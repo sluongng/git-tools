@@ -11,9 +11,6 @@ TASK_TMP=$(mktemp -d "${TMPDIR:-/tmp}/git-nfs-smoke.XXXXXX")
 TASK_PID=
 TASK_MOUNTED=0
 TASK_GENERATION=0
-privileged() {
-  if [ "$(id -u)" = 0 ]; then "$@"; else sudo -n "$@"; fi
-}
 await_exit() {
   kill -s "$1" "$TASK_PID" 2>/dev/null || true
   TASK_STOP_ATTEMPTS=0
@@ -25,7 +22,7 @@ await_exit() {
 }
 stop() {
   if [ "$TASK_MOUNTED" = 1 ]; then
-    privileged umount "$TASK_TMP/mount" || return 1
+    umount "$TASK_TMP/mount" || return 1
     TASK_MOUNTED=0
   fi
   if [ -n "$TASK_PID" ]; then
@@ -112,9 +109,9 @@ start() {
   done
   TASK_PORT=$(sed -n 's/^NFS export ready on 127\.0\.0\.1:\([0-9][0-9]*\);.*/\1/p' "$TASK_LOG")
   [ -n "$TASK_PORT" ] || { echo 'Could not determine NFS listener port.' >&2; return 1; }
-  # No interactive password prompts in a remote verifier. Obtain sudo authority
-  # beforehand, or run this script from a root shell on the native Mac.
-  privileged mount_nfs -o "vers=3,tcp,nolocks,resvport,port=$TASK_PORT,mountport=$TASK_PORT,nobrowse,nosuid,nodev" \
+  # The loopback export does not require a privileged source port. Mount as the
+  # current user, who owns this temporary mountpoint; do not invoke sudo.
+  mount_nfs -o "vers=3,tcp,nolocks,noresvport,port=$TASK_PORT,mountport=$TASK_PORT,nobrowse,nosuid,nodev" \
     127.0.0.1:/ "$TASK_TMP/mount"
   TASK_MOUNTED=1
 }

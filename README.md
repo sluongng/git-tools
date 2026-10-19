@@ -11,7 +11,7 @@ Additional crates: [`workspace-nfs`](crates/workspace-nfs/) for macOS NFS,
 [`workspace-projfs`](crates/workspace-projfs/) for Windows,
 [`jj-vfs`](crates/jj-vfs/) for Jujutsu working copies, and
 [`bazel-output-service`](crates/bazel-output-service/) for BuildBuddy-backed Bazel outputs.
-These are experimental; native macOS kernel acceptance is still pending.
+These are experimental; native macOS NFS acceptance passes without sudo.
 Crate names describe responsibilities; executable names remain `git-vfs`,
 `git-nfs`, `git-projfs`, `git-jj`, and `git-output-service` for compatibility.
 

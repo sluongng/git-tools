@@ -105,7 +105,7 @@ async fn main() -> Result<()> {
     let server = NFSTcpListener::bind(&args.listen.to_string(), fs.clone()).await?;
     let port = server.get_listen_port();
     eprintln!(
-        "NFS export ready on 127.0.0.1:{port}; macOS mount: sudo mount_nfs -o vers=3,tcp,nolocks,resvport,port={port},mountport={port},nobrowse 127.0.0.1:/ {}",
+        "NFS export ready on 127.0.0.1:{port}; macOS mount: mount_nfs -o vers=3,tcp,nolocks,noresvport,port={port},mountport={port},nobrowse,nosuid,nodev 127.0.0.1:/ {}",
         mountpoint.display()
     );
     tokio::select! {

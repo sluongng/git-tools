@@ -11,14 +11,14 @@ cargo build -p workspace-nfs
 mkdir -p /tmp/git-workspace
 target/debug/git-nfs --repo repo.git --overlay state --mountpoint /tmp/git-workspace
 # macOS, in another terminal (default TCP port 11111):
-sudo mount_nfs -o vers=3,tcp,nolocks,resvport,port=11111,mountport=11111,nobrowse \
+mount_nfs -o vers=3,tcp,nolocks,noresvport,port=11111,mountport=11111,nobrowse,nosuid,nodev \
   127.0.0.1:/ /tmp/git-workspace
 ```
 
 Native macOS acceptance: read tracked files and symlinks; create/write/truncate,
 rename and remove a file and directory; run `git status`, `git add` and `git commit`;
-unmount with `sudo umount /tmp/git-workspace`, stop/restart the server and remount,
-and verify edited data and status survive. **Not yet runtime-verified on macOS.**
+unmount with `umount /tmp/git-workspace`, stop/restart the server and remount,
+and verify edited data and status survive. **Passed on macOS 27.2 arm64 without sudo.**
 Linux wire tests exercise actual TCP RPC without requiring privileged mounts.
 
 Writes are flushed before the server acknowledges FILE_SYNC. Hardlinks, locking,
@@ -35,4 +35,7 @@ isolation boundary. Use `nosuid,nodev` client options where supported. Directory
 pagination can return BAD_COOKIE if the namespace changes between pages. Mount
 and unmount manually; never remove the overlay to clear a cache.
 
-Automated native verifier: `GIT_NFS_BIN=/absolute/git-nfs ./crates/workspace-nfs/scripts/macos-smoke.sh` (mount needs sudo).
+Mount and unmount as the user who owns the mountpoint; no sudo is needed for
+this loopback export. `noresvport` avoids the root-only reserved source port.
+
+Automated native verifier: `GIT_NFS_BIN=/absolute/git-nfs ./crates/workspace-nfs/scripts/macos-smoke.sh`.
