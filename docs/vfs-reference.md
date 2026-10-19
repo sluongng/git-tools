@@ -270,6 +270,9 @@ Invalid includes fail before mount. Prefetch is optional; ordinary mounts remain
 fully lazy.
 
 Background prefetch and demand reads share the demand-prioritized scheduler.
+Mounted prefetch uses bounded batches (32 object IDs by default), rather than
+guaranteeing the standalone command's single initial fetch. Demand can reorder
+queued work to preserve foreground responsiveness.
 Already-local reads continue while remote batches wait; overlapping object reads
 coalesce, and foreground demand can promote queued speculation. Failed prefetch
 does not take down the mount. Unmount cancels and reaps native Git process groups.
