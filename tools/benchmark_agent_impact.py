@@ -283,10 +283,12 @@ class Harness:
             "--cache-dir", cache, "--listen", f"127.0.0.1:{port}", "--refresh-ttl-seconds", "86400",
             "--pack-cache-ttl-seconds", "86400", "--pack-cache-max-entry-bytes", "268435456"]
         log = (self.output / (name + ".stderr")).open("wb")
+        started = time.monotonic()
         process = subprocess.Popen(list(map(str, command)), stdout=subprocess.DEVNULL, stderr=log,
             env=dict(self.env, GIT_TRACE2_EVENT=str(self.output / (name + ".trace2.jsonl"))), start_new_session=True)
         with self.lock:
-            self.commands.append({"name": name, "argv": list(map(str, command)), "kind": "owned proxy"})
+            command_row = {"name": name, "argv": list(map(str, command)), "kind": "owned proxy"}
+            self.commands.append(command_row)
         try:
             deadline = time.monotonic() + 30
             while time.monotonic() < deadline:
@@ -294,6 +296,7 @@ class Harness:
                     raise RuntimeError("proxy exited during readiness gate")
                 try:
                     self.stats(origin)
+                    command_row["seconds_to_ready"] = time.monotonic() - started
                     return origin, (process, log)
                 except (OSError, ValueError):
                     time.sleep(.02)
@@ -438,9 +441,9 @@ class Harness:
         self.result["restart_probes"].append(row)
         origin, state = self.start_proxy(self.binaries[version + "-proxy"], cache, name + "-before")
         try:
-            self.clone(origin, directory / "prime", name + "-prime", False)
+            row["prime_clone"] = self.clone(origin, directory / "prime", name + "-prime", False)
             before = self.stats(origin)
-            self.clone(origin, directory / "warm-proof", name + "-warm-proof", False)
+            row["warm_clone"] = self.clone(origin, directory / "warm-proof", name + "-warm-proof", False)
             after = self.stats(origin)
             row["warm_fetch_stats_delta"] = delta(before, after)
             if row["warm_fetch_stats_delta"].get("pack_cache", {}).get("hits", 0) < 1:
