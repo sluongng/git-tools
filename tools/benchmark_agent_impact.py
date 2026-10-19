@@ -64,6 +64,20 @@ def filesystem_identity(path):
         return {"type": "unknown", "id": None}
 
 
+def prefetch_mount_args(args, arm):
+    """Workload-tuned ablation; checkout never receives mount flags."""
+    if arm == "checkout" or not (args.prefetch or arm == "candidate-prefetch"):
+        return []
+    result = ["--prefetch-bazel"]
+    for path in args.prefetch_path:
+        result += ["--prefetch-path", path]
+    for path in args.prefetch_include:
+        result += ["--prefetch-include", path]
+    if args.prefetch_no_discover:
+        result.append("--prefetch-no-discover")
+    return result
+
+
 def delta(before, after):
     result = {}
     for key, value in after.items():
@@ -249,6 +263,9 @@ class Harness:
             self.binaries[name] = target
             self.result["provenance"][name] = {"input": str(path), "sha256": sha256(target)}
         self.git_binary = str(self.binaries["git"])
+        self.result["provenance"]["arm_binary_map"] = {
+            arm: "candidate-vfs" if arm == "candidate-prefetch" else arm
+            for arm in self.args.arms if arm != "checkout"}
         self.result["provenance"]["harness_sha256"] = sha256(Path(__file__))
         shutil.copy2(Path(__file__), frozen / Path(__file__).name)
         self.result["provenance"]["baseline_source"] = self.args.baseline_source
@@ -396,14 +413,13 @@ class Harness:
             if arm == "checkout":
                 view = repo
             else:
-                binary = self.binaries[arm]
+                binary = self.binaries["candidate-vfs" if arm == "candidate-prefetch" else arm]
                 phases["warm_sizes"] = self.run([binary, "--git", self.git_binary, "warm-sizes", "--repo", repo,
                     "--size-source", "git"], name + "-sizes")
                 mount.mkdir()
                 command = [binary, "--git", self.git_binary, "mount", "--repo", repo,
                     "--size-source", "git", "--overlay", directory / "overlay"]
-                if self.args.prefetch:
-                    command += ["--prefetch-bazel"]
+                command += prefetch_mount_args(self.args, arm)
                 command += [mount]
                 log = (self.output / (name + "-mount.stderr")).open("wb")
                 mounted = time.monotonic()
@@ -440,6 +456,8 @@ class Harness:
         directory = self.scratch / name
         directory.mkdir()
         row = {"name": name, "trial": trial, "arm": arm, "journey": journey, "agents": count, "complete": False}
+        row["prefetch"] = {"mount_flags": prefetch_mount_args(self.args, arm),
+            "scope": "workload-tuned async prefetch ablation, not general Bazel default" if arm == "candidate-prefetch" else "existing arm policy"}
         self.result["cells"].append(row)
         self.save()
         cache = self.prepare_cache(directory, name)
@@ -552,10 +570,13 @@ def arguments():
     parser.add_argument("--trials", type=int, default=3)
     parser.add_argument("--agents", nargs="+", type=int, default=[1, 4], choices=[1, 4, 8])
     parser.add_argument("--journeys", nargs="+", choices=["narrow", "broad"], default=["narrow"])
-    parser.add_argument("--arms", nargs="+", choices=["checkout", "baseline-vfs", "candidate-vfs"], default=["checkout", "baseline-vfs", "candidate-vfs"])
+    parser.add_argument("--arms", nargs="+", choices=["checkout", "baseline-vfs", "candidate-vfs", "candidate-prefetch"], default=["checkout", "baseline-vfs", "candidate-vfs"])
     parser.add_argument("--narrow-path", action="append", default=None)
     parser.add_argument("--broad-prefix", action="append", default=None)
     parser.add_argument("--prefetch", action="store_true", help="Async Bazel metadata prefetch on both VFS arms")
+    parser.add_argument("--prefetch-path", action="append", default=[], help="Repeatable workload-tuned prefetch root (not a general default)")
+    parser.add_argument("--prefetch-include", action="append", default=[], help="Repeatable extra known working-set file/subtree")
+    parser.add_argument("--prefetch-no-discover", action="store_true", help="Disable literal MODULE/rc discovery in selected prefetch arms")
     parser.add_argument("--restart-only", action="store_true")
     parser.add_argument("--skip-restart", action="store_true")
     parser.add_argument("--require-persistent-reuse", action="store_true", help="Fail if candidate restart probe has no actual pack-cache hit")
@@ -571,7 +592,10 @@ def arguments():
     output, mirror, parent = (p.resolve() for p in (args.output, args.mirror, args.workspace_parent))
     if output.is_relative_to(mirror) or mirror.is_relative_to(output) or parent.is_relative_to(output) or parent.is_relative_to(mirror):
         parser.error("workspace parent must be outside output/fixture; output and fixture must be disjoint")
-    for path in args.narrow_path + args.broad_prefix:
+    if (args.prefetch_path or args.prefetch_include or args.prefetch_no_discover) and (
+            args.restart_only or not any(arm != "checkout" and (args.prefetch or arm == "candidate-prefetch") for arm in args.arms)):
+        parser.error("prefetch selections require a selected candidate-prefetch arm or --prefetch on a selected VFS arm")
+    for path in args.narrow_path + args.broad_prefix + args.prefetch_path + args.prefetch_include:
         if Path(path).is_absolute() or ".." in Path(path).parts:
             parser.error("journey selections must be safe repository-relative paths")
     return args
@@ -585,6 +609,8 @@ def main():
     if not args.run:
         print(json.dumps({"execution": False, "trials": args.trials, "arms": args.arms, "agents": args.agents,
             "journeys": args.journeys, "prefetch": args.prefetch, "restart_probes": not args.skip_restart,
+            "prefetch_by_arm": {arm: prefetch_mount_args(args, arm) for arm in args.arms},
+            "prefetch_scope": "candidate-prefetch is workload-tuned, using the same candidate binary; not a general Bazel default",
             "readiness_gates": ["full standalone SHA1 mirror", "Linux pidfd/FUSE", "frozen binary hashes",
                 "actual warm cache hit before restart comparison", "every selected file verified against tree blob SHA1"],
             "practical_matrix": "narrow / 1,4 agents / 3 arms / 3 rotated trials + 6 restart probes; broad and 8-agent runs are opt-in",
