@@ -193,6 +193,16 @@ impl WritableGitFs {
         self.overlay.sync()
     }
 }
+// FUSE_DESTROY is not guaranteed on every orderly session teardown. The owned
+// filesystem is dropped exactly once after dispatch stops, including remount-only
+// sessions, so report here rather than depending on that protocol callback.
+impl Drop for WritableGitFs {
+    fn drop(&mut self) {
+        if let Ok(stats) = serde_json::to_string(&self.overlay.stats()) {
+            eprintln!("Overlay state: {stats}");
+        }
+    }
+}
 impl Filesystem for WritableGitFs {
     fn destroy(&mut self) {
         if let Err(e) = self.overlay.sync() {
@@ -638,7 +648,7 @@ impl Filesystem for WritableGitFs {
         let result = (|| {
             if name == OsStr::new("user.blake3") || name == OsStr::new("user.blake3.hex") {
                 let stats = self.blake3.as_ref().ok_or_else(|| error(libc::ENODATA))?;
-                let entry = self.overlay.entry(ino)?;
+                let entry = self.overlay.content_entry(ino)?;
                 if entry.control || entry.kind.is_dir() {
                     stats.miss();
                     return Err(error(libc::ENODATA));

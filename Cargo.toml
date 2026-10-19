@@ -1,3 +1,7 @@
 [workspace]
 members = ["crates/git-vfs", "crates/git-proxy"]
+exclude = ["third_party/fuser"]
 resolver = "3"
+
+[patch.crates-io]
+fuser = { path = "third_party/fuser" }

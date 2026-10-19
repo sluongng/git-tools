@@ -1,7 +1,7 @@
 //! Durable Fjall overlay and a read-only journal service for Git subprocesses.
 use super::{
     BaseKind, Entry, Kind, Snapshot,
-    codec::{decode, encode},
+    codec::{decode_for_open, encode},
 };
 use crate::storage::open_fjall;
 use anyhow::{Context, Result, ensure};
@@ -36,6 +36,7 @@ struct Handles {
 pub(super) struct Store {
     handles: Option<Handles>,
     service: Option<Service>,
+    pub(super) reclaimed_payload_bytes: u64,
 }
 fn number(bytes: &[u8]) -> Result<u64> {
     Ok(u64::from_be_bytes(
@@ -189,13 +190,53 @@ impl Store {
             tx.insert(&handles.meta, b"generation", 0u64.to_be_bytes());
             tx.insert(&handles.meta, b"commit", snapshot.commit.as_bytes());
         }
+        // Finish initialization before maintenance. Fresh open holds the exclusive
+        // owner lock, so no live FUSE/open-file references can reach these inodes.
+        tx.commit()?;
         let mut loaded = BTreeMap::new();
-        for item in tx.iter(&handles.entries) {
-            let (key, value) = item.into_inner()?;
-            let e = decode(&value)?;
-            ensure!(number(&key)? == e.inode, "overlay entry key mismatch");
-            loaded.insert(e.inode, e);
+        let mut reclaimed_payload_bytes = 0u64;
+        let mut cursor: Option<Vec<u8>> = None;
+        const MAINTENANCE_RECORDS: usize = 128;
+        loop {
+            let read = handles.db.read_tx();
+            let lower = cursor.as_ref().map_or(std::ops::Bound::Unbounded, |key| {
+                std::ops::Bound::Excluded(key.clone())
+            });
+            let mut maintenance = Vec::new();
+            let mut count = 0;
+            for item in read
+                .range(&handles.entries, (lower, std::ops::Bound::Unbounded))
+                .take(MAINTENANCE_RECORDS)
+            {
+                let (key, value) = item.into_inner()?;
+                let (e, reclaimed) = decode_for_open(&value)?;
+                ensure!(number(&key)? == e.inode, "overlay entry key mismatch");
+                if let Some(bytes) = reclaimed {
+                    reclaimed_payload_bytes = reclaimed_payload_bytes
+                        .checked_add(bytes)
+                        .context("overlay reclaimed byte count overflow")?;
+                    // A zero-length inline payload also needs its marker removed.
+                    // Already-pruned records need no second durable write.
+                    maintenance.push((key.to_vec(), encode_entry(&e)?));
+                }
+                cursor = Some(key.to_vec());
+                loaded.insert(e.inode, e);
+                count += 1;
+            }
+            // Do not pin old LSM versions across maintenance commits.
+            drop(read);
+            if !maintenance.is_empty() {
+                let mut tx = handles.db.write_tx().durability(Some(PersistMode::SyncAll));
+                for (key, value) in maintenance {
+                    tx.insert(&handles.entries, key, value);
+                }
+                tx.commit()?;
+            }
+            if count < MAINTENANCE_RECORDS {
+                break;
+            }
         }
+        let mut tx = handles.db.write_tx().durability(Some(PersistMode::SyncAll));
         let absolute = gitdir
             .canonicalize()
             .context("resolve worktree Git directory")?;
@@ -243,6 +284,7 @@ impl Store {
             Self {
                 handles: Some(handles),
                 service: Some(service),
+                reclaimed_payload_bytes,
             },
             loaded,
         ))

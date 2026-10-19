@@ -69,6 +69,25 @@ Always preserve:
 7. Agent clones/overlays/output bases remain private; only immutable content and the
    existing proxy may be shared within the authorized cache namespace.
 
+## Required dispatch-lifetime boundary
+
+Early benchmark instrumentation exposed an existing fuser0.16 lifecycle issue:
+`BackgroundSession` drop detaches dispatch; simply calling its `join` can hang
+while a client retains an idle file/directory descriptor after lazy unmount.
+A real idle-FD probe reproduced that behavior. Bring this shutdown prerequisite
+forward before trusting per-session reclamation counters.
+
+Retain the upstream MIT fuser0.16 source with a narrow Linux `Session::run_until`
+patch: nonblocking receive and finite poll with stop checks, original descriptor
+flags restored by an owned guard. Existing upstream `run` remains unchanged.
+Own Session/dispatch thread/stop/unmount explicitly in git-vfs. Cancel native Git
+first, stop dispatch, detach the mount and join filesystem/database teardown
+before releasing the working-tree owner. Idle-client references must not prevent
+exit; an uncancellable host sync already in progress is not a hard wall-clock bound.
+No fusectl access, guessed connection IDs, thread kills or client termination.
+Validate idle file+directory handles, stalled reads with/without prefetch,
+external unmount and immediate remount/acknowledged-data persistence.
+
 ## Stage A: baseline harness and conservative reclamation
 
 Freeze baseline binaries before rebuilding. Promote the disposable churn probe into
@@ -88,6 +107,28 @@ base fallback). Maintenance is idempotent and does not emit user mutations.
 This stage bounds dead *payload* at remount, not tombstone count or live-session
 churn. Replacing values makes old LSM versions reclaimable; physical disk shrink
 follows compaction and is measured separately.
+
+### Stage A measured checkpoint (2026-10-19)
+
+Three rotated actual-FUSE trials per arm, 64 operations of 256 KiB, against
+frozen `c0687ee`. [Samples and correctness checks](../benchmarks/2026-10-19-vfs-remount.json).
+Every candidate session emitted valid counters; remount retained the linked
+256 KiB edit and reclaimed 16 MiB of dead payload (plus seven bytes for atomic saves).
+
+| Median | Baseline | Stage A |
+|---|---:|---:|
+| Unlink churn | 125.23 ms | 133.81 ms |
+| Atomic-save churn | 138.20 ms | 138.35 ms |
+| Remount RSS, unlink | 55.26 MiB | 39.50 MiB |
+| Remount RSS, atomic-save | 71.23 MiB | 55.43 MiB |
+
+Allocated disk stayed approximately 32.52/48.59 MiB respectively; immediate
+physical shrink is not established. Live-session retention is unchanged.
+One unlink candidate took 228 ms; it remains in the samples. Earlier diagnostic
+runs exposed missing shutdown counters and an idle-handle join hang; those runs
+were not accepted as complete mechanism verification. The final dispatch fix also
+passed shutdown/remount with idle file and directory handles as normal user and
+inside an isolated root user/mount namespace. This is not a Bazel latency result.
 
 ## Stage B: mutable data as ranged backing files
 

@@ -68,6 +68,21 @@ pub struct Overlay {
     database: fjall::Store,
     entries: BTreeMap<u64, Entry>,
     namespace: HashMap<u64, DirectoryIndex>,
+    // Only inodes already unlinked at exclusive open are reclaimed. Inodes
+    // unlinked during this session retain their open-descriptor semantics.
+    reclaimed: HashSet<u64>,
+}
+
+/// Logical overlay state; protected `.git` pointer bytes are not user payload.
+#[derive(Clone, Debug, Default, serde::Serialize)]
+pub struct OverlayStats {
+    pub entry_count: u64,
+    pub linked_entries: u64,
+    pub tombstone_entries: u64,
+    pub live_payload_bytes: u64,
+    pub dead_payload_bytes: u64,
+    /// Payload bytes removed during this exclusive open, not lifetime total.
+    pub reclaimed_payload_bytes: u64,
 }
 
 #[derive(Default)]
@@ -183,11 +198,47 @@ impl Overlay {
                 index.insert(binding);
             }
         }
+        let reclaimed = entries
+            .values()
+            .filter(|e| !e.linked && !e.control)
+            .map(|e| e.inode)
+            .collect();
         Ok(Self {
             database,
             entries,
             namespace,
+            reclaimed,
         })
+    }
+    pub fn stats(&self) -> OverlayStats {
+        let mut stats = OverlayStats {
+            entry_count: self.entries.len() as u64,
+            reclaimed_payload_bytes: self.database.reclaimed_payload_bytes,
+            ..OverlayStats::default()
+        };
+        for entry in self.entries.values() {
+            if entry.linked {
+                stats.linked_entries += 1;
+            } else {
+                stats.tombstone_entries += 1;
+            }
+            if !entry.control {
+                let bytes = entry.data.as_ref().map_or(0, |data| data.len() as u64);
+                if entry.linked {
+                    stats.live_payload_bytes += bytes;
+                } else {
+                    stats.dead_payload_bytes += bytes;
+                }
+            }
+        }
+        stats
+    }
+    /// Reject reclaimed inode content rather than resurrecting its base blob.
+    pub fn content_entry(&self, ino: u64) -> Result<&Entry> {
+        if self.reclaimed.contains(&ino) {
+            return Err(error(libc::ENOENT));
+        }
+        self.entry(ino)
     }
     pub fn entry(&self, ino: u64) -> Result<&Entry> {
         self.entries.get(&ino).ok_or_else(|| error(libc::ENOENT))
@@ -231,7 +282,7 @@ impl Overlay {
             .map_or(0, |index| index.directory_children))
     }
     pub fn size(&mut self, ino: u64, repo: &mut GitRepo) -> Result<u64> {
-        let e = self.entry(ino)?;
+        let e = self.content_entry(ino)?;
         if e.kind.is_dir() {
             return Ok(0);
         }
@@ -245,7 +296,7 @@ impl Overlay {
             .context("missing blob size")
     }
     pub fn read(&mut self, ino: u64, repo: &mut GitRepo) -> Result<Vec<u8>> {
-        let e = self.entry(ino)?;
+        let e = self.content_entry(ino)?;
         if e.kind.is_dir() {
             return Err(error(libc::EISDIR));
         }
@@ -255,7 +306,7 @@ impl Overlay {
         }
     }
     pub fn digest(&self, ino: u64) -> Result<Vec<u8>> {
-        let e = self.entry(ino)?;
+        let e = self.content_entry(ino)?;
         if e.control || e.kind.is_dir() {
             return Err(error(libc::ENODATA));
         }
@@ -473,7 +524,7 @@ impl Overlay {
         data: &[u8],
         repo: &mut GitRepo,
     ) -> Result<usize> {
-        let mut e = self.entry(ino)?.clone();
+        let mut e = self.content_entry(ino)?.clone();
         if e.control {
             return Err(error(libc::EPERM));
         }
@@ -515,7 +566,7 @@ impl Overlay {
         mtime: Option<SystemTime>,
         repo: &mut GitRepo,
     ) -> Result<()> {
-        let mut e = self.entry(ino)?.clone();
+        let mut e = self.content_entry(ino)?.clone();
         if e.control {
             return Err(error(libc::EPERM));
         }

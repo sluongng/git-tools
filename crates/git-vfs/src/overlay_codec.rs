@@ -57,7 +57,8 @@ impl<'a> Decoder<'a> {
         Ok(b == 1)
     }
 }
-pub(super) fn decode(bytes: &[u8]) -> Result<Entry> {
+// Borrow and validate dead payload bytes without copying them into the live map.
+pub(super) fn decode_for_open(bytes: &[u8]) -> Result<(Entry, Option<u64>)> {
     let mut d = Decoder(bytes);
     ensure!(d.take(1)? == [1], "unsupported overlay entry version");
     let inode = d.number()?;
@@ -71,21 +72,32 @@ pub(super) fn decode(bytes: &[u8]) -> Result<Entry> {
         .bytes()?
         .map(|bytes| String::from_utf8(bytes.to_vec()))
         .transpose()?;
-    let data = d.bytes()?.map(<[u8]>::to_vec);
+    let payload = d.bytes()?;
+    let reclaimed = payload
+        .filter(|_| !linked && !control)
+        .map(|p| p.len() as u64);
+    let data = if !linked && !control {
+        None
+    } else {
+        payload.map(<[u8]>::to_vec)
+    };
     let mtime = parse_time(std::str::from_utf8(d.required()?)?.to_owned())?;
     let ctime = parse_time(std::str::from_utf8(d.required()?)?.to_owned())?;
     ensure!(d.0.is_empty(), "trailing overlay entry data");
-    Ok(Entry {
-        inode,
-        parent,
-        name,
-        kind,
-        mode,
-        base_oid,
-        data,
-        mtime,
-        ctime,
-        linked,
-        control,
-    })
+    Ok((
+        Entry {
+            inode,
+            parent,
+            name,
+            kind,
+            mode,
+            base_oid,
+            data,
+            mtime,
+            ctime,
+            linked,
+            control,
+        },
+        reclaimed,
+    ))
 }

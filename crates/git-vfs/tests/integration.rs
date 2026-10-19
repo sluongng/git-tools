@@ -516,10 +516,31 @@ fn writable_namespace_lookup_counts_and_tombstones_survive_mutation_and_reopen()
     assert_eq!(overlay.directory_children_count(b).unwrap(), 0);
     let children = overlay.children(b).unwrap();
     assert_eq!(children, vec![replacement, raw_inode]);
+    // Live-session unlinked files still support descriptor-style content access.
+    overlay.write(source, 0, b"SOURCE", &mut repo).unwrap();
+    assert_eq!(overlay.read(source, &mut repo).unwrap(), b"SOURCE bytes");
+    let base = overlay.lookup(1, OsStr::new("hello.txt")).unwrap();
+    overlay.write(base, 0, b"edited base", &mut repo).unwrap();
+    overlay.unlink(1, OsStr::new("hello.txt"), false).unwrap();
+    let unmodified = overlay.lookup(1, OsStr::new("binary")).unwrap();
+    overlay.unlink(1, OsStr::new("binary"), false).unwrap();
+    // Cross the maintenance batch boundary; all records/inode high-water remain.
+    let mut highest = 0;
+    for n in 0..130 {
+        let name = OsString::from(format!("discard-{n}"));
+        highest = overlay
+            .create(1, &name, Kind::File, 0o600, Some(vec![7; n]))
+            .unwrap();
+        overlay.unlink(1, &name, false).unwrap();
+    }
+    let before = overlay.stats();
+    assert!(before.dead_payload_bytes > 0);
+    let (token, _) = git_vfs::overlay::changes_since(&directory, "").unwrap();
+    let dirty = git_vfs::overlay::dirty_paths(&directory).unwrap();
     overlay.sync().unwrap();
     drop(overlay);
 
-    let overlay = Overlay::open(&directory, &snapshot, &gitdir).unwrap();
+    let mut overlay = Overlay::open(&directory, &snapshot, &gitdir).unwrap();
     assert_eq!(overlay.lookup(1, OsStr::new(".")).unwrap(), 1);
     assert_eq!(overlay.lookup(b, OsStr::new("..")).unwrap(), 1);
     assert_eq!(overlay.lookup(b, &raw_name).unwrap(), raw_inode);
@@ -536,6 +557,54 @@ fn writable_namespace_lookup_counts_and_tombstones_survive_mutation_and_reopen()
     assert!(!overlay.entry(source).unwrap().linked);
     assert!(!overlay.entry(overwritten).unwrap().linked);
     assert!(overlay.lookup(1, OsStr::new(".git")).is_ok());
+    let after = overlay.stats();
+    assert_eq!(after.entry_count, before.entry_count);
+    assert_eq!(after.linked_entries, before.linked_entries);
+    assert_eq!(after.tombstone_entries, before.tombstone_entries);
+    assert_eq!(after.live_payload_bytes, before.live_payload_bytes);
+    assert_eq!(after.dead_payload_bytes, 0);
+    assert_eq!(after.reclaimed_payload_bytes, before.dead_payload_bytes);
+    assert_eq!(overlay.read(replacement, &mut repo).unwrap(), b"new bytes");
+    assert_eq!(overlay.read(raw_inode, &mut repo).unwrap(), [1, 2]);
+    assert!(overlay.lookup(1, OsStr::new("hello.txt")).is_err());
+    for inode in [source, overwritten, base, unmodified, highest] {
+        let entry = overlay.entry(inode).unwrap();
+        assert!(!entry.linked);
+        assert!(entry.data.is_none());
+        assert!(overlay.read(inode, &mut repo).is_err());
+        assert!(overlay.size(inode, &mut repo).is_err());
+        assert!(overlay.digest(inode).is_err());
+        assert!(overlay.content_entry(inode).is_err());
+        assert!(
+            overlay
+                .write(inode, 0, b"no resurrection", &mut repo)
+                .is_err()
+        );
+        assert!(
+            overlay
+                .setattr(inode, None, Some(0), None, &mut repo)
+                .is_err()
+        );
+    }
+    assert!(overlay.entry(base).unwrap().base_oid.is_some());
+    assert_eq!(
+        git_vfs::overlay::changes_since(&directory, &token).unwrap(),
+        (token.clone(), vec![])
+    );
+    assert_eq!(git_vfs::overlay::dirty_paths(&directory).unwrap(), dirty);
+    drop(overlay);
+    let mut overlay = Overlay::open(&directory, &snapshot, &gitdir).unwrap();
+    assert_eq!(overlay.stats().reclaimed_payload_bytes, 0);
+    assert_eq!(overlay.stats().dead_payload_bytes, 0);
+    assert_eq!(overlay.stats().entry_count, before.entry_count);
+    assert_eq!(
+        git_vfs::overlay::changes_since(&directory, &token).unwrap(),
+        (token, vec![])
+    );
+    let next = overlay
+        .create(1, OsStr::new("next"), Kind::File, 0o600, None)
+        .unwrap();
+    assert!(next > highest);
 }
 
 #[test]
@@ -1272,8 +1341,8 @@ fn writable_mount_options(
     }
 }
 
-// The wrapper pauses only explicit speculative fetches. Metadata commands and
-// ordinary Git lazy fetches remain available to the mounted filesystem.
+// The wrapper normally pauses only explicit speculative fetches. A marker can
+// instead pause the demand-only blob reader, without blocking metadata commands.
 struct ControlledPrefetch {
     wrapper: PathBuf,
     marker: PathBuf,
@@ -1301,9 +1370,11 @@ impl ControlledPrefetch {
             r#"#!/usr/bin/env python3
 import os, pathlib, sys, time
 root = pathlib.Path(__file__).parent
-if 'fetch' in sys.argv and '--stdin' in sys.argv:
+is_fetch = 'fetch' in sys.argv and '--stdin' in sys.argv
+is_demand = (root / 'pause-demand').exists() and sys.argv[-2:] == ['cat-file', '--batch']
+if is_fetch or is_demand:
     with (root / 'fetch-requests').open('a') as log:
-        log.write('fetch\n')
+        log.write('fetch\n' if is_fetch else 'demand\n')
     (root / 'fetch-started').write_text(f'{os.getpid()} {os.getpgrp()}\n')
     while not (root / 'fetch-release').exists():
         time.sleep(0.01)
@@ -1320,15 +1391,23 @@ os.execvp('git', ['git', *sys.argv[1:]])
     }
 
     fn mount(&self, fixture: &Fixture, args: &[&str]) -> Mounted {
-        let child = Command::new(env!("CARGO_BIN_EXE_git-vfs"))
+        self.mount_with_prefetch(fixture, args, true)
+    }
+
+    fn mount_with_prefetch(&self, fixture: &Fixture, args: &[&str], prefetch: bool) -> Mounted {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_git-vfs"));
+        command
             .arg("--git")
             .arg(&self.wrapper)
             .env("GIT_TRACE", &self.trace)
             .args(["mount", "--repo"])
             .arg(&fixture.clone)
             .arg("--overlay")
-            .arg(fixture._temp.path().join("async-overlay"))
-            .arg("--prefetch-bazel")
+            .arg(fixture._temp.path().join("async-overlay"));
+        if prefetch {
+            command.arg("--prefetch-bazel");
+        }
+        let child = command
             .args(args)
             .arg(&fixture.mount)
             .stdout(Stdio::null())
@@ -1519,77 +1598,121 @@ fn mounted_background_prefetch_is_live_scoped_and_shares_hydration_with_reads() 
 #[test]
 #[ignore = "requires Linux /dev/fuse and permission to mount"]
 fn mounted_background_prefetch_cancels_stalled_fetch_on_unmount() {
-    let fixture = Fixture::with_blob_count(2);
-    let control = ControlledPrefetch::new(&fixture);
-    let mut mounted = control.mount(&fixture, &["--prefetch-include", "hello.txt"]);
-    control.wait_for(|| control.marker.exists(), "background fetch never started");
-    let ids: Vec<i32> = fs::read_to_string(&control.marker)
-        .unwrap()
-        .split_whitespace()
-        .map(|id| id.parse().unwrap())
-        .collect();
-    assert_ne!(
-        ids[1],
-        unsafe { libc::getpgrp() },
-        "fetch must have an independently cancellable process group"
-    );
-    let mut reader = Command::new("cat")
-        .arg(fixture.mount.join("hello.txt"))
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .unwrap();
-    control.wait_for(
-        || reader_is_reading_mount(&reader, &fixture.mount.join("hello.txt")),
-        "reader never blocked behind stalled prefetch",
-    );
-    let started = Instant::now();
-    unsafe {
-        libc::kill(mounted.child.id() as i32, libc::SIGINT);
+    struct Case {
+        name: &'static str,
+        prefetch: bool,
+        expected_requests: &'static str,
     }
-    loop {
-        let daemon_exited = mounted.child.try_wait().unwrap().is_some();
-        let reader_exited = reader.try_wait().unwrap().is_some();
-        if daemon_exited && reader_exited {
-            break;
+    for case in [
+        Case {
+            name: "stalled speculative prefetch",
+            prefetch: true,
+            expected_requests: "fetch\n",
+        },
+        Case {
+            name: "stalled demand without prefetch",
+            prefetch: false,
+            expected_requests: "demand\n",
+        },
+    ] {
+        let fixture = Fixture::with_blob_count(2);
+        let control = ControlledPrefetch::new(&fixture);
+        if !case.prefetch {
+            fs::write(fixture._temp.path().join("pause-demand"), b"pause").unwrap();
         }
-        assert!(
-            started.elapsed() < Duration::from_secs(5),
-            "shutdown exceeded deadline: daemon_exited={daemon_exited}, reader_exited={reader_exited}"
+        let args: &[&str] = if case.prefetch {
+            &["--prefetch-include", "hello.txt"]
+        } else {
+            &[]
+        };
+        let mut mounted = control.mount_with_prefetch(&fixture, args, case.prefetch);
+        if case.prefetch {
+            control.wait_for(|| control.marker.exists(), "background fetch never started");
+        }
+        let mut reader = Command::new("cat")
+            .arg(fixture.mount.join("hello.txt"))
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        control.wait_for(
+            || control.marker.exists(),
+            "controlled content reader never started",
         );
-        std::thread::sleep(Duration::from_millis(10));
+        let ids: Vec<i32> = fs::read_to_string(&control.marker)
+            .unwrap()
+            .split_whitespace()
+            .map(|id| id.parse().unwrap())
+            .collect();
+        assert_eq!(ids.len(), 2, "{}", case.name);
+        assert_ne!(
+            ids[1],
+            unsafe { libc::getpgrp() },
+            "{} must have an independently cancellable process group",
+            case.name
+        );
+        control.wait_for(
+            || reader_is_reading_mount(&reader, &fixture.mount.join("hello.txt")),
+            "reader never blocked behind controlled content operation",
+        );
+        let started = Instant::now();
+        unsafe {
+            libc::kill(mounted.child.id() as i32, libc::SIGINT);
+        }
+        loop {
+            let daemon_exited = mounted.child.try_wait().unwrap().is_some();
+            let reader_exited = reader.try_wait().unwrap().is_some();
+            if daemon_exited && reader_exited {
+                break;
+            }
+            assert!(
+                started.elapsed() < Duration::from_secs(5),
+                "shutdown exceeded deadline: daemon_exited={daemon_exited}, reader_exited={reader_exited}"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let output = reader.wait_with_output().unwrap();
+        assert!(
+            !output.status.success(),
+            "pending read unexpectedly succeeded during shutdown"
+        );
+        assert!(output.stdout.is_empty());
+        let native_fetches = fs::read_to_string(&control.trace)
+            .unwrap()
+            .lines()
+            .filter(|line| line.contains("built-in: git ") && line.contains(" fetch "))
+            .count();
+        assert_eq!(
+            native_fetches, 0,
+            "shutdown must not start an implicit lazy fetch after cancelling the paused batch"
+        );
+        assert!(!control.release.exists());
+        assert_eq!(
+            fs::read_to_string(&control.requests).unwrap(),
+            case.expected_requests,
+            "{}: cancelled content workers must not start another batch",
+            case.name
+        );
+        assert_eq!(
+            unsafe { libc::kill(ids[0], 0) },
+            -1,
+            "fetch wrapper survived unmount"
+        );
+        assert_eq!(
+            unsafe { libc::kill(-ids[1], 0) },
+            -1,
+            "fetch process group survived unmount"
+        );
+        let shutdown = fs::read_to_string(&control.stderr).unwrap();
+        let reports: Vec<_> = shutdown
+            .lines()
+            .filter_map(|line| line.strip_prefix("Overlay state: "))
+            .collect();
+        assert_eq!(reports.len(), 1, "{}: {shutdown}", case.name);
+        let state: serde_json::Value = serde_json::from_str(reports[0]).unwrap();
+        assert!(state["entry_count"].as_u64().unwrap() > 0);
+        assert_eq!(state["dead_payload_bytes"], 0);
     }
-    let output = reader.wait_with_output().unwrap();
-    assert!(
-        !output.status.success(),
-        "pending read unexpectedly succeeded during shutdown"
-    );
-    assert!(output.stdout.is_empty());
-    let native_fetches = fs::read_to_string(&control.trace)
-        .unwrap()
-        .lines()
-        .filter(|line| line.contains("built-in: git ") && line.contains(" fetch "))
-        .count();
-    assert_eq!(
-        native_fetches, 0,
-        "shutdown must not start an implicit lazy fetch after cancelling the paused batch"
-    );
-    assert!(!control.release.exists());
-    assert_eq!(
-        fs::read_to_string(&control.requests).unwrap(),
-        "fetch\n",
-        "cancelled workers must not start another discovery batch"
-    );
-    assert_eq!(
-        unsafe { libc::kill(ids[0], 0) },
-        -1,
-        "fetch wrapper survived unmount"
-    );
-    assert_eq!(
-        unsafe { libc::kill(-ids[1], 0) },
-        -1,
-        "fetch process group survived unmount"
-    );
 }
 
 #[test]
@@ -1694,7 +1817,7 @@ fn writable_mount_native_git_status_uses_journal_and_survives_remount() {
     oids.sort();
     oids.dedup();
     drop(repo);
-    let mounted = writable_mount(&fixture, &overlay);
+    let mut mounted = writable_mount(&fixture, &overlay);
     assert_eq!(
         git(&fixture.mount, &["rev-parse", "--is-shallow-repository"]).stdout,
         b"true\n"
@@ -1854,8 +1977,42 @@ fn writable_mount_native_git_status_uses_journal_and_survives_remount() {
     let before = status(&fixture.mount);
     let missing = fixture.missing_blobs(&oids);
     assert_eq!(missing, oids.len(), "fixture must begin blobless");
+    // Idle descriptors must not keep the session thread or overlay owner alive.
+    // Keep both descriptors open until after the same overlay has remounted.
+    let idle_file = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(fixture.mount.join("hello.txt"))
+        .unwrap();
+    idle_file.sync_all().unwrap();
+    let idle_directory = fs::read_dir(fixture.mount.join("new-dir")).unwrap();
+    let (journal_token, _) = git_vfs::overlay::changes_since(&overlay, "").unwrap();
+    let shutdown_started = Instant::now();
+    assert_eq!(
+        unsafe { libc::kill(mounted.child.id() as i32, libc::SIGINT) },
+        0
+    );
+    loop {
+        if let Some(exit) = mounted.child.try_wait().unwrap() {
+            assert!(exit.success(), "idle-descriptor shutdown failed: {exit}");
+            break;
+        }
+        assert!(
+            shutdown_started.elapsed() < Duration::from_secs(5),
+            "daemon did not exit while idle file and directory descriptors remained open"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
     drop(mounted);
+    // Immediate reacquisition proves the daemon joined its filesystem/database
+    // owner before returning, rather than leaving a detached session behind.
     let mounted = writable_mount(&fixture, &overlay);
+    assert_eq!(
+        git_vfs::overlay::changes_since(&overlay, &journal_token).unwrap(),
+        (journal_token, vec![])
+    );
+    drop(idle_directory);
+    drop(idle_file);
     assert_eq!(
         git(&fixture.mount, &["rev-parse", "--is-shallow-repository"]).stdout,
         b"false\n"

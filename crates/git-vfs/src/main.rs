@@ -285,6 +285,61 @@ fn clone_repository(
     }))
 }
 
+// Own dispatch separately from mount detachment: client descriptors can outlive
+// a lazy unmount, but must not prevent our filesystem/database teardown.
+struct MountedSession {
+    unmount: fuser::SessionUnmounter,
+    worker: Option<std::thread::JoinHandle<std::io::Result<()>>>,
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    cancellation: git_vfs::backend::BackgroundCancellation,
+}
+
+impl MountedSession {
+    fn shutdown(&mut self) -> Result<()> {
+        self.cancellation.cancel();
+        let unmount = self.unmount.unmount();
+        // Let dispatch service any final unmount requests before stopping it.
+        // A lazy detach may leave client handles alive, so it is not itself a
+        // termination signal for the receive loop.
+        self.stop.store(true, std::sync::atomic::Ordering::Release);
+        let dispatch = self.worker.take().map(|worker| worker.join());
+        unmount.context("unmount git-vfs")?;
+        if let Some(dispatch) = dispatch {
+            dispatch
+                .map_err(|_| anyhow::anyhow!("git-vfs dispatch thread panicked"))?
+                .context("stop git-vfs dispatch")?;
+        }
+        Ok(())
+    }
+}
+
+impl Drop for MountedSession {
+    fn drop(&mut self) {
+        let _ = self.shutdown();
+    }
+}
+
+fn spawn_session<F: fuser::Filesystem + Send + 'static>(
+    fs: F,
+    mountpoint: &Path,
+    options: &[MountOption],
+    cancellation: git_vfs::backend::BackgroundCancellation,
+) -> std::io::Result<MountedSession> {
+    let mut session = fuser::Session::new(fs, mountpoint, options)?;
+    let unmount = session.unmount_callable();
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let worker_stop = stop.clone();
+    let worker = std::thread::Builder::new()
+        .name("git-vfs-dispatch".into())
+        .spawn(move || session.run_until(&worker_stop))?;
+    Ok(MountedSession {
+        unmount,
+        worker: Some(worker),
+        stop,
+        cancellation,
+    })
+}
+
 fn mount(
     mut repo: GitRepo,
     snapshot: Snapshot,
@@ -309,11 +364,18 @@ fn mount(
         let _ = sender.send(());
     })?;
     let commit = snapshot.commit.clone();
+    // Demand-only mounts need the same native-process cancellation scope as
+    // prefetch mounts before we can safely join their dispatch thread.
+    let (background_repo, mount_cancellation) = repo.background_handle()?;
     let background = prefetch
         .map(|policy| {
             policy.validate(&snapshot)?;
-            let (repo, cancellation) = repo.background_handle()?;
-            Ok::<_, anyhow::Error>((repo, snapshot.clone(), policy, cancellation))
+            Ok::<_, anyhow::Error>((
+                background_repo,
+                snapshot.clone(),
+                policy,
+                mount_cancellation.clone(),
+            ))
         })
         .transpose()?;
     let mut options = vec![
@@ -324,7 +386,7 @@ fn mount(
     ];
     let stats = std::sync::Arc::new(git_vfs::blake3_xattr::Blake3XattrStats::default());
     let working;
-    let session = if read_only {
+    let mut session = if read_only {
         options.push(MountOption::RO);
         working = None;
         {
@@ -334,7 +396,7 @@ fn mount(
             } else {
                 fs
             };
-            fuser::spawn_mount2(fs, &mountpoint, &options)
+            spawn_session(fs, &mountpoint, &options, mount_cancellation.clone())
         }
     } else {
         options.push(MountOption::RW);
@@ -356,7 +418,7 @@ fn mount(
             } else {
                 fs
             };
-            fuser::spawn_mount2(fs, &mountpoint, &options)
+            spawn_session(fs, &mountpoint, &options, mount_cancellation.clone())
         }
     }
     .context("mounting git-vfs (check /dev/fuse and fusermount3)")?;
@@ -391,15 +453,23 @@ fn mount(
     loop {
         match receiver.recv_timeout(std::time::Duration::from_millis(200)) {
             Ok(()) => break,
-            Err(std::sync::mpsc::RecvTimeoutError::Timeout) if session.guard.is_finished() => break,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+                if session
+                    .worker
+                    .as_ref()
+                    .is_some_and(|worker| worker.is_finished()) =>
+            {
+                break;
+            }
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
             Err(error) => return Err(error).context("waiting for shutdown signal"),
         }
     }
     // Cancel and reap native Git commands before releasing the FUSE session:
     // an early read might be waiting for its in-flight batch.
+    mount_cancellation.cancel();
     drop(background);
-    drop(session);
+    session.shutdown()?;
     drop(working);
     if blake3 {
         eprintln!("BLAKE3 xattrs: {}", serde_json::to_string(&stats.report())?);
