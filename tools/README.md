@@ -86,6 +86,12 @@ short readiness checks as non-headline evidence.
 
 ## Evidence and interpretation
 
+For this project's own local versus BuildBuddy Rust build matrix, use
+`benchmark_developer_build.py --config rbe --output FRESH_OUTPUT --source-edit
+crates/git-vfs/src/main.rs crates/git-workspace/src/backend.rs`. Add `--run`
+after reviewing the dry run. It separates clean-output reuse, no-op and
+metadata-changing edits; see [developer build setup](../docs/development.md).
+
 Harnesses retain frozen binary hashes, raw commands/logs, TRACE2, object-presence
 manifests, profiles, and checkpointed results on success or failure.
 Do not call logical blob bytes network bytes. Keep failures/outliers; do not

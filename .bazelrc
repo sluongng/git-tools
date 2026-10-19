@@ -1,0 +1,22 @@
+common --noannounce_rc
+build --incompatible_strict_action_env
+build --compilation_mode=opt
+build --enable_platform_specific_config
+build --jobs=16
+test --test_output=errors
+# Match Cargo's conventional host scratch; overridable on the command line.
+test --test_tmpdir=/tmp/git-tools-bazel-tests
+
+# Hermetic Rust/LLVM toolchains are identical locally and on remote executors.
+common:rbe --remote_executor=grpcs://remote.buildbuddy.io
+common:rbe --remote_cache=grpcs://remote.buildbuddy.io
+common:rbe --bes_backend=grpcs://remote.buildbuddy.io
+common:rbe --bes_results_url=https://app.buildbuddy.io/invocation/
+build:rbe --extra_execution_platforms=//:rbe_linux_x86_64
+build:rbe --remote_timeout=600
+build:rbe --remote_download_toplevel
+build:rbe --remote_cache_compression
+build:rbe --jobs=64
+
+# Local endpoint overrides and credentials are never checked in.
+try-import %workspace%/user.bazelrc

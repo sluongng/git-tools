@@ -1,0 +1,32 @@
+load("@crates//:defs.bzl", "aliases", "all_crate_deps")
+load("@rules_rs//rs:rust_library.bzl", "rust_library")
+load("@rules_rs//rs:cargo_build_script.bzl", "cargo_build_script")
+
+package(default_visibility = ["//visibility:public"])
+
+cargo_build_script(
+    name = "build_script",
+    srcs = ["//build_defs:reapi_build.rs"],
+    edition = "2024",
+    version = "0.1.0",
+    pkg_name = "git-reapi",
+    aliases = aliases(),
+    data = glob(["proto/**"]) + ["@crates//:protoc_headers", "@crates//:protoc_descriptor"],
+    tools = ["@crates//:protoc"],
+    build_script_env = {
+        "PROTOC": "$(execpath @crates//:protoc)",
+        "PROTOC_DESCRIPTOR": "$(execpath @crates//:protoc_descriptor)",
+    },
+    deps = ["@crates//:tonic-prost-build"],
+)
+
+rust_library(
+    name = "git-reapi",
+    srcs = glob(["src/**/*.rs"], exclude = ["src/main.rs"]),
+    crate_name = "git_reapi",
+    crate_root = "src/lib.rs",
+    edition = "2024",
+    version = "0.1.0",
+    aliases = aliases(),
+    deps = [":build_script"] + all_crate_deps(normal = True),
+)

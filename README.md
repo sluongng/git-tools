@@ -100,3 +100,16 @@ and staged work: **do not delete it as a cache**.
 For background workspace publication, see [CAS sync](docs/proxy-cas-sync.md).
 It complements r2c2 external-repository caching; neither a digest mapping nor a
 queued upload proves that a remote CAS holds the content.
+
+## Development
+
+Bazel uses pinned Rust/LLVM toolchains and the same Cargo lockfile:
+
+```sh
+bazel build //:git-vfs //:git-proxy
+bazel test --config=rbe //...
+```
+
+Put BuildBuddy credentials in the **gitignored** `user.bazelrc`.
+See [build setup and crate boundaries](docs/development.md) and
+[next EdenFS lessons](docs/design/edenfs-next-steps.md).
