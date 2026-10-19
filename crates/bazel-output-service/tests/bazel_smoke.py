@@ -322,7 +322,7 @@ def main():
                 for line in stats.splitlines():
                     if not line.startswith("output_service_stats "):
                         continue
-                    for key, value in re.findall(r"\b(stage_requests|staged_files|verified_bytes|lazy_fetches|lazy_verified_bytes|lazy_cache_hits): (\d+)", line):
+                    for key, value in re.findall(r"\b(stage_requests|staged_files|verified_bytes|lazy_fetches|lazy_verified_bytes|lazy_cache_hits|zstd_read_requests|cas_read_wire_bytes): (\d+)", line):
                         metrics[key] = metrics.get(key, 0) + int(value)
             except Exception as error:
                 cleanup_failure("service metrics", error)

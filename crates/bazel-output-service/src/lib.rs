@@ -20,9 +20,10 @@ use std::{
     },
     time::Duration,
 };
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, OnceCell};
 use tonic::{
     Request, Response, Status,
+    codec::CompressionEncoding,
     transport::{Channel, ClientTlsConfig, Endpoint},
 };
 
@@ -74,6 +75,8 @@ pub struct MetricsSnapshot {
     pub lazy_fetches: u64,
     pub lazy_verified_bytes: u64,
     pub lazy_cache_hits: u64,
+    pub zstd_read_requests: u64,
+    pub cas_read_wire_bytes: u64,
 }
 struct Build {
     id: String,
@@ -100,6 +103,10 @@ struct Backend {
     api_key: Option<tonic::metadata::MetadataValue<tonic::metadata::Ascii>>,
     max_blob_bytes: u64,
     timeout: Duration,
+    zstd_supported: Arc<OnceCell<bool>>,
+    grpc_compression: Arc<reapi::compression::GrpcCompression>,
+    zstd_read_requests: Arc<AtomicU64>,
+    cas_read_wire_bytes: Arc<AtomicU64>,
 }
 
 fn io_status(error: std::io::Error) -> Status {
@@ -302,6 +309,39 @@ impl Backend {
         }
         req
     }
+    async fn supports_zstd(&self) -> Result<bool, Status> {
+        use reapi::reapi::{GetCapabilitiesRequest, capabilities_client::CapabilitiesClient};
+        self.zstd_supported
+            .get_or_try_init(|| async {
+                let mut client = CapabilitiesClient::new(self.channel.clone())
+                    .accept_compressed(CompressionEncoding::Gzip);
+                if let Some(encoding) = self.grpc_compression.request_encoding() {
+                    client = client.send_compressed(encoding);
+                }
+                let response = tokio::time::timeout(
+                    self.timeout,
+                    client.get_capabilities(self.request(GetCapabilitiesRequest {
+                        instance_name: self.instance.clone(),
+                    })),
+                )
+                .await
+                .map_err(|_| Status::deadline_exceeded("CAS capabilities timed out"))?;
+                match response {
+                    Ok(response) => {
+                        self.grpc_compression.observe(response.metadata());
+                        Ok(response
+                            .into_inner()
+                            .cache_capabilities
+                            .is_some_and(|caps| caps.supported_compressors.contains(&1)))
+                    }
+                    // Older CAS deployments do not implement capability discovery.
+                    Err(error) if error.code() == tonic::Code::Unimplemented => Ok(false),
+                    Err(error) => Err(error),
+                }
+            })
+            .await
+            .copied()
+    }
     async fn download(
         &self,
         digest: &Digest,
@@ -313,15 +353,25 @@ impl Backend {
                 "blob exceeds configured size limit",
             ));
         }
+        let compressed = self.supports_zstd().await?;
         let resource = format!(
-            "{}{}blobs/{}{}/{}",
+            "{}{}{}/{}{}/{}",
             self.instance,
             if self.instance.is_empty() { "" } else { "/" },
+            if compressed {
+                "compressed-blobs/zstd"
+            } else {
+                "blobs"
+            },
             if function == 9 { "blake3/" } else { "" },
             digest.hash,
             digest.size_bytes
         );
-        let mut client = bs::byte_stream_client::ByteStreamClient::new(self.channel.clone());
+        let mut client = bs::byte_stream_client::ByteStreamClient::new(self.channel.clone())
+            .accept_compressed(CompressionEncoding::Gzip);
+        if compressed {
+            self.zstd_read_requests.fetch_add(1, Ordering::Relaxed);
+        }
         let mut stream = client
             .read(self.request(bs::ReadRequest {
                 resource_name: resource,
@@ -330,19 +380,89 @@ impl Backend {
             }))
             .await?
             .into_inner();
-        let mut hasher = Hasher::new(function)?;
-        let mut size = 0u64;
-        while let Some(chunk) = stream.message().await? {
-            size = size
-                .checked_add(chunk.data.len() as u64)
-                .ok_or_else(|| Status::data_loss("CAS stream length overflow"))?;
-            if size > digest.size_bytes as u64 {
-                return Err(Status::data_loss("CAS stream exceeded declared length"));
-            }
-            file.write_all(&chunk.data).map_err(io_status)?;
-            hasher.update(&chunk.data);
+        // This writer checks the uncompressed length before publishing each chunk.
+        // The decoder uses a fixed-size buffer, never a whole-blob allocation.
+        struct VerifiedWriter<'a, W> {
+            file: &'a mut W,
+            hasher: Hasher,
+            size: u64,
+            limit: u64,
         }
-        if size != digest.size_bytes as u64 || hasher.finish() != digest.hash {
+        impl<W: Write> Write for VerifiedWriter<'_, W> {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                let size = self
+                    .size
+                    .checked_add(bytes.len() as u64)
+                    .filter(|size| *size <= self.limit)
+                    .ok_or_else(|| {
+                        std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            "CAS stream exceeded declared length",
+                        )
+                    })?;
+                self.file.write_all(bytes)?;
+                self.hasher.update(bytes);
+                self.size = size;
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                self.file.flush()
+            }
+        }
+        let mut writer = VerifiedWriter {
+            file,
+            hasher: Hasher::new(function)?,
+            size: 0,
+            limit: digest.size_bytes as u64,
+        };
+        let mut decoder = compressed
+            .then(reapi::compression::ZstdDecoder::new)
+            .transpose()
+            .map_err(|_| Status::internal("cannot initialize CAS decoder"))?;
+        let mut wire_bytes = 0u64;
+        let wire_limit = (digest.size_bytes as u64)
+            .saturating_add((digest.size_bytes as u64 / 8).max(1024 * 1024));
+        let mut empty_messages = 0u32;
+        while let Some(chunk) = stream.message().await? {
+            self.cas_read_wire_bytes
+                .fetch_add(chunk.data.len() as u64, Ordering::Relaxed);
+            wire_bytes = wire_bytes
+                .checked_add(chunk.data.len() as u64)
+                .filter(|size| *size <= wire_limit)
+                .ok_or_else(|| Status::data_loss("CAS compressed stream exceeded wire limit"))?;
+            empty_messages = if chunk.data.is_empty() {
+                empty_messages + 1
+            } else {
+                0
+            };
+            if empty_messages > 1024 {
+                return Err(Status::data_loss("CAS stream made no progress"));
+            }
+            if let Some(decoder) = &mut decoder {
+                let mut input = chunk.data.as_slice();
+                let mut drain = false;
+                while !input.is_empty() || drain {
+                    let step = decoder
+                        .decode_step(input, &mut writer)
+                        .map_err(|_| Status::data_loss("invalid CAS content stream"))?;
+                    input = &input[step.consumed..];
+                    drain = step.needs_drain;
+                    // A tiny compressed message can expand into many output chunks.
+                    // Yield after each bounded step so the total deadline can cancel it.
+                    tokio::task::yield_now().await;
+                }
+            } else {
+                writer
+                    .write_all(&chunk.data)
+                    .map_err(|_| Status::data_loss("invalid CAS content stream"))?;
+            }
+        }
+        if let Some(decoder) = decoder {
+            decoder
+                .finish()
+                .map_err(|_| Status::data_loss("truncated CAS compressed stream"))?;
+        }
+        if writer.size != digest.size_bytes as u64 || writer.hasher.finish() != digest.hash {
             return Err(Status::data_loss("CAS content digest or length mismatch"));
         }
         Ok(())
@@ -396,14 +516,35 @@ impl BlobSource for Backend {
                         size_bytes: i64::try_from(artifact.size)?,
                     });
                 }
-                let response = ContentAddressableStorageClient::new(self.channel.clone())
-                    .find_missing_blobs(self.request(FindMissingBlobsRequest {
-                        instance_name: self.instance.clone(),
-                        blob_digests: digests,
-                        digest_function: function,
-                    }))
-                    .await?
-                    .into_inner();
+                self.supports_zstd().await?;
+                let request = FindMissingBlobsRequest {
+                    instance_name: self.instance.clone(),
+                    blob_digests: digests,
+                    digest_function: function,
+                };
+                let response = tokio::time::timeout(self.timeout, async {
+                    let attempted = self.grpc_compression.request_encoding();
+                    let mut client = ContentAddressableStorageClient::new(self.channel.clone())
+                        .accept_compressed(CompressionEncoding::Gzip);
+                    if let Some(encoding) = attempted {
+                        client = client.send_compressed(encoding);
+                    }
+                    match client
+                        .find_missing_blobs(self.request(request.clone()))
+                        .await
+                    {
+                        Err(error) if self.grpc_compression.retry_identity(&error, attempted) => {
+                            ContentAddressableStorageClient::new(self.channel.clone())
+                                .accept_compressed(CompressionEncoding::Gzip)
+                                .find_missing_blobs(self.request(request))
+                                .await
+                        }
+                        result => result,
+                    }
+                })
+                .await
+                .map_err(|_| Status::deadline_exceeded("CAS presence check timed out"))??
+                .into_inner();
                 for digest in response.missing_blob_digests {
                     let artifact = batch
                         .iter()
@@ -465,6 +606,10 @@ impl OutputService {
                 api_key,
                 max_blob_bytes: config.max_blob_bytes,
                 timeout: config.rpc_timeout,
+                zstd_supported: Arc::new(OnceCell::new()),
+                grpc_compression: Arc::new(reapi::compression::GrpcCompression::default()),
+                zstd_read_requests: Arc::new(AtomicU64::new(0)),
+                cas_read_wire_bytes: Arc::new(AtomicU64::new(0)),
             },
             projection: None,
             projection_tree: None,
@@ -508,6 +653,8 @@ impl OutputService {
             lazy_fetches: cache.fetches,
             lazy_verified_bytes: cache.verified_bytes,
             lazy_cache_hits: cache.hits,
+            zstd_read_requests: self.backend.zstd_read_requests.load(Ordering::Relaxed),
+            cas_read_wire_bytes: self.backend.cas_read_wire_bytes.load(Ordering::Relaxed),
         }
     }
     fn key(id: &str) -> Result<String, Status> {

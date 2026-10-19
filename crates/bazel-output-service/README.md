@@ -34,6 +34,15 @@ The verified cache defaults to 4 GiB; a blob must also fit the 256 MiB in-flight
 budget. Adjust `--max-cache-bytes`, `--max-inflight-bytes` and
 `--max-concurrent-fetches` for the workload. Metadata staging does not prove CAS
 residency; each build checks presence and requests conservative revalidation.
+Both eager and lazy reads negotiate ZSTD with CAS capabilities; legacy or
+identity-only servers keep working. Digests and limits describe decoded bytes.
+Streaming decoding is bounded, checks complete frames and yields for deadlines.
+The decoder accepts concatenated frames with windows up to **8 MiB**; valid
+frames requiring larger windows are rejected. Corruption is never hidden by a
+broad identity retry. Metadata gRPC calls support gzip with codec-aware fallback;
+outbound ByteStream RPCs do not add gRPC compression to ZSTD payloads. Tiny
+frames can be larger than the original content.
+
 Local changes never retain a trusted remote digest. Staged files are executable
 because the protocol has no executable bit.
 

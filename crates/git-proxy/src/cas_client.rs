@@ -5,10 +5,17 @@ use serde::Serialize;
 use std::{
     collections::HashSet,
     path::PathBuf,
-    sync::{Arc, Mutex},
+    pin::Pin,
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicU64, Ordering},
+    },
+    task::{Context as TaskContext, Poll},
     time::Duration,
 };
-use tokio::io::{AsyncReadExt, AsyncSeekExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncSeekExt, BufReader, ReadBuf};
+use tokio_stream::StreamExt;
+use tonic::codec::CompressionEncoding;
 use tonic::{
     Code, Request,
     metadata::{Ascii, MetadataKey, MetadataValue},
@@ -18,6 +25,7 @@ use tonic::{
 pub use ::reapi::{Digest, proto, reapi};
 use proto::google::bytestream as bs;
 
+const ZSTD: i32 = reapi::compressor::Value::Zstd as i32;
 const BLAKE3: i32 = reapi::digest_function::Value::Blake3 as i32;
 const FIND_MISSING_LIMIT: usize = 1000;
 const BATCH_BYTES: usize = 2 * 1024 * 1024;
@@ -54,6 +62,10 @@ pub struct UploadStats {
     pub bytestream_write_calls: u64,
     pub splice_calls: u64,
     pub uploaded_bytes: u64,
+    /// Application payload bytes emitted into RPC messages, excluding protobuf/HTTP framing.
+    pub uploaded_wire_bytes: u64,
+    pub zstd_batch_blobs: u64,
+    pub zstd_stream_blobs: u64,
     pub uploaded_blobs: u64,
     pub cdc_blobs: u64,
     pub cdc_chunks: u64,
@@ -66,6 +78,9 @@ impl UploadStats {
         self.bytestream_write_calls += other.bytestream_write_calls;
         self.splice_calls += other.splice_calls;
         self.uploaded_bytes += other.uploaded_bytes;
+        self.uploaded_wire_bytes += other.uploaded_wire_bytes;
+        self.zstd_batch_blobs += other.zstd_batch_blobs;
+        self.zstd_stream_blobs += other.zstd_stream_blobs;
         self.uploaded_blobs += other.uploaded_blobs;
         self.cdc_blobs += other.cdc_blobs;
         self.cdc_chunks += other.cdc_chunks;
@@ -79,6 +94,7 @@ pub struct CasClient {
     headers: Arc<Vec<(MetadataKey<Ascii>, MetadataValue<Ascii>)>>,
     caps: reapi::CacheCapabilities,
     rpc_timeout: Duration,
+    grpc_compression: Arc<::reapi::compression::GrpcCompression>,
     stats: Arc<Mutex<UploadStats>>,
 }
 #[derive(Clone)]
@@ -107,6 +123,49 @@ fn validate_digest(d: &Digest) -> Result<()> {
         "invalid BLAKE3 digest"
     );
     Ok(())
+}
+
+// Verify the exact uncompressed part as it is read, before an encoder can emit
+// its final frame. A corrupt or truncated spool can never finish the upload.
+struct VerifiedPartReader {
+    file: tokio::io::Take<tokio::fs::File>,
+    remaining: u64,
+    hasher: blake3::Hasher,
+    hash: String,
+    verified: bool,
+}
+impl AsyncRead for VerifiedPartReader {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut TaskContext<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        let before = buf.filled().len();
+        match Pin::new(&mut self.file).poll_read(cx, buf) {
+            Poll::Pending => Poll::Pending,
+            Poll::Ready(Err(error)) => Poll::Ready(Err(error)),
+            Poll::Ready(Ok(())) => {
+                let data = &buf.filled()[before..];
+                self.hasher.update(data);
+                self.remaining -= data.len() as u64;
+                if self.remaining == 0 && !self.verified {
+                    if self.hasher.finalize().to_hex().as_str() != self.hash {
+                        return Poll::Ready(Err(std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            "CAS spool content does not match digest",
+                        )));
+                    }
+                    self.verified = true;
+                } else if data.is_empty() && self.remaining != 0 && buf.remaining() != 0 {
+                    return Poll::Ready(Err(std::io::Error::new(
+                        std::io::ErrorKind::UnexpectedEof,
+                        "truncated CAS spool",
+                    )));
+                }
+                Poll::Ready(Ok(()))
+            }
+        }
+    }
 }
 
 impl CasClient {
@@ -162,11 +221,13 @@ impl CasClient {
             headers: Arc::new(headers),
             caps: Default::default(),
             rpc_timeout: Duration::from_secs(60),
+            grpc_compression: Arc::new(Default::default()),
             stats: Arc::new(Mutex::new(Default::default())),
         };
         let response = bounded_rpc(
             client.rpc_timeout,
             reapi::capabilities_client::CapabilitiesClient::new(client.channel.clone())
+                .accept_compressed(CompressionEncoding::Gzip)
                 .get_capabilities(client.request(
                     reapi::GetCapabilitiesRequest {
                         instance_name: client.instance.clone(),
@@ -175,9 +236,10 @@ impl CasClient {
                 )),
         )
         .await
-        .map_err(|s| rpc_error("GetCapabilities", s))?
-        .into_inner();
+        .map_err(|s| rpc_error("GetCapabilities", s))?;
+        client.grpc_compression.observe(response.metadata());
         client.caps = response
+            .into_inner()
             .cache_capabilities
             .context("CAS omitted cache capabilities")?;
         ensure!(
@@ -220,8 +282,40 @@ impl CasClient {
         reapi::content_addressable_storage_client::ContentAddressableStorageClient::new(
             self.channel.clone(),
         )
+        .accept_compressed(CompressionEncoding::Gzip)
         .max_encoding_message_size(GRPC_BYTES)
         .max_decoding_message_size(GRPC_BYTES)
+    }
+    fn metadata_cas(
+        &self,
+        encoding: Option<CompressionEncoding>,
+    ) -> reapi::content_addressable_storage_client::ContentAddressableStorageClient<Channel> {
+        let client = self.cas();
+        match encoding {
+            Some(encoding) => client.send_compressed(encoding),
+            None => client,
+        }
+    }
+    // One outer deadline covers both attempts. Only an explicit transport-codec
+    // rejection permits an identity retry; application/authentication failures do not.
+    async fn metadata_rpc<T, F, Fut>(
+        &self,
+        mut call: F,
+    ) -> Result<tonic::Response<T>, tonic::Status>
+    where
+        F: FnMut(Option<CompressionEncoding>) -> Fut,
+        Fut: std::future::Future<Output = Result<tonic::Response<T>, tonic::Status>>,
+    {
+        let encoding = self.grpc_compression.request_encoding();
+        bounded_rpc(self.rpc_timeout, async {
+            match call(encoding).await {
+                Err(status) if self.grpc_compression.retry_identity(&status, encoding) => {
+                    call(None).await
+                }
+                response => response,
+            }
+        })
+        .await
     }
     /// Validate each response against its request. Never infer presence from an incomplete upload response.
     pub async fn find_missing(&self, digests: &[Digest]) -> Result<Vec<Digest>> {
@@ -238,20 +332,20 @@ impl CasClient {
                 find_missing_calls: 1,
                 ..Default::default()
             });
-            let response = bounded_rpc(
-                self.rpc_timeout,
-                self.cas().find_missing_blobs(self.request(
-                    reapi::FindMissingBlobsRequest {
-                        instance_name: self.instance.clone(),
-                        blob_digests: batch.to_vec(),
-                        digest_function: BLAKE3,
-                    },
-                    chunk,
-                )),
-            )
-            .await
-            .map_err(|s| rpc_error("FindMissingBlobs", s))?
-            .into_inner();
+            let request = reapi::FindMissingBlobsRequest {
+                instance_name: self.instance.clone(),
+                blob_digests: batch.to_vec(),
+                digest_function: BLAKE3,
+            };
+            let response = self
+                .metadata_rpc(|encoding| {
+                    let mut client = self.metadata_cas(encoding);
+                    let request = self.request(request.clone(), chunk);
+                    async move { client.find_missing_blobs(request).await }
+                })
+                .await
+                .map_err(|s| rpc_error("FindMissingBlobs", s))?
+                .into_inner();
             let mut seen = HashSet::new();
             for d in response.missing_blob_digests {
                 validate_digest(&d)?;
@@ -349,11 +443,28 @@ impl CasClient {
             *bytes = 0;
         }
         let data = read_part(&part).await?;
-        let request = reapi::batch_update_blobs_request::Request {
-            digest: Some(part.digest),
-            data,
-            compressor: 0,
+        let (data, compressor) = if self.caps.supported_batch_update_compressors.contains(&ZSTD) {
+            (::reapi::compression::encode_zstd(&data)?, ZSTD)
+        } else {
+            (data, 0)
         };
+        let request = reapi::batch_update_blobs_request::Request {
+            digest: Some(part.digest.clone()),
+            data,
+            compressor,
+        };
+        let envelope = reapi::BatchUpdateBlobsRequest {
+            instance_name: self.instance.clone(),
+            requests: Vec::new(),
+            digest_function: BLAKE3,
+        }
+        .encoded_len();
+        let request_bytes = request.encoded_len();
+        if envelope + 1 + prost::length_delimiter_len(request_bytes) + request_bytes > GRPC_BYTES {
+            self.flush_batch(pending, chunk, stats).await?;
+            *bytes = 0;
+            return self.stream_part(&part, chunk, stats).await;
+        }
         pending.push(request);
         let envelope_bytes = reapi::BatchUpdateBlobsRequest {
             instance_name: self.instance.clone(),
@@ -392,26 +503,40 @@ impl CasClient {
             .iter()
             .map(|r| key(r.digest.as_ref().unwrap()))
             .collect();
-        let bytes: u64 = requests.iter().map(|r| r.data.len() as u64).sum();
+        let bytes: u64 = requests
+            .iter()
+            .map(|r| r.digest.as_ref().unwrap().size_bytes as u64)
+            .sum();
         let count = requests.len() as u64;
+        let wire_bytes = requests.iter().map(|r| r.data.len() as u64).sum();
+        let zstd_batch_blobs = requests.iter().filter(|r| r.compressor == ZSTD).count() as u64;
         let started = UploadStats {
             batch_update_calls: 1,
             ..Default::default()
         };
         stats.add(&started);
         self.record(&started);
-        let response = bounded_rpc(
-            self.rpc_timeout,
-            self.cas().batch_update_blobs(self.request(
-                reapi::BatchUpdateBlobsRequest {
-                    instance_name: self.instance.clone(),
-                    requests,
-                    digest_function: BLAKE3,
-                },
-                chunk,
-            )),
-        )
-        .await
+        // Use transport compression only for identity batches. ZSTD entries are
+        // already compressed independently under the CAS protocol.
+        let request = reapi::BatchUpdateBlobsRequest {
+            instance_name: self.instance.clone(),
+            requests,
+            digest_function: BLAKE3,
+        };
+        let response = if request.requests.iter().all(|r| r.compressor == 0) {
+            self.metadata_rpc(|encoding| {
+                let mut client = self.metadata_cas(encoding);
+                let request = self.request(request.clone(), chunk);
+                async move { client.batch_update_blobs(request).await }
+            })
+            .await
+        } else {
+            bounded_rpc(
+                self.rpc_timeout,
+                self.cas().batch_update_blobs(self.request(request, chunk)),
+            )
+            .await
+        }
         .map_err(|s| rpc_error("BatchUpdateBlobs", s))?
         .into_inner();
         let mut seen = HashSet::new();
@@ -431,6 +556,8 @@ impl CasClient {
         ensure!(seen == expected, "CAS omitted batch upload responses");
         let complete = UploadStats {
             uploaded_bytes: bytes,
+            uploaded_wire_bytes: wire_bytes,
+            zstd_batch_blobs,
             uploaded_blobs: count,
             ..Default::default()
         };
@@ -439,14 +566,20 @@ impl CasClient {
         Ok(())
     }
     async fn stream_part(&self, part: &Part, chunk: bool, stats: &mut UploadStats) -> Result<()> {
+        let compressed = self.caps.supported_compressors.contains(&ZSTD);
         let upload_id = uuid::Uuid::new_v4().to_string();
         let prefix = if self.instance.is_empty() {
             String::new()
         } else {
             format!("{}/", self.instance)
         };
+        let kind = if compressed {
+            "compressed-blobs/zstd"
+        } else {
+            "blobs"
+        };
         let resource = format!(
-            "{prefix}uploads/{upload_id}/blobs/blake3/{}/{}",
+            "{prefix}uploads/{upload_id}/{kind}/blake3/{}/{}",
             part.digest.hash, part.digest.size_bytes
         );
         let (tx, rx) = tokio::sync::mpsc::channel(2);
@@ -457,21 +590,27 @@ impl CasClient {
                 .await
                 .context("open CAS spool")?;
             file.seek(std::io::SeekFrom::Start(part.offset)).await?;
-            let mut remaining = part.digest.size_bytes as usize;
+            let verified = VerifiedPartReader {
+                file: file.take(part.digest.size_bytes as u64),
+                remaining: part.digest.size_bytes as u64,
+                hasher: blake3::Hasher::new(),
+                hash: part.digest.hash,
+                verified: false,
+            };
+            // Both paths keep memory bounded by the encoder window, one read buffer
+            // and the two-frame channel. The digest always describes plaintext.
+            let mut reader: Box<dyn AsyncRead + Unpin + Send> = if compressed {
+                Box::new(async_compression::tokio::bufread::ZstdEncoder::new(
+                    BufReader::new(verified),
+                ))
+            } else {
+                Box::new(verified)
+            };
             let mut offset = 0i64;
-            let mut hasher = blake3::Hasher::new();
             loop {
-                let mut data = vec![0; remaining.min(STREAM_BYTES)];
-                file.read_exact(&mut data).await.context("read CAS spool")?;
-                hasher.update(&data);
-                remaining -= data.len();
-                if remaining == 0 {
-                    ensure!(
-                        hasher.finalize().to_hex().as_str() == part.digest.hash,
-                        "CAS spool content does not match digest"
-                    );
-                }
-                let len = data.len() as i64;
+                let mut data = vec![0; STREAM_BYTES];
+                let n = reader.read(&mut data).await.context("read CAS upload")?;
+                data.truncate(n);
                 tx.send(bs::WriteRequest {
                     resource_name: if offset == 0 {
                         resource.clone()
@@ -479,14 +618,14 @@ impl CasClient {
                         String::new()
                     },
                     write_offset: offset,
-                    finish_write: remaining == 0,
+                    finish_write: n == 0,
                     data,
                 })
                 .await
                 .map_err(|_| anyhow::anyhow!("CAS stopped consuming upload"))?;
-                offset += len;
-                if remaining == 0 {
-                    return Ok::<_, anyhow::Error>(());
+                offset += n as i64;
+                if n == 0 {
+                    return Ok::<_, anyhow::Error>(offset);
                 }
             }
         }));
@@ -496,26 +635,45 @@ impl CasClient {
         };
         stats.add(&started);
         self.record(&started);
+        let wire_bytes = Arc::new(AtomicU64::new(0));
+        let sent = wire_bytes.clone();
+        let stream = tokio_stream::wrappers::ReceiverStream::new(rx).map(
+            move |request: bs::WriteRequest| {
+                sent.fetch_add(request.data.len() as u64, Ordering::Relaxed);
+                request
+            },
+        );
         let response = bounded_rpc(
             self.rpc_timeout,
             bs::byte_stream_client::ByteStreamClient::new(self.channel.clone())
-                .write(self.request(tokio_stream::wrappers::ReceiverStream::new(rx), chunk)),
+                .accept_compressed(CompressionEncoding::Gzip)
+                .write(self.request(stream, chunk)),
         )
-        .await;
-        let produced = tokio::time::timeout(Duration::from_secs(60), &mut producer.0)
-            .await
-            .context("CAS upload reader timed out")?
-            .context("CAS upload reader task failed")?;
-        let response = response
-            .map_err(|s| rpc_error("ByteStream.Write", s))?
-            .into_inner();
-        produced?;
-        ensure!(
-            response.committed_size == expected_size,
-            "CAS ByteStream committed_size mismatch"
-        );
+        .await
+        .map_err(|s| rpc_error("ByteStream.Write", s))?
+        .into_inner();
+        // REAPI permits early success when another writer already populated CAS.
+        // Drop and join the producer immediately rather than waiting on a full queue.
+        if (compressed && response.committed_size == -1)
+            || (!compressed && response.committed_size == expected_size)
+        {
+            producer.0.abort();
+            let _ = (&mut producer.0).await;
+        } else {
+            let produced = tokio::time::timeout(self.rpc_timeout, &mut producer.0)
+                .await
+                .context("CAS upload reader timed out")?
+                .context("CAS upload reader task failed")??;
+            ensure!(
+                response.committed_size == produced,
+                "CAS ByteStream committed_size mismatch"
+            );
+            ensure!(compressed, "CAS ByteStream committed_size mismatch");
+        }
         let done = UploadStats {
             uploaded_bytes: expected_size as u64,
+            uploaded_wire_bytes: wire_bytes.load(Ordering::Relaxed),
+            zstd_stream_blobs: u64::from(compressed),
             uploaded_blobs: 1,
             ..Default::default()
         };
@@ -591,11 +749,13 @@ impl CasClient {
             };
             stats.add(&started);
             self.record(&started);
-            let response = bounded_rpc(
-                self.rpc_timeout,
-                self.cas().splice_blob(self.request(request.clone(), false)),
-            )
-            .await;
+            let response = self
+                .metadata_rpc(|encoding| {
+                    let mut client = self.metadata_cas(encoding);
+                    let request = self.request(request.clone(), false);
+                    async move { client.splice_blob(request).await }
+                })
+                .await;
             match response {
                 Ok(r) => {
                     ensure!(
@@ -762,6 +922,8 @@ pub(crate) mod tests {
         missing_sizes: Vec<usize>,
         batch_sizes: Vec<usize>,
         frames: Vec<usize>,
+        batch_compressors: Vec<i32>,
+        batch_plain_sizes: Vec<usize>,
         resources: Vec<String>,
         chunk_headers: usize,
         splice_calls: usize,
@@ -800,7 +962,7 @@ pub(crate) mod tests {
         ) -> Result<Response<reapi::ServerCapabilities>, Status> {
             self.note(&req)?;
             assert_eq!(req.get_ref().instance_name, "test/instance");
-            Ok(Response::new(reapi::ServerCapabilities {
+            let mut response = Response::new(reapi::ServerCapabilities {
                 cache_capabilities: Some(self.0.lock().unwrap().caps.clone()),
                 high_api_version: Some(proto::build::bazel::semver::SemVer {
                     major: 2,
@@ -808,7 +970,14 @@ pub(crate) mod tests {
                     ..Default::default()
                 }),
                 ..Default::default()
-            }))
+            });
+            // Tonic does not automatically advertise request codecs on successful
+            // replies; model a peer that explicitly advertises this capability.
+            response.metadata_mut().insert(
+                "grpc-accept-encoding",
+                MetadataValue::from_static("gzip,identity"),
+            );
+            Ok(response)
         }
     }
     #[tonic::async_trait]
@@ -822,6 +991,28 @@ pub(crate) mod tests {
             assert_eq!(req.digest_function, BLAKE3);
             let mut s = self.0.lock().unwrap();
             s.missing_sizes.push(req.blob_digests.len());
+            if matches!(
+                s.mode,
+                "metadata-unimplemented" | "metadata-unauthenticated" | "metadata-denied"
+            ) {
+                let code = match s.mode {
+                    "metadata-unimplemented" => Code::Unimplemented,
+                    "metadata-unauthenticated" => Code::Unauthenticated,
+                    _ => Code::PermissionDenied,
+                };
+                let mut metadata = tonic::metadata::MetadataMap::new();
+                if code != Code::Unimplemented {
+                    metadata.insert(
+                        "grpc-accept-encoding",
+                        MetadataValue::from_static("identity"),
+                    );
+                }
+                return Err(Status::with_metadata(
+                    code,
+                    "fixture-secret must not leak",
+                    metadata,
+                ));
+            }
             if s.mode == "chunk-find-unimplemented" {
                 return Err(Status::unimplemented("chunk lookup unsupported"));
             }
@@ -850,16 +1041,28 @@ pub(crate) mod tests {
             }
             let req = req.into_inner();
             assert_eq!(req.digest_function, BLAKE3);
-            let mut s = self.0.lock().unwrap();
-            s.batch_sizes
-                .push(req.requests.iter().map(|r| r.data.len()).sum());
-            let mut responses = Vec::new();
+            let wire_bytes = req.requests.iter().map(|r| r.data.len()).sum();
+            let mut decoded = Vec::new();
             for r in req.requests {
-                let d = r.digest.unwrap();
-                assert_eq!(d.hash, blake3::hash(&r.data).to_hex().to_string());
-                assert_eq!(d.size_bytes, r.data.len() as i64);
-                assert_eq!(r.compressor, 0);
-                s.blobs.insert(key(&d), r.data);
+                let data = decode_upload(r.data, r.compressor == ZSTD).await;
+                decoded.push((r.digest.unwrap(), r.compressor, data));
+            }
+            let mut s = self.0.lock().unwrap();
+            s.batch_sizes.push(wire_bytes);
+            s.batch_plain_sizes
+                .push(decoded.iter().map(|(_, _, data)| data.len()).sum());
+            let mut responses = Vec::new();
+            for (d, compressor, data) in decoded {
+                s.batch_compressors.push(compressor);
+                assert!(
+                    compressor == 0
+                        || s.caps
+                            .supported_batch_update_compressors
+                            .contains(&compressor)
+                );
+                assert_eq!(d.hash, blake3::hash(&data).to_hex().to_string());
+                assert_eq!(d.size_bytes, data.len() as i64);
+                s.blobs.insert(key(&d), data);
                 responses.push(reapi::batch_update_blobs_response::Response {
                     digest: Some(d),
                     status: Some(proto::google::rpc::Status {
@@ -977,6 +1180,9 @@ pub(crate) mod tests {
             req: Request<tonic::Streaming<bs::WriteRequest>>,
         ) -> Result<Response<bs::WriteResponse>, Status> {
             self.note(&req)?;
+            if self.0.lock().unwrap().mode == "hang-write" {
+                return std::future::pending().await;
+            }
             let mut stream = req.into_inner();
             let mut data = Vec::new();
             let mut resource = String::new();
@@ -990,6 +1196,15 @@ pub(crate) mod tests {
                 } else {
                     assert!(r.resource_name.is_empty());
                 }
+                if self.0.lock().unwrap().mode == "early-complete" {
+                    return Ok(Response::new(bs::WriteResponse {
+                        committed_size: if resource.contains("/compressed-blobs/") {
+                            -1
+                        } else {
+                            resource.rsplit('/').next().unwrap().parse().unwrap()
+                        },
+                    }));
+                }
                 self.0.lock().unwrap().frames.push(r.data.len());
                 data.extend_from_slice(&r.data);
                 finished = r.finish_write;
@@ -998,7 +1213,10 @@ pub(crate) mod tests {
                 return Err(Status::invalid_argument("unfinished write"));
             }
             assert!(resource.starts_with("test/instance/uploads/"));
-            assert!(resource.contains("/blobs/blake3/"));
+            let compressed = resource.contains("/compressed-blobs/zstd/blake3/");
+            assert!(compressed || resource.contains("/blobs/blake3/"));
+            let wire_len = data.len() as i64;
+            let data = decode_upload(data, compressed).await;
             let d = Digest {
                 hash: blake3::hash(&data).to_hex().to_string(),
                 size_bytes: data.len() as i64,
@@ -1008,7 +1226,14 @@ pub(crate) mod tests {
             s.resources.push(resource);
             s.blobs.insert(key(&d), data);
             Ok(Response::new(bs::WriteResponse {
-                committed_size: d.size_bytes - if s.mode == "short-write" { 1 } else { 0 },
+                committed_size: if s.mode == "stream-minus-one" {
+                    -1
+                } else if s.mode == "wrong-compressed-size" {
+                    d.size_bytes
+                } else {
+                    (if compressed { wire_len } else { d.size_bytes })
+                        - if s.mode == "short-write" { 1 } else { 0 }
+                },
             }))
         }
     }
@@ -1054,9 +1279,20 @@ pub(crate) mod tests {
         }
     }
     pub(crate) async fn server(cdc: bool, max_batch: i64, mode: &'static str) -> Running {
+        compressed_server(cdc, max_batch, mode, false, false).await
+    }
+    async fn compressed_server(
+        cdc: bool,
+        max_batch: i64,
+        mode: &'static str,
+        batch_zstd: bool,
+        stream_zstd: bool,
+    ) -> Running {
         let fixture = Fixture::default();
         fixture.0.lock().unwrap().caps = reapi::CacheCapabilities {
             digest_functions: vec![BLAKE3],
+            supported_compressors: if stream_zstd { vec![ZSTD] } else { vec![] },
+            supported_batch_update_compressors: if batch_zstd { vec![ZSTD] } else { vec![] },
             max_batch_total_size_bytes: max_batch,
             splice_blob_support: cdc,
             fast_cdc_2020_params: cdc.then_some(reapi::FastCdc2020Params {
@@ -1071,11 +1307,27 @@ pub(crate) mod tests {
         let endpoint = format!("http://{}", listener.local_addr().unwrap());
         let (tx, rx) = tokio::sync::oneshot::channel();
         let service = fixture.clone();
+        let response_encoding = CompressionEncoding::Gzip;
         let task = tokio::spawn(async move {
+            let cas = ContentAddressableStorageServer::new(service.clone())
+                .send_compressed(response_encoding);
+            let cas = if mode == "identity-cas" {
+                cas
+            } else {
+                cas.accept_compressed(CompressionEncoding::Gzip)
+            };
             tonic::transport::Server::builder()
-                .add_service(CapabilitiesServer::new(service.clone()))
-                .add_service(ContentAddressableStorageServer::new(service.clone()))
-                .add_service(ByteStreamServer::new(service))
+                .add_service(
+                    CapabilitiesServer::new(service.clone())
+                        .send_compressed(response_encoding)
+                        .accept_compressed(CompressionEncoding::Gzip),
+                )
+                .add_service(cas)
+                .add_service(
+                    ByteStreamServer::new(service)
+                        .send_compressed(response_encoding)
+                        .accept_compressed(CompressionEncoding::Gzip),
+                )
                 .serve_with_incoming_shutdown(
                     tokio_stream::wrappers::TcpListenerStream::new(listener),
                     async {
@@ -1099,6 +1351,15 @@ pub(crate) mod tests {
             shutdown: Some(tx),
             task,
         }
+    }
+    async fn decode_upload(data: Vec<u8>, compressed: bool) -> Vec<u8> {
+        if !compressed {
+            return data;
+        }
+        let mut decoder = async_compression::tokio::bufread::ZstdDecoder::new(data.as_slice());
+        let mut decoded = Vec::new();
+        decoder.read_to_end(&mut decoded).await.unwrap();
+        decoded
     }
     fn blob(dir: &std::path::Path, name: &str, data: &[u8]) -> UploadBlob {
         let path = dir.join(name);
@@ -1287,15 +1548,17 @@ pub(crate) mod tests {
         let dir = tempfile::tempdir().unwrap();
         let b = blob(dir.path(), "changed", &vec![1; BATCH_BYTES + 1]);
         std::fs::write(&b.path, vec![2; BATCH_BYTES + 1]).unwrap();
-        let running = server(false, 0, "").await;
-        assert!(
-            running
-                .client
-                .upload_missing(std::slice::from_ref(&b))
-                .await
-                .is_err()
-        );
-        assert!(running.fixture.0.lock().unwrap().blobs.is_empty());
+        for compressed in [false, true] {
+            let running = compressed_server(false, 0, "", false, compressed).await;
+            assert!(
+                running
+                    .client
+                    .upload_missing(std::slice::from_ref(&b))
+                    .await
+                    .is_err()
+            );
+            assert!(running.fixture.0.lock().unwrap().blobs.is_empty());
+        }
         let good = blob(dir.path(), "good", &deterministic_data(50_000));
         let mut cdc = server(true, 0, "").await;
         cdc.client
@@ -1349,6 +1612,238 @@ pub(crate) mod tests {
             "upload exceeded the deadline failsafe: {elapsed:?}"
         );
         assert!(!running.contains(&blob.digest));
+        assert_eq!(running.client.stats().uploaded_blobs, 0);
+    }
+    #[tokio::test]
+    async fn grpc_metadata_retries_explicit_cross_service_codec_rejection_as_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        let b = blob(dir.path(), "identity-cas", &deterministic_data(50_000));
+        let running = compressed_server(true, 0, "identity-cas", false, true).await;
+        assert_eq!(
+            running.client.grpc_compression.request_encoding(),
+            Some(CompressionEncoding::Gzip)
+        );
+        assert_eq!(
+            running
+                .client
+                .find_missing(std::slice::from_ref(&b.digest))
+                .await
+                .unwrap(),
+            std::slice::from_ref(&b.digest)
+        );
+        assert_eq!(running.client.grpc_compression.request_encoding(), None);
+        let stats = running
+            .client
+            .upload_missing(std::slice::from_ref(&b))
+            .await
+            .unwrap();
+        assert_eq!(stats.cdc_blobs, 1);
+        assert!(running.contains(&b.digest));
+        // Exercise identity BatchUpdate as the first CAS request too.
+        let running = compressed_server(false, 0, "identity-cas", false, false).await;
+        assert_eq!(
+            running
+                .client
+                .upload_missing(&[b])
+                .await
+                .unwrap()
+                .uploaded_blobs,
+            1
+        );
+        assert_eq!(running.client.grpc_compression.request_encoding(), None);
+    }
+    #[tokio::test]
+    async fn grpc_metadata_does_not_retry_application_unimplemented_or_authentication_failures() {
+        let d = Digest {
+            hash: "a".repeat(64),
+            size_bytes: 1,
+        };
+        for mode in [
+            "metadata-unimplemented",
+            "metadata-unauthenticated",
+            "metadata-denied",
+        ] {
+            let running = server(false, 0, mode).await;
+            let error = running
+                .client
+                .find_missing(std::slice::from_ref(&d))
+                .await
+                .unwrap_err();
+            assert!(!error.to_string().contains("fixture-secret"));
+            assert_eq!(
+                running.fixture.0.lock().unwrap().missing_sizes,
+                [1],
+                "{mode}"
+            );
+            assert_eq!(
+                running.client.grpc_compression.request_encoding(),
+                Some(CompressionEncoding::Gzip)
+            );
+        }
+    }
+    #[tokio::test]
+    async fn grpc_gzip_unary_responses_work_for_capabilities_presence_upload_and_splice() {
+        let dir = tempfile::tempdir().unwrap();
+        let b = blob(dir.path(), "unary-zstd", &deterministic_data(50_000));
+        let running = compressed_server(true, 0, "grpc-gzip", true, true).await;
+        assert_eq!(
+            running
+                .client
+                .find_missing(std::slice::from_ref(&b.digest))
+                .await
+                .unwrap(),
+            std::slice::from_ref(&b.digest)
+        );
+        let stats = running
+            .client
+            .upload_missing(std::slice::from_ref(&b))
+            .await
+            .unwrap();
+        assert_eq!(stats.cdc_blobs, 1);
+        assert!(running.contains(&b.digest));
+    }
+    #[tokio::test]
+    async fn grpc_zstd_negotiates_batch_and_stream_independently_and_keeps_plain_budget() {
+        let dir = tempfile::tempdir().unwrap();
+        for (batch_zstd, stream_zstd) in [(true, false), (false, true), (true, true)] {
+            let running = compressed_server(false, 128, "", batch_zstd, stream_zstd).await;
+            let blobs = vec![
+                blob(dir.path(), "a", &[1; 100]),
+                blob(dir.path(), "b", &[2; 100]),
+                blob(dir.path(), "large", &deterministic_data(STREAM_BYTES * 3)),
+            ];
+            let stats = running.client.upload_missing(&blobs).await.unwrap();
+            assert_eq!(
+                stats.batch_update_calls, 2,
+                "compression must not relax plaintext budget"
+            );
+            assert_eq!(stats.bytestream_write_calls, 1);
+            assert_eq!(stats.zstd_batch_blobs, if batch_zstd { 2 } else { 0 });
+            assert_eq!(stats.zstd_stream_blobs, u64::from(stream_zstd));
+            assert_eq!(stats.uploaded_bytes, (200 + STREAM_BYTES * 3) as u64);
+            let s = running.fixture.0.lock().unwrap();
+            assert_eq!(
+                s.batch_compressors,
+                vec![if batch_zstd { ZSTD } else { 0 }; 2]
+            );
+            assert!(s.batch_plain_sizes.iter().all(|n| *n <= 128));
+            if batch_zstd {
+                assert!(
+                    s.batch_sizes
+                        .iter()
+                        .zip(&s.batch_plain_sizes)
+                        .all(|(wire, plain)| wire < plain)
+                );
+            }
+            assert_eq!(
+                s.resources[0].contains("/compressed-blobs/zstd/"),
+                stream_zstd
+            );
+            for b in &blobs {
+                assert!(s.blobs.contains_key(&key(&b.digest)));
+            }
+        }
+    }
+    #[tokio::test]
+    async fn grpc_zstd_stream_accepts_compressed_commit_and_early_existing_but_rejects_wrong_size()
+    {
+        let dir = tempfile::tempdir().unwrap();
+        let b = blob(dir.path(), "large", &vec![7; BATCH_BYTES * 2]);
+        let early = blob(
+            dir.path(),
+            "early-large",
+            &deterministic_data(BATCH_BYTES * 2),
+        );
+        for (mode, compressed) in [
+            ("", true),
+            ("stream-minus-one", true),
+            ("early-complete", true),
+            ("early-complete", false),
+        ] {
+            let running = compressed_server(false, 1, mode, false, compressed).await;
+            let stats =
+                tokio::time::timeout(
+                    Duration::from_secs(2),
+                    running.client.upload_missing(std::slice::from_ref(
+                        if mode == "early-complete" { &early } else { &b },
+                    )),
+                )
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(stats.uploaded_blobs, 1);
+            assert_eq!(stats.uploaded_bytes, b.digest.size_bytes as u64);
+            assert_eq!(stats.zstd_stream_blobs, u64::from(compressed));
+            if mode.is_empty() {
+                assert!(stats.uploaded_wire_bytes < stats.uploaded_bytes / 100);
+            }
+        }
+        let running = compressed_server(false, 1, "wrong-compressed-size", false, true).await;
+        assert!(
+            running
+                .client
+                .upload_missing(&[b])
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("committed_size")
+        );
+    }
+    #[tokio::test]
+    async fn grpc_zstd_cdc_chunks_use_batch_or_stream_and_compress_fallback() {
+        let dir = tempfile::tempdir().unwrap();
+        let b = blob(dir.path(), "cdc-compressed", &deterministic_data(50_000));
+        for limit in [128, BATCH_BYTES as i64] {
+            let running = compressed_server(true, limit, "", true, true).await;
+            let stats = running
+                .client
+                .upload_missing(std::slice::from_ref(&b))
+                .await
+                .unwrap();
+            assert_eq!(stats.cdc_blobs, 1);
+            assert!(running.contains(&b.digest));
+            let s = running.fixture.0.lock().unwrap();
+            if limit == 128 {
+                assert!(stats.bytestream_write_calls > 0);
+                assert!(
+                    s.resources
+                        .iter()
+                        .all(|r| r.contains("/compressed-blobs/zstd/"))
+                );
+            } else {
+                assert!(stats.batch_update_calls > 0);
+                assert!(s.batch_compressors.iter().all(|c| *c == ZSTD));
+            }
+        }
+        let running = compressed_server(true, 0, "splice-unimplemented", true, true).await;
+        let stats = running.client.upload_missing(&[b]).await.unwrap();
+        assert_eq!(stats.cdc_fallbacks, 1);
+        assert!(
+            running
+                .fixture
+                .0
+                .lock()
+                .unwrap()
+                .resources
+                .iter()
+                .all(|r| r.contains("/compressed-blobs/zstd/"))
+        );
+    }
+    #[tokio::test]
+    async fn grpc_zstd_stream_deadline_cancels_bounded_producer_without_confirming_presence() {
+        let dir = tempfile::tempdir().unwrap();
+        let b = blob(
+            dir.path(),
+            "stalled-stream",
+            &deterministic_data(BATCH_BYTES * 2),
+        );
+        let mut running = compressed_server(false, 1, "hang-write", false, true).await;
+        running.client.rpc_timeout = Duration::from_millis(30);
+        let result =
+            tokio::time::timeout(Duration::from_secs(2), running.client.upload_missing(&[b]))
+                .await
+                .unwrap();
+        assert!(result.is_err());
         assert_eq!(running.client.stats().uploaded_blobs, 0);
     }
     #[test]

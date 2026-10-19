@@ -56,15 +56,27 @@ The ordinary-blob batching heuristic follows BuildBuddy Executor:
 | Operation | Policy |
 |---|---|
 | FindMissingBlobs | At most 1,000 digests per request |
-| Small uploads | Sum actual payload bytes up to 2 MiB; flush before overflow and at drain |
-| Large uploads | Raw size >2 MiB uses ByteStream, in 256,000-byte frames |
+| Small uploads | Sum uncompressed sizes up to 2 MiB; flush before overflow and at drain |
+| Large uploads | Raw size >2 MiB uses ByteStream, with bounded compressed/identity frames |
 | Advertised limits | Reduce batch limit and respect serialized gRPC-message bounds |
 
-Identity compression is currently used; ZSTD and parallel upload tuning are not
-implemented. Uploads are serialized. Payload accounting therefore equals raw
-size; this is the same batching rule, not identical compression or concurrency
-settings to the Executor. Lookup failures fail the background job rather than
-assuming presence or uploading the entire uncertain batch.
+ZSTD is selected independently from the server's batch-update and ByteStream
+compressor capabilities. Batch items stay identity when compression would expand
+them; large blobs are compressed incrementally. CDC chunks and whole-blob
+fallback use the same policy. Digests, batching budgets and presence records
+always describe uncompressed content. Serialized protobuf size is checked
+separately. Uploads remain serialized; this is not the Executor's full parallel
+upload policy. Lookup failures fail the job rather than assuming presence.
+
+All metadata clients accept gzip responses. Metadata requests use gzip only after
+an explicit peer advertisement; a service rejecting that codec can trigger one
+identity retry within the original deadline. Authentication and method failures
+are not codec retries. Already-compressed payload RPCs are not compressed again
+at the gRPC layer. `uploaded_bytes` counts uncompressed confirmed content;
+`uploaded_wire_bytes` counts emitted application payload bytes, excluding
+protobuf/HTTP framing and potential transport gzip. `zstd_batch_blobs` and
+`zstd_stream_blobs` show actual compression use. Tiny compressed frames can be
+larger than identity; compression support alone is not a speedup claim.
 
 GetCapabilities must advertise BLAKE3. For large eligible blobs, the client
 negotiates FastCDC 2020 parameters and unary SpliceBlob support. It uses the

@@ -107,7 +107,11 @@ async fn main() -> anyhow::Result<()> {
             None
         };
         let result = tonic::transport::Server::builder()
-            .add_service(BazelOutputServiceServer::new(service.clone()))
+            .add_service(
+                BazelOutputServiceServer::new(service.clone())
+                    .accept_compressed(tonic::codec::CompressionEncoding::Gzip)
+                    .send_compressed(tonic::codec::CompressionEncoding::Gzip),
+            )
             .serve_with_shutdown(args.listen, async {
                 let _ = wait_for_shutdown().await;
             })
@@ -168,6 +172,7 @@ fn write_metrics(path: &std::path::Path, service: &OutputService) -> anyhow::Res
         "stage_requests": metrics.stage_requests, "staged_files": metrics.staged_files,
         "verified_bytes": metrics.verified_bytes, "lazy_fetches": metrics.lazy_fetches,
         "lazy_verified_bytes": metrics.lazy_verified_bytes, "lazy_cache_hits": metrics.lazy_cache_hits,
+        "zstd_read_requests": metrics.zstd_read_requests, "cas_read_wire_bytes": metrics.cas_read_wire_bytes,
     });
     let temp = path.with_extension(format!("{}.tmp", std::process::id()));
     std::fs::write(&temp, serde_json::to_vec(&data)?)?;

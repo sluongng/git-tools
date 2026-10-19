@@ -13,7 +13,7 @@ use std::{
     collections::HashMap,
     sync::{
         Arc, Mutex,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
     },
     time::Duration,
 };
@@ -26,8 +26,44 @@ struct Cas {
     reads: Arc<Mutex<Vec<String>>>,
     stall: Arc<AtomicBool>,
     presence_queries: Arc<Mutex<Vec<cas_proto::FindMissingBlobsRequest>>>,
+    zstd: Arc<AtomicBool>,
+    capabilities_implemented: Arc<AtomicBool>,
+    capabilities_queries: Arc<AtomicUsize>,
+    compressed_metadata_requests: Arc<AtomicUsize>,
+    metadata_rejection: Arc<AtomicUsize>,
+    wire_override: Arc<Mutex<Option<Vec<u8>>>>,
+    read_fragment_bytes: Arc<AtomicUsize>,
 }
 
+#[tonic::async_trait]
+impl cas_proto::capabilities_server::Capabilities for Cas {
+    async fn get_capabilities(
+        &self,
+        request: Request<cas_proto::GetCapabilitiesRequest>,
+    ) -> Result<Response<cas_proto::ServerCapabilities>, Status> {
+        assert_eq!(
+            request.metadata().get("x-buildbuddy-api-key").unwrap(),
+            "test-key"
+        );
+        assert_eq!(request.into_inner().instance_name, "fixture");
+        self.capabilities_queries.fetch_add(1, Ordering::SeqCst);
+        let zstd = self.zstd.load(Ordering::SeqCst);
+        if !zstd && !self.capabilities_implemented.load(Ordering::SeqCst) {
+            return Err(Status::unimplemented("legacy CAS"));
+        }
+        let mut response = Response::new(cas_proto::ServerCapabilities {
+            cache_capabilities: Some(cas_proto::CacheCapabilities {
+                supported_compressors: if zstd { vec![1] } else { vec![] },
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+        response
+            .metadata_mut()
+            .insert("grpc-accept-encoding", "gzip".parse().unwrap());
+        Ok(response)
+    }
+}
 #[tonic::async_trait]
 impl cas_proto::content_addressable_storage_server::ContentAddressableStorage for Cas {
     type GetTreeStream =
@@ -46,6 +82,26 @@ impl cas_proto::content_addressable_storage_server::ContentAddressableStorage fo
             != Some("test-key")
         {
             return Err(Status::unauthenticated("missing credential"));
+        }
+        if request
+            .metadata()
+            .get("grpc-encoding")
+            .is_some_and(|value| value == "gzip")
+        {
+            self.compressed_metadata_requests
+                .fetch_add(1, Ordering::SeqCst);
+            match self.metadata_rejection.load(Ordering::SeqCst) {
+                1 => {
+                    let mut status = Status::unimplemented("unsupported request codec");
+                    status
+                        .metadata_mut()
+                        .insert("grpc-accept-encoding", "identity".parse().unwrap());
+                    return Err(status);
+                }
+                2 => return Err(Status::unauthenticated("fixture authentication rejection")),
+                3 => return Err(Status::unimplemented("fixture method rejection")),
+                _ => {}
+            }
         }
         let request = request.into_inner();
         self.presence_queries.lock().unwrap().push(request.clone());
@@ -130,20 +186,36 @@ impl bs::byte_stream_server::ByteStream for Cas {
         {
             return Err(Status::unauthenticated("missing credential"));
         }
+        assert!(
+            request.metadata().get("grpc-encoding").is_none(),
+            "ByteStream must not apply gRPC compression over compressed blobs"
+        );
         let name = request.into_inner().resource_name;
         self.reads.lock().unwrap().push(name.clone());
+        let compressed = name.contains("/compressed-blobs/zstd/");
+        let identity_name = name.replace("/compressed-blobs/zstd/", "/blobs/");
         let bytes = self
             .data
             .lock()
             .unwrap()
-            .get(&name)
+            .get(&identity_name)
             .cloned()
             .ok_or_else(|| Status::not_found("missing fixture blob"))?;
         if self.stall.load(Ordering::SeqCst) {
             return Ok(Response::new(Box::pin(tokio_stream::pending())));
         }
+        let bytes = if compressed {
+            self.wire_override
+                .lock()
+                .unwrap()
+                .clone()
+                .unwrap_or_else(|| reapi::compression::encode_zstd(&bytes).unwrap())
+        } else {
+            bytes
+        };
+        let fragment = self.read_fragment_bytes.load(Ordering::SeqCst);
         let chunks: Vec<_> = bytes
-            .chunks(3)
+            .chunks(if fragment == 0 { 3 } else { fragment })
             .map(|chunk| {
                 Ok(bs::ReadResponse {
                     data: chunk.to_vec(),
@@ -221,16 +293,21 @@ impl Fixture {
         Self::configured(false, Duration::from_secs(10)).await
     }
     async fn configured(lazy: bool, timeout: Duration) -> Self {
+        Self::configured_limit(lazy, timeout, 1024 * 1024).await
+    }
+    async fn configured_limit(lazy: bool, timeout: Duration, max_blob_bytes: u64) -> Self {
         let dir = tempfile::tempdir().unwrap();
         let cas = Cas::default();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let endpoint = format!("http://{}", listener.local_addr().unwrap());
         let cas_service = cas.clone();
         let cas_presence = cas.clone();
+        let cas_capabilities = cas.clone();
         let cas_task = tokio::spawn(async move {
             tonic::transport::Server::builder()
-                .add_service(bs::byte_stream_server::ByteStreamServer::new(cas_service))
-                .add_service(cas_proto::content_addressable_storage_server::ContentAddressableStorageServer::new(cas_presence))
+                .add_service(bs::byte_stream_server::ByteStreamServer::new(cas_service).send_compressed(tonic::codec::CompressionEncoding::Gzip))
+                .add_service(cas_proto::content_addressable_storage_server::ContentAddressableStorageServer::new(cas_presence).accept_compressed(tonic::codec::CompressionEncoding::Gzip).send_compressed(tonic::codec::CompressionEncoding::Gzip))
+                .add_service(cas_proto::capabilities_server::CapabilitiesServer::new(cas_capabilities).accept_compressed(tonic::codec::CompressionEncoding::Gzip).send_compressed(tonic::codec::CompressionEncoding::Gzip))
                 .serve_with_incoming(TcpListenerStream::new(listener))
                 .await
                 .unwrap();
@@ -240,7 +317,7 @@ impl Fixture {
             cas_endpoint: endpoint.clone(),
             instance_name: "fixture".into(),
             api_key: Some("test-key".into()),
-            max_blob_bytes: 1024 * 1024,
+            max_blob_bytes,
             rpc_timeout: timeout,
         })
         .await
@@ -274,7 +351,11 @@ impl Fixture {
         let service_clone = service.clone();
         let service_task = tokio::spawn(async move {
             tonic::transport::Server::builder()
-                .add_service(BazelOutputServiceServer::new(service_clone))
+                .add_service(
+                    BazelOutputServiceServer::new(service_clone)
+                        .accept_compressed(tonic::codec::CompressionEncoding::Gzip)
+                        .send_compressed(tonic::codec::CompressionEncoding::Gzip),
+                )
                 .serve_with_incoming(TcpListenerStream::new(listener))
                 .await
                 .unwrap();
@@ -1073,4 +1154,392 @@ async fn lazy_bos_stages_metadata_reads_verified_content_and_prunes_expired_cas(
         .await
         .unwrap();
     assert!(projection.tree.resolve(&prefix).is_err());
+}
+
+#[tokio::test]
+async fn compressed_cas_staging_is_atomic_and_negotiated_once() {
+    for function in [1, 9] {
+        let mut fixture = Fixture::new().await;
+        fixture.cas.zstd.store(true, Ordering::SeqCst);
+        fixture.client = fixture
+            .client
+            .clone()
+            .send_compressed(tonic::codec::CompressionEncoding::Gzip)
+            .accept_compressed(tonic::codec::CompressionEncoding::Gzip);
+        let response = fixture
+            .client
+            .start_build(fixture.request("compressed", function))
+            .await
+            .unwrap()
+            .into_inner();
+        let root = std::path::PathBuf::from(response.output_path_suffix);
+        let content = vec![b'x'; 128 * 1024];
+        let digest = fixture.blob(&content, function);
+        assert_eq!(
+            fixture.stage("compressed", "output", digest.clone()).await,
+            0
+        );
+        assert_eq!(std::fs::read(root.join("output")).unwrap(), content);
+        let encoded = reapi::compression::encode_zstd(&content).unwrap();
+        let metrics = fixture.service.metrics();
+        assert_eq!(metrics.zstd_read_requests, 1);
+        assert_eq!(metrics.cas_read_wire_bytes, encoded.len() as u64);
+        assert!(metrics.cas_read_wire_bytes < content.len() as u64);
+        let stats = fixture
+            .client
+            .batch_stat(proto::BatchStatRequest {
+                build_id: "compressed".into(),
+                paths: vec!["output".into()],
+            })
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(stats.responses.len(), 1);
+        assert!(stats.responses[0].stat.is_some());
+
+        let cases = [
+            ("truncated", encoded[..encoded.len() - 1].to_vec()),
+            ("corrupt", vec![0xff; 32]),
+            (
+                "oversized",
+                reapi::compression::encode_zstd(&vec![b'x'; content.len() + 1]).unwrap(),
+            ),
+            (
+                "wrong digest",
+                reapi::compression::encode_zstd(&vec![b'y'; content.len()]).unwrap(),
+            ),
+        ];
+        for (name, wire) in cases {
+            *fixture.cas.wire_override.lock().unwrap() = Some(wire);
+            assert_eq!(
+                fixture.stage("compressed", "output", digest.clone()).await,
+                tonic::Code::DataLoss as i32,
+                "{name}"
+            );
+            assert_eq!(
+                std::fs::read(root.join("output")).unwrap(),
+                content,
+                "{name}"
+            );
+            assert!(!std::fs::read_dir(&root).unwrap().any(|entry| {
+                entry
+                    .unwrap()
+                    .file_name()
+                    .to_string_lossy()
+                    .ends_with(".tmp")
+            }));
+        }
+        let small = fixture.blob(b"sixteen bytes!!!", function);
+        *fixture.cas.wire_override.lock().unwrap() =
+            Some(reapi::compression::encode_zstd(&vec![b'x'; 2 * 1024 * 1024]).unwrap());
+        let artifact = output_core::Artifact {
+            backend: fixture.service.backend_identity(),
+            instance: "fixture".into(),
+            digest_function: function,
+            hash: small.hash,
+            size: small.size_bytes as u64,
+        };
+        let mut partial = tempfile::tempfile().unwrap();
+        let error = fixture
+            .service
+            .blob_source()
+            .fetch(&artifact, &mut partial)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            error.downcast_ref::<Status>().unwrap().code(),
+            tonic::Code::DataLoss
+        );
+        assert!(
+            partial.metadata().unwrap().len() <= artifact.size,
+            "compressed bombs must be rejected before an oversized chunk reaches disk"
+        );
+        assert_eq!(fixture.cas.capabilities_queries.load(Ordering::SeqCst), 1);
+        assert!(
+            fixture
+                .cas
+                .reads
+                .lock()
+                .unwrap()
+                .iter()
+                .all(|resource| resource.contains("/compressed-blobs/zstd/"))
+        );
+    }
+}
+
+#[tokio::test]
+async fn lazy_compressed_cas_verifies_before_exposing_a_range() {
+    for function in [1, 9] {
+        let mut fixture = Fixture::configured(true, Duration::from_secs(10)).await;
+        fixture.cas.zstd.store(true, Ordering::SeqCst);
+        let response = fixture
+            .client
+            .start_build(fixture.request("compressed-lazy", function))
+            .await
+            .unwrap()
+            .into_inner();
+        let prefix = std::path::Path::new(&response.output_path_suffix)
+            .file_name()
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_owned();
+        let content = vec![b'z'; 128 * 1024];
+        let digest = fixture.blob(&content, function);
+        assert_eq!(fixture.stage("compressed-lazy", "output", digest).await, 0);
+        assert!(fixture.cas.reads.lock().unwrap().is_empty());
+        let tree = &fixture.projection.as_ref().unwrap().tree;
+        let node = tree.resolve(&format!("{prefix}/output")).unwrap();
+        let encoded = reapi::compression::encode_zstd(&content).unwrap();
+        *fixture.cas.wire_override.lock().unwrap() = Some(encoded[..encoded.len() - 1].to_vec());
+        assert!(
+            tree.read(node.id, 0, 1).await.is_err(),
+            "even a one-byte read must not expose an unverified compressed blob"
+        );
+        *fixture.cas.wire_override.lock().unwrap() = None;
+        assert_eq!(tree.read(node.id, 0, 4).await.unwrap(), b"zzzz");
+        assert_eq!(tree.read(node.id, 4, 4).await.unwrap(), b"zzzz");
+        tree.refresh(&prefix).await.unwrap();
+        assert_eq!(
+            fixture
+                .cas
+                .compressed_metadata_requests
+                .load(Ordering::SeqCst),
+            1,
+            "FindMissingBlobs should compress requests after explicit transport advertisement"
+        );
+        let metrics = fixture.service.metrics();
+        assert_eq!(metrics.zstd_read_requests, 2);
+        assert_eq!(metrics.cas_read_wire_bytes, (encoded.len() * 2 - 1) as u64);
+        assert_eq!(fixture.cas.reads.lock().unwrap().len(), 2);
+        assert_eq!(fixture.cas.capabilities_queries.load(Ordering::SeqCst), 1);
+    }
+}
+
+#[tokio::test]
+async fn legacy_cas_uses_identity_and_compressed_stream_deadlines_are_total() {
+    for implemented in [false, true] {
+        let fixture = Fixture::configured(false, Duration::from_millis(150)).await;
+        fixture
+            .cas
+            .capabilities_implemented
+            .store(implemented, Ordering::SeqCst);
+        let digest = fixture.blob(b"legacy identity", 1);
+        let source = fixture.service.blob_source();
+        let artifact = output_core::Artifact {
+            backend: fixture.service.backend_identity(),
+            instance: "fixture".into(),
+            digest_function: 1,
+            hash: digest.hash,
+            size: digest.size_bytes as u64,
+        };
+        for _ in 0..2 {
+            source
+                .fetch(&artifact, &mut tempfile::tempfile().unwrap())
+                .await
+                .unwrap();
+        }
+        assert_eq!(fixture.cas.capabilities_queries.load(Ordering::SeqCst), 1);
+        assert!(
+            fixture
+                .cas
+                .reads
+                .lock()
+                .unwrap()
+                .iter()
+                .all(|r| r.contains("/blobs/"))
+        );
+    }
+
+    let fixture = Fixture::configured(false, Duration::from_millis(150)).await;
+    fixture.cas.zstd.store(true, Ordering::SeqCst);
+    let digest = fixture.blob(b"stalled compressed stream", 9);
+    fixture.cas.stall.store(true, Ordering::SeqCst);
+    let artifact = output_core::Artifact {
+        backend: fixture.service.backend_identity(),
+        instance: "fixture".into(),
+        digest_function: 9,
+        hash: digest.hash,
+        size: digest.size_bytes as u64,
+    };
+    let error = tokio::time::timeout(
+        Duration::from_secs(2),
+        fixture
+            .service
+            .blob_source()
+            .fetch(&artifact, &mut tempfile::tempfile().unwrap()),
+    )
+    .await
+    .unwrap()
+    .unwrap_err();
+    assert_eq!(
+        error.downcast_ref::<Status>().unwrap().code(),
+        tonic::Code::DeadlineExceeded
+    );
+    assert!(fixture.cas.reads.lock().unwrap()[0].contains("/compressed-blobs/zstd/"));
+}
+
+#[tokio::test]
+async fn lazy_presence_deadlines_include_unary_response_bodies() {
+    for stalled_method in ["GetCapabilities", "FindMissingBlobs"] {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.unwrap();
+            let mut connection = h2::server::handshake(socket).await.unwrap();
+            let mut pending_bodies = Vec::new();
+            while let Some(request) = connection.accept().await {
+                let (request, mut respond) = request.unwrap();
+                let mut body = respond
+                    .send_response(
+                        http::Response::builder()
+                            .status(200)
+                            .header("content-type", "application/grpc")
+                            .body(())
+                            .unwrap(),
+                        false,
+                    )
+                    .unwrap();
+                if request.uri().path().ends_with(stalled_method) {
+                    // Headers are flushed while the message body and trailers never arrive.
+                    pending_bodies.push(body);
+                } else {
+                    assert!(request.uri().path().ends_with("GetCapabilities"));
+                    let message = cas_proto::ServerCapabilities::default().encode_to_vec();
+                    let mut frame = vec![0];
+                    frame.extend_from_slice(&(message.len() as u32).to_be_bytes());
+                    frame.extend_from_slice(&message);
+                    body.send_data(frame.into(), false).unwrap();
+                    let mut trailers = http::HeaderMap::new();
+                    trailers.insert("grpc-status", "0".parse().unwrap());
+                    body.send_trailers(trailers).unwrap();
+                }
+            }
+        });
+        let dir = tempfile::tempdir().unwrap();
+        let service = OutputService::new(Config {
+            root: dir.path().into(),
+            cas_endpoint: endpoint,
+            instance_name: "fixture".into(),
+            api_key: None,
+            max_blob_bytes: 1024,
+            rpc_timeout: Duration::from_millis(80),
+        })
+        .await
+        .unwrap();
+        let artifact = output_core::Artifact {
+            backend: service.backend_identity(),
+            instance: "fixture".into(),
+            digest_function: 1,
+            hash: format!("{:x}", Sha256::digest(b"one")),
+            size: 3,
+        };
+        let error = tokio::time::timeout(
+            Duration::from_secs(2),
+            service.blob_source().missing(&[artifact]),
+        )
+        .await
+        .expect("headers alone must not bypass the total unary deadline")
+        .unwrap_err();
+        assert_eq!(
+            error.downcast_ref::<Status>().unwrap().code(),
+            tonic::Code::DeadlineExceeded,
+            "{stalled_method}"
+        );
+        server.abort();
+    }
+}
+
+#[tokio::test]
+async fn metadata_compression_retries_only_explicit_codec_rejections() {
+    for rejection in [1, 2, 3] {
+        let fixture = Fixture::new().await;
+        fixture.cas.zstd.store(true, Ordering::SeqCst);
+        fixture
+            .cas
+            .metadata_rejection
+            .store(rejection, Ordering::SeqCst);
+        let digest = fixture.blob(b"presence only", 1);
+        let artifact = output_core::Artifact {
+            backend: fixture.service.backend_identity(),
+            instance: "fixture".into(),
+            digest_function: 1,
+            hash: digest.hash,
+            size: digest.size_bytes as u64,
+        };
+        let result = fixture.service.blob_source().missing(&[artifact]).await;
+        match rejection {
+            1 => assert!(result.unwrap().is_empty()),
+            2 => assert_eq!(
+                result.unwrap_err().downcast_ref::<Status>().unwrap().code(),
+                tonic::Code::Unauthenticated
+            ),
+            3 => assert_eq!(
+                result.unwrap_err().downcast_ref::<Status>().unwrap().code(),
+                tonic::Code::Unimplemented
+            ),
+            _ => unreachable!(),
+        }
+        assert_eq!(
+            fixture
+                .cas
+                .compressed_metadata_requests
+                .load(Ordering::SeqCst),
+            1
+        );
+        assert_eq!(
+            fixture.cas.presence_queries.lock().unwrap().len(),
+            usize::from(rejection == 1)
+        );
+        assert!(fixture.cas.reads.lock().unwrap().is_empty());
+    }
+}
+
+#[tokio::test]
+async fn single_message_expansion_yields_to_the_total_read_deadline() {
+    let fixture =
+        Fixture::configured_limit(false, Duration::from_millis(100), 1024 * 1024 * 1024).await;
+    fixture.cas.zstd.store(true, Ordering::SeqCst);
+    fixture
+        .cas
+        .read_fragment_bytes
+        .store(usize::MAX, Ordering::SeqCst);
+    let source = fixture.service.blob_source();
+    let small = fixture.blob(b"prewarm transport and capability discovery", 1);
+    let mut artifact = output_core::Artifact {
+        backend: fixture.service.backend_identity(),
+        instance: "fixture".into(),
+        digest_function: 1,
+        hash: small.hash,
+        size: small.size_bytes as u64,
+    };
+    source
+        .fetch(&artifact, &mut tempfile::tempfile().unwrap())
+        .await
+        .unwrap();
+    let frame = reapi::compression::encode_zstd(&[b'x'; 64 * 1024]).unwrap();
+    let wire = frame.repeat(8192); // 512 MiB decoded, no whole-blob allocation.
+    artifact.size = 512 * 1024 * 1024;
+    fixture.cas.data.lock().unwrap().insert(
+        format!("fixture/blobs/{}/{}", artifact.hash, artifact.size),
+        vec![],
+    );
+    *fixture.cas.wire_override.lock().unwrap() = Some(wire);
+    let mut partial = tempfile::tempfile().unwrap();
+    let error = tokio::time::timeout(
+        Duration::from_secs(2),
+        source.fetch(&artifact, &mut partial),
+    )
+    .await
+    .expect("one compressed message must not monopolize the async executor")
+    .unwrap_err();
+    assert_eq!(
+        error.downcast_ref::<Status>().unwrap().code(),
+        tonic::Code::DeadlineExceeded
+    );
+    let size = partial.metadata().unwrap().len();
+    assert!(
+        size > 0 && size < artifact.size,
+        "deadline should interrupt actual decompression, not only network setup: {size}"
+    );
 }
