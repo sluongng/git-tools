@@ -126,8 +126,9 @@ class Benchmark:
     def bazel_args(self, base):
         return [self.config["bazel"], "--nosystem_rc", "--nohome_rc",
                 "--output_user_root=" + self.config["output_user_root"],
-                "--output_base=" + str(base), "--digest_function=GITSHA1",
-                "--unix_digest_hash_attribute_name=user.gitsha1"]
+                "--output_base=" + str(base),
+                "--digest_function=" + self.config.get("digest_function", "GITSHA1"),
+                "--unix_digest_hash_attribute_name=" + self.config.get("digest_attribute", "user.gitsha1")]
 
     def expand(self, command, repo):
         values = {"vfs": str(self.vfs), "git": self.config["git"], "repo": str(repo)}
@@ -317,7 +318,8 @@ class Benchmark:
     def mount(self, repo, overlay, mountpoint, name):
         mountpoint.mkdir()
         command = [str(value) for value in self.vfs_args("mount", "--repo", repo, "--overlay", overlay,
-                                                       *self.expand(self.mount_prefetch_args, repo), mountpoint)]
+                                                       *self.expand(self.mount_prefetch_args, repo),
+                                                       *self.expand(self.config.get("mount_options", []), repo), mountpoint)]
         log = (self.root / (name + "-mount.stderr")).open("wb")
         start = time.perf_counter()
         process = subprocess.Popen(command, cwd=self.root, env=self.traced_env(name + "-mount"),
