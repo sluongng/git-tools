@@ -396,6 +396,7 @@ async fn rejects_bad_sessions_paths_and_corrupt_cas_without_replacing_output() {
         fixture.stage("first", "existing", digest).await,
         tonic::Code::NotFound as i32
     );
+    assert_eq!(std::fs::read(root.join("existing")).unwrap(), b"keep me");
     fixture
         .client
         .start_build(fixture.request("second", 1))
