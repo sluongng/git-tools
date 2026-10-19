@@ -1,0 +1,30 @@
+load("//build_defs:local_test.bzl", "local_test")
+load("@crates//:defs.bzl", "aliases", "all_crate_deps")
+load("@rules_rs//rs:rust_library.bzl", "rust_library")
+load("@rules_rs//rs:rust_test.bzl", "rust_test")
+
+package(default_visibility = ["//visibility:public"])
+
+rust_library(
+    name = "workspace-core",
+    srcs = glob(["src/**/*.rs"], exclude = ["src/main.rs"]),
+    crate_name = "workspace_core",
+    crate_root = "src/lib.rs",
+    edition = "2024",
+    version = "0.1.0",
+    aliases = aliases(),
+    deps = all_crate_deps(normal = True),
+)
+
+rust_test(
+    name = "unit_tests_binary",
+    crate = ":workspace-core",
+    tags = ["manual"],
+    aliases = aliases(),
+    deps = all_crate_deps(normal_dev = True),
+)
+
+local_test(
+    name = "unit_tests",
+    binary = ":unit_tests_binary",
+)

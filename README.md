@@ -4,14 +4,16 @@ Rust tools for starting work on Git repositories without a full checkout.
 
 - [`git-proxy`](crates/git-proxy/): shared Git mirror, fetch-response cache,
   batch object sizes, and optional Git SHA1 → BLAKE3 mappings.
-- [`git-vfs`](crates/git-vfs/): writable Linux FUSE view of a blobless clone,
+- [`workspace-fuse`](crates/workspace-fuse/): writable Linux FUSE view of a blobless clone,
   with lazy reads and persistent per-agent edits.
 
-Additional crates: [`git-nfs`](crates/git-nfs/) for macOS NFS,
-[`git-projfs`](crates/git-projfs/) for Windows,
-[`git-jj`](crates/git-jj/) for Jujutsu working copies, and
-[`git-output-service`](crates/git-output-service/) for BuildBuddy-backed Bazel outputs.
+Additional crates: [`workspace-nfs`](crates/workspace-nfs/) for macOS NFS,
+[`workspace-projfs`](crates/workspace-projfs/) for Windows,
+[`jj-vfs`](crates/jj-vfs/) for Jujutsu working copies, and
+[`bazel-output-service`](crates/bazel-output-service/) for BuildBuddy-backed Bazel outputs.
 These are experimental; native macOS kernel acceptance is still pending.
+Crate names describe responsibilities; executable names remain `git-vfs`,
+`git-nfs`, `git-projfs`, `git-jj`, and `git-output-service` for compatibility.
 
 Native Git stores and transfers objects; Fjall stores local metadata.
 The VFS also works directly with GitHub, without a proxy.
@@ -25,7 +27,7 @@ Run commands from this repository's root.
 **Shared proxy — run once, in its own terminal:**
 
 ```sh
-cargo build --release -p git-proxy -p git-vfs
+cargo build --release -p git-proxy -p workspace-fuse
 target/release/git-proxy --cache-dir /tmp/git-tools-proxy \
   --repo bazel=https://github.com/bazelbuild/bazel.git --enable-blake3
 ```
@@ -50,7 +52,7 @@ The mount stays in the foreground; Ctrl-C unmounts it.
 BLAKE3 mapping import is blocking metadata work; content prefetch runs after mount.
 Other contents load on demand. Remount the same overlay to retain edits and index.
 For direct GitHub use, change the clone URL and omit both BLAKE3 proxy options.
-See the [VFS guide](crates/git-vfs/README.md) for metadata-provider requirements.
+See the [VFS guide](crates/workspace-fuse/README.md) for metadata-provider requirements.
 
 **Another terminal — Git and Bazel:**
 
@@ -93,7 +95,7 @@ including reclamation, rename/digest work and real incremental RBE builds.
 ## Guides and limits
 
 - [Cloud Bazel agent example skill](examples/skills/cloud-bazel-agent/SKILL.md)
-- [VFS guide](crates/git-vfs/README.md) / [full reference](docs/vfs-reference.md)
+- [VFS guide](crates/workspace-fuse/README.md) / [full reference](docs/vfs-reference.md)
 - [Proxy guide](crates/git-proxy/README.md) / [full reference](docs/proxy-reference.md)
 - [Proxy design and research](docs/proxy-design.md)
 - [VFS lifecycle design and measurements](docs/design/vfs-iteration-lifecycle.md)
@@ -112,7 +114,7 @@ queued upload proves that a remote CAS holds the content.
 Bazel uses pinned Rust/LLVM toolchains and the same Cargo lockfile:
 
 ```sh
-bazel build //:git-vfs //:git-proxy
+bazel build //:workspace-fuse //:git-proxy
 bazel test --config=rbe //...
 ```
 

@@ -250,6 +250,30 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ac07cdecf99051d9a5238b80f35af32cdeba5b336e55d957b318b50137e18da5"
 
 [[package]]
+name = "bazel-output-service"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "blake3",
+ "cap-fs-ext",
+ "cap-std",
+ "clap",
+ "libc",
+ "prost",
+ "prost-types",
+ "protoc-bin-vendored",
+ "reapi",
+ "sha2 0.10.9",
+ "tempfile",
+ "tokio",
+ "tokio-stream",
+ "tonic",
+ "tonic-prost",
+ "tonic-prost-build",
+ "uuid",
+]
+
+[[package]]
 name = "beef"
 version = "0.5.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1387,81 +1411,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "git-jj"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "async-trait",
- "clap",
- "fs2",
- "futures",
- "git-overlay",
- "jj-cli",
- "jj-lib",
- "rustix",
- "serde",
- "serde_json",
- "tempfile",
- "xattr",
-]
-
-[[package]]
-name = "git-nfs"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "async-trait",
- "blake3",
- "clap",
- "git-overlay",
- "git-workspace",
- "libc",
- "nfsserve",
- "tempfile",
- "tokio",
-]
-
-[[package]]
-name = "git-output-service"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "blake3",
- "cap-fs-ext",
- "cap-std",
- "clap",
- "git-reapi",
- "libc",
- "prost",
- "prost-types",
- "protoc-bin-vendored",
- "sha2 0.10.9",
- "tempfile",
- "tokio",
- "tokio-stream",
- "tonic",
- "tonic-prost",
- "tonic-prost-build",
- "uuid",
-]
-
-[[package]]
-name = "git-overlay"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "blake3",
- "fjall",
- "git-workspace",
- "hex",
- "libc",
- "serde",
- "serde_json",
- "sha1",
- "tempfile",
-]
-
-[[package]]
 name = "git-pack-cache"
 version = "0.1.0"
 dependencies = [
@@ -1475,22 +1424,6 @@ dependencies = [
  "serde_json",
  "tempfile",
  "tokio",
-]
-
-[[package]]
-name = "git-projfs"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "clap",
- "ctrlc",
- "git-workspace",
- "hex",
- "serde",
- "serde_json",
- "sha1",
- "tempfile",
- "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -1509,10 +1442,10 @@ dependencies = [
  "fs2",
  "futures-core",
  "git-pack-cache",
- "git-reapi",
  "hex",
  "libc",
  "prost",
+ "reapi",
  "reqwest",
  "serde",
  "serde_json",
@@ -1521,52 +1454,6 @@ dependencies = [
  "tokio-stream",
  "tonic",
  "uuid",
-]
-
-[[package]]
-name = "git-reapi"
-version = "0.1.0"
-dependencies = [
- "prost",
- "prost-types",
- "protoc-bin-vendored",
- "tonic",
- "tonic-prost",
- "tonic-prost-build",
-]
-
-[[package]]
-name = "git-vfs"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "blake3",
- "clap",
- "ctrlc",
- "fjall",
- "fuser",
- "git-overlay",
- "git-workspace",
- "hex",
- "libc",
- "serde",
- "serde_json",
- "tempfile",
-]
-
-[[package]]
-name = "git-workspace"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "fjall",
- "hex",
- "libc",
- "reqwest",
- "serde",
- "serde_json",
- "tempfile",
- "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -3056,6 +2943,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "jj-vfs"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "clap",
+ "fs2",
+ "futures",
+ "jj-cli",
+ "jj-lib",
+ "rustix",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "workspace-overlay",
+ "xattr",
+]
+
+[[package]]
 name = "js-sys"
 version = "0.3.106"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4220,6 +4126,18 @@ checksum = "22e18b0f0062d30d4230b2e85ff77fdfe4326feb054b9783a3460d8435c8ab91"
 dependencies = [
  "crossbeam-deque",
  "crossbeam-utils",
+]
+
+[[package]]
+name = "reapi"
+version = "0.1.0"
+dependencies = [
+ "prost",
+ "prost-types",
+ "protoc-bin-vendored",
+ "tonic",
+ "tonic-prost",
+ "tonic-prost-build",
 ]
 
 [[package]]
@@ -5983,6 +5901,88 @@ name = "wit-bindgen"
 version = "0.57.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1ebf944e87a7c253233ad6766e082e3cd714b5d03812acc24c318f549614536e"
+
+[[package]]
+name = "workspace-core"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "fjall",
+ "hex",
+ "libc",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "workspace-fuse"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "blake3",
+ "clap",
+ "ctrlc",
+ "fjall",
+ "fuser",
+ "hex",
+ "libc",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "workspace-core",
+ "workspace-overlay",
+]
+
+[[package]]
+name = "workspace-nfs"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "blake3",
+ "clap",
+ "libc",
+ "nfsserve",
+ "tempfile",
+ "tokio",
+ "workspace-core",
+ "workspace-overlay",
+]
+
+[[package]]
+name = "workspace-overlay"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "blake3",
+ "fjall",
+ "hex",
+ "libc",
+ "serde",
+ "serde_json",
+ "sha1",
+ "tempfile",
+ "workspace-core",
+]
+
+[[package]]
+name = "workspace-projfs"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "ctrlc",
+ "hex",
+ "serde",
+ "serde_json",
+ "sha1",
+ "tempfile",
+ "windows-sys 0.61.2",
+ "workspace-core",
+]
 
 [[package]]
 name = "writeable"

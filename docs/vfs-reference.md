@@ -1,6 +1,6 @@
 # VFS reference
 
-[Quick start](../crates/git-vfs/README.md) · [Project overview](../README.md)
+[Quick start](../crates/workspace-fuse/README.md) · [Project overview](../README.md)
 
 ## Mount and clone behavior
 
@@ -10,7 +10,7 @@ need Git with `cat-file remote-object-info` support and a server advertising
 protocol-v2 `object-info`; protocol-v2 support alone is not sufficient.
 For a Git server you control, enable `transfer.advertiseObjectInfo=true`.
 
-For the basic build/clone/mount commands, use the [quick start](../crates/git-vfs/README.md#start-a-workspace).
+For the basic build/clone/mount commands, use the [quick start](../crates/workspace-fuse/README.md#start-a-workspace).
 Use `warm-sizes --repo PATH` before mount for an explicit metadata-only phase.
 
 
@@ -156,7 +156,7 @@ not an optimized backing store for build outputs or large databases.
 
 ## Git proxy size and BLAKE3 mapping
 
-Build from the workspace root with `cargo build --release -p git-vfs`.
+Build from the workspace root with `cargo build --release -p workspace-fuse`.
 A configured `git-proxy` repository can serve the native Git clone and protocol-v2
 `object-info` size queries, including when its upstream does not advertise them:
 
@@ -455,11 +455,11 @@ The immutable `git-vfs-sizes.fjall/` directory described above remains a separat
 
 ```sh
 cargo fmt --check
-cargo clippy -p git-workspace -p git-overlay -p git-vfs --all-targets -- -D warnings
-cargo test -p git-workspace -p git-overlay -p git-vfs
+cargo clippy -p workspace-core -p workspace-overlay -p workspace-fuse --all-targets -- -D warnings
+cargo test -p workspace-core -p workspace-overlay -p workspace-fuse
 
 # Explicit kernel-level integration tests (require working /dev/fuse).
-cargo test -p git-vfs --test integration -- --ignored --nocapture
+cargo test -p workspace-fuse --test integration -- --ignored --nocapture
 
 ```
 

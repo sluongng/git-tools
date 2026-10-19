@@ -9,9 +9,15 @@ platform(
     },
 )
 
-alias(name = "git-vfs", actual = "//crates/git-vfs:git-vfs-bin", visibility = ["//visibility:public"])
+alias(name = "workspace-fuse", actual = "//crates/workspace-fuse:git-vfs-bin", visibility = ["//visibility:public"])
 alias(name = "git-proxy", actual = "//crates/git-proxy:git-proxy-bin", visibility = ["//visibility:public"])
-alias(name = "git-nfs", actual = "//crates/git-nfs:git-nfs-bin", visibility = ["//visibility:public"])
-alias(name = "git-projfs", actual = "//crates/git-projfs:git-projfs-bin", visibility = ["//visibility:public"])
-alias(name = "git-jj", actual = "//crates/git-jj:git-jj-bin", visibility = ["//visibility:public"])
-alias(name = "git-output-service", actual = "//crates/git-output-service:git-output-service-bin", visibility = ["//visibility:public"])
+alias(name = "workspace-nfs", actual = "//crates/workspace-nfs:git-nfs-bin", visibility = ["//visibility:public"])
+alias(name = "workspace-projfs", actual = "//crates/workspace-projfs:git-projfs-bin", visibility = ["//visibility:public"])
+alias(name = "jj-vfs", actual = "//crates/jj-vfs:git-jj-bin", visibility = ["//visibility:public"])
+alias(name = "bazel-output-service", actual = "//crates/bazel-output-service:git-output-service-bin", visibility = ["//visibility:public"])
+# Compatibility labels retain existing build commands.
+alias(name = "git-vfs", actual = ":workspace-fuse", visibility = ["//visibility:public"])
+alias(name = "git-nfs", actual = ":workspace-nfs", visibility = ["//visibility:public"])
+alias(name = "git-projfs", actual = ":workspace-projfs", visibility = ["//visibility:public"])
+alias(name = "git-jj", actual = ":jj-vfs", visibility = ["//visibility:public"])
+alias(name = "git-output-service", actual = ":bazel-output-service", visibility = ["//visibility:public"])

@@ -40,7 +40,8 @@ configuration uses 64 jobs; the matched table above deliberately uses 16 for bot
 ## What the crate split buys
 
 The CLI edit executed exactly one Rust action: `git-vfs-bin`.
-The lower-layer edit executed exactly four, in dependency order:
+The lower-layer edit executed exactly four, in dependency order
+(names at measurement time, before the crate rename):
 
 1. `git-workspace`
 2. `git-overlay`
@@ -94,7 +95,7 @@ Reproduce from a committed, clean source tree using the ignored credential rc:
 ```sh
 python3 tools/benchmark_developer_build.py --config rbe \
   --output artifacts/my-build-benchmark --trials 3 --jobs 16 \
-  --source-edit crates/git-vfs/src/main.rs crates/git-workspace/src/backend.rs
+  --source-edit crates/workspace-fuse/src/main.rs crates/workspace-core/src/backend.rs
 # Review the plan, then repeat with --run. Omit --execution-log for timings.
 ```
 

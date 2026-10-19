@@ -4,10 +4,10 @@ The object/cache backend remains shared. Each frontend lives in a separate crate
 
 | Crate | User-facing surface | Mutable state |
 | --- | --- | --- |
-| `git-nfs` | NFSv3 server for the built-in macOS client | Existing durable `git-overlay` |
-| `git-projfs` | Windows Projected File System provider | NTFS local files and ProjFS tombstones |
-| `git-jj` | Custom Jujutsu CLI and working-copy implementation | Jujutsu state plus the mounted durable overlay |
-| `git-output-service` | Bazel Output Service gRPC, backed by BuildBuddy CAS | Dedicated local output trees |
+| `workspace-nfs` | NFSv3 server for the built-in macOS client | Existing durable `workspace-overlay` |
+| `workspace-projfs` | Windows Projected File System provider | NTFS local files and ProjFS tombstones |
+| `jj-vfs` | Custom Jujutsu CLI and working-copy implementation | Jujutsu state plus the mounted durable overlay |
+| `bazel-output-service` | Bazel Output Service gRPC, backed by BuildBuddy CAS | Dedicated local output trees |
 
 ## Contracts
 

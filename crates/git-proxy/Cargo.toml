@@ -7,7 +7,7 @@ description = "Read-only native Git pull-through cache and object metadata servi
 
 [dependencies]
 git-pack-cache = { path = "../git-pack-cache" }
-git-reapi = { path = "../git-reapi" }
+reapi = { path = "../reapi" }
 anyhow = "1"
 async-stream = "0.3"
 axum = "0.8"

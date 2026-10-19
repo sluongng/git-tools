@@ -15,7 +15,7 @@ use tonic::{
     transport::{Channel, ClientTlsConfig, Endpoint},
 };
 
-pub use git_reapi::{Digest, proto, reapi};
+pub use ::reapi::{Digest, proto, reapi};
 use proto::google::bytestream as bs;
 
 const BLAKE3: i32 = reapi::digest_function::Value::Blake3 as i32;
@@ -744,14 +744,14 @@ fn chunk_file(blob: UploadBlob, params: reapi::FastCdc2020Params) -> Result<Vec<
 
 #[cfg(test)]
 pub(crate) mod tests {
-    use super::*;
-    use bs::byte_stream_server::{ByteStream, ByteStreamServer};
-    use reapi::{
+    use super::reapi::{
         capabilities_server::{Capabilities, CapabilitiesServer},
         content_addressable_storage_server::{
             ContentAddressableStorage, ContentAddressableStorageServer,
         },
     };
+    use super::*;
+    use bs::byte_stream_server::{ByteStream, ByteStreamServer};
     use std::collections::HashMap;
     use tonic::{Response, Status};
 

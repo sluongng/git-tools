@@ -1,15 +1,15 @@
 [workspace]
 members = [
-    "crates/git-workspace",
-    "crates/git-overlay",
-    "crates/git-vfs",
+    "crates/workspace-core",
+    "crates/workspace-overlay",
+    "crates/workspace-fuse",
     "crates/git-pack-cache",
-    "crates/git-reapi",
+    "crates/reapi",
     "crates/git-proxy",
-    "crates/git-projfs",
-    "crates/git-output-service",
-    "crates/git-nfs",
-    "crates/git-jj",
+    "crates/workspace-projfs",
+    "crates/bazel-output-service",
+    "crates/workspace-nfs",
+    "crates/jj-vfs",
 ]
 exclude = ["third_party/fuser", "third_party/nfsserve"]
 resolver = "3"

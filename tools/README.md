@@ -88,7 +88,7 @@ short readiness checks as non-headline evidence.
 
 For this project's own local versus BuildBuddy Rust build matrix, use
 `benchmark_developer_build.py --config rbe --output FRESH_OUTPUT --source-edit
-crates/git-vfs/src/main.rs crates/git-workspace/src/backend.rs`. Add `--run`
+crates/workspace-fuse/src/main.rs crates/workspace-core/src/backend.rs`. Add `--run`
 after reviewing the dry run. It separates clean-output reuse, no-op and
 metadata-changing edits; see [developer build setup](../docs/development.md).
 

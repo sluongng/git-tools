@@ -138,5 +138,5 @@ force execution without disabling dependency reuse.
 
 Sources: [BuildBuddy uploader](https://github.com/buildbuddy-io/buildbuddy/blob/171043b63cb257653511c3ece31c7be62c7ab316/server/remote_cache/cachetools/cachetools.go),
 [Executor presence batches](https://github.com/buildbuddy-io/buildbuddy/blob/171043b63cb257653511c3ece31c7be62c7ab316/server/cache/dirtools/dirtools.go),
-[REAPI schema and pins](../crates/git-reapi/proto/SOURCES.md),
+[REAPI schema and pins](../crates/reapi/proto/SOURCES.md),
 [Bazel TTL](https://github.com/bazelbuild/bazel/blob/9.2.0/src/main/java/com/google/devtools/build/lib/remote/options/CommonRemoteOptions.java).

@@ -5,12 +5,12 @@ Linux x86-64 is the initial Bazel target. Native Git and `/dev/fuse` are runtime
 requirements, not dependencies of every library.
 
 ```sh
-bazel build //:git-vfs //:git-proxy
+bazel build //:workspace-fuse //:git-proxy
 bazel test //...
 ```
 
 The root aliases build executable targets; their library counterparts live in
-`//crates/git-vfs:git-vfs` and `//crates/git-proxy:git-proxy`.
+`//crates/workspace-fuse:workspace-fuse` and `//crates/git-proxy:git-proxy`.
 Cargo remains supported: `cargo test --locked --workspace`.
 
 Tests requiring native Git run on the host; their Rust compilation remains
@@ -18,7 +18,7 @@ eligible for remote execution. Use Git with `cat-file remote-object-info`
 support on `PATH`. The FUSE cases are opt-in:
 
 ```sh
-bazel test //crates/git-vfs:integration_tests \
+bazel test //crates/workspace-fuse:integration_tests \
   --test_arg=--ignored --test_arg=--test-threads=1
 ```
 
@@ -39,7 +39,7 @@ BuildBuddy deployment. Do not enable `--announce_rc` with a key-bearing rc.
 ```sh
 chmod 600 user.bazelrc
 git check-ignore user.bazelrc
-bazel build --config=rbe //:git-vfs //:git-proxy
+bazel build --config=rbe //:workspace-fuse //:git-proxy
 bazel test --config=rbe //...
 ```
 
@@ -52,24 +52,24 @@ The remote execution platform pins a standard BuildBuddy Ubuntu image by digest.
 
 | Crate | Responsibility | Local dependencies |
 |---|---|---|
-| `git-workspace` | Git object access, immutable trees, metadata, prefetch and shared Fjall registry | None |
-| `git-overlay` | Persistent writable namespace, journal, payloads and native Git worktree | `git-workspace` |
-| `git-vfs` | FUSE adapters and CLI | `git-workspace`, `git-overlay` |
+| `workspace-core` | Git object access, immutable trees, metadata, prefetch and shared Fjall registry | None |
+| `workspace-overlay` | Persistent writable namespace, journal, payloads and native Git worktree | `workspace-core` |
+| `workspace-fuse` | FUSE adapters and CLI | `workspace-core`, `workspace-overlay` |
 | `git-pack-cache` | Smart-HTTP keys, framing and bounded generated responses | None |
-| `git-reapi` | Generated REAPI/ByteStream bindings | None |
-| `git-proxy` | HTTP server, native Git orchestration and CAS transport/sync | `git-pack-cache`, `git-reapi` |
-| `git-nfs` | Loopback writable NFSv3 frontend | `git-workspace`, `git-overlay` |
-| `git-projfs` | Windows ProjFS provider and native Git admin | `git-workspace` |
-| `git-jj` | Custom Jujutsu CLI/working-copy backend | `git-overlay` |
-| `git-output-service` | Bazel output-tree lifecycle and verified CAS materialization | `git-reapi` |
+| `reapi` | Generated REAPI/ByteStream bindings | None |
+| `git-proxy` | HTTP server, native Git orchestration and CAS transport/sync | `git-pack-cache`, `reapi` |
+| `workspace-nfs` | Loopback writable NFSv3 frontend | `workspace-core`, `workspace-overlay` |
+| `workspace-projfs` | Windows ProjFS provider and native Git admin | `workspace-core` |
+| `jj-vfs` | Custom Jujutsu CLI/working-copy backend | `workspace-overlay` |
+| `bazel-output-service` | Bazel output-tree lifecycle and verified CAS materialization | `reapi` |
 
 Each frontend has a root executable alias and crate-local verification instructions.
 See [platform contracts and acceptance](design/platform-frontends.md); compiling
 a platform target does not establish native runtime support. The pinned NFS fork
 and its local changes live in `third_party/nfsserve`.
 
-The lower VFS crates do not depend on FUSE. Existing `git_vfs` module paths and
-proxy protocol/config exports are reexported for compatibility. All workspace
+The lower VFS crates do not depend on FUSE. `workspace-fuse` reexports shared
+backend and overlay APIs; the proxy reexports its protocol/config APIs. All workspace
 metadata owners share one Fjall registry, rather than opening the same database
 independently. Protocol generation and pack parsing do not rebuild merely
 because the proxy's routing or CAS orchestration changes.

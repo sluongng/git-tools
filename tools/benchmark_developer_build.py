@@ -2,8 +2,8 @@
 """Bazel developer-build cells; print the plan unless --run is supplied.
 
 Example: tools/benchmark_developer_build.py --bazel bazel --config rbe \
-  --output artifacts/developer-build --source-edit crates/git-vfs/src/main.rs \
-  crates/git-workspace/src/backend.rs --run //:git-vfs //:git-proxy
+  --output artifacts/developer-build --source-edit crates/workspace-fuse/src/main.rs \
+  crates/workspace-core/src/backend.rs --run //:workspace-fuse //:git-proxy
 
 Population runs once per arm: a first normal build, NOT a forced cold cache.
 Each arm gets a private output base; --trials repeats the other cells.
@@ -287,7 +287,7 @@ def main():
     parser.add_argument('--edit-seed', help='Edit namespace; default is fresh per invocation to avoid old action-cache hits')
     parser.add_argument('--execution-log', action='store_true', help='Heavy JSON diagnostics; do not use for headline timing')
     parser.add_argument('--run', action='store_true')
-    parser.add_argument('targets', nargs='*', default=['//:git-vfs', '//:git-proxy'])
+    parser.add_argument('targets', nargs='*', default=['//:workspace-fuse', '//:git-proxy'])
     args = parser.parse_args()
     root = Path(__file__).resolve().parents[1]
     args.output = args.output.resolve()
