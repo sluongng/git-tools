@@ -52,8 +52,8 @@ Its HEAD starts detached at the base commit, and its index is populated from tha
 The admin shares base objects through Git alternates; staging writes new objects into the isolated admin,
 not the base clone. No upstream push or source-clone ref update is performed by the VFS.
 
-For every acknowledged mutation, one Fjall transaction persists the namespace/content change and a
-generation-tagged path journal. The fsmonitor hook returns an opaque generation token plus NUL-separated
+For every acknowledged mutation, durable payload preparation precedes an atomic Fjall
+metadata/journal publication. The fsmonitor hook returns an opaque generation token plus NUL-separated
 paths changed since the previous token. Renames report both names, including descendants for directory renames.
 Git checks those candidate paths against its normal index; the VFS does not invent Git status results.
 Changing a file and then restoring its original bytes can therefore become clean again.
@@ -323,18 +323,19 @@ Do not edit cached sizes manually.
 
 ## Fjall storage
 
-Fjall is the only storage engine; there is no `--storage` selector. The writable
-state lives at `<overlay>/overlay.fjall/`. Namespace changes, file bytes, generation
-advancement, and journal paths commit atomically with `PersistMode::SyncAll` before
-updating the mounted in-memory view. Default buffered-only writes are not used for
-acknowledged mutations.
+Fjall is the only metadata engine; there is no `--storage` selector. Metadata and
+journal live at `<overlay>/overlay.fjall/`; mutable backing files live in
+`<overlay>/payloads/`. Range writes use synced redo recovery before atomic
+`PersistMode::SyncAll` metadata publication. Uncertain writes block content and
+mutations until remount recovery. Linked edits are never treated as cache data.
+Exclusive remount reclaims dead payloads while retaining deletion tombstones.
 
-The existing Fjall cache and overlay formats are unchanged. SQLite and LMDB are no
-longer supported: legacy cache files are left untouched but are not imported, and
-legacy writable overlays are rejected rather than treated as empty workspaces.
-There is no automatic migration. Keep the old overlay and an older binary if you
-need to recover its uncommitted or staged work; a new overlay directory starts a
-separate working tree.
+The size-cache format is unchanged. Older Fjall inline overlays migrate resumably
+to payload format 2; older mounting binaries reject the upgraded overlay.
+SQLite and LMDB overlays remain unsupported and
+are rejected, not imported or treated as empty workspaces. Preserve those overlays
+with their older binary if needed; a new directory starts a separate workspace.
+See the [lifecycle design and measured checkpoints](design/vfs-iteration-lifecycle.md).
 
 Fjall allows one owning process per database. The mount owns its databases, while
 Git's separate fsmonitor hook requests a consistent journal snapshot through a

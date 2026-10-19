@@ -23,6 +23,9 @@ impl Blake3XattrStats {
             misses: self.misses.load(Ordering::Relaxed),
         }
     }
+    pub fn record_local_hash(&self) {
+        self.local_hashes.fetch_add(1, Ordering::Relaxed);
+    }
     pub fn local(&self, data: &[u8]) -> [u8; 32] {
         self.local_hashes.fetch_add(1, Ordering::Relaxed);
         *blake3::hash(data).as_bytes()

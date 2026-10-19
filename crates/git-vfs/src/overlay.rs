@@ -4,9 +4,12 @@ use crate::backend::GitRepo;
 mod codec;
 #[path = "overlay_fjall.rs"]
 mod fjall;
+#[path = "overlay_payload.rs"]
+mod payload;
 use crate::filesystem::{Kind as BaseKind, Snapshot};
 use anyhow::{Context, Result, ensure};
 use fuser::FileType;
+pub use payload::Payload;
 use sha1::{Digest, Sha1};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::ffi::{OsStr, OsString};
@@ -58,7 +61,7 @@ pub struct Entry {
     pub kind: Kind,
     pub mode: u32,
     pub base_oid: Option<String>,
-    pub data: Option<Vec<u8>>,
+    pub payload: Payload,
     pub mtime: SystemTime,
     pub ctime: SystemTime,
     pub linked: bool,
@@ -83,6 +86,14 @@ pub struct OverlayStats {
     pub dead_payload_bytes: u64,
     /// Payload bytes removed during this exclusive open, not lifetime total.
     pub reclaimed_payload_bytes: u64,
+    pub payload_read_bytes: u64,
+    pub payload_write_bytes: u64,
+    pub payload_copy_bytes: u64,
+    pub payload_hash_bytes: u64,
+    pub payload_syncs: u64,
+    pub payload_directory_syncs: u64,
+    pub metadata_syncs: u64,
+    pub recovered_operations: u64,
 }
 
 #[derive(Default)]
@@ -214,6 +225,14 @@ impl Overlay {
         let mut stats = OverlayStats {
             entry_count: self.entries.len() as u64,
             reclaimed_payload_bytes: self.database.reclaimed_payload_bytes,
+            payload_read_bytes: self.database.files.counters.read.get(),
+            payload_write_bytes: self.database.files.counters.written.get(),
+            payload_copy_bytes: self.database.files.counters.copied.get(),
+            payload_hash_bytes: self.database.files.counters.hashed.get(),
+            payload_syncs: self.database.files.counters.syncs.get(),
+            payload_directory_syncs: self.database.files.counters.directory_syncs.get(),
+            metadata_syncs: self.database.metadata_syncs.get(),
+            recovered_operations: self.database.files.counters.recovered.get(),
             ..OverlayStats::default()
         };
         for entry in self.entries.values() {
@@ -223,7 +242,7 @@ impl Overlay {
                 stats.tombstone_entries += 1;
             }
             if !entry.control {
-                let bytes = entry.data.as_ref().map_or(0, |data| data.len() as u64);
+                let bytes = entry.payload.size().unwrap_or(0);
                 if entry.linked {
                     stats.live_payload_bytes += bytes;
                 } else {
@@ -235,6 +254,7 @@ impl Overlay {
     }
     /// Reject reclaimed inode content rather than resurrecting its base blob.
     pub fn content_entry(&self, ino: u64) -> Result<&Entry> {
+        self.database.check_healthy()?;
         if self.reclaimed.contains(&ino) {
             return Err(error(libc::ENOENT));
         }
@@ -286,40 +306,86 @@ impl Overlay {
         if e.kind.is_dir() {
             return Ok(0);
         }
-        if let Some(data) = &e.data {
-            return Ok(data.len() as u64);
+        if let Some(size) = e.payload.size() {
+            return Ok(size);
         }
-        let oid = e.base_oid.as_ref().context("file has no content")?;
+        ensure!(matches!(e.payload, Payload::Base), "file has no content");
+        let oid = e.base_oid.as_ref().context("base file has no identity")?;
         repo.blob_sizes(std::slice::from_ref(oid))?
             .get(oid)
             .copied()
             .context("missing blob size")
     }
-    pub fn read(&mut self, ino: u64, repo: &mut GitRepo) -> Result<Vec<u8>> {
+    pub fn read_range(
+        &mut self,
+        ino: u64,
+        offset: u64,
+        length: usize,
+        repo: &mut GitRepo,
+    ) -> Result<Vec<u8>> {
         let e = self.content_entry(ino)?;
         if e.kind.is_dir() {
             return Err(error(libc::EISDIR));
         }
-        match &e.data {
-            Some(data) => Ok(data.clone()),
-            None => repo.read_blob(e.base_oid.as_deref().context("file has no content")?),
+        match &e.payload {
+            Payload::File { size, .. } => self.database.files.read(ino, *size, offset, length),
+            Payload::Inline(data) => {
+                let start = usize::try_from(offset)
+                    .unwrap_or(usize::MAX)
+                    .min(data.len());
+                Ok(data[start..start.saturating_add(length).min(data.len())].to_vec())
+            }
+            Payload::Base => {
+                let data =
+                    repo.read_blob(e.base_oid.as_deref().context("base file has no identity")?)?;
+                let start = usize::try_from(offset)
+                    .unwrap_or(usize::MAX)
+                    .min(data.len());
+                Ok(data[start..start.saturating_add(length).min(data.len())].to_vec())
+            }
+            Payload::None => Err(error(libc::ENOENT)),
         }
+    }
+    pub fn read(&mut self, ino: u64, repo: &mut GitRepo) -> Result<Vec<u8>> {
+        let size = usize::try_from(self.size(ino, repo)?).map_err(|_| error(libc::EFBIG))?;
+        self.read_range(ino, 0, size, repo)
     }
     pub fn digest(&self, ino: u64) -> Result<Vec<u8>> {
         let e = self.content_entry(ino)?;
         if e.control || e.kind.is_dir() {
             return Err(error(libc::ENODATA));
         }
-        if let Some(data) = &e.data {
-            let mut h = Sha1::new();
-            h.update(format!("blob {}\0", data.len()).as_bytes());
-            h.update(data);
-            Ok(h.finalize().to_vec())
-        } else {
-            Ok(hex::decode(
-                e.base_oid.as_deref().context("file has no digest")?,
-            )?)
+        if matches!(e.payload, Payload::Base) {
+            return Ok(hex::decode(
+                e.base_oid.as_deref().context("base file has no digest")?,
+            )?);
         }
+        let size = e.payload.size().context("file has no digest")?;
+        let mut hash = Sha1::new();
+        hash.update(format!("blob {size}\0").as_bytes());
+        match &e.payload {
+            Payload::Inline(data) => hash.update(data),
+            Payload::File { .. } => self
+                .database
+                .files
+                .hash(ino, size, |data| hash.update(data))?,
+            _ => return Err(error(libc::ENODATA)),
+        }
+        Ok(hash.finalize().to_vec())
+    }
+    pub fn blake3_digest(&self, ino: u64) -> Result<[u8; 32]> {
+        let entry = self.content_entry(ino)?;
+        let mut hash = blake3::Hasher::new();
+        match &entry.payload {
+            Payload::Inline(data) => {
+                hash.update(data);
+            }
+            Payload::File { size, .. } => self.database.files.hash(ino, *size, |data| {
+                hash.update(data);
+            })?,
+            _ => return Err(error(libc::ENODATA)),
+        }
+        Ok(*hash.finalize().as_bytes())
     }
     fn validate_name(&self, parent: u64, name: &OsStr) -> Result<()> {
         let b = name.as_bytes();
@@ -365,6 +431,7 @@ impl Overlay {
         Ok(p)
     }
     fn commit(&mut self, changed: Vec<Entry>, paths: Vec<Vec<u8>>) -> Result<()> {
+        self.database.check_healthy()?;
         let mut post_entries = HashMap::with_capacity(changed.len());
         let mut deltas = Vec::new();
         for entry in &changed {
@@ -468,6 +535,7 @@ impl Overlay {
         mode: u32,
         data: Option<Vec<u8>>,
     ) -> Result<u64> {
+        self.database.check_healthy()?;
         self.validate_name(parent, name)?;
         match self.lookup(parent, name) {
             Ok(_) => return Err(error(libc::EEXIST)),
@@ -493,10 +561,21 @@ impl Overlay {
             kind,
             mode: mode & 0o7777,
             base_oid: None,
-            data: if kind.is_dir() {
-                None
+            payload: if kind.is_dir() {
+                Payload::None
+            } else if kind == Kind::File {
+                let data = data.unwrap_or_default();
+                if data.is_empty() {
+                    Payload::Inline(data)
+                } else {
+                    self.database.files.install(ino, &data)?;
+                    Payload::File {
+                        size: data.len() as u64,
+                        generation: 0,
+                    }
+                }
             } else {
-                Some(data.unwrap_or_default())
+                Payload::Inline(data.unwrap_or_default())
             },
             mtime: now,
             ctime: now,
@@ -517,6 +596,30 @@ impl Overlay {
         self.commit(vec![e, p], vec![path])?;
         Ok(ino)
     }
+    fn change_payload(
+        &mut self,
+        ino: u64,
+        after: &Entry,
+        paths: &[Vec<u8>],
+        write: Option<(u64, &[u8])>,
+        repo: &mut GitRepo,
+    ) -> Result<()> {
+        if matches!(self.entry(ino)?.payload, Payload::File { .. }) {
+            return self.database.mutate(self.entry(ino)?, after, paths, write);
+        }
+        let Payload::File { size, .. } = after.payload else {
+            anyhow::bail!("copy-up target missing")
+        };
+        // Only first copy-up uses the old authoritative Base/Inline contents.
+        // Its unpublished backing can be rebuilt on retry without a redo intent.
+        let old = if size == 0 {
+            Vec::new()
+        } else {
+            self.read(ino, repo)?
+        };
+        self.database
+            .copy_up(self.entry(ino)?, after, paths, &old, write)
+    }
     pub fn write(
         &mut self,
         ino: u64,
@@ -534,20 +637,19 @@ impl Overlay {
         if data.is_empty() {
             return Ok(0);
         }
-        let start = usize::try_from(offset).map_err(|_| error(libc::EFBIG))?;
-        let end = start
-            .checked_add(data.len())
-            .filter(|n| *n <= isize::MAX as usize)
+        let end = offset
+            .checked_add(data.len() as u64)
+            .filter(|n| *n <= i64::MAX as u64)
             .ok_or_else(|| error(libc::EFBIG))?;
-        let mut content = self.read(ino, repo)?;
-        if end > content.len() {
-            content
-                .try_reserve(end - content.len())
-                .map_err(|_| error(libc::EFBIG))?;
-            content.resize(end, 0);
-        }
-        content[start..end].copy_from_slice(data);
-        e.data = Some(content);
+        let size = self.size(ino, repo)?.max(end);
+        let previous_generation = match e.payload {
+            Payload::File { generation, .. } => generation,
+            _ => 0,
+        };
+        let generation = previous_generation
+            .checked_add(1)
+            .context("content generation overflow")?;
+        e.payload = Payload::File { size, generation };
         e.mtime = SystemTime::now();
         e.ctime = e.mtime;
         let paths = if e.linked {
@@ -555,7 +657,8 @@ impl Overlay {
         } else {
             vec![]
         };
-        self.commit(vec![e], paths)?;
+        self.change_payload(ino, &e, &paths, Some((offset, data)), repo)?;
+        self.entries.insert(ino, e);
         Ok(data.len())
     }
     pub fn setattr(
@@ -574,21 +677,17 @@ impl Overlay {
             if e.kind.is_dir() {
                 return Err(error(libc::EISDIR));
             }
-            let size = usize::try_from(size)
-                .ok()
-                .filter(|s| *s <= isize::MAX as usize)
-                .ok_or_else(|| error(libc::EFBIG))?;
-            let mut data = if size == 0 {
-                Vec::new()
-            } else {
-                self.read(ino, repo)?
-            };
-            if size > data.len() {
-                data.try_reserve(size - data.len())
-                    .map_err(|_| error(libc::EFBIG))?;
+            if size > i64::MAX as u64 {
+                return Err(error(libc::EFBIG));
             }
-            data.resize(size, 0);
-            e.data = Some(data);
+            let previous_generation = match e.payload {
+                Payload::File { generation, .. } => generation,
+                _ => 0,
+            };
+            let generation = previous_generation
+                .checked_add(1)
+                .context("content generation overflow")?;
+            e.payload = Payload::File { size, generation };
             e.mtime = SystemTime::now();
         }
         if let Some(mode) = mode {
@@ -603,7 +702,13 @@ impl Overlay {
         } else {
             vec![]
         };
-        self.commit(vec![e], paths)
+        if size.is_some() {
+            self.change_payload(ino, &e, &paths, None, repo)?;
+            self.entries.insert(ino, e);
+            Ok(())
+        } else {
+            self.commit(vec![e], paths)
+        }
     }
     pub fn unlink(&mut self, parent: u64, name: &OsStr, directory: bool) -> Result<()> {
         self.validate_name(parent, name)?;

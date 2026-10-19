@@ -570,7 +570,7 @@ fn writable_namespace_lookup_counts_and_tombstones_survive_mutation_and_reopen()
     for inode in [source, overwritten, base, unmodified, highest] {
         let entry = overlay.entry(inode).unwrap();
         assert!(!entry.linked);
-        assert!(entry.data.is_none());
+        assert!(matches!(entry.payload, git_vfs::overlay::Payload::None));
         assert!(overlay.read(inode, &mut repo).is_err());
         assert!(overlay.size(inode, &mut repo).is_err());
         assert!(overlay.digest(inode).is_err());

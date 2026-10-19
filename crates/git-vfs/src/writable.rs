@@ -317,12 +317,8 @@ impl Filesystem for WritableGitFs {
             if size == 0 {
                 return Ok(Vec::new());
             }
-            let data = self.overlay.read(ino, &mut self.repo)?;
-            let start = usize::try_from(offset)
-                .unwrap_or(usize::MAX)
-                .min(data.len());
-            let end = start.saturating_add(size as usize).min(data.len());
-            Ok(data[start..end].to_vec())
+            self.overlay
+                .read_range(ino, offset as u64, size as usize, &mut self.repo)
         })();
         match result {
             Ok(data) => reply.data(&data),
@@ -655,13 +651,18 @@ impl Filesystem for WritableGitFs {
                 }
                 // data is authoritative after every write, including same-size edits;
                 // base_oid remains the original Git identity for journal purposes.
-                let digest = if let Some(data) = &entry.data {
-                    stats.local(data).to_vec()
-                } else if let Some(oid) = &entry.base_oid {
-                    stats.base(&self.repo, oid)?
+                let digest = if matches!(entry.payload, crate::overlay::Payload::Base) {
+                    stats.base(
+                        &self.repo,
+                        entry
+                            .base_oid
+                            .as_deref()
+                            .ok_or_else(|| error(libc::ENODATA))?,
+                    )?
                 } else {
-                    stats.miss();
-                    return Err(error(libc::ENODATA));
+                    let digest = self.overlay.blake3_digest(ino)?;
+                    stats.record_local_hash();
+                    digest.to_vec()
                 };
                 return Ok(if name == OsStr::new("user.blake3.hex") {
                     hex::encode(digest).into_bytes()

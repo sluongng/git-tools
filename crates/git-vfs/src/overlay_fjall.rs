@@ -1,7 +1,8 @@
 //! Durable Fjall overlay and a read-only journal service for Git subprocesses.
 use super::{
-    BaseKind, Entry, Kind, Snapshot,
-    codec::{decode_for_open, encode},
+    BaseKind, Entry, Kind, Payload, Snapshot,
+    codec::{decode_exact, decode_for_open, encode},
+    payload::{Files, Intent, Operation, failure},
 };
 use crate::storage::open_fjall;
 use anyhow::{Context, Result, ensure};
@@ -37,6 +38,9 @@ pub(super) struct Store {
     handles: Option<Handles>,
     service: Option<Service>,
     pub(super) reclaimed_payload_bytes: u64,
+    pub(super) files: Files,
+    poisoned: std::cell::Cell<bool>,
+    pub(super) metadata_syncs: std::cell::Cell<u64>,
 }
 fn number(bytes: &[u8]) -> Result<u64> {
     Ok(u64::from_be_bytes(
@@ -48,7 +52,10 @@ fn encode_entry(entry: &Entry) -> Result<Vec<u8>> {
         75usize,
         entry.name.as_bytes().len(),
         entry.base_oid.as_ref().map_or(0, String::len),
-        entry.data.as_ref().map_or(0, Vec::len),
+        match &entry.payload {
+            Payload::Inline(bytes) => bytes.len(),
+            _ => 17,
+        },
         super::timestamp(entry.mtime).len(),
         super::timestamp(entry.ctime).len(),
     ];
@@ -172,7 +179,11 @@ impl Store {
                     kind,
                     mode,
                     base_oid: n.oid.clone(),
-                    data: None,
+                    payload: if n.oid.is_some() && !kind.is_dir() {
+                        Payload::Base
+                    } else {
+                        Payload::None
+                    },
                     mtime: snapshot.timestamp,
                     ctime: snapshot.timestamp,
                     linked: true,
@@ -192,7 +203,23 @@ impl Store {
         }
         // Finish initialization before maintenance. Fresh open holds the exclusive
         // owner lock, so no live FUSE/open-file references can reach these inodes.
+        // Root is always decoded by the old binary; upgrading it first makes
+        // mixed-format migration fail closed before any external-file reference.
+        let root = tx
+            .get(&handles.entries, 1u64.to_be_bytes())?
+            .context("overlay root missing")?;
+        tx.insert(
+            &handles.entries,
+            1u64.to_be_bytes(),
+            encode_entry(&decode_exact(&root)?)?,
+        );
+        if let Some(format) = tx.get(&handles.meta, b"payload_format")? {
+            ensure!(&*format == b"2", "unsupported overlay payload format");
+        }
+        tx.insert(&handles.meta, b"payload_format", b"2");
         tx.commit()?;
+        let files = Files::open(directory)?;
+        Self::recover(&handles, &files)?;
         let mut loaded = BTreeMap::new();
         let mut reclaimed_payload_bytes = 0u64;
         let mut cursor: Option<Vec<u8>> = None;
@@ -203,13 +230,14 @@ impl Store {
                 std::ops::Bound::Excluded(key.clone())
             });
             let mut maintenance = Vec::new();
+            let mut discarded = Vec::new();
             let mut count = 0;
             for item in read
                 .range(&handles.entries, (lower, std::ops::Bound::Unbounded))
                 .take(MAINTENANCE_RECORDS)
             {
                 let (key, value) = item.into_inner()?;
-                let (e, reclaimed) = decode_for_open(&value)?;
+                let (mut e, reclaimed) = decode_for_open(&value)?;
                 ensure!(number(&key)? == e.inode, "overlay entry key mismatch");
                 if let Some(bytes) = reclaimed {
                     reclaimed_payload_bytes = reclaimed_payload_bytes
@@ -218,6 +246,21 @@ impl Store {
                     // A zero-length inline payload also needs its marker removed.
                     // Already-pruned records need no second durable write.
                     maintenance.push((key.to_vec(), encode_entry(&e)?));
+                }
+                if e.linked && !e.control && e.kind == Kind::File {
+                    if let Payload::Inline(bytes) = &e.payload {
+                        files.install(e.inode, bytes)?;
+                        e.payload = Payload::File {
+                            size: bytes.len() as u64,
+                            generation: 0,
+                        };
+                        maintenance.push((key.to_vec(), encode_entry(&e)?));
+                    } else if let Payload::File { size, .. } = e.payload {
+                        files.file(e.inode, size)?;
+                    }
+                }
+                if !e.linked && !e.control {
+                    discarded.push(e.inode);
                 }
                 cursor = Some(key.to_vec());
                 loaded.insert(e.inode, e);
@@ -231,6 +274,9 @@ impl Store {
                     tx.insert(&handles.entries, key, value);
                 }
                 tx.commit()?;
+            }
+            for inode in discarded {
+                files.remove(inode)?;
             }
             if count < MAINTENANCE_RECORDS {
                 break;
@@ -264,14 +310,14 @@ impl Store {
                 kind: Kind::File,
                 mode: 0o444,
                 base_oid: None,
-                data: None,
+                payload: Payload::None,
                 mtime: snapshot.timestamp,
                 ctime: snapshot.timestamp,
                 linked: true,
                 control: true,
             }
         };
-        control.data = Some(pointer);
+        control.payload = Payload::Inline(pointer);
         tx.insert(
             &handles.entries,
             control.inode.to_be_bytes(),
@@ -285,11 +331,237 @@ impl Store {
                 handles: Some(handles),
                 service: Some(service),
                 reclaimed_payload_bytes,
+                files,
+                poisoned: std::cell::Cell::new(false),
+                metadata_syncs: std::cell::Cell::new(0),
             },
             loaded,
         ))
     }
+    pub(super) fn check_healthy(&self) -> Result<()> {
+        ensure!(
+            !self.poisoned.get(),
+            "overlay requires recovery after uncertain payload mutation"
+        );
+        Ok(())
+    }
+    fn publish(handles: &Handles, intent: &Intent) -> Result<()> {
+        let entry = decode_exact(&intent.after_entry)?;
+        let mut tx = handles.db.write_tx().durability(Some(PersistMode::SyncAll));
+        let generation = number(
+            &tx.get(&handles.meta, b"generation")?
+                .context("overlay generation missing")?,
+        )?;
+        ensure!(
+            generation == intent.before_generation,
+            "redo journal generation conflict"
+        );
+        let current = tx
+            .get(&handles.entries, entry.inode.to_be_bytes())?
+            .context("redo inode missing")?;
+        ensure!(
+            encode(&decode_exact(&current)?) == intent.before_entry,
+            "redo entry generation conflict"
+        );
+        let generation = generation
+            .checked_add(1)
+            .context("overlay generation overflow")?;
+        tx.insert(
+            &handles.entries,
+            entry.inode.to_be_bytes(),
+            intent.after_entry.as_slice(),
+        );
+        for (ordinal, path) in intent
+            .paths
+            .iter()
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .enumerate()
+        {
+            let mut key = [0; 16];
+            key[..8].copy_from_slice(&generation.to_be_bytes());
+            key[8..].copy_from_slice(&(ordinal as u64).to_be_bytes());
+            tx.insert(&handles.journal, key, path.as_slice());
+        }
+        tx.insert(&handles.meta, b"generation", generation.to_be_bytes());
+        tx.remove(&handles.meta, b"payload_intent");
+        failure("before_final_commit")?;
+        tx.commit()?;
+        failure("after_final_commit")?;
+        Ok(())
+    }
+    fn validate_intent(intent: &Intent) -> Result<(Entry, u64)> {
+        let before = decode_exact(&intent.before_entry)?;
+        let after = decode_exact(&intent.after_entry)?;
+        ensure!(
+            before.inode == after.inode
+                && before.parent == after.parent
+                && before.name == after.name
+                && before.linked == after.linked
+                && before.kind == after.kind
+                && before.base_oid == after.base_oid
+                && !before.control
+                && !before.kind.is_dir(),
+            "invalid payload intent namespace"
+        );
+        if let Payload::File { size, .. } = before.payload {
+            ensure!(
+                size == intent.before_size,
+                "redo pre-backing size conflicts with file metadata"
+            );
+        }
+        let pre_generation = match before.payload {
+            Payload::File { generation, .. } => generation,
+            _ => 0,
+        };
+        let Payload::File { size, generation } = after.payload else {
+            anyhow::bail!("redo target is not file-backed")
+        };
+        ensure!(
+            pre_generation.checked_add(1) == Some(generation),
+            "invalid redo content generation"
+        );
+        if let Operation::Write {
+            offset,
+            length,
+            ref hash,
+        } = intent.operation
+        {
+            ensure!(
+                size >= intent.before_size
+                    && length > 0
+                    && offset.checked_add(length).is_some_and(|end| end <= size)
+                    && hash.len() == 64
+                    && hex::decode(hash)?.len() == 32,
+                "invalid redo write bounds"
+            );
+        }
+        ensure!(size <= i64::MAX as u64, "redo file too large");
+        Ok((after, size))
+    }
+    fn recover(handles: &Handles, files: &Files) -> Result<()> {
+        let tx = handles.db.read_tx();
+        let raw = tx.get(&handles.meta, b"payload_intent")?;
+        if let Some(raw) = raw {
+            let intent: Intent =
+                serde_json::from_slice(&raw).context("invalid payload redo intent")?;
+            let (entry, size) = Self::validate_intent(&intent)?;
+            let generation = number(
+                &tx.get(&handles.meta, b"generation")?
+                    .context("overlay generation missing")?,
+            )?;
+            let current = tx
+                .get(&handles.entries, entry.inode.to_be_bytes())?
+                .context("redo inode missing")?;
+            let current = encode(&decode_exact(&current)?);
+            // Publication atomically replaces the entry/generation and removes
+            // the intent. A pending intent can therefore only name pre-state;
+            // accepting post-state would bless corruption and discard evidence.
+            ensure!(
+                generation == intent.before_generation,
+                "redo journal generation conflict"
+            );
+            ensure!(current == intent.before_entry, "redo pre-state conflict");
+            drop(tx);
+            files.apply(entry.inode, intent.before_size, size, &intent.operation)?;
+            Self::publish(handles, &intent)?;
+            files
+                .counters
+                .recovered
+                .set(files.counters.recovered.get() + 1);
+        } else {
+            drop(tx);
+        }
+        // Only this fixed scratch name is disposable after tracing the intent.
+        files.retire_redo()
+    }
+    pub(super) fn copy_up(
+        &self,
+        before: &Entry,
+        after: &Entry,
+        paths: &[Vec<u8>],
+        old: &[u8],
+        write: Option<(u64, &[u8])>,
+    ) -> Result<()> {
+        self.check_healthy()?;
+        ensure!(
+            !matches!(before.payload, Payload::File { .. }),
+            "copy-up would overwrite referenced payload"
+        );
+        let Payload::File {
+            size,
+            generation: 1,
+        } = after.payload
+        else {
+            anyhow::bail!("invalid initial copy-up generation")
+        };
+        self.files
+            .prepare_unpublished(before.inode, old, size, write)?;
+        // Until this durable publication, the old Base/Inline record remains
+        // authoritative. Failure before it needs no redo and loses no edits.
+        failure("before_copyup_commit")?;
+        self.commit(std::slice::from_ref(after), paths)
+    }
+    pub(super) fn mutate(
+        &self,
+        before: &Entry,
+        after: &Entry,
+        paths: &[Vec<u8>],
+        write: Option<(u64, &[u8])>,
+    ) -> Result<()> {
+        self.check_healthy()?;
+        let h = self.handles.as_ref().context("overlay closed")?;
+        let tx = h.db.read_tx();
+        ensure!(
+            tx.get(&h.meta, b"payload_intent")?.is_none(),
+            "payload intent already pending"
+        );
+        let before_generation = number(
+            &tx.get(&h.meta, b"generation")?
+                .context("overlay generation missing")?,
+        )?;
+        before_generation
+            .checked_add(1)
+            .context("overlay generation overflow")?;
+        drop(tx);
+        let operation = if let Some((offset, bytes)) = write {
+            self.files.stage(bytes)?;
+            Operation::Write {
+                offset,
+                length: bytes.len() as u64,
+                hash: blake3::hash(bytes).to_hex().to_string(),
+            }
+        } else {
+            Operation::Truncate
+        };
+        let intent = Intent {
+            before_generation,
+            before_size: self.files.len(before.inode)?,
+            before_entry: encode_entry(before)?,
+            after_entry: encode_entry(after)?,
+            paths: paths.to_vec(),
+            operation,
+        };
+        let (entry, size) = Self::validate_intent(&intent)?;
+        let encoded = serde_json::to_vec(&intent)?;
+        // A failed durable commit may nevertheless have reached storage. No
+        // content or mutation can proceed until an exclusive recovery open.
+        self.poisoned.set(true);
+        let mut tx = h.db.write_tx().durability(Some(PersistMode::SyncAll));
+        tx.insert(&h.meta, b"payload_intent", encoded);
+        self.metadata_syncs.set(self.metadata_syncs.get() + 1);
+        tx.commit()?;
+        failure("after_intent")?;
+        self.files
+            .apply(entry.inode, intent.before_size, size, &intent.operation)?;
+        self.metadata_syncs.set(self.metadata_syncs.get() + 1);
+        Self::publish(h, &intent)?;
+        self.files.retire_redo()?;
+        self.poisoned.set(false);
+        Ok(())
+    }
     pub(super) fn commit(&self, changed: &[Entry], paths: &[Vec<u8>]) -> Result<()> {
+        self.check_healthy()?;
         let h = self.handles.as_ref().context("overlay closed")?;
         let mut tx = h.db.write_tx().durability(Some(PersistMode::SyncAll));
         let generation = number(
@@ -313,10 +585,16 @@ impl Store {
             tx.insert(&h.journal, key, path.as_slice());
         }
         tx.insert(&h.meta, b"generation", generation.to_be_bytes());
+        self.poisoned.set(true);
+        failure("before_namespace_commit")?;
+        self.metadata_syncs.set(self.metadata_syncs.get() + 1);
         tx.commit()?;
+        failure("after_namespace_commit")?;
+        self.poisoned.set(false);
         Ok(())
     }
     pub(super) fn sync(&self) -> Result<()> {
+        self.check_healthy()?;
         self.handles
             .as_ref()
             .context("overlay closed")?
@@ -612,4 +890,631 @@ pub(super) fn changes_since(directory: &Path, token: &str) -> Result<(String, Ve
 }
 pub(super) fn dirty_paths(directory: &Path) -> Result<Vec<Vec<u8>>> {
     Ok(query(directory, Query { token: None })?.paths)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::backend::{GitRepo, SizeFallback};
+    use crate::overlay::{Overlay, payload::fail_next};
+    use std::ffi::OsStr;
+    use std::process::Command;
+
+    fn fixture() -> (tempfile::TempDir, GitRepo, Snapshot, PathBuf, PathBuf) {
+        let temp = tempfile::tempdir().unwrap();
+        let gitdir = temp.path().join("repo");
+        std::fs::create_dir(&gitdir).unwrap();
+        for args in [
+            vec!["init", "-q"],
+            vec!["config", "user.name", "Fixture"],
+            vec!["config", "user.email", "fixture@example.test"],
+        ] {
+            assert!(
+                Command::new("git")
+                    .arg("-C")
+                    .arg(&gitdir)
+                    .args(args)
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+        }
+        std::fs::write(gitdir.join("base"), b"base bytes").unwrap();
+        assert!(
+            Command::new("git")
+                .arg("-C")
+                .arg(&gitdir)
+                .args(["add", "."])
+                .status()
+                .unwrap()
+                .success()
+        );
+        assert!(
+            Command::new("git")
+                .arg("-C")
+                .arg(&gitdir)
+                .args(["-c", "commit.gpgsign=false", "commit", "-qm", "Fixture"])
+                .status()
+                .unwrap()
+                .success()
+        );
+        let bare = temp.path().join("bare.git");
+        assert!(
+            Command::new("git")
+                .args(["clone", "--bare", "--quiet"])
+                .arg(&gitdir)
+                .arg(&bare)
+                .status()
+                .unwrap()
+                .success()
+        );
+        let gitdir = bare;
+        let repo = GitRepo::open(&gitdir, "git", "origin", SizeFallback::Error).unwrap();
+        let snapshot = Snapshot::load(&repo, "HEAD").unwrap();
+        let overlay = temp.path().join("overlay");
+        (temp, repo, snapshot, overlay, gitdir)
+    }
+
+    fn legacy_record(entry: &Entry) -> Vec<u8> {
+        fn bytes(out: &mut Vec<u8>, value: Option<&[u8]>) {
+            out.extend_from_slice(&value.map_or(u64::MAX, |v| v.len() as u64).to_be_bytes());
+            if let Some(value) = value {
+                out.extend_from_slice(value);
+            }
+        }
+        let mut out = vec![1];
+        for n in [
+            entry.inode,
+            entry.parent,
+            entry.kind.code() as u64,
+            entry.mode as u64,
+        ] {
+            out.extend_from_slice(&n.to_be_bytes());
+        }
+        out.push(u8::from(entry.linked));
+        out.push(u8::from(entry.control));
+        bytes(&mut out, Some(entry.name.as_bytes()));
+        bytes(&mut out, entry.base_oid.as_deref().map(str::as_bytes));
+        bytes(
+            &mut out,
+            match &entry.payload {
+                Payload::Inline(data) => Some(data),
+                _ => None,
+            },
+        );
+        bytes(
+            &mut out,
+            Some(crate::overlay::timestamp(entry.mtime).as_bytes()),
+        );
+        bytes(
+            &mut out,
+            Some(crate::overlay::timestamp(entry.ctime).as_bytes()),
+        );
+        out
+    }
+
+    #[test]
+    fn interrupted_legacy_migration_preserves_bytes_journal_and_downgrade_guard() {
+        let (_temp, mut repo, snapshot, directory, gitdir) = fixture();
+        let mut overlay = Overlay::open(&directory, &snapshot, &gitdir).unwrap();
+        let ino = overlay
+            .create(
+                1,
+                OsStr::new("legacy-edit"),
+                Kind::File,
+                0o600,
+                Some(vec![4; 128 * 1024]),
+            )
+            .unwrap();
+        let mut entry = overlay.entry(ino).unwrap().clone();
+        entry.payload = Payload::Inline(vec![4; 128 * 1024]);
+        let root = overlay.entry(1).unwrap().clone();
+        let (token, _) = super::changes_since(&directory, "").unwrap();
+        drop(overlay);
+        let handles = Handles::open(&directory, false).unwrap();
+        let mut tx = handles.db.write_tx().durability(Some(PersistMode::SyncAll));
+        tx.insert(&handles.entries, ino.to_be_bytes(), legacy_record(&entry));
+        tx.insert(&handles.entries, 1u64.to_be_bytes(), legacy_record(&root));
+        tx.remove(&handles.meta, b"payload_format");
+        tx.commit().unwrap();
+        drop(handles);
+        fail_next("after_install_sync");
+        assert!(Overlay::open(&directory, &snapshot, &gitdir).is_err());
+        let handles = Handles::open(&directory, false).unwrap();
+        let tx = handles.db.read_tx();
+        // The old decoder rejects this sentinel before it could serve or commit.
+        assert_eq!(
+            tx.get(&handles.entries, 1u64.to_be_bytes())
+                .unwrap()
+                .unwrap()[0],
+            2
+        );
+        assert_eq!(
+            tx.get(&handles.entries, ino.to_be_bytes())
+                .unwrap()
+                .unwrap()[0],
+            1
+        );
+        drop(tx);
+        drop(handles);
+        let mut overlay = Overlay::open(&directory, &snapshot, &gitdir).unwrap();
+        assert!(matches!(
+            overlay.entry(ino).unwrap().payload,
+            Payload::File { generation: 0, .. }
+        ));
+        assert_eq!(overlay.read(ino, &mut repo).unwrap(), vec![4; 128 * 1024]);
+        assert_eq!(
+            super::changes_since(&directory, &token).unwrap(),
+            (token, vec![])
+        );
+        drop(overlay);
+        let mut overlay = Overlay::open(&directory, &snapshot, &gitdir).unwrap();
+        assert_eq!(overlay.stats().payload_copy_bytes, 0);
+        assert_eq!(overlay.read_range(ino, 0, 1, &mut repo).unwrap(), [4]);
+    }
+
+    #[test]
+    fn unpublished_first_copyup_failure_preserves_authoritative_bytes() {
+        for point in [
+            "after_copyup_old",
+            "after_copyup_data",
+            "before_copyup_directory_sync",
+            "after_copyup_sync",
+            "before_copyup_commit",
+        ] {
+            for from_base in [false, true] {
+                let (_temp, mut repo, snapshot, directory, gitdir) = fixture();
+                let mut overlay = Overlay::open(&directory, &snapshot, &gitdir).unwrap();
+                let ino = if from_base {
+                    overlay.lookup(1, OsStr::new("base")).unwrap()
+                } else {
+                    overlay
+                        .create(1, OsStr::new("empty"), Kind::File, 0o600, None)
+                        .unwrap()
+                };
+                let old = overlay.read(ino, &mut repo).unwrap();
+                let (token, _) = super::changes_since(&directory, "").unwrap();
+                fail_next(point);
+                assert!(
+                    overlay.write(ino, 3, &[7; 4], &mut repo).is_err(),
+                    "{point}"
+                );
+                assert_eq!(overlay.read(ino, &mut repo).unwrap(), old, "{point}");
+                assert_eq!(
+                    super::changes_since(&directory, &token).unwrap(),
+                    (token, vec![])
+                );
+                overlay.write(ino, 3, &[7; 4], &mut repo).unwrap();
+                let mut expected = old;
+                expected.resize(expected.len().max(7), 0);
+                expected[3..7].fill(7);
+                assert_eq!(overlay.read(ino, &mut repo).unwrap(), expected);
+                assert_eq!(overlay.stats().recovered_operations, 0);
+                drop(overlay);
+                let mut overlay = Overlay::open(&directory, &snapshot, &gitdir).unwrap();
+                assert_eq!(overlay.read(ino, &mut repo).unwrap(), expected);
+            }
+        }
+        for (point, committed) in [
+            ("before_namespace_commit", false),
+            ("after_namespace_commit", true),
+        ] {
+            let (_temp, mut repo, snapshot, directory, gitdir) = fixture();
+            let mut overlay = Overlay::open(&directory, &snapshot, &gitdir).unwrap();
+            let ino = overlay
+                .create(1, OsStr::new("empty"), Kind::File, 0o600, None)
+                .unwrap();
+            let (token, _) = super::changes_since(&directory, "").unwrap();
+            fail_next(point);
+            assert!(overlay.write(ino, 0, b"new", &mut repo).is_err());
+            assert!(overlay.read(ino, &mut repo).is_err());
+            drop(overlay);
+            let mut overlay = Overlay::open(&directory, &snapshot, &gitdir).unwrap();
+            assert_eq!(
+                overlay.read(ino, &mut repo).unwrap(),
+                if committed { b"new".as_slice() } else { b"" }
+            );
+            assert_eq!(
+                !super::changes_since(&directory, &token)
+                    .unwrap()
+                    .1
+                    .is_empty(),
+                committed
+            );
+        }
+    }
+
+    #[test]
+    fn durable_payload_failures_poison_then_recover_once() {
+        for point in [
+            "after_intent",
+            "before_payload_write",
+            "after_first_write",
+            "before_payload_resize",
+            "before_payload_sync",
+            "after_payload_sync",
+            "before_final_commit",
+            "after_final_commit",
+            "before_redo_retire",
+        ] {
+            let (_temp, mut repo, snapshot, directory, gitdir) = fixture();
+            let mut overlay = Overlay::open(&directory, &snapshot, &gitdir).unwrap();
+            let ino = overlay
+                .create(
+                    1,
+                    OsStr::new("edited"),
+                    Kind::File,
+                    0o600,
+                    Some(vec![1; 192 * 1024]),
+                )
+                .unwrap();
+            let (before_token, _) = super::changes_since(&directory, "").unwrap();
+            let bytes = vec![2; 128 * 1024];
+            fail_next(point);
+            assert!(
+                overlay.write(ino, 32 * 1024, &bytes, &mut repo).is_err(),
+                "{point}"
+            );
+            assert!(overlay.read_range(ino, 0, 1, &mut repo).is_err(), "{point}");
+            assert!(overlay.digest(ino).is_err(), "{point}");
+            assert!(overlay.sync().is_err(), "{point}");
+            assert!(
+                overlay
+                    .create(1, OsStr::new("forbidden"), Kind::File, 0o600, None)
+                    .is_err(),
+                "{point}"
+            );
+            drop(overlay);
+            let mut overlay = Overlay::open(&directory, &snapshot, &gitdir).unwrap();
+            let mut expected = vec![1; 192 * 1024];
+            expected[32 * 1024..160 * 1024].copy_from_slice(&bytes);
+            assert_eq!(overlay.read(ino, &mut repo).unwrap(), expected, "{point}");
+            let (after_token, paths) = super::changes_since(&directory, &before_token).unwrap();
+            assert_eq!(paths, [b"edited".to_vec()], "{point}");
+            let before_generation: u64 = before_token.rsplit(':').next().unwrap().parse().unwrap();
+            let after_generation: u64 = after_token.rsplit(':').next().unwrap().parse().unwrap();
+            assert_eq!(after_generation, before_generation + 1, "{point}");
+            assert_eq!(
+                std::fs::metadata(directory.join("payloads/redo.data"))
+                    .unwrap()
+                    .len(),
+                0
+            );
+            drop(overlay);
+            let mut overlay = Overlay::open(&directory, &snapshot, &gitdir).unwrap();
+            assert_eq!(overlay.read(ino, &mut repo).unwrap(), expected);
+            assert_eq!(
+                super::changes_since(&directory, &after_token).unwrap(),
+                (after_token, vec![])
+            );
+        }
+    }
+
+    #[test]
+    fn replay_can_fail_again_and_corrupt_redo_fails_closed() {
+        let (_temp, mut repo, snapshot, directory, gitdir) = fixture();
+        let mut overlay = Overlay::open(&directory, &snapshot, &gitdir).unwrap();
+        let ino = overlay
+            .create(
+                1,
+                OsStr::new("edited"),
+                Kind::File,
+                0o600,
+                Some(vec![1; 192 * 1024]),
+            )
+            .unwrap();
+        let (token, _) = super::changes_since(&directory, "").unwrap();
+        let bytes = vec![9; 128 * 1024];
+        fail_next("after_intent");
+        assert!(overlay.write(ino, 0, &bytes, &mut repo).is_err());
+        drop(overlay);
+        let redo = directory.join("payloads/redo.data");
+        std::fs::write(&redo, vec![8; bytes.len()]).unwrap();
+        assert!(Overlay::open(&directory, &snapshot, &gitdir).is_err());
+        assert_eq!(
+            super::changes_since(&directory, &token).unwrap(),
+            (token.clone(), vec![])
+        );
+        // Postmetadata with a still-pending intent is impossible: publication
+        // removes it in the same transaction. Reject without altering evidence.
+        let payload_path = directory.join("payloads").join(format!("{ino:016x}.data"));
+        let payload_before = std::fs::read(&payload_path).unwrap();
+        let redo_before = std::fs::read(&redo).unwrap();
+        let handles = Handles::open(&directory, false).unwrap();
+        let mut tx = handles.db.write_tx().durability(Some(PersistMode::SyncAll));
+        let raw_intent = tx
+            .get(&handles.meta, b"payload_intent")
+            .unwrap()
+            .unwrap()
+            .to_vec();
+        let intent: Intent = serde_json::from_slice(&raw_intent).unwrap();
+        let journal_before: Vec<_> = tx
+            .iter(&handles.journal)
+            .map(|item| {
+                let (k, v) = item.into_inner().unwrap();
+                (k.to_vec(), v.to_vec())
+            })
+            .collect();
+        tx.insert(
+            &handles.entries,
+            ino.to_be_bytes(),
+            intent.after_entry.as_slice(),
+        );
+        tx.insert(
+            &handles.meta,
+            b"generation",
+            (intent.before_generation + 1).to_be_bytes(),
+        );
+        tx.commit().unwrap();
+        drop(handles);
+        assert!(Overlay::open(&directory, &snapshot, &gitdir).is_err());
+        assert_eq!(std::fs::read(&payload_path).unwrap(), payload_before);
+        assert_eq!(std::fs::read(&redo).unwrap(), redo_before);
+        let handles = Handles::open(&directory, false).unwrap();
+        let mut tx = handles.db.write_tx().durability(Some(PersistMode::SyncAll));
+        assert_eq!(
+            &*tx.get(&handles.meta, b"payload_intent").unwrap().unwrap(),
+            raw_intent
+        );
+        assert_eq!(
+            &*tx.get(&handles.entries, ino.to_be_bytes())
+                .unwrap()
+                .unwrap(),
+            intent.after_entry
+        );
+        assert_eq!(
+            number(&tx.get(&handles.meta, b"generation").unwrap().unwrap()).unwrap(),
+            intent.before_generation + 1
+        );
+        let journal_after: Vec<_> = tx
+            .iter(&handles.journal)
+            .map(|item| {
+                let (k, v) = item.into_inner().unwrap();
+                (k.to_vec(), v.to_vec())
+            })
+            .collect();
+        assert_eq!(journal_after, journal_before);
+        // Repair only the explicitly injected metadata to continue the existing
+        // valid replay / repeated failure checks using the original intent.
+        tx.insert(
+            &handles.entries,
+            ino.to_be_bytes(),
+            intent.before_entry.as_slice(),
+        );
+        tx.insert(
+            &handles.meta,
+            b"generation",
+            intent.before_generation.to_be_bytes(),
+        );
+        tx.commit().unwrap();
+        drop(handles);
+        std::fs::write(&redo, &bytes).unwrap();
+        fail_next("after_first_write");
+        assert!(Overlay::open(&directory, &snapshot, &gitdir).is_err());
+        assert_eq!(
+            super::changes_since(&directory, &token).unwrap(),
+            (token.clone(), vec![])
+        );
+        let mut overlay = Overlay::open(&directory, &snapshot, &gitdir).unwrap();
+        assert_eq!(overlay.stats().recovered_operations, 1);
+        assert_eq!(
+            overlay.read_range(ino, 0, bytes.len(), &mut repo).unwrap(),
+            bytes
+        );
+        assert_eq!(
+            super::changes_since(&directory, &token).unwrap().1,
+            [b"edited".to_vec()]
+        );
+    }
+
+    #[test]
+    fn unexpectedly_truncated_prepared_payload_is_not_zero_filled() {
+        let (_temp, mut repo, snapshot, directory, gitdir) = fixture();
+        let mut overlay = Overlay::open(&directory, &snapshot, &gitdir).unwrap();
+        let ino = overlay
+            .create(
+                1,
+                OsStr::new("edited"),
+                Kind::File,
+                0o600,
+                Some(vec![1; 128 * 1024]),
+            )
+            .unwrap();
+        let (token, _) = super::changes_since(&directory, "").unwrap();
+        fail_next("after_intent");
+        assert!(overlay.write(ino, 0, &[2; 16], &mut repo).is_err());
+        drop(overlay);
+        let path = directory.join("payloads").join(format!("{ino:016x}.data"));
+        OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_len(1024)
+            .unwrap();
+        assert!(Overlay::open(&directory, &snapshot, &gitdir).is_err());
+        assert_eq!(std::fs::metadata(path).unwrap().len(), 1024);
+        assert_eq!(
+            super::changes_since(&directory, &token).unwrap(),
+            (token, vec![])
+        );
+    }
+
+    #[test]
+    fn truncate_failure_recovery_preserves_the_single_journal_generation() {
+        for size in [1024u64, 256 * 1024] {
+            let (_temp, mut repo, snapshot, directory, gitdir) = fixture();
+            let mut overlay = Overlay::open(&directory, &snapshot, &gitdir).unwrap();
+            let ino = overlay
+                .create(
+                    1,
+                    OsStr::new("edited"),
+                    Kind::File,
+                    0o600,
+                    Some(vec![1; 128 * 1024]),
+                )
+                .unwrap();
+            let (token, _) = super::changes_since(&directory, "").unwrap();
+            fail_next("after_payload_sync");
+            assert!(
+                overlay
+                    .setattr(ino, None, Some(size), None, &mut repo)
+                    .is_err()
+            );
+            assert!(overlay.read(ino, &mut repo).is_err());
+            drop(overlay);
+            fail_next("before_final_commit");
+            assert!(Overlay::open(&directory, &snapshot, &gitdir).is_err());
+            let mut overlay = Overlay::open(&directory, &snapshot, &gitdir).unwrap();
+            let actual = overlay.read(ino, &mut repo).unwrap();
+            let mut expected = vec![1; 128 * 1024];
+            expected.resize(size as usize, 0);
+            assert_eq!(actual, expected);
+            let (new, paths) = super::changes_since(&directory, &token).unwrap();
+            assert_eq!(paths, [b"edited".to_vec()]);
+            let generation = |s: &str| s.rsplit(':').next().unwrap().parse::<u64>().unwrap();
+            assert_eq!(generation(&new), generation(&token) + 1);
+        }
+    }
+
+    #[test]
+    fn killed_prepared_mutations_and_replay_recover_acknowledged_state() {
+        const TEST: &str = "overlay::fjall::tests::killed_prepared_mutations_and_replay_recover_acknowledged_state";
+        if let Some(root) = std::env::var_os("GIT_VFS_TEST_CRASH_ROOT") {
+            let root = PathBuf::from(root);
+            let gitdir = root.join("bare.git");
+            let mut repo = GitRepo::open(&gitdir, "git", "origin", SizeFallback::Error).unwrap();
+            let snapshot = Snapshot::load(&repo, "HEAD").unwrap();
+            let mut overlay = Overlay::open(&root.join("overlay"), &snapshot, &gitdir).unwrap();
+            if std::env::var("GIT_VFS_TEST_ACTION").as_deref() == Ok("mutate") {
+                let ino = overlay.lookup(1, OsStr::new("edited")).unwrap();
+                overlay
+                    .write(ino, 32 * 1024, &vec![2; 128 * 1024], &mut repo)
+                    .unwrap();
+            }
+            panic!("child never reached requested durable pause boundary");
+        }
+        for point in [
+            "after_intent",
+            "after_first_write",
+            "after_payload_sync",
+            "after_final_commit",
+        ] {
+            let (temp, repo, snapshot, directory, gitdir) = fixture();
+            let mut overlay = Overlay::open(&directory, &snapshot, &gitdir).unwrap();
+            let ino = overlay
+                .create(
+                    1,
+                    OsStr::new("edited"),
+                    Kind::File,
+                    0o600,
+                    Some(vec![1; 192 * 1024]),
+                )
+                .unwrap();
+            let (token, _) = super::changes_since(&directory, "").unwrap();
+            drop(overlay);
+            drop(repo); // The child owns the private Git size-cache database too.
+            let kill_at = |pause: &str, action: &str| {
+                let marker = temp.path().join("crash-ready");
+                let _ = std::fs::remove_file(&marker);
+                let mut child = Command::new(std::env::current_exe().unwrap())
+                    .args(["--exact", TEST, "--nocapture"])
+                    .env("GIT_VFS_TEST_CRASH_ROOT", temp.path())
+                    .env("GIT_VFS_TEST_PAUSE_AT", pause)
+                    .env("GIT_VFS_TEST_ACTION", action)
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .spawn()
+                    .unwrap();
+                let deadline = std::time::Instant::now() + Duration::from_secs(5);
+                while !marker.exists() {
+                    if let Some(status) = child.try_wait().unwrap() {
+                        panic!("crash child exited before {pause}: {status}");
+                    }
+                    if std::time::Instant::now() >= deadline {
+                        let _ = child.kill();
+                        let _ = child.wait();
+                        panic!("crash child stalled before {pause}");
+                    }
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                child.kill().unwrap();
+                assert!(!child.wait().unwrap().success());
+            };
+            kill_at(point, "mutate");
+            if point == "after_first_write" {
+                // Kill a second process in the middle of replaying the same intent.
+                kill_at("after_first_write", "recover");
+            }
+            let mut repo = GitRepo::open(&gitdir, "git", "origin", SizeFallback::Error).unwrap();
+            let mut overlay = Overlay::open(&directory, &snapshot, &gitdir).unwrap();
+            let mut expected = vec![1; 192 * 1024];
+            expected[32 * 1024..160 * 1024].fill(2);
+            assert_eq!(overlay.read(ino, &mut repo).unwrap(), expected, "{point}");
+            let (new, paths) = super::changes_since(&directory, &token).unwrap();
+            assert_eq!(paths, [b"edited".to_vec()], "{point}");
+            let generation = |s: &str| s.rsplit(':').next().unwrap().parse::<u64>().unwrap();
+            assert_eq!(generation(&new), generation(&token) + 1, "{point}");
+        }
+    }
+
+    #[test]
+    fn range_writes_and_sparse_truncate_do_not_copy_whole_files() {
+        let (_temp, mut repo, snapshot, directory, gitdir) = fixture();
+        let mut overlay = Overlay::open(&directory, &snapshot, &gitdir).unwrap();
+        let ino = overlay
+            .create(
+                1,
+                OsStr::new("edited"),
+                Kind::File,
+                0o600,
+                Some(vec![1; 2 * 1024 * 1024]),
+            )
+            .unwrap();
+        let before = overlay.stats();
+        assert_eq!(
+            overlay.read_range(ino, 1024, 16, &mut repo).unwrap(),
+            [1; 16]
+        );
+        overlay.write(ino, 1024, &[2; 8], &mut repo).unwrap();
+        overlay
+            .setattr(ino, None, Some(3 * 1024 * 1024), None, &mut repo)
+            .unwrap();
+        let after = overlay.stats();
+        assert_eq!(after.payload_read_bytes - before.payload_read_bytes, 16);
+        assert_eq!(after.payload_write_bytes - before.payload_write_bytes, 8);
+        assert_eq!(after.payload_copy_bytes, before.payload_copy_bytes);
+        assert_eq!(
+            overlay.read_range(ino, 1020, 16, &mut repo).unwrap(),
+            [1, 1, 1, 1, 2, 2, 2, 2, 2, 2, 2, 2, 1, 1, 1, 1]
+        );
+        assert_eq!(
+            overlay
+                .read_range(ino, 2 * 1024 * 1024, 8, &mut repo)
+                .unwrap(),
+            [0; 8]
+        );
+        overlay
+            .write(ino, 3 * 1024 * 1024 + 16, &[5; 4], &mut repo)
+            .unwrap();
+        assert_eq!(
+            overlay
+                .read_range(ino, 3 * 1024 * 1024, 20, &mut repo)
+                .unwrap(),
+            [vec![0; 16], vec![5; 4]].concat()
+        );
+        let before = overlay.stats();
+        overlay.digest(ino).unwrap();
+        overlay.blake3_digest(ino).unwrap();
+        assert_eq!(
+            overlay.stats().payload_hash_bytes - before.payload_hash_bytes,
+            2 * (3 * 1024 * 1024 + 20)
+        );
+        fail_next("before_redo_stage");
+        assert!(overlay.write(ino, 0, &[3], &mut repo).is_err());
+        assert_eq!(overlay.read_range(ino, 0, 1, &mut repo).unwrap(), [1]);
+        overlay
+            .setattr(ino, None, Some(0), None, &mut repo)
+            .unwrap();
+        assert!(overlay.read(ino, &mut repo).unwrap().is_empty());
+    }
 }

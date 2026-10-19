@@ -15,7 +15,7 @@ Fjall remains the metadata engine. Replacing the database is not this proposal.
 
 ## Evidence and motivation
 
-The current overlay stores full mutable contents inside `Entry.data`, persists
+At the baseline, the overlay stores full mutable contents inside `Entry.data`, persists
 unlinked entries indefinitely, and reloads all their payloads on remount. Every
 write copies/serializes the full value; ranged reads load the full contents.
 Rename scans the full entry map. Mutation history is append-only. Edited-file
@@ -81,7 +81,8 @@ Retain the upstream MIT fuser0.16 source with a narrow Linux `Session::run_until
 patch: nonblocking receive and finite poll with stop checks, original descriptor
 flags restored by an owned guard. Existing upstream `run` remains unchanged.
 Own Session/dispatch thread/stop/unmount explicitly in git-vfs. Cancel native Git
-first, stop dispatch, detach the mount and join filesystem/database teardown
+first, detach while dispatch can serve final unmount requests, then stop dispatch
+and join filesystem/database teardown
 before releasing the working-tree owner. Idle-client references must not prevent
 exit; an uncancellable host sync already in progress is not a hard wall-clock bound.
 No fusectl access, guessed connection IDs, thread kills or client termination.
@@ -160,9 +161,43 @@ implementation keeps the single serialized mutation order; concurrent writers ma
 not bypass it. Specify and test each failure boundary before enabling this format.
 Large intents stream to owned files rather than duplicating unbounded buffers.
 
+An empty newly created file may remain inline until its first content change.
+For Base/Inline to File copy-up only, prepare the complete backing file plus the
+requested range/truncate, sync that file and its directory, then publish its
+reference with one metadata/journal transaction. The prior database content is
+authoritative until publication; a failed preparation cannot damage acknowledged
+bytes. This is a one-time transition, not full-file COW on later range writes.
+Keep the fixed redo scratch pathname between operations: sync its new contents
+before each intent, but do not create/unlink and sync the directory per write.
+Only reset unreferenced scratch after tracing any pending intent during recovery.
+
 Do not use full-file COW on every write as the normal fallback: that keeps the
 amplification this stage is intended to remove. Document any filesystem-specific
 optimization (e.g. reflink) as optional, not a correctness prerequisite.
+
+### Stage B measured checkpoint (2026-10-19)
+
+Three rotated trials against the same frozen baseline; 16 MiB edited file and
+64 × 4 KiB operations. [Samples, counters and retained regression](../benchmarks/2026-10-19-vfs-ranges.json).
+
+| Median | Baseline | Stage B |
+|---|---:|---:|
+| First hydration/copy-up | 42.42 ms | 38.90 ms |
+| 64 warm range reads | 24.42 ms | 0.47 ms |
+| 64 appends | 1,034.25 ms | 105.95 ms |
+| RSS after appends | 441.91 MiB | 8.07 MiB |
+| Allocated overlay after appends | 81.36 MiB | 16.45 MiB |
+| 64 create/delete operations, 256 KiB | 126.97 ms | 125.38 ms |
+| 64 atomic saves, 256 KiB | 150.09 ms | 126.39 ms |
+
+All 18 final range/churn cells passed byte, remount and mechanism checks. An
+earlier version regressed churn by 73–86%; unpublished first copy-up and a
+persistent redo pathname removed that regression without relaxing durability.
+The first-copy-up path still obtains base bytes through the whole-blob Git API.
+Logical payload counters exclude redo scratch traffic; metadata counters count
+configured commit-barrier attempts, not kernel syscalls. Warm range timing excludes
+verification reads, which remain included in cumulative counters. This does not
+establish a Bazel latency improvement or online GC bound.
 
 ## Stage C: online lifetime accounting and bounded journal
 
@@ -186,6 +221,23 @@ collapses to `/` invalidate-all until a safe index checkpoint. Response-construc
 overflow also returns `/`, never a truncated success. Bound response construction
 as well as wire encoding. Retention defaults and
 limits are explicit and observable; they are not inferred from remote CAS TTL.
+
+Initial logical limits: 8,192 retained journal records, 4 MiB of key-plus-path
+bytes and a 4,096-generation window; 4,096 unique dirty/query paths, 1 MiB of
+raw path bytes and an 8 MiB encoded response. Evict complete generations. The
+floor is the oldest acceptable input token: records at or below it are gone,
+but a token exactly at the floor still receives all later changes. Overflow
+returns `/`, never a partial successful response. These limits do not bound
+physical WAL/LSM allocation.
+
+Activate bounded history atomically with a new generation key and remove the
+legacy `generation` key. Older offline fsmonitor helpers bypass entry decoding;
+the payload-format sentinel alone cannot stop them from returning incomplete
+history after trimming. New-format activation invalidates prior tokens and
+conservatively seeds the dirty set before old history is retired. Keep dirty
+candidates (or the bounded `/` marker) indefinitely until a separately durable
+Git-index checkpoint protocol exists; a merely present `git-ready` marker is
+not such a checkpoint.
 
 ## Stage D: namespace and digest work elimination
 

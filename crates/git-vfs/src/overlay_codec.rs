@@ -1,5 +1,5 @@
 //! Versioned native-byte overlay records shared by the persistent filesystem.
-use super::{Entry, Kind, parse_time, timestamp};
+use super::{Entry, Kind, Payload, parse_time, timestamp};
 use anyhow::{Context, Result, ensure};
 use std::ffi::OsString;
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
@@ -16,7 +16,7 @@ fn put_bytes(out: &mut Vec<u8>, bytes: Option<&[u8]>) {
     }
 }
 pub(super) fn encode(e: &Entry) -> Vec<u8> {
-    let mut out = vec![1];
+    let mut out = vec![2];
     for n in [e.inode, e.parent, e.kind.code() as u64, e.mode as u64] {
         out.extend_from_slice(&n.to_be_bytes());
     }
@@ -24,7 +24,19 @@ pub(super) fn encode(e: &Entry) -> Vec<u8> {
     out.push(u8::from(e.control));
     put_bytes(&mut out, Some(e.name.as_bytes()));
     put_bytes(&mut out, e.base_oid.as_deref().map(str::as_bytes));
-    put_bytes(&mut out, e.data.as_deref());
+    match &e.payload {
+        Payload::Base => out.push(0),
+        Payload::None => out.push(1),
+        Payload::Inline(bytes) => {
+            out.push(2);
+            put_bytes(&mut out, Some(bytes));
+        }
+        Payload::File { size, generation } => {
+            out.push(3);
+            out.extend_from_slice(&size.to_be_bytes());
+            out.extend_from_slice(&generation.to_be_bytes());
+        }
+    }
     put_bytes(&mut out, Some(timestamp(e.mtime).as_bytes()));
     put_bytes(&mut out, Some(timestamp(e.ctime).as_bytes()));
     out
@@ -59,8 +71,18 @@ impl<'a> Decoder<'a> {
 }
 // Borrow and validate dead payload bytes without copying them into the live map.
 pub(super) fn decode_for_open(bytes: &[u8]) -> Result<(Entry, Option<u64>)> {
+    decode(bytes, true)
+}
+pub(super) fn decode_exact(bytes: &[u8]) -> Result<Entry> {
+    Ok(decode(bytes, false)?.0)
+}
+fn decode(bytes: &[u8], prune: bool) -> Result<(Entry, Option<u64>)> {
     let mut d = Decoder(bytes);
-    ensure!(d.take(1)? == [1], "unsupported overlay entry version");
+    let version = d.take(1)?[0];
+    ensure!(
+        matches!(version, 1 | 2),
+        "unsupported overlay entry version"
+    );
     let inode = d.number()?;
     let parent = d.number()?;
     let kind = Kind::decode(i64::try_from(d.number()?)?)?;
@@ -72,14 +94,65 @@ pub(super) fn decode_for_open(bytes: &[u8]) -> Result<(Entry, Option<u64>)> {
         .bytes()?
         .map(|bytes| String::from_utf8(bytes.to_vec()))
         .transpose()?;
-    let payload = d.bytes()?;
-    let reclaimed = payload
-        .filter(|_| !linked && !control)
-        .map(|p| p.len() as u64);
-    let data = if !linked && !control {
-        None
+    let mut pruned_inline = None;
+    let mut payload = if version == 1 {
+        match d.bytes()? {
+            Some(bytes) if prune && !linked && !control => {
+                // Validate the remaining record before returning the pruned state.
+                let len = bytes.len() as u64;
+                let mtime = parse_time(std::str::from_utf8(d.required()?)?.to_owned())?;
+                let ctime = parse_time(std::str::from_utf8(d.required()?)?.to_owned())?;
+                ensure!(d.0.is_empty(), "trailing overlay entry data");
+                return Ok((
+                    Entry {
+                        inode,
+                        parent,
+                        name,
+                        kind,
+                        mode,
+                        base_oid,
+                        payload: Payload::None,
+                        mtime,
+                        ctime,
+                        linked,
+                        control,
+                    },
+                    Some(len),
+                ));
+            }
+            Some(bytes) => Payload::Inline(bytes.to_vec()),
+            None if base_oid.is_some() => Payload::Base,
+            None => Payload::None,
+        }
     } else {
-        payload.map(<[u8]>::to_vec)
+        match d.take(1)?[0] {
+            0 => {
+                ensure!(base_oid.is_some(), "base payload lacks identity");
+                Payload::Base
+            }
+            1 => Payload::None,
+            2 => {
+                let bytes = d.required()?;
+                if prune && !linked && !control {
+                    pruned_inline = Some(bytes.len() as u64);
+                    Payload::None
+                } else {
+                    Payload::Inline(bytes.to_vec())
+                }
+            }
+            3 => Payload::File {
+                size: d.number()?,
+                generation: d.number()?,
+            },
+            _ => anyhow::bail!("unsupported payload state"),
+        }
+    };
+    let reclaimed = if prune && !linked && !control {
+        let size = pruned_inline.or_else(|| payload.size());
+        payload = Payload::None;
+        size
+    } else {
+        None
     };
     let mtime = parse_time(std::str::from_utf8(d.required()?)?.to_owned())?;
     let ctime = parse_time(std::str::from_utf8(d.required()?)?.to_owned())?;
@@ -92,7 +165,7 @@ pub(super) fn decode_for_open(bytes: &[u8]) -> Result<(Entry, Option<u64>)> {
             kind,
             mode,
             base_oid,
-            data,
+            payload,
             mtime,
             ctime,
             linked,
