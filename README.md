@@ -69,10 +69,13 @@ Pinned `bazel.git`, warm dependency caches, fresh clients and Bazel output bases
 |---|---:|---:|
 | Direct GitHub, background-prefetch query (Oct 16, five pairs) | 8.384 s | 4.964 s |
 | Warm local proxy, BLAKE3-xattr query (Oct 19, three trials) | 3.277 s | 2.896 s |
+| Warm proxy/CAS, first narrow RBE build (Oct 19, three trials) | 24.969 s | 24.316 s |
 
-These are medians from clone launch to first successful query, not equivalent
-cache conditions. The proxy result excludes mirror population/server prewarming;
-xattrs saved only 27 ms versus normal VFS hashing, not a reliable extra query win.
+These are clone-to-query/build medians under different cache conditions.
+The RBE difference is only 2.62%, with overlapping ranges; see
+[agent-startup results](docs/proxy-agent-startup.md) for phases and caveats.
+Proxy experiments exclude mirror population/server prewarming. In the query
+experiment, xattrs saved only 27 ms versus normal VFS hashing, not a reliable win.
 Full-snapshot BLAKE3 mapping creation took 12.481 s; warm lookup took 86 ms.
 See [direct-GitHub results](docs/github-bazel-async-prefetch.md),
 [BLAKE3 results and caveats](docs/proxy-blake3-benchmarks.md), and

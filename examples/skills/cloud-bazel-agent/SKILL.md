@@ -13,7 +13,7 @@ Do not create a worktree by default.
 
 Use a provisioned Linux host with `/dev/fuse`, `git-vfs`, native Git supporting
 `cat-file --batch-command`'s `remote-object-info`, and a repository-compatible
-Bazel with BLAKE3 digest-xattr support (8.7+ or 9.2+ on those release lines).
+Bazel with BLAKE3 digest-xattr and r2c2 support (shown flags verified with 9.2).
 The shared proxy must have this repository and BLAKE3 mappings warmed with
 `--enable-blake3`; a cold mapping import can block startup.
 Keep the unauthenticated proxy on a trusted network, not the public Internet.
@@ -23,6 +23,7 @@ Obtain these task inputs from the scheduler or existing environment:
 - `PROXY_URL`: proxy origin, such as `http://127.0.0.1:8082`, without credentials.
 - `PROXY_REPO`: configured repository alias, such as `bazel`.
 - `TASK_REF`: branch or tag to clone; `TASK_REVISION`: full immutable commit SHA.
+- `TASK_TARGET`: the task's narrow build target.
 - `AGENT_STATE_ROOT`: writable directory outside all mounts.
 - `AGENT_BAZELRC`: provisioned absolute-path rc file outside the repository,
   configuring the organization's RBE, BLAKE3-capable remote cache, and remote
@@ -30,7 +31,9 @@ Obtain these task inputs from the scheduler or existing environment:
 
 Use the organization's existing credential helper or mounted secret files.
 Do not put credentials in Git URLs, command-line flags, or the source tree.
-Do not guess r2c2 flags: the host's Bazel version and deployed service determine
+Provision stable SDKs and pre-generated RBE toolchain configuration in the agent
+image. r2c2 caches eligible reproducible repositories, not host-local SDK detection
+or arbitrary toolchain generators. The host's Bazel version and service determine
 its configuration. If provisioning is missing, report that dependency rather
 than claiming remote execution or dependency caching is active.
 
@@ -85,8 +88,9 @@ agent_bazel() {
     --experimental_remote_repo_contents_cache \
     --digest_function=BLAKE3 --unix_digest_hash_attribute_name=user.blake3 "$@"
 }
-agent_bazel query //... --experimental_remote_cache_ttl=3h
-# Use --experimental_remote_cache_ttl=3h on task build/test commands too.
+: "${TASK_TARGET:?}"
+agent_bazel build "$TASK_TARGET" --experimental_remote_cache_ttl=3h
+# Keep the same remote TTL on subsequent build/test commands.
 git status --short
 ```
 

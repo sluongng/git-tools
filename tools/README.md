@@ -55,6 +55,23 @@ Mirror population and server prewarming are excluded from fresh-client latency.
 `--build-proof` checks matched outputs and a same-size edit/rebuild after queries.
 Digest counters distinguish actual reuse from merely configuring BLAKE3.
 
+## Fresh-agent BuildBuddy RBE
+
+Use a config with a verified provisioned RBE toolchain and matching manifest:
+
+```sh
+python3 tools/benchmark_proxy_agent_rbe.py \
+  --config CONFIG.json --output FRESH_OUTPUT --mirror CLOSED_CACHE/bazel.git \
+  --credential-rc EXISTING_PRIVATE_RC --trials 3 --proxy-cas-sync
+```
+
+Rotates the same three arms with async prefetch and a build **before any query**.
+Every cell has a fresh local r2c2 cache, verifies three uncached remote BLAKE3
+C++ actions and compares output bytes. Proxy/mapping/CAS preparation is separate.
+The rc selects one existing BuildBuddy credential; it is never copied into output.
+Private RPC logs become sanitized status/count summaries, then are removed.
+See [agent startup results](../docs/proxy-agent-startup.md) for scope and setup.
+
 ## Evidence and interpretation
 
 Harnesses retain frozen binary hashes, raw commands/logs, TRACE2, object-presence

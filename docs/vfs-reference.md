@@ -156,8 +156,9 @@ fragment, or path prefix. Aliases contain 1-128 ASCII letters, digits, `_`, and 
 Requests have a 30-second timeout and bounded responses. Redirects and environment
 HTTP proxies are disabled; no Git credential helper or other authentication is
 invoked for this API. Keep an unauthenticated proxy on a trusted local network.
-This lookup does **not** upload anything to a CAS, change Bazel's digest mode, or
-replace the existing `user.gitsha1` xattr.
+This client lookup does **not** itself upload to a CAS or change Bazel's digest
+mode; a separately configured proxy can queue
+[background publication](proxy-cas-sync.md). It does not replace the existing `user.gitsha1` xattr.
 
 ## Bazel metadata prefetch and file watching
 
@@ -467,8 +468,9 @@ Only opted-in mounts expose `user.blake3` (32 raw bytes) and
 lookups; an absent mapping returns `ENODATA`, never an HTTP request from a
 filesystem callback. Edited and new files hash their current overlay bytes,
 including same-size edits. Directories and the private `.git` control files do
-not expose a BLAKE3 digest. These mappings neither upload content to a remote
-CAS nor assert that a remote CAS already holds it.
+not expose a BLAKE3 digest. These mappings do not assert CAS residency. A
+separately configured proxy may asynchronously publish content; see
+[CAS sync](proxy-cas-sync.md).
 
 At shutdown, `BLAKE3 xattrs: {...}` reports per-mount `base_hits`,
 `local_hashes` and `misses`. Counters include xattr size probes and reads, not

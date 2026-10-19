@@ -112,8 +112,9 @@ BLAKE3 must be explicitly enabled on the server (`--enable-blake3`) and requeste
 with `"blake3":true`. Only blobs receive a digest; trees/commits/tags return null.
 Hashing reads raw blob content through `git cat-file`, bounded to 64 KiB at a time,
 with no Git header. The result is the REAPI BLAKE3 digest `(hash, size_bytes)`;
-it does not upload anything to a CAS or prove CAS presence. Fjall stores raw
-20-byte Git SHA1 keys and 40-byte values (32-byte BLAKE3 plus big-endian u64 size),
+returning it does not prove CAS presence or wait for publication. An optional
+[CAS sync worker](proxy-cas-sync.md) queues background uploads when configured.
+Fjall stores raw 20-byte Git SHA1 keys and 40-byte values (32-byte BLAKE3 plus big-endian u64 size),
 using synchronous durable commits. Persisted mappings are reused after restart.
 
 ## Operational boundary
