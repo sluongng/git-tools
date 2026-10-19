@@ -54,6 +54,16 @@ def disk_usage(path):
     return {"logical_file_bytes": logical, "allocated_bytes": allocated, "files": files}
 
 
+def filesystem_identity(path):
+    try:
+        value = subprocess.check_output(["stat", "-f", "--format=%T:%i", str(path)],
+            stderr=subprocess.DEVNULL, timeout=5).decode().strip()
+        kind, identity = value.split(":", 1)
+        return {"type": kind, "id": identity}
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return {"type": "unknown", "id": None}
+
+
 def delta(before, after):
     result = {}
     for key, value in after.items():
@@ -243,6 +253,13 @@ class Harness:
         shutil.copy2(Path(__file__), frozen / Path(__file__).name)
         self.result["provenance"]["baseline_source"] = self.args.baseline_source
         self.result["provenance"]["candidate_source"] = self.args.candidate_source
+        self.result["storage_preflight"] = {
+            "scratch_filesystem": filesystem_identity(self.scratch),
+            "mirror_filesystem": filesystem_identity(self.args.mirror.resolve()),
+            "scratch_free_bytes": shutil.disk_usage(self.scratch).free,
+            "mirror": disk_usage(self.args.mirror.resolve()),
+            "retention": "successful cells retire only owned fixture.git mirror copies; client/response caches remain after success or failure",
+        }
         for source in (self.args.mirror.resolve(),):
             if self.git(source, "rev-parse", "--is-bare-repository").strip() != b"true":
                 raise ValueError("mirror must be a bare full repository")
@@ -318,6 +335,19 @@ class Harness:
         log.close()
 
     def prepare_cache(self, directory, name):
+        storage = self.result["storage_preflight"]
+        free = shutil.disk_usage(directory).free
+        source_fs, target_fs = storage["mirror_filesystem"], storage["scratch_filesystem"]
+        reflink_possible = (source_fs["type"] in {"btrfs", "xfs"} and source_fs == target_fs)
+        # Same-filesystem CoW copies need metadata, not a full mirror-sized free
+        # extent. cp --reflink=auto remains authoritative about actual support.
+        budget = 64 * 1024 * 1024 + (0 if reflink_possible else storage["mirror"]["allocated_bytes"])
+        check = {"cell": name, "free_bytes": free, "required_free_budget_bytes": budget,
+            "same_filesystem_reflink_possible": reflink_possible}
+        self.result.setdefault("storage_copy_checks", []).append(check)
+        self.save()
+        if free < budget:
+            raise RuntimeError(f"Insufficient scratch free-space budget for {name}: {free} < {budget}; use a larger or same-filesystem CoW workspace parent")
         cache = directory / "proxy-cache"
         cache.mkdir()
         mirror = cache / "fixture.git"
@@ -326,6 +356,26 @@ class Harness:
             ("uploadpack.allowAnySHA1InWant", "true"), ("transfer.advertiseObjectInfo", "true"), ("http.receivepack", "false")):
             self.git(mirror, "config", key, value)
         return cache
+
+    def retire_mirror(self, cache, row):
+        """Delete only this campaign's disposable copy, after proxy shutdown."""
+        target = cache / "fixture.git"
+        record = row["mirror_retirement"] = {"path": str(target), "complete": False}
+        try:
+            scratch = self.scratch.resolve(strict=True)
+            if (cache.name != "proxy-cache" or cache.is_symlink() or target.is_symlink() or not target.is_dir()
+                    or not cache.resolve(strict=True).is_relative_to(scratch)
+                    or cache.resolve(strict=True).parent.parent != scratch
+                    or target.resolve(strict=True) != cache.resolve(strict=True) / "fixture.git"
+                    or target.resolve(strict=True) == self.args.mirror.resolve(strict=True)):
+                raise RuntimeError("refusing to retire an unowned or symlinked fixture mirror")
+            shutil.rmtree(target)
+            record["complete"] = True
+        except BaseException as error:
+            record["error"] = repr(error)
+            row["complete"] = False
+            self.result["failures"].append({"phase": "owned mirror retirement", "error": repr(error), "path": str(target)})
+            raise
 
     def clone(self, origin, repo, name, checkout):
         args = [self.git_binary, "-c", "protocol.version=2", "clone", "--depth=1", "--revision=" + self.args.commit]
@@ -429,8 +479,15 @@ class Harness:
             row["trace2"] = trace_summary(self.output, name + "-agent-")
             row["complete"] = True
         finally:
-            self.stop(*state)
-            self.save()
+            try:
+                self.stop(*state)
+                if row["complete"]:
+                    self.retire_mirror(cache, row)
+            except BaseException:
+                row["complete"] = False
+                raise
+            finally:
+                self.save()
 
     def restart_probe(self, trial, version):
         name = f"restart-{trial}-{version}"
@@ -468,9 +525,16 @@ class Harness:
                 raise RuntimeError("restart clone returned wrong commit")
             row["complete"] = True
         finally:
-            self.stop(*state)
-            row["trace2"] = trace_summary(self.output, name + "-")
-            self.save()
+            try:
+                self.stop(*state)
+                if row["complete"]:
+                    self.retire_mirror(cache, row)
+            except BaseException:
+                row["complete"] = False
+                raise
+            finally:
+                row["trace2"] = trace_summary(self.output, name + "-")
+                self.save()
 
 
 def arguments():
@@ -555,11 +619,10 @@ def main():
         raise
     finally:
         harness.save()
-        # Preserve failed workspaces for diagnosis; never delete user fixtures.
-        if harness.result["complete"]:
-            shutil.rmtree(harness.scratch)
-            harness.result["workspace_removed_after_success"] = True
-            harness.save()
+        # Per-cell retirement removes only disposable full mirror copies. Keep
+        # client workspaces and response caches, even on campaign success.
+        harness.result["workspace_retained"] = True
+        harness.save()
     print(json.dumps({"complete": True, "results": str(harness.output / "results.json")}))
 
 
