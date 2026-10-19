@@ -2,6 +2,9 @@
 
 The object/cache backend remains shared. Each frontend lives in a separate crate so platform dependencies do not enter the Linux FUSE binary.
 
+See [EdenFS platform lessons](edenfs-platforms-and-outputs.md) for the proposed
+shared contracts behind future native lazy output mounts.
+
 | Crate | User-facing surface | Mutable state |
 | --- | --- | --- |
 | `workspace-nfs` | NFSv3 server for the built-in macOS client | Existing durable `workspace-overlay` |

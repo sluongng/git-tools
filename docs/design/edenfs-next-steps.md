@@ -1,5 +1,9 @@
 # Next lessons from EdenFS
 
+The [native platform and output-service follow-up](edenfs-platforms-and-outputs.md)
+updates the macOS/Windows lessons, including current NFS GC invalidation and
+the boundary between eager output-service portability and future lazy mounts.
+
 Source review: October 19, 2026, at Sapling/EdenFS revision
 [`79071c2`](https://github.com/facebook/sapling/tree/79071c2a3ea20c36ed71332608535e5801101bba).
 The remaining proposals are design hypotheses, not an EdenFS runtime comparison. The completed
