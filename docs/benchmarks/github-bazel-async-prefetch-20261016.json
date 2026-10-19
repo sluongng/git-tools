@@ -1,0 +1,1211 @@
+{
+  "date": "2026-10-16",
+  "workload": {
+    "source": "https://github.com/bazelbuild/bazel.git",
+    "commit": "c9af12d1db12d1b2df2137feb9ea8d39e3a25c79",
+    "query": "//...",
+    "golden_label_count": 4213,
+    "golden_labels_sha256": "56d7a2f6140674159f5252bccc16411b6ec59f5eb30bb46571381491a32883fa",
+    "bazel_version": "bazel 9.2.0",
+    "cache_policy": "shared archive/dependency cache explicitly warmed by parent pilot; fresh output base per cell; fresh source clone; no action/disk/remote cache added by harness"
+  },
+  "vfs_source": "fdbbd2845d79e84b2ff6027673f0bfe5c6b189e0",
+  "binary_sha256": "fcb393f331e248dfc9b2ee9286a9b9b60ce84f3c03bb1de7265bea688b8f81bd",
+  "schedule": "before/after on odd trials, after/before on even trials; checkout/VFS on odd trials, VFS/checkout on even trials",
+  "modes": {
+    "before-mount": {
+      "raw_results": "artifacts/github-bazel-async-prefetch-20261016/before-mount/results.json",
+      "raw_results_sha256": "23f866869d93cb1524e8b0184c890d6b5124d1e0b4624287589bfd9d2902496e",
+      "variants": {
+        "checkout": {
+          "n": 5,
+          "median_clone_to_query_seconds": 8.641714375000447,
+          "range_seconds": [
+            8.102476589032449,
+            9.292684497020673
+          ],
+          "median_setup_before_bazel_launch_seconds": 6.102152065024711,
+          "phase_medians_seconds": {
+            "clone": 6.102010998991318,
+            "cold_query": 2.513902781996876,
+            "warm_query_1": 0.06494332698639482
+          },
+          "trials": [
+            {
+              "trial": 1,
+              "clone_to_query_seconds": 8.272432512021624,
+              "phases": {
+                "clone": {
+                  "seconds": 5.965468886017334,
+                  "returncode": 0,
+                  "timed_out": false,
+                  "start_perf_counter": 312769.911104791,
+                  "wait_end_perf_counter": 312775.876573677
+                },
+                "cold_query": {
+                  "seconds": 2.30682059598621,
+                  "returncode": 0,
+                  "timed_out": false,
+                  "start_perf_counter": 312775.876716707,
+                  "wait_end_perf_counter": 312778.183537303
+                },
+                "warm_query_1": {
+                  "seconds": 0.06304486998124048,
+                  "returncode": 0,
+                  "timed_out": false,
+                  "start_perf_counter": 312778.270623381,
+                  "wait_end_perf_counter": 312778.333668251
+                }
+              },
+              "query_labels": {
+                "label_count": 4213,
+                "labels_sha256": "56d7a2f6140674159f5252bccc16411b6ec59f5eb30bb46571381491a32883fa"
+              },
+              "object_counts": {
+                "snapshot_unique_blobs": 11850,
+                "snapshot_blob_paths": 14232,
+                "present_blobs": 11850,
+                "hydrated_paths": 14232,
+                "present_logical_unique_bytes": 138576774,
+                "audit_scope": "base_only_no_private_admin_requested",
+                "manifest": "trial-1-checkout-presence-after_cold_query.json"
+              }
+            },
+            {
+              "trial": 2,
+              "clone_to_query_seconds": 9.292684497020673,
+              "phases": {
+                "clone": {
+                  "seconds": 6.300624367024284,
+                  "returncode": 0,
+                  "timed_out": false,
+                  "start_perf_counter": 312823.502738119,
+                  "wait_end_perf_counter": 312829.803362486
+                },
+                "cold_query": {
+                  "seconds": 2.991859611996915,
+                  "returncode": 0,
+                  "timed_out": false,
+                  "start_perf_counter": 312829.803563004,
+                  "wait_end_perf_counter": 312832.795422616
+                },
+                "warm_query_1": {
+                  "seconds": 0.06668783299392089,
+                  "returncode": 0,
+                  "timed_out": false,
+                  "start_perf_counter": 312832.877588303,
+                  "wait_end_perf_counter": 312832.944276136
+                }
+              },
+              "query_labels": {
+                "label_count": 4213,
+                "labels_sha256": "56d7a2f6140674159f5252bccc16411b6ec59f5eb30bb46571381491a32883fa"
+              },
+              "object_counts": {
+                "snapshot_unique_blobs": 11850,
+                "snapshot_blob_paths": 14232,
+                "present_blobs": 11850,
+                "hydrated_paths": 14232,
+                "present_logical_unique_bytes": 138576774,
+                "audit_scope": "base_only_no_private_admin_requested",
+                "manifest": "trial-2-checkout-presence-after_cold_query.json"
+              }
+            },
+            {
+              "trial": 3,
+              "clone_to_query_seconds": 8.641714375000447,
+              "phases": {
+                "clone": {
+                  "seconds": 6.102010998991318,
+                  "returncode": 0,
+                  "timed_out": false,
+                  "start_perf_counter": 312834.120267467,
+                  "wait_end_perf_counter": 312840.222278466
+                },
+                "cold_query": {
+                  "seconds": 2.539562309975736,
+                  "returncode": 0,
+                  "timed_out": false,
+                  "start_perf_counter": 312840.222419532,
+                  "wait_end_perf_counter": 312842.761981842
+                },
+                "warm_query_1": {
+                  "seconds": 0.06475914904149249,
+                  "returncode": 0,
+                  "timed_out": false,
+                  "start_perf_counter": 312842.844701633,
+                  "wait_end_perf_counter": 312842.909460782
+                }
+              },
+              "query_labels": {
+                "label_count": 4213,
+                "labels_sha256": "56d7a2f6140674159f5252bccc16411b6ec59f5eb30bb46571381491a32883fa"
+              },
+              "object_counts": {
+                "snapshot_unique_blobs": 11850,
+                "snapshot_blob_paths": 14232,
+                "present_blobs": 11850,
+                "hydrated_paths": 14232,
+                "present_logical_unique_bytes": 138576774,
+                "audit_scope": "base_only_no_private_admin_requested",
+                "manifest": "trial-3-checkout-presence-after_cold_query.json"
+              }
+            },
+            {
+              "trial": 4,
+              "clone_to_query_seconds": 9.059971267008223,
+              "phases": {
+                "clone": {
+                  "seconds": 6.710268402006477,
+                  "returncode": 0,
+                  "timed_out": false,
+                  "start_perf_counter": 312889.443572478,
+                  "wait_end_perf_counter": 312896.15384088
+                },
+                "cold_query": {
+                  "seconds": 2.3494613600196317,
+                  "returncode": 0,
+                  "timed_out": false,
+                  "start_perf_counter": 312896.154082385,
+                  "wait_end_perf_counter": 312898.503543745
+                },
+                "warm_query_1": {
+                  "seconds": 0.06494332698639482,
+                  "returncode": 0,
+                  "timed_out": false,
+                  "start_perf_counter": 312898.586876962,
+                  "wait_end_perf_counter": 312898.651820289
+                }
+              },
+              "query_labels": {
+                "label_count": 4213,
+                "labels_sha256": "56d7a2f6140674159f5252bccc16411b6ec59f5eb30bb46571381491a32883fa"
+              },
+              "object_counts": {
+                "snapshot_unique_blobs": 11850,
+                "snapshot_blob_paths": 14232,
+                "present_blobs": 11850,
+                "hydrated_paths": 14232,
+                "present_logical_unique_bytes": 138576774,
+                "audit_scope": "base_only_no_private_admin_requested",
+                "manifest": "trial-4-checkout-presence-after_cold_query.json"
+              }
+            },
+            {
+              "trial": 5,
+              "clone_to_query_seconds": 8.102476589032449,
+              "phases": {
+                "clone": {
+                  "seconds": 5.588436026999261,
+                  "returncode": 0,
+                  "timed_out": false,
+                  "start_perf_counter": 312900.019571214,
+                  "wait_end_perf_counter": 312905.608007241
+                },
+                "cold_query": {
+                  "seconds": 2.513902781996876,
+                  "returncode": 0,
+                  "timed_out": false,
+                  "start_perf_counter": 312905.608145021,
+                  "wait_end_perf_counter": 312908.122047803
+                },
+                "warm_query_1": {
+                  "seconds": 0.07928195403655991,
+                  "returncode": 0,
+                  "timed_out": false,
+                  "start_perf_counter": 312908.205077127,
+                  "wait_end_perf_counter": 312908.284359081
+                }
+              },
+              "query_labels": {
+                "label_count": 4213,
+                "labels_sha256": "56d7a2f6140674159f5252bccc16411b6ec59f5eb30bb46571381491a32883fa"
+              },
+              "object_counts": {
+                "snapshot_unique_blobs": 11850,
+                "snapshot_blob_paths": 14232,
+                "present_blobs": 11850,
+                "hydrated_paths": 14232,
+                "present_logical_unique_bytes": 138576774,
+                "audit_scope": "base_only_no_private_admin_requested",
+                "manifest": "trial-5-checkout-presence-after_cold_query.json"
+              }
+            }
+          ]
+        },
+        "vfs": {
+          "n": 5,
+          "median_clone_to_query_seconds": 5.191571031988133,
+          "range_seconds": [
+            5.076861536013894,
+            6.581650369043928
+          ],
+          "median_setup_before_bazel_launch_seconds": 2.5623571400064975,
+          "phase_medians_seconds": {
+            "clone": 0.7566125040175393,
+            "warm_sizes": 0.3228021059767343,
+            "prefetch": 1.3400618229643442,
+            "mount": 0.13700426497962326,
+            "cold_query": 2.689211599994451,
+            "warm_query_1": 0.06610489496961236
+          },
+          "trials": [
+            {
+              "trial": 1,
+              "clone_to_query_seconds": 6.581650369043928,
+              "phases": {
+                "clone": {
+                  "seconds": 0.7576231580460444,
+                  "returncode": 0,
+                  "timed_out": false,
+                  "start_perf_counter": 312779.421838148,
+                  "wait_end_perf_counter": 312780.179461306
+                },
+                "warm_sizes": {
+                  "seconds": 1.114228307036683,
+                  "returncode": 0,
+                  "timed_out": false,
+                  "start_perf_counter": 312780.17960145,
+                  "wait_end_perf_counter": 312781.293829757
+                },
+                "prefetch": {
+                  "seconds": 1.841110572044272,
+                  "returncode": 0,
+                  "timed_out": false,
+                  "start_perf_counter": 312781.294022941,
+                  "wait_end_perf_counter": 312783.135133513
+                },
+                "mount": {
+                  "seconds": 0.13706351595465094,
+                  "returncode": 0
+                },
+                "cold_query": {
+                  "seconds": 2.7309057009988464,
+                  "returncode": 0,
+                  "timed_out": false,
+                  "start_perf_counter": 312783.272582816,
+                  "wait_end_perf_counter": 312786.003488517
+                },
+                "warm_query_1": {
+                  "seconds": 0.06573823397047818,
+                  "returncode": 0,
+                  "timed_out": false,
+                  "start_perf_counter": 312786.159032464,
+                  "wait_end_perf_counter": 312786.224770698
+                }
+              },
+              "query_labels": {
+                "label_count": 4213,
+                "labels_sha256": "56d7a2f6140674159f5252bccc16411b6ec59f5eb30bb46571381491a32883fa"
+              },
+              "object_counts": {
+                "snapshot_unique_blobs": 11850,
+                "snapshot_blob_paths": 14232,
+                "present_blobs": 696,
+                "hydrated_paths": 699,
+                "present_logical_unique_bytes": 3495118,
+                "audit_scope": "base_and_private_admin_with_alternates",
+                "base_present_blobs": 696,
+                "base_present_logical_unique_bytes": 3495118,
+                "private_available_blobs": 696,
+                "private_available_logical_unique_bytes": 3495118,
+                "private_only_blobs": 0,
+                "private_only_logical_unique_bytes": 0,
+                "union_present_blobs": 696,
+                "union_present_logical_unique_bytes": 3495118,
+                "manifest": "trial-1-vfs-presence-after_cold_query.json"
+              },
+              "mount_native_fetches": 0
+            },
+            {
+              "trial": 2,
+              "clone_to_query_seconds": 5.076861536013894,
+              "phases": {
+                "clone": {
+                  "seconds": 0.7488138100015931,
+                  "returncode": 0,
+                  "timed_out": false,
+                  "start_perf_counter": 312817.503686847,
+                  "wait_end_perf_counter": 312818.252500657
+                },
+                "warm_sizes": {
+                  "seconds": 0.3228021059767343,
+                  "returncode": 0,
+                  "timed_out": false,
+                  "start_perf_counter": 312818.252662752,
+                  "wait_end_perf_counter": 312818.575464858
+                },
+                "prefetch": {
+                  "seconds": 1.3530051309498958,
+                  "returncode": 0,
+                  "timed_out": false,
+                  "start_perf_counter": 312818.57562512,
+                  "wait_end_perf_counter": 312819.928630251
+                },
+                "mount": {
+                  "seconds": 0.13700426497962326,
+                  "returncode": 0
+                },
+                "cold_query": {
+                  "seconds": 2.5145043960073963,
+                  "returncode": 0,
+                  "timed_out": false,
+                  "start_perf_counter": 312820.066043987,
+                  "wait_end_perf_counter": 312822.580548383
+                },
+                "warm_query_1": {
+                  "seconds": 0.06610489496961236,
+                  "returncode": 0,
+                  "timed_out": false,
+                  "start_perf_counter": 312822.735327519,
+                  "wait_end_perf_counter": 312822.801432414
+                }
+              },
+              "query_labels": {
+                "label_count": 4213,
+                "labels_sha256": "56d7a2f6140674159f5252bccc16411b6ec59f5eb30bb46571381491a32883fa"
+              },
+              "object_counts": {
+                "snapshot_unique_blobs": 11850,
+                "snapshot_blob_paths": 14232,
+                "present_blobs": 696,
+                "hydrated_paths": 699,
+                "present_logical_unique_bytes": 3495118,
+                "audit_scope": "base_and_private_admin_with_alternates",
+                "base_present_blobs": 696,
+                "base_present_logical_unique_bytes": 3495118,
+                "private_available_blobs": 696,
+                "private_available_logical_unique_bytes": 3495118,
+                "private_only_blobs": 0,
+                "private_only_logical_unique_bytes": 0,
+                "union_present_blobs": 696,
+                "union_present_logical_unique_bytes": 3495118,
+                "manifest": "trial-2-vfs-presence-after_cold_query.json"
+              },
+              "mount_native_fetches": 0
+            },
+            {
+              "trial": 3,
+              "clone_to_query_seconds": 5.191571031988133,
+              "phases": {
+                "clone": {
+                  "seconds": 0.7630665350006893,
+                  "returncode": 0,
+                  "timed_out": false,
+                  "start_perf_counter": 312844.2020091,
+                  "wait_end_perf_counter": 312844.965075635
+                },
+                "warm_sizes": {
+                  "seconds": 0.3422708089929074,
+                  "returncode": 0,
+                  "timed_out": false,
+                  "start_perf_counter": 312844.965234284,
+                  "wait_end_perf_counter": 312845.307505093
+                },
+                "prefetch": {
+                  "seconds": 1.3214525899966247,
+                  "returncode": 0,
+                  "timed_out": false,
+                  "start_perf_counter": 312845.307591606,
+                  "wait_end_perf_counter": 312846.629044196
+                },
+                "mount": {
+                  "seconds": 0.13699150999309495,
+                  "returncode": 0
+                },
+                "cold_query": {
+                  "seconds": 2.6271289529977366,
+                  "returncode": 0,
+                  "timed_out": false,
+                  "start_perf_counter": 312846.766451179,
+                  "wait_end_perf_counter": 312849.393580132
+                },
+                "warm_query_1": {
+                  "seconds": 0.0667777230264619,
+                  "returncode": 0,
+                  "timed_out": false,
+                  "start_perf_counter": 312849.549242082,
+                  "wait_end_perf_counter": 312849.616019805
+                }
+              },
+              "query_labels": {
+                "label_count": 4213,
+                "labels_sha256": "56d7a2f6140674159f5252bccc16411b6ec59f5eb30bb46571381491a32883fa"
+              },
+              "object_counts": {
+                "snapshot_unique_blobs": 11850,
+                "snapshot_blob_paths": 14232,
+                "present_blobs": 696,
+                "hydrated_paths": 699,
+                "present_logical_unique_bytes": 3495118,
+                "audit_scope": "base_and_private_admin_with_alternates",
+                "base_present_blobs": 696,
+                "base_present_logical_unique_bytes": 3495118,
+                "private_available_blobs": 696,
+                "private_available_logical_unique_bytes": 3495118,
+                "private_only_blobs": 0,
+                "private_only_logical_unique_bytes": 0,
+                "union_present_blobs": 696,
+                "union_present_logical_unique_bytes": 3495118,
+                "manifest": "trial-3-vfs-presence-after_cold_query.json"
+              },
+              "mount_native_fetches": 0
+            },
+            {
+              "trial": 4,
+              "clone_to_query_seconds": 5.348653908993583,
+              "phases": {
+                "clone": {
+                  "seconds": 0.7566125040175393,
+                  "returncode": 0,
+                  "timed_out": false,
+                  "start_perf_counter": 312883.003889716,
+                  "wait_end_perf_counter": 312883.76050222
+                },
+                "warm_sizes": {
+                  "seconds": 0.31905574700795114,
+                  "returncode": 0,
+                  "timed_out": false,
+                  "start_perf_counter": 312883.760659497,
+                  "wait_end_perf_counter": 312884.079715244
+                },
+                "prefetch": {
+                  "seconds": 1.3400618229643442,
+                  "returncode": 0,
+                  "timed_out": false,
+                  "start_perf_counter": 312884.079854977,
+                  "wait_end_perf_counter": 312885.4199168
+                },
+                "mount": {
+                  "seconds": 0.13266617100453004,
+                  "returncode": 0
+                },
+                "cold_query": {
+                  "seconds": 2.799545963003766,
+                  "returncode": 0,
+                  "timed_out": false,
+                  "start_perf_counter": 312885.552997662,
+                  "wait_end_perf_counter": 312888.352543625
+                },
+                "warm_query_1": {
+                  "seconds": 0.06541198998456821,
+                  "returncode": 0,
+                  "timed_out": false,
+                  "start_perf_counter": 312888.506432613,
+                  "wait_end_perf_counter": 312888.571844603
+                }
+              },
+              "query_labels": {
+                "label_count": 4213,
+                "labels_sha256": "56d7a2f6140674159f5252bccc16411b6ec59f5eb30bb46571381491a32883fa"
+              },
+              "object_counts": {
+                "snapshot_unique_blobs": 11850,
+                "snapshot_blob_paths": 14232,
+                "present_blobs": 696,
+                "hydrated_paths": 699,
+                "present_logical_unique_bytes": 3495118,
+                "audit_scope": "base_and_private_admin_with_alternates",
+                "base_present_blobs": 696,
+                "base_present_logical_unique_bytes": 3495118,
+                "private_available_blobs": 696,
+                "private_available_logical_unique_bytes": 3495118,
+                "private_only_blobs": 0,
+                "private_only_logical_unique_bytes": 0,
+                "union_present_blobs": 696,
+                "union_present_logical_unique_bytes": 3495118,
+                "manifest": "trial-4-vfs-presence-after_cold_query.json"
+              },
+              "mount_native_fetches": 0
+            },
+            {
+              "trial": 5,
+              "clone_to_query_seconds": 5.171514241024852,
+              "phases": {
+                "clone": {
+                  "seconds": 0.7414580300101079,
+                  "returncode": 0,
+                  "timed_out": false,
+                  "start_perf_counter": 312909.741100071,
+                  "wait_end_perf_counter": 312910.482558101
+                },
+                "warm_sizes": {
+                  "seconds": 0.32212260499363765,
+                  "returncode": 0,
+                  "timed_out": false,
+                  "start_perf_counter": 312910.482662198,
+                  "wait_end_perf_counter": 312910.804784803
+                },
+                "prefetch": {
+                  "seconds": 1.2710756190354005,
+                  "returncode": 0,
+                  "timed_out": false,
+                  "start_perf_counter": 312910.804965103,
+                  "wait_end_perf_counter": 312912.076040722
+                },
+                "mount": {
+                  "seconds": 0.14696973096579313,
+                  "returncode": 0
+                },
+                "cold_query": {
+                  "seconds": 2.689211599994451,
+                  "returncode": 0,
+                  "timed_out": false,
+                  "start_perf_counter": 312912.223402712,
+                  "wait_end_perf_counter": 312914.912614312
+                },
+                "warm_query_1": {
+                  "seconds": 0.07042224996257573,
+                  "returncode": 0,
+                  "timed_out": false,
+                  "start_perf_counter": 312915.067406653,
+                  "wait_end_perf_counter": 312915.137828903
+                }
+              },
+              "query_labels": {
+                "label_count": 4213,
+                "labels_sha256": "56d7a2f6140674159f5252bccc16411b6ec59f5eb30bb46571381491a32883fa"
+              },
+              "object_counts": {
+                "snapshot_unique_blobs": 11850,
+                "snapshot_blob_paths": 14232,
+                "present_blobs": 696,
+                "hydrated_paths": 699,
+                "present_logical_unique_bytes": 3495118,
+                "audit_scope": "base_and_private_admin_with_alternates",
+                "base_present_blobs": 696,
+                "base_present_logical_unique_bytes": 3495118,
+                "private_available_blobs": 696,
+                "private_available_logical_unique_bytes": 3495118,
+                "private_only_blobs": 0,
+                "private_only_logical_unique_bytes": 0,
+                "union_present_blobs": 696,
+                "union_present_logical_unique_bytes": 3495118,
+                "manifest": "trial-5-vfs-presence-after_cold_query.json"
+              },
+              "mount_native_fetches": 0
+            }
+          ]
+        }
+      }
+    },
+    "after-mount": {
+      "raw_results": "artifacts/github-bazel-async-prefetch-20261016/after-mount/results.json",
+      "raw_results_sha256": "f1ad3ed960974ba8504e991bc012e4b8b216b0000caf69e270673d54ce968d27",
+      "variants": {
+        "checkout": {
+          "n": 5,
+          "median_clone_to_query_seconds": 8.384407785022631,
+          "range_seconds": [
+            8.289663969015237,
+            8.792369369009975
+          ],
+          "median_setup_before_bazel_launch_seconds": 5.949592782009859,
+          "phase_medians_seconds": {
+            "clone": 5.949452066037338,
+            "cold_query": 2.612088694004342,
+            "warm_query_1": 0.06646389199886471
+          },
+          "trials": [
+            {
+              "trial": 1,
+              "clone_to_query_seconds": 8.342186331981793,
+              "phases": {
+                "clone": {
+                  "seconds": 6.016225551022217,
+                  "returncode": 0,
+                  "timed_out": false,
+                  "start_perf_counter": 312786.906051923,
+                  "wait_end_perf_counter": 312792.922277474
+                },
+                "cold_query": {
+                  "seconds": 2.325741977954749,
+                  "returncode": 0,
+                  "timed_out": false,
+                  "start_perf_counter": 312792.922496277,
+                  "wait_end_perf_counter": 312795.248238255
+                },
+                "warm_query_1": {
+                  "seconds": 0.06488446600269526,
+                  "returncode": 0,
+                  "timed_out": false,
+                  "start_perf_counter": 312795.331192478,
+                  "wait_end_perf_counter": 312795.396076944
+                }
+              },
+              "query_labels": {
+                "label_count": 4213,
+                "labels_sha256": "56d7a2f6140674159f5252bccc16411b6ec59f5eb30bb46571381491a32883fa"
+              },
+              "object_counts": {
+                "snapshot_unique_blobs": 11850,
+                "snapshot_blob_paths": 14232,
+                "present_blobs": 11850,
+                "hydrated_paths": 14232,
+                "present_logical_unique_bytes": 138576774,
+                "audit_scope": "base_only_no_private_admin_requested",
+                "manifest": "trial-1-checkout-presence-after_cold_query.json"
+              }
+            },
+            {
+              "trial": 2,
+              "clone_to_query_seconds": 8.289663969015237,
+              "phases": {
+                "clone": {
+                  "seconds": 5.895603465032764,
+                  "returncode": 0,
+                  "timed_out": false,
+                  "start_perf_counter": 312807.883973029,
+                  "wait_end_perf_counter": 312813.779576494
+                },
+                "cold_query": {
+                  "seconds": 2.393918996967841,
+                  "returncode": 0,
+                  "timed_out": false,
+                  "start_perf_counter": 312813.779718001,
+                  "wait_end_perf_counter": 312816.173636998
+                },
+                "warm_query_1": {
+                  "seconds": 0.06646389199886471,
+                  "returncode": 0,
+                  "timed_out": false,
+                  "start_perf_counter": 312816.258588094,
+                  "wait_end_perf_counter": 312816.325051986
+                }
+              },
+              "query_labels": {
+                "label_count": 4213,
+                "labels_sha256": "56d7a2f6140674159f5252bccc16411b6ec59f5eb30bb46571381491a32883fa"
+              },
+              "object_counts": {
+                "snapshot_unique_blobs": 11850,
+                "snapshot_blob_paths": 14232,
+                "present_blobs": 11850,
+                "hydrated_paths": 14232,
+                "present_logical_unique_bytes": 138576774,
+                "audit_scope": "base_only_no_private_admin_requested",
+                "manifest": "trial-2-checkout-presence-after_cold_query.json"
+              }
+            },
+            {
+              "trial": 3,
+              "clone_to_query_seconds": 8.619657294999342,
+              "phases": {
+                "clone": {
+                  "seconds": 5.949452066037338,
+                  "returncode": 0,
+                  "timed_out": false,
+                  "start_perf_counter": 312850.484222618,
+                  "wait_end_perf_counter": 312856.433674684
+                },
+                "cold_query": {
+                  "seconds": 2.6700645129894838,
+                  "returncode": 0,
+                  "timed_out": false,
+                  "start_perf_counter": 312856.4338154,
+                  "wait_end_perf_counter": 312859.103879913
+                },
+                "warm_query_1": {
+                  "seconds": 0.06673382100416347,
+                  "returncode": 0,
+                  "timed_out": false,
+                  "start_perf_counter": 312859.185411735,
+                  "wait_end_perf_counter": 312859.252145556
+                }
+              },
+              "query_labels": {
+                "label_count": 4213,
+                "labels_sha256": "56d7a2f6140674159f5252bccc16411b6ec59f5eb30bb46571381491a32883fa"
+              },
+              "object_counts": {
+                "snapshot_unique_blobs": 11850,
+                "snapshot_blob_paths": 14232,
+                "present_blobs": 11850,
+                "hydrated_paths": 14232,
+                "present_logical_unique_bytes": 138576774,
+                "audit_scope": "base_only_no_private_admin_requested",
+                "manifest": "trial-3-checkout-presence-after_cold_query.json"
+              }
+            },
+            {
+              "trial": 4,
+              "clone_to_query_seconds": 8.792369369009975,
+              "phases": {
+                "clone": {
+                  "seconds": 6.170697027002461,
+                  "returncode": 0,
+                  "timed_out": false,
+                  "start_perf_counter": 312872.659053549,
+                  "wait_end_perf_counter": 312878.829750576
+                },
+                "cold_query": {
+                  "seconds": 2.621531015029177,
+                  "returncode": 0,
+                  "timed_out": false,
+                  "start_perf_counter": 312878.829891903,
+                  "wait_end_perf_counter": 312881.451422918
+                },
+                "warm_query_1": {
+                  "seconds": 0.06802395201520994,
+                  "returncode": 0,
+                  "timed_out": false,
+                  "start_perf_counter": 312881.536921585,
+                  "wait_end_perf_counter": 312881.604945537
+                }
+              },
+              "query_labels": {
+                "label_count": 4213,
+                "labels_sha256": "56d7a2f6140674159f5252bccc16411b6ec59f5eb30bb46571381491a32883fa"
+              },
+              "object_counts": {
+                "snapshot_unique_blobs": 11850,
+                "snapshot_blob_paths": 14232,
+                "present_blobs": 11850,
+                "hydrated_paths": 14232,
+                "present_logical_unique_bytes": 138576774,
+                "audit_scope": "base_only_no_private_admin_requested",
+                "manifest": "trial-4-checkout-presence-after_cold_query.json"
+              }
+            },
+            {
+              "trial": 5,
+              "clone_to_query_seconds": 8.384407785022631,
+              "phases": {
+                "clone": {
+                  "seconds": 5.772092324041296,
+                  "returncode": 0,
+                  "timed_out": false,
+                  "start_perf_counter": 312916.185760933,
+                  "wait_end_perf_counter": 312921.957853257
+                },
+                "cold_query": {
+                  "seconds": 2.612088694004342,
+                  "returncode": 0,
+                  "timed_out": false,
+                  "start_perf_counter": 312921.958080024,
+                  "wait_end_perf_counter": 312924.570168718
+                },
+                "warm_query_1": {
+                  "seconds": 0.06525217898888513,
+                  "returncode": 0,
+                  "timed_out": false,
+                  "start_perf_counter": 312924.729076533,
+                  "wait_end_perf_counter": 312924.794328712
+                }
+              },
+              "query_labels": {
+                "label_count": 4213,
+                "labels_sha256": "56d7a2f6140674159f5252bccc16411b6ec59f5eb30bb46571381491a32883fa"
+              },
+              "object_counts": {
+                "snapshot_unique_blobs": 11850,
+                "snapshot_blob_paths": 14232,
+                "present_blobs": 11850,
+                "hydrated_paths": 14232,
+                "present_logical_unique_bytes": 138576774,
+                "audit_scope": "base_only_no_private_admin_requested",
+                "manifest": "trial-5-checkout-presence-after_cold_query.json"
+              }
+            }
+          ]
+        },
+        "vfs": {
+          "n": 5,
+          "median_clone_to_query_seconds": 4.963515868992545,
+          "range_seconds": [
+            4.506335366982967,
+            5.267075578973163
+          ],
+          "median_setup_before_bazel_launch_seconds": 1.331257063022349,
+          "phase_medians_seconds": {
+            "clone": 0.8588914389838465,
+            "warm_sizes": 0.3209211319917813,
+            "mount": 0.14208464603871107,
+            "cold_query": 3.6192700720275752,
+            "warm_query_1": 0.06479682098142803
+          },
+          "trials": [
+            {
+              "trial": 1,
+              "clone_to_query_seconds": 4.506335366982967,
+              "phases": {
+                "clone": {
+                  "seconds": 0.8588914389838465,
+                  "returncode": 0,
+                  "timed_out": false,
+                  "start_perf_counter": 312796.480390394,
+                  "wait_end_perf_counter": 312797.339281833
+                },
+                "warm_sizes": {
+                  "seconds": 0.32462691399268806,
+                  "returncode": 0,
+                  "timed_out": false,
+                  "start_perf_counter": 312797.339422117,
+                  "wait_end_perf_counter": 312797.664049031
+                },
+                "mount": {
+                  "seconds": 0.1472091720206663,
+                  "returncode": 0
+                },
+                "cold_query": {
+                  "seconds": 3.1750783039606176,
+                  "returncode": 0,
+                  "timed_out": false,
+                  "start_perf_counter": 312797.811647457,
+                  "wait_end_perf_counter": 312800.986725761
+                },
+                "warm_query_1": {
+                  "seconds": 0.06587415101239458,
+                  "returncode": 0,
+                  "timed_out": false,
+                  "start_perf_counter": 312801.142705118,
+                  "wait_end_perf_counter": 312801.208579269
+                }
+              },
+              "query_labels": {
+                "label_count": 4213,
+                "labels_sha256": "56d7a2f6140674159f5252bccc16411b6ec59f5eb30bb46571381491a32883fa"
+              },
+              "object_counts": {
+                "snapshot_unique_blobs": 11850,
+                "snapshot_blob_paths": 14232,
+                "present_blobs": 696,
+                "hydrated_paths": 699,
+                "present_logical_unique_bytes": 3495118,
+                "audit_scope": "base_and_private_admin_with_alternates",
+                "base_present_blobs": 696,
+                "base_present_logical_unique_bytes": 3495118,
+                "private_available_blobs": 696,
+                "private_available_logical_unique_bytes": 3495118,
+                "private_only_blobs": 0,
+                "private_only_logical_unique_bytes": 0,
+                "union_present_blobs": 696,
+                "union_present_logical_unique_bytes": 3495118,
+                "manifest": "trial-1-vfs-presence-after_cold_query.json"
+              },
+              "mount_native_fetches": 2,
+              "background_prefetch": {
+                "status": "complete",
+                "seconds": 1.186744421,
+                "blobs": {
+                  "already_local_blobs": 0,
+                  "fetch_batches": 2,
+                  "fetched_blobs": 696,
+                  "requested_blobs": 696
+                },
+                "selected_path_count": 699
+              }
+            },
+            {
+              "trial": 2,
+              "clone_to_query_seconds": 4.963515868992545,
+              "phases": {
+                "clone": {
+                  "seconds": 0.8882947109523229,
+                  "returncode": 0,
+                  "timed_out": false,
+                  "start_perf_counter": 312801.94431673,
+                  "wait_end_perf_counter": 312802.832611441
+                },
+                "warm_sizes": {
+                  "seconds": 0.31793420400936157,
+                  "returncode": 0,
+                  "timed_out": false,
+                  "start_perf_counter": 312802.832775299,
+                  "wait_end_perf_counter": 312803.150709503
+                },
+                "mount": {
+                  "seconds": 0.13740772497840226,
+                  "returncode": 0
+                },
+                "cold_query": {
+                  "seconds": 3.6192700720275752,
+                  "returncode": 0,
+                  "timed_out": false,
+                  "start_perf_counter": 312803.288562527,
+                  "wait_end_perf_counter": 312806.907832599
+                },
+                "warm_query_1": {
+                  "seconds": 0.06479682098142803,
+                  "returncode": 0,
+                  "timed_out": false,
+                  "start_perf_counter": 312807.081802454,
+                  "wait_end_perf_counter": 312807.146599275
+                }
+              },
+              "query_labels": {
+                "label_count": 4213,
+                "labels_sha256": "56d7a2f6140674159f5252bccc16411b6ec59f5eb30bb46571381491a32883fa"
+              },
+              "object_counts": {
+                "snapshot_unique_blobs": 11850,
+                "snapshot_blob_paths": 14232,
+                "present_blobs": 696,
+                "hydrated_paths": 699,
+                "present_logical_unique_bytes": 3495118,
+                "audit_scope": "base_and_private_admin_with_alternates",
+                "base_present_blobs": 696,
+                "base_present_logical_unique_bytes": 3495118,
+                "private_available_blobs": 696,
+                "private_available_logical_unique_bytes": 3495118,
+                "private_only_blobs": 0,
+                "private_only_logical_unique_bytes": 0,
+                "union_present_blobs": 696,
+                "union_present_logical_unique_bytes": 3495118,
+                "manifest": "trial-2-vfs-presence-after_cold_query.json"
+              },
+              "mount_native_fetches": 3,
+              "background_prefetch": {
+                "status": "complete",
+                "seconds": 1.727547125,
+                "blobs": {
+                  "already_local_blobs": 1,
+                  "fetch_batches": 2,
+                  "fetched_blobs": 695,
+                  "requested_blobs": 696
+                },
+                "selected_path_count": 699
+              }
+            },
+            {
+              "trial": 3,
+              "clone_to_query_seconds": 5.267075578973163,
+              "phases": {
+                "clone": {
+                  "seconds": 1.0886234019999392,
+                  "returncode": 0,
+                  "timed_out": false,
+                  "start_perf_counter": 312860.524606304,
+                  "wait_end_perf_counter": 312861.613229706
+                },
+                "warm_sizes": {
+                  "seconds": 0.338939723034855,
+                  "returncode": 0,
+                  "timed_out": false,
+                  "start_perf_counter": 312861.613360953,
+                  "wait_end_perf_counter": 312861.952300676
+                },
+                "mount": {
+                  "seconds": 0.14207802497548983,
+                  "returncode": 0
+                },
+                "cold_query": {
+                  "seconds": 3.696873302978929,
+                  "returncode": 0,
+                  "timed_out": false,
+                  "start_perf_counter": 312862.09480858,
+                  "wait_end_perf_counter": 312865.791681883
+                },
+                "warm_query_1": {
+                  "seconds": 0.0647745180176571,
+                  "returncode": 0,
+                  "timed_out": false,
+                  "start_perf_counter": 312865.946841706,
+                  "wait_end_perf_counter": 312866.011616224
+                }
+              },
+              "query_labels": {
+                "label_count": 4213,
+                "labels_sha256": "56d7a2f6140674159f5252bccc16411b6ec59f5eb30bb46571381491a32883fa"
+              },
+              "object_counts": {
+                "snapshot_unique_blobs": 11850,
+                "snapshot_blob_paths": 14232,
+                "present_blobs": 696,
+                "hydrated_paths": 699,
+                "present_logical_unique_bytes": 3495118,
+                "audit_scope": "base_and_private_admin_with_alternates",
+                "base_present_blobs": 696,
+                "base_present_logical_unique_bytes": 3495118,
+                "private_available_blobs": 696,
+                "private_available_logical_unique_bytes": 3495118,
+                "private_only_blobs": 0,
+                "private_only_logical_unique_bytes": 0,
+                "union_present_blobs": 696,
+                "union_present_logical_unique_bytes": 3495118,
+                "manifest": "trial-3-vfs-presence-after_cold_query.json"
+              },
+              "mount_native_fetches": 2,
+              "background_prefetch": {
+                "status": "complete",
+                "seconds": 1.2699813070000001,
+                "blobs": {
+                  "already_local_blobs": 0,
+                  "fetch_batches": 2,
+                  "fetched_blobs": 696,
+                  "requested_blobs": 696
+                },
+                "selected_path_count": 699
+              }
+            },
+            {
+              "trial": 4,
+              "clone_to_query_seconds": 4.646183498960454,
+              "phases": {
+                "clone": {
+                  "seconds": 0.8165885609923862,
+                  "returncode": 0,
+                  "timed_out": false,
+                  "start_perf_counter": 312866.905624771,
+                  "wait_end_perf_counter": 312867.722213332
+                },
+                "warm_sizes": {
+                  "seconds": 0.3209211319917813,
+                  "returncode": 0,
+                  "timed_out": false,
+                  "start_perf_counter": 312867.722381569,
+                  "wait_end_perf_counter": 312868.043302701
+                },
+                "mount": {
+                  "seconds": 0.14707361703040078,
+                  "returncode": 0
+                },
+                "cold_query": {
+                  "seconds": 3.361034533008933,
+                  "returncode": 0,
+                  "timed_out": false,
+                  "start_perf_counter": 312868.190773737,
+                  "wait_end_perf_counter": 312871.55180827
+                },
+                "warm_query_1": {
+                  "seconds": 0.0603596800356172,
+                  "returncode": 0,
+                  "timed_out": false,
+                  "start_perf_counter": 312871.702117814,
+                  "wait_end_perf_counter": 312871.762477494
+                }
+              },
+              "query_labels": {
+                "label_count": 4213,
+                "labels_sha256": "56d7a2f6140674159f5252bccc16411b6ec59f5eb30bb46571381491a32883fa"
+              },
+              "object_counts": {
+                "snapshot_unique_blobs": 11850,
+                "snapshot_blob_paths": 14232,
+                "present_blobs": 696,
+                "hydrated_paths": 699,
+                "present_logical_unique_bytes": 3495118,
+                "audit_scope": "base_and_private_admin_with_alternates",
+                "base_present_blobs": 696,
+                "base_present_logical_unique_bytes": 3495118,
+                "private_available_blobs": 696,
+                "private_available_logical_unique_bytes": 3495118,
+                "private_only_blobs": 0,
+                "private_only_logical_unique_bytes": 0,
+                "union_present_blobs": 696,
+                "union_present_logical_unique_bytes": 3495118,
+                "manifest": "trial-4-vfs-presence-after_cold_query.json"
+              },
+              "mount_native_fetches": 2,
+              "background_prefetch": {
+                "status": "complete",
+                "seconds": 1.235647816,
+                "blobs": {
+                  "already_local_blobs": 0,
+                  "fetch_batches": 2,
+                  "fetched_blobs": 696,
+                  "requested_blobs": 696
+                },
+                "selected_path_count": 699
+              }
+            },
+            {
+              "trial": 5,
+              "clone_to_query_seconds": 4.970915170037188,
+              "phases": {
+                "clone": {
+                  "seconds": 0.7188156970078126,
+                  "returncode": 0,
+                  "timed_out": false,
+                  "start_perf_counter": 312926.256768671,
+                  "wait_end_perf_counter": 312926.975584368
+                },
+                "warm_sizes": {
+                  "seconds": 0.3133876769570634,
+                  "returncode": 0,
+                  "timed_out": false,
+                  "start_perf_counter": 312926.975672424,
+                  "wait_end_perf_counter": 312927.289060101
+                },
+                "mount": {
+                  "seconds": 0.14208464603871107,
+                  "returncode": 0
+                },
+                "cold_query": {
+                  "seconds": 3.7961117080412805,
+                  "returncode": 0,
+                  "timed_out": false,
+                  "start_perf_counter": 312927.431572133,
+                  "wait_end_perf_counter": 312931.227683841
+                },
+                "warm_query_1": {
+                  "seconds": 0.06913312099641189,
+                  "returncode": 0,
+                  "timed_out": false,
+                  "start_perf_counter": 312931.398061448,
+                  "wait_end_perf_counter": 312931.467194569
+                }
+              },
+              "query_labels": {
+                "label_count": 4213,
+                "labels_sha256": "56d7a2f6140674159f5252bccc16411b6ec59f5eb30bb46571381491a32883fa"
+              },
+              "object_counts": {
+                "snapshot_unique_blobs": 11850,
+                "snapshot_blob_paths": 14232,
+                "present_blobs": 696,
+                "hydrated_paths": 699,
+                "present_logical_unique_bytes": 3495118,
+                "audit_scope": "base_and_private_admin_with_alternates",
+                "base_present_blobs": 696,
+                "base_present_logical_unique_bytes": 3495118,
+                "private_available_blobs": 696,
+                "private_available_logical_unique_bytes": 3495118,
+                "private_only_blobs": 0,
+                "private_only_logical_unique_bytes": 0,
+                "union_present_blobs": 696,
+                "union_present_logical_unique_bytes": 3495118,
+                "manifest": "trial-5-vfs-presence-after_cold_query.json"
+              },
+              "mount_native_fetches": 3,
+              "background_prefetch": {
+                "status": "complete",
+                "seconds": 1.717813806,
+                "blobs": {
+                  "already_local_blobs": 1,
+                  "fetch_batches": 2,
+                  "fetched_blobs": 695,
+                  "requested_blobs": 696
+                },
+                "selected_path_count": 699
+              }
+            }
+          ]
+        }
+      }
+    }
+  },
+  "comparison": {
+    "async_vs_paired_checkout_saved_seconds": 3.4208919160300866,
+    "async_vs_paired_checkout_reduction_percent": 40.800638563178524,
+    "async_vs_blocking_median_saved_seconds": 0.22805516299558803,
+    "async_vs_blocking_reduction_percent": 4.392796738991233,
+    "paired_async_savings_seconds": [
+      2.075315002060961,
+      0.11334566702134907,
+      -0.07550454698503017,
+      0.7024704100331292,
+      0.20059907098766416
+    ],
+    "median_paired_async_savings_seconds": 0.20059907098766416,
+    "async_wins": 4,
+    "sample_limit": "Five interleaved trials per mode; descriptive single-machine comparison, not a latency guarantee. Most prefetch time shifts into query waits."
+  },
+  "validation": {
+    "unit_tests_passed": 19,
+    "ordinary_integration_tests_passed": 13,
+    "real_fuse_tests_passed": 7,
+    "independent_source_review": "no remaining actionable findings",
+    "retained_failure": "One parallel ordinary-suite invocation failed executing the existing size-warming wrapper with ETXTBSY (Text file busy) in GitRepo::open. The targeted test and serial full suite passed afterward; no timeout/retry workaround or unrelated repair was added."
+  }
+}

@@ -1,0 +1,22 @@
+[package]
+name = "git-vfs"
+version = "0.1.0"
+edition = "2024"
+description = "Writable Git partial-clone filesystem with GITSHA1 xattrs and journal-backed status"
+license = "MIT"
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4.5", features = ["derive"] }
+ctrlc = "3.4"
+fuser = { version = "0.16", default-features = false, features = ["abi-7-31"] }
+fjall = "=3.1.12"
+hex = "0.4"
+libc = "0.2"
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls", "json"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha1 = "0.10"
+
+[dev-dependencies]
+tempfile = "3"

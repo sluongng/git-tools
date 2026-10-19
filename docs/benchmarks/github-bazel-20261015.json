@@ -1,0 +1,2995 @@
+{
+  "scope": "Current final binary: two default-query matrices plus a separate project/target-tuned true-first-build matrix",
+  "environment": {
+    "platform": "Linux-unspecified-x86_64-with-glibc2.44",
+    "logical_cpu_count": 32,
+    "native_git_version": "2.55.0.1095.g6de20f6092",
+    "bazel_version": "bazel 9.2.0",
+    "source_url": "https://github.com/bazelbuild/bazel.git",
+    "snapshot_commit": "c9af12d1db12d1b2df2137feb9ea8d39e3a25c79",
+    "snapshot_tree": "27ef12c1012f715ecd20b35f7492198ac0433093",
+    "vfs_binary_sha256": "7156c37bae6cb86dbe5b3df159efceeaaf31532fd01b02c026cbd988b125ebb4",
+    "vfs_verified_source_revision": "75790ef90f69d9c6a8f5bd3beed1decd51e2fb94",
+    "harness_source_revision": "7fee7d96544901bf87a6e562f26aa193aa0eaf6b",
+    "harness_provenance": "Exact byte comparison against committed harness and frozen queue copy",
+    "digest_function": "GITSHA1",
+    "digest_xattr": "user.gitsha1",
+    "watchfs": true,
+    "build_target": "//src/main/cpp/util:strings",
+    "build_flags": [
+      "--jobs=8",
+      "--remote_cache=",
+      "--remote_executor=",
+      "--disk_cache="
+    ],
+    "query_expression": "//...",
+    "metadata_mode": "production-warm-sizes",
+    "pair_order": [
+      [
+        "checkout",
+        "vfs"
+      ],
+      [
+        "vfs",
+        "checkout"
+      ],
+      [
+        "checkout",
+        "vfs"
+      ],
+      [
+        "vfs",
+        "checkout"
+      ],
+      [
+        "checkout",
+        "vfs"
+      ]
+    ],
+    "archive_dependencies_installation": "warm",
+    "source_clones_overlays_output_bases": "fresh",
+    "os_page_cache": "not dropped",
+    "harness_script_sha256": "0ff640f29ac7510f9dcc365703ab789370133f6bd4f05ee1652d3ce307232fbe"
+  },
+  "matrices": {
+    "query-a": {
+      "workflow": "query",
+      "arms": {
+        "checkout": {
+          "continuous_clone_to_first_command_seconds": {
+            "samples": 5,
+            "median": 8.929091192025226,
+            "min": 8.54482257599011,
+            "max": 9.968172585999127
+          },
+          "first_command_seconds": {
+            "samples": 5,
+            "median": 2.6816218640014995,
+            "min": 2.499992361990735,
+            "max": 2.834096489008516
+          },
+          "warm_command_seconds": {
+            "samples": 15,
+            "median": 0.05351252399850637,
+            "min": 0.0445460649789311,
+            "max": 0.07335279101971537
+          },
+          "source_overlay_allocated_bytes": {
+            "samples": 5,
+            "median": 283459584,
+            "min": 283459584,
+            "max": 283459584
+          },
+          "source_overlay_apparent_bytes": {
+            "samples": 5,
+            "median": 251413300,
+            "min": 251413282,
+            "max": 251413300
+          },
+          "first_build_after_queries_seconds": {
+            "samples": 5,
+            "median": 1.2424242419947404,
+            "min": 1.201018658990506,
+            "max": 1.253246020001825
+          }
+        },
+        "vfs": {
+          "continuous_clone_to_first_command_seconds": {
+            "samples": 5,
+            "median": 5.910710116993869,
+            "min": 5.685166534007294,
+            "max": 6.439231897995342
+          },
+          "first_command_seconds": {
+            "samples": 5,
+            "median": 2.658586398989428,
+            "min": 2.5774172459787223,
+            "max": 2.8745497229974717
+          },
+          "warm_command_seconds": {
+            "samples": 15,
+            "median": 0.05174777898355387,
+            "min": 0.04638278600759804,
+            "max": 0.07360076997429132
+          },
+          "source_overlay_allocated_bytes": {
+            "samples": 5,
+            "median": 7028736,
+            "min": 7028736,
+            "max": 7028736
+          },
+          "source_overlay_apparent_bytes": {
+            "samples": 5,
+            "median": 70754168,
+            "min": 70754168,
+            "max": 70754175
+          },
+          "first_build_after_queries_seconds": {
+            "samples": 5,
+            "median": 2.5266157570003998,
+            "min": 2.4252105290070176,
+            "max": 2.784390887012705
+          }
+        }
+      },
+      "pairs": [
+        {
+          "trial": 1,
+          "checkout_seconds": 9.968172585999127,
+          "vfs_seconds": 6.439231897995342,
+          "vfs_saving_seconds": 3.528940688003786,
+          "speedup": 1.5480375212301973
+        },
+        {
+          "trial": 2,
+          "checkout_seconds": 8.669740549987182,
+          "vfs_seconds": 5.74500974098919,
+          "vfs_saving_seconds": 2.9247308089979924,
+          "speedup": 1.5090906614362685
+        },
+        {
+          "trial": 3,
+          "checkout_seconds": 8.54482257599011,
+          "vfs_seconds": 5.910710116993869,
+          "vfs_saving_seconds": 2.634112458996242,
+          "speedup": 1.4456507605444753
+        },
+        {
+          "trial": 4,
+          "checkout_seconds": 8.934294222999597,
+          "vfs_seconds": 5.685166534007294,
+          "vfs_saving_seconds": 3.249127688992303,
+          "speedup": 1.5715096769033599
+        },
+        {
+          "trial": 5,
+          "checkout_seconds": 8.929091192025226,
+          "vfs_seconds": 5.967493584990734,
+          "vfs_saving_seconds": 2.9615976070344914,
+          "speedup": 1.496288360407025
+        }
+      ],
+      "vfs_cells": [
+        {
+          "trial": 1,
+          "metadata": {
+            "source": "github",
+            "http_requests": 1,
+            "http_bytes": 4217464,
+            "cached_blobs": 0,
+            "learned_blobs": 11850,
+            "total_unique_blobs": 11850,
+            "pinned_commit": "c9af12d1db12d1b2df2137feb9ea8d39e3a25c79",
+            "pinned_tree": "27ef12c1012f715ecd20b35f7492198ac0433093"
+          },
+          "prefetch": {
+            "paths": 699,
+            "blobs": {
+              "requested_blobs": 696,
+              "already_local_blobs": 0,
+              "fetched_blobs": 696,
+              "fetch_batches": 2
+            },
+            "discovery_waves": 1,
+            "skipped_discovery": []
+          },
+          "availability_by_phase": {
+            "after_cold_query": {
+              "present_blobs": 696,
+              "present_logical_unique_bytes": 3495118,
+              "private_available_blobs": 696,
+              "private_only_blobs": 0,
+              "private_only_logical_unique_bytes": 0,
+              "union_present_blobs": 696,
+              "union_present_logical_unique_bytes": 3495118
+            },
+            "after_warm_query_1": {
+              "present_blobs": 696,
+              "present_logical_unique_bytes": 3495118,
+              "private_available_blobs": 696,
+              "private_only_blobs": 0,
+              "private_only_logical_unique_bytes": 0,
+              "union_present_blobs": 696,
+              "union_present_logical_unique_bytes": 3495118
+            },
+            "after_warm_query_2": {
+              "present_blobs": 696,
+              "present_logical_unique_bytes": 3495118,
+              "private_available_blobs": 696,
+              "private_only_blobs": 0,
+              "private_only_logical_unique_bytes": 0,
+              "union_present_blobs": 696,
+              "union_present_logical_unique_bytes": 3495118
+            },
+            "after_warm_query_3": {
+              "present_blobs": 696,
+              "present_logical_unique_bytes": 3495118,
+              "private_available_blobs": 696,
+              "private_only_blobs": 0,
+              "private_only_logical_unique_bytes": 0,
+              "union_present_blobs": 696,
+              "union_present_logical_unique_bytes": 3495118
+            },
+            "after_build": {
+              "present_blobs": 699,
+              "present_logical_unique_bytes": 3513935,
+              "private_available_blobs": 699,
+              "private_only_blobs": 0,
+              "private_only_logical_unique_bytes": 0,
+              "union_present_blobs": 699,
+              "union_present_logical_unique_bytes": 3513935
+            }
+          },
+          "native_process_starts_by_phase": {
+            "mount_or_handover": {
+              "rev-parse": 4,
+              "other": 7,
+              "ls-tree": 1,
+              "init": 1,
+              "config": 17
+            },
+            "cold_query": {
+              "cat-file": 1
+            },
+            "incremental_first_build_after_queries": {
+              "fetch": 3,
+              "remote-https": 3,
+              "other": 3,
+              "index-pack": 3,
+              "maintenance": 3
+            }
+          },
+          "private_allocated_bytes": {
+            "overlay": 5107712,
+            "git_admin": 1880064,
+            "git_object_files_excluding_alternates_metadata": 0
+          }
+        },
+        {
+          "trial": 2,
+          "metadata": {
+            "source": "github",
+            "http_requests": 1,
+            "http_bytes": 4217464,
+            "cached_blobs": 0,
+            "learned_blobs": 11850,
+            "total_unique_blobs": 11850,
+            "pinned_commit": "c9af12d1db12d1b2df2137feb9ea8d39e3a25c79",
+            "pinned_tree": "27ef12c1012f715ecd20b35f7492198ac0433093"
+          },
+          "prefetch": {
+            "paths": 699,
+            "blobs": {
+              "requested_blobs": 696,
+              "already_local_blobs": 0,
+              "fetched_blobs": 696,
+              "fetch_batches": 2
+            },
+            "discovery_waves": 1,
+            "skipped_discovery": []
+          },
+          "availability_by_phase": {
+            "after_cold_query": {
+              "present_blobs": 696,
+              "present_logical_unique_bytes": 3495118,
+              "private_available_blobs": 696,
+              "private_only_blobs": 0,
+              "private_only_logical_unique_bytes": 0,
+              "union_present_blobs": 696,
+              "union_present_logical_unique_bytes": 3495118
+            },
+            "after_warm_query_1": {
+              "present_blobs": 696,
+              "present_logical_unique_bytes": 3495118,
+              "private_available_blobs": 696,
+              "private_only_blobs": 0,
+              "private_only_logical_unique_bytes": 0,
+              "union_present_blobs": 696,
+              "union_present_logical_unique_bytes": 3495118
+            },
+            "after_warm_query_2": {
+              "present_blobs": 696,
+              "present_logical_unique_bytes": 3495118,
+              "private_available_blobs": 696,
+              "private_only_blobs": 0,
+              "private_only_logical_unique_bytes": 0,
+              "union_present_blobs": 696,
+              "union_present_logical_unique_bytes": 3495118
+            },
+            "after_warm_query_3": {
+              "present_blobs": 696,
+              "present_logical_unique_bytes": 3495118,
+              "private_available_blobs": 696,
+              "private_only_blobs": 0,
+              "private_only_logical_unique_bytes": 0,
+              "union_present_blobs": 696,
+              "union_present_logical_unique_bytes": 3495118
+            },
+            "after_build": {
+              "present_blobs": 699,
+              "present_logical_unique_bytes": 3513935,
+              "private_available_blobs": 699,
+              "private_only_blobs": 0,
+              "private_only_logical_unique_bytes": 0,
+              "union_present_blobs": 699,
+              "union_present_logical_unique_bytes": 3513935
+            }
+          },
+          "native_process_starts_by_phase": {
+            "mount_or_handover": {
+              "rev-parse": 4,
+              "other": 7,
+              "ls-tree": 1,
+              "init": 1,
+              "config": 17
+            },
+            "cold_query": {
+              "cat-file": 1
+            },
+            "incremental_first_build_after_queries": {
+              "fetch": 3,
+              "remote-https": 3,
+              "other": 3,
+              "index-pack": 3,
+              "maintenance": 3
+            }
+          },
+          "private_allocated_bytes": {
+            "overlay": 5107712,
+            "git_admin": 1880064,
+            "git_object_files_excluding_alternates_metadata": 0
+          }
+        },
+        {
+          "trial": 3,
+          "metadata": {
+            "source": "github",
+            "http_requests": 1,
+            "http_bytes": 4217464,
+            "cached_blobs": 0,
+            "learned_blobs": 11850,
+            "total_unique_blobs": 11850,
+            "pinned_commit": "c9af12d1db12d1b2df2137feb9ea8d39e3a25c79",
+            "pinned_tree": "27ef12c1012f715ecd20b35f7492198ac0433093"
+          },
+          "prefetch": {
+            "paths": 699,
+            "blobs": {
+              "requested_blobs": 696,
+              "already_local_blobs": 0,
+              "fetched_blobs": 696,
+              "fetch_batches": 2
+            },
+            "discovery_waves": 1,
+            "skipped_discovery": []
+          },
+          "availability_by_phase": {
+            "after_cold_query": {
+              "present_blobs": 696,
+              "present_logical_unique_bytes": 3495118,
+              "private_available_blobs": 696,
+              "private_only_blobs": 0,
+              "private_only_logical_unique_bytes": 0,
+              "union_present_blobs": 696,
+              "union_present_logical_unique_bytes": 3495118
+            },
+            "after_warm_query_1": {
+              "present_blobs": 696,
+              "present_logical_unique_bytes": 3495118,
+              "private_available_blobs": 696,
+              "private_only_blobs": 0,
+              "private_only_logical_unique_bytes": 0,
+              "union_present_blobs": 696,
+              "union_present_logical_unique_bytes": 3495118
+            },
+            "after_warm_query_2": {
+              "present_blobs": 696,
+              "present_logical_unique_bytes": 3495118,
+              "private_available_blobs": 696,
+              "private_only_blobs": 0,
+              "private_only_logical_unique_bytes": 0,
+              "union_present_blobs": 696,
+              "union_present_logical_unique_bytes": 3495118
+            },
+            "after_warm_query_3": {
+              "present_blobs": 696,
+              "present_logical_unique_bytes": 3495118,
+              "private_available_blobs": 696,
+              "private_only_blobs": 0,
+              "private_only_logical_unique_bytes": 0,
+              "union_present_blobs": 696,
+              "union_present_logical_unique_bytes": 3495118
+            },
+            "after_build": {
+              "present_blobs": 699,
+              "present_logical_unique_bytes": 3513935,
+              "private_available_blobs": 699,
+              "private_only_blobs": 0,
+              "private_only_logical_unique_bytes": 0,
+              "union_present_blobs": 699,
+              "union_present_logical_unique_bytes": 3513935
+            }
+          },
+          "native_process_starts_by_phase": {
+            "mount_or_handover": {
+              "rev-parse": 4,
+              "other": 7,
+              "ls-tree": 1,
+              "init": 1,
+              "config": 17
+            },
+            "cold_query": {
+              "cat-file": 1
+            },
+            "incremental_first_build_after_queries": {
+              "fetch": 3,
+              "remote-https": 3,
+              "other": 3,
+              "index-pack": 3,
+              "maintenance": 3
+            }
+          },
+          "private_allocated_bytes": {
+            "overlay": 5107712,
+            "git_admin": 1880064,
+            "git_object_files_excluding_alternates_metadata": 0
+          }
+        },
+        {
+          "trial": 4,
+          "metadata": {
+            "source": "github",
+            "http_requests": 1,
+            "http_bytes": 4217464,
+            "cached_blobs": 0,
+            "learned_blobs": 11850,
+            "total_unique_blobs": 11850,
+            "pinned_commit": "c9af12d1db12d1b2df2137feb9ea8d39e3a25c79",
+            "pinned_tree": "27ef12c1012f715ecd20b35f7492198ac0433093"
+          },
+          "prefetch": {
+            "paths": 699,
+            "blobs": {
+              "requested_blobs": 696,
+              "already_local_blobs": 0,
+              "fetched_blobs": 696,
+              "fetch_batches": 2
+            },
+            "discovery_waves": 1,
+            "skipped_discovery": []
+          },
+          "availability_by_phase": {
+            "after_cold_query": {
+              "present_blobs": 696,
+              "present_logical_unique_bytes": 3495118,
+              "private_available_blobs": 696,
+              "private_only_blobs": 0,
+              "private_only_logical_unique_bytes": 0,
+              "union_present_blobs": 696,
+              "union_present_logical_unique_bytes": 3495118
+            },
+            "after_warm_query_1": {
+              "present_blobs": 696,
+              "present_logical_unique_bytes": 3495118,
+              "private_available_blobs": 696,
+              "private_only_blobs": 0,
+              "private_only_logical_unique_bytes": 0,
+              "union_present_blobs": 696,
+              "union_present_logical_unique_bytes": 3495118
+            },
+            "after_warm_query_2": {
+              "present_blobs": 696,
+              "present_logical_unique_bytes": 3495118,
+              "private_available_blobs": 696,
+              "private_only_blobs": 0,
+              "private_only_logical_unique_bytes": 0,
+              "union_present_blobs": 696,
+              "union_present_logical_unique_bytes": 3495118
+            },
+            "after_warm_query_3": {
+              "present_blobs": 696,
+              "present_logical_unique_bytes": 3495118,
+              "private_available_blobs": 696,
+              "private_only_blobs": 0,
+              "private_only_logical_unique_bytes": 0,
+              "union_present_blobs": 696,
+              "union_present_logical_unique_bytes": 3495118
+            },
+            "after_build": {
+              "present_blobs": 699,
+              "present_logical_unique_bytes": 3513935,
+              "private_available_blobs": 699,
+              "private_only_blobs": 0,
+              "private_only_logical_unique_bytes": 0,
+              "union_present_blobs": 699,
+              "union_present_logical_unique_bytes": 3513935
+            }
+          },
+          "native_process_starts_by_phase": {
+            "mount_or_handover": {
+              "rev-parse": 4,
+              "other": 7,
+              "ls-tree": 1,
+              "init": 1,
+              "config": 17
+            },
+            "cold_query": {
+              "cat-file": 1
+            },
+            "incremental_first_build_after_queries": {
+              "fetch": 3,
+              "remote-https": 3,
+              "other": 3,
+              "index-pack": 3,
+              "maintenance": 3
+            }
+          },
+          "private_allocated_bytes": {
+            "overlay": 5107712,
+            "git_admin": 1880064,
+            "git_object_files_excluding_alternates_metadata": 0
+          }
+        },
+        {
+          "trial": 5,
+          "metadata": {
+            "source": "github",
+            "http_requests": 1,
+            "http_bytes": 4217464,
+            "cached_blobs": 0,
+            "learned_blobs": 11850,
+            "total_unique_blobs": 11850,
+            "pinned_commit": "c9af12d1db12d1b2df2137feb9ea8d39e3a25c79",
+            "pinned_tree": "27ef12c1012f715ecd20b35f7492198ac0433093"
+          },
+          "prefetch": {
+            "paths": 699,
+            "blobs": {
+              "requested_blobs": 696,
+              "already_local_blobs": 0,
+              "fetched_blobs": 696,
+              "fetch_batches": 2
+            },
+            "discovery_waves": 1,
+            "skipped_discovery": []
+          },
+          "availability_by_phase": {
+            "after_cold_query": {
+              "present_blobs": 696,
+              "present_logical_unique_bytes": 3495118,
+              "private_available_blobs": 696,
+              "private_only_blobs": 0,
+              "private_only_logical_unique_bytes": 0,
+              "union_present_blobs": 696,
+              "union_present_logical_unique_bytes": 3495118
+            },
+            "after_warm_query_1": {
+              "present_blobs": 696,
+              "present_logical_unique_bytes": 3495118,
+              "private_available_blobs": 696,
+              "private_only_blobs": 0,
+              "private_only_logical_unique_bytes": 0,
+              "union_present_blobs": 696,
+              "union_present_logical_unique_bytes": 3495118
+            },
+            "after_warm_query_2": {
+              "present_blobs": 696,
+              "present_logical_unique_bytes": 3495118,
+              "private_available_blobs": 696,
+              "private_only_blobs": 0,
+              "private_only_logical_unique_bytes": 0,
+              "union_present_blobs": 696,
+              "union_present_logical_unique_bytes": 3495118
+            },
+            "after_warm_query_3": {
+              "present_blobs": 696,
+              "present_logical_unique_bytes": 3495118,
+              "private_available_blobs": 696,
+              "private_only_blobs": 0,
+              "private_only_logical_unique_bytes": 0,
+              "union_present_blobs": 696,
+              "union_present_logical_unique_bytes": 3495118
+            },
+            "after_build": {
+              "present_blobs": 699,
+              "present_logical_unique_bytes": 3513935,
+              "private_available_blobs": 699,
+              "private_only_blobs": 0,
+              "private_only_logical_unique_bytes": 0,
+              "union_present_blobs": 699,
+              "union_present_logical_unique_bytes": 3513935
+            }
+          },
+          "native_process_starts_by_phase": {
+            "mount_or_handover": {
+              "rev-parse": 4,
+              "other": 7,
+              "ls-tree": 1,
+              "init": 1,
+              "config": 17
+            },
+            "cold_query": {
+              "cat-file": 1
+            },
+            "incremental_first_build_after_queries": {
+              "fetch": 3,
+              "remote-https": 3,
+              "other": 3,
+              "index-pack": 3,
+              "maintenance": 3
+            }
+          },
+          "private_allocated_bytes": {
+            "overlay": 5107712,
+            "git_admin": 1880064,
+            "git_object_files_excluding_alternates_metadata": 0
+          }
+        }
+      ],
+      "cross_arm_trial_output_consistency": {
+        "verified": true,
+        "cells": 10,
+        "build_commands": 10,
+        "reference_source": "config.golden_build_outputs",
+        "outputs": [
+          {
+            "path": "bazel-bin/src/main/cpp/util/libstrings.a",
+            "sha256": "2744043bb632d44940cc70cd1f834421e0928499f16551e6f3facddc49645335",
+            "size_bytes": 142284
+          },
+          {
+            "path": "bazel-bin/src/main/cpp/util/libstrings.so",
+            "sha256": "6bdbbf97c39b8bc83c82ec06ec6ced7854f807c80c6faf795ab044d3f76350e8",
+            "size_bytes": 89384
+          }
+        ]
+      },
+      "build_evidence": [
+        {
+          "trial": 1,
+          "variant": "checkout",
+          "phases": {
+            "incremental_first_build_after_queries": {
+              "valid_action_summary": true,
+              "actions_executed": 4,
+              "content_actions_executed": 3,
+              "verified_content_noop": false
+            }
+          },
+          "matches_global_path_hash_size_reference": true
+        },
+        {
+          "trial": 1,
+          "variant": "vfs",
+          "phases": {
+            "incremental_first_build_after_queries": {
+              "valid_action_summary": true,
+              "actions_executed": 4,
+              "content_actions_executed": 3,
+              "verified_content_noop": false
+            }
+          },
+          "matches_global_path_hash_size_reference": true
+        },
+        {
+          "trial": 2,
+          "variant": "vfs",
+          "phases": {
+            "incremental_first_build_after_queries": {
+              "valid_action_summary": true,
+              "actions_executed": 4,
+              "content_actions_executed": 3,
+              "verified_content_noop": false
+            }
+          },
+          "matches_global_path_hash_size_reference": true
+        },
+        {
+          "trial": 2,
+          "variant": "checkout",
+          "phases": {
+            "incremental_first_build_after_queries": {
+              "valid_action_summary": true,
+              "actions_executed": 4,
+              "content_actions_executed": 3,
+              "verified_content_noop": false
+            }
+          },
+          "matches_global_path_hash_size_reference": true
+        },
+        {
+          "trial": 3,
+          "variant": "checkout",
+          "phases": {
+            "incremental_first_build_after_queries": {
+              "valid_action_summary": true,
+              "actions_executed": 4,
+              "content_actions_executed": 3,
+              "verified_content_noop": false
+            }
+          },
+          "matches_global_path_hash_size_reference": true
+        },
+        {
+          "trial": 3,
+          "variant": "vfs",
+          "phases": {
+            "incremental_first_build_after_queries": {
+              "valid_action_summary": true,
+              "actions_executed": 4,
+              "content_actions_executed": 3,
+              "verified_content_noop": false
+            }
+          },
+          "matches_global_path_hash_size_reference": true
+        },
+        {
+          "trial": 4,
+          "variant": "vfs",
+          "phases": {
+            "incremental_first_build_after_queries": {
+              "valid_action_summary": true,
+              "actions_executed": 4,
+              "content_actions_executed": 3,
+              "verified_content_noop": false
+            }
+          },
+          "matches_global_path_hash_size_reference": true
+        },
+        {
+          "trial": 4,
+          "variant": "checkout",
+          "phases": {
+            "incremental_first_build_after_queries": {
+              "valid_action_summary": true,
+              "actions_executed": 4,
+              "content_actions_executed": 3,
+              "verified_content_noop": false
+            }
+          },
+          "matches_global_path_hash_size_reference": true
+        },
+        {
+          "trial": 5,
+          "variant": "checkout",
+          "phases": {
+            "incremental_first_build_after_queries": {
+              "valid_action_summary": true,
+              "actions_executed": 4,
+              "content_actions_executed": 3,
+              "verified_content_noop": false
+            }
+          },
+          "matches_global_path_hash_size_reference": true
+        },
+        {
+          "trial": 5,
+          "variant": "vfs",
+          "phases": {
+            "incremental_first_build_after_queries": {
+              "valid_action_summary": true,
+              "actions_executed": 4,
+              "content_actions_executed": 3,
+              "verified_content_noop": false
+            }
+          },
+          "matches_global_path_hash_size_reference": true
+        }
+      ],
+      "verified_content_noop_builds": 0,
+      "failures": 0,
+      "exclusions": 0,
+      "paired_statistics": {
+        "vfs_wins": 5,
+        "saving_seconds": {
+          "samples": 5,
+          "median": 2.9615976070344914,
+          "min": 2.634112458996242,
+          "max": 3.528940688003786
+        },
+        "speedup": {
+          "samples": 5,
+          "median": 1.5090906614362685,
+          "min": 1.4456507605444753,
+          "max": 1.5715096769033599
+        },
+        "ratio_of_medians_reduction_percent": 33.80390019677637
+      },
+      "prefetch_policy": "Production default metadata and literal-reference discovery"
+    },
+    "query-b": {
+      "workflow": "query",
+      "arms": {
+        "checkout": {
+          "continuous_clone_to_first_command_seconds": {
+            "samples": 5,
+            "median": 9.127644276013598,
+            "min": 8.687714822997805,
+            "max": 9.430774578009732
+          },
+          "first_command_seconds": {
+            "samples": 5,
+            "median": 2.601202307996573,
+            "min": 2.4420923569996376,
+            "max": 2.6434968069952447
+          },
+          "warm_command_seconds": {
+            "samples": 15,
+            "median": 0.05380226898705587,
+            "min": 0.04443125499528833,
+            "max": 0.073933481995482
+          },
+          "source_overlay_allocated_bytes": {
+            "samples": 5,
+            "median": 283459584,
+            "min": 283459584,
+            "max": 283459584
+          },
+          "source_overlay_apparent_bytes": {
+            "samples": 5,
+            "median": 251413300,
+            "min": 251413282,
+            "max": 251413300
+          },
+          "first_build_after_queries_seconds": {
+            "samples": 5,
+            "median": 1.224407446978148,
+            "min": 1.1889982299762778,
+            "max": 1.2496743440278806
+          }
+        },
+        "vfs": {
+          "continuous_clone_to_first_command_seconds": {
+            "samples": 5,
+            "median": 5.383730189001653,
+            "min": 5.292110182024771,
+            "max": 5.978854389017215
+          },
+          "first_command_seconds": {
+            "samples": 5,
+            "median": 2.6559652390133124,
+            "min": 2.5047029620036483,
+            "max": 2.8255601020064205
+          },
+          "warm_command_seconds": {
+            "samples": 15,
+            "median": 0.05175542098004371,
+            "min": 0.04540085399639793,
+            "max": 0.072674630995607
+          },
+          "source_overlay_allocated_bytes": {
+            "samples": 5,
+            "median": 7028736,
+            "min": 7028736,
+            "max": 7028736
+          },
+          "source_overlay_apparent_bytes": {
+            "samples": 5,
+            "median": 70754175,
+            "min": 70754175,
+            "max": 70754175
+          },
+          "first_build_after_queries_seconds": {
+            "samples": 5,
+            "median": 2.4674018080113456,
+            "min": 2.45821045601042,
+            "max": 2.5250577369879466
+          }
+        }
+      },
+      "pairs": [
+        {
+          "trial": 1,
+          "checkout_seconds": 9.224325216986472,
+          "vfs_seconds": 5.383730189001653,
+          "vfs_saving_seconds": 3.8405950279848184,
+          "speedup": 1.7133706358150556
+        },
+        {
+          "trial": 2,
+          "checkout_seconds": 8.912146775983274,
+          "vfs_seconds": 5.292110182024771,
+          "vfs_saving_seconds": 3.6200365939585026,
+          "speedup": 1.6840440711635882
+        },
+        {
+          "trial": 3,
+          "checkout_seconds": 8.687714822997805,
+          "vfs_seconds": 5.705332997022197,
+          "vfs_saving_seconds": 2.982381825975608,
+          "speedup": 1.5227358030692009
+        },
+        {
+          "trial": 4,
+          "checkout_seconds": 9.127644276013598,
+          "vfs_seconds": 5.328369936993113,
+          "vfs_saving_seconds": 3.799274339020485,
+          "speedup": 1.7130275082147315
+        },
+        {
+          "trial": 5,
+          "checkout_seconds": 9.430774578009732,
+          "vfs_seconds": 5.978854389017215,
+          "vfs_saving_seconds": 3.451920188992517,
+          "speedup": 1.577354784778415
+        }
+      ],
+      "vfs_cells": [
+        {
+          "trial": 1,
+          "metadata": {
+            "source": "github",
+            "http_requests": 1,
+            "http_bytes": 4217464,
+            "cached_blobs": 0,
+            "learned_blobs": 11850,
+            "total_unique_blobs": 11850,
+            "pinned_commit": "c9af12d1db12d1b2df2137feb9ea8d39e3a25c79",
+            "pinned_tree": "27ef12c1012f715ecd20b35f7492198ac0433093"
+          },
+          "prefetch": {
+            "paths": 699,
+            "blobs": {
+              "requested_blobs": 696,
+              "already_local_blobs": 0,
+              "fetched_blobs": 696,
+              "fetch_batches": 2
+            },
+            "discovery_waves": 1,
+            "skipped_discovery": []
+          },
+          "availability_by_phase": {
+            "after_cold_query": {
+              "present_blobs": 696,
+              "present_logical_unique_bytes": 3495118,
+              "private_available_blobs": 696,
+              "private_only_blobs": 0,
+              "private_only_logical_unique_bytes": 0,
+              "union_present_blobs": 696,
+              "union_present_logical_unique_bytes": 3495118
+            },
+            "after_warm_query_1": {
+              "present_blobs": 696,
+              "present_logical_unique_bytes": 3495118,
+              "private_available_blobs": 696,
+              "private_only_blobs": 0,
+              "private_only_logical_unique_bytes": 0,
+              "union_present_blobs": 696,
+              "union_present_logical_unique_bytes": 3495118
+            },
+            "after_warm_query_2": {
+              "present_blobs": 696,
+              "present_logical_unique_bytes": 3495118,
+              "private_available_blobs": 696,
+              "private_only_blobs": 0,
+              "private_only_logical_unique_bytes": 0,
+              "union_present_blobs": 696,
+              "union_present_logical_unique_bytes": 3495118
+            },
+            "after_warm_query_3": {
+              "present_blobs": 696,
+              "present_logical_unique_bytes": 3495118,
+              "private_available_blobs": 696,
+              "private_only_blobs": 0,
+              "private_only_logical_unique_bytes": 0,
+              "union_present_blobs": 696,
+              "union_present_logical_unique_bytes": 3495118
+            },
+            "after_build": {
+              "present_blobs": 699,
+              "present_logical_unique_bytes": 3513935,
+              "private_available_blobs": 699,
+              "private_only_blobs": 0,
+              "private_only_logical_unique_bytes": 0,
+              "union_present_blobs": 699,
+              "union_present_logical_unique_bytes": 3513935
+            }
+          },
+          "native_process_starts_by_phase": {
+            "mount_or_handover": {
+              "rev-parse": 4,
+              "other": 7,
+              "ls-tree": 1,
+              "init": 1,
+              "config": 17
+            },
+            "cold_query": {
+              "cat-file": 1
+            },
+            "incremental_first_build_after_queries": {
+              "fetch": 3,
+              "remote-https": 3,
+              "other": 3,
+              "index-pack": 3,
+              "maintenance": 3
+            }
+          },
+          "private_allocated_bytes": {
+            "overlay": 5107712,
+            "git_admin": 1880064,
+            "git_object_files_excluding_alternates_metadata": 0
+          }
+        },
+        {
+          "trial": 2,
+          "metadata": {
+            "source": "github",
+            "http_requests": 1,
+            "http_bytes": 4217464,
+            "cached_blobs": 0,
+            "learned_blobs": 11850,
+            "total_unique_blobs": 11850,
+            "pinned_commit": "c9af12d1db12d1b2df2137feb9ea8d39e3a25c79",
+            "pinned_tree": "27ef12c1012f715ecd20b35f7492198ac0433093"
+          },
+          "prefetch": {
+            "paths": 699,
+            "blobs": {
+              "requested_blobs": 696,
+              "already_local_blobs": 0,
+              "fetched_blobs": 696,
+              "fetch_batches": 2
+            },
+            "discovery_waves": 1,
+            "skipped_discovery": []
+          },
+          "availability_by_phase": {
+            "after_cold_query": {
+              "present_blobs": 696,
+              "present_logical_unique_bytes": 3495118,
+              "private_available_blobs": 696,
+              "private_only_blobs": 0,
+              "private_only_logical_unique_bytes": 0,
+              "union_present_blobs": 696,
+              "union_present_logical_unique_bytes": 3495118
+            },
+            "after_warm_query_1": {
+              "present_blobs": 696,
+              "present_logical_unique_bytes": 3495118,
+              "private_available_blobs": 696,
+              "private_only_blobs": 0,
+              "private_only_logical_unique_bytes": 0,
+              "union_present_blobs": 696,
+              "union_present_logical_unique_bytes": 3495118
+            },
+            "after_warm_query_2": {
+              "present_blobs": 696,
+              "present_logical_unique_bytes": 3495118,
+              "private_available_blobs": 696,
+              "private_only_blobs": 0,
+              "private_only_logical_unique_bytes": 0,
+              "union_present_blobs": 696,
+              "union_present_logical_unique_bytes": 3495118
+            },
+            "after_warm_query_3": {
+              "present_blobs": 696,
+              "present_logical_unique_bytes": 3495118,
+              "private_available_blobs": 696,
+              "private_only_blobs": 0,
+              "private_only_logical_unique_bytes": 0,
+              "union_present_blobs": 696,
+              "union_present_logical_unique_bytes": 3495118
+            },
+            "after_build": {
+              "present_blobs": 699,
+              "present_logical_unique_bytes": 3513935,
+              "private_available_blobs": 699,
+              "private_only_blobs": 0,
+              "private_only_logical_unique_bytes": 0,
+              "union_present_blobs": 699,
+              "union_present_logical_unique_bytes": 3513935
+            }
+          },
+          "native_process_starts_by_phase": {
+            "mount_or_handover": {
+              "rev-parse": 4,
+              "other": 7,
+              "ls-tree": 1,
+              "init": 1,
+              "config": 17
+            },
+            "cold_query": {
+              "cat-file": 1
+            },
+            "incremental_first_build_after_queries": {
+              "fetch": 3,
+              "remote-https": 3,
+              "other": 3,
+              "index-pack": 3,
+              "maintenance": 3
+            }
+          },
+          "private_allocated_bytes": {
+            "overlay": 5107712,
+            "git_admin": 1880064,
+            "git_object_files_excluding_alternates_metadata": 0
+          }
+        },
+        {
+          "trial": 3,
+          "metadata": {
+            "source": "github",
+            "http_requests": 1,
+            "http_bytes": 4217464,
+            "cached_blobs": 0,
+            "learned_blobs": 11850,
+            "total_unique_blobs": 11850,
+            "pinned_commit": "c9af12d1db12d1b2df2137feb9ea8d39e3a25c79",
+            "pinned_tree": "27ef12c1012f715ecd20b35f7492198ac0433093"
+          },
+          "prefetch": {
+            "paths": 699,
+            "blobs": {
+              "requested_blobs": 696,
+              "already_local_blobs": 0,
+              "fetched_blobs": 696,
+              "fetch_batches": 2
+            },
+            "discovery_waves": 1,
+            "skipped_discovery": []
+          },
+          "availability_by_phase": {
+            "after_cold_query": {
+              "present_blobs": 696,
+              "present_logical_unique_bytes": 3495118,
+              "private_available_blobs": 696,
+              "private_only_blobs": 0,
+              "private_only_logical_unique_bytes": 0,
+              "union_present_blobs": 696,
+              "union_present_logical_unique_bytes": 3495118
+            },
+            "after_warm_query_1": {
+              "present_blobs": 696,
+              "present_logical_unique_bytes": 3495118,
+              "private_available_blobs": 696,
+              "private_only_blobs": 0,
+              "private_only_logical_unique_bytes": 0,
+              "union_present_blobs": 696,
+              "union_present_logical_unique_bytes": 3495118
+            },
+            "after_warm_query_2": {
+              "present_blobs": 696,
+              "present_logical_unique_bytes": 3495118,
+              "private_available_blobs": 696,
+              "private_only_blobs": 0,
+              "private_only_logical_unique_bytes": 0,
+              "union_present_blobs": 696,
+              "union_present_logical_unique_bytes": 3495118
+            },
+            "after_warm_query_3": {
+              "present_blobs": 696,
+              "present_logical_unique_bytes": 3495118,
+              "private_available_blobs": 696,
+              "private_only_blobs": 0,
+              "private_only_logical_unique_bytes": 0,
+              "union_present_blobs": 696,
+              "union_present_logical_unique_bytes": 3495118
+            },
+            "after_build": {
+              "present_blobs": 699,
+              "present_logical_unique_bytes": 3513935,
+              "private_available_blobs": 699,
+              "private_only_blobs": 0,
+              "private_only_logical_unique_bytes": 0,
+              "union_present_blobs": 699,
+              "union_present_logical_unique_bytes": 3513935
+            }
+          },
+          "native_process_starts_by_phase": {
+            "mount_or_handover": {
+              "rev-parse": 4,
+              "other": 7,
+              "ls-tree": 1,
+              "init": 1,
+              "config": 17
+            },
+            "cold_query": {
+              "cat-file": 1
+            },
+            "incremental_first_build_after_queries": {
+              "fetch": 3,
+              "remote-https": 3,
+              "other": 3,
+              "index-pack": 3,
+              "maintenance": 3
+            }
+          },
+          "private_allocated_bytes": {
+            "overlay": 5107712,
+            "git_admin": 1880064,
+            "git_object_files_excluding_alternates_metadata": 0
+          }
+        },
+        {
+          "trial": 4,
+          "metadata": {
+            "source": "github",
+            "http_requests": 1,
+            "http_bytes": 4217464,
+            "cached_blobs": 0,
+            "learned_blobs": 11850,
+            "total_unique_blobs": 11850,
+            "pinned_commit": "c9af12d1db12d1b2df2137feb9ea8d39e3a25c79",
+            "pinned_tree": "27ef12c1012f715ecd20b35f7492198ac0433093"
+          },
+          "prefetch": {
+            "paths": 699,
+            "blobs": {
+              "requested_blobs": 696,
+              "already_local_blobs": 0,
+              "fetched_blobs": 696,
+              "fetch_batches": 2
+            },
+            "discovery_waves": 1,
+            "skipped_discovery": []
+          },
+          "availability_by_phase": {
+            "after_cold_query": {
+              "present_blobs": 696,
+              "present_logical_unique_bytes": 3495118,
+              "private_available_blobs": 696,
+              "private_only_blobs": 0,
+              "private_only_logical_unique_bytes": 0,
+              "union_present_blobs": 696,
+              "union_present_logical_unique_bytes": 3495118
+            },
+            "after_warm_query_1": {
+              "present_blobs": 696,
+              "present_logical_unique_bytes": 3495118,
+              "private_available_blobs": 696,
+              "private_only_blobs": 0,
+              "private_only_logical_unique_bytes": 0,
+              "union_present_blobs": 696,
+              "union_present_logical_unique_bytes": 3495118
+            },
+            "after_warm_query_2": {
+              "present_blobs": 696,
+              "present_logical_unique_bytes": 3495118,
+              "private_available_blobs": 696,
+              "private_only_blobs": 0,
+              "private_only_logical_unique_bytes": 0,
+              "union_present_blobs": 696,
+              "union_present_logical_unique_bytes": 3495118
+            },
+            "after_warm_query_3": {
+              "present_blobs": 696,
+              "present_logical_unique_bytes": 3495118,
+              "private_available_blobs": 696,
+              "private_only_blobs": 0,
+              "private_only_logical_unique_bytes": 0,
+              "union_present_blobs": 696,
+              "union_present_logical_unique_bytes": 3495118
+            },
+            "after_build": {
+              "present_blobs": 699,
+              "present_logical_unique_bytes": 3513935,
+              "private_available_blobs": 699,
+              "private_only_blobs": 0,
+              "private_only_logical_unique_bytes": 0,
+              "union_present_blobs": 699,
+              "union_present_logical_unique_bytes": 3513935
+            }
+          },
+          "native_process_starts_by_phase": {
+            "mount_or_handover": {
+              "rev-parse": 4,
+              "other": 7,
+              "ls-tree": 1,
+              "init": 1,
+              "config": 17
+            },
+            "cold_query": {
+              "cat-file": 1
+            },
+            "incremental_first_build_after_queries": {
+              "fetch": 3,
+              "remote-https": 3,
+              "other": 3,
+              "index-pack": 3,
+              "maintenance": 3
+            }
+          },
+          "private_allocated_bytes": {
+            "overlay": 5107712,
+            "git_admin": 1880064,
+            "git_object_files_excluding_alternates_metadata": 0
+          }
+        },
+        {
+          "trial": 5,
+          "metadata": {
+            "source": "github",
+            "http_requests": 1,
+            "http_bytes": 4217464,
+            "cached_blobs": 0,
+            "learned_blobs": 11850,
+            "total_unique_blobs": 11850,
+            "pinned_commit": "c9af12d1db12d1b2df2137feb9ea8d39e3a25c79",
+            "pinned_tree": "27ef12c1012f715ecd20b35f7492198ac0433093"
+          },
+          "prefetch": {
+            "paths": 699,
+            "blobs": {
+              "requested_blobs": 696,
+              "already_local_blobs": 0,
+              "fetched_blobs": 696,
+              "fetch_batches": 2
+            },
+            "discovery_waves": 1,
+            "skipped_discovery": []
+          },
+          "availability_by_phase": {
+            "after_cold_query": {
+              "present_blobs": 696,
+              "present_logical_unique_bytes": 3495118,
+              "private_available_blobs": 696,
+              "private_only_blobs": 0,
+              "private_only_logical_unique_bytes": 0,
+              "union_present_blobs": 696,
+              "union_present_logical_unique_bytes": 3495118
+            },
+            "after_warm_query_1": {
+              "present_blobs": 696,
+              "present_logical_unique_bytes": 3495118,
+              "private_available_blobs": 696,
+              "private_only_blobs": 0,
+              "private_only_logical_unique_bytes": 0,
+              "union_present_blobs": 696,
+              "union_present_logical_unique_bytes": 3495118
+            },
+            "after_warm_query_2": {
+              "present_blobs": 696,
+              "present_logical_unique_bytes": 3495118,
+              "private_available_blobs": 696,
+              "private_only_blobs": 0,
+              "private_only_logical_unique_bytes": 0,
+              "union_present_blobs": 696,
+              "union_present_logical_unique_bytes": 3495118
+            },
+            "after_warm_query_3": {
+              "present_blobs": 696,
+              "present_logical_unique_bytes": 3495118,
+              "private_available_blobs": 696,
+              "private_only_blobs": 0,
+              "private_only_logical_unique_bytes": 0,
+              "union_present_blobs": 696,
+              "union_present_logical_unique_bytes": 3495118
+            },
+            "after_build": {
+              "present_blobs": 699,
+              "present_logical_unique_bytes": 3513935,
+              "private_available_blobs": 699,
+              "private_only_blobs": 0,
+              "private_only_logical_unique_bytes": 0,
+              "union_present_blobs": 699,
+              "union_present_logical_unique_bytes": 3513935
+            }
+          },
+          "native_process_starts_by_phase": {
+            "mount_or_handover": {
+              "rev-parse": 4,
+              "other": 7,
+              "ls-tree": 1,
+              "init": 1,
+              "config": 17
+            },
+            "cold_query": {
+              "cat-file": 1
+            },
+            "incremental_first_build_after_queries": {
+              "fetch": 3,
+              "remote-https": 3,
+              "other": 3,
+              "index-pack": 3,
+              "maintenance": 3
+            }
+          },
+          "private_allocated_bytes": {
+            "overlay": 5107712,
+            "git_admin": 1880064,
+            "git_object_files_excluding_alternates_metadata": 0
+          }
+        }
+      ],
+      "cross_arm_trial_output_consistency": {
+        "verified": true,
+        "cells": 10,
+        "build_commands": 10,
+        "reference_source": "config.golden_build_outputs",
+        "outputs": [
+          {
+            "path": "bazel-bin/src/main/cpp/util/libstrings.a",
+            "sha256": "2744043bb632d44940cc70cd1f834421e0928499f16551e6f3facddc49645335",
+            "size_bytes": 142284
+          },
+          {
+            "path": "bazel-bin/src/main/cpp/util/libstrings.so",
+            "sha256": "6bdbbf97c39b8bc83c82ec06ec6ced7854f807c80c6faf795ab044d3f76350e8",
+            "size_bytes": 89384
+          }
+        ]
+      },
+      "build_evidence": [
+        {
+          "trial": 1,
+          "variant": "checkout",
+          "phases": {
+            "incremental_first_build_after_queries": {
+              "valid_action_summary": true,
+              "actions_executed": 4,
+              "content_actions_executed": 3,
+              "verified_content_noop": false
+            }
+          },
+          "matches_global_path_hash_size_reference": true
+        },
+        {
+          "trial": 1,
+          "variant": "vfs",
+          "phases": {
+            "incremental_first_build_after_queries": {
+              "valid_action_summary": true,
+              "actions_executed": 4,
+              "content_actions_executed": 3,
+              "verified_content_noop": false
+            }
+          },
+          "matches_global_path_hash_size_reference": true
+        },
+        {
+          "trial": 2,
+          "variant": "vfs",
+          "phases": {
+            "incremental_first_build_after_queries": {
+              "valid_action_summary": true,
+              "actions_executed": 4,
+              "content_actions_executed": 3,
+              "verified_content_noop": false
+            }
+          },
+          "matches_global_path_hash_size_reference": true
+        },
+        {
+          "trial": 2,
+          "variant": "checkout",
+          "phases": {
+            "incremental_first_build_after_queries": {
+              "valid_action_summary": true,
+              "actions_executed": 4,
+              "content_actions_executed": 3,
+              "verified_content_noop": false
+            }
+          },
+          "matches_global_path_hash_size_reference": true
+        },
+        {
+          "trial": 3,
+          "variant": "checkout",
+          "phases": {
+            "incremental_first_build_after_queries": {
+              "valid_action_summary": true,
+              "actions_executed": 4,
+              "content_actions_executed": 3,
+              "verified_content_noop": false
+            }
+          },
+          "matches_global_path_hash_size_reference": true
+        },
+        {
+          "trial": 3,
+          "variant": "vfs",
+          "phases": {
+            "incremental_first_build_after_queries": {
+              "valid_action_summary": true,
+              "actions_executed": 4,
+              "content_actions_executed": 3,
+              "verified_content_noop": false
+            }
+          },
+          "matches_global_path_hash_size_reference": true
+        },
+        {
+          "trial": 4,
+          "variant": "vfs",
+          "phases": {
+            "incremental_first_build_after_queries": {
+              "valid_action_summary": true,
+              "actions_executed": 4,
+              "content_actions_executed": 3,
+              "verified_content_noop": false
+            }
+          },
+          "matches_global_path_hash_size_reference": true
+        },
+        {
+          "trial": 4,
+          "variant": "checkout",
+          "phases": {
+            "incremental_first_build_after_queries": {
+              "valid_action_summary": true,
+              "actions_executed": 4,
+              "content_actions_executed": 3,
+              "verified_content_noop": false
+            }
+          },
+          "matches_global_path_hash_size_reference": true
+        },
+        {
+          "trial": 5,
+          "variant": "checkout",
+          "phases": {
+            "incremental_first_build_after_queries": {
+              "valid_action_summary": true,
+              "actions_executed": 4,
+              "content_actions_executed": 3,
+              "verified_content_noop": false
+            }
+          },
+          "matches_global_path_hash_size_reference": true
+        },
+        {
+          "trial": 5,
+          "variant": "vfs",
+          "phases": {
+            "incremental_first_build_after_queries": {
+              "valid_action_summary": true,
+              "actions_executed": 4,
+              "content_actions_executed": 3,
+              "verified_content_noop": false
+            }
+          },
+          "matches_global_path_hash_size_reference": true
+        }
+      ],
+      "verified_content_noop_builds": 0,
+      "failures": 0,
+      "exclusions": 0,
+      "paired_statistics": {
+        "vfs_wins": 5,
+        "saving_seconds": {
+          "samples": 5,
+          "median": 3.6200365939585026,
+          "min": 2.982381825975608,
+          "max": 3.8405950279848184
+        },
+        "speedup": {
+          "samples": 5,
+          "median": 1.6840440711635882,
+          "min": 1.5227358030692009,
+          "max": 1.7133706358150556
+        },
+        "ratio_of_medians_reduction_percent": 41.01730932756135
+      },
+      "prefetch_policy": "Production default metadata and literal-reference discovery"
+    },
+    "tuned-build-first": {
+      "workflow": "build-first",
+      "arms": {
+        "checkout": {
+          "continuous_clone_to_first_command_seconds": {
+            "samples": 5,
+            "median": 9.653527396003483,
+            "min": 9.271863956993911,
+            "max": 9.872506276005879
+          },
+          "first_command_seconds": {
+            "samples": 5,
+            "median": 3.4604872619966045,
+            "min": 3.3947273250087164,
+            "max": 3.540188371989643
+          },
+          "warm_command_seconds": {
+            "samples": 15,
+            "median": 0.06976289898739196,
+            "min": 0.06247205697582103,
+            "max": 0.1458109699888155
+          },
+          "source_overlay_allocated_bytes": {
+            "samples": 5,
+            "median": 283459584,
+            "min": 283459584,
+            "max": 283459584
+          },
+          "source_overlay_apparent_bytes": {
+            "samples": 5,
+            "median": 251413322,
+            "min": 251413322,
+            "max": 251413340
+          }
+        },
+        "vfs": {
+          "continuous_clone_to_first_command_seconds": {
+            "samples": 5,
+            "median": 6.03422617301112,
+            "min": 5.655103397992207,
+            "max": 6.221523108979454
+          },
+          "first_command_seconds": {
+            "samples": 5,
+            "median": 3.7200737350212876,
+            "min": 3.530577767000068,
+            "max": 4.009631858993089
+          },
+          "warm_command_seconds": {
+            "samples": 15,
+            "median": 0.0706471859884914,
+            "min": 0.06182167201768607,
+            "max": 0.1416697170061525
+          },
+          "source_overlay_allocated_bytes": {
+            "samples": 5,
+            "median": 7000064,
+            "min": 7000064,
+            "max": 7000064
+          },
+          "source_overlay_apparent_bytes": {
+            "samples": 5,
+            "median": 70754633,
+            "min": 70754626,
+            "max": 70754633
+          }
+        }
+      },
+      "pairs": [
+        {
+          "trial": 1,
+          "checkout_seconds": 9.83507967100013,
+          "vfs_seconds": 6.03422617301112,
+          "vfs_saving_seconds": 3.80085349798901,
+          "speedup": 1.6298825050656591
+        },
+        {
+          "trial": 2,
+          "checkout_seconds": 9.271863956993911,
+          "vfs_seconds": 5.9682309750060085,
+          "vfs_saving_seconds": 3.303632981987903,
+          "speedup": 1.5535363821914712
+        },
+        {
+          "trial": 3,
+          "checkout_seconds": 9.872506276005879,
+          "vfs_seconds": 5.655103397992207,
+          "vfs_saving_seconds": 4.217402878013672,
+          "speedup": 1.7457693663940828
+        },
+        {
+          "trial": 4,
+          "checkout_seconds": 9.653527396003483,
+          "vfs_seconds": 6.221523108979454,
+          "vfs_saving_seconds": 3.4320042870240286,
+          "speedup": 1.5516340977775451
+        },
+        {
+          "trial": 5,
+          "checkout_seconds": 9.321805450017564,
+          "vfs_seconds": 6.102841701009311,
+          "vfs_saving_seconds": 3.218963749008253,
+          "speedup": 1.5274532597619055
+        }
+      ],
+      "vfs_cells": [
+        {
+          "trial": 1,
+          "metadata": {
+            "source": "github",
+            "http_requests": 1,
+            "http_bytes": 4217464,
+            "cached_blobs": 0,
+            "learned_blobs": 11850,
+            "total_unique_blobs": 11850,
+            "pinned_commit": "c9af12d1db12d1b2df2137feb9ea8d39e3a25c79",
+            "pinned_tree": "27ef12c1012f715ecd20b35f7492198ac0433093"
+          },
+          "prefetch": {
+            "paths": 704,
+            "blobs": {
+              "requested_blobs": 701,
+              "already_local_blobs": 0,
+              "fetched_blobs": 701,
+              "fetch_batches": 1
+            },
+            "discovery_waves": 1,
+            "skipped_discovery": []
+          },
+          "availability_by_phase": {
+            "after_first_build": {
+              "present_blobs": 701,
+              "present_logical_unique_bytes": 3523195,
+              "private_available_blobs": 701,
+              "private_only_blobs": 0,
+              "private_only_logical_unique_bytes": 0,
+              "union_present_blobs": 701,
+              "union_present_logical_unique_bytes": 3523195
+            },
+            "after_warm_build_1": {
+              "present_blobs": 701,
+              "present_logical_unique_bytes": 3523195,
+              "private_available_blobs": 701,
+              "private_only_blobs": 0,
+              "private_only_logical_unique_bytes": 0,
+              "union_present_blobs": 701,
+              "union_present_logical_unique_bytes": 3523195
+            },
+            "after_warm_build_2": {
+              "present_blobs": 701,
+              "present_logical_unique_bytes": 3523195,
+              "private_available_blobs": 701,
+              "private_only_blobs": 0,
+              "private_only_logical_unique_bytes": 0,
+              "union_present_blobs": 701,
+              "union_present_logical_unique_bytes": 3523195
+            },
+            "after_warm_build_3": {
+              "present_blobs": 701,
+              "present_logical_unique_bytes": 3523195,
+              "private_available_blobs": 701,
+              "private_only_blobs": 0,
+              "private_only_logical_unique_bytes": 0,
+              "union_present_blobs": 701,
+              "union_present_logical_unique_bytes": 3523195
+            },
+            "after_post_build_query": {
+              "present_blobs": 701,
+              "present_logical_unique_bytes": 3523195,
+              "private_available_blobs": 701,
+              "private_only_blobs": 0,
+              "private_only_logical_unique_bytes": 0,
+              "union_present_blobs": 701,
+              "union_present_logical_unique_bytes": 3523195
+            }
+          },
+          "native_process_starts_by_phase": {
+            "mount_or_handover": {
+              "rev-parse": 4,
+              "other": 7,
+              "ls-tree": 1,
+              "init": 1,
+              "config": 17
+            },
+            "first_build": {
+              "cat-file": 1
+            }
+          },
+          "private_allocated_bytes": {
+            "overlay": 5107712,
+            "git_admin": 1880064,
+            "git_object_files_excluding_alternates_metadata": 0
+          }
+        },
+        {
+          "trial": 2,
+          "metadata": {
+            "source": "github",
+            "http_requests": 1,
+            "http_bytes": 4217464,
+            "cached_blobs": 0,
+            "learned_blobs": 11850,
+            "total_unique_blobs": 11850,
+            "pinned_commit": "c9af12d1db12d1b2df2137feb9ea8d39e3a25c79",
+            "pinned_tree": "27ef12c1012f715ecd20b35f7492198ac0433093"
+          },
+          "prefetch": {
+            "paths": 704,
+            "blobs": {
+              "requested_blobs": 701,
+              "already_local_blobs": 0,
+              "fetched_blobs": 701,
+              "fetch_batches": 1
+            },
+            "discovery_waves": 1,
+            "skipped_discovery": []
+          },
+          "availability_by_phase": {
+            "after_first_build": {
+              "present_blobs": 701,
+              "present_logical_unique_bytes": 3523195,
+              "private_available_blobs": 701,
+              "private_only_blobs": 0,
+              "private_only_logical_unique_bytes": 0,
+              "union_present_blobs": 701,
+              "union_present_logical_unique_bytes": 3523195
+            },
+            "after_warm_build_1": {
+              "present_blobs": 701,
+              "present_logical_unique_bytes": 3523195,
+              "private_available_blobs": 701,
+              "private_only_blobs": 0,
+              "private_only_logical_unique_bytes": 0,
+              "union_present_blobs": 701,
+              "union_present_logical_unique_bytes": 3523195
+            },
+            "after_warm_build_2": {
+              "present_blobs": 701,
+              "present_logical_unique_bytes": 3523195,
+              "private_available_blobs": 701,
+              "private_only_blobs": 0,
+              "private_only_logical_unique_bytes": 0,
+              "union_present_blobs": 701,
+              "union_present_logical_unique_bytes": 3523195
+            },
+            "after_warm_build_3": {
+              "present_blobs": 701,
+              "present_logical_unique_bytes": 3523195,
+              "private_available_blobs": 701,
+              "private_only_blobs": 0,
+              "private_only_logical_unique_bytes": 0,
+              "union_present_blobs": 701,
+              "union_present_logical_unique_bytes": 3523195
+            },
+            "after_post_build_query": {
+              "present_blobs": 701,
+              "present_logical_unique_bytes": 3523195,
+              "private_available_blobs": 701,
+              "private_only_blobs": 0,
+              "private_only_logical_unique_bytes": 0,
+              "union_present_blobs": 701,
+              "union_present_logical_unique_bytes": 3523195
+            }
+          },
+          "native_process_starts_by_phase": {
+            "mount_or_handover": {
+              "rev-parse": 4,
+              "other": 7,
+              "ls-tree": 1,
+              "init": 1,
+              "config": 17
+            },
+            "first_build": {
+              "cat-file": 1
+            }
+          },
+          "private_allocated_bytes": {
+            "overlay": 5107712,
+            "git_admin": 1880064,
+            "git_object_files_excluding_alternates_metadata": 0
+          }
+        },
+        {
+          "trial": 3,
+          "metadata": {
+            "source": "github",
+            "http_requests": 1,
+            "http_bytes": 4217464,
+            "cached_blobs": 0,
+            "learned_blobs": 11850,
+            "total_unique_blobs": 11850,
+            "pinned_commit": "c9af12d1db12d1b2df2137feb9ea8d39e3a25c79",
+            "pinned_tree": "27ef12c1012f715ecd20b35f7492198ac0433093"
+          },
+          "prefetch": {
+            "paths": 704,
+            "blobs": {
+              "requested_blobs": 701,
+              "already_local_blobs": 0,
+              "fetched_blobs": 701,
+              "fetch_batches": 1
+            },
+            "discovery_waves": 1,
+            "skipped_discovery": []
+          },
+          "availability_by_phase": {
+            "after_first_build": {
+              "present_blobs": 701,
+              "present_logical_unique_bytes": 3523195,
+              "private_available_blobs": 701,
+              "private_only_blobs": 0,
+              "private_only_logical_unique_bytes": 0,
+              "union_present_blobs": 701,
+              "union_present_logical_unique_bytes": 3523195
+            },
+            "after_warm_build_1": {
+              "present_blobs": 701,
+              "present_logical_unique_bytes": 3523195,
+              "private_available_blobs": 701,
+              "private_only_blobs": 0,
+              "private_only_logical_unique_bytes": 0,
+              "union_present_blobs": 701,
+              "union_present_logical_unique_bytes": 3523195
+            },
+            "after_warm_build_2": {
+              "present_blobs": 701,
+              "present_logical_unique_bytes": 3523195,
+              "private_available_blobs": 701,
+              "private_only_blobs": 0,
+              "private_only_logical_unique_bytes": 0,
+              "union_present_blobs": 701,
+              "union_present_logical_unique_bytes": 3523195
+            },
+            "after_warm_build_3": {
+              "present_blobs": 701,
+              "present_logical_unique_bytes": 3523195,
+              "private_available_blobs": 701,
+              "private_only_blobs": 0,
+              "private_only_logical_unique_bytes": 0,
+              "union_present_blobs": 701,
+              "union_present_logical_unique_bytes": 3523195
+            },
+            "after_post_build_query": {
+              "present_blobs": 701,
+              "present_logical_unique_bytes": 3523195,
+              "private_available_blobs": 701,
+              "private_only_blobs": 0,
+              "private_only_logical_unique_bytes": 0,
+              "union_present_blobs": 701,
+              "union_present_logical_unique_bytes": 3523195
+            }
+          },
+          "native_process_starts_by_phase": {
+            "mount_or_handover": {
+              "rev-parse": 4,
+              "other": 7,
+              "ls-tree": 1,
+              "init": 1,
+              "config": 17
+            },
+            "first_build": {
+              "cat-file": 1
+            }
+          },
+          "private_allocated_bytes": {
+            "overlay": 5107712,
+            "git_admin": 1880064,
+            "git_object_files_excluding_alternates_metadata": 0
+          }
+        },
+        {
+          "trial": 4,
+          "metadata": {
+            "source": "github",
+            "http_requests": 1,
+            "http_bytes": 4217464,
+            "cached_blobs": 0,
+            "learned_blobs": 11850,
+            "total_unique_blobs": 11850,
+            "pinned_commit": "c9af12d1db12d1b2df2137feb9ea8d39e3a25c79",
+            "pinned_tree": "27ef12c1012f715ecd20b35f7492198ac0433093"
+          },
+          "prefetch": {
+            "paths": 704,
+            "blobs": {
+              "requested_blobs": 701,
+              "already_local_blobs": 0,
+              "fetched_blobs": 701,
+              "fetch_batches": 1
+            },
+            "discovery_waves": 1,
+            "skipped_discovery": []
+          },
+          "availability_by_phase": {
+            "after_first_build": {
+              "present_blobs": 701,
+              "present_logical_unique_bytes": 3523195,
+              "private_available_blobs": 701,
+              "private_only_blobs": 0,
+              "private_only_logical_unique_bytes": 0,
+              "union_present_blobs": 701,
+              "union_present_logical_unique_bytes": 3523195
+            },
+            "after_warm_build_1": {
+              "present_blobs": 701,
+              "present_logical_unique_bytes": 3523195,
+              "private_available_blobs": 701,
+              "private_only_blobs": 0,
+              "private_only_logical_unique_bytes": 0,
+              "union_present_blobs": 701,
+              "union_present_logical_unique_bytes": 3523195
+            },
+            "after_warm_build_2": {
+              "present_blobs": 701,
+              "present_logical_unique_bytes": 3523195,
+              "private_available_blobs": 701,
+              "private_only_blobs": 0,
+              "private_only_logical_unique_bytes": 0,
+              "union_present_blobs": 701,
+              "union_present_logical_unique_bytes": 3523195
+            },
+            "after_warm_build_3": {
+              "present_blobs": 701,
+              "present_logical_unique_bytes": 3523195,
+              "private_available_blobs": 701,
+              "private_only_blobs": 0,
+              "private_only_logical_unique_bytes": 0,
+              "union_present_blobs": 701,
+              "union_present_logical_unique_bytes": 3523195
+            },
+            "after_post_build_query": {
+              "present_blobs": 701,
+              "present_logical_unique_bytes": 3523195,
+              "private_available_blobs": 701,
+              "private_only_blobs": 0,
+              "private_only_logical_unique_bytes": 0,
+              "union_present_blobs": 701,
+              "union_present_logical_unique_bytes": 3523195
+            }
+          },
+          "native_process_starts_by_phase": {
+            "mount_or_handover": {
+              "rev-parse": 4,
+              "other": 7,
+              "ls-tree": 1,
+              "init": 1,
+              "config": 17
+            },
+            "first_build": {
+              "cat-file": 1
+            }
+          },
+          "private_allocated_bytes": {
+            "overlay": 5107712,
+            "git_admin": 1880064,
+            "git_object_files_excluding_alternates_metadata": 0
+          }
+        },
+        {
+          "trial": 5,
+          "metadata": {
+            "source": "github",
+            "http_requests": 1,
+            "http_bytes": 4217464,
+            "cached_blobs": 0,
+            "learned_blobs": 11850,
+            "total_unique_blobs": 11850,
+            "pinned_commit": "c9af12d1db12d1b2df2137feb9ea8d39e3a25c79",
+            "pinned_tree": "27ef12c1012f715ecd20b35f7492198ac0433093"
+          },
+          "prefetch": {
+            "paths": 704,
+            "blobs": {
+              "requested_blobs": 701,
+              "already_local_blobs": 0,
+              "fetched_blobs": 701,
+              "fetch_batches": 1
+            },
+            "discovery_waves": 1,
+            "skipped_discovery": []
+          },
+          "availability_by_phase": {
+            "after_first_build": {
+              "present_blobs": 701,
+              "present_logical_unique_bytes": 3523195,
+              "private_available_blobs": 701,
+              "private_only_blobs": 0,
+              "private_only_logical_unique_bytes": 0,
+              "union_present_blobs": 701,
+              "union_present_logical_unique_bytes": 3523195
+            },
+            "after_warm_build_1": {
+              "present_blobs": 701,
+              "present_logical_unique_bytes": 3523195,
+              "private_available_blobs": 701,
+              "private_only_blobs": 0,
+              "private_only_logical_unique_bytes": 0,
+              "union_present_blobs": 701,
+              "union_present_logical_unique_bytes": 3523195
+            },
+            "after_warm_build_2": {
+              "present_blobs": 701,
+              "present_logical_unique_bytes": 3523195,
+              "private_available_blobs": 701,
+              "private_only_blobs": 0,
+              "private_only_logical_unique_bytes": 0,
+              "union_present_blobs": 701,
+              "union_present_logical_unique_bytes": 3523195
+            },
+            "after_warm_build_3": {
+              "present_blobs": 701,
+              "present_logical_unique_bytes": 3523195,
+              "private_available_blobs": 701,
+              "private_only_blobs": 0,
+              "private_only_logical_unique_bytes": 0,
+              "union_present_blobs": 701,
+              "union_present_logical_unique_bytes": 3523195
+            },
+            "after_post_build_query": {
+              "present_blobs": 701,
+              "present_logical_unique_bytes": 3523195,
+              "private_available_blobs": 701,
+              "private_only_blobs": 0,
+              "private_only_logical_unique_bytes": 0,
+              "union_present_blobs": 701,
+              "union_present_logical_unique_bytes": 3523195
+            }
+          },
+          "native_process_starts_by_phase": {
+            "mount_or_handover": {
+              "rev-parse": 4,
+              "other": 7,
+              "ls-tree": 1,
+              "init": 1,
+              "config": 17
+            },
+            "first_build": {
+              "cat-file": 1
+            }
+          },
+          "private_allocated_bytes": {
+            "overlay": 5107712,
+            "git_admin": 1880064,
+            "git_object_files_excluding_alternates_metadata": 0
+          }
+        }
+      ],
+      "cross_arm_trial_output_consistency": {
+        "verified": true,
+        "cells": 10,
+        "build_commands": 40,
+        "reference_source": "config.golden_build_outputs",
+        "outputs": [
+          {
+            "path": "bazel-bin/src/main/cpp/util/libstrings.a",
+            "sha256": "2744043bb632d44940cc70cd1f834421e0928499f16551e6f3facddc49645335",
+            "size_bytes": 142284
+          },
+          {
+            "path": "bazel-bin/src/main/cpp/util/libstrings.so",
+            "sha256": "6bdbbf97c39b8bc83c82ec06ec6ced7854f807c80c6faf795ab044d3f76350e8",
+            "size_bytes": 89384
+          }
+        ]
+      },
+      "build_evidence": [
+        {
+          "trial": 1,
+          "variant": "checkout",
+          "phases": {
+            "first_build": {
+              "valid_action_summary": true,
+              "actions_executed": 4,
+              "content_actions_executed": 3,
+              "verified_content_noop": false
+            },
+            "warm_build_1": {
+              "valid_action_summary": true,
+              "actions_executed": 1,
+              "content_actions_executed": 0,
+              "verified_content_noop": true
+            },
+            "warm_build_2": {
+              "valid_action_summary": true,
+              "actions_executed": 1,
+              "content_actions_executed": 0,
+              "verified_content_noop": true
+            },
+            "warm_build_3": {
+              "valid_action_summary": true,
+              "actions_executed": 1,
+              "content_actions_executed": 0,
+              "verified_content_noop": true
+            }
+          },
+          "matches_global_path_hash_size_reference": true
+        },
+        {
+          "trial": 1,
+          "variant": "vfs",
+          "phases": {
+            "first_build": {
+              "valid_action_summary": true,
+              "actions_executed": 4,
+              "content_actions_executed": 3,
+              "verified_content_noop": false
+            },
+            "warm_build_1": {
+              "valid_action_summary": true,
+              "actions_executed": 1,
+              "content_actions_executed": 0,
+              "verified_content_noop": true
+            },
+            "warm_build_2": {
+              "valid_action_summary": true,
+              "actions_executed": 1,
+              "content_actions_executed": 0,
+              "verified_content_noop": true
+            },
+            "warm_build_3": {
+              "valid_action_summary": true,
+              "actions_executed": 1,
+              "content_actions_executed": 0,
+              "verified_content_noop": true
+            }
+          },
+          "matches_global_path_hash_size_reference": true
+        },
+        {
+          "trial": 2,
+          "variant": "vfs",
+          "phases": {
+            "first_build": {
+              "valid_action_summary": true,
+              "actions_executed": 4,
+              "content_actions_executed": 3,
+              "verified_content_noop": false
+            },
+            "warm_build_1": {
+              "valid_action_summary": true,
+              "actions_executed": 1,
+              "content_actions_executed": 0,
+              "verified_content_noop": true
+            },
+            "warm_build_2": {
+              "valid_action_summary": true,
+              "actions_executed": 1,
+              "content_actions_executed": 0,
+              "verified_content_noop": true
+            },
+            "warm_build_3": {
+              "valid_action_summary": true,
+              "actions_executed": 1,
+              "content_actions_executed": 0,
+              "verified_content_noop": true
+            }
+          },
+          "matches_global_path_hash_size_reference": true
+        },
+        {
+          "trial": 2,
+          "variant": "checkout",
+          "phases": {
+            "first_build": {
+              "valid_action_summary": true,
+              "actions_executed": 4,
+              "content_actions_executed": 3,
+              "verified_content_noop": false
+            },
+            "warm_build_1": {
+              "valid_action_summary": true,
+              "actions_executed": 1,
+              "content_actions_executed": 0,
+              "verified_content_noop": true
+            },
+            "warm_build_2": {
+              "valid_action_summary": true,
+              "actions_executed": 1,
+              "content_actions_executed": 0,
+              "verified_content_noop": true
+            },
+            "warm_build_3": {
+              "valid_action_summary": true,
+              "actions_executed": 1,
+              "content_actions_executed": 0,
+              "verified_content_noop": true
+            }
+          },
+          "matches_global_path_hash_size_reference": true
+        },
+        {
+          "trial": 3,
+          "variant": "checkout",
+          "phases": {
+            "first_build": {
+              "valid_action_summary": true,
+              "actions_executed": 4,
+              "content_actions_executed": 3,
+              "verified_content_noop": false
+            },
+            "warm_build_1": {
+              "valid_action_summary": true,
+              "actions_executed": 1,
+              "content_actions_executed": 0,
+              "verified_content_noop": true
+            },
+            "warm_build_2": {
+              "valid_action_summary": true,
+              "actions_executed": 1,
+              "content_actions_executed": 0,
+              "verified_content_noop": true
+            },
+            "warm_build_3": {
+              "valid_action_summary": true,
+              "actions_executed": 1,
+              "content_actions_executed": 0,
+              "verified_content_noop": true
+            }
+          },
+          "matches_global_path_hash_size_reference": true
+        },
+        {
+          "trial": 3,
+          "variant": "vfs",
+          "phases": {
+            "first_build": {
+              "valid_action_summary": true,
+              "actions_executed": 4,
+              "content_actions_executed": 3,
+              "verified_content_noop": false
+            },
+            "warm_build_1": {
+              "valid_action_summary": true,
+              "actions_executed": 1,
+              "content_actions_executed": 0,
+              "verified_content_noop": true
+            },
+            "warm_build_2": {
+              "valid_action_summary": true,
+              "actions_executed": 1,
+              "content_actions_executed": 0,
+              "verified_content_noop": true
+            },
+            "warm_build_3": {
+              "valid_action_summary": true,
+              "actions_executed": 1,
+              "content_actions_executed": 0,
+              "verified_content_noop": true
+            }
+          },
+          "matches_global_path_hash_size_reference": true
+        },
+        {
+          "trial": 4,
+          "variant": "vfs",
+          "phases": {
+            "first_build": {
+              "valid_action_summary": true,
+              "actions_executed": 4,
+              "content_actions_executed": 3,
+              "verified_content_noop": false
+            },
+            "warm_build_1": {
+              "valid_action_summary": true,
+              "actions_executed": 1,
+              "content_actions_executed": 0,
+              "verified_content_noop": true
+            },
+            "warm_build_2": {
+              "valid_action_summary": true,
+              "actions_executed": 1,
+              "content_actions_executed": 0,
+              "verified_content_noop": true
+            },
+            "warm_build_3": {
+              "valid_action_summary": true,
+              "actions_executed": 1,
+              "content_actions_executed": 0,
+              "verified_content_noop": true
+            }
+          },
+          "matches_global_path_hash_size_reference": true
+        },
+        {
+          "trial": 4,
+          "variant": "checkout",
+          "phases": {
+            "first_build": {
+              "valid_action_summary": true,
+              "actions_executed": 4,
+              "content_actions_executed": 3,
+              "verified_content_noop": false
+            },
+            "warm_build_1": {
+              "valid_action_summary": true,
+              "actions_executed": 1,
+              "content_actions_executed": 0,
+              "verified_content_noop": true
+            },
+            "warm_build_2": {
+              "valid_action_summary": true,
+              "actions_executed": 1,
+              "content_actions_executed": 0,
+              "verified_content_noop": true
+            },
+            "warm_build_3": {
+              "valid_action_summary": true,
+              "actions_executed": 1,
+              "content_actions_executed": 0,
+              "verified_content_noop": true
+            }
+          },
+          "matches_global_path_hash_size_reference": true
+        },
+        {
+          "trial": 5,
+          "variant": "checkout",
+          "phases": {
+            "first_build": {
+              "valid_action_summary": true,
+              "actions_executed": 4,
+              "content_actions_executed": 3,
+              "verified_content_noop": false
+            },
+            "warm_build_1": {
+              "valid_action_summary": true,
+              "actions_executed": 1,
+              "content_actions_executed": 0,
+              "verified_content_noop": true
+            },
+            "warm_build_2": {
+              "valid_action_summary": true,
+              "actions_executed": 1,
+              "content_actions_executed": 0,
+              "verified_content_noop": true
+            },
+            "warm_build_3": {
+              "valid_action_summary": true,
+              "actions_executed": 1,
+              "content_actions_executed": 0,
+              "verified_content_noop": true
+            }
+          },
+          "matches_global_path_hash_size_reference": true
+        },
+        {
+          "trial": 5,
+          "variant": "vfs",
+          "phases": {
+            "first_build": {
+              "valid_action_summary": true,
+              "actions_executed": 4,
+              "content_actions_executed": 3,
+              "verified_content_noop": false
+            },
+            "warm_build_1": {
+              "valid_action_summary": true,
+              "actions_executed": 1,
+              "content_actions_executed": 0,
+              "verified_content_noop": true
+            },
+            "warm_build_2": {
+              "valid_action_summary": true,
+              "actions_executed": 1,
+              "content_actions_executed": 0,
+              "verified_content_noop": true
+            },
+            "warm_build_3": {
+              "valid_action_summary": true,
+              "actions_executed": 1,
+              "content_actions_executed": 0,
+              "verified_content_noop": true
+            }
+          },
+          "matches_global_path_hash_size_reference": true
+        }
+      ],
+      "verified_content_noop_builds": 30,
+      "failures": 0,
+      "exclusions": 0,
+      "paired_statistics": {
+        "vfs_wins": 5,
+        "saving_seconds": {
+          "samples": 5,
+          "median": 3.4320042870240286,
+          "min": 3.218963749008253,
+          "max": 4.217402878013672
+        },
+        "speedup": {
+          "samples": 5,
+          "median": 1.5535363821914712,
+          "min": 1.5274532597619055,
+          "max": 1.7457693663940828
+        },
+        "ratio_of_medians_reduction_percent": 37.492007579433995
+      },
+      "prefetch_policy": "Explicit 21 project/target includes, one batch; two speculative patches add 9,260 bytes",
+      "tuning_details": {
+        "configured_includes": 21,
+        "query_survey_includes": 18,
+        "observed_build_source_includes": 3,
+        "unique_prefetched_blobs": 701,
+        "prefetched_paths": 704,
+        "native_fetch_batches": 1,
+        "first_build_demand_fetches": 0,
+        "union_logical_blob_bytes": 3523195,
+        "extra_unique_blobs_over_default_first_build": 2,
+        "extra_logical_bytes_over_default_first_build": 9260,
+        "speculative_paths": [
+          "third_party/apple_support.patch",
+          "third_party/def_parser/def_parser.patch"
+        ],
+        "interpretation": "Project/target-specific configuration, not universal default. Primary comparison is matched checkout. Prior default first-build measurements are time-separated and also differ in TTL; they do not isolate a prefetch causal effect."
+      }
+    }
+  },
+  "build_output_reference": [
+    {
+      "path": "bazel-bin/src/main/cpp/util/libstrings.a",
+      "sha256": "2744043bb632d44940cc70cd1f834421e0928499f16551e6f3facddc49645335",
+      "size_bytes": 142284
+    },
+    {
+      "path": "bazel-bin/src/main/cpp/util/libstrings.so",
+      "sha256": "6bdbbf97c39b8bc83c82ec06ec6ced7854f807c80c6faf795ab044d3f76350e8",
+      "size_bytes": 89384
+    }
+  ],
+  "totals": {
+    "golden_queries": 90,
+    "verified_build_commands": 60,
+    "verified_content_noop_builds": 30,
+    "metadata_http_requests": 15,
+    "metadata_http_response_bytes": 63261960,
+    "additional_causal_ablation_golden_queries": 10
+  },
+  "limitations": [
+    "Shared archive/dependency and Bazel installation caches explicitly warm; source/output bases fresh; OS cache not dropped.",
+    "Logical blob bytes are not native Git transport bytes; encrypted Git transfer volume was not measured.",
+    "Persistent Git process lifetime spans phases; process-start counts are valid but nested wall sums are not additive critical-path time.",
+    "Git commit was not part of these timed matrices; separate native-commit compatibility and hydration evidence is required."
+  ],
+  "cleanup": {
+    "completed_cells": 30,
+    "successful_shutdown_commands": 30,
+    "recorded_cleanup_errors": 0,
+    "basis": "Existing successful shutdown commands and completed-cell records; completion follows mount teardown and unmounted check. Aggregation performs no new process or mount probes.",
+    "final_live_audit": {
+      "remaining_artifact_mounts": 0,
+      "remaining_artifact_processes": 0,
+      "diagnostic_leftover_detected_and_removed": true,
+      "correction": "One disconnected tracing mount remained after its tracer/daemon exited. Normal untraced fusermount3 -u removed it; final live mountinfo/proc verification supersedes the earlier diagnostic teardown flag. Timed matrices unaffected."
+    }
+  },
+  "full_snapshot": {
+    "unique_blobs": 11850,
+    "blob_paths": 14232,
+    "logical_blob_bytes": 138576774
+  },
+  "positive_ttl_ablation": {
+    "scope": "Populated-source causal comparison of TTL0/4096 batching versus positiveTTL1+in-band kernel coherence/4096 batching; not freshGitHub clone",
+    "complete": true,
+    "binary_sha256": {
+      "ttl-zero": "4294101f420a234f9827dfdc40ce189c9060382003433f58feea7c04b68052ab",
+      "ttl-one": "7156c37bae6cb86dbe5b3df159efceeaaf31532fd01b02c026cbd988b125ebb4"
+    },
+    "summary": {
+      "ttl-zero": {
+        "query_median": 3.411543995985994,
+        "query_min": 3.25356853500125,
+        "query_max": 3.7809719009965193,
+        "cpu_median": 0.66,
+        "cpu_min": 0.65,
+        "cpu_max": 0.96,
+        "rss_median_bytes": 27324416
+      },
+      "ttl-one": {
+        "query_median": 2.635261786985211,
+        "query_min": 2.5539985620125663,
+        "query_max": 2.8268106050090864,
+        "cpu_median": 0.15000000000000002,
+        "cpu_min": 0.13,
+        "cpu_max": 0.16000000000000003,
+        "rss_median_bytes": 27594752
+      }
+    },
+    "paired_gate": {
+      "pairs": [
+        {
+          "trial": 1,
+          "ttl_zero_seconds": 3.25356853500125,
+          "ttl_one_seconds": 2.559948971000267,
+          "saved_seconds": 0.6936195640009828,
+          "gain_percent": 21.318732233212856
+        },
+        {
+          "trial": 2,
+          "ttl_zero_seconds": 3.411543995985994,
+          "ttl_one_seconds": 2.635261786985211,
+          "saved_seconds": 0.776282209000783,
+          "gain_percent": 22.754571241471687
+        },
+        {
+          "trial": 3,
+          "ttl_zero_seconds": 3.503643739997642,
+          "ttl_one_seconds": 2.643539418000728,
+          "saved_seconds": 0.8601043219969142,
+          "gain_percent": 24.54885216147841
+        },
+        {
+          "trial": 4,
+          "ttl_zero_seconds": 3.2707110379997175,
+          "ttl_one_seconds": 2.5539985620125663,
+          "saved_seconds": 0.7167124759871513,
+          "gain_percent": 21.913047886537665
+        },
+        {
+          "trial": 5,
+          "ttl_zero_seconds": 3.7809719009965193,
+          "ttl_one_seconds": 2.8268106050090864,
+          "saved_seconds": 0.9541612959874328,
+          "gain_percent": 25.235873763990483
+        }
+      ],
+      "median_gain_percent": 22.754571241471687,
+      "all_pairs_improve": true,
+      "policy": "Proceed only with >=5% median paired query gain, all five pairs improving, and correctness/fetch/cleanup checks passing.",
+      "passed": true
+    },
+    "golden_queries": 10,
+    "all_lifecycle_fetches_zero": true,
+    "source_blob_count_before": 699,
+    "source_blob_count_after": 699,
+    "cleanup_checks_passed": true
+  },
+  "project_prefetch": {
+    "query": {
+      "commit": "c9af12d1db12d1b2df2137feb9ea8d39e3a25c79",
+      "selection": "Pinned-tree survey: all .patch, .cfg, requirements*.txt; frozen before timing. Explicit project configuration, not proposed default.",
+      "paths": [
+        {
+          "path": "bazel_downloader.cfg",
+          "oid": "99a15d355ebec04e8386d852d040b9ddc2f53ff5",
+          "size_bytes": 313,
+          "speculative": false
+        },
+        {
+          "path": "requirements.txt",
+          "oid": "b8dcd87f3eefea08dff2340a1dd92120c30385e1",
+          "size_bytes": 327,
+          "speculative": false
+        },
+        {
+          "path": "third_party/apple_support.patch",
+          "oid": "fa2a5fdcb78535df4cdf3e84e90bfc50638c4298",
+          "size_bytes": 660,
+          "speculative": true
+        },
+        {
+          "path": "third_party/def_parser/def_parser.patch",
+          "oid": "56679bf2348fe47a0165c812afcbe8da98eca970",
+          "size_bytes": 8600,
+          "speculative": true
+        },
+        {
+          "path": "third_party/googleapis.patch",
+          "oid": "2079a76499a99f45c8e18c78c5b256da025e4e9d",
+          "size_bytes": 12272,
+          "speculative": false
+        },
+        {
+          "path": "third_party/grpc-java-12207.patch",
+          "oid": "d63fc0e9993dd39da1b9023b809c42ff43077e60",
+          "size_bytes": 3527,
+          "speculative": false
+        },
+        {
+          "path": "third_party/grpc-java-12222.patch",
+          "oid": "f227be107ae427a550135389aaaec8c9564d5bc7",
+          "size_bytes": 3313,
+          "speculative": false
+        },
+        {
+          "path": "third_party/grpc-java-addloads.patch",
+          "oid": "5a1da4c85859402c721be704fd8f626a4d11a5a9",
+          "size_bytes": 9458,
+          "speculative": false
+        },
+        {
+          "path": "third_party/grpc-java.patch",
+          "oid": "b3d2410a4455ee300b8fba75e8280d81d26504df",
+          "size_bytes": 2731,
+          "speculative": false
+        },
+        {
+          "path": "third_party/grpc-load-fixes.patch",
+          "oid": "1d62b35fb15ed1adbe30abb1f0c9e27be69506bd",
+          "size_bytes": 1699,
+          "speculative": false
+        },
+        {
+          "path": "third_party/protobuf.patch",
+          "oid": "ee9ffa1b29b4657c8d4a007cf1515a2e31543c72",
+          "size_bytes": 10149,
+          "speculative": false
+        },
+        {
+          "path": "third_party/rules_graalvm_bazel9_fixes.patch",
+          "oid": "c71b44a121a2980dc8d58ca4aff4ee5d408c7be3",
+          "size_bytes": 13986,
+          "speculative": false
+        },
+        {
+          "path": "third_party/rules_graalvm_fix.patch",
+          "oid": "eec1f9d910d45191ef392f7b6d19f9e65030be71",
+          "size_bytes": 2411,
+          "speculative": false
+        },
+        {
+          "path": "third_party/rules_graalvm_graalvm25.patch",
+          "oid": "32bc6d0d9aa08b87f4f143134865d062248930fa",
+          "size_bytes": 6176,
+          "speculative": false
+        },
+        {
+          "path": "third_party/rules_graalvm_load_fix.patch",
+          "oid": "7465bb32da6644c3d1aac3a8c0217808ed4d807c",
+          "size_bytes": 1423,
+          "speculative": false
+        },
+        {
+          "path": "third_party/rules_graalvm_unicode.patch",
+          "oid": "d4b0dc3f790fe47bd2bc7fe53eb12c4bf31b7baa",
+          "size_bytes": 2359,
+          "speculative": false
+        },
+        {
+          "path": "third_party/rules_jvm_external_6.8_bazel_vendor.patch",
+          "oid": "e61a977baca035ea1002536039057398e23a4a5f",
+          "size_bytes": 7644,
+          "speculative": false
+        },
+        {
+          "path": "third_party/rules_jvm_external_6.8_exec_jar_tools.patch",
+          "oid": "dd32e5fd12ce9bec7963ec787e4e701da551e96a",
+          "size_bytes": 3632,
+          "speculative": false
+        }
+      ],
+      "unique_logical_bytes": 90680,
+      "speculative_logical_bytes": 9260
+    },
+    "strings_build": {
+      "commit": "c9af12d1db12d1b2df2137feb9ea8d39e3a25c79",
+      "selection": "Explicit pinned-project prefetch configuration:18 previously frozen query includes plus3 observed source inputs of //src/main/cpp/util:strings. Not a universal default.",
+      "paths": [
+        {
+          "path": "bazel_downloader.cfg",
+          "oid": "99a15d355ebec04e8386d852d040b9ddc2f53ff5",
+          "size_bytes": 313,
+          "speculative": false
+        },
+        {
+          "path": "requirements.txt",
+          "oid": "b8dcd87f3eefea08dff2340a1dd92120c30385e1",
+          "size_bytes": 327,
+          "speculative": false
+        },
+        {
+          "path": "third_party/apple_support.patch",
+          "oid": "fa2a5fdcb78535df4cdf3e84e90bfc50638c4298",
+          "size_bytes": 660,
+          "speculative": true
+        },
+        {
+          "path": "third_party/def_parser/def_parser.patch",
+          "oid": "56679bf2348fe47a0165c812afcbe8da98eca970",
+          "size_bytes": 8600,
+          "speculative": true
+        },
+        {
+          "path": "third_party/googleapis.patch",
+          "oid": "2079a76499a99f45c8e18c78c5b256da025e4e9d",
+          "size_bytes": 12272,
+          "speculative": false
+        },
+        {
+          "path": "third_party/grpc-java-12207.patch",
+          "oid": "d63fc0e9993dd39da1b9023b809c42ff43077e60",
+          "size_bytes": 3527,
+          "speculative": false
+        },
+        {
+          "path": "third_party/grpc-java-12222.patch",
+          "oid": "f227be107ae427a550135389aaaec8c9564d5bc7",
+          "size_bytes": 3313,
+          "speculative": false
+        },
+        {
+          "path": "third_party/grpc-java-addloads.patch",
+          "oid": "5a1da4c85859402c721be704fd8f626a4d11a5a9",
+          "size_bytes": 9458,
+          "speculative": false
+        },
+        {
+          "path": "third_party/grpc-java.patch",
+          "oid": "b3d2410a4455ee300b8fba75e8280d81d26504df",
+          "size_bytes": 2731,
+          "speculative": false
+        },
+        {
+          "path": "third_party/grpc-load-fixes.patch",
+          "oid": "1d62b35fb15ed1adbe30abb1f0c9e27be69506bd",
+          "size_bytes": 1699,
+          "speculative": false
+        },
+        {
+          "path": "third_party/protobuf.patch",
+          "oid": "ee9ffa1b29b4657c8d4a007cf1515a2e31543c72",
+          "size_bytes": 10149,
+          "speculative": false
+        },
+        {
+          "path": "third_party/rules_graalvm_bazel9_fixes.patch",
+          "oid": "c71b44a121a2980dc8d58ca4aff4ee5d408c7be3",
+          "size_bytes": 13986,
+          "speculative": false
+        },
+        {
+          "path": "third_party/rules_graalvm_fix.patch",
+          "oid": "eec1f9d910d45191ef392f7b6d19f9e65030be71",
+          "size_bytes": 2411,
+          "speculative": false
+        },
+        {
+          "path": "third_party/rules_graalvm_graalvm25.patch",
+          "oid": "32bc6d0d9aa08b87f4f143134865d062248930fa",
+          "size_bytes": 6176,
+          "speculative": false
+        },
+        {
+          "path": "third_party/rules_graalvm_load_fix.patch",
+          "oid": "7465bb32da6644c3d1aac3a8c0217808ed4d807c",
+          "size_bytes": 1423,
+          "speculative": false
+        },
+        {
+          "path": "third_party/rules_graalvm_unicode.patch",
+          "oid": "d4b0dc3f790fe47bd2bc7fe53eb12c4bf31b7baa",
+          "size_bytes": 2359,
+          "speculative": false
+        },
+        {
+          "path": "third_party/rules_jvm_external_6.8_bazel_vendor.patch",
+          "oid": "e61a977baca035ea1002536039057398e23a4a5f",
+          "size_bytes": 7644,
+          "speculative": false
+        },
+        {
+          "path": "third_party/rules_jvm_external_6.8_exec_jar_tools.patch",
+          "oid": "dd32e5fd12ce9bec7963ec787e4e701da551e96a",
+          "size_bytes": 3632,
+          "speculative": false
+        },
+        {
+          "path": "src/main/cpp/util/strings.cc",
+          "oid": "77385f31bfa98cff88aa7fabf075cafcdeade01e",
+          "size_bytes": 11331,
+          "speculative": false,
+          "reason": "Observed source input of pinned //src/main/cpp/util:strings build; explicit target-specific configuration"
+        },
+        {
+          "path": "src/main/cpp/util/strings.h",
+          "oid": "b2da41b3043f233038de07d61762d7f06f19d388",
+          "size_bytes": 5681,
+          "speculative": false,
+          "reason": "Observed source input of pinned //src/main/cpp/util:strings build; explicit target-specific configuration"
+        },
+        {
+          "path": "src/main/cpp/util/exit_code.h",
+          "oid": "4b18bc6b01e4a38a9eb85814136f09e81d72e757",
+          "size_bytes": 1805,
+          "speculative": false,
+          "reason": "Observed source input of pinned //src/main/cpp/util:strings build; explicit target-specific configuration"
+        }
+      ],
+      "unique_logical_bytes": 109497,
+      "speculative_logical_bytes": 9260,
+      "build_source_logical_bytes": 18817
+    }
+  },
+  "tuned_additional_paths_relative_to_default_query": [
+    {
+      "path": "src/main/cpp/util/exit_code.h",
+      "gitsha1": "4b18bc6b01e4a38a9eb85814136f09e81d72e757",
+      "mode": "100644",
+      "size_bytes": 1805,
+      "prefetch_reasons": [
+        "explicit include"
+      ],
+      "explicit_include": true,
+      "speculative": false
+    },
+    {
+      "path": "src/main/cpp/util/strings.cc",
+      "gitsha1": "77385f31bfa98cff88aa7fabf075cafcdeade01e",
+      "mode": "100644",
+      "size_bytes": 11331,
+      "prefetch_reasons": [
+        "explicit include"
+      ],
+      "explicit_include": true,
+      "speculative": false
+    },
+    {
+      "path": "src/main/cpp/util/strings.h",
+      "gitsha1": "b2da41b3043f233038de07d61762d7f06f19d388",
+      "mode": "100644",
+      "size_bytes": 5681,
+      "prefetch_reasons": [
+        "explicit include"
+      ],
+      "explicit_include": true,
+      "speculative": false
+    },
+    {
+      "path": "third_party/apple_support.patch",
+      "gitsha1": "fa2a5fdcb78535df4cdf3e84e90bfc50638c4298",
+      "mode": "100644",
+      "size_bytes": 660,
+      "prefetch_reasons": [
+        "explicit include"
+      ],
+      "explicit_include": true,
+      "speculative": true
+    },
+    {
+      "path": "third_party/def_parser/def_parser.patch",
+      "gitsha1": "56679bf2348fe47a0165c812afcbe8da98eca970",
+      "mode": "100644",
+      "size_bytes": 8600,
+      "prefetch_reasons": [
+        "explicit include"
+      ],
+      "explicit_include": true,
+      "speculative": true
+    }
+  ],
+  "secondary_experiments": {
+    "native_size_batch_ablation": {
+      "scope": "Five rotated pairs, same warm proxy, fresh clients, size-only not Bazel end-to-end",
+      "batch128_median_seconds": 4.919961,
+      "batch4096_median_seconds": 0.331571,
+      "remote_requests_before_after": [
+        93,
+        3
+      ],
+      "blobs_hydrated": 0
+    },
+    "final_warm_proxy": {
+      "scope": "Three fresh clients against one warm mirror; not a cold proxy result or paired direct comparison",
+      "clone_to_query_seconds": [
+        3.412704,
+        3.262494,
+        3.059412
+      ],
+      "median_seconds": 3.262494,
+      "warm_query_median_seconds": 0.054477,
+      "build_after_queries_median_seconds": 1.386229,
+      "startup_refresh_and_fixture_seconds_separate": 1.741896,
+      "server_allocated_bytes": 1844244480,
+      "client_overlay_allocated_bytes": 7053312,
+      "golden_queries": 12,
+      "golden_builds": 3,
+      "private_only_blobs": 0
+    },
+    "historical_cold_proxy": {
+      "scope": "Actual full GitHub mirror; OLD128-OID/TTL0 client, not final candidate cold total",
+      "mirror_clone_seconds": 97.234,
+      "clone_to_query_seconds": 106.096,
+      "mirror_pack_bytes": 1793964858
+    },
+    "fuse_header_counts": {
+      "scope": "Device-header trace counts only, traced wall not performance",
+      "cold_ttl_zero": 412954,
+      "cold_ttl_one": 37458,
+      "warm_ttl_zero": 59,
+      "warm_ttl_one": 20,
+      "successful_headers_all_parsed": true,
+      "shutdown_reads_without_header_per_run": 1
+    },
+    "http_compression_probe": {
+      "scope": "Three paired curl HTTP1.1 requests per mode, transfer-only not VFS/Bazel end-to-end",
+      "summary": {
+        "plain": {
+          "ttfb_seconds": 0.052252,
+          "total_seconds": 0.180325,
+          "download_after_headers_seconds": 0.12807300000000002,
+          "encoded_body_bytes": 4217464
+        },
+        "compressed": {
+          "ttfb_seconds": 0.049046,
+          "total_seconds": 0.119174,
+          "download_after_headers_seconds": 0.07083600000000001,
+          "encoded_body_bytes": 738838
+        }
+      }
+    }
+  },
+  "validation_note": "An initial workspace run reported a namespace-reopen test failure, with its error chain truncated in tool output. Targeted rerun, ten integration reproduction suites, and the complete workspace rerun passed. No cause was established and no speculative fix or retry-budget change was applied."
+}

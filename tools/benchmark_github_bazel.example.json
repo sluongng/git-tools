@@ -1,0 +1,50 @@
+{
+  "source": "https://github.com/bazelbuild/bazel.git",
+  "commit": "c9af12d1db12d1b2df2137feb9ea8d39e3a25c79",
+  "bazel_version": "bazel 9.2.0",
+  "query_expression": "//...",
+  "query_flags": [
+    "--output=label",
+    "--lockfile_mode=off",
+    "--noshow_progress",
+    "--color=no",
+    "--curses=no"
+  ],
+  "golden_label_count": 4213,
+  "golden_labels_sha256": "56d7a2f6140674159f5252bccc16411b6ec59f5eb30bb46571381491a32883fa",
+  "workspace_rc_enabled": true,
+  "build_target": "//src/main/cpp/util:strings",
+  "build_flags": [
+    "--jobs=8",
+    "--remote_cache=",
+    "--remote_executor=",
+    "--disk_cache="
+  ],
+  "build_output_paths": [
+    "bazel-bin/src/main/cpp/util/libstrings.a",
+    "bazel-bin/src/main/cpp/util/libstrings.so"
+  ],
+  "warm_sizes_command": [
+    "{vfs}",
+    "--git",
+    "{git}",
+    "warm-sizes",
+    "--repo",
+    "{repo}"
+  ],
+  "prefetch_command": [
+    "{vfs}",
+    "--git",
+    "{git}",
+    "prefetch-bazel",
+    "--repo",
+    "{repo}"
+  ],
+  "git": "git",
+  "bazel": "bazel",
+  "vfs_binary": "target/release/git-vfs",
+  "repository_cache": "/tmp/git-vfs-benchmark/repository-cache",
+  "output_user_root": "/tmp/git-vfs-benchmark/bazel-root",
+  "pilot_dependencies_warm_verified": false,
+  "metadata_mode": "production-warm-sizes"
+}
