@@ -6,6 +6,7 @@ use std::collections::HashMap;
 use std::ffi::OsString;
 use std::os::unix::ffi::OsStringExt;
 use std::path::{Component, Path, PathBuf};
+use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -60,11 +61,12 @@ pub struct FileMetadata {
     pub digest_hex: Option<String>,
 }
 
+/// Clones share immutable tree records and path lookup storage.
 #[derive(Clone)]
 pub struct Snapshot {
     pub commit: String,
-    pub(crate) nodes: Vec<Node>,
-    paths: HashMap<PathBuf, u64>,
+    pub(crate) nodes: Arc<Vec<Node>>,
+    paths: Arc<HashMap<PathBuf, u64>>,
     pub(crate) timestamp: SystemTime,
 }
 
@@ -111,23 +113,19 @@ impl Snapshot {
             UNIX_EPOCH.checked_sub(Duration::from_secs(seconds.unsigned_abs()))
         }
         .context("commit timestamp is out of range")?;
-        let mut snapshot = Self {
-            commit,
-            nodes: vec![Node {
-                inode: 1,
-                parent: 1,
-                path: PathBuf::new(),
-                name: OsString::new(),
-                mode: 0o040000,
-                kind: Kind::Directory,
-                oid: None,
-                children: Vec::new(),
-            }],
-            paths: HashMap::from([(PathBuf::new(), 1)]),
-            timestamp,
-        };
+        let mut nodes = vec![Node {
+            inode: 1,
+            parent: 1,
+            path: PathBuf::new(),
+            name: OsString::new(),
+            mode: 0o040000,
+            kind: Kind::Directory,
+            oid: None,
+            children: Vec::new(),
+        }];
+        let mut paths = HashMap::from([(PathBuf::new(), 1)]);
         let tree = repo.git_output(
-            &["ls-tree", "-r", "-t", "-z", "--full-tree", &snapshot.commit],
+            &["ls-tree", "-r", "-t", "-z", "--full-tree", &commit],
             false,
         )?;
         for record in tree.split(|&b| b == 0).filter(|r| !r.is_empty()) {
@@ -170,22 +168,21 @@ impl Snapshot {
                 "unsafe Git tree path"
             );
             let parent_path = path.parent().unwrap_or(Path::new(""));
-            let parent = *snapshot
-                .paths
+            let parent = *paths
                 .get(parent_path)
                 .context("tree entry missing parent")?;
             ensure!(
-                snapshot.node(parent)?.kind == Kind::Directory,
+                nodes[(parent - 1) as usize].kind == Kind::Directory,
                 "tree entry below non-directory"
             );
-            ensure!(!snapshot.paths.contains_key(&path), "duplicate tree path");
-            let inode = snapshot.nodes.len() as u64 + 1;
+            ensure!(!paths.contains_key(&path), "duplicate tree path");
+            let inode = nodes.len() as u64 + 1;
             let name = path
                 .file_name()
                 .context("tree path missing name")?
                 .to_owned();
-            snapshot.paths.insert(path.clone(), inode);
-            snapshot.nodes.push(Node {
+            paths.insert(path.clone(), inode);
+            nodes.push(Node {
                 inode,
                 parent,
                 path,
@@ -195,9 +192,14 @@ impl Snapshot {
                 oid: Some(fields[2].to_owned()),
                 children: Vec::new(),
             });
-            snapshot.nodes[(parent - 1) as usize].children.push(inode);
+            nodes[(parent - 1) as usize].children.push(inode);
         }
-        Ok(snapshot)
+        Ok(Self {
+            commit,
+            nodes: Arc::new(nodes),
+            paths: Arc::new(paths),
+            timestamp,
+        })
     }
 
     pub fn node(&self, inode: u64) -> Result<&Node> {

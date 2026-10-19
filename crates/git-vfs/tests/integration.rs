@@ -2180,6 +2180,15 @@ fn writable_mount_native_git_status_uses_journal_and_survives_remount() {
         .unwrap();
     idle_file.sync_all().unwrap();
     let idle_directory = fs::read_dir(fixture.mount.join("new-dir")).unwrap();
+    let user_config = "arbitrary user value\nwith 'quotes' and \"escapes\"";
+    git(
+        &fixture.mount,
+        &["config", "--local", "agent.fixture", user_config],
+    );
+    let config_modified = fs::metadata(overlay.join("git/config"))
+        .unwrap()
+        .modified()
+        .unwrap();
     let (journal_token, _) = git_vfs::overlay::changes_since(&overlay, "").unwrap();
     let shutdown_started = Instant::now();
     assert_eq!(
@@ -2201,6 +2210,19 @@ fn writable_mount_native_git_status_uses_journal_and_survives_remount() {
     // Immediate reacquisition proves the daemon joined its filesystem/database
     // owner before returning, rather than leaving a detached session behind.
     let mounted = writable_mount(&fixture, &overlay);
+    assert_eq!(
+        git(&fixture.mount, &["config", "--local", "agent.fixture"]).stdout,
+        format!("{user_config}\n").as_bytes(),
+        "remount preserves unrelated native Git configuration"
+    );
+    assert_eq!(
+        fs::metadata(overlay.join("git/config"))
+            .unwrap()
+            .modified()
+            .unwrap(),
+        config_modified,
+        "unchanged remount does not rewrite native Git configuration"
+    );
     assert_eq!(
         git_vfs::overlay::changes_since(&overlay, &journal_token).unwrap(),
         (journal_token, vec![])

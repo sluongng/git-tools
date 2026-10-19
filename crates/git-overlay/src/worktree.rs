@@ -121,6 +121,27 @@ impl WorkingTree {
                 Err(error) => return Err(error).context("read initial shallow boundary"),
             }
         }
+        // A remount normally keeps every managed value unchanged. Read them in
+        // one process instead of taking Git's config lock and rewriting the
+        // config once per setting. Keep Git as the writer for changed values:
+        // it preserves arbitrary user config and provides atomic lock/rename.
+        let local_config = if fresh {
+            // All managed settings must be initialized; do not add a config
+            // read to the first mount's critical path.
+            Vec::new()
+        } else {
+            self.git(
+                repo,
+                mountpoint,
+                &[
+                    "config".into(),
+                    "--local".into(),
+                    "--null".into(),
+                    "--list".into(),
+                ],
+                None,
+            )?
+        };
         for (key, value) in [
             ("core.bare", "false"),
             ("core.filemode", "true"),
@@ -135,36 +156,23 @@ impl WorkingTree {
             ("core.ignorecase", "false"),
             ("core.ignorestat", "false"),
         ] {
-            self.git(
-                repo,
-                mountpoint,
-                &["config".into(), "--local".into(), key.into(), value.into()],
-                None,
-            )?;
+            self.set_config(repo, mountpoint, &local_config, key, OsStr::new(value))?;
         }
-        self.git(
+        self.set_config(
             repo,
             mountpoint,
-            &[
-                "config".into(),
-                "--local".into(),
-                "core.worktree".into(),
-                mountpoint.as_os_str().to_owned(),
-            ],
-            None,
+            &local_config,
+            "core.worktree",
+            mountpoint.as_os_str(),
         )?;
         let hooks = self.gitdir.join("hooks");
         fs::create_dir_all(&hooks)?;
-        self.git(
+        self.set_config(
             repo,
             mountpoint,
-            &[
-                "config".into(),
-                "--local".into(),
-                "core.hooksPath".into(),
-                hooks.as_os_str().to_owned(),
-            ],
-            None,
+            &local_config,
+            "core.hooksPath",
+            hooks.as_os_str(),
         )?;
         // Copy configured promisor transports into the isolated admin directory without printing URLs.
         // The object store is shared read-only through alternates; user refs and index are isolated.
@@ -201,17 +209,14 @@ impl WorkingTree {
         script.extend_from_slice(b" \"$@\"\n");
         fs::write(&hook, script)?;
         fs::set_permissions(&hook, fs::Permissions::from_mode(0o700))?;
-        self.git(
+        // Git treats this config as a shell command, not an argv pathname.
+        let hook_command = OsString::from_vec(shell_quote(hook.as_os_str()));
+        self.set_config(
             repo,
             mountpoint,
-            &[
-                "config".into(),
-                "--local".into(),
-                "core.fsmonitor".into(),
-                // Git treats this config as a shell command, not an argv pathname.
-                OsString::from_vec(shell_quote(hook.as_os_str())),
-            ],
-            None,
+            &local_config,
+            "core.fsmonitor",
+            &hook_command,
         )?;
         if fresh {
             // Never checkout files or refresh the empty stat cache: that would hydrate every blob.
@@ -276,6 +281,31 @@ impl WorkingTree {
         Ok(())
     }
 
+    fn set_config(
+        &self,
+        repo: &GitRepo,
+        mountpoint: &Path,
+        local_config: &[u8],
+        key: &str,
+        value: &OsStr,
+    ) -> Result<()> {
+        if config_value_matches(local_config, key, value) {
+            return Ok(());
+        }
+        self.git(
+            repo,
+            mountpoint,
+            &[
+                "config".into(),
+                "--local".into(),
+                key.into(),
+                value.to_owned(),
+            ],
+            None,
+        )?;
+        Ok(())
+    }
+
     fn git(
         &self,
         repo: &GitRepo,
@@ -291,6 +321,21 @@ impl WorkingTree {
             input,
         )
     }
+}
+
+// `git config --null --list` separates each key from its optional value by
+// newline and each record by NUL. Values may themselves contain newlines;
+// valueless booleans must not compare equal to an explicit managed string.
+// Only skip a write for one exact value, retaining Git's existing behavior
+// (including errors) for duplicate settings.
+fn config_value_matches(config: &[u8], key: &str, value: &OsStr) -> bool {
+    let mut matches = config.split(|&byte| byte == 0).filter_map(|record| {
+        let split = record.iter().position(|&byte| byte == b'\n');
+        let name = split.map_or(record, |split| &record[..split]);
+        name.eq_ignore_ascii_case(key.as_bytes())
+            .then(|| split.map(|split| &record[split + 1..]))
+    });
+    matches.next() == Some(Some(value.as_bytes())) && matches.next().is_none()
 }
 
 fn run(

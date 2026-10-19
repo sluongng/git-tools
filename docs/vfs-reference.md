@@ -56,7 +56,23 @@ that cache. Reply-budget saturation returns `EAGAIN`; very small budgets can rej
 ordinary kernel read ranges. Native Git working memory and serialized first-write
 copy-up are outside these limits. See the [lifecycle design and measurements](design/vfs-iteration-lifecycle.md).
 
+Decoded overlay-entry metadata has an independent LRU limit: 4,096 entries and
+4 MiB of estimated entry bytes by default. Set `GIT_VFS_METADATA_CACHE_ENTRIES`
+and `GIT_VFS_METADATA_CACHE_BYTES` before mounting; zero disables residency.
+Evicted records reload from Fjall without changing durable inode identities.
+Overlay statistics expose resident entries/estimated bytes, configured limits,
+hits, misses and evictions. Estimates exclude allocator overhead, caller-held
+entry guards and Fjall pages. Namespace summaries/indexes and the immutable Git
+snapshot still scale with repository size; this is not a whole-mount RSS bound.
+Snapshot clones share immutable tree and path storage, avoiding a second full
+metadata copy for prefetch, but initial snapshot construction is still eager.
+
 ## Native Git status from filesystem state
+
+On remount, managed Git settings are read once and already-matching single values
+are left untouched. Changed values still use native Git setters; custom settings
+are preserved. Git readiness remains blocking; this does not eliminate index
+bootstrap work.
 
 In another terminal:
 
@@ -253,15 +269,19 @@ standalone command; `--prefetch-no-discover` disables literal input discovery.
 Invalid includes fail before mount. Prefetch is optional; ordinary mounts remain
 fully lazy.
 
-Background prefetch and demand reads share a content-transfer lock. An early
-content read waits for an active batch, then reuses its objects. Metadata does
-not take that lock, but FUSE dispatch is serial: a waiting content read also
-queues later filesystem requests. This first implementation also delays
-already-local blob reads behind an active batch. Failure is reported without
-taking down the mount; later reads can still fetch on demand. Unmount cancels
-and reaps native Git process groups in the shared shutdown scope. This overlaps
-work; it does not eliminate transfer
-time. Benchmark clone-to-successful-query/build, not just mount readiness.
+Background prefetch and demand reads share the demand-prioritized scheduler.
+Already-local reads continue while remote batches wait; overlapping object reads
+coalesce, and foreground demand can promote queued speculation. Failed prefetch
+does not take down the mount. Unmount cancels and reaps native Git process groups.
+This overlaps work; it does not eliminate transfer time. Benchmark
+clone-to-successful-query/build, not just mount readiness.
+
+Content scheduler statistics attribute successful remote object counts and
+uncompressed blob bytes by dispatch cause (demand or prefetch), plus demand queue,
+completion and fetch-service latency buckets. These are not network-byte or pure
+network-latency measurements. A bounded recent-object window records later demand
+for completed speculative fetches; unobserved or evicted records do not prove the
+bytes will never be used, and native Git reads bypass this observation.
 
 `query` loads packages; `aquery` additionally analyzes the action graph. Neither is
 a substitute for validating action-input digests during a real build. Even with

@@ -16,8 +16,10 @@ use sha1::{Digest, Sha1};
 use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::ffi::{OsStr, OsString};
+use std::ops::Deref;
 use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
+use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -63,14 +65,137 @@ pub struct Entry {
     pub linked: bool,
     pub control: bool,
 }
+/// Owned view of decoded metadata. Eviction never invalidates a caller's view.
+#[derive(Debug)]
+pub struct EntryGuard(Arc<Entry>);
+impl Deref for EntryGuard {
+    type Target = Entry;
+    fn deref(&self) -> &Entry {
+        &self.0
+    }
+}
+
+#[derive(Clone, Copy)]
+struct EntrySummary {
+    linked: bool,
+    control: bool,
+    payload_bytes: u64,
+}
+impl From<&Entry> for EntrySummary {
+    fn from(e: &Entry) -> Self {
+        Self {
+            linked: e.linked,
+            control: e.control,
+            payload_bytes: e.payload.size().unwrap_or(0),
+        }
+    }
+}
+
+/// Limits apply to cached decoded metadata, not namespace indexes, the Git tree,
+/// Fjall pages, or temporary caller-held guards. Zero disables residency.
+#[derive(Clone, Copy, Debug)]
+pub struct MetadataCacheConfig {
+    pub entries: usize,
+    pub bytes: usize,
+}
+impl Default for MetadataCacheConfig {
+    fn default() -> Self {
+        Self {
+            entries: 4096,
+            bytes: 4 * 1024 * 1024,
+        }
+    }
+}
+struct MetadataCache {
+    config: MetadataCacheConfig,
+    entries: HashMap<u64, (Arc<Entry>, u64, usize)>,
+    recency: BTreeMap<u64, u64>,
+    clock: u64,
+    bytes: usize,
+    hits: u64,
+    misses: u64,
+    evictions: u64,
+}
+impl MetadataCache {
+    fn new(config: MetadataCacheConfig) -> Self {
+        Self {
+            config,
+            entries: HashMap::new(),
+            recency: BTreeMap::new(),
+            clock: 0,
+            bytes: 0,
+            hits: 0,
+            misses: 0,
+            evictions: 0,
+        }
+    }
+    fn tick(&mut self) -> u64 {
+        // Renormalization also keeps pathological long-lived sessions correct.
+        if self.clock == u64::MAX {
+            let ordered: Vec<_> = self.recency.values().copied().collect();
+            self.recency.clear();
+            for (index, inode) in ordered.into_iter().enumerate() {
+                let tick = index as u64;
+                self.entries.get_mut(&inode).unwrap().1 = tick;
+                self.recency.insert(tick, inode);
+            }
+            self.clock = self.entries.len() as u64;
+        }
+        self.clock += 1;
+        self.clock
+    }
+    fn get(&mut self, inode: u64) -> Option<Arc<Entry>> {
+        if !self.entries.contains_key(&inode) {
+            self.misses += 1;
+            return None;
+        }
+        self.hits += 1;
+        let tick = self.tick();
+        let (entry, previous, _) = self.entries.get_mut(&inode).unwrap();
+        self.recency.remove(previous);
+        *previous = tick;
+        self.recency.insert(tick, inode);
+        Some(entry.clone())
+    }
+    fn remove(&mut self, inode: u64) {
+        if let Some((_, tick, bytes)) = self.entries.remove(&inode) {
+            self.recency.remove(&tick);
+            self.bytes -= bytes;
+        }
+    }
+    fn insert(&mut self, entry: Arc<Entry>) {
+        self.remove(entry.inode);
+        let bytes = std::mem::size_of::<Entry>()
+            + entry.name.as_bytes().len()
+            + entry.base_oid.as_ref().map_or(0, String::len)
+            + match &entry.payload {
+                Payload::Inline(bytes) => bytes.len(),
+                _ => 0,
+            };
+        if self.config.entries == 0 || bytes > self.config.bytes {
+            return;
+        }
+        while self.entries.len() >= self.config.entries || self.bytes > self.config.bytes - bytes {
+            let (_, inode) = self.recency.first_key_value().unwrap();
+            let inode = *inode;
+            self.remove(inode);
+            self.evictions += 1;
+        }
+        let tick = self.tick();
+        self.bytes += bytes;
+        self.recency.insert(tick, entry.inode);
+        self.entries.insert(entry.inode, (entry, tick, bytes));
+    }
+}
 pub struct Overlay {
     database: fjall::Store,
-    entries: BTreeMap<u64, Entry>,
+    entries: BTreeMap<u64, EntrySummary>,
+    metadata: RefCell<MetadataCache>,
     namespace: HashMap<u64, DirectoryIndex>,
     // Only inodes already unlinked at exclusive open are reclaimed. Inodes
     // unlinked during this session retain their open-descriptor semantics.
     reclaimed: HashSet<u64>,
-    base_inodes: HashSet<u64>,
+    base_inode_highwater: u64,
     dependencies: HashMap<u64, usize>,
     lifetime: lifetime::Lifetime,
     online_reclaimed_payload_bytes: u64,
@@ -97,6 +222,13 @@ struct CachedDigests {
 #[derive(Clone, Debug, Default, serde::Serialize)]
 pub struct OverlayStats {
     pub entry_count: u64,
+    pub metadata_resident_entries: u64,
+    pub metadata_cache_max_entries: u64,
+    pub metadata_cache_max_estimated_bytes: u64,
+    pub metadata_resident_estimated_bytes: u64,
+    pub metadata_cache_hits: u64,
+    pub metadata_cache_misses: u64,
+    pub metadata_cache_evictions: u64,
     pub linked_entries: u64,
     pub tombstone_entries: u64,
     pub live_payload_bytes: u64,
@@ -232,9 +364,45 @@ impl Overlay {
     pub fn open(directory: &Path, snapshot: &Snapshot, gitdir: &Path) -> Result<Self> {
         reject_legacy_overlay(directory)?;
         std::fs::create_dir_all(directory)?;
-        let (database, entries) = fjall::Store::open(directory, snapshot, gitdir)?;
+        let config = MetadataCacheConfig {
+            entries: std::env::var("GIT_VFS_METADATA_CACHE_ENTRIES")
+                .ok()
+                .map(|v| v.parse())
+                .transpose()
+                .context("invalid metadata cache entry limit")?
+                .unwrap_or(MetadataCacheConfig::default().entries),
+            bytes: std::env::var("GIT_VFS_METADATA_CACHE_BYTES")
+                .ok()
+                .map(|v| v.parse())
+                .transpose()
+                .context("invalid metadata cache byte limit")?
+                .unwrap_or(MetadataCacheConfig::default().bytes),
+        };
+        Self::open_with_metadata_cache(directory, snapshot, gitdir, config)
+    }
+    pub fn open_with_metadata_cache(
+        directory: &Path,
+        snapshot: &Snapshot,
+        gitdir: &Path,
+        config: MetadataCacheConfig,
+    ) -> Result<Self> {
+        reject_legacy_overlay(directory)?;
+        std::fs::create_dir_all(directory)?;
+        let base_inode_highwater = snapshot.nodes().len() as u64;
+        ensure!(
+            snapshot
+                .nodes()
+                .iter()
+                .enumerate()
+                .all(|(i, n)| n.inode == i as u64 + 1),
+            "base snapshot inode allocation must be contiguous"
+        );
+        let mut entries = BTreeMap::new();
         let mut namespace: HashMap<u64, DirectoryIndex> = HashMap::new();
-        for entry in entries.values() {
+        let lifetime = lifetime::Lifetime::default();
+        let mut dependencies = HashMap::new();
+        let mut unlinked_inodes = BTreeSet::new();
+        let database = fjall::Store::open(directory, snapshot, gitdir, |entry| {
             if let Some(binding) = Binding::from_entry(entry) {
                 let index = namespace.entry(binding.parent).or_default();
                 ensure!(
@@ -243,34 +411,33 @@ impl Overlay {
                 );
                 index.insert(binding);
             }
-        }
-        let reclaimed = entries
-            .values()
-            .filter(|e| !e.linked && !e.control)
-            .map(|e| e.inode)
-            .collect();
-        let lifetime = lifetime::Lifetime::default();
-        let mut dependencies = HashMap::new();
-        for entry in entries.values() {
             if entry.inode != 1 {
                 *dependencies.entry(entry.parent).or_insert(0) += 1;
             }
             if entry.control || entry.inode == 1 {
                 lifetime.protect(entry.inode);
             }
-        }
-        let unlinked_inodes: BTreeSet<_> = entries
-            .values()
-            .filter(|e| !e.linked && !e.control)
-            .map(|e| e.inode)
-            .collect();
+            if entry.control {
+                ensure!(
+                    entry.inode > base_inode_highwater,
+                    "control overlaps base inode range"
+                );
+            }
+            if !entry.linked && !entry.control {
+                unlinked_inodes.insert(entry.inode);
+            }
+            entries.insert(entry.inode, EntrySummary::from(entry));
+            Ok(())
+        })?;
+        let reclaimed = unlinked_inodes.iter().copied().collect();
         let gc_ready = unlinked_inodes.clone();
         let mut overlay = Self {
             database,
             entries,
             namespace,
             reclaimed,
-            base_inodes: snapshot.nodes().iter().map(|n| n.inode).collect(),
+            base_inode_highwater,
+            metadata: RefCell::new(MetadataCache::new(config)),
             dependencies,
             lifetime,
             online_reclaimed_payload_bytes: 0,
@@ -326,7 +493,7 @@ impl Overlay {
                 continue;
             }
             let entry = self.entry(inode)?.clone();
-            let remove = !self.base_inodes.contains(&inode)
+            let remove = inode > self.base_inode_highwater
                 && self.dependencies.get(&inode).copied().unwrap_or(0) == 0;
             if !remove && matches!(entry.payload, Payload::None) {
                 continue;
@@ -339,6 +506,7 @@ impl Overlay {
                 self.reclaimed.remove(&inode);
                 self.unlinked_inodes.remove(&inode);
                 self.entries.remove(&inode);
+                self.metadata.borrow_mut().remove(inode);
                 self.reclaimed_entries += 1;
                 let count = self
                     .dependencies
@@ -355,7 +523,9 @@ impl Overlay {
                 }
             } else {
                 self.reclaimed.insert(inode);
-                self.entries.get_mut(&inode).unwrap().payload = Payload::None;
+                let mut entry = entry;
+                entry.payload = Payload::None;
+                self.publish_entry(entry);
             }
         }
         Ok(())
@@ -364,7 +534,15 @@ impl Overlay {
     pub fn stats(&self) -> OverlayStats {
         let (pending_items, pending_bytes, _, fallbacks, failed) = self.database.retirement_stats();
         let (lookups, opens, pins, errors) = self.lifetime.stats();
+        let metadata = self.metadata.borrow();
         let mut stats = OverlayStats {
+            metadata_resident_entries: metadata.entries.len() as u64,
+            metadata_cache_max_entries: metadata.config.entries as u64,
+            metadata_cache_max_estimated_bytes: metadata.config.bytes as u64,
+            metadata_resident_estimated_bytes: metadata.bytes as u64,
+            metadata_cache_hits: metadata.hits,
+            metadata_cache_misses: metadata.misses,
+            metadata_cache_evictions: metadata.evictions,
             online_reclaimed_payload_bytes: self.online_reclaimed_payload_bytes,
             reclaimed_entries: self.reclaimed_entries,
             gc_visited_entries: self.gc_visited_entries,
@@ -405,7 +583,7 @@ impl Overlay {
                 stats.tombstone_entries += 1;
             }
             if !entry.control {
-                let bytes = entry.payload.size().unwrap_or(0);
+                let bytes = entry.payload_bytes;
                 if entry.linked {
                     stats.live_payload_bytes += bytes;
                 } else {
@@ -416,15 +594,33 @@ impl Overlay {
         stats
     }
     /// Reject reclaimed inode content rather than resurrecting its base blob.
-    pub fn content_entry(&self, ino: u64) -> Result<&Entry> {
+    pub fn content_entry(&self, ino: u64) -> Result<EntryGuard> {
         self.database.check_healthy()?;
         if self.reclaimed.contains(&ino) {
             return Err(error(libc::ENOENT));
         }
         self.entry(ino)
     }
-    pub fn entry(&self, ino: u64) -> Result<&Entry> {
-        self.entries.get(&ino).ok_or_else(|| error(libc::ENOENT))
+    pub fn entry(&self, ino: u64) -> Result<EntryGuard> {
+        self.database.check_healthy()?;
+        if !self.entries.contains_key(&ino) {
+            return Err(error(libc::ENOENT));
+        }
+        if let Some(entry) = self.metadata.borrow_mut().get(ino) {
+            return Ok(EntryGuard(entry));
+        }
+        let entry = Arc::new(
+            self.database
+                .read_entry(ino)?
+                .context("overlay metadata record missing")?,
+        );
+        ensure!(entry.inode == ino, "overlay entry key mismatch");
+        self.metadata.borrow_mut().insert(entry.clone());
+        Ok(EntryGuard(entry))
+    }
+    fn publish_entry(&mut self, entry: Entry) {
+        self.entries.insert(entry.inode, EntrySummary::from(&entry));
+        self.metadata.borrow_mut().insert(Arc::new(entry));
     }
     pub fn lookup(&self, parent: u64, name: &OsStr) -> Result<u64> {
         let p = self.entry(parent)?;
@@ -623,7 +819,7 @@ impl Overlay {
         while i != 1 {
             ensure!(seen.insert(i), "overlay parent cycle");
             let e = self.entry(i)?;
-            names.push(e.name.as_bytes());
+            names.push(e.name.as_bytes().to_vec());
             i = e.parent;
         }
         let mut path = Vec::new();
@@ -631,7 +827,7 @@ impl Overlay {
             if !path.is_empty() {
                 path.push(b'/');
             }
-            path.extend_from_slice(name);
+            path.extend_from_slice(&name);
         }
         Ok(path)
     }
@@ -646,18 +842,24 @@ impl Overlay {
         self.database.check_healthy()?;
         let mut post_entries = HashMap::with_capacity(changed.len());
         let mut deltas = Vec::new();
+        let mut previous_entries = HashMap::new();
         for entry in &changed {
             ensure!(
                 post_entries.insert(entry.inode, entry).is_none(),
                 "duplicate changed overlay inode"
             );
-            let old = self.entries.get(&entry.inode);
-            if !Binding::unchanged(old, entry) {
+            let old = self.database.read_entry(entry.inode)?;
+            ensure!(
+                old.is_some() == self.entries.contains_key(&entry.inode),
+                "overlay identity summary mismatch"
+            );
+            if !Binding::unchanged(old.as_ref(), entry) {
                 deltas.push((
-                    old.and_then(Binding::from_entry),
+                    old.as_ref().and_then(Binding::from_entry),
                     Binding::from_entry(entry),
                 ));
             }
+            previous_entries.insert(entry.inode, old);
         }
 
         // Validate the final namespace before its durable transaction. A rename
@@ -682,11 +884,13 @@ impl Overlay {
         let mut added = HashSet::with_capacity(deltas.len());
         for (_, new) in &deltas {
             if let Some(new) = new {
-                let parent = post_entries
-                    .get(&new.parent)
-                    .copied()
-                    .or_else(|| self.entries.get(&new.parent))
-                    .context("missing overlay namespace parent")?;
+                let parent_guard;
+                let parent = if let Some(parent) = post_entries.get(&new.parent) {
+                    *parent
+                } else {
+                    parent_guard = self.entry(new.parent)?;
+                    &parent_guard
+                };
                 ensure!(
                     parent.linked && parent.kind.is_dir(),
                     "invalid overlay namespace parent"
@@ -735,16 +939,14 @@ impl Overlay {
             }
         }
         for entry in changed {
-            if !entry.linked
-                && !entry.control
-                && self.entries.get(&entry.inode).is_none_or(|old| old.linked)
-            {
+            let previous = previous_entries.remove(&entry.inode).flatten();
+            if !entry.linked && !entry.control && previous.as_ref().is_none_or(|old| old.linked) {
                 self.unlinked_inodes.insert(entry.inode);
                 self.gc_ready.insert(entry.inode);
             }
-            if !self.entries.contains_key(&entry.inode) && entry.inode != 1 {
+            if previous.is_none() && entry.inode != 1 {
                 *self.dependencies.entry(entry.parent).or_insert(0) += 1;
-            } else if let Some(previous) = self.entries.get(&entry.inode)
+            } else if let Some(previous) = previous.as_ref()
                 && previous.parent != entry.parent
             {
                 let count = self.dependencies.get_mut(&previous.parent).unwrap();
@@ -754,7 +956,7 @@ impl Overlay {
                 }
                 *self.dependencies.entry(entry.parent).or_insert(0) += 1;
             }
-            self.entries.insert(entry.inode, entry);
+            self.publish_entry(entry);
         }
         Ok(())
     }
@@ -834,7 +1036,9 @@ impl Overlay {
         repo: &mut GitRepo,
     ) -> Result<()> {
         if matches!(self.entry(ino)?.payload, Payload::File { .. }) {
-            return self.database.mutate(self.entry(ino)?, after, paths, write);
+            return self
+                .database
+                .mutate(&*self.entry(ino)?, after, paths, write);
         }
         let Payload::File { size, .. } = after.payload else {
             anyhow::bail!("copy-up target missing")
@@ -847,7 +1051,7 @@ impl Overlay {
             self.read(ino, repo)?
         };
         self.database
-            .copy_up(self.entry(ino)?, after, paths, &old, write)
+            .copy_up(&*self.entry(ino)?, after, paths, &old, write)
     }
     pub fn write(
         &mut self,
@@ -888,7 +1092,7 @@ impl Overlay {
         };
         self.change_payload(ino, &e, &paths, Some((offset, data)), repo)?;
         self.digests.borrow_mut().remove(&ino);
-        self.entries.insert(ino, e);
+        self.publish_entry(e);
         Ok(data.len())
     }
     pub fn setattr(
@@ -935,7 +1139,7 @@ impl Overlay {
         if size.is_some() {
             self.change_payload(ino, &e, &paths, None, repo)?;
             self.digests.borrow_mut().remove(&ino);
-            self.entries.insert(ino, e);
+            self.publish_entry(e);
             Ok(())
         } else {
             self.commit(vec![e], paths)

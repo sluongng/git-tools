@@ -15,7 +15,7 @@ use fjall::{
 };
 use serde::{Deserialize, Serialize};
 use sha1::{Digest, Sha1};
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 use std::ffi::OsString;
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Write};
@@ -107,7 +107,8 @@ impl Store {
         directory: &Path,
         snapshot: &Snapshot,
         gitdir: &Path,
-    ) -> Result<(Self, BTreeMap<u64, Entry>)> {
+        mut visit: impl FnMut(&Entry) -> Result<()>,
+    ) -> Result<Self> {
         let endpoint = Endpoint::new(directory)?;
         let mut lock = endpoint.lock()?;
         ensure!(
@@ -199,7 +200,8 @@ impl Store {
         Self::recover(&handles, &files)?;
         journal::initialize(&handles)?;
         retirement::Retirements::drain(&handles, &files)?;
-        let mut loaded = BTreeMap::new();
+        let mut control_entry = None;
+        let mut maximum_inode = 0;
         let mut reclaimed_payload_bytes = 0u64;
         let mut cursor: Option<Vec<u8>> = None;
         const MAINTENANCE_RECORDS: usize = 128;
@@ -242,7 +244,13 @@ impl Store {
                     discarded.push(e.inode);
                 }
                 cursor = Some(key.to_vec());
-                loaded.insert(e.inode, e);
+                maximum_inode = maximum_inode.max(e.inode);
+                if e.control {
+                    ensure!(control_entry.is_none(), "multiple overlay control records");
+                    control_entry = Some(e);
+                } else {
+                    visit(&e)?;
+                }
                 count += 1;
             }
             // Do not pin old LSM versions across maintenance commits.
@@ -284,16 +292,11 @@ impl Store {
         let mut pointer = b"gitdir: ".to_vec();
         pointer.extend_from_slice(absolute.as_os_str().as_bytes());
         pointer.push(b'\n');
-        let control = loaded.values().find(|e| e.control).cloned();
-        let mut control = if let Some(control) = control {
+        let mut control = if let Some(control) = control_entry {
             control
         } else {
             Entry {
-                inode: loaded
-                    .keys()
-                    .next_back()
-                    .copied()
-                    .unwrap_or(0)
+                inode: maximum_inode
                     .max(
                         tx.get(&handles.meta, b"allocation_highwater")?
                             .as_deref()
@@ -321,8 +324,9 @@ impl Store {
             control.inode.to_be_bytes(),
             encode_entry(&control)?,
         );
-        loaded.insert(control.inode, control);
-        let highwater = loaded.keys().next_back().copied().unwrap_or(0).max(
+        maximum_inode = maximum_inode.max(control.inode);
+        visit(&control)?;
+        let highwater = maximum_inode.max(
             tx.get(&handles.meta, b"allocation_highwater")?
                 .as_deref()
                 .map(number)
@@ -340,19 +344,24 @@ impl Store {
         // must stop workers/drop database handles before releasing ownership.
         let mut service = Service::start(endpoint, handles.clone())?;
         service._lock = Some(lock);
-        Ok((
-            Self {
-                handles: Some(handles),
-                service: Some(service),
-                reclaimed_payload_bytes,
-                files,
-                poisoned: std::cell::Cell::new(false),
-                metadata_syncs: std::cell::Cell::new(0),
-                highwater: std::cell::Cell::new(highwater),
-                retirements: Some(retirements),
-            },
-            loaded,
-        ))
+        Ok(Self {
+            handles: Some(handles),
+            service: Some(service),
+            reclaimed_payload_bytes,
+            files,
+            poisoned: std::cell::Cell::new(false),
+            metadata_syncs: std::cell::Cell::new(0),
+            highwater: std::cell::Cell::new(highwater),
+            retirements: Some(retirements),
+        })
+    }
+    pub(super) fn read_entry(&self, inode: u64) -> Result<Option<Entry>> {
+        self.check_healthy()?;
+        let h = self.handles.as_ref().context("overlay store closed")?;
+        h.db.read_tx()
+            .get(&h.entries, inode.to_be_bytes())?
+            .map(|bytes| decode_exact(&bytes))
+            .transpose()
     }
     fn append_history(
         tx: &mut fjall::SingleWriterWriteTx,
@@ -588,6 +597,10 @@ impl Store {
     ) -> Result<()> {
         self.check_healthy()?;
         ensure!(
+            self.read_entry(before.inode)?.as_ref().map(encode).as_ref() == Some(&encode(before)),
+            "copy-up entry generation conflict"
+        );
+        ensure!(
             !matches!(before.payload, Payload::File { .. }),
             "copy-up would overwrite referenced payload"
         );
@@ -618,6 +631,13 @@ impl Store {
         ensure!(
             tx.get(&h.meta, b"payload_intent")?.is_none(),
             "payload intent already pending"
+        );
+        let current = tx
+            .get(&h.entries, before.inode.to_be_bytes())?
+            .context("mutation inode missing")?;
+        ensure!(
+            encode(&decode_exact(&current)?) == encode(before),
+            "mutation entry generation conflict"
         );
         let before_generation = journal::generation(&tx, h)?;
         before_generation
@@ -1160,6 +1180,118 @@ mod tests {
         (temp, repo, snapshot, overlay, gitdir)
     }
 
+    #[test]
+    fn bounded_metadata_reload_preserves_namespace_open_leases_and_remount() {
+        use crate::overlay::{MetadataCacheConfig, PinKind};
+        let (_temp, mut repo, snapshot, directory, gitdir) = fixture();
+        let limits = MetadataCacheConfig {
+            entries: 2,
+            bytes: 4096,
+        };
+        let mut overlay =
+            Overlay::open_with_metadata_cache(&directory, &snapshot, &gitdir, limits).unwrap();
+        let base = overlay.lookup(1, OsStr::new("base")).unwrap();
+        let held = overlay.entry(base).unwrap();
+        let original_name = held.name.clone();
+        let parent = overlay
+            .create(1, OsStr::new("parent"), Kind::Directory, 0o755, None)
+            .unwrap();
+        let child = overlay
+            .create(
+                parent,
+                OsStr::new("child"),
+                Kind::File,
+                0o644,
+                Some(b"original".to_vec()),
+            )
+            .unwrap();
+        for index in 0..20 {
+            let name = OsString::from(format!("file-{index}"));
+            let inode = overlay
+                .create(parent, &name, Kind::File, 0o644, None)
+                .unwrap();
+            assert_eq!(overlay.entry(inode).unwrap().name, name);
+        }
+        let before_reload = overlay.stats();
+        assert!(before_reload.metadata_cache_evictions > 0);
+        assert!(before_reload.metadata_resident_entries <= 2);
+        assert!(before_reload.metadata_resident_estimated_bytes <= 4096);
+        assert!(before_reload.entry_count > before_reload.metadata_resident_entries);
+        assert_eq!(
+            held.name, original_name,
+            "eviction must not invalidate active guards"
+        );
+        assert_eq!(overlay.entry(base).unwrap().name, original_name);
+        assert!(overlay.stats().metadata_cache_misses > before_reload.metadata_cache_misses);
+        overlay
+            .rename(1, OsStr::new("parent"), 1, OsStr::new("renamed"), 0)
+            .unwrap();
+        assert_eq!(overlay.lookup(1, OsStr::new("renamed")).unwrap(), parent);
+        assert_eq!(overlay.lookup(parent, OsStr::new("child")).unwrap(), child);
+        // Reload an evicted mutable record, then publish its new generation.
+        overlay.write(child, 0, b"changed!", &mut repo).unwrap();
+        assert_eq!(overlay.read(child, &mut repo).unwrap(), b"changed!");
+        let lease = overlay.pin(vec![child], PinKind::Open).unwrap();
+        overlay.unlink(parent, OsStr::new("child"), false).unwrap();
+        // A linked record scan continually evicts the open-but-unlinked record.
+        for inode in overlay.children(parent).unwrap() {
+            overlay.entry(inode).unwrap();
+        }
+        overlay.reclaim_unreferenced().unwrap();
+        assert_eq!(overlay.read(child, &mut repo).unwrap(), b"changed!");
+        drop(lease);
+        overlay.reclaim_unreferenced().unwrap();
+        overlay.drain_maintenance().unwrap();
+        assert!(overlay.entry(child).is_err());
+        assert_eq!(overlay.stats().online_reclaimed_payload_bytes, 8);
+        assert_eq!(overlay.stats().dead_payload_bytes, 0);
+        let logical_entries = overlay.stats().entry_count;
+        drop(held);
+        drop(overlay);
+        let mut overlay =
+            Overlay::open_with_metadata_cache(&directory, &snapshot, &gitdir, limits).unwrap();
+        assert_eq!(overlay.stats().entry_count, logical_entries);
+        assert_eq!(overlay.lookup(1, OsStr::new("renamed")).unwrap(), parent);
+        assert!(overlay.lookup(parent, OsStr::new("child")).is_err());
+        assert_eq!(overlay.read(base, &mut repo).unwrap(), b"base bytes");
+        assert!(overlay.stats().metadata_resident_entries <= 2);
+        let next = overlay
+            .create(parent, OsStr::new("next"), Kind::File, 0o644, None)
+            .unwrap();
+        assert!(next > child, "reclaimed identity must not be reused");
+    }
+
+    #[test]
+    fn disabled_or_undersized_metadata_cache_keeps_durable_entries_accessible() {
+        use crate::overlay::MetadataCacheConfig;
+        let (_temp, mut repo, snapshot, directory, gitdir) = fixture();
+        for limits in [
+            MetadataCacheConfig {
+                entries: 0,
+                bytes: 4096,
+            },
+            MetadataCacheConfig {
+                entries: 32,
+                bytes: 1,
+            },
+        ] {
+            let mut overlay =
+                Overlay::open_with_metadata_cache(&directory, &snapshot, &gitdir, limits).unwrap();
+            let base = overlay.lookup(1, OsStr::new("base")).unwrap();
+            assert_eq!(overlay.read(base, &mut repo).unwrap(), b"base bytes");
+            overlay
+                .setattr(base, Some(0o600), None, None, &mut repo)
+                .unwrap();
+            assert_eq!(overlay.entry(base).unwrap().mode, 0o600);
+            assert_eq!(overlay.entry(1).unwrap().inode, 1);
+            let control = overlay.lookup(1, OsStr::new(".git")).unwrap();
+            assert!(overlay.entry(control).unwrap().control);
+            assert_eq!(overlay.stats().metadata_resident_entries, 0);
+            assert_eq!(overlay.stats().metadata_resident_estimated_bytes, 0);
+            assert!(overlay.stats().metadata_cache_misses > 0);
+        }
+    }
+
     fn legacy_record(entry: &Entry) -> Vec<u8> {
         fn bytes(out: &mut Vec<u8>, value: Option<&[u8]>) {
             out.extend_from_slice(&value.map_or(u64::MAX, |v| v.len() as u64).to_be_bytes());
@@ -1325,7 +1457,9 @@ mod tests {
         );
         let base_dir = overlay.lookup(1, OsStr::new("base-dir")).unwrap();
         // Compatibility boundary: origin cannot depend on an optional tree OID.
-        overlay.entries.get_mut(&base_dir).unwrap().base_oid = None;
+        let mut base_entry = overlay.entry(base_dir).unwrap().clone();
+        base_entry.base_oid = None;
+        overlay.commit(vec![base_entry], vec![]).unwrap();
         assert!(overlay.entry(base_dir).unwrap().base_oid.is_none());
         overlay
             .unlink(base_dir, OsStr::new("child"), false)

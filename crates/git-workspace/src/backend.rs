@@ -477,6 +477,7 @@ impl GitRepo {
         let gate = Arc::clone(&self.hydration);
         let _hydration = self.hydration_lock(&gate)?;
         self.prefetch_blobs_scheduled(oids, None)
+            .map(|(report, _)| report)
     }
 
     // Only the owned scheduler fetch worker calls this, with no network gate on
@@ -485,7 +486,7 @@ impl GitRepo {
         &mut self,
         oids: &[String],
         attempts: Option<&std::sync::atomic::AtomicU64>,
-    ) -> Result<BlobPrefetchReport> {
+    ) -> Result<(BlobPrefetchReport, HashMap<String, u64>)> {
         let mut requested = Vec::new();
         let mut seen = HashSet::new();
         for oid in oids {
@@ -507,6 +508,7 @@ impl GitRepo {
             fetched_blobs: 0,
             fetch_batches: 0,
         };
+        let mut fetched_sizes = HashMap::new();
         if !missing.is_empty() {
             // Require a configured remote, not an arbitrary URL or filesystem path.
             let configured = self
@@ -551,12 +553,13 @@ impl GitRepo {
                     "prefetch completed without all requested blobs"
                 );
                 report.fetched_blobs += fetched.len();
+                fetched_sizes.extend(fetched.iter().map(|(oid, size)| (oid.clone(), *size)));
                 sizes.extend(fetched);
             }
             report.fetch_batches = 1;
         }
         self.persist_sizes(&sizes)?;
-        Ok(report)
+        Ok((report, fetched_sizes))
     }
 
     fn local_blob_sizes(&self, oids: &[String]) -> Result<(HashMap<String, u64>, Vec<String>)> {

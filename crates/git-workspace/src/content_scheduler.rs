@@ -10,7 +10,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// Independent bounds for callbacks, reply buffers, and anonymous cache files.
 #[derive(Clone, Debug)]
@@ -82,6 +82,38 @@ struct Counters {
     rejected: AtomicU64,
     callback_panics: AtomicU64,
     worker_failures: AtomicU64,
+    demand_fetch_objects: AtomicU64,
+    demand_fetch_bytes: AtomicU64,
+    prefetch_fetch_objects: AtomicU64,
+    prefetch_fetch_bytes: AtomicU64,
+    prefetch_inflight_demand_joins: AtomicU64,
+    prefetch_completed_before_demand_objects: AtomicU64,
+    prefetch_completed_before_demand_bytes: AtomicU64,
+    useful_prefetch_objects: AtomicU64,
+    useful_prefetch_bytes: AtomicU64,
+    prefetch_unobserved_evicted_objects: AtomicU64,
+    prefetch_unobserved_evicted_bytes: AtomicU64,
+    demand_initial_queue: Histogram,
+    demand_completion: Histogram,
+    demand_fetch_queue: Histogram,
+    demand_fetch_service: Histogram,
+}
+
+// Disjoint buckets: <=100 us, <=1 ms, <=10 ms, <=100 ms, <=1 s,
+// <=10 s, and >10 s. Fixed cardinality regardless of repository size.
+#[derive(Default)]
+struct Histogram([AtomicU64; 7]);
+impl Histogram {
+    fn observe(&self, elapsed: Duration) {
+        let bucket = [100, 1_000, 10_000, 100_000, 1_000_000, 10_000_000]
+            .iter()
+            .position(|bound| elapsed <= Duration::from_micros(*bound))
+            .unwrap_or(6);
+        self.0[bucket].fetch_add(1, Ordering::Relaxed);
+    }
+    fn snapshot(&self) -> [u64; 7] {
+        std::array::from_fn(|index| self.0[index].load(Ordering::Relaxed))
+    }
 }
 #[derive(Clone, Debug, Serialize)]
 pub struct ContentStats {
@@ -108,6 +140,40 @@ pub struct ContentStats {
     pub rejected_requests: u64,
     pub callback_panics: u64,
     pub worker_failures: u64,
+    /// Successful remotely fetched objects, attributed at fetch dispatch.
+    /// Bytes are uncompressed Git blob bytes, not wire or pack bytes.
+    pub demand_fetch_objects: u64,
+    pub demand_fetch_bytes: u64,
+    pub prefetch_fetch_objects: u64,
+    pub prefetch_fetch_bytes: u64,
+    /// First foreground consumer joining an already dispatched speculative fetch.
+    pub prefetch_inflight_demand_joins: u64,
+    /// Successful speculative fetches with no foreground consumer at completion.
+    pub prefetch_completed_before_demand_objects: u64,
+    pub prefetch_completed_before_demand_bytes: u64,
+    /// First demand for an object fetched speculatively before that demand,
+    /// observed within the last max_prefetch completed, unjoined speculative objects.
+    pub useful_prefetch_objects: u64,
+    pub useful_prefetch_bytes: u64,
+    pub prefetch_observation_capacity: usize,
+    pub prefetch_unobserved_objects: usize,
+    pub prefetch_unobserved_bytes: u64,
+    /// Eviction means demand was not observed in the bounded window, not that
+    /// the object will never be used. Native Git reads bypass this observation.
+    pub prefetch_unobserved_evicted_objects: u64,
+    pub prefetch_unobserved_evicted_bytes: u64,
+    /// Disjoint latency buckets in microseconds: <=100, <=1000, <=10000,
+    /// <=100000, <=1000000, <=10000000, >10000000.
+    /// Initial ready-for-local-read queue wait, one sample per accepted read
+    /// that reaches a local worker. Excludes time waiting on an in-flight fetch.
+    pub demand_initial_queue_us_buckets: [u64; 7],
+    /// Admission to callback start, including errors, excluding callback work.
+    pub demand_completion_us_buckets: [u64; 7],
+    /// Per-OID demand fetch queue wait, from missing detection/promotion to dispatch.
+    pub demand_fetch_queue_us_buckets: [u64; 7],
+    /// Per demand batch: local checks, optional Git fetch and size persistence,
+    /// including failed batches. Not a pure network-latency measurement.
+    pub demand_fetch_service_us_buckets: [u64; 7],
 }
 struct Permit {
     counters: Arc<Counters>,
@@ -139,6 +205,9 @@ impl AsRef<[u8]> for ContentData {
     }
 }
 struct Waiter {
+    submitted: Instant,
+    initial_queue_recorded: bool,
+    ready_since: Option<Instant>,
     offset: u64,
     size: u32,
     callback: Option<Callback>,
@@ -147,6 +216,7 @@ struct Waiter {
 impl Waiter {
     fn finish(mut self, result: std::result::Result<Vec<u8>, ContentError>) {
         let counters = Arc::clone(&self.permit.as_ref().unwrap().counters);
+        counters.demand_completion.observe(self.submitted.elapsed());
         let permit = self.permit.take().unwrap();
         let mut error_permit = None;
         let result = match result {
@@ -170,6 +240,7 @@ impl Drop for Waiter {
         // out of the flight table. Never silently discard an accepted reply.
         if let Some(callback) = self.callback.take() {
             let counters = &self.permit.as_ref().unwrap().counters;
+            counters.demand_completion.observe(self.submitted.elapsed());
             invoke(callback, Err(ContentError::Io), counters);
         }
     }
@@ -202,6 +273,7 @@ impl Completion {
     }
 }
 struct Flight {
+    fetch_queued: Instant,
     phase: Phase,
     foreground: bool,
     fetched: bool,
@@ -216,6 +288,48 @@ struct State {
     large: VecDeque<String>,
     foreground: VecDeque<String>,
     speculative: VecDeque<String>,
+    // Attribution only: never holds blob bodies or adds work to either queue.
+    prefetched: VecDeque<(String, u64, bool)>,
+}
+impl State {
+    fn observe_demand(&mut self, oid: &str, counters: &Counters) {
+        if let Some((_, bytes, observed)) = self
+            .prefetched
+            .iter_mut()
+            .find(|(key, _, observed)| key == oid && !*observed)
+        {
+            *observed = true;
+            counters
+                .useful_prefetch_objects
+                .fetch_add(1, Ordering::Relaxed);
+            counters
+                .useful_prefetch_bytes
+                .fetch_add(*bytes, Ordering::Relaxed);
+        }
+    }
+    fn observe_prefetch(&mut self, oid: String, bytes: u64, capacity: usize, counters: &Counters) {
+        // A second successful fetch of the same object cannot normally occur,
+        // but remove it to preserve a strict unique-object observation window.
+        self.prefetched.retain(|(key, _, _)| key != &oid);
+        if self.prefetched.len() == capacity {
+            let (_, evicted, observed) = self.prefetched.pop_front().unwrap();
+            if !observed {
+                counters
+                    .prefetch_unobserved_evicted_objects
+                    .fetch_add(1, Ordering::Relaxed);
+                counters
+                    .prefetch_unobserved_evicted_bytes
+                    .fetch_add(evicted, Ordering::Relaxed);
+            }
+        }
+        counters
+            .prefetch_completed_before_demand_objects
+            .fetch_add(1, Ordering::Relaxed);
+        counters
+            .prefetch_completed_before_demand_bytes
+            .fetch_add(bytes, Ordering::Relaxed);
+        self.prefetched.push_back((oid, bytes, false));
+    }
 }
 struct Inner {
     state: Mutex<State>,
@@ -282,7 +396,11 @@ impl ContentHandle {
         counters
             .reply_bytes
             .fetch_add(size as u64, Ordering::Relaxed);
-        let waiter = Waiter {
+        state.observe_demand(&oid, counters);
+        let mut waiter = Waiter {
+            submitted: Instant::now(),
+            initial_queue_recorded: false,
+            ready_since: Some(Instant::now()),
             offset,
             size,
             callback: Some(Box::new(callback)),
@@ -292,11 +410,20 @@ impl ContentHandle {
             }),
         };
         if let Some(flight) = state.flights.get_mut(&oid) {
+            if matches!(flight.phase, Phase::Fetch | Phase::Fetching) {
+                waiter.ready_since = None;
+            }
             counters.coalesced.fetch_add(1, Ordering::Relaxed);
+            if !flight.foreground && flight.phase == Phase::Fetching {
+                counters
+                    .prefetch_inflight_demand_joins
+                    .fetch_add(1, Ordering::Relaxed);
+            }
             let promote = !flight.foreground && flight.phase == Phase::Fetch;
             flight.foreground = true;
             flight.waiters.push(waiter);
             if promote {
+                flight.fetch_queued = Instant::now();
                 counters.promotions.fetch_add(1, Ordering::Relaxed);
                 state.speculative.retain(|queued| queued != &oid);
                 state.foreground.push_back(oid);
@@ -305,6 +432,7 @@ impl ContentHandle {
             state.flights.insert(
                 oid.clone(),
                 Flight {
+                    fetch_queued: Instant::now(),
                     phase: Phase::Local,
                     foreground: true,
                     fetched: false,
@@ -338,6 +466,7 @@ impl ContentHandle {
             state.flights.insert(
                 oid.clone(),
                 Flight {
+                    fetch_queued: Instant::now(),
                     phase: Phase::Fetch,
                     foreground: false,
                     fetched: false,
@@ -396,6 +525,9 @@ impl ContentHandle {
                         .unwrap_or_else(|e| e.into_inner())
                         .0;
                 }
+                if foreground {
+                    state.observe_demand(&oid, &self.0.counters);
+                }
                 let existing = state.flights.contains_key(&oid);
                 if foreground && existing {
                     self.0.counters.coalesced.fetch_add(1, Ordering::Relaxed);
@@ -404,6 +536,7 @@ impl ContentHandle {
                     state.flights.insert(
                         oid.clone(),
                         Flight {
+                            fetch_queued: Instant::now(),
                             phase: Phase::Fetch,
                             foreground,
                             fetched: false,
@@ -423,9 +556,20 @@ impl ContentHandle {
                         .get(&oid)
                         .is_some_and(|f| !f.foreground && f.phase == Phase::Fetch);
                 if foreground {
+                    if state
+                        .flights
+                        .get(&oid)
+                        .is_some_and(|f| !f.foreground && f.phase == Phase::Fetching)
+                    {
+                        self.0
+                            .counters
+                            .prefetch_inflight_demand_joins
+                            .fetch_add(1, Ordering::Relaxed);
+                    }
                     state.flights.get_mut(&oid).unwrap().foreground = true;
                 }
                 if promote {
+                    state.flights.get_mut(&oid).unwrap().fetch_queued = Instant::now();
                     self.0.counters.promotions.fetch_add(1, Ordering::Relaxed);
                     state.speculative.retain(|queued| queued != &oid);
                     state.foreground.push_back(oid.clone());
@@ -505,6 +649,35 @@ impl ContentHandle {
             rejected_requests: get(&c.rejected),
             callback_panics: get(&c.callback_panics),
             worker_failures: get(&c.worker_failures),
+            demand_fetch_objects: get(&c.demand_fetch_objects),
+            demand_fetch_bytes: get(&c.demand_fetch_bytes),
+            prefetch_fetch_objects: get(&c.prefetch_fetch_objects),
+            prefetch_fetch_bytes: get(&c.prefetch_fetch_bytes),
+            prefetch_inflight_demand_joins: get(&c.prefetch_inflight_demand_joins),
+            prefetch_completed_before_demand_objects: get(
+                &c.prefetch_completed_before_demand_objects
+            ),
+            prefetch_completed_before_demand_bytes: get(&c.prefetch_completed_before_demand_bytes),
+            useful_prefetch_objects: get(&c.useful_prefetch_objects),
+            useful_prefetch_bytes: get(&c.useful_prefetch_bytes),
+            prefetch_observation_capacity: self.0.config.max_prefetch,
+            prefetch_unobserved_objects: state
+                .prefetched
+                .iter()
+                .filter(|(_, _, observed)| !observed)
+                .count(),
+            prefetch_unobserved_bytes: state
+                .prefetched
+                .iter()
+                .filter(|(_, _, observed)| !observed)
+                .map(|(_, bytes, _)| *bytes)
+                .sum(),
+            prefetch_unobserved_evicted_objects: get(&c.prefetch_unobserved_evicted_objects),
+            prefetch_unobserved_evicted_bytes: get(&c.prefetch_unobserved_evicted_bytes),
+            demand_initial_queue_us_buckets: c.demand_initial_queue.snapshot(),
+            demand_completion_us_buckets: c.demand_completion.snapshot(),
+            demand_fetch_queue_us_buckets: c.demand_fetch_queue.snapshot(),
+            demand_fetch_service_us_buckets: c.demand_fetch_service.snapshot(),
         }
     }
 }
@@ -795,31 +968,41 @@ fn local_worker(handle: ContentHandle, repo: GitRepo, cache: Arc<Mutex<Cache>>, 
     let _failure = WorkerFailure(handle.clone());
     let mut reader = None;
     loop {
-        let (oid, waiters) = {
-            let mut state = handle.0.state.lock().unwrap_or_else(|e| e.into_inner());
-            loop {
-                if stopped(&handle, &state) {
-                    return;
+        let (oid, waiters) =
+            {
+                let mut state = handle.0.state.lock().unwrap_or_else(|e| e.into_inner());
+                loop {
+                    if stopped(&handle, &state) {
+                        return;
+                    }
+                    let next = if large {
+                        state.large.pop_front()
+                    } else {
+                        state.local.pop_front()
+                    };
+                    if let Some(oid) = next
+                        && let Some(flight) = state.flights.get_mut(&oid)
+                    {
+                        flight.phase = Phase::Reading;
+                        let mut waiters = std::mem::take(&mut flight.waiters);
+                        for waiter in &mut waiters {
+                            if !waiter.initial_queue_recorded {
+                                handle.0.counters.demand_initial_queue.observe(
+                                    waiter.ready_since.unwrap_or_else(Instant::now).elapsed(),
+                                );
+                                waiter.initial_queue_recorded = true;
+                            }
+                        }
+                        break (oid, waiters);
+                    }
+                    state = handle
+                        .0
+                        .wake
+                        .wait_timeout(state, Duration::from_millis(100))
+                        .unwrap_or_else(|e| e.into_inner())
+                        .0;
                 }
-                let next = if large {
-                    state.large.pop_front()
-                } else {
-                    state.local.pop_front()
-                };
-                if let Some(oid) = next
-                    && let Some(flight) = state.flights.get_mut(&oid)
-                {
-                    flight.phase = Phase::Reading;
-                    break (oid, std::mem::take(&mut flight.waiters));
-                }
-                state = handle
-                    .0
-                    .wake
-                    .wait_timeout(state, Duration::from_millis(100))
-                    .unwrap_or_else(|e| e.into_inner())
-                    .0;
-            }
-        };
+            };
         let result = read_local(&handle, &repo, &mut reader, &cache, &oid, &waiters, large);
         match result {
             Ok(Some(buffers)) => {
@@ -857,7 +1040,16 @@ fn local_worker(handle: ContentHandle, repo: GitRepo, cache: Arc<Mutex<Cache>>, 
                         continue;
                     }
                     flight.waiters.extend(waiters);
+                    // Reads joining an active local probe have not entered a
+                    // worker yet. Their local-ready queue clock must stop while
+                    // the missing object is fetched, just like Fetching joiners.
+                    for waiter in &mut flight.waiters {
+                        if !waiter.initial_queue_recorded {
+                            waiter.ready_since = None;
+                        }
+                    }
                     flight.phase = Phase::Fetch;
+                    flight.fetch_queued = Instant::now();
                     state.foreground.push_back(oid);
                     handle.0.wake.notify_all();
                 } else {
@@ -1006,7 +1198,7 @@ fn read_local(
 fn fetch_worker(handle: ContentHandle, mut repo: GitRepo) {
     let _failure = WorkerFailure(handle.clone());
     loop {
-        let batch = {
+        let (batch, foreground) = {
             let mut state = handle.0.state.lock().unwrap_or_else(|e| e.into_inner());
             loop {
                 if stopped(&handle, &state) {
@@ -1027,11 +1219,18 @@ fn fetch_worker(handle: ContentHandle, mut repo: GitRepo) {
                         && flight.phase == Phase::Fetch
                     {
                         flight.phase = Phase::Fetching;
+                        if foreground {
+                            handle
+                                .0
+                                .counters
+                                .demand_fetch_queue
+                                .observe(flight.fetch_queued.elapsed());
+                        }
                         batch.push(oid);
                     }
                 }
                 if !batch.is_empty() {
-                    break batch;
+                    break (batch, foreground);
                 }
                 state = handle
                     .0
@@ -1041,9 +1240,29 @@ fn fetch_worker(handle: ContentHandle, mut repo: GitRepo) {
                     .0;
             }
         };
+        let started = Instant::now();
         let result =
             repo.prefetch_blobs_scheduled(&batch, Some(&handle.0.counters.fetched_batches));
-        if let Ok(report) = &result {
+        if foreground {
+            // One sample per dispatched demand batch, including failed service.
+            handle
+                .0
+                .counters
+                .demand_fetch_service
+                .observe(started.elapsed());
+        }
+        if let Ok((report, fetched_sizes)) = &result {
+            let counters = &handle.0.counters;
+            let (objects, bytes) = if foreground {
+                (&counters.demand_fetch_objects, &counters.demand_fetch_bytes)
+            } else {
+                (
+                    &counters.prefetch_fetch_objects,
+                    &counters.prefetch_fetch_bytes,
+                )
+            };
+            objects.fetch_add(report.fetched_blobs as u64, Ordering::Relaxed);
+            bytes.fetch_add(fetched_sizes.values().sum(), Ordering::Relaxed);
             handle
                 .0
                 .counters
@@ -1065,6 +1284,7 @@ fn fetch_worker(handle: ContentHandle, mut repo: GitRepo) {
             }
             let mut state = handle.0.state.lock().unwrap_or_else(|e| e.into_inner());
             if let Some(flight) = state.flights.get_mut(&oid) {
+                let observed_demand = flight.foreground;
                 flight.fetched = true;
                 if let Some(done) = flight.completion.take() {
                     done.finish(Ok(()));
@@ -1073,7 +1293,21 @@ fn fetch_worker(handle: ContentHandle, mut repo: GitRepo) {
                     state.flights.remove(&oid);
                 } else {
                     flight.phase = Phase::Local;
-                    state.local.push_back(oid);
+                    for waiter in &mut flight.waiters {
+                        waiter.ready_since.get_or_insert_with(Instant::now);
+                    }
+                    state.local.push_back(oid.clone());
+                }
+                if !foreground
+                    && !observed_demand
+                    && let Some(bytes) = result.as_ref().unwrap().1.get(&oid)
+                {
+                    state.observe_prefetch(
+                        oid,
+                        *bytes,
+                        handle.0.config.max_prefetch,
+                        &handle.0.counters,
+                    );
                 }
             }
             handle.0.wake.notify_all();
@@ -1352,6 +1586,201 @@ os.execvp('git',['git',*sys.argv[1:]])
         assert_eq!(&*receive(&second), b"other");
         barrier.join().unwrap().unwrap();
         assert_eq!(handle.stats().fetched_objects, 2);
+        assert_eq!(handle.stats().demand_fetch_objects, 2);
+        assert_eq!(handle.stats().demand_fetch_bytes, 256 * 1024 + 20);
+        assert_eq!(handle.stats().prefetch_fetch_objects, 0);
+        assert_eq!(
+            handle
+                .stats()
+                .demand_fetch_queue_us_buckets
+                .iter()
+                .sum::<u64>(),
+            2
+        );
+        assert_eq!(
+            handle
+                .stats()
+                .demand_fetch_service_us_buckets
+                .iter()
+                .sum::<u64>(),
+            2
+        );
+        scheduler.shutdown().unwrap();
+    }
+
+    #[test]
+    fn prefetch_attribution_has_a_bounded_observation_window_without_staging_content() {
+        let mut fixture = Fixture::new();
+        fixture.release();
+        let config = ContentConfig {
+            max_prefetch: 1,
+            ..ContentConfig::default()
+        };
+        let mut scheduler = ContentScheduler::new(&mut fixture.repo, config).unwrap();
+        let handle = scheduler.handle();
+        let object = |name: &str| {
+            String::from_utf8(git(
+                &fixture.root.path().join("source"),
+                &["rev-parse", name],
+            ))
+            .unwrap()
+            .trim()
+            .to_owned()
+        };
+        let other = object("HEAD:other");
+        let large = object("HEAD:large");
+        handle
+            .prefetch_wait(std::slice::from_ref(&fixture.missing))
+            .unwrap();
+        let before = handle.stats();
+        assert_eq!(before.prefetch_fetch_objects, 1);
+        assert_eq!(before.prefetch_fetch_bytes, 256 * 1024);
+        assert_eq!(before.prefetch_unobserved_bytes, 256 * 1024);
+        assert_eq!(
+            before.cache_files, 0,
+            "speculation does not stage anonymous content"
+        );
+        drop(receive(&request(&handle, &fixture.missing, 0, 1)));
+        drop(receive(&request(&handle, &fixture.missing, 0, 1)));
+        assert_eq!(handle.stats().useful_prefetch_objects, 1);
+        assert_eq!(handle.stats().useful_prefetch_bytes, 256 * 1024);
+        assert_eq!(handle.stats().prefetch_unobserved_objects, 0);
+        handle.prefetch_wait(std::slice::from_ref(&other)).unwrap();
+        assert_eq!(handle.stats().prefetch_unobserved_evicted_objects, 0);
+        handle.prefetch_wait(std::slice::from_ref(&large)).unwrap();
+        let after = handle.stats();
+        assert_eq!(after.prefetch_observation_capacity, 1);
+        assert_eq!(after.prefetch_unobserved_objects, 1);
+        assert_eq!(after.prefetch_unobserved_bytes, 2 * 1024 * 1024);
+        assert_eq!(after.prefetch_unobserved_evicted_objects, 1);
+        assert_eq!(after.prefetch_unobserved_evicted_bytes, 20);
+        assert_eq!(
+            after.prefetch_completed_before_demand_objects,
+            after.useful_prefetch_objects
+                + after.prefetch_unobserved_objects as u64
+                + after.prefetch_unobserved_evicted_objects
+        );
+        assert_eq!(
+            after.prefetch_completed_before_demand_bytes,
+            after.useful_prefetch_bytes
+                + after.prefetch_unobserved_bytes
+                + after.prefetch_unobserved_evicted_bytes
+        );
+        drop(receive(&request(&handle, &other, 0, 1)));
+        assert_eq!(
+            handle.stats().useful_prefetch_objects,
+            1,
+            "late demand is outside the observation window"
+        );
+        handle
+            .prefetch_wait(std::slice::from_ref(&fixture.local))
+            .unwrap();
+        assert_eq!(
+            handle.stats().prefetch_fetch_objects,
+            3,
+            "already-local objects are not fetched bytes"
+        );
+        assert_eq!(handle.stats().demand_fetch_objects, 0);
+        let stats = handle.stats();
+        assert_eq!(stats.demand_initial_queue_us_buckets.iter().sum::<u64>(), 3);
+        assert_eq!(stats.demand_completion_us_buckets.iter().sum::<u64>(), 3);
+        scheduler.shutdown().unwrap();
+    }
+
+    #[test]
+    fn demand_joining_a_local_miss_does_not_count_fetch_service_as_local_queue_wait() {
+        let mut fixture = Fixture::new();
+        let wrapper = fixture.root.path().join("controlled-git");
+        std::fs::write(
+            &wrapper,
+            format!(
+                r#"#!/usr/bin/env python3
+import os,pathlib,subprocess,sys,time
+root=pathlib.Path(__file__).parent
+if sys.argv[-2:]==['cat-file','--batch'] and os.environ.get('GIT_NO_LAZY_FETCH')=='1':
+    for line in sys.stdin.buffer:
+        if line.decode().strip()=={oid} and not (root/'probe-started').exists():
+            (root/'probe-started').touch()
+            while not (root/'probe-release').exists(): time.sleep(.001)
+        result=subprocess.run(['git',*sys.argv[1:]],input=line,stdout=subprocess.PIPE,check=True)
+        sys.stdout.buffer.write(result.stdout);sys.stdout.buffer.flush()
+    sys.exit(0)
+if 'fetch' in sys.argv and '--stdin' in sys.argv:
+    (root/'started').touch()
+    while not (root/'release').exists(): time.sleep(.001)
+os.execvp('git',['git',*sys.argv[1:]])
+"#,
+                oid = serde_json::to_string(&fixture.missing).unwrap()
+            ),
+        )
+        .unwrap();
+        let mut scheduler =
+            ContentScheduler::new(&mut fixture.repo, ContentConfig::default()).unwrap();
+        let handle = scheduler.handle();
+        let first = request(&handle, &fixture.missing, 0, 1);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !fixture.root.path().join("probe-started").exists() {
+            assert!(
+                Instant::now() < deadline,
+                "controlled local probe did not start"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        let joined = request(&handle, &fixture.missing, 0, 1);
+        std::fs::write(fixture.root.path().join("probe-release"), b"ok").unwrap();
+        fixture.wait_fetch();
+        // Cross the 100 ms histogram boundary while only remote service is held.
+        std::thread::sleep(Duration::from_millis(120));
+        fixture.release();
+        drop(receive(&first));
+        drop(receive(&joined));
+        let stats = handle.stats();
+        assert_eq!(stats.demand_initial_queue_us_buckets.iter().sum::<u64>(), 2);
+        assert_eq!(
+            stats.demand_initial_queue_us_buckets[4..]
+                .iter()
+                .sum::<u64>(),
+            0,
+            "time held in fetch service must not become local-ready queue time"
+        );
+        assert_eq!(
+            stats.demand_completion_us_buckets[4..].iter().sum::<u64>(),
+            2,
+            "completion latency still includes the controlled fetch delay"
+        );
+        scheduler.shutdown().unwrap();
+    }
+
+    #[test]
+    fn demand_joining_an_inflight_prefetch_keeps_dispatch_origin_and_counts_join() {
+        let mut fixture = Fixture::new();
+        let mut scheduler =
+            ContentScheduler::new(&mut fixture.repo, ContentConfig::default()).unwrap();
+        let handle = scheduler.handle();
+        assert_eq!(
+            handle
+                .prefetch(std::slice::from_ref(&fixture.missing))
+                .unwrap(),
+            1
+        );
+        fixture.wait_fetch();
+        let read = request(&handle, &fixture.missing, 0, 1);
+        assert_eq!(handle.stats().prefetch_inflight_demand_joins, 1);
+        fixture.release();
+        drop(receive(&read));
+        let stats = handle.stats();
+        assert_eq!(stats.prefetch_fetch_objects, 1);
+        assert_eq!(stats.prefetch_fetch_bytes, 256 * 1024);
+        assert_eq!(stats.demand_fetch_objects, 0);
+        assert_eq!(
+            stats.useful_prefetch_objects, 0,
+            "prefetch did not finish before demand"
+        );
+        assert_eq!(
+            stats.prefetch_unobserved_objects, 0,
+            "joined demand is known, not unused"
+        );
+        assert_eq!(stats.demand_completion_us_buckets.iter().sum::<u64>(), 1);
         scheduler.shutdown().unwrap();
     }
 
@@ -1449,6 +1878,9 @@ os.execvp('git',['git',*sys.argv[1:]])
         counters.reply_bytes.fetch_add(4, Ordering::Relaxed);
         let (tx, rx) = mpsc::channel();
         let waiter = Waiter {
+            submitted: Instant::now(),
+            initial_queue_recorded: false,
+            ready_since: Some(Instant::now()),
             offset: 0,
             size: 4,
             callback: Some(Box::new(move |value| {
@@ -1500,8 +1932,8 @@ if sys.argv[-2:]==['cat-file','--batch'] and os.environ.get('GIT_NO_LAZY_FETCH')
     for line in sys.stdin.buffer:
         oid=line.decode().strip()
         if oid=={oid}:
-            sys.stdout.buffer.write((oid+' blob 2097152\n').encode());sys.stdout.buffer.flush()
             with (root/'large-attempts').open('a') as f: f.write('header\n')
+            sys.stdout.buffer.write((oid+' blob 2097152\n').encode());sys.stdout.buffer.flush()
             while not (root/'large-release').exists(): time.sleep(.01)
             data=b'x'*2097152
         else:
