@@ -826,6 +826,21 @@ fn try_lock(lock: &mut OwnerLock) -> Result<bool> {
         }
     }
 }
+#[cfg(target_os = "macos")]
+fn check_peer(stream: &UnixStream) -> Result<()> {
+    let mut uid = 0;
+    let mut gid = 0;
+    // SAFETY: The connected socket is live and both output pointers are valid.
+    if unsafe { libc::getpeereid(stream.as_raw_fd(), &mut uid, &mut gid) } != 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    ensure!(
+        uid == unsafe { libc::geteuid() },
+        "journal peer has a different user identity"
+    );
+    Ok(())
+}
+#[cfg(not(target_os = "macos"))]
 fn check_peer(stream: &UnixStream) -> Result<()> {
     let mut credentials = libc::ucred {
         pid: 0,
@@ -854,6 +869,9 @@ fn check_peer(stream: &UnixStream) -> Result<()> {
     Ok(())
 }
 fn configure(stream: &UnixStream) -> Result<()> {
+    // macOS accepts inherit the listener's nonblocking flag. Framed journal
+    // reads and writes must instead wait for their configured timeouts.
+    stream.set_nonblocking(false)?;
     stream.set_read_timeout(Some(Duration::from_secs(3)))?;
     stream.set_write_timeout(Some(Duration::from_secs(3)))?;
     check_peer(stream)
