@@ -48,6 +48,18 @@ async fn main() -> anyhow::Result<()> {
     tonic::transport::Server::builder()
         .add_service(BazelOutputServiceServer::new(service.clone()))
         .serve_with_shutdown(args.listen, async {
+            #[cfg(windows)]
+            {
+                // Python and other supervising terminals send CTRL_BREAK to an
+                // owned process group, without interrupting their own console.
+                let mut breaks =
+                    tokio::signal::windows::ctrl_break().expect("install CTRL_BREAK handler");
+                tokio::select! {
+                    _ = tokio::signal::ctrl_c() => {},
+                    _ = breaks.recv() => {},
+                }
+            }
+            #[cfg(not(windows))]
             let _ = tokio::signal::ctrl_c().await;
         })
         .await?;

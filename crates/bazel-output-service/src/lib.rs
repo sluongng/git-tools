@@ -117,6 +117,36 @@ fn relative(path: &str, allow_root: bool) -> Result<PathBuf, Status> {
             "path must be confined and relative",
         ));
     }
+    // Reject Win32 aliases before capability resolution: ADS and device names
+    // are not ordinary output files, even when the path itself is relative.
+    #[cfg(windows)]
+    for component in path.components() {
+        if let Component::Normal(name) = component {
+            let name = name
+                .to_str()
+                .ok_or_else(|| Status::invalid_argument("invalid Windows output name"))?;
+            let stem = name
+                .split('.')
+                .next()
+                .unwrap()
+                .trim_end_matches(' ')
+                .to_uppercase();
+            if name.ends_with(['.', ' '])
+                || name.chars().any(|ch| ch < ' ' || "<>:\"|?*".contains(ch))
+                || name.encode_utf16().count() > 255
+                || matches!(
+                    stem.as_str(),
+                    "CON" | "PRN" | "AUX" | "NUL" | "CONIN$" | "CONOUT$"
+                )
+                || (stem.len() == 4
+                    && (stem.starts_with("COM") || stem.starts_with("LPT"))
+                    && matches!(stem.as_bytes()[3], b'1'..=b'9'))
+                || ["COM¹", "COM²", "COM³", "LPT¹", "LPT²", "LPT³"].contains(&stem.as_str())
+            {
+                return Err(Status::invalid_argument("invalid Windows output name"));
+            }
+        }
+    }
     Ok(if path.as_os_str().is_empty() {
         PathBuf::from(".")
     } else {
@@ -373,9 +403,38 @@ impl OutputService {
                 file.set_permissions(cap_std::fs::Permissions::from_mode(0o755))
                     .map_err(io_status)?;
             }
-            temp.parent
-                .rename(&temp.name, &temp.parent, name)
-                .map_err(io_status)?;
+            let renamed = temp.parent.rename(&temp.name, &temp.parent, name);
+            #[cfg(windows)]
+            let renamed = match renamed {
+                Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
+                    use cap_std::fs::OpenOptionsExt;
+                    // Windows cannot replace a read-only file. Open only the
+                    // destination's attributes without following a reparse point;
+                    // never unlink the old output before verified atomic rename.
+                    let mut options = OpenOptions::new();
+                    options.access_mode(0x80 | 0x100).follow(FollowSymlinks::No);
+                    match temp.parent.open_with(name, &options) {
+                        Ok(destination) if destination.metadata().map_err(io_status)?.is_file() => {
+                            let original = destination.metadata().map_err(io_status)?.permissions();
+                            if original.readonly() {
+                                let mut writable = original.clone();
+                                writable.set_readonly(false);
+                                destination.set_permissions(writable).map_err(io_status)?;
+                                let retry = temp.parent.rename(&temp.name, &temp.parent, name);
+                                if retry.is_err() {
+                                    let _ = destination.set_permissions(original);
+                                }
+                                retry
+                            } else {
+                                Err(error)
+                            }
+                        }
+                        _ => Err(error),
+                    }
+                }
+                result => result,
+            };
+            renamed.map_err(io_status)?;
             self.metrics.staged_files.fetch_add(1, Ordering::Relaxed);
             self.metrics
                 .verified_bytes

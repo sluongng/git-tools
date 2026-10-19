@@ -41,39 +41,77 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--bazel", required=True, type=Path)
     parser.add_argument("--service-bin", required=True, type=Path)
-    parser.add_argument("--credential-rc", required=True, type=Path)
+    credentials = parser.add_mutually_exclusive_group(required=True)
+    credentials.add_argument("--credential-rc", type=Path)
+    credentials.add_argument("--credential-env", help="name of the environment variable holding the selected API key")
+    parser.add_argument("--cas-endpoint", help="required with --credential-env")
     parser.add_argument("--credential-profile", default="common:rbe")
     parser.add_argument("--instance-name", default="")
     parser.add_argument("--execute-remotely", action="store_true", help="also force warm-cache genrules onto the selected BuildBuddy RBE backend")
     parser.add_argument("--container-image", default="docker://gcr.io/flame-public/rbe-ubuntu22-04@sha256:0d84a80bb0fc36ba5381942adcf6493249594dcc9044845c617b78c9b621cae3")
     parser.add_argument("--artifacts", required=True, type=Path)
     args = parser.parse_args()
-    endpoint, credential = selected(args.credential_rc, args.credential_profile)
+    def selection():
+        if args.credential_rc is not None:
+            if args.cas_endpoint is not None:
+                parser.error("--cas-endpoint is only used with --credential-env")
+            return selected(args.credential_rc, args.credential_profile)
+        if not args.cas_endpoint or not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", args.credential_env):
+            parser.error("--credential-env requires a variable name and --cas-endpoint")
+        key = os.environ.get(args.credential_env, "")
+        if not key or any(c in key for c in "\r\n"):
+            raise RuntimeError("selected credential environment variable is missing or invalid")
+        return args.cas_endpoint, key
+    endpoint, credential = selection()
     host = urlsplit(endpoint).hostname
+    if not host or urlsplit(endpoint).scheme not in ("grpc", "grpcs", "http", "https"):
+        parser.error("CAS endpoint must have an http(s)/grpc(s) host")
+    windows = os.name == "nt"
+    if windows and args.execute_remotely:
+        parser.error("Windows smoke validates CAS only; Windows RBE worker selection is not configured")
+    executable_name = "smoke.cmd" if windows else "smoke.sh"
     args.artifacts.mkdir(parents=True, exist_ok=True)
     args.artifacts = args.artifacts.resolve()
     os.chmod(args.artifacts, 0o700)
     with tempfile.TemporaryDirectory(prefix="git-output-service-smoke-") as temporary:
-        scratch = Path(temporary)
+        scratch = Path(temporary).resolve()
         workspace = scratch / "workspace"
         workspace.mkdir()
         (workspace / "MODULE.bazel").write_text('module(name = "output_service_smoke")\n')
-        (workspace / "BUILD.bazel").write_text(
-            'genrule(name="output", outs=["message.txt"], cmd="printf git-output-service-smoke > $@")\n'
-            'genrule(name="executable", outs=["smoke.sh"], executable=True, '
-            "cmd=\"echo '#!/bin/sh' > $@; echo 'printf executable-output-smoke' >> $@; chmod +x $@\")\n")
-        helper = scratch / "credential-helper"
-        # The helper reselects the one authorized key at the trusted host boundary.
-        helper.write_text("#!/usr/bin/env python3\n" +
-            "import json,sys,shlex\nfrom pathlib import Path\nfrom urllib.parse import urlsplit\n" +
-            f"assert urlsplit(json.load(sys.stdin)['uri']).hostname == {host!r}\n" +
-            f"lines=Path({str(args.credential_rc.resolve())!r}).read_text().splitlines()\n" +
-            f"words=[shlex.split(line, comments=True) for line in lines]\n" +
-            f"headers=[word.split('=',1)[1] for row in words if row and row[0]=={args.credential_profile!r} for word in row[1:] if word.startswith('--remote_header=')]\n" +
-            "assert len(headers)==1\nname,value=headers[0].split('=',1)\nassert name.lower()=='x-buildbuddy-api-key'\njson.dump({'headers':{name:[value]}},sys.stdout)\n")
+        if windows:
+            (workspace / "BUILD.bazel").write_text(
+                'genrule(name="output", outs=["message.txt"], cmd_bat=">$@ <nul set /p=git-output-service-smoke& exit /b 0")\n'
+                'genrule(name="executable", outs=["smoke.cmd"], executable=True, '
+                'cmd_bat=">$@ echo @echo off& >>$@ echo ^<nul set /p=executable-output-smoke& >>$@ echo exit /b 0")\n')
+        else:
+            (workspace / "BUILD.bazel").write_text(
+                'genrule(name="output", outs=["message.txt"], cmd="printf git-output-service-smoke > $@")\n'
+                'genrule(name="executable", outs=["smoke.sh"], executable=True, '
+                "cmd=\"echo '#!/bin/sh' > $@; echo 'printf executable-output-smoke' >> $@; chmod +x $@\")\n")
+        helper_script = scratch / "credential-helper.py"
+        # Re-select only the authorized key, after checking the requested host.
+        helper_source = ("import json,os,sys,shlex\nfrom pathlib import Path\nfrom urllib.parse import urlsplit\n" +
+            f"assert urlsplit(json.load(sys.stdin)['uri']).hostname == {host!r}\n")
+        if args.credential_env:
+            helper_source += f"name='x-buildbuddy-api-key'\nvalue=os.environ[{args.credential_env!r}]\n"
+        else:
+            helper_source += (
+                f"lines=Path({str(args.credential_rc.resolve())!r}).read_text().splitlines()\n" +
+                "words=[shlex.split(line, comments=True) for line in lines]\n" +
+                f"headers=[word.split('=',1)[1] for row in words if row and row[0]=={args.credential_profile!r} for word in row[1:] if word.startswith('--remote_header=')]\n" +
+                "assert len(headers)==1\nname,value=headers[0].split('=',1)\nassert name.lower()=='x-buildbuddy-api-key'\n")
+        helper_source += "assert value and not any(c in value for c in '\\r\\n')\njson.dump({'headers':{name:[value]}},sys.stdout)\n"
+        helper_script.write_text(helper_source)
+        helper = scratch / ("credential-helper.cmd" if windows else "credential-helper")
+        if windows:
+            # No credential is written into this launcher or the generated rc.
+            helper.write_text(f'@echo off\n"{sys.executable}" "{helper_script}" %*\n')
+        else:
+            helper.write_text(f"#!/bin/sh\nexec {shlex.quote(sys.executable)} {shlex.quote(str(helper_script))} \"$@\"\n")
         helper.chmod(0o700)
         rc = scratch / "smoke.bazelrc"
-        rc.write_text(f"common --noannounce_rc\ncommon --credential_helper={host}={helper}\n")
+        helper_option = f"--credential_helper={host}={helper.as_posix()}"
+        rc.write_text(f"common --noannounce_rc\ncommon {json.dumps(helper_option)}\n")
         root = scratch / "outputs"
         root.mkdir()
         sock = socket.socket()
@@ -94,14 +132,14 @@ def main():
             # Avoid interpolating command/environment data into diagnostics.
             cleanup_errors.append(f"{operation}: {type(error).__name__}")
         def start_service():
-            selected_endpoint, key = selected(args.credential_rc, args.credential_profile)
+            selected_endpoint, key = selection()
             if selected_endpoint != endpoint:
                 raise RuntimeError("selected CAS endpoint changed during smoke")
             env = dict(os.environ, BUILDBUDDY_API_KEY=key)
             del key
             try:
                 with service_log.open("a") as log:
-                    process = subprocess.Popen([str(args.service_bin.resolve()), "--listen", f"127.0.0.1:{port}", "--root", str(root), "--cas-endpoint", endpoint, "--instance-name", args.instance_name], env=env, stdout=log, stderr=subprocess.STDOUT)
+                    process = subprocess.Popen([str(args.service_bin.resolve()), "--listen", f"127.0.0.1:{port}", "--root", str(root), "--cas-endpoint", endpoint, "--instance-name", args.instance_name], env=env, stdout=log, stderr=subprocess.STDOUT, creationflags=subprocess.CREATE_NEW_PROCESS_GROUP if windows else 0)
             finally:
                 env.pop("BUILDBUDDY_API_KEY", None)
             service_processes.append(process)
@@ -126,7 +164,7 @@ def main():
                 return
             # Only signal this smoke's owned child, escalating with bounds.
             for action, timeout in [
-                (lambda: process.send_signal(signal.SIGINT), 10),
+                (lambda: process.send_signal(signal.CTRL_BREAK_EVENT if windows else signal.SIGINT), 10),
                 (process.terminate, 5),
                 (process.kill, 5),
             ]:
@@ -136,6 +174,10 @@ def main():
                     action()
                 except ProcessLookupError:
                     return
+                except OSError:
+                    # A Windows non-console supervisor cannot send CTRL_BREAK.
+                    # Continue to bounded terminate/kill, rather than leaking it.
+                    continue
                 try:
                     process.wait(timeout=timeout)
                     return
@@ -168,11 +210,13 @@ def main():
                 content = (workspace / "bazel-bin/message.txt").read_bytes()
                 assert content == b"git-output-service-smoke", "incorrect materialized output"
                 receipt["output_verified"] = True
-                executable = workspace / "bazel-bin/smoke.sh"
-                assert executable.stat().st_mode & stat.S_IXUSR, "staged executable lost execute mode"
-                execution = subprocess.run([str(executable)], capture_output=True, timeout=10)
+                executable = workspace / "bazel-bin" / executable_name
+                if not windows:
+                    assert executable.stat().st_mode & stat.S_IXUSR, "staged executable lost execute mode"
+                executable_command = [os.environ.get("COMSPEC", "cmd.exe"), "/d", "/c", str(executable)] if windows else [str(executable)]
+                execution = subprocess.run(executable_command, capture_output=True, timeout=10)
                 assert execution.returncode == 0 and execution.stdout == b"executable-output-smoke", "staged executable did not run correctly"
-                receipt["executable_mode_verified"] = True
+                receipt["executable_mode_verified"] = not windows
                 receipt["executable_execution_verified"] = True
                 if output_service:
                     target = (workspace / "bazel-out").resolve()
@@ -190,7 +234,7 @@ def main():
                 # Restart the actual daemon, not merely a new build session.
                 # Reuse root, listen address, CAS configuration and Bazel base.
                 projected_root = (workspace / "bazel-out").resolve()
-                outputs = [workspace / "bazel-bin/message.txt", workspace / "bazel-bin/smoke.sh"]
+                outputs = [workspace / "bazel-bin/message.txt", workspace / "bazel-bin" / executable_name]
                 checkpoint = [path.read_bytes() for path in outputs]
                 old_pid = service.pid
                 stop_service(service)

@@ -643,3 +643,135 @@ async fn concurrent_fifo_and_symlink_replacements_do_not_block_batch_stat() {
         .expect("BatchStat must not block on a concurrently substituted FIFO")
         .unwrap();
 }
+
+#[cfg(windows)]
+#[tokio::test]
+async fn windows_rejects_aliases_and_replaces_existing_outputs() {
+    let mut fixture = Fixture::new().await;
+    let response = fixture
+        .client
+        .start_build(fixture.request("windows", 1))
+        .await
+        .unwrap()
+        .into_inner();
+    let root = std::path::PathBuf::from(response.output_path_suffix);
+    let digest = fixture.blob(b"verified replacement", 1);
+    for path in [
+        "existing:stream",
+        "NUL",
+        "dir/COM1.txt",
+        "LPT¹",
+        "trailing.",
+        "dir /output",
+        "wild*card",
+        "control\u{1f}",
+    ] {
+        assert_eq!(
+            fixture.stage("windows", path, digest.clone()).await,
+            tonic::Code::InvalidArgument as i32,
+            "{path:?}"
+        );
+    }
+    std::fs::write(root.join("existing"), b"old bytes").unwrap();
+    assert_eq!(
+        fixture.stage("windows", "existing", digest.clone()).await,
+        0
+    );
+    assert_eq!(
+        std::fs::read(root.join("existing")).unwrap(),
+        b"verified replacement"
+    );
+    // Bazel may mark outputs read-only between builds.
+    let mut permissions = std::fs::metadata(root.join("existing"))
+        .unwrap()
+        .permissions();
+    permissions.set_readonly(true);
+    std::fs::set_permissions(root.join("existing"), permissions).unwrap();
+    let resource = format!("fixture/blobs/{}/{}", digest.hash, digest.size_bytes);
+    fixture
+        .cas
+        .data
+        .lock()
+        .unwrap()
+        .insert(resource.clone(), b"corrupted replacement".to_vec());
+    assert_eq!(
+        fixture.stage("windows", "existing", digest.clone()).await,
+        tonic::Code::DataLoss as i32
+    );
+    assert!(
+        std::fs::metadata(root.join("existing"))
+            .unwrap()
+            .permissions()
+            .readonly()
+    );
+    assert_eq!(
+        std::fs::read(root.join("existing")).unwrap(),
+        b"verified replacement"
+    );
+    fixture
+        .cas
+        .data
+        .lock()
+        .unwrap()
+        .insert(resource, b"verified replacement".to_vec());
+    // A sharing violation must not leave the original file writable.
+    use std::os::windows::fs::OpenOptionsExt;
+    let held = std::fs::OpenOptions::new()
+        .read(true)
+        .share_mode(1 | 2)
+        .open(root.join("existing"))
+        .unwrap();
+    assert_ne!(
+        fixture.stage("windows", "existing", digest.clone()).await,
+        0
+    );
+    assert!(
+        std::fs::metadata(root.join("existing"))
+            .unwrap()
+            .permissions()
+            .readonly()
+    );
+    assert_eq!(
+        std::fs::read(root.join("existing")).unwrap(),
+        b"verified replacement"
+    );
+    drop(held);
+    assert_eq!(
+        fixture.stage("windows", "existing", digest.clone()).await,
+        0
+    );
+    assert_eq!(
+        std::fs::read(root.join("existing")).unwrap(),
+        b"verified replacement"
+    );
+    // Junction creation does not require developer mode or symlink privilege.
+    std::fs::write(fixture.outside.path().join("protected"), b"outside").unwrap();
+    let junction = root.join("escape");
+    let result = std::process::Command::new("cmd.exe")
+        .args(["/d", "/c", "mklink", "/J"])
+        .arg(&junction)
+        .arg(fixture.outside.path())
+        .output()
+        .unwrap();
+    assert!(
+        result.status.success(),
+        "junction fixture failed: {}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    assert_ne!(
+        fixture.stage("windows", "escape/protected", digest).await,
+        0
+    );
+    fixture
+        .client
+        .clean(proto::CleanRequest {
+            output_base_id: "base".into(),
+        })
+        .await
+        .unwrap();
+    assert!(!root.exists());
+    assert_eq!(
+        std::fs::read(fixture.outside.path().join("protected")).unwrap(),
+        b"outside"
+    );
+}

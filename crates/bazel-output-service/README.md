@@ -29,6 +29,11 @@ finalization. All outputs remain local across builds, but each build requests
 full revalidation, so edits cannot be hidden by stale incremental metadata.
 Staged files are executable (the protocol carries no executable bit).
 
+Native Bazel 9.2 + BuildBuddy CAS acceptance passes on macOS arm64 and Windows
+x64 for SHA256/BLAKE3, execution, restart, tamper repair and clean. Windows uses
+native paths and a directory junction; read-only output replacement is supported.
+This verifies native cache clients, not Windows/macOS RBE worker provisioning.
+
 **Limits:** trusted single-user loopback service, not a multi-tenant server.
 No lazy output hydration, remote-only retention, TreeArtifactLocator staging,
 output eviction, or modification journal yet. Stage requests are serialized with
@@ -38,3 +43,7 @@ Checks: `cargo test -p bazel-output-service`. The opt-in
 [`tests/bazel_smoke.py`](tests/bazel_smoke.py) exercises real Bazel + an
 operator-selected BuildBuddy CAS with SHA256/BLAKE3, cached outputs,
 incremental builds, tamper repair, and clean; `--help` lists inputs.
+For environment-only credentials use `--credential-env VARIABLE_NAME` with
+`--cas-endpoint`; no credential value is written into generated helper/rc files.
+See the [native lazy-mount design](../../docs/design/edenfs-platforms-and-outputs.md)
+for the separate NFS/ProjFS output projection work.
