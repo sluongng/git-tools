@@ -702,6 +702,43 @@ impl Filesystem for WritableGitFs {
         size: u32,
         reply: ReplyXattr,
     ) {
+        if size == 0 {
+            let result = (|| -> Result<u32> {
+                let hex = matches!(name.as_bytes(), b"user.gitsha1.hex" | b"user.blake3.hex");
+                let blake3 = matches!(name.as_bytes(), b"user.blake3" | b"user.blake3.hex");
+                if !blake3 && !matches!(name.as_bytes(), b"user.gitsha1" | b"user.gitsha1.hex") {
+                    return Err(error(libc::ENODATA));
+                }
+                self.overlay.digest_available(ino)?;
+                if blake3 {
+                    if self.blake3.is_none() {
+                        return Err(error(libc::ENODATA));
+                    }
+                    let entry = self.overlay.content_entry(ino)?;
+                    if matches!(entry.payload, crate::overlay::Payload::Base) {
+                        let oid = entry
+                            .base_oid
+                            .as_deref()
+                            .ok_or_else(|| error(libc::ENODATA))?;
+                        self.repo
+                            .cached_blake3(oid)?
+                            .ok_or_else(|| error(libc::ENODATA))?;
+                    }
+                }
+                Ok(if blake3 {
+                    if hex { 64 } else { 32 }
+                } else if hex {
+                    40
+                } else {
+                    20
+                })
+            })();
+            match result {
+                Ok(length) => reply.size(length),
+                Err(error) => reply.error(fail(error)),
+            };
+            return;
+        }
         let result = (|| {
             if name == OsStr::new("user.blake3") || name == OsStr::new("user.blake3.hex") {
                 let stats = self.blake3.as_ref().ok_or_else(|| error(libc::ENODATA))?;
@@ -710,7 +747,7 @@ impl Filesystem for WritableGitFs {
                     stats.miss();
                     return Err(error(libc::ENODATA));
                 }
-                // data is authoritative after every write, including same-size edits;
+                // Payload state is authoritative after every write, including same-size edits;
                 // base_oid remains the original Git identity for journal purposes.
                 let digest = if matches!(entry.payload, crate::overlay::Payload::Base) {
                     stats.base(
@@ -721,8 +758,12 @@ impl Filesystem for WritableGitFs {
                             .ok_or_else(|| error(libc::ENODATA))?,
                     )?
                 } else {
-                    let digest = self.overlay.blake3_digest(ino)?;
-                    stats.record_local_hash();
+                    let (digest, computed) = self.overlay.blake3_digest_with_status(ino)?;
+                    if computed {
+                        stats.record_local_hash();
+                    } else {
+                        stats.record_local_cache_hit();
+                    }
                     digest.to_vec()
                 };
                 return Ok(if name == OsStr::new("user.blake3.hex") {

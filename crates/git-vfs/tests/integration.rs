@@ -537,6 +537,11 @@ fn writable_namespace_lookup_counts_and_tombstones_survive_mutation_and_reopen()
     assert!(before.dead_payload_bytes > 0);
     let (token, _) = git_vfs::overlay::changes_since(&directory, "").unwrap();
     let dirty = git_vfs::overlay::dirty_paths(&directory).unwrap();
+    assert_eq!(
+        overlay.stats().rename_visited_entries,
+        3,
+        "two file moves and one empty-directory move visit only their sources"
+    );
     overlay.sync().unwrap();
     drop(overlay);
 
@@ -609,6 +614,182 @@ fn writable_namespace_lookup_counts_and_tombstones_survive_mutation_and_reopen()
         .create(1, OsStr::new("next"), Kind::File, 0o600, None)
         .unwrap();
     assert!(next > highest);
+    let moving = overlay
+        .create(1, OsStr::new("moving"), Kind::Directory, 0o700, None)
+        .unwrap();
+    overlay
+        .create(moving, OsStr::new("alpha"), Kind::File, 0o600, None)
+        .unwrap();
+    let deep = overlay
+        .create(moving, OsStr::new("deep"), Kind::Directory, 0o700, None)
+        .unwrap();
+    let native_child = OsString::from_vec(b"bravo-\xff".to_vec());
+    overlay
+        .create(deep, &native_child, Kind::File, 0o600, None)
+        .unwrap();
+    let (token, _) = git_vfs::overlay::changes_since(&directory, "").unwrap();
+    overlay
+        .rename(1, OsStr::new("moving"), 1, OsStr::new("moved"), 0)
+        .unwrap();
+    assert_eq!(overlay.stats().rename_visited_entries, 4);
+    let mut expected = vec![
+        b"moving/".to_vec(),
+        b"moving/alpha".to_vec(),
+        b"moving/deep/".to_vec(),
+        b"moving/deep/bravo-\xff".to_vec(),
+        b"moved/".to_vec(),
+        b"moved/alpha".to_vec(),
+        b"moved/deep/".to_vec(),
+        b"moved/deep/bravo-\xff".to_vec(),
+    ];
+    expected.sort();
+    assert_eq!(
+        git_vfs::overlay::changes_since(&directory, &token)
+            .unwrap()
+            .1,
+        expected
+    );
+}
+
+#[test]
+fn edited_digest_pairs_cache_by_generation_and_retire_with_payloads() {
+    use git_vfs::overlay::{Kind, Overlay};
+    use std::ffi::OsStr;
+    let fixture = Fixture::with_blob_count(0);
+    let mut repo = fixture.repo(SizeFallback::Error);
+    let snapshot = Snapshot::load(&repo, "HEAD").unwrap();
+    let directory = fixture._temp.path().join("digest-generations");
+    let mut overlay = Overlay::open(&directory, &snapshot, &fixture.clone).unwrap();
+    let inode = overlay.lookup(1, OsStr::new("hello.txt")).unwrap();
+    assert_eq!(
+        overlay.digest(inode).unwrap(),
+        snapshot.digest_path(Path::new("hello.txt")).unwrap()
+    );
+    assert_eq!(overlay.stats().digest_hash_operations, 0);
+    overlay.write(inode, 0, b"H", &mut repo).unwrap();
+    for _ in 0..10 {
+        overlay.digest_available(inode).unwrap();
+    }
+    assert_eq!(
+        overlay.stats().digest_hash_operations,
+        0,
+        "availability probes do not hash"
+    );
+    let first = overlay.digest(inode).unwrap();
+    assert_eq!(
+        overlay.blake3_digest(inode).unwrap(),
+        *blake3::hash(b"Hello from git-vfs\n").as_bytes()
+    );
+    assert_eq!(overlay.stats().digest_hash_operations, 1);
+    assert_eq!(overlay.stats().digest_hash_bytes, 19);
+    assert_eq!(
+        overlay.stats().payload_hash_bytes,
+        19,
+        "both algorithms use one backing stream"
+    );
+    overlay
+        .setattr(inode, Some(0o600), None, None, &mut repo)
+        .unwrap();
+    assert_eq!(overlay.digest(inode).unwrap(), first);
+    assert_eq!(
+        overlay.stats().digest_hash_operations,
+        1,
+        "metadata changes retain cached content"
+    );
+    overlay.write(inode, 0, b"h", &mut repo).unwrap();
+    assert_ne!(
+        overlay.digest(inode).unwrap(),
+        first,
+        "same-size edits invalidate the cached pair"
+    );
+    assert_eq!(
+        overlay.blake3_digest(inode).unwrap(),
+        *blake3::hash(b"hello from git-vfs\n").as_bytes()
+    );
+    assert_eq!(overlay.stats().digest_hash_operations, 2);
+    overlay
+        .setattr(inode, None, Some(19), None, &mut repo)
+        .unwrap();
+    assert!(
+        overlay.blake3_digest_with_status(inode).unwrap().1,
+        "even same-size truncate advances content generation"
+    );
+    assert_eq!(overlay.stats().digest_hash_operations, 3);
+    overlay
+        .setattr(inode, None, Some(0), None, &mut repo)
+        .unwrap();
+    assert_eq!(
+        overlay.blake3_digest(inode).unwrap(),
+        *blake3::hash(b"").as_bytes()
+    );
+    assert_eq!(overlay.stats().digest_hash_operations, 4);
+    assert_eq!(overlay.stats().digest_hash_bytes, 57);
+    overlay.unlink(1, OsStr::new("hello.txt"), false).unwrap();
+    overlay.reclaim_unreferenced().unwrap();
+    overlay.drain_maintenance().unwrap();
+    assert_eq!(
+        overlay.stats().digest_cache_entries,
+        0,
+        "retired base tombstones retain no digest cache"
+    );
+    assert!(overlay.digest(inode).is_err());
+    for _ in 0..8 {
+        let inode = overlay
+            .create(1, OsStr::new("temporary"), Kind::File, 0o600, None)
+            .unwrap();
+        overlay.digest(inode).unwrap();
+        assert_eq!(overlay.stats().digest_cache_entries, 1);
+        overlay.unlink(1, OsStr::new("temporary"), false).unwrap();
+        overlay.reclaim_unreferenced().unwrap();
+        assert_eq!(
+            overlay.stats().digest_cache_entries,
+            0,
+            "created inode collection retires cached digests"
+        );
+    }
+}
+
+#[test]
+fn directory_rename_overflow_uses_bounded_subtree_invalidation() {
+    use git_vfs::overlay::{Kind, Overlay};
+    use std::ffi::OsStr;
+    let fixture = Fixture::with_blob_count(0);
+    let repo = fixture.repo(SizeFallback::Error);
+    let snapshot = Snapshot::load(&repo, "HEAD").unwrap();
+    let directory = fixture._temp.path().join("bounded-rename");
+    let mut overlay = Overlay::open(&directory, &snapshot, &fixture.clone).unwrap();
+    let source = overlay
+        .create(1, OsStr::new("source"), Kind::Directory, 0o700, None)
+        .unwrap();
+    for n in 0..4096 {
+        overlay
+            .create(
+                source,
+                OsStr::new(&format!("child-{n}")),
+                Kind::File,
+                0o600,
+                None,
+            )
+            .unwrap();
+    }
+    let (token, _) = git_vfs::overlay::changes_since(&directory, "").unwrap();
+    let before = overlay.stats().rename_visited_entries;
+    overlay
+        .rename(1, OsStr::new("source"), 1, OsStr::new("moved"), 0)
+        .unwrap();
+    assert_eq!(
+        overlay.stats().rename_visited_entries - before,
+        2049,
+        "stop walking after the full-invalidation fallback"
+    );
+    assert_eq!(
+        git_vfs::overlay::changes_since(&directory, &token)
+            .unwrap()
+            .1,
+        [b"/".to_vec()]
+    );
+    assert_eq!(overlay.lookup(1, OsStr::new("moved")).unwrap(), source);
+    assert!(overlay.lookup(source, OsStr::new("child-4095")).is_ok());
 }
 
 #[test]
@@ -1307,6 +1488,15 @@ fn writable_mount_options(
     environment: &[(&str, &str)],
     extra: &[&str],
 ) -> Mounted {
+    writable_mount_options_with_stderr(fixture, overlay, environment, extra, Stdio::inherit())
+}
+fn writable_mount_options_with_stderr(
+    fixture: &Fixture,
+    overlay: &Path,
+    environment: &[(&str, &str)],
+    extra: &[&str],
+    stderr: Stdio,
+) -> Mounted {
     let child = Command::new(env!("CARGO_BIN_EXE_git-vfs"))
         .envs(environment.iter().copied())
         .arg("mount")
@@ -1317,7 +1507,7 @@ fn writable_mount_options(
         .arg(overlay)
         .arg(&fixture.mount)
         .stdout(Stdio::null())
-        .stderr(Stdio::inherit())
+        .stderr(stderr)
         .spawn()
         .unwrap();
     let mut mounted = Mounted {
@@ -2884,7 +3074,8 @@ fn mounted_blake3_xattrs_use_cached_base_and_current_same_size_overlay_bytes() {
     ]);
     server.join().unwrap();
     let overlay = fixture._temp.path().join("blake3-overlay");
-    let mounted = writable_mount_options(
+    let writable_log = fixture._temp.path().join("digest-writable.log");
+    let mounted = writable_mount_options_with_stderr(
         &fixture,
         &overlay,
         &[],
@@ -2894,8 +3085,24 @@ fn mounted_blake3_xattrs_use_cached_base_and_current_same_size_overlay_bytes() {
             "--blake3-proxy-repo",
             "fixture_repo",
         ],
+        Stdio::from(fs::File::create(&writable_log).unwrap()),
     );
     let path = fixture.mount.join("hello.txt");
+    for (name, length) in [
+        ("user.gitsha1", 20),
+        ("user.gitsha1.hex", 40),
+        ("user.blake3", 32),
+        ("user.blake3.hex", 64),
+    ] {
+        let path = CString::new(path.as_os_str().as_bytes()).unwrap();
+        let name = CString::new(name).unwrap();
+        for _ in 0..3 {
+            assert_eq!(
+                unsafe { libc::getxattr(path.as_ptr(), name.as_ptr(), std::ptr::null_mut(), 0) },
+                length
+            );
+        }
+    }
     assert_eq!(
         xattr(&path, "user.blake3"),
         blake3::hash(b"hello from git-vfs\n").as_bytes()
@@ -2906,6 +3113,22 @@ fn mounted_blake3_xattrs_use_cached_base_and_current_same_size_overlay_bytes() {
         "base xattr must not hydrate"
     );
     fs::write(&path, b"HELLO from git-vfs\n").unwrap();
+    for (name, length) in [
+        ("user.gitsha1", 20),
+        ("user.gitsha1.hex", 40),
+        ("user.blake3", 32),
+        ("user.blake3.hex", 64),
+    ] {
+        let path = CString::new(path.as_os_str().as_bytes()).unwrap();
+        let name = CString::new(name).unwrap();
+        for _ in 0..3 {
+            assert_eq!(
+                unsafe { libc::getxattr(path.as_ptr(), name.as_ptr(), std::ptr::null_mut(), 0) },
+                length
+            );
+        }
+    }
+
     assert_eq!(
         xattr(&path, "user.blake3"),
         blake3::hash(b"HELLO from git-vfs\n").as_bytes()
@@ -2913,6 +3136,11 @@ fn mounted_blake3_xattrs_use_cached_base_and_current_same_size_overlay_bytes() {
     assert_eq!(
         xattr(&path, "user.blake3.hex"),
         blake3::hash(b"HELLO from git-vfs\n").to_hex().as_bytes()
+    );
+    let sha1 = xattr(&path, "user.gitsha1");
+    assert_eq!(
+        xattr(&path, "user.gitsha1.hex"),
+        hex::encode(&sha1).as_bytes()
     );
     fs::write(fixture.mount.join("new.txt"), b"new bytes").unwrap();
     assert_eq!(
@@ -2932,7 +3160,28 @@ fn mounted_blake3_xattrs_use_cached_base_and_current_same_size_overlay_bytes() {
         );
     }
     drop(mounted);
-    let readonly = writable_mount_options(
+    fn report(log: &Path, prefix: &str) -> serde_json::Value {
+        let log = fs::read_to_string(log).unwrap();
+        let matches: Vec<_> = log
+            .lines()
+            .filter_map(|line| line.strip_prefix(prefix))
+            .collect();
+        assert_eq!(matches.len(), 1, "{log}");
+        serde_json::from_str(matches[0]).unwrap()
+    }
+    let work = report(&writable_log, "Overlay state: ");
+    assert_eq!(work["digest_hash_operations"], 2);
+    assert_eq!(work["digest_hash_bytes"], 28);
+    assert_eq!(
+        work["digest_cache_hits"], 3,
+        "size probes must not touch the content cache"
+    );
+    let consumption = report(&writable_log, "BLAKE3 xattrs: ");
+    assert_eq!(consumption["base_hits"], 1);
+    assert_eq!(consumption["local_hashes"], 2);
+    assert_eq!(consumption["local_cache_hits"], 1);
+    let readonly_log = fixture._temp.path().join("digest-readonly.log");
+    let readonly = writable_mount_options_with_stderr(
         &fixture,
         &overlay,
         &[],
@@ -2943,10 +3192,30 @@ fn mounted_blake3_xattrs_use_cached_base_and_current_same_size_overlay_bytes() {
             "--blake3-proxy-repo",
             "fixture_repo",
         ],
+        Stdio::from(fs::File::create(&readonly_log).unwrap()),
     );
+    for (name, length) in [
+        ("user.gitsha1", 20),
+        ("user.gitsha1.hex", 40),
+        ("user.blake3", 32),
+        ("user.blake3.hex", 64),
+    ] {
+        let native = CString::new(path.as_os_str().as_bytes()).unwrap();
+        let name = CString::new(name).unwrap();
+        assert_eq!(
+            unsafe { libc::getxattr(native.as_ptr(), name.as_ptr(), std::ptr::null_mut(), 0) },
+            length
+        );
+    }
     assert_eq!(
         xattr(&path, "user.blake3"),
         blake3::hash(b"hello from git-vfs\n").as_bytes()
     );
     drop(readonly);
+    let consumption = report(&readonly_log, "BLAKE3 xattrs: ");
+    assert_eq!(
+        consumption["base_hits"], 1,
+        "readonly size probes must not count as digest consumption"
+    );
+    assert_eq!(consumption["local_hashes"], 0);
 }

@@ -551,6 +551,45 @@ impl Filesystem for GitFs {
             return;
         }
         let oid = n.oid.as_ref().expect("validated blob ID");
+        if size == 0 {
+            let length = match name.as_bytes() {
+                b"user.gitsha1" => 20,
+                b"user.gitsha1.hex" => 40,
+                b"user.blake3" | b"user.blake3.hex" => {
+                    if self.blake3.is_none() {
+                        reply.error(libc::ENODATA);
+                        return;
+                    }
+                    let available = self
+                        .repo
+                        .lock()
+                        .map_err(|_| anyhow::anyhow!("backend lock poisoned"))
+                        .and_then(|repo| repo.cached_blake3(oid));
+                    match available {
+                        Ok(Some(_)) => {}
+                        Ok(None) => {
+                            reply.error(libc::ENODATA);
+                            return;
+                        }
+                        Err(error) => {
+                            reply.error(errno(&error));
+                            return;
+                        }
+                    }
+                    if name.as_bytes() == b"user.blake3.hex" {
+                        64
+                    } else {
+                        32
+                    }
+                }
+                _ => {
+                    reply.error(libc::ENODATA);
+                    return;
+                }
+            };
+            reply.size(length);
+            return;
+        }
         if matches!(name.as_bytes(), b"user.blake3" | b"user.blake3.hex") {
             let Some(stats) = &self.blake3 else {
                 reply.error(libc::ENODATA);

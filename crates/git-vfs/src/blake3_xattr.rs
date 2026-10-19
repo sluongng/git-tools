@@ -7,12 +7,14 @@ pub const XATTRS: &[u8] = b"user.gitsha1\0user.gitsha1.hex\0user.blake3\0user.bl
 pub struct Blake3XattrStats {
     base_hits: AtomicU64,
     local_hashes: AtomicU64,
+    local_cache_hits: AtomicU64,
     misses: AtomicU64,
 }
 #[derive(Serialize)]
 pub struct Blake3XattrReport {
     base_hits: u64,
     local_hashes: u64,
+    local_cache_hits: u64,
     misses: u64,
 }
 impl Blake3XattrStats {
@@ -20,8 +22,12 @@ impl Blake3XattrStats {
         Blake3XattrReport {
             base_hits: self.base_hits.load(Ordering::Relaxed),
             local_hashes: self.local_hashes.load(Ordering::Relaxed),
+            local_cache_hits: self.local_cache_hits.load(Ordering::Relaxed),
             misses: self.misses.load(Ordering::Relaxed),
         }
+    }
+    pub fn record_local_cache_hit(&self) {
+        self.local_cache_hits.fetch_add(1, Ordering::Relaxed);
     }
     pub fn record_local_hash(&self) {
         self.local_hashes.fetch_add(1, Ordering::Relaxed);

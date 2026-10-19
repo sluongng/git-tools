@@ -2059,7 +2059,7 @@ mod tests {
         overlay.blake3_digest(ino).unwrap();
         assert_eq!(
             overlay.stats().payload_hash_bytes - before.payload_hash_bytes,
-            2 * (3 * 1024 * 1024 + 20)
+            3 * 1024 * 1024 + 20
         );
         fail_next("before_redo_stage");
         assert!(overlay.write(ino, 0, &[3], &mut repo).is_err());

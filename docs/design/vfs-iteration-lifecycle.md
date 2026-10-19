@@ -296,9 +296,44 @@ invalidation semantics until a tested subtree-invalidation contract replaces the
 
 Cache edited SHA1/BLAKE3 by inode/content generation, not size/mtime alone. Increment
 content generation on every successful write/truncate; metadata-only changes do not
-force a rehash. Size probes return fixed digest length without hashing. Stream file
-hashes rather than loading an entire mutable file into a Vec. Instrument bytes hashed
-and hits/misses so mechanism movement can be verified.
+force a rehash. Compute both digests in one 64 KiB-buffered pass and retain one pair
+per edited inode; GC purges retired entries. Size probes return fixed digest length
+without hashing or counting a value-cache hit.
+
+Directory traversal uses indexed child iterators and reusable old/new path buffers.
+Collect at most 4,096 paths / 1 MiB before returning `/` full invalidation; file
+rename visits one source inode, independent of unrelated repository size. Keep native
+path bytes intact. `rename_visited_entries` counts source inodes, not emitted paths.
+
+Overlay pair counters measure actual computations/bytes and cache reuse across both
+algorithms. BLAKE3 xattr `local_hashes` counts value requests that initiated work;
+`local_cache_hits` counts value requests reusing it. If SHA1 initiated a paired hash,
+the next BLAKE3 request is a cache hit, not another local hash. Base xattr size probes
+check mapping availability without counting digest consumption.
+
+### Stage D measured checkpoint (2026-10-19)
+
+Three rotated real-FUSE trials against frozen `c0687ee`.
+[Samples and exact work checks](../benchmarks/2026-10-19-vfs-metadata.json).
+
+| Median summed syscall time | Baseline | Stage D |
+|---|---:|---:|
+| 64 file replacements, 1k unrelated entries | 31.84 ms | 16.87 ms |
+| 64 file replacements, 10k unrelated entries | 87.16 ms | 17.55 ms |
+| 64 file replacements, 100k unrelated entries | 808.59 ms | 17.06 ms |
+| 64 four-entry directory moves, 100k unrelated entries | 1,060.45 ms | 30.83 ms |
+| 64 SHA1 size probes, 16 MiB edited file, first generation | 407.96 ms | 0.40 ms |
+| 64 SHA1 value calls, same generation | 407.99 ms | 8.67 ms |
+| 64 BLAKE3 value calls after SHA1, same generation | 89.28 ms | 0.23 ms |
+
+All 24 cells passed. Candidate rename work was exactly 324 visited inodes at each
+repository size, including the untimed final directory move. Two same-size digest
+generations caused exactly two paired computations / 32 MiB hashed; size probes
+caused neither hashing nor value-cache hits. Chmod reused the pair, and remount
+recomputed it once. Native path bytes, overwritten-open descriptors, Git status and
+remounted bytes matched. Timings exclude setup/verification; cumulative counters
+include them. BLAKE3 value calls benefit from the preceding SHA1 pair computation.
+The loopback mapping fixture is not the proxy, and this is not a Bazel latency result.
 
 ## Stage E: hydration scheduling and reusable content
 

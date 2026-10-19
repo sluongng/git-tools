@@ -14,6 +14,7 @@ use fuser::FileType;
 pub use lifetime::{Lease, PinKind};
 pub use payload::Payload;
 use sha1::{Digest, Sha1};
+use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::ffi::{OsStr, OsString};
 use std::os::unix::ffi::OsStrExt;
@@ -85,6 +86,19 @@ pub struct Overlay {
     unlinked_inodes: BTreeSet<u64>,
     gc_ready: BTreeSet<u64>,
     gc_visited_entries: u64,
+    rename_visited_entries: u64,
+    digests: RefCell<HashMap<u64, CachedDigests>>,
+    digest_hash_operations: Cell<u64>,
+    digest_hash_bytes: Cell<u64>,
+    digest_cache_hits: Cell<u64>,
+}
+
+#[derive(Clone, Copy)]
+struct CachedDigests {
+    generation: u64,
+    size: u64,
+    sha1: [u8; 20],
+    blake3: [u8; 32],
 }
 
 /// Logical overlay state; protected `.git` pointer bytes are not user payload.
@@ -108,6 +122,11 @@ pub struct OverlayStats {
     pub online_reclaimed_payload_bytes: u64,
     pub reclaimed_entries: u64,
     pub gc_visited_entries: u64,
+    pub rename_visited_entries: u64,
+    pub digest_hash_operations: u64,
+    pub digest_hash_bytes: u64,
+    pub digest_cache_hits: u64,
+    pub digest_cache_entries: u64,
     pub retirement_pending_items: u64,
     pub retirement_pending_bytes: u64,
     pub retirement_failures: u64,
@@ -267,6 +286,11 @@ impl Overlay {
             unlinked_inodes,
             gc_ready,
             gc_visited_entries: 0,
+            rename_visited_entries: 0,
+            digests: RefCell::default(),
+            digest_hash_operations: Cell::new(0),
+            digest_hash_bytes: Cell::new(0),
+            digest_cache_hits: Cell::new(0),
         };
         overlay.reclaim_unreferenced()?;
         overlay.drain_maintenance()?;
@@ -318,6 +342,7 @@ impl Overlay {
             let bytes = entry.payload.size().unwrap_or(0);
             self.database.retire(&entry, remove)?;
             self.online_reclaimed_payload_bytes += bytes;
+            self.digests.borrow_mut().remove(&inode);
             if remove {
                 self.reclaimed.remove(&inode);
                 self.unlinked_inodes.remove(&inode);
@@ -351,6 +376,11 @@ impl Overlay {
             online_reclaimed_payload_bytes: self.online_reclaimed_payload_bytes,
             reclaimed_entries: self.reclaimed_entries,
             gc_visited_entries: self.gc_visited_entries,
+            rename_visited_entries: self.rename_visited_entries,
+            digest_hash_operations: self.digest_hash_operations.get(),
+            digest_hash_bytes: self.digest_hash_bytes.get(),
+            digest_cache_hits: self.digest_cache_hits.get(),
+            digest_cache_entries: self.digests.borrow().len() as u64,
             retirement_pending_items: pending_items,
             retirement_pending_bytes: pending_bytes,
             retirement_failures: failed,
@@ -491,42 +521,91 @@ impl Overlay {
         let size = usize::try_from(self.size(ino, repo)?).map_err(|_| error(libc::EFBIG))?;
         self.read_range(ino, 0, size, repo)
     }
-    pub fn digest(&self, ino: u64) -> Result<Vec<u8>> {
-        let e = self.content_entry(ino)?;
-        if e.control || e.kind.is_dir() {
+    /// Validate digest availability without reading or hashing mutable contents.
+    pub fn digest_available(&self, ino: u64) -> Result<()> {
+        let entry = self.content_entry(ino)?;
+        if entry.control || entry.kind.is_dir() {
             return Err(error(libc::ENODATA));
         }
-        if matches!(e.payload, Payload::Base) {
+        match &entry.payload {
+            Payload::Base => {
+                let oid = entry
+                    .base_oid
+                    .as_ref()
+                    .ok_or_else(|| error(libc::ENODATA))?;
+                ensure!(
+                    hex::decode(oid)?.len() == 20,
+                    "invalid base digest identity"
+                );
+                Ok(())
+            }
+            Payload::Inline(_) | Payload::File { .. } => Ok(()),
+            Payload::None => Err(error(libc::ENODATA)),
+        }
+    }
+    fn local_digests(&self, ino: u64) -> Result<(CachedDigests, bool)> {
+        self.digest_available(ino)?;
+        let entry = self.content_entry(ino)?;
+        let (generation, size) = match &entry.payload {
+            Payload::Inline(data) => (0, data.len() as u64),
+            Payload::File { generation, size } => (*generation, *size),
+            _ => return Err(error(libc::ENODATA)),
+        };
+        if let Some(cached) = self
+            .digests
+            .borrow()
+            .get(&ino)
+            .copied()
+            .filter(|cached| cached.generation == generation && cached.size == size)
+        {
+            self.digest_cache_hits.set(self.digest_cache_hits.get() + 1);
+            return Ok((cached, false));
+        }
+        let mut sha1 = Sha1::new();
+        sha1.update(format!("blob {size}\0").as_bytes());
+        let mut blake3 = blake3::Hasher::new();
+        let mut consume = |bytes: &[u8]| {
+            sha1.update(bytes);
+            blake3.update(bytes);
+        };
+        match &entry.payload {
+            Payload::Inline(data) => consume(data),
+            Payload::File { .. } => self.database.files.hash(ino, size, consume)?,
+            _ => return Err(error(libc::ENODATA)),
+        }
+        let cached = CachedDigests {
+            generation,
+            size,
+            sha1: sha1.finalize().into(),
+            blake3: *blake3.finalize().as_bytes(),
+        };
+        self.digests.borrow_mut().insert(ino, cached);
+        self.digest_hash_operations
+            .set(self.digest_hash_operations.get() + 1);
+        self.digest_hash_bytes
+            .set(self.digest_hash_bytes.get() + size);
+        Ok((cached, true))
+    }
+    pub fn digest(&self, ino: u64) -> Result<Vec<u8>> {
+        self.digest_available(ino)?;
+        let entry = self.content_entry(ino)?;
+        if matches!(entry.payload, Payload::Base) {
             return Ok(hex::decode(
-                e.base_oid.as_deref().context("base file has no digest")?,
+                entry
+                    .base_oid
+                    .as_deref()
+                    .context("base file has no digest")?,
             )?);
         }
-        let size = e.payload.size().context("file has no digest")?;
-        let mut hash = Sha1::new();
-        hash.update(format!("blob {size}\0").as_bytes());
-        match &e.payload {
-            Payload::Inline(data) => hash.update(data),
-            Payload::File { .. } => self
-                .database
-                .files
-                .hash(ino, size, |data| hash.update(data))?,
-            _ => return Err(error(libc::ENODATA)),
-        }
-        Ok(hash.finalize().to_vec())
+        Ok(self.local_digests(ino)?.0.sha1.to_vec())
     }
     pub fn blake3_digest(&self, ino: u64) -> Result<[u8; 32]> {
-        let entry = self.content_entry(ino)?;
-        let mut hash = blake3::Hasher::new();
-        match &entry.payload {
-            Payload::Inline(data) => {
-                hash.update(data);
-            }
-            Payload::File { size, .. } => self.database.files.hash(ino, *size, |data| {
-                hash.update(data);
-            })?,
-            _ => return Err(error(libc::ENODATA)),
-        }
-        Ok(*hash.finalize().as_bytes())
+        Ok(self.blake3_digest_with_status(ino)?.0)
+    }
+    /// Returns the local digest and whether this request computed the pair.
+    pub fn blake3_digest_with_status(&self, ino: u64) -> Result<([u8; 32], bool)> {
+        let (cached, computed) = self.local_digests(ino)?;
+        Ok((cached.blake3, computed))
     }
     fn validate_name(&self, parent: u64, name: &OsStr) -> Result<()> {
         let b = name.as_bytes();
@@ -816,6 +895,7 @@ impl Overlay {
             vec![]
         };
         self.change_payload(ino, &e, &paths, Some((offset, data)), repo)?;
+        self.digests.borrow_mut().remove(&ino);
         self.entries.insert(ino, e);
         Ok(data.len())
     }
@@ -862,6 +942,7 @@ impl Overlay {
         };
         if size.is_some() {
             self.change_payload(ino, &e, &paths, None, repo)?;
+            self.digests.borrow_mut().remove(&ino);
             self.entries.insert(ino, e);
             Ok(())
         } else {
@@ -889,6 +970,88 @@ impl Overlay {
         p.mtime = e.ctime;
         p.ctime = e.ctime;
         self.commit(vec![e, p], vec![path])
+    }
+    fn rename_paths(
+        &self,
+        inode: u64,
+        newparent: u64,
+        newname: &OsStr,
+    ) -> Result<(Vec<Vec<u8>>, u64)> {
+        fn add(
+            paths: &mut Vec<Vec<u8>>,
+            bytes: &mut usize,
+            old: &[u8],
+            new: &[u8],
+            directory: bool,
+        ) -> bool {
+            let suffix = usize::from(directory);
+            let added = old
+                .len()
+                .saturating_add(new.len())
+                .saturating_add(2 * suffix);
+            if paths.len() + 2 > 4096 || bytes.saturating_add(added) > 1024 * 1024 {
+                paths.clear();
+                paths.push(b"/".to_vec());
+                return false;
+            }
+            let mut old = old.to_vec();
+            let mut new = new.to_vec();
+            if directory {
+                old.push(b'/');
+                new.push(b'/');
+            }
+            *bytes += added;
+            paths.push(old);
+            paths.push(new);
+            true
+        }
+        let mut old = self.path(inode)?;
+        let mut new = self.path(newparent)?;
+        if !new.is_empty() {
+            new.push(b'/');
+        }
+        new.extend_from_slice(newname.as_bytes());
+        let mut paths = Vec::new();
+        let mut bytes = 0;
+        let mut visited = 1;
+        let directory = self.entry(inode)?.kind.is_dir();
+        if !add(&mut paths, &mut bytes, &old, &new, directory) || !directory {
+            return Ok((paths, visited));
+        }
+        let empty = BTreeSet::new();
+        // Iterator frames keep traversal memory proportional to depth. Do not
+        // queue every child/path before the bounded full-invalidation fallback.
+        let children = self
+            .namespace
+            .get(&inode)
+            .map_or(&empty, |index| &index.children);
+        let mut stack = vec![(children.iter(), old.len(), new.len())];
+        while let Some((children, old_len, new_len)) = stack.last_mut() {
+            let Some(child) = children.next().copied() else {
+                stack.pop();
+                continue;
+            };
+            old.truncate(*old_len);
+            new.truncate(*new_len);
+            let entry = self.entry(child)?;
+            old.push(b'/');
+            old.extend_from_slice(entry.name.as_bytes());
+            new.push(b'/');
+            new.extend_from_slice(entry.name.as_bytes());
+            visited += 1;
+            let directory = entry.kind.is_dir();
+            if !add(&mut paths, &mut bytes, &old, &new, directory) {
+                break;
+            }
+            if directory {
+                let children = self
+                    .namespace
+                    .get(&child)
+                    .map_or(&empty, |index| &index.children);
+                stack.push((children.iter(), old.len(), new.len()));
+            }
+        }
+        Ok((paths, visited))
     }
     pub fn rename(
         &mut self,
@@ -949,33 +1112,8 @@ impl Overlay {
             e.ctime = SystemTime::now();
             changed.push(e);
         }
-        let old = self.path(ino)?;
-        let mut new = self.path(newparent)?;
-        if !new.is_empty() {
-            new.push(b'/');
-        }
-        new.extend_from_slice(newname.as_bytes());
-        let mut paths = Vec::new();
-        for e in self
-            .entries
-            .values()
-            .filter(|e| e.linked && e.inode != 1 && !e.control)
-        {
-            let path = self.path(e.inode)?;
-            if path == old
-                || (source.kind.is_dir() && path.starts_with(&[old.as_slice(), b"/"].concat()))
-            {
-                let mut replacement = new.clone();
-                replacement.extend_from_slice(&path[old.len()..]);
-                let mut path = path;
-                if e.kind.is_dir() {
-                    path.push(b'/');
-                    replacement.push(b'/');
-                }
-                paths.push(path);
-                paths.push(replacement);
-            }
-        }
+        let (paths, visited) = self.rename_paths(ino, newparent, newname)?;
+        self.rename_visited_entries += visited;
         let now = SystemTime::now();
         source.parent = newparent;
         source.name = newname.to_owned();
