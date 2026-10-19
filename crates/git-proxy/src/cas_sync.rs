@@ -31,7 +31,7 @@ pub struct CasSyncConfig {
     pub endpoint: String,
     pub instance_name: String,
     pub header_env: Vec<(String, String)>,
-    pub remote_ttl: Duration,
+    pub policy: ::reapi::policy::Policy,
     pub staging_limit_bytes: u64,
 }
 impl CasSyncConfig {
@@ -40,7 +40,7 @@ impl CasSyncConfig {
             endpoint,
             instance_name: String::new(),
             header_env: Vec::new(),
-            remote_ttl: Duration::from_secs(10_800),
+            policy: Default::default(),
             staging_limit_bytes: DEFAULT_STAGING,
         }
     }
@@ -57,6 +57,7 @@ impl CasSyncConfig {
             endpoint: self.endpoint.clone(),
             instance_name: self.instance_name.clone(),
             headers,
+            policy: self.policy.clone(),
         })
     }
 }
@@ -197,6 +198,7 @@ impl CasSync {
         );
         // Validate credential selection before accepting traffic, without
         // retaining values in Debug-printable server configuration.
+        config.policy.validate()?;
         config.client_config()?;
         let (sender, receiver) = mpsc::channel(QUEUED_JOBS);
         let (shutdown, cancelled) = watch::channel(false);
@@ -234,9 +236,10 @@ impl CasSync {
                     alias: job.alias.clone(),
                     oids: job.oids.clone(),
                 };
+                let deadline = tokio::time::Instant::now() + config.policy.background_timeout();
                 let result = tokio::select! { biased;
                     _ = cancelled.changed() => { shared.with(|c| c.stats.cancelled_jobs += 1); drop(guard); break; },
-                    result = run_job(&app, &shared, &config, &mut client, job) => result,
+                    result = tokio::time::timeout_at(deadline, run_job(&app, &shared, &config, &mut client, job, deadline)) => result.unwrap_or(Err("background_deadline")),
                 };
                 shared.with(|c| {
                     if let Some(client) = &client {
@@ -341,6 +344,7 @@ async fn run_job(
     config: &CasSyncConfig,
     client: &mut Option<CasClient>,
     job: Job,
+    deadline: tokio::time::Instant,
 ) -> Result<(), &'static str> {
     if client.is_none() {
         let cfg = config
@@ -352,7 +356,7 @@ async fn run_job(
                 .map_err(|_| "connect_or_capabilities")?,
         );
     }
-    let client = client.as_ref().unwrap();
+    let client = client.as_ref().unwrap().with_deadline(deadline);
     for oids in job.oids.chunks(PRESENCE_BATCH) {
         let app = app.upgrade().ok_or("proxy_stopped")?;
         let repo = app
@@ -416,12 +420,17 @@ async fn run_job(
             .into_iter()
             .map(|d| (d.hash, d.size_bytes))
             .collect();
+        shared.with(|c| {
+            for digest in &missing {
+                c.present.remove(digest);
+            }
+        });
         let present: Vec<_> = digests
             .iter()
             .filter(|d| !missing.contains(&(d.hash.clone(), d.size_bytes)))
             .cloned()
             .collect();
-        shared.confirm(&present, started, config.remote_ttl);
+        shared.confirm(&present, started, config.policy.presence_ttl());
         let scratch = app.config.cache_dir.join("cas-spool");
         std::fs::create_dir_all(&scratch).map_err(|_| "spool")?;
         let staging = tempfile::Builder::new()
@@ -442,7 +451,7 @@ async fn run_job(
                 continue;
             }
             if staged_bytes + size > config.staging_limit_bytes {
-                upload_batch(client, shared, config, &mut batch, started).await?;
+                upload_batch(&client, shared, config, &mut batch, started).await?;
                 staged_bytes = 0;
             }
             let path = staging.path().join(&oid);
@@ -454,7 +463,7 @@ async fn run_job(
         }
         // Release the proxy/mirror owner before the remaining network work.
         drop(app);
-        upload_batch(client, shared, config, &mut batch, started).await?;
+        upload_batch(&client, shared, config, &mut batch, started).await?;
         if oversize {
             return Err("blob_exceeds_staging_limit");
         }
@@ -473,7 +482,7 @@ async fn upload_batch(
     }
     client.upload_missing(batch).await.map_err(|_| "upload")?;
     let digests: Vec<_> = batch.iter().map(|b| b.digest.clone()).collect();
-    shared.confirm(&digests, started, config.remote_ttl);
+    shared.confirm(&digests, started, config.policy.presence_ttl());
     shared.with(|c| {
         c.stats.uploaded_objects += batch.len() as u64;
         c.stats.uploaded_logical_bytes += digests.iter().map(|d| d.size_bytes as u64).sum::<u64>();
@@ -576,7 +585,7 @@ mod tests {
     fn configuration(root: &Path, source: &Path, endpoint: String, ttl: Duration) -> Config {
         let mut cas = CasSyncConfig::new(endpoint);
         cas.instance_name = "test/instance".into();
-        cas.remote_ttl = ttl;
+        cas.policy.presence_ttl_seconds = ttl.as_secs();
         Config {
             cache_dir: root.join("cache"),
             git: "git".into(),
@@ -672,7 +681,7 @@ mod tests {
             root.path(),
             &source,
             remote.endpoint.clone(),
-            Duration::from_millis(300),
+            Duration::from_secs(2),
         );
         let server = HttpServer::start(config.clone()).await;
         let mapping = server
@@ -701,7 +710,7 @@ mod tests {
         assert_eq!(repaired["failed_jobs"], 0);
         assert!(remote.contains(&digests[0]));
         assert_eq!(remote.find_missing_count(), checks + 1);
-        tokio::time::sleep(Duration::from_millis(350)).await;
+        tokio::time::sleep(Duration::from_millis(2050)).await;
         let uploads = remote.upload_count();
         server.post("cas-sync", json!({"oids":oids})).await;
         server.settled().await;
@@ -713,6 +722,37 @@ mod tests {
         let restarted = server.settled().await;
         assert_eq!(restarted["uploaded_objects"], 0);
         assert_eq!(remote.find_missing_count(), checks + 3);
+        server.stop().await;
+    }
+
+    #[tokio::test]
+    async fn default_zero_presence_ttl_rechecks_and_repairs_without_force() {
+        assert_eq!(
+            CasSyncConfig::new("http://127.0.0.1:1".into())
+                .policy
+                .presence_ttl(),
+            Duration::ZERO
+        );
+        let root = tempfile::tempdir().unwrap();
+        let (source, oids, digests) = fixture(root.path());
+        let remote = wire::server(false, 2 * 1024 * 1024, "no-auth").await;
+        let server = HttpServer::start(configuration(
+            root.path(),
+            &source,
+            remote.endpoint.clone(),
+            Duration::ZERO,
+        ))
+        .await;
+        server.post("cas-sync", json!({"oids":oids})).await;
+        server.settled().await;
+        let checks = remote.find_missing_count();
+        remote.evict(&digests[0]);
+        server.post("cas-sync", json!({"oids":oids})).await;
+        let repaired = server.settled().await;
+        assert_eq!(repaired["failed_jobs"], 0);
+        assert_eq!(repaired["ttl_hits"], 0);
+        assert_eq!(remote.find_missing_count(), checks + 1);
+        assert!(remote.contains(&digests[0]));
         server.stop().await;
     }
 

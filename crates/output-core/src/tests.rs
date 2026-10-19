@@ -9,6 +9,10 @@ struct Source {
     delay: AtomicBool,
     entered: tokio::sync::Notify,
     release: tokio::sync::Notify,
+    missing_delay: AtomicBool,
+    missing_entered: tokio::sync::Notify,
+    missing_release: tokio::sync::Notify,
+    unrequested_missing: AtomicBool,
 }
 impl Source {
     fn artifact(&self, bytes: &[u8]) -> Artifact {
@@ -45,6 +49,13 @@ impl BlobSource for Source {
         Ok(())
     }
     async fn missing(&self, artifacts: &[Artifact]) -> Result<Vec<Artifact>> {
+        if self.missing_delay.swap(false, Ordering::SeqCst) {
+            self.missing_entered.notify_one();
+            self.missing_release.notified().await;
+        }
+        if self.unrequested_missing.load(Ordering::SeqCst) {
+            return Ok(vec![self.artifact(b"unrequested")]);
+        }
         let data = self.data.lock().unwrap();
         Ok(artifacts
             .iter()
@@ -128,6 +139,109 @@ async fn cancellation_of_first_waiter_does_not_cancel_shared_fetch() {
     source.release.notify_one();
     assert_eq!(second.await.unwrap(), b"survives");
     assert_eq!(source.calls.load(Ordering::SeqCst), 1);
+}
+#[tokio::test]
+async fn waiter_deadline_does_not_cancel_independent_shared_fetch() {
+    let (_dir, source, tree) = setup(CacheConfig {
+        operation_timeout: Duration::from_millis(1000),
+        fetch_timeout: Duration::from_secs(5),
+        ..Default::default()
+    });
+    let node = tree
+        .stage("out", source.artifact(b"survives timeout"))
+        .await
+        .unwrap();
+    source.delay.store(true, Ordering::SeqCst);
+    let first = {
+        let tree = tree.clone();
+        tokio::spawn(async move { tree.read(node.id, 0, 99).await })
+    };
+    source.entered.notified().await;
+    let error = first.await.unwrap().unwrap_err();
+    assert!(error.downcast_ref::<CacheTimeoutError>().is_some());
+    assert_eq!(tree.cache_metrics().timed_out_waiters, 1);
+    // The first caller's deadline has already expired. A new waiter can still
+    // join that fetch, which has its own lifetime and retains its permits.
+    source.release.notify_one();
+    assert_eq!(
+        tree.read(node.id, 0, 99).await.unwrap(),
+        b"survives timeout"
+    );
+    assert_eq!(source.calls.load(Ordering::SeqCst), 1);
+}
+#[tokio::test]
+async fn fetch_slot_wait_is_inside_foreground_deadline() {
+    let (_dir, source, tree) = setup(CacheConfig {
+        max_concurrent_fetches: 1,
+        operation_timeout: Duration::from_millis(1000),
+        fetch_timeout: Duration::from_secs(5),
+        ..Default::default()
+    });
+    let first_artifact = source.artifact(b"blocked");
+    let second_artifact = source.artifact(b"queued");
+    source.delay.store(true, Ordering::SeqCst);
+    let first = {
+        let tree = tree.clone();
+        let artifact = first_artifact.clone();
+        tokio::spawn(async move { tree.content(&artifact).await })
+    };
+    source.entered.notified().await;
+    let error = tree.content(&second_artifact).await.err().unwrap();
+    assert!(error.downcast_ref::<CacheTimeoutError>().is_some());
+    assert_eq!(source.calls.load(Ordering::SeqCst), 1);
+    assert!(first.await.unwrap().is_err());
+    source.release.notify_one();
+    let first_bytes = tree.content(&first_artifact).await.unwrap();
+    assert_eq!(fs::read(first_bytes.path()).unwrap(), b"blocked");
+    let second_bytes = tree.content(&second_artifact).await.unwrap();
+    assert_eq!(fs::read(second_bytes.path()).unwrap(), b"queued");
+    assert!(tree.cache_metrics().admission_wait_ns > 0);
+}
+#[tokio::test]
+async fn shared_fetch_expiry_releases_temporary_bytes_and_allows_retry() {
+    let (dir, source, tree) = setup(CacheConfig {
+        operation_timeout: Duration::from_secs(5),
+        fetch_timeout: Duration::from_millis(1000),
+        ..Default::default()
+    });
+    let artifact = source.artifact(b"bounded fetch");
+    source.delay.store(true, Ordering::SeqCst);
+    let error = tree.content(&artifact).await.err().unwrap();
+    assert!(error.downcast_ref::<CacheTimeoutError>().is_some());
+    assert_eq!(tree.cache_metrics().timed_out_fetches, 1);
+    assert_eq!(fs::read_dir(dir.path().join("cache")).unwrap().count(), 0);
+    let bytes = tree.content(&artifact).await.unwrap();
+    assert_eq!(fs::read(bytes.path()).unwrap(), b"bounded fetch");
+    assert_eq!(source.calls.load(Ordering::SeqCst), 2);
+}
+#[tokio::test]
+async fn byte_admission_is_inside_foreground_deadline() {
+    let (_dir, source, tree) = setup(CacheConfig {
+        max_concurrent_fetches: 2,
+        max_inflight_bytes: 4096,
+        operation_timeout: Duration::from_millis(1000),
+        fetch_timeout: Duration::from_secs(5),
+        ..Default::default()
+    });
+    let first_artifact = source.artifact(b"blocked");
+    let second_artifact = source.artifact(b"queued");
+    source.delay.store(true, Ordering::SeqCst);
+    let first = {
+        let tree = tree.clone();
+        let artifact = first_artifact.clone();
+        tokio::spawn(async move { tree.content(&artifact).await })
+    };
+    source.entered.notified().await;
+    // Two fetch slots are available, but each small object occupies the only
+    // 4KiB transfer unit. The second operation times out before source.fetch.
+    let error = tree.content(&second_artifact).await.err().unwrap();
+    assert!(error.downcast_ref::<CacheTimeoutError>().is_some());
+    assert_eq!(source.calls.load(Ordering::SeqCst), 1);
+    assert!(first.await.unwrap().is_err());
+    source.release.notify_one();
+    let bytes = tree.content(&second_artifact).await.unwrap();
+    assert_eq!(fs::read(bytes.path()).unwrap(), b"queued");
+    assert_eq!(source.calls.load(Ordering::SeqCst), 2);
 }
 #[tokio::test]
 async fn corrupt_payload_is_not_published_and_retry_is_possible() {
@@ -376,4 +490,94 @@ async fn truncate_zero_needs_no_remote_content_and_tree_identity_survives_restar
     let tree = Tree::open(dir.path(), "test", source, CacheConfig::default()).unwrap();
     assert_eq!(tree.identity(), identity);
     assert_eq!(tree.get(n.id).unwrap().size, 15);
+}
+
+#[tokio::test]
+async fn blocked_refresh_does_not_block_other_base_and_revalidates_mutations() {
+    let (_dir, source, tree) = setup(CacheConfig::default());
+    let missing = source.artifact(b"expired");
+    let replacement = tree.stage("a/replaced", missing.clone()).await.unwrap();
+    let dirty = tree.stage("a/dirty", missing.clone()).await.unwrap();
+    let renamed = tree.stage("a/sub/file", missing.clone()).await.unwrap();
+    tree.stage("a/unchanged", missing.clone()).await.unwrap();
+    source.data.lock().unwrap().remove(&missing);
+    source.missing_delay.store(true, Ordering::SeqCst);
+    let pending = {
+        let tree = tree.clone();
+        tokio::spawn(async move { tree.prepare_refresh("a").await.unwrap() })
+    };
+    source.missing_entered.notified().await;
+    tokio::time::timeout(std::time::Duration::from_secs(1), async {
+        let other = source.artifact(b"other base");
+        tree.stage("b/out", other.clone()).await.unwrap();
+        assert_eq!(
+            tree.stat("b/out", 9).await.unwrap(),
+            Some(TreeStat::File {
+                artifact: Some(other)
+            })
+        );
+        let new = tree.stage("a/replaced", missing.clone()).await.unwrap();
+        assert_ne!(new.id, replacement.id);
+        tree.setattr(
+            dirty.id,
+            SetAttr {
+                size: Some(0),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let parent = tree.resolve("a").unwrap().id;
+        tree.rename(parent, "sub", parent, "renamed").await.unwrap();
+    })
+    .await
+    .unwrap();
+    source.missing_release.notify_one();
+    let plan = pending.await.unwrap();
+    assert_eq!(tree.apply_refresh(plan).await.unwrap(), vec!["a/unchanged"]);
+    assert!(tree.resolve("a/replaced").is_ok());
+    assert_eq!(tree.resolve("a/renamed/file").unwrap().id, renamed.id);
+    assert!(tree.get(dirty.id).unwrap().remote.is_none());
+    assert_eq!(tree.read(dirty.id, 0, 99).await.unwrap(), b"");
+}
+
+#[tokio::test]
+async fn refresh_rejects_unrequested_presence_results_without_mutating_namespace() {
+    let (_dir, source, tree) = setup(CacheConfig::default());
+    let artifact = source.artifact(b"retained");
+    let node = tree.stage("out", artifact).await.unwrap();
+    source.unrequested_missing.store(true, Ordering::SeqCst);
+    assert!(tree.prepare_refresh("").await.is_err());
+    assert_eq!(tree.resolve("out").unwrap(), node);
+}
+
+#[tokio::test]
+async fn same_inode_readers_share_one_foreground_admission_budget() {
+    let (_dir, source, tree) = setup(CacheConfig {
+        operation_timeout: Duration::from_millis(100),
+        fetch_timeout: Duration::from_secs(5),
+        ..Default::default()
+    });
+    let node = tree
+        .stage("out", source.artifact(b"delayed"))
+        .await
+        .unwrap();
+    source.delay.store(true, Ordering::SeqCst);
+    let readers: Vec<_> = (0..16)
+        .map(|_| {
+            let tree = tree.clone();
+            tokio::spawn(async move { tree.read(node.id, 0, 99).await })
+        })
+        .collect();
+    source.entered.notified().await;
+    tokio::time::timeout(Duration::from_secs(1), async {
+        for reader in readers {
+            let error = reader.await.unwrap().unwrap_err();
+            assert!(error.downcast_ref::<CacheTimeoutError>().is_some());
+        }
+    })
+    .await
+    .expect("inode admission must not multiply the foreground budget");
+    assert_eq!(source.calls.load(Ordering::SeqCst), 1);
+    source.release.notify_one();
 }

@@ -3,6 +3,7 @@ use bazel_output_service::{
 };
 use clap::{Parser, ValueEnum};
 use output_core::{Projection, Tree};
+use reapi::policy::Policy;
 use std::{net::SocketAddr, path::PathBuf, sync::Arc, time::Duration};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
@@ -28,8 +29,12 @@ struct Args {
     api_key_env: String,
     #[arg(long, default_value_t = 17_179_869_184)]
     max_blob_bytes: u64,
-    #[arg(long, default_value_t = 120)]
-    rpc_timeout_secs: u64,
+    /// Explicit TOML policy file. No configuration is loaded automatically.
+    #[arg(long)]
+    config: Option<PathBuf>,
+    /// Override the per-attempt unary RPC timeout (not the total operation budget).
+    #[arg(long)]
+    rpc_timeout_secs: Option<u64>,
     #[arg(long, value_enum, default_value_t = Storage::Eager)]
     storage: Storage,
     /// Durable namespace, writable payloads and verified cache; outside --root.
@@ -49,6 +54,8 @@ struct Args {
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let args = Args::parse();
+    // Reject invalid policy before inspecting or mounting native storage.
+    let policy = args.policy()?;
     anyhow::ensure!(
         args.listen.ip().is_loopback(),
         "unauthenticated service must bind loopback"
@@ -70,7 +77,7 @@ async fn main() -> anyhow::Result<()> {
         instance_name: args.instance_name.clone(),
         api_key,
         max_blob_bytes: args.max_blob_bytes,
-        rpc_timeout: Duration::from_secs(args.rpc_timeout_secs),
+        policy,
     })
     .await?;
     let (projection, tree) = if args.storage == Storage::Eager {
@@ -143,6 +150,22 @@ async fn main() -> anyhow::Result<()> {
     result
 }
 
+impl Args {
+    fn policy(&self) -> anyhow::Result<Policy> {
+        let mut policy = match &self.config {
+            Some(path) => Policy::load(path)?,
+            None => Policy::default(),
+        };
+        if let Some(seconds) = self.rpc_timeout_secs {
+            policy.rpc_timeout_ms = seconds
+                .checked_mul(1_000)
+                .ok_or_else(|| anyhow::anyhow!("--rpc-timeout-secs is too large"))?;
+        }
+        policy.validate()?;
+        Ok(policy)
+    }
+}
+
 async fn wait_for_shutdown() -> anyhow::Result<()> {
     #[cfg(windows)]
     {
@@ -204,6 +227,8 @@ async fn mount_projection(
             max_bytes: args.max_cache_bytes,
             max_concurrent_fetches: args.max_concurrent_fetches,
             max_inflight_bytes: args.max_inflight_bytes,
+            operation_timeout: service.policy().operation_timeout(),
+            fetch_timeout: service.policy().operation_timeout(),
         },
     )?;
     let projection: Arc<dyn Projection> = match args.storage {
@@ -240,4 +265,54 @@ async fn mount_projection(
     _service: &OutputService,
 ) -> anyhow::Result<(Arc<dyn Projection>, Arc<Tree>)> {
     anyhow::bail!("native lazy output mounts require macOS NFS or Windows ProjFS")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn args(extra: &[&str]) -> Args {
+        Args::try_parse_from(
+            [
+                "git-output-service",
+                "--root",
+                "outputs",
+                "--cas-endpoint",
+                "grpc://127.0.0.1:1985",
+            ]
+            .into_iter()
+            .chain(extra.iter().copied()),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn explicit_config_and_cli_override_preserve_other_budgets() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("policy.toml");
+        std::fs::write(
+            &path,
+            "[reapi]\nrpc_timeout_ms = 23000\noperation_timeout_ms = 91000\n",
+        )
+        .unwrap();
+        let path = path.to_str().unwrap();
+        let from_file = args(&["--config", path]).policy().unwrap();
+        assert_eq!(from_file.rpc_timeout(), Duration::from_secs(23));
+        let overridden = args(&["--config", path, "--rpc-timeout-secs", "7"])
+            .policy()
+            .unwrap();
+        assert_eq!(overridden.rpc_timeout(), Duration::from_secs(7));
+        assert_eq!(overridden.operation_timeout(), Duration::from_secs(91));
+        assert_eq!(args(&[]).policy().unwrap(), Policy::default());
+    }
+
+    #[test]
+    fn invalid_override_is_rejected_before_startup() {
+        assert!(args(&["--rpc-timeout-secs", "0"]).policy().is_err());
+        assert!(
+            args(&["--rpc-timeout-secs", "18446744073709551615"])
+                .policy()
+                .is_err()
+        );
+    }
 }

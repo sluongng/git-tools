@@ -822,9 +822,43 @@ impl Projection for ProjfsMount {
         self.provider.tree.stat(path, digest_function).await
     }
     async fn refresh(&self, prefix: &str) -> Result<()> {
+        {
+            let _guard = self.publication.lock().await;
+            self.recover_publication().await?;
+        }
+        // FMB may stall; keep publication for unrelated output bases available.
+        let mut plan = self.provider.tree.prepare_refresh(prefix).await?;
         let _guard = self.publication.lock().await;
         self.recover_publication().await?;
-        let missing = self.provider.tree.refresh(prefix).await?;
+        plan.retain_candidates(|path, node| {
+            // Native data/rename authority can change while FMB is in flight.
+            // Keep such nodes and let normal stat/rebuild reconciliation decide.
+            if self.provider.is_distrusted(path) {
+                return Ok(false);
+            }
+            if self
+                .provider
+                .native_state(path)?
+                .is_some_and(|state| state & (PRJ_FILE_STATE_FULL | PRJ_FILE_STATE_TOMBSTONE) != 0)
+            {
+                return Ok(false);
+            }
+            let expected = self
+                .provider
+                .fingerprints
+                .lock()
+                .unwrap()
+                .records
+                .get(&node.id)
+                .cloned();
+            if let Some(actual) = native_fingerprint(&self.root().join(path))? {
+                if expected.as_ref() != Some(&actual) {
+                    return Ok(false);
+                }
+            }
+            Ok(true)
+        })?;
+        let missing = self.provider.tree.apply_refresh(plan).await?;
         for path in missing {
             let n = wide(path.replace('/', "\\"));
             self.provider.context_call(|c| unsafe {

@@ -4266,9 +4266,13 @@ dependencies = [
 name = "reapi"
 version = "0.1.0"
 dependencies = [
+ "fastrand",
  "prost",
  "prost-types",
  "protoc-bin-vendored",
+ "serde",
+ "tokio",
+ "toml",
  "tonic",
  "tonic-prost",
  "tonic-prost-build",

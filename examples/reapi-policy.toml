@@ -1,0 +1,16 @@
+# Pass explicitly with --config /path/to/reapi-policy.toml.
+# This file contains policy only; credentials remain in the environment.
+[reapi]
+connect_timeout_ms = 10000
+rpc_timeout_ms = 60000
+stream_idle_timeout_ms = 60000
+operation_timeout_ms = 120000
+background_timeout_ms = 600000
+# Zero disables positive-presence suppression, not remote storage expiry.
+presence_ttl_seconds = 0
+
+[reapi.retry]
+# Includes the first attempt. Backoff uses full jitter within this cap.
+max_attempts = 4
+initial_backoff_ms = 100
+max_backoff_ms = 5000

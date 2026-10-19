@@ -18,6 +18,9 @@ bazel --digest_function=BLAKE3 build //:target \
 
 Configure Bazel's host-scoped credential helper separately. SHA256 also works.
 Set `--instance-name` to match a nonempty Bazel `--remote_instance_name`.
+Use `--config /path/to/reapi-policy.toml` for conservative, configurable timeout
+and retry settings; see [policy defaults and example](../../docs/reapi-policy.md).
+Explicit CLI overrides take precedence. No file is loaded automatically.
 
 ## Storage
 
@@ -51,7 +54,7 @@ with zero-download initial cached builds. First consumption pays the whole-blob
 verification cost; this is not an established eager-versus-lazy speedup.
 
 **Limits:** experimental native mounts, independent source/output caches,
-serialized lifecycle/staging, no TreeArtifactLocator staging or modification
+serialized lifecycle/staging per output base, no TreeArtifactLocator staging or modification
 journal. Retired IDs/local payloads are retained conservatively; cache leases do
 not guarantee an indefinitely open NFS descriptor works after CAS expiration.
 Windows permits local directory renames, but rejects moves containing projected

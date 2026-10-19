@@ -20,11 +20,20 @@ use std::{
 use tokio_stream::{Stream, wrappers::TcpListenerStream};
 use tonic::{Request, Response, Status};
 
+fn test_policy(timeout: Duration) -> reapi::policy::Policy {
+    let mut policy = reapi::policy::Policy::default();
+    policy.rpc_timeout_ms = timeout.as_millis() as u64;
+    policy.stream_idle_timeout_ms = timeout.as_millis() as u64;
+    policy.operation_timeout_ms = timeout.as_millis() as u64;
+    policy
+}
+
 #[derive(Clone, Default)]
 struct Cas {
     data: Arc<Mutex<HashMap<String, Vec<u8>>>>,
     reads: Arc<Mutex<Vec<String>>>,
     stall: Arc<AtomicBool>,
+    transient_reads: Arc<AtomicUsize>,
     presence_queries: Arc<Mutex<Vec<cas_proto::FindMissingBlobsRequest>>>,
     zstd: Arc<AtomicBool>,
     capabilities_implemented: Arc<AtomicBool>,
@@ -201,6 +210,18 @@ impl bs::byte_stream_server::ByteStream for Cas {
             .get(&identity_name)
             .cloned()
             .ok_or_else(|| Status::not_found("missing fixture blob"))?;
+        if self
+            .transient_reads
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+            .is_ok()
+        {
+            return Ok(Response::new(Box::pin(tokio_stream::iter(vec![
+                Ok(bs::ReadResponse {
+                    data: bytes[..bytes.len().min(2)].to_vec(),
+                }),
+                Err(Status::unavailable("transient fixture disconnect")),
+            ]))));
+        }
         if self.stall.load(Ordering::SeqCst) {
             return Ok(Response::new(Box::pin(tokio_stream::pending())));
         }
@@ -253,6 +274,7 @@ struct HeadlessProjection {
     tree: Arc<output_core::Tree>,
     root: std::path::PathBuf,
     _state: tempfile::TempDir,
+    refresh_gate: Mutex<Option<(String, Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>>,
 }
 #[async_trait::async_trait]
 impl output_core::Projection for HeadlessProjection {
@@ -271,6 +293,13 @@ impl output_core::Projection for HeadlessProjection {
         self.tree.stat(p, f).await
     }
     async fn refresh(&self, p: &str) -> anyhow::Result<()> {
+        let gate = self.refresh_gate.lock().unwrap().clone();
+        if let Some((path, entered, release)) = gate {
+            if path == p {
+                entered.notify_one();
+                release.notified().await;
+            }
+        }
         self.tree.refresh(p).await?;
         Ok(())
     }
@@ -296,6 +325,13 @@ impl Fixture {
         Self::configured_limit(lazy, timeout, 1024 * 1024).await
     }
     async fn configured_limit(lazy: bool, timeout: Duration, max_blob_bytes: u64) -> Self {
+        Self::configured_policy(lazy, test_policy(timeout), max_blob_bytes).await
+    }
+    async fn configured_policy(
+        lazy: bool,
+        policy: reapi::policy::Policy,
+        max_blob_bytes: u64,
+    ) -> Self {
         let dir = tempfile::tempdir().unwrap();
         let cas = Cas::default();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -318,7 +354,7 @@ impl Fixture {
             instance_name: "fixture".into(),
             api_key: Some("test-key".into()),
             max_blob_bytes,
-            rpc_timeout: timeout,
+            policy,
         })
         .await
         .unwrap();
@@ -335,6 +371,7 @@ impl Fixture {
                 tree,
                 root: dir.path().canonicalize().unwrap(),
                 _state: state,
+                refresh_gate: Mutex::new(None),
             }))
         } else {
             None
@@ -1423,7 +1460,7 @@ async fn lazy_presence_deadlines_include_unary_response_bodies() {
             instance_name: "fixture".into(),
             api_key: None,
             max_blob_bytes: 1024,
-            rpc_timeout: Duration::from_millis(80),
+            policy: test_policy(Duration::from_millis(80)),
         })
         .await
         .unwrap();
@@ -1542,4 +1579,176 @@ async fn single_message_expansion_yields_to_the_total_read_deadline() {
         size > 0 && size < artifact.size,
         "deadline should interrupt actual decompression, not only network setup: {size}"
     );
+}
+
+#[tokio::test]
+async fn retry_restarts_partial_reads_and_does_not_retry_missing_or_corruption() {
+    let fixture = Fixture::new().await;
+    let digest = fixture.blob(b"verified complete retry content", 1);
+    let artifact = output_core::Artifact {
+        backend: fixture.service.backend_identity(),
+        instance: "fixture".into(),
+        digest_function: 1,
+        hash: digest.hash.clone(),
+        size: digest.size_bytes as u64,
+    };
+    fixture.cas.transient_reads.store(1, Ordering::SeqCst);
+    let mut file = tempfile::tempfile().unwrap();
+    fixture
+        .service
+        .blob_source()
+        .fetch(&artifact, &mut file)
+        .await
+        .unwrap();
+    assert_eq!(fixture.cas.reads.lock().unwrap().len(), 2);
+    use std::io::{Read, Seek};
+    file.rewind().unwrap();
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes).unwrap();
+    assert_eq!(bytes, b"verified complete retry content");
+
+    fixture.cas.data.lock().unwrap().clear();
+    let error = fixture
+        .service
+        .blob_source()
+        .fetch(&artifact, &mut file)
+        .await
+        .unwrap_err();
+    assert_eq!(
+        error.downcast_ref::<Status>().unwrap().code(),
+        tonic::Code::NotFound
+    );
+    assert_eq!(fixture.cas.reads.lock().unwrap().len(), 3);
+    fixture.cas.data.lock().unwrap().insert(
+        format!("fixture/blobs/{}/{}", digest.hash, digest.size_bytes),
+        vec![b'x'; digest.size_bytes as usize],
+    );
+    let error = fixture
+        .service
+        .blob_source()
+        .fetch(&artifact, &mut file)
+        .await
+        .unwrap_err();
+    assert_eq!(
+        error.downcast_ref::<Status>().unwrap().code(),
+        tonic::Code::DataLoss
+    );
+    assert_eq!(fixture.cas.reads.lock().unwrap().len(), 4);
+}
+
+#[tokio::test]
+async fn blocked_start_isolated_by_base_and_cancelled_reservation_is_reusable() {
+    use proto::bazel_output_service_server::BazelOutputService;
+    let fixture = Fixture::configured(true, Duration::from_secs(5)).await;
+    let service = fixture.service.clone();
+    service
+        .start_build(Request::new(fixture.request("old", 1)))
+        .await
+        .unwrap();
+    let projection = fixture.projection.as_ref().unwrap();
+    let entered = Arc::new(tokio::sync::Notify::new());
+    let release = Arc::new(tokio::sync::Notify::new());
+    let key = blake3::hash(b"base").to_hex().to_string();
+    *projection.refresh_gate.lock().unwrap() = Some((key, entered.clone(), release));
+    let request = fixture.request("reserved", 1);
+    let task_service = service.clone();
+    let blocked =
+        tokio::spawn(async move { task_service.start_build(Request::new(request)).await });
+    tokio::time::timeout(Duration::from_secs(1), entered.notified())
+        .await
+        .unwrap();
+    let mut other = fixture.request("other", 1);
+    other.output_base_id = "other-base".into();
+    tokio::time::timeout(
+        Duration::from_secs(1),
+        service.start_build(Request::new(other)),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    let mut duplicate = fixture.request("reserved", 1);
+    duplicate.output_base_id = "duplicate-base".into();
+    assert_eq!(
+        service
+            .start_build(Request::new(duplicate.clone()))
+            .await
+            .unwrap_err()
+            .code(),
+        tonic::Code::AlreadyExists
+    );
+    assert!(
+        tokio::time::timeout(
+            Duration::from_millis(40),
+            service.batch_stat(Request::new(proto::BatchStatRequest {
+                build_id: "old".into(),
+                paths: vec![]
+            }))
+        )
+        .await
+        .is_err()
+    );
+    blocked.abort();
+    let _ = blocked.await;
+    *projection.refresh_gate.lock().unwrap() = None;
+    service
+        .batch_stat(Request::new(proto::BatchStatRequest {
+            build_id: "old".into(),
+            paths: vec![],
+        }))
+        .await
+        .unwrap();
+    service.start_build(Request::new(duplicate)).await.unwrap();
+    service
+        .clean(Request::new(proto::CleanRequest {
+            output_base_id: "base".into(),
+        }))
+        .await
+        .unwrap();
+    service
+        .start_build(Request::new(fixture.request("reused", 1)))
+        .await
+        .unwrap();
+    assert_eq!(
+        service
+            .batch_stat(Request::new(proto::BatchStatRequest {
+                build_id: "old".into(),
+                paths: vec![]
+            }))
+            .await
+            .unwrap_err()
+            .code(),
+        tonic::Code::FailedPrecondition
+    );
+}
+
+#[tokio::test]
+async fn stream_idle_deadline_is_independent_of_the_operation_budget() {
+    let mut policy = test_policy(Duration::from_secs(5));
+    policy.stream_idle_timeout_ms = 40;
+    policy.retry.max_attempts = 1;
+    let fixture = Fixture::configured_policy(false, policy, 1024).await;
+    let digest = fixture.blob(b"stalled progress", 1);
+    fixture.cas.stall.store(true, Ordering::SeqCst);
+    let artifact = output_core::Artifact {
+        backend: fixture.service.backend_identity(),
+        instance: "fixture".into(),
+        digest_function: 1,
+        hash: digest.hash,
+        size: digest.size_bytes as u64,
+    };
+    let error = tokio::time::timeout(
+        Duration::from_secs(1),
+        fixture
+            .service
+            .blob_source()
+            .fetch(&artifact, &mut tempfile::tempfile().unwrap()),
+    )
+    .await
+    .expect("idle timeout must precede the five-second operation deadline")
+    .unwrap_err();
+    assert_eq!(
+        error.downcast_ref::<Status>().unwrap().code(),
+        tonic::Code::DeadlineExceeded
+    );
+    assert_eq!(fixture.cas.reads.lock().unwrap().len(), 1);
 }

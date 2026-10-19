@@ -595,7 +595,7 @@ pub struct NfsMount {
     root: PathBuf,
     #[cfg(target_os = "macos")]
     identity: MountIdentity,
-    control: AsyncMutex<()>,
+    control: Arc<AsyncMutex<()>>,
     server: Mutex<Option<tokio::task::JoinHandle<std::io::Result<()>>>>,
 }
 impl NfsMount {
@@ -652,13 +652,41 @@ impl NfsMount {
                 identity,
                 fs,
                 root,
-                control: AsyncMutex::new(()),
+                control: Arc::new(AsyncMutex::new(())),
                 server: Mutex::new(Some(server)),
             })
         }
     }
+    // Admission is cancellable. Once admitted, namespace publication and the
+    // complete native invalidation barrier retain their guard independently of
+    // the caller: dropping a JoinHandle does not abort its task.
+    async fn complete<F, Fut>(&self, operation: F) -> Result<()>
+    where
+        F: FnOnce(NfsPublisher) -> Fut + Send + 'static,
+        Fut: std::future::Future<Output = Result<()>> + Send + 'static,
+    {
+        let guard = self.control.clone().lock_owned().await;
+        let publisher = NfsPublisher {
+            fs: self.fs.clone(),
+            root: self.root.clone(),
+        };
+        tokio::spawn(async move {
+            let _guard = guard;
+            operation(publisher).await
+        })
+        .await
+        .context("native publication task failed")?
+    }
+}
+#[derive(Clone)]
+struct NfsPublisher {
+    fs: OutputNfs,
+    root: PathBuf,
+}
+impl NfsPublisher {
     // chmod re-enters the server. Never hold Tree namespace locks here.
     async fn invalidate(&self, paths: Vec<(String, Node)>) -> Result<()> {
+        let mut failure = None;
         for (relative, node) in paths {
             let _marker = self.fs.mark(vec![node.id])?;
             let root = self.root.clone();
@@ -666,9 +694,19 @@ impl NfsMount {
             let result =
                 tokio::task::spawn_blocking(move || invalidate_no_follow(&root, &relative, mode))
                     .await;
-            result??;
+            if let Err(error) = result
+                .context("native invalidation task failed")
+                .and_then(|result| result)
+            {
+                if failure.is_none() {
+                    failure = Some(error);
+                }
+            }
         }
-        Ok(())
+        match failure {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
     }
     async fn publish(&self, path: &str, node: Option<Node>) -> Result<()> {
         let ancestors = self.ancestor_nodes(path)?;
@@ -676,11 +714,11 @@ impl NfsMount {
         // from the nearest visible ancestor before traversing deeper paths.
         let mut before = ancestors.clone();
         before.reverse();
-        self.invalidate(before).await?;
         if let Some(node) = node {
-            self.invalidate(vec![(path.to_owned(), node)]).await?;
+            before.push((path.to_owned(), node));
         }
-        self.invalidate(ancestors).await
+        before.extend(ancestors);
+        self.invalidate(before).await
     }
     fn ancestor_nodes(&self, path: &str) -> Result<Vec<(String, Node)>> {
         let mut current = Path::new(path).parent();
@@ -699,47 +737,60 @@ impl Projection for NfsMount {
         &self.root
     }
     async fn ensure_dir(&self, path: &str) -> Result<()> {
-        let _guard = self.control.lock().await;
-        self.fs.tree.ensure_dir(path).await?;
-        self.publish(path, None).await
+        let path = path.to_owned();
+        self.complete(move |publisher| async move {
+            publisher.fs.tree.ensure_dir(&path).await?;
+            publisher.publish(&path, None).await
+        })
+        .await
     }
     async fn stage(&self, path: &str, artifact: Artifact) -> Result<()> {
-        let _guard = self.control.lock().await;
-        let previous = self.fs.tree.resolve(path).ok();
-        self.fs.tree.stage(path, artifact).await?;
-        // Invalidate cached old file data before parent name/negative caches.
-        let node = self.fs.tree.resolve(path)?;
-        let _old_marker = self
-            .fs
-            .mark(previous.iter().map(|node| node.id).collect())?;
-        self.publish(path, Some(node)).await
+        let path = path.to_owned();
+        self.complete(move |publisher| async move {
+            let previous = publisher.fs.tree.resolve(&path).ok();
+            publisher.fs.tree.stage(&path, artifact).await?;
+            let node = publisher.fs.tree.resolve(&path)?;
+            // Keep the retired generation marked through every native cache barrier.
+            let _old_marker = publisher
+                .fs
+                .mark(previous.iter().map(|node| node.id).collect())?;
+            publisher.publish(&path, Some(node)).await
+        })
+        .await
     }
     async fn stat(&self, path: &str, digest_function: i32) -> Result<Option<TreeStat>> {
         self.fs.tree.stat(path, digest_function).await
     }
     async fn refresh(&self, prefix: &str) -> Result<()> {
-        let _guard = self.control.lock().await;
-        let removed = self.fs.tree.refresh(prefix).await?;
-        let mut nodes = Vec::new();
-        let mut seen = HashSet::new();
-        for path in removed {
-            for item in self.ancestor_nodes(&path)? {
-                if seen.insert(item.1.id) {
-                    nodes.push(item);
+        // Remote presence checks must not block publication for other bases.
+        let plan = self.fs.tree.prepare_refresh(prefix).await?;
+        self.complete(move |publisher| async move {
+            let removed = publisher.fs.tree.apply_refresh(plan).await?;
+            let mut nodes = Vec::new();
+            let mut seen = HashSet::new();
+            for path in removed {
+                for item in publisher.ancestor_nodes(&path)? {
+                    if seen.insert(item.1.id) {
+                        nodes.push(item);
+                    }
                 }
             }
-        }
-        nodes.sort_by_key(|(path, _)| std::cmp::Reverse(Path::new(path).components().count()));
-        self.invalidate(nodes).await
+            nodes.sort_by_key(|(path, _)| std::cmp::Reverse(Path::new(path).components().count()));
+            publisher.invalidate(nodes).await
+        })
+        .await
     }
     async fn clean(&self, prefix: &str) -> Result<()> {
-        let _guard = self.control.lock().await;
-        self.fs.tree.clean(prefix).await?;
-        let mut nodes = self.ancestor_nodes(prefix)?;
-        if nodes.is_empty() {
-            nodes.push(("".to_owned(), self.fs.tree.get(1)?))
-        }
-        self.invalidate(nodes).await
+        let prefix = prefix.to_owned();
+        self.complete(move |publisher| async move {
+            publisher.fs.tree.clean(&prefix).await?;
+            let mut nodes = publisher.ancestor_nodes(&prefix)?;
+            if nodes.is_empty() {
+                nodes.push(("".to_owned(), publisher.fs.tree.get(1)?));
+            }
+            publisher.invalidate(nodes).await
+        })
+        .await
     }
     async fn shutdown(&self) -> Result<()> {
         let _guard = self.control.lock().await;
@@ -802,5 +853,116 @@ impl Projection for NfsMount {
             server.abort()
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod publication_tests {
+    use super::*;
+    use std::{
+        io::Write,
+        sync::atomic::{AtomicBool, Ordering},
+        time::Duration,
+    };
+
+    struct Source;
+    #[async_trait]
+    impl output_core::BlobSource for Source {
+        async fn fetch(&self, _: &Artifact, _: &mut std::fs::File) -> Result<()> {
+            bail!("publication must not fetch content")
+        }
+        async fn missing(&self, _: &[Artifact]) -> Result<Vec<Artifact>> {
+            Ok(vec![])
+        }
+    }
+    fn artifact(hash: &str) -> Artifact {
+        Artifact {
+            backend: "fixture".into(),
+            instance: "".into(),
+            digest_function: 1,
+            hash: hash.repeat(64),
+            size: 1,
+        }
+    }
+    // Use a local directory for the native barrier, without needing an NFS mount.
+    // The delayed blocking callback has the same non-abortable lifetime as chmod.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cancelled_publication_retains_markers_and_excludes_following_mutation() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("view");
+        std::fs::create_dir(&root).unwrap();
+        std::fs::File::create(root.join("file"))
+            .unwrap()
+            .write_all(b"x")
+            .unwrap();
+        let tree = Tree::open(
+            dir.path().join("state"),
+            "fixture",
+            Arc::new(Source),
+            output_core::CacheConfig::default(),
+        )
+        .unwrap();
+        tree.stage("file", artifact("1")).await.unwrap();
+        let old = tree.resolve("file").unwrap();
+        let mount = Arc::new(NfsMount {
+            fs: OutputNfs::new(tree.clone()),
+            root,
+            #[cfg(target_os = "macos")]
+            identity: MountIdentity {
+                fsid: [0, 0],
+                source: vec![],
+            },
+            control: Arc::new(AsyncMutex::new(())),
+            server: Mutex::new(None),
+        });
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let (release, blocked) = std::sync::mpsc::channel();
+        let task_mount = mount.clone();
+        let task_entered = entered.clone();
+        let caller = tokio::spawn(async move {
+            task_mount
+                .complete(move |publisher| async move {
+                    let _marker = publisher.fs.mark(vec![old.id])?;
+                    publisher.fs.tree.stage("file", artifact("2")).await?;
+                    task_entered.notify_one();
+                    tokio::task::spawn_blocking(move || blocked.recv()).await??;
+                    let node = publisher.fs.tree.resolve("file")?;
+                    publisher.publish("file", Some(node)).await
+                })
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(2), entered.notified())
+            .await
+            .unwrap();
+        caller.abort();
+        let _ = caller.await;
+        assert!(mount.fs.invalidating.lock().unwrap().contains(&old.id));
+        let finished = Arc::new(AtomicBool::new(false));
+        let next_mount = mount.clone();
+        let next_finished = finished.clone();
+        let mut next = tokio::spawn(async move {
+            next_mount.stage("file", artifact("3")).await.unwrap();
+            next_finished.store(true, Ordering::SeqCst);
+        });
+        assert!(
+            tokio::time::timeout(Duration::from_millis(40), &mut next)
+                .await
+                .is_err()
+        );
+        assert!(!finished.load(Ordering::SeqCst));
+        assert_eq!(
+            tree.resolve("file").unwrap().remote.unwrap().hash,
+            artifact("2").hash
+        );
+        release.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(2), next)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            tree.resolve("file").unwrap().remote.unwrap().hash,
+            artifact("3").hash
+        );
+        assert!(!mount.fs.invalidating.lock().unwrap().contains(&old.id));
     }
 }

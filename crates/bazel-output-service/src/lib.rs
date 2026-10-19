@@ -8,14 +8,18 @@ use cap_fs_ext::{FollowSymlinks, OpenOptionsFollowExt, OpenOptionsSyncExt};
 use cap_std::fs::{Dir, OpenOptions};
 use output_core::{Artifact, BlobSource, Projection, TreeStat};
 use prost::Message;
-use reapi::{Digest, proto::google::bytestream as bs};
+use reapi::{
+    Digest,
+    policy::{Policy, timeout},
+    proto::google::bytestream as bs,
+};
 use sha2::{Digest as _, Sha256};
 use std::{
     collections::HashMap,
-    io::{Read, Write},
+    io::{Read, Seek, SeekFrom, Write},
     path::{Component, Path, PathBuf},
     sync::{
-        Arc,
+        Arc, Mutex as StdMutex, Weak,
         atomic::{AtomicU64, Ordering},
     },
     time::Duration,
@@ -47,7 +51,7 @@ pub struct Config {
     pub instance_name: String,
     pub api_key: Option<String>,
     pub max_blob_bytes: u64,
-    pub rpc_timeout: Duration,
+    pub policy: Policy,
 }
 #[derive(Clone)]
 pub struct OutputService {
@@ -56,9 +60,8 @@ pub struct OutputService {
     backend: Backend,
     projection: Option<Arc<dyn Projection>>,
     projection_tree: Option<Arc<output_core::Tree>>,
-    // Serializes lifecycle changes with staging, including across network awaits.
-    // This favors correctness over parallel staging in this initial implementation.
-    state: Arc<Mutex<HashMap<String, Build>>>,
+    // Registry operations never await; each output base owns its lifecycle lock.
+    state: Arc<StdMutex<Registry>>,
     metrics: Arc<Metrics>,
 }
 #[derive(Default)]
@@ -85,6 +88,35 @@ struct Build {
     digest_function: i32,
     finalized: bool,
 }
+type Base = Mutex<Option<Build>>;
+#[derive(Default)]
+struct Registry {
+    bases: HashMap<String, Weak<Base>>,
+    active: HashMap<String, Arc<Base>>,
+    ids: HashMap<String, (String, u64)>,
+    next_token: u64,
+}
+// A canceled or failed StartBuild must not retain its tentative build ID.
+struct Reservation {
+    registry: Arc<StdMutex<Registry>>,
+    id: String,
+    token: u64,
+    committed: bool,
+}
+impl Drop for Reservation {
+    fn drop(&mut self) {
+        if !self.committed {
+            let mut registry = self.registry.lock().unwrap();
+            if registry
+                .ids
+                .get(&self.id)
+                .is_some_and(|(_, token)| *token == self.token)
+            {
+                registry.ids.remove(&self.id);
+            }
+        }
+    }
+}
 // Clean up even when a stage RPC future is cancelled during a CAS read.
 struct TempOutput {
     parent: Dir,
@@ -102,7 +134,7 @@ struct Backend {
     instance: String,
     api_key: Option<tonic::metadata::MetadataValue<tonic::metadata::Ascii>>,
     max_blob_bytes: u64,
-    timeout: Duration,
+    policy: Policy,
     zstd_supported: Arc<OnceCell<bool>>,
     grpc_compression: Arc<reapi::compression::GrpcCompression>,
     zstd_read_requests: Arc<AtomicU64>,
@@ -119,6 +151,12 @@ fn io_status(error: std::io::Error) -> Status {
     }
 }
 fn projection_status(error: anyhow::Error) -> Status {
+    if error
+        .downcast_ref::<output_core::CacheTimeoutError>()
+        .is_some()
+    {
+        return Status::deadline_exceeded("output cache operation timed out");
+    }
     if error
         .downcast_ref::<output_core::CacheLimitError>()
         .is_some()
@@ -300,60 +338,103 @@ impl Backend {
             .to_hex()
             .to_string()
     }
-    fn request<T>(&self, value: T) -> Request<T> {
+    fn request_with_timeout<T>(&self, value: T, budget: Duration) -> Request<T> {
         let mut req = Request::new(value);
-        req.set_timeout(self.timeout);
+        req.set_timeout(budget);
         if let Some(key) = &self.api_key {
             req.metadata_mut()
                 .insert("x-buildbuddy-api-key", key.clone());
         }
         req
     }
-    async fn supports_zstd(&self) -> Result<bool, Status> {
+    async fn supports_zstd(&self, deadline: tokio::time::Instant) -> Result<bool, Status> {
         use reapi::reapi::{GetCapabilitiesRequest, capabilities_client::CapabilitiesClient};
-        self.zstd_supported
-            .get_or_try_init(|| async {
-                let mut client = CapabilitiesClient::new(self.channel.clone())
-                    .accept_compressed(CompressionEncoding::Gzip);
-                if let Some(encoding) = self.grpc_compression.request_encoding() {
-                    client = client.send_compressed(encoding);
-                }
-                let response = tokio::time::timeout(
-                    self.timeout,
-                    client.get_capabilities(self.request(GetCapabilitiesRequest {
-                        instance_name: self.instance.clone(),
-                    })),
-                )
+        timeout(deadline, async {
+            self.zstd_supported
+                .get_or_try_init(|| async {
+                    self.policy
+                        .retry(deadline, self.policy.rpc_timeout(), |budget| async move {
+                            let mut client = CapabilitiesClient::new(self.channel.clone())
+                                .accept_compressed(CompressionEncoding::Gzip);
+                            if let Some(encoding) = self.grpc_compression.request_encoding() {
+                                client = client.send_compressed(encoding);
+                            }
+                            let request = GetCapabilitiesRequest {
+                                instance_name: self.instance.clone(),
+                            };
+                            let attempted = self.grpc_compression.request_encoding();
+                            let response = match client
+                                .get_capabilities(
+                                    self.request_with_timeout(request.clone(), budget),
+                                )
+                                .await
+                            {
+                                Err(error)
+                                    if self.grpc_compression.retry_identity(&error, attempted) =>
+                                {
+                                    CapabilitiesClient::new(self.channel.clone())
+                                        .accept_compressed(CompressionEncoding::Gzip)
+                                        .get_capabilities(
+                                            self.request_with_timeout(request, budget),
+                                        )
+                                        .await
+                                }
+                                result => result,
+                            };
+                            match response {
+                                Ok(response) => {
+                                    self.grpc_compression.observe(response.metadata());
+                                    Ok(response.into_inner().cache_capabilities.is_some_and(
+                                        |caps| caps.supported_compressors.contains(&1),
+                                    ))
+                                }
+                                Err(error) if error.code() == tonic::Code::Unimplemented => {
+                                    Ok(false)
+                                }
+                                Err(error) => Err(error),
+                            }
+                        })
+                        .await
+                })
                 .await
-                .map_err(|_| Status::deadline_exceeded("CAS capabilities timed out"))?;
-                match response {
-                    Ok(response) => {
-                        self.grpc_compression.observe(response.metadata());
-                        Ok(response
-                            .into_inner()
-                            .cache_capabilities
-                            .is_some_and(|caps| caps.supported_compressors.contains(&1)))
-                    }
-                    // Older CAS deployments do not implement capability discovery.
-                    Err(error) if error.code() == tonic::Code::Unimplemented => Ok(false),
-                    Err(error) => Err(error),
-                }
-            })
-            .await
-            .copied()
+                .copied()
+        })
+        .await
     }
     async fn download(
         &self,
         digest: &Digest,
         function: i32,
-        file: &mut (impl Write + Send),
+        file: &mut std::fs::File,
+    ) -> Result<(), Status> {
+        let deadline = tokio::time::Instant::now() + self.policy.operation_timeout();
+        let compressed = self.supports_zstd(deadline).await?;
+        self.policy
+            .retry(deadline, self.policy.operation_timeout(), |_| {
+                let file = file.try_clone().map_err(io_status);
+                async move {
+                    let mut file = file?;
+                    file.set_len(0).map_err(io_status)?;
+                    file.seek(SeekFrom::Start(0)).map_err(io_status)?;
+                    self.download_attempt(digest, function, &mut file, compressed, deadline)
+                        .await
+                }
+            })
+            .await
+    }
+    async fn download_attempt(
+        &self,
+        digest: &Digest,
+        function: i32,
+        file: &mut std::fs::File,
+        compressed: bool,
+        deadline: tokio::time::Instant,
     ) -> Result<(), Status> {
         if digest.size_bytes as u64 > self.max_blob_bytes {
             return Err(Status::resource_exhausted(
                 "blob exceeds configured size limit",
             ));
         }
-        let compressed = self.supports_zstd().await?;
         let resource = format!(
             "{}{}{}/{}{}/{}",
             self.instance,
@@ -372,14 +453,19 @@ impl Backend {
         if compressed {
             self.zstd_read_requests.fetch_add(1, Ordering::Relaxed);
         }
-        let mut stream = client
-            .read(self.request(bs::ReadRequest {
-                resource_name: resource,
-                read_offset: 0,
-                read_limit: 0,
-            }))
-            .await?
-            .into_inner();
+        let mut stream = timeout(
+            (tokio::time::Instant::now() + self.policy.rpc_timeout()).min(deadline),
+            client.read(self.request_with_timeout(
+                bs::ReadRequest {
+                    resource_name: resource,
+                    read_offset: 0,
+                    read_limit: 0,
+                },
+                deadline.saturating_duration_since(tokio::time::Instant::now()),
+            )),
+        )
+        .await?
+        .into_inner();
         // This writer checks the uncompressed length before publishing each chunk.
         // The decoder uses a fixed-size buffer, never a whole-blob allocation.
         struct VerifiedWriter<'a, W> {
@@ -423,7 +509,13 @@ impl Backend {
         let wire_limit = (digest.size_bytes as u64)
             .saturating_add((digest.size_bytes as u64 / 8).max(1024 * 1024));
         let mut empty_messages = 0u32;
-        while let Some(chunk) = stream.message().await? {
+        let mut progress_deadline =
+            (tokio::time::Instant::now() + self.policy.stream_idle_timeout()).min(deadline);
+        while let Some(chunk) = timeout(progress_deadline, stream.message()).await? {
+            if !chunk.data.is_empty() {
+                progress_deadline =
+                    (tokio::time::Instant::now() + self.policy.stream_idle_timeout()).min(deadline);
+            }
             self.cas_read_wire_bytes
                 .fetch_add(chunk.data.len() as u64, Ordering::Relaxed);
             wire_bytes = wire_bytes
@@ -477,19 +569,15 @@ impl BlobSource for Backend {
             "artifact does not belong to the configured CAS"
         );
         let size_bytes = i64::try_from(artifact.size)?;
-        tokio::time::timeout(
-            self.timeout,
-            self.download(
-                &Digest {
-                    hash: artifact.hash.clone(),
-                    size_bytes,
-                },
-                artifact.digest_function,
-                file,
-            ),
+        self.download(
+            &Digest {
+                hash: artifact.hash.clone(),
+                size_bytes,
+            },
+            artifact.digest_function,
+            file,
         )
-        .await
-        .map_err(|_| Status::deadline_exceeded("CAS read timed out"))??;
+        .await?;
         Ok(())
     }
 
@@ -498,6 +586,7 @@ impl BlobSource for Backend {
             FindMissingBlobsRequest,
             content_addressable_storage_client::ContentAddressableStorageClient,
         };
+        let deadline = tokio::time::Instant::now() + self.policy.operation_timeout();
         let mut missing = Vec::new();
         for function in [1, 9] {
             let selected: Vec<_> = artifacts
@@ -516,35 +605,46 @@ impl BlobSource for Backend {
                         size_bytes: i64::try_from(artifact.size)?,
                     });
                 }
-                self.supports_zstd().await?;
+                self.supports_zstd(deadline).await?;
                 let request = FindMissingBlobsRequest {
                     instance_name: self.instance.clone(),
                     blob_digests: digests,
                     digest_function: function,
                 };
-                let response = tokio::time::timeout(self.timeout, async {
-                    let attempted = self.grpc_compression.request_encoding();
-                    let mut client = ContentAddressableStorageClient::new(self.channel.clone())
-                        .accept_compressed(CompressionEncoding::Gzip);
-                    if let Some(encoding) = attempted {
-                        client = client.send_compressed(encoding);
-                    }
-                    match client
-                        .find_missing_blobs(self.request(request.clone()))
-                        .await
-                    {
-                        Err(error) if self.grpc_compression.retry_identity(&error, attempted) => {
-                            ContentAddressableStorageClient::new(self.channel.clone())
-                                .accept_compressed(CompressionEncoding::Gzip)
-                                .find_missing_blobs(self.request(request))
+                let response = self
+                    .policy
+                    .retry(deadline, self.policy.rpc_timeout(), |budget| {
+                        let request = request.clone();
+                        async move {
+                            let attempted = self.grpc_compression.request_encoding();
+                            let mut client =
+                                ContentAddressableStorageClient::new(self.channel.clone())
+                                    .accept_compressed(CompressionEncoding::Gzip);
+                            if let Some(encoding) = attempted {
+                                client = client.send_compressed(encoding);
+                            }
+                            match client
+                                .find_missing_blobs(
+                                    self.request_with_timeout(request.clone(), budget),
+                                )
                                 .await
+                            {
+                                Err(error)
+                                    if self.grpc_compression.retry_identity(&error, attempted) =>
+                                {
+                                    ContentAddressableStorageClient::new(self.channel.clone())
+                                        .accept_compressed(CompressionEncoding::Gzip)
+                                        .find_missing_blobs(
+                                            self.request_with_timeout(request, budget),
+                                        )
+                                        .await
+                                }
+                                result => result,
+                            }
                         }
-                        result => result,
-                    }
-                })
-                .await
-                .map_err(|_| Status::deadline_exceeded("CAS presence check timed out"))??
-                .into_inner();
+                    })
+                    .await?
+                    .into_inner();
                 for digest in response.missing_blob_digests {
                     let artifact = batch
                         .iter()
@@ -568,6 +668,7 @@ impl BlobSource for Backend {
 }
 impl OutputService {
     pub async fn new(config: Config) -> anyhow::Result<Self> {
+        config.policy.validate()?;
         let endpoint = origin(&config.cas_endpoint)?;
         if config.instance_name.starts_with('/')
             || config.instance_name.ends_with('/')
@@ -583,8 +684,7 @@ impl OutputService {
         let root_path = std::fs::canonicalize(&config.root)?;
         let root = Dir::open_ambient_dir(&root_path, cap_std::ambient_authority())?;
         let mut transport = Endpoint::from_shared(endpoint.clone())?
-            .connect_timeout(config.rpc_timeout)
-            .timeout(config.rpc_timeout);
+            .connect_timeout(config.policy.connect_timeout());
         if endpoint.starts_with("https://") {
             transport = transport.tls_config(ClientTlsConfig::new().with_webpki_roots())?;
         }
@@ -605,7 +705,7 @@ impl OutputService {
                 instance: config.instance_name,
                 api_key,
                 max_blob_bytes: config.max_blob_bytes,
-                timeout: config.rpc_timeout,
+                policy: config.policy,
                 zstd_supported: Arc::new(OnceCell::new()),
                 grpc_compression: Arc::new(reapi::compression::GrpcCompression::default()),
                 zstd_read_requests: Arc::new(AtomicU64::new(0)),
@@ -613,9 +713,12 @@ impl OutputService {
             },
             projection: None,
             projection_tree: None,
-            state: Arc::new(Mutex::new(HashMap::new())),
+            state: Arc::new(StdMutex::new(Registry::default())),
             metrics: Arc::new(Metrics::default()),
         })
+    }
+    pub fn policy(&self) -> &Policy {
+        &self.backend.policy
     }
     /// A credential-bearing source restricted to this operator-selected backend.
     pub fn blob_source(&self) -> Arc<dyn BlobSource> {
@@ -663,10 +766,35 @@ impl OutputService {
         }
         Ok(blake3::hash(id.as_bytes()).to_hex().to_string())
     }
-    fn build<'a>(state: &'a HashMap<String, Build>, id: &str) -> Result<&'a Build, Status> {
+    fn base(&self, key: &str) -> Result<Arc<Base>, Status> {
+        let mut registry = self.state.lock().unwrap();
+        registry.bases.retain(|_, base| base.strong_count() != 0);
+        if let Some(base) = registry.bases.get(key).and_then(Weak::upgrade) {
+            return Ok(base);
+        }
+        if registry.bases.len() >= MAX_ITEMS {
+            return Err(Status::resource_exhausted("too many output bases"));
+        }
+        let base = Arc::new(Mutex::new(None));
+        registry.bases.insert(key.to_owned(), Arc::downgrade(&base));
+        Ok(base)
+    }
+    fn session(&self, id: &str) -> Result<Arc<Base>, Status> {
+        let registry = self.state.lock().unwrap();
+        let (key, _) = registry
+            .ids
+            .get(id)
+            .ok_or_else(|| Status::failed_precondition("unknown build_id"))?;
+        registry
+            .bases
+            .get(key)
+            .and_then(Weak::upgrade)
+            .ok_or_else(|| Status::failed_precondition("unknown build_id"))
+    }
+    fn build<'a>(state: &'a Option<Build>, id: &str) -> Result<&'a Build, Status> {
         state
-            .values()
-            .find(|b| b.id == id && !b.finalized)
+            .as_ref()
+            .filter(|b| b.id == id && !b.finalized)
             .ok_or_else(|| Status::failed_precondition("unknown or finalized build_id"))
     }
     async fn stage(
@@ -716,16 +844,13 @@ impl OutputService {
         let temp = format!(".git-output-service-{}.tmp", uuid::Uuid::new_v4());
         let mut options = OpenOptions::new();
         options.write(true).create_new(true);
-        let mut file = parent.open_with(&temp, &options).map_err(io_status)?;
+        let file = parent.open_with(&temp, &options).map_err(io_status)?;
         let temp = TempOutput { parent, name: temp };
         async {
-            tokio::time::timeout(
-                self.backend.timeout,
-                self.backend
-                    .download(&digest, build.digest_function, &mut file),
-            )
-            .await
-            .map_err(|_| Status::deadline_exceeded("CAS read timed out"))??;
+            let mut target = file.try_clone().map_err(io_status)?.into_std();
+            self.backend
+                .download(&digest, build.digest_function, &mut target)
+                .await?;
             file.sync_all().map_err(io_status)?;
             // The protocol carries no executable bit: all staged files may be
             // executed, matching remote-output-service filesystem semantics.
@@ -840,7 +965,7 @@ impl OutputService {
             if !current.is_file() || current.len() > self.backend.max_blob_bytes {
                 return Ok(Some(Stat { r#type: None }));
             }
-            let deadline = std::time::Instant::now() + self.backend.timeout;
+            let deadline = std::time::Instant::now() + self.backend.policy.operation_timeout();
             let mut hash = Hasher::new(build.digest_function)?;
             let mut buffer = [0u8; 64 * 1024];
             let mut size = 0i64;
@@ -877,200 +1002,264 @@ impl BazelOutputService for OutputService {
         &self,
         request: Request<proto::StartBuildRequest>,
     ) -> Result<Response<proto::StartBuildResponse>, Status> {
-        let req = request.into_inner();
-        if req.version != 1 {
-            return Err(Status::invalid_argument(
-                "unsupported BOS protocol version (expected 1)",
-            ));
-        }
-        if req.build_id.is_empty() || req.build_id.len() > 256 {
-            return Err(Status::invalid_argument("invalid build_id"));
-        }
-        let args = unpack::<rev2::StartBuildArgs>(req.args, ARGS_TYPE)?;
-        Hasher::new(args.digest_function)?;
-        if origin(&args.remote_cache)? != self.backend.endpoint
-            || args.instance_name != self.backend.instance
-        {
-            return Err(Status::permission_denied(
-                "requested CAS does not match configured backend",
-            ));
-        }
-        let key = Self::key(&req.output_base_id)?;
-        let target = self.root_path.join(&key);
-        let suffix = if req.output_path_prefix.is_empty() {
-            target.clone()
-        } else {
-            // Both paths must use the same canonical spelling, particularly
-            // Windows verbatim prefixes and macOS /var -> /private/var aliases.
-            let prefix = Path::new(&req.output_path_prefix);
-            if !prefix.is_absolute() {
+        let deadline = tokio::time::Instant::now() + self.policy().operation_timeout();
+        timeout(deadline, async {
+            let req = request.into_inner();
+            if req.version != 1 {
                 return Err(Status::invalid_argument(
-                    "output_path_prefix must be absolute",
+                    "unsupported BOS protocol version (expected 1)",
                 ));
             }
-            // The configured root was canonicalized before mounting. Its exact
-            // path and ancestors need no filesystem round trip. In particular,
-            // realpath/statfs on our own NFS mount can block its Tokio I/O driver.
-            let prefix = if self.root_path.starts_with(prefix) {
-                prefix.to_path_buf()
+            if req.build_id.is_empty() || req.build_id.len() > 256 {
+                return Err(Status::invalid_argument("invalid build_id"));
+            }
+            let args = unpack::<rev2::StartBuildArgs>(req.args, ARGS_TYPE)?;
+            Hasher::new(args.digest_function)?;
+            if origin(&args.remote_cache)? != self.backend.endpoint
+                || args.instance_name != self.backend.instance
+            {
+                return Err(Status::permission_denied(
+                    "requested CAS does not match configured backend",
+                ));
+            }
+            let key = Self::key(&req.output_base_id)?;
+            let target = self.root_path.join(&key);
+            let suffix = if req.output_path_prefix.is_empty() {
+                target.clone()
             } else {
-                let prefix = prefix.to_path_buf();
-                tokio::task::spawn_blocking(move || std::fs::canonicalize(prefix))
-                    .await
-                    .map_err(|_| Status::internal("output prefix resolution task failed"))?
+                // Both paths must use the same canonical spelling, particularly
+                // Windows verbatim prefixes and macOS /var -> /private/var aliases.
+                let prefix = Path::new(&req.output_path_prefix);
+                if !prefix.is_absolute() {
+                    return Err(Status::invalid_argument(
+                        "output_path_prefix must be absolute",
+                    ));
+                }
+                // The configured root was canonicalized before mounting. Its exact
+                // path and ancestors need no filesystem round trip. In particular,
+                // realpath/statfs on our own NFS mount can block its Tokio I/O driver.
+                let prefix = if self.root_path.starts_with(prefix) {
+                    prefix.to_path_buf()
+                } else {
+                    let prefix = prefix.to_path_buf();
+                    tokio::task::spawn_blocking(move || std::fs::canonicalize(prefix))
+                        .await
+                        .map_err(|_| Status::internal("output prefix resolution task failed"))?
+                        .map_err(|_| {
+                            Status::invalid_argument(
+                                "output_path_prefix must name an existing local directory",
+                            )
+                        })?
+                };
+                target
+                    .strip_prefix(prefix)
                     .map_err(|_| {
                         Status::invalid_argument(
-                            "output_path_prefix must name an existing local directory",
+                            "output_path_prefix must contain configured output root",
                         )
                     })?
+                    .to_path_buf()
             };
-            target
-                .strip_prefix(prefix)
-                .map_err(|_| {
-                    Status::invalid_argument(
-                        "output_path_prefix must contain configured output root",
-                    )
-                })?
-                .to_path_buf()
-        };
-        let mut state = self.state.lock().await;
-        if state
-            .iter()
-            .any(|(other, b)| *other != key && b.id == req.build_id)
-        {
-            return Err(Status::already_exists(
-                "build_id already used by another output base",
-            ));
-        }
-        let dir = if let Some(projection) = &self.projection {
-            projection
-                .ensure_dir(&key)
-                .await
-                .map_err(projection_status)?;
-            // A remote-only tree must not claim objects that expired from CAS.
-            // The projection invalidates pruned bindings before acknowledging.
-            projection.refresh(&key).await.map_err(projection_status)?;
-            None
-        } else {
-            self.root.create_dir_all(&key).map_err(io_status)?;
-            Some(self.root.open_dir(&key).map_err(io_status)?)
-        };
-        state.insert(
-            key.clone(),
-            Build {
-                id: req.build_id,
-                dir,
-                key,
-                digest_function: args.digest_function,
-                finalized: false,
-            },
-        );
-        // No incremental tracking promise. All bytes are already local, and
-        // Bazel must revalidate outputs instead of trusting stale metadata.
-        Ok(Response::new(proto::StartBuildResponse {
-            initial_output_path_contents: None,
-            output_path_suffix: suffix.to_string_lossy().into_owned(),
-        }))
+            let base = self.base(&key)?;
+            let mut state = base.lock().await;
+            let mut reservation = {
+                let mut registry = self.state.lock().unwrap();
+                if registry
+                    .ids
+                    .get(&req.build_id)
+                    .is_some_and(|(other, _)| *other != key)
+                {
+                    return Err(Status::already_exists(
+                        "build_id already used by another output base",
+                    ));
+                }
+                registry.next_token = registry.next_token.wrapping_add(1);
+                let token = registry.next_token;
+                // An existing same-base ID is already reserved by the previous build.
+                // Restore it on cancellation rather than erasing that active session.
+                let existing = registry.ids.get(&req.build_id).cloned();
+                if existing.is_none() {
+                    registry
+                        .ids
+                        .insert(req.build_id.clone(), (key.clone(), token));
+                }
+                Reservation {
+                    registry: self.state.clone(),
+                    id: req.build_id.clone(),
+                    token,
+                    committed: existing.is_some(),
+                }
+            };
+            let dir = if let Some(projection) = &self.projection {
+                projection
+                    .ensure_dir(&key)
+                    .await
+                    .map_err(projection_status)?;
+                // A remote-only tree must not claim objects that expired from CAS.
+                // The projection invalidates pruned bindings before acknowledging.
+                projection.refresh(&key).await.map_err(projection_status)?;
+                None
+            } else {
+                self.root.create_dir_all(&key).map_err(io_status)?;
+                Some(self.root.open_dir(&key).map_err(io_status)?)
+            };
+            {
+                let mut registry = self.state.lock().unwrap();
+                if let Some(old) = state.as_ref() {
+                    if old.id != req.build_id {
+                        registry.ids.remove(&old.id);
+                    }
+                }
+                registry.active.insert(key.clone(), base.clone());
+                *state = Some(Build {
+                    id: req.build_id,
+                    dir,
+                    key,
+                    digest_function: args.digest_function,
+                    finalized: false,
+                });
+                reservation.committed = true;
+            }
+            // No incremental tracking promise. All bytes are already local, and
+            // Bazel must revalidate outputs instead of trusting stale metadata.
+            Ok(Response::new(proto::StartBuildResponse {
+                initial_output_path_contents: None,
+                output_path_suffix: suffix.to_string_lossy().into_owned(),
+            }))
+        })
+        .await
     }
     async fn stage_artifacts(
         &self,
         request: Request<proto::StageArtifactsRequest>,
     ) -> Result<Response<proto::StageArtifactsResponse>, Status> {
-        let req = request.into_inner();
-        if req.artifacts.len() > MAX_ITEMS {
-            return Err(Status::resource_exhausted("too many artifacts"));
-        }
-        let state = self.state.lock().await;
-        let build = Self::build(&state, &req.build_id)?;
-        self.metrics.stage_requests.fetch_add(1, Ordering::Relaxed);
-        let mut responses = Vec::with_capacity(req.artifacts.len());
-        for artifact in req.artifacts {
-            let status = match self.stage(build, &artifact.path, artifact.locator).await {
-                Ok(()) => reapi::proto::google::rpc::Status::default(),
-                Err(error) => reapi::proto::google::rpc::Status {
-                    code: error.code() as i32,
-                    message: error.message().to_owned(),
-                    details: vec![],
-                },
-            };
-            responses.push(proto::stage_artifacts_response::Response {
-                status: Some(status),
-            });
-        }
-        Ok(Response::new(proto::StageArtifactsResponse { responses }))
+        let deadline = tokio::time::Instant::now() + self.policy().operation_timeout();
+        timeout(deadline, async {
+            let req = request.into_inner();
+            if req.artifacts.len() > MAX_ITEMS {
+                return Err(Status::resource_exhausted("too many artifacts"));
+            }
+            let base = self.session(&req.build_id)?;
+            let state = base.lock().await;
+            let build = Self::build(&state, &req.build_id)?;
+            self.metrics.stage_requests.fetch_add(1, Ordering::Relaxed);
+            let mut responses = Vec::with_capacity(req.artifacts.len());
+            for artifact in req.artifacts {
+                let status = match self.stage(build, &artifact.path, artifact.locator).await {
+                    Ok(()) => reapi::proto::google::rpc::Status::default(),
+                    Err(error) => reapi::proto::google::rpc::Status {
+                        code: error.code() as i32,
+                        message: error.message().to_owned(),
+                        details: vec![],
+                    },
+                };
+                responses.push(proto::stage_artifacts_response::Response {
+                    status: Some(status),
+                });
+            }
+            Ok(Response::new(proto::StageArtifactsResponse { responses }))
+        })
+        .await
     }
     async fn finalize_artifacts(
         &self,
         request: Request<proto::FinalizeArtifactsRequest>,
     ) -> Result<Response<proto::FinalizeArtifactsResponse>, Status> {
-        let req = request.into_inner();
-        if req.artifacts.len() > MAX_ITEMS {
-            return Err(Status::resource_exhausted("too many artifacts"));
-        }
-        let state = self.state.lock().await;
-        let build = Self::build(&state, &req.build_id)?;
-        // Deliberately no dirty-bit promise: the next build scans everything.
-        // Still validate paths/locators so malformed callers fail immediately.
-        for artifact in req.artifacts {
-            relative(&artifact.path, false)?;
-            if artifact.locator.is_some() {
-                digest_of(artifact.locator)?;
+        let deadline = tokio::time::Instant::now() + self.policy().operation_timeout();
+        timeout(deadline, async {
+            let req = request.into_inner();
+            if req.artifacts.len() > MAX_ITEMS {
+                return Err(Status::resource_exhausted("too many artifacts"));
             }
-        }
-        let _ = build;
-        Ok(Response::new(proto::FinalizeArtifactsResponse {}))
+            let base = self.session(&req.build_id)?;
+            let state = base.lock().await;
+            let build = Self::build(&state, &req.build_id)?;
+            // Deliberately no dirty-bit promise: the next build scans everything.
+            // Still validate paths/locators so malformed callers fail immediately.
+            for artifact in req.artifacts {
+                relative(&artifact.path, false)?;
+                if artifact.locator.is_some() {
+                    digest_of(artifact.locator)?;
+                }
+            }
+            let _ = build;
+            Ok(Response::new(proto::FinalizeArtifactsResponse {}))
+        })
+        .await
     }
     async fn finalize_build(
         &self,
         request: Request<proto::FinalizeBuildRequest>,
     ) -> Result<Response<proto::FinalizeBuildResponse>, Status> {
-        let req = request.into_inner();
-        let mut state = self.state.lock().await;
-        let build = state
-            .values_mut()
-            .find(|b| b.id == req.build_id)
-            .ok_or_else(|| Status::failed_precondition("unknown build_id"))?;
-        // Finalization is idempotent so a lost successful response is retryable.
-        build.finalized = true;
-        Ok(Response::new(proto::FinalizeBuildResponse {}))
+        let deadline = tokio::time::Instant::now() + self.policy().operation_timeout();
+        timeout(deadline, async {
+            let req = request.into_inner();
+            let base = self.session(&req.build_id)?;
+            let mut state = base.lock().await;
+            let build = state
+                .as_mut()
+                .filter(|b| b.id == req.build_id)
+                .ok_or_else(|| Status::failed_precondition("unknown build_id"))?;
+            // Finalization is idempotent so a lost successful response is retryable.
+            build.finalized = true;
+            Ok(Response::new(proto::FinalizeBuildResponse {}))
+        })
+        .await
     }
     async fn clean(
         &self,
         request: Request<proto::CleanRequest>,
     ) -> Result<Response<proto::CleanResponse>, Status> {
-        let key = Self::key(&request.into_inner().output_base_id)?;
-        let mut state = self.state.lock().await;
-        // Close the retained directory handle first: on Windows directory
-        // handles do not share delete access. A failed clean invalidates the
-        // session but can safely be retried by output_base_id.
-        state.remove(&key);
-        if let Some(projection) = &self.projection {
-            projection.clean(&key).await.map_err(projection_status)?;
-            return Ok(Response::new(proto::CleanResponse {}));
-        }
-        match self.root.remove_dir_all(&key) {
-            Ok(()) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            Err(e) => return Err(io_status(e)),
-        }
-        Ok(Response::new(proto::CleanResponse {}))
+        let deadline = tokio::time::Instant::now() + self.policy().operation_timeout();
+        timeout(deadline, async {
+            let key = Self::key(&request.into_inner().output_base_id)?;
+            let base = self.base(&key)?;
+            let mut state = base.lock().await;
+            // Drop eager directory handles before delete. Queued users retain the same
+            // base lock through the weak registry even after the session is removed.
+            let old = state.take();
+            {
+                let mut registry = self.state.lock().unwrap();
+                if let Some(old) = &old {
+                    registry.ids.remove(&old.id);
+                }
+                registry.active.remove(&key);
+            }
+            drop(old);
+            if let Some(projection) = &self.projection {
+                projection.clean(&key).await.map_err(projection_status)?;
+                return Ok(Response::new(proto::CleanResponse {}));
+            }
+            match self.root.remove_dir_all(&key) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => return Err(io_status(e)),
+            }
+            Ok(Response::new(proto::CleanResponse {}))
+        })
+        .await
     }
     async fn batch_stat(
         &self,
         request: Request<proto::BatchStatRequest>,
     ) -> Result<Response<proto::BatchStatResponse>, Status> {
-        let req = request.into_inner();
-        if req.paths.len() > MAX_ITEMS {
-            return Err(Status::resource_exhausted("too many paths"));
-        }
-        let state = self.state.lock().await;
-        let build = Self::build(&state, &req.build_id)?;
-        let mut responses = Vec::with_capacity(req.paths.len());
-        for path in req.paths {
-            responses.push(proto::batch_stat_response::StatResponse {
-                stat: self.stat(build, &path).await?,
-            });
-        }
-        Ok(Response::new(proto::BatchStatResponse { responses }))
+        let deadline = tokio::time::Instant::now() + self.policy().operation_timeout();
+        timeout(deadline, async {
+            let req = request.into_inner();
+            if req.paths.len() > MAX_ITEMS {
+                return Err(Status::resource_exhausted("too many paths"));
+            }
+            let base = self.session(&req.build_id)?;
+            let state = base.lock().await;
+            let build = Self::build(&state, &req.build_id)?;
+            let mut responses = Vec::with_capacity(req.paths.len());
+            for path in req.paths {
+                responses.push(proto::batch_stat_response::StatResponse {
+                    stat: self.stat(build, &path).await?,
+                });
+            }
+            Ok(Response::new(proto::BatchStatResponse { responses }))
+        })
+        .await
     }
 }

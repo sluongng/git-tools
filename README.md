@@ -100,6 +100,7 @@ including reclamation, rename/digest work and real incremental RBE builds.
 - [VFS guide](crates/workspace-fuse/README.md) / [full reference](docs/vfs-reference.md)
 - [Proxy guide](crates/git-proxy/README.md) / [full reference](docs/proxy-reference.md)
 - [Proxy design and research](docs/proxy-design.md)
+- [REAPI timeout, retry and presence policy](docs/reapi-policy.md)
 - [VFS lifecycle design and measurements](docs/design/vfs-iteration-lifecycle.md)
 
 This is a source-tree prototype: SHA1 repositories, fixed base commit per mount,

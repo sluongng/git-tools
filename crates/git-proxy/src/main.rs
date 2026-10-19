@@ -4,6 +4,9 @@ use std::{net::SocketAddr, path::PathBuf, time::Duration};
 #[derive(Parser)]
 #[command(about = "Read-only configured-origin Git pull-through cache")]
 struct Args {
+    /// Optional strict TOML file containing a [reapi] policy table.
+    #[arg(long)]
+    config: Option<PathBuf>,
     #[arg(long, required = true, value_name = "ALIAS=UPSTREAM")]
     repo: Vec<String>,
     #[arg(long)]
@@ -24,9 +27,9 @@ struct Args {
     /// HEADER=ENV_VAR; values never appear in arguments or configuration logs.
     #[arg(long, value_name = "HEADER=ENV_VAR")]
     cas_header_env: Vec<String>,
-    /// Match Bazel --experimental_remote_cache_ttl; not negotiated by REAPI.
-    #[arg(long, default_value_t = 10800)]
-    cas_remote_ttl_seconds: u64,
+    /// Override configured positive-presence TTL; 0 rechecks every sync (default).
+    #[arg(long)]
+    cas_remote_ttl_seconds: Option<u64>,
     #[arg(long, default_value_t = 64 * 1024 * 1024)]
     cas_staging_limit_bytes: u64,
     /// Maximum completed and reserved generated-response bytes; 0 disables caching.
@@ -39,9 +42,23 @@ struct Args {
     #[arg(long, default_value_t = 300)]
     pack_cache_ttl_seconds: u64,
 }
+impl Args {
+    fn policy(&self) -> Result<reapi::policy::Policy> {
+        let mut policy = match &self.config {
+            Some(path) => reapi::policy::Policy::load(path)?,
+            None => reapi::policy::Policy::default(),
+        };
+        if let Some(ttl) = self.cas_remote_ttl_seconds {
+            policy.presence_ttl_seconds = ttl;
+        }
+        policy.validate()?;
+        Ok(policy)
+    }
+}
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Args::parse();
+    let policy = args.policy()?;
     let repositories = args
         .repo
         .into_iter()
@@ -69,7 +86,7 @@ async fn main() -> Result<()> {
                 endpoint,
                 instance_name: args.cas_instance_name,
                 header_env,
-                remote_ttl: Duration::from_secs(args.cas_remote_ttl_seconds),
+                policy: policy.clone(),
                 staging_limit_bytes: args.cas_staging_limit_bytes,
             })
         })
@@ -99,4 +116,45 @@ async fn main() -> Result<()> {
         cas.shutdown().await;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn cli_presence_override_wins_over_toml_without_overriding_other_settings() {
+        let config = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(
+            config.path(),
+            "[reapi]\npresence_ttl_seconds = 37\nrpc_timeout_ms = 1234\n",
+        )
+        .unwrap();
+        let args = Args::try_parse_from([
+            "git-proxy",
+            "--repo",
+            "repo=https://example.invalid/repo.git",
+            "--cache-dir",
+            "/tmp/proxy-fixture",
+            "--config",
+            config.path().to_str().unwrap(),
+            "--cas-remote-ttl-seconds",
+            "0",
+        ])
+        .unwrap();
+        let policy = args.policy().unwrap();
+        assert_eq!(policy.presence_ttl_seconds, 0);
+        assert_eq!(policy.rpc_timeout_ms, 1234);
+    }
+    #[test]
+    fn cli_without_config_disables_presence_suppression() {
+        let args = Args::try_parse_from([
+            "git-proxy",
+            "--repo",
+            "repo=https://example.invalid/repo.git",
+            "--cache-dir",
+            "/tmp/proxy-fixture",
+        ])
+        .unwrap();
+        assert_eq!(args.policy().unwrap().presence_ttl_seconds, 0);
+    }
 }

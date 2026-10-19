@@ -16,8 +16,42 @@ target/release/git-proxy --cache-dir /var/tmp/git-proxy \
   --cas-endpoint https://CACHE_HOST \
   --cas-instance-name INSTANCE \
   --cas-header-env x-buildbuddy-api-key=AGENT_CAS_KEY \
-  --cas-remote-ttl-seconds 10800
+  --config /etc/git-tools/reapi.toml
 ```
+
+An optional explicit TOML file configures the shared REAPI policy. Missing keys
+use conservative defaults; unknown keys/sections, invalid values and files over
+64 KiB fail startup. There is no implicit discovery or environment expansion.
+Endpoint, instance and credential selection remain explicit CLI arguments.
+
+```toml
+[reapi]
+connect_timeout_ms = 10000
+rpc_timeout_ms = 60000
+stream_idle_timeout_ms = 60000
+operation_timeout_ms = 120000
+background_timeout_ms = 600000
+presence_ttl_seconds = 0
+
+[reapi.retry]
+max_attempts = 4
+initial_backoff_ms = 100
+max_backoff_ms = 5000
+```
+
+`max_attempts` includes the original call. Replay-safe transient failures use
+exponential full-jitter backoff within the original deadline; valid server retry
+hints are respected. Authentication, malformed responses, missing objects and
+integrity failures are not blindly retried. Partial batch uploads retry only
+transient failed entries, not acknowledged successes. Stream retries reopen the
+immutable spool with a new upload ID, restarting at offset zero.
+
+Unary attempts have their own timeout. ByteStream uploads instead use an idle
+watchdog, so ongoing progress can exceed the unary timeout. One foreground
+operation deadline includes local reads/verification and all retries; background
+publication has one separate job budget covering Git mapping, spooling and CAS
+work. Cancelling the job drops attempts/backoff and aborts bounded upload readers.
+`--cas-remote-ttl-seconds` explicitly overrides the TOML presence setting.
 
 The CAS endpoint is an HTTP(S) **origin**, equivalent to Bazel's `grpc(s)` cache
 address. This does not configure a remote executor or expose a new CAS server.
@@ -61,8 +95,8 @@ The ordinary-blob batching heuristic follows BuildBuddy Executor:
 | Advertised limits | Reduce batch limit and respect serialized gRPC-message bounds |
 
 ZSTD is selected independently from the server's batch-update and ByteStream
-compressor capabilities. Batch items stay identity when compression would expand
-them; large blobs are compressed incrementally. CDC chunks and whole-blob
+compressor capabilities. Advertised ZSTD is used even for small batch items;
+large blobs are compressed incrementally. CDC chunks and whole-blob
 fallback use the same policy. Digests, batching budgets and presence records
 always describe uncompressed content. Serialized protobuf size is checked
 separately. Uploads remain serialized; this is not the Executor's full parallel
@@ -96,10 +130,13 @@ BuildBuddy's compression/parallel ByteStream policy.
 
 ## TTL and completion
 
-Set `--cas-remote-ttl-seconds` to match Bazel's
-`--experimental_remote_cache_ttl` (default **10800 seconds / 3h**). REAPI does
-**not** negotiate this TTL. It must be slightly below the cache deployment's
-actual minimum retention guarantee; it is not a promise against early eviction.
+Positive-presence suppression is **disabled by default** (`presence_ttl_seconds
+= 0`): every sync checks authoritative CAS state, including after an earlier
+successful upload. If enabling it, choose a short advisory interval below the
+backend's actual minimum retention guarantee. REAPI does **not** negotiate that
+guarantee. A local hit neither extends the observation nor refreshes remote
+access time; this hint is not a lease. Use `force:true` when repairing known loss.
+Bazel's independent remote-cache TTL is not automatically a safe proxy setting.
 
 Positive observations are scoped to this process's configured endpoint,
 instance, credentials, BLAKE3 hash and raw size. They expire from **request start**,
@@ -126,7 +163,9 @@ from this optimization and fail the sync job; Bazel can upload them normally.
 Temporary files are removed on completion, failure or cancellation. Crashed
 processes can leave staging directories; clean those only with the proxy stopped.
 
-RPC deadlines cover response bodies as well as connection/header waits. Ctrl-C
+RPC deadlines cover response bodies as well as connection/header waits; the
+background job deadline also bounds staging and retries. Splice attempts allow
+max(60s, 250ms per chunk), capped at 10 minutes and the remaining job budget. Ctrl-C
 stops HTTP and cancels/joins the CAS worker, killing in-flight native Git process
 groups. Pending work is best-effort, not a durable queue: restart requires
 requeueing. Embedders must use `router_with_cas_shutdown` and retain its owner

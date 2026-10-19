@@ -1,5 +1,6 @@
 //! Pinned Remote Execution API and ByteStream protocol bindings.
 pub mod compression;
+pub mod policy;
 #[allow(clippy::doc_lazy_continuation)]
 pub mod proto {
     pub mod google {

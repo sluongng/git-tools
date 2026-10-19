@@ -15,9 +15,9 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         Arc, Mutex, Weak,
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 use tokio::sync::{Mutex as AsyncMutex, Semaphore};
 
@@ -54,6 +54,16 @@ impl std::fmt::Display for CacheLimitError {
     }
 }
 impl std::error::Error for CacheLimitError {}
+/// A bounded hydration operation expired. This does not authorize tearing down
+/// native paging reads or cancelling a shared fetch on behalf of one waiter.
+#[derive(Clone, Copy, Debug)]
+pub struct CacheTimeoutError;
+impl std::fmt::Display for CacheTimeoutError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "output cache operation deadline exceeded")
+    }
+}
+impl std::error::Error for CacheTimeoutError {}
 fn require(condition: bool, error: CoreError) -> Result<()> {
     if condition { Ok(()) } else { Err(error.into()) }
 }
@@ -95,6 +105,10 @@ pub struct CacheConfig {
     pub max_bytes: u64,
     pub max_concurrent_fetches: usize,
     pub max_inflight_bytes: u64,
+    /// Per-waiter budget, including fetch-slot admission and a shared result.
+    pub operation_timeout: Duration,
+    /// Independent admitted-fetch lifetime, including byte admission and verify.
+    pub fetch_timeout: Duration,
 }
 impl Default for CacheConfig {
     fn default() -> Self {
@@ -102,6 +116,8 @@ impl Default for CacheConfig {
             max_bytes: 4 * 1024 * 1024 * 1024,
             max_concurrent_fetches: 8,
             max_inflight_bytes: 512 * 1024 * 1024,
+            operation_timeout: Duration::from_secs(120),
+            fetch_timeout: Duration::from_secs(120),
         }
     }
 }
@@ -111,6 +127,9 @@ pub struct CacheMetrics {
     pub verified_bytes: u64,
     pub verification_bytes: u64,
     pub hits: u64,
+    pub timed_out_waiters: u64,
+    pub timed_out_fetches: u64,
+    pub admission_wait_ns: u64,
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum NodeKind {
@@ -131,6 +150,29 @@ pub struct Node {
     pub remote: Option<Artifact>,
     pub generation: u64,
     pub linked: bool,
+}
+/// Remote refresh result, tied to one tree and immutable namespace snapshots.
+/// Preparing this plan never requires a native projection publication lock.
+pub struct RefreshPlan {
+    identity: String,
+    candidates: Vec<(Node, String)>,
+    missing: HashSet<Artifact>,
+}
+impl RefreshPlan {
+    /// Native frontends can preserve locally authoritative files before pruning.
+    pub fn retain_candidates(
+        &mut self,
+        mut keep: impl FnMut(&str, &Node) -> Result<bool>,
+    ) -> Result<()> {
+        let mut retained = Vec::with_capacity(self.candidates.len());
+        for (node, path) in self.candidates.drain(..) {
+            if keep(&path, &node)? {
+                retained.push((node, path));
+            }
+        }
+        self.candidates = retained;
+        Ok(())
+    }
 }
 #[derive(Clone, Debug, Default)]
 pub struct SetAttr {
@@ -355,7 +397,11 @@ impl Tree {
         ensure!(
             config.max_bytes > 0
                 && config.max_concurrent_fetches > 0
-                && config.max_inflight_bytes > 0,
+                && config.max_inflight_bytes > 0
+                && !config.operation_timeout.is_zero()
+                && !config.fetch_timeout.is_zero()
+                && config.operation_timeout <= Duration::from_secs(86_400)
+                && config.fetch_timeout <= Duration::from_secs(86_400),
             "cache budgets must be positive"
         );
         fs::create_dir_all(state_dir.as_ref())?;
@@ -914,7 +960,28 @@ impl Tree {
             Ok(node)
         })
     }
+    async fn bounded_operation<T>(
+        &self,
+        deadline: tokio::time::Instant,
+        future: impl std::future::Future<Output = Result<T>>,
+    ) -> Result<T> {
+        match tokio::time::timeout_at(deadline, future).await {
+            // Cache admission may report the same expiry in this poll. Keep
+            // its typed result rather than counting one reader at both layers.
+            Ok(Err(error)) if error.downcast_ref::<CacheTimeoutError>().is_some() => Err(error),
+            Ok(result) if tokio::time::Instant::now() < deadline => result,
+            _ => {
+                self.cache.timed_out_waiters.fetch_add(1, Ordering::Relaxed);
+                Err(CacheTimeoutError.into())
+            }
+        }
+    }
     pub async fn read(&self, id: u64, offset: u64, count: usize) -> Result<Vec<u8>> {
+        let deadline = tokio::time::Instant::now() + self.cache.config.operation_timeout;
+        self.bounded_operation(deadline, self.read_inner(id, offset, count))
+            .await
+    }
+    async fn read_inner(&self, id: u64, offset: u64, count: usize) -> Result<Vec<u8>> {
         let lock = self.inode_lock(id);
         let _guard = lock.lock().await;
         let node = self.get(id)?;
@@ -929,22 +996,48 @@ impl Tree {
             .map_or_else(|| self.local_path(id), |l| l.path().to_owned());
         read_range(&path, offset, count)
     }
-    async fn make_local(&self, id: u64) -> Result<()> {
+    async fn make_local(&self, id: u64, deadline: tokio::time::Instant) -> Result<()> {
         let node = self.get(id)?;
         if let Some(artifact) = &node.remote {
             let lease = self.content(artifact).await?;
-            let temp = self.state_dir.join("local").join(format!("{id}.tmp"));
-            let mut guard = Temporary(temp.clone());
-            let source = lease.path().to_owned();
-            let destination = temp.clone();
-            tokio::task::spawn_blocking(move || fs::copy(source, destination))
-                .await
-                .context("local snapshot task failed")??;
-            OpenOptions::new()
-                .read(true)
-                .write(true)
-                .open(&temp)?
-                .sync_all()?;
+            let temp = self
+                .state_dir
+                .join("local")
+                .join(format!("{id}-{}.tmp", uuid::Uuid::new_v4()));
+            let cancelled = Arc::new(AtomicBool::new(false));
+            let _cancel_on_drop = CancelWork(cancelled.clone());
+            // The worker owns both the cache lease and unique temporary payload.
+            // Cancelling the caller cannot unpin its source, reuse its path or
+            // delete its destination while a detached copy is still writing.
+            let mut guard = tokio::task::spawn_blocking(move || {
+                let guard = Temporary(temp);
+                let mut input = File::open(lease.path())?;
+                let mut output = OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .open(&guard.0)?;
+                let mut buffer = [0u8; 128 * 1024];
+                loop {
+                    if cancelled.load(Ordering::Relaxed) || tokio::time::Instant::now() >= deadline
+                    {
+                        return Err(CacheTimeoutError.into());
+                    }
+                    let count = input.read(&mut buffer)?;
+                    if count == 0 {
+                        break;
+                    }
+                    output.write_all(&buffer[..count])?;
+                }
+                output.sync_all()?;
+                drop(output);
+                Ok::<_, anyhow::Error>(guard)
+            })
+            .await
+            .context("local snapshot task failed")??;
+            if tokio::time::Instant::now() >= deadline {
+                return Err(CacheTimeoutError.into());
+            }
+            let temp = guard.0.clone();
             #[cfg(windows)]
             if self.local_path(id).exists() {
                 fs::remove_file(self.local_path(id))?;
@@ -962,13 +1055,24 @@ impl Tree {
         Ok(())
     }
     pub async fn write(&self, id: u64, offset: u64, bytes: &[u8]) -> Result<usize> {
+        let deadline = tokio::time::Instant::now() + self.cache.config.operation_timeout;
+        self.bounded_operation(deadline, self.write_inner(id, offset, bytes, deadline))
+            .await
+    }
+    async fn write_inner(
+        &self,
+        id: u64,
+        offset: u64,
+        bytes: &[u8],
+        deadline: tokio::time::Instant,
+    ) -> Result<usize> {
         let lock = self.inode_lock(id);
         let _guard = lock.lock().await;
         ensure!(self.get(id)?.kind == NodeKind::File, "not a regular file");
         if bytes.is_empty() {
             return Ok(0);
         }
-        self.make_local(id).await?;
+        self.make_local(id, deadline).await?;
         let mut file = OpenOptions::new().write(true).open(self.local_path(id))?;
         file.seek(SeekFrom::Start(offset))?;
         file.write_all(bytes)?;
@@ -991,6 +1095,20 @@ impl Tree {
         attrs: SetAttr,
         expected_ctime: Option<u64>,
     ) -> Result<Node> {
+        let deadline = tokio::time::Instant::now() + self.cache.config.operation_timeout;
+        self.bounded_operation(
+            deadline,
+            self.setattr_inner(id, attrs, expected_ctime, deadline),
+        )
+        .await
+    }
+    async fn setattr_inner(
+        &self,
+        id: u64,
+        attrs: SetAttr,
+        expected_ctime: Option<u64>,
+        deadline: tokio::time::Instant,
+    ) -> Result<Node> {
         let lock = self.inode_lock(id);
         let _guard = lock.lock().await;
         let node = self.get(id)?;
@@ -1010,7 +1128,7 @@ impl Tree {
                     Ok(())
                 })?;
             } else {
-                self.make_local(id).await?;
+                self.make_local(id, deadline).await?;
             }
             let f = OpenOptions::new().write(true).open(self.local_path(id))?;
             f.set_len(size)?;
@@ -1050,41 +1168,78 @@ impl Tree {
             .filter(|a| seen.insert(a.clone()))
             .collect())
     }
-    pub async fn refresh(&self, prefix: &str) -> Result<Vec<String>> {
+    pub async fn prepare_refresh(&self, prefix: &str) -> Result<RefreshPlan> {
         let candidates = {
             let ns = self.namespace.lock().unwrap();
-            let Some(root) = resolve_state(&ns.state, prefix)? else {
-                return Ok(vec![]);
-            };
-            descendants(&ns.state, root)
-                .into_iter()
-                .filter_map(|id| {
-                    let n = &record(&ns.state, id).ok()?.node;
-                    n.remote.clone().map(|a| (id, a))
-                })
-                .collect::<Vec<_>>()
+            let mut candidates = Vec::new();
+            if let Some(root) = resolve_state(&ns.state, prefix)? {
+                for id in descendants(&ns.state, root) {
+                    let node = &record(&ns.state, id)?.node;
+                    if node.remote.is_some() {
+                        candidates.push((node.clone(), path_for(&ns.state, id)?));
+                    }
+                }
+            }
+            candidates
         };
-        let artifacts = candidates
+        let artifacts: HashSet<_> = candidates
             .iter()
-            .map(|(_, a)| a.clone())
-            .collect::<Vec<_>>();
-        if artifacts.is_empty() {
-            return Ok(vec![]);
-        }
-        let missing: HashSet<_> = self.source.missing(&artifacts).await?.into_iter().collect();
+            .filter_map(|(node, _)| node.remote.clone())
+            .collect();
+        let missing: HashSet<_> = if artifacts.is_empty() {
+            HashSet::new()
+        } else {
+            self.source
+                .missing(&artifacts.iter().cloned().collect::<Vec<_>>())
+                .await?
+                .into_iter()
+                .collect()
+        };
+        ensure!(
+            missing.is_subset(&artifacts),
+            "CAS refresh returned an unrequested artifact"
+        );
+        Ok(RefreshPlan {
+            identity: self.identity.clone(),
+            candidates,
+            missing,
+        })
+    }
+    pub async fn apply_refresh(&self, plan: RefreshPlan) -> Result<Vec<String>> {
+        ensure!(
+            plan.identity == self.identity,
+            "refresh plan belongs to another tree"
+        );
         self.change(|s| {
             let mut removed = vec![];
-            for (id, a) in &candidates {
-                let node = &record(s, *id)?.node;
-                if node.linked && node.remote.as_ref() == Some(a) && missing.contains(a) {
-                    removed.push(path_for(s, *id)?);
-                    let parent = node.parent;
-                    s.nodes.get_mut(id).unwrap().node.linked = false;
-                    touch(s, parent);
+            for (expected, path) in &plan.candidates {
+                let Some(artifact) = &expected.remote else {
+                    continue;
+                };
+                if !plan.missing.contains(artifact) {
+                    continue;
                 }
+                let Some(current) = s.nodes.get(&expected.id) else {
+                    continue;
+                };
+                // Replacements, local writes, setattr and ancestor renames all
+                // invalidate stale plans. Never prune a newly bound native path.
+                if current.node != *expected
+                    || resolve_state(s, path)? != Some(expected.id)
+                    || path_for(s, expected.id)? != *path
+                {
+                    continue;
+                }
+                removed.push(path.clone());
+                s.nodes.get_mut(&expected.id).unwrap().node.linked = false;
+                touch(s, expected.parent);
             }
             Ok(removed)
         })
+    }
+    pub async fn refresh(&self, prefix: &str) -> Result<Vec<String>> {
+        let plan = self.prepare_refresh(prefix).await?;
+        self.apply_refresh(plan).await
     }
     pub async fn clean(&self, prefix: &str) -> Result<()> {
         parts(prefix)?;
@@ -1129,6 +1284,16 @@ impl Tree {
         })
     }
     pub async fn stat(&self, path: &str, digest_function: i32) -> Result<Option<TreeStat>> {
+        let deadline = tokio::time::Instant::now() + self.cache.config.operation_timeout;
+        self.bounded_operation(deadline, self.stat_inner(path, digest_function, deadline))
+            .await
+    }
+    async fn stat_inner(
+        &self,
+        path: &str,
+        digest_function: i32,
+        deadline: tokio::time::Instant,
+    ) -> Result<Option<TreeStat>> {
         let node = {
             let ns = self.namespace.lock().unwrap();
             let Some(id) = resolve_state(&ns.state, path)? else {
@@ -1162,10 +1327,11 @@ impl Tree {
                     }
                 } else {
                     let local = self.local_path(current.id);
-                    let (hash, size) =
-                        tokio::task::spawn_blocking(move || hash_file(&local, digest_function))
-                            .await
-                            .context("local hash task failed")??;
+                    let (hash, size) = tokio::task::spawn_blocking(move || {
+                        hash_file_until(&local, digest_function, Some(deadline))
+                    })
+                    .await
+                    .context("local hash task failed")??;
                     Some(Artifact {
                         backend: self.backend.clone(),
                         instance: String::new(),
@@ -1270,7 +1436,11 @@ fn read_range(path: &Path, offset: u64, count: usize) -> Result<Vec<u8>> {
     file.take(count as u64).read_to_end(&mut bytes)?;
     Ok(bytes)
 }
-fn hash_file(path: &Path, function: i32) -> Result<(String, u64)> {
+fn hash_file_until(
+    path: &Path,
+    function: i32,
+    deadline: Option<tokio::time::Instant>,
+) -> Result<(String, u64)> {
     let mut file = File::open(path)?;
     let mut sha = Sha256::new();
     let mut blake = blake3::Hasher::new();
@@ -1278,6 +1448,11 @@ fn hash_file(path: &Path, function: i32) -> Result<(String, u64)> {
     let mut size = 0;
     let mut buf = [0u8; 128 * 1024];
     loop {
+        // Blocking OS reads cannot be preempted, but an expired verification
+        // must stop between chunks rather than continue detached over the file.
+        if deadline.is_some_and(|d| tokio::time::Instant::now() >= d) {
+            return Err(CacheTimeoutError.into());
+        }
         let n = file.read(&mut buf)?;
         if n == 0 {
             break;
@@ -1297,6 +1472,12 @@ fn hash_file(path: &Path, function: i32) -> Result<(String, u64)> {
         },
         size,
     ))
+}
+struct CancelWork(Arc<AtomicBool>);
+impl Drop for CancelWork {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::Relaxed);
+    }
 }
 struct Temporary(PathBuf);
 impl Drop for Temporary {
@@ -1362,8 +1543,28 @@ struct CacheFiles {
     entries: HashMap<PathBuf, CacheEntry>,
     reserved: u64,
 }
+#[derive(Clone)]
+enum FlightFailure {
+    Timeout,
+    Other(String),
+}
+impl FlightFailure {
+    fn from_error(error: anyhow::Error) -> Self {
+        if error.downcast_ref::<CacheTimeoutError>().is_some() {
+            Self::Timeout
+        } else {
+            Self::Other(format!("{error:#}"))
+        }
+    }
+    fn into_error(self) -> anyhow::Error {
+        match self {
+            Self::Timeout => CacheTimeoutError.into(),
+            Self::Other(message) => anyhow::Error::msg(message),
+        }
+    }
+}
 struct Flight {
-    result: Mutex<Option<std::result::Result<Arc<CachedBlob>, String>>>,
+    result: Mutex<Option<std::result::Result<Arc<CachedBlob>, FlightFailure>>>,
     ready: tokio::sync::Notify,
 }
 impl Flight {
@@ -1373,7 +1574,7 @@ impl Flight {
             tokio::pin!(notified);
             notified.as_mut().enable();
             if let Some(result) = self.result.lock().unwrap().as_ref() {
-                return result.clone().map_err(anyhow::Error::msg);
+                return result.clone().map_err(FlightFailure::into_error);
             }
             notified.await;
         }
@@ -1382,6 +1583,18 @@ impl Flight {
 struct Reservation {
     cache: Weak<Cache>,
     bytes: u64,
+}
+struct AdmissionTimer<'a> {
+    elapsed: &'a AtomicU64,
+    started: tokio::time::Instant,
+}
+impl Drop for AdmissionTimer<'_> {
+    fn drop(&mut self) {
+        self.elapsed.fetch_add(
+            self.started.elapsed().as_nanos().min(u64::MAX as u128) as u64,
+            Ordering::Relaxed,
+        );
+    }
 }
 impl Drop for Reservation {
     fn drop(&mut self) {
@@ -1404,6 +1617,9 @@ struct Cache {
     verified_bytes: AtomicU64,
     verification_bytes: AtomicU64,
     hits: AtomicU64,
+    timed_out_waiters: AtomicU64,
+    timed_out_fetches: AtomicU64,
+    admission_wait_ns: AtomicU64,
 }
 impl Cache {
     fn new(dir: PathBuf, source: Arc<dyn BlobSource>, config: CacheConfig) -> Result<Self> {
@@ -1456,6 +1672,9 @@ impl Cache {
             verified_bytes: AtomicU64::new(0),
             verification_bytes: AtomicU64::new(0),
             hits: AtomicU64::new(0),
+            timed_out_waiters: AtomicU64::new(0),
+            timed_out_fetches: AtomicU64::new(0),
+            admission_wait_ns: AtomicU64::new(0),
         })
     }
     fn metrics(&self) -> CacheMetrics {
@@ -1464,6 +1683,9 @@ impl Cache {
             verified_bytes: self.verified_bytes.load(Ordering::Relaxed),
             verification_bytes: self.verification_bytes.load(Ordering::Relaxed),
             hits: self.hits.load(Ordering::Relaxed),
+            timed_out_waiters: self.timed_out_waiters.load(Ordering::Relaxed),
+            timed_out_fetches: self.timed_out_fetches.load(Ordering::Relaxed),
+            admission_wait_ns: self.admission_wait_ns.load(Ordering::Relaxed),
         }
     }
     fn key(artifact: &Artifact) -> Result<String> {
@@ -1472,6 +1694,16 @@ impl Cache {
             .to_string())
     }
     async fn content(self: Arc<Self>, artifact: Artifact) -> Result<Arc<CachedBlob>> {
+        let deadline = tokio::time::Instant::now() + self.config.operation_timeout;
+        match tokio::time::timeout_at(deadline, self.clone().content_inner(artifact)).await {
+            Ok(result) if tokio::time::Instant::now() < deadline => result,
+            _ => {
+                self.timed_out_waiters.fetch_add(1, Ordering::Relaxed);
+                Err(CacheTimeoutError.into())
+            }
+        }
+    }
+    async fn content_inner(self: Arc<Self>, artifact: Artifact) -> Result<Arc<CachedBlob>> {
         artifact.validate()?;
         let limit = self.config.max_bytes.min(self.config.max_inflight_bytes);
         if artifact.size > limit {
@@ -1488,12 +1720,17 @@ impl Cache {
         }
         // Admission happens before spawning; queued callers consume no detached
         // tasks or temporary files. Only one admitted task exists per key.
+        let admission = AdmissionTimer {
+            elapsed: &self.admission_wait_ns,
+            started: tokio::time::Instant::now(),
+        };
         let request = self
             .requests
             .clone()
             .acquire_owned()
             .await
             .context("cache shutting down")?;
+        drop(admission);
         let (flight, start) = {
             let mut flights = self.flights.lock().unwrap();
             if let Some(flight) = flights.get(&key) {
@@ -1510,13 +1747,36 @@ impl Cache {
         if start {
             let cache = self.clone();
             let flight = flight.clone();
+            let fetch_deadline = tokio::time::Instant::now() + self.config.fetch_timeout;
             tokio::spawn(async move {
                 let _request = request;
                 let worker = cache.clone();
-                let result = match tokio::spawn(async move { worker.obtain(&artifact).await }).await
+                // The deadline is inside the worker: timing out a JoinHandle
+                // alone would detach work that could publish after expiry.
+                let result = match tokio::spawn(async move {
+                    let result = match tokio::time::timeout_at(
+                        fetch_deadline,
+                        worker.clone().obtain(&artifact, fetch_deadline),
+                    )
+                    .await
+                    {
+                        Ok(result) if tokio::time::Instant::now() < fetch_deadline => result,
+                        _ => Err(CacheTimeoutError.into()),
+                    };
+                    if result
+                        .as_ref()
+                        .is_err_and(|error| error.downcast_ref::<CacheTimeoutError>().is_some())
+                    {
+                        worker.timed_out_fetches.fetch_add(1, Ordering::Relaxed);
+                    }
+                    result
+                })
+                .await
                 {
-                    Ok(result) => result.map_err(|e| format!("{e:#}")),
-                    Err(error) => Err(format!("cache worker failed: {error}")),
+                    Ok(result) => result.map_err(FlightFailure::from_error),
+                    Err(error) => Err(FlightFailure::Other(format!(
+                        "cache worker failed: {error}"
+                    ))),
                 };
                 *flight.result.lock().unwrap() = Some(result);
                 cache.flights.lock().unwrap().remove(&key);
@@ -1548,16 +1808,26 @@ impl Cache {
             bytes: size,
         })
     }
-    async fn verify(&self, path: &Path, function: i32) -> Result<(String, u64)> {
+    async fn verify(
+        &self,
+        path: &Path,
+        function: i32,
+        deadline: tokio::time::Instant,
+    ) -> Result<(String, u64)> {
         let path = path.to_owned();
-        let result = tokio::task::spawn_blocking(move || hash_file(&path, function))
-            .await
-            .context("verification task failed")??;
+        let result =
+            tokio::task::spawn_blocking(move || hash_file_until(&path, function, Some(deadline)))
+                .await
+                .context("verification task failed")??;
         self.verification_bytes
             .fetch_add(result.1, Ordering::Relaxed);
         Ok(result)
     }
-    async fn obtain(self: Arc<Self>, artifact: &Artifact) -> Result<Arc<CachedBlob>> {
+    async fn obtain(
+        self: Arc<Self>,
+        artifact: &Artifact,
+        deadline: tokio::time::Instant,
+    ) -> Result<Arc<CachedBlob>> {
         let path = self.dir.join(Self::key(artifact)?);
         let verified = {
             let mut state = self.files.lock().unwrap();
@@ -1578,7 +1848,7 @@ impl Cache {
             let current = fingerprint(&path);
             let valid = match current.as_ref() {
                 Ok(current) if known.as_ref() == Some(current) => true,
-                Ok(before) => match self.verify(&path, artifact.digest_function).await {
+                Ok(before) => match self.verify(&path, artifact.digest_function, deadline).await {
                     Ok((hash, size)) if hash == artifact.hash && size == artifact.size => {
                         fingerprint(&path).as_ref().ok() == Some(before)
                     }
@@ -1587,6 +1857,9 @@ impl Cache {
                 Err(_) => false,
             };
             if valid {
+                if tokio::time::Instant::now() >= deadline {
+                    return Err(CacheTimeoutError.into());
+                }
                 let mut state = self.files.lock().unwrap();
                 let entry = state
                     .entries
@@ -1637,11 +1910,16 @@ impl Cache {
         self.source.fetch(artifact, &mut target).await?;
         target.sync_all()?;
         drop(target);
-        let (hash, size) = self.verify(&temp_path, artifact.digest_function).await?;
+        let (hash, size) = self
+            .verify(&temp_path, artifact.digest_function, deadline)
+            .await?;
         ensure!(
             size == artifact.size && hash == artifact.hash,
             "CAS blob digest or size mismatch"
         );
+        if tokio::time::Instant::now() >= deadline {
+            return Err(CacheTimeoutError.into());
+        }
         fs::rename(&temp_path, &path)?;
         let verified = fingerprint(&path)?;
         self.files.lock().unwrap().entries.insert(

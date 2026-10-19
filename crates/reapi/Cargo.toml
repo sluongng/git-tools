@@ -6,8 +6,12 @@ license = "MIT"
 description = "Pinned Remote Execution API and ByteStream bindings"
 
 [dependencies]
+fastrand = "2"
 prost = "0.14"
 prost-types = "0.14"
+serde = { version = "1", features = ["derive"] }
+tokio = { version = "1", features = ["time", "rt", "macros"] }
+toml = "1.1"
 tonic = { version = "0.14", features = ["gzip"] }
 tonic-prost = "0.14"
 zstd = "0.14"

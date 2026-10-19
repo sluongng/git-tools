@@ -8,7 +8,7 @@ use std::{
     pin::Pin,
     sync::{
         Arc, Mutex,
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
     task::{Context as TaskContext, Poll},
     time::Duration,
@@ -22,8 +22,10 @@ use tonic::{
     transport::{Channel, ClientTlsConfig, Endpoint},
 };
 
+use ::reapi::policy::Policy;
 pub use ::reapi::{Digest, proto, reapi};
 use proto::google::bytestream as bs;
+use tokio::time::Instant;
 
 const ZSTD: i32 = reapi::compressor::Value::Zstd as i32;
 const BLAKE3: i32 = reapi::digest_function::Value::Blake3 as i32;
@@ -39,6 +41,7 @@ pub struct CasConfig {
     pub endpoint: String,
     pub instance_name: String,
     pub headers: Vec<(String, String)>,
+    pub policy: Policy,
 }
 impl std::fmt::Debug for CasConfig {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -93,7 +96,8 @@ pub struct CasClient {
     instance: String,
     headers: Arc<Vec<(MetadataKey<Ascii>, MetadataValue<Ascii>)>>,
     caps: reapi::CacheCapabilities,
-    rpc_timeout: Duration,
+    policy: Policy,
+    deadline: Option<Instant>,
     grpc_compression: Arc<::reapi::compression::GrpcCompression>,
     stats: Arc<Mutex<UploadStats>>,
 }
@@ -108,6 +112,12 @@ struct AbortOnDrop<T>(tokio::task::JoinHandle<T>);
 impl<T> Drop for AbortOnDrop<T> {
     fn drop(&mut self) {
         self.0.abort();
+    }
+}
+struct CancelChunkOnDrop(Arc<AtomicBool>);
+impl Drop for CancelChunkOnDrop {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::Relaxed);
     }
 }
 fn key(d: &Digest) -> (String, i64) {
@@ -170,6 +180,8 @@ impl AsyncRead for VerifiedPartReader {
 
 impl CasClient {
     pub async fn connect(config: CasConfig) -> Result<Self> {
+        config.policy.validate()?;
+        let deadline = Instant::now() + config.policy.operation_timeout();
         let uri: axum::http::Uri = config
             .endpoint
             .parse()
@@ -207,36 +219,43 @@ impl CasClient {
         let https = uri.scheme_str() == Some("https");
         let mut endpoint = Endpoint::from_shared(config.endpoint)
             .map_err(|_| anyhow::anyhow!("invalid CAS endpoint"))?
-            .connect_timeout(Duration::from_secs(10))
-            .timeout(Duration::from_secs(60));
+            .connect_timeout(config.policy.connect_timeout());
         if https {
             endpoint = endpoint
                 .tls_config(ClientTlsConfig::new().with_webpki_roots())
                 .context("configure CAS TLS")?;
         }
-        let channel = endpoint.connect().await.context("connect CAS")?;
+        let channel = tokio::time::timeout_at(deadline, endpoint.connect())
+            .await
+            .context("CAS connection timed out")?
+            .context("connect CAS")?;
         let mut client = Self {
             channel,
             instance: config.instance_name,
             headers: Arc::new(headers),
             caps: Default::default(),
-            rpc_timeout: Duration::from_secs(60),
+            policy: config.policy,
+            deadline: None,
             grpc_compression: Arc::new(Default::default()),
             stats: Arc::new(Mutex::new(Default::default())),
         };
-        let response = bounded_rpc(
-            client.rpc_timeout,
-            reapi::capabilities_client::CapabilitiesClient::new(client.channel.clone())
-                .accept_compressed(CompressionEncoding::Gzip)
-                .get_capabilities(client.request(
+        let response = client
+            .policy
+            .retry(deadline, client.policy.rpc_timeout(), |budget| {
+                let mut request = client.request(
                     reapi::GetCapabilitiesRequest {
                         instance_name: client.instance.clone(),
                     },
                     false,
-                )),
-        )
-        .await
-        .map_err(|s| rpc_error("GetCapabilities", s))?;
+                );
+                request.set_timeout(budget);
+                let mut rpc =
+                    reapi::capabilities_client::CapabilitiesClient::new(client.channel.clone())
+                        .accept_compressed(CompressionEncoding::Gzip);
+                async move { rpc.get_capabilities(request).await }
+            })
+            .await
+            .map_err(|s| rpc_error("GetCapabilities", s))?;
         client.grpc_compression.observe(response.metadata());
         client.caps = response
             .into_inner()
@@ -252,6 +271,11 @@ impl CasClient {
         );
         Ok(client)
     }
+    pub(crate) fn with_deadline(&self, deadline: Instant) -> Self {
+        let mut client = self.clone();
+        client.deadline = Some(deadline);
+        client
+    }
     pub fn capabilities(&self) -> &reapi::CacheCapabilities {
         &self.caps
     }
@@ -266,7 +290,7 @@ impl CasClient {
     }
     fn request<T>(&self, value: T, chunk: bool) -> Request<T> {
         let mut req = Request::new(value);
-        req.set_timeout(self.rpc_timeout);
+        req.set_timeout(self.policy.rpc_timeout());
         for (k, v) in self.headers.iter() {
             req.metadata_mut().insert(k.clone(), v.clone());
         }
@@ -296,30 +320,67 @@ impl CasClient {
             None => client,
         }
     }
-    // One outer deadline covers both attempts. Only an explicit transport-codec
-    // rejection permits an identity retry; application/authentication failures do not.
-    async fn metadata_rpc<T, F, Fut>(
-        &self,
-        mut call: F,
-    ) -> Result<tonic::Response<T>, tonic::Status>
+    fn deadline(&self) -> Instant {
+        self.deadline
+            .unwrap_or_else(|| Instant::now() + self.policy.operation_timeout())
+    }
+    // All retries, including the narrowly classified codec fallback, share one
+    // original deadline. A codec fallback never grants a fresh retry budget.
+    async fn metadata_rpc<T, F, Fut>(&self, call: F) -> Result<tonic::Response<T>, tonic::Status>
     where
-        F: FnMut(Option<CompressionEncoding>) -> Fut,
+        F: Fn(Option<CompressionEncoding>, Duration) -> Fut,
         Fut: std::future::Future<Output = Result<tonic::Response<T>, tonic::Status>>,
     {
-        let encoding = self.grpc_compression.request_encoding();
-        bounded_rpc(self.rpc_timeout, async {
-            match call(encoding).await {
-                Err(status) if self.grpc_compression.retry_identity(&status, encoding) => {
-                    call(None).await
+        self.metadata_rpc_timeout(self.policy.rpc_timeout(), call)
+            .await
+    }
+    async fn metadata_rpc_timeout<T, F, Fut>(
+        &self,
+        attempt_timeout: Duration,
+        call: F,
+    ) -> Result<tonic::Response<T>, tonic::Status>
+    where
+        F: Fn(Option<CompressionEncoding>, Duration) -> Fut,
+        Fut: std::future::Future<Output = Result<tonic::Response<T>, tonic::Status>>,
+    {
+        self.policy
+            .retry(self.deadline(), attempt_timeout, |budget| {
+                let call = &call;
+                async move {
+                    let deadline = Instant::now() + budget;
+                    let encoding = self.grpc_compression.request_encoding();
+                    match call(encoding, budget).await {
+                        Err(status) if self.grpc_compression.retry_identity(&status, encoding) => {
+                            let remaining = deadline.saturating_duration_since(Instant::now());
+                            ::reapi::policy::timeout(deadline, call(None, remaining)).await
+                        }
+                        response => response,
+                    }
                 }
-                response => response,
-            }
-        })
-        .await
+            })
+            .await
     }
     /// Validate each response against its request. Never infer presence from an incomplete upload response.
     pub async fn find_missing(&self, digests: &[Digest]) -> Result<Vec<Digest>> {
-        self.find_missing_inner(digests, false).await
+        let mut operation = self.clone();
+        operation.deadline = Some(self.deadline());
+        let result = tokio::time::timeout_at(
+            operation.deadline(),
+            operation.find_missing_inner(digests, false),
+        )
+        .await;
+        if Instant::now() >= operation.deadline() {
+            return Err(rpc_error(
+                "FindMissingBlobs",
+                tonic::Status::deadline_exceeded("operation timed out"),
+            ));
+        }
+        result.map_err(|_| {
+            rpc_error(
+                "FindMissingBlobs",
+                tonic::Status::deadline_exceeded("operation timed out"),
+            )
+        })?
     }
     async fn find_missing_inner(&self, digests: &[Digest], chunk: bool) -> Result<Vec<Digest>> {
         for d in digests {
@@ -328,19 +389,20 @@ impl CasClient {
         let mut missing = Vec::new();
         for batch in digests.chunks(FIND_MISSING_LIMIT) {
             let allowed: HashSet<_> = batch.iter().map(key).collect();
-            self.record(&UploadStats {
-                find_missing_calls: 1,
-                ..Default::default()
-            });
             let request = reapi::FindMissingBlobsRequest {
                 instance_name: self.instance.clone(),
                 blob_digests: batch.to_vec(),
                 digest_function: BLAKE3,
             };
             let response = self
-                .metadata_rpc(|encoding| {
+                .metadata_rpc(|encoding, budget| {
+                    self.record(&UploadStats {
+                        find_missing_calls: 1,
+                        ..Default::default()
+                    });
                     let mut client = self.metadata_cas(encoding);
-                    let request = self.request(request.clone(), chunk);
+                    let mut request = self.request(request.clone(), chunk);
+                    request.set_timeout(budget);
                     async move { client.find_missing_blobs(request).await }
                 })
                 .await
@@ -360,6 +422,26 @@ impl CasClient {
     }
     /// Upload blobs already known to be missing. The caller owns presence TTLs and initial FindMissing.
     pub async fn upload_missing(&self, blobs: &[UploadBlob]) -> Result<UploadStats> {
+        let mut operation = self.clone();
+        operation.deadline = Some(self.deadline());
+        let result =
+            tokio::time::timeout_at(operation.deadline(), operation.upload_missing_inner(blobs))
+                .await;
+        if Instant::now() >= operation.deadline() {
+            return Err(rpc_error(
+                "Upload",
+                tonic::Status::deadline_exceeded("operation timed out"),
+            ));
+        }
+        result.map_err(|_| {
+            rpc_error(
+                "Upload",
+                tonic::Status::deadline_exceeded("operation timed out"),
+            )
+        })?
+    }
+
+    async fn upload_missing_inner(&self, blobs: &[UploadBlob]) -> Result<UploadStats> {
         let mut stats = UploadStats::default();
         let mut pending = Vec::new();
         let mut pending_bytes = 0;
@@ -498,74 +580,202 @@ impl CasClient {
         if pending.is_empty() {
             return Ok(());
         }
-        let requests = std::mem::take(pending);
-        let expected: HashSet<_> = requests
-            .iter()
-            .map(|r| key(r.digest.as_ref().unwrap()))
-            .collect();
-        let bytes: u64 = requests
-            .iter()
-            .map(|r| r.digest.as_ref().unwrap().size_bytes as u64)
-            .sum();
-        let count = requests.len() as u64;
-        let wire_bytes = requests.iter().map(|r| r.data.len() as u64).sum();
-        let zstd_batch_blobs = requests.iter().filter(|r| r.compressor == ZSTD).count() as u64;
-        let started = UploadStats {
-            batch_update_calls: 1,
-            ..Default::default()
-        };
-        stats.add(&started);
-        self.record(&started);
-        // Use transport compression only for identity batches. ZSTD entries are
-        // already compressed independently under the CAS protocol.
-        let request = reapi::BatchUpdateBlobsRequest {
-            instance_name: self.instance.clone(),
-            requests,
-            digest_function: BLAKE3,
-        };
-        let response = if request.requests.iter().all(|r| r.compressor == 0) {
-            self.metadata_rpc(|encoding| {
+        let remaining = Arc::new(Mutex::new(std::mem::take(pending)));
+        let attempts = AtomicU64::new(0);
+        let complete = Arc::new(Mutex::new(UploadStats::default()));
+        let result = self
+            .policy
+            .retry(self.deadline(), self.policy.rpc_timeout(), |budget| {
+                attempts.fetch_add(1, Ordering::Relaxed);
+                self.record(&UploadStats {
+                    batch_update_calls: 1,
+                    ..Default::default()
+                });
+                let requests = remaining.lock().unwrap().clone();
+                let emitted = UploadStats {
+                    uploaded_wire_bytes: requests.iter().map(|r| r.data.len() as u64).sum(),
+                    zstd_batch_blobs: requests.iter().filter(|r| r.compressor == ZSTD).count()
+                        as u64,
+                    ..Default::default()
+                };
+                self.record(&emitted);
+                complete.lock().unwrap().add(&emitted);
+                let encoding = if requests.iter().all(|r| r.compressor == 0) {
+                    self.grpc_compression.request_encoding()
+                } else {
+                    None
+                };
                 let mut client = self.metadata_cas(encoding);
-                let request = self.request(request.clone(), chunk);
-                async move { client.batch_update_blobs(request).await }
+                let mut request = self.request(
+                    reapi::BatchUpdateBlobsRequest {
+                        instance_name: self.instance.clone(),
+                        requests: requests.clone(),
+                        digest_function: BLAKE3,
+                    },
+                    chunk,
+                );
+                request.set_timeout(budget);
+                let remaining = remaining.clone();
+                let complete = complete.clone();
+                let codec = &self.grpc_compression;
+                // Codec fallback shares this attempt's original deadline and never
+                // replays acknowledged per-item successes.
+                let attempts = &attempts;
+                async move {
+                    let deadline = Instant::now() + budget;
+                    let response = match client.batch_update_blobs(request).await {
+                        Err(status) if codec.retry_identity(&status, encoding) => {
+                            attempts.fetch_add(1, Ordering::Relaxed);
+                            let emitted = UploadStats {
+                                batch_update_calls: 1,
+                                uploaded_wire_bytes: requests
+                                    .iter()
+                                    .map(|r| r.data.len() as u64)
+                                    .sum(),
+                                zstd_batch_blobs: requests
+                                    .iter()
+                                    .filter(|r| r.compressor == ZSTD)
+                                    .count()
+                                    as u64,
+                                ..Default::default()
+                            };
+                            self.record(&emitted);
+                            // The call count is accumulated separately below.
+                            let mut wire = emitted;
+                            wire.batch_update_calls = 0;
+                            complete.lock().unwrap().add(&wire);
+                            let mut identity = self.request(
+                                reapi::BatchUpdateBlobsRequest {
+                                    instance_name: self.instance.clone(),
+                                    requests: requests.clone(),
+                                    digest_function: BLAKE3,
+                                },
+                                chunk,
+                            );
+                            identity
+                                .set_timeout(deadline.saturating_duration_since(Instant::now()));
+                            self.cas().batch_update_blobs(identity).await?
+                        }
+                        result => result?,
+                    }
+                    .into_inner();
+                    let expected: HashSet<_> = requests
+                        .iter()
+                        .map(|r| key(r.digest.as_ref().unwrap()))
+                        .collect();
+                    let mut seen = HashSet::new();
+                    let mut statuses = std::collections::HashMap::new();
+                    for response in response.responses {
+                        let digest = response
+                            .digest
+                            .ok_or_else(|| tonic::Status::data_loss("missing batch digest"))?;
+                        if !expected.contains(&key(&digest)) || !seen.insert(key(&digest)) {
+                            return Err(tonic::Status::data_loss(
+                                "unexpected or duplicate batch digest",
+                            ));
+                        }
+                        let status = response
+                            .status
+                            .ok_or_else(|| tonic::Status::data_loss("missing batch status"))?;
+                        statuses.insert(key(&digest), status);
+                    }
+                    if seen != expected {
+                        return Err(tonic::Status::data_loss("missing batch responses"));
+                    }
+                    let mut retry = Vec::new();
+                    let mut failure = None;
+                    let mut done = UploadStats::default();
+                    for request in requests {
+                        let digest = request.digest.as_ref().unwrap();
+                        let item_status = &statuses[&key(digest)];
+                        let code = Code::from_i32(item_status.code);
+                        if code == Code::Ok {
+                            done.uploaded_blobs += 1;
+                            done.uploaded_bytes += digest.size_bytes as u64;
+                        } else {
+                            let status = tonic::Status::with_details(
+                                code,
+                                "CAS batch item failed",
+                                item_status.encode_to_vec().into(),
+                            );
+                            if ::reapi::policy::retryable(&status) {
+                                retry.push(request);
+                                if failure.is_none() {
+                                    failure = Some(status);
+                                }
+                            } else {
+                                // Permanent failures take priority over transient entries.
+                                failure = Some(status);
+                            }
+                        }
+                    }
+                    self.record(&done);
+                    complete.lock().unwrap().add(&done);
+                    *remaining.lock().unwrap() = retry;
+                    match failure {
+                        Some(status) => Err(status),
+                        None => Ok(()),
+                    }
+                }
             })
-            .await
-        } else {
-            bounded_rpc(
-                self.rpc_timeout,
-                self.cas().batch_update_blobs(self.request(request, chunk)),
-            )
-            .await
-        }
-        .map_err(|s| rpc_error("BatchUpdateBlobs", s))?
-        .into_inner();
-        let mut seen = HashSet::new();
-        for r in response.responses {
-            let digest = r.digest.context("CAS omitted batch response digest")?;
-            ensure!(
-                expected.contains(&key(&digest)) && seen.insert(key(&digest)),
-                "CAS returned unexpected or duplicate batch response"
-            );
-            let status = r.status.context("CAS omitted batch response status")?;
-            ensure!(
-                status.code == 0,
-                "CAS batch upload failed with code {}",
-                status.code
-            );
-        }
-        ensure!(seen == expected, "CAS omitted batch upload responses");
-        let complete = UploadStats {
-            uploaded_bytes: bytes,
-            uploaded_wire_bytes: wire_bytes,
-            zstd_batch_blobs,
-            uploaded_blobs: count,
-            ..Default::default()
-        };
-        stats.add(&complete);
-        self.record(&complete);
-        Ok(())
+            .await;
+        stats.batch_update_calls += attempts.load(Ordering::Relaxed);
+        stats.add(&complete.lock().unwrap());
+        result.map_err(|s| rpc_error("BatchUpdateBlobs", s))
     }
     async fn stream_part(&self, part: &Part, chunk: bool, stats: &mut UploadStats) -> Result<()> {
+        let deadline = self.deadline();
+        let attempts = AtomicU64::new(0);
+        let local_failure = Mutex::new(None);
+        let emitted = Arc::new(AtomicU64::new(0));
+        let done = self
+            .policy
+            .retry(
+                deadline,
+                deadline.saturating_duration_since(Instant::now()),
+                |budget| {
+                    attempts.fetch_add(1, Ordering::Relaxed);
+                    let local_failure = &local_failure;
+                    let emitted = emitted.clone();
+                    async move {
+                        self.stream_part_attempt(part, chunk, budget, emitted)
+                            .await
+                            .map_err(|error| match error.downcast_ref::<RpcError>() {
+                                Some(rpc) => rpc.status.clone(),
+                                None => {
+                                    *local_failure.lock().unwrap() = Some(error);
+                                    tonic::Status::data_loss(
+                                        "CAS upload source or acknowledgment invalid",
+                                    )
+                                }
+                            })
+                    }
+                },
+            )
+            .await;
+        let attempts = attempts.load(Ordering::Relaxed);
+        stats.bytestream_write_calls += attempts;
+        stats.zstd_stream_blobs +=
+            attempts * u64::from(self.caps.supported_compressors.contains(&ZSTD));
+        stats.uploaded_wire_bytes += emitted.load(Ordering::Relaxed);
+        let done = done.map_err(|status| {
+            local_failure
+                .lock()
+                .unwrap()
+                .take()
+                .unwrap_or_else(|| rpc_error("ByteStream.Write", status))
+        })?;
+        stats.add(&done);
+        self.record(&done);
+        Ok(())
+    }
+    async fn stream_part_attempt(
+        &self,
+        part: &Part,
+        chunk: bool,
+        budget: Duration,
+        emitted: Arc<AtomicU64>,
+    ) -> Result<UploadStats> {
         let compressed = self.caps.supported_compressors.contains(&ZSTD);
         let upload_id = uuid::Uuid::new_v4().to_string();
         let prefix = if self.instance.is_empty() {
@@ -631,25 +841,48 @@ impl CasClient {
         }));
         let started = UploadStats {
             bytestream_write_calls: 1,
+            zstd_stream_blobs: u64::from(compressed),
             ..Default::default()
         };
-        stats.add(&started);
         self.record(&started);
-        let wire_bytes = Arc::new(AtomicU64::new(0));
-        let sent = wire_bytes.clone();
+        let shared_stats = self.stats.clone();
+        let (progress, mut progress_rx) = tokio::sync::watch::channel(Instant::now());
         let stream = tokio_stream::wrappers::ReceiverStream::new(rx).map(
             move |request: bs::WriteRequest| {
-                sent.fetch_add(request.data.len() as u64, Ordering::Relaxed);
+                let bytes = request.data.len() as u64;
+                emitted.fetch_add(bytes, Ordering::Relaxed);
+                shared_stats
+                    .lock()
+                    .expect("CAS stats mutex poisoned")
+                    .uploaded_wire_bytes += bytes;
+                progress.send_replace(Instant::now());
                 request
             },
         );
-        let response = bounded_rpc(
-            self.rpc_timeout,
-            bs::byte_stream_client::ByteStreamClient::new(self.channel.clone())
-                .accept_compressed(CompressionEncoding::Gzip)
-                .write(self.request(stream, chunk)),
-        )
-        .await
+        let mut request = self.request(stream, chunk);
+        request.set_timeout(budget);
+        let mut client = bs::byte_stream_client::ByteStreamClient::new(self.channel.clone())
+            .accept_compressed(CompressionEncoding::Gzip);
+        let rpc = client.write(request);
+        tokio::pin!(rpc);
+        let mut progress_closed = false;
+        let response = loop {
+            let idle_deadline = *progress_rx.borrow() + self.policy.stream_idle_timeout();
+            tokio::select! {
+                response = &mut rpc => break response,
+                _ = tokio::time::sleep_until(idle_deadline) => {
+                    if Instant::now() >= *progress_rx.borrow() + self.policy.stream_idle_timeout() {
+                        break Err(tonic::Status::deadline_exceeded("CAS stream made no progress"));
+                    }
+                }
+                changed = progress_rx.changed(), if !progress_closed => {
+                    if changed.is_err() {
+                        // The stream is fully consumed; still bound the final acknowledgment.
+                        progress_closed = true;
+                    }
+                }
+            }
+        }
         .map_err(|s| rpc_error("ByteStream.Write", s))?
         .into_inner();
         // REAPI permits early success when another writer already populated CAS.
@@ -660,7 +893,7 @@ impl CasClient {
             producer.0.abort();
             let _ = (&mut producer.0).await;
         } else {
-            let produced = tokio::time::timeout(self.rpc_timeout, &mut producer.0)
+            let produced = tokio::time::timeout_at(self.deadline(), &mut producer.0)
                 .await
                 .context("CAS upload reader timed out")?
                 .context("CAS upload reader task failed")??;
@@ -672,14 +905,10 @@ impl CasClient {
         }
         let done = UploadStats {
             uploaded_bytes: expected_size as u64,
-            uploaded_wire_bytes: wire_bytes.load(Ordering::Relaxed),
-            zstd_stream_blobs: u64::from(compressed),
             uploaded_blobs: 1,
             ..Default::default()
         };
-        stats.add(&done);
-        self.record(&done);
-        Ok(())
+        Ok(done)
     }
     async fn upload_cdc(
         &self,
@@ -721,9 +950,13 @@ impl CasClient {
         stats: &mut UploadStats,
     ) -> Result<()> {
         let source = blob.clone();
-        let parts = tokio::task::spawn_blocking(move || chunk_file(source, params))
-            .await
-            .context("CAS chunk task failed")??;
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let _cancel = CancelChunkOnDrop(cancelled.clone());
+        let deadline = self.deadline();
+        let parts =
+            tokio::task::spawn_blocking(move || chunk_file(source, params, &cancelled, deadline))
+                .await
+                .context("CAS chunk task failed")??;
         let mut digests = Vec::new();
         let mut unique = HashSet::new();
         for p in &parts {
@@ -750,11 +983,19 @@ impl CasClient {
             stats.add(&started);
             self.record(&started);
             let response = self
-                .metadata_rpc(|encoding| {
-                    let mut client = self.metadata_cas(encoding);
-                    let request = self.request(request.clone(), false);
-                    async move { client.splice_blob(request).await }
-                })
+                .metadata_rpc_timeout(
+                    Duration::from_millis(
+                        (parts.len() as u64)
+                            .saturating_mul(250)
+                            .clamp(60_000, 600_000),
+                    ),
+                    |encoding, budget| {
+                        let mut client = self.metadata_cas(encoding);
+                        let mut request = self.request(request.clone(), false);
+                        request.set_timeout(budget);
+                        async move { client.splice_blob(request).await }
+                    },
+                )
                 .await;
             match response {
                 Ok(r) => {
@@ -812,16 +1053,6 @@ impl CasClient {
         self.flush_batch(&mut pending, true, stats).await
     }
 }
-// Endpoint timeouts need not cover unary response-body decoding. Bound the entire
-// generated RPC future as well, and propagate a deadline to the server.
-async fn bounded_rpc<T>(
-    timeout: Duration,
-    future: impl std::future::Future<Output = std::result::Result<tonic::Response<T>, tonic::Status>>,
-) -> std::result::Result<tonic::Response<T>, tonic::Status> {
-    tokio::time::timeout(timeout, future)
-        .await
-        .unwrap_or_else(|_| Err(tonic::Status::deadline_exceeded("CAS RPC timed out")))
-}
 #[derive(Debug)]
 struct CdcLimit;
 impl std::fmt::Display for CdcLimit {
@@ -830,10 +1061,20 @@ impl std::fmt::Display for CdcLimit {
     }
 }
 impl std::error::Error for CdcLimit {}
-#[derive(Debug)]
 struct RpcError {
     method: String,
     code: Code,
+    // Retain RetryInfo for the shared policy, but never render server-provided
+    // text, metadata or details through either Display or Debug.
+    status: tonic::Status,
+}
+impl std::fmt::Debug for RpcError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RpcError")
+            .field("method", &self.method)
+            .field("code", &self.code)
+            .finish()
+    }
 }
 impl std::fmt::Display for RpcError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -846,6 +1087,7 @@ fn rpc_error(method: &str, s: tonic::Status) -> anyhow::Error {
     RpcError {
         method: method.into(),
         code: s.code(),
+        status: s,
     }
     .into()
 }
@@ -864,7 +1106,12 @@ async fn read_part(part: &Part) -> Result<Vec<u8>> {
     );
     Ok(bytes)
 }
-fn chunk_file(blob: UploadBlob, params: reapi::FastCdc2020Params) -> Result<Vec<Part>> {
+fn chunk_file(
+    blob: UploadBlob,
+    params: reapi::FastCdc2020Params,
+    cancelled: &AtomicBool,
+    deadline: Instant,
+) -> Result<Vec<Part>> {
     let file = std::fs::File::open(&blob.path).context("open CAS chunk spool")?;
     let avg = params.avg_chunk_size_bytes as usize;
     let chunks = fastcdc::v2020::StreamCDC::with_level_and_seed(
@@ -879,6 +1126,10 @@ fn chunk_file(blob: UploadBlob, params: reapi::FastCdc2020Params) -> Result<Vec<
     let mut full = blake3::Hasher::new();
     let mut total = 0;
     for chunk in chunks {
+        ensure!(
+            !cancelled.load(Ordering::Relaxed) && Instant::now() < deadline,
+            "CAS chunking cancelled or timed out"
+        );
         let chunk = chunk.context("read CAS chunk spool")?;
         // Bound metadata independently of source-file size and fall back to ByteStream.
         if parts.len() == 32_768 {
@@ -927,6 +1178,8 @@ pub(crate) mod tests {
         resources: Vec<String>,
         chunk_headers: usize,
         splice_calls: usize,
+        write_calls: usize,
+        capabilities_calls: usize,
         mode: &'static str,
         allow_no_auth: bool,
     }
@@ -962,6 +1215,13 @@ pub(crate) mod tests {
         ) -> Result<Response<reapi::ServerCapabilities>, Status> {
             self.note(&req)?;
             assert_eq!(req.get_ref().instance_name, "test/instance");
+            {
+                let mut state = self.0.lock().unwrap();
+                state.capabilities_calls += 1;
+                if state.mode == "transient-capabilities" && state.capabilities_calls == 1 {
+                    return Err(Status::unavailable("temporary"));
+                }
+            }
             let mut response = Response::new(reapi::ServerCapabilities {
                 cache_capabilities: Some(self.0.lock().unwrap().caps.clone()),
                 high_api_version: Some(proto::build::bazel::semver::SemVer {
@@ -991,6 +1251,9 @@ pub(crate) mod tests {
             assert_eq!(req.digest_function, BLAKE3);
             let mut s = self.0.lock().unwrap();
             s.missing_sizes.push(req.blob_digests.len());
+            if s.mode == "transient-missing" && s.missing_sizes.len() == 1 {
+                return Err(Status::unavailable("temporary"));
+            }
             if matches!(
                 s.mode,
                 "metadata-unimplemented" | "metadata-unauthenticated" | "metadata-denied"
@@ -1052,7 +1315,8 @@ pub(crate) mod tests {
             s.batch_plain_sizes
                 .push(decoded.iter().map(|(_, _, data)| data.len()).sum());
             let mut responses = Vec::new();
-            for (d, compressor, data) in decoded {
+            let first_batch = s.batch_sizes.len() == 1;
+            for (index, (d, compressor, data)) in decoded.into_iter().enumerate() {
                 s.batch_compressors.push(compressor);
                 assert!(
                     compressor == 0
@@ -1062,11 +1326,20 @@ pub(crate) mod tests {
                 );
                 assert_eq!(d.hash, blake3::hash(&data).to_hex().to_string());
                 assert_eq!(d.size_bytes, data.len() as i64);
-                s.blobs.insert(key(&d), data);
+                let transient = s.mode == "partial-transient-batch" && first_batch && index == 0;
+                if !transient {
+                    s.blobs.insert(key(&d), data);
+                }
                 responses.push(reapi::batch_update_blobs_response::Response {
                     digest: Some(d),
                     status: Some(proto::google::rpc::Status {
-                        code: if s.mode == "batch-error" { 7 } else { 0 },
+                        code: if s.mode == "batch-error" {
+                            7
+                        } else if transient {
+                            14
+                        } else {
+                            0
+                        },
                         ..Default::default()
                     }),
                 });
@@ -1180,6 +1453,10 @@ pub(crate) mod tests {
             req: Request<tonic::Streaming<bs::WriteRequest>>,
         ) -> Result<Response<bs::WriteResponse>, Status> {
             self.note(&req)?;
+            {
+                let mut state = self.0.lock().unwrap();
+                state.write_calls += 1;
+            }
             if self.0.lock().unwrap().mode == "hang-write" {
                 return std::future::pending().await;
             }
@@ -1207,6 +1484,13 @@ pub(crate) mod tests {
                 }
                 self.0.lock().unwrap().frames.push(r.data.len());
                 data.extend_from_slice(&r.data);
+                let transient_failure = {
+                    let state = self.0.lock().unwrap();
+                    state.mode == "transient-write" && state.write_calls == 1
+                };
+                if transient_failure {
+                    return Err(Status::unavailable("temporary after partial upload"));
+                }
                 finished = r.finish_write;
             }
             if !finished {
@@ -1222,6 +1506,10 @@ pub(crate) mod tests {
                 size_bytes: data.len() as i64,
             };
             assert!(resource.ends_with(&format!("/{}/{}", d.hash, d.size_bytes)));
+            let delayed = self.0.lock().unwrap().mode == "delayed-write-ack";
+            if delayed {
+                tokio::time::sleep(Duration::from_millis(80)).await;
+            }
             let mut s = self.0.lock().unwrap();
             s.resources.push(resource);
             s.blobs.insert(key(&d), data);
@@ -1340,6 +1628,7 @@ pub(crate) mod tests {
         let client = CasClient::connect(CasConfig {
             endpoint: endpoint.clone(),
             instance_name: "test/instance".into(),
+            policy: Policy::default(),
             headers: vec![("x-buildbuddy-api-key".into(), "fixture-secret".into())],
         })
         .await
@@ -1382,6 +1671,77 @@ pub(crate) mod tests {
                 x as u8
             })
             .collect()
+    }
+    #[tokio::test]
+    async fn transient_presence_retry_and_partial_batch_do_not_reupload_successes() {
+        let dir = tempfile::tempdir().unwrap();
+        let blobs = [
+            blob(dir.path(), "first", &[1; 11]),
+            blob(dir.path(), "second", &[2; 17]),
+        ];
+        let running = server(false, 0, "transient-missing").await;
+        let missing = running
+            .client
+            .find_missing(&blobs.iter().map(|b| b.digest.clone()).collect::<Vec<_>>())
+            .await
+            .unwrap();
+        assert_eq!(missing.len(), 2);
+        assert_eq!(running.fixture.0.lock().unwrap().missing_sizes, [2, 2]);
+        let running = server(false, 0, "partial-transient-batch").await;
+        let stats = running.client.upload_missing(&blobs).await.unwrap();
+        assert_eq!(stats.uploaded_blobs, 2);
+        assert_eq!(stats.batch_update_calls, 2);
+        assert_eq!(
+            running.fixture.0.lock().unwrap().batch_plain_sizes,
+            [28, 11]
+        );
+        assert!(blobs.iter().all(|blob| running.contains(&blob.digest)));
+    }
+    #[tokio::test]
+    async fn capabilities_and_immutable_stream_recover_from_transient_failure() {
+        let running = server(false, 0, "transient-capabilities").await;
+        assert_eq!(running.fixture.0.lock().unwrap().capabilities_calls, 2);
+        let dir = tempfile::tempdir().unwrap();
+        let b = blob(dir.path(), "retry-stream", &[3; 100]);
+        let running = compressed_server(false, 1, "transient-write", false, true).await;
+        let stats = running
+            .client
+            .upload_missing(std::slice::from_ref(&b))
+            .await
+            .unwrap();
+        assert_eq!(stats.bytestream_write_calls, 2);
+        assert_eq!(stats.uploaded_blobs, 1);
+        assert_eq!(stats.uploaded_bytes, b.digest.size_bytes as u64);
+        assert_eq!(
+            stats.zstd_stream_blobs, 2,
+            "compression counts request attempts"
+        );
+        let state = running.fixture.0.lock().unwrap();
+        assert_eq!(state.write_calls, 2);
+        let first_attempt_wire = state.frames[0] as u64;
+        let all_received_wire = state.frames.iter().sum::<usize>() as u64;
+        assert!(first_attempt_wire > 0);
+        assert_eq!(stats.uploaded_wire_bytes, all_received_wire);
+        assert_eq!(stats.uploaded_wire_bytes, first_attempt_wire * 2);
+        drop(state);
+        assert_eq!(
+            running.client.stats().uploaded_wire_bytes,
+            stats.uploaded_wire_bytes
+        );
+        assert_eq!(running.client.stats().zstd_stream_blobs, 2);
+        assert!(running.contains(&b.digest));
+    }
+    #[tokio::test]
+    async fn stream_ack_is_not_cut_off_by_unary_timeout() {
+        let dir = tempfile::tempdir().unwrap();
+        let b = blob(dir.path(), "delayed-stream", &[1; 100]);
+        let mut running = server(false, 1, "delayed-write-ack").await;
+        running.client.policy.rpc_timeout_ms = 20;
+        running.client.policy.stream_idle_timeout_ms = 500;
+        running.client.policy.operation_timeout_ms = 1000;
+        let stats = running.client.upload_missing(&[b]).await.unwrap();
+        assert_eq!(stats.bytestream_write_calls, 1);
+        assert_eq!(stats.uploaded_blobs, 1);
     }
     #[tokio::test]
     async fn grpc_batches_missing_and_uploads_by_payload_boundaries() {
@@ -1584,7 +1944,9 @@ pub(crate) mod tests {
         let dir = tempfile::tempdir().unwrap();
         let blob = blob(dir.path(), "one", &[1]);
         let mut running = server(false, 0, "hang-batch").await;
-        running.client.rpc_timeout = Duration::from_millis(30);
+        running.client.policy.rpc_timeout_ms = 30;
+        running.client.policy.operation_timeout_ms = 30;
+        running.client.policy.stream_idle_timeout_ms = 30;
         let started = std::time::Instant::now();
         let error = tokio::time::timeout(
             Duration::from_secs(2),
@@ -1838,7 +2200,10 @@ pub(crate) mod tests {
             &deterministic_data(BATCH_BYTES * 2),
         );
         let mut running = compressed_server(false, 1, "hang-write", false, true).await;
-        running.client.rpc_timeout = Duration::from_millis(30);
+        running.client.policy.rpc_timeout_ms = 30;
+        running.client.policy.operation_timeout_ms = 1000;
+        running.client.policy.retry.max_attempts = 1;
+        running.client.policy.stream_idle_timeout_ms = 30;
         let result =
             tokio::time::timeout(Duration::from_secs(2), running.client.upload_missing(&[b]))
                 .await
