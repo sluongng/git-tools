@@ -2,6 +2,7 @@
 # Actual macOS kernel NFS acceptance, not a Linux protocol substitute.
 # Prerequisite: PATH git must support cat-file remote-object-info on both client
 # and file:// upload-pack server. No content-fetch fallback is allowed for sizes.
+# Python 3 exercises native client-local locking between separate processes.
 set -eu
 [ "$(uname -s)" = Darwin ] || { echo 'This verifier requires macOS.' >&2; exit 1; }
 : "${GIT_NFS_BIN:?absolute path to git-nfs}"
@@ -111,11 +112,35 @@ start() {
   [ -n "$TASK_PORT" ] || { echo 'Could not determine NFS listener port.' >&2; return 1; }
   # The loopback export does not require a privileged source port. Mount as the
   # current user, who owns this temporary mountpoint; do not invoke sudo.
-  mount_nfs -o "vers=3,tcp,nolocks,noresvport,port=$TASK_PORT,mountport=$TASK_PORT,nobrowse,nosuid,nodev" \
+  mount_nfs -o "vers=3,tcp,locallocks,noresvport,port=$TASK_PORT,mountport=$TASK_PORT,nobrowse,nosuid,nodev" \
     127.0.0.1:/ "$TASK_TMP/mount"
   TASK_MOUNTED=1
 }
 start
+python3 - "$TASK_TMP/mount/local-lock-check" <<'PY'
+import fcntl, subprocess, sys
+path = sys.argv[1]
+child = '''import fcntl,sys
+with open(sys.argv[1], "r+") as handle:
+    try:
+        getattr(fcntl, sys.argv[2])(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        sys.exit(0 if sys.argv[3] == "blocked" else 1)
+    sys.exit(0 if sys.argv[3] == "free" else 1)
+'''
+with open(path, "w+") as handle:
+    for method in ("flock", "lockf"):
+        lock = getattr(fcntl, method)
+        lock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        subprocess.run([sys.executable, "-c", child, path, method, "blocked"], check=True, timeout=10)
+        lock(handle, fcntl.LOCK_UN)
+        subprocess.run([sys.executable, "-c", child, path, method, "free"], check=True, timeout=10)
+        # The child exited holding its lock; process exit must release it.
+        lock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        lock(handle, fcntl.LOCK_UN)
+print("Client-local flock/fcntl exclusion and release PASS")
+PY
+rm "$TASK_TMP/mount/local-lock-check"
 object_state after-mount
 missing after-mount "$TASK_TRACKED_OID"
 missing after-mount "$TASK_UNRELATED_OID"
