@@ -82,6 +82,9 @@ class WarmProxyBenchmark(Benchmark):
         dump(self.root / "frozen-config.json", self.config)
         self.save()
 
+    def proxy_extra_args(self):
+        return []
+
     def prepare_proxy(self):
         fixture = self.args.mirror.resolve()
         if not fixture.is_dir() or self.git(fixture, ["rev-parse", "--is-bare-repository"]).strip() != b"true":
@@ -112,7 +115,7 @@ class WarmProxyBenchmark(Benchmark):
         command = [str(self.proxy), "--git", self.config["git"], "--repo", "bazel=" + SOURCE,
                    "--cache-dir", str(cache), "--listen", f"127.0.0.1:{port}", "--enable-blake3",
                    "--refresh-ttl-seconds", "86400", "--pack-cache-ttl-seconds", "86400",
-                   "--pack-cache-max-entry-bytes", "268435456"]
+                   "--pack-cache-max-entry-bytes", "268435456", *self.proxy_extra_args()]
         log = (self.root / "server.stderr").open("wb")
         start = time.perf_counter()
         process = subprocess.Popen(command, env=self.traced_env("server"), cwd=self.root,
