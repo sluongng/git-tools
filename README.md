@@ -162,6 +162,56 @@ CAS residency, enables remote execution, or changes Bazel's digest mode. It
 reflects the base snapshot, not overlay edits. Keep this unauthenticated prototype
 on a trusted local network; see the [proxy guide](crates/git-proxy/README.md).
 
+## Optional: Bazel BLAKE3 digest reuse
+
+With an already populated proxy started with `--enable-blake3`, import its
+mappings before mounting, then enable the digest attributes on the mount:
+
+```sh
+target/release/git-vfs warm-blake3 --repo /tmp/bazel-proxy-vfs.git \
+  --proxy-url http://127.0.0.1:8082 --proxy-repo bazel
+target/release/git-vfs mount --repo /tmp/bazel-proxy-vfs.git \
+  --blake3-proxy-url http://127.0.0.1:8082 --blake3-proxy-repo bazel \
+  --prefetch-bazel /tmp/bazel-proxy-mount
+```
+
+Run the earlier Bazel command with `--digest_function=BLAKE3` and
+`--unix_digest_hash_attribute_name=user.blake3` instead of the GITSHA1 options.
+Both are startup flags, before `query` or `build`. Base-file digests come from
+local cached mappings without fetching content; edited/new files hash their
+current overlay bytes. Mapping import is blocking metadata work, independent
+of asynchronous content prefetch. Stop an existing mount before importing.
+A remote cache/executor must separately support BLAKE3 and receive required
+content; digest mappings alone do not populate its CAS.
+
+### Warm-proxy measurements, October 19, 2026
+
+For the same pinned Bazel snapshot, creating mappings for **11,850 unique blobs
+(132.16 MiB raw content)** took **12.481 s** with a warm Git mirror and a fresh
+mapping DB. Reusing them took **86 ms**, including after proxy restart. For the
+query's 696 blobs, creation took **0.799 s** and warm lookup **8 ms**.
+
+A separate three-trial, rotated comparison used fresh clients and Bazel output
+bases against a warm local proxy, with BLAKE3 in every arm:
+
+| Clone to first `query //...` | Median | Change vs checkout |
+|---|---:|---:|
+| Shallow checkout | 3.277 s | — |
+| VFS, normal BLAKE3 hashing | 2.922 s | −10.82% |
+| VFS, cached BLAKE3 xattrs | 2.896 s | −11.63% |
+
+Both VFS arms imported identical mappings and used **blocking prefetch** to
+isolate digest reuse. The xattr arm was only 27 ms (0.91%) faster than the other
+VFS arm; this small experiment does **not** establish a reliable extra query
+speedup from digest reuse. Query-only cells did make 617 cached-digest xattr
+calls with zero misses. Both VFS arms still hydrated the same 696 blobs.
+
+These are not direct-GitHub or cold-proxy timings. Full mirror population and
+server prewarming are excluded. Go SDK catalogue downloads remained in query
+time; one checkout trial took 9.284 s, with a 7.118 s download event. That run
+is retained. See the [BLAKE3 benchmark report](docs/proxy-blake3-benchmarks.md)
+for distributions, phases, correctness checks, and reproduction.
+
 ## Limits and further reading
 
 Native `git status`, `add`, basic `commit`/`log`, and remount are validated, but

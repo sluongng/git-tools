@@ -294,3 +294,10 @@ plus both builds, not the query alone. These diagnostics are outside query
 timings; their raw commands, profiles, events, and output evidence are retained.
 Restoring the source does not rebuild its outputs; artifact directories retain
 the edited build outputs alongside both recorded manifests.
+
+The October 19 run still performed mutable Go SDK catalogue downloads during
+module extension evaluation despite warm archive/dependency caches. Record such
+profile events as query costs, retain outliers, and do not call this an offline
+Bazel benchmark. Earlier GITSHA1 build manifests are not automatically valid
+BLAKE3 goldens: use a current matched checkout reference when configuring a new
+comparison and retain any rejected historical-reference pilot separately.
