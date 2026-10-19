@@ -45,12 +45,14 @@ streams the native response while it is written to a temporary file; matching
 concurrent clients wait for successful completion, then read the published file.
 Later requests avoid `git http-backend` and pack generation entirely.
 
-Keys include the repository identity and refresh generation, protocol capabilities,
+Keys include a stable repository/ref-view identity, protocol capabilities,
 and exact fetch arguments, including wants, haves, shallow/deepen state, filters,
 and pack options. Only top-level agent/session IDs are ignored. Unknown extensions,
 intermediate negotiation rounds, ref-name wants, and packfile-URI requests bypass
-the cache. Refresh attempts invalidate prior generations, including when fetched
-refs changed but the subsequent HEAD refresh failed.
+the cache. Under a ref read lease, the identity includes the configured upstream,
+refs, HEAD, local Git configuration and selected Git version. Refresh attempts
+invalidate the process-local identity memo even on failure; unchanged views can
+reuse completed responses across refreshes and restarts.
 
 Admission requires HTTP 200, Git's upload-pack content type, successful native Git
 exit, complete packet framing and pack section, and no protocol error. This framing
@@ -68,10 +70,18 @@ Followers of a failed fill generate their own uncached response.
 | `--pack-cache-max-entries` | 1,024 | Completed entries plus in-flight producers; `0` disables caching. |
 | `--pack-cache-ttl-seconds` | 300 | Completed-entry lifetime. |
 
-LRU eviction and TTL expiry skip files pinned by active readers. The index is
-process-local: restart discards generated-response files in the cache's own schema
-directory. Mirrors and Fjall digest mappings persist. The process owner lock also
-covers detached fills and readers. This is the local cache/coalescing part of the
+LRU eviction and TTL expiry skip files pinned by active readers. Completed
+responses persist in `generated-packs/schema-v2/` with bounded per-response
+manifests. Publication syncs the body and manifest, then atomically commits the
+manifest and syncs the directory. Restart validates headers, length, BLAKE3 body
+integrity and the original wall-clock TTL; it does not renew entry lifetime.
+Recovery admits only entries within current limits, hashes at most the configured
+cache-byte budget and rejects directories exceeding 100,000 entries. Invalid,
+expired and incomplete owned schema-v2 files are removed. Older schema directories
+are untouched and **outside the active cache quota**; remove obsolete data only
+while no process uses it. Recovery adds startup reads/checksumming; durable fills
+add sync I/O. Mirrors and Fjall digest mappings persist separately. The process
+owner lock also covers detached fills and readers. This is the local cache/coalescing part of the
 Packhorse approach; object-storage offload via `packfile-uris` and live fan-out to
 followers are not implemented.
 
@@ -88,6 +98,21 @@ Object-info depends on a native Git version implementing that extension; use the
 same Git build as git-vfs's `remote-object-info` implementation. The service does
 not reimplement this wire extension in Rust. The JSON API below works independently
 of whether the selected Git advertises object-info.
+
+## Storage accounting
+
+`GET /api/v1/storage` reports file counts, logical bytes and allocated-byte
+estimates for mirror packs/indexes/loose objects, auxiliary mirror files,
+generated responses, digest databases and proxy auxiliary files. It is accounting
+only: there is no new eviction, retention or repository-lease policy.
+
+Snapshots are cached for five seconds. Each scan is limited to 100,000 visited
+entries, two seconds and depth 64; concurrent uncached scans return 503. Check
+`complete` and errors before interpreting totals. Symlinks are skipped and hard
+links deduplicated. Allocated bytes are estimates, not exclusive physical usage:
+filesystem compression, shared extents, directory metadata and unrecognized paths
+are not fully represented. This does not count writable VFS overlays or agent
+commits, and does not make them disposable caches.
 
 ## Batch object metadata API
 

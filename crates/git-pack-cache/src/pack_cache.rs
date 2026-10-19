@@ -1,4 +1,4 @@
-//! Bounded, process-local index of complete generated smart-HTTP fetch responses.
+//! Bounded, restart-persistent cache of complete generated smart-HTTP fetch responses.
 use anyhow::{Result, ensure};
 use axum::{
     body::Body,
@@ -7,16 +7,17 @@ use axum::{
 };
 use bytes::Bytes;
 use futures_core::Stream;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::{
     collections::HashMap,
     future::poll_fn,
-    path::PathBuf,
+    io::Read,
+    path::{Path, PathBuf},
     sync::{
         Arc, Mutex,
         atomic::{AtomicBool, AtomicU64, Ordering},
     },
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
@@ -25,6 +26,8 @@ use tokio::{
 
 #[derive(Clone, Debug)]
 pub struct PackCacheConfig {
+    /// Completed response bodies plus worst-case in-flight body reservations.
+    /// Sidecar metadata is separately bounded by max_entries * 128 KiB.
     pub max_bytes: u64,
     pub max_entry_bytes: u64,
     pub max_entries: usize,
@@ -67,11 +70,167 @@ struct Counters {
 }
 struct Entry {
     path: PathBuf,
+    manifest: PathBuf,
     size: u64,
     created: Instant,
     status: StatusCode,
     version: Version,
     headers: HeaderMap,
+}
+// One bounded manifest per response avoids rewriting a global index for every fill.
+// Its atomic rename is the commit record; response files without it are disposable.
+const SCHEMA_VERSION: u32 = 2;
+const MAX_MANIFEST_BYTES: u64 = 128 * 1024;
+const MAX_STARTUP_FILES: usize = 100_000;
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Manifest {
+    schema: u32,
+    key: String,
+    size: u64,
+    created_unix_ms: u64,
+    blake3: String,
+    status: u16,
+    version: String,
+    headers: Vec<(String, Vec<u8>)>,
+}
+fn stem(key: &str) -> String {
+    blake3::hash(key.as_bytes()).to_hex().to_string()
+}
+fn recognized(name: &str) -> bool {
+    [".response", ".json", ".tmp", ".manifest.tmp"]
+        .iter()
+        .any(|suffix| {
+            name.strip_suffix(suffix)
+                .is_some_and(|s| s.len() == 64 && s.bytes().all(|b| b.is_ascii_hexdigit()))
+        })
+}
+fn bounded_headers(headers: &HeaderMap) -> bool {
+    headers.len() <= 64
+        && headers
+            .iter()
+            .map(|(k, v)| k.as_str().len() + v.len())
+            .sum::<usize>()
+            <= 16 * 1024
+}
+fn unix_ms() -> Result<u64> {
+    Ok(SystemTime::now()
+        .duration_since(UNIX_EPOCH)?
+        .as_millis()
+        .try_into()?)
+}
+fn version_name(version: Version) -> Result<&'static str> {
+    match version {
+        Version::HTTP_09 => Ok("0.9"),
+        Version::HTTP_10 => Ok("1.0"),
+        Version::HTTP_11 => Ok("1.1"),
+        Version::HTTP_2 => Ok("2"),
+        Version::HTTP_3 => Ok("3"),
+        _ => anyhow::bail!("unsupported HTTP version"),
+    }
+}
+fn restore(
+    dir: &Path,
+    path: &Path,
+    config: &PackCacheConfig,
+    hash_budget: &mut u64,
+) -> Result<(String, Entry)> {
+    ensure!(
+        std::fs::symlink_metadata(path)?.file_type().is_file(),
+        "manifest is not regular"
+    );
+    ensure!(
+        std::fs::metadata(path)?.len() <= MAX_MANIFEST_BYTES,
+        "manifest too large"
+    );
+    let manifest: Manifest =
+        serde_json::from_reader(std::fs::File::open(path)?.take(MAX_MANIFEST_BYTES + 1))?;
+    ensure!(
+        manifest.schema == SCHEMA_VERSION && manifest.key.len() <= 128,
+        "invalid manifest schema/key"
+    );
+    let name = stem(&manifest.key);
+    ensure!(
+        path.file_name().and_then(|n| n.to_str()) == Some(&format!("{name}.json")),
+        "key mismatch"
+    );
+    ensure!(
+        manifest.size <= config.max_entry_bytes && manifest.size <= config.max_bytes,
+        "entry exceeds quota"
+    );
+    let age = Duration::from_millis(
+        unix_ms()?
+            .checked_sub(manifest.created_unix_ms)
+            .ok_or_else(|| anyhow::anyhow!("future timestamp"))?,
+    );
+    ensure!(age < config.ttl, "expired entry");
+    let body = dir.join(format!("{name}.response"));
+    ensure!(
+        std::fs::symlink_metadata(&body)?.file_type().is_file(),
+        "body is not regular"
+    );
+    let mut file = std::fs::File::open(&body)?;
+    ensure!(
+        file.metadata()?.len() == manifest.size,
+        "body length mismatch"
+    );
+    ensure!(
+        manifest.size <= *hash_budget,
+        "startup hash budget exhausted"
+    );
+    *hash_budget -= manifest.size;
+    let mut hasher = blake3::Hasher::new();
+    let mut buffer = [0u8; 64 * 1024];
+    loop {
+        let n = file.read(&mut buffer)?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buffer[..n]);
+    }
+    ensure!(
+        hasher.finalize().to_hex().as_str() == manifest.blake3,
+        "body checksum mismatch"
+    );
+    let status = StatusCode::from_u16(manifest.status)?;
+    ensure!(status.is_success(), "uncacheable status");
+    ensure!(manifest.headers.len() <= 64, "too many headers");
+    let mut headers = HeaderMap::new();
+    for (name, value) in manifest.headers {
+        headers.append(
+            axum::http::HeaderName::from_bytes(name.as_bytes())?,
+            axum::http::HeaderValue::from_bytes(&value)?,
+        );
+    }
+    ensure!(bounded_headers(&headers), "headers exceed limit");
+    if let Some(length) = headers.get(axum::http::header::CONTENT_LENGTH) {
+        ensure!(
+            length.to_str()?.parse::<u64>()? == manifest.size,
+            "content length mismatch"
+        );
+    }
+    let version = match manifest.version.as_str() {
+        "0.9" => Version::HTTP_09,
+        "1.0" => Version::HTTP_10,
+        "1.1" => Version::HTTP_11,
+        "2" => Version::HTTP_2,
+        "3" => Version::HTTP_3,
+        _ => anyhow::bail!("invalid HTTP version"),
+    };
+    Ok((
+        manifest.key,
+        Entry {
+            path: body,
+            manifest: path.to_owned(),
+            size: manifest.size,
+            created: Instant::now()
+                .checked_sub(age)
+                .ok_or_else(|| anyhow::anyhow!("invalid age"))?,
+            status,
+            version,
+            headers,
+        },
+    ))
 }
 struct Slot {
     entry: Arc<Entry>,
@@ -128,29 +287,58 @@ impl PackCache {
             config.max_bytes == 0 || config.max_entry_bytes > 0,
             "pack cache entry limit must be positive"
         );
-        let dir = root.join("generated-packs/schema-v1");
+        let dir = root.join("generated-packs/schema-v2");
         std::fs::create_dir_all(&dir)?;
-        // The enclosing proxy cache lock guarantees one owner. Only remove our own
-        // schema's recognized generated files; never walk arbitrary directories.
-        for item in std::fs::read_dir(&dir)? {
+        // The enclosing proxy lock grants one owner. Bound directory work as well
+        // as admitted bytes; unexpected directory explosion fails closed rather
+        // than silently forgetting disk usage. Never touch other schemas/files.
+        let mut owned = HashMap::new();
+        for (index, item) in std::fs::read_dir(&dir)?.enumerate() {
+            ensure!(
+                index < MAX_STARTUP_FILES,
+                "pack cache startup file limit exceeded"
+            );
             let item = item?;
-            let name = item.file_name();
-            let name = name.to_string_lossy();
-            let recognized = name
-                .strip_suffix(".tmp")
-                .or_else(|| name.strip_suffix(".response"))
-                .is_some_and(|stem| {
-                    stem.len() == 64 && stem.bytes().all(|b| b.is_ascii_hexdigit())
-                });
-            if recognized && item.file_type()?.is_file() {
-                std::fs::remove_file(item.path())?;
+            let name = item.file_name().to_string_lossy().into_owned();
+            if recognized(&name) && item.file_type()?.is_file() {
+                owned.insert(name, item.path());
             }
+        }
+        let mut state = State::default();
+        let manifests: Vec<_> = owned
+            .iter()
+            .filter(|(n, _)| n.ends_with(".json"))
+            .map(|(_, p)| p.clone())
+            .collect();
+        let mut hash_budget = config.max_bytes;
+        for path in manifests {
+            // Check remaining admission budget before reading/hashing a body.
+            if state.entries.len() >= config.max_entries || state.bytes >= config.max_bytes {
+                break;
+            }
+            if let Ok((key, entry)) = restore(&dir, &path, &config, &mut hash_budget)
+                && entry.size <= config.max_bytes - state.bytes
+            {
+                owned.remove(entry.path.file_name().unwrap().to_str().unwrap());
+                owned.remove(entry.manifest.file_name().unwrap().to_str().unwrap());
+                state.bytes += entry.size;
+                state.entries.insert(
+                    key,
+                    Slot {
+                        entry: Arc::new(entry),
+                        used: Instant::now(),
+                    },
+                );
+            }
+        }
+        for path in owned.values() {
+            std::fs::remove_file(path)?;
         }
         Ok(Arc::new(Self {
             _owner: owner,
             dir,
             config,
-            state: Mutex::new(State::default()),
+            state: Mutex::new(state),
             counters: Counters::default(),
         }))
     }
@@ -231,10 +419,16 @@ impl PackCache {
         })
     }
     fn evict(&self, state: &mut State, key: &str) -> bool {
-        if let Some(slot) = state.entries.get(key)
-            && std::fs::remove_file(&slot.entry.path).is_err()
-        {
-            return false;
+        if let Some(slot) = state.entries.get(key) {
+            // Remove the commit record first: a crash can leave only an orphan,
+            // never a manifest referring to data that was deliberately evicted.
+            for path in [&slot.entry.manifest, &slot.entry.path] {
+                if let Err(error) = std::fs::remove_file(path)
+                    && error.kind() != std::io::ErrorKind::NotFound
+                {
+                    return false;
+                }
+            }
         }
         if let Some(slot) = state.entries.remove(key) {
             state.bytes -= slot.entry.size;
@@ -371,29 +565,22 @@ impl ProducerPermit {
             let producer_failure = failure.clone();
             let fill = async move {
                 let _http_permit = http_permit;
-                let mut hasher = blake3::Hasher::new();
-                hasher.update(self.key.as_bytes());
-                hasher.update(&self.id.to_le_bytes());
-                let name = hasher.finalize().to_hex().to_string();
+                let name = stem(&self.key);
+                let mut body_hash = blake3::Hasher::new();
                 let temporary = self.cache.dir.join(format!("{name}.tmp"));
                 let destination = self.cache.dir.join(format!("{name}.response"));
                 self.temporary = Some(temporary.clone());
-                let bounded_headers = headers.len() <= 64
-                    && headers
-                        .iter()
-                        .map(|(k, v)| k.as_str().len() + v.len())
-                        .sum::<usize>()
-                        <= 16 * 1024;
-                let mut file = if status.is_success() && bounded_headers {
-                    tokio::fs::OpenOptions::new()
-                        .write(true)
-                        .create_new(true)
-                        .open(&temporary)
-                        .await
-                        .ok()
-                } else {
-                    None
-                };
+                let mut file =
+                    if status.is_success() && bounded_headers(&headers) && self.key.len() <= 128 {
+                        tokio::fs::OpenOptions::new()
+                            .write(true)
+                            .create_new(true)
+                            .open(&temporary)
+                            .await
+                            .ok()
+                    } else {
+                        None
+                    };
                 if file.is_none() {
                     self.cache.counters.errors.fetch_add(1, Ordering::Relaxed);
                     self.complete(None);
@@ -420,6 +607,7 @@ impl ProducerPermit {
                         .generated_bytes
                         .fetch_add(chunk.len() as u64, Ordering::Relaxed);
                     size = size.saturating_add(chunk.len() as u64);
+                    body_hash.update(&chunk);
                     if let Some(writer) = &mut file {
                         let oversized = size > self.cache.config.max_entry_bytes;
                         let write_failed = !oversized && writer.write_all(&chunk).await.is_err();
@@ -449,13 +637,48 @@ impl ProducerPermit {
                 }
                 if successful && let Some(mut file) = file {
                     let flushed = file.flush().await.is_ok();
+                    let synced = flushed && file.sync_all().await.is_ok();
                     drop(file);
-                    // Keep rename and index publication in one non-yielding step.
-                    // Cancelling an asynchronous rename could otherwise leave an
-                    // unaccounted completed file after the fill deadline.
-                    if flushed && std::fs::rename(&temporary, &destination).is_ok() {
+                    // The manifest rename commits the pair. Do not yield between
+                    // the response rename and accounting publication: cancellation
+                    // must not strand an unaccounted final response in this process.
+                    let manifest_path = self.cache.dir.join(format!("{name}.json"));
+                    let manifest_tmp = self.cache.dir.join(format!("{name}.manifest.tmp"));
+                    let publish = || -> Result<()> {
+                        ensure!(synced, "response flush failed");
+                        let manifest = Manifest {
+                            schema: SCHEMA_VERSION,
+                            key: self.key.clone(),
+                            size,
+                            created_unix_ms: unix_ms()?,
+                            blake3: body_hash.finalize().to_hex().to_string(),
+                            status: status.as_u16(),
+                            version: version_name(version)?.to_owned(),
+                            headers: headers
+                                .iter()
+                                .map(|(k, v)| (k.as_str().to_owned(), v.as_bytes().to_vec()))
+                                .collect(),
+                        };
+                        let bytes = serde_json::to_vec(&manifest)?;
+                        ensure!(
+                            bytes.len() as u64 <= MAX_MANIFEST_BYTES,
+                            "manifest exceeds limit"
+                        );
+                        let mut commit = std::fs::OpenOptions::new()
+                            .write(true)
+                            .create_new(true)
+                            .open(&manifest_tmp)?;
+                        std::io::Write::write_all(&mut commit, &bytes)?;
+                        commit.sync_all()?;
+                        std::fs::rename(&temporary, &destination)?;
+                        std::fs::rename(&manifest_tmp, &manifest_path)?;
+                        std::fs::File::open(&self.cache.dir)?.sync_all()?;
+                        Ok(())
+                    };
+                    if publish().is_ok() {
                         self.complete(Some(Arc::new(Entry {
                             path: destination,
+                            manifest: manifest_path,
                             size,
                             created: Instant::now(),
                             status,
@@ -463,7 +686,11 @@ impl ProducerPermit {
                             headers,
                         })));
                     } else {
-                        let _ = tokio::fs::remove_file(&temporary).await;
+                        let _ = std::fs::remove_file(&manifest_tmp);
+                        let _ = std::fs::remove_file(&manifest_path);
+                        let _ = std::fs::remove_file(&temporary);
+                        // Conservatively account final data if unlink fails.
+                        self.temporary = Some(destination);
                         self.cache.counters.errors.fetch_add(1, Ordering::Relaxed);
                         self.complete(None);
                     }
@@ -755,7 +982,7 @@ mod tests {
     #[test]
     fn startup_only_purges_own_schema_files() {
         let dir = tempfile::tempdir().unwrap();
-        let owned = dir.path().join("generated-packs/schema-v1");
+        let owned = dir.path().join("generated-packs/schema-v2");
         std::fs::create_dir_all(&owned).unwrap();
         let stale = owned.join(format!("{}.tmp", "a".repeat(64)));
         let completed = owned.join(format!("{}.response", "b".repeat(64)));
@@ -820,5 +1047,128 @@ mod tests {
         );
         assert!(to_bytes(response.into_body(), 100).await.is_err());
         assert_eq!(cache.snapshot().entries, 0);
+    }
+    fn reopen(dir: &tempfile::TempDir, config: PackCacheConfig) -> Arc<PackCache> {
+        PackCache::new(
+            dir.path().to_owned(),
+            config,
+            Arc::new(tempfile::tempfile().unwrap()),
+        )
+        .unwrap()
+    }
+    #[tokio::test]
+    async fn restart_restores_headers_body_and_accounting_without_new_generation() {
+        let (dir, cache) = cache(64, 32);
+        let mut original = Response::new(Body::from("persisted pack"));
+        original.headers_mut().append(
+            "content-type",
+            "application/x-git-upload-pack-result".parse().unwrap(),
+        );
+        original
+            .headers_mut()
+            .append("x-fixture", "one".parse().unwrap());
+        original
+            .headers_mut()
+            .append("x-fixture", "two".parse().unwrap());
+        let response = producer(&cache, "persist").await.stream_with_deadline(
+            original,
+            permit().await,
+            tokio::time::Instant::now() + Duration::from_secs(10),
+        );
+        to_bytes(response.into_body(), 100).await.unwrap();
+        let config = cache.config.clone();
+        drop(cache);
+        let cache = reopen(&dir, config);
+        assert_eq!(cache.snapshot().entries, 1);
+        assert_eq!(cache.snapshot().current_bytes, 14);
+        let response = hit(&cache, "persist").await.response("HIT");
+        assert_eq!(response.headers().get_all("x-fixture").iter().count(), 2);
+        assert_eq!(
+            to_bytes(response.into_body(), 100).await.unwrap(),
+            "persisted pack"
+        );
+        assert_eq!(cache.snapshot().misses, 0);
+    }
+    #[tokio::test]
+    async fn interrupted_publication_and_body_corruption_are_discarded_on_restart() {
+        for corruption in [
+            "missing-manifest",
+            "truncated",
+            "same-length",
+            "manifest",
+            "future",
+            "oversized-headers",
+        ] {
+            let (dir, cache) = cache(64, 32);
+            fill(&cache, "entry", b"original").await;
+            let body = cache.dir.join(format!("{}.response", stem("entry")));
+            let manifest = cache.dir.join(format!("{}.json", stem("entry")));
+            let temp = cache.dir.join(format!("{}.tmp", "b".repeat(64)));
+            std::fs::write(&temp, b"interrupted").unwrap();
+            match corruption {
+                "missing-manifest" => std::fs::remove_file(&manifest).unwrap(),
+                "truncated" => std::fs::write(&body, b"short").unwrap(),
+                "same-length" => std::fs::write(&body, b"modified").unwrap(),
+                "manifest" => std::fs::write(&manifest, b"{broken").unwrap(),
+                "future" | "oversized-headers" => {
+                    let mut m: Manifest =
+                        serde_json::from_slice(&std::fs::read(&manifest).unwrap()).unwrap();
+                    if corruption == "future" {
+                        m.created_unix_ms = u64::MAX;
+                    } else {
+                        m.headers = vec![("x-fixture".to_owned(), vec![b'x'; 17 * 1024])];
+                    }
+                    std::fs::write(&manifest, serde_json::to_vec(&m).unwrap()).unwrap();
+                }
+                _ => unreachable!(),
+            }
+            let config = cache.config.clone();
+            drop(cache);
+            let cache = reopen(&dir, config);
+            assert_eq!(cache.snapshot().entries, 0, "{corruption}");
+            assert_eq!(cache.snapshot().current_bytes, 0, "{corruption}");
+            assert!(!body.exists());
+            assert!(!manifest.exists());
+            assert!(!temp.exists());
+            assert!(matches!(cache.lookup("entry").await, Lookup::Produce(_)));
+        }
+    }
+    #[tokio::test]
+    async fn restart_preserves_original_ttl_age_and_enforces_reduced_quota() {
+        let (dir, cache) = cache(64, 16);
+        fill(&cache, "a", b"aaaa").await;
+        fill(&cache, "b", b"bbbb").await;
+        let mut config = cache.config.clone();
+        let manifest = cache.dir.join(format!("{}.json", stem("a")));
+        let mut m: Manifest = serde_json::from_slice(&std::fs::read(&manifest).unwrap()).unwrap();
+        m.created_unix_ms = unix_ms().unwrap() - 120_000;
+        std::fs::write(&manifest, serde_json::to_vec(&m).unwrap()).unwrap();
+        drop(cache);
+        config.max_bytes = 4;
+        config.max_entry_bytes = 4;
+        config.max_entries = 1;
+        let cache = reopen(&dir, config.clone());
+        assert_eq!(cache.snapshot().entries, 1);
+        assert_eq!(cache.snapshot().current_bytes, 4);
+        assert!(matches!(cache.lookup("b").await, Lookup::Hit(_)));
+        drop(cache);
+        config.ttl = Duration::ZERO;
+        let cache = reopen(&dir, config);
+        assert_eq!(cache.snapshot().entries, 0);
+        assert_eq!(cache.snapshot().current_bytes, 0);
+    }
+    #[tokio::test]
+    async fn restored_entries_keep_read_leases_during_quota_eviction() {
+        let (dir, cache) = cache(12, 8);
+        fill(&cache, "a", b"aaaa").await;
+        fill(&cache, "b", b"bbbb").await;
+        let config = cache.config.clone();
+        drop(cache);
+        let cache = reopen(&dir, config);
+        let response = hit(&cache, "a").await.response("HIT");
+        let writer = producer(&cache, "c").await;
+        assert_eq!(cache.snapshot().evictions, 1);
+        assert_eq!(to_bytes(response.into_body(), 10).await.unwrap(), "aaaa");
+        drop(writer);
     }
 }

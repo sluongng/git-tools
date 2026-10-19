@@ -58,20 +58,25 @@ using Git's packfile-URI extension. We implement the local response-cache and
 singleflight boundary, not the object-storage tier.
 
 Only conservatively recognized complete protocol-v2 fetch requests receive keys.
-Repository identity, refresh epoch, capabilities, and exact pack-affecting request
+Repository/ref-view identity, capabilities, and exact pack-affecting request
 arguments partition entries. Agent/session identifiers may differ without changing
 the key. Unknown semantics bypass instead of guessing equivalence. A refresh
-attempt advances the epoch even on failure/cancellation, so a partially completed
-refresh cannot leave prior responses reusable after refs changed.
+attempt invalidates the identity memo even on failure/cancellation. Under a ref
+read lease, the stable key hashes upstream identity, refs, HEAD, local Git config
+and Git version, so unchanged views remain reusable across process restarts.
 
 The producer streams to its first client while writing a bounded temporary file.
 Followers wait for the full successful response; they never consume a partial
 file. Native exit status and protocol framing gate atomic publication. A failed
 or oversize fill releases followers to uncached generation. A hard fill deadline
 also covers blocked client sends. Total disk reservations, entry count, TTL, LRU,
-and reader leases bound the generated-response cache. The index intentionally
-starts cold after process restart. See the [proxy guide](../crates/git-proxy/README.md#generated-fetch-response-cache)
-for limits and observability.
+and reader leases bound the generated-response cache. Synced schema-v2 manifests
+restore completed responses after restart, checking original TTL, body length and
+BLAKE3 integrity within startup budgets. This trades startup checksum reads and
+fill sync I/O for avoided regeneration. Old schema directories are untouched and
+outside the active quota. See the [proxy reference](proxy-reference.md#generated-fetch-response-cache)
+for limits and observability. Storage accounting is read-only; broader mirror and
+database retention still needs an ownership and lease policy.
 
 ## Cache boundary and freshness
 

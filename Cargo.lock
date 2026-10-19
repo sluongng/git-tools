@@ -706,6 +706,7 @@ dependencies = [
  "bytes",
  "futures-core",
  "serde",
+ "serde_json",
  "tempfile",
  "tokio",
 ]

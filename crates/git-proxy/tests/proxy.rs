@@ -544,6 +544,48 @@ async fn generated_cache_reuses_native_clones_and_distinguishes_fetch_inputs() {
     assert!(metrics.contains("git_proxy_pack_cache_hits 2\n"));
     task.stop().await;
 }
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn generated_responses_survive_restart_but_changed_tags_get_new_identity() {
+    let temp = tempfile::tempdir().unwrap();
+    let (upstream, _, head) = upstream(temp.path()).await;
+    let cfg = config(temp.path(), &upstream, 0);
+    let client = reqwest::Client::new();
+    let body = fetch_body(&head, &["include-tag\n"]);
+    let (url, task) = serve(cfg.clone()).await;
+    run(&["ls-remote", &format!("{url}/git/test.git"), "HEAD"]).await;
+    let (disposition, original) = fetch_response(&client, &url, body.clone()).await;
+    assert_eq!(disposition, "MISS");
+    task.stop().await;
+    let (url, task) = serve(cfg.clone()).await;
+    // A restarted process starts epoch at zero, but the actual ref view is stable.
+    assert_eq!(
+        fetch_response(&client, &url, body.clone()).await,
+        ("HIT".to_owned(), original.clone())
+    );
+    assert_eq!(cache_stats(&client, &url).await["fetch_generations"], 0);
+    task.stop().await;
+    run(&[
+        "-C",
+        upstream.to_str().unwrap(),
+        "tag",
+        "-a",
+        "restart-tag",
+        "-m",
+        "annotated after restart",
+    ])
+    .await;
+    let (url, task) = serve(cfg).await;
+    run(&["ls-remote", &format!("{url}/git/test.git"), "HEAD"]).await;
+    let (disposition, changed) = fetch_response(&client, &url, body.clone()).await;
+    assert_eq!(disposition, "MISS");
+    assert_ne!(
+        changed, original,
+        "include-tag must include the new annotated tag"
+    );
+    assert_eq!(fetch_response(&client, &url, body).await.0, "HIT");
+    task.stop().await;
+}
+
 fn gated_git(root: &Path) -> PathBuf {
     use std::os::unix::fs::PermissionsExt;
     fn quote(s: &str) -> String {
@@ -583,6 +625,72 @@ exec {git} "$@"
     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
     path
 }
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn refresh_waits_for_generated_response_ref_view_to_finish() {
+    let temp = tempfile::tempdir().unwrap();
+    let (upstream, _, head) = upstream(temp.path()).await;
+    let mut cfg = config(temp.path(), &upstream, 0);
+    cfg.git = gated_git(temp.path());
+    let (url, task) = serve(cfg).await;
+    let client = reqwest::Client::new();
+    run(&["ls-remote", &format!("{url}/git/test.git"), "HEAD"]).await;
+    run(&[
+        "-C",
+        upstream.to_str().unwrap(),
+        "tag",
+        "-a",
+        "concurrent-tag",
+        "-m",
+        "new upstream tag",
+    ])
+    .await;
+    std::fs::write(temp.path().join("block-fetch"), "").unwrap();
+    let body = fetch_body(&head, &["include-tag\n"]);
+    let first = {
+        let c = client.clone();
+        let u = url.clone();
+        let b = body.clone();
+        tokio::spawn(async move { fetch_response(&c, &u, b).await })
+    };
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while !temp.path().join("fetch-started").exists() {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let advertisement = {
+        let c = client.clone();
+        let u = url.clone();
+        tokio::spawn(async move {
+            c.get(format!(
+                "{u}/git/test.git/info/refs?service=git-upload-pack"
+            ))
+            .send()
+            .await
+            .unwrap()
+            .bytes()
+            .await
+            .unwrap()
+        })
+    };
+    // The native fetch body is paused before reading refs. The refresh may start
+    // concurrently, but its writer must not alter the producer's pinned view.
+    std::fs::write(temp.path().join("release-fetch"), "").unwrap();
+    let old = tokio::time::timeout(Duration::from_secs(5), first)
+        .await
+        .unwrap()
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(5), advertisement)
+        .await
+        .unwrap()
+        .unwrap();
+    let new = fetch_response(&client, &url, body).await;
+    assert_eq!((old.0.as_str(), new.0.as_str()), ("MISS", "MISS"));
+    assert_ne!(old.1, new.1, "the new view must include the annotated tag");
+    task.stop().await;
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn concurrent_fetches_share_generation_and_oversize_followers_bypass_cleanly() {
     for (limit, expected_status, expected_generations, expected_entries) in

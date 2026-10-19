@@ -1,6 +1,7 @@
 //! A single-owner, configured-origin, read-only smart HTTP Git cache.
 pub mod cas_client;
 mod cas_sync;
+mod storage_accounting;
 pub use cas_sync::{CasShutdown, CasSyncConfig};
 use git_pack_cache as pack_cache;
 pub use pack_cache::PackCacheConfig;
@@ -30,7 +31,7 @@ use std::{
 use tokio::{
     io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
     process::{Child, Command},
-    sync::{Mutex, OwnedSemaphorePermit, Semaphore},
+    sync::{Mutex, OwnedRwLockReadGuard, OwnedSemaphorePermit, RwLock, Semaphore},
 };
 
 const MAX_BODY: usize = 2 * 1024 * 1024;
@@ -52,6 +53,8 @@ struct Repository {
     path: PathBuf,
     refreshed: Mutex<Option<Instant>>,
     epoch: AtomicU64,
+    refs_gate: Arc<RwLock<()>>,
+    pack_identity: Mutex<Option<(u64, String)>>,
 }
 // A native fetch can update refs before a later error or cancellation. Invalidate
 // cached responses on every exit path, not only after all refresh steps succeed.
@@ -71,6 +74,7 @@ struct App {
     digests: std::sync::Mutex<DigestCache>,
     slots: Arc<Semaphore>,
     packs: Arc<pack_cache::PackCache>,
+    storage_accounting: storage_accounting::StorageAccounting,
     http_backend_calls: AtomicU64,
     fetch_generations: AtomicU64,
     _lock: Arc<File>,
@@ -115,6 +119,8 @@ pub fn router_with_cas_shutdown(mut config: Config) -> Result<(Router, Option<Ca
                 path: config.cache_dir.join(format!("{alias}.git")),
                 refreshed: Mutex::new(None),
                 epoch: AtomicU64::new(0),
+                refs_gate: Arc::new(RwLock::new(())),
+                pack_identity: Mutex::new(None),
             },
         );
     }
@@ -137,12 +143,17 @@ pub fn router_with_cas_shutdown(mut config: Config) -> Result<(Router, Option<Ca
         .map(cas_sync::CasSync::new)
         .transpose()?;
     let cas_sync = sync.as_ref().map(|(sync, _, _)| sync.clone());
+    let storage_accounting = storage_accounting::StorageAccounting::new(
+        &config.cache_dir,
+        repositories.values().map(|repo| repo.path.clone()),
+    );
     let app = Arc::new(App {
         config,
         repositories,
         digests: std::sync::Mutex::new(DigestCache { keyspace, db }),
         slots: Arc::new(Semaphore::new(16)),
         packs,
+        storage_accounting,
         http_backend_calls: AtomicU64::new(0),
         fetch_generations: AtomicU64::new(0),
         _lock: lock,
@@ -261,6 +272,16 @@ async fn checked(mut command: Command) -> Result<Vec<u8>> {
 }
 
 async fn ensure_repo(app: &App, repo: &Repository, refresh: bool) -> Result<()> {
+    {
+        let refreshed = repo.refreshed.lock().await;
+        if refreshed.is_some_and(|t| !refresh || t.elapsed() < app.config.refresh_ttl) {
+            return Ok(());
+        }
+    }
+    // Always acquire refs_gate before refreshed. A cache producer may hold a
+    // read lease while fetching missing objects under refreshed; holding that
+    // mutex while waiting for a write lease would deadlock those two requests.
+    let _refs_write = repo.refs_gate.write().await;
     let mut refreshed = repo.refreshed.lock().await;
     if refreshed.is_some_and(|t| !refresh || t.elapsed() < app.config.refresh_ttl) {
         return Ok(());
@@ -377,6 +398,50 @@ async fn ensure_repo(app: &App, repo: &Repository, refresh: bool) -> Result<()> 
     }
     Ok(())
 }
+// Called under refs_gate's read lease. The process-local epoch only invalidates
+// this memo; the persisted key is a hash of the actual ref/config/Git view.
+async fn pack_identity(app: &App, repo: &Repository, alias: &str) -> Result<String> {
+    let epoch = repo.epoch.load(Ordering::Acquire);
+    let mut memo = repo.pack_identity.lock().await;
+    if let Some((generation, identity)) = &*memo
+        && *generation == epoch
+    {
+        return Ok(identity.clone());
+    }
+    let mut hash = blake3::Hasher::new();
+    for value in [
+        b"git-proxy/ref-view/v2".as_slice(),
+        alias.as_bytes(),
+        repo.upstream.as_bytes(),
+        app.config.git.as_os_str().as_encoded_bytes(),
+    ] {
+        hash.update(&(value.len() as u64).to_le_bytes());
+        hash.update(value);
+    }
+    for args in [
+        vec![
+            "for-each-ref",
+            "--sort=refname",
+            "--format=%(refname)%00%(objectname)%00%(symref)",
+        ],
+        vec!["rev-parse", "--symbolic-full-name", "HEAD"],
+        vec!["rev-parse", "--verify", "HEAD"],
+        vec!["config", "--local", "--includes", "--null", "--list"],
+        vec!["version"],
+    ] {
+        let value = checked({
+            let mut c = git(app, Some(&repo.path));
+            c.args(args);
+            c
+        })
+        .await?;
+        hash.update(&(value.len() as u64).to_le_bytes());
+        hash.update(&value);
+    }
+    let identity = hash.finalize().to_hex().to_string();
+    *memo = Some((epoch, identity.clone()));
+    Ok(identity)
+}
 #[derive(Debug)]
 struct HttpError(StatusCode, String);
 impl IntoResponse for HttpError {
@@ -401,6 +466,20 @@ async fn read_body(request: Request) -> Result<Bytes, HttpError> {
     .map_err(|_| HttpError(StatusCode::PAYLOAD_TOO_LARGE, "request too large\n".into()))
 }
 async fn handle(State(app): State<Arc<App>>, request: Request) -> Result<Response, HttpError> {
+    if request.uri().path() == "/api/v1/storage" {
+        if request.method() != "GET" {
+            return Err(HttpError(
+                StatusCode::METHOD_NOT_ALLOWED,
+                "GET required\n".into(),
+            ));
+        }
+        let snapshot = app
+            .storage_accounting
+            .snapshot()
+            .await
+            .map_err(|message| HttpError(StatusCode::SERVICE_UNAVAILABLE, message.into()))?;
+        return Ok(axum::Json(&*snapshot).into_response());
+    }
     if matches!(request.uri().path(), "/api/v1/cache/stats" | "/metrics") {
         if request.method() != "GET" {
             return Err(HttpError(
@@ -601,11 +680,14 @@ async fn handle(State(app): State<Arc<App>>, request: Request) -> Result<Respons
     ensure_repo(&app, repo, advertisement)
         .await
         .map_err(internal)?;
-    let epoch = repo.epoch.load(Ordering::Acquire);
-    let identity = format!("{alias}\0{}\0{}", repo.upstream, app.config.git.display());
-    let key = upload
-        .then(|| pack_cache::cache_key(&protocol, &body, &identity, epoch))
-        .flatten();
+    let refs_lease = repo.refs_gate.clone().read_owned().await;
+    // Unknown/oversized ref views bypass caching, not native Git service.
+    let identity = if upload {
+        pack_identity(&app, repo, alias).await.ok()
+    } else {
+        None
+    };
+    let key = identity.and_then(|identity| pack_cache::cache_key(&protocol, &body, &identity, 0));
     if let Some(key) = key {
         let lookup = app.packs.lookup(&key).await;
         let producer = match lookup {
@@ -648,7 +730,7 @@ async fn handle(State(app): State<Arc<App>>, request: Request) -> Result<Respons
                 return Ok(hold_permit(response, permit));
             }
             return Ok(producer.stream_with_deadline(
-                response,
+                hold_refs(response, refs_lease),
                 permit,
                 tokio::time::Instant::now() + GIT_TIMEOUT,
             ));
@@ -691,6 +773,23 @@ async fn handle(State(app): State<Arc<App>>, request: Request) -> Result<Respons
         .headers_mut()
         .insert("x-git-proxy-pack-cache", "BYPASS".parse().unwrap());
     Ok(response)
+}
+fn hold_refs(response: Response, lease: OwnedRwLockReadGuard<()>) -> Response {
+    let (parts, body) = response.into_parts();
+    let stream = async_stream::try_stream! {
+        let _lease = lease;
+        let mut data = Box::pin(body.into_data_stream());
+        while let Some(chunk) = std::future::poll_fn(|cx| futures_core::Stream::poll_next(data.as_mut(), cx)).await {
+            yield chunk?;
+        }
+    };
+    Response::from_parts(
+        parts,
+        Body::from_stream(Box::pin(stream)
+            as std::pin::Pin<
+                Box<dyn futures_core::Stream<Item = Result<Bytes, axum::Error>> + Send>,
+            >),
+    )
 }
 fn hold_permit(response: Response, permit: OwnedSemaphorePermit) -> Response {
     let (parts, body) = response.into_parts();
