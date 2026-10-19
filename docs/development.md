@@ -27,6 +27,8 @@ Host scratch defaults to `/tmp/git-tools-bazel-tests`, overridable with
 reproduces frequently on Btrfs and can still occur on tmpfs. This build migration
 leaves that unrelated fixture unchanged; see the build results for failed runs.
 
+[Measured build results and validation caveats](developer-build-benchmarks.md).
+
 ## BuildBuddy remote execution
 
 Create `user.bazelrc` locally; it is ignored by Git. Configure the credential

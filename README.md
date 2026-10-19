@@ -112,4 +112,5 @@ bazel test --config=rbe //...
 
 Put BuildBuddy credentials in the **gitignored** `user.bazelrc`.
 See [build setup and crate boundaries](docs/development.md) and
+[local/RBE build measurements](docs/developer-build-benchmarks.md), plus
 [next EdenFS lessons](docs/design/edenfs-next-steps.md).
