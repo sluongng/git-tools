@@ -73,7 +73,7 @@ Fjall permits one owning process: run standalone cache/prefetch commands before
 mount or after unmount. Preserve the base clone and overlay; the overlay contains
 uncommitted/staged work. Only `git-vfs-sizes.fjall/` is disposable metadata.
 Linux/SHA1 only; no LFS expansion, checkout filters, hard links, or shared writes.
-Large files and many small writes are not optimized.
+Namespace metadata is eager; native Git and first-write copy-up have separate memory costs.
 
 ## Reference and validation
 

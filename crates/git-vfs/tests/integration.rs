@@ -1565,7 +1565,7 @@ impl ControlledPrefetch {
 import os, pathlib, sys, time
 root = pathlib.Path(__file__).parent
 is_fetch = 'fetch' in sys.argv and '--stdin' in sys.argv
-is_demand = (root / 'pause-demand').exists() and sys.argv[-2:] == ['cat-file', '--batch']
+is_demand = (root / 'pause-demand').exists() and sys.argv[-2:] == ['cat-file', '--batch'] and os.environ.get('GIT_NO_LAZY_FETCH') != '1'
 if is_fetch or is_demand:
     with (root / 'fetch-requests').open('a') as log:
         log.write('fetch\n' if is_fetch else 'demand\n')
@@ -1804,9 +1804,9 @@ fn mounted_background_prefetch_cancels_stalled_fetch_on_unmount() {
             expected_requests: "fetch\n",
         },
         Case {
-            name: "stalled demand without prefetch",
+            name: "stalled explicit demand without prefetch",
             prefetch: false,
-            expected_requests: "demand\n",
+            expected_requests: "fetch\n",
         },
     ] {
         let fixture = Fixture::with_blob_count(2);

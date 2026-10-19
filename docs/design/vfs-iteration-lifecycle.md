@@ -344,11 +344,73 @@ prefetch. Queued foreground requests promote matching speculative requests; alre
 local unrelated reads do not wait behind a network fetch. Large speculative work is
 split at bounded batch boundaries; do not claim preemption of an active Git RPC.
 
-Cache immutable content under byte-accounted bounds with separate resident,
-reader-pinned and in-flight counters. A minimum item count must not quietly retain
-many huge objects. Admission, eviction and shutdown account for the full lifetime.
-Keep remote CAS presence observations, metadata caches and native Git object disk
-retention separate. No global drop-caches or direct deletion of Git pack members.
+Defaults are 64 outstanding reply callbacks with a separate 64 MiB reply-buffer
+budget; anonymous immutable cache files have a shared 64 MiB / 256-entry limit.
+Cache accounting includes resident, reader-pinned and in-flight files. Oversized
+objects bypass admission and stream through 64 KiB buffers while retaining only
+the requested ranges. No minimum item count may override the byte limit. Mount
+flags `--content-cache-bytes` and `--content-reply-bytes` tune the independent
+budgets; cache zero disables admission. Saturation reports retryable `EAGAIN`.
+
+Two independent local no-fetch reader lanes separate small/cached requests from
+uncached streams larger than 1 MiB. One explicit fetch worker prioritizes demand
+over up to 256 speculative OIDs in bounded batches (default 32). Per-OID flights
+also serve completion-only barriers for synchronous mutable copy-up. Mounted
+compatibility readers wait for shared availability and then use no-fetch Git;
+background discovery uses no-fetch reads after scheduled prefetch waves.
+
+Reply buffers retain admission through callback completion/transfers. Worker
+failure completes accepted work, stops admission and is observable. Cancel owned
+native jobs before unmount; filesystem-owned scheduler guards join workers before
+releasing overlay references and database ownership. Emit one final content report.
+
+These bounds cover scheduler buffers/cache files, not native Git child-process
+working memory, Git object-store disk retention or the compatibility whole-blob
+allocation still used by serialized mutable copy-up. Metadata projection remains
+eager. Keep remote CAS presence observations and metadata caches separate too.
+No global drop-caches or direct deletion of Git pack members.
+
+### Stage E measured checkpoint (2026-10-19)
+
+Three rotated baseline/candidate trials for controlled hydration, cache pressure,
+and integrated mutable-I/O rechecks.
+[Samples, bounds and retained baseline failure](../benchmarks/2026-10-19-vfs-hydration.json).
+
+| Measurement | Baseline | Stage E |
+|---|---:|---:|
+| Local stat/read complete within 1 s during stalled demand | 0/3 trials | 3/3 trials |
+| Local stat/read complete within 1 s during stalled prefetch | 0/3 trials | 3/3 trials |
+| Demand shutdown while native request is stalled | >5 s, censored | 49 ms median |
+| Prefetch shutdown while native request is stalled | 50 ms | 94 ms |
+| First range pass over 20 × 4 MiB local blobs | 153.76 ms | 166.51 ms |
+| Reverse range pass, cache pressure retained | 154.39 ms | 38.90 ms |
+| Next forward range pass | 153.52 ms | 38.04 ms |
+| One tail range from an 80 MiB object | 159.69 ms | 156.57 ms |
+| Sampled VFS RSS peak during that oversized read | 90.92 MiB | 7.53 MiB |
+| Mutable first copy-up, 16 MiB | 42.33 ms | 44.20 ms |
+| 64 warm mutable range reads | 25.72 ms | 0.51 ms |
+| 64 mutable appends | 831.43 ms | 106.12 ms |
+
+All 12 candidate hydration cells passed strict scheduling/fetch/drain checks; all
+24 cells completed. Baseline demand shutdown left its controlled legacy wrapper
+alive in three trials, requiring exact owned-process cleanup after the five-second
+observation. Candidate needed no forced cleanup. Successful prefetch/demand overlap
+shared one missing-object fetch. Local probe times include helper-process startup
+and polling (roughly 32–51 ms), not isolated filesystem syscall latency.
+
+All six pressure cells passed bytes/status/remount checks. Each candidate observed
+32 cache hits, one oversized bypass, a 64 MiB cache peak and 192 MiB streamed locally;
+all queues, files and byte charges drained after shutdown. Cold ranges are 8% slower,
+and stalled-prefetch shutdown is slower but remains below 100 ms in these samples.
+The anonymous cache consumes disk, not a 64 MiB VFS buffer; overlay allocation
+samples exclude those anonymous files. RSS samples cover only the VFS PID every
+20 ms, not native Git children or an absolute instantaneous maximum.
+
+All six final range and 12 churn cells passed their mechanism checks. Create/delete
+medians were 136.78 → 134.69 ms and atomic-save medians 141.34 → 140.18 ms; retain
+all samples rather than interpreting this small difference as a broad win. Source
+bounds and focused admission tests supplement these sequential mounted workloads;
+they do not constitute a concurrent saturation throughput benchmark.
 
 ## Benchmark ladder and acceptance
 

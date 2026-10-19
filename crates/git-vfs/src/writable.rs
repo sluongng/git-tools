@@ -1,6 +1,6 @@
 //! Mutable FUSE view backed by a persistent copy-on-write overlay.
-use crate::backend::GitRepo;
-use crate::overlay::{Kind, Lease, Overlay, PinKind};
+use crate::backend::{ContentScheduler, GitRepo};
+use crate::overlay::{Kind, Lease, Overlay, Payload, PinKind};
 use anyhow::Result;
 use fuser::{
     FileAttr, FileType, Filesystem, ReplyAttr, ReplyCreate, ReplyData, ReplyDirectory, ReplyEmpty,
@@ -65,6 +65,7 @@ struct DirHandle {
 pub struct WritableGitFs {
     blake3: Option<std::sync::Arc<crate::blake3_xattr::Blake3XattrStats>>,
     overlay: Overlay,
+    content_owner: Option<ContentScheduler>,
     repo: GitRepo,
     uid: u32,
     gid: u32,
@@ -78,6 +79,7 @@ impl WritableGitFs {
         Self {
             blake3: None,
             overlay,
+            content_owner: None,
             repo,
             uid: unsafe { libc::getuid() },
             gid: unsafe { libc::getgid() },
@@ -86,6 +88,11 @@ impl WritableGitFs {
             file_pins: HashMap::new(),
             dirs: HashMap::new(),
         }
+    }
+    pub fn with_content_scheduler(mut self, scheduler: ContentScheduler) -> Self {
+        self.repo.set_content_handle(scheduler.handle());
+        self.content_owner = Some(scheduler);
+        self
     }
     pub fn with_blake3(
         mut self,
@@ -203,6 +210,9 @@ impl WritableGitFs {
 // sessions, so report here rather than depending on that protocol callback.
 impl Drop for WritableGitFs {
     fn drop(&mut self) {
+        // Async callbacks own only immutable OIDs, reply objects and lifetime
+        // leases. Join them before releasing overlay/kernel references or DBs.
+        drop(self.content_owner.take());
         self.files.clear();
         self.file_pins.clear();
         self.dirs.clear();
@@ -331,6 +341,45 @@ impl Filesystem for WritableGitFs {
         _lock_owner: Option<u64>,
         reply: ReplyData,
     ) {
+        if let Some(content) = self.repo.content_handle() {
+            let plan = (|| -> Result<Option<(String, Lease)>> {
+                let handle = self.file_handle(ino, fh)?;
+                if handle.flags & libc::O_ACCMODE == libc::O_WRONLY {
+                    return Err(error(libc::EBADF));
+                }
+                if offset < 0 {
+                    return Err(error(libc::EINVAL));
+                }
+                let entry = self.overlay.content_entry(ino)?;
+                if entry.kind.is_dir() {
+                    return Err(error(libc::EISDIR));
+                }
+                if size != 0 && matches!(entry.payload, Payload::Base) {
+                    let oid = entry.base_oid.clone().ok_or_else(|| error(libc::EIO))?;
+                    return Ok(Some((oid, self.overlay.pin(vec![ino], PinKind::Async)?)));
+                }
+                Ok(None)
+            })();
+            match plan {
+                Ok(Some((oid, lease))) => {
+                    // Snapshot at dispatch: a later write/rename/release cannot
+                    // change the bytes or retire this in-flight inode reference.
+                    let _ = content.read(&oid, offset as u64, size, move |result| {
+                        let _lease = lease;
+                        match result {
+                            Ok(bytes) => reply.data(&bytes),
+                            Err(error) => reply.error(error.errno()),
+                        }
+                    });
+                    return;
+                }
+                Err(error) => {
+                    reply.error(fail(error));
+                    return;
+                }
+                Ok(None) => {}
+            }
+        }
         let result = (|| {
             let h = self.file_handle(ino, fh)?;
             if h.flags & libc::O_ACCMODE == libc::O_WRONLY {
@@ -516,6 +565,42 @@ impl Filesystem for WritableGitFs {
         }
     }
     fn readlink(&mut self, _req: &Request<'_>, ino: u64, reply: ReplyData) {
+        if let Some(content) = self.repo.content_handle() {
+            let plan = (|| -> Result<Option<(String, u32, Lease)>> {
+                let entry = self.overlay.content_entry(ino)?;
+                if entry.kind != Kind::Symlink {
+                    return Err(error(libc::EINVAL));
+                }
+                if matches!(entry.payload, Payload::Base) {
+                    let oid = entry.base_oid.clone().ok_or_else(|| error(libc::EIO))?;
+                    let length = u32::try_from(self.overlay.size(ino, &mut self.repo)?)
+                        .map_err(|_| error(libc::EFBIG))?;
+                    return Ok(Some((
+                        oid,
+                        length,
+                        self.overlay.pin(vec![ino], PinKind::Async)?,
+                    )));
+                }
+                Ok(None)
+            })();
+            match plan {
+                Ok(Some((oid, length, lease))) => {
+                    let _ = content.read(&oid, 0, length, move |result| {
+                        let _lease = lease;
+                        match result {
+                            Ok(bytes) => reply.data(&bytes),
+                            Err(error) => reply.error(error.errno()),
+                        }
+                    });
+                    return;
+                }
+                Err(error) => {
+                    reply.error(fail(error));
+                    return;
+                }
+                Ok(None) => {}
+            }
+        }
         let result = (|| {
             if self.overlay.entry(ino)?.kind != Kind::Symlink {
                 return Err(error(libc::EINVAL));

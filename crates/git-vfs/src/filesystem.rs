@@ -326,6 +326,7 @@ impl Snapshot {
 }
 
 pub struct GitFs {
+    content_owner: Option<crate::backend::ContentScheduler>,
     blake3: Option<std::sync::Arc<crate::blake3_xattr::Blake3XattrStats>>,
     snapshot: Snapshot,
     repo: Mutex<GitRepo>,
@@ -336,11 +337,26 @@ impl GitFs {
     pub fn new(snapshot: Snapshot, repo: GitRepo) -> Self {
         Self {
             blake3: None,
+            content_owner: None,
             snapshot,
             repo: Mutex::new(repo),
             uid: unsafe { libc::getuid() },
             gid: unsafe { libc::getgid() },
         }
+    }
+    pub fn with_content_scheduler(mut self, scheduler: crate::backend::ContentScheduler) -> Self {
+        self.repo
+            .get_mut()
+            .unwrap_or_else(|e| e.into_inner())
+            .set_content_handle(scheduler.handle());
+        self.content_owner = Some(scheduler);
+        self
+    }
+    fn content_handle(&self) -> Option<crate::backend::ContentHandle> {
+        self.repo
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .content_handle()
     }
     pub fn with_blake3(
         mut self,
@@ -396,6 +412,12 @@ fn reply_xattr(reply: ReplyXattr, size: u32, data: &[u8]) {
         reply.error(libc::ERANGE);
     } else {
         reply.data(data);
+    }
+}
+
+impl Drop for GitFs {
+    fn drop(&mut self) {
+        drop(self.content_owner.take());
     }
 }
 
@@ -458,6 +480,23 @@ impl Filesystem for GitFs {
             reply.error(libc::EINVAL);
             return;
         }
+        if let Some(content) = self.content_handle() {
+            match self.snapshot.node(ino) {
+                Ok(node) if !node.kind.is_dir() => {
+                    let Some(oid) = node.oid.clone() else {
+                        reply.error(libc::EIO);
+                        return;
+                    };
+                    let _ = content.read(&oid, offset as u64, size, move |result| match result {
+                        Ok(bytes) => reply.data(&bytes),
+                        Err(error) => reply.error(error.errno()),
+                    });
+                }
+                Ok(_) => reply.error(libc::EISDIR),
+                Err(error) => reply.error(errno(&error)),
+            }
+            return;
+        }
         // No userspace content cache: Git persists fetched objects, and the kernel caches reads.
         match self.data(ino) {
             Ok(data) => {
@@ -471,6 +510,28 @@ impl Filesystem for GitFs {
         }
     }
     fn readlink(&mut self, _req: &Request<'_>, ino: u64, reply: ReplyData) {
+        if let Some(content) = self.content_handle() {
+            let plan = (|| -> Result<(String, u32)> {
+                let node = self.snapshot.node(ino)?;
+                if node.kind != Kind::Symlink {
+                    return Err(errno_error(libc::EINVAL));
+                }
+                let oid = node.oid.clone().ok_or_else(|| errno_error(libc::EIO))?;
+                let length =
+                    u32::try_from(self.attr(ino)?.size).map_err(|_| errno_error(libc::EFBIG))?;
+                Ok((oid, length))
+            })();
+            match plan {
+                Ok((oid, length)) => {
+                    let _ = content.read(&oid, 0, length, move |result| match result {
+                        Ok(bytes) => reply.data(&bytes),
+                        Err(error) => reply.error(error.errno()),
+                    });
+                }
+                Err(error) => reply.error(errno(&error)),
+            }
+            return;
+        }
         match self.snapshot.node(ino) {
             Err(e) => reply.error(errno(&e)),
             Ok(n) if n.kind != Kind::Symlink => reply.error(libc::EINVAL),

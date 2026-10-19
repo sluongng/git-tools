@@ -20,7 +20,25 @@ impl BlobReader {
         binary: &Path,
         cancellation: Option<&BackgroundCancellation>,
     ) -> Result<Self> {
-        let mut command = super::git_command(repository, binary, &["cat-file", "--batch"], true);
+        Self::start_with_fetch(repository, binary, cancellation, true)
+    }
+
+    pub(super) fn start_local(
+        repository: &Path,
+        binary: &Path,
+        cancellation: Option<&BackgroundCancellation>,
+    ) -> Result<Self> {
+        Self::start_with_fetch(repository, binary, cancellation, false)
+    }
+
+    fn start_with_fetch(
+        repository: &Path,
+        binary: &Path,
+        cancellation: Option<&BackgroundCancellation>,
+        allow_fetch: bool,
+    ) -> Result<Self> {
+        let mut command =
+            super::git_command(repository, binary, &["cat-file", "--batch"], allow_fetch);
         // A private process group also owns any native promisor-fetch children.
         // Discard stderr directly: no pipe can fill, and credential-bearing URLs
         // never enter errors or an unbounded diagnostic buffer.
@@ -44,6 +62,53 @@ impl BlobReader {
             input,
             output,
         })
+    }
+
+    /// Stream a local object through fixed-size buffers. Missing objects leave
+    /// the batch protocol aligned; callback errors require discarding this reader.
+    pub(super) fn stream_local(
+        &mut self,
+        oid: &str,
+        mut consume: impl FnMut(u64, u64, &[u8]) -> Result<()>,
+    ) -> Result<Option<u64>> {
+        writeln!(self.input, "{oid}")?;
+        self.input.flush()?;
+        let mut header = Vec::new();
+        self.output
+            .by_ref()
+            .take(129)
+            .read_until(b'\n', &mut header)?;
+        ensure!(
+            header.len() <= 128 && header.last() == Some(&b'\n'),
+            "invalid bounded blob header"
+        );
+        let header = std::str::from_utf8(&header[..header.len() - 1])?;
+        let fields: Vec<_> = header.split(' ').collect();
+        if fields == [oid, "missing"] {
+            return Ok(None);
+        }
+        ensure!(
+            fields.len() == 3 && fields[0] == oid && fields[1] == "blob",
+            "invalid local blob response"
+        );
+        ensure!(
+            !fields[2].is_empty() && fields[2].bytes().all(|b| b.is_ascii_digit()),
+            "invalid local blob size"
+        );
+        let size: u64 = fields[2].parse()?;
+        consume(size, 0, &[])?;
+        let mut buffer = [0u8; 65536];
+        let mut offset = 0;
+        while offset < size {
+            let count = (size - offset).min(buffer.len() as u64) as usize;
+            self.output.read_exact(&mut buffer[..count])?;
+            consume(size, offset, &buffer[..count])?;
+            offset += count as u64;
+        }
+        let mut newline = [0];
+        self.output.read_exact(&mut newline)?;
+        ensure!(newline == [b'\n'], "invalid local blob terminator");
+        Ok(Some(size))
     }
 
     pub(super) fn read(&mut self, oid: &str) -> Result<Vec<u8>> {

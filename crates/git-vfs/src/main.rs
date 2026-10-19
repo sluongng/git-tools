@@ -118,6 +118,12 @@ enum Commands {
         /// Skip literal MODULE/rc discovery in background prefetch.
         #[arg(long, requires = "prefetch_bazel")]
         prefetch_no_discover: bool,
+        /// Maximum logical bytes in immutable content cache files (0 disables admission).
+        #[arg(long, default_value_t = 67108864)]
+        content_cache_bytes: u64,
+        /// Maximum bytes reserved by outstanding immutable read replies (at least 16 MiB).
+        #[arg(long, default_value_t = 67108864, value_parser = clap::value_parser!(u64).range(16777216..))]
+        content_reply_bytes: u64,
     },
     /// List the projected namespace without asking for blob sizes or contents.
     List {
@@ -340,6 +346,11 @@ fn spawn_session<F: fuser::Filesystem + Send + 'static>(
     })
 }
 
+struct MountRuntime {
+    blake3: bool,
+    content: git_vfs::backend::ContentConfig,
+}
+
 fn mount(
     mut repo: GitRepo,
     snapshot: Snapshot,
@@ -347,8 +358,12 @@ fn mount(
     read_only: bool,
     overlay_path: Option<&Path>,
     prefetch: Option<BazelPrefetchPolicy>,
-    blake3: bool,
+    runtime: MountRuntime,
 ) -> Result<()> {
+    let MountRuntime {
+        blake3,
+        content: content_config,
+    } = runtime;
     let mountpoint = mountpoint
         .canonicalize()
         .context("mountpoint must already exist")?;
@@ -366,6 +381,9 @@ fn mount(
     let commit = snapshot.commit.clone();
     // Demand-only mounts need the same native-process cancellation scope as
     // prefetch mounts before we can safely join their dispatch thread.
+    let content_owner = git_vfs::backend::ContentScheduler::new(&mut repo, content_config)?;
+    let content = content_owner.handle();
+    repo.set_content_handle(content.clone());
     let (background_repo, mount_cancellation) = repo.background_handle()?;
     let background = prefetch
         .map(|policy| {
@@ -390,7 +408,7 @@ fn mount(
         options.push(MountOption::RO);
         working = None;
         {
-            let fs = GitFs::new(snapshot, repo);
+            let fs = GitFs::new(snapshot, repo).with_content_scheduler(content_owner);
             let fs = if blake3 {
                 fs.with_blake3(stats.clone())
             } else {
@@ -411,8 +429,9 @@ fn mount(
         state.prepare(&repo, &snapshot, &mountpoint, &std::env::current_exe()?)?;
         eprintln!("Writable overlay: {}", state.directory.display());
         working = Some(state);
+        drop(snapshot);
         {
-            let fs = WritableGitFs::new(overlay, repo);
+            let fs = WritableGitFs::new(overlay, repo).with_content_scheduler(content_owner);
             let fs = if blake3 {
                 fs.with_blake3(stats.clone())
             } else {
@@ -467,9 +486,16 @@ fn mount(
     }
     // Cancel and reap native Git commands before releasing the FUSE session:
     // an early read might be waiting for its in-flight batch.
+    content.cancel();
     mount_cancellation.cancel();
     drop(background);
     session.shutdown()?;
+    let content_state = content.stats();
+    anyhow::ensure!(content_state.worker_failures == 0, "content worker failed");
+    anyhow::ensure!(
+        content_state.outstanding_requests == 0 && content_state.inflight_oids == 0,
+        "content requests remain after dispatch shutdown"
+    );
     drop(working);
     if blake3 {
         eprintln!("BLAKE3 xattrs: {}", serde_json::to_string(&stats.report())?);
@@ -511,6 +537,8 @@ fn main() -> Result<()> {
             prefetch_path,
             prefetch_include,
             prefetch_no_discover,
+            content_cache_bytes,
+            content_reply_bytes,
         } => {
             let mut repo = open(&repository, &cli.git)?;
             let snapshot = Snapshot::load(&repo, &repository.revision)?;
@@ -545,7 +573,14 @@ fn main() -> Result<()> {
                 read_only,
                 overlay.as_deref(),
                 policy,
-                blake3,
+                MountRuntime {
+                    blake3,
+                    content: git_vfs::backend::ContentConfig {
+                        cache_bytes: content_cache_bytes,
+                        reply_bytes: content_reply_bytes,
+                        ..git_vfs::backend::ContentConfig::default()
+                    },
+                },
             )
         }
         Commands::List { repository } => {

@@ -87,6 +87,7 @@ See [direct-GitHub results](docs/github-bazel-async-prefetch.md),
 - [VFS guide](crates/git-vfs/README.md) / [full reference](docs/vfs-reference.md)
 - [Proxy guide](crates/git-proxy/README.md) / [full reference](docs/proxy-reference.md)
 - [Proxy design and research](docs/proxy-design.md)
+- [VFS lifecycle design and measurements](docs/design/vfs-iteration-lifecycle.md)
 
 This is a source-tree prototype: Linux/SHA1 only, fixed base commit per mount,
 no general checkout/merge/rebase guarantee. Basic Git commit/log work, but a first

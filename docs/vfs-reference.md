@@ -35,6 +35,27 @@ Remounts preserve that admin's boundary, including subsequent native Git deepeni
 An existing bare SHA-1 repository can also be mounted directly.
 Git may fall back to an unfiltered clone if the remote does not support filters; inspect its warnings.
 
+## Repeated edits and content limits
+
+Mutable files use private ranged backing files with durable redo recovery. Unlinked
+data is reclaimed after lookup/open/read references disappear; remount also drains
+eligible cleanup. Fsmonitor history is bounded, and old tokens request a full scan.
+Edited SHA1/BLAKE3 digests are reused until the content changes; size probes do not hash.
+
+Missing immutable reads and background prefetch share demand-prioritized fetches.
+Local reads continue while a remote fetch waits. The default immutable disk-content
+cache is 64 MiB / 256 files, with an independent 64 MiB reply-buffer budget:
+
+```sh
+git-vfs mount --repo /tmp/repo.git \
+  --content-cache-bytes 67108864 --content-reply-bytes 67108864 /tmp/workspace
+```
+
+Cache zero disables admission. Oversized immutable blobs stream without entering
+that cache. Reply-budget saturation returns `EAGAIN`; very small budgets can reject
+ordinary kernel read ranges. Native Git working memory and serialized first-write
+copy-up are outside these limits. See the [lifecycle design and measurements](design/vfs-iteration-lifecycle.md).
+
 ## Native Git status from filesystem state
 
 In another terminal:

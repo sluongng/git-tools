@@ -20,6 +20,12 @@ use size_cache::SizeCache;
 mod blob_reader;
 use blob_reader::BlobReader;
 
+#[path = "content_scheduler.rs"]
+mod content_scheduler;
+pub use content_scheduler::{
+    ContentConfig, ContentData, ContentError, ContentHandle, ContentScheduler, ContentStats,
+};
+
 #[path = "background_process.rs"]
 mod background_process;
 pub use background_process::BackgroundCancellation;
@@ -92,6 +98,7 @@ pub struct GitRepo {
     hydration: Arc<Mutex<()>>,
     cancellation: Option<BackgroundCancellation>,
     blob_reader: Option<BlobReader>,
+    content: Option<ContentHandle>,
 }
 
 fn canonical_oid(oid: &str) -> Result<String> {
@@ -153,6 +160,7 @@ impl GitRepo {
             hydration: Arc::new(Mutex::new(())),
             cancellation: None,
             blob_reader: None,
+            content: None,
         })
     }
 
@@ -181,9 +189,18 @@ impl GitRepo {
                 hydration: Arc::clone(&self.hydration),
                 cancellation: Some(cancellation.clone()),
                 blob_reader: None,
+                content: self.content.clone(),
             },
             cancellation,
         ))
+    }
+
+    /// Installed only for mounted asynchronous reads and background prefetch.
+    pub fn set_content_handle(&mut self, handle: ContentHandle) {
+        self.content = Some(handle);
+    }
+    pub fn content_handle(&self) -> Option<ContentHandle> {
+        self.content.clone()
     }
 
     fn cache_lock(&self) -> Result<MutexGuard<'_, SizeCache>> {
@@ -419,10 +436,56 @@ impl GitRepo {
 
     /// Fetch only explicitly requested blobs, using Git's native promisor fetch recipe.
     pub fn prefetch_blobs(&mut self, oids: &[String]) -> Result<BlobPrefetchReport> {
+        if let Some(content) = self.content.clone() {
+            let requested = oids
+                .iter()
+                .map(|oid| canonical_oid(oid))
+                .collect::<Result<HashSet<_>>>()?
+                .into_iter()
+                .collect::<Vec<_>>();
+            let mut sizes = HashMap::new();
+            let mut missing = Vec::new();
+            for chunk in requested.chunks(128) {
+                let (local, absent) = self.local_blob_sizes(chunk)?;
+                sizes.extend(local);
+                missing.extend(absent);
+            }
+            let before = content.stats().fetch_batches;
+            content.prefetch_wait(&missing)?;
+            let mut fetched = 0;
+            for chunk in missing.chunks(128) {
+                let (local, absent) = self.local_blob_sizes(chunk)?;
+                ensure!(
+                    absent.is_empty(),
+                    "scheduled prefetch did not provide requested blobs"
+                );
+                fetched += local.len();
+                sizes.extend(local);
+            }
+            self.persist_sizes(&sizes)?;
+            return Ok(BlobPrefetchReport {
+                requested_blobs: requested.len(),
+                already_local_blobs: requested.len() - missing.len(),
+                fetched_blobs: fetched,
+                // Scheduler-wide observed batches in this barrier interval; concurrent
+                // demand may join or contribute. Native trace retains exact requests.
+                fetch_batches: content.stats().fetch_batches.saturating_sub(before) as usize,
+            });
+        }
         // Only content operations wait for a running batch. Metadata operations
         // use independent no-fetch processes and never acquire this gate.
         let gate = Arc::clone(&self.hydration);
         let _hydration = self.hydration_lock(&gate)?;
+        self.prefetch_blobs_scheduled(oids, None)
+    }
+
+    // Only the owned scheduler fetch worker calls this, with no network gate on
+    // its independent local no-fetch reader. Legacy callers retain their gate.
+    fn prefetch_blobs_scheduled(
+        &mut self,
+        oids: &[String],
+        attempts: Option<&std::sync::atomic::AtomicU64>,
+    ) -> Result<BlobPrefetchReport> {
         let mut requested = Vec::new();
         let mut seen = HashSet::new();
         for oid in oids {
@@ -458,6 +521,9 @@ impl GitRepo {
             let input = format!("{}\n", missing.join("\n"));
             // blob:none excludes unrelated source blobs, while explicit blob wants
             // remain included. No branch refspec, tags, or submodules are fetched.
+            if let Some(attempts) = attempts {
+                attempts.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
             self.git_input(
                 &[
                     "-c",
@@ -583,12 +649,25 @@ impl GitRepo {
     fn raw_blob(&mut self, oid: &str) -> Result<Vec<u8>> {
         let gate = Arc::clone(&self.hydration);
         let _hydration = self.hydration_lock(&gate)?;
+        if let Some(content) = self.content.clone() {
+            let requested = [oid.to_owned()];
+            let (_, missing) = self.local_blob_sizes(&requested)?;
+            content.ensure_available(&missing)?;
+        }
         if self.blob_reader.is_none() {
-            self.blob_reader = Some(BlobReader::start(
-                &self.repository,
-                &self.git_binary,
-                self.cancellation.as_ref(),
-            )?);
+            self.blob_reader = Some(if self.content.is_some() {
+                BlobReader::start_local(
+                    &self.repository,
+                    &self.git_binary,
+                    self.cancellation.as_ref(),
+                )?
+            } else {
+                BlobReader::start(
+                    &self.repository,
+                    &self.git_binary,
+                    self.cancellation.as_ref(),
+                )?
+            });
         }
         let result = self
             .blob_reader
