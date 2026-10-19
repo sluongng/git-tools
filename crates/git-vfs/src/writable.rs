@@ -1,6 +1,6 @@
 //! Mutable FUSE view backed by a persistent copy-on-write overlay.
 use crate::backend::GitRepo;
-use crate::overlay::{Kind, Overlay};
+use crate::overlay::{Kind, Lease, Overlay, PinKind};
 use anyhow::Result;
 use fuser::{
     FileAttr, FileType, Filesystem, ReplyAttr, ReplyCreate, ReplyData, ReplyDirectory, ReplyEmpty,
@@ -59,6 +59,7 @@ struct FileHandle {
 struct DirHandle {
     inode: u64,
     entries: Vec<(u64, FileType, OsString)>,
+    _lease: Lease,
 }
 
 pub struct WritableGitFs {
@@ -69,6 +70,7 @@ pub struct WritableGitFs {
     gid: u32,
     next_handle: u64,
     files: HashMap<u64, FileHandle>,
+    file_pins: HashMap<u64, Lease>,
     dirs: HashMap<u64, DirHandle>,
 }
 impl WritableGitFs {
@@ -81,6 +83,7 @@ impl WritableGitFs {
             gid: unsafe { libc::getgid() },
             next_handle: 1,
             files: HashMap::new(),
+            file_pins: HashMap::new(),
             dirs: HashMap::new(),
         }
     }
@@ -185,6 +188,8 @@ impl WritableGitFs {
                 .setattr(inode, None, Some(0), None, &mut self.repo)?;
         }
         let fh = self.handle_id()?;
+        self.file_pins
+            .insert(fh, self.overlay.pin(vec![inode], PinKind::Open)?);
         self.files.insert(fh, FileHandle { inode, flags });
         Ok(fh)
     }
@@ -198,6 +203,17 @@ impl WritableGitFs {
 // sessions, so report here rather than depending on that protocol callback.
 impl Drop for WritableGitFs {
     fn drop(&mut self) {
+        self.files.clear();
+        self.file_pins.clear();
+        self.dirs.clear();
+        self.overlay.release_kernel_references();
+        if let Err(error) = self.overlay.reclaim_unreferenced() {
+            let _ = fail(error);
+        }
+        // Failure must not skip joining/draining already-admitted maintenance.
+        if let Err(error) = self.overlay.drain_maintenance() {
+            let _ = fail(error);
+        }
         if let Ok(stats) = serde_json::to_string(&self.overlay.stats()) {
             eprintln!("Overlay state: {stats}");
         }
@@ -215,8 +231,17 @@ impl Filesystem for WritableGitFs {
             .lookup(parent, name)
             .and_then(|ino| self.attr(ino));
         match result {
-            Ok(attr) => reply.entry(&TTL, &attr, 0),
+            Ok(attr) => match self.overlay.record_lookup(attr.ino) {
+                Ok(()) => reply.entry(&TTL, &attr, 0),
+                Err(error) => reply.error(fail(error)),
+            },
             Err(e) => reply.error(fail(e)),
+        }
+    }
+    fn forget(&mut self, _req: &Request<'_>, ino: u64, nlookup: u64) {
+        self.overlay.forget(ino, nlookup);
+        if let Err(error) = self.overlay.reclaim_unreferenced() {
+            let _ = fail(error);
         }
     }
     fn getattr(&mut self, _req: &Request<'_>, ino: u64, fh: Option<u64>, reply: ReplyAttr) {
@@ -392,8 +417,13 @@ impl Filesystem for WritableGitFs {
                 Some(Vec::new()),
             )?;
             // Creation grants the requested descriptor access even with mode 000.
+            let lease = self.overlay.pin(vec![ino], PinKind::Open)?;
+            let attr = self.attr(ino)?;
+            self.overlay.record_lookup(ino)?;
+            // No fallible work remains after installing the returned handle.
+            self.file_pins.insert(fh, lease);
             self.files.insert(fh, FileHandle { inode: ino, flags });
-            Ok((self.attr(ino)?, fh))
+            Ok((attr, fh))
         })();
         match result {
             Ok((attr, fh)) => reply.created(&TTL, &attr, 0, fh, DIRECT_IO),
@@ -425,7 +455,10 @@ impl Filesystem for WritableGitFs {
             )
             .and_then(|ino| self.attr(ino));
         match result {
-            Ok(attr) => reply.entry(&TTL, &attr, 0),
+            Ok(attr) => match self.overlay.record_lookup(attr.ino) {
+                Ok(()) => reply.entry(&TTL, &attr, 0),
+                Err(error) => reply.error(fail(error)),
+            },
             Err(e) => reply.error(fail(e)),
         }
     }
@@ -449,7 +482,10 @@ impl Filesystem for WritableGitFs {
             )
             .and_then(|ino| self.attr(ino));
         match result {
-            Ok(attr) => reply.entry(&TTL, &attr, 0),
+            Ok(attr) => match self.overlay.record_lookup(attr.ino) {
+                Ok(()) => reply.entry(&TTL, &attr, 0),
+                Err(error) => reply.error(fail(error)),
+            },
             Err(e) => reply.error(fail(e)),
         }
     }
@@ -472,7 +508,10 @@ impl Filesystem for WritableGitFs {
             )
             .and_then(|ino| self.attr(ino));
         match result {
-            Ok(attr) => reply.entry(&TTL, &attr, 0),
+            Ok(attr) => match self.overlay.record_lookup(attr.ino) {
+                Ok(()) => reply.entry(&TTL, &attr, 0),
+                Err(error) => reply.error(fail(error)),
+            },
             Err(e) => reply.error(fail(e)),
         }
     }
@@ -489,10 +528,18 @@ impl Filesystem for WritableGitFs {
         }
     }
     fn unlink(&mut self, _req: &Request<'_>, parent: u64, name: &OsStr, reply: ReplyEmpty) {
-        empty(reply, self.overlay.unlink(parent, name, false));
+        let result = self
+            .overlay
+            .unlink(parent, name, false)
+            .and_then(|_| self.overlay.reclaim_unreferenced());
+        empty(reply, result);
     }
     fn rmdir(&mut self, _req: &Request<'_>, parent: u64, name: &OsStr, reply: ReplyEmpty) {
-        empty(reply, self.overlay.unlink(parent, name, true));
+        let result = self
+            .overlay
+            .unlink(parent, name, true)
+            .and_then(|_| self.overlay.reclaim_unreferenced());
+        empty(reply, result);
     }
     fn rename(
         &mut self,
@@ -506,7 +553,9 @@ impl Filesystem for WritableGitFs {
     ) {
         empty(
             reply,
-            self.overlay.rename(parent, name, newparent, newname, flags),
+            self.overlay
+                .rename(parent, name, newparent, newname, flags)
+                .and_then(|_| self.overlay.reclaim_unreferenced()),
         );
     }
     fn flush(&mut self, _req: &Request<'_>, ino: u64, fh: u64, _owner: u64, reply: ReplyEmpty) {
@@ -537,13 +586,17 @@ impl Filesystem for WritableGitFs {
     ) {
         let result = self.file_handle(ino, fh).and_then(|handle| {
             self.files.remove(&fh);
+            self.file_pins.remove(&fh);
             if handle.flags & libc::O_ACCMODE == libc::O_RDONLY {
                 Ok(())
             } else {
                 self.overlay.sync()
             }
         });
-        empty(reply, result);
+        empty(
+            reply,
+            result.and_then(|_| self.overlay.reclaim_unreferenced()),
+        );
     }
     fn opendir(&mut self, _req: &Request<'_>, ino: u64, flags: i32, reply: ReplyOpen) {
         let result = (|| {
@@ -563,11 +616,16 @@ impl Filesystem for WritableGitFs {
                 entries.push((child, n.kind.file_type(), n.name.clone()));
             }
             let fh = self.handle_id()?;
+            let lease = self.overlay.pin(
+                entries.iter().map(|entry| entry.0).collect(),
+                PinKind::Snapshot,
+            )?;
             self.dirs.insert(
                 fh,
                 DirHandle {
                     inode: ino,
                     entries,
+                    _lease: lease,
                 },
             );
             Ok(fh)
@@ -617,7 +675,10 @@ impl Filesystem for WritableGitFs {
         let result = self.dir_handle(ino, fh).map(|_| ()).map(|_| {
             self.dirs.remove(&fh);
         });
-        empty(reply, result);
+        empty(
+            reply,
+            result.and_then(|_| self.overlay.reclaim_unreferenced()),
+        );
     }
     fn fsyncdir(
         &mut self,

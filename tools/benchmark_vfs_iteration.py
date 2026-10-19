@@ -20,6 +20,7 @@ from pathlib import Path
 import shutil
 import signal
 import statistics
+import stat
 import subprocess
 import time
 import traceback
@@ -51,6 +52,9 @@ def run(command, env, cwd=None, timeout=15):
 
 
 SESSIONS = ('initial', 'remount_after_churn', 'correctness_only')
+ONLINE_FIELDS = ('online_reclaimed_payload_bytes', 'reclaimed_entries',
+                 'retirement_pending_items', 'retirement_pending_bytes',
+                 'retirement_failures', 'lookup_accounting_errors')
 STAT_FIELDS = ('entry_count', 'linked_entries', 'tombstone_entries',
                'live_payload_bytes', 'dead_payload_bytes', 'reclaimed_payload_bytes')
 
@@ -198,26 +202,58 @@ class Cell:
                 except (json.JSONDecodeError, ValueError) as error:
                     session['parse_errors'].append({'line': line_number, 'error': str(error)})
         self.result['overlay_shutdown_states'] = sessions
-        required = self.args.require_candidate_stats and self.result['arm'] == 'candidate'
-        proof = {'required': required, 'passed': None, 'checks': {}}
+        online = getattr(self.args, 'require_online_gc', False)
+        required = (self.args.require_candidate_stats or online) and self.result['arm'] == 'candidate'
+        proof = {'required': required, 'mode': 'online_gc' if online else 'remount_only',
+                 'passed': None, 'checks': {}}
         self.result['mechanism_validation'] = proof
         if not required:
             return
         reports_valid = all(len(value['reports']) == 1 and not value['parse_errors']
                             for value in sessions.values())
+        if online and reports_valid:
+            reports_valid = all(all(type(value['reports'][0].get(field)) is int and
+                                    value['reports'][0][field] >= 0 for field in ONLINE_FIELDS)
+                                for value in sessions.values())
         proof['checks']['exactly_one_valid_report_per_session'] = reports_valid
         if reports_valid:
             initial = sessions['initial']['reports'][0]
             remount = sessions['remount_after_churn']['reports'][0]
             expected_dead = self.args.iterations * self.args.payload_bytes
             proof['expected_minimum_reclaimed_bytes'] = expected_dead
-            proof['checks'].update({
-                'remount_dead_payload_zero': remount['dead_payload_bytes'] == 0,
-                'linked_payload_preserved': initial['live_payload_bytes'] ==
-                    remount['live_payload_bytes'] == self.args.payload_bytes,
-                'reclaimed_expected_churn_payload': remount['reclaimed_payload_bytes'] >= expected_dead,
-                'initial_dead_payload_covers_churn': initial['dead_payload_bytes'] >= expected_dead,
-            })
+            if online:
+                proof['checks'].update({
+                    'initial_and_remount_dead_payload_zero': initial['dead_payload_bytes'] ==
+                        remount['dead_payload_bytes'] == 0,
+                    'linked_payload_preserved': initial['live_payload_bytes'] ==
+                        remount['live_payload_bytes'] == self.args.payload_bytes,
+                    'online_reclaimed_expected_churn_payload':
+                        initial['online_reclaimed_payload_bytes'] >= expected_dead,
+                    'created_churn_entries_reclaimed': initial['reclaimed_entries'] >= self.args.iterations,
+                    'physical_payload_drained_while_mounted': len(clean_samples := [
+                        sample for sample in self.result['samples'] if sample['label'] == 'after_churn_clean'
+                    ]) == 1 and
+                        type(clean_samples[0].get('backing_payload_files')) is int and
+                        type(clean_samples[0].get('backing_payload_bytes')) is int and
+                        clean_samples[0]['backing_payload_files'] == 0 and
+                        clean_samples[0]['backing_payload_bytes'] == 0,
+                    'all_sessions_retirement_drained': all(
+                        value['reports'][0]['retirement_pending_items'] == 0 and
+                        value['reports'][0]['retirement_pending_bytes'] == 0
+                        for value in sessions.values()),
+                    'all_sessions_no_retirement_failures': all(
+                        value['reports'][0]['retirement_failures'] == 0 for value in sessions.values()),
+                    'all_sessions_lookup_accounting_valid': all(
+                        value['reports'][0]['lookup_accounting_errors'] == 0 for value in sessions.values()),
+                })
+            else:
+                proof['checks'].update({
+                    'remount_dead_payload_zero': remount['dead_payload_bytes'] == 0,
+                    'linked_payload_preserved': initial['live_payload_bytes'] ==
+                        remount['live_payload_bytes'] == self.args.payload_bytes,
+                    'reclaimed_expected_churn_payload': remount['reclaimed_payload_bytes'] >= expected_dead,
+                    'initial_dead_payload_covers_churn': initial['dead_payload_bytes'] >= expected_dead,
+                })
         proof['passed'] = all(proof['checks'].values())
         if not proof['passed']:
             self.result['status'] = 'failed'
@@ -228,10 +264,32 @@ class Cell:
         status = Path(f'/proc/{self.proc.pid}/status').read_text()
         rss = next(int(line.split()[1]) * 1024 for line in status.splitlines()
                    if line.startswith('VmRSS:'))
-        files = [path.stat() for path in self.overlay.rglob('*') if path.is_file()]
+        files = []
+        for path in self.overlay.rglob('*'):
+            try:
+                metadata = path.stat()
+            except FileNotFoundError:
+                continue  # The retirement worker may delete between enumeration and stat.
+            if stat.S_ISREG(metadata.st_mode):
+                files.append(metadata)
+        payload_directory = self.overlay / 'payloads'
+        backing_files = backing_bytes = None
+        if payload_directory.is_dir():
+            backing_files = backing_bytes = 0
+            for path in payload_directory.iterdir():
+                if path.name == 'redo.data':
+                    continue
+                try:
+                    metadata = path.stat()
+                except FileNotFoundError:
+                    continue
+                if stat.S_ISREG(metadata.st_mode):
+                    backing_files += 1
+                    backing_bytes += metadata.st_size
         visible = [path for path in self.mount.rglob('*')
                    if '.git' not in path.relative_to(self.mount).parts and path.is_file()]
         self.result['samples'].append({'label': label, 'rss_bytes': rss,
+            'backing_payload_files': backing_files, 'backing_payload_bytes': backing_bytes,
             'overlay_file_bytes': sum(stat.st_size for stat in files),
             'overlay_allocated_bytes': sum(stat.st_blocks * 512 for stat in files),
             'visible_payload_bytes': sum(path.stat().st_size for path in visible),
@@ -328,6 +386,8 @@ def main():
     parser.add_argument('--baseline-only', action='store_true')
     parser.add_argument('--require-candidate-stats', action='store_true',
                         help='fail candidate cells without complete per-session reclamation proof')
+    parser.add_argument('--require-online-gc', action='store_true',
+                        help='require candidate online reclamation and drained retirement proof; replaces remount-only proof')
     parser.add_argument('--baseline-source', default='unknown (caller did not supply a source claim)')
     parser.add_argument('--candidate-source', default='unknown (caller did not supply a source claim)')
     parser.add_argument('--git', type=Path, required=True)
@@ -342,8 +402,8 @@ def main():
     args = parser.parse_args()
     if not args.baseline_only and args.candidate is None:
         parser.error('--candidate is required unless --baseline-only')
-    if args.baseline_only and args.require_candidate_stats:
-        parser.error('--require-candidate-stats needs a candidate arm')
+    if args.baseline_only and (args.require_candidate_stats or args.require_online_gc):
+        parser.error('--require-candidate-stats/--require-online-gc need a candidate arm')
     if args.baseline_only and args.candidate is not None:
         parser.error('--candidate and --baseline-only are mutually exclusive')
     if not (1 <= args.trials <= 20 and 1 <= args.iterations <= 4096 and

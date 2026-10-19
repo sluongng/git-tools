@@ -554,13 +554,13 @@ fn writable_namespace_lookup_counts_and_tombstones_survive_mutation_and_reopen()
         initial_directories + 2
     );
     assert_eq!(overlay.directory_children_count(b).unwrap(), 0);
-    assert!(!overlay.entry(source).unwrap().linked);
-    assert!(!overlay.entry(overwritten).unwrap().linked);
+    assert!(overlay.entry(source).is_err());
+    assert!(overlay.entry(overwritten).is_err());
     assert!(overlay.lookup(1, OsStr::new(".git")).is_ok());
     let after = overlay.stats();
-    assert_eq!(after.entry_count, before.entry_count);
+    assert_eq!(after.entry_count, before.linked_entries + 2);
     assert_eq!(after.linked_entries, before.linked_entries);
-    assert_eq!(after.tombstone_entries, before.tombstone_entries);
+    assert_eq!(after.tombstone_entries, 2);
     assert_eq!(after.live_payload_bytes, before.live_payload_bytes);
     assert_eq!(after.dead_payload_bytes, 0);
     assert_eq!(after.reclaimed_payload_bytes, before.dead_payload_bytes);
@@ -568,9 +568,13 @@ fn writable_namespace_lookup_counts_and_tombstones_survive_mutation_and_reopen()
     assert_eq!(overlay.read(raw_inode, &mut repo).unwrap(), [1, 2]);
     assert!(overlay.lookup(1, OsStr::new("hello.txt")).is_err());
     for inode in [source, overwritten, base, unmodified, highest] {
-        let entry = overlay.entry(inode).unwrap();
-        assert!(!entry.linked);
-        assert!(matches!(entry.payload, git_vfs::overlay::Payload::None));
+        if inode == base || inode == unmodified {
+            let entry = overlay.entry(inode).unwrap();
+            assert!(!entry.linked);
+            assert!(matches!(entry.payload, git_vfs::overlay::Payload::None));
+        } else {
+            assert!(overlay.entry(inode).is_err());
+        }
         assert!(overlay.read(inode, &mut repo).is_err());
         assert!(overlay.size(inode, &mut repo).is_err());
         assert!(overlay.digest(inode).is_err());
@@ -596,7 +600,7 @@ fn writable_namespace_lookup_counts_and_tombstones_survive_mutation_and_reopen()
     let mut overlay = Overlay::open(&directory, &snapshot, &gitdir).unwrap();
     assert_eq!(overlay.stats().reclaimed_payload_bytes, 0);
     assert_eq!(overlay.stats().dead_payload_bytes, 0);
-    assert_eq!(overlay.stats().entry_count, before.entry_count);
+    assert_eq!(overlay.stats().entry_count, after.entry_count);
     assert_eq!(
         git_vfs::overlay::changes_since(&directory, &token).unwrap(),
         (token, vec![])
@@ -2031,6 +2035,72 @@ fn writable_mount_native_git_status_uses_journal_and_survives_remount() {
     assert_eq!(
         fs::read_link(fixture.mount.join("new-link")).unwrap(),
         Path::new("hello.txt")
+    );
+    drop(mounted);
+}
+
+#[test]
+#[ignore = "requires Linux /dev/fuse and permission to mount"]
+fn writable_trimmed_history_bootstrap_still_reports_all_edits_after_crash() {
+    let fixture = Fixture::with_blob_count(2);
+    let overlay = fixture._temp.path().join("trimmed-bootstrap");
+    let mut mounted = writable_mount(&fixture, &overlay);
+    assert!(status(&fixture.mount).is_empty());
+    fs::write(fixture.mount.join("hello.txt"), b"preserved edit\n").unwrap();
+    fs::remove_file(fixture.mount.join("binary")).unwrap();
+    fs::rename(
+        fixture.mount.join("run.sh"),
+        fixture.mount.join("renamed.sh"),
+    )
+    .unwrap();
+    let (old_token, _) = git_vfs::overlay::changes_since(&overlay, "").unwrap();
+    for n in 0..4097 {
+        fs::set_permissions(
+            fixture.mount.join("hello.txt"),
+            fs::Permissions::from_mode(if n % 2 == 0 { 0o644 } else { 0o600 }),
+        )
+        .unwrap();
+    }
+    assert_eq!(
+        git_vfs::overlay::changes_since(&overlay, &old_token)
+            .unwrap()
+            .1,
+        [b"/".to_vec()]
+    );
+    let expected = status(&fixture.mount);
+    for path in [
+        b" M hello.txt".as_slice(),
+        b" D binary",
+        b" D run.sh",
+        b"?? renamed.sh",
+    ] {
+        assert!(
+            expected.iter().any(|entry| entry == path),
+            "missing {path:?}: {expected:?}"
+        );
+    }
+    // Model an interrupted first index setup, preserving every other state file.
+    mounted.child.kill().unwrap();
+    assert!(
+        Command::new("fusermount3")
+            .arg("-uz")
+            .arg(&fixture.mount)
+            .status()
+            .unwrap()
+            .success()
+    );
+    drop(mounted);
+    fs::remove_file(overlay.join("git-ready")).unwrap();
+    let mounted = writable_mount(&fixture, &overlay);
+    assert_eq!(
+        fs::read(fixture.mount.join("hello.txt")).unwrap(),
+        b"preserved edit\n"
+    );
+    assert!(!fixture.mount.join("binary").exists());
+    assert_eq!(
+        status(&fixture.mount),
+        expected,
+        "bounded history must not erase index-bootstrap dirty candidates"
     );
     drop(mounted);
 }

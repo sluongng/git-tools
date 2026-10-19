@@ -212,6 +212,18 @@ fallback, never drop work or build an unbounded backlog. Closing cached descript
 is part of reclamation. Crash cleanup traces durable metadata/intents and never
 age-deletes unknown potential user edits.
 
+Initial queued/in-flight deletion admission is 256 jobs and 32 MiB of durable
+pending payload bytes, including failed retirements. A single oversized payload
+uses synchronous deletion alone after draining other jobs; its bytes remain
+reported rather than hidden outside accounting. Persist retirement
+with payload-reference removal; unlink and sync the payload directory before
+retiring that ledger item. Saturation uses safe synchronous deletion outside the
+metadata transaction; an undrainable backlog applies backpressure rather than
+accepting unbounded new cleanup work. Inode origin comes from the pinned snapshot,
+not blob-OID presence (base directories have no blob OID). Retained-child
+dependencies and directory snapshot pins prevent removing a parent still needed
+by an unlinked child. Excess forget accounting quarantines an inode from GC.
+
 Bound journal history by accounted serialized bytes and record/generation limits.
 Persist the retained-generation floor atomically with trimming. Tokens below the
 floor return `/` full invalidation; tokens at/above it return complete changes.
@@ -238,6 +250,43 @@ conservatively seeds the dirty set before old history is retired. Keep dirty
 candidates (or the bounded `/` marker) indefinitely until a separately durable
 Git-index checkpoint protocol exists; a merely present `git-ready` marker is
 not such a checkpoint.
+
+### Stage C measured checkpoint (2026-10-19)
+
+Three rotated trials per workload against frozen `c0687ee`.
+[Samples, counters and retained regression](../benchmarks/2026-10-19-vfs-online-gc-journal.json).
+
+| Median | Baseline | Stage C |
+|---|---:|---:|
+| 64 create/delete operations, 256 KiB | 127.38 ms | 137.13 ms |
+| 64 atomic saves, 256 KiB | 144.38 ms | 140.70 ms |
+| 256 create/delete operations | 451.37 ms | 482.41 ms |
+| 256 atomic saves | 517.16 ms | 497.08 ms |
+| RSS after 256 create/delete operations | 203.14 MiB | 9.99 MiB |
+| RSS after 256 atomic saves | 203.86 MiB | 10.37 MiB |
+| Allocated overlay after 256 create/delete operations | 192.93 MiB | 0.60 MiB |
+| 12,000 same-path metadata changes | 2.757 s | 3.007 s |
+| Expired/old-token query, including CLI startup | 3.12 ms | 0.90 ms |
+| Current-token query, including CLI startup | 0.73 ms | 0.73 ms |
+| RSS after 12,000 metadata changes | 13.41 MiB | 17.51 MiB |
+| Allocated overlay after 12,000 metadata changes | 3.97 MiB | 6.15 MiB |
+
+All 24 churn and six final journal cells passed correctness/mechanism checks.
+The churn runs measured zero temporary backing files while still mounted, before
+shutdown; the linked survivor and open-unlink/overwritten-open checks survived.
+The 12,000-change journal retained 4,096 records / 110,592 key-plus-path bytes;
+expired tokens requested full invalidation and current tokens stayed exact.
+
+An earlier journal implementation took 8.18 seconds: each trim repeatedly crossed
+an accumulating deleted-key prefix. Seeking from the previous durable floor removed
+that ramp; the final metadata-change total is still 9% above baseline. Durable
+retention bookkeeping and deletion tombstones increase WAL allocation and RSS in
+this workload. Logical history bounds do **not** imply physical LSM/WAL or RSS
+reclamation. Expired-token full invalidation is not an equivalent incremental
+response. The longer churn measurement precedes the journal seek-only fix; final 64-operation
+churn includes both that fix and explicit owner-lock release after shutdown. Binary
+hashes and all attempted runs are retained. These are component results, not an end-to-end
+Bazel improvement.
 
 ## Stage D: namespace and digest work elimination
 

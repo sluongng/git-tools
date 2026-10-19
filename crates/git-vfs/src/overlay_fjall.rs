@@ -1,4 +1,8 @@
 //! Durable Fjall overlay and a read-only journal service for Git subprocesses.
+#[path = "overlay_journal.rs"]
+mod journal;
+#[path = "overlay_retirement.rs"]
+mod retirement;
 use super::{
     BaseKind, Entry, Kind, Payload, Snapshot,
     codec::{decode_exact, decode_for_open, encode},
@@ -32,6 +36,9 @@ struct Handles {
     entries: SingleWriterTxKeyspace,
     meta: SingleWriterTxKeyspace,
     journal: SingleWriterTxKeyspace,
+    journal_v3: SingleWriterTxKeyspace,
+    dirty_paths: SingleWriterTxKeyspace,
+    retired_payloads: SingleWriterTxKeyspace,
     db: Arc<SingleWriterTxDatabase>,
 }
 pub(super) struct Store {
@@ -41,6 +48,8 @@ pub(super) struct Store {
     pub(super) files: Files,
     poisoned: std::cell::Cell<bool>,
     pub(super) metadata_syncs: std::cell::Cell<u64>,
+    pub(super) highwater: std::cell::Cell<u64>,
+    retirements: Option<retirement::Retirements>,
 }
 fn number(bytes: &[u8]) -> Result<u64> {
     Ok(u64::from_be_bytes(
@@ -76,53 +85,21 @@ impl Handles {
         let entries = db.keyspace("entries", KeyspaceCreateOptions::default)?;
         let meta = db.keyspace("meta", KeyspaceCreateOptions::default)?;
         let journal = db.keyspace("journal", KeyspaceCreateOptions::default)?;
+        let journal_v3 = db.keyspace("journal_v3", KeyspaceCreateOptions::default)?;
+        let dirty_paths = db.keyspace("dirty_paths", KeyspaceCreateOptions::default)?;
+        let retired_payloads = db.keyspace("retired_payloads", KeyspaceCreateOptions::default)?;
         Ok(Self {
             entries,
             meta,
             journal,
+            journal_v3,
+            dirty_paths,
+            retired_payloads,
             db,
         })
     }
     fn query(&self, request: Query) -> Result<Response> {
-        let tx = self.db.read_tx();
-        let identity = tx
-            .get(&self.meta, b"identity")?
-            .context("overlay identity missing")?;
-        let identity = std::str::from_utf8(&identity)?;
-        let generation = number(
-            &tx.get(&self.meta, b"generation")?
-                .context("overlay generation missing")?,
-        )?;
-        let token = format!("v2:{identity}:{generation}");
-        let after = match request.token {
-            None => Some(0),
-            Some(previous) => {
-                let parts: Vec<_> = previous.split(':').collect();
-                if parts.len() == 3 && parts[0] == "v2" && parts[1] == identity {
-                    parts[2].parse::<u64>().ok().filter(|n| *n <= generation)
-                } else {
-                    None
-                }
-            }
-        };
-        let paths = if let Some(after) = after {
-            let mut paths = BTreeSet::new();
-            if let Some(first) = after.checked_add(1) {
-                for item in tx.range(&self.journal, first.to_be_bytes().to_vec()..) {
-                    let (key, path) = item.into_inner()?;
-                    ensure!(key.len() == 16, "invalid overlay journal key");
-                    paths.insert(path.to_vec());
-                }
-            }
-            paths.into_iter().collect()
-        } else {
-            vec![b"/".to_vec()]
-        };
-        Ok(Response {
-            token,
-            paths,
-            error: None,
-        })
+        journal::query(self, request)
     }
 }
 impl Store {
@@ -132,9 +109,9 @@ impl Store {
         gitdir: &Path,
     ) -> Result<(Self, BTreeMap<u64, Entry>)> {
         let endpoint = Endpoint::new(directory)?;
-        let lock = endpoint.lock()?;
+        let mut lock = endpoint.lock()?;
         ensure!(
-            try_lock(&lock)?,
+            try_lock(&mut lock)?,
             "Fjall overlay already has an active owner"
         );
         let handles = Handles::open(directory, true)?;
@@ -220,6 +197,8 @@ impl Store {
         tx.commit()?;
         let files = Files::open(directory)?;
         Self::recover(&handles, &files)?;
+        journal::initialize(&handles)?;
+        retirement::Retirements::drain(&handles, &files)?;
         let mut loaded = BTreeMap::new();
         let mut reclaimed_payload_bytes = 0u64;
         let mut cursor: Option<Vec<u8>> = None;
@@ -271,13 +250,25 @@ impl Store {
             if !maintenance.is_empty() {
                 let mut tx = handles.db.write_tx().durability(Some(PersistMode::SyncAll));
                 for (key, value) in maintenance {
+                    let inode = number(&key)?;
+                    let old = tx
+                        .get(&handles.entries, &key)?
+                        .context("maintenance inode missing")?;
+                    if let Payload::File { size, .. } = decode_exact(&old)?.payload {
+                        tx.insert(
+                            &handles.retired_payloads,
+                            inode.to_be_bytes(),
+                            size.to_be_bytes(),
+                        );
+                    }
                     tx.insert(&handles.entries, key, value);
                 }
                 tx.commit()?;
             }
-            for inode in discarded {
-                files.remove(inode)?;
-            }
+            // References were durably cleared before any physical deletion.
+            // Preserve unknown files; only the retirement ledger authorizes unlink.
+            let _ = discarded;
+            retirement::Retirements::drain(&handles, &files)?;
             if count < MAINTENANCE_RECORDS {
                 break;
             }
@@ -303,6 +294,13 @@ impl Store {
                     .next_back()
                     .copied()
                     .unwrap_or(0)
+                    .max(
+                        tx.get(&handles.meta, b"allocation_highwater")?
+                            .as_deref()
+                            .map(number)
+                            .transpose()?
+                            .unwrap_or(0),
+                    )
                     .checked_add(1)
                     .context("overlay inode overflow")?,
                 parent: 1,
@@ -324,8 +322,24 @@ impl Store {
             encode_entry(&control)?,
         );
         loaded.insert(control.inode, control);
+        let highwater = loaded.keys().next_back().copied().unwrap_or(0).max(
+            tx.get(&handles.meta, b"allocation_highwater")?
+                .as_deref()
+                .map(number)
+                .transpose()?
+                .unwrap_or(0),
+        );
+        tx.insert(
+            &handles.meta,
+            b"allocation_highwater",
+            highwater.to_be_bytes(),
+        );
         tx.commit()?;
-        let service = Service::start(endpoint, lock, handles.clone())?;
+        let retirements = retirement::Retirements::start(handles.clone(), files.worker_copy())?;
+        // Keep the guard local until setup succeeds. An early service error
+        // must stop workers/drop database handles before releasing ownership.
+        let mut service = Service::start(endpoint, handles.clone())?;
+        service._lock = Some(lock);
         Ok((
             Self {
                 handles: Some(handles),
@@ -334,11 +348,121 @@ impl Store {
                 files,
                 poisoned: std::cell::Cell::new(false),
                 metadata_syncs: std::cell::Cell::new(0),
+                highwater: std::cell::Cell::new(highwater),
+                retirements: Some(retirements),
             },
             loaded,
         ))
     }
+    fn append_history(
+        tx: &mut fjall::SingleWriterWriteTx,
+        h: &Handles,
+        paths: &[Vec<u8>],
+    ) -> Result<u64> {
+        if tx.get(&h.meta, b"journal_generation")?.is_some() {
+            return journal::append(tx, h, paths);
+        }
+        // Legacy Stage B redo is recovered before bounded-history activation.
+        let generation = journal::generation(tx, h)?
+            .checked_add(1)
+            .context("overlay generation overflow")?;
+        for (ordinal, path) in paths
+            .iter()
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .enumerate()
+        {
+            let mut key = [0; 16];
+            key[..8].copy_from_slice(&generation.to_be_bytes());
+            key[8..].copy_from_slice(&(ordinal as u64).to_be_bytes());
+            tx.insert(&h.journal, key, path.as_slice());
+        }
+        tx.insert(&h.meta, b"generation", generation.to_be_bytes());
+        Ok(generation)
+    }
+    pub(super) fn journal_stats(&self) -> Result<journal::JournalStats> {
+        journal::stats(self.handles.as_ref().context("overlay closed")?)
+    }
+    pub(super) fn retirement_stats(&self) -> (u64, u64, u64, u64, u64) {
+        self.retirements
+            .as_ref()
+            .map_or((0, 0, 0, 0, 0), retirement::Retirements::stats)
+    }
+    pub(super) fn drain_maintenance(&mut self) -> Result<()> {
+        let result = self
+            .retirements
+            .as_ref()
+            .map_or(Ok(()), retirement::Retirements::wait);
+        if result.is_err()
+            && let Some(retirements) = self.retirements.as_mut()
+        {
+            retirements.stop();
+        }
+        result
+    }
+    pub(super) fn retire(&self, entry: &Entry, remove: bool) -> Result<()> {
+        self.check_healthy()?;
+        let h = self.handles.as_ref().context("overlay closed")?;
+        let bytes = match entry.payload {
+            Payload::File { size, .. } => Some(size),
+            _ => None,
+        };
+        let admission = bytes
+            .map(|bytes| {
+                self.retirements
+                    .as_ref()
+                    .context("retirement worker missing")?
+                    .reserve(bytes)
+            })
+            .transpose()?;
+        let mut tx = h.db.write_tx().durability(Some(PersistMode::SyncAll));
+        if remove {
+            tx.remove(&h.entries, entry.inode.to_be_bytes());
+        } else {
+            let mut tombstone = entry.clone();
+            tombstone.payload = Payload::None;
+            tx.insert(
+                &h.entries,
+                entry.inode.to_be_bytes(),
+                encode_entry(&tombstone)?,
+            );
+        }
+        if let Some(bytes) = bytes {
+            tx.insert(
+                &h.retired_payloads,
+                entry.inode.to_be_bytes(),
+                bytes.to_be_bytes(),
+            );
+        }
+        self.poisoned.set(true);
+        let committed = (|| -> Result<()> {
+            failure("before_retirement_commit")?;
+            tx.commit()?;
+            failure("after_retirement_commit")?;
+            Ok(())
+        })();
+        if let Err(error) = committed {
+            if let Some(admission) = admission {
+                self.retirements.as_ref().unwrap().uncertain(admission);
+            }
+            return Err(error);
+        }
+        self.poisoned.set(false);
+        if let Some(admission) = admission {
+            self.retirements
+                .as_ref()
+                .unwrap()
+                .submit(admission, h, &self.files, entry.inode);
+        }
+        Ok(())
+    }
     pub(super) fn check_healthy(&self) -> Result<()> {
+        ensure!(
+            self.retirements
+                .as_ref()
+                .is_none_or(retirement::Retirements::healthy),
+            "payload retirement failed; reopen for recovery"
+        );
         ensure!(
             !self.poisoned.get(),
             "overlay requires recovery after uncertain payload mutation"
@@ -348,10 +472,7 @@ impl Store {
     fn publish(handles: &Handles, intent: &Intent) -> Result<()> {
         let entry = decode_exact(&intent.after_entry)?;
         let mut tx = handles.db.write_tx().durability(Some(PersistMode::SyncAll));
-        let generation = number(
-            &tx.get(&handles.meta, b"generation")?
-                .context("overlay generation missing")?,
-        )?;
+        let generation = journal::generation(&tx, handles)?;
         ensure!(
             generation == intent.before_generation,
             "redo journal generation conflict"
@@ -363,27 +484,12 @@ impl Store {
             encode(&decode_exact(&current)?) == intent.before_entry,
             "redo entry generation conflict"
         );
-        let generation = generation
-            .checked_add(1)
-            .context("overlay generation overflow")?;
         tx.insert(
             &handles.entries,
             entry.inode.to_be_bytes(),
             intent.after_entry.as_slice(),
         );
-        for (ordinal, path) in intent
-            .paths
-            .iter()
-            .collect::<BTreeSet<_>>()
-            .into_iter()
-            .enumerate()
-        {
-            let mut key = [0; 16];
-            key[..8].copy_from_slice(&generation.to_be_bytes());
-            key[8..].copy_from_slice(&(ordinal as u64).to_be_bytes());
-            tx.insert(&handles.journal, key, path.as_slice());
-        }
-        tx.insert(&handles.meta, b"generation", generation.to_be_bytes());
+        Self::append_history(&mut tx, handles, &intent.paths)?;
         tx.remove(&handles.meta, b"payload_intent");
         failure("before_final_commit")?;
         tx.commit()?;
@@ -446,10 +552,7 @@ impl Store {
             let intent: Intent =
                 serde_json::from_slice(&raw).context("invalid payload redo intent")?;
             let (entry, size) = Self::validate_intent(&intent)?;
-            let generation = number(
-                &tx.get(&handles.meta, b"generation")?
-                    .context("overlay generation missing")?,
-            )?;
+            let generation = journal::generation(&tx, handles)?;
             let current = tx
                 .get(&handles.entries, entry.inode.to_be_bytes())?
                 .context("redo inode missing")?;
@@ -516,10 +619,7 @@ impl Store {
             tx.get(&h.meta, b"payload_intent")?.is_none(),
             "payload intent already pending"
         );
-        let before_generation = number(
-            &tx.get(&h.meta, b"generation")?
-                .context("overlay generation missing")?,
-        )?;
+        let before_generation = journal::generation(&tx, h)?;
         before_generation
             .checked_add(1)
             .context("overlay generation overflow")?;
@@ -564,32 +664,23 @@ impl Store {
         self.check_healthy()?;
         let h = self.handles.as_ref().context("overlay closed")?;
         let mut tx = h.db.write_tx().durability(Some(PersistMode::SyncAll));
-        let generation = number(
-            &tx.get(&h.meta, b"generation")?
-                .context("overlay generation missing")?,
-        )?
-        .checked_add(1)
-        .context("overlay generation overflow")?;
         for entry in changed {
             tx.insert(&h.entries, entry.inode.to_be_bytes(), encode_entry(entry)?);
         }
-        for (ordinal, path) in paths
+        Self::append_history(&mut tx, h, paths)?;
+        let highwater = changed
             .iter()
-            .collect::<BTreeSet<_>>()
-            .into_iter()
-            .enumerate()
-        {
-            let mut key = [0u8; 16];
-            key[..8].copy_from_slice(&generation.to_be_bytes());
-            key[8..].copy_from_slice(&(ordinal as u64).to_be_bytes());
-            tx.insert(&h.journal, key, path.as_slice());
-        }
-        tx.insert(&h.meta, b"generation", generation.to_be_bytes());
+            .map(|e| e.inode)
+            .max()
+            .unwrap_or(0)
+            .max(self.highwater.get());
+        tx.insert(&h.meta, b"allocation_highwater", highwater.to_be_bytes());
         self.poisoned.set(true);
         failure("before_namespace_commit")?;
         self.metadata_syncs.set(self.metadata_syncs.get() + 1);
         tx.commit()?;
         failure("after_namespace_commit")?;
+        self.highwater.set(highwater);
         self.poisoned.set(false);
         Ok(())
     }
@@ -607,6 +698,9 @@ impl Drop for Store {
     fn drop(&mut self) {
         if let Some(mut service) = self.service.take() {
             service.stop();
+            if let Some(retirements) = self.retirements.as_mut() {
+                retirements.stop();
+            }
             // The service lock stays held until both the serving thread and all
             // database/keyspace handles are gone, so offline readers cannot race.
             drop(self.handles.take());
@@ -655,7 +749,7 @@ impl Endpoint {
             lock: runtime.join(format!("{hash}.lock")),
         })
     }
-    fn lock(&self) -> Result<File> {
+    fn lock(&self) -> Result<OwnerLock> {
         let file = OpenOptions::new()
             .read(true)
             .write(true)
@@ -671,18 +765,45 @@ impl Endpoint {
                 && metadata.permissions().mode() & 0o077 == 0,
             "unsafe Fjall journal owner lock"
         );
-        Ok(file)
+        Ok(OwnerLock {
+            file,
+            acquired: false,
+        })
     }
 }
-fn try_lock(file: &File) -> Result<bool> {
-    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
-        return Ok(true);
+struct OwnerLock {
+    file: File,
+    acquired: bool,
+}
+impl Drop for OwnerLock {
+    fn drop(&mut self) {
+        if self.acquired {
+            // CLOEXEC does not close a descriptor between fork and exec. A
+            // subprocess may still share this open-file description after our
+            // File closes, so release ownership explicitly before closing it.
+            loop {
+                if unsafe { libc::flock(self.file.as_raw_fd(), libc::LOCK_UN) } == 0 {
+                    break;
+                }
+                if std::io::Error::last_os_error().raw_os_error() != Some(libc::EINTR) {
+                    break;
+                }
+            }
+        }
     }
-    let error = std::io::Error::last_os_error();
-    if error.raw_os_error() == Some(libc::EWOULDBLOCK) {
-        Ok(false)
-    } else {
-        Err(error.into())
+}
+fn try_lock(lock: &mut OwnerLock) -> Result<bool> {
+    loop {
+        if unsafe { libc::flock(lock.file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+            lock.acquired = true;
+            return Ok(true);
+        }
+        let error = std::io::Error::last_os_error();
+        match error.raw_os_error() {
+            Some(libc::EINTR) => continue,
+            Some(libc::EWOULDBLOCK) => return Ok(false),
+            _ => return Err(error.into()),
+        }
     }
 }
 fn check_peer(stream: &UnixStream) -> Result<()> {
@@ -740,10 +861,10 @@ struct Service {
     stop: Arc<AtomicBool>,
     wake: UnixStream,
     endpoint: Endpoint,
-    _lock: File,
+    _lock: Option<OwnerLock>,
 }
 impl Service {
-    fn start(endpoint: Endpoint, lock: File, handles: Handles) -> Result<Self> {
+    fn start(endpoint: Endpoint, handles: Handles) -> Result<Self> {
         match std::fs::remove_file(&endpoint.socket) {
             Ok(()) => {}
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
@@ -825,7 +946,7 @@ impl Service {
                 stop,
                 wake,
                 endpoint,
-                _lock: lock,
+                _lock: None,
             }),
             Err(e) => {
                 let _ = std::fs::remove_file(&endpoint.socket);
@@ -864,9 +985,9 @@ fn query(directory: &Path, request: Query) -> Result<Response> {
             Ok(response)
         }
         Err(connect_error) => {
-            let lock = endpoint.lock()?;
+            let mut lock = endpoint.lock()?;
             ensure!(
-                try_lock(&lock)?,
+                try_lock(&mut lock)?,
                 "Fjall journal owner is active but unavailable: {connect_error}"
             );
             let handles = Handles::open(directory, false).context(
@@ -900,6 +1021,88 @@ mod tests {
     use std::ffi::OsStr;
     use std::process::Command;
 
+    #[test]
+    fn owner_lock_releases_while_forked_child_holds_inherited_descriptor() {
+        let directory = tempfile::tempdir().unwrap();
+        let endpoint = Endpoint::new(directory.path()).unwrap();
+        let mut owner = endpoint.lock().unwrap();
+        assert!(try_lock(&mut owner).unwrap());
+        let mut denied = endpoint.lock().unwrap();
+        assert!(!try_lock(&mut denied).unwrap());
+        drop(denied);
+        let mut still_denied = endpoint.lock().unwrap();
+        assert!(
+            !try_lock(&mut still_denied).unwrap(),
+            "dropping an unsuccessful contender must not unlock the owner"
+        );
+        drop(still_denied);
+
+        let (mut parent, child) = UnixStream::pair().unwrap();
+        parent
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        parent
+            .set_write_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        child
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let parent_fd = parent.as_raw_fd();
+        let child_fd = child.as_raw_fd();
+        // Other tests may have threads alive. Between fork and _exit the child
+        // uses only async-signal-safe syscalls, with no Rust destructors/locks.
+        let pid = unsafe { libc::fork() };
+        assert!(pid >= 0, "fork: {}", std::io::Error::last_os_error());
+        if pid == 0 {
+            unsafe {
+                libc::close(parent_fd);
+                let ready = [1u8];
+                if libc::write(child_fd, ready.as_ptr().cast(), 1) != 1 {
+                    libc::_exit(2);
+                }
+                let mut release = [0u8];
+                let received = libc::read(child_fd, release.as_mut_ptr().cast(), 1);
+                libc::close(child_fd);
+                libc::_exit(if received == 1 && release[0] == 1 {
+                    0
+                } else {
+                    3
+                });
+            }
+        }
+        drop(child);
+        let mut ready = [0u8];
+        let barrier = parent.read_exact(&mut ready);
+        // The child is still paused with the inherited owner descriptor open.
+        // Merely closing File here would leave flock held until child exit.
+        drop(owner);
+        let reacquired = endpoint.lock().and_then(|mut lock| try_lock(&mut lock));
+        let released = parent.write_all(&[1]);
+        drop(parent);
+        let mut status = 0;
+        let reaped = loop {
+            let result = unsafe { libc::waitpid(pid, &mut status, 0) };
+            if result >= 0 {
+                break result;
+            }
+            if std::io::Error::last_os_error().raw_os_error() != Some(libc::EINTR) {
+                break result;
+            }
+        };
+        // Assert only after releasing and reaping the child, including failure
+        // paths, so a failed lock assertion cannot leak a blocked subprocess.
+        assert!(barrier.is_ok(), "child readiness: {barrier:?}");
+        assert_eq!(ready, [1]);
+        assert!(released.is_ok(), "child release: {released:?}");
+        assert_eq!(reaped, pid);
+        assert!(libc::WIFEXITED(status));
+        assert_eq!(libc::WEXITSTATUS(status), 0);
+        assert!(
+            reacquired.unwrap(),
+            "inherited descriptor retained owner flock"
+        );
+    }
+
     fn fixture() -> (tempfile::TempDir, GitRepo, Snapshot, PathBuf, PathBuf) {
         let temp = tempfile::tempdir().unwrap();
         let gitdir = temp.path().join("repo");
@@ -920,6 +1123,8 @@ mod tests {
             );
         }
         std::fs::write(gitdir.join("base"), b"base bytes").unwrap();
+        std::fs::create_dir(gitdir.join("base-dir")).unwrap();
+        std::fs::write(gitdir.join("base-dir/child"), b"child").unwrap();
         assert!(
             Command::new("git")
                 .arg("-C")
@@ -1016,6 +1221,30 @@ mod tests {
         tx.insert(&handles.entries, ino.to_be_bytes(), legacy_record(&entry));
         tx.insert(&handles.entries, 1u64.to_be_bytes(), legacy_record(&root));
         tx.remove(&handles.meta, b"payload_format");
+        let legacy_generation = journal::generation(&tx, &handles).unwrap();
+        tx.insert(
+            &handles.meta,
+            b"generation",
+            legacy_generation.to_be_bytes(),
+        );
+        tx.remove(&handles.meta, b"journal_generation");
+        tx.remove(&handles.meta, b"journal_bounds");
+        let old: Vec<_> = tx
+            .iter(&handles.journal_v3)
+            .map(|item| item.into_inner().unwrap())
+            .collect();
+        for (key, value) in old {
+            tx.insert(&handles.journal, &*key, &*value);
+            tx.remove(&handles.journal_v3, &*key);
+        }
+        let dirty: Vec<_> = tx
+            .iter(&handles.dirty_paths)
+            .map(|item| item.into_inner().unwrap().0)
+            .collect();
+        for key in dirty {
+            tx.remove(&handles.dirty_paths, key);
+        }
+
         tx.commit().unwrap();
         drop(handles);
         fail_next("after_install_sync");
@@ -1051,6 +1280,324 @@ mod tests {
         let mut overlay = Overlay::open(&directory, &snapshot, &gitdir).unwrap();
         assert_eq!(overlay.stats().payload_copy_bytes, 0);
         assert_eq!(overlay.read_range(ino, 0, 1, &mut repo).unwrap(), [4]);
+    }
+
+    #[test]
+    fn online_collection_respects_lookup_open_snapshot_and_async_pins() {
+        use crate::overlay::PinKind;
+        let (_temp, mut repo, mut snapshot, directory, gitdir) = fixture();
+        // Compatibility boundary: origin cannot depend on an optional tree OID.
+        snapshot
+            .nodes
+            .iter_mut()
+            .find(|n| n.name == OsStr::new("base-dir"))
+            .unwrap()
+            .oid = None;
+        let mut overlay = Overlay::open(&directory, &snapshot, &gitdir).unwrap();
+        let inode = overlay
+            .create(
+                1,
+                OsStr::new("temp"),
+                Kind::File,
+                0o600,
+                Some(vec![5; 128 * 1024]),
+            )
+            .unwrap();
+        overlay.record_lookup(inode).unwrap();
+        let open = overlay.pin(vec![inode], PinKind::Open).unwrap();
+        let snapshot_pin = overlay.pin(vec![1, inode], PinKind::Snapshot).unwrap();
+        let asynchronous = overlay.pin(vec![inode], PinKind::Async).unwrap();
+        overlay.unlink(1, OsStr::new("temp"), false).unwrap();
+        let (token, _) = super::changes_since(&directory, "").unwrap();
+        overlay.reclaim_unreferenced().unwrap();
+        assert_eq!(overlay.read_range(inode, 0, 1, &mut repo).unwrap(), [5]);
+        overlay.forget(inode, 1);
+        drop(open);
+        overlay.reclaim_unreferenced().unwrap();
+        assert!(overlay.entry(inode).is_ok());
+        drop(snapshot_pin);
+        overlay.reclaim_unreferenced().unwrap();
+        assert!(overlay.entry(inode).is_ok());
+        drop(asynchronous);
+        overlay.reclaim_unreferenced().unwrap();
+        overlay.drain_maintenance().unwrap();
+        assert!(overlay.entry(inode).is_err());
+        assert_eq!(overlay.stats().online_reclaimed_payload_bytes, 128 * 1024);
+        assert_eq!(overlay.stats().reclaimed_entries, 1);
+        assert_eq!(overlay.stats().retirement_pending_items, 0);
+        assert_eq!(overlay.stats().retirement_pending_bytes, 0);
+        assert_eq!(
+            super::changes_since(&directory, &token).unwrap(),
+            (token, vec![])
+        );
+        let base_dir = overlay.lookup(1, OsStr::new("base-dir")).unwrap();
+        assert!(overlay.entry(base_dir).unwrap().base_oid.is_none());
+        overlay
+            .unlink(base_dir, OsStr::new("child"), false)
+            .unwrap();
+        overlay.unlink(1, OsStr::new("base-dir"), true).unwrap();
+        overlay.reclaim_unreferenced().unwrap();
+        assert!(
+            overlay.entry(base_dir).is_ok(),
+            "base directory origin comes from snapshot, not base_oid"
+        );
+    }
+
+    #[test]
+    fn retained_children_and_quarantined_lookups_keep_dead_metadata_safe() {
+        use crate::overlay::PinKind;
+        let (_temp, mut repo, snapshot, directory, gitdir) = fixture();
+        let mut overlay = Overlay::open(&directory, &snapshot, &gitdir).unwrap();
+        let parent = overlay
+            .create(1, OsStr::new("parent"), Kind::Directory, 0o700, None)
+            .unwrap();
+        let child = overlay
+            .create(
+                parent,
+                OsStr::new("child"),
+                Kind::File,
+                0o600,
+                Some(vec![3; 16]),
+            )
+            .unwrap();
+        let pin = overlay.pin(vec![child], PinKind::Open).unwrap();
+        overlay.unlink(parent, OsStr::new("child"), false).unwrap();
+        overlay.unlink(1, OsStr::new("parent"), true).unwrap();
+        overlay.reclaim_unreferenced().unwrap();
+        assert_eq!(overlay.entry(child).unwrap().parent, parent);
+        assert!(overlay.entry(parent).is_ok());
+        assert_eq!(overlay.read_range(child, 0, 1, &mut repo).unwrap(), [3]);
+        drop(pin);
+        overlay.reclaim_unreferenced().unwrap();
+        overlay.drain_maintenance().unwrap();
+        assert!(overlay.entry(child).is_err());
+        assert!(overlay.entry(parent).is_err());
+        let quarantined = overlay
+            .create(
+                1,
+                OsStr::new("quarantined"),
+                Kind::File,
+                0o600,
+                Some(vec![7; 8]),
+            )
+            .unwrap();
+        overlay.record_lookup(quarantined).unwrap();
+        overlay.forget(quarantined, 2);
+        overlay.forget(u64::MAX, 99); // Unknown forget is harmless; excess known count quarantines.
+        overlay.unlink(1, OsStr::new("quarantined"), false).unwrap();
+        overlay.reclaim_unreferenced().unwrap();
+        assert_eq!(overlay.stats().lookup_accounting_errors, 1);
+        assert_eq!(
+            overlay.read_range(quarantined, 0, 1, &mut repo).unwrap(),
+            [7]
+        );
+        drop(overlay);
+        let mut overlay = Overlay::open(&directory, &snapshot, &gitdir).unwrap();
+        assert!(overlay.entry(quarantined).is_err());
+        let next = overlay
+            .create(1, OsStr::new("next"), Kind::File, 0o600, None)
+            .unwrap();
+        assert!(
+            next > quarantined && next > child,
+            "persistent highwater survives collecting highest inode"
+        );
+    }
+
+    #[test]
+    fn retirement_capacity_falls_back_synchronously_and_failed_ledger_recovers() {
+        let (_temp, mut repo, snapshot, directory, gitdir) = fixture();
+        let mut overlay = Overlay::open(&directory, &snapshot, &gitdir).unwrap();
+        let pause = overlay.database.retirements.as_ref().unwrap().pause();
+        for n in 0..256 {
+            let name = OsString::from(format!("temp-{n}"));
+            overlay
+                .create(1, &name, Kind::File, 0o600, Some(vec![1; 8]))
+                .unwrap();
+            overlay.unlink(1, &name, false).unwrap();
+            overlay.reclaim_unreferenced().unwrap();
+        }
+        assert_eq!(overlay.stats().retirement_pending_items, 256);
+        assert_eq!(overlay.stats().retirement_pending_bytes, 256 * 8);
+        let release = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(20));
+            drop(pause);
+        });
+        let inode = overlay
+            .create(
+                1,
+                OsStr::new("overflow"),
+                Kind::File,
+                0o600,
+                Some(vec![1; 8]),
+            )
+            .unwrap();
+        overlay.unlink(1, OsStr::new("overflow"), false).unwrap();
+        overlay.reclaim_unreferenced().unwrap();
+        release.join().unwrap();
+        overlay.drain_maintenance().unwrap();
+        assert!(overlay.entry(inode).is_err());
+        assert_eq!(overlay.stats().retirement_pending_items, 0);
+        assert_eq!(overlay.stats().retirement_sync_fallbacks, 1);
+        // Byte capacity counts queued and in-flight records, not just messages.
+        let pause = overlay.database.retirements.as_ref().unwrap().pause();
+        for name in ["bytes-a", "bytes-b"] {
+            overlay
+                .create(
+                    1,
+                    OsStr::new(name),
+                    Kind::File,
+                    0o600,
+                    Some(vec![2; 16 * 1024 * 1024]),
+                )
+                .unwrap();
+            overlay.unlink(1, OsStr::new(name), false).unwrap();
+            overlay.reclaim_unreferenced().unwrap();
+        }
+        assert_eq!(overlay.stats().retirement_pending_items, 2);
+        assert_eq!(overlay.stats().retirement_pending_bytes, 32 * 1024 * 1024);
+        let release = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(20));
+            drop(pause);
+        });
+        overlay
+            .create(
+                1,
+                OsStr::new("byte-overflow"),
+                Kind::File,
+                0o600,
+                Some(vec![1; 8]),
+            )
+            .unwrap();
+        overlay
+            .unlink(1, OsStr::new("byte-overflow"), false)
+            .unwrap();
+        overlay.reclaim_unreferenced().unwrap();
+        release.join().unwrap();
+        overlay.drain_maintenance().unwrap();
+        assert_eq!(overlay.stats().retirement_sync_fallbacks, 2);
+        // One oversize payload is handled synchronously and alone, never queued.
+        overlay
+            .create(
+                1,
+                OsStr::new("oversize"),
+                Kind::File,
+                0o600,
+                Some(vec![2; 33 * 1024 * 1024]),
+            )
+            .unwrap();
+        overlay.unlink(1, OsStr::new("oversize"), false).unwrap();
+        overlay.reclaim_unreferenced().unwrap();
+        assert_eq!(overlay.stats().retirement_sync_fallbacks, 3);
+        assert_eq!(overlay.stats().retirement_pending_items, 0);
+        assert_eq!(overlay.stats().retirement_pending_bytes, 0);
+        let survivor = overlay
+            .create(
+                1,
+                OsStr::new("survivor"),
+                Kind::File,
+                0o600,
+                Some(b"preserved".to_vec()),
+            )
+            .unwrap();
+        let doomed = overlay
+            .create(1, OsStr::new("doomed"), Kind::File, 0o600, Some(vec![4; 8]))
+            .unwrap();
+        overlay.unlink(1, OsStr::new("doomed"), false).unwrap();
+        let path = directory
+            .join("payloads")
+            .join(format!("{doomed:016x}.data"));
+        let backup = directory.join("saved-payload");
+        std::fs::rename(&path, &backup).unwrap();
+        std::fs::create_dir(&path).unwrap();
+        overlay.reclaim_unreferenced().unwrap();
+        assert!(overlay.drain_maintenance().is_err());
+        assert_eq!(overlay.stats().retirement_failures, 1);
+        assert_eq!(overlay.stats().retirement_pending_items, 1);
+        assert_eq!(overlay.stats().retirement_pending_bytes, 8);
+        assert!(
+            overlay
+                .create(1, OsStr::new("blocked"), Kind::File, 0o600, None)
+                .is_err()
+        );
+        assert_eq!(std::fs::read(&backup).unwrap(), [4; 8]);
+        std::fs::remove_dir(&path).unwrap();
+        std::fs::rename(&backup, &path).unwrap();
+        let unknown = directory.join("payloads/unknown-orphan");
+        std::fs::write(&unknown, b"do not guess").unwrap();
+        drop(overlay);
+        let mut overlay = Overlay::open(&directory, &snapshot, &gitdir).unwrap();
+        assert!(!path.exists());
+        assert!(overlay.entry(doomed).is_err());
+        assert_eq!(overlay.read(survivor, &mut repo).unwrap(), b"preserved");
+        assert_eq!(std::fs::read(unknown).unwrap(), b"do not guess");
+    }
+
+    #[test]
+    fn retirement_commit_uncertainty_recovers_without_journal_mutation() {
+        for point in ["before_retirement_commit", "after_retirement_commit"] {
+            let (_temp, mut repo, snapshot, directory, gitdir) = fixture();
+            let mut overlay = Overlay::open(&directory, &snapshot, &gitdir).unwrap();
+            let inode = overlay
+                .create(1, OsStr::new("temp"), Kind::File, 0o600, Some(vec![9; 64]))
+                .unwrap();
+            overlay.unlink(1, OsStr::new("temp"), false).unwrap();
+            let (token, _) = super::changes_since(&directory, "").unwrap();
+            fail_next(point);
+            assert!(overlay.reclaim_unreferenced().is_err());
+            assert!(overlay.read(inode, &mut repo).is_err());
+            assert_eq!(overlay.stats().retirement_failures, 1);
+            drop(overlay);
+            let mut overlay = Overlay::open(&directory, &snapshot, &gitdir).unwrap();
+            assert!(overlay.entry(inode).is_err());
+            assert_eq!(
+                super::changes_since(&directory, &token).unwrap(),
+                (token, vec![])
+            );
+            assert!(
+                overlay
+                    .create(1, OsStr::new("next"), Kind::File, 0o600, None)
+                    .unwrap()
+                    > inode
+            );
+        }
+    }
+
+    #[test]
+    fn collection_visits_only_retired_candidates_in_a_large_base_tree() {
+        let (_temp, _repo, mut snapshot, directory, gitdir) = fixture();
+        let oid = snapshot
+            .nodes
+            .iter()
+            .find(|n| n.name == OsStr::new("base"))
+            .unwrap()
+            .oid
+            .clone();
+        let mut next = snapshot.nodes.iter().map(|n| n.inode).max().unwrap() + 1;
+        for n in 0..100_000 {
+            let name = OsString::from(format!("padding-{n}"));
+            snapshot.nodes.push(crate::filesystem::Node {
+                inode: next,
+                parent: 1,
+                path: PathBuf::from(&name),
+                name,
+                mode: 0o100644,
+                kind: BaseKind::File,
+                oid: oid.clone(),
+                children: vec![],
+            });
+            next += 1;
+        }
+        let mut overlay = Overlay::open(&directory, &snapshot, &gitdir).unwrap();
+        let before = overlay.stats().gc_visited_entries;
+        let inode = overlay
+            .create(1, OsStr::new("temp"), Kind::File, 0o600, None)
+            .unwrap();
+        overlay.unlink(1, OsStr::new("temp"), false).unwrap();
+        overlay.reclaim_unreferenced().unwrap();
+        assert!(overlay.entry(inode).is_err());
+        assert_eq!(overlay.stats().gc_visited_entries - before, 1);
+        overlay.reclaim_unreferenced().unwrap();
+        assert_eq!(overlay.stats().gc_visited_entries - before, 1);
     }
 
     #[test]
@@ -1242,7 +1789,7 @@ mod tests {
         );
         tx.insert(
             &handles.meta,
-            b"generation",
+            b"journal_generation",
             (intent.before_generation + 1).to_be_bytes(),
         );
         tx.commit().unwrap();
@@ -1263,7 +1810,12 @@ mod tests {
             intent.after_entry
         );
         assert_eq!(
-            number(&tx.get(&handles.meta, b"generation").unwrap().unwrap()).unwrap(),
+            number(
+                &tx.get(&handles.meta, b"journal_generation")
+                    .unwrap()
+                    .unwrap()
+            )
+            .unwrap(),
             intent.before_generation + 1
         );
         let journal_after: Vec<_> = tx
@@ -1283,7 +1835,7 @@ mod tests {
         );
         tx.insert(
             &handles.meta,
-            b"generation",
+            b"journal_generation",
             intent.before_generation.to_be_bytes(),
         );
         tx.commit().unwrap();

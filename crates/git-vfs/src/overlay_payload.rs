@@ -105,6 +105,12 @@ impl Files {
             counters: Counters::default(),
         })
     }
+    pub fn worker_copy(&self) -> Self {
+        Self {
+            directory: self.directory.clone(),
+            counters: Counters::default(),
+        }
+    }
     fn path(&self, inode: u64) -> PathBuf {
         self.directory.join(format!("{inode:016x}.data"))
     }
@@ -292,7 +298,7 @@ impl Files {
     pub fn remove(&self, inode: u64) -> Result<()> {
         match std::fs::remove_file(self.path(inode)) {
             Ok(()) => self.sync_directory(),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => self.sync_directory(),
             Err(e) => Err(e.into()),
         }
     }

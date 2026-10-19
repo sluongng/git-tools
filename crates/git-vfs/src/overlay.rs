@@ -4,11 +4,14 @@ use crate::backend::GitRepo;
 mod codec;
 #[path = "overlay_fjall.rs"]
 mod fjall;
+#[path = "overlay_lifetime.rs"]
+mod lifetime;
 #[path = "overlay_payload.rs"]
 mod payload;
 use crate::filesystem::{Kind as BaseKind, Snapshot};
 use anyhow::{Context, Result, ensure};
 use fuser::FileType;
+pub use lifetime::{Lease, PinKind};
 pub use payload::Payload;
 use sha1::{Digest, Sha1};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
@@ -74,6 +77,14 @@ pub struct Overlay {
     // Only inodes already unlinked at exclusive open are reclaimed. Inodes
     // unlinked during this session retain their open-descriptor semantics.
     reclaimed: HashSet<u64>,
+    base_inodes: HashSet<u64>,
+    dependencies: HashMap<u64, usize>,
+    lifetime: lifetime::Lifetime,
+    online_reclaimed_payload_bytes: u64,
+    reclaimed_entries: u64,
+    unlinked_inodes: BTreeSet<u64>,
+    gc_ready: BTreeSet<u64>,
+    gc_visited_entries: u64,
 }
 
 /// Logical overlay state; protected `.git` pointer bytes are not user payload.
@@ -94,6 +105,19 @@ pub struct OverlayStats {
     pub payload_directory_syncs: u64,
     pub metadata_syncs: u64,
     pub recovered_operations: u64,
+    pub online_reclaimed_payload_bytes: u64,
+    pub reclaimed_entries: u64,
+    pub gc_visited_entries: u64,
+    pub retirement_pending_items: u64,
+    pub retirement_pending_bytes: u64,
+    pub retirement_failures: u64,
+    pub retirement_sync_fallbacks: u64,
+    pub lookup_references: u64,
+    pub open_references: u64,
+    pub pinned_references: u64,
+    pub lookup_accounting_errors: u64,
+    #[serde(flatten)]
+    pub journal: Option<serde_json::Value>,
 }
 
 #[derive(Default)]
@@ -214,15 +238,132 @@ impl Overlay {
             .filter(|e| !e.linked && !e.control)
             .map(|e| e.inode)
             .collect();
-        Ok(Self {
+        let lifetime = lifetime::Lifetime::default();
+        let mut dependencies = HashMap::new();
+        for entry in entries.values() {
+            if entry.inode != 1 {
+                *dependencies.entry(entry.parent).or_insert(0) += 1;
+            }
+            if entry.control || entry.inode == 1 {
+                lifetime.protect(entry.inode);
+            }
+        }
+        let unlinked_inodes: BTreeSet<_> = entries
+            .values()
+            .filter(|e| !e.linked && !e.control)
+            .map(|e| e.inode)
+            .collect();
+        let gc_ready = unlinked_inodes.clone();
+        let mut overlay = Self {
             database,
             entries,
             namespace,
             reclaimed,
-        })
+            base_inodes: snapshot.nodes.iter().map(|n| n.inode).collect(),
+            dependencies,
+            lifetime,
+            online_reclaimed_payload_bytes: 0,
+            reclaimed_entries: 0,
+            unlinked_inodes,
+            gc_ready,
+            gc_visited_entries: 0,
+        };
+        overlay.reclaim_unreferenced()?;
+        overlay.drain_maintenance()?;
+        // Startup reclamation belongs to the existing remount counter, not the
+        // online work attributed to this newly served session.
+        overlay.online_reclaimed_payload_bytes = 0;
+        overlay.reclaimed_entries = 0;
+        Ok(overlay)
     }
+    pub fn record_lookup(&self, inode: u64) -> Result<()> {
+        self.entry(inode)?;
+        self.lifetime.lookup(inode)
+    }
+    pub fn forget(&mut self, inode: u64, nlookup: u64) {
+        self.lifetime.forget(inode, nlookup);
+    }
+    pub fn pin(&self, inodes: Vec<u64>, kind: PinKind) -> Result<Lease> {
+        for inode in &inodes {
+            self.entry(*inode)?;
+        }
+        self.lifetime.pin(inodes, kind)
+    }
+    pub fn release_kernel_references(&self) {
+        self.lifetime.release_kernel();
+    }
+    pub fn drain_maintenance(&mut self) -> Result<()> {
+        self.database.drain_maintenance()
+    }
+    /// Explicit safe collection. Direct callers retain unlinked content until
+    /// requesting this maintenance operation; mounted callers supply real pins.
+    pub fn reclaim_unreferenced(&mut self) -> Result<()> {
+        self.database.check_healthy()?;
+        for inode in self.lifetime.take_notifications() {
+            if self.unlinked_inodes.contains(&inode) {
+                self.gc_ready.insert(inode);
+            }
+        }
+        while let Some(inode) = self.gc_ready.pop_first() {
+            self.gc_visited_entries += 1;
+            if !self.unlinked_inodes.contains(&inode) || !self.lifetime.eligible(inode) {
+                continue;
+            }
+            let entry = self.entry(inode)?.clone();
+            let remove = !self.base_inodes.contains(&inode)
+                && self.dependencies.get(&inode).copied().unwrap_or(0) == 0;
+            if !remove && matches!(entry.payload, Payload::None) {
+                continue;
+            }
+            let bytes = entry.payload.size().unwrap_or(0);
+            self.database.retire(&entry, remove)?;
+            self.online_reclaimed_payload_bytes += bytes;
+            if remove {
+                self.reclaimed.remove(&inode);
+                self.unlinked_inodes.remove(&inode);
+                self.entries.remove(&inode);
+                self.reclaimed_entries += 1;
+                let count = self
+                    .dependencies
+                    .get_mut(&entry.parent)
+                    .context("missing retained-parent dependency")?;
+                *count = count
+                    .checked_sub(1)
+                    .context("retained-parent dependency underflow")?;
+                if *count == 0 {
+                    self.dependencies.remove(&entry.parent);
+                }
+                if self.unlinked_inodes.contains(&entry.parent) {
+                    self.gc_ready.insert(entry.parent);
+                }
+            } else {
+                self.reclaimed.insert(inode);
+                self.entries.get_mut(&inode).unwrap().payload = Payload::None;
+            }
+        }
+        Ok(())
+    }
+
     pub fn stats(&self) -> OverlayStats {
+        let (pending_items, pending_bytes, _, fallbacks, failed) = self.database.retirement_stats();
+        let (lookups, opens, pins, errors) = self.lifetime.stats();
         let mut stats = OverlayStats {
+            online_reclaimed_payload_bytes: self.online_reclaimed_payload_bytes,
+            reclaimed_entries: self.reclaimed_entries,
+            gc_visited_entries: self.gc_visited_entries,
+            retirement_pending_items: pending_items,
+            retirement_pending_bytes: pending_bytes,
+            retirement_failures: failed,
+            retirement_sync_fallbacks: fallbacks,
+            lookup_references: lookups,
+            open_references: opens,
+            pinned_references: pins,
+            lookup_accounting_errors: errors,
+            journal: self
+                .database
+                .journal_stats()
+                .ok()
+                .and_then(|stats| serde_json::to_value(stats).ok()),
             entry_count: self.entries.len() as u64,
             reclaimed_payload_bytes: self.database.reclaimed_payload_bytes,
             payload_read_bytes: self.database.files.counters.read.get(),
@@ -523,6 +664,25 @@ impl Overlay {
             }
         }
         for entry in changed {
+            if !entry.linked
+                && !entry.control
+                && self.entries.get(&entry.inode).is_none_or(|old| old.linked)
+            {
+                self.unlinked_inodes.insert(entry.inode);
+                self.gc_ready.insert(entry.inode);
+            }
+            if !self.entries.contains_key(&entry.inode) && entry.inode != 1 {
+                *self.dependencies.entry(entry.parent).or_insert(0) += 1;
+            } else if let Some(previous) = self.entries.get(&entry.inode)
+                && previous.parent != entry.parent
+            {
+                let count = self.dependencies.get_mut(&previous.parent).unwrap();
+                *count -= 1;
+                if *count == 0 {
+                    self.dependencies.remove(&previous.parent);
+                }
+                *self.dependencies.entry(entry.parent).or_insert(0) += 1;
+            }
             self.entries.insert(entry.inode, entry);
         }
         Ok(())
@@ -546,11 +706,9 @@ impl Overlay {
             Err(e) => return Err(e),
         };
         let ino = self
-            .entries
-            .keys()
-            .next_back()
-            .copied()
-            .unwrap_or(0)
+            .database
+            .highwater
+            .get()
             .checked_add(1)
             .ok_or_else(|| error(libc::EFBIG))?;
         let now = SystemTime::now();
