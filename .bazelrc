@@ -18,5 +18,9 @@ build:rbe --remote_download_toplevel
 build:rbe --remote_cache_compression
 build:rbe --jobs=64
 
+# Share the RBE platform/cache/BES configuration, but compile cache misses locally.
+common:cache-only --config=rbe
+common:cache-only --remote_executor=
+
 # Local endpoint overrides and credentials are never checked in.
 try-import %workspace%/user.bazelrc

@@ -102,6 +102,13 @@ The harness disables inherited disk caches in both arms and uses a fresh edit
 namespace per invocation. Reusing `--edit-seed` intentionally can replay old
 cached edits; inspect runner counts before calling them uncached executions.
 
+To compare local, remote-cache-only, and RBE at matched concurrency, replace
+`--config rbe` above with `--arm local --arm cache-only --arm rbe`.
+`cache-only` keeps RBE's execution platform, cache, and BES settings, but executes
+cache misses locally. Edit namespaces include a fixed-width arm hash so one arm
+cannot populate another arm's measured edit. This additional comparison has no
+results recorded here yet.
+
 ## Validation and known failure
 
 Cargo: 85 unit, 23 ordinary integration and 9 real-FUSE cases passed; scoped

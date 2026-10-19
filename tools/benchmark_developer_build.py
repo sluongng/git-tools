@@ -227,7 +227,10 @@ class Benchmark:
                             self.build(arm, phase, trial, 'measured')
                         else:
                             original = path.read_bytes()
-                            marker = f'{self.args.edit_seed}-{phase}-trial-{trial}'
+                            # Fixed-width arm hashes keep edits equal in size but
+                            # prevent one arm from warming another arm's action.
+                            arm_namespace = hashlib.sha256(arm.encode()).hexdigest()
+                            marker = f'{self.args.edit_seed}-{phase}-trial-{trial}-arm-{arm_namespace}'
                             if self.args.edit_kind == 'public-const':
                                 addition = f'pub const GIT_TOOLS_BENCHMARK_REVISION: &str = "{marker}";'
                             else:
@@ -236,6 +239,7 @@ class Benchmark:
                             self.result['edits'].append({
                                 'arm': arm, 'phase': phase, 'trial': trial,
                                 'path': str(path.relative_to(self.root)), 'marker': marker,
+                                'arm_namespace_sha256': arm_namespace,
                                 'edit_kind': self.args.edit_kind,
                                 'original_sha256': sha(original), 'edited_sha256': sha(edited)})
                             self.save()
@@ -323,7 +327,11 @@ def main():
     plan = {'root': str(root), 'bazel': args.bazel, 'output': str(args.output),
             'arms': arms, 'phases': phases, 'trials': args.trials, 'jobs': args.jobs,
             'targets': args.targets, 'source_edit': args.source_edit, 'edit_kind': args.edit_kind,
-            'edit_seed': args.edit_seed, 'disk_cache': 'disabled in every arm',
+            'edit_seed': args.edit_seed,
+            'edit_namespace': {'scheme': 'seed-phase-trial-arm-sha256',
+                               'arm_sha256': {arm: hashlib.sha256(arm.encode()).hexdigest() for arm in arms},
+                               'purpose': 'equal-sized unique edits prevent cross-arm action-cache contamination'},
+            'disk_cache': 'disabled in every arm',
             'trial_arm_order': [arms[index % len(arms):] + arms[:index % len(arms)]
                                 for index in range(args.trials)],
             'execution_log': args.execution_log,
