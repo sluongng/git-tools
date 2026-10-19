@@ -5,7 +5,7 @@ const MAX_WANTS: usize = 16_384;
 /// Unknown or incomplete requests bypass caching and remain native Git's concern.
 /// Repository epochs invalidate responses whose contents depend on changed refs
 /// (notably include-tag), even though wants themselves are full object IDs.
-pub(crate) fn cache_key(
+pub fn cache_key(
     protocol: &str,
     body: &[u8],
     repository_identity: &str,

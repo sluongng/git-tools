@@ -1,5 +1,12 @@
 [workspace]
-members = ["crates/git-vfs", "crates/git-proxy"]
+members = [
+    "crates/git-workspace",
+    "crates/git-overlay",
+    "crates/git-vfs",
+    "crates/git-pack-cache",
+    "crates/git-reapi",
+    "crates/git-proxy",
+]
 exclude = ["third_party/fuser"]
 resolver = "3"
 

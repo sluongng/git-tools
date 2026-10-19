@@ -680,6 +680,37 @@ dependencies = [
 ]
 
 [[package]]
+name = "git-overlay"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "blake3",
+ "fjall",
+ "git-workspace",
+ "hex",
+ "libc",
+ "serde",
+ "serde_json",
+ "sha1",
+ "tempfile",
+]
+
+[[package]]
+name = "git-pack-cache"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-stream",
+ "axum",
+ "blake3",
+ "bytes",
+ "futures-core",
+ "serde",
+ "tempfile",
+ "tokio",
+]
+
+[[package]]
 name = "git-proxy"
 version = "0.1.0"
 dependencies = [
@@ -694,11 +725,11 @@ dependencies = [
  "flate2",
  "fs2",
  "futures-core",
+ "git-pack-cache",
+ "git-reapi",
  "hex",
  "libc",
  "prost",
- "prost-types",
- "protoc-bin-vendored",
  "reqwest",
  "serde",
  "serde_json",
@@ -706,9 +737,19 @@ dependencies = [
  "tokio",
  "tokio-stream",
  "tonic",
+ "uuid",
+]
+
+[[package]]
+name = "git-reapi"
+version = "0.1.0"
+dependencies = [
+ "prost",
+ "prost-types",
+ "protoc-bin-vendored",
+ "tonic",
  "tonic-prost",
  "tonic-prost-build",
- "uuid",
 ]
 
 [[package]]
@@ -721,12 +762,26 @@ dependencies = [
  "ctrlc",
  "fjall",
  "fuser",
+ "git-overlay",
+ "git-workspace",
+ "hex",
+ "libc",
+ "serde",
+ "serde_json",
+ "tempfile",
+]
+
+[[package]]
+name = "git-workspace"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "fjall",
  "hex",
  "libc",
  "reqwest",
  "serde",
  "serde_json",
- "sha1",
  "tempfile",
 ]
 

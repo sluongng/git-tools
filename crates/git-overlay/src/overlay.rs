@@ -10,7 +10,6 @@ mod lifetime;
 mod payload;
 use crate::filesystem::{Kind as BaseKind, Snapshot};
 use anyhow::{Context, Result, ensure};
-use fuser::FileType;
 pub use lifetime::{Lease, PinKind};
 pub use payload::Payload;
 use sha1::{Digest, Sha1};
@@ -31,13 +30,6 @@ pub enum Kind {
 impl Kind {
     pub fn is_dir(self) -> bool {
         matches!(self, Self::Directory | Self::Gitlink)
-    }
-    pub fn file_type(self) -> FileType {
-        match self {
-            Self::File => FileType::RegularFile,
-            Self::Symlink => FileType::Symlink,
-            _ => FileType::Directory,
-        }
     }
     fn code(self) -> i64 {
         match self {
@@ -278,7 +270,7 @@ impl Overlay {
             entries,
             namespace,
             reclaimed,
-            base_inodes: snapshot.nodes.iter().map(|n| n.inode).collect(),
+            base_inodes: snapshot.nodes().iter().map(|n| n.inode).collect(),
             dependencies,
             lifetime,
             online_reclaimed_payload_bytes: 0,

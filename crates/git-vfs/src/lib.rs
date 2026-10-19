@@ -1,12 +1,6 @@
-pub mod backend;
-pub mod filesystem;
-pub mod overlay;
-pub mod prefetch;
-pub mod storage;
-pub mod worktree;
-pub mod writable;
-
-mod github_sizes;
-
+//! FUSE adapters and command-line support for Git-backed workspaces.
+pub use git_overlay::{overlay, worktree};
+pub use git_workspace::{backend, cas_digest, prefetch, storage};
 pub mod blake3_xattr;
-pub mod cas_digest;
+pub mod filesystem;
+pub mod writable;

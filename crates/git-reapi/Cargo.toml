@@ -1,0 +1,16 @@
+[package]
+name = "git-reapi"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+description = "Pinned Remote Execution API and ByteStream bindings"
+
+[dependencies]
+prost = "0.14"
+prost-types = "0.14"
+tonic = "0.14"
+tonic-prost = "0.14"
+
+[build-dependencies]
+tonic-prost-build = "0.14"
+protoc-bin-vendored = "3"

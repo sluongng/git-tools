@@ -427,8 +427,8 @@ The immutable `git-vfs-sizes.fjall/` directory described above remains a separat
 
 ```sh
 cargo fmt --check
-cargo clippy -p git-vfs --all-targets -- -D warnings
-cargo test -p git-vfs
+cargo clippy -p git-workspace -p git-overlay -p git-vfs --all-targets -- -D warnings
+cargo test -p git-workspace -p git-overlay -p git-vfs
 
 # Explicit kernel-level integration tests (require working /dev/fuse).
 cargo test -p git-vfs --test integration -- --ignored --nocapture

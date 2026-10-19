@@ -245,7 +245,7 @@ impl WorkingTree {
             )?;
             let dirty = dirty_paths(&self.directory)?;
             let mut paths = Vec::new();
-            for node in &snapshot.nodes {
+            for node in snapshot.nodes() {
                 if node.kind.name() == "directory" {
                     continue;
                 }

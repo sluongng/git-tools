@@ -15,37 +15,8 @@ use tonic::{
     transport::{Channel, ClientTlsConfig, Endpoint},
 };
 
-#[allow(clippy::doc_lazy_continuation)]
-pub mod proto {
-    pub mod google {
-        pub mod rpc {
-            tonic::include_proto!("google.rpc");
-        }
-        pub mod longrunning {
-            tonic::include_proto!("google.longrunning");
-        }
-        pub mod bytestream {
-            tonic::include_proto!("google.bytestream");
-        }
-    }
-    pub mod build {
-        pub mod bazel {
-            pub mod semver {
-                tonic::include_proto!("build.bazel.semver");
-            }
-            pub mod remote {
-                pub mod execution {
-                    pub mod v2 {
-                        tonic::include_proto!("build.bazel.remote.execution.v2");
-                    }
-                }
-            }
-        }
-    }
-}
-pub use proto::build::bazel::remote::execution::v2 as reapi;
+pub use git_reapi::{Digest, proto, reapi};
 use proto::google::bytestream as bs;
-pub use reapi::Digest;
 
 const BLAKE3: i32 = reapi::digest_function::Value::Blake3 as i32;
 const FIND_MISSING_LIMIT: usize = 1000;
@@ -1382,9 +1353,8 @@ pub(crate) mod tests {
     }
     #[test]
     fn fastcdc_matches_official_zero_and_nonzero_seed_vectors() {
-        let image = include_bytes!("../proto/build/bazel/remote/execution/v2/SekienAkashita.jpg");
-        let text =
-            include_str!("../proto/build/bazel/remote/execution/v2/fastcdc2020_test_vectors.txt");
+        let image = include_bytes!("../testdata/SekienAkashita.jpg");
+        let text = include_str!("../testdata/fastcdc2020_test_vectors.txt");
         let mut seed = 0;
         let mut expected: HashMap<u64, Vec<(usize, usize, u64)>> = HashMap::new();
         for line in text.lines() {

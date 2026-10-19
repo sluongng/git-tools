@@ -20,6 +20,14 @@ const TTL: Duration = Duration::from_secs(1);
 const DIRECT_IO: u32 = 1;
 const XATTRS: &[u8] = b"user.gitsha1\0user.gitsha1.hex\0";
 
+fn file_type(kind: Kind) -> FileType {
+    match kind {
+        Kind::File => FileType::RegularFile,
+        Kind::Symlink => FileType::Symlink,
+        _ => FileType::Directory,
+    }
+}
+
 fn error(code: i32) -> anyhow::Error {
     std::io::Error::from_raw_os_error(code).into()
 }
@@ -137,7 +145,7 @@ impl WritableGitFs {
             mtime: n.mtime,
             ctime: n.ctime,
             crtime: n.ctime,
-            kind: n.kind.file_type(),
+            kind: file_type(n.kind),
             perm: (n.mode & 0o7777) as u16,
             nlink,
             uid: self.uid,
@@ -698,7 +706,7 @@ impl Filesystem for WritableGitFs {
             ];
             for child in self.overlay.children(ino)? {
                 let n = self.overlay.entry(child)?;
-                entries.push((child, n.kind.file_type(), n.name.clone()));
+                entries.push((child, file_type(n.kind), n.name.clone()));
             }
             let fh = self.handle_id()?;
             let lease = self.overlay.pin(

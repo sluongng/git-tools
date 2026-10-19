@@ -83,4 +83,5 @@ No push or dumb-HTTP file serving is exposed.
 - [Design and research](../../docs/proxy-design.md): Goblet, Origin,
   Gitretriever, and Packhorse.
 - [Mapping benchmarks](../../docs/proxy-blake3-benchmarks.md).
-- Test: `cargo test -p git-proxy`; select Git with `GIT_PROXY_TEST_GIT`.
+- Test: `cargo test -p git-pack-cache -p git-reapi -p git-proxy`;
+  select Git with `GIT_PROXY_TEST_GIT`.

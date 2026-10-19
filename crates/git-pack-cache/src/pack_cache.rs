@@ -344,14 +344,10 @@ impl ProducerPermit {
         }
         self.done = true;
     }
-    pub fn stream(self, response: Response, http_permit: OwnedSemaphorePermit) -> Response {
-        self.stream_with_deadline(
-            response,
-            http_permit,
-            tokio::time::Instant::now() + super::GIT_TIMEOUT,
-        )
-    }
-    fn stream_with_deadline(
+    /// Stream the generated response while filling the cache until `deadline`.
+    /// The caller supplies its native Git operation deadline and HTTP slot; the
+    /// producer retains the slot until completion even if its reader disconnects.
+    pub fn stream_with_deadline(
         mut self,
         response: Response,
         http_permit: OwnedSemaphorePermit,
@@ -531,9 +527,11 @@ mod tests {
         }
     }
     async fn fill(cache: &Arc<PackCache>, key: &str, bytes: &'static [u8]) {
-        let response = producer(cache, key)
-            .await
-            .stream(Response::new(Body::from(bytes)), permit().await);
+        let response = producer(cache, key).await.stream_with_deadline(
+            Response::new(Body::from(bytes)),
+            permit().await,
+            tokio::time::Instant::now() + Duration::from_secs(600),
+        );
         assert_eq!(
             to_bytes(response.into_body(), usize::MAX).await.unwrap(),
             bytes
@@ -554,7 +552,11 @@ mod tests {
             "content-type",
             "application/x-git-upload-pack-result".parse().unwrap(),
         );
-        let response = p.stream(original, permit().await);
+        let response = p.stream_with_deadline(
+            original,
+            permit().await,
+            tokio::time::Instant::now() + Duration::from_secs(600),
+        );
         assert_eq!(response.headers()["x-git-proxy-pack-cache"], "MISS");
         assert_eq!(
             to_bytes(response.into_body(), 100).await.unwrap(),
@@ -592,7 +594,11 @@ mod tests {
             release.notified().await;
             yield Ok(Bytes::from_static(b"second"));
         };
-        let response = p.stream(Response::new(Body::from_stream(source)), permit().await);
+        let response = p.stream_with_deadline(
+            Response::new(Body::from_stream(source)),
+            permit().await,
+            tokio::time::Instant::now() + Duration::from_secs(600),
+        );
         drop(response);
         ready.notify_one();
         let cached = waiter.wait().await.unwrap();
@@ -621,7 +627,11 @@ mod tests {
             yield Ok(Bytes::from_static(b"partial"));
             yield Err(std::io::Error::other("backend exited unsuccessfully"));
         };
-        let response = p.stream(Response::new(Body::from_stream(source)), permit().await);
+        let response = p.stream_with_deadline(
+            Response::new(Body::from_stream(source)),
+            permit().await,
+            tokio::time::Instant::now() + Duration::from_secs(600),
+        );
         assert!(to_bytes(response.into_body(), 100).await.is_err());
         assert!(waiter.wait().await.is_none());
         assert_eq!(
@@ -637,9 +647,10 @@ mod tests {
         let Lookup::Wait(waiter) = cache.lookup("a").await else {
             panic!()
         };
-        let response = p.stream(
+        let response = p.stream_with_deadline(
             Response::new(Body::from("oversized response")),
             permit().await,
+            tokio::time::Instant::now() + Duration::from_secs(600),
         );
         assert_eq!(
             to_bytes(response.into_body(), 100).await.unwrap(),
@@ -699,9 +710,10 @@ mod tests {
             panic!()
         };
         std::fs::remove_dir(&cache.dir).unwrap();
-        let response = p.stream(
+        let response = p.stream_with_deadline(
             Response::new(Body::from("uncached content")),
             permit().await,
+            tokio::time::Instant::now() + Duration::from_secs(600),
         );
         assert_eq!(
             to_bytes(response.into_body(), 100).await.unwrap(),
@@ -726,7 +738,11 @@ mod tests {
             gate.notified().await;
             yield Ok::<_, std::io::Error>(Bytes::from_static(b"pack"));
         };
-        drop(p.stream(Response::new(Body::from_stream(source)), slot));
+        drop(p.stream_with_deadline(
+            Response::new(Body::from_stream(source)),
+            slot,
+            tokio::time::Instant::now() + Duration::from_secs(600),
+        ));
         assert_eq!(slots.available_permits(), 0);
         release.notify_one();
         let response = waiter.wait().await.unwrap().response("COALESCED");
@@ -790,7 +806,11 @@ mod tests {
             for _ in 0..4 { yield Ok(Bytes::from_static(b"chunk")); }
             yield Err(std::io::Error::other("native process failed"));
         };
-        let response = p.stream(Response::new(Body::from_stream(source)), permit().await);
+        let response = p.stream_with_deadline(
+            Response::new(Body::from_stream(source)),
+            permit().await,
+            tokio::time::Instant::now() + Duration::from_secs(600),
+        );
         // Do not poll the leader response: the bounded data channel is full.
         assert!(
             tokio::time::timeout(Duration::from_secs(5), waiter.wait())

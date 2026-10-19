@@ -8,7 +8,7 @@ use anyhow::{Result, bail, ensure};
 // Git's pkt-line.h: LARGE_PACKET_MAX includes the four-byte length prefix.
 const MAX_PACKET: usize = 65_520;
 
-pub(crate) struct FetchResponseValidator {
+pub struct FetchResponseValidator {
     packet: Vec<u8>,
     in_pack: bool,
     terminal: bool,
@@ -17,8 +17,14 @@ pub(crate) struct FetchResponseValidator {
     pack_bytes: u64,
 }
 
+impl Default for FetchResponseValidator {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl FetchResponseValidator {
-    pub(crate) fn new() -> Self {
+    pub fn new() -> Self {
         Self {
             packet: Vec::new(),
             in_pack: false,
@@ -29,7 +35,7 @@ impl FetchResponseValidator {
         }
     }
 
-    pub(crate) fn feed(&mut self, mut bytes: &[u8]) -> Result<()> {
+    pub fn feed(&mut self, mut bytes: &[u8]) -> Result<()> {
         while !bytes.is_empty() {
             if self.packet.len() < 4 {
                 let take = (4 - self.packet.len()).min(bytes.len());
@@ -129,7 +135,7 @@ impl FetchResponseValidator {
         Ok(())
     }
 
-    pub(crate) fn finish(self) -> Result<()> {
+    pub fn finish(self) -> Result<()> {
         ensure!(self.packet.is_empty(), "truncated fetch pkt-line");
         ensure!(self.in_pack && self.terminal, "incomplete fetch response");
         // A SHA-1 pack has a 12-byte header and a 20-byte trailer, even with

@@ -80,5 +80,5 @@ Namespace metadata is eager; native Git and first-write copy-up have separate me
 - [Full reference](../../docs/vfs-reference.md): provider limits, proxy API,
   authentication, prefetch scopes, storage formats, compatibility, and recovery.
 - [Project quick start](../../README.md) / [benchmarks](../../tools/README.md).
-- `cargo test -p git-vfs`; kernel tests require `/dev/fuse`:
+- `cargo test -p git-workspace -p git-overlay -p git-vfs`; kernel tests require `/dev/fuse`:
   `cargo test -p git-vfs --test integration -- --ignored --nocapture`.

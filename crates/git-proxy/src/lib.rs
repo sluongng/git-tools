@@ -1,10 +1,8 @@
 //! A single-owner, configured-origin, read-only smart HTTP Git cache.
 pub mod cas_client;
 mod cas_sync;
-mod fetch_key;
 pub use cas_sync::{CasShutdown, CasSyncConfig};
-mod fetch_response;
-mod pack_cache;
+use git_pack_cache as pack_cache;
 pub use pack_cache::PackCacheConfig;
 
 use anyhow::{Context, Result, ensure};
@@ -606,7 +604,7 @@ async fn handle(State(app): State<Arc<App>>, request: Request) -> Result<Respons
     let epoch = repo.epoch.load(Ordering::Acquire);
     let identity = format!("{alias}\0{}\0{}", repo.upstream, app.config.git.display());
     let key = upload
-        .then(|| fetch_key::cache_key(&protocol, &body, &identity, epoch))
+        .then(|| pack_cache::cache_key(&protocol, &body, &identity, epoch))
         .flatten();
     if let Some(key) = key {
         let lookup = app.packs.lookup(&key).await;
@@ -649,7 +647,11 @@ async fn handle(State(app): State<Arc<App>>, request: Request) -> Result<Respons
                 drop(producer);
                 return Ok(hold_permit(response, permit));
             }
-            return Ok(producer.stream(response, permit));
+            return Ok(producer.stream_with_deadline(
+                response,
+                permit,
+                tokio::time::Instant::now() + GIT_TIMEOUT,
+            ));
         }
         let mut response = git_http(
             app.clone(),
@@ -811,7 +813,7 @@ async fn git_http(
             let _group_guard = group_guard;
             let deadline = tokio::time::Instant::now() + GIT_TIMEOUT;
             let mut chunk = vec![0u8; 64 * 1024];
-            let mut validator = validate_fetch.then(fetch_response::FetchResponseValidator::new);
+            let mut validator = validate_fetch.then(pack_cache::FetchResponseValidator::new);
             loop {
                 let n = tokio::time::timeout_at(deadline, stdout.read(&mut chunk)).await.map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "Git response timed out"))??;
                 if n == 0 { break; }

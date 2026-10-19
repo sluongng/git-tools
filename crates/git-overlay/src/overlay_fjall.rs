@@ -127,7 +127,7 @@ impl Store {
                     && tx.iter(&handles.journal).next().is_none(),
                 "uninitialized overlay contains records"
             );
-            for n in &snapshot.nodes {
+            for n in snapshot.nodes() {
                 ensure!(
                     n.parent != 1 || !n.name.as_bytes().eq_ignore_ascii_case(b".git"),
                     "Git tree conflicts with protected .git entry"
@@ -161,8 +161,8 @@ impl Store {
                     } else {
                         Payload::None
                     },
-                    mtime: snapshot.timestamp,
-                    ctime: snapshot.timestamp,
+                    mtime: snapshot.timestamp(),
+                    ctime: snapshot.timestamp(),
                     linked: true,
                     control: false,
                 };
@@ -309,8 +309,8 @@ impl Store {
                 mode: 0o444,
                 base_oid: None,
                 payload: Payload::None,
-                mtime: snapshot.timestamp,
-                ctime: snapshot.timestamp,
+                mtime: snapshot.timestamp(),
+                ctime: snapshot.timestamp(),
                 linked: true,
                 control: true,
             }
@@ -1285,14 +1285,7 @@ mod tests {
     #[test]
     fn online_collection_respects_lookup_open_snapshot_and_async_pins() {
         use crate::overlay::PinKind;
-        let (_temp, mut repo, mut snapshot, directory, gitdir) = fixture();
-        // Compatibility boundary: origin cannot depend on an optional tree OID.
-        snapshot
-            .nodes
-            .iter_mut()
-            .find(|n| n.name == OsStr::new("base-dir"))
-            .unwrap()
-            .oid = None;
+        let (_temp, mut repo, snapshot, directory, gitdir) = fixture();
         let mut overlay = Overlay::open(&directory, &snapshot, &gitdir).unwrap();
         let inode = overlay
             .create(
@@ -1331,6 +1324,8 @@ mod tests {
             (token, vec![])
         );
         let base_dir = overlay.lookup(1, OsStr::new("base-dir")).unwrap();
+        // Compatibility boundary: origin cannot depend on an optional tree OID.
+        overlay.entries.get_mut(&base_dir).unwrap().base_oid = None;
         assert!(overlay.entry(base_dir).unwrap().base_oid.is_none());
         overlay
             .unlink(base_dir, OsStr::new("child"), false)
@@ -1564,29 +1559,54 @@ mod tests {
 
     #[test]
     fn collection_visits_only_retired_candidates_in_a_large_base_tree() {
-        let (_temp, _repo, mut snapshot, directory, gitdir) = fixture();
+        let (_temp, repo, snapshot, directory, gitdir) = fixture();
         let oid = snapshot
-            .nodes
+            .nodes()
             .iter()
             .find(|n| n.name == OsStr::new("base"))
             .unwrap()
             .oid
-            .clone();
-        let mut next = snapshot.nodes.iter().map(|n| n.inode).max().unwrap() + 1;
-        for n in 0..100_000 {
-            let name = OsString::from(format!("padding-{n}"));
-            snapshot.nodes.push(crate::filesystem::Node {
-                inode: next,
-                parent: 1,
-                path: PathBuf::from(&name),
-                name,
-                mode: 0o100644,
-                kind: BaseKind::File,
-                oid: oid.clone(),
-                children: vec![],
-            });
-            next += 1;
+            .as_deref()
+            .unwrap();
+        // Build a real large Git tree instead of mutating the immutable snapshot.
+        let mut tree = Command::new("git")
+            .arg("-C")
+            .arg(&gitdir)
+            .arg("mktree")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        {
+            let mut input = tree.stdin.take().unwrap();
+            writeln!(input, "100644 blob {oid}\tbase").unwrap();
+            for n in 0..100_000 {
+                writeln!(input, "100644 blob {oid}\tpadding-{n}").unwrap();
+            }
         }
+        let tree = tree.wait_with_output().unwrap();
+        assert!(tree.status.success());
+        let tree = String::from_utf8(tree.stdout).unwrap();
+        let commit = Command::new("git")
+            .arg("-C")
+            .arg(&gitdir)
+            .args([
+                "commit-tree",
+                tree.trim(),
+                "-p",
+                &snapshot.commit,
+                "-m",
+                "Large tree fixture",
+            ])
+            .env("GIT_AUTHOR_NAME", "Fixture")
+            .env("GIT_AUTHOR_EMAIL", "fixture@example.test")
+            .env("GIT_COMMITTER_NAME", "Fixture")
+            .env("GIT_COMMITTER_EMAIL", "fixture@example.test")
+            .output()
+            .unwrap();
+        assert!(commit.status.success());
+        let commit = String::from_utf8(commit.stdout).unwrap();
+        let snapshot = Snapshot::load(&repo, commit.trim()).unwrap();
         let mut overlay = Overlay::open(&directory, &snapshot, &gitdir).unwrap();
         let before = overlay.stats().gc_visited_entries;
         let inode = overlay
