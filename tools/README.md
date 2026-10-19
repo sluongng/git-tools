@@ -72,6 +72,18 @@ The rc selects one existing BuildBuddy credential; it is never copied into outpu
 Private RPC logs become sanitized status/count summaries, then are removed.
 See [agent startup results](../docs/proxy-agent-startup.md) for scope and setup.
 
+## Iterative workspaces
+
+[Lifecycle results and protocol](../docs/vfs-iteration-benchmarks.md) cover the
+`benchmark_vfs_{iteration,ranges,journal,metadata,hydration,content}.py` local
+harnesses. Each takes frozen baseline/candidate binaries; use `--help` for its
+workload and strict-counter flags. Three rotated trials are the default.
+
+`benchmark_iterative_agent_rbe.py` uses the fresh-agent setup above and adds
+`--baseline-vfs`, `--candidate-vfs`, their verified source commits, and `--cycles 8`.
+Primary runs require at least three trials. `--functional-pilot` explicitly marks
+short readiness checks as non-headline evidence.
+
 ## Evidence and interpretation
 
 Harnesses retain frozen binary hashes, raw commands/logs, TRACE2, object-presence

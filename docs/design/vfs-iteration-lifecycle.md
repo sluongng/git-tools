@@ -436,6 +436,17 @@ warm incremental iteration. A reproducible >10% local-median regression outside
 variance is investigated before retaining a change; noisy remote samples are not a
 license to claim a win. End-to-end latency improvement is measured, not guaranteed.
 
+### Final iterative RBE acceptance (2026-10-19)
+
+[Results, phase breakdown and qualifications](../vfs-iteration-benchmarks.md):
+three rotated pairs and eight edits per cell passed all 54 build / 162 uncached
+remote BLAKE3 action checks. First-build p50 was 25.295 → 25.030 s; warm continuous
+edit/status/build p50/p95 was 3.535/4.386 → 3.433/3.858 s. Per-trial medians were
+mixed, so this does not establish a reliable RBE speedup. All matching edits
+produced matching outputs; the candidate's 5.077 s outlier remains included.
+Each startup observed 34 successful r2c2 lookups, while warm cycles required none.
+All owned mounts/processes and private helper files were cleaned up.
+
 ## Tests, rollout and completion
 
 Extend existing overlay/FUSE integration coverage rather than duplicate suites.

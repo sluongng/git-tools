@@ -81,6 +81,9 @@ See [direct-GitHub results](docs/github-bazel-async-prefetch.md),
 [BLAKE3 results and caveats](docs/proxy-blake3-benchmarks.md), and
 [benchmark reproduction](tools/README.md).
 
+For repeated edits, see the [VFS iteration results](docs/vfs-iteration-benchmarks.md),
+including reclamation, rename/digest work and real incremental RBE builds.
+
 ## Guides and limits
 
 - [Cloud Bazel agent example skill](examples/skills/cloud-bazel-agent/SKILL.md)

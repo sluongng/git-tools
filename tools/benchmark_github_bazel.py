@@ -12,12 +12,12 @@ import json
 import os
 from pathlib import Path
 import platform
+import select
 import shutil
 import signal
 import statistics
 import subprocess
 import time
-import threading
 import traceback
 
 SOURCE = "https://github.com/bazelbuild/bazel.git"
@@ -84,6 +84,8 @@ class Benchmark:
                     GIT_TRACE_REDACT="1")
 
     def run(self, argv, name, cwd=None, timeout=600, check=True):
+        if not hasattr(os, "pidfd_open"):
+            raise RuntimeError("Benchmark subprocess ownership requires Linux pidfd_open")
         argv = [str(value) for value in argv]
         cwd = cwd or self.root
         start = time.perf_counter()
@@ -91,29 +93,46 @@ class Benchmark:
         with (self.root / (name + ".stdout")).open("wb") as out, (self.root / (name + ".stderr")).open("wb") as err:
             process = subprocess.Popen(argv, cwd=cwd, env=self.traced_env(name), stdout=out,
                                        stderr=err, start_new_session=True)
-            def expire():
-                nonlocal timed_out
-                timed_out = True
-                try:
-                    os.killpg(process.pid, signal.SIGKILL)
-                except ProcessLookupError:
-                    pass
-            timer = threading.Timer(timeout, expire)
-            timer.daemon = True
-            timer.start()
+            descriptor, interrupted = None, None
             try:
-                process.wait()  # Blocking wait avoids polling latency in short warm queries.
-                ended = time.perf_counter()
+                descriptor = os.pidfd_open(process.pid)
+                ready, _, _ = select.select([descriptor], [], [], max(0, timeout - (time.perf_counter() - start)))
+                timed_out = not ready
+            except BaseException as error:
+                interrupted = error
             finally:
-                timer.cancel()
+                # No poll()/wait() or concurrent reaper has run: even an exited
+                # leader remains unreaped, reserving its PID/PGID while we signal.
+                try:
+                    if timed_out or interrupted is not None:
+                        try:
+                            os.killpg(process.pid, signal.SIGKILL)
+                        except ProcessLookupError:
+                            pass
+                    try:
+                        process.wait()  # pidfd readiness avoids polling latency.
+                    except KeyboardInterrupt as error:
+                        # Exit was ready, or SIGKILL was sent. Never signal the
+                        # numeric group after entering wait/reap.
+                        interrupted = interrupted or error
+                        process.wait()
+                    ended = time.perf_counter()
+                finally:
+                    if descriptor is not None:
+                        os.close(descriptor)
         result = {"seconds": ended - start, "returncode": process.returncode,
                   "timed_out": timed_out, "start_perf_counter": start,
                   "wait_end_perf_counter": ended}
+        if interrupted is not None:
+            result["interrupted"] = type(interrupted).__name__
         self.commands.append({"name": name, "argv": argv, "cwd": str(cwd),
                               "trace2": name + ".trace2.jsonl", **result})
         self.save()
-        if check and process.returncode:
-            raise RuntimeError(f"{name} failed ({process.returncode}); see {name}.stderr")
+        if interrupted is not None:
+            raise interrupted
+        if check and (timed_out or process.returncode):
+            reason = "exceeded its fixed timeout" if timed_out else f"failed ({process.returncode})"
+            raise RuntimeError(f"{name} {reason}; see {name}.stderr")
         return result
 
     def git(self, repo, args, data=None):
