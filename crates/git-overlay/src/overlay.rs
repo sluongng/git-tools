@@ -1257,7 +1257,8 @@ impl Overlay {
         newname: &OsStr,
         flags: u32,
     ) -> Result<()> {
-        if flags & !libc::RENAME_NOREPLACE != 0 {
+        // The overlay API uses Linux/FUSE rename flag values on every Unix host.
+        if flags & !1_u32 != 0 {
             return Err(error(libc::EINVAL));
         }
         self.validate_name(parent, name)?;

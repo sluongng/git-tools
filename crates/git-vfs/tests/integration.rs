@@ -2682,6 +2682,7 @@ fn mounted_filesystem_exposes_native_reads_and_raw_digest_xattrs() {
     let child = Command::new(env!("CARGO_BIN_EXE_git-vfs"))
         .arg("mount")
         .arg("--read-only")
+        .args(["--size-source", "git"])
         .arg("--repo")
         .arg(&fixture.clone)
         .arg(&fixture.mount)
@@ -2722,6 +2723,10 @@ fn mounted_filesystem_exposes_native_reads_and_raw_digest_xattrs() {
         xattr(&fixture.mount.join("hello.txt"), "user.gitsha1.hex"),
         hex::encode(&digest).as_bytes()
     );
+    assert_eq!(
+        xattr(&fixture.mount.join("hello.txt"), "user.gitsha1.base"),
+        digest
+    );
     assert_eq!(fixture.missing_blobs(&oids), oids.len());
     assert_eq!(
         fs::read(fixture.mount.join("hello.txt")).unwrap(),
@@ -2755,6 +2760,15 @@ fn mounted_filesystem_exposes_native_reads_and_raw_digest_xattrs() {
     assert!(fs::write(fixture.mount.join("new-file"), b"new").is_err());
     drop(file);
     drop(session);
+    assert_eq!(
+        fixture
+            .repo(SizeFallback::Error)
+            .cache_stats()
+            .unwrap()
+            .entries as usize,
+        oids.iter().collect::<std::collections::HashSet<_>>().len(),
+        "explicit native metadata must warm the whole snapshot before traversal"
+    );
     assert_eq!(
         fs::read_dir(&fixture.mount).unwrap().count(),
         0,
@@ -3112,6 +3126,7 @@ fn mounted_blake3_xattrs_use_cached_base_and_current_same_size_overlay_bytes() {
     let path = fixture.mount.join("hello.txt");
     for (name, length) in [
         ("user.gitsha1", 20),
+        ("user.gitsha1.base", 20),
         ("user.gitsha1.hex", 40),
         ("user.blake3", 32),
         ("user.blake3.hex", 64),
@@ -3134,7 +3149,33 @@ fn mounted_blake3_xattrs_use_cached_base_and_current_same_size_overlay_bytes() {
         oids.len(),
         "base xattr must not hydrate"
     );
+    assert_eq!(
+        xattr(&path, "user.gitsha1.base"),
+        xattr(&path, "user.gitsha1")
+    );
     fs::write(&path, b"HELLO from git-vfs\n").unwrap();
+    // A computed digest is not proof that the backing Git store contains a
+    // blob. Mutable bytes must never be advertised as a reusable base object.
+    let native_path = CString::new(path.as_os_str().as_bytes()).unwrap();
+    let base_name = CString::new("user.gitsha1.base").unwrap();
+    for capacity in [0, 20] {
+        let mut output = [0u8; 20];
+        assert_eq!(
+            unsafe {
+                libc::getxattr(
+                    native_path.as_ptr(),
+                    base_name.as_ptr(),
+                    output.as_mut_ptr().cast(),
+                    capacity,
+                )
+            },
+            -1
+        );
+        assert_eq!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::ENODATA)
+        );
+    }
     for (name, length) in [
         ("user.gitsha1", 20),
         ("user.gitsha1.hex", 40),
@@ -3165,6 +3206,22 @@ fn mounted_blake3_xattrs_use_cached_base_and_current_same_size_overlay_bytes() {
         hex::encode(&sha1).as_bytes()
     );
     fs::write(fixture.mount.join("new.txt"), b"new bytes").unwrap();
+    let new_path = CString::new(fixture.mount.join("new.txt").as_os_str().as_bytes()).unwrap();
+    assert_eq!(
+        unsafe {
+            libc::getxattr(
+                new_path.as_ptr(),
+                base_name.as_ptr(),
+                std::ptr::null_mut(),
+                0,
+            )
+        },
+        -1
+    );
+    assert_eq!(
+        std::io::Error::last_os_error().raw_os_error(),
+        Some(libc::ENODATA)
+    );
     assert_eq!(
         xattr(&fixture.mount.join("new.txt"), "user.blake3"),
         blake3::hash(b"new bytes").as_bytes()

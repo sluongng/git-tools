@@ -11,3 +11,7 @@ platform(
 
 alias(name = "git-vfs", actual = "//crates/git-vfs:git-vfs-bin", visibility = ["//visibility:public"])
 alias(name = "git-proxy", actual = "//crates/git-proxy:git-proxy-bin", visibility = ["//visibility:public"])
+alias(name = "git-nfs", actual = "//crates/git-nfs:git-nfs-bin", visibility = ["//visibility:public"])
+alias(name = "git-projfs", actual = "//crates/git-projfs:git-projfs-bin", visibility = ["//visibility:public"])
+alias(name = "git-jj", actual = "//crates/git-jj:git-jj-bin", visibility = ["//visibility:public"])
+alias(name = "git-output-service", actual = "//crates/git-output-service:git-output-service-bin", visibility = ["//visibility:public"])

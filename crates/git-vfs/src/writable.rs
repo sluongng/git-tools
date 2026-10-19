@@ -19,6 +19,7 @@ use std::time::{Duration, SystemTime};
 const TTL: Duration = Duration::from_secs(1);
 const DIRECT_IO: u32 = 1;
 const XATTRS: &[u8] = b"user.gitsha1\0user.gitsha1.hex\0";
+const BASE_XATTRS: &[u8] = b"user.gitsha1\0user.gitsha1.hex\0user.gitsha1.base\0";
 
 fn file_type(kind: Kind) -> FileType {
     match kind {
@@ -795,6 +796,32 @@ impl Filesystem for WritableGitFs {
         size: u32,
         reply: ReplyXattr,
     ) {
+        // Unlike user.gitsha1 (which also hashes dirty payloads), this identity
+        // is safe to reference in the backing Git object store without first
+        // writing a new blob. A modified/new payload must be stored by callers.
+        if name == OsStr::new("user.gitsha1.base") {
+            let result = (|| -> Result<Vec<u8>> {
+                let entry = self.overlay.content_entry(ino)?;
+                if entry.control || entry.kind.is_dir() || !matches!(entry.payload, Payload::Base) {
+                    return Err(error(libc::ENODATA));
+                }
+                let oid = entry
+                    .base_oid
+                    .as_deref()
+                    .ok_or_else(|| error(libc::ENODATA))?;
+                let digest = hex::decode(oid)?;
+                if digest.len() != 20 {
+                    return Err(error(libc::EIO));
+                }
+                Ok(digest)
+            })();
+            match result {
+                Ok(data) if size == 0 => reply.size(data.len() as u32),
+                Ok(data) => xattr(reply, size, &data),
+                Err(e) => reply.error(fail(e)),
+            }
+            return;
+        }
         if size == 0 {
             let result = (|| -> Result<u32> {
                 let hex = matches!(name.as_bytes(), b"user.gitsha1.hex" | b"user.blake3.hex");
@@ -887,6 +914,10 @@ impl Filesystem for WritableGitFs {
                 size,
                 if n.kind.is_dir() || n.control {
                     b""
+                } else if matches!(n.payload, Payload::Base) && self.blake3.is_some() {
+                    crate::blake3_xattr::BASE_XATTRS
+                } else if matches!(n.payload, Payload::Base) {
+                    BASE_XATTRS
                 } else if self.blake3.is_some() {
                     crate::blake3_xattr::XATTRS
                 } else {

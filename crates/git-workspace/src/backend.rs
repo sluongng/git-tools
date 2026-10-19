@@ -688,12 +688,48 @@ impl GitRepo {
 
 // Shared repository/environment isolation for one-shot commands and the owned
 // content reader. Authentication and ordinary Git configuration remain native.
+// Windows filesystem calls accept verbatim paths returned by canonicalize,
+// but Git for Windows parses --git-dir itself and does not accept that prefix.
+// Keep the canonical PathBuf for filesystem I/O and convert only Git's argv.
+// Work in UTF-16 rather than a lossy string so UNC and Unicode names survive.
+#[cfg(windows)]
+fn native_git_path(path: &Path) -> std::ffi::OsString {
+    use std::os::windows::ffi::{OsStrExt, OsStringExt};
+    use std::path::Prefix;
+    let units: Vec<u16> = path.as_os_str().encode_wide().collect();
+    let prefix = path.components().next();
+    let (leading, skip): (&[u16], usize) = match prefix {
+        Some(std::path::Component::Prefix(prefix)) => match prefix.kind() {
+            Prefix::VerbatimDisk(_) => (&[], 4),
+            Prefix::VerbatimUNC(_, _) => (&[b'/' as u16, b'/' as u16], 8),
+            _ => (&[], 0),
+        },
+        _ => (&[], 0),
+    };
+    let converted: Vec<_> = leading
+        .iter()
+        .copied()
+        .chain(units[skip..].iter().map(|&unit| {
+            if unit == b'\\' as u16 {
+                b'/' as u16
+            } else {
+                unit
+            }
+        }))
+        .collect();
+    std::ffi::OsString::from_wide(&converted)
+}
+#[cfg(unix)]
+fn native_git_path(path: &Path) -> &std::ffi::OsStr {
+    path.as_os_str()
+}
+
 fn git_command(repository: &Path, binary: &Path, args: &[&str], allow_fetch: bool) -> Command {
     let mut command = Command::new(binary);
     command
         .arg("--no-replace-objects")
         .arg("--git-dir")
-        .arg(repository)
+        .arg(native_git_path(repository))
         .args(args)
         .current_dir(repository)
         .stdout(Stdio::piped())

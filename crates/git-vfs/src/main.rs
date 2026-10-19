@@ -55,7 +55,8 @@ struct RepoArgs {
     remote: String,
     #[arg(long, value_enum, default_value = "error")]
     size_fallback: Fallback,
-    /// Provider for warm-sizes. Auto also warms GitHub metadata before mounting.
+    /// Provider for warm-sizes. Explicit providers batch metadata before mount;
+    /// auto warms GitHub metadata but keeps other origins demand-driven.
     #[arg(long, value_enum, default_value = "auto")]
     size_source: SizeSourceArg,
     /// Read an API token from this environment variable (never a token value).
@@ -552,9 +553,11 @@ fn main() -> Result<()> {
                 eprintln!("BLAKE3 metadata: {}", serde_json::to_string(&report)?);
             }
             if !blake3
-                && (repository.size_source == SizeSourceArg::Github
-                    || (repository.size_source == SizeSourceArg::Auto
-                        && repo.is_github_remote()?))
+                && (matches!(
+                    repository.size_source,
+                    SizeSourceArg::Github | SizeSourceArg::Git
+                ) || (repository.size_source == SizeSourceArg::Auto
+                    && repo.is_github_remote()?))
             {
                 let report = repo.warm_snapshot_sizes(&snapshot, &repository.size_options())?;
                 eprintln!("Size metadata: {}", serde_json::to_string(&report)?);

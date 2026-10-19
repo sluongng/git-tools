@@ -3,6 +3,8 @@ use serde::Serialize;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 pub const XATTRS: &[u8] = b"user.gitsha1\0user.gitsha1.hex\0user.blake3\0user.blake3.hex\0";
+pub const BASE_XATTRS: &[u8] =
+    b"user.gitsha1\0user.gitsha1.hex\0user.gitsha1.base\0user.blake3\0user.blake3.hex\0";
 #[derive(Default)]
 pub struct Blake3XattrStats {
     base_hits: AtomicU64,

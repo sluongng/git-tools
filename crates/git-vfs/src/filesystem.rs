@@ -12,7 +12,7 @@ use std::os::unix::ffi::OsStrExt;
 use std::sync::Mutex;
 use std::time::Duration;
 const TTL: Duration = Duration::from_secs(3600);
-const XATTRS: &[u8] = b"user.gitsha1\0user.gitsha1.hex\0";
+const XATTRS: &[u8] = b"user.gitsha1\0user.gitsha1.hex\0user.gitsha1.base\0";
 fn errno_error(code: i32) -> anyhow::Error {
     std::io::Error::from_raw_os_error(code).into()
 }
@@ -359,7 +359,7 @@ impl Filesystem for GitFs {
         let oid = n.oid.as_ref().expect("validated blob ID");
         if size == 0 {
             let length = match name.as_bytes() {
-                b"user.gitsha1" => 20,
+                b"user.gitsha1" | b"user.gitsha1.base" => 20,
                 b"user.gitsha1.hex" => 40,
                 b"user.blake3" | b"user.blake3.hex" => {
                     if self.blake3.is_none() {
@@ -421,7 +421,7 @@ impl Filesystem for GitFs {
             return;
         }
         match name.as_bytes() {
-            b"user.gitsha1" => match hex::decode(oid) {
+            b"user.gitsha1" | b"user.gitsha1.base" => match hex::decode(oid) {
                 Ok(data) => reply_xattr(reply, size, &data),
                 Err(_) => reply.error(libc::EIO),
             },
@@ -437,7 +437,7 @@ impl Filesystem for GitFs {
                 if n.kind.is_dir() {
                     b""
                 } else if self.blake3.is_some() {
-                    crate::blake3_xattr::XATTRS
+                    crate::blake3_xattr::BASE_XATTRS
                 } else {
                     XATTRS
                 },

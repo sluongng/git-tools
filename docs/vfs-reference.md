@@ -345,8 +345,12 @@ Discovery is bounded to 8 MiB per response, 64 MiB in aggregate, 1,024 requests,
 and 500,000 local manifest entries. Exceeding a limit fails explicitly rather than
 accepting incomplete metadata or hydrating contents.
 
-Use `--size-source=git` to retain native Git size discovery and skip automatic
-GitHub warming on mount, or `--size-source=github` to require the GitHub provider.
+Use `--size-source=git` to batch native Git size metadata before mounting instead
+of GitHub warming, or `--size-source=github` to require the GitHub provider.
+Native batching requires protocol-v2 object-info; the default error fallback
+does not fetch contents. Mount readiness includes this metadata phase.
+Selecting `--size-fallback=fetch` explicitly can download the whole snapshot
+during native warming if the remote cannot supply object sizes.
 The API endpoint is fixed to `https://api.github.com`, redirects are not followed,
 and no Git credentials are automatically forwarded. Public metadata needs no token.
 For a private repository or higher rate limit, explicitly select a token-bearing
@@ -436,7 +440,8 @@ The mounted filesystem and path-taking commands preserve the original native fil
   model; external overlay writers would require explicit invalidation. Native Git's
   private mmap hashing works on the tested kernel; writable/shared mmap, hard links, device nodes,
   arbitrary user xattr mutations, and atime tracking are not implemented.
-- Metadata requests currently query one OID at a time. Use `warm-sizes` to batch before traversal.
+- On-demand native attributes can query one OID at a time. Use `--size-source=git`
+  to batch before mounting, or run `warm-sizes` separately before traversal.
 - Native Git handles transport, authentication, and object retrieval. No credential extraction or new auth layer.
 - Backend operations are serialized within a mount. Git subprocesses have no timeout/cancellation layer yet;
   a blocked authentication/network operation can delay a FUSE request.

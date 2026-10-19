@@ -7,19 +7,25 @@ Rust tools for starting work on Git repositories without a full checkout.
 - [`git-vfs`](crates/git-vfs/): writable Linux FUSE view of a blobless clone,
   with lazy reads and persistent per-agent edits.
 
+Additional crates: [`git-nfs`](crates/git-nfs/) for macOS NFS,
+[`git-projfs`](crates/git-projfs/) for Windows,
+[`git-jj`](crates/git-jj/) for Jujutsu working copies, and
+[`git-output-service`](crates/git-output-service/) for BuildBuddy-backed Bazel outputs.
+These are experimental; native macOS kernel acceptance is still pending.
+
 Native Git stores and transfers objects; Fjall stores local metadata.
 The VFS also works directly with GitHub, without a proxy.
 
 ## Quick start
 
-Requires Rust/Cargo with edition 2024 support, native Git, Linux `/dev/fuse`,
+Requires the pinned Rust toolchain, native Git, Linux `/dev/fuse`,
 and `fusermount3` (usually the `fuse3` package).
 Run commands from this repository's root.
 
 **Shared proxy — run once, in its own terminal:**
 
 ```sh
-cargo build --release --workspace
+cargo build --release -p git-proxy -p git-vfs
 target/release/git-proxy --cache-dir /tmp/git-tools-proxy \
   --repo bazel=https://github.com/bazelbuild/bazel.git --enable-blake3
 ```
@@ -92,7 +98,7 @@ including reclamation, rename/digest work and real incremental RBE builds.
 - [Proxy design and research](docs/proxy-design.md)
 - [VFS lifecycle design and measurements](docs/design/vfs-iteration-lifecycle.md)
 
-This is a source-tree prototype: Linux/SHA1 only, fixed base commit per mount,
+This is a source-tree prototype: SHA1 repositories, fixed base commit per mount,
 no general checkout/merge/rebase guarantee. Basic Git commit/log work, but a first
 commit can hydrate the entire indexed snapshot. The overlay contains uncommitted
 and staged work: **do not delete it as a cache**.

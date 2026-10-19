@@ -4,6 +4,7 @@ use anyhow::{Context, Result, anyhow, ensure};
 use serde::Serialize;
 use std::collections::HashMap;
 use std::ffi::OsString;
+#[cfg(unix)]
 use std::os::unix::ffi::OsStringExt;
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
@@ -68,6 +69,18 @@ pub struct Snapshot {
     pub(crate) nodes: Arc<Vec<Node>>,
     paths: Arc<HashMap<PathBuf, u64>>,
     pub(crate) timestamp: SystemTime,
+}
+
+/// Display-only repository paths use Git's slash separators on every host.
+pub(crate) fn display_git_path(path: &Path) -> String {
+    #[cfg(windows)]
+    {
+        path.to_string_lossy().replace('\\', "/")
+    }
+    #[cfg(unix)]
+    {
+        path.to_string_lossy().into_owned()
+    }
 }
 
 fn errno_error(code: i32) -> anyhow::Error {
@@ -161,7 +174,15 @@ impl Snapshot {
                     .all(|part| !part.is_empty() && part != b"." && part != b".."),
                 "unsafe Git tree path"
             );
+            #[cfg(unix)]
             let path = PathBuf::from(OsString::from_vec(raw_path.to_vec()));
+            #[cfg(windows)]
+            let path = {
+                let text =
+                    std::str::from_utf8(raw_path).context("Windows requires UTF-8 Git paths")?;
+                ensure!(!text.contains(['\\', ':']), "unsupported Windows Git path");
+                PathBuf::from(text)
+            };
             ensure!(
                 !path.as_os_str().is_empty()
                     && path.components().all(|c| matches!(c, Component::Normal(_))),
@@ -228,7 +249,7 @@ impl Snapshot {
             .iter()
             .skip(1)
             .map(|n| PublicEntry {
-                path: n.path.to_string_lossy().into_owned(),
+                path: display_git_path(&n.path),
                 inode: n.inode,
                 mode: n.mode,
                 kind: n.kind.name().into(),
@@ -250,7 +271,7 @@ impl Snapshot {
     pub fn stat_path(&self, repo: &mut GitRepo, path: &Path) -> Result<FileMetadata> {
         let n = self.path_node(path)?;
         Ok(FileMetadata {
-            path: n.path.to_string_lossy().into_owned(),
+            path: display_git_path(&n.path),
             inode: n.inode,
             mode: n.mode,
             kind: n.kind.name().into(),
@@ -272,10 +293,26 @@ impl Snapshot {
     pub fn digest_path(&self, path: &Path) -> Result<Vec<u8>> {
         let n = self.path_node(path)?;
         if n.kind.is_dir() {
-            return Err(errno_error(libc::ENODATA));
+            return Err(errno_error(missing_xattr_errno()));
         }
         Ok(hex::decode(
             n.oid.as_deref().context("blob missing object ID")?,
         )?)
+    }
+}
+
+/// Windows has no POSIX extended attribute errno; callers map not-found uniformly.
+fn missing_xattr_errno() -> i32 {
+    #[cfg(target_os = "linux")]
+    {
+        libc::ENODATA
+    }
+    #[cfg(target_os = "macos")]
+    {
+        libc::ENOATTR
+    }
+    #[cfg(windows)]
+    {
+        libc::ENOENT
     }
 }

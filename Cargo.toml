@@ -6,8 +6,12 @@ members = [
     "crates/git-pack-cache",
     "crates/git-reapi",
     "crates/git-proxy",
+    "crates/git-projfs",
+    "crates/git-output-service",
+    "crates/git-nfs",
+    "crates/git-jj",
 ]
-exclude = ["third_party/fuser"]
+exclude = ["third_party/fuser", "third_party/nfsserve"]
 resolver = "3"
 
 [patch.crates-io]

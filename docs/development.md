@@ -1,6 +1,6 @@
 # Building git-tools
 
-Use Bazelisk (the repository pins Bazel) or Cargo with Rust edition 2024 support.
+Use Bazelisk or Cargo; the repository pins both Bazel and Rust toolchains.
 Linux x86-64 is the initial Bazel target. Native Git and `/dev/fuse` are runtime
 requirements, not dependencies of every library.
 
@@ -58,6 +58,15 @@ The remote execution platform pins a standard BuildBuddy Ubuntu image by digest.
 | `git-pack-cache` | Smart-HTTP keys, framing and bounded generated responses | None |
 | `git-reapi` | Generated REAPI/ByteStream bindings | None |
 | `git-proxy` | HTTP server, native Git orchestration and CAS transport/sync | `git-pack-cache`, `git-reapi` |
+| `git-nfs` | Loopback writable NFSv3 frontend | `git-workspace`, `git-overlay` |
+| `git-projfs` | Windows ProjFS provider and native Git admin | `git-workspace` |
+| `git-jj` | Custom Jujutsu CLI/working-copy backend | `git-overlay` |
+| `git-output-service` | Bazel output-tree lifecycle and verified CAS materialization | `git-reapi` |
+
+Each frontend has a root executable alias and crate-local verification instructions.
+See [platform contracts and acceptance](design/platform-frontends.md); compiling
+a platform target does not establish native runtime support. The pinned NFS fork
+and its local changes live in `third_party/nfsserve`.
 
 The lower VFS crates do not depend on FUSE. Existing `git_vfs` module paths and
 proxy protocol/config exports are reexported for compatibility. All workspace

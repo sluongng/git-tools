@@ -1,6 +1,7 @@
 //! GitHub tree metadata is trusted only after matching the local pinned tree manifest.
 use std::collections::{HashMap, HashSet};
 use std::io::Read;
+#[cfg(unix)]
 use std::os::unix::ffi::OsStrExt;
 use std::time::{Duration, Instant};
 
@@ -230,7 +231,7 @@ fn manifest(snapshot: &Snapshot) -> Result<Manifest> {
         ensure!(
             expected
                 .insert(
-                    node.path.as_os_str().as_bytes().to_vec(),
+                    git_path_bytes(&node.path)?,
                     Expected {
                         mode: node.mode,
                         oid: id,
@@ -378,6 +379,21 @@ fn load(snapshot: &Snapshot, root: &str, transport: &mut impl Transport) -> Resu
         validate(response, &children, &mut metadata.sizes)?;
     }
     Ok(metadata)
+}
+
+fn git_path_bytes(path: &std::path::Path) -> Result<Vec<u8>> {
+    #[cfg(unix)]
+    {
+        Ok(path.as_os_str().as_bytes().to_vec())
+    }
+    #[cfg(windows)]
+    {
+        Ok(path
+            .to_str()
+            .context("Windows requires UTF-8 Git paths")?
+            .replace('\\', "/")
+            .into_bytes())
+    }
 }
 
 #[cfg(test)]

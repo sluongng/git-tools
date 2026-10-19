@@ -5,7 +5,10 @@ use serde::Serialize;
 use std::collections::{HashMap, VecDeque};
 use std::fs::{File, OpenOptions};
 use std::io::Write;
+#[cfg(unix)]
 use std::os::unix::fs::{FileExt, OpenOptionsExt};
+#[cfg(windows)]
+use std::os::windows::fs::{FileExt, OpenOptionsExt};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
@@ -775,6 +778,7 @@ static NEXT_DIRECTORY: AtomicU64 = AtomicU64::new(0);
 struct SpoolDirectory(PathBuf);
 impl SpoolDirectory {
     fn new(repo: &std::path::Path) -> Result<Self> {
+        #[cfg(unix)]
         use std::os::unix::fs::DirBuilderExt;
         for _ in 0..1024 {
             let directory = repo.join(format!(
@@ -782,7 +786,11 @@ impl SpoolDirectory {
                 std::process::id(),
                 NEXT_DIRECTORY.fetch_add(1, Ordering::Relaxed)
             ));
-            match std::fs::DirBuilder::new().mode(0o700).create(&directory) {
+            #[cfg(unix)]
+            let created = std::fs::DirBuilder::new().mode(0o700).create(&directory);
+            #[cfg(windows)]
+            let created = std::fs::create_dir(&directory);
+            match created {
                 Ok(()) => return Ok(Self(directory)),
                 Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
                 Err(e) => return Err(e.into()),
@@ -795,13 +803,28 @@ impl SpoolDirectory {
             "object-{}",
             NEXT_DIRECTORY.fetch_add(1, Ordering::Relaxed)
         ));
-        let file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create_new(true)
+        let mut options = OpenOptions::new();
+        options.read(true).write(true).create_new(true);
+        #[cfg(unix)]
+        options
             .mode(0o600)
-            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
-            .open(&path)?;
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
+        // CREATE_NEW refuses existing files, including reparse points. Keep
+        // the spool anonymous through a delete-on-close handle on Windows.
+        #[cfg(windows)]
+        options
+            .custom_flags(
+                windows_sys::Win32::Storage::FileSystem::FILE_FLAG_DELETE_ON_CLOSE
+                    | windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT,
+            )
+            .access_mode(
+                windows_sys::Win32::Storage::FileSystem::FILE_GENERIC_READ
+                    | windows_sys::Win32::Storage::FileSystem::FILE_GENERIC_WRITE
+                    | windows_sys::Win32::Storage::FileSystem::DELETE,
+            )
+            .share_mode(0);
+        let file = options.open(&path)?;
+        #[cfg(unix)]
         std::fs::remove_file(path)?;
         Ok(file)
     }
@@ -1093,7 +1116,17 @@ fn local_worker(handle: ContentHandle, repo: GitRepo, cache: Arc<Mutex<Cache>>, 
 fn read_range(file: &File, offset: u64, size: u32, length: u64) -> Result<Vec<u8>> {
     let count = length.saturating_sub(offset).min(size as u64) as usize;
     let mut data = vec![0; count];
+    #[cfg(unix)]
     file.read_exact_at(&mut data, offset)?;
+    #[cfg(windows)]
+    {
+        let mut read = 0;
+        while read < data.len() {
+            let count = file.seek_read(&mut data[read..], offset + read as u64)?;
+            ensure!(count != 0, "unexpected end of content spool");
+            read += count;
+        }
+    }
     Ok(data)
 }
 fn read_local(
@@ -1315,7 +1348,7 @@ fn fetch_worker(handle: ContentHandle, mut repo: GitRepo) {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
     use std::path::Path;
@@ -1993,5 +2026,74 @@ os.execvp('git',['git',*sys.argv[1:]])
         assert!(!stale.contains(&directory.0));
         drop(directory);
         assert!(stale.iter().all(|path| path.is_dir()));
+    }
+}
+
+// Unlike the controlled-promisor Unix fixtures above, this public scheduler
+// workflow uses only native Git and runs on Windows as well as Unix.
+#[cfg(test)]
+mod portable_tests {
+    use super::*;
+    use std::process::{Command, Stdio};
+    use std::sync::mpsc;
+
+    #[test]
+    fn native_git_cached_ranges_and_shutdown_remove_spool_files() {
+        let root = tempfile::tempdir().unwrap();
+        let bare = root.path().join("objects ü with spaces.git");
+        let status = Command::new("git")
+            .args(["init", "--bare", "--object-format=sha1"])
+            .arg(&bare)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let bytes: Vec<_> = (0..(256 * 1024)).map(|i| (i % 251) as u8).collect();
+        let mut child = Command::new("git")
+            .arg("--git-dir")
+            .arg(&bare)
+            .args(["hash-object", "-w", "--stdin"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        child.stdin.take().unwrap().write_all(&bytes).unwrap();
+        let output = child.wait_with_output().unwrap();
+        assert!(output.status.success());
+        let oid = String::from_utf8(output.stdout).unwrap().trim().to_owned();
+        let mut repo =
+            GitRepo::open(&bare, "git", "origin", super::super::SizeFallback::Error).unwrap();
+        let mut scheduler = ContentScheduler::new(&mut repo, ContentConfig::default()).unwrap();
+        let handle = scheduler.handle();
+        for (offset, requested) in [
+            (0, 512),
+            (65_529, 64),
+            (bytes.len() - 7, 64),
+            (bytes.len() + 1, 8),
+        ] {
+            let (tx, rx) = mpsc::channel();
+            handle
+                .read(&oid, offset as u64, requested, move |value| {
+                    let _ = tx.send(value);
+                })
+                .unwrap();
+            let data = rx.recv_timeout(Duration::from_secs(10)).unwrap().unwrap();
+            let start = offset.min(bytes.len());
+            let end = offset.saturating_add(requested as usize).min(bytes.len());
+            assert_eq!(data.as_ref(), &bytes[start..end]);
+        }
+        assert_eq!(handle.stats().cache_files, 1);
+        assert!(handle.stats().cache_hits >= 3);
+        scheduler.shutdown().unwrap();
+        assert_eq!(handle.stats().cache_total_bytes, 0);
+        assert!(
+            !std::fs::read_dir(&bare).unwrap().any(|entry| entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with("vfs-content-")),
+            "shutdown must close delete-on-close handles before removing the spool directory"
+        );
     }
 }

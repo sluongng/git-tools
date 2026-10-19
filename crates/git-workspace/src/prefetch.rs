@@ -4,14 +4,13 @@
 //! attributes, and symlink referents remain lazy. RC paths are workspace-relative.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::os::unix::ffi::OsStrExt;
 use std::path::{Component, Path, PathBuf};
 
 use anyhow::{Context, Result, ensure};
 use serde::Serialize;
 
 use crate::backend::{BlobPrefetchReport, GitRepo};
-use crate::filesystem::{PublicEntry, Snapshot};
+use crate::filesystem::{PublicEntry, Snapshot, display_git_path};
 
 #[derive(Debug, Serialize)]
 pub struct BazelPrefetchReport {
@@ -121,7 +120,7 @@ impl BazelPrefetchPolicy {
             .skip(1)
             .filter(|entry| self.matches(&entry.path, entry.kind.name()))
             .map(|entry| PublicEntry {
-                path: entry.path.to_string_lossy().into_owned(),
+                path: display_git_path(&entry.path),
                 inode: entry.inode,
                 mode: entry.mode,
                 kind: entry.kind.name().to_owned(),
@@ -137,7 +136,7 @@ pub fn is_bazel_metadata_path(path: &Path) -> bool {
     let Some(name) = path.file_name() else {
         return false;
     };
-    let name = name.as_bytes();
+    let name = name.as_encoded_bytes();
     matches!(
         name,
         b"BUILD"
@@ -203,7 +202,7 @@ pub fn prefetch_bazel_with_policy(
             "Bazel metadata filename"
         };
         reasons
-            .entry(path.to_string_lossy().into_owned())
+            .entry(display_git_path(path))
             .or_default()
             .push(reason.into());
         let oid = node
@@ -295,7 +294,7 @@ pub fn prefetch_bazel_with_policy(
                     stop = true;
                     break 'seed_loop;
                 }
-                let display = target.to_string_lossy().into_owned();
+                let display = display_git_path(&target);
                 let reason = format!("{} in {}", reference.reason, path.display());
                 let target_reasons = reasons.entry(display).or_default();
                 if !target_reasons.contains(&reason) {
@@ -330,10 +329,7 @@ pub fn prefetch_bazel_with_policy(
         }
         seeds = next;
     }
-    let mut selected_paths: Vec<_> = selected
-        .into_iter()
-        .map(|p| p.to_string_lossy().into_owned())
-        .collect();
+    let mut selected_paths: Vec<_> = selected.into_iter().map(|p| display_git_path(&p)).collect();
     selected_paths.sort();
     Ok(BazelPrefetchReport {
         selected_paths,
@@ -350,7 +346,7 @@ enum Seed {
     Rc,
 }
 fn seed_kind(path: &Path) -> Option<Seed> {
-    let name = path.file_name()?.as_bytes();
+    let name = path.file_name()?.as_encoded_bytes();
     if name == b".bazelrc" {
         Some(Seed::Rc)
     } else if name == b"MODULE.bazel" || name.ends_with(b".MODULE.bazel") {
