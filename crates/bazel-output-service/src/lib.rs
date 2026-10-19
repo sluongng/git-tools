@@ -1,10 +1,12 @@
-//! Bazel 9.2 Remote Output Service v1, eagerly materializing a pinned CAS.
+//! Bazel 9.2 Remote Output Service v1 with eager and native lazy projections.
 //!
-//! Outputs are real local files. Every build requests a conservative rescan;
-//! no remote-only metadata or unverified incremental state survives a build.
+//! Eager storage downloads before staging; native lazy projections publish CAS
+//! metadata and verify content on first read. Every build requests a conservative
+//! rescan and checks remote presence before retaining untouched lazy entries.
 //! The service is intended for a single trusted local user on loopback.
 use cap_fs_ext::{FollowSymlinks, OpenOptionsFollowExt, OpenOptionsSyncExt};
 use cap_std::fs::{Dir, OpenOptions};
+use output_core::{Artifact, BlobSource, Projection, TreeStat};
 use prost::Message;
 use reapi::{Digest, proto::google::bytestream as bs};
 use sha2::{Digest as _, Sha256};
@@ -51,6 +53,8 @@ pub struct OutputService {
     root: Arc<Dir>,
     root_path: PathBuf,
     backend: Backend,
+    projection: Option<Arc<dyn Projection>>,
+    projection_tree: Option<Arc<output_core::Tree>>,
     // Serializes lifecycle changes with staging, including across network awaits.
     // This favors correctness over parallel staging in this initial implementation.
     state: Arc<Mutex<HashMap<String, Build>>>,
@@ -67,10 +71,14 @@ pub struct MetricsSnapshot {
     pub stage_requests: u64,
     pub staged_files: u64,
     pub verified_bytes: u64,
+    pub lazy_fetches: u64,
+    pub lazy_verified_bytes: u64,
+    pub lazy_cache_hits: u64,
 }
 struct Build {
     id: String,
-    dir: Dir,
+    dir: Option<Dir>,
+    key: String,
     digest_function: i32,
     finalized: bool,
 }
@@ -101,6 +109,42 @@ fn io_status(error: std::io::Error) -> Status {
             Status::permission_denied("output path is not accessible within the output tree")
         }
         _ => Status::failed_precondition("output filesystem operation failed"),
+    }
+}
+fn projection_status(error: anyhow::Error) -> Status {
+    if error
+        .downcast_ref::<output_core::CacheLimitError>()
+        .is_some()
+    {
+        return Status::resource_exhausted("artifact exceeds configured lazy cache limits");
+    }
+    if let Some(status) = error.downcast_ref::<Status>() {
+        return status.clone();
+    }
+    if let Some(error) = error.downcast_ref::<std::io::Error>() {
+        return match error.kind() {
+            std::io::ErrorKind::NotFound => Status::not_found("output path does not exist"),
+            std::io::ErrorKind::PermissionDenied => {
+                Status::permission_denied("output path is not accessible")
+            }
+            std::io::ErrorKind::AlreadyExists => {
+                Status::already_exists("output path already exists")
+            }
+            _ => Status::failed_precondition("projected output filesystem operation failed"),
+        };
+    }
+    Status::failed_precondition("projected output operation failed")
+}
+
+fn projected_path(build: &Build, path: &Path) -> String {
+    if path == Path::new(".") || path.as_os_str().is_empty() {
+        build.key.clone()
+    } else {
+        format!(
+            "{}/{}",
+            build.key,
+            path.to_string_lossy().replace('\\', "/")
+        )
     }
 }
 fn relative(path: &str, allow_root: bool) -> Result<PathBuf, Status> {
@@ -244,6 +288,11 @@ impl Hasher {
     }
 }
 impl Backend {
+    fn identity(&self) -> String {
+        blake3::hash(format!("{}\0{}", self.endpoint, self.instance).as_bytes())
+            .to_hex()
+            .to_string()
+    }
     fn request<T>(&self, value: T) -> Request<T> {
         let mut req = Request::new(value);
         req.set_timeout(self.timeout);
@@ -257,7 +306,7 @@ impl Backend {
         &self,
         digest: &Digest,
         function: i32,
-        file: &mut cap_std::fs::File,
+        file: &mut (impl Write + Send),
     ) -> Result<(), Status> {
         if digest.size_bytes as u64 > self.max_blob_bytes {
             return Err(Status::resource_exhausted(
@@ -297,6 +346,83 @@ impl Backend {
             return Err(Status::data_loss("CAS content digest or length mismatch"));
         }
         Ok(())
+    }
+}
+
+#[async_trait::async_trait]
+impl BlobSource for Backend {
+    async fn fetch(&self, artifact: &Artifact, file: &mut std::fs::File) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            artifact.backend == self.identity() && artifact.instance == self.instance,
+            "artifact does not belong to the configured CAS"
+        );
+        let size_bytes = i64::try_from(artifact.size)?;
+        tokio::time::timeout(
+            self.timeout,
+            self.download(
+                &Digest {
+                    hash: artifact.hash.clone(),
+                    size_bytes,
+                },
+                artifact.digest_function,
+                file,
+            ),
+        )
+        .await
+        .map_err(|_| Status::deadline_exceeded("CAS read timed out"))??;
+        Ok(())
+    }
+
+    async fn missing(&self, artifacts: &[Artifact]) -> anyhow::Result<Vec<Artifact>> {
+        use reapi::reapi::{
+            FindMissingBlobsRequest,
+            content_addressable_storage_client::ContentAddressableStorageClient,
+        };
+        let mut missing = Vec::new();
+        for function in [1, 9] {
+            let selected: Vec<_> = artifacts
+                .iter()
+                .filter(|a| a.digest_function == function)
+                .collect();
+            for batch in selected.chunks(512) {
+                let mut digests = Vec::new();
+                for artifact in batch {
+                    anyhow::ensure!(
+                        artifact.backend == self.identity() && artifact.instance == self.instance,
+                        "artifact does not belong to the configured CAS"
+                    );
+                    digests.push(Digest {
+                        hash: artifact.hash.clone(),
+                        size_bytes: i64::try_from(artifact.size)?,
+                    });
+                }
+                let response = ContentAddressableStorageClient::new(self.channel.clone())
+                    .find_missing_blobs(self.request(FindMissingBlobsRequest {
+                        instance_name: self.instance.clone(),
+                        blob_digests: digests,
+                        digest_function: function,
+                    }))
+                    .await?
+                    .into_inner();
+                for digest in response.missing_blob_digests {
+                    let artifact = batch
+                        .iter()
+                        .find(|a| {
+                            a.hash == digest.hash
+                                && i64::try_from(a.size).ok() == Some(digest.size_bytes)
+                        })
+                        .ok_or_else(|| {
+                            anyhow::anyhow!("CAS returned an unrequested missing digest")
+                        })?;
+                    missing.push((*artifact).clone());
+                }
+            }
+        }
+        anyhow::ensure!(
+            artifacts.iter().all(|a| matches!(a.digest_function, 1 | 9)),
+            "unsupported digest function"
+        );
+        Ok(missing)
     }
 }
 impl OutputService {
@@ -340,15 +466,48 @@ impl OutputService {
                 max_blob_bytes: config.max_blob_bytes,
                 timeout: config.rpc_timeout,
             },
+            projection: None,
+            projection_tree: None,
             state: Arc::new(Mutex::new(HashMap::new())),
             metrics: Arc::new(Metrics::default()),
         })
     }
+    /// A credential-bearing source restricted to this operator-selected backend.
+    pub fn blob_source(&self) -> Arc<dyn BlobSource> {
+        Arc::new(self.backend.clone())
+    }
+    pub fn backend_identity(&self) -> String {
+        self.backend.identity()
+    }
+    /// Attach a mounted projection before accepting any build requests.
+    /// The adapter must return the root canonicalized before mounting. Do not
+    /// re-enter a native mount synchronously from the async service.
+    pub fn with_projection(
+        mut self,
+        projection: Arc<dyn Projection>,
+        tree: Arc<output_core::Tree>,
+    ) -> anyhow::Result<Self> {
+        anyhow::ensure!(
+            projection.root() == self.root_path,
+            "projection root must match the configured output root"
+        );
+        self.projection = Some(projection);
+        self.projection_tree = Some(tree);
+        Ok(self)
+    }
     pub fn metrics(&self) -> MetricsSnapshot {
+        let cache = self
+            .projection_tree
+            .as_ref()
+            .map(|t| t.cache_metrics())
+            .unwrap_or_default();
         MetricsSnapshot {
             stage_requests: self.metrics.stage_requests.load(Ordering::Relaxed),
             staged_files: self.metrics.staged_files.load(Ordering::Relaxed),
             verified_bytes: self.metrics.verified_bytes.load(Ordering::Relaxed),
+            lazy_fetches: cache.fetches,
+            lazy_verified_bytes: cache.verified_bytes,
+            lazy_cache_hits: cache.hits,
         }
     }
     fn key(id: &str) -> Result<String, Status> {
@@ -371,13 +530,39 @@ impl OutputService {
     ) -> Result<(), Status> {
         let path = relative(path, false)?;
         let digest = digest_of(locator)?;
+        if digest.size_bytes as u64 > self.backend.max_blob_bytes {
+            return Err(Status::resource_exhausted(
+                "blob exceeds configured size limit",
+            ));
+        }
+        if let Some(projection) = &self.projection {
+            projection
+                .stage(
+                    &projected_path(build, &path),
+                    Artifact {
+                        backend: self.backend.identity(),
+                        instance: self.backend.instance.clone(),
+                        digest_function: build.digest_function,
+                        hash: digest.hash,
+                        size: digest.size_bytes as u64,
+                    },
+                )
+                .await
+                .map_err(projection_status)?;
+            self.metrics.staged_files.fetch_add(1, Ordering::Relaxed);
+            return Ok(());
+        }
+        let dir = build
+            .dir
+            .as_ref()
+            .ok_or_else(|| Status::internal("missing eager output directory"))?;
         let parent_path = path
             .parent()
             .filter(|p| !p.as_os_str().is_empty())
             .unwrap_or(Path::new("."));
         // Capability-relative resolution rejects symlink escapes and is race-safe.
-        build.dir.create_dir_all(parent_path).map_err(io_status)?;
-        let parent = build.dir.open_dir(parent_path).map_err(io_status)?;
+        dir.create_dir_all(parent_path).map_err(io_status)?;
+        let parent = dir.open_dir(parent_path).map_err(io_status)?;
         let name = path
             .file_name()
             .ok_or_else(|| Status::invalid_argument("missing file name"))?;
@@ -450,7 +635,36 @@ impl OutputService {
     ) -> Result<Option<proto::batch_stat_response::Stat>, Status> {
         use proto::batch_stat_response::{Stat, stat};
         let path = relative(path, true)?;
-        let metadata = match build.dir.symlink_metadata(&path) {
+        if let Some(projection) = &self.projection {
+            return projection
+                .stat(&projected_path(build, &path), build.digest_function)
+                .await
+                .map_err(projection_status)
+                .map(|metadata| {
+                    metadata.map(|metadata| Stat {
+                        r#type: match metadata {
+                            TreeStat::Directory => Some(stat::Type::Directory(stat::Directory {})),
+                            TreeStat::Symlink { target } => {
+                                Some(stat::Type::Symlink(stat::Symlink { target }))
+                            }
+                            TreeStat::File { artifact } => Some(stat::Type::File(stat::File {
+                                locator: artifact.map(|a| {
+                                    file_locator(Digest {
+                                        hash: a.hash,
+                                        size_bytes: a.size as i64,
+                                    })
+                                }),
+                            })),
+                            TreeStat::Unknown => None,
+                        },
+                    })
+                });
+        }
+        let dir = build
+            .dir
+            .as_ref()
+            .ok_or_else(|| Status::internal("missing eager output directory"))?;
+        let metadata = match dir.symlink_metadata(&path) {
             Ok(m) => m,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
             // An unresolvable external symlink or special path is an unknown
@@ -458,7 +672,7 @@ impl OutputService {
             Err(_) => return Ok(Some(Stat { r#type: None })),
         };
         let kind = if metadata.is_symlink() {
-            match build.dir.read_link_contents(&path) {
+            match dir.read_link_contents(&path) {
                 Ok(target) => Some(stat::Type::Symlink(stat::Symlink {
                     target: target.to_string_lossy().into_owned(),
                 })),
@@ -469,7 +683,7 @@ impl OutputService {
         } else if metadata.is_file() {
             let mut options = OpenOptions::new();
             options.read(true).follow(FollowSymlinks::No).nonblock(true);
-            let mut file = match build.dir.open_with(&path, &options) {
+            let mut file = match dir.open_with(&path, &options) {
                 Ok(file) => file,
                 // A concurrent type change cannot turn lstat into a following
                 // open, or block on a FIFO while retaining the lifecycle lock.
@@ -547,9 +761,22 @@ impl BazelOutputService for OutputService {
                     "output_path_prefix must be absolute",
                 ));
             }
-            let prefix = std::fs::canonicalize(prefix).map_err(|_| {
-                Status::invalid_argument("output_path_prefix must name an existing local directory")
-            })?;
+            // The configured root was canonicalized before mounting. Its exact
+            // path and ancestors need no filesystem round trip. In particular,
+            // realpath/statfs on our own NFS mount can block its Tokio I/O driver.
+            let prefix = if self.root_path.starts_with(prefix) {
+                prefix.to_path_buf()
+            } else {
+                let prefix = prefix.to_path_buf();
+                tokio::task::spawn_blocking(move || std::fs::canonicalize(prefix))
+                    .await
+                    .map_err(|_| Status::internal("output prefix resolution task failed"))?
+                    .map_err(|_| {
+                        Status::invalid_argument(
+                            "output_path_prefix must name an existing local directory",
+                        )
+                    })?
+            };
             target
                 .strip_prefix(prefix)
                 .map_err(|_| {
@@ -568,13 +795,25 @@ impl BazelOutputService for OutputService {
                 "build_id already used by another output base",
             ));
         }
-        self.root.create_dir_all(&key).map_err(io_status)?;
-        let dir = self.root.open_dir(&key).map_err(io_status)?;
+        let dir = if let Some(projection) = &self.projection {
+            projection
+                .ensure_dir(&key)
+                .await
+                .map_err(projection_status)?;
+            // A remote-only tree must not claim objects that expired from CAS.
+            // The projection invalidates pruned bindings before acknowledging.
+            projection.refresh(&key).await.map_err(projection_status)?;
+            None
+        } else {
+            self.root.create_dir_all(&key).map_err(io_status)?;
+            Some(self.root.open_dir(&key).map_err(io_status)?)
+        };
         state.insert(
-            key,
+            key.clone(),
             Build {
                 id: req.build_id,
                 dir,
+                key,
                 digest_function: args.digest_function,
                 finalized: false,
             },
@@ -658,6 +897,10 @@ impl BazelOutputService for OutputService {
         // handles do not share delete access. A failed clean invalidates the
         // session but can safely be retried by output_base_id.
         state.remove(&key);
+        if let Some(projection) = &self.projection {
+            projection.clean(&key).await.map_err(projection_status)?;
+            return Ok(Response::new(proto::CleanResponse {}));
+        }
         match self.root.remove_dir_all(&key) {
             Ok(()) => {}
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}

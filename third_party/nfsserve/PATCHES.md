@@ -28,10 +28,16 @@ Local changes:
   capacity, so fresh requests continue to run. In-progress records are never
   evicted: if all entries are in progress, overload closes the client connection
   explicitly for retry instead of silently classifying new XIDs as duplicates.
-  Parse errors release their in-progress tracking entry.
+  Parse errors release their in-progress tracking entry. NFSv3 JUKEBOX replies
+  are sent but not retained, allowing the same XID to retry after admission
+  recovers. This exception requires a matching NFSv3 procedure and a strictly
+  validated accepted-success RPC envelope; successful mutations still replay.
 - Guarded SETATTR compares ctime and applies attributes under one backend lock;
   guarded CREATE likewise performs existence checking and creation atomically.
-- The listener admits 16 connections and 16 in-flight RPCs globally, with two
+- The listener admits 16 connections and defaults to 16 in-flight RPCs globally.
+  Backends can select a bounded request budget (capped at 1024); lazy outputs
+  use 128 slots with 64 separately admitted payload operations, reserving room
+  for metadata while cold content waits. There are two
   queued replies per connection. Separate socket forwarding/writing prevents
   reply starvation when request queues apply backpressure.
 - XDR byte arrays and integer arrays enforce a 2 MiB allocation ceiling before

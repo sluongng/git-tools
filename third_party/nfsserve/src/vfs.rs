@@ -93,6 +93,10 @@ pub enum VFSCapabilities {
 ///  The 0 fileid is reserved and should not be used
 #[async_trait]
 pub trait NFSFileSystem: Sync {
+    /// Bounded global RPC admission. Implementations that independently bound
+    /// payload waits may reserve more slots for metadata/publication traffic.
+    fn max_inflight_requests(&self) -> usize { 16 }
+
     /// Returns the set of capabilities supported
     fn capabilities(&self) -> VFSCapabilities;
     /// Returns the ID the of the root directory "/"

@@ -48,6 +48,9 @@ async fn handle_rpc(
             return Ok(false);
         }
 
+        // Only NFSv3 procedures 1..21 have an nfsstat3 result. NULL and
+        // unrelated RPC services must retain their ordinary replay behavior.
+        let nfs_status_reply = call.prog == nfs::PROGRAM && call.vers == 3 && (1..=21).contains(&call.proc);
         let mut response = Vec::new();
         let destination = &mut response;
         let res = {
@@ -73,7 +76,18 @@ async fn handle_rpc(
         .map(|_| true);
         if res.is_ok() {
             output.write_all(&response)?;
-            context.transaction_tracker.mark_processed(xid, &context.client_addr, response);
+            // The emitted success envelope uses an empty AUTH_NULL verifier.
+            // Check every discriminant before inspecting its NFS status: a
+            // successful mutation payload must never be mistaken for overload.
+            let success_header = [xid, 1, 0, 0, 0, 0].map(u32::to_be_bytes);
+            let transient = nfs_status_reply
+                && response.get(..24) == Some(success_header.as_flattened())
+                && response.get(24..28) == Some((nfs::nfsstat3::NFS3ERR_JUKEBOX as u32).to_be_bytes().as_slice());
+            if transient {
+                context.transaction_tracker.abandon(xid, &context.client_addr);
+            } else {
+                context.transaction_tracker.mark_processed(xid, &context.client_addr, response);
+            }
         }
         if res.is_err() { context.transaction_tracker.abandon(xid,&context.client_addr); }
         res

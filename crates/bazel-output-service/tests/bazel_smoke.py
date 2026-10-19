@@ -6,6 +6,7 @@ host-restricted Bazel credential helper and the service's environment receive it
 Artifacts contain logs/receipts, never credential values or a credential rc copy.
 """
 import argparse
+import contextlib
 import json
 import os
 from pathlib import Path
@@ -50,6 +51,8 @@ def main():
     parser.add_argument("--execute-remotely", action="store_true", help="also force warm-cache genrules onto the selected BuildBuddy RBE backend")
     parser.add_argument("--container-image", default="docker://gcr.io/flame-public/rbe-ubuntu22-04@sha256:0d84a80bb0fc36ba5381942adcf6493249594dcc9044845c617b78c9b621cae3")
     parser.add_argument("--artifacts", required=True, type=Path)
+    parser.add_argument("--storage", choices=("eager", "nfs", "projfs"), default="eager")
+    parser.add_argument("--keep-scratch", action="store_true", help="retain owned non-secret fixture for native failure diagnosis")
     args = parser.parse_args()
     def selection():
         if args.credential_rc is not None:
@@ -73,7 +76,9 @@ def main():
     args.artifacts.mkdir(parents=True, exist_ok=True)
     args.artifacts = args.artifacts.resolve()
     os.chmod(args.artifacts, 0o700)
-    with tempfile.TemporaryDirectory(prefix="git-output-service-smoke-") as temporary:
+    temporary_context = (contextlib.nullcontext(tempfile.mkdtemp(prefix="git-output-service-smoke-"))
+                         if args.keep_scratch else tempfile.TemporaryDirectory(prefix="git-output-service-smoke-"))
+    with temporary_context as temporary:
         scratch = Path(temporary).resolve()
         workspace = scratch / "workspace"
         workspace.mkdir()
@@ -114,6 +119,8 @@ def main():
         rc.write_text(f"common --noannounce_rc\ncommon {json.dumps(helper_option)}\n")
         root = scratch / "outputs"
         root.mkdir()
+        state = scratch / "state"
+        metrics_file = scratch / "metrics.json"
         sock = socket.socket()
         sock.bind(("127.0.0.1", 0))
         port = sock.getsockname()[1]
@@ -139,12 +146,15 @@ def main():
             del key
             try:
                 with service_log.open("a") as log:
-                    process = subprocess.Popen([str(args.service_bin.resolve()), "--listen", f"127.0.0.1:{port}", "--root", str(root), "--cas-endpoint", endpoint, "--instance-name", args.instance_name], env=env, stdout=log, stderr=subprocess.STDOUT, creationflags=subprocess.CREATE_NEW_PROCESS_GROUP if windows else 0)
+                    command = [str(args.service_bin.resolve()), "--listen", f"127.0.0.1:{port}", "--root", str(root), "--cas-endpoint", endpoint, "--instance-name", args.instance_name, "--storage", args.storage, "--metrics-file", str(metrics_file)]
+                    if args.storage != "eager":
+                        command += ["--state-dir", str(state)]
+                    process = subprocess.Popen(command, env=env, stdout=log, stderr=subprocess.STDOUT, creationflags=subprocess.CREATE_NEW_PROCESS_GROUP if windows else 0)
             finally:
                 env.pop("BUILDBUDDY_API_KEY", None)
             service_processes.append(process)
             try:
-                for _ in range(100):
+                for _ in range(400):
                     if process.poll() is not None:
                         raise RuntimeError("output service exited before readiness")
                     try:
@@ -163,14 +173,26 @@ def main():
             if process is None:
                 return
             # Only signal this smoke's owned child, escalating with bounds.
+            shutdown_signal = lambda: process.send_signal(signal.CTRL_BREAK_EVENT if windows else signal.SIGINT)
             for action, timeout in [
-                (lambda: process.send_signal(signal.CTRL_BREAK_EVENT if windows else signal.SIGINT), 10),
+                (shutdown_signal, 15),
                 (process.terminate, 5),
                 (process.kill, 5),
             ]:
                 if process.poll() is not None:
                     return
                 try:
+                    # Never kill a native NFS server under its live mount. A busy
+                    # client can outlast the daemon's graceful unmount deadline.
+                    # This root belongs exclusively to this fixture, not a user mount.
+                    if args.storage == "nfs" and action != shutdown_signal:
+                        unmount = subprocess.run(["/sbin/umount", "-f", str(root)],
+                            capture_output=True, timeout=15)
+                        if unmount.returncode:
+                            mounts = subprocess.run(["/sbin/mount"], capture_output=True,
+                                text=True, timeout=5, check=True).stdout
+                            if f" on {root} (" in mounts:
+                                raise RuntimeError("owned NFS mount could not be released; retaining server")
                     action()
                 except ProcessLookupError:
                     return
@@ -184,6 +206,16 @@ def main():
                 except subprocess.TimeoutExpired:
                     continue
             raise RuntimeError("owned output-service process did not exit after kill")
+        def snapshot(not_before_ns=0):
+            for _ in range(100):
+                try:
+                    counters = json.loads(metrics_file.read_text())
+                    if counters["sampled_at_ns"] >= not_before_ns:
+                        return counters
+                except (FileNotFoundError, PermissionError, json.JSONDecodeError):
+                    pass
+                time.sleep(0.02)
+            raise RuntimeError("output-service metrics did not advance")
         def run(phase, base, function, output_service=False, clean=False):
             clean_root = (workspace / "bazel-out").resolve() if clean and output_service else None
             if clean_root is not None:
@@ -196,6 +228,7 @@ def main():
                 command += [f"--experimental_remote_output_service=grpc://127.0.0.1:{port}", f"--experimental_remote_output_service_output_path_prefix={root}"]
             if not clean:
                 command += ["--remote_download_outputs=all", "//:output", "//:executable"]
+            before_build = snapshot(time.time_ns()) if output_service else None
             start = time.monotonic()
             with (args.artifacts / f"{phase}.log").open("w") as log:
                 result = subprocess.run(command, cwd=workspace, stdout=log, stderr=subprocess.STDOUT, timeout=180)
@@ -207,6 +240,16 @@ def main():
                 assert not clean_root.exists(), "native bazel clean did not remove the adopted service output tree"
                 receipt["service_output_root_removed"] = True
             if not clean:
+                if output_service:
+                    before_read = snapshot(time.time_ns())
+                    receipt["before_consumer"] = before_read
+                    if phase.endswith("service-cache-hit"):
+                        receipt["staged_files_delta"] = before_read["staged_files"] - before_build["staged_files"]
+                        assert receipt["staged_files_delta"] == 2, "cached build did not stage both outputs; local fallback is not lazy acceptance"
+                        if args.storage != "eager":
+                            receipt["fetches_during_build"] = before_read["lazy_fetches"] - before_build["lazy_fetches"]
+                            assert receipt["fetches_during_build"] == 0, "lazy cached build hydrated outputs before the first consumer"
+                            receipt["metadata_only_build_verified"] = True
                 content = (workspace / "bazel-bin/message.txt").read_bytes()
                 assert content == b"git-output-service-smoke", "incorrect materialized output"
                 receipt["output_verified"] = True
@@ -218,10 +261,12 @@ def main():
                 assert execution.returncode == 0 and execution.stdout == b"executable-output-smoke", "staged executable did not run correctly"
                 receipt["executable_mode_verified"] = not windows
                 receipt["executable_execution_verified"] = True
+                receipt["through_first_consumer_seconds"] = round(time.monotonic()-start, 3)
                 if output_service:
                     target = (workspace / "bazel-out").resolve()
                     assert target.is_relative_to(root), "Bazel did not adopt service output root"
                     receipt["service_output_root_verified"] = True
+                    receipt["after_consumer"] = snapshot(time.time_ns())
         try:
             service = start_service()
             for function in ["SHA256", "BLAKE3"]:
@@ -238,7 +283,8 @@ def main():
                 checkpoint = [path.read_bytes() for path in outputs]
                 old_pid = service.pid
                 stop_service(service)
-                assert [path.read_bytes() for path in outputs] == checkpoint, "daemon shutdown removed outputs"
+                if args.storage != "nfs":
+                    assert [path.read_bytes() for path in outputs] == checkpoint, "daemon shutdown removed outputs"
                 service = start_service()
                 assert service.pid != old_pid, "smoke did not create a new daemon process"
                 assert [path.read_bytes() for path in outputs] == checkpoint, "restart clobbered existing output bytes"
@@ -273,11 +319,14 @@ def main():
             metrics = {}
             try:
                 stats = service_log.read_text()
-                for key, value in re.findall(r"(stage_requests|staged_files|verified_bytes): (\d+)", stats):
-                    metrics[key] = metrics.get(key, 0) + int(value)
+                for line in stats.splitlines():
+                    if not line.startswith("output_service_stats "):
+                        continue
+                    for key, value in re.findall(r"\b(stage_requests|staged_files|verified_bytes|lazy_fetches|lazy_verified_bytes|lazy_cache_hits): (\d+)", line):
+                        metrics[key] = metrics.get(key, 0) + int(value)
             except Exception as error:
                 cleanup_failure("service metrics", error)
-            receipt = {"protocol": "Bazel9.2 BOS v1", "backend": "operator-selected BuildBuddy CAS", "remote_execution_requested": args.execute_remotely, "phases": receipts, "service_restarts": restarts, "metrics": metrics, "cleanup_errors": cleanup_errors}
+            receipt = {"protocol": "Bazel9.2 BOS v1", "backend": "operator-selected BuildBuddy CAS", "storage": args.storage, "retained_scratch": str(scratch) if args.keep_scratch else None, "remote_execution_requested": args.execute_remotely, "phases": receipts, "service_restarts": restarts, "metrics": metrics, "cleanup_errors": cleanup_errors, "timing_note": "Single correctness run, not matched benchmark. First-consumer timing includes up to 50ms metrics sampling latency."}
             try:
                 (args.artifacts / "receipt.json").write_text(json.dumps(receipt, indent=2)+"\n")
             except Exception as error:

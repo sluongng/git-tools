@@ -160,7 +160,7 @@ impl<T: NFSFileSystem + Send + Sync + 'static> NFSTcp for NFSTcpListener<T> {
     /// Loops forever and never returns handling all incoming connections.
     async fn handle_forever(&self) -> io::Result<()> {
         let connections = Arc::new(tokio::sync::Semaphore::new(16));
-        let requests = Arc::new(tokio::sync::Semaphore::new(16));
+        let requests = Arc::new(tokio::sync::Semaphore::new(self.arcfs.max_inflight_requests().clamp(1, 1024)));
         loop {
             let connection = connections.clone().acquire_owned().await.map_err(io::Error::other)?;
             let (socket, _) = self.listener.accept().await?;

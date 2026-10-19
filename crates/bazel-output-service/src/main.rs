@@ -1,10 +1,18 @@
 use bazel_output_service::{
     Config, OutputService, proto::bazel_output_service_server::BazelOutputServiceServer,
 };
-use clap::Parser;
-use std::{net::SocketAddr, path::PathBuf, time::Duration};
+use clap::{Parser, ValueEnum};
+use output_core::{Projection, Tree};
+use std::{net::SocketAddr, path::PathBuf, sync::Arc, time::Duration};
 
-/// Local Bazel Remote Output Service; files are eagerly verified and materialized.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+enum Storage {
+    Eager,
+    Nfs,
+    Projfs,
+}
+
+/// Local Bazel Remote Output Service with verified eager or native lazy outputs.
 #[derive(Parser)]
 struct Args {
     #[arg(long, default_value = "127.0.0.1:8377")]
@@ -22,6 +30,21 @@ struct Args {
     max_blob_bytes: u64,
     #[arg(long, default_value_t = 120)]
     rpc_timeout_secs: u64,
+    #[arg(long, value_enum, default_value_t = Storage::Eager)]
+    storage: Storage,
+    /// Durable namespace, writable payloads and verified cache; outside --root.
+    #[arg(long)]
+    state_dir: Option<PathBuf>,
+    /// Maximum verified CAS cache bytes. A single blob must fit this budget.
+    #[arg(long, default_value_t = 4_294_967_296)]
+    max_cache_bytes: u64,
+    #[arg(long, default_value_t = 8)]
+    max_concurrent_fetches: usize,
+    #[arg(long, default_value_t = 268_435_456)]
+    max_inflight_bytes: u64,
+    /// Optional atomic JSON counters for local diagnostics (never credentials).
+    #[arg(long)]
+    metrics_file: Option<PathBuf>,
 }
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -30,39 +53,186 @@ async fn main() -> anyhow::Result<()> {
         args.listen.ip().is_loopback(),
         "unauthenticated service must bind loopback"
     );
+    #[cfg(target_os = "macos")]
+    if args.storage == Storage::Nfs {
+        // Never canonicalize/stat a stale NFS mount before inspecting the mount
+        // table: those calls can wait indefinitely for its departed server.
+        output_nfs::ensure_unmounted(&args.root)?;
+    }
     let api_key = match std::env::var(&args.api_key_env) {
         Ok(value) => Some(value),
         Err(std::env::VarError::NotPresent) => None,
         Err(_) => anyhow::bail!("credential environment variable is not valid Unicode"),
     };
     let service = OutputService::new(Config {
-        root: args.root,
-        cas_endpoint: args.cas_endpoint,
-        instance_name: args.instance_name,
+        root: args.root.clone(),
+        cas_endpoint: args.cas_endpoint.clone(),
+        instance_name: args.instance_name.clone(),
         api_key,
         max_blob_bytes: args.max_blob_bytes,
         rpc_timeout: Duration::from_secs(args.rpc_timeout_secs),
     })
     .await?;
-    eprintln!("Bazel Remote Output Service listening on {}", args.listen);
-    tonic::transport::Server::builder()
-        .add_service(BazelOutputServiceServer::new(service.clone()))
-        .serve_with_shutdown(args.listen, async {
+    let (projection, tree) = if args.storage == Storage::Eager {
+        (None, None)
+    } else {
+        let (projection, tree) = mount_projection(&args, &service).await?;
+        (Some(projection), Some(tree))
+    };
+    // Once a native mount exists, every subsequent error must pass through
+    // shutdown. Dropping the runtime under a busy NFS mount would strand it.
+    let result = async {
+        let service = if let Some(projection) = &projection {
+            service.with_projection(projection.clone(), tree.as_ref().unwrap().clone())?
+        } else {
+            service
+        };
+        eprintln!(
+            "Bazel Remote Output Service listening on {} ({:?})",
+            args.listen, args.storage
+        );
+        let metrics_task = if let Some(path) = args.metrics_file.clone() {
+            write_metrics(&path, &service)?;
+            let service = service.clone();
+            Some(tokio::spawn(async move {
+                let mut ticks = tokio::time::interval(Duration::from_millis(50));
+                ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                loop {
+                    ticks.tick().await;
+                    // Readers on Windows can transiently deny rename sharing.
+                    let _ = write_metrics(&path, &service);
+                }
+            }))
+        } else {
+            None
+        };
+        let result = tonic::transport::Server::builder()
+            .add_service(BazelOutputServiceServer::new(service.clone()))
+            .serve_with_shutdown(args.listen, async {
+                let _ = wait_for_shutdown().await;
+            })
+            .await;
+        eprintln!("output_service_stats {:?}", service.metrics());
+        if let Some(task) = metrics_task {
+            task.abort();
+            let _ = task.await;
+        }
+        result?;
+        if let Some(path) = &args.metrics_file {
+            write_metrics(path, &service)?;
+        }
+        anyhow::Ok(())
+    }
+    .await;
+    if let Some(tree) = &tree {
+        eprintln!("output_cache_stats {:?}", tree.cache_metrics());
+    }
+    if let Some(projection) = &projection {
+        while let Err(error) = projection.shutdown().await {
+            eprintln!(
+                "output mount shutdown failed: {error:#}; keeping the filesystem server alive. \
+                 Release open files or unmount it, then interrupt this process again to retry."
+            );
+            wait_for_shutdown().await?;
+        }
+    }
+    result
+}
+
+async fn wait_for_shutdown() -> anyhow::Result<()> {
+    #[cfg(windows)]
+    {
+        // Supervisors send CTRL_BREAK to the owned process group.
+        let mut breaks = tokio::signal::windows::ctrl_break()?;
+        tokio::select! {
+            result = tokio::signal::ctrl_c() => result?,
+            _ = breaks.recv() => {},
+        }
+    }
+    #[cfg(unix)]
+    {
+        let mut terminate =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+        tokio::select! {
+            result = tokio::signal::ctrl_c() => result?,
+            _ = terminate.recv() => {},
+        }
+    }
+    Ok(())
+}
+
+fn write_metrics(path: &std::path::Path, service: &OutputService) -> anyhow::Result<()> {
+    let metrics = service.metrics();
+    let data = serde_json::json!({
+        "sampled_at_ns": std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_nanos(),
+        "stage_requests": metrics.stage_requests, "staged_files": metrics.staged_files,
+        "verified_bytes": metrics.verified_bytes, "lazy_fetches": metrics.lazy_fetches,
+        "lazy_verified_bytes": metrics.lazy_verified_bytes, "lazy_cache_hits": metrics.lazy_cache_hits,
+    });
+    let temp = path.with_extension(format!("{}.tmp", std::process::id()));
+    std::fs::write(&temp, serde_json::to_vec(&data)?)?;
+    std::fs::rename(temp, path)?;
+    Ok(())
+}
+
+#[cfg(any(target_os = "macos", windows))]
+async fn mount_projection(
+    args: &Args,
+    service: &OutputService,
+) -> anyhow::Result<(Arc<dyn Projection>, Arc<Tree>)> {
+    let state = args
+        .state_dir
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("--state-dir is required for lazy storage"))?;
+    std::fs::create_dir_all(state)?;
+    let state = std::fs::canonicalize(state)?;
+    let root = std::fs::canonicalize(&args.root)?;
+    anyhow::ensure!(
+        !state.starts_with(&root) && !root.starts_with(&state),
+        "state directory and output mount must not overlap"
+    );
+    let namespace = Tree::open(
+        &state,
+        service.backend_identity(),
+        service.blob_source(),
+        output_core::CacheConfig {
+            max_bytes: args.max_cache_bytes,
+            max_concurrent_fetches: args.max_concurrent_fetches,
+            max_inflight_bytes: args.max_inflight_bytes,
+        },
+    )?;
+    let projection: Arc<dyn Projection> = match args.storage {
+        Storage::Nfs => {
+            #[cfg(target_os = "macos")]
+            {
+                Arc::new(output_nfs::NfsMount::start(namespace.clone(), &root).await?)
+            }
+            #[cfg(not(target_os = "macos"))]
+            {
+                anyhow::bail!("NFS lazy storage requires the native macOS client")
+            }
+        }
+        Storage::Projfs => {
             #[cfg(windows)]
             {
-                // Python and other supervising terminals send CTRL_BREAK to an
-                // owned process group, without interrupting their own console.
-                let mut breaks =
-                    tokio::signal::windows::ctrl_break().expect("install CTRL_BREAK handler");
-                tokio::select! {
-                    _ = tokio::signal::ctrl_c() => {},
-                    _ = breaks.recv() => {},
-                }
+                Arc::new(
+                    output_projfs::start(namespace.clone(), &root, &state.join("provider")).await?,
+                )
             }
             #[cfg(not(windows))]
-            let _ = tokio::signal::ctrl_c().await;
-        })
-        .await?;
-    eprintln!("output_service_stats {:?}", service.metrics());
-    Ok(())
+            {
+                anyhow::bail!("ProjFS lazy storage requires native Windows with ProjFS enabled")
+            }
+        }
+        Storage::Eager => unreachable!(),
+    };
+    Ok((projection, namespace))
+}
+
+#[cfg(not(any(target_os = "macos", windows)))]
+async fn mount_projection(
+    _args: &Args,
+    _service: &OutputService,
+) -> anyhow::Result<(Arc<dyn Projection>, Arc<Tree>)> {
+    anyhow::bail!("native lazy output mounts require macOS NFS or Windows ProjFS")
 }

@@ -13,9 +13,10 @@ Keep NFSv3 on macOS and ProjFS on Windows.
 Share content retrieval and identity rules, not a Unix-shaped mutable overlay on every platform.
 Keep build scratch and the output base outside the source projection.
 
-The existing Bazel output service is an **eager local-directory implementation**, not a lazy mount.
-Native portability and lazy output projection are separate milestones.
-A successful native Bazel build does not establish metadata-only staging or lazy hydration.
+The Bazel output service retains **eager local-directory storage by default**.
+Opt-in native lazy projections now use the shared `output-core`, `output-nfs`
+and `output-projfs` crates. Native portability and lazy acceptance remain
+separate: a successful build alone does not establish metadata-only staging.
 
 ### Native baseline verified in this follow-up
 
@@ -27,6 +28,42 @@ A successful native Bazel build does not establish metadata-only staging or lazy
 
 The CAS runs observed six staged files per host and no cleanup errors.
 They are correctness smoke tests, not comparative performance benchmarks.
+
+## Native lazy acceptance
+
+The opt-in adapters pass **12 real Bazel 9.2 / BuildBuddy CAS phases per host**:
+SHA256 and BLAKE3, two actual daemon restarts, output execution, tamper repair and
+clean. Each initial cached build stages both artifacts with **zero payload
+fetches before the first consumer**. No local fallback or cleanup errors occurred.
+
+Single correctness-run timings for the two-output fixture, not an eager/lazy
+benchmark or a large-repository result:
+
+| Native lazy client | Digest | Cached build | Through read + execution | Payload fetched before consumer |
+| --- | --- | ---: | ---: | ---: |
+| macOS NFS | SHA256 | 1.893 s | 2.471 s | 0 B |
+| macOS NFS | BLAKE3 | 1.947 s | 2.451 s | 0 B |
+| Windows ProjFS | SHA256 | 2.922 s | 3.422 s | 0 B |
+| Windows ProjFS | BLAKE3 | 2.984 s | 3.500 s | 0 B |
+
+First-consumer times include up to 50 ms diagnostic sampling latency. Consumers
+read and execute all fixture outputs, fetching 65 B per digest on macOS and
+83 B on Windows. Across staging, repair and restart, six files are staged but
+only four blobs fetched: 130 B on macOS, 166 B on Windows. These tiny fixtures
+establish deferred hydration, not a bandwidth or end-to-end speedup claim.
+
+Focused coverage: core 11 tests, BOS 8, NFS protocol 4 plus native mounted 5,
+ProjFS policy 1 plus native 3. Native channels cover generation races, negative
+caches, local edits and clean; Windows additionally verifies 32 readers during
+shutdown with successful payloads checked. Native cancellation attempts all
+completed normally: **the CancelCommand callback was not observed**. Graceful
+ProjFS shutdown drains existing verified reads before stopping; the configured
+CAS adapter supplies a total RPC deadline. Generic BlobSource implementations
+must also provide a deadline. Forced process termination is not graceful shutdown.
+
+The acceptance run exposed and fixed publication beneath native Bazel-created
+parents, Windows metadata-only changes forcing unnecessary hashing, cached NFS
+missing ancestors and synchronous realpath/statfs re-entry in StartBuild.
 
 ## Lessons that change our priorities
 
@@ -106,10 +143,11 @@ Our source provider restricts directory renames, external symlinks and revision 
 Generated output directories need their own semantics.
 Preserve actual Windows name collation; reject alternate streams, reserved devices and ambiguous names at the API boundary.
 
-## Lazy output architecture: proposed, not implemented
+## Implemented lazy output architecture
 
-Keep the eager backend as an explicit fallback.
-Extract these responsibilities into separate crates when implementing lazy mode:
+The CLI selects `--storage eager|nfs|projfs`; lazy modes require a durable
+`--state-dir` outside the mount root. The eager backend remains the default.
+Responsibilities are split into separate crates:
 
 | Component | Owns | Must not own |
 | --- | --- | --- |
@@ -118,8 +156,10 @@ Extract these responsibilities into separate crates when implementing lazy mode:
 | `output-projfs` | Placeholder versions, pending requests, view updates, native dirty state and negative-cache invalidation | A second copy of authoritative NTFS edits |
 | `bazel-output-service` | Build lifecycle, locator validation, explicit eager/lazy selection and backend selection | Pretending staging completion proves kernel visibility |
 
-Reuse channel utilities from the workspace frontends without making CAS outputs look like Git blobs.
-Extract common transport machinery only when both consumers exercise it.
+CAS outputs are not modeled as Git blobs. Shared NFS transport has a per-provider
+request budget; the output channel reserves metadata capacity under cold-read load.
+Fjall transactions update individual namespace records and persistent indexes,
+not a serialized copy of the whole tree.
 
 ### Identity and publication
 
@@ -141,12 +181,20 @@ GC cannot reclaim a generation merely because a new path binding exists.
 
 ### Integrity and digest trust
 
-Initially fetch each requested CAS blob into a bounded disk cache, verify the whole digest/size, then serve ranges.
+The implementation fetches each requested CAS blob into a bounded disk cache,
+verifies the whole digest/size, then serves ranges. Concurrent readers coalesce;
+one canceled waiter does not cancel the shared fetch. Fingerprint-stable warm
+ranges reuse whole-object verification. Declared blobs exceeding cache/in-flight
+budgets fail before publication.
 A 4 KiB range request does not authenticate an arbitrary range of a SHA256/BLAKE3 blob.
 Chunked transport can follow once verified chunk identities and whole-object composition are available.
 
 `BatchStat` may answer without hydration only for an untouched, generation-matched remote entry.
-Local writes, truncation, replacement and offline edits invalidate that digest authority.
+Local content writes, truncation, replacement and offline edits invalidate that
+digest authority. On Windows a dirty placeholder indicates metadata-only changes,
+not modified content; a full file indicates writable content. Native file identity
+and rename distrust must still match before retaining its locator. See
+[Microsoft's cache-state contract](https://learn.microsoft.com/en-us/windows/win32/projfs/cache-state).
 Hash local contents or return an unknown locator conservatively.
 Bazel 9.2 uses BOS locators as fast digests, so an incorrect metadata answer can produce an incorrect action key.
 Its client also does not yet consume `modified_path_prefixes` for incremental invalidation; a journal alone will not remove its full-rescan fallback.
@@ -159,7 +207,7 @@ Windows uses a native command artifact, not Unix execute-bit assertions.
 Directory junction adoption does not require treating paths as file URIs.
 Native cache-client acceptance does not provision Darwin or Windows RBE workers; target/execution-platform compatibility remains operator configuration.
 
-Before enabling lazy mode, require:
+Native acceptance checks require:
 
 - Stage and metadata stat cause zero payload downloads; first read verifies one fetch and later reads reuse it.
 - Cached ENOENT → stage and same-sized A → B replacement are immediately visible after publication.
@@ -174,5 +222,21 @@ Report stage/build completion, first usable output, first-read latency, network 
 Use 1/8/32 concurrent cold reads plus warm stat/list traffic, large-file random reads, repeated edit/build cycles and cancellation under load.
 Include the cost moved from build completion to the first consumer; metadata-only staging is not automatically a faster usable build.
 
-Implementation order: native eager portability → shared output identity/state → channel publication barriers → opt-in lazy hydration → safe clean-cache GC.
-Do not advertise lazy macOS/Windows output mounts until those native assertions pass.
+### Deliberate lifetime limits
+
+The verified cache is bounded, but retired IDs and authoritative local payloads
+are retained conservatively. Cache leases protect active reads, not indefinitely
+open NFS descriptors: eviction followed by CAS expiration can make a later read
+fail. It cannot resolve a new generation at the old identity. There is no claim
+of indefinite offline FD/mmap preservation or live NFS daemon takeover.
+
+Windows keeps writable data on NTFS. Persisted native file identities and rename
+distrust prevent moved/offline-changed files from retaining the old path digest.
+Ordinary native temporary-directory renames work; directories containing projected
+remote descendants cannot move until subtree rebasing is implemented. Native
+publication journals are atomically replaced and recovered before other mutators.
+
+The CLI always attempts cleanup after a successful mount. A failed unmount keeps
+the filesystem server alive until the user releases handles and interrupts again.
+Generic core-local-payload power-loss durability is only implemented for Unix;
+ProjFS does not use that payload path. Sudden power loss was not fault-injected.

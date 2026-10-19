@@ -7,7 +7,7 @@ use bazel_output_service::{
     rev2,
 };
 use prost::Message;
-use reapi::{Digest, proto::google::bytestream as bs};
+use reapi::{Digest, proto::google::bytestream as bs, reapi as cas_proto};
 use sha2::{Digest as _, Sha256};
 use std::{
     collections::HashMap,
@@ -25,6 +25,94 @@ struct Cas {
     data: Arc<Mutex<HashMap<String, Vec<u8>>>>,
     reads: Arc<Mutex<Vec<String>>>,
     stall: Arc<AtomicBool>,
+    presence_queries: Arc<Mutex<Vec<cas_proto::FindMissingBlobsRequest>>>,
+}
+
+#[tonic::async_trait]
+impl cas_proto::content_addressable_storage_server::ContentAddressableStorage for Cas {
+    type GetTreeStream =
+        std::pin::Pin<Box<dyn Stream<Item = Result<cas_proto::GetTreeResponse, Status>> + Send>>;
+    type GetChunkMappingStream = std::pin::Pin<
+        Box<dyn Stream<Item = Result<cas_proto::GetChunkMappingResponse, Status>> + Send>,
+    >;
+    async fn find_missing_blobs(
+        &self,
+        request: Request<cas_proto::FindMissingBlobsRequest>,
+    ) -> Result<Response<cas_proto::FindMissingBlobsResponse>, Status> {
+        if request
+            .metadata()
+            .get("x-buildbuddy-api-key")
+            .and_then(|v| v.to_str().ok())
+            != Some("test-key")
+        {
+            return Err(Status::unauthenticated("missing credential"));
+        }
+        let request = request.into_inner();
+        self.presence_queries.lock().unwrap().push(request.clone());
+        let data = self.data.lock().unwrap();
+        let missing_blob_digests = request
+            .blob_digests
+            .into_iter()
+            .filter(|digest| {
+                !data.contains_key(&format!(
+                    "{}/blobs/{}{}/{}",
+                    request.instance_name,
+                    if request.digest_function == 9 {
+                        "blake3/"
+                    } else {
+                        ""
+                    },
+                    digest.hash,
+                    digest.size_bytes
+                ))
+            })
+            .collect();
+        Ok(Response::new(cas_proto::FindMissingBlobsResponse {
+            missing_blob_digests,
+        }))
+    }
+    async fn batch_update_blobs(
+        &self,
+        _: Request<cas_proto::BatchUpdateBlobsRequest>,
+    ) -> Result<Response<cas_proto::BatchUpdateBlobsResponse>, Status> {
+        Err(Status::unimplemented("fixture"))
+    }
+    async fn batch_read_blobs(
+        &self,
+        _: Request<cas_proto::BatchReadBlobsRequest>,
+    ) -> Result<Response<cas_proto::BatchReadBlobsResponse>, Status> {
+        Err(Status::unimplemented("fixture"))
+    }
+    async fn get_tree(
+        &self,
+        _: Request<cas_proto::GetTreeRequest>,
+    ) -> Result<Response<Self::GetTreeStream>, Status> {
+        Err(Status::unimplemented("fixture"))
+    }
+    async fn split_blob(
+        &self,
+        _: Request<cas_proto::SplitBlobRequest>,
+    ) -> Result<Response<cas_proto::SplitBlobResponse>, Status> {
+        Err(Status::unimplemented("fixture"))
+    }
+    async fn get_chunk_mapping(
+        &self,
+        _: Request<cas_proto::GetChunkMappingRequest>,
+    ) -> Result<Response<Self::GetChunkMappingStream>, Status> {
+        Err(Status::unimplemented("fixture"))
+    }
+    async fn splice_blob(
+        &self,
+        _: Request<cas_proto::SpliceBlobRequest>,
+    ) -> Result<Response<cas_proto::SpliceBlobResponse>, Status> {
+        Err(Status::unimplemented("fixture"))
+    }
+    async fn register_chunk_mapping(
+        &self,
+        _: Request<tonic::Streaming<cas_proto::RegisterChunkMappingRequest>>,
+    ) -> Result<Response<cas_proto::RegisterChunkMappingResponse>, Status> {
+        Err(Status::unimplemented("fixture"))
+    }
 }
 #[tonic::async_trait]
 impl bs::byte_stream_server::ByteStream for Cas {
@@ -85,6 +173,41 @@ struct Fixture {
     endpoint: String,
     service: OutputService,
     servers: Vec<tokio::task::JoinHandle<()>>,
+    projection: Option<Arc<HeadlessProjection>>,
+}
+
+// This exercises BOS's real CAS adapter without substituting for native mount tests.
+struct HeadlessProjection {
+    tree: Arc<output_core::Tree>,
+    root: std::path::PathBuf,
+    _state: tempfile::TempDir,
+}
+#[async_trait::async_trait]
+impl output_core::Projection for HeadlessProjection {
+    fn root(&self) -> &std::path::Path {
+        &self.root
+    }
+    async fn ensure_dir(&self, p: &str) -> anyhow::Result<()> {
+        self.tree.ensure_dir(p).await?;
+        Ok(())
+    }
+    async fn stage(&self, p: &str, a: output_core::Artifact) -> anyhow::Result<()> {
+        self.tree.stage(p, a).await?;
+        Ok(())
+    }
+    async fn stat(&self, p: &str, f: i32) -> anyhow::Result<Option<output_core::TreeStat>> {
+        self.tree.stat(p, f).await
+    }
+    async fn refresh(&self, p: &str) -> anyhow::Result<()> {
+        self.tree.refresh(p).await?;
+        Ok(())
+    }
+    async fn clean(&self, p: &str) -> anyhow::Result<()> {
+        self.tree.clean(p).await
+    }
+    async fn shutdown(&self) -> anyhow::Result<()> {
+        Ok(())
+    }
 }
 impl Drop for Fixture {
     fn drop(&mut self) {
@@ -95,14 +218,19 @@ impl Drop for Fixture {
 }
 impl Fixture {
     async fn new() -> Self {
+        Self::configured(false, Duration::from_secs(10)).await
+    }
+    async fn configured(lazy: bool, timeout: Duration) -> Self {
         let dir = tempfile::tempdir().unwrap();
         let cas = Cas::default();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let endpoint = format!("http://{}", listener.local_addr().unwrap());
         let cas_service = cas.clone();
+        let cas_presence = cas.clone();
         let cas_task = tokio::spawn(async move {
             tonic::transport::Server::builder()
                 .add_service(bs::byte_stream_server::ByteStreamServer::new(cas_service))
+                .add_service(cas_proto::content_addressable_storage_server::ContentAddressableStorageServer::new(cas_presence))
                 .serve_with_incoming(TcpListenerStream::new(listener))
                 .await
                 .unwrap();
@@ -113,10 +241,34 @@ impl Fixture {
             instance_name: "fixture".into(),
             api_key: Some("test-key".into()),
             max_blob_bytes: 1024 * 1024,
-            rpc_timeout: Duration::from_secs(10),
+            rpc_timeout: timeout,
         })
         .await
         .unwrap();
+        let projection = if lazy {
+            let state = tempfile::tempdir().unwrap();
+            let tree = output_core::Tree::open(
+                state.path(),
+                service.backend_identity(),
+                service.blob_source(),
+                output_core::CacheConfig::default(),
+            )
+            .unwrap();
+            Some(Arc::new(HeadlessProjection {
+                tree,
+                root: dir.path().canonicalize().unwrap(),
+                _state: state,
+            }))
+        } else {
+            None
+        };
+        let service = if let Some(projection) = &projection {
+            service
+                .with_projection(projection.clone(), projection.tree.clone())
+                .unwrap()
+        } else {
+            service
+        };
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let service_endpoint = format!("http://{}", listener.local_addr().unwrap());
         let service_clone = service.clone();
@@ -138,6 +290,7 @@ impl Fixture {
             endpoint,
             service,
             servers: vec![cas_task, service_task],
+            projection,
         }
     }
     fn request(&self, id: &str, function: i32) -> proto::StartBuildRequest {
@@ -774,4 +927,150 @@ async fn windows_rejects_aliases_and_replaces_existing_outputs() {
         std::fs::read(fixture.outside.path().join("protected")).unwrap(),
         b"outside"
     );
+}
+
+#[tokio::test]
+async fn lazy_cas_adapter_times_out_after_stream_headers() {
+    let fixture = Fixture::configured(false, Duration::from_millis(100)).await;
+    let digest = fixture.blob(b"stalled stream", 9);
+    fixture.cas.stall.store(true, Ordering::SeqCst);
+    let artifact = output_core::Artifact {
+        backend: fixture.service.backend_identity(),
+        instance: "fixture".into(),
+        digest_function: 9,
+        hash: digest.hash,
+        size: digest.size_bytes as u64,
+    };
+    let source = fixture.service.blob_source();
+    let mut file = tempfile::tempfile().unwrap();
+    let error = tokio::time::timeout(Duration::from_secs(2), source.fetch(&artifact, &mut file))
+        .await
+        .expect("lazy stream must have a total deadline")
+        .unwrap_err();
+    assert_eq!(
+        error.downcast_ref::<Status>().unwrap().code(),
+        tonic::Code::DeadlineExceeded
+    );
+}
+
+#[tokio::test]
+async fn lazy_bos_stages_metadata_reads_verified_content_and_prunes_expired_cas() {
+    let mut fixture = Fixture::configured(true, Duration::from_secs(10)).await;
+    let response = fixture
+        .client
+        .start_build(fixture.request("lazy", 9))
+        .await
+        .unwrap()
+        .into_inner();
+    let prefix = std::path::Path::new(&response.output_path_suffix)
+        .file_name()
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_owned();
+    let digest = fixture.blob(b"lazy verified output", 9);
+    assert_eq!(
+        fixture.stage("lazy", "nested/output", digest.clone()).await,
+        0
+    );
+    let stats = fixture
+        .client
+        .batch_stat(proto::BatchStatRequest {
+            build_id: "lazy".into(),
+            paths: vec!["nested/output".into()],
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    let proto::batch_stat_response::stat::Type::File(file) = stats.responses[0]
+        .stat
+        .as_ref()
+        .unwrap()
+        .r#type
+        .as_ref()
+        .unwrap()
+    else {
+        panic!("not a file")
+    };
+    assert_eq!(
+        rev2::FileArtifactLocator::decode(file.locator.as_ref().unwrap().value.as_slice())
+            .unwrap()
+            .digest
+            .unwrap(),
+        digest
+    );
+    assert!(
+        fixture.cas.reads.lock().unwrap().is_empty(),
+        "stage and stat must not fetch payloads"
+    );
+    let projection = fixture.projection.as_ref().unwrap().clone();
+    let path = format!("{prefix}/nested/output");
+    let node = projection.tree.resolve(&path).unwrap();
+    assert_eq!(
+        projection.tree.read(node.id, 0, 100).await.unwrap(),
+        b"lazy verified output"
+    );
+    assert_eq!(projection.tree.read(node.id, 0, 4).await.unwrap(), b"lazy");
+    assert_eq!(fixture.cas.reads.lock().unwrap().len(), 1);
+    projection.tree.write(node.id, 0, b"edit").await.unwrap();
+    let stats = fixture
+        .client
+        .batch_stat(proto::BatchStatRequest {
+            build_id: "lazy".into(),
+            paths: vec!["nested/output".into()],
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    let proto::batch_stat_response::stat::Type::File(file) = stats.responses[0]
+        .stat
+        .as_ref()
+        .unwrap()
+        .r#type
+        .as_ref()
+        .unwrap()
+    else {
+        panic!("not a file")
+    };
+    let dirty = rev2::FileArtifactLocator::decode(file.locator.as_ref().unwrap().value.as_slice())
+        .unwrap()
+        .digest
+        .unwrap();
+    assert_ne!(
+        dirty.hash, digest.hash,
+        "local edits must invalidate remote digest authority"
+    );
+    assert_eq!(fixture.stage("lazy", "expires", digest).await, 0);
+    fixture.cas.data.lock().unwrap().clear();
+    fixture
+        .client
+        .start_build(fixture.request("next-lazy", 9))
+        .await
+        .unwrap();
+    assert!(!fixture.cas.presence_queries.lock().unwrap().is_empty());
+    let stats = fixture
+        .client
+        .batch_stat(proto::BatchStatRequest {
+            build_id: "next-lazy".into(),
+            paths: vec!["expires".into(), "nested/output".into()],
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(
+        stats.responses[0].stat.is_none(),
+        "expired remote binding must be removed"
+    );
+    assert!(
+        stats.responses[1].stat.is_some(),
+        "authoritative local output must be retained"
+    );
+    fixture
+        .client
+        .clean(proto::CleanRequest {
+            output_base_id: "base".into(),
+        })
+        .await
+        .unwrap();
+    assert!(projection.tree.resolve(&prefix).is_err());
 }
