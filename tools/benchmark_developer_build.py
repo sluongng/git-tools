@@ -27,6 +27,7 @@ import shutil
 import subprocess
 import sys
 import time
+import uuid
 
 PHASES = ('population', 'remote-reuse', 'noop', 'frontend-edit', 'lowerlayer-edit')
 SECRET = re.compile(
@@ -179,7 +180,8 @@ class Benchmark:
                 # Disable inherited remote endpoints for the local comparison arm.
                 command += ['--remote_executor=', '--remote_cache=', '--disk_cache=',
                             '--remote_download_outputs=all']
-            command.append(f'--jobs={self.args.jobs}')
+            # A host-wide disk cache must not masquerade as remote CAS reuse.
+            command += ['--disk_cache=', f'--jobs={self.args.jobs}']
         return command
 
     def build(self, arm, phase, trial, role):
@@ -225,7 +227,7 @@ class Benchmark:
                             self.build(arm, phase, trial, 'measured')
                         else:
                             original = path.read_bytes()
-                            marker = f'{phase}-trial-{trial}'
+                            marker = f'{self.args.edit_seed}-{phase}-trial-{trial}'
                             if self.args.edit_kind == 'public-const':
                                 addition = f'pub const GIT_TOOLS_BENCHMARK_REVISION: &str = "{marker}";'
                             else:
@@ -278,7 +280,8 @@ def main():
     parser.add_argument('--source-edit', nargs=2, metavar=('FRONTEND_RS', 'LOWERLAYER_RS'))
     parser.add_argument('--edit-kind', choices=('comment', 'public-const'), default='public-const',
                         help='Exported-metadata change (default), or comment-only boundary check')
-    parser.add_argument('--execution-log', action='store_true', help='Require supported JSON execution-log flag')
+    parser.add_argument('--edit-seed', help='Edit namespace; default is fresh per invocation to avoid old action-cache hits')
+    parser.add_argument('--execution-log', action='store_true', help='Heavy JSON diagnostics; do not use for headline timing')
     parser.add_argument('--run', action='store_true')
     parser.add_argument('targets', nargs='*', default=['//:git-vfs', '//:git-proxy'])
     args = parser.parse_args()
@@ -296,6 +299,9 @@ def main():
         parser.error('--trials must be positive')
     if args.jobs < 1:
         parser.error('--jobs must be positive')
+    args.edit_seed = args.edit_seed or uuid.uuid4().hex[:12]
+    if not re.fullmatch(r'[A-Za-z0-9_-]{1,64}', args.edit_seed):
+        parser.error('--edit-seed must contain 1-64 simple identifier characters')
     phases = args.phase or list(PHASES)
     arms = args.arm or (['local', args.config] if args.config else ['local'])
     if len(set(phases)) != len(phases):
@@ -317,6 +323,7 @@ def main():
     plan = {'root': str(root), 'bazel': args.bazel, 'output': str(args.output),
             'arms': arms, 'phases': phases, 'trials': args.trials, 'jobs': args.jobs,
             'targets': args.targets, 'source_edit': args.source_edit, 'edit_kind': args.edit_kind,
+            'edit_seed': args.edit_seed, 'disk_cache': 'disabled in every arm',
             'trial_arm_order': [arms[index % len(arms):] + arms[:index % len(arms)]
                                 for index in range(args.trials)],
             'execution_log': args.execution_log,
