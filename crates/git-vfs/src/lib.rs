@@ -7,3 +7,6 @@ pub mod worktree;
 pub mod writable;
 
 mod github_sizes;
+
+pub mod blake3_xattr;
+pub mod cas_digest;

@@ -62,6 +62,7 @@ struct DirHandle {
 }
 
 pub struct WritableGitFs {
+    blake3: Option<std::sync::Arc<crate::blake3_xattr::Blake3XattrStats>>,
     overlay: Overlay,
     repo: GitRepo,
     uid: u32,
@@ -73,6 +74,7 @@ pub struct WritableGitFs {
 impl WritableGitFs {
     pub fn new(overlay: Overlay, repo: GitRepo) -> Self {
         Self {
+            blake3: None,
             overlay,
             repo,
             uid: unsafe { libc::getuid() },
@@ -81,6 +83,13 @@ impl WritableGitFs {
             files: HashMap::new(),
             dirs: HashMap::new(),
         }
+    }
+    pub fn with_blake3(
+        mut self,
+        stats: std::sync::Arc<crate::blake3_xattr::Blake3XattrStats>,
+    ) -> Self {
+        self.blake3 = Some(stats);
+        self
     }
     fn handle_id(&mut self) -> Result<u64> {
         let id = self.next_handle;
@@ -627,6 +636,29 @@ impl Filesystem for WritableGitFs {
         reply: ReplyXattr,
     ) {
         let result = (|| {
+            if name == OsStr::new("user.blake3") || name == OsStr::new("user.blake3.hex") {
+                let stats = self.blake3.as_ref().ok_or_else(|| error(libc::ENODATA))?;
+                let entry = self.overlay.entry(ino)?;
+                if entry.control || entry.kind.is_dir() {
+                    stats.miss();
+                    return Err(error(libc::ENODATA));
+                }
+                // data is authoritative after every write, including same-size edits;
+                // base_oid remains the original Git identity for journal purposes.
+                let digest = if let Some(data) = &entry.data {
+                    stats.local(data).to_vec()
+                } else if let Some(oid) = &entry.base_oid {
+                    stats.base(&self.repo, oid)?
+                } else {
+                    stats.miss();
+                    return Err(error(libc::ENODATA));
+                };
+                return Ok(if name == OsStr::new("user.blake3.hex") {
+                    hex::encode(digest).into_bytes()
+                } else {
+                    digest
+                });
+            }
             if name != OsStr::new("user.gitsha1") && name != OsStr::new("user.gitsha1.hex") {
                 return Err(error(libc::ENODATA));
             }
@@ -649,6 +681,8 @@ impl Filesystem for WritableGitFs {
                 size,
                 if n.kind.is_dir() || n.control {
                     b""
+                } else if self.blake3.is_some() {
+                    crate::blake3_xattr::XATTRS
                 } else {
                     XATTRS
                 },

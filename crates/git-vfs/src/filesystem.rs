@@ -326,6 +326,7 @@ impl Snapshot {
 }
 
 pub struct GitFs {
+    blake3: Option<std::sync::Arc<crate::blake3_xattr::Blake3XattrStats>>,
     snapshot: Snapshot,
     repo: Mutex<GitRepo>,
     uid: u32,
@@ -334,11 +335,19 @@ pub struct GitFs {
 impl GitFs {
     pub fn new(snapshot: Snapshot, repo: GitRepo) -> Self {
         Self {
+            blake3: None,
             snapshot,
             repo: Mutex::new(repo),
             uid: unsafe { libc::getuid() },
             gid: unsafe { libc::getgid() },
         }
+    }
+    pub fn with_blake3(
+        mut self,
+        stats: std::sync::Arc<crate::blake3_xattr::Blake3XattrStats>,
+    ) -> Self {
+        self.blake3 = Some(stats);
+        self
     }
     fn attr(&self, inode: u64) -> Result<FileAttr> {
         self.snapshot
@@ -542,6 +551,30 @@ impl Filesystem for GitFs {
             return;
         }
         let oid = n.oid.as_ref().expect("validated blob ID");
+        if matches!(name.as_bytes(), b"user.blake3" | b"user.blake3.hex") {
+            let Some(stats) = &self.blake3 else {
+                reply.error(libc::ENODATA);
+                return;
+            };
+            match self
+                .repo
+                .lock()
+                .map_err(|_| anyhow::anyhow!("backend lock poisoned"))
+                .and_then(|repo| stats.base(&repo, oid))
+            {
+                Ok(data) => reply_xattr(
+                    reply,
+                    size,
+                    &if name.as_bytes() == b"user.blake3.hex" {
+                        hex::encode(data).into_bytes()
+                    } else {
+                        data
+                    },
+                ),
+                Err(error) => reply.error(errno(&error)),
+            }
+            return;
+        }
         match name.as_bytes() {
             b"user.gitsha1" => match hex::decode(oid) {
                 Ok(data) => reply_xattr(reply, size, &data),
@@ -553,7 +586,17 @@ impl Filesystem for GitFs {
     }
     fn listxattr(&mut self, _req: &Request<'_>, ino: u64, size: u32, reply: ReplyXattr) {
         match self.snapshot.node(ino) {
-            Ok(n) => reply_xattr(reply, size, if n.kind.is_dir() { b"" } else { XATTRS }),
+            Ok(n) => reply_xattr(
+                reply,
+                size,
+                if n.kind.is_dir() {
+                    b""
+                } else if self.blake3.is_some() {
+                    crate::blake3_xattr::XATTRS
+                } else {
+                    XATTRS
+                },
+            ),
             Err(e) => reply.error(errno(&e)),
         }
     }

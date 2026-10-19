@@ -12,6 +12,7 @@ use crate::storage::open_fjall;
 pub(super) struct SizeCache {
     // Drop the keyspace before its shared database owner.
     database: fjall::SingleWriterTxKeyspace,
+    mappings: fjall::SingleWriterTxKeyspace,
     owner: Arc<fjall::SingleWriterTxDatabase>,
 }
 
@@ -19,7 +20,12 @@ impl SizeCache {
     pub(super) fn open(repository: &Path) -> Result<Self> {
         let owner = open_fjall(&repository.join("git-vfs-sizes.fjall"))?;
         let database = owner.keyspace("blob_sizes", fjall::KeyspaceCreateOptions::default)?;
-        Ok(Self { database, owner })
+        let mappings = owner.keyspace("blob_blake3", fjall::KeyspaceCreateOptions::default)?;
+        Ok(Self {
+            database,
+            mappings,
+            owner,
+        })
     }
 
     pub(super) fn get_many(&self, oids: &[String]) -> Result<HashMap<String, u64>> {
@@ -53,6 +59,59 @@ impl SizeCache {
             } else {
                 transaction.insert(&self.database, key, size.to_be_bytes());
             }
+        }
+        transaction.commit()?;
+        Ok(())
+    }
+
+    pub(super) fn blake3_many(&self, oids: &[String]) -> Result<HashMap<String, (u64, [u8; 32])>> {
+        let transaction = self.owner.read_tx();
+        let mut result = HashMap::new();
+        for oid in oids {
+            let key = oid_key(oid)?;
+            if let Some(value) = transaction.get(&self.mappings, key)? {
+                ensure!(value.len() == 40, "invalid BLAKE3 cache value");
+                let size = decode_size(&value[..8])?;
+                let size_value = transaction
+                    .get(&self.database, key)?
+                    .context("BLAKE3 cache lacks blob size")?;
+                ensure!(
+                    decode_size(&size_value)? == size,
+                    "BLAKE3 cache size mismatch"
+                );
+                result.insert(oid.clone(), (size, value[8..].try_into()?));
+            }
+        }
+        Ok(result)
+    }
+
+    pub(super) fn persist_blake3(
+        &mut self,
+        mappings: &HashMap<String, (u64, [u8; 32])>,
+    ) -> Result<()> {
+        let mut transaction = self
+            .owner
+            .write_tx()
+            .durability(Some(fjall::PersistMode::SyncAll));
+        for (oid, (size, hash)) in mappings {
+            let key = oid_key(oid)?;
+            ensure!(*size <= i64::MAX as u64, "blob exceeds REAPI size limit");
+            let mut value = size.to_be_bytes().to_vec();
+            value.extend(hash);
+            if let Some(existing) = transaction.get(&self.database, key)? {
+                ensure!(
+                    decode_size(&existing)? == *size,
+                    "conflicting size for Git blob {oid}"
+                );
+            }
+            if let Some(existing) = transaction.get(&self.mappings, key)? {
+                ensure!(
+                    &*existing == value.as_slice(),
+                    "conflicting BLAKE3 mapping for Git blob {oid}"
+                );
+            }
+            transaction.insert(&self.database, key, size.to_be_bytes());
+            transaction.insert(&self.mappings, key, value);
         }
         transaction.commit()?;
         Ok(())

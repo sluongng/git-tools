@@ -73,6 +73,16 @@ pub struct BlobPrefetchReport {
     pub fetch_batches: usize,
 }
 
+#[derive(Debug, Serialize)]
+pub struct Blake3WarmReport {
+    pub unique_blobs: usize,
+    pub cache_hits: usize,
+    pub proxy_objects: usize,
+    pub requests: usize,
+    pub size_bytes: u64,
+    pub elapsed_seconds: f64,
+}
+
 pub struct GitRepo {
     repository: PathBuf,
     git_binary: PathBuf,
@@ -249,6 +259,71 @@ impl GitRepo {
             .git_output(&["remote", "get-url", &self.remote], false)
             .context("inspect configured size-warming remote")?;
         Ok(crate::github_sizes::github_repository(&remote).is_some())
+    }
+
+    /// Warm trusted content mappings without reading any local blob contents.
+    pub fn warm_blake3_snapshot(
+        &mut self,
+        snapshot: &crate::filesystem::Snapshot,
+        origin: &str,
+        alias: &str,
+    ) -> Result<Blake3WarmReport> {
+        use crate::filesystem::Kind;
+        crate::cas_digest::endpoint(origin, alias)?;
+        let started = std::time::Instant::now();
+        let mut oids: Vec<_> = snapshot
+            .nodes
+            .iter()
+            .filter(|node| matches!(node.kind, Kind::File | Kind::Symlink))
+            .filter_map(|node| node.oid.clone())
+            .collect::<HashSet<_>>()
+            .into_iter()
+            .collect();
+        oids.sort();
+        let cached = self.cache_lock()?.blake3_many(&oids)?;
+        let missing: Vec<_> = oids
+            .iter()
+            .filter(|oid| !cached.contains_key(*oid))
+            .cloned()
+            .collect();
+        let mut requests = 0;
+        let mut size_bytes = cached.values().try_fold(0u64, |total, (size, _)| {
+            total
+                .checked_add(*size)
+                .context("snapshot sizes exceed u64")
+        })?;
+        for chunk in missing.chunks(crate::cas_digest::BATCH_SIZE) {
+            let mappings = crate::cas_digest::lookup_batch(origin, alias, chunk)?;
+            let batch_size = mappings.values().try_fold(0u64, |total, (size, _)| {
+                total
+                    .checked_add(*size)
+                    .context("snapshot sizes exceed u64")
+            })?;
+            let next_size_bytes = size_bytes
+                .checked_add(batch_size)
+                .context("snapshot sizes exceed u64")?;
+            self.cache_lock()?.persist_blake3(&mappings)?;
+            size_bytes = next_size_bytes;
+            requests += 1;
+        }
+        Ok(Blake3WarmReport {
+            unique_blobs: oids.len(),
+            cache_hits: cached.len(),
+            proxy_objects: missing.len(),
+            requests,
+            size_bytes,
+            elapsed_seconds: started.elapsed().as_secs_f64(),
+        })
+    }
+
+    /// Cache-only lookup: never fetches metadata or blob content.
+    pub fn cached_blake3(&self, oid: &str) -> Result<Option<[u8; 32]>> {
+        let oid = canonical_oid(oid)?;
+        Ok(self
+            .cache_lock()?
+            .blake3_many(std::slice::from_ref(&oid))?
+            .get(&oid)
+            .map(|(_, hash)| *hash))
     }
 
     /// Warm snapshot metadata without hydrating content on the GitHub path.

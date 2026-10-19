@@ -1225,9 +1225,19 @@ fn writable_mount_with_env(
     overlay: &Path,
     environment: &[(&str, &str)],
 ) -> Mounted {
+    writable_mount_options(fixture, overlay, environment, &[])
+}
+
+fn writable_mount_options(
+    fixture: &Fixture,
+    overlay: &Path,
+    environment: &[(&str, &str)],
+    extra: &[&str],
+) -> Mounted {
     let child = Command::new(env!("CARGO_BIN_EXE_git-vfs"))
         .envs(environment.iter().copied())
         .arg("mount")
+        .args(extra)
         .arg("--repo")
         .arg(&fixture.clone)
         .arg("--overlay")
@@ -2525,4 +2535,191 @@ fn proxy_cas_digest_requires_explicit_origin_and_safe_alias() {
         assert!(!result.status.success(), "accepted {origin} / {alias}");
         assert!(!String::from_utf8_lossy(&result.stderr).contains("querying proxy"));
     }
+}
+
+fn snapshot_mapping_response(fixture: &Fixture) -> (Vec<String>, serde_json::Value) {
+    let repo = fixture.repo(SizeFallback::Error);
+    let snapshot = Snapshot::load(&repo, "HEAD").unwrap();
+    let mut oids: Vec<_> = snapshot
+        .entries()
+        .into_iter()
+        .filter(|entry| matches!(entry.kind.as_str(), "file" | "symlink"))
+        .filter_map(|entry| entry.oid)
+        .collect();
+    oids.sort();
+    oids.dedup();
+    let objects: Vec<_> = oids
+        .iter()
+        .map(|oid| {
+            let data = git(&fixture.source, &["cat-file", "blob", oid]).stdout;
+            serde_json::json!({"oid": oid, "object_type": "blob", "size_bytes": data.len(),
+            "blake3": {"hash": blake3::hash(&data).to_hex().to_string(), "size_bytes": data.len()}})
+        })
+        .collect();
+    (oids, serde_json::json!({"objects": objects}))
+}
+
+#[test]
+fn proxy_blake3_warming_is_batched_persistent_and_atomic_on_invalid_response() {
+    let fixture = Fixture::with_blob_count(0);
+    let (oids, body) = snapshot_mapping_response(&fixture);
+    let mut invalid = body.clone();
+    invalid["objects"][1] = invalid["objects"][0].clone();
+    let (origin, server) = digest_proxy_response(200, invalid.to_string());
+    {
+        let mut repo = fixture.repo(SizeFallback::Error);
+        let snapshot = Snapshot::load(&repo, "HEAD").unwrap();
+        assert!(
+            repo.warm_blake3_snapshot(&snapshot, &origin, "fixture_repo")
+                .is_err()
+        );
+        for oid in &oids {
+            assert!(repo.cached_blake3(oid).unwrap().is_none());
+        }
+    }
+    server.join().unwrap();
+    let mut overflow = body.clone();
+    for object in overflow["objects"]
+        .as_array_mut()
+        .unwrap()
+        .iter_mut()
+        .take(3)
+    {
+        object["size_bytes"] = serde_json::json!(i64::MAX as u64);
+        object["blake3"]["size_bytes"] = serde_json::json!(i64::MAX as u64);
+    }
+    let (origin, server) = digest_proxy_response(200, overflow.to_string());
+    {
+        let mut repo = fixture.repo(SizeFallback::Error);
+        let snapshot = Snapshot::load(&repo, "HEAD").unwrap();
+        let error = repo
+            .warm_blake3_snapshot(&snapshot, &origin, "fixture_repo")
+            .unwrap_err();
+        assert!(error.to_string().contains("snapshot sizes exceed u64"));
+        for oid in &oids {
+            assert!(repo.cached_blake3(oid).unwrap().is_none());
+        }
+        assert_eq!(
+            repo.cache_stats().unwrap().entries,
+            0,
+            "overflow must not persist sizes or hashes"
+        );
+    }
+    server.join().unwrap();
+    let (origin, server) = digest_proxy_response(200, body.to_string());
+    let output = ok_cli(&[
+        "warm-blake3",
+        "--repo",
+        fixture.clone.to_str().unwrap(),
+        "--proxy-url",
+        &origin,
+        "--proxy-repo",
+        "fixture_repo",
+    ]);
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["requests"], 1);
+    assert_eq!(report["proxy_objects"], oids.len());
+    let request = server.join().unwrap();
+    assert_eq!(request["oids"].as_array().unwrap().len(), oids.len());
+    assert_eq!(request["blake3"], true);
+    // No listener now: a reopened cache must answer entirely offline.
+    let output = ok_cli(&[
+        "warm-blake3",
+        "--repo",
+        fixture.clone.to_str().unwrap(),
+        "--proxy-url",
+        &origin,
+        "--proxy-repo",
+        "fixture_repo",
+    ]);
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["requests"], 0);
+    assert_eq!(report["cache_hits"], oids.len());
+    assert_eq!(fixture.missing_blobs(&oids), oids.len());
+    // Existing cas-digest response tests cover type, size, hash and HTTP errors;
+    // this batch case specifically verifies duplicate identity and atomicity.
+}
+
+#[test]
+#[ignore = "requires Linux /dev/fuse and fusermount3"]
+fn mounted_blake3_xattrs_use_cached_base_and_current_same_size_overlay_bytes() {
+    let fixture = Fixture::with_blob_count(0);
+    let (oids, body) = snapshot_mapping_response(&fixture);
+    let (origin, server) = digest_proxy_response(200, body.to_string());
+    ok_cli(&[
+        "warm-blake3",
+        "--repo",
+        fixture.clone.to_str().unwrap(),
+        "--proxy-url",
+        &origin,
+        "--proxy-repo",
+        "fixture_repo",
+    ]);
+    server.join().unwrap();
+    let overlay = fixture._temp.path().join("blake3-overlay");
+    let mounted = writable_mount_options(
+        &fixture,
+        &overlay,
+        &[],
+        &[
+            "--blake3-proxy-url",
+            &origin,
+            "--blake3-proxy-repo",
+            "fixture_repo",
+        ],
+    );
+    let path = fixture.mount.join("hello.txt");
+    assert_eq!(
+        xattr(&path, "user.blake3"),
+        blake3::hash(b"hello from git-vfs\n").as_bytes()
+    );
+    assert_eq!(
+        fixture.missing_blobs(&oids),
+        oids.len(),
+        "base xattr must not hydrate"
+    );
+    fs::write(&path, b"HELLO from git-vfs\n").unwrap();
+    assert_eq!(
+        xattr(&path, "user.blake3"),
+        blake3::hash(b"HELLO from git-vfs\n").as_bytes()
+    );
+    assert_eq!(
+        xattr(&path, "user.blake3.hex"),
+        blake3::hash(b"HELLO from git-vfs\n").to_hex().as_bytes()
+    );
+    fs::write(fixture.mount.join("new.txt"), b"new bytes").unwrap();
+    assert_eq!(
+        xattr(&fixture.mount.join("new.txt"), "user.blake3"),
+        blake3::hash(b"new bytes").as_bytes()
+    );
+    for path in [fixture.mount.clone(), fixture.mount.join(".git")] {
+        let path = CString::new(path.as_os_str().as_bytes()).unwrap();
+        let name = CString::new("user.blake3").unwrap();
+        assert_eq!(
+            unsafe { libc::getxattr(path.as_ptr(), name.as_ptr(), std::ptr::null_mut(), 0) },
+            -1
+        );
+        assert_eq!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::ENODATA)
+        );
+    }
+    drop(mounted);
+    let readonly = writable_mount_options(
+        &fixture,
+        &overlay,
+        &[],
+        &[
+            "--read-only",
+            "--blake3-proxy-url",
+            &origin,
+            "--blake3-proxy-repo",
+            "fixture_repo",
+        ],
+    );
+    assert_eq!(
+        xattr(&path, "user.blake3"),
+        blake3::hash(b"hello from git-vfs\n").as_bytes()
+    );
+    drop(readonly);
 }

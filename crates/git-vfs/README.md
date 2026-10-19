@@ -445,3 +445,50 @@ of legacy SQLite/LMDB overlays without loss of their contents.
 - [Git fsmonitor v2 hook contract](https://git-scm.com/docs/githooks#_fsmonitor_watchman)
 - [REAPI digest functions](https://github.com/bazelbuild/remote-apis/blob/main/build/bazel/remote/execution/v2/remote_execution.proto)
 - [Bazel GITSHA1 implementation](https://github.com/bazelbuild/bazel/blob/master/src/main/java/com/google/devtools/build/lib/vfs/GitSha1HashFunction.java)
+
+## Opt-in BLAKE3 mappings from a trusted proxy
+
+A proxy started with `--enable-blake3` can supply raw-content BLAKE3 digests
+without the VFS downloading the corresponding Git blobs. Explicitly opt in:
+
+```sh
+# Optional separate phase for measuring or reusing the persistent metadata cache.
+target/release/git-vfs warm-blake3 --repo /tmp/project.git \
+  --proxy-url http://127.0.0.1:8080 --proxy-repo project
+
+target/release/git-vfs mount --repo /tmp/project.git \
+  --blake3-proxy-url http://127.0.0.1:8080 --blake3-proxy-repo project \
+  --prefetch-bazel /tmp/git-vfs-mount
+
+# In another terminal, with a Bazel build that supports BLAKE3:
+cd /tmp/git-vfs-mount
+bazel --digest_function=BLAKE3 query \
+  --unix_digest_hash_attribute_name=user.blake3 //...
+```
+
+Mount startup first warms every unique file/symlink mapping in batches of at
+most 16,384 object IDs. This is a **blocking metadata phase**, separate from
+optional asynchronous content prefetch. A warm local mapping cache needs no
+HTTP request. Sizes and 32-byte hashes are persisted together in the existing
+Fjall size database, with conflict checks against previously cached values.
+The provider is trusted to report the correct content hash: the VFS validates
+identities, blob types, hash encoding and size agreement, but cannot verify a
+content hash without downloading the bytes. Use a trusted origin and transport.
+Redirects, URL credentials and path prefixes are rejected.
+
+Only opted-in mounts expose `user.blake3` (32 raw bytes) and
+`user.blake3.hex` (64 hexadecimal bytes). Untouched base files use cache-only
+lookups; an absent mapping returns `ENODATA`, never an HTTP request from a
+filesystem callback. Edited and new files hash their current overlay bytes,
+including same-size edits. Directories and the private `.git` control files do
+not expose a BLAKE3 digest. These mappings neither upload content to a remote
+CAS nor assert that a remote CAS already holds it.
+
+At shutdown, `BLAKE3 xattrs: {...}` reports per-mount `base_hits`,
+`local_hashes` and `misses`. Counters include xattr size probes and reads, not
+unique paths. Stop filesystem users before shutdown to measure a quiescent
+mount: these are best-effort snapshots, not a dispatch-thread join guarantee.
+A query may load BUILD/Starlark files without requesting content
+digests; zero hits means that run did not exercise digest reuse, regardless of
+its configured digest function. Use an actual build/action-input workload to
+measure digest reuse when query alone does not request the attributes.

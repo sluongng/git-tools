@@ -11,7 +11,7 @@ use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-mod cas_digest;
+use git_vfs::cas_digest;
 
 #[derive(Parser)]
 #[command(
@@ -100,6 +100,12 @@ enum Commands {
         /// Persistent writable state directory. Defaults inside the bare repository.
         #[arg(long)]
         overlay: Option<PathBuf>,
+        /// Trust this proxy's cached BLAKE3 mappings and expose user.blake3.
+        #[arg(long, requires = "blake3_proxy_repo")]
+        blake3_proxy_url: Option<String>,
+        /// Repository alias on the BLAKE3 mapping proxy.
+        #[arg(long, requires = "blake3_proxy_url")]
+        blake3_proxy_repo: Option<String>,
         /// Batch-prefetch Bazel inputs in the background after mounting.
         #[arg(long)]
         prefetch_bazel: bool,
@@ -150,6 +156,15 @@ enum Commands {
         #[arg(long)]
         proxy_repo: String,
         path: PathBuf,
+    },
+    /// Batch-cache trusted proxy BLAKE3 mappings and sizes without reading blobs.
+    WarmBlake3 {
+        #[command(flatten)]
+        repository: RepoArgs,
+        #[arg(long)]
+        proxy_url: String,
+        #[arg(long)]
+        proxy_repo: String,
     },
     /// Prefill the persistent size cache for a commit without reading blobs.
     WarmSizes {
@@ -277,6 +292,7 @@ fn mount(
     read_only: bool,
     overlay_path: Option<&Path>,
     prefetch: Option<BazelPrefetchPolicy>,
+    blake3: bool,
 ) -> Result<()> {
     let mountpoint = mountpoint
         .canonicalize()
@@ -306,11 +322,20 @@ fn mount(
         MountOption::DefaultPermissions,
         MountOption::FSName("git-vfs".into()),
     ];
+    let stats = std::sync::Arc::new(git_vfs::blake3_xattr::Blake3XattrStats::default());
     let working;
     let session = if read_only {
         options.push(MountOption::RO);
         working = None;
-        fuser::spawn_mount2(GitFs::new(snapshot, repo), &mountpoint, &options)
+        {
+            let fs = GitFs::new(snapshot, repo);
+            let fs = if blake3 {
+                fs.with_blake3(stats.clone())
+            } else {
+                fs
+            };
+            fuser::spawn_mount2(fs, &mountpoint, &options)
+        }
     } else {
         options.push(MountOption::RW);
         let directory = overlay_path
@@ -324,7 +349,15 @@ fn mount(
         state.prepare(&repo, &snapshot, &mountpoint, &std::env::current_exe()?)?;
         eprintln!("Writable overlay: {}", state.directory.display());
         working = Some(state);
-        fuser::spawn_mount2(WritableGitFs::new(overlay, repo), &mountpoint, &options)
+        {
+            let fs = WritableGitFs::new(overlay, repo);
+            let fs = if blake3 {
+                fs.with_blake3(stats.clone())
+            } else {
+                fs
+            };
+            fuser::spawn_mount2(fs, &mountpoint, &options)
+        }
     }
     .context("mounting git-vfs (check /dev/fuse and fusermount3)")?;
     // The mount is live before speculative content transfer starts. This uses a
@@ -368,6 +401,9 @@ fn mount(
     drop(background);
     drop(session);
     drop(working);
+    if blake3 {
+        eprintln!("BLAKE3 xattrs: {}", serde_json::to_string(&stats.report())?);
+    }
     Ok(())
 }
 
@@ -400,14 +436,27 @@ fn main() -> Result<()> {
             read_only,
             overlay,
             prefetch_bazel,
+            blake3_proxy_url,
+            blake3_proxy_repo,
             prefetch_path,
             prefetch_include,
             prefetch_no_discover,
         } => {
             let mut repo = open(&repository, &cli.git)?;
             let snapshot = Snapshot::load(&repo, &repository.revision)?;
-            if repository.size_source == SizeSourceArg::Github
-                || (repository.size_source == SizeSourceArg::Auto && repo.is_github_remote()?)
+            let blake3 = blake3_proxy_url.is_some();
+            if let Some(origin) = blake3_proxy_url.as_deref() {
+                let report = repo.warm_blake3_snapshot(
+                    &snapshot,
+                    origin,
+                    blake3_proxy_repo.as_deref().expect("paired arguments"),
+                )?;
+                eprintln!("BLAKE3 metadata: {}", serde_json::to_string(&report)?);
+            }
+            if !blake3
+                && (repository.size_source == SizeSourceArg::Github
+                    || (repository.size_source == SizeSourceArg::Auto
+                        && repo.is_github_remote()?))
             {
                 let report = repo.warm_snapshot_sizes(&snapshot, &repository.size_options())?;
                 eprintln!("Size metadata: {}", serde_json::to_string(&report)?);
@@ -426,6 +475,7 @@ fn main() -> Result<()> {
                 read_only,
                 overlay.as_deref(),
                 policy,
+                blake3,
             )
         }
         Commands::List { repository } => {
@@ -473,6 +523,15 @@ fn main() -> Result<()> {
             let snapshot = Snapshot::load(&repo, &repository.revision)?;
             let oid = hex::encode(snapshot.digest_path(&path)?);
             print_json(&cas_digest::lookup(&proxy_url, &proxy_repo, &oid)?)
+        }
+        Commands::WarmBlake3 {
+            repository,
+            proxy_url,
+            proxy_repo,
+        } => {
+            let mut repo = open(&repository, &cli.git)?;
+            let snapshot = Snapshot::load(&repo, &repository.revision)?;
+            print_json(&repo.warm_blake3_snapshot(&snapshot, &proxy_url, &proxy_repo)?)
         }
         Commands::WarmSizes { repository } => {
             let mut repo = open(&repository, &cli.git)?;
