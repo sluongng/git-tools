@@ -234,8 +234,17 @@ fn category(root: &'static str, relative: &Path) -> &'static str {
             };
         }
         let name = second.as_os_str().to_string_lossy();
-        if name.len() == 2 && name.bytes().all(|b| b.is_ascii_hexdigit()) {
-            return "mirror_loose_objects";
+        if name.len() == 2
+            && name.bytes().all(|b| b.is_ascii_hexdigit())
+            && let Some(object) = parts.next()
+        {
+            let object = object.as_os_str().to_string_lossy();
+            if object.len() == 38
+                && object.bytes().all(|b| b.is_ascii_hexdigit())
+                && parts.next().is_none()
+            {
+                return "mirror_loose_objects";
+            }
         }
     }
     "mirror_auxiliary"
@@ -305,7 +314,11 @@ mod tests {
         }
         fs::write(repo.join("objects/pack/a.pack"), [0; 20]).unwrap();
         fs::write(repo.join("objects/pack/a.idx"), [0; 7]).unwrap();
-        fs::write(repo.join("objects/ab/object"), [0; 3]).unwrap();
+        fs::write(repo.join("objects/ab").join("c".repeat(38)), [0; 3]).unwrap();
+        fs::write(repo.join("objects/ab/not-an-object"), [0; 5]).unwrap();
+        let nested = repo.join("objects/ab").join("d".repeat(38));
+        fs::create_dir(&nested).unwrap();
+        fs::write(nested.join("e".repeat(38)), [0; 9]).unwrap();
         fs::write(cache.join("generated-packs/schema-v2/a.response"), [0; 11]).unwrap();
         fs::write(cache.join("digests.fjall/data"), [0; 13]).unwrap();
         fs::write(temp.path().join("private"), [0; 100]).unwrap();
@@ -322,6 +335,8 @@ mod tests {
         assert_eq!(result.categories["mirror_packs"].logical_bytes, 20);
         assert_eq!(result.categories["mirror_indexes"].logical_bytes, 7);
         assert_eq!(result.categories["mirror_loose_objects"].logical_bytes, 3);
+        assert_eq!(result.categories["mirror_loose_objects"].files, 1);
+        assert_eq!(result.categories["mirror_auxiliary"].logical_bytes, 14);
         assert_eq!(result.categories["generated_responses"].logical_bytes, 11);
         assert_eq!(result.categories["digest_database"].logical_bytes, 13);
         assert_eq!(result.symlinks_skipped, 2);

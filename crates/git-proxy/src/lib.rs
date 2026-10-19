@@ -77,6 +77,7 @@ struct App {
     storage_accounting: storage_accounting::StorageAccounting,
     http_backend_calls: AtomicU64,
     fetch_generations: AtomicU64,
+    pack_identity_failures: AtomicU64,
     _lock: Arc<File>,
     cas_sync: Option<Arc<cas_sync::CasSync>>,
 }
@@ -156,6 +157,7 @@ pub fn router_with_cas_shutdown(mut config: Config) -> Result<(Router, Option<Ca
         storage_accounting,
         http_backend_calls: AtomicU64::new(0),
         fetch_generations: AtomicU64::new(0),
+        pack_identity_failures: AtomicU64::new(0),
         _lock: lock,
         cas_sync,
     });
@@ -398,6 +400,40 @@ async fn ensure_repo(app: &App, repo: &Repository, refresh: bool) -> Result<()> 
     }
     Ok(())
 }
+// Hash potentially large ref inventories without capturing them in memory. The
+// byte/time budgets bound work even when an origin has an extreme ref count.
+const MAX_IDENTITY_BYTES: u64 = 64 * 1024 * 1024;
+const IDENTITY_TIMEOUT: Duration = Duration::from_secs(30);
+async fn checked_digest(mut command: Command) -> Result<(u64, blake3::Hash)> {
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+    let mut child = command.spawn()?;
+    let _group = group(&child);
+    let mut stdout = child.stdout.take().unwrap();
+    tokio::time::timeout(IDENTITY_TIMEOUT, async {
+        let mut digest = blake3::Hasher::new();
+        let mut count = 0u64;
+        let mut buffer = [0u8; 64 * 1024];
+        loop {
+            let n = stdout.read(&mut buffer).await?;
+            if n == 0 {
+                break;
+            }
+            count += n as u64;
+            ensure!(
+                count <= MAX_IDENTITY_BYTES,
+                "Git identity output exceeded 64 MiB"
+            );
+            digest.update(&buffer[..n]);
+        }
+        ensure!(child.wait().await?.success(), "Git identity command failed");
+        Ok((count, digest.finalize()))
+    })
+    .await
+    .context("Git identity command timed out")?
+}
 // Called under refs_gate's read lease. The process-local epoch only invalidates
 // this memo; the persisted key is a hash of the actual ref/config/Git view.
 async fn pack_identity(app: &App, repo: &Repository, alias: &str) -> Result<String> {
@@ -410,7 +446,7 @@ async fn pack_identity(app: &App, repo: &Repository, alias: &str) -> Result<Stri
     }
     let mut hash = blake3::Hasher::new();
     for value in [
-        b"git-proxy/ref-view/v2".as_slice(),
+        b"git-proxy/ref-view/v3".as_slice(),
         alias.as_bytes(),
         repo.upstream.as_bytes(),
         app.config.git.as_os_str().as_encoded_bytes(),
@@ -429,14 +465,14 @@ async fn pack_identity(app: &App, repo: &Repository, alias: &str) -> Result<Stri
         vec!["config", "--local", "--includes", "--null", "--list"],
         vec!["version"],
     ] {
-        let value = checked({
+        let (length, digest) = checked_digest({
             let mut c = git(app, Some(&repo.path));
             c.args(args);
             c
         })
         .await?;
-        hash.update(&(value.len() as u64).to_le_bytes());
-        hash.update(&value);
+        hash.update(&length.to_le_bytes());
+        hash.update(digest.as_bytes());
     }
     let identity = hash.finalize().to_hex().to_string();
     *memo = Some((epoch, identity.clone()));
@@ -491,6 +527,7 @@ async fn handle(State(app): State<Arc<App>>, request: Request) -> Result<Respons
             "pack_cache": app.packs.snapshot(),
             "http_backend_calls": app.http_backend_calls.load(Ordering::Relaxed),
             "fetch_generations": app.fetch_generations.load(Ordering::Relaxed),
+            "pack_identity_failures": app.pack_identity_failures.load(Ordering::Relaxed),
             "cas_sync": app.cas_sync.as_ref().map(|sync| sync.snapshot()),
         });
         if request.uri().path() == "/metrics" {
@@ -499,8 +536,8 @@ async fn handle(State(app): State<Arc<App>>, request: Request) -> Result<Respons
                 text.push_str(&format!("git_proxy_pack_cache_{name} {value}\n"));
             }
             text.push_str(&format!(
-                "git_proxy_http_backend_calls {}\ngit_proxy_fetch_generations {}\n",
-                stats["http_backend_calls"], stats["fetch_generations"]
+                "git_proxy_http_backend_calls {}\ngit_proxy_fetch_generations {}\ngit_proxy_pack_identity_failures {}\n",
+                stats["http_backend_calls"], stats["fetch_generations"], stats["pack_identity_failures"]
             ));
             return Ok(
                 ([(header::CONTENT_TYPE, "text/plain; version=0.0.4")], text).into_response(),
@@ -683,7 +720,13 @@ async fn handle(State(app): State<Arc<App>>, request: Request) -> Result<Respons
     let refs_lease = repo.refs_gate.clone().read_owned().await;
     // Unknown/oversized ref views bypass caching, not native Git service.
     let identity = if upload {
-        pack_identity(&app, repo, alias).await.ok()
+        match pack_identity(&app, repo, alias).await {
+            Ok(identity) => Some(identity),
+            Err(_) => {
+                app.pack_identity_failures.fetch_add(1, Ordering::Relaxed);
+                None
+            }
+        }
     } else {
         None
     };

@@ -586,6 +586,76 @@ async fn generated_responses_survive_restart_but_changed_tags_get_new_identity()
     task.stop().await;
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn large_ref_inventory_is_cacheable_and_survives_restart() {
+    let temp = tempfile::tempdir().unwrap();
+    let (upstream, _, head) = upstream(temp.path()).await;
+    let mut command = Command::new(git());
+    command
+        .args(["-C", upstream.to_str().unwrap(), "update-ref", "--stdin"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped());
+    let mut child = command.spawn().unwrap();
+    let mut input = child.stdin.take().unwrap();
+    let mut updates = String::new();
+    for index in 0..20_000 {
+        updates.push_str(&format!(
+            "create refs/heads/cache-fixture/{index:05}-{} {head}\n",
+            "x".repeat(50)
+        ));
+    }
+    input.write_all(updates.as_bytes()).await.unwrap();
+    drop(input);
+    let output = child.wait_with_output().await.unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    run(&[
+        "-C",
+        upstream.to_str().unwrap(),
+        "pack-refs",
+        "--all",
+        "--prune",
+    ])
+    .await;
+    let inventory = run(&[
+        "-C",
+        upstream.to_str().unwrap(),
+        "for-each-ref",
+        "--sort=refname",
+        "--format=%(refname)%00%(objectname)%00%(symref)",
+    ])
+    .await;
+    assert!(
+        inventory.len() > 2 * 1024 * 1024,
+        "fixture must exceed both the old 1 MiB capture bound and 2 MiB"
+    );
+    let cfg = config(temp.path(), &upstream, 3600);
+    let client = reqwest::Client::new();
+    let body = fetch_body(&head, &["include-tag\n"]);
+    let (url, task) = serve(cfg.clone()).await;
+    let original = fetch_response(&client, &url, body.clone()).await;
+    assert_eq!(original.0, "MISS");
+    assert_eq!(fetch_response(&client, &url, body.clone()).await.0, "HIT");
+    assert_eq!(
+        cache_stats(&client, &url).await["pack_identity_failures"],
+        0
+    );
+    task.stop().await;
+    let (url, task) = serve(cfg).await;
+    assert_eq!(
+        fetch_response(&client, &url, body).await,
+        ("HIT".to_owned(), original.1)
+    );
+    let stats = cache_stats(&client, &url).await;
+    assert_eq!(stats["fetch_generations"], 0);
+    assert_eq!(stats["pack_identity_failures"], 0);
+    task.stop().await;
+}
+
 fn gated_git(root: &Path) -> PathBuf {
     use std::os::unix::fs::PermissionsExt;
     fn quote(s: &str) -> String {
