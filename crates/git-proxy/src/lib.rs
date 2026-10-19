@@ -1,5 +1,8 @@
 //! A single-owner, configured-origin, read-only smart HTTP Git cache.
+pub mod cas_client;
+mod cas_sync;
 mod fetch_key;
+pub use cas_sync::{CasShutdown, CasSyncConfig};
 mod fetch_response;
 mod pack_cache;
 pub use pack_cache::PackCacheConfig;
@@ -44,6 +47,7 @@ pub struct Config {
     pub refresh_ttl: Duration,
     pub enable_blake3: bool,
     pub pack_cache: PackCacheConfig,
+    pub cas_sync: Option<CasSyncConfig>,
 }
 struct Repository {
     upstream: String,
@@ -72,9 +76,19 @@ struct App {
     http_backend_calls: AtomicU64,
     fetch_generations: AtomicU64,
     _lock: Arc<File>,
+    cas_sync: Option<Arc<cas_sync::CasSync>>,
 }
 
-pub fn router(mut config: Config) -> Result<Router> {
+pub fn router(config: Config) -> Result<Router> {
+    ensure!(
+        config.cas_sync.is_none(),
+        "CAS sync requires router_with_cas_shutdown and its service-owner handle"
+    );
+    Ok(router_with_cas_shutdown(config)?.0)
+}
+
+/// Join optional CAS work after stopping new HTTP traffic.
+pub fn router_with_cas_shutdown(mut config: Config) -> Result<(Router, Option<CasShutdown>)> {
     std::fs::create_dir_all(&config.cache_dir)?;
     config.cache_dir = std::fs::canonicalize(&config.cache_dir)?;
     let lock = std::fs::OpenOptions::new()
@@ -115,6 +129,16 @@ pub fn router(mut config: Config) -> Result<Router> {
         config.pack_cache.clone(),
         lock.clone(),
     )?;
+    ensure!(
+        config.cas_sync.is_none() || config.enable_blake3,
+        "CAS sync requires BLAKE3 mapping support"
+    );
+    let sync = config
+        .cas_sync
+        .clone()
+        .map(cas_sync::CasSync::new)
+        .transpose()?;
+    let cas_sync = sync.as_ref().map(|(sync, _, _)| sync.clone());
     let app = Arc::new(App {
         config,
         repositories,
@@ -124,8 +148,11 @@ pub fn router(mut config: Config) -> Result<Router> {
         http_backend_calls: AtomicU64::new(0),
         fetch_generations: AtomicU64::new(0),
         _lock: lock,
+        cas_sync,
     });
-    Ok(Router::new().fallback(handle).with_state(app))
+    let shutdown =
+        sync.map(|(sync, jobs, cancelled)| sync.start(Arc::downgrade(&app), jobs, cancelled));
+    Ok((Router::new().fallback(handle).with_state(app), shutdown))
 }
 fn valid_alias(s: &str) -> bool {
     !s.is_empty()
@@ -138,6 +165,11 @@ fn valid_oid(s: &str) -> bool {
 }
 fn git(app: &App, path: Option<&Path>) -> Command {
     let mut command = Command::new(&app.config.git);
+    if let Some(cas) = &app.config.cas_sync {
+        for (_, variable) in &cas.header_env {
+            command.env_remove(variable);
+        }
+    }
     command.process_group(0);
     command.arg("--no-replace-objects");
     command
@@ -382,6 +414,7 @@ async fn handle(State(app): State<Arc<App>>, request: Request) -> Result<Respons
             "pack_cache": app.packs.snapshot(),
             "http_backend_calls": app.http_backend_calls.load(Ordering::Relaxed),
             "fetch_generations": app.fetch_generations.load(Ordering::Relaxed),
+            "cas_sync": app.cas_sync.as_ref().map(|sync| sync.snapshot()),
         });
         if request.uri().path() == "/metrics" {
             let mut text = String::new();
@@ -405,6 +438,44 @@ async fn handle(State(app): State<Arc<App>>, request: Request) -> Result<Respons
         )
     })?;
     let path = request.uri().path().to_owned();
+    if let Some(alias) = path
+        .strip_prefix("/api/v1/repos/")
+        .and_then(|s| s.strip_suffix("/cas-sync"))
+    {
+        if request.method() != "POST" {
+            return Err(HttpError(
+                StatusCode::METHOD_NOT_ALLOWED,
+                "POST required\n".into(),
+            ));
+        }
+        if !app.repositories.contains_key(alias) {
+            return Err(HttpError(
+                StatusCode::NOT_FOUND,
+                "unknown repository\n".into(),
+            ));
+        }
+        let sync = app.cas_sync.as_ref().ok_or_else(|| {
+            HttpError(
+                StatusCode::BAD_REQUEST,
+                "CAS sync is not configured\n".into(),
+            )
+        })?;
+        let query: SyncRequest = serde_json::from_slice(&read_body(request).await?)
+            .map_err(|_| HttpError(StatusCode::BAD_REQUEST, "invalid JSON\n".into()))?;
+        if query.oids.len() > MAX_OBJECTS || query.oids.iter().any(|oid| !valid_oid(oid)) {
+            return Err(HttpError(
+                StatusCode::BAD_REQUEST,
+                "expected at most 16384 full SHA1 blob IDs\n".into(),
+            ));
+        }
+        let accepted = sync.enqueue(alias, query.oids, query.force).map_err(|_| {
+            HttpError(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "CAS queue full, shutting down, or force overlaps pending work\n".into(),
+            )
+        })?;
+        return Ok((StatusCode::ACCEPTED, axum::Json(accepted)).into_response());
+    }
     if let Some(alias) = path
         .strip_prefix("/api/v1/repos/")
         .and_then(|s| s.strip_suffix("/objects"))
@@ -435,7 +506,20 @@ async fn handle(State(app): State<Arc<App>>, request: Request) -> Result<Respons
             ));
         }
         ensure_repo(&app, repo, false).await.map_err(internal)?;
+        let enqueue = query.blake3;
         let objects = metadata(&app, repo, query).await?;
+        if enqueue && let Some(sync) = &app.cas_sync {
+            // Publication is optional and never delays/fails metadata RPCs.
+            let _ = sync.enqueue(
+                alias,
+                objects
+                    .iter()
+                    .filter(|obj| obj.object_type == "blob")
+                    .map(|obj| obj.oid.clone())
+                    .collect(),
+                false,
+            );
+        }
         drop(permit);
         return Ok(axum::Json(ObjectResponse { objects }).into_response());
     }
@@ -741,6 +825,13 @@ async fn git_http(
     response
         .body(Body::from_stream(stream))
         .map_err(|e| internal(e.into()))
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SyncRequest {
+    oids: Vec<String>,
+    #[serde(default)]
+    force: bool,
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]

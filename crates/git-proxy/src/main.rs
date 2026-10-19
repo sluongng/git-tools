@@ -16,6 +16,19 @@ struct Args {
     refresh_ttl_seconds: u64,
     #[arg(long)]
     enable_blake3: bool,
+    /// Opt-in BLAKE3 CAS publication; http(s) origin, not a Git endpoint.
+    #[arg(long)]
+    cas_endpoint: Option<String>,
+    #[arg(long, default_value = "")]
+    cas_instance_name: String,
+    /// HEADER=ENV_VAR; values never appear in arguments or configuration logs.
+    #[arg(long, value_name = "HEADER=ENV_VAR")]
+    cas_header_env: Vec<String>,
+    /// Match Bazel --experimental_remote_cache_ttl; not negotiated by REAPI.
+    #[arg(long, default_value_t = 10800)]
+    cas_remote_ttl_seconds: u64,
+    #[arg(long, default_value_t = 64 * 1024 * 1024)]
+    cas_staging_limit_bytes: u64,
     /// Maximum completed and reserved generated-response bytes; 0 disables caching.
     #[arg(long, default_value_t = 1024 * 1024 * 1024)]
     pack_cache_max_bytes: u64,
@@ -38,12 +51,36 @@ async fn main() -> Result<()> {
                 .context("--repo must be ALIAS=UPSTREAM")
         })
         .collect::<Result<Vec<_>>>()?;
-    let router = git_proxy::router(git_proxy::Config {
+    let cas_sync = args
+        .cas_endpoint
+        .map(|endpoint| {
+            let header_env = args
+                .cas_header_env
+                .iter()
+                .map(|entry| {
+                    entry
+                        .split_once('=')
+                        .map(|(header, env)| (header.to_owned(), env.to_owned()))
+                        .filter(|(header, env)| !header.is_empty() && !env.is_empty())
+                        .context("--cas-header-env requires HEADER=ENV_VAR")
+                })
+                .collect::<Result<Vec<_>>>()?;
+            Ok::<_, anyhow::Error>(git_proxy::CasSyncConfig {
+                endpoint,
+                instance_name: args.cas_instance_name,
+                header_env,
+                remote_ttl: Duration::from_secs(args.cas_remote_ttl_seconds),
+                staging_limit_bytes: args.cas_staging_limit_bytes,
+            })
+        })
+        .transpose()?;
+    let (router, cas_shutdown) = git_proxy::router_with_cas_shutdown(git_proxy::Config {
         cache_dir: args.cache_dir,
         git: args.git,
         repositories,
         refresh_ttl: Duration::from_secs(args.refresh_ttl_seconds),
         enable_blake3: args.enable_blake3,
+        cas_sync,
         pack_cache: git_proxy::PackCacheConfig {
             max_bytes: args.pack_cache_max_bytes,
             max_entry_bytes: args.pack_cache_max_entry_bytes,
@@ -58,5 +95,8 @@ async fn main() -> Result<()> {
             let _ = tokio::signal::ctrl_c().await;
         })
         .await?;
+    if let Some(cas) = cas_shutdown {
+        cas.shutdown().await;
+    }
     Ok(())
 }

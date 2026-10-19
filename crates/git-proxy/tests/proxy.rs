@@ -94,6 +94,7 @@ fn config(root: &Path, upstream: &Path, ttl: u64) -> Config {
         refresh_ttl: Duration::from_secs(ttl),
         enable_blake3: true,
         pack_cache: git_proxy::PackCacheConfig::default(),
+        cas_sync: None,
     }
 }
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -671,4 +672,93 @@ async fn fetched_ref_changes_invalidate_cache_even_when_head_refresh_fails() {
     assert_eq!(fetch_response(&client, &url, body).await.0, "MISS");
     assert_eq!(cache_stats(&client, &url).await["fetch_generations"], 2);
     task.stop().await;
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn cas_credentials_do_not_reach_git_subprocesses() {
+    use std::os::unix::fs::PermissionsExt;
+    let root = tempfile::tempdir().unwrap();
+    let (upstream, blob, _) = upstream(root.path()).await;
+    let wrapper = root.path().join("credential-checking-git");
+    let observed = root.path().join("git-without-cas-credential");
+    let native_git = git().to_string_lossy().replace('\'', "'\"'\"'");
+    std::fs::write(
+        &wrapper,
+        format!(
+            r#"#!/bin/sh
+if [ "${{GIT_TOOLS_FIXTURE_CAS_CREDENTIAL+x}}" = x ]; then exit 42; fi
+printf 'clean\n' >> '{}'
+exec '{}' "$@"
+"#,
+            observed.display(),
+            native_git
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o700)).unwrap();
+    // Only the spawned server receives this synthetic credential; the test
+    // process/global environment and concurrent tests remain untouched.
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    drop(listener);
+    let process = std::process::Command::new(env!("CARGO_BIN_EXE_git-proxy"))
+        .args([
+            "--repo",
+            &format!("fixture={}", upstream.display()),
+            "--cache-dir",
+        ])
+        .arg(root.path().join("cas-cache"))
+        .arg("--git")
+        .arg(&wrapper)
+        .args([
+            "--listen",
+            &address.to_string(),
+            "--enable-blake3",
+            "--cas-endpoint",
+            "http://127.0.0.1:1",
+            "--cas-header-env",
+            "x-buildbuddy-api-key=GIT_TOOLS_FIXTURE_CAS_CREDENTIAL",
+        ])
+        .env(
+            "GIT_TOOLS_FIXTURE_CAS_CREDENTIAL",
+            "synthetic-cas-only-secret",
+        )
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    struct Owned(std::process::Child);
+    impl Drop for Owned {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    let _owned = Owned(process);
+    let origin = format!("http://{address}");
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if reqwest::get(format!("{origin}/api/v1/cache/stats"))
+                .await
+                .is_ok()
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let response = reqwest::Client::new()
+        .post(format!("{origin}/api/v1/repos/fixture/objects"))
+        .json(&serde_json::json!({"oids":[blob],"blake3":true}))
+        .send()
+        .await
+        .unwrap();
+    assert!(
+        response.status().is_success(),
+        "Git must work without inheriting the CAS credential"
+    );
+    assert!(!std::fs::read_to_string(observed).unwrap().is_empty());
 }
