@@ -1,6 +1,7 @@
 /target/
 /bazel-*
 /user.bazelrc
+/AGENTS.md
 /artifacts/
 __pycache__/
 
