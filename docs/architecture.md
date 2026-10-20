@@ -59,3 +59,11 @@ we do not implement its distributed write/replication layer.
 Local eviction follows [EdenFS byte totals and recency indexing](https://github.com/facebook/sapling/blob/f787ffaceddd5a350212542fbe676702360f694a/eden/fs/store/ObjectCache-inl.h)
 and [Buck2 batched access-time persistence](https://github.com/facebook/buck2/blob/5cb30436e4070ecf0770fef256e157fd467ec734/app/buck2_execute_impl/src/materializers/deferred/command_processor.rs).
 Our hard file leases are stronger than Eden's in-memory interest handles.
+
+[actiond](https://github.com/hermeticbuild/actiond/blob/430aefe62e02d180ff9bd84bf1b29b8c2d499c56/ARCHITECTURE.md)
+adds a useful comparison: lazy Directory lookup, backing-file reads and same-disk
+CAS publication avoid eager input forests and duplicate copies. It is a local
+Linux-VM executor, not a replacement for native source mounts or BuildBuddy RBE.
+Its inspected version uses SHA256 and lacks remote-cache compression; do not
+assume it accepts this project's BLAKE3 configuration. We borrow the boundaries,
+not its kernel module or a new execution backend.

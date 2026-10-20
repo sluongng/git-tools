@@ -128,6 +128,12 @@ independent 64MiB limit. Configure `--content-cache-bytes` and
 bypass that cache. Reply saturation can return `EAGAIN`; tiny limits may reject
 ordinary read ranges. First-write copy-up and native Git memory are separate costs.
 
+Source NFS and ProjFS use the same bounded scheduler with its default budgets.
+NFS fetches immutable bytes outside namespace locks and rechecks edits afterward;
+ProjFS uses ranged replies tied to the original stream identity. Blobs above the
+64MiB decoded-cache budget can still be re-extracted for later ranges. Bounded
+reply memory does not promise one extraction per large blob.
+
 Decoded metadata residency defaults to 4,096 entries / 4MiB estimated bytes;
 `GIT_VFS_METADATA_CACHE_ENTRIES` / `GIT_VFS_METADATA_CACHE_BYTES` override it.
 Namespace indexes and the immutable snapshot remain eager; these are not RSS bounds.

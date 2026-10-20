@@ -65,6 +65,41 @@ Cold immutable reads were 8% slower; 12,000 metadata changes were 9% slower.
 RSS samples exclude native Git children; logical journal bounds do not imply
 physical LSM compaction or a whole-mount memory bound.
 
+## Multiple fresh agents (Oct 20)
+
+Three trials per count, warm proxy/CAS, private source/Bazel/r2c2 client roots.
+Median assignment → first narrow RBE build (not a full Bazel bootstrap):
+
+| Concurrent agents | Shallow checkout | VFS | Change |
+| --- | ---: | ---: | ---: |
+| 1 | 25.46s | 25.25s | -0.8% |
+| 2 | 26.36s | 25.88s | -1.8% |
+| 4 | 27.90s | 26.88s | -3.7% |
+| 8 | 31.57s | 27.93s | -11.5% |
+
+All 180 builds executed **540 uncached remote BLAKE3 actions** and matched
+outputs; cleanup left no owned mounts/processes. The eight-agent startup win
+mostly removes checkout work: clone median 4.71s versus VFS phase medians of
+0.12s clone, 0.48s metadata and 0.27s mount. These phase medians are not additive
+continuous latency. Build-phase medians remained about 27s in both arms.
+
+Tradeoffs: at eight agents, edit → build → native save was **3.94s checkout /
+4.34s VFS**; reaped client CPU per cohort was **16.38s / 22.11s** (shared proxy
+excluded). Retained client roots used about **546MB / 295MB per agent**, including
+outputs/tools/receipts, not workspace-only or exclusive physical blocks. Shared
+service allocation was 2.25GB and preparation 22.36s, both excluded from clients;
+upstream mirror population was not measured.
+
+Keep all outliers: a VFS edit hit cold remote setup and took 35.7s. Three trials
+and pooled agent quantiles are not production tail estimates. The cold pilot's
+90s checkout /25s VFS result is **not** a source speedup. Native save still permits
+Git hydration; post-audit output reads are not first physical BOS hydration.
+See [samples, scope and failures](benchmarks/2026-10-20-agent-scaling.json).
+
+The next diagnostic is a trusted-host shared local `--repo_contents_cache`:
+Bazel already supports it, but shared dependency directories introduce a trust
+boundary. The private-cache overhead here is not intrinsic to r2c2.
+
 ## Evidence and reproduction
 
 Use [benchmark tools](../tools/README.md) and their `--help`; they default to dry

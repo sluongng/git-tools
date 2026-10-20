@@ -5,6 +5,7 @@ Rust tools for private, writable agent workspaces and Bazel remote execution.
 
 | Tool | What it does |
 | --- | --- |
+| [`agent-session`](crates/agent-session/README.md) | Create, resume, build, save and stop private Linux agent sessions |
 | [`git-vfs`](crates/workspace-fuse/README.md) | Linux FUSE workspace: lazy Git reads, persistent edits, native Git status |
 | [`git-proxy`](crates/git-proxy/README.md) | Shared Git mirror and fetch cache, object sizes, BLAKE3 mappings, optional CAS uploads |
 | [`git-output-service`](crates/bazel-output-service/README.md) | Lazy Bazel outputs backed by a BuildBuddy/REAPI CAS |
@@ -53,6 +54,9 @@ for BLAKE3 digest reuse, BuildBuddy RBE and remote repository-content caching
 (r2c2). [CAS sync](docs/proxy-cas-sync.md) can publish workspace blobs in the
 background. A mapping or queued upload is not proof of remote CAS residency.
 Keep build outputs and caches outside the source mount.
+
+[`agent-session`](crates/agent-session/README.md) wraps that lifecycle without
+sharing mutable state or deleting edits on stop. RBE/r2c2 remain provisioned services.
 
 ## Learn more
 

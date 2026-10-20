@@ -14,9 +14,23 @@ for cache boundaries, provenance, output correctness and cleanup.
 | Warm proxy: checkout vs VFS vs digest xattrs | `benchmark_warm_proxy_bazel.py` |
 | Fresh agent → first BuildBuddy RBE build | `benchmark_proxy_agent_rbe.py` |
 | Repeated source edit/status/RBE build | `benchmark_iterative_agent_rbe.py` |
-| Two private agents sharing a proxy | `benchmark_concurrent_agents.py` (correctness smoke, not throughput) |
+| Private agents sharing a proxy | `benchmark_concurrent_agents.py` (smoke or opt-in paired performance) |
 | Local VFS subsystem costs | `benchmark_vfs_{iteration,ranges,journal,metadata,hydration,content}.py` |
 | This project's local/RBE Rust build iteration | `benchmark_developer_build.py` |
+
+`benchmark_concurrent_agents.py --performance --agent-counts 1 2 4 8 --trials 3`
+enables paired warm-proxy checkout/VFS cohorts; default remains a two-agent
+correctness smoke. Pilot one agent/one trial first. The full matrix retains
+private outputs and executes many remote actions; it does not include upstream
+mirror population. Save measures native Git commit, including possible hydration.
+Select the provisioned credential class before running: `--credential-config rbe`
+reads only `common:rbe` headers from `--credential-rc`; the default is
+`remote-shared`. Neither mode probes another credential class on failure.
+
+For path-cardinality startup, use `benchmark_vfs_metadata.py --workloads startup
+--entry-counts 100000 1000000`. Its three-blob fixture isolates namespace costs,
+not a million distinct mappings. `GIT_TOOLS_METADATA_TIMINGS=1` enables phase JSON
+on stderr without changing normal output or storage formats.
 
 ## Common commands
 
