@@ -25,6 +25,8 @@ Obtain these inputs from the scheduler or provisioned environment:
 - `AGENT_SESSION`: new absolute private session path outside all mounts.
 - `AGENT_BAZELRC`: existing absolute-path rc outside the repository, configuring
   RBE, a BLAKE3-capable cache, r2c2 and compatible execution platforms.
+- `AGENT_REPO_CONTENTS_CACHE`: existing absolute host directory for this trusted
+  agent pool, outside all sessions; preseed separately when low startup latency matters.
 
 Use existing credential helpers/secret files, never keys in URLs or flags.
 Provision SDKs and generated execution-platform configuration in the agent image;
@@ -37,10 +39,13 @@ Report missing provisioning rather than claiming RBE/r2c2 is active.
 set -eu
 : "${PROXY_URL:?}" "${PROXY_REPO:?}" "${TASK_REF:?}" "${TASK_REVISION:?}"
 : "${AGENT_SESSION:?}" "${AGENT_BAZELRC:?}" "${TASK_TARGET:?}"
+: "${AGENT_REPO_CONTENTS_CACHE:?}"
 agent-session create "$AGENT_SESSION" \
   --proxy-url "$PROXY_URL" --proxy-repo "$PROXY_REPO" \
   --reference "$TASK_REF" --revision "$TASK_REVISION" \
-  --bazelrc "$AGENT_BAZELRC"
+  --bazelrc "$AGENT_BAZELRC" \
+  --repo-contents-cache "$AGENT_REPO_CONTENTS_CACHE" \
+  --remote-repo-contents-cache=true
 agent-session build "$AGENT_SESSION" -- "$TASK_TARGET"
 cd "$AGENT_SESSION/workspace"
 git status --short
@@ -94,6 +99,8 @@ action-cache reads. Endpoint/auth/instance remain in the provisioned rc.
 Remote hits do not fill the local extracted-directory cache. A separate shared
 Bazel `--disk_cache` can reuse lazy remote blobs within a trusted scope; configure
 its GC budget. Bazel 9.2 ignores that disk cache with remote output service enabled.
+If the host cache is preseeded, record that preparation separately. Populate full
+trees with a separate r2c2-off build/session; ordinary agents keep r2c2 enabled.
 
 Provision Bazel's remote TTL from the backend's actual retention contract. It is
 an operator assumption, not a REAPI lease; omitting it keeps Bazel's own default,

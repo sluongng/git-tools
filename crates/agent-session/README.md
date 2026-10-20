@@ -31,15 +31,19 @@ session and pass `--repo-contents-cache /absolute/host/repo-contents` at creatio
 The canonical path is retained across resume and never deleted by stop. Cached
 dependencies are symlink-shared, so this is not isolation against dependency
 edits. Omitting the option preserves Bazel/rc defaults under the private roots.
+Bazel owns this cache's age/deduplication GC; it is not a byte quota or our CAS.
 
 Remote repository caching is **on by default**, independently of host sharing.
 Use `--remote-repo-contents-cache=false` (or `--no-remote-repo-contents-cache`) at
 creation to disable r2c2 without disabling RBE. The provisioned rc still supplies
 the remote cache endpoint, credentials and instance; reads require
-`--remote_accept_cached=true`. A remote hit stays lazy and does not populate the
-local extracted-directory cache. Optional `--disk_cache` in the rc can reuse
+`--remote_accept_cached=true`. [Remote hits](https://github.com/bazelbuild/bazel/blob/8220c6198837d5c13d53fea211cf3282aa12408a/src/main/java/com/google/devtools/build/lib/bazel/repository/RepositoryFetchFunction.java#L251-L299)
+stay lazy and do not populate the local extracted-directory cache. Optional `--disk_cache` in the rc can reuse
 downloaded remote blobs; scope it to trusted agents and configure its GC budget.
 Bazel 9.2 ignores that disk cache when its remote output service is enabled.
+To prime host repository trees, run a separate build/session with r2c2 off and
+the shared path selected, then keep r2c2 on for agents' fallback. Count that
+preparation time and storage separately; an empty shared path is not a warm cache.
 
 Commands return JSON `{ "ok": true, "report": ... }` (or `ok: false` and
 a nonzero exit status on failure), with revision, readiness, paths and phase wall times;

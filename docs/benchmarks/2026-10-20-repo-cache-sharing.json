@@ -1,0 +1,535 @@
+{
+  "schema": 1,
+  "complete": true,
+  "comparison": "Same candidate VFS and Git proxy: private local repo contents cache versus separately primed trusted-host shared local repo contents cache",
+  "orchestration": "Benchmark harness, not agent-session CLI; target is Bazel repository //src/main/cpp/util:strings, not a full Bazel bootstrap build",
+  "planned_trials": 3,
+  "planned_concurrent_agents": [
+    1,
+    8
+  ],
+  "workload_pinned_git_commit": "c9af12d1db12d1b2df2137feb9ea8d39e3a25c79",
+  "bazel_binary_reported_version": "bazel 9.2.0",
+  "config_sha256": "085633642d84d8411ad502dff6d09e9050905e24125da30b320f200a93be5b28",
+  "fixed_runtime_harness_sha256": "a7e99f70aaaa47b99fda7522b84a6e1062b558f6b16776866fe1ef59a7eb0be4",
+  "disk_cache_policy": "Disabled in all cells and seed; shared disk-CAS/read-through cache and BOS behavior NOT measured.",
+  "actual_binaries_sha256": {
+    "git_vfs": "996035587755ba83bd61fb405595d2535ca86b8d8792e46c337025b0f106bc85",
+    "git_proxy": "d17daced1dd4cd84b708a15af0755676540d11ded57a98fccdd0d0024268b13d"
+  },
+  "remote_policy": "ALL measured private/shared clients keep remote cache, remote CAS, RBE and experimental remote repository contents cache ON. Three content action results per build deliberately bypass AC to prove uncached RBE.",
+  "local_seed_policy": "Only separately measured seed disables experimental remote repository contents cache so eligible repository rules execute and populate local contents. Ordinary remote cache/CAS and RBE remain ON.",
+  "trust_policy": "Explicit same-trusted-user/campaign opt-in. Shared cached dependency directories may be mutable and are symlink-shared. Source overlays, source Git admins, output bases and output-user roots remain private.",
+  "cache_conditions": "Preexisting warm archive cache and OS pages; warm owned Git proxy; remote executor state uncontrolled. Cold internet archive download and upstream Git mirror population NOT measured.",
+  "statistics": "Observed pooled agent quantiles across three counterbalanced trials, nearest-rank p95; not stable production-tail estimates. Trial all-first-build critical paths shown separately. Phase medians and action metrics overlap/do not sum to wall duration.",
+  "schedule": "Assignment synchronized, then agents progress independently into edit/save; edits may overlap slower agents initial builds.",
+  "consumer_scope": "Read after output verification/audits, potentially warm pages; NOT first physical BOS hydration.",
+  "rpc_scope": "All logged initial-build RPCs; GetActionResult status counts are not filtered by repository action ID. Byte counters are RPC log counters, not wire/total-network bytes; source Git HTTP and edit-build RPCs are outside these summaries.",
+  "save_scope": "Native Git commit, including any promised-object hydration; no native lazy-save optimization claim.",
+  "allocation_scope": "du allocated blocks; shared repo contents counted ONCE, client roots do not dereference dependency symlinks. Includes installs, outputs, benchmark tools/logs; not workspace-only or exclusive physical bytes.",
+  "cpu_scope": "Reaped client-side children; live shared Git proxy CPU excluded.",
+  "service_preparation_seconds": 26.36313076701481,
+  "shared_git_proxy_service_allocated_bytes": 2251304960,
+  "shared_local_repo_cache_allocated_bytes": 167882752,
+  "results": [
+    {
+      "agents": 1,
+      "local_repo_cache_policy": "private",
+      "trials": 3,
+      "first_build_seconds": {
+        "samples": 3,
+        "p50": 25.07716597401304,
+        "p95": 25.374647447955795
+      },
+      "trial_all_first_build_critical_path_seconds": [
+        {
+          "trial": 1,
+          "seconds": 24.793623354984447
+        },
+        {
+          "trial": 2,
+          "seconds": 25.374647447955795
+        },
+        {
+          "trial": 3,
+          "seconds": 25.07716597401304
+        }
+      ],
+      "edit_to_saved_seconds": {
+        "samples": 3,
+        "p50": 4.056987589981873,
+        "p95": 4.8415288319811225
+      },
+      "edit_build_seconds": {
+        "samples": 3,
+        "p50": 3.519618553982582,
+        "p95": 3.679829230008181
+      },
+      "native_save_seconds": {
+        "samples": 3,
+        "p50": 0.5266958060092293,
+        "p95": 1.1493023629882373
+      },
+      "post_audit_consumer_read_seconds": {
+        "samples": 3,
+        "p50": 0.00012286100536584854,
+        "p95": 0.00012677896302193403
+      },
+      "phase_seconds": {
+        "clone": {
+          "samples": 3,
+          "p50": 0.07098224002402276,
+          "p95": 0.13023445301223546
+        },
+        "first_build": {
+          "samples": 3,
+          "p50": 24.591501132992562,
+          "p95": 24.84976925898809
+        },
+        "mount": {
+          "samples": 3,
+          "p50": 0.20306965004419908,
+          "p95": 0.26337015902390704
+        },
+        "warm_blake3_sizes": {
+          "samples": 3,
+          "p50": 0.17034263297682628,
+          "p95": 0.1929547360050492
+        }
+      },
+      "initial_build_rpc_calls": {
+        "samples": 3,
+        "p50": 3369,
+        "p95": 3369
+      },
+      "initial_build_successful_bytestream_reads": {
+        "samples": 3,
+        "p50": 3316,
+        "p95": 3316
+      },
+      "initial_build_logged_rpc_bytes_read": {
+        "samples": 3,
+        "p50": 24523396,
+        "p95": 24523396
+      },
+      "initial_build_logged_rpc_bytes_written": {
+        "samples": 3,
+        "p50": 0,
+        "p95": 0
+      },
+      "initial_build_action_cache_hits": {
+        "samples": 3,
+        "p50": 34,
+        "p95": 34
+      },
+      "initial_build_action_cache_misses": {
+        "samples": 3,
+        "p50": 12,
+        "p95": 12
+      },
+      "external_repo_symlinks_into_shared_local_cache": {
+        "samples": 3,
+        "p50": 0,
+        "p95": 0
+      },
+      "all_clients_remote_cache_and_remote_repo_cache_on": true,
+      "median_allocated_client_bytes_per_agent": 294989824.0,
+      "median_reaped_child_cpu_seconds_per_cohort": 2.4872560000000004,
+      "remote_action_setup_seconds": {
+        "samples": 18,
+        "p50": 0.04,
+        "p95": 0.085
+      },
+      "remote_actions_setup_over_5s": 0
+    },
+    {
+      "agents": 1,
+      "local_repo_cache_policy": "shared",
+      "trials": 3,
+      "first_build_seconds": {
+        "samples": 3,
+        "p50": 8.048553169006482,
+        "p95": 8.428437329013832
+      },
+      "trial_all_first_build_critical_path_seconds": [
+        {
+          "trial": 1,
+          "seconds": 7.944865892000962
+        },
+        {
+          "trial": 2,
+          "seconds": 8.428437329013832
+        },
+        {
+          "trial": 3,
+          "seconds": 8.048553169006482
+        }
+      ],
+      "edit_to_saved_seconds": {
+        "samples": 3,
+        "p50": 3.7557633710093796,
+        "p95": 3.941594219999388
+      },
+      "edit_build_seconds": {
+        "samples": 3,
+        "p50": 3.1959355659782887,
+        "p95": 3.4170131820137613
+      },
+      "native_save_seconds": {
+        "samples": 3,
+        "p50": 0.5156881489674561,
+        "p95": 0.5979958039824851
+      },
+      "post_audit_consumer_read_seconds": {
+        "samples": 3,
+        "p50": 8.16939864307642e-05,
+        "p95": 8.628296200186014e-05
+      },
+      "phase_seconds": {
+        "clone": {
+          "samples": 3,
+          "p50": 0.06328939698869362,
+          "p95": 0.12917199899675325
+        },
+        "first_build": {
+          "samples": 3,
+          "p50": 7.606837622995954,
+          "p95": 7.93805593799334
+        },
+        "mount": {
+          "samples": 3,
+          "p50": 0.19268397300038487,
+          "p95": 0.19284964102553204
+        },
+        "warm_blake3_sizes": {
+          "samples": 3,
+          "p50": 0.1657336869975552,
+          "p95": 0.16854639898519963
+        }
+      },
+      "initial_build_rpc_calls": {
+        "samples": 3,
+        "p50": 22,
+        "p95": 22
+      },
+      "initial_build_successful_bytestream_reads": {
+        "samples": 3,
+        "p50": 3,
+        "p95": 3
+      },
+      "initial_build_logged_rpc_bytes_read": {
+        "samples": 3,
+        "p50": 198778,
+        "p95": 198778
+      },
+      "initial_build_logged_rpc_bytes_written": {
+        "samples": 3,
+        "p50": 0,
+        "p95": 0
+      },
+      "initial_build_action_cache_hits": {
+        "samples": 3,
+        "p50": 0,
+        "p95": 0
+      },
+      "initial_build_action_cache_misses": {
+        "samples": 3,
+        "p50": 12,
+        "p95": 12
+      },
+      "external_repo_symlinks_into_shared_local_cache": {
+        "samples": 3,
+        "p50": 25,
+        "p95": 25
+      },
+      "all_clients_remote_cache_and_remote_repo_cache_on": true,
+      "median_allocated_client_bytes_per_agent": 262885376.0,
+      "median_reaped_child_cpu_seconds_per_cohort": 2.4197150000000107,
+      "remote_action_setup_seconds": {
+        "samples": 18,
+        "p50": 0.0415,
+        "p95": 0.074
+      },
+      "remote_actions_setup_over_5s": 0
+    },
+    {
+      "agents": 8,
+      "local_repo_cache_policy": "private",
+      "trials": 3,
+      "first_build_seconds": {
+        "samples": 24,
+        "p50": 28.16291611251654,
+        "p95": 29.08060069801286
+      },
+      "trial_all_first_build_critical_path_seconds": [
+        {
+          "trial": 1,
+          "seconds": 28.741490882006474
+        },
+        {
+          "trial": 2,
+          "seconds": 29.08062985300785
+        },
+        {
+          "trial": 3,
+          "seconds": 29.247838678013068
+        }
+      ],
+      "edit_to_saved_seconds": {
+        "samples": 24,
+        "p50": 4.327969465026399,
+        "p95": 5.094253495044541
+      },
+      "edit_build_seconds": {
+        "samples": 24,
+        "p50": 3.622389355499763,
+        "p95": 4.10947261803085
+      },
+      "native_save_seconds": {
+        "samples": 24,
+        "p50": 0.6727424034907017,
+        "p95": 1.2740099480142817
+      },
+      "post_audit_consumer_read_seconds": {
+        "samples": 24,
+        "p50": 0.00021422849385999143,
+        "p95": 0.0010138709913007915
+      },
+      "phase_seconds": {
+        "clone": {
+          "samples": 24,
+          "p50": 0.08416765349102207,
+          "p95": 0.10625963000347838
+        },
+        "first_build": {
+          "samples": 24,
+          "p50": 27.47843640751671,
+          "p95": 28.349172101996373
+        },
+        "mount": {
+          "samples": 24,
+          "p50": 0.25911492848536,
+          "p95": 0.2841608470189385
+        },
+        "warm_blake3_sizes": {
+          "samples": 24,
+          "p50": 0.296942790504545,
+          "p95": 0.3690985499997623
+        }
+      },
+      "initial_build_rpc_calls": {
+        "samples": 24,
+        "p50": 3369.0,
+        "p95": 3369
+      },
+      "initial_build_successful_bytestream_reads": {
+        "samples": 24,
+        "p50": 3316.0,
+        "p95": 3316
+      },
+      "initial_build_logged_rpc_bytes_read": {
+        "samples": 24,
+        "p50": 24523396.0,
+        "p95": 24523396
+      },
+      "initial_build_logged_rpc_bytes_written": {
+        "samples": 24,
+        "p50": 0.0,
+        "p95": 0
+      },
+      "initial_build_action_cache_hits": {
+        "samples": 24,
+        "p50": 34.0,
+        "p95": 34
+      },
+      "initial_build_action_cache_misses": {
+        "samples": 24,
+        "p50": 12.0,
+        "p95": 12
+      },
+      "external_repo_symlinks_into_shared_local_cache": {
+        "samples": 24,
+        "p50": 0.0,
+        "p95": 0
+      },
+      "all_clients_remote_cache_and_remote_repo_cache_on": true,
+      "median_allocated_client_bytes_per_agent": 294841344.0,
+      "median_reaped_child_cpu_seconds_per_cohort": 21.954252,
+      "remote_action_setup_seconds": {
+        "samples": 144,
+        "p50": 0.0395,
+        "p95": 0.076
+      },
+      "remote_actions_setup_over_5s": 0
+    },
+    {
+      "agents": 8,
+      "local_repo_cache_policy": "shared",
+      "trials": 3,
+      "first_build_seconds": {
+        "samples": 24,
+        "p50": 14.066537167003844,
+        "p95": 14.380253665032797
+      },
+      "trial_all_first_build_critical_path_seconds": [
+        {
+          "trial": 1,
+          "seconds": 14.147537899028976
+        },
+        {
+          "trial": 2,
+          "seconds": 14.45931860402925
+        },
+        {
+          "trial": 3,
+          "seconds": 14.380406312993728
+        }
+      ],
+      "edit_to_saved_seconds": {
+        "samples": 24,
+        "p50": 3.8614959655096754,
+        "p95": 4.370116193022113
+      },
+      "edit_build_seconds": {
+        "samples": 24,
+        "p50": 3.1841725900012534,
+        "p95": 3.2781348699936643
+      },
+      "native_save_seconds": {
+        "samples": 24,
+        "p50": 0.591304140019929,
+        "p95": 1.2022088399971835
+      },
+      "post_audit_consumer_read_seconds": {
+        "samples": 24,
+        "p50": 0.0002844459959305823,
+        "p95": 0.0017584029701538384
+      },
+      "phase_seconds": {
+        "clone": {
+          "samples": 24,
+          "p50": 0.10125333099858835,
+          "p95": 0.1331134460051544
+        },
+        "first_build": {
+          "samples": 24,
+          "p50": 13.419775883987313,
+          "p95": 13.739605802984443
+        },
+        "mount": {
+          "samples": 24,
+          "p50": 0.26381714950548485,
+          "p95": 0.27422744198702276
+        },
+        "warm_blake3_sizes": {
+          "samples": 24,
+          "p50": 0.29002291650976986,
+          "p95": 0.32632107503013685
+        }
+      },
+      "initial_build_rpc_calls": {
+        "samples": 24,
+        "p50": 22.0,
+        "p95": 22
+      },
+      "initial_build_successful_bytestream_reads": {
+        "samples": 24,
+        "p50": 3.0,
+        "p95": 3
+      },
+      "initial_build_logged_rpc_bytes_read": {
+        "samples": 24,
+        "p50": 198778.0,
+        "p95": 198778
+      },
+      "initial_build_logged_rpc_bytes_written": {
+        "samples": 24,
+        "p50": 0.0,
+        "p95": 0
+      },
+      "initial_build_action_cache_hits": {
+        "samples": 24,
+        "p50": 0.0,
+        "p95": 0
+      },
+      "initial_build_action_cache_misses": {
+        "samples": 24,
+        "p50": 12.0,
+        "p95": 12
+      },
+      "external_repo_symlinks_into_shared_local_cache": {
+        "samples": 24,
+        "p50": 25.0,
+        "p95": 25
+      },
+      "all_clients_remote_cache_and_remote_repo_cache_on": true,
+      "median_allocated_client_bytes_per_agent": 262779392.0,
+      "median_reaped_child_cpu_seconds_per_cohort": 22.188028000000003,
+      "remote_action_setup_seconds": {
+        "samples": 144,
+        "p50": 0.039,
+        "p95": 0.049
+      },
+      "remote_actions_setup_over_5s": 0
+    }
+  ],
+  "matrix_failures": 0,
+  "separate_local_seed": {
+    "complete": true,
+    "whole_cell_seconds": 8.996947075007483,
+    "assignment_to_build_seconds": 8.009278017038014,
+    "phase_seconds": {
+      "clone": 0.06621520797489211,
+      "warm_blake3_sizes": 0.19980636099353433,
+      "mount": 0.25868837302550673,
+      "first_build": 7.481713877001312
+    },
+    "excluded_from_client_headline": true,
+    "initial_local_cache_empty": true,
+    "local_cache_entries_after": 25,
+    "allocated_bytes_after": 167882752,
+    "remote_repo_cache_on": false,
+    "ordinary_remote_cache_and_rbe_on": true,
+    "successful_bytestream_reads": 3,
+    "rpc_calls": 10,
+    "logged_rpc_bytes_read": 198778,
+    "uncached_remote_blake3_actions": 3,
+    "scope": "Includes seed clone/mount/build/audits/shutdown; excludes frozen-tool harness preparation and shared Git proxy preparation. Warm archive cache; cold archive downloads not measured."
+  },
+  "remote_action_proof": {
+    "matrix_initial_builds": 54,
+    "matrix_edited_builds": 54,
+    "matrix_expected_actions": 324,
+    "matrix_observed_content_actions": 324,
+    "matrix_all_uncached_remote_blake3": true,
+    "seed_actions": 3,
+    "total_observed_actions_including_seed": 327,
+    "all_proofs_match_expected_total_327": true,
+    "pristine_and_edited_outputs_match_across_policies_and_agents": true
+  },
+  "cleanup": {
+    "owned_processes_remaining": 0,
+    "owned_mounts_remaining": 0,
+    "all_cohorts_complete": true,
+    "reported_client_cleanup_errors": 0
+  },
+  "separate_empty_shared_remote_on_pilot": {
+    "complete": true,
+    "first_build_seconds": 27.3856738859904,
+    "local_entries_before": 0,
+    "local_entries_after": 0,
+    "allocated_cache_bytes_after": 0,
+    "actual_cache_symlinks": 0,
+    "remote_repo_cache_on": true,
+    "rpc_calls": 3369,
+    "bytestream_reads": 3316,
+    "scope": "Separate control, not pooled: remote repo hits did not populate the full local repository contents cache."
+  },
+  "source_evidence": {
+    "bazel_version": "9.2.0",
+    "bazel_release_source_commit": "8220c6198837d5c13d53fea211cf3282aa12408a",
+    "lookup_order": "RepositoryFetchFunction.java251-299: local cache checked before remote; remote hit returns before local rule cache population",
+    "local_population": "RepositoryFetchFunction.java350-355: eligible locally executed reproducible repository contents persisted",
+    "sharing": "LocalRepoContentsCache.java181-190: symlink publication and shared reader lock; cached directories are not an untrusted-tenant isolation boundary"
+  }
+}

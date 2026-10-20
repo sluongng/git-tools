@@ -96,9 +96,34 @@ and pooled agent quantiles are not production tail estimates. The cold pilot's
 Git hydration; post-audit output reads are not first physical BOS hydration.
 See [samples, scope and failures](benchmarks/2026-10-20-agent-scaling.json).
 
-The next diagnostic is a trusted-host shared local `--repo_contents_cache`:
-Bazel already supports it, but shared dependency directories introduce a trust
-boundary. The private-cache overhead here is not intrinsic to r2c2.
+## Host-shared repository contents (Oct 20)
+
+Same VFS/proxy, three trials, **remote r2c2 on in both policies**. Only the local
+repository-contents cache changes: private versus separately primed host-shared.
+This isolates cache policy, not a new shallow-checkout comparison. Median
+assignment → first narrow RBE build:
+
+| Concurrent agents | Private local contents | Shared local contents | Change |
+| --- | ---: | ---: | ---: |
+| 1 | 25.08s | 8.05s | -67.9% |
+| 8 | 28.16s | 14.07s | -50.1% |
+
+Initial-build RPCs fell **3,369 → 22**, with ByteStream reads **3,316 → 3**.
+Every shared client reused 25 actual cached repository symlinks. All 108 measured
+builds /324 uncached remote BLAKE3 actions matched outputs, plus 3 seed actions;
+cleanup left no owned processes/mounts. At eight agents, edit → saved medians
+were 4.33s /3.86s; reaped client CPU was about 22s per cohort in either policy.
+
+**Preparation is separate:** a one-off r2c2-off seed took 9.00s and retained
+168MB; normal CAS/RBE stayed on. Archives/OS caches were warm, not cold internet.
+Remote hits do not populate this local tree cache: the empty-shared control took
+27.39s and retained zero repository entries. Shared trees are mutable symlink
+targets, so use one trusted agent pool and retain private source/output roots.
+Bazel owns age/deduplication GC, not a hard byte quota. See [scope and samples](benchmarks/2026-10-20-repo-cache-sharing.json).
+
+A separate shared Bazel disk cache can reuse lazy remote downloads, but that
+performance is **not measured here**; Bazel 9.2 ignores it with remote output
+service enabled. See [session configuration](../crates/agent-session/README.md).
 
 ## Evidence and reproduction
 
