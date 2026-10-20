@@ -10,6 +10,7 @@ from contextlib import ExitStack
 import copy
 import json
 import math
+import os
 import resource
 import statistics
 import subprocess
@@ -80,6 +81,14 @@ class PerformanceAgent(AgentRbeBenchmark):
         self.marker = (identity + "\n").encode()
         self.did_cycles = False
 
+    def bazel_args(self, base):
+        command = super().bazel_args(base)
+        if getattr(self, "seed_local_repositories", False):
+            # Remote repo hits return before populating the full local repo
+            # cache. Only this separately timed seed runs repository rules.
+            command += ["--noexperimental_remote_repo_contents_cache"]
+        return command
+
     def traced_env(self, name):
         env = dict(super().traced_env(name), GIT_TOOLS_METADATA_TIMINGS="1")
         if name.endswith("-save"):
@@ -87,6 +96,30 @@ class PerformanceAgent(AgentRbeBenchmark):
             # that hydration; audit commands retain NO_LAZY_FETCH.
             env.pop("GIT_NO_LAZY_FETCH", None)
         return env
+
+    def remote_build_command(self, base, name, contents_cache, raw_workspace_log, raw_grpc_log):
+        shared = getattr(self, "shared_repo_contents_cache", None)
+        effective = shared if shared is not None else contents_cache
+        command = super().remote_build_command(base, name, effective, raw_workspace_log, raw_grpc_log)
+        # Select treatment after all public extras/config expansions. Bazel's
+        # old --repository_contents_cache alias can override an earlier flag too.
+        command += ["--repo_contents_cache=" + str(effective)]
+        # A local cache-policy comparison must not silently disable its remote
+        # baseline. Content action results still deliberately bypass AC to prove RBE.
+        remote_caches = [flag.split("=", 1)[1] for flag in command if flag.startswith("--remote_cache=")]
+        if not remote_caches or not remote_caches[-1] or "--noremote_accept_cached" in command or "--remote_accept_cached=false" in command:
+            raise ValueError("Performance comparisons require remote cache and r2c2 lookups enabled")
+        repo_flags = [flag != "--noexperimental_remote_repo_contents_cache" for flag in command
+                      if flag in ("--experimental_remote_repo_contents_cache", "--noexperimental_remote_repo_contents_cache")]
+        remote_repos = bool(repo_flags and repo_flags[-1])
+        if remote_repos == getattr(self, "seed_local_repositories", False):
+            raise ValueError("Measured clients require remote repo caching on; only explicit local seed disables it")
+        row = self.result.get("active_cell", {})
+        row.update(local_repo_contents_cache=str(effective),
+            local_repo_cache_policy="shared" if shared is not None else "private",
+            remote_cache_enabled=True, remote_repo_contents_cache_enabled=remote_repos,
+            content_action_cache_policy="Results bypassed for uncached RBE proof; remote CAS and r2c2 remain enabled")
+        return command
 
     def clone(self, repo, name, checkout):
         self.barrier.wait(timeout=120)
@@ -112,6 +145,18 @@ class PerformanceAgent(AgentRbeBenchmark):
             row = self.result.get("active_cell", {})
             if not self.did_cycles and "build_outputs" in row:
                 self.did_cycles = True
+                shared = getattr(self, "shared_repo_contents_cache", None)
+                reused = 0
+                if shared is not None:
+                    for entry in (base / "external").iterdir():
+                        if entry.is_symlink() and entry.resolve().is_relative_to(shared):
+                            reused += 1
+                row["local_repo_cache_observation"] = {
+                    "external_repo_symlinks_into_campaign_cache": reused,
+                    "recorded_input_entries": len(list(shared.glob("*/*.recorded_inputs"))) if shared is not None else None,
+                    "local_reuse_required": getattr(self, "require_shared_reuse", False)}
+                if getattr(self, "require_shared_reuse", False) and reused == 0:
+                    raise RuntimeError("Primed shared local cache produced no observable repo reuse")
                 row["assignment_perf_counter"] = self.assigned
                 row["assignment_to_first_build_seconds"] = (
                     row["phases"]["first_build"]["wait_end_perf_counter"] - self.assigned)
@@ -176,6 +221,43 @@ def quantiles(values):
         "p95_method": "nearest-rank; small cohorts are not a stable tail estimate"}
 
 
+def host_resources(root, args, count):
+    free_disk = shutil.disk_usage(root).free
+    available_memory = next(int(line.split()[1]) * 1024
+        for line in Path("/proc/meminfo").read_text().splitlines() if line.startswith("MemAvailable:"))
+    if free_disk < args.min_free_disk_gib * 1024 ** 3:
+        raise RuntimeError("Insufficient free disk for next cohort/seed; retained prior receipts")
+    if available_memory < count * args.min_memory_gib_per_agent * 1024 ** 3:
+        raise RuntimeError("Insufficient available memory for next cohort/seed; retained prior receipts")
+    return {"free_disk_bytes": free_disk, "available_memory_bytes": available_memory}
+
+
+def make_performance_agent(args, config, directory, identity, barrier, edits,
+                           server, contexts, expected, shared_cache=None, *, seed_local_repositories=False, require_shared_reuse=False):
+    directory.parent.mkdir(parents=True, exist_ok=True)
+    agent_config = copy.deepcopy(config)
+    agent_config["output_user_root"] = str(directory.with_name(identity + "-bazel-user"))
+    config_path = directory.with_name(identity + "-config.json")
+    dump(config_path, agent_config)
+    agent = PerformanceAgent(arguments_for(args, config_path, directory), identity, barrier, edits)
+    agent.shared_repo_contents_cache = shared_cache
+    agent.seed_local_repositories = seed_local_repositories
+    agent.require_shared_reuse = require_shared_reuse
+    agent.credential = contexts.enter_context(credential_helper(args.credential_rc, args.credential_config))
+    agent.freeze()
+    agent.origin, agent.clone_url = server.origin, server.clone_url
+    agent.config["source"] = server.clone_url
+    agent.config["mount_options"] = ["--blake3-proxy-url", server.origin, "--blake3-proxy-repo", "bazel"]
+    agent.result["build_output_reference"] = copy.deepcopy(expected)
+    agent.result["environment"]["cache_policy"] = (
+        "Private source, overlay, Bazel output/user roots; "
+        + ("remote CAS/RBE on, remote repo caching OFF only for separately timed local seed; "
+           if seed_local_repositories else "remote cache+r2c2 enabled; ")
+        + ("campaign-owned trusted-host shared local repository contents cache" if shared_cache is not None
+           else "fresh private local repository contents cache"))
+    return agent
+
+
 def performance(args, config, expected):
     """Paired cohorts reuse one explicitly warmed service, not a cold-origin claim."""
     root = args.output.resolve()
@@ -185,7 +267,9 @@ def performance(args, config, expected):
         "config_sha256": sha256(args.config), "harness_sha256": sha256(Path(__file__)),
         "reference_results": {"path": str(args.reference_results.resolve()), "sha256": sha256(args.reference_results)},
         "credential_config": args.credential_config,
-        "cache_policy": "Service preparation measured separately. Fresh private clones, overlays, Bazel roots and r2c2 clients per cohort; warm shared proxy and existing archive cache. r2c2 hits/misses measured, not assumed; remote executor state uncontrolled (action setup metrics retained); OS caches NOT dropped.",
+        "local_repo_cache_policy": args.local_repo_cache_policy,
+        "performance_arms": args.performance_arms,
+        "cache_policy": "Service preparation measured separately. Fresh private clones, overlays and Bazel roots per cohort; local repo contents cache follows explicit private/shared campaign policy, remote repo cache remains enabled; warm shared proxy and existing archive cache. r2c2 hits/misses measured, not assumed; remote executor state uncontrolled (action setup metrics retained); OS caches NOT dropped.",
         "cold_service_scope": "Fresh proxy mapping/pack cache on preexisting mirror; upstream population not measured. Preparation is NOT a cold first-client latency.",
         "commit_scope": "Same pinned commit across agents. Use metadata probe for distinct commits; this RBE fixture intentionally rejects arbitrary revisions.",
         "edited_output_references": {},
@@ -201,45 +285,107 @@ def performance(args, config, expected):
             server.prepare_proxy()
             result["service_preparation_seconds"] = time.perf_counter() - setup_start
             result["service_preparation"] = server.result["server_preparation"]
+            shared_cache = None
+            if args.local_repo_cache_policy != "private":
+                # Never reuse an arbitrary host cache across trust scopes. The
+                # output campaign must be fresh; only this owner can traverse it.
+                if root.stat().st_uid != os.getuid():
+                    raise ValueError("Shared campaign root must belong to current user")
+                root.chmod(0o700)
+                shared_cache = root / "trusted-host-repo-contents-cache"
+                shared_cache.mkdir(mode=0o700)
+                if shared_cache.is_symlink() or shared_cache.resolve() != shared_cache:
+                    raise ValueError("Shared local cache must be a canonical campaign-owned directory")
+                owner = root / "trusted-host-cache-owner.json"
+                with owner.open("x") as stream:
+                    json.dump({"owner_uid": os.getuid(), "config_sha256": sha256(args.config),
+                        "cache": str(shared_cache), "trust_scope": "This fresh trusted-user campaign only; shared repo dirs may be mutable"}, stream)
+                result["shared_local_cache"] = {"path": str(shared_cache),
+                    "trust_scope": "Explicit opt-in: same trusted user/campaign; cached repo directories are symlink-shared, not source/output roots",
+                    "initially_empty": not any(shared_cache.iterdir())}
+                if args.probe_empty_shared_cache:
+                    probe_resources = host_resources(root, args, 1)
+                    probe_cache = root / "empty-shared-probe-cache"
+                    probe_cache.mkdir(mode=0o700)
+                    probe = make_performance_agent(args, config, root / "empty-shared-probe" / "agent-probe",
+                        "agent-probe", threading.Barrier(1), args.edit_cycles, server, contexts, expected, probe_cache)
+                    probe_result = result["empty_shared_cache_probe"] = {"complete": False,
+                        "excluded_from_paired_matrix": True, "initial_cache_entries": 0,
+                        "remote_repo_cache_enabled": True, "receipt": str(probe.root / "results.json"),
+                        "host_resources_before": probe_resources}
+                    probe_started = time.perf_counter()
+                    try:
+                        probe.cell(1, "vfs-blake3-xattr")
+                        probe.completed_build_consistency()
+                        probe.verify_toolchain("after")
+                        probe.result["complete"] = True
+                        probe_row = probe.result["results"][0]
+                        probe_row["bazel_blake3_counter_scope"] = "Whole mount lifetime: initial build, audits, edit builds and native Git save activity; not first-build-only"
+                        for edit in probe_row["edit_cycles"]:
+                            result["edited_output_references"][str(edit["cycle"])] = AgentRbeBenchmark.canonical_outputs(edit["outputs"])
+                        probe_result.update(complete=True, row=probe_row)
+                    finally:
+                        probe.critical = False
+                        probe.save()
+                        probe_result["seconds"] = time.perf_counter() - probe_started
+                        probe_result["cache_entries_after"] = len(list(probe_cache.glob("*/*.recorded_inputs")))
+                        probe_result["allocated_cache_bytes_after"] = int(subprocess.check_output(
+                            ["du", "-s", "--block-size=1", str(probe_cache)]).split()[0])
+                        dump(root / "results.json", result)
+                seed_resources = host_resources(root, args, 1)
+                seed = make_performance_agent(args, config, root / "shared-cache-seed" / "agent-seed",
+                    "agent-seed", threading.Barrier(1), 0, server, contexts, expected, shared_cache,
+                    seed_local_repositories=True)
+                seed_result = result["shared_local_cache_seed"] = {"complete": False,
+                    "excluded_from_client_latency": True, "receipt": str(seed.root / "results.json"),
+                    "remote_repo_cache_enabled": False, "ordinary_remote_cas_and_rbe_enabled": True, "host_resources_before": seed_resources,
+                    "reason": "Remote repo hits do not populate full local contents cache; explicit seed executes eligible repository rules"}
+                seed_started = time.perf_counter()
+                try:
+                    seed.cell(1, "vfs-blake3-xattr")
+                    seed.completed_build_consistency()
+                    seed.verify_toolchain("after")
+                    entries = len(list(shared_cache.glob("*/*.recorded_inputs")))
+                    if entries == 0:
+                        raise RuntimeError("Local repository seed did not populate any eligible cache entries")
+                    seed.result["complete"] = True
+                    seed_result.update(complete=True, row=seed.result["results"][0], local_cache_entries_after=entries)
+                finally:
+                    seed.critical = False
+                    seed.save()
+                    seed_result["seconds"] = time.perf_counter() - seed_started
+                    seed_result["allocated_cache_bytes_after"] = int(subprocess.check_output(
+                        ["du", "-s", "--block-size=1", str(shared_cache)]).split()[0])
+                    dump(root / "results.json", result)
             for trial in range(1, args.trials + 1):
                 for count in args.agent_counts:
                     # Counterbalance paired order across trials, but never mix
                     # checkout and VFS within one load cohort.
-                    arms = ["checkout", "vfs-blake3-xattr"]
+                    policies = (["private", "shared"] if args.local_repo_cache_policy == "compare"
+                                else [args.local_repo_cache_policy])
+                    cases = [(arm, policy) for arm in args.performance_arms for policy in policies]
                     if trial % 2 == 0:
-                        arms.reverse()
-                    for arm in arms:
-                        free_disk = shutil.disk_usage(root).free
-                        available_memory = next(int(line.split()[1]) * 1024
-                            for line in Path("/proc/meminfo").read_text().splitlines()
-                            if line.startswith("MemAvailable:"))
-                        if free_disk < args.min_free_disk_gib * 1024 ** 3:
-                            raise RuntimeError("Insufficient free disk for next cohort; retained prior receipts")
-                        if available_memory < count * args.min_memory_gib_per_agent * 1024 ** 3:
-                            raise RuntimeError("Insufficient available memory for next cohort; retained prior receipts")
-                        cohort_root = root / f"trial-{trial}-{count}-{arm}"
+                        cases.reverse()
+                    for arm, policy in cases:
+                        resources_before = host_resources(root, args, count)
+                        suffix = "" if args.local_repo_cache_policy == "private" else "-" + policy
+                        cohort_root = root / f"trial-{trial}-{count}-{arm}{suffix}"
                         cohort_root.mkdir(parents=True)
                         barrier = threading.Barrier(count)
                         agents = []
                         for index in range(count):
                             identity = f"agent-{index + 1}"
-                            agent_config = copy.deepcopy(config)
-                            agent_config["output_user_root"] = str(cohort_root / (identity + "-bazel-user"))
-                            config_path = cohort_root / (identity + "-config.json")
-                            dump(config_path, agent_config)
-                            agent = PerformanceAgent(arguments_for(args, config_path, cohort_root / identity), identity, barrier, args.edit_cycles)
-                            agent.credential = contexts.enter_context(credential_helper(args.credential_rc, args.credential_config))
-                            agent.freeze()
-                            agent.origin, agent.clone_url = server.origin, server.clone_url
-                            agent.config["source"] = server.clone_url
-                            agent.config["mount_options"] = ["--blake3-proxy-url", server.origin, "--blake3-proxy-repo", "bazel"]
-                            agent.result["build_output_reference"] = copy.deepcopy(expected)
+                            agent = make_performance_agent(args, config, cohort_root / identity,
+                                identity, barrier, args.edit_cycles, server, contexts, expected,
+                                shared_cache if policy == "shared" else None,
+                                require_shared_reuse=policy == "shared")
                             agents.append(agent)
                         before = resource.getrusage(resource.RUSAGE_CHILDREN)
                         start = time.perf_counter()
                         cohort = {"trial": trial, "agents": count, "variant": arm, "complete": False,
                             "cache_state": "warm-proxy-new-agent",
-                            "host_resources_before": {"free_disk_bytes": free_disk, "available_memory_bytes": available_memory},
+                            "local_repo_cache_policy": policy,
+                            "host_resources_before": resources_before,
                             "proxy_stats_before": server.proxy_stats(), "results": [], "errors": []}
                         result["cohorts"].append(cohort)
                         def execute(agent):
@@ -305,6 +451,10 @@ def performance(args, config, expected):
                         dump(root / "results.json", result)
                         if cohort["errors"]:
                             raise RuntimeError("Performance cohort failed; partial receipts retained")
+            if shared_cache is not None:
+                result["shared_local_cache"]["allocated_bytes_after"] = int(subprocess.check_output(
+                    ["du", "-s", "--block-size=1", str(shared_cache)]).split()[0])
+                result["shared_local_cache"]["disk_note"] = "Counted once separately; cohort du does not dereference dependency symlinks"
             server.verify_toolchain("after")
             for tool in server.result["tool_provenance"].values():
                 if sha256(Path(tool["path"])) != tool["sha256"]:
@@ -334,6 +484,12 @@ def main():
         help="Completed serial primary results.json with verified checkout output reference")
     parser.add_argument("--proxy-cas-sync", action="store_true")
     parser.add_argument("--performance", action="store_true", help="Opt-in paired checkout/VFS cohort timing; default remains two-agent correctness smoke")
+    parser.add_argument("--local-repo-cache-policy", choices=["private", "shared", "compare"], default="private",
+        help="Performance-only trusted-host opt-in: private remains default; shared cache is freshly owned/seeded once per campaign, remote cache stays enabled")
+    parser.add_argument("--probe-empty-shared-cache", action="store_true",
+        help="Before local seed, separately run a remote-on agent with another empty cache to observe non-population; performance sharing only")
+    parser.add_argument("--performance-arms", nargs="+", choices=["checkout", "vfs-blake3-xattr"],
+        default=["checkout", "vfs-blake3-xattr"], help="Select source arms independently of local cache policy")
     parser.add_argument("--agent-counts", nargs="+", type=int, default=[1, 2, 4, 8])
     parser.add_argument("--min-free-disk-gib", type=float, default=10, help="Fail before a new performance cohort below this free-disk floor")
     parser.add_argument("--min-memory-gib-per-agent", type=float, default=2, help="Required MemAvailable per concurrent performance agent")
@@ -345,6 +501,12 @@ def main():
         parser.error("resource floors require disk1..1024GiB and memory0.5..128GiB per agent")
     if not 1 <= args.trials <= 20 or not 0 <= args.edit_cycles <= 16 or not args.agent_counts or len(set(args.agent_counts)) != len(args.agent_counts) or any(n not in (1, 2, 4, 8) for n in args.agent_counts):
         parser.error("trials1..20, edits0..16, and unique agent counts chosen from 1/2/4/8 required")
+    if not args.performance and args.local_repo_cache_policy != "private":
+        parser.error("local repo cache sharing/comparison requires --performance")
+    if args.probe_empty_shared_cache and (not args.performance or args.local_repo_cache_policy == "private"):
+        parser.error("empty shared-cache probe requires performance sharing/comparison")
+    if len(set(args.performance_arms)) != len(args.performance_arms):
+        parser.error("performance source arms must be unique")
     root = args.output.resolve()
     if root.exists() and any(root.iterdir()):
         parser.error("use a fresh empty output directory")
@@ -353,6 +515,11 @@ def main():
     if not args.run:
         print(json.dumps({"execution": False, "agents": args.agent_counts if args.performance else 2, "shared_proxy": True,
             "mode": "performance" if args.performance else "correctness", "trials": args.trials if args.performance else 1,
+            "local_repo_cache_policy": args.local_repo_cache_policy, "performance_arms": args.performance_arms,
+            "remote_cache_enabled": True, "remote_repo_cache_enabled": True,
+            "shared_cache_seed_separately_measured": args.performance and args.local_repo_cache_policy != "private",
+            "shared_seed_policy": "Remote repo cache OFF only for separate local-materialization seed; remote CAS/RBE stay ON",
+            "probe_empty_shared_cache": args.probe_empty_shared_cache,
             "purpose": ("paired cohort startup/build/edit/save measurement" if args.performance else "functional correctness and overlay isolation, not performance evidence"),
             "reference_results": str(args.reference_results), "output": str(root)}, indent=2))
         return

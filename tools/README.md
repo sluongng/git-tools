@@ -27,6 +27,12 @@ Select the provisioned credential class before running: `--credential-config rbe
 reads only `common:rbe` headers from `--credential-rc`; the default is
 `remote-shared`. Neither mode probes another credential class on failure.
 
+For trusted-host local cache sharing, add `--local-repo-cache-policy compare
+--performance-arms vfs-blake3-xattr`. Remote r2c2 remains on in both measured
+policies. A separately timed remote-r2c2-off seed populates eligible local
+repositories; remote hits alone do not populate that directory cache. Add
+`--probe-empty-shared-cache` to observe that distinction before priming.
+
 For path-cardinality startup, use `benchmark_vfs_metadata.py --workloads startup
 --entry-counts 100000 1000000`. Its three-blob fixture isolates namespace costs,
 not a million distinct mappings. `GIT_TOOLS_METADATA_TIMINGS=1` enables phase JSON
