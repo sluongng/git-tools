@@ -59,3 +59,17 @@ rust_test(
         normal_dev = True,
     ),
 )
+
+# Exercise the public CLI/TOML resolution path, including lazy admission policy.
+rust_test(
+    name = "config_tests",
+    srcs = ["src/main.rs"],
+    compile_data = ["//:examples/bazel-output-service.toml"],
+    aliases = aliases(),
+    edition = "2024",
+    version = "0.1.0",
+    deps = [":bazel-output-service"] + all_crate_deps(
+        normal = True,
+        normal_dev = True,
+    ),
+)

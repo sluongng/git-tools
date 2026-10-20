@@ -52,7 +52,7 @@ fn artifact(bytes: &[u8]) -> Artifact {
         size: bytes.len() as u64,
     }
 }
-fn fixture() -> (tempfile::TempDir, Arc<Tree>, Arc<Source>) {
+fn fixture_with_config(config: CacheConfig) -> (tempfile::TempDir, Arc<Tree>, Arc<Source>) {
     let dir = tempfile::tempdir().unwrap();
     let source = Arc::new(Source {
         blobs: [
@@ -66,14 +66,27 @@ fn fixture() -> (tempfile::TempDir, Arc<Tree>, Arc<Source>) {
         delay: Mutex::new(None),
         absent: Mutex::new(Vec::new()),
     });
-    let tree = Tree::open(
-        dir.path().join("state"),
-        "fixture",
-        source.clone(),
-        CacheConfig::default(),
-    )
-    .unwrap();
+    let tree = Tree::open(dir.path().join("state"), "fixture", source.clone(), config).unwrap();
     (dir, tree, source)
+}
+fn fixture() -> (tempfile::TempDir, Arc<Tree>, Arc<Source>) {
+    fixture_with_config(CacheConfig::default())
+}
+#[tokio::test]
+async fn oversized_metadata_is_visible_and_read_limit_has_specific_nfs_error() {
+    let (_dir, tree, source) = fixture_with_config(CacheConfig {
+        max_inflight_bytes: 4,
+        max_oversized_inflight_bytes: 0,
+        ..Default::default()
+    });
+    let node = tree.stage("file", artifact(b"first")).await.unwrap();
+    let fs = OutputNfs::new(tree);
+    assert_eq!(fs.getattr(node.id).await.unwrap().size, 5);
+    assert!(matches!(
+        fs.read(node.id, 0, 1).await,
+        Err(nfsstat3::NFS3ERR_FBIG)
+    ));
+    assert_eq!(source.fetches.load(Ordering::SeqCst), 0);
 }
 #[tokio::test]
 async fn metadata_is_lazy_and_old_handles_keep_content() {

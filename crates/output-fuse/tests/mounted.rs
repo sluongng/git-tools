@@ -116,6 +116,24 @@ async fn mounted_outputs_are_lazy_writable_and_generation_safe() {
         output_fuse::start(tree.clone(), &root).await.is_err(),
         "must not stack mounts"
     );
+    let mut oversized = source.artifact(b"metadata only");
+    oversized.size = CacheConfig::default().readable_limit() + 1;
+    mount.stage("oversized", oversized.clone()).await.unwrap();
+    let oversized_path = root.join("oversized");
+    io(move || {
+        assert_eq!(fs::metadata(&oversized_path).unwrap().len(), oversized.size);
+        let error = File::open(&oversized_path).unwrap_err();
+        assert_eq!(error.raw_os_error(), Some(libc::EFBIG));
+        // Discarding the oversized generation needs no hydration or quota.
+        OpenOptions::new()
+            .write(true)
+            .truncate(true)
+            .open(&oversized_path)
+            .unwrap();
+        assert_eq!(fs::metadata(&oversized_path).unwrap().len(), 0);
+    })
+    .await;
+    assert_eq!(source.fetches.load(Ordering::SeqCst), 0);
     let old = source.artifact(b"old bytes");
     let new = source.artifact(b"new bytes");
     mount.ensure_dir("base").await.unwrap();

@@ -157,11 +157,8 @@ fn projection_status(error: anyhow::Error) -> Status {
     {
         return Status::deadline_exceeded("output cache operation timed out");
     }
-    if error
-        .downcast_ref::<output_core::CacheLimitError>()
-        .is_some()
-    {
-        return Status::resource_exhausted("artifact exceeds configured lazy cache limits");
+    if let Some(limit) = error.downcast_ref::<output_core::CacheLimitError>() {
+        return Status::resource_exhausted(limit.to_string());
     }
     if let Some(status) = error.downcast_ref::<Status>() {
         return status.clone();

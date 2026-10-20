@@ -15,6 +15,9 @@ storage = "lazy" # Linux FUSE, macOS NFS, Windows ProjFS; no eager fallback.
 max_blob_bytes = 17179869184
 max_cache_bytes = 4294967296
 max_inflight_bytes = 268435456
+# Separate verified transfer lane for larger files; 0 disables it.
+# Both lanes share the fetch-count and cache-disk limits. Not a heap allocation.
+max_oversized_inflight_bytes = 1073741824
 max_concurrent_fetches = 8
 # Optional atomic JSON counters. The parent directory must exist.
 # metrics_file = "./metrics.json"

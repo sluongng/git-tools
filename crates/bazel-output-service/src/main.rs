@@ -61,6 +61,9 @@ struct Args {
     max_concurrent_fetches: Option<usize>,
     #[arg(long)]
     max_inflight_bytes: Option<u64>,
+    /// Additional streamed-to-disk admission budget for larger verified blobs.
+    #[arg(long)]
+    max_oversized_inflight_bytes: Option<u64>,
     /// Optional atomic JSON counters for local diagnostics (never credentials).
     #[arg(long)]
     metrics_file: Option<PathBuf>,
@@ -88,6 +91,7 @@ struct FileOptions {
     max_cache_bytes: Option<u64>,
     max_concurrent_fetches: Option<usize>,
     max_inflight_bytes: Option<u64>,
+    max_oversized_inflight_bytes: Option<u64>,
     metrics_file: Option<PathBuf>,
 }
 
@@ -104,6 +108,7 @@ struct ResolvedArgs {
     max_cache_bytes: u64,
     max_concurrent_fetches: usize,
     max_inflight_bytes: u64,
+    max_oversized_inflight_bytes: u64,
     metrics_file: Option<PathBuf>,
     policy: Policy,
 }
@@ -319,6 +324,10 @@ impl Args {
                 .max_inflight_bytes
                 .or(options.max_inflight_bytes)
                 .unwrap_or(268_435_456),
+            max_oversized_inflight_bytes: self
+                .max_oversized_inflight_bytes
+                .or(options.max_oversized_inflight_bytes)
+                .unwrap_or(1_073_741_824),
             metrics_file: self.metrics_file.or(options.metrics_file),
             policy: file.reapi,
         };
@@ -422,10 +431,20 @@ async fn mount_projection(
             max_bytes: args.max_cache_bytes,
             max_concurrent_fetches: args.max_concurrent_fetches,
             max_inflight_bytes: args.max_inflight_bytes,
+            max_oversized_inflight_bytes: args.max_oversized_inflight_bytes,
             operation_timeout: service.policy().operation_timeout(),
             fetch_timeout: service.policy().operation_timeout(),
         },
     )?;
+    eprintln!(
+        "lazy output limits (bytes): metadata={} readable={} cache={} normal_inflight={} oversized_inflight={}; concurrent_fetches={} (oversized=0 disables the extra lane)",
+        args.max_blob_bytes,
+        args.max_blob_bytes.min(cache.config().readable_limit()),
+        args.max_cache_bytes,
+        args.max_inflight_bytes,
+        args.max_oversized_inflight_bytes,
+        args.max_concurrent_fetches,
+    );
     let namespace = Tree::open_with_cache(&state, service.backend_identity(), cache)?;
     let projection: Arc<dyn Projection> = match args.storage {
         Storage::Fuse => {
@@ -529,6 +548,7 @@ storage = "lazy"
 max_blob_bytes = 12345
 max_cache_bytes = 23456
 max_inflight_bytes = 34567
+max_oversized_inflight_bytes = 45678
 max_concurrent_fetches = 3
 [reapi]
 rpc_timeout_ms = 1234
@@ -560,6 +580,7 @@ rpc_timeout_ms = 1234
         assert_eq!(configured.max_blob_bytes, 12345);
         assert_eq!(configured.max_cache_bytes, 23456);
         assert_eq!(configured.max_inflight_bytes, 34567);
+        assert_eq!(configured.max_oversized_inflight_bytes, 45678);
         assert_eq!(configured.max_concurrent_fetches, 3);
         assert_eq!(configured.policy.rpc_timeout_ms, 1234);
         let overridden = parse(&[
@@ -587,6 +608,8 @@ rpc_timeout_ms = 1234
             "300",
             "--max-concurrent-fetches",
             "2",
+            "--max-oversized-inflight-bytes",
+            "0",
         ]);
         assert_eq!(overridden.root, PathBuf::from("cli-mount"));
         assert_eq!(overridden.state_dir, Some(PathBuf::from("cli-state")));
@@ -599,6 +622,7 @@ rpc_timeout_ms = 1234
         assert_eq!(overridden.max_blob_bytes, 100);
         assert_eq!(overridden.max_cache_bytes, 200);
         assert_eq!(overridden.max_inflight_bytes, 300);
+        assert_eq!(overridden.max_oversized_inflight_bytes, 0);
         assert_eq!(overridden.max_concurrent_fetches, 2);
         assert_eq!(overridden.policy.rpc_timeout_ms, 1234);
     }
@@ -610,6 +634,7 @@ rpc_timeout_ms = 1234
         assert_eq!(defaults.listen, "127.0.0.1:8377".parse().unwrap());
         assert_eq!(defaults.max_cache_bytes, 4_294_967_296);
         assert_eq!(defaults.max_inflight_bytes, 268_435_456);
+        assert_eq!(defaults.max_oversized_inflight_bytes, 1_073_741_824);
         assert_eq!(defaults.max_concurrent_fetches, 8);
         assert_eq!(defaults.max_blob_bytes, 17_179_869_184);
         assert_eq!(defaults.api_key_env, "BUILDBUDDY_API_KEY");
@@ -690,5 +715,9 @@ rpc_timeout_ms = 1234
         assert!(file.output_service.state_dir.is_some());
         assert!(file.output_service.cas_endpoint.is_some());
         assert_eq!(file.output_service.storage, Some(Storage::Lazy));
+        assert_eq!(
+            file.output_service.max_oversized_inflight_bytes,
+            Some(1_073_741_824)
+        );
     }
 }

@@ -1,4 +1,4 @@
-exports_files(["Cargo.toml", "Cargo.lock"])
+exports_files(["Cargo.toml", "Cargo.lock", "examples/bazel-output-service.toml"])
 
 platform(
     name = "rbe_linux_x86_64",

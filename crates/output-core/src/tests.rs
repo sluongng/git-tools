@@ -221,7 +221,8 @@ async fn shared_fetch_expiry_releases_temporary_bytes_and_allows_retry() {
 async fn byte_admission_is_inside_foreground_deadline() {
     let (_dir, source, tree) = setup(CacheConfig {
         max_concurrent_fetches: 2,
-        max_inflight_bytes: 4096,
+        max_inflight_bytes: 4,
+        max_oversized_inflight_bytes: 4096,
         operation_timeout: Duration::from_millis(1000),
         fetch_timeout: Duration::from_secs(5),
         ..Default::default()
@@ -634,4 +635,44 @@ async fn independent_namespaces_share_content_cache_without_sharing_writable_aut
         b"shared clean output"
     );
     assert!(second.resolve("different/path").is_ok());
+}
+
+#[tokio::test]
+async fn delayed_oversized_read_does_not_occupy_normal_byte_admission() {
+    let (_dir, source, tree) = setup(CacheConfig {
+        max_bytes: 12,
+        max_inflight_bytes: 4,
+        max_oversized_inflight_bytes: 8,
+        max_concurrent_fetches: 2,
+        ..Default::default()
+    });
+    let large = tree
+        .stage("large", source.artifact(b"abcdefgh"))
+        .await
+        .unwrap();
+    let small = tree.stage("small", source.artifact(b"tiny")).await.unwrap();
+    assert_eq!(
+        source.calls.load(Ordering::SeqCst),
+        0,
+        "staging remains metadata-only"
+    );
+    source.delay.store(true, Ordering::SeqCst);
+    let reader = {
+        let tree = tree.clone();
+        tokio::spawn(async move { tree.read(large.id, 0, 8).await })
+    };
+    source.entered.notified().await;
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(1), tree.read(small.id, 0, 4))
+            .await
+            .unwrap()
+            .unwrap(),
+        b"tiny"
+    );
+    assert!(!reader.is_finished(), "large transfer remains stalled");
+    source.release.notify_one();
+    assert_eq!(reader.await.unwrap().unwrap(), b"abcdefgh");
+    assert_eq!(tree.read(large.id, 2, 3).await.unwrap(), b"cde");
+    assert_eq!(source.calls.load(Ordering::SeqCst), 2);
+    assert_eq!(tree.cache_metrics().resident_bytes, 12);
 }

@@ -60,10 +60,14 @@ Backend identity now includes a credential fingerprint. Old namespace state or
 a changed endpoint/instance/API key fails closed: use a fresh state directory,
 and preserve/export any local edits from the old state rather than deleting it.
 
-The verified cache defaults to 4 GiB. Metadata can describe larger blobs without
-fetching them; a content read must fit both the cache and the 256 MiB in-flight
-budget. Adjust `--max-cache-bytes`, `--max-inflight-bytes` and
-`--max-concurrent-fetches` for the workload. Metadata staging does not prove CAS
+The verified cache defaults to 4 GiB. Normal transfers share a 256 MiB budget;
+larger files use a separate 1 GiB lane (`--max-oversized-inflight-bytes`, 0 disables).
+Both lanes share fetch slots and disk quota; these are transfer limits, not
+whole-file heap allocations. The default largest readable artifact is 1 GiB;
+larger metadata can still stage, but reading reports a size-limit error. Adjust
+`--max-cache-bytes`, both transfer budgets and `--max-concurrent-fetches` for the
+workload. Staging, listing and stat never hydrate content; truncating an old
+generation can discard it without fetching. Metadata staging does not prove CAS
 residency; each build checks presence and requests conservative revalidation.
 Both eager and lazy reads negotiate ZSTD with CAS capabilities; legacy or
 identity-only servers keep working. Digests and limits describe decoded bytes.

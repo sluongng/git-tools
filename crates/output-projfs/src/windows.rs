@@ -40,6 +40,16 @@ fn hr(c: u32) -> HRESULT {
         (c & 0xffff | 0x80070000) as i32
     }
 }
+fn hydration_error(error: &anyhow::Error) -> HRESULT {
+    if error
+        .downcast_ref::<output_core::CacheLimitError>()
+        .is_some()
+    {
+        hr(ERROR_FILE_TOO_LARGE)
+    } else {
+        E_FAIL
+    }
+}
 fn check(h: HRESULT, op: &str) -> Result<()> {
     ensure!(h >= 0, "{op}: HRESULT {:#010x}", h as u32);
     Ok(())
@@ -1058,7 +1068,7 @@ unsafe fn callback(
         Ok(Ok(h)) => h,
         Ok(Err(e)) => {
             eprintln!("output-projfs callback: {e:#}");
-            E_FAIL
+            hydration_error(&e)
         }
         Err(_) => E_UNEXPECTED,
     }
@@ -1274,7 +1284,7 @@ unsafe extern "system" fn hydrate(
                     Ok(Ok(result)) => result,
                     Ok(Err(error)) => {
                         eprintln!("output-projfs hydration: {error:#}");
-                        E_FAIL
+                        hydration_error(&error)
                     }
                     Err(error) => {
                         eprintln!("output-projfs worker failed: {error}");

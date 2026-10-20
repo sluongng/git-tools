@@ -31,7 +31,7 @@ impl std::fmt::Display for CacheLimitError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "artifact size {} exceeds hydration budget {}",
+            "artifact size {} exceeds effective readable limit {} (increase cache and/or hydration byte budgets)",
             self.size, self.limit
         )
     }
@@ -85,6 +85,10 @@ pub struct CacheConfig {
     pub max_bytes: u64,
     pub max_concurrent_fetches: usize,
     pub max_inflight_bytes: u64,
+    /// Separate disk/transfer admission lane for blobs larger than the normal
+    /// in-flight budget. Zero disables it. Still bounded by max_bytes, shared
+    /// fetch slots, full-object verification, deadlines and cache leases.
+    pub max_oversized_inflight_bytes: u64,
     /// Per-waiter budget, including fetch-slot admission and a shared result.
     pub operation_timeout: Duration,
     /// Independent admitted-fetch lifetime, including byte admission and verify.
@@ -96,9 +100,20 @@ impl Default for CacheConfig {
             max_bytes: 4 * 1024 * 1024 * 1024,
             max_concurrent_fetches: 8,
             max_inflight_bytes: 512 * 1024 * 1024,
+            max_oversized_inflight_bytes: 0,
             operation_timeout: Duration::from_secs(120),
             fetch_timeout: Duration::from_secs(120),
         }
+    }
+}
+impl CacheConfig {
+    /// Largest artifact whose bytes may be hydrated. Staging metadata does not
+    /// require hydration and intentionally accepts larger artifacts.
+    pub fn readable_limit(&self) -> u64 {
+        self.max_bytes.min(
+            self.max_inflight_bytes
+                .max(self.max_oversized_inflight_bytes),
+        )
     }
 }
 #[derive(Clone, Copy, Debug, Default)]
@@ -355,6 +370,8 @@ pub struct LocalCas {
     requests: Arc<Semaphore>,
     bytes: Semaphore,
     byte_units: u32,
+    oversized_bytes: Semaphore,
+    oversized_byte_units: u32,
     flights: Mutex<HashMap<String, Arc<Flight>>>,
     files: Mutex<CacheFiles>,
     serial: AtomicU64,
@@ -403,6 +420,8 @@ impl LocalCas {
             .context("local CAS directory already owned by another handle or process")?;
         let ownership = DirectoryOwnership(ownership);
         let byte_units = (config.max_inflight_bytes / 4096).clamp(1, u32::MAX as u64) as u32;
+        let oversized_byte_units =
+            (config.max_oversized_inflight_bytes / 4096).clamp(1, u32::MAX as u64) as u32;
         let mut recency_errors = 0;
         let hints = match fs::read(dir.join("recency.json")) {
             Ok(bytes) => match serde_json::from_slice::<Recency>(&bytes) {
@@ -492,6 +511,8 @@ impl LocalCas {
             requests: Arc::new(Semaphore::new(config.max_concurrent_fetches)),
             bytes: Semaphore::new(byte_units as usize),
             byte_units,
+            oversized_bytes: Semaphore::new(oversized_byte_units as usize),
+            oversized_byte_units,
             config,
             flights: Mutex::new(HashMap::new()),
             files: Mutex::new(files),
@@ -677,7 +698,7 @@ impl LocalCas {
         source: Arc<dyn BlobSource>,
     ) -> Result<Arc<CachedBlob>> {
         artifact.validate()?;
-        let limit = self.config.max_bytes.min(self.config.max_inflight_bytes);
+        let limit = self.config.readable_limit();
         if artifact.size > limit {
             return Err(CacheLimitError {
                 size: artifact.size,
@@ -786,9 +807,9 @@ impl LocalCas {
         let mut state = self.files.lock().unwrap();
         while state
             .resident
-            .saturating_add(state.reserved)
-            .saturating_add(size)
-            > self.config.max_bytes
+            .checked_add(state.reserved)
+            .and_then(|used| used.checked_add(size))
+            .is_none_or(|total| total > self.config.max_bytes)
         {
             let (_, path) = state
                 .evictable
@@ -801,7 +822,10 @@ impl LocalCas {
             self.evictions.fetch_add(1, Ordering::Relaxed);
             self.evicted_bytes.fetch_add(bytes, Ordering::Relaxed);
         }
-        state.reserved += size;
+        state.reserved = state
+            .reserved
+            .checked_add(size)
+            .context("cache reservation overflow")?;
         Ok(Reservation {
             cache: Arc::downgrade(self),
             bytes: size,
@@ -901,12 +925,16 @@ impl LocalCas {
             })?;
             state.remove(&path);
         }
-        let units = artifact
-            .size
-            .div_ceil(4096)
-            .clamp(1, self.byte_units as u64) as u32;
-        let _bytes = self
-            .bytes
+        // Large streamed objects get their own explicitly budgeted lane. They
+        // do not consume the normal lane's byte permits, but share the global
+        // request cap and the on-disk reservation accounting.
+        let (budget, units) = if artifact.size > self.config.max_inflight_bytes {
+            (&self.oversized_bytes, self.oversized_byte_units)
+        } else {
+            (&self.bytes, self.byte_units)
+        };
+        let units = artifact.size.div_ceil(4096).clamp(1, units as u64) as u32;
+        let _bytes = budget
             .acquire_many(units)
             .await
             .context("cache shutting down")?;

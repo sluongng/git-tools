@@ -562,6 +562,11 @@ impl Tree {
         ensure!(r.node.kind == NodeKind::Symlink, "not a symlink");
         r.target.clone().context("missing symlink target")
     }
+    /// Maximum immutable artifact size admitted by the configured cache lanes.
+    /// Metadata-only staging may represent larger artifacts without fetching.
+    pub fn readable_limit(&self) -> u64 {
+        self.cache.config().readable_limit()
+    }
     pub fn cache_metrics(&self) -> CacheMetrics {
         self.cache.metrics()
     }

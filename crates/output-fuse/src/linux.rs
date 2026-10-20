@@ -21,6 +21,13 @@ const TTL: Duration = Duration::ZERO;
 const PAYLOAD_SLOTS: usize = 64;
 
 fn errno(error: anyhow::Error) -> i32 {
+    if error
+        .downcast_ref::<output_core::CacheLimitError>()
+        .is_some()
+    {
+        eprintln!("output-fuse hydration: {error:#}");
+        return libc::EFBIG;
+    }
     if let Some(e) = error.downcast_ref::<CoreError>() {
         return match e {
             CoreError::NotFound => libc::ENOENT,
@@ -124,6 +131,7 @@ impl Drop for RequestTicket {
 #[derive(Clone)]
 struct Adapter {
     tree: Arc<Tree>,
+    atomic_truncate: bool,
     runtime: Handle,
     payload: Arc<Semaphore>,
     pending: Arc<Pending>,
@@ -157,6 +165,7 @@ impl Adapter {
 }
 impl Filesystem for Adapter {
     fn init(&mut self, _: &Request<'_>, config: &mut KernelConfig) -> Result<(), i32> {
+        self.atomic_truncate = config.add_capabilities(consts::FUSE_ATOMIC_O_TRUNC).is_ok();
         let _ = config.set_max_background(128);
         let _ = config.set_max_write(1024 * 1024);
         Ok(())
@@ -233,6 +242,26 @@ impl Filesystem for Adapter {
             return;
         }
         if flags & libc::O_TRUNC == 0 {
+            // Linux buffered reads can normalize a FUSE page-cache failure to
+            // EIO. Reject known impossible hydration at open instead, without
+            // fetching, so users get the actionable file-too-large error.
+            // O_TRUNC still discards a remote generation without hydrating it.
+            // On old kernels without atomic truncation, writable opens must
+            // remain possible for the kernel's separate truncate operation.
+            let limit = self.tree.readable_limit();
+            if node.remote.is_some()
+                && node.size > limit
+                && (self.atomic_truncate || flags & libc::O_ACCMODE == libc::O_RDONLY)
+            {
+                reply.error(errno(
+                    output_core::CacheLimitError {
+                        size: node.size,
+                        limit,
+                    }
+                    .into(),
+                ));
+                return;
+            }
             reply.opened(ino, 0);
             return;
         }
@@ -806,6 +835,7 @@ pub async fn start(tree: Arc<Tree>, root: &Path) -> Result<Arc<FuseMount>> {
         );
         let adapter = Adapter {
             tree,
+            atomic_truncate: false,
             runtime,
             payload: Arc::new(Semaphore::new(PAYLOAD_SLOTS)),
             pending: Arc::new(Pending::default()),

@@ -244,6 +244,7 @@ impl CasSync {
             CacheConfig {
                 max_bytes: config.cache_max_bytes,
                 max_inflight_bytes: config.staging_limit_bytes,
+                max_oversized_inflight_bytes: 0,
                 max_concurrent_fetches: 1,
                 operation_timeout: config.policy.background_timeout(),
                 fetch_timeout: config.policy.background_timeout(),

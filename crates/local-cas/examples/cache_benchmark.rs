@@ -8,7 +8,7 @@ use serde_json::{Value, json};
 use std::{
     collections::HashMap,
     fs::{self, File},
-    io::Write,
+    io::{Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
     sync::{
         Arc,
@@ -73,6 +73,7 @@ fn config(bytes: u64) -> CacheConfig {
     CacheConfig {
         max_bytes: bytes,
         max_inflight_bytes: bytes,
+        max_oversized_inflight_bytes: 0,
         max_concurrent_fetches: 8,
         operation_timeout: Duration::from_secs(120),
         fetch_timeout: Duration::from_secs(120),
@@ -349,6 +350,113 @@ async fn large_admission(root: &Path, retained: usize, rows: &mut Vec<Value>) ->
     Ok(())
 }
 
+// Deliberately stream a fixed-size buffer: this benchmark must not allocate the
+// whole 257MiB/1GiB fixture or imply the transfer quota equals resident memory.
+struct StreamSource;
+#[async_trait]
+impl BlobSource for StreamSource {
+    async fn fetch(&self, artifact: &Artifact, target: &mut File) -> Result<()> {
+        let block = [0xa5u8; 128 * 1024];
+        let mut remaining = artifact.size;
+        while remaining > 0 {
+            let n = remaining.min(block.len() as u64) as usize;
+            target.write_all(&block[..n])?;
+            remaining -= n as u64;
+            tokio::task::yield_now().await;
+        }
+        Ok(())
+    }
+    async fn missing(&self, _: &[Artifact]) -> Result<Vec<Artifact>> {
+        Ok(vec![])
+    }
+}
+async fn oversized_streams(root: &Path, label: &str) -> Result<()> {
+    let source = Arc::new(StreamSource);
+    let normal = CacheConfig {
+        max_bytes: 4 * 1024 * 1024 * 1024,
+        max_inflight_bytes: 256 * 1024 * 1024,
+        max_oversized_inflight_bytes: 0,
+        operation_timeout: Duration::from_secs(300),
+        fetch_timeout: Duration::from_secs(300),
+        ..Default::default()
+    };
+    let before = LocalCas::open(root.join("disabled"), source.clone(), normal.clone())?;
+    let mut enabled = normal;
+    enabled.max_oversized_inflight_bytes = 1024 * 1024 * 1024;
+    let dir = root.join("enabled");
+    let after = LocalCas::open(&dir, source, enabled)?;
+    let mut rows = Vec::new();
+    for size in [257 * 1024 * 1024u64, 1024 * 1024 * 1024] {
+        eprintln!("{label}: streaming oversized bytes={size}");
+        let setup = Instant::now();
+        let mut hash = blake3::Hasher::new();
+        let block = [0xa5u8; 128 * 1024];
+        let mut remaining = size;
+        while remaining > 0 {
+            let n = remaining.min(block.len() as u64) as usize;
+            hash.update(&block[..n]);
+            remaining -= n as u64;
+        }
+        let artifact = Artifact {
+            backend: "synthetic-streaming-benchmark".into(),
+            instance: String::new(),
+            digest_function: 9,
+            hash: hash.finalize().to_hex().to_string(),
+            size,
+        };
+        let setup_seconds = setup.elapsed().as_secs_f64();
+        let start = Instant::now();
+        let error = before
+            .clone()
+            .content(artifact.clone())
+            .await
+            .err()
+            .context("disabled lane unexpectedly admitted oversized blob")?;
+        ensure!(
+            error.downcast_ref::<local_cas::CacheLimitError>().is_some(),
+            "unexpected rejection: {error:#}"
+        );
+        let rejected_seconds = start.elapsed().as_secs_f64();
+        let metrics = after.metrics();
+        let start = Instant::now();
+        let lease = after.clone().content(artifact.clone()).await?;
+        let cold_seconds = start.elapsed().as_secs_f64();
+        ensure!(fs::metadata(lease.path())?.len() == size, "size mismatch");
+        let cold_metrics = metrics_delta(metrics, after.metrics());
+        drop(lease);
+        let metrics = after.metrics();
+        let start = Instant::now();
+        let lease = after.clone().content(artifact).await?;
+        let mut file = File::open(lease.path())?;
+        file.seek(SeekFrom::Start(size / 2))?;
+        let mut bytes = [0; 4096];
+        file.read_exact(&mut bytes)?;
+        ensure!(
+            bytes.iter().all(|byte| *byte == 0xa5),
+            "warm range mismatch"
+        );
+        let warm_seconds = start.elapsed().as_secs_f64();
+        rows.push(
+            json!({"size_bytes": size, "fixture_hash_seconds": setup_seconds,
+            "disabled_rejection_seconds": rejected_seconds, "cold_verified_seconds": cold_seconds,
+            "cold_mib_per_second": size as f64 / 1048576.0 / cold_seconds,
+            "warm_verified_4k_read_seconds": warm_seconds,
+            "cold_metrics": cold_metrics, "warm_metrics": metrics_delta(metrics, after.metrics()),
+            "disk_after": disk(&dir)?}),
+        );
+    }
+    ensure!(before.metrics().fetches == 0, "disabled lane fetched bytes");
+    let receipt = json!({"schema_version": 1, "label": label, "scenario": "oversized_streamed_verified_disk_admission",
+        "normal_inflight_bytes": 268435456, "oversized_inflight_bytes": 1073741824,
+        "cache_bytes": 4294967296u64, "source_buffer_bytes": 131072,
+        "note": "Network-free BLAKE3 full-object verification with 128KiB streamed writes. Cold includes write, sync, verify and atomic publication. Warm reads 4KiB of a process-verified blob with warm OS cache. No claim about end-to-end CAS network or RBE build performance; measure peak RSS externally.",
+        "results": rows});
+    let encoded = serde_json::to_string_pretty(&receipt)?;
+    fs::write(root.join("receipt.json"), &encoded)?;
+    println!("{encoded}");
+    Ok(())
+}
+
 #[tokio::main(flavor = "multi_thread", worker_threads = 8)]
 async fn main() -> Result<()> {
     let mut args = std::env::args().skip(1);
@@ -357,8 +465,17 @@ async fn main() -> Result<()> {
             .context("usage: cache_benchmark OUTPUT_DIR LABEL")?,
     );
     let label = args.next().context("missing receipt label")?;
+    let mode = args.next();
+    ensure!(
+        mode.as_deref().is_none_or(|mode| mode == "--oversized"),
+        "optional mode must be --oversized"
+    );
+    ensure!(args.next().is_none(), "unexpected arguments");
     ensure!(!root.exists(), "OUTPUT_DIR already exists");
     fs::create_dir_all(&root)?;
+    if mode.is_some() {
+        return oversized_streams(&root, &label).await;
+    }
     let start = Instant::now();
     let mut rows = Vec::new();
     for retained in [1000, 10000, 30000] {

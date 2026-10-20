@@ -37,6 +37,13 @@ fn status(error: anyhow::Error) -> nfsstat3 {
     status_ref(&error)
 }
 fn status_ref(error: &anyhow::Error) -> nfsstat3 {
+    if error
+        .downcast_ref::<output_core::CacheLimitError>()
+        .is_some()
+    {
+        eprintln!("output-nfs hydration: {error:#}");
+        return nfsstat3::NFS3ERR_FBIG;
+    }
     if let Some(error) = error.downcast_ref::<CoreError>() {
         return match error {
             CoreError::NotFound => nfsstat3::NFS3ERR_NOENT,

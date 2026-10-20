@@ -386,7 +386,16 @@ async fn source_override_survives_cancelled_waiter_and_coalesces_without_default
     let dir = tempfile::tempdir().unwrap();
     let default_source = Arc::new(Source::default());
     default_source.reject.store(true, Ordering::Relaxed);
-    let cache = LocalCas::open(dir.path(), default_source.clone(), CacheConfig::default()).unwrap();
+    let cache = LocalCas::open(
+        dir.path(),
+        default_source.clone(),
+        CacheConfig {
+            max_inflight_bytes: 2,
+            max_oversized_inflight_bytes: 4,
+            ..Default::default()
+        },
+    )
+    .unwrap();
     let entered = Arc::new(tokio::sync::Notify::new());
     let release = Arc::new(tokio::sync::Notify::new());
     let dropped = Arc::new(AtomicBool::new(false));
@@ -522,6 +531,8 @@ async fn idle_barrier_waits_for_fetch_teardown_after_its_waiter_times_out() {
         Arc::new(Source::default()),
         CacheConfig {
             max_concurrent_fetches: 1,
+            max_inflight_bytes: 2,
+            max_oversized_inflight_bytes: 4,
             operation_timeout: Duration::from_millis(10),
             fetch_timeout: Duration::from_secs(5),
             ..Default::default()
@@ -622,4 +633,129 @@ fn idle_barrier_includes_blocking_verification_after_fetch_timeout() {
         )
         .unwrap();
     });
+}
+
+#[tokio::test]
+async fn oversized_admission_is_opt_in_and_never_exceeds_disk_quota() {
+    for (normal, oversized, disk, expected) in [(4, 0, 16, 4), (4, 8, 16, 8), (4, 8, 6, 6)] {
+        let dir = tempfile::tempdir().unwrap();
+        let source = Arc::new(Source::default());
+        let config = CacheConfig {
+            max_bytes: disk,
+            max_inflight_bytes: normal,
+            max_oversized_inflight_bytes: oversized,
+            ..Default::default()
+        };
+        assert_eq!(config.readable_limit(), expected);
+        let cache = LocalCas::open(dir.path(), source.clone(), config).unwrap();
+        let result = cache
+            .clone()
+            .content_from(
+                artifact(b"abcdefgh"),
+                Arc::new(BytesSource(b"abcdefgh".to_vec())),
+            )
+            .await;
+        if expected < 8 {
+            let error = result.err().unwrap();
+            let limit = error.downcast_ref::<CacheLimitError>().unwrap();
+            assert_eq!(limit.limit, expected);
+            assert!(error.to_string().contains("effective readable limit"));
+            assert_eq!(cache.metrics().fetches, 0);
+        } else {
+            let lease = result.unwrap();
+            assert_eq!(fs::read(lease.path()).unwrap(), b"abcdefgh");
+            assert_eq!(cache.metrics().resident_bytes, 8);
+        }
+        assert_eq!(cache.metrics().reserved_bytes, 0);
+    }
+}
+
+#[tokio::test]
+async fn oversized_blobs_verify_completely_before_publication_and_obey_pinned_lru() {
+    let dir = tempfile::tempdir().unwrap();
+    let cache = LocalCas::open(
+        dir.path(),
+        Arc::new(Source::default()),
+        CacheConfig {
+            max_bytes: 8,
+            max_inflight_bytes: 4,
+            max_oversized_inflight_bytes: 8,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    for invalid in [b"abcdefg".as_slice(), b"abcdefghX", b"12345678"] {
+        assert!(
+            cache
+                .clone()
+                .content_from(
+                    artifact(b"abcdefgh"),
+                    Arc::new(BytesSource(invalid.to_vec()))
+                )
+                .await
+                .is_err()
+        );
+        assert_eq!(cache.metrics().resident_bytes, 0);
+        assert_eq!(cache.metrics().reserved_bytes, 0);
+        assert!(!fs::read_dir(dir.path()).unwrap().any(|entry| {
+            entry
+                .unwrap()
+                .path()
+                .extension()
+                .is_some_and(|ext| ext == "tmp")
+        }));
+    }
+    let lease = bytes(&cache, b"abcdefgh").await;
+    let path = lease.path().to_owned();
+    assert!(
+        cache.clone().content(artifact(b"aaaa")).await.is_err(),
+        "oversized lease cannot be reclaimed"
+    );
+    drop(lease);
+    let replacement = bytes(&cache, b"aaaa").await;
+    assert!(!path.exists());
+    assert_eq!(fs::read(replacement.path()).unwrap(), b"aaaa");
+    assert_eq!(cache.metrics().evicted_bytes, 8);
+}
+
+#[tokio::test]
+async fn extreme_declared_size_cannot_wrap_reserved_disk_accounting() {
+    let dir = tempfile::tempdir().unwrap();
+    let default_source = Arc::new(Source::default());
+    let cache = LocalCas::open(
+        dir.path(),
+        default_source.clone(),
+        CacheConfig {
+            max_bytes: u64::MAX,
+            max_inflight_bytes: 4,
+            max_oversized_inflight_bytes: u64::MAX,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let entered = Arc::new(tokio::sync::Notify::new());
+    let release = Arc::new(tokio::sync::Notify::new());
+    let mut enormous = artifact(b"aaaa");
+    enormous.size = u64::MAX; // Explicit invalid-source/budget boundary fixture.
+    let caller = tokio::spawn(cache.clone().content_from(
+        enormous,
+        Arc::new(HeldSource {
+            entered: entered.clone(),
+            release: release.clone(),
+            dropped: Arc::new(AtomicBool::new(false)),
+        }),
+    ));
+    entered.notified().await;
+    assert_eq!(cache.metrics().reserved_bytes, u64::MAX);
+    assert!(cache.clone().content(artifact(b"bbbb")).await.is_err());
+    assert_eq!(cache.metrics().reserved_bytes, u64::MAX);
+    assert_eq!(default_source.calls.load(Ordering::Relaxed), 0);
+    release.notify_one();
+    assert!(
+        caller.await.unwrap().is_err(),
+        "truncated oversized source is never published"
+    );
+    cache.wait_for_idle().await.unwrap();
+    assert_eq!(cache.metrics().reserved_bytes, 0);
+    assert_eq!(cache.metrics().resident_bytes, 0);
 }
