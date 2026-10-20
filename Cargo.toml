@@ -1,5 +1,6 @@
 [workspace]
 members = [
+    "crates/agent-session",
     "crates/workspace-core",
     "crates/workspace-overlay",
     "crates/workspace-fuse",

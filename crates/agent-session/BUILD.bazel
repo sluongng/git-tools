@@ -1,0 +1,42 @@
+load("@crates//:defs.bzl", "aliases", "all_crate_deps")
+load("@rules_rs//rs:rust_binary.bzl", "rust_binary")
+load("@rules_rs//rs:rust_library.bzl", "rust_library")
+load("@rules_rs//rs:rust_test.bzl", "rust_test")
+load("//build_defs:fixture_test.bzl", "fixture_test")
+
+package(default_visibility = ["//visibility:public"])
+
+rust_library(
+    name = "agent-session",
+    srcs = ["src/lib.rs"],
+    aliases = aliases(),
+    crate_name = "agent_session",
+    edition = "2024",
+    version = "0.1.0",
+    deps = all_crate_deps(normal = True),
+)
+
+rust_binary(
+    name = "agent-session-bin",
+    srcs = ["src/main.rs"],
+    aliases = aliases(),
+    crate_name = "agent_session",
+    edition = "2024",
+    version = "0.1.0",
+    deps = [":agent-session"] + all_crate_deps(normal = True),
+)
+
+rust_test(
+    name = "lifecycle_binary",
+    srcs = ["tests/lifecycle.rs"],
+    aliases = aliases(),
+    edition = "2024",
+    tags = ["manual"],
+    deps = [":agent-session"] + all_crate_deps(normal = True),
+)
+
+fixture_test(
+    name = "lifecycle",
+    binary = ":lifecycle_binary",
+    git = True,
+)
