@@ -1752,3 +1752,74 @@ async fn stream_idle_deadline_is_independent_of_the_operation_budget() {
     );
     assert_eq!(fixture.cas.reads.lock().unwrap().len(), 1);
 }
+
+#[tokio::test]
+async fn canonical_empty_outputs_are_verified_locally_for_eager_and_lazy_reads() {
+    use std::io::{Read, Seek, SeekFrom, Write};
+    for function in [1, 9] {
+        let mut fixture = Fixture::new().await;
+        fixture.cas.zstd.store(true, Ordering::SeqCst);
+        let response = fixture
+            .client
+            .start_build(fixture.request("empty", function))
+            .await
+            .unwrap()
+            .into_inner();
+        let root = std::path::PathBuf::from(response.output_path_suffix);
+        let digest = fixture.blob(b"", function);
+        fixture.cas.data.lock().unwrap().clear();
+        std::fs::write(root.join("output"), b"old output").unwrap();
+        assert_eq!(fixture.stage("empty", "output", digest.clone()).await, 0);
+        assert_eq!(std::fs::read(root.join("output")).unwrap(), b"");
+
+        let source = fixture.service.blob_source();
+        let artifact = output_core::Artifact {
+            backend: fixture.service.backend_identity(),
+            instance: "fixture".into(),
+            digest_function: function,
+            hash: digest.hash,
+            size: 0,
+        };
+        let mut target = tempfile::tempfile().unwrap();
+        target.write_all(b"old lazy contents").unwrap();
+        source.fetch(&artifact, &mut target).await.unwrap();
+        assert_eq!(target.metadata().unwrap().len(), 0);
+        assert_eq!(target.stream_position().unwrap(), 0);
+
+        // A zero length alone is not enough: an incorrect hash must neither be
+        // accepted nor replace an existing eager output or lazy target.
+        let wrong = Digest {
+            hash: "0".repeat(64),
+            size_bytes: 0,
+        };
+        std::fs::write(root.join("output"), b"preserve eager").unwrap();
+        assert_eq!(
+            fixture.stage("empty", "output", wrong.clone()).await,
+            tonic::Code::DataLoss as i32
+        );
+        assert_eq!(
+            std::fs::read(root.join("output")).unwrap(),
+            b"preserve eager"
+        );
+        target.write_all(b"preserve lazy").unwrap();
+        let wrong_artifact = output_core::Artifact {
+            hash: wrong.hash,
+            ..artifact
+        };
+        let error = source
+            .fetch(&wrong_artifact, &mut target)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            error.downcast_ref::<Status>().unwrap().code(),
+            tonic::Code::DataLoss
+        );
+        target.seek(SeekFrom::Start(0)).unwrap();
+        let mut bytes = Vec::new();
+        target.read_to_end(&mut bytes).unwrap();
+        assert_eq!(bytes, b"preserve lazy");
+        assert!(fixture.cas.reads.lock().unwrap().is_empty());
+        assert_eq!(fixture.cas.capabilities_queries.load(Ordering::SeqCst), 0);
+        assert_eq!(fixture.service.metrics().zstd_read_requests, 0);
+    }
+}

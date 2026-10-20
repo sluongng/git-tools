@@ -407,6 +407,17 @@ impl Backend {
         function: i32,
         file: &mut std::fs::File,
     ) -> Result<(), Status> {
+        // REAPI's canonical empty blob exists without a CAS transfer. In
+        // particular, compressed ByteStream reads may finish without emitting a
+        // ZSTD frame; verify the digest locally instead of weakening EOF checks.
+        if digest.size_bytes == 0 {
+            if Hasher::new(function)?.finish() != digest.hash {
+                return Err(Status::data_loss("CAS empty content digest mismatch"));
+            }
+            file.set_len(0).map_err(io_status)?;
+            file.seek(SeekFrom::Start(0)).map_err(io_status)?;
+            return Ok(());
+        }
         let deadline = tokio::time::Instant::now() + self.policy.operation_timeout();
         let compressed = self.supports_zstd(deadline).await?;
         self.policy
