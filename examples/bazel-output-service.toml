@@ -1,0 +1,34 @@
+# Copy to a private location and edit the endpoint/paths, then run:
+# git-output-service --config /path/to/bazel-output-service.toml
+# Relative paths resolve beside this file; ~ and environment variables do not expand.
+[output_service]
+cas_endpoint = "grpcs://YOUR_INSTANCE.buildbuddy.io"
+instance_name = ""
+listen = "127.0.0.1:8377"
+root = "./outputs"
+state_dir = "./output-state"
+# Optional; the default is state_dir/cache. Keep this separate from writable data.
+cas_cache_dir = "./output-cas"
+# Name only: populate this environment variable from your secret store.
+api_key_env = "BUILDBUDDY_API_KEY"
+storage = "lazy" # Linux FUSE, macOS NFS, Windows ProjFS; no eager fallback.
+max_blob_bytes = 17179869184
+max_cache_bytes = 4294967296
+max_inflight_bytes = 268435456
+max_concurrent_fetches = 8
+# Optional atomic JSON counters. The parent directory must exist.
+# metrics_file = "./metrics.json"
+
+[reapi]
+connect_timeout_ms = 10000
+rpc_timeout_ms = 60000
+stream_idle_timeout_ms = 60000
+operation_timeout_ms = 120000
+background_timeout_ms = 600000
+# Positive-presence suppression, not a retention guarantee; zero always rechecks.
+presence_ttl_seconds = 0
+
+[reapi.retry]
+max_attempts = 4
+initial_backoff_ms = 100
+max_backoff_ms = 5000

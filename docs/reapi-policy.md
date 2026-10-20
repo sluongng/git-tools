@@ -7,15 +7,20 @@ See the complete [example](../examples/reapi-policy.toml).
 
 ```sh
 git-output-service --config /path/to/reapi-policy.toml \
-  --root /path/to/outputs --cas-endpoint grpcs://cache.example.com
+  --root /path/to/outputs --state-dir /path/to/output-state \
+  --cas-endpoint grpcs://cache.example.com
 ```
 
 Configuration precedence is explicit CLI overrides, then TOML, then built-in
 defaults.
 An omitted field keeps its built-in default.
 Unknown keys and invalid values fail startup before mounting storage.
-This is a policy file, not a complete daemon configuration: endpoints, paths and
-resource limits keep their existing CLI options.
+The shared example is a policy-only file: proxy endpoints, paths and resource
+limits keep their CLI options.
+The output service also accepts an `[output_service]` table for complete daemon
+configuration; see its [example](../examples/bazel-output-service.toml).
+That complete file is BOS-specific: the proxy intentionally rejects its extra
+table. Existing `[reapi]`-only files remain compatible with both daemons.
 Credentials stay in environment variables; do not put keys in TOML or CLI flags.
 
 ## Defaults

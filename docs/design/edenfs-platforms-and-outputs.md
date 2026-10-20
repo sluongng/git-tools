@@ -145,8 +145,11 @@ Preserve actual Windows name collation; reject alternate streams, reserved devic
 
 ## Implemented lazy output architecture
 
-The CLI selects `--storage eager|nfs|projfs`; lazy modes require a durable
-`--state-dir` outside the mount root. The eager backend remains the default.
+The CLI defaults to `--storage lazy`, selecting Linux FUSE, macOS NFS or Windows
+ProjFS. Lazy modes require a durable `--state-dir` outside the mount root.
+Eager downloads are available only through the CLI-only `--debug-eager` switch,
+not normal storage selection or TOML. See the complete
+[configuration example](../../examples/bazel-output-service.toml).
 Responsibilities are split into separate crates:
 
 | Component | Owns | Must not own |
@@ -154,7 +157,7 @@ Responsibilities are split into separate crates:
 | `output-core` | Durable per-output-base namespace, generations, dirty/local state, tombstones, CAS locators and cache leases | Git index/bootstrap, platform callbacks |
 | `output-nfs` | NFS operations, mounted publication barrier and NFS handle lifetime | Git object identity or CAS authentication policy |
 | `output-projfs` | Placeholder versions, pending requests, view updates, native dirty state and negative-cache invalidation | A second copy of authoritative NTFS edits |
-| `bazel-output-service` | Build lifecycle, locator validation, explicit eager/lazy selection and backend selection | Pretending staging completion proves kernel visibility |
+| `bazel-output-service` | Build lifecycle, locator validation, lazy backend selection and explicit debug mode | Pretending staging completion proves kernel visibility |
 
 CAS outputs are not modeled as Git blobs. Shared NFS transport has a per-provider
 request budget; the output channel reserves metadata capacity under cold-read load.

@@ -6,22 +6,27 @@ BuildBuddy / REAPI CAS. This manages **build outputs**, not the Git source VFS.
 ```sh
 # Populate this variable from your secret store, not a command-line key.
 export BUILDBUDDY_API_KEY
-cargo run -p bazel-output-service -- \
-  --root "$HOME/.cache/bazel-outputs" \
-  --state-dir "$HOME/.cache/bazel-output-state" \
-  --cas-endpoint grpcs://YOUR_INSTANCE.buildbuddy.io
+# Copy the example to a private location; edit its endpoint and paths.
+cargo run -p bazel-output-service -- --config /path/to/bazel-output-service.toml
 
 bazel --digest_function=BLAKE3 build //:target \
   --remote_cache=grpcs://YOUR_INSTANCE.buildbuddy.io \
   --experimental_remote_output_service=grpc://127.0.0.1:8377 \
-  --experimental_remote_output_service_output_path_prefix="$HOME/.cache/bazel-outputs"
+  --experimental_remote_output_service_output_path_prefix=/path/to/outputs
 ```
 
+The Bazel output path prefix must match the resolved TOML `root`.
 Configure Bazel's host-scoped credential helper separately. SHA256 also works.
 Set `--instance-name` to match a nonempty Bazel `--remote_instance_name`.
-Use `--config /path/to/reapi-policy.toml` for conservative, configurable timeout
-and retry settings; see [policy defaults and example](../../docs/reapi-policy.md).
-Explicit CLI overrides take precedence. No file is loaded automatically.
+Use the complete [TOML example](../../examples/bazel-output-service.toml) for
+paths, endpoint, cache limits and [REAPI policy](../../docs/reapi-policy.md).
+CLI options override TOML; omitted values use built-in defaults.
+Relative TOML paths resolve beside the file; CLI paths remain relative to the
+working directory. No file is loaded automatically, and no environment or `~`
+expansion occurs. Only the credential environment variable's **name** belongs
+in TOML, never its value. Unknown fields, malformed TOML and files over 64 KiB
+are rejected without echoing their contents.
+Existing `[reapi]`-only policy files still work with endpoint/path CLI options.
 
 ## Storage
 
@@ -33,8 +38,9 @@ Explicit CLI overrides take precedence. No file is loaded automatically.
   Linux needs `/dev/fuse` and `fusermount3`; macOS NFS needs no sudo; Windows
   needs ProjFS enabled. Keep the daemon running while accessing outputs.
   Restart by unmount/remount, not takeover. There is no silent eager fallback.
-- `--storage eager` remains an explicit compatibility/debugging option: stream
-  and verify every staged blob before publication to an ordinary directory.
+- Eager storage is **debug-only**: `--debug-eager` streams and verifies every
+  staged blob before publication to an ordinary directory, with a startup warning.
+  It cannot be selected via `--storage`, TOML, or alongside explicit `--storage`.
 
 Bazel currently supplies flattened output paths and digests, including tree
 children; BOS creates their parent directories without another CAS download.

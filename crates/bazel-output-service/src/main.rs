@@ -4,13 +4,18 @@ use bazel_output_service::{
 use clap::{Parser, ValueEnum};
 use output_core::{Projection, Tree};
 use reapi::policy::Policy;
+use serde::Deserialize;
+use std::io::Read;
 use std::{net::SocketAddr, path::PathBuf, sync::Arc, time::Duration};
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum, Deserialize)]
+#[serde(rename_all = "lowercase")]
 enum Storage {
     /// Select the native lazy backend for this operating system.
     Lazy,
     Fuse,
+    #[value(skip)]
+    #[serde(skip)]
     Eager,
     Nfs,
     Projfs,
@@ -19,55 +24,97 @@ enum Storage {
 /// Local Bazel Remote Output Service with verified, demand-loaded outputs.
 #[derive(Parser)]
 struct Args {
-    #[arg(long, default_value = "127.0.0.1:8377")]
-    listen: SocketAddr,
     #[arg(long)]
-    root: PathBuf,
+    listen: Option<SocketAddr>,
     #[arg(long)]
-    cas_endpoint: String,
-    #[arg(long, default_value = "")]
-    instance_name: String,
+    root: Option<PathBuf>,
+    #[arg(long)]
+    cas_endpoint: Option<String>,
+    #[arg(long)]
+    instance_name: Option<String>,
     /// Name of the environment variable holding a BuildBuddy API key (not its value).
-    #[arg(long, default_value = "BUILDBUDDY_API_KEY")]
-    api_key_env: String,
-    #[arg(long, default_value_t = 17_179_869_184)]
-    max_blob_bytes: u64,
-    /// Explicit TOML policy file. No configuration is loaded automatically.
+    #[arg(long)]
+    api_key_env: Option<String>,
+    #[arg(long)]
+    max_blob_bytes: Option<u64>,
+    /// Explicit TOML configuration. No configuration is loaded automatically.
     #[arg(long)]
     config: Option<PathBuf>,
     /// Override the per-attempt unary RPC timeout (not the total operation budget).
     #[arg(long)]
     rpc_timeout_secs: Option<u64>,
-    #[arg(long, value_enum, default_value_t = Storage::Lazy)]
-    storage: Storage,
-    /// Durable namespace, writable payloads and verified cache; outside --root.
+    /// Lazy is the default. Native backend selection never falls back to eager.
+    #[arg(long, value_enum, conflicts_with = "debug_eager")]
+    storage: Option<Storage>,
+    /// DEBUG ONLY: download every staged blob to an ordinary directory.
+    #[arg(long, conflicts_with = "storage")]
+    debug_eager: bool,
+    /// Durable namespace and writable payloads, outside --root. Required for lazy storage.
     #[arg(long)]
     state_dir: Option<PathBuf>,
-    /// Optional verified CAS directory, separate from authoritative namespace state.
-    /// One owner holds this directory; library consumers can share its cache handle.
+    /// Optional verified CAS directory. One process owns the directory.
     #[arg(long)]
     cas_cache_dir: Option<PathBuf>,
-    /// Maximum verified CAS cache bytes. A single blob must fit this budget.
-    #[arg(long, default_value_t = 4_294_967_296)]
-    max_cache_bytes: u64,
-    #[arg(long, default_value_t = 8)]
-    max_concurrent_fetches: usize,
-    #[arg(long, default_value_t = 268_435_456)]
-    max_inflight_bytes: u64,
+    #[arg(long)]
+    max_cache_bytes: Option<u64>,
+    #[arg(long)]
+    max_concurrent_fetches: Option<usize>,
+    #[arg(long)]
+    max_inflight_bytes: Option<u64>,
     /// Optional atomic JSON counters for local diagnostics (never credentials).
     #[arg(long)]
     metrics_file: Option<PathBuf>,
 }
+
+#[derive(Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct ConfigFile {
+    reapi: Policy,
+    output_service: FileOptions,
+}
+
+#[derive(Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct FileOptions {
+    listen: Option<SocketAddr>,
+    root: Option<PathBuf>,
+    cas_endpoint: Option<String>,
+    instance_name: Option<String>,
+    api_key_env: Option<String>,
+    storage: Option<Storage>,
+    state_dir: Option<PathBuf>,
+    cas_cache_dir: Option<PathBuf>,
+    max_blob_bytes: Option<u64>,
+    max_cache_bytes: Option<u64>,
+    max_concurrent_fetches: Option<usize>,
+    max_inflight_bytes: Option<u64>,
+    metrics_file: Option<PathBuf>,
+}
+
+struct ResolvedArgs {
+    listen: SocketAddr,
+    root: PathBuf,
+    cas_endpoint: String,
+    instance_name: String,
+    api_key_env: String,
+    max_blob_bytes: u64,
+    storage: Storage,
+    state_dir: Option<PathBuf>,
+    cas_cache_dir: Option<PathBuf>,
+    max_cache_bytes: u64,
+    max_concurrent_fetches: usize,
+    max_inflight_bytes: u64,
+    metrics_file: Option<PathBuf>,
+    policy: Policy,
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    let mut args = Args::parse();
-    // Reject invalid policy before inspecting or mounting native storage.
-    let policy = args.policy()?;
-    args.storage = args.storage.resolve()?;
-    anyhow::ensure!(
-        args.listen.ip().is_loopback(),
-        "unauthenticated service must bind loopback"
-    );
+    // Resolve and validate configuration before credentials, network or mounts.
+    let args = Args::parse().resolve()?;
+    if args.storage == Storage::Eager {
+        eprintln!("WARNING: --debug-eager enables debug-only eager output downloads");
+    }
     #[cfg(target_os = "macos")]
     if args.storage == Storage::Nfs {
         // Never canonicalize/stat a stale NFS mount before inspecting the mount
@@ -85,7 +132,7 @@ async fn main() -> anyhow::Result<()> {
         instance_name: args.instance_name.clone(),
         api_key,
         max_blob_bytes: args.max_blob_bytes,
-        policy,
+        policy: args.policy.clone(),
     })
     .await?;
     let (projection, tree) = if args.storage == Storage::Eager {
@@ -175,18 +222,130 @@ impl Storage {
 }
 
 impl Args {
-    fn policy(&self) -> anyhow::Result<Policy> {
-        let mut policy = match &self.config {
-            Some(path) => Policy::load(path)?,
-            None => Policy::default(),
+    fn resolve(self) -> anyhow::Result<ResolvedArgs> {
+        let mut file = if let Some(path) = &self.config {
+            let input = std::fs::File::open(path)
+                .map_err(|_| anyhow::anyhow!("cannot open output service configuration file"))?;
+            let mut bytes = Vec::new();
+            input
+                .take(65_537)
+                .read_to_end(&mut bytes)
+                .map_err(|_| anyhow::anyhow!("cannot read output service configuration file"))?;
+            anyhow::ensure!(
+                bytes.len() <= 65_536,
+                "output service configuration exceeds 64 KiB"
+            );
+            let text = std::str::from_utf8(&bytes)
+                .map_err(|_| anyhow::anyhow!("output service configuration is not UTF-8"))?;
+            let mut file: ConfigFile = toml::from_str(text).map_err(|_| {
+                anyhow::anyhow!(
+                    "invalid output service TOML configuration; check schema and value types"
+                )
+            })?;
+            let base = path.parent().unwrap_or_else(|| std::path::Path::new("."));
+            for path in [
+                &mut file.output_service.root,
+                &mut file.output_service.state_dir,
+                &mut file.output_service.cas_cache_dir,
+                &mut file.output_service.metrics_file,
+            ]
+            .into_iter()
+            .flatten()
+            {
+                if path.is_relative() {
+                    *path = base.join(&*path);
+                }
+            }
+            file
+        } else {
+            ConfigFile::default()
         };
         if let Some(seconds) = self.rpc_timeout_secs {
-            policy.rpc_timeout_ms = seconds
+            file.reapi.rpc_timeout_ms = seconds
                 .checked_mul(1_000)
                 .ok_or_else(|| anyhow::anyhow!("--rpc-timeout-secs is too large"))?;
         }
-        policy.validate()?;
-        Ok(policy)
+        file.reapi.validate()?;
+        let options = file.output_service;
+        let storage = if self.debug_eager {
+            anyhow::ensure!(
+                self.storage.is_none(),
+                "--debug-eager conflicts with --storage"
+            );
+            Storage::Eager
+        } else {
+            self.storage
+                .or(options.storage)
+                .unwrap_or(Storage::Lazy)
+                .resolve()?
+        };
+        let args = ResolvedArgs {
+            listen: self
+                .listen
+                .or(options.listen)
+                .unwrap_or_else(|| "127.0.0.1:8377".parse().unwrap()),
+            root: self.root.or(options.root).ok_or_else(|| {
+                anyhow::anyhow!("root is required via --root or [output_service].root")
+            })?,
+            cas_endpoint: self.cas_endpoint.or(options.cas_endpoint).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "CAS endpoint is required via --cas-endpoint or [output_service].cas_endpoint"
+                )
+            })?,
+            instance_name: self
+                .instance_name
+                .or(options.instance_name)
+                .unwrap_or_default(),
+            api_key_env: self
+                .api_key_env
+                .or(options.api_key_env)
+                .unwrap_or_else(|| "BUILDBUDDY_API_KEY".into()),
+            max_blob_bytes: self
+                .max_blob_bytes
+                .or(options.max_blob_bytes)
+                .unwrap_or(17_179_869_184),
+            storage,
+            state_dir: self.state_dir.or(options.state_dir),
+            cas_cache_dir: self.cas_cache_dir.or(options.cas_cache_dir),
+            max_cache_bytes: self
+                .max_cache_bytes
+                .or(options.max_cache_bytes)
+                .unwrap_or(4_294_967_296),
+            max_concurrent_fetches: self
+                .max_concurrent_fetches
+                .or(options.max_concurrent_fetches)
+                .unwrap_or(8),
+            max_inflight_bytes: self
+                .max_inflight_bytes
+                .or(options.max_inflight_bytes)
+                .unwrap_or(268_435_456),
+            metrics_file: self.metrics_file.or(options.metrics_file),
+            policy: file.reapi,
+        };
+        anyhow::ensure!(
+            args.listen.ip().is_loopback(),
+            "unauthenticated service must bind loopback"
+        );
+        anyhow::ensure!(
+            args.storage == Storage::Eager || args.state_dir.is_some(),
+            "state directory is required for lazy storage"
+        );
+        anyhow::ensure!(
+            !args.cas_endpoint.is_empty(),
+            "CAS endpoint must not be empty"
+        );
+        anyhow::ensure!(
+            !args.api_key_env.is_empty() && !args.api_key_env.contains(['=', '\0']),
+            "credential environment variable name is invalid"
+        );
+        anyhow::ensure!(
+            args.max_blob_bytes > 0
+                && args.max_cache_bytes > 0
+                && args.max_inflight_bytes > 0
+                && args.max_concurrent_fetches > 0,
+            "output service resource limits must be nonzero"
+        );
+        Ok(args)
     }
 }
 
@@ -228,7 +387,7 @@ fn write_metrics(path: &std::path::Path, service: &OutputService) -> anyhow::Res
 }
 
 async fn mount_projection(
-    args: &Args,
+    args: &ResolvedArgs,
     service: &OutputService,
 ) -> anyhow::Result<(Arc<dyn Projection>, Arc<Tree>)> {
     let state = args
@@ -316,6 +475,8 @@ mod tests {
                 "git-output-service",
                 "--root",
                 "outputs",
+                "--state-dir",
+                "state",
                 "--cas-endpoint",
                 "grpc://127.0.0.1:1985",
             ]
@@ -326,7 +487,7 @@ mod tests {
     }
 
     #[test]
-    fn explicit_config_and_cli_override_preserve_other_budgets() {
+    fn explicit_policy_file_and_cli_override_preserve_other_budgets() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("policy.toml");
         std::fs::write(
@@ -335,40 +496,199 @@ mod tests {
         )
         .unwrap();
         let path = path.to_str().unwrap();
-        let from_file = args(&["--config", path]).policy().unwrap();
-        assert_eq!(from_file.rpc_timeout(), Duration::from_secs(23));
+        let from_file = args(&["--config", path]).resolve().unwrap();
+        assert_eq!(from_file.policy.rpc_timeout(), Duration::from_secs(23));
         let overridden = args(&["--config", path, "--rpc-timeout-secs", "7"])
-            .policy()
+            .resolve()
             .unwrap();
-        assert_eq!(overridden.rpc_timeout(), Duration::from_secs(7));
-        assert_eq!(overridden.operation_timeout(), Duration::from_secs(91));
-        assert_eq!(args(&[]).policy().unwrap(), Policy::default());
+        assert_eq!(overridden.policy.rpc_timeout(), Duration::from_secs(7));
+        assert_eq!(
+            overridden.policy.operation_timeout(),
+            Duration::from_secs(91)
+        );
+        assert_eq!(args(&[]).resolve().unwrap().policy, Policy::default());
     }
 
     #[test]
-    fn native_lazy_storage_is_default_and_eager_requires_selection() {
-        let defaults = args(&[]);
-        assert_eq!(defaults.storage, Storage::Lazy);
-        let native = defaults.storage.resolve().unwrap();
-        #[cfg(target_os = "linux")]
-        assert_eq!(native, Storage::Fuse);
-        #[cfg(target_os = "macos")]
-        assert_eq!(native, Storage::Nfs);
-        #[cfg(windows)]
-        assert_eq!(native, Storage::Projfs);
+    fn complete_config_resolves_paths_and_cli_takes_precedence() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("service.toml");
+        std::fs::write(
+            &path,
+            r#"
+[output_service]
+root = "mount"
+state_dir = "state"
+cas_cache_dir = "cas"
+metrics_file = "metrics.json"
+cas_endpoint = "grpcs://cache.example.com"
+instance_name = "builds"
+listen = "127.0.0.1:8001"
+api_key_env = "EXAMPLE_CAS_KEY"
+storage = "lazy"
+max_blob_bytes = 12345
+max_cache_bytes = 23456
+max_inflight_bytes = 34567
+max_concurrent_fetches = 3
+[reapi]
+rpc_timeout_ms = 1234
+"#,
+        )
+        .unwrap();
+        let parse = |extra: &[&str]| {
+            Args::try_parse_from(
+                ["git-output-service", "--config", path.to_str().unwrap()]
+                    .into_iter()
+                    .chain(extra.iter().copied()),
+            )
+            .unwrap()
+            .resolve()
+            .unwrap()
+        };
+        let configured = parse(&[]);
+        assert_eq!(configured.root, dir.path().join("mount"));
+        assert_eq!(configured.state_dir, Some(dir.path().join("state")));
+        assert_eq!(configured.cas_cache_dir, Some(dir.path().join("cas")));
         assert_eq!(
-            args(&["--storage", "eager"]).storage.resolve().unwrap(),
+            configured.metrics_file,
+            Some(dir.path().join("metrics.json"))
+        );
+        assert_eq!(configured.cas_endpoint, "grpcs://cache.example.com");
+        assert_eq!(configured.instance_name, "builds");
+        assert_eq!(configured.listen.port(), 8001);
+        assert_eq!(configured.api_key_env, "EXAMPLE_CAS_KEY");
+        assert_eq!(configured.max_blob_bytes, 12345);
+        assert_eq!(configured.max_cache_bytes, 23456);
+        assert_eq!(configured.max_inflight_bytes, 34567);
+        assert_eq!(configured.max_concurrent_fetches, 3);
+        assert_eq!(configured.policy.rpc_timeout_ms, 1234);
+        let overridden = parse(&[
+            "--root",
+            "cli-mount",
+            "--state-dir",
+            "cli-state",
+            "--cas-cache-dir",
+            "cli-cas",
+            "--metrics-file",
+            "cli.json",
+            "--cas-endpoint",
+            "grpc://127.0.0.1:9999",
+            "--instance-name",
+            "",
+            "--listen",
+            "127.0.0.1:8002",
+            "--api-key-env",
+            "CLI_KEY",
+            "--max-blob-bytes",
+            "100",
+            "--max-cache-bytes",
+            "200",
+            "--max-inflight-bytes",
+            "300",
+            "--max-concurrent-fetches",
+            "2",
+        ]);
+        assert_eq!(overridden.root, PathBuf::from("cli-mount"));
+        assert_eq!(overridden.state_dir, Some(PathBuf::from("cli-state")));
+        assert_eq!(overridden.cas_cache_dir, Some(PathBuf::from("cli-cas")));
+        assert_eq!(overridden.metrics_file, Some(PathBuf::from("cli.json")));
+        assert_eq!(overridden.cas_endpoint, "grpc://127.0.0.1:9999");
+        assert_eq!(overridden.instance_name, "");
+        assert_eq!(overridden.listen.port(), 8002);
+        assert_eq!(overridden.api_key_env, "CLI_KEY");
+        assert_eq!(overridden.max_blob_bytes, 100);
+        assert_eq!(overridden.max_cache_bytes, 200);
+        assert_eq!(overridden.max_inflight_bytes, 300);
+        assert_eq!(overridden.max_concurrent_fetches, 2);
+        assert_eq!(overridden.policy.rpc_timeout_ms, 1234);
+    }
+
+    #[test]
+    fn native_lazy_default_and_debug_only_eager() {
+        let defaults = args(&[]).resolve().unwrap();
+        assert_eq!(defaults.storage, Storage::Lazy.resolve().unwrap());
+        assert_eq!(defaults.listen, "127.0.0.1:8377".parse().unwrap());
+        assert_eq!(defaults.max_cache_bytes, 4_294_967_296);
+        assert_eq!(defaults.max_inflight_bytes, 268_435_456);
+        assert_eq!(defaults.max_concurrent_fetches, 8);
+        assert_eq!(defaults.max_blob_bytes, 17_179_869_184);
+        assert_eq!(defaults.api_key_env, "BUILDBUDDY_API_KEY");
+        assert_eq!(
+            args(&["--debug-eager"]).resolve().unwrap().storage,
             Storage::Eager
         );
+        assert!(Args::try_parse_from(["bos", "--storage", "eager"]).is_err());
+        assert!(Args::try_parse_from(["bos", "--storage", "lazy", "--debug-eager"]).is_err());
+        assert!(
+            Args::try_parse_from(["bos", "--root", "out", "--cas-endpoint", "grpc://127.0.0.1"])
+                .unwrap()
+                .resolve()
+                .is_err()
+        );
+        assert!(
+            Args::try_parse_from([
+                "bos",
+                "--root",
+                "out",
+                "--cas-endpoint",
+                "grpc://127.0.0.1",
+                "--debug-eager"
+            ])
+            .unwrap()
+            .resolve()
+            .is_ok()
+        );
     }
 
     #[test]
-    fn invalid_override_is_rejected_before_startup() {
-        assert!(args(&["--rpc-timeout-secs", "0"]).policy().is_err());
+    fn invalid_or_sensitive_config_is_rejected_without_echoing_content() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("bad.toml");
+        for input in [
+            "[output_service]\napi_key = 'SECRET_VALUE'",
+            "[output_service]\nstorage = 'eager' # SECRET_VALUE",
+            "[output_service]\ndebug_eager = true # SECRET_VALUE",
+            "[unknown]\nkey = 'SECRET_VALUE'",
+            "[reapi]\nrpc_timeout_ms = 'SECRET_VALUE'",
+            "[output_service]\nroot = 'SECRET_VALUE",
+        ] {
+            std::fs::write(&path, input).unwrap();
+            let error = args(&["--config", path.to_str().unwrap()])
+                .resolve()
+                .err()
+                .unwrap();
+            assert!(!format!("{error:#}").contains("SECRET_VALUE"));
+        }
+        std::fs::write(&path, vec![b' '; 65_537]).unwrap();
         assert!(
-            args(&["--rpc-timeout-secs", "18446744073709551615"])
-                .policy()
+            args(&["--config", path.to_str().unwrap()])
+                .resolve()
                 .is_err()
         );
+        std::fs::write(&path, [0xff]).unwrap();
+        assert!(
+            args(&["--config", path.to_str().unwrap()])
+                .resolve()
+                .is_err()
+        );
+        assert!(args(&["--rpc-timeout-secs", "0"]).resolve().is_err());
+        assert!(
+            args(&["--rpc-timeout-secs", "18446744073709551615"])
+                .resolve()
+                .is_err()
+        );
+        assert!(args(&["--max-concurrent-fetches", "0"]).resolve().is_err());
+        assert!(args(&["--listen", "0.0.0.0:8000"]).resolve().is_err());
+    }
+
+    #[test]
+    fn shipped_example_is_a_complete_valid_config() {
+        let file: ConfigFile =
+            toml::from_str(include_str!("../../../examples/bazel-output-service.toml")).unwrap();
+        file.reapi.validate().unwrap();
+        assert!(file.output_service.root.is_some());
+        assert!(file.output_service.state_dir.is_some());
+        assert!(file.output_service.cas_endpoint.is_some());
+        assert_eq!(file.output_service.storage, Some(Storage::Lazy));
     }
 }

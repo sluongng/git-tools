@@ -51,7 +51,7 @@ def main():
     parser.add_argument("--execute-remotely", action="store_true", help="also force warm-cache genrules onto the selected BuildBuddy RBE backend")
     parser.add_argument("--container-image", default="docker://gcr.io/flame-public/rbe-ubuntu22-04@sha256:0d84a80bb0fc36ba5381942adcf6493249594dcc9044845c617b78c9b621cae3")
     parser.add_argument("--artifacts", required=True, type=Path)
-    parser.add_argument("--storage", choices=("lazy", "fuse", "eager", "nfs", "projfs"), default="lazy")
+    parser.add_argument("--storage", choices=("lazy", "fuse", "eager", "nfs", "projfs"), default="lazy", help="native lazy backend; eager is a debug-only fixture")
     parser.add_argument("--keep-scratch", action="store_true", help="retain owned non-secret fixture for native failure diagnosis")
     args = parser.parse_args()
     if args.storage == "lazy":
@@ -148,9 +148,22 @@ def main():
             del key
             try:
                 with service_log.open("a") as log:
-                    command = [str(args.service_bin.resolve()), "--listen", f"127.0.0.1:{port}", "--root", str(root), "--cas-endpoint", endpoint, "--instance-name", args.instance_name, "--storage", args.storage, "--metrics-file", str(metrics_file)]
-                    if args.storage != "eager":
-                        command += ["--state-dir", str(state)]
+                    # Exercise complete TOML configuration, without persisting
+                    # the credential value selected above.
+                    settings = {
+                        "listen": f"127.0.0.1:{port}", "root": str(root),
+                        "cas_endpoint": endpoint, "instance_name": args.instance_name,
+                        "metrics_file": str(metrics_file), "api_key_env": "BUILDBUDDY_API_KEY",
+                        "state_dir": str(state),
+                        "storage": "lazy" if args.storage == "eager" else args.storage,
+                    }
+                    service_config = scratch / "output-service.toml"
+                    service_config.write_text("[output_service]\n" + "".join(
+                        f"{name} = {json.dumps(value, ensure_ascii=False)}\n"
+                        for name, value in settings.items()), encoding="utf-8")
+                    command = [str(args.service_bin.resolve()), "--config", str(service_config)]
+                    if args.storage == "eager":
+                        command += ["--debug-eager"]
                     process = subprocess.Popen(command, env=env, stdout=log, stderr=subprocess.STDOUT, creationflags=subprocess.CREATE_NEW_PROCESS_GROUP if windows else 0)
             finally:
                 env.pop("BUILDBUDDY_API_KEY", None)
@@ -328,7 +341,7 @@ def main():
                         metrics[key] = metrics.get(key, 0) + int(value)
             except Exception as error:
                 cleanup_failure("service metrics", error)
-            receipt = {"protocol": "Bazel9.2 BOS v1", "backend": "operator-selected BuildBuddy CAS", "storage": args.storage, "retained_scratch": str(scratch) if args.keep_scratch else None, "remote_execution_requested": args.execute_remotely, "phases": receipts, "service_restarts": restarts, "metrics": metrics, "cleanup_errors": cleanup_errors, "timing_note": "Single correctness run, not matched benchmark. First-consumer timing includes up to 50ms metrics sampling latency."}
+            receipt = {"protocol": "Bazel9.2 BOS v1", "backend": "operator-selected BuildBuddy CAS", "storage": args.storage, "debug_eager": args.storage == "eager", "retained_scratch": str(scratch) if args.keep_scratch else None, "remote_execution_requested": args.execute_remotely, "phases": receipts, "service_restarts": restarts, "metrics": metrics, "cleanup_errors": cleanup_errors, "timing_note": "Single correctness run, not matched benchmark. First-consumer timing includes up to 50ms metrics sampling latency."}
             try:
                 (args.artifacts / "receipt.json").write_text(json.dumps(receipt, indent=2)+"\n")
             except Exception as error:
