@@ -1,0 +1,91 @@
+diff --git a/BUILD.bazel b/BUILD.bazel
+--- a/BUILD.bazel
++++ b/BUILD.bazel
+@@ -259,9 +259,9 @@
+     cmd = """
+       set -euo pipefail
+ 
+-      GIT_VERSION="2.55.0"
+-      GIT_BUILT_FROM_COMMIT="e9019fcafe0040228b8631c30f97ae1adb61bcdc"
+-      GIT_DATE="2026-06-29"
++      GIT_VERSION="2.55.GIT-g4b27b7c707"
++      GIT_BUILT_FROM_COMMIT="4b27b7c7077764401f6a465940e3cdf396d33e54"
++      GIT_DATE="2026-08-23"
+       GIT_USER_AGENT="git/$${GIT_VERSION}"
+ 
+       export GIT_VERSION GIT_BUILT_FROM_COMMIT GIT_DATE GIT_USER_AGENT
+@@ -415,9 +415,9 @@
+     outs = ["version-def.h"],
+     cmd = """
+       set -euo pipefail
+-      GIT_VERSION="2.55.0"
+-      GIT_BUILT_FROM_COMMIT="e9019fcafe0040228b8631c30f97ae1adb61bcdc"
+-      GIT_DATE="2026-06-29"
++      GIT_VERSION="2.55.GIT-g4b27b7c707"
++      GIT_BUILT_FROM_COMMIT="4b27b7c7077764401f6a465940e3cdf396d33e54"
++      GIT_DATE="2026-08-23"
+       GIT_USER_AGENT="git/$${GIT_VERSION}"
+ 
+       export GIT_VERSION GIT_BUILT_FROM_COMMIT GIT_DATE GIT_USER_AGENT
+@@ -751,7 +751,7 @@
+ 
+ cc_library(
+     name = "packfile",
+-    hdrs = ["packfile.h"],
++    hdrs = ["packfile.h", "packfile-list.h"],
+     deps = [":list"],
+ )
+ 
+@@ -1140,6 +1140,7 @@
+         "pack-revindex.c",
+         "pack-write.c",
+         "packfile.c",
++        "packfile-list.c",
+         "pager.c",
+         "parallel-checkout.c",
+         "parse.c",
+@@ -1268,6 +1269,7 @@
+     srcs = [
+         "connect.c",
+         "fetch-pack.c",
++        "fetch-object-info.c",
+         "ls-refs.c",
+         "protocol.c",
+         "protocol-caps.c",
+@@ -1544,3 +1546,9 @@
+     name = "git_send_email",
+     actual = ":git-send-email",
+ )
++
++# The upstream ODB split consumes additional common Git headers.
++cc_library(
++    name = "root_headers",
++    hdrs = glob(["*.h"]),
++)
+diff --git a/odb/BUILD.bazel b/odb/BUILD.bazel
+--- a/odb/BUILD.bazel
++++ b/odb/BUILD.bazel
+@@ -10,6 +10,7 @@
+         "source-files.c",
+         "source-inmemory.c",
+         "source-loose.c",
++        "source-packed.c",
+         "streaming.c",
+         "transaction.c",
+     ],
+@@ -17,12 +18,15 @@
+         "source-files.h",
+         "source-inmemory.h",
+         "source-loose.h",
++        "source-packed.h",
+         "source.h",
+         "streaming.h",
+         "transaction.h",
+     ],
+     copts = GIT_COPTS,
+     deps = [
++        "//:root_headers",
++        "//ewah",
+         "//:abspath",
+         "//:chdir_notify",
+         "//:convert",

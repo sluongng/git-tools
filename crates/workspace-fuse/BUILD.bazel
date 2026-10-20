@@ -1,8 +1,8 @@
-load("//build_defs:local_test.bzl", "local_test")
 load("@crates//:defs.bzl", "aliases", "all_crate_deps")
+load("@rules_rs//rs:rust_binary.bzl", "rust_binary")
 load("@rules_rs//rs:rust_library.bzl", "rust_library")
 load("@rules_rs//rs:rust_test.bzl", "rust_test")
-load("@rules_rs//rs:rust_binary.bzl", "rust_binary")
+load("//build_defs:fixture_test.bzl", "fixture_test")
 
 # Keep the patched path crate's generated dependency off the action graph;
 # its generic importer also includes ignored Cargo build output.
@@ -24,40 +24,57 @@ package(default_visibility = ["//visibility:public"])
 
 rust_library(
     name = "workspace-fuse",
-    srcs = glob(["src/**/*.rs"], exclude = ["src/main.rs"]),
+    srcs = glob(
+        ["src/**/*.rs"],
+        exclude = ["src/main.rs"],
+    ),
+    aliases = aliases(),
     crate_name = "workspace_fuse",
     crate_root = "src/lib.rs",
     edition = "2024",
     version = "0.1.0",
-    aliases = aliases(),
     deps = _VFS_DEPS,
 )
-
 
 rust_binary(
     name = "git-vfs-bin",
     srcs = ["src/main.rs"],
+    aliases = aliases(),
     crate_name = "workspace_fuse",
     edition = "2024",
     version = "0.1.0",
-    aliases = aliases(),
     deps = [":workspace-fuse"] + _VFS_DEPS,
 )
 
-# Native Git and, for ignored cases, /dev/fuse are host integration fixtures.
+# Git/Python fixtures run remotely; ignored mount cases remain opt-in.
 rust_test(
     name = "integration_tests_binary",
     srcs = ["tests/integration.rs"],
-    edition = "2024",
-    version = "0.1.0",
     aliases = aliases(),
     data = [":git-vfs-bin"],
+    edition = "2024",
     rustc_env = {"CARGO_BIN_EXE_git-vfs": "$(rootpath :git-vfs-bin)"},
-    deps = [":workspace-fuse"] + _VFS_DEPS + all_crate_deps(normal_dev = True),
     tags = ["manual"],
+    version = "0.1.0",
+    deps = [":workspace-fuse"] + _VFS_DEPS + all_crate_deps(normal_dev = True),
 )
 
-local_test(
+fixture_test(
     name = "integration_tests",
     binary = ":integration_tests_binary",
+    git = True,
+    python = True,
+)
+
+# Explicit kernel/device acceptance: never part of the default RBE test set.
+fixture_test(
+    name = "mounted_tests",
+    args = ["--ignored"],
+    binary = ":integration_tests_binary",
+    git = True,
+    python = True,
+    tags = [
+        "local",
+        "manual",
+    ],
 )

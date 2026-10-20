@@ -1,1 +1,4 @@
-exports_files(["reapi_build.rs"])
+exports_files([
+    "reapi_build.rs",
+    "git-upstream.patch",
+])

@@ -1,6 +1,6 @@
 load("@rules_rs//rs:rust_library.bzl", "rust_library")
 load("@rules_rs//rs:rust_test.bzl", "rust_test")
-load("//build_defs:local_test.bzl", "local_test")
+load("//build_defs:fixture_test.bzl", "fixture_test")
 
 package(default_visibility = ["//visibility:public"])
 
@@ -15,19 +15,32 @@ _DEPS = [
 
 rust_library(
     name = "output-fuse",
+    srcs = glob(["src/**/*.rs"]),
     crate_name = "output_fuse",
     crate_root = "src/lib.rs",
-    srcs = glob(["src/**/*.rs"]),
     edition = "2024",
     version = "0.1.0",
     deps = _DEPS,
 )
 
 rust_test(
-    name = "integration_tests_binary",
+    name = "integration_tests",
     srcs = ["tests/mounted.rs"],
     edition = "2024",
-    deps = [":output-fuse", "@crates//:blake3", "@crates//:tempfile"] + _DEPS,
-    tags = ["manual"],
+    deps = [
+        ":output-fuse",
+        "@crates//:blake3",
+        "@crates//:tempfile",
+    ] + _DEPS,
 )
-local_test(name = "integration_tests", binary = ":integration_tests_binary")
+
+# Explicit kernel/device acceptance; validation-only cases above run on RBE.
+fixture_test(
+    name = "mounted_tests",
+    args = ["--ignored"],
+    binary = ":integration_tests",
+    tags = [
+        "local",
+        "manual",
+    ],
+)

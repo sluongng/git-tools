@@ -1,61 +1,61 @@
-load("//build_defs:local_test.bzl", "local_test")
 load("@crates//:defs.bzl", "aliases", "all_crate_deps")
-load("@rules_rs//rs:rust_library.bzl", "rust_library")
-load("@rules_rs//rs:rust_binary.bzl", "rust_binary")
-load("@rules_rs//rs:rust_test.bzl", "rust_test")
 load("@rules_rs//rs:cargo_build_script.bzl", "cargo_build_script")
+load("@rules_rs//rs:rust_binary.bzl", "rust_binary")
+load("@rules_rs//rs:rust_library.bzl", "rust_library")
+load("@rules_rs//rs:rust_test.bzl", "rust_test")
 
 package(default_visibility = ["//visibility:public"])
 
 cargo_build_script(
     name = "build_script",
     srcs = ["bazel_build.rs"],
-    edition = "2024",
-    version = "0.1.0",
-    pkg_name = "bazel-output-service",
     aliases = aliases(),
-    data = glob(["proto/**"]) + ["//crates/reapi:proto_files", "@crates//:protoc_headers", "@crates//:protoc_descriptor"],
-    tools = ["@crates//:protoc"],
     build_script_env = {
         "PROTOC": "$(execpath @crates//:protoc)",
         "PROTOC_DESCRIPTOR": "$(execpath @crates//:protoc_descriptor)",
         "PROTO_IMPORT_FILES": "$(execpaths //crates/reapi:proto_files)",
     },
+    data = glob(["proto/**"]) + [
+        "//crates/reapi:proto_files",
+        "@crates//:protoc_descriptor",
+        "@crates//:protoc_headers",
+    ],
+    edition = "2024",
+    pkg_name = "bazel-output-service",
+    tools = ["@crates//:protoc"],
+    version = "0.1.0",
     deps = ["@crates//:tonic-prost-build"],
 )
 
 rust_library(
     name = "bazel-output-service",
     srcs = ["src/lib.rs"],
+    aliases = aliases(),
     crate_name = "bazel_output_service",
     crate_root = "src/lib.rs",
     edition = "2024",
     version = "0.1.0",
-    aliases = aliases(),
     deps = [":build_script"] + all_crate_deps(normal = True),
 )
 
 rust_binary(
     name = "git-output-service-bin",
     srcs = ["src/main.rs"],
+    aliases = aliases(),
     crate_name = "bazel_output_service",
     edition = "2024",
     version = "0.1.0",
-    aliases = aliases(),
     deps = [":bazel-output-service"] + all_crate_deps(normal = True),
 )
 
 rust_test(
-    name = "integration_tests_binary",
+    name = "integration_tests",
     srcs = ["tests/service.rs"],
+    aliases = aliases(),
     edition = "2024",
     version = "0.1.0",
-    aliases = aliases(),
-    deps = [":bazel-output-service"] + all_crate_deps(normal = True, normal_dev = True),
-    tags = ["manual"],
-)
-
-local_test(
-    name = "integration_tests",
-    binary = ":integration_tests_binary",
+    deps = [":bazel-output-service"] + all_crate_deps(
+        normal = True,
+        normal_dev = True,
+    ),
 )

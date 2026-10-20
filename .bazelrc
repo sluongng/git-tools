@@ -2,10 +2,10 @@ common --noannounce_rc
 build --incompatible_strict_action_env
 build --compilation_mode=opt
 build --enable_platform_specific_config
+# Git and its HTTP transport must use the same TLS implementation.
+build --@curl//:ssl_lib=openssl
 build --jobs=16
 test --test_output=errors
-# Match Cargo's conventional host scratch; overridable on the command line.
-test --test_tmpdir=/tmp/git-tools-bazel-tests
 
 # Hermetic Rust/LLVM toolchains are identical locally and on remote executors.
 common:rbe --remote_executor=grpcs://remote.buildbuddy.io
