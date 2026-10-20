@@ -11,9 +11,9 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
-    collections::HashMap,
+    collections::{BTreeSet, HashMap},
     fs::{self, File, OpenOptions},
-    io::Read,
+    io::{Read, Write},
     path::{Path, PathBuf},
     sync::{
         Arc, Mutex, Weak,
@@ -21,7 +21,7 @@ use std::{
     },
     time::{Duration, SystemTime},
 };
-use tokio::sync::Semaphore;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 #[derive(Clone, Debug)]
 pub struct CacheLimitError {
     pub size: u64,
@@ -110,6 +110,11 @@ pub struct CacheMetrics {
     pub timed_out_waiters: u64,
     pub timed_out_fetches: u64,
     pub admission_wait_ns: u64,
+    pub resident_bytes: u64,
+    pub reserved_bytes: u64,
+    pub evictions: u64,
+    pub evicted_bytes: u64,
+    pub recency_errors: u64,
 }
 fn hash_file_until(
     path: &Path,
@@ -173,6 +178,10 @@ impl Drop for CachedBlob {
         let mut state = self.cache.files.lock().unwrap();
         if let Some(entry) = state.entries.get_mut(&self.path) {
             entry.pins = entry.pins.saturating_sub(1);
+            if entry.pins == 0 {
+                let rank = entry.accessed;
+                state.evictable.insert((rank, self.path.clone()));
+            }
         }
     }
 }
@@ -208,7 +217,55 @@ struct CacheEntry {
 #[derive(Default)]
 struct CacheFiles {
     entries: HashMap<PathBuf, CacheEntry>,
+    evictable: BTreeSet<(u64, PathBuf)>,
+    resident: u64,
     reserved: u64,
+    next_rank: u64,
+    revision: u64,
+    dirty: bool,
+}
+impl CacheFiles {
+    fn changed(&mut self) {
+        self.revision = self.revision.wrapping_add(1);
+        self.dirty = true;
+    }
+    fn rank(&mut self) -> u64 {
+        if self.next_rank == u64::MAX {
+            let mut order: Vec<_> = self
+                .entries
+                .iter()
+                .map(|(p, e)| (e.accessed, p.clone()))
+                .collect();
+            order.sort();
+            self.evictable.clear();
+            for (rank, (_, path)) in order.into_iter().enumerate() {
+                let entry = self.entries.get_mut(&path).unwrap();
+                entry.accessed = rank as u64;
+                if entry.pins == 0 {
+                    self.evictable.insert((entry.accessed, path));
+                }
+            }
+            self.next_rank = self.entries.len() as u64;
+        }
+        let rank = self.next_rank;
+        self.next_rank += 1;
+        rank
+    }
+    fn remove(&mut self, path: &Path) {
+        if let Some(entry) = self.entries.remove(path) {
+            self.evictable.remove(&(entry.accessed, path.to_owned()));
+            self.resident -= entry.bytes;
+            self.changed();
+        }
+    }
+}
+#[derive(Serialize, Deserialize)]
+struct Recency {
+    version: u32,
+    entries: HashMap<String, u64>,
+}
+struct Checkpoint {
+    last: std::time::Instant,
 }
 #[derive(Clone)]
 enum FlightFailure {
@@ -308,6 +365,10 @@ pub struct LocalCas {
     timed_out_waiters: AtomicU64,
     timed_out_fetches: AtomicU64,
     admission_wait_ns: AtomicU64,
+    evictions: AtomicU64,
+    evicted_bytes: AtomicU64,
+    recency_errors: AtomicU64,
+    checkpoint: Mutex<Checkpoint>,
 }
 impl LocalCas {
     /// Open an exclusively owned cache directory. Share the returned handle,
@@ -321,7 +382,7 @@ impl LocalCas {
         ensure!(
             config.max_bytes > 0
                 && config.max_concurrent_fetches > 0
-                && config.max_concurrent_fetches <= Semaphore::MAX_PERMITS
+                && config.max_concurrent_fetches <= Semaphore::MAX_PERMITS.min(u32::MAX as usize)
                 && config.max_inflight_bytes > 0
                 && !config.operation_timeout.is_zero()
                 && !config.fetch_timeout.is_zero()
@@ -342,6 +403,21 @@ impl LocalCas {
             .context("local CAS directory already owned by another handle or process")?;
         let ownership = DirectoryOwnership(ownership);
         let byte_units = (config.max_inflight_bytes / 4096).clamp(1, u32::MAX as u64) as u32;
+        let mut recency_errors = 0;
+        let hints = match fs::read(dir.join("recency.json")) {
+            Ok(bytes) => match serde_json::from_slice::<Recency>(&bytes) {
+                Ok(hints) if hints.version == 1 => hints.entries,
+                _ => {
+                    recency_errors += 1;
+                    HashMap::new()
+                }
+            },
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => HashMap::new(),
+            Err(_) => {
+                recency_errors += 1;
+                HashMap::new()
+            }
+        };
         let mut files = CacheFiles::default();
         for entry in fs::read_dir(&dir)? {
             let entry = entry?;
@@ -360,26 +436,54 @@ impl LocalCas {
                         CacheEntry {
                             bytes: entry.metadata()?.len(),
                             pins: 0,
-                            accessed: 0,
+                            accessed: hints
+                                .get(entry.file_name().to_str().unwrap())
+                                .copied()
+                                .unwrap_or(0),
                             verified: None,
                         },
                     );
                 }
             }
         }
-        // A reduced quota on restart also applies to previously cached bytes.
-        // No leases exist yet, so every existing clean cache file is eligible.
-        let mut retained = files.entries.values().map(|e| e.bytes).sum::<u64>();
-        while retained > config.max_bytes {
-            let (path, size) = files
-                .entries
-                .iter()
-                .next()
-                .map(|(p, e)| (p.clone(), e.bytes))
+        // Sidecar ranks are untrusted hints, never byte-integrity authority.
+        // Normalize arbitrary/duplicate/u64::MAX hints into a deterministic
+        // total order, with filenames breaking ties and cold entries first.
+        let mut order: Vec<_> = files
+            .entries
+            .iter()
+            .map(|(p, e)| {
+                (
+                    hints.contains_key(p.file_name().unwrap().to_str().unwrap()),
+                    e.accessed,
+                    p.clone(),
+                )
+            })
+            .collect();
+        order.sort();
+        for (_, _, path) in order {
+            let rank = files.rank();
+            let entry = files.entries.get_mut(&path).unwrap();
+            entry.accessed = rank;
+            files.resident = files
+                .resident
+                .checked_add(entry.bytes)
+                .context("cache byte accounting overflow")?;
+            files.evictable.insert((rank, path));
+        }
+        let mut evictions = 0;
+        let mut evicted_bytes = 0;
+        while files.resident > config.max_bytes {
+            let (_, path) = files
+                .evictable
+                .first()
+                .cloned()
                 .context("cache size accounting mismatch")?;
+            let bytes = files.entries[&path].bytes;
             fs::remove_file(&path)?;
-            files.entries.remove(&path);
-            retained = retained.saturating_sub(size);
+            files.remove(&path);
+            evictions += 1;
+            evicted_bytes += bytes;
         }
         Ok(Arc::new(Self {
             dir,
@@ -399,9 +503,16 @@ impl LocalCas {
             timed_out_waiters: AtomicU64::new(0),
             timed_out_fetches: AtomicU64::new(0),
             admission_wait_ns: AtomicU64::new(0),
+            evictions: AtomicU64::new(evictions),
+            evicted_bytes: AtomicU64::new(evicted_bytes),
+            recency_errors: AtomicU64::new(recency_errors),
+            checkpoint: Mutex::new(Checkpoint {
+                last: std::time::Instant::now(),
+            }),
         }))
     }
     pub fn metrics(&self) -> CacheMetrics {
+        let files = self.files.lock().unwrap();
         CacheMetrics {
             fetches: self.fetches.load(Ordering::Relaxed),
             verified_bytes: self.verified_bytes.load(Ordering::Relaxed),
@@ -410,7 +521,119 @@ impl LocalCas {
             timed_out_waiters: self.timed_out_waiters.load(Ordering::Relaxed),
             timed_out_fetches: self.timed_out_fetches.load(Ordering::Relaxed),
             admission_wait_ns: self.admission_wait_ns.load(Ordering::Relaxed),
+            resident_bytes: files.resident,
+            reserved_bytes: files.reserved,
+            evictions: self.evictions.load(Ordering::Relaxed),
+            evicted_bytes: self.evicted_bytes.load(Ordering::Relaxed),
+            recency_errors: self.recency_errors.load(Ordering::Relaxed),
         }
+    }
+    /// Wait until admitted fetch workers release their ownership and permits.
+    /// Callers must first stop submitting work and cancel/drain their own
+    /// producers. This does not close admission, cancel other readers, or wait
+    /// for public blob leases. Unlike a waiter deadline, this proves fetch
+    /// teardown even when a shared fetch outlived its initiating caller.
+    pub async fn wait_for_idle(&self) -> Result<()> {
+        let _idle = self
+            .requests
+            .clone()
+            .acquire_many_owned(self.config.max_concurrent_fetches as u32)
+            .await
+            .context("cache shutting down")?;
+        Ok(())
+    }
+    /// Persist LRU hints explicitly. This does not mark cached bytes verified.
+    /// Normal operations coalesce checkpoints to at most once per five seconds.
+    pub fn flush_recency(&self) -> Result<()> {
+        self.checkpoint_recency(true)
+    }
+    async fn checkpoint_if_due(self: &Arc<Self>) {
+        // Never wait for a checkpoint writer on an async runtime thread. The
+        // slow path is awaited in this existing admitted worker, not detached.
+        let due = self
+            .checkpoint
+            .try_lock()
+            .is_ok_and(|checkpoint| checkpoint.last.elapsed() >= Duration::from_secs(5));
+        if !due {
+            return;
+        }
+        let owner = self.clone();
+        if tokio::task::spawn_blocking(move || {
+            let result = owner.checkpoint_recency(false);
+            // A task may expose its result before destroying its captures.
+            drop(owner);
+            result
+        })
+        .await
+        .is_err()
+        {
+            self.recency_errors.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+    fn checkpoint_recency(&self, force: bool) -> Result<()> {
+        let result = self.write_recency(force);
+        if result.is_err() {
+            self.recency_errors.fetch_add(1, Ordering::Relaxed);
+        }
+        result
+    }
+    fn write_recency(&self, force: bool) -> Result<()> {
+        // Serialize writers independently of the hot cache mutex. Only the
+        // metadata snapshot is taken under that mutex; all IO happens outside.
+        let mut checkpoint = self
+            .checkpoint
+            .lock()
+            .map_err(|_| anyhow::anyhow!("recency checkpoint mutex poisoned"))?;
+        if !force && checkpoint.last.elapsed() < Duration::from_secs(5) {
+            return Ok(());
+        }
+        checkpoint.last = std::time::Instant::now();
+        let (revision, entries) = {
+            let files = self
+                .files
+                .lock()
+                .map_err(|_| anyhow::anyhow!("cache metadata mutex poisoned"))?;
+            if !files.dirty {
+                return Ok(());
+            }
+            (
+                files.revision,
+                files
+                    .entries
+                    .iter()
+                    .map(|(p, e)| {
+                        (
+                            p.file_name().unwrap().to_str().unwrap().to_owned(),
+                            e.accessed,
+                        )
+                    })
+                    .collect(),
+            )
+        };
+        let bytes = serde_json::to_vec(&Recency {
+            version: 1,
+            entries,
+        })?;
+        let path = self.dir.join("recency.tmp");
+        let _temporary = Temporary(path.clone());
+        let mut target = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)?;
+        target.write_all(&bytes)?;
+        target.sync_all()?;
+        drop(target);
+        fs::rename(path, self.dir.join("recency.json"))?;
+        #[cfg(unix)]
+        File::open(&self.dir)?.sync_all()?;
+        let mut files = self
+            .files
+            .lock()
+            .map_err(|_| anyhow::anyhow!("cache metadata mutex poisoned"))?;
+        if files.revision == revision {
+            files.dirty = false;
+        }
+        Ok(())
     }
     pub fn config(&self) -> &CacheConfig {
         &self.config
@@ -428,8 +651,19 @@ impl LocalCas {
             .to_string())
     }
     pub async fn content(self: Arc<Self>, artifact: Artifact) -> Result<Arc<CachedBlob>> {
+        let source = self.source.clone();
+        self.content_from(artifact, source).await
+    }
+    /// Fetch through an owned request-specific source (for example, a spool
+    /// descriptor). Hits and coalesced callers do not invoke unused sources.
+    pub async fn content_from(
+        self: Arc<Self>,
+        artifact: Artifact,
+        source: Arc<dyn BlobSource>,
+    ) -> Result<Arc<CachedBlob>> {
         let deadline = tokio::time::Instant::now() + self.config.operation_timeout;
-        match tokio::time::timeout_at(deadline, self.clone().content_inner(artifact)).await {
+        match tokio::time::timeout_at(deadline, self.clone().content_inner(artifact, source)).await
+        {
             Ok(result) if tokio::time::Instant::now() < deadline => result,
             _ => {
                 self.timed_out_waiters.fetch_add(1, Ordering::Relaxed);
@@ -437,7 +671,11 @@ impl LocalCas {
             }
         }
     }
-    async fn content_inner(self: Arc<Self>, artifact: Artifact) -> Result<Arc<CachedBlob>> {
+    async fn content_inner(
+        self: Arc<Self>,
+        artifact: Artifact,
+        source: Arc<dyn BlobSource>,
+    ) -> Result<Arc<CachedBlob>> {
         artifact.validate()?;
         let limit = self.config.max_bytes.min(self.config.max_inflight_bytes);
         if artifact.size > limit {
@@ -464,6 +702,7 @@ impl LocalCas {
             .acquire_owned()
             .await
             .context("cache shutting down")?;
+        let request = Arc::new(request);
         drop(admission);
         let (flight, start) = {
             let mut flights = self.flights.lock().unwrap();
@@ -486,12 +725,18 @@ impl LocalCas {
             tokio::spawn(async move {
                 let request = request;
                 let worker = cache.clone();
+                let worker_request = request.clone();
                 // The deadline is inside the worker: timing out a JoinHandle
                 // alone would detach work that could publish after expiry.
                 let result = match tokio::spawn(async move {
                     let result = match tokio::time::timeout_at(
                         fetch_deadline,
-                        worker.clone().obtain(&artifact, fetch_deadline),
+                        worker.clone().obtain(
+                            &artifact,
+                            fetch_deadline,
+                            source.clone(),
+                            worker_request,
+                        ),
                     )
                     .await
                     {
@@ -504,6 +749,8 @@ impl LocalCas {
                     {
                         worker.timed_out_fetches.fetch_add(1, Ordering::Relaxed);
                     }
+                    drop(source);
+                    worker.checkpoint_if_due().await;
                     // Tokio may expose a task result before dropping its
                     // completed future. Do not leave ownership in that frame.
                     drop(worker);
@@ -521,8 +768,10 @@ impl LocalCas {
                 *flight.result.lock().unwrap() = Some(result);
                 cache.flights.lock().unwrap().remove(&key);
                 drop(cache);
-                drop(request);
                 drop(flight);
+                // The all-permits idle barrier may return as soon as this
+                // permit is released; worker-owned cache/leases must be gone.
+                drop(request);
                 // These two handles contain no cache or blob references. No
                 // worker ownership may remain when a waiter observes complete.
                 complete.store(true, Ordering::Release);
@@ -535,18 +784,22 @@ impl LocalCas {
     }
     fn reserve(self: &Arc<Self>, size: u64) -> Result<Reservation> {
         let mut state = self.files.lock().unwrap();
-        let mut total = state.entries.values().map(|e| e.bytes).sum::<u64>();
-        while total.saturating_add(state.reserved).saturating_add(size) > self.config.max_bytes {
-            let victim = state
-                .entries
-                .iter()
-                .filter(|(_, e)| e.pins == 0)
-                .min_by_key(|(_, e)| e.accessed)
-                .map(|(p, e)| (p.clone(), e.bytes))
+        while state
+            .resident
+            .saturating_add(state.reserved)
+            .saturating_add(size)
+            > self.config.max_bytes
+        {
+            let (_, path) = state
+                .evictable
+                .first()
+                .cloned()
                 .context("disk cache budget occupied by pinned content or active downloads")?;
-            fs::remove_file(&victim.0)?;
-            state.entries.remove(&victim.0);
-            total = total.saturating_sub(victim.1);
+            let bytes = state.entries[&path].bytes;
+            fs::remove_file(&path)?;
+            state.remove(&path);
+            self.evictions.fetch_add(1, Ordering::Relaxed);
+            self.evicted_bytes.fetch_add(bytes, Ordering::Relaxed);
         }
         state.reserved += size;
         Ok(Reservation {
@@ -559,12 +812,16 @@ impl LocalCas {
         path: &Path,
         function: i32,
         deadline: tokio::time::Instant,
+        request: Arc<OwnedSemaphorePermit>,
     ) -> Result<(String, u64)> {
         let path = path.to_owned();
-        let ownership = self.clone();
+        // Tuple fields drop left-to-right, including during unwinding: cache
+        // ownership ends before this verifier releases its request-slot clone.
+        let ownership = (self.clone(), request);
         let result = tokio::task::spawn_blocking(move || {
-            let _ownership = ownership;
-            hash_file_until(&path, function, Some(deadline))
+            let result = hash_file_until(&path, function, Some(deadline));
+            drop(ownership);
+            result
         })
         .await
         .context("verification task failed")??;
@@ -576,13 +833,18 @@ impl LocalCas {
         self: Arc<Self>,
         artifact: &Artifact,
         deadline: tokio::time::Instant,
+        source: Arc<dyn BlobSource>,
+        request: Arc<OwnedSemaphorePermit>,
     ) -> Result<Arc<CachedBlob>> {
         let path = self.dir.join(Self::key(artifact)?);
         let verified = {
             let mut state = self.files.lock().unwrap();
             if let Some(entry) = state.entries.get_mut(&path) {
+                let rank = entry.accessed;
+                let known = entry.verified.clone();
                 entry.pins += 1;
-                Some(entry.verified.clone())
+                state.evictable.remove(&(rank, path.clone()));
+                Some(known)
             } else {
                 None
             }
@@ -597,7 +859,10 @@ impl LocalCas {
             let current = fingerprint(&path);
             let valid = match current.as_ref() {
                 Ok(current) if known.as_ref() == Some(current) => true,
-                Ok(before) => match self.verify(&path, artifact.digest_function, deadline).await {
+                Ok(before) => match self
+                    .verify(&path, artifact.digest_function, deadline, request.clone())
+                    .await
+                {
                     Ok((hash, size)) if hash == artifact.hash && size == artifact.size => {
                         fingerprint(&path).as_ref().ok() == Some(before)
                     }
@@ -610,12 +875,14 @@ impl LocalCas {
                     return Err(CacheTimeoutError.into());
                 }
                 let mut state = self.files.lock().unwrap();
+                let rank = state.rank();
                 let entry = state
                     .entries
                     .get_mut(&path)
                     .context("pinned cache entry disappeared")?;
                 entry.verified = current.ok();
-                entry.accessed = self.serial.fetch_add(1, Ordering::Relaxed);
+                entry.accessed = rank;
+                state.changed();
                 self.hits.fetch_add(1, Ordering::Relaxed);
                 return Ok(lease);
             }
@@ -632,7 +899,7 @@ impl LocalCas {
                     Err(e)
                 }
             })?;
-            state.entries.remove(&path);
+            state.remove(&path);
         }
         let units = artifact
             .size
@@ -643,7 +910,7 @@ impl LocalCas {
             .acquire_many(units)
             .await
             .context("cache shutting down")?;
-        let _reservation = self.reserve(artifact.size)?;
+        let mut reservation = self.reserve(artifact.size)?;
         let temp_path = self.dir.join(format!(
             "{}-{}.tmp",
             std::process::id(),
@@ -656,11 +923,16 @@ impl LocalCas {
             .create_new(true)
             .open(&temp_path)?;
         self.fetches.fetch_add(1, Ordering::Relaxed);
-        self.source.fetch(artifact, &mut target).await?;
+        source.fetch(artifact, &mut target).await?;
         target.sync_all()?;
         drop(target);
         let (hash, size) = self
-            .verify(&temp_path, artifact.digest_function, deadline)
+            .verify(
+                &temp_path,
+                artifact.digest_function,
+                deadline,
+                request.clone(),
+            )
             .await?;
         ensure!(
             size == artifact.size && hash == artifact.hash,
@@ -676,20 +948,37 @@ impl LocalCas {
             return Err(error.into());
         }
         let verified = fingerprint(&path)?;
-        self.files.lock().unwrap().entries.insert(
-            path.clone(),
-            CacheEntry {
-                bytes: size,
-                pins: 1,
-                accessed: self.serial.fetch_add(1, Ordering::Relaxed),
-                verified: Some(verified),
-            },
-        );
+        {
+            let mut state = self.files.lock().unwrap();
+            let rank = state.rank();
+            state.entries.insert(
+                path.clone(),
+                CacheEntry {
+                    bytes: size,
+                    pins: 1,
+                    accessed: rank,
+                    verified: Some(verified),
+                },
+            );
+            // Convert reserved bytes to resident bytes in one transaction.
+            state.reserved -= reservation.bytes;
+            reservation.bytes = 0;
+            state.resident += size;
+            state.changed();
+        }
         self.verified_bytes.fetch_add(size, Ordering::Relaxed);
         Ok(Arc::new(CachedBlob {
             path,
             cache: self.clone(),
         }))
+    }
+}
+
+impl Drop for LocalCas {
+    fn drop(&mut self) {
+        // No autonomous checkpoint task retains the last owner. Keep the
+        // directory lock through this best-effort final metadata publication.
+        let _ = self.checkpoint_recency(true);
     }
 }
 

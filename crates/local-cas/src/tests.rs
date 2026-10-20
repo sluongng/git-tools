@@ -204,3 +204,422 @@ fn duplicate_descriptor_does_not_extend_logical_cache_ownership() {
     );
     drop(reopened);
 }
+
+struct BytesSource(Vec<u8>);
+#[async_trait]
+impl BlobSource for BytesSource {
+    async fn fetch(&self, _: &Artifact, target: &mut File) -> Result<()> {
+        target.write_all(&self.0)?;
+        Ok(())
+    }
+    async fn missing(&self, _: &[Artifact]) -> Result<Vec<Artifact>> {
+        Ok(vec![])
+    }
+}
+async fn bytes(cache: &Arc<LocalCas>, data: &[u8]) -> Arc<CachedBlob> {
+    cache
+        .clone()
+        .content_from(artifact(data), Arc::new(BytesSource(data.to_vec())))
+        .await
+        .unwrap()
+}
+
+#[tokio::test]
+async fn multi_victim_lru_preserves_pins_and_restores_unpinned_candidates() {
+    let dir = tempfile::tempdir().unwrap();
+    let cache = LocalCas::open(
+        dir.path(),
+        Arc::new(Source::default()),
+        CacheConfig {
+            max_bytes: 16,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let mut paths = vec![];
+    for data in [b"aaaa", b"bbbb", b"cccc", b"dddd"] {
+        paths.push(bytes(&cache, data).await.path().to_owned());
+    }
+    let pinned = bytes(&cache, b"bbbb").await;
+    drop(bytes(&cache, b"aaaa").await);
+    let large = bytes(&cache, b"abcdefghijkl").await;
+    assert_eq!(cache.metrics().evictions, 3);
+    assert_eq!(cache.metrics().evicted_bytes, 12);
+    assert_eq!(cache.metrics().resident_bytes, 16);
+    assert_eq!(cache.metrics().reserved_bytes, 0);
+    assert!(paths[1].exists());
+    for index in [0, 2, 3] {
+        assert!(!paths[index].exists());
+    }
+    drop(pinned);
+    let replacement = bytes(&cache, b"eeee").await;
+    assert!(!paths[1].exists());
+    assert_eq!(fs::read(large.path()).unwrap(), b"abcdefghijkl");
+    assert_eq!(fs::read(replacement.path()).unwrap(), b"eeee");
+    assert_eq!(cache.metrics().evictions, 4);
+}
+
+#[tokio::test]
+async fn checkpoint_preserves_hot_entries_under_reduced_restart_quota() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = Arc::new(Source::default());
+    let cache = LocalCas::open(
+        dir.path(),
+        source.clone(),
+        CacheConfig {
+            max_bytes: 12,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let mut paths = vec![];
+    for data in [b"aaaa", b"bbbb", b"cccc"] {
+        paths.push(bytes(&cache, data).await.path().to_owned());
+    }
+    let modified = fs::metadata(&paths[0]).unwrap().modified().unwrap();
+    // Advance only the checkpoint's clock; no sleeps are needed to exercise
+    // the real worker's periodic blocking-IO path and its ownership barrier.
+    cache.checkpoint.lock().unwrap().last = std::time::Instant::now() - Duration::from_secs(6);
+    drop(bytes(&cache, b"aaaa").await);
+    assert!(dir.path().join("recency.json").exists());
+    assert_eq!(
+        fs::metadata(&paths[0]).unwrap().modified().unwrap(),
+        modified,
+        "cache reads must not touch payload mtimes"
+    );
+    drop(cache);
+    let cache = LocalCas::open(
+        dir.path(),
+        source.clone(),
+        CacheConfig {
+            max_bytes: 4,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    assert!(paths[0].exists());
+    assert!(!paths[1].exists());
+    assert!(!paths[2].exists());
+    source.reject.store(true, Ordering::Relaxed);
+    assert_eq!(
+        fs::read(
+            cache
+                .clone()
+                .content(artifact(b"aaaa"))
+                .await
+                .unwrap()
+                .path()
+        )
+        .unwrap(),
+        b"aaaa"
+    );
+    assert_eq!(
+        cache.metrics().verification_bytes,
+        4,
+        "recency never grants integrity authority"
+    );
+    assert_eq!(cache.metrics().resident_bytes, 4);
+}
+
+#[tokio::test]
+async fn corrupt_or_unsupported_recency_uses_deterministic_safe_fallback() {
+    for hint in [
+        b"not-json".as_slice(),
+        br#"{"version":99,"entries":{}}"#.as_slice(),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = LocalCas::open(
+            dir.path(),
+            Arc::new(Source::default()),
+            CacheConfig::default(),
+        )
+        .unwrap();
+        let mut paths = vec![];
+        for data in [b"aaaa", b"bbbb", b"cccc"] {
+            paths.push(bytes(&cache, data).await.path().to_owned());
+        }
+        drop(cache);
+        fs::write(dir.path().join("recency.json"), hint).unwrap();
+        let cache = LocalCas::open(
+            dir.path(),
+            Arc::new(Source::default()),
+            CacheConfig {
+                max_bytes: 4,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        paths.sort();
+        assert!(!paths[0].exists());
+        assert!(!paths[1].exists());
+        assert!(paths[2].exists());
+        assert_eq!(cache.metrics().recency_errors, 1);
+        assert_eq!(cache.metrics().resident_bytes, 4);
+    }
+}
+
+struct HeldSource {
+    entered: Arc<tokio::sync::Notify>,
+    release: Arc<tokio::sync::Notify>,
+    dropped: Arc<AtomicBool>,
+}
+impl Drop for HeldSource {
+    fn drop(&mut self) {
+        self.dropped.store(true, Ordering::SeqCst);
+    }
+}
+#[async_trait]
+impl BlobSource for HeldSource {
+    async fn fetch(&self, _: &Artifact, target: &mut File) -> Result<()> {
+        self.entered.notify_one();
+        self.release.notified().await;
+        target.write_all(b"aaaa")?;
+        Ok(())
+    }
+    async fn missing(&self, _: &[Artifact]) -> Result<Vec<Artifact>> {
+        Ok(vec![])
+    }
+}
+
+#[tokio::test]
+async fn source_override_survives_cancelled_waiter_and_coalesces_without_default_source() {
+    let dir = tempfile::tempdir().unwrap();
+    let default_source = Arc::new(Source::default());
+    default_source.reject.store(true, Ordering::Relaxed);
+    let cache = LocalCas::open(dir.path(), default_source.clone(), CacheConfig::default()).unwrap();
+    let entered = Arc::new(tokio::sync::Notify::new());
+    let release = Arc::new(tokio::sync::Notify::new());
+    let dropped = Arc::new(AtomicBool::new(false));
+    let source = Arc::new(HeldSource {
+        entered: entered.clone(),
+        release: release.clone(),
+        dropped: dropped.clone(),
+    });
+    let first = tokio::spawn(cache.clone().content_from(artifact(b"aaaa"), source));
+    entered.notified().await;
+    first.abort();
+    assert!(first.await.err().unwrap().is_cancelled());
+    assert!(
+        !dropped.load(Ordering::SeqCst),
+        "the admitted fetch owns its source independently"
+    );
+    let second = cache
+        .clone()
+        .content_from(artifact(b"aaaa"), default_source.clone());
+    tokio::pin!(second);
+    // Poll the second caller into the existing flight before releasing it.
+    std::future::poll_fn(|cx| {
+        assert!(std::future::Future::poll(second.as_mut(), cx).is_pending());
+        std::task::Poll::Ready(())
+    })
+    .await;
+    release.notify_one();
+    let lease = second.await.unwrap();
+    assert_eq!(fs::read(lease.path()).unwrap(), b"aaaa");
+    assert!(
+        dropped.load(Ordering::SeqCst),
+        "source ownership ends before completion is visible"
+    );
+    assert_eq!(cache.metrics().fetches, 1);
+    assert_eq!(default_source.calls.load(Ordering::Relaxed), 0);
+}
+
+struct FailedSource;
+#[async_trait]
+impl BlobSource for FailedSource {
+    async fn fetch(&self, _: &Artifact, target: &mut File) -> Result<()> {
+        target.write_all(b"par")?;
+        anyhow::bail!("source failed")
+    }
+    async fn missing(&self, _: &[Artifact]) -> Result<Vec<Artifact>> {
+        Ok(vec![])
+    }
+}
+#[tokio::test]
+async fn failed_fetch_releases_reservation_and_publication_never_double_charges_bytes() {
+    let dir = tempfile::tempdir().unwrap();
+    let cache = LocalCas::open(
+        dir.path(),
+        Arc::new(Source::default()),
+        CacheConfig {
+            max_bytes: 4,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    assert!(
+        cache
+            .clone()
+            .content_from(artifact(b"aaaa"), Arc::new(FailedSource))
+            .await
+            .is_err()
+    );
+    assert_eq!(cache.metrics().reserved_bytes, 0);
+    assert_eq!(cache.metrics().resident_bytes, 0);
+    let first = bytes(&cache, b"aaaa").await;
+    assert_eq!(cache.metrics().reserved_bytes, 0);
+    assert_eq!(cache.metrics().resident_bytes, 4);
+    drop(first);
+    let second = bytes(&cache, b"bbbb").await;
+    assert_eq!(cache.metrics().resident_bytes, 4);
+    assert_eq!(cache.metrics().reserved_bytes, 0);
+    assert_eq!(fs::read(second.path()).unwrap(), b"bbbb");
+}
+
+#[tokio::test]
+async fn stale_and_maximal_recency_hints_are_normalized_without_trusting_bytes() {
+    let dir = tempfile::tempdir().unwrap();
+    let cache = LocalCas::open(
+        dir.path(),
+        Arc::new(Source::default()),
+        CacheConfig::default(),
+    )
+    .unwrap();
+    let hot_path = bytes(&cache, b"aaaa").await.path().to_owned();
+    let cold_path = bytes(&cache, b"bbbb").await.path().to_owned();
+    drop(cache);
+    let mut entries = HashMap::new();
+    entries.insert(
+        hot_path.file_name().unwrap().to_str().unwrap().to_owned(),
+        u64::MAX,
+    );
+    entries.insert("f".repeat(64), u64::MAX); // stale hint, no payload
+    fs::write(
+        dir.path().join("recency.json"),
+        serde_json::to_vec(&Recency {
+            version: 1,
+            entries,
+        })
+        .unwrap(),
+    )
+    .unwrap();
+    let cache = LocalCas::open(
+        dir.path(),
+        Arc::new(Source::default()),
+        CacheConfig {
+            max_bytes: 4,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    assert!(hot_path.exists());
+    assert!(!cold_path.exists());
+    let lease = cache.clone().content(artifact(b"aaaa")).await.unwrap();
+    assert_eq!(cache.metrics().verification_bytes, 4);
+    assert_eq!(fs::read(lease.path()).unwrap(), b"aaaa");
+    cache.flush_recency().unwrap();
+    let normalized: Recency =
+        serde_json::from_slice(&fs::read(dir.path().join("recency.json")).unwrap()).unwrap();
+    assert_eq!(normalized.entries.len(), 1);
+    assert!(normalized.entries.values().all(|rank| *rank < 100));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn idle_barrier_waits_for_fetch_teardown_after_its_waiter_times_out() {
+    let dir = tempfile::tempdir().unwrap();
+    let cache = LocalCas::open(
+        dir.path(),
+        Arc::new(Source::default()),
+        CacheConfig {
+            max_concurrent_fetches: 1,
+            operation_timeout: Duration::from_millis(10),
+            fetch_timeout: Duration::from_secs(5),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let entered = Arc::new(tokio::sync::Notify::new());
+    let release = Arc::new(tokio::sync::Notify::new());
+    let dropped = Arc::new(AtomicBool::new(false));
+    let source = Arc::new(HeldSource {
+        entered: entered.clone(),
+        release: release.clone(),
+        dropped: dropped.clone(),
+    });
+    let caller = tokio::spawn(cache.clone().content_from(artifact(b"aaaa"), source));
+    entered.notified().await;
+    let error = caller.await.unwrap().err().unwrap();
+    assert!(error.downcast_ref::<CacheTimeoutError>().is_some());
+    assert!(!dropped.load(Ordering::SeqCst));
+    {
+        let idle = cache.wait_for_idle();
+        tokio::pin!(idle);
+        std::future::poll_fn(|cx| {
+            assert!(std::future::Future::poll(idle.as_mut(), cx).is_pending());
+            std::task::Poll::Ready(())
+        })
+        .await;
+        release.notify_one();
+        idle.as_mut().await.unwrap();
+        assert!(dropped.load(Ordering::SeqCst));
+    }
+    drop(cache);
+    LocalCas::open(
+        dir.path(),
+        Arc::new(Source::default()),
+        CacheConfig::default(),
+    )
+    .unwrap();
+}
+
+#[test]
+fn idle_barrier_includes_blocking_verification_after_fetch_timeout() {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .max_blocking_threads(1)
+        .build()
+        .unwrap();
+    let (release, blocked) = std::sync::mpsc::channel();
+    let (entered, started) = std::sync::mpsc::channel();
+    let blocker = runtime.spawn_blocking(move || {
+        entered.send(()).unwrap();
+        blocked.recv().unwrap();
+    });
+    started.recv().unwrap();
+    runtime.block_on(async {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = LocalCas::open(
+            dir.path(),
+            Arc::new(Source::default()),
+            CacheConfig {
+                max_concurrent_fetches: 1,
+                operation_timeout: Duration::from_secs(2),
+                fetch_timeout: Duration::from_millis(20),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        // Fetch completes immediately, but verification queues behind blocker.
+        let error = cache
+            .clone()
+            .content(artifact(b"aaaa"))
+            .await
+            .err()
+            .unwrap();
+        assert!(error.downcast_ref::<CacheTimeoutError>().is_some());
+        assert_eq!(cache.metrics().fetches, 1);
+        assert_eq!(cache.metrics().timed_out_fetches, 1);
+        {
+            let idle = cache.wait_for_idle();
+            tokio::pin!(idle);
+            std::future::poll_fn(|cx| {
+                assert!(
+                    std::future::Future::poll(idle.as_mut(), cx).is_pending(),
+                    "a detached verifier must retain its fetch permit"
+                );
+                std::task::Poll::Ready(())
+            })
+            .await;
+            release.send(()).unwrap();
+            idle.await.unwrap();
+        }
+        blocker.await.unwrap();
+        drop(cache);
+        LocalCas::open(
+            dir.path(),
+            Arc::new(Source::default()),
+            CacheConfig::default(),
+        )
+        .unwrap();
+    });
+}

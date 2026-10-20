@@ -53,7 +53,8 @@ and evicts least-recently-used, unpinned entries. Active read leases and in-flig
 downloads are protected. It defaults to `--state-dir/cache`; use `--cas-cache-dir`
 to separate disposable cache bytes from authoritative state. One process owns a
 cache directory; library consumers share its `Arc<LocalCas>`, not independent
-writers/GC. Recency ranking is process-local; retained bytes are reverified after restart.
+writers/GC. Batched recency hints survive graceful restart; retained bytes are
+still independently reverified. A crash may lose recent access hints.
 
 Backend identity now includes a credential fingerprint. Old namespace state or
 a changed endpoint/instance/API key fails closed: use a fresh state directory,
