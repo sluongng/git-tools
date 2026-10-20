@@ -84,6 +84,17 @@ own lifecycle commands. See [session limits](../../../crates/agent-session/READM
 
 ## Cache policy
 
+On a trusted host, provision an existing shared directory outside every session
+and add `--repo-contents-cache /absolute/host/repo-contents` to `create`. Source,
+overlay and output roots remain private; cached dependencies are symlink-shared
+and must not be edited. Remote r2c2 stays on independently; disable it only with
+`--remote-repo-contents-cache=false` at creation, not by disabling all remote
+action-cache reads. Endpoint/auth/instance remain in the provisioned rc.
+
+Remote hits do not fill the local extracted-directory cache. A separate shared
+Bazel `--disk_cache` can reuse lazy remote blobs within a trusted scope; configure
+its GC budget. Bazel 9.2 ignores that disk cache with remote output service enabled.
+
 Provision Bazel's remote TTL from the backend's actual retention contract. It is
 an operator assumption, not a REAPI lease; omitting it keeps Bazel's own default,
 not zero. Proxy presence suppression is separate and defaults to zero (recheck).

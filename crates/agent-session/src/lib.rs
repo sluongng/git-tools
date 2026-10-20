@@ -22,6 +22,15 @@ pub struct Settings {
     pub git: PathBuf,
     pub bazel: PathBuf,
     pub mount_timeout_seconds: u64,
+    /// Explicit host sharing; None preserves Bazel/provisioned rc behavior.
+    #[serde(default)]
+    pub repo_contents_cache: Option<PathBuf>,
+    #[serde(default = "remote_repo_contents_cache_default")]
+    pub remote_repo_contents_cache: bool,
+}
+
+fn remote_repo_contents_cache_default() -> bool {
+    true
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -60,6 +69,10 @@ pub struct Report {
     pub last_successful_save_unix_ms: Option<u128>,
     pub process_verified: bool,
     pub workspace: PathBuf,
+    /// Pinned explicit path, or Bazel's default/provisioned rc policy when None.
+    pub repo_contents_cache: Option<PathBuf>,
+    pub repo_contents_cache_policy: &'static str,
+    pub remote_repo_contents_cache: bool,
     pub timings_ms: Vec<(String, u128)>,
 }
 
@@ -210,6 +223,12 @@ fn validate(settings: &Settings) -> Result<()> {
             && !settings.reference.chars().any(char::is_control),
         "invalid clone reference"
     );
+    if let Some(cache) = &settings.repo_contents_cache {
+        ensure!(
+            cache.is_absolute(),
+            "shared repo contents cache must be an absolute directory path"
+        );
+    }
     ensure!(
         (1..=3600).contains(&settings.mount_timeout_seconds),
         "mount timeout must be 1..3600 seconds"
@@ -306,13 +325,31 @@ impl Session {
         command
     }
 
+    fn check_shared_cache(&self) -> Result<()> {
+        if let Some(cache) = &self.manifest.settings.repo_contents_cache {
+            ensure!(
+                !cache.starts_with(&self.root) && !self.root.starts_with(cache),
+                "shared repo contents cache and session directory must not overlap"
+            );
+            ensure!(
+                cache.is_dir() && cache.canonicalize().is_ok_and(|current| current == *cache),
+                "shared repo contents cache is missing or its canonical location changed; restore the pinned directory before resume/build"
+            );
+        }
+        Ok(())
+    }
+
     fn bazel(&self) -> Command {
         let mut command = Command::new(&self.manifest.settings.bazel);
         command
             .current_dir(self.root.join("workspace"))
             .arg("--nosystem_rc")
             .arg("--nohome_rc")
-            .arg("--experimental_remote_repo_contents_cache")
+            .arg(if self.manifest.settings.remote_repo_contents_cache {
+                "--experimental_remote_repo_contents_cache"
+            } else {
+                "--noexperimental_remote_repo_contents_cache"
+            })
             .arg("--digest_function=BLAKE3")
             .arg("--unix_digest_hash_attribute_name=user.blake3")
             .arg(format!(
@@ -342,6 +379,13 @@ impl Session {
             last_successful_save_unix_ms: self.manifest.last_successful_save_unix_ms,
             process_verified: self.manifest.mount.as_ref().is_some_and(process_matches),
             workspace: self.root.join("workspace"),
+            repo_contents_cache: self.manifest.settings.repo_contents_cache.clone(),
+            repo_contents_cache_policy: if self.manifest.settings.repo_contents_cache.is_some() {
+                "explicit pinned host directory"
+            } else {
+                "Bazel default under private output_user_root unless provisioned rc/build arguments override"
+            },
+            remote_repo_contents_cache: self.manifest.settings.remote_repo_contents_cache,
             timings_ms: if self.timings.is_empty() {
                 self.manifest.timings_ms.clone()
             } else {
@@ -360,6 +404,7 @@ impl Session {
     }
 
     fn start(&mut self) -> Result<()> {
+        self.check_shared_cache()?;
         if mounted(&self.root.join("workspace"))? {
             self.ready()?;
             self.manifest.phase = "edit_ready".into();
@@ -484,6 +529,15 @@ impl Session {
 pub fn create(root: &Path, mut settings: Settings) -> Result<Report> {
     platform()?;
     validate(&settings)?;
+    if let Some(cache) = &mut settings.repo_contents_cache {
+        *cache = cache
+            .canonicalize()
+            .context("shared repo contents cache must already exist")?;
+        ensure!(
+            cache.is_dir(),
+            "shared repo contents cache must be a directory"
+        );
+    }
     settings.git_vfs = executable(&settings.git_vfs)?;
     settings.git = executable(&settings.git)?;
     settings.bazel = executable(&settings.bazel)?;
@@ -517,6 +571,7 @@ pub fn create(root: &Path, mut settings: Settings) -> Result<Report> {
         _lock: guard,
         timings: vec![],
     };
+    session.check_shared_cache()?;
     session.persist()?;
     let mut clone = session.vfs();
     clone
@@ -550,9 +605,33 @@ pub fn status(root: &Path) -> Result<Report> {
 pub fn build(root: &Path, args: &[String]) -> Result<Report> {
     ensure!(!args.is_empty(), "build requires at least one target");
     let mut session = Session::open(root)?;
+    if session.manifest.settings.repo_contents_cache.is_some() {
+        ensure!(
+            !args.iter().any(|arg| matches!(
+                arg.as_str(),
+                "--repo_contents_cache" | "--repository_contents_cache"
+            ) || arg.starts_with("--repo_contents_cache=")
+                || arg.starts_with("--repository_contents_cache=")),
+            "repo contents cache is pinned by session settings; select it at create time rather than overriding build arguments"
+        );
+    }
     session.ready()?;
+    session.check_shared_cache()?;
     let mut command = session.bazel();
-    command.arg("build").args(args);
+    command.arg("build");
+    if let Some(cache) = &session.manifest.settings.repo_contents_cache {
+        // A trailing explicit value overrides earlier --config expansions. Keep
+        // it before an optional target separator so Bazel still parses it.
+        let separator = args
+            .iter()
+            .position(|arg| arg == "--")
+            .unwrap_or(args.len());
+        command.args(&args[..separator]);
+        command.arg(format!("--repo_contents_cache={}", cache.display()));
+        command.args(&args[separator..]);
+    } else {
+        command.args(args);
+    }
     session.run("build", &mut command)?;
     session.manifest.last_successful_build_unix_ms =
         Some(SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis());

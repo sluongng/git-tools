@@ -73,6 +73,11 @@ fn failed_mount_is_resumable_without_reclone_and_stop_preserves_private_state() 
     )
     .unwrap();
     let root = temp.path().join("session");
+    let shared_cache = temp.path().join("shared-repo-contents");
+    fs::create_dir(&shared_cache).unwrap();
+    fs::write(shared_cache.join("retained-cache-entry"), "shared content").unwrap();
+    let cache_alias = temp.path().join("shared-cache-alias");
+    std::os::unix::fs::symlink(&shared_cache, &cache_alias).unwrap();
     let settings = Settings {
         proxy_url: "http://127.0.0.1:8082".into(),
         proxy_repo: "repo".into(),
@@ -83,6 +88,8 @@ fn failed_mount_is_resumable_without_reclone_and_stop_preserves_private_state() 
         git: "git".into(),
         bazel,
         mount_timeout_seconds: 1,
+        repo_contents_cache: Some(cache_alias),
+        remote_repo_contents_cache: false,
     };
     let error = create(&root, settings).unwrap_err().to_string();
     assert!(
@@ -91,7 +98,18 @@ fn failed_mount_is_resumable_without_reclone_and_stop_preserves_private_state() 
     );
     let manifest = fs::read_to_string(root.join("session.json")).unwrap();
     assert!(!manifest.contains("DO_NOT_COPY"));
-    assert_eq!(status(&root).unwrap().revision, revision);
+    let report = status(&root).unwrap();
+    assert_eq!(report.revision, revision);
+    assert_eq!(
+        report.repo_contents_cache,
+        Some(shared_cache.canonicalize().unwrap())
+    );
+    assert!(!report.remote_repo_contents_cache);
+    let pinned: serde_json::Value = serde_json::from_str(&manifest).unwrap();
+    assert_eq!(
+        pinned["settings"]["repo_contents_cache"],
+        shared_cache.to_str().unwrap()
+    );
     fs::create_dir_all(root.join("overlay/git")).unwrap();
     fs::write(root.join("overlay/edit"), "user edit").unwrap();
     fs::write(root.join("overlay/git/index"), "private index").unwrap();
@@ -155,6 +173,29 @@ fn failed_mount_is_resumable_without_reclone_and_stop_preserves_private_state() 
         "user edit"
     );
     assert_eq!(stop(&root).unwrap().phase, "stopped");
+    assert_eq!(
+        status(&root).unwrap().repo_contents_cache,
+        Some(shared_cache.clone())
+    );
+    assert_eq!(
+        fs::read_to_string(shared_cache.join("retained-cache-entry")).unwrap(),
+        "shared content"
+    );
+    // Pin the canonical location, not an alias that can silently be retargeted.
+    // Even when the cache needs repair, stop must remain usable for cleanup.
+    let retained_cache = temp.path().join("retained-shared-cache");
+    fs::rename(&shared_cache, &retained_cache).unwrap();
+    let replacement = temp.path().join("replacement-cache");
+    fs::create_dir(&replacement).unwrap();
+    std::os::unix::fs::symlink(replacement, &shared_cache).unwrap();
+    assert!(
+        resume(&root)
+            .unwrap_err()
+            .to_string()
+            .contains("canonical location changed")
+    );
+    assert_eq!(stop(&root).unwrap().phase, "stopped");
+    assert!(retained_cache.join("retained-cache-entry").exists());
 }
 
 fn status_settings(manifest: &str) -> Settings {
@@ -178,6 +219,8 @@ fn rejects_unpinned_revision_credentials_and_unknown_manifest_versions() {
         git: "git".into(),
         bazel: "missing".into(),
         mount_timeout_seconds: 1,
+        repo_contents_cache: None,
+        remote_repo_contents_cache: true,
     };
     let root = temp.path().join("session");
     assert!(
@@ -328,6 +371,10 @@ fn stopped_mount_still_shuts_down_only_private_bazel_server() {
     let report = stop(root).unwrap();
     assert!(!report.edit_ready);
     assert!(report.last_successful_build_unix_ms.is_none());
+    // Older manifests omitted both settings: remote stays enabled and local
+    // cache location remains delegated to the existing Bazel/rc policy.
+    assert!(report.remote_repo_contents_cache);
+    assert!(report.repo_contents_cache.is_none());
     let args = fs::read_to_string(root.join("bazel-control/bazel-invocation")).unwrap();
     assert!(args.contains(&format!(
         "--output_base={}\n",
@@ -348,6 +395,31 @@ fn stopped_mount_still_shuts_down_only_private_bazel_server() {
         root.join("bazel-control").to_str().unwrap()
     );
     assert_eq!(status(root).unwrap().timings_ms[0].0, "bazel_shutdown");
+    assert!(!args.contains("--repo_contents_cache="));
+
+    let shared_cache_owner = tempfile::tempdir().unwrap();
+    let shared_cache = shared_cache_owner.path().to_owned();
+    fs::write(shared_cache.join("retained"), "cache entry").unwrap();
+    let mut updated: serde_json::Value =
+        serde_json::from_slice(&fs::read(root.join("session.json")).unwrap()).unwrap();
+    updated["settings"]["remote_repo_contents_cache"] = serde_json::json!(false);
+    updated["settings"]["repo_contents_cache"] = serde_json::json!(shared_cache);
+    fs::write(
+        root.join("session.json"),
+        serde_json::to_vec(&updated).unwrap(),
+    )
+    .unwrap();
+    let disabled = stop(root).unwrap();
+    assert!(!disabled.remote_repo_contents_cache);
+    assert_eq!(disabled.repo_contents_cache, Some(shared_cache.clone()));
+    let args = fs::read_to_string(root.join("bazel-control/bazel-invocation")).unwrap();
+    assert!(args.contains("--noexperimental_remote_repo_contents_cache\n"));
+    assert!(!args.contains("\n--experimental_remote_repo_contents_cache\n"));
+    assert!(
+        !args.contains("--repo_contents_cache="),
+        "local path is a build option, not a shutdown/startup option"
+    );
+    assert!(shared_cache.join("retained").exists());
 }
 
 #[test]

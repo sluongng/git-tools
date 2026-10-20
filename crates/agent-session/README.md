@@ -26,6 +26,21 @@ creation. The external bazelrc configures RBE, execution platforms, credentials
 and justified remote TTL. The CLI neither copies secrets nor proves RBE was used;
 inspect the first BuildBuddy invocation. Do not put credentials in the proxy URL.
 
+For cooperating agents on one trusted host, create a directory outside every
+session and pass `--repo-contents-cache /absolute/host/repo-contents` at creation.
+The canonical path is retained across resume and never deleted by stop. Cached
+dependencies are symlink-shared, so this is not isolation against dependency
+edits. Omitting the option preserves Bazel/rc defaults under the private roots.
+
+Remote repository caching is **on by default**, independently of host sharing.
+Use `--remote-repo-contents-cache=false` (or `--no-remote-repo-contents-cache`) at
+creation to disable r2c2 without disabling RBE. The provisioned rc still supplies
+the remote cache endpoint, credentials and instance; reads require
+`--remote_accept_cached=true`. A remote hit stays lazy and does not populate the
+local extracted-directory cache. Optional `--disk_cache` in the rc can reuse
+downloaded remote blobs; scope it to trusted agents and configure its GC budget.
+Bazel 9.2 ignores that disk cache when its remote output service is enabled.
+
 Commands return JSON `{ "ok": true, "report": ... }` (or `ok: false` and
 a nonzero exit status on failure), with revision, readiness, paths and phase wall times;
 subprocess output goes to stderr. Create times clone, mapping import and mount

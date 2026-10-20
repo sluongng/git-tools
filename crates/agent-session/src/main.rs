@@ -36,6 +36,15 @@ enum Operation {
         bazel: PathBuf,
         #[arg(long, default_value_t = 60)]
         mount_timeout_seconds: u64,
+        /// Existing absolute host directory shared by cooperating agents.
+        #[arg(long)]
+        repo_contents_cache: Option<PathBuf>,
+        /// Enable remote repository contents caching independently of local sharing.
+        #[arg(long, default_value_t = true, action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true", conflicts_with = "no_remote_repo_contents_cache")]
+        remote_repo_contents_cache: bool,
+        /// Disable remote repository caching without changing local sharing.
+        #[arg(long, conflicts_with = "remote_repo_contents_cache")]
+        no_remote_repo_contents_cache: bool,
     },
     /// Reuse the pinned repository and durable overlay without recloning.
     Resume { session: PathBuf },
@@ -80,6 +89,9 @@ fn main() -> std::process::ExitCode {
             git,
             bazel,
             mount_timeout_seconds,
+            repo_contents_cache,
+            remote_repo_contents_cache,
+            no_remote_repo_contents_cache,
         } => agent_session::create(
             &session,
             agent_session::Settings {
@@ -92,6 +104,9 @@ fn main() -> std::process::ExitCode {
                 git,
                 bazel,
                 mount_timeout_seconds,
+                repo_contents_cache,
+                remote_repo_contents_cache: remote_repo_contents_cache
+                    && !no_remote_repo_contents_cache,
             },
         ),
         Operation::Resume { session } => agent_session::resume(&session),
