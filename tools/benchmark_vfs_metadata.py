@@ -14,9 +14,11 @@ import ctypes
 import hashlib
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
+import math
 import os
 from pathlib import Path
 import platform
+import resource
 import shutil
 import signal
 import statistics
@@ -106,6 +108,8 @@ class MetadataCell(common.Cell):
         self.entries = entries
         self.mapping = None
         self.result.update(entries=entries, operation_seconds={})
+        if workload == 'startup':
+            self.env['GIT_TOOLS_METADATA_TIMINGS'] = '1'
 
     def blake3(self, data):
         output = subprocess.run([str(self.args.b3sum), '--no-names'], input=data,
@@ -132,7 +136,7 @@ class MetadataCell(common.Cell):
             for mark, (path, data) in enumerate(contents.items(), 1):
                 marks[path] = mark
                 stream.write(f'blob\nmark :{mark}\ndata {len(data)}\n'.encode() + data + b'\n')
-                if self.workload == 'digest':
+                if self.workload in ('digest', 'startup'):
                     oid = gitsha(data).hex()
                     mappings[oid] = {'oid': oid, 'object_type': 'blob', 'size_bytes': len(data),
                                      'blake3': {'hash': self.blake3(data).hex(), 'size_bytes': len(data)}}
@@ -140,15 +144,17 @@ class MetadataCell(common.Cell):
             for path, mark in marks.items():
                 stream.write(f'M 100644 :{mark} {path}\n'.encode())
             for index in range(self.entries):
-                stream.write(f'M 100644 :1 unrelated/{index:06d}.txt\n'.encode())
+                path = (f'unrelated/{index // 1000:04d}/{index:07d}.txt'
+                        if self.workload == 'startup' else f'unrelated/{index:06d}.txt')
+                stream.write(f'M 100644 :1 {path}\n'.encode())
             stream.write(b'\ndone\n')
         with import_path.open('rb') as stream:
             subprocess.run([str(self.git), '-C', str(self.repo), 'fast-import', '--quiet'],
                            stdin=stream, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                           env=self.env, timeout=60, check=True)
+                           env=self.env, timeout=self.args.cell_budget, check=True)
         self.result['fixture_commit'] = self.git_run('-C', self.repo, 'rev-parse', 'HEAD').decode().strip()
         self.result['fixture_import_sha256'] = common.sha256(import_path)
-        if self.workload == 'digest':
+        if self.workload in ('digest', 'startup'):
             self.mapping = MappingFixture(mappings)
             self.result['blake3_mapping_source'] = 'owned loopback fixture; independently hashed local base blobs'
         self.save()
@@ -178,7 +184,8 @@ class MetadataCell(common.Cell):
         status = Path(f'/proc/{self.proc.pid}/status').read_text()
         rss = next(int(line.split()[1]) * 1024 for line in status.splitlines() if line.startswith('VmRSS:'))
         files = [path.stat() for path in self.overlay.rglob('*') if path.is_file()]
-        self.result['samples'].append({'label': label, 'rss_bytes': rss,
+        peak_rss = next(int(line.split()[1]) * 1024 for line in status.splitlines() if line.startswith('VmHWM:'))
+        self.result['samples'].append({'label': label, 'rss_bytes': rss, 'process_peak_rss_bytes': peak_rss,
             'overlay_file_bytes': sum(stat.st_size for stat in files),
             'overlay_allocated_bytes': sum(stat.st_blocks * 512 for stat in files)})
         self.save()
@@ -287,8 +294,64 @@ class MetadataCell(common.Cell):
                 'unexpected digest fixture Git status')
         self.result['correctness'].update(remount_persistence=True, unchanged_base_preserved=True)
 
+    def startup_workload(self):
+        """Separate snapshot, mapping and overlay costs, no full namespace walk."""
+        self.result['startup'] = []
+        self.result['fixture_scope'] = ('Many paths share three independently hashed blobs; '
+            'Startup paths are sharded into at most 1000 files/directory to avoid quadratic Git fast-import fixture preparation. '
+            'Path-scaling probe, NOT high unique-blob-cardinality mapping throughput. '
+            'Distinct revision changes commit identity with the same tree; no tree-diff claim.')
+        for revision in self.args.startup_revisions:
+            if revision == 'distinct':
+                old = self.git_run('-C', self.repo, 'rev-parse', 'HEAD').decode().strip()
+                tree = self.git_run('-C', self.repo, 'rev-parse', 'HEAD^{tree}').decode().strip()
+                commit = subprocess.run([str(self.git), '-C', str(self.repo), 'commit-tree', tree,
+                    '-p', old], input=b'distinct startup identity\n', env=dict(self.env,
+                        GIT_AUTHOR_NAME='Fixture', GIT_AUTHOR_EMAIL='fixture@example.invalid',
+                        GIT_COMMITTER_NAME='Fixture', GIT_COMMITTER_EMAIL='fixture@example.invalid',
+                        GIT_AUTHOR_DATE='2000-01-01T00:00:00Z', GIT_COMMITTER_DATE='2000-01-01T00:00:00Z'),
+                    stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True, timeout=30).stdout.strip()
+                self.git_run('-C', self.repo, 'update-ref', 'refs/heads/main', commit.decode())
+                self.overlay = self.directory / 'overlay-distinct'
+            item = {'revision_kind': revision, 'commit': self.git_run('-C', self.repo, 'rev-parse', 'HEAD').decode().strip(),
+                    'mapping_commands': [], 'mount_seconds': []}
+            self.result['startup'].append(item)
+            for attempt in range(2):
+                label = f'{revision}-mapping-{attempt + 1}'
+                log = self.directory / (label + '.stderr')
+                started = time.monotonic()
+                with log.open('wb') as err:
+                    subprocess.run([str(self.binary), '--git', str(self.git), 'warm-blake3',
+                        '--repo', str(self.repo), '--proxy-url', self.mapping.url, '--proxy-repo', 'fixture'],
+                        env=self.env, stdout=subprocess.DEVNULL, stderr=err, check=True,
+                        timeout=self.args.cell_budget)
+                item['mapping_commands'].append({'seconds': time.monotonic() - started,
+                    'attempt': attempt + 1, 'timings': self.metadata_timings(log)})
+            for attempt in range(2):
+                self.start()
+                item['mount_seconds'].append(self.result['mount_seconds'][-1])
+                self.sample(f'{revision}-mount-{attempt + 1}')
+                self.stop()
+                item.setdefault('mount_timings', []).append(self.metadata_timings(self.logs[-1]))
+            self.save()
+
+    @staticmethod
+    def metadata_timings(path):
+        return [json.loads(line.split('METADATA_TIMING ', 1)[1])
+                for line in path.read_text(errors='replace').splitlines() if line.startswith('METADATA_TIMING ')]
+
     def execute(self):
+        prepare_started = time.monotonic()
         self.prepare()
+        self.result['fixture_prepare_seconds'] = time.monotonic() - prepare_started
+        if self.workload == 'startup':
+            started = time.monotonic()
+            self.startup_workload()
+            self.result['startup_continuous_seconds'] = time.monotonic() - started
+            self.result['startup_continuous_scope'] = 'All same/distinct mapping commands, two mounts each, samples, shutdown and audits; excludes fixture generation. Individual phases are not summed as this wall duration.'
+            self.result['status'] = 'complete'
+            self.save()
+            return
         self.start()
         self.sample('before_workload')
         if self.workload == 'rename':
@@ -301,6 +364,11 @@ class MetadataCell(common.Cell):
         self.save()
 
     def collect_stats(self):
+        if self.workload == 'startup':
+            self.result['metadata_timings_available'] = any(
+                item.get('mount_timings') and any(item['mount_timings'])
+                for item in self.result.get('startup', []))
+            return
         sessions = {'workload': {'reports': [], 'parse_errors': []},
                     'remount_verification': {'reports': [], 'parse_errors': []}}
         for index, log in enumerate(self.logs):
@@ -381,8 +449,9 @@ def main():
     parser.add_argument('--git', type=Path, required=True)
     parser.add_argument('--b3sum', type=Path, default=Path(shutil.which('b3sum') or '/usr/bin/b3sum'))
     parser.add_argument('--output', type=Path, required=True)
-    parser.add_argument('--workloads', choices=['rename', 'digest'], nargs='+', default=['rename', 'digest'])
+    parser.add_argument('--workloads', choices=['rename', 'digest', 'startup'], nargs='+', default=['rename', 'digest'])
     parser.add_argument('--entry-counts', type=int, nargs='+', default=[1000, 10000, 100000])
+    parser.add_argument('--startup-revisions', nargs='+', choices=['same', 'distinct'], default=['same', 'distinct'])
     parser.add_argument('--trials', type=int, default=3)
     parser.add_argument('--iterations', type=int, default=64)
     parser.add_argument('--file-bytes', type=int, default=16 * 1024 * 1024)
@@ -395,14 +464,14 @@ def main():
     if not (1 <= args.trials <= 20 and 1 <= args.iterations <= 4096 and
             4096 <= args.file_bytes <= 128 * 1024 * 1024 and
             1 <= args.mount_budget <= 120 and 30 <= args.cell_budget <= 3600 and
-            all(1 <= count <= 100000 for count in args.entry_counts) and
+            all(1 <= count <= (1000000 if args.workloads == ['startup'] else 100000) for count in args.entry_counts) and
             len(set(args.entry_counts)) == len(args.entry_counts) and len(set(args.workloads)) == len(args.workloads)):
-        parser.error('invalid bounds: trials1..20; iterations1..4096; file4KiB..128MiB; mount1..120s; cell30..3600s; unique entries1..100000/workloads')
+        parser.error('invalid bounds: trials1..20; iterations1..4096; file4KiB..128MiB; mount1..120s; cell30..3600s; unique entries1..100000 (startup-only1..1000000)/workloads')
     args.output = args.output.resolve()
     args.git = args.git.resolve(strict=True)
     binaries = {name: getattr(args, name).resolve(strict=True) for name in ('baseline', 'candidate')}
     paths = [args.git, *binaries.values()]
-    if 'digest' in args.workloads:
+    if set(args.workloads) & {'digest', 'startup'}:
         args.b3sum = args.b3sum.resolve(strict=True)
         paths.append(args.b3sum)
     for path in paths:
@@ -417,11 +486,11 @@ def main():
         'binaries': {name: {'path': str(path), 'sha256': common.sha256(path),
                             'source_claim': getattr(args, f'{name}_source')} for name, path in binaries.items()},
         'git': {'path': str(args.git), 'sha256': common.sha256(args.git)},
-        'b3sum': {'path': str(args.b3sum), 'sha256': common.sha256(args.b3sum)} if 'digest' in args.workloads else None,
+        'b3sum': {'path': str(args.b3sum), 'sha256': common.sha256(args.b3sum)} if set(args.workloads) & {'digest', 'startup'} else None,
         'host': {'system': platform.system(), 'release': platform.release(), 'machine': platform.machine(),
                  'python': platform.python_version(), 'cpu_count': os.cpu_count()},
         'harness_sha256': common.sha256(Path(__file__)), 'helper_sha256': common.sha256(helper),
-        'timing_contract': 'rename syscall only; digest getxattr query/value syscall only; all preparation/hashing/verification outside timers',
+        'timing_contract': 'Startup: command/mount readiness plus opt-in internal phase telemetry; no additive overlapping sums. Other workloads: rename syscall only; digest getxattr query/value syscall only; all preparation/hashing/verification outside timers',
         'counter_scope': 'shutdown counters include untimed preparation, verification and chmod probes; optional, never synthesize zeros'}
     if not args.run:
         print(json.dumps(result, indent=2))
@@ -446,7 +515,7 @@ def main():
     for trial in range(args.trials):
         order = list(binaries) if trial % 2 == 0 else list(reversed(binaries))
         for workload in args.workloads:
-            counts = args.entry_counts if workload == 'rename' else [0]
+            counts = args.entry_counts if workload in ('rename', 'startup') else [0]
             for count in counts:
                 for arm in order:
                     directory = args.output / f'trial-{trial + 1}-{workload}-{count}-{arm}'
@@ -455,6 +524,8 @@ def main():
                     result['cells'].append(cell.result)
                     print(f'start {directory.name}', flush=True)
                     signal.alarm(args.cell_budget)
+                    cell_started = time.monotonic()
+                    resources_before = resource.getrusage(resource.RUSAGE_CHILDREN)
                     try:
                         cell.execute()
                     except BaseException as error:
@@ -472,6 +543,13 @@ def main():
                             except BaseException as error:
                                 cell.result.update(status='failed', mapping_cleanup_error=str(error))
                         cell.collect_stats()
+                        cell.result['cell_wall_seconds'] = time.monotonic() - cell_started
+                        resources_after = resource.getrusage(resource.RUSAGE_CHILDREN)
+                        cell.result['reaped_child_resources'] = {
+                            'user_cpu_seconds': resources_after.ru_utime - resources_before.ru_utime,
+                            'system_cpu_seconds': resources_after.ru_stime - resources_before.ru_stime,
+                            'block_inputs': resources_after.ru_inblock - resources_before.ru_inblock,
+                            'block_outputs': resources_after.ru_oublock - resources_before.ru_oublock}
                         if directory.exists():
                             cell.save()
                         common.checkpoint(args.output / 'results.json', result)
@@ -492,10 +570,20 @@ def main():
                     values[f'epoch{phase["epoch"]}:{kind}:{name}'] = times
         for name, times in values.items():
             summary.setdefault(name, []).append(sum(times))
+    for cell in result['cells']:
+        for item in cell.get('startup', []):
+            key = f'startup-{cell["entries"]}-{cell["arm"]}-{item["revision_kind"]}'
+            summary = result['summary'].setdefault(key, {})
+            for index, seconds in enumerate(item['mount_seconds']):
+                summary.setdefault(f'mount-{index + 1}', []).append(seconds)
+            for index, command in enumerate(item['mapping_commands']):
+                summary.setdefault(f'mapping-command-{index + 1}', []).append(command['seconds'])
     for summary in result['summary'].values():
         for name, values in summary.items():
             summary[name] = {'median_seconds': statistics.median(values), 'min_seconds': min(values),
-                             'max_seconds': max(values), 'trials': len(values)}
+                             'max_seconds': max(values), 'trials': len(values),
+                             'p95_seconds': sorted(values)[max(0, math.ceil(.95 * len(values)) - 1)],
+                             'p95_note': 'nearest-rank; small trial counts do not establish stable tail latency'}
     common.checkpoint(args.output / 'results.json', result)
     print(json.dumps(result['summary'], indent=2))
     return 0

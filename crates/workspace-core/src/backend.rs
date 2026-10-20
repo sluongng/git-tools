@@ -297,6 +297,7 @@ impl GitRepo {
             .into_iter()
             .collect();
         oids.sort();
+        let enumeration_seconds = started.elapsed().as_secs_f64();
         let cached = self.cache_lock()?.blake3_many(&oids)?;
         let missing: Vec<_> = oids
             .iter()
@@ -322,6 +323,17 @@ impl GitRepo {
             self.cache_lock()?.persist_blake3(&mappings)?;
             size_bytes = next_size_bytes;
             requests += 1;
+        }
+        if std::env::var_os("GIT_TOOLS_METADATA_TIMINGS").is_some() {
+            eprintln!(
+                "METADATA_TIMING {}",
+                serde_json::json!({
+                    "phase": "mapping_import", "entries": snapshot.nodes.len(),
+                    "unique_blobs": oids.len(), "cached_blobs": cached.len(), "requests": requests,
+                    "enumeration_seconds": enumeration_seconds,
+                    "total_seconds": started.elapsed().as_secs_f64(),
+                })
+            );
         }
         Ok(Blake3WarmReport {
             unique_blobs: oids.len(),

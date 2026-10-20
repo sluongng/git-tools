@@ -22,7 +22,7 @@ try:
         raise ValueError("unsupported host")
     selected = []
     for line in Path(__CREDENTIAL_RC__).open():
-        if not line.startswith("common:remote-shared "):
+        if not line.startswith(__CREDENTIAL_CONFIG__ + " "):
             continue
         words = shlex.split(line, comments=True)
         selected.extend(w.split("=", 1)[1] for w in words[1:] if w.startswith("--remote_header="))
@@ -39,13 +39,16 @@ except Exception:
 
 
 @contextmanager
-def credential_helper(rc_path):
+def credential_helper(rc_path, config="remote-shared"):
     """Yield a host-restricted helper; the selected credential never leaves memory."""
+    if config not in {"remote-shared", "rbe"}:
+        raise ValueError("Unknown credential configuration class")
     with tempfile.TemporaryDirectory(prefix="git-tools-rbe-credential-") as directory:
         helper_dir = Path(directory)
         os.chmod(helper_dir, 0o700)
         helper = helper_dir / "credential-helper"
-        helper.write_text(HELPER.replace("__CREDENTIAL_RC__", repr(str(Path(rc_path).resolve()))))
+        helper.write_text(HELPER.replace("__CREDENTIAL_RC__", repr(str(Path(rc_path).resolve())))
+                          .replace("__CREDENTIAL_CONFIG__", repr("common:" + config)))
         helper.chmod(0o700)
         yield helper
 

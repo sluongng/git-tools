@@ -109,6 +109,7 @@ impl Store {
         gitdir: &Path,
         mut visit: impl FnMut(&Entry) -> Result<()>,
     ) -> Result<Self> {
+        let started = std::time::Instant::now();
         let endpoint = Endpoint::new(directory)?;
         let mut lock = endpoint.lock()?;
         ensure!(
@@ -117,6 +118,7 @@ impl Store {
         );
         let handles = Handles::open(directory, true)?;
         let mut tx = handles.db.write_tx().durability(Some(PersistMode::SyncAll));
+        let reused_baseline = tx.get(&handles.meta, b"commit")?.is_some();
         if let Some(commit) = tx.get(&handles.meta, b"commit")? {
             ensure!(
                 &*commit == snapshot.commit.as_bytes(),
@@ -196,6 +198,7 @@ impl Store {
         }
         tx.insert(&handles.meta, b"payload_format", b"2");
         tx.commit()?;
+        let baseline_seconds = started.elapsed().as_secs_f64();
         let files = Files::open(directory)?;
         Self::recover(&handles, &files)?;
         journal::initialize(&handles)?;
@@ -344,6 +347,16 @@ impl Store {
         // must stop workers/drop database handles before releasing ownership.
         let mut service = Service::start(endpoint, handles.clone())?;
         service._lock = Some(lock);
+        if std::env::var_os("GIT_TOOLS_METADATA_TIMINGS").is_some() {
+            eprintln!(
+                "METADATA_TIMING {}",
+                serde_json::json!({
+                    "phase": "overlay_open", "entries": snapshot.nodes().len(),
+                    "reused_baseline": reused_baseline, "baseline_seconds": baseline_seconds,
+                    "total_seconds": started.elapsed().as_secs_f64(),
+                })
+            );
+        }
         Ok(Self {
             handles: Some(handles),
             service: Some(service),

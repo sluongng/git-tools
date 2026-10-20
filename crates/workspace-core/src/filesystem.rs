@@ -97,6 +97,7 @@ impl Snapshot {
     }
 
     pub fn load(repo: &GitRepo, revision: &str) -> Result<Self> {
+        let started = std::time::Instant::now();
         let spec = format!("{revision}^{{commit}}");
         let commit = String::from_utf8(
             repo.git_output(&["rev-parse", "--verify", "--end-of-options", &spec], false)?,
@@ -141,6 +142,7 @@ impl Snapshot {
             &["ls-tree", "-r", "-t", "-z", "--full-tree", &commit],
             false,
         )?;
+        let enumeration_seconds = started.elapsed().as_secs_f64();
         for record in tree.split(|&b| b == 0).filter(|r| !r.is_empty()) {
             let tab = record
                 .iter()
@@ -214,6 +216,16 @@ impl Snapshot {
                 children: Vec::new(),
             });
             nodes[(parent - 1) as usize].children.push(inode);
+        }
+        if std::env::var_os("GIT_TOOLS_METADATA_TIMINGS").is_some() {
+            eprintln!(
+                "METADATA_TIMING {}",
+                serde_json::json!({
+                    "phase": "snapshot_load", "commit": commit, "entries": nodes.len(),
+                    "tree_output_bytes": tree.len(), "enumeration_seconds": enumeration_seconds,
+                    "total_seconds": started.elapsed().as_secs_f64(),
+                })
+            );
         }
         Ok(Self {
             commit,
