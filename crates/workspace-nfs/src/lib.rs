@@ -5,7 +5,10 @@ use nfsserve::{nfs::*, vfs::*};
 use std::ffi::OsStr;
 use std::io::Write;
 use std::os::unix::ffi::OsStrExt;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+
+pub mod host;
 use std::time::{SystemTime, UNIX_EPOCH};
 use workspace_core::backend::{ContentConfig, ContentScheduler, ContentStats, GitRepo};
 use workspace_overlay::overlay::{Kind, Overlay, Payload};
@@ -20,6 +23,7 @@ struct State {
 
 #[derive(Clone)]
 pub struct GitNfs {
+    closed: Arc<AtomicBool>,
     state: Arc<Mutex<State>>,
     // Mount-scoped workers outlive every cloned RPC endpoint.
     content: Arc<ContentScheduler>,
@@ -151,6 +155,7 @@ impl GitNfs {
         let content = Arc::new(ContentScheduler::new(&mut repo, ContentConfig::default())?);
         repo.set_content_handle(content.handle());
         Ok(Self {
+            closed: Arc::new(AtomicBool::new(false)),
             state: Arc::new(Mutex::new(State {
                 repo,
                 overlay,
@@ -164,8 +169,12 @@ impl GitNfs {
         action: impl FnOnce(&mut State) -> Result<T, nfsstat3> + Send + 'static,
     ) -> Result<T, nfsstat3> {
         let state = self.state.clone();
+        let closed = self.closed.clone();
         tokio::task::spawn_blocking(move || {
             let mut guard = state.lock().map_err(|_| nfsstat3::NFS3ERR_SERVERFAULT)?;
+            if closed.load(Ordering::Acquire) {
+                return Err(nfsstat3::NFS3ERR_STALE);
+            }
             action(&mut guard)
         })
         .await
@@ -201,6 +210,25 @@ impl GitNfs {
     /// Cancels the mount, not an individual request or a shared external Git.
     pub fn cancel_content(&self) {
         self.content.cancel();
+    }
+    /// Reject queued and future RPC operations, including old TCP connections.
+    /// Call only after the native client has unmounted this export.
+    pub fn close_admission(&self) {
+        self.closed.store(true, Ordering::Release);
+        self.cancel_content();
+    }
+    /// Flush after closing admission. Already-admitted mutations finish first.
+    pub async fn close(&self) -> anyhow::Result<()> {
+        self.close_admission();
+        let state = self.state.clone();
+        tokio::task::spawn_blocking(move || {
+            let mut state = state
+                .lock()
+                .map_err(|_| anyhow::anyhow!("NFS state poisoned"))?;
+            state.overlay.sync()
+        })
+        .await??;
+        Ok(())
     }
     /// Immutable hydration counters, independent of mutable overlay storage.
     pub fn content_stats(&self) -> ContentStats {

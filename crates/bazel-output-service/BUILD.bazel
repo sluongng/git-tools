@@ -29,7 +29,7 @@ cargo_build_script(
 
 rust_library(
     name = "bazel-output-service",
-    srcs = ["src/lib.rs"],
+    srcs = glob(["src/**/*.rs"], exclude = ["src/main.rs"]),
     aliases = aliases(),
     crate_name = "bazel_output_service",
     crate_root = "src/lib.rs",

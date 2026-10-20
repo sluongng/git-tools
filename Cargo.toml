@@ -1,6 +1,8 @@
 [workspace]
 members = [
     "crates/agent-session",
+    "crates/cache-proxy",
+    "crates/workspace-daemon",
     "crates/workspace-core",
     "crates/workspace-overlay",
     "crates/workspace-fuse",

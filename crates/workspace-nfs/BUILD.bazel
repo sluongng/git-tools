@@ -8,7 +8,7 @@ package(default_visibility = ["//visibility:public"])
 
 rust_library(
     name = "workspace-nfs",
-    srcs = ["src/lib.rs"],
+    srcs = glob(["src/**/*.rs"], exclude = ["src/main.rs"]),
     aliases = aliases(),
     crate_name = "workspace_nfs",
     edition = "2024",

@@ -10,6 +10,32 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const VERSION: u32 = 1;
 
+/// A source mount hosted by the shared daemon. Writable state remains private.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MountRequest {
+    pub session: PathBuf,
+    pub repo: PathBuf,
+    pub revision: String,
+    pub overlay: PathBuf,
+    pub mountpoint: PathBuf,
+    pub proxy_url: String,
+    pub proxy_repo: String,
+    pub git: PathBuf,
+    pub timeout_seconds: u64,
+}
+
+/// External lifecycle authority. No daemon PID is stored as a killable child.
+pub trait MountController {
+    fn mount(&self, request: MountRequest) -> Result<()>;
+    fn unmount(&self, session: &Path) -> Result<()>;
+    fn is_mounted(&self, session: &Path) -> Result<bool>;
+    /// Enforced cache/BOS flags, appended after user rc and command arguments.
+    fn bazel_args(&self) -> Result<Vec<String>> {
+        Ok(Vec::new())
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Settings {
@@ -50,6 +76,8 @@ struct Manifest {
     phase: String,
     mount: Option<Process>,
     #[serde(default)]
+    daemon_managed: bool,
+    #[serde(default)]
     timings_ms: Vec<(String, u128)>,
     #[serde(default)]
     last_successful_build_unix_ms: Option<u128>,
@@ -68,6 +96,7 @@ pub struct Report {
     pub last_successful_build_unix_ms: Option<u128>,
     pub last_successful_save_unix_ms: Option<u128>,
     pub process_verified: bool,
+    pub daemon_managed: bool,
     pub workspace: PathBuf,
     /// Pinned explicit path, or Bazel's default/provisioned rc policy when None.
     pub repo_contents_cache: Option<PathBuf>,
@@ -192,18 +221,30 @@ fn lock(root: &Path) -> Result<File> {
     Ok(file)
 }
 
-fn validate(settings: &Settings) -> Result<()> {
+fn validate(settings: &Settings, daemon_managed: bool) -> Result<()> {
     let authority = settings
         .proxy_url
         .strip_prefix("http://")
         .or_else(|| settings.proxy_url.strip_prefix("https://"))
         .context("proxy URL must be an HTTP(S) origin")?;
+    let local_capability = daemon_managed
+        && settings.proxy_url.starts_with("http://")
+        && authority
+            .trim_end_matches('/')
+            .split_once('/')
+            .is_some_and(|(address, path)| {
+                address
+                    .parse::<std::net::SocketAddr>()
+                    .is_ok_and(|address| address.ip().is_loopback() && address.port() != 0)
+                    && path.len() == 64
+                    && path.bytes().all(|byte| byte.is_ascii_hexdigit())
+            });
     ensure!(
         !authority.is_empty()
             && !authority.contains(['@', '?', '#'])
             && !authority.chars().any(char::is_whitespace)
-            && !authority.trim_end_matches('/').contains('/'),
-        "proxy URL must be an origin without credentials, query or path"
+            && (local_capability || !authority.trim_end_matches('/').contains('/')),
+        "proxy URL must not contain embedded credentials, query or fragment; only daemon-owned loopback capability prefixes are allowed"
     );
     ensure!(
         !settings.proxy_repo.is_empty()
@@ -279,7 +320,7 @@ impl Session {
             manifest.session_root == root,
             "session manifest belongs to a different directory; copied/moved sessions cannot control the original processes"
         );
-        validate(&manifest.settings)?;
+        validate(&manifest.settings, manifest.daemon_managed)?;
         Ok(Self {
             root,
             manifest,
@@ -368,16 +409,29 @@ impl Session {
     }
 
     fn report(&self) -> Result<Report> {
+        self.report_with_controller(None)
+    }
+
+    fn report_with_controller(&self, controller: Option<&dyn MountController>) -> Result<Report> {
+        let mount_present = mounted(&self.root.join("workspace"))?;
+        let verified = if self.manifest.daemon_managed {
+            match controller {
+                Some(controller) => controller.is_mounted(&self.root)?,
+                None => false,
+            }
+        } else {
+            self.manifest.mount.as_ref().is_some_and(process_matches)
+        };
         Ok(Report {
             session: self.root.clone(),
             revision: self.manifest.settings.revision.clone(),
             phase: self.manifest.phase.clone(),
-            edit_ready: mounted(&self.root.join("workspace"))?
-                && self.manifest.mount.as_ref().is_some_and(process_matches),
-            mounted: mounted(&self.root.join("workspace"))?,
+            edit_ready: mount_present && verified,
+            mounted: mount_present,
             last_successful_build_unix_ms: self.manifest.last_successful_build_unix_ms,
             last_successful_save_unix_ms: self.manifest.last_successful_save_unix_ms,
-            process_verified: self.manifest.mount.as_ref().is_some_and(process_matches),
+            process_verified: verified,
+            daemon_managed: self.manifest.daemon_managed,
             workspace: self.root.join("workspace"),
             repo_contents_cache: self.manifest.settings.repo_contents_cache.clone(),
             repo_contents_cache_policy: if self.manifest.settings.repo_contents_cache.is_some() {
@@ -394,8 +448,8 @@ impl Session {
         })
     }
 
-    fn ready(&self) -> Result<()> {
-        let report = self.report()?;
+    fn ready_with_controller(&self, controller: Option<&dyn MountController>) -> Result<()> {
+        let report = self.report_with_controller(controller)?;
         ensure!(
             report.mounted && report.process_verified,
             "session is not ready; inspect status/vfs.log, then resume"
@@ -404,9 +458,17 @@ impl Session {
     }
 
     fn start(&mut self) -> Result<()> {
+        self.start_with_controller(None)
+    }
+
+    fn start_with_controller(&mut self, controller: Option<&dyn MountController>) -> Result<()> {
+        ensure!(
+            self.manifest.daemon_managed == controller.is_some(),
+            "session lifecycle owner differs; use the workspace daemon for daemon-managed sessions"
+        );
         self.check_shared_cache()?;
         if mounted(&self.root.join("workspace"))? {
-            self.ready()?;
+            self.ready_with_controller(controller)?;
             self.manifest.phase = "edit_ready".into();
             return self.persist();
         }
@@ -447,6 +509,28 @@ impl Session {
                     .eq_ignore_ascii_case(&revision),
             "pinned revision does not resolve to the requested commit"
         );
+        if let Some(controller) = controller {
+            self.manifest.phase = "mounting".into();
+            self.persist()?;
+            let started = Instant::now();
+            controller.mount(MountRequest {
+                session: self.root.clone(),
+                repo,
+                revision,
+                overlay: self.root.join("overlay"),
+                mountpoint: self.root.join("workspace"),
+                proxy_url,
+                proxy_repo,
+                git: self.manifest.settings.git.clone(),
+                timeout_seconds: self.manifest.settings.mount_timeout_seconds,
+            })?;
+            self.ready_with_controller(Some(controller))?;
+            self.timings
+                .push(("mount_ready".into(), started.elapsed().as_millis()));
+            self.manifest.timings_ms = self.timings.clone();
+            self.manifest.phase = "edit_ready".into();
+            return self.persist();
+        }
         let mut warm = self.vfs();
         warm.arg("warm-blake3").arg("--repo").arg(&repo).args([
             "--revision",
@@ -526,9 +610,25 @@ impl Session {
     }
 }
 
-pub fn create(root: &Path, mut settings: Settings) -> Result<Report> {
+pub fn create(root: &Path, settings: Settings) -> Result<Report> {
+    create_inner(root, settings, None)
+}
+
+pub fn create_with_controller(
+    root: &Path,
+    settings: Settings,
+    controller: &dyn MountController,
+) -> Result<Report> {
+    create_inner(root, settings, Some(controller))
+}
+
+fn create_inner(
+    root: &Path,
+    mut settings: Settings,
+    controller: Option<&dyn MountController>,
+) -> Result<Report> {
     platform()?;
-    validate(&settings)?;
+    validate(&settings, controller.is_some())?;
     if let Some(cache) = &mut settings.repo_contents_cache {
         *cache = cache
             .canonicalize()
@@ -538,7 +638,9 @@ pub fn create(root: &Path, mut settings: Settings) -> Result<Report> {
             "shared repo contents cache must be a directory"
         );
     }
-    settings.git_vfs = executable(&settings.git_vfs)?;
+    if controller.is_none() {
+        settings.git_vfs = executable(&settings.git_vfs)?;
+    }
     settings.git = executable(&settings.git)?;
     settings.bazel = executable(&settings.bazel)?;
     settings.bazelrc = settings
@@ -564,6 +666,7 @@ pub fn create(root: &Path, mut settings: Settings) -> Result<Report> {
             settings,
             phase: "creating".into(),
             mount: None,
+            daemon_managed: controller.is_some(),
             timings_ms: vec![],
             last_successful_build_unix_ms: None,
             last_successful_save_unix_ms: None,
@@ -573,10 +676,56 @@ pub fn create(root: &Path, mut settings: Settings) -> Result<Report> {
     };
     session.check_shared_cache()?;
     session.persist()?;
-    let mut clone = session.vfs();
+    let mut clone = if controller.is_some() {
+        let mut command = Command::new(&session.manifest.settings.git);
+        isolate_git_context(&mut command);
+        command.args([
+            "--no-replace-objects",
+            "-c",
+            "protocol.version=2",
+            "clone",
+            "--bare",
+            "--filter=blob:none",
+            "--single-branch",
+            "--no-local",
+        ]);
+        command
+    } else {
+        let mut command = session.vfs();
+        command.arg("clone");
+        command
+    };
+    // Keep the daemon's local HTTP capability out of process arguments. Git
+    // receives HTTP authorization via its private environment during clone;
+    // later native fetches read the equivalent private repository configuration.
+    let proxy = session
+        .manifest
+        .settings
+        .proxy_url
+        .trim_end_matches('/')
+        .to_owned();
+    let capability_origin = if controller.is_some() {
+        proxy
+            .rsplit_once('/')
+            .filter(|(_, suffix)| {
+                suffix.len() == 64 && suffix.bytes().all(|byte| byte.is_ascii_hexdigit())
+            })
+            .map(|(origin, _)| origin.to_owned())
+    } else {
+        None
+    };
+    if let Some(origin) = &capability_origin {
+        let token = proxy.rsplit('/').next().expect("validated capability");
+        clone
+            .env("GIT_CONFIG_COUNT", "1")
+            .env("GIT_CONFIG_KEY_0", format!("http.{origin}/.extraHeader"))
+            .env(
+                "GIT_CONFIG_VALUE_0",
+                format!("authorization: Bearer {token}"),
+            );
+    }
     clone
         .args([
-            "clone",
             "--depth",
             "1",
             "--branch",
@@ -584,13 +733,24 @@ pub fn create(root: &Path, mut settings: Settings) -> Result<Report> {
         ])
         .arg(format!(
             "{}/git/{}.git",
-            session.manifest.settings.proxy_url.trim_end_matches('/'),
+            capability_origin.as_deref().unwrap_or(&proxy),
             session.manifest.settings.proxy_repo
         ))
         .arg(session.root.join("repo.git"));
     session.run("clone", &mut clone)?;
-    session.start()?;
-    session.report()
+    if let Some(origin) = &capability_origin {
+        let token = proxy.rsplit('/').next().expect("validated capability");
+        let mut config = OpenOptions::new()
+            .append(true)
+            .open(session.root.join("repo.git/config"))?;
+        writeln!(
+            config,
+            "\n[http \"{origin}/\"]\n\textraHeader = authorization: Bearer {token}"
+        )?;
+        config.sync_all()?;
+    }
+    session.start_with_controller(controller)?;
+    session.report_with_controller(controller)
 }
 
 pub fn resume(root: &Path) -> Result<Report> {
@@ -598,12 +758,53 @@ pub fn resume(root: &Path) -> Result<Report> {
     session.start()?;
     session.report()
 }
+pub fn resume_with_controller(root: &Path, controller: &dyn MountController) -> Result<Report> {
+    let mut session = Session::open(root)?;
+    session.start_with_controller(Some(controller))?;
+    session.report_with_controller(Some(controller))
+}
 pub fn status(root: &Path) -> Result<Report> {
     Session::open(root)?.report()
 }
 
+pub fn status_with_controller(root: &Path, controller: &dyn MountController) -> Result<Report> {
+    Session::open(root)?.report_with_controller(Some(controller))
+}
+
 pub fn build(root: &Path, args: &[String]) -> Result<Report> {
-    ensure!(!args.is_empty(), "build requires at least one target");
+    bazel_operation(root, "build", args, None)
+}
+
+pub fn test(root: &Path, args: &[String]) -> Result<Report> {
+    bazel_operation(root, "test", args, None)
+}
+
+pub fn build_with_controller(
+    root: &Path,
+    args: &[String],
+    controller: &dyn MountController,
+) -> Result<Report> {
+    bazel_operation(root, "build", args, Some(controller))
+}
+
+pub fn test_with_controller(
+    root: &Path,
+    args: &[String],
+    controller: &dyn MountController,
+) -> Result<Report> {
+    bazel_operation(root, "test", args, Some(controller))
+}
+
+fn bazel_operation(
+    root: &Path,
+    operation: &str,
+    args: &[String],
+    controller: Option<&dyn MountController>,
+) -> Result<Report> {
+    ensure!(
+        !args.is_empty(),
+        "Bazel operation requires at least one target"
+    );
     let mut session = Session::open(root)?;
     if session.manifest.settings.repo_contents_cache.is_some() {
         ensure!(
@@ -615,11 +816,15 @@ pub fn build(root: &Path, args: &[String]) -> Result<Report> {
             "repo contents cache is pinned by session settings; select it at create time rather than overriding build arguments"
         );
     }
-    session.ready()?;
+    session.ready_with_controller(controller)?;
     session.check_shared_cache()?;
     let mut command = session.bazel();
-    command.arg("build");
-    if let Some(cache) = &session.manifest.settings.repo_contents_cache {
+    command.arg(operation);
+    let enforced = controller
+        .map(|c| c.bazel_args())
+        .transpose()?
+        .unwrap_or_default();
+    if session.manifest.settings.repo_contents_cache.is_some() || !enforced.is_empty() {
         // A trailing explicit value overrides earlier --config expansions. Keep
         // it before an optional target separator so Bazel still parses it.
         let separator = args
@@ -627,22 +832,41 @@ pub fn build(root: &Path, args: &[String]) -> Result<Report> {
             .position(|arg| arg == "--")
             .unwrap_or(args.len());
         command.args(&args[..separator]);
-        command.arg(format!("--repo_contents_cache={}", cache.display()));
+        if let Some(cache) = &session.manifest.settings.repo_contents_cache {
+            command.arg(format!("--repo_contents_cache={}", cache.display()));
+        }
+        command.args(enforced);
         command.args(&args[separator..]);
     } else {
         command.args(args);
     }
-    session.run("build", &mut command)?;
+    session.run(operation, &mut command)?;
     session.manifest.last_successful_build_unix_ms =
         Some(SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis());
     session.manifest.phase = "edit_ready".into();
     session.persist()?;
-    session.report()
+    session.report_with_controller(controller)
 }
 
 pub fn save(root: &Path, args: &[String]) -> Result<Report> {
+    save_inner(root, args, None)
+}
+
+pub fn save_with_controller(
+    root: &Path,
+    args: &[String],
+    controller: &dyn MountController,
+) -> Result<Report> {
+    save_inner(root, args, Some(controller))
+}
+
+fn save_inner(
+    root: &Path,
+    args: &[String],
+    controller: Option<&dyn MountController>,
+) -> Result<Report> {
     let mut session = Session::open(root)?;
-    session.ready()?;
+    session.ready_with_controller(controller)?;
     let mut command = Command::new(&session.manifest.settings.git);
     isolate_git_context(&mut command);
     command
@@ -655,11 +879,23 @@ pub fn save(root: &Path, args: &[String]) -> Result<Report> {
         Some(SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis());
     session.manifest.phase = "edit_ready".into();
     session.persist()?;
-    session.report()
+    session.report_with_controller(controller)
 }
 
 pub fn stop(root: &Path) -> Result<Report> {
+    stop_inner(root, None)
+}
+
+pub fn stop_with_controller(root: &Path, controller: &dyn MountController) -> Result<Report> {
+    stop_inner(root, Some(controller))
+}
+
+fn stop_inner(root: &Path, controller: Option<&dyn MountController>) -> Result<Report> {
     let mut session = Session::open(root)?;
+    ensure!(
+        session.manifest.daemon_managed == controller.is_some(),
+        "session lifecycle owner differs; use workspace stop for daemon-managed sessions"
+    );
     // Do not create a new Bazel server solely to stop it.
     if session
         .root
@@ -683,7 +919,13 @@ pub fn stop(root: &Path) -> Result<Report> {
         command.arg("--nobatch").arg("shutdown");
         session.run("bazel_shutdown", &mut command)?;
     }
-    if let Some(process) = session
+    if let Some(controller) = controller {
+        let started = Instant::now();
+        controller.unmount(&session.root)?;
+        session
+            .timings
+            .push(("vfs_shutdown".into(), started.elapsed().as_millis()));
+    } else if let Some(process) = session
         .manifest
         .mount
         .as_ref()
@@ -710,7 +952,7 @@ pub fn stop(root: &Path) -> Result<Report> {
     session.manifest.mount = None;
     session.manifest.phase = "stopped".into();
     session.persist()?;
-    session.report()
+    session.report_with_controller(controller)
 }
 
 #[cfg(target_os = "linux")]

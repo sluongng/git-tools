@@ -677,3 +677,53 @@ async fn repeated_immutable_ranges_reuse_the_verified_spool() {
     assert_eq!(fs.content_stats().local_bytes, extracted);
     assert!(fs.content_stats().cache_hits >= 3);
 }
+
+#[tokio::test]
+async fn export_host_closes_admission_and_preserves_writes_on_restart() {
+    use workspace_nfs::host::{ExportConfig, ExportHost};
+    let dir = fixture();
+    let repo = GitRepo::open(
+        dir.path().join("repo.git"),
+        "git",
+        "origin",
+        SizeFallback::Fetch,
+    )
+    .unwrap();
+    let snapshot = Snapshot::load(&repo, "HEAD").unwrap();
+    let mut host = ExportHost::start(
+        repo,
+        snapshot,
+        ExportConfig {
+            mountpoint: dir.path().join("mount"),
+            overlay: dir.path().join("state"),
+            listen: "127.0.0.1:0".parse().unwrap(),
+            git_vfs_executable: std::path::PathBuf::from(env!("CARGO_BIN_EXE_git-nfs")),
+        },
+    )
+    .await
+    .unwrap();
+    let fs = host.filesystem();
+    let id = fs
+        .lookup(fs.root_dir(), &b"hello.txt"[..].into())
+        .await
+        .unwrap();
+    fs.write(id, 0, b"HELLO").await.unwrap();
+    let mut args = Vec::new();
+    opaque(&mut args, &fs.id_to_fh(id).data);
+    let attrs = rpc(host.port(), 1, args).await;
+    assert_eq!(&attrs[..4], &[0; 4]);
+    host.shutdown().await.unwrap();
+    host.shutdown().await.unwrap();
+    assert!(host.is_finished());
+    assert!(matches!(
+        fs.write(id, 0, b"wrong").await,
+        Err(nfsstat3::NFS3ERR_STALE)
+    ));
+    drop(fs);
+    drop(host);
+    let reopened = open(dir.path());
+    assert_eq!(
+        reopened.read(id, 0, 100).await.unwrap().0,
+        b"HELLO from Git\n"
+    );
+}

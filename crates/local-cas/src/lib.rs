@@ -282,23 +282,37 @@ struct Recency {
 struct Checkpoint {
     last: std::time::Instant,
 }
+// Preserve typed source errors across coalesced waiters without coupling this
+// crate to a transport. Adapters can inspect e.g. tonic::Status in the chain.
+#[derive(Debug)]
+struct SharedFailure(Arc<anyhow::Error>);
+impl std::fmt::Display for SharedFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+impl std::error::Error for SharedFailure {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(self.0.as_ref().as_ref())
+    }
+}
 #[derive(Clone)]
 enum FlightFailure {
     Timeout,
-    Other(String),
+    Other(Arc<anyhow::Error>),
 }
 impl FlightFailure {
     fn from_error(error: anyhow::Error) -> Self {
         if error.downcast_ref::<CacheTimeoutError>().is_some() {
             Self::Timeout
         } else {
-            Self::Other(format!("{error:#}"))
+            Self::Other(Arc::new(error))
         }
     }
     fn into_error(self) -> anyhow::Error {
         match self {
             Self::Timeout => CacheTimeoutError.into(),
-            Self::Other(message) => anyhow::Error::msg(message),
+            Self::Other(error) => anyhow::Error::new(SharedFailure(error)),
         }
     }
 }
@@ -780,8 +794,8 @@ impl LocalCas {
                 .await
                 {
                     Ok(result) => result.map_err(FlightFailure::from_error),
-                    Err(error) => Err(FlightFailure::Other(format!(
-                        "cache worker failed: {error}"
+                    Err(error) => Err(FlightFailure::Other(Arc::new(
+                        anyhow::Error::new(error).context("cache worker failed"),
                     ))),
                 };
                 let complete = flight.complete.clone();
@@ -853,13 +867,34 @@ impl LocalCas {
             .fetch_add(result.1, Ordering::Relaxed);
         Ok(result)
     }
-    async fn obtain(
+    /// Return an existing verified lease without joining or creating a hydration
+    /// flight. A local-only consumer cannot publish its source's miss/failure to
+    /// another consumer that can hydrate the same artifact from upstream.
+    pub async fn cached_content(
+        self: Arc<Self>,
+        artifact: Artifact,
+    ) -> Result<Option<Arc<CachedBlob>>> {
+        artifact.validate()?;
+        let deadline = tokio::time::Instant::now() + self.config.operation_timeout;
+        tokio::time::timeout_at(deadline, async {
+            let request = Arc::new(
+                self.requests
+                    .clone()
+                    .acquire_owned()
+                    .await
+                    .context("cache shutting down")?,
+            );
+            self.cached_inner(&artifact, deadline, request).await
+        })
+        .await
+        .map_err(|_| anyhow::Error::from(CacheTimeoutError))?
+    }
+    async fn cached_inner(
         self: Arc<Self>,
         artifact: &Artifact,
         deadline: tokio::time::Instant,
-        source: Arc<dyn BlobSource>,
         request: Arc<OwnedSemaphorePermit>,
-    ) -> Result<Arc<CachedBlob>> {
+    ) -> Result<Option<Arc<CachedBlob>>> {
         let path = self.dir.join(Self::key(artifact)?);
         let verified = {
             let mut state = self.files.lock().unwrap();
@@ -908,7 +943,7 @@ impl LocalCas {
                 entry.accessed = rank;
                 state.changed();
                 self.hits.fetch_add(1, Ordering::Relaxed);
-                return Ok(lease);
+                return Ok(Some(lease));
             }
             drop(lease);
             let mut state = self.files.lock().unwrap();
@@ -925,6 +960,23 @@ impl LocalCas {
             })?;
             state.remove(&path);
         }
+        Ok(None)
+    }
+    async fn obtain(
+        self: Arc<Self>,
+        artifact: &Artifact,
+        deadline: tokio::time::Instant,
+        source: Arc<dyn BlobSource>,
+        request: Arc<OwnedSemaphorePermit>,
+    ) -> Result<Arc<CachedBlob>> {
+        if let Some(blob) = self
+            .clone()
+            .cached_inner(artifact, deadline, request.clone())
+            .await?
+        {
+            return Ok(blob);
+        }
+        let path = self.dir.join(Self::key(artifact)?);
         // Large streamed objects get their own explicitly budgeted lane. They
         // do not consume the normal lane's byte permits, but share the global
         // request cap and the on-disk reservation accounting.

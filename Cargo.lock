@@ -458,6 +458,26 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0d74937895e761d5984206f82ca8ff7725d0fd8021921011921894b41ab1b9f7"
 
 [[package]]
+name = "cache-proxy"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-compression",
+ "async-stream",
+ "async-trait",
+ "blake3",
+ "futures-core",
+ "local-cas",
+ "prost",
+ "reapi",
+ "sha2 0.10.9",
+ "tempfile",
+ "tokio",
+ "tokio-stream",
+ "tonic",
+]
+
+[[package]]
 name = "cap-fs-ext"
 version = "3.4.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6105,14 +6125,47 @@ name = "workspace-core"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-trait",
+ "blake3",
  "fjall",
  "hex",
  "libc",
+ "local-cas",
  "reqwest",
  "serde",
  "serde_json",
+ "sha1",
  "tempfile",
+ "tokio",
  "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "workspace-daemon"
+version = "0.1.0"
+dependencies = [
+ "agent-session",
+ "anyhow",
+ "async-trait",
+ "axum",
+ "bazel-output-service",
+ "cache-proxy",
+ "clap",
+ "fs2",
+ "git-proxy",
+ "libc",
+ "local-cas",
+ "reapi",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tokio-stream",
+ "toml",
+ "tonic",
+ "uuid",
+ "workspace-core",
+ "workspace-fuse",
 ]
 
 [[package]]

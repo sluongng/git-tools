@@ -15,6 +15,7 @@ for cache boundaries, provenance, output correctness and cleanup.
 | Fresh agent → first BuildBuddy RBE build | `benchmark_proxy_agent_rbe.py` |
 | Repeated source edit/status/RBE build | `benchmark_iterative_agent_rbe.py` |
 | Private agents sharing a proxy | `benchmark_concurrent_agents.py` (smoke or opt-in paired performance) |
+| Direct remote cache vs shared-daemon cache | `benchmark_shared_daemon.py` |
 | Local VFS subsystem costs | `benchmark_vfs_{iteration,ranges,journal,metadata,hydration,content}.py` |
 | This project's local/RBE Rust build iteration | `benchmark_developer_build.py` |
 
@@ -78,6 +79,17 @@ Local CAS component measurement:
 ```sh
 bazel run --config=rbe //crates/local-cas:cache_benchmark -- /tmp/fresh-cas-bench candidate
 ```
+
+For the shared daemon, supply a private plan JSON with `cwd`, `source_revision`
+and a Bazel `command` argv array. Placeholders are `{output_base}`,
+`{output_user_root}`, `{artifacts}` and `{endpoint}`. Run the same plan against
+the upstream endpoint and `unix:/absolute/state/cache.sock`, with fresh output
+directories. Keep credentials in a helper/private rc, never the command array.
+`--noop` measures a separate same-server incremental build; it is not another
+remote-cache sample. Record mirror population and daemon cache priming separately.
+This endpoint comparison isolates the proxy, not source VFS or BOS benefits.
+Match actual action-hit/execution counts, not just flags. Check build-event
+upload warnings even when Bazel exits successfully.
 
 Do not run matrices alongside compilation/profiling. Keep failures/outliers and
 raw receipts; never label logical blob sizes as network bytes or no-op cache

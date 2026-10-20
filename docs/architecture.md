@@ -10,7 +10,8 @@ The diagram is a logical ownership map, not a required deployment topology.
 Purple components are built in this project; gray components are external.
 Cylinders represent storage; boxes represent services and mount frontends.
 Each agent keeps writable source, Git admin and Bazel output roots private.
-`agent-session` orchestrates Linux source/Bazel lifecycle; BOS is started separately.
+`workspace` hosts Linux source mounts, BOS, Git transport and the REAPI cache
+front end in one daemon; `agent-session` remains the standalone lifecycle client.
 Native source/output adapters also support macOS NFS and Windows ProjFS.
 
 - **Source:** the proxy serves filtered Git fetches and object metadata; edits
@@ -23,7 +24,8 @@ Native source/output adapters also support macOS NFS and Windows ProjFS.
   main-workspace blobs asynchronously; queued is not uploaded.
 - **Outputs:** Bazel sends BOS paths/digests, not payloads. BOS checks remote
   presence, then fetches and verifies complete blobs on first content access.
-  Proxy and BOS reuse `local-cas` code but own separate cache directories.
+  The daemon shares one `Arc<LocalCas>` across source reads, Git CAS sync, BOS and
+  REAPI downloads; standalone proxy/BOS processes still need separate directories.
 
 ## What can be evicted?
 
@@ -39,6 +41,10 @@ Native source/output adapters also support macOS NFS and Windows ProjFS.
 Each `local-cas` directory has **one process owner**. Library consumers share
 `Arc<LocalCas>`; separate proxy/BOS processes need separate directories.
 Cache quotas cover logical payloads, not metadata, filesystem blocks or RSS.
+The daemon's AC metadata cache is separate, memory-bounded, and disabled by
+default (TTL zero). Configuring a positive TTL requires a retention assumption.
+CAS writes and `FindMissingBlobs` reach the upstream before claiming availability
+to Bazel: a local hit alone cannot satisfy a remote executor's input requirement.
 
 Local CAS keeps maintained byte totals and an ordered unpinned-entry index.
 Recency checkpoints are batched and restored on restart; contents are still

@@ -5,6 +5,7 @@ Rust tools for private, writable agent workspaces and Bazel remote execution.
 
 | Tool | What it does |
 | --- | --- |
+| [`workspace`](crates/workspace-daemon/README.md) | One entry point: private sessions, shared Git/REAPI proxy, lazy source/output mounts and bounded local CAS |
 | [`agent-session`](crates/agent-session/README.md) | Create, resume, build, save and stop private Linux agent sessions |
 | [`git-vfs`](crates/workspace-fuse/README.md) | Linux FUSE workspace: lazy Git reads, persistent edits, native Git status |
 | [`git-proxy`](crates/git-proxy/README.md) | Shared Git mirror and fetch cache, object sizes, BLAKE3 mappings, optional CAS uploads |
@@ -15,39 +16,51 @@ macOS uses [NFS](crates/workspace-nfs/README.md); Windows uses
 requires our custom `git-jj` CLI. Native acceptance and restrictions differ by
 platform; see [platform support](docs/platforms.md).
 
-## Quick start: Linux workspace
+## Quick start: shared Linux daemon
 
-Requires native Git, `/dev/fuse`, `fusermount3`, and the pinned Rust toolchain.
-Run from this repository:
-
-```sh
-cargo build --release -p workspace-fuse
-target/release/git-vfs clone https://github.com/bazelbuild/bazel.git /tmp/agent.git --depth 1
-mkdir -p /tmp/agent
-target/release/git-vfs mount --repo /tmp/agent.git \
-  --overlay /tmp/agent-state --prefetch-bazel /tmp/agent
-```
-
-The foreground process owns the mount; Ctrl-C unmounts. In another terminal:
+Requires native Git, `/dev/fuse`, `fusermount3`, compatible Bazel, and provisioned
+BuildBuddy RBE credentials/toolchains. Build the single entry point:
 
 ```sh
-git -C /tmp/agent status --short
-cd /tmp/agent
-bazel --output_user_root=/tmp/agent-bazel-user \
-  --output_base=/tmp/agent-bazel-output query //...
+bazel build --config=rbe //:workspace
+export PATH="$PWD/bazel-bin/crates/workspace-daemon:$PATH"
+workspace init
+# Edit ~/.config/workspace/config.toml; see examples/workspace.toml.
+# Provision BUILDBUDDY_API_KEY using your normal secret mechanism.
+workspace create /tmp/agent-1 --repo bazel --revision FULL_COMMIT_SHA \
+  --bazelrc /absolute/path/to/provisioned.bazelrc
+workspace build /tmp/agent-1 -- //src:target
+workspace status
 ```
 
-GitHub size metadata loads before mount; likely Bazel inputs prefetch afterward.
-Other contents load on demand. Remount the same clone and overlay to retain edits.
-**The overlay contains your work, not disposable cache data.** Base commits are
-fixed per mount. Basic Git commit/log work, but a first commit can hydrate the
-whole indexed snapshot; general checkout/merge/rebase are not supported.
+`create` starts the daemon automatically. Each agent keeps its own
+source edits, Git state and Bazel output base. Source/output payloads are lazy;
+likely Bazel source inputs prefetch asynchronously after mounting.
+
+```sh
+git -C /tmp/agent-1/workspace status --short
+workspace test /tmp/agent-1 -- //...
+workspace stop /tmp/agent-1
+```
+
+Defaults: 4 GiB verified-byte LRU cache, eight fetches and private local sockets.
+Linux BOS is opt-in (`[bos] enabled = true`) and strictly lazy when enabled;
+its current metadata-publication overhead can outweigh download savings.
+Action-result TTL is zero unless an operator supplies a
+retention guarantee. **Edits and commits are not disposable cache data.** Native
+commit can hydrate indexed files; general checkout/merge/rebase are not supported.
+
+Bazel must include the [Unix-socket authority fix](https://github.com/bazelbuild/bazel/commit/242563f1a14378801725e5f6b0ee397ef0d307f2)
+as well as BLAKE3/xattr/r2c2 support. Bazel 9.3.0rc2 lacks this fix; select a
+compatible binary with `session.bazel` in the TOML.
 
 ## Multiple agents and remote builds
 
-Run one [proxy](crates/git-proxy/README.md), then give each agent a private clone,
-overlay, mount and Bazel output base. The first proxy request creates a **full
-all-refs mirror**; prewarm it rather than charging that cost to every agent.
+Configure repository aliases and the BuildBuddy upstream in
+[`workspace.toml`](examples/workspace.toml). One daemon hosts the Git proxy,
+source/BOS mounts and local AC/CAS front end, sharing immutable bytes across
+agents. The first repository request creates a **full all-refs mirror**; preparation
+and native Git storage are separate from the CAS quota.
 
 Use the [cloud-agent example skill](examples/skills/cloud-bazel-agent/SKILL.md)
 for BLAKE3 digest reuse, BuildBuddy RBE and remote repository-content caching
@@ -55,8 +68,10 @@ for BLAKE3 digest reuse, BuildBuddy RBE and remote repository-content caching
 background. A mapping or queued upload is not proof of remote CAS residency.
 Keep build outputs and caches outside the source mount.
 
-[`agent-session`](crates/agent-session/README.md) wraps that lifecycle without
-sharing mutable state or deleting edits on stop. RBE/r2c2 remain provisioned services.
+The standalone component tools remain available. Unified source-session lifecycle
+is currently Linux-only; native NFS/ProjFS adapters have separate platform setup.
+BuildBuddy scheduling/execution stays remote; local caching never proves that an
+input has reached the remote CAS.
 
 ## Learn more
 
@@ -68,7 +83,8 @@ sharing mutable state or deleting edits on stop. RBE/r2c2 remain provisioned ser
 - [Benchmarks and tradeoffs](docs/benchmarks.md) · [Reproduce measurements](tools/README.md)
 - [Build and test with RBE](docs/development.md)
 
-Measured direct-GitHub clone-to-query median: **4.964s VFS vs 8.384s shallow
-checkout** in five paired trials. A warm-proxy narrow RBE build was **24.316s vs
-24.969s**, with overlapping ranges: no reliable broad RBE speedup is established.
-These are different pinned workloads/cache conditions, not general guarantees.
+The latest cache-endpoint comparison measured BuildBuddy CI `build //...` at
+**93–98s direct / 86–92s through the daemon**. A narrow Bazel target was
+**5.78s direct / 6.82s daemon-cold / 5.67s warm**. These are small samples with
+prepared dependency caches, not a cold-clone or general RBE speedup claim.
+See [scope, failures and historical checkout comparisons](docs/benchmarks.md).

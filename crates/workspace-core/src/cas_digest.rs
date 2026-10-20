@@ -54,6 +54,21 @@ pub(crate) fn endpoint(origin: &str, alias: &str) -> Result<Url> {
         "proxy repository alias must be 1-128 ASCII letters, digits, '_' or '-'"
     );
     let mut url = Url::parse(origin).context("invalid proxy URL")?;
+    // The shared daemon protects loopback HTTP Git/metadata routes with an
+    // unguessable capability. General remote path prefixes remain unsupported.
+    let capability = url.path().trim_matches('/');
+    let local_capability = url.scheme() == "http"
+        && url
+            .host_str()
+            .and_then(|host| {
+                host.trim_matches(['[', ']'])
+                    .parse::<std::net::IpAddr>()
+                    .ok()
+            })
+            .is_some_and(|ip| ip.is_loopback())
+        && capability.len() == 64
+        && capability.bytes().all(|byte| byte.is_ascii_hexdigit())
+        && matches!(url.path().strip_prefix('/'), Some(path) if path == capability || path == format!("{capability}/"));
     ensure!(
         matches!(url.scheme(), "http" | "https")
             && url.host_str().is_some()
@@ -61,9 +76,9 @@ pub(crate) fn endpoint(origin: &str, alias: &str) -> Result<Url> {
             && url.password().is_none()
             && url.query().is_none()
             && url.fragment().is_none()
-            && url.path() == "/"
+            && (url.path() == "/" || local_capability)
             && !origin.chars().any(|c| c.is_whitespace() || c == '\\'),
-        "proxy URL must be an HTTP(S) origin without credentials, query, fragment, or path prefix"
+        "proxy URL must be an HTTP(S) origin or a private daemon loopback capability"
     );
     // Reject paths that URL parsing would normalize back to the origin root.
     let authority = origin.split_once("://").context("invalid proxy origin")?.1;
@@ -71,10 +86,17 @@ pub(crate) fn endpoint(origin: &str, alias: &str) -> Result<Url> {
         !authority.contains('@')
             && authority
                 .split_once('/')
-                .is_none_or(|(_, suffix)| suffix.is_empty()),
+                .is_none_or(|(_, suffix)| suffix.is_empty()
+                    || (local_capability
+                        && (suffix == capability || suffix == format!("{capability}/")))),
         "proxy URL must not contain credentials or a path prefix"
     );
-    url.set_path(&format!("/api/v1/repos/{alias}/objects"));
+    let prefix = if local_capability {
+        format!("/{capability}")
+    } else {
+        String::new()
+    };
+    url.set_path(&format!("{prefix}/api/v1/repos/{alias}/objects"));
     Ok(url)
 }
 

@@ -1,0 +1,42 @@
+load("@crates//:defs.bzl", "aliases", "all_crate_deps")
+load("@rules_rs//rs:rust_binary.bzl", "rust_binary")
+load("@rules_rs//rs:rust_library.bzl", "rust_library")
+load("@rules_rs//rs:rust_test.bzl", "rust_test")
+
+package(default_visibility = ["//visibility:public"])
+
+rust_library(
+    name = "workspace-daemon",
+    srcs = glob(["src/**/*.rs"], exclude = ["src/main.rs"]),
+    aliases = aliases(),
+    crate_name = "workspace_daemon",
+    crate_root = "src/lib.rs",
+    edition = "2024",
+    version = "0.1.0",
+    deps = all_crate_deps(normal = True),
+)
+
+rust_binary(
+    name = "workspace",
+    srcs = ["src/main.rs"],
+    aliases = aliases(),
+    crate_name = "workspace",
+    edition = "2024",
+    version = "0.1.0",
+    deps = [":workspace-daemon"] + all_crate_deps(normal = True),
+)
+
+rust_test(
+    name = "unit_tests",
+    crate = ":workspace-daemon",
+    aliases = aliases(),
+    deps = all_crate_deps(normal = True, normal_dev = True),
+)
+
+rust_test(
+    name = "control_tests",
+    srcs = ["tests/control.rs"],
+    aliases = aliases(),
+    edition = "2024",
+    deps = [":workspace-daemon"] + all_crate_deps(normal = True, normal_dev = True),
+)

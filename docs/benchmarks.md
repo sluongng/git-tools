@@ -1,9 +1,66 @@
 # Benchmarks and tradeoffs
 
-Single-machine results on pinned `bazel.git`, not universal guarantees. Source
+Single-machine results on pinned repositories, not universal guarantees. Source
 startup, first build and warm iteration are separate workloads. Shared archive
 caches were warm; OS page caches were not dropped. Numbers below are historical
 measurements, not a benchmark of every later commit.
+
+## Shared daemon (Oct 20)
+
+Same source, fixed Bazel client, flags and preexisting remote cache; fresh private
+Bazel roots per cell. This isolates **direct remote cache versus the daemon cache
+endpoint**, with source VFS/BOS off and shared dependency caches already prepared.
+Times include client startup and build-event upload finalization.
+
+| Workload | Direct | Daemon CAS cold | Daemon CAS warm |
+| --- | ---: | ---: | ---: |
+| BuildBuddy CI `build //...` | 93.23 / 97.82s | 86.17s | 91.72s |
+| Bazel `//src/main/cpp/util:strings` | 5.78s | 6.82s | 5.67s |
+
+Only two direct BuildBuddy samples and one cell per other policy: **no reliable
+general speedup established**. BuildBuddy matched 38,289 remote action hits and
+14 executions in every arm; about 38,300 action-cache checks dominate. Their
+overlapping wall-span union was 83–87s direct and 74–78s through the daemon;
+these spans are not additive phase costs. AC TTL stayed zero throughout.
+
+Bazel matched three action-cache hits and zero executions. Cold added 1.05s;
+warm was essentially tied. The initial 9.13s direct cell executed two actions and
+is **population, not a comparison baseline**. This is not a full Bazel self-build.
+Pins: BuildBuddy `880460ccd17c`; Bazel/client `78b8a87bc6bd` from `rbe/master`.
+BuildBuddy used `--check_direct_dependencies=off` in both arms for this client's
+builtin module versions. The client includes the required Unix-authority fix.
+
+Separate full BuildBuddy test validation took 1,022s: 736 passed (three flaky),
+three failed on worker prerequisites, one macOS-only skip. No filters
+or worker-environment fixes were applied. A full Bazel self-build readiness
+attempt was stopped at a cold compiler graph; do not compare older-client full
+self-build timings with this matrix. Raw failures and private reports stay
+outside Git; reproduce endpoint cells with `benchmark_shared_daemon.py`.
+
+### Full source/output path
+
+Forced real remote work, identical output hashes; command plus first output read:
+
+| Workload | Prepared native checkout | Source + proxy, BOS off | Source + proxy + lazy BOS |
+| --- | ---: | ---: | ---: |
+| BuildBuddy `retry_test`, one real RBE test | 24.47s | 29.74s | 55.19s |
+| Bazel strings, three real RBE actions | 8.93s | 10.33s | 8.33s after resume |
+
+These are single-cell integration measurements, not a clone comparison. Native
+checkout preparation is excluded. Source creation added 6.91s BOS-off / 7.09s
+BOS-on for BuildBuddy; these separately timed phases exclude mirror population,
+daemon startup and orchestration pauses. The BOS-on 20.1MB binary first read alone
+took 2.33s. The original Bazel BOS-on cell needed hydration/resume: `git show -s`
+attempted merge rename-detection blob reads. The metadata-only timestamp fix
+passed a fresh default/BOS-off session: 21.34s create + 10.33s build, matching
+native output. This is a phase sum, not continuous wall time; source preparation
+includes mapping metadata and is not free. The old resumed cell is not clean
+startup evidence.
+
+**BOS is opt-in by default.** Its BuildBuddy command took 52.87s versus 29.73s
+without BOS. Profiles show staging/stat RPC convoys and durable generated-file
+writes; the next optimization is batched metadata publication, not disabling
+durability. Source + proxy alone was still 5.26s slower than native here.
 
 ## Checkout versus VFS
 

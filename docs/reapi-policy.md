@@ -4,6 +4,8 @@ The Git proxy and Bazel output service share a conservative REAPI client policy.
 Pass a TOML file explicitly; neither daemon searches the working directory or
 loads a repository-supplied file automatically.
 See the complete [example](../examples/reapi-policy.toml).
+For the unified `workspace` entry point, use the same `[reapi]` table in
+[`workspace.toml`](../examples/workspace.toml), alongside endpoints and cache limits.
 
 ```sh
 git-output-service --config /path/to/reapi-policy.toml \

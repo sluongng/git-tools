@@ -153,7 +153,34 @@ pub fn router(config: Config) -> Result<Router> {
 }
 
 /// Join optional CAS work after stopping new HTTP traffic.
-pub fn router_with_cas_shutdown(mut config: Config) -> Result<(Router, Option<CasShutdown>)> {
+pub fn router_with_cas_shutdown(config: Config) -> Result<(Router, Option<CasShutdown>)> {
+    create_router(config, None)
+}
+
+/// Host Git HTTP/metadata service inside a daemon that already owns its CAS.
+///
+/// `backend_identity` must be the same authorization-scoped identity used by the
+/// daemon's REAPI proxy and output service. The caller is responsible for that
+/// identity's endpoint, instance, and credentials matching `config.cas_sync`.
+/// The Git mirror/pack/metadata directory still has its own exclusive owner;
+/// no second blob cache directory is opened. Stop HTTP admission before calling
+/// the returned optional shutdown handle, then drain the shared cache last.
+pub fn router_with_shared_cache(
+    config: Config,
+    cache: Arc<local_cas::LocalCas>,
+    backend_identity: String,
+) -> Result<(Router, Option<CasShutdown>)> {
+    ensure!(
+        !backend_identity.is_empty(),
+        "shared CAS backend identity is required"
+    );
+    create_router(config, Some((cache, backend_identity)))
+}
+
+fn create_router(
+    mut config: Config,
+    shared_cache: Option<(Arc<local_cas::LocalCas>, String)>,
+) -> Result<(Router, Option<CasShutdown>)> {
     std::fs::create_dir_all(&config.cache_dir)?;
     config.cache_dir = std::fs::canonicalize(&config.cache_dir)?;
     let lock = std::fs::OpenOptions::new()
@@ -205,7 +232,7 @@ pub fn router_with_cas_shutdown(mut config: Config) -> Result<(Router, Option<Ca
     let sync = config
         .cas_sync
         .clone()
-        .map(|sync| cas_sync::CasSync::new(sync, &config.cache_dir))
+        .map(|sync| cas_sync::CasSync::new(sync, &config.cache_dir, shared_cache))
         .transpose()?;
     let cas_sync = sync.as_ref().map(|(sync, _, _)| sync.clone());
     let storage_accounting = storage_accounting::StorageAccounting::new(

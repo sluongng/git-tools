@@ -56,6 +56,12 @@ enum Operation {
         #[arg(last = true, required = true)]
         args: Vec<String>,
     },
+    /// Run Bazel test with the same private output roots and cache policy.
+    Test {
+        session: PathBuf,
+        #[arg(last = true, required = true)]
+        args: Vec<String>,
+    },
     /// Native git commit, using the existing index, hooks and signing settings.
     /// Stage changes yourself first. Extra commit arguments follow --.
     Save {
@@ -74,6 +80,7 @@ fn main() -> std::process::ExitCode {
         | Operation::Resume { session }
         | Operation::Status { session }
         | Operation::Build { session, .. }
+        | Operation::Test { session, .. }
         | Operation::Save { session, .. }
         | Operation::Stop { session } => session.clone(),
     };
@@ -112,6 +119,7 @@ fn main() -> std::process::ExitCode {
         Operation::Resume { session } => agent_session::resume(&session),
         Operation::Status { session } => agent_session::status(&session),
         Operation::Build { session, args } => agent_session::build(&session, &args),
+        Operation::Test { session, args } => agent_session::test(&session, &args),
         Operation::Save { session, args } => agent_session::save(&session, &args),
         Operation::Stop { session } => agent_session::stop(&session),
     };

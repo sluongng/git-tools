@@ -249,13 +249,30 @@ pub fn start_with_size_options(
     git: &Path,
     sizes: &SizeWarmOptions,
 ) -> Result<Projection> {
+    let mut repo = GitRepo::open(repository, git, "origin", SizeFallback::Error)?;
+    let snapshot = Snapshot::load(&repo, revision)?;
+    repo.warm_snapshot_sizes(&snapshot, sizes)?;
+    start_with_repo(repo, snapshot, root, state)
+}
+
+/// Host a caller-prepared repository, including its shared source CAS. Object
+/// sizes must already be available; this entrypoint never performs metadata warmup.
+pub fn start_with_repo(
+    mut repo: GitRepo,
+    snapshot: Snapshot,
+    root: &Path,
+    state: &Path,
+) -> Result<Projection> {
     std::fs::create_dir_all(state)?;
     std::fs::create_dir_all(root)?;
     let state = state.canonicalize()?;
     let root = root.canonicalize()?;
-    let repository = repository.canonicalize()?;
+    let repository = repo.repository_path().canonicalize()?;
     ensure!(
-        !state.starts_with(&root) && !repository.starts_with(&root),
+        !state.starts_with(&root)
+            && !root.starts_with(&state)
+            && !repository.starts_with(&root)
+            && !root.starts_with(&repository),
         "state and repository must be outside projection root"
     );
     let lock = OpenOptions::new()
@@ -266,13 +283,8 @@ pub fn start_with_size_options(
         .share_mode(0)
         .open(state.join("provider.lock"))
         .context("another provider owns this state")?;
-    let mut repo = GitRepo::open(&repository, git, "origin", SizeFallback::Error)?;
     let (_, cancellation) = repo.background_handle()?;
-    let snapshot = Snapshot::load(&repo, revision)?;
     let namespace = Namespace::from_snapshot(&snapshot)?;
-    // ProjFS enumeration requires exact lengths. Preseed metadata in one batch
-    // (GitHub tree API for github.com), never hydrate file content for stat.
-    repo.warm_snapshot_sizes(&snapshot, sizes)?;
     // Reject collisions according to actual Windows comparison as well.
     let mut names: Vec<_> = namespace
         .entries

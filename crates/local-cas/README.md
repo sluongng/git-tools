@@ -4,6 +4,8 @@ Reusable verified SHA256/BLAKE3 disk cache. Open a directory once with
 `LocalCas::open(path, source, config)` and share its `Arc<LocalCas>` across
 consumers. `BlobSource` supplies remote bytes; `content(artifact).await` returns
 an `Arc<CachedBlob>` lease whose path is safe to read until the lease is dropped.
+The [`workspace` daemon](../workspace-daemon/README.md) shares this owner across
+source mounts, BOS, Git uploads and its REAPI cache front end.
 
 - Exact hash/size verification and atomic publication; retained bytes are
   reverified after restart.
@@ -11,6 +13,8 @@ an `Arc<CachedBlob>` lease whose path is safe to read until the lease is dropped
   maintained byte totals and an ordered index avoid full-cache victim scans.
 - Concurrent reads coalesce; a cancelled/timed-out waiter does not cancel another
   reader's admitted fetch. Concurrency, byte and timeout budgets are configurable.
+- `cached_content` returns a verified lease or a miss without creating/joining a
+  fetch. Use it for local-only probes so their misses cannot fail another source.
 - Keys include backend authorization scope, instance, digest function, hash and
   size. Callers must give distinct backend identities to distinct auth scopes.
 - One owner holds the cache directory lock, including outstanding leases and

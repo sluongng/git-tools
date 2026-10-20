@@ -320,6 +320,15 @@ impl Tree {
         cache: Arc<LocalCas>,
     ) -> Result<Arc<Self>> {
         let source = cache.source();
+        Self::open_with_cache_and_source(state_dir, backend_identity, cache, source)
+    }
+    /// Share cache ownership while retaining this namespace's authorized source.
+    pub fn open_with_cache_and_source(
+        state_dir: impl AsRef<Path>,
+        backend_identity: impl Into<String>,
+        cache: Arc<LocalCas>,
+        source: Arc<dyn BlobSource>,
+    ) -> Result<Arc<Self>> {
         fs::create_dir_all(state_dir.as_ref())?;
         let dir = state_dir.as_ref().canonicalize()?;
         fs::create_dir_all(dir.join("local"))?;
@@ -575,7 +584,10 @@ impl Tree {
             artifact.backend == self.backend,
             "CAS backend identity mismatch"
         );
-        self.cache.clone().content(artifact.clone()).await
+        self.cache
+            .clone()
+            .content_from(artifact.clone(), self.source.clone())
+            .await
     }
     pub async fn ensure_dir(&self, path: &str) -> Result<Node> {
         let names = parts(path)?;

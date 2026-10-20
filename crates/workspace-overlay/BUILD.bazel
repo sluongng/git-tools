@@ -31,4 +31,5 @@ fixture_test(
     name = "unit_tests",
     binary = ":unit_tests_binary",
     git = True,
+    python = True,
 )

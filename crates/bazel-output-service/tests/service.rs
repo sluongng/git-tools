@@ -332,6 +332,14 @@ impl Fixture {
         policy: reapi::policy::Policy,
         max_blob_bytes: u64,
     ) -> Self {
+        Self::configured_client_endpoint(lazy, policy, max_blob_bytes, None).await
+    }
+    async fn configured_client_endpoint(
+        lazy: bool,
+        policy: reapi::policy::Policy,
+        max_blob_bytes: u64,
+        client_endpoint: Option<&str>,
+    ) -> Self {
         let dir = tempfile::tempdir().unwrap();
         let cas = Cas::default();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -348,16 +356,20 @@ impl Fixture {
                 .await
                 .unwrap();
         });
-        let service = OutputService::new(Config {
-            root: dir.path().to_path_buf(),
-            cas_endpoint: endpoint.clone(),
-            instance_name: "fixture".into(),
-            api_key: Some("test-key".into()),
-            max_blob_bytes,
-            policy,
-        })
+        let service = OutputService::new_with_client_endpoint(
+            Config {
+                root: dir.path().to_path_buf(),
+                cas_endpoint: endpoint.clone(),
+                instance_name: "fixture".into(),
+                api_key: Some("test-key".into()),
+                max_blob_bytes,
+                policy,
+            },
+            client_endpoint.unwrap_or(&endpoint),
+        )
         .await
         .unwrap();
+        let endpoint = client_endpoint.unwrap_or(&endpoint).to_owned();
         let projection = if lazy {
             let state = tempfile::tempdir().unwrap();
             let tree = output_core::Tree::open(
@@ -1854,4 +1866,51 @@ async fn backend_authority_separates_credentials_and_is_stable_across_state_path
     assert_ne!(identities[0], identities[2]);
     assert_ne!(identities[1], identities[2]);
     assert_eq!(identities[0], identities[3]);
+}
+
+#[tokio::test]
+async fn local_proxy_alias_retains_upstream_fetch_and_exact_client_scope() {
+    for alias in ["http://127.0.0.1:18473", "unix:/tmp/private-cache.sock"] {
+        let mut fixture = Fixture::configured_client_endpoint(
+            false,
+            test_policy(Duration::from_secs(10)),
+            1024 * 1024,
+            Some(alias),
+        )
+        .await;
+        let mut invalid = fixture.request("wrong", 9);
+        invalid.args.as_mut().unwrap().value = rev2::StartBuildArgs {
+            remote_cache: "http://127.0.0.1:18474".into(),
+            instance_name: "fixture".into(),
+            digest_function: 9,
+        }
+        .encode_to_vec();
+        assert_eq!(
+            fixture
+                .client
+                .start_build(invalid)
+                .await
+                .unwrap_err()
+                .code(),
+            tonic::Code::PermissionDenied
+        );
+        let response = fixture
+            .client
+            .start_build(fixture.request("alias", 9))
+            .await
+            .unwrap()
+            .into_inner();
+        let root = std::path::PathBuf::from(response.output_path_suffix);
+        let digest = fixture.blob(b"upstream contents", 9);
+        assert_eq!(fixture.stage("alias", "result", digest).await, 0);
+        assert_eq!(
+            std::fs::read(root.join("result")).unwrap(),
+            b"upstream contents"
+        );
+        assert_eq!(
+            fixture.cas.reads.lock().unwrap().len(),
+            1,
+            "content must be read from configured upstream, never the client alias"
+        );
+    }
 }

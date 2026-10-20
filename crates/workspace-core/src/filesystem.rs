@@ -110,8 +110,12 @@ impl Snapshot {
         );
         let seconds: i64 = String::from_utf8(repo.git_output(
             &[
-                "show",
-                "-s",
+                // `show -s` can still inspect changed blobs (for example during
+                // merge/rename processing). Snapshot metadata must work before
+                // any promisor blobs have been hydrated.
+                "log",
+                "-1",
+                "--no-walk",
                 "--no-show-signature",
                 "--no-notes",
                 "--format=%ct",

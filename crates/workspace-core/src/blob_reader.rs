@@ -8,14 +8,14 @@ use anyhow::{Context, Result, ensure};
 
 /// One serialized native reader per repository. Only immutable, full blob OIDs
 /// enter this protocol; metadata commands deliberately use separate no-fetch Git.
-pub(super) struct BlobReader {
+pub(crate) struct BlobReader {
     _child: NativeChild,
     input: ChildStdin,
     output: BufReader<ChildStdout>,
 }
 
 impl BlobReader {
-    pub(super) fn start(
+    pub(crate) fn start(
         repository: &Path,
         binary: &Path,
         cancellation: Option<&BackgroundCancellation>,
@@ -23,7 +23,7 @@ impl BlobReader {
         Self::start_with_fetch(repository, binary, cancellation, true)
     }
 
-    pub(super) fn start_local(
+    pub(crate) fn start_local(
         repository: &Path,
         binary: &Path,
         cancellation: Option<&BackgroundCancellation>,
@@ -66,7 +66,7 @@ impl BlobReader {
 
     /// Stream a local object through fixed-size buffers. Missing objects leave
     /// the batch protocol aligned; callback errors require discarding this reader.
-    pub(super) fn stream_local(
+    pub(crate) fn stream_local(
         &mut self,
         oid: &str,
         mut consume: impl FnMut(u64, u64, &[u8]) -> Result<()>,
@@ -111,7 +111,7 @@ impl BlobReader {
         Ok(Some(size))
     }
 
-    pub(super) fn read(&mut self, oid: &str) -> Result<Vec<u8>> {
+    pub(crate) fn read(&mut self, oid: &str) -> Result<Vec<u8>> {
         writeln!(self.input, "{oid}").context("request Git blob")?;
         self.input.flush().context("flush Git blob request")?;
         // SHA1, type and a decimal usize fit comfortably; a broken/wrapped Git

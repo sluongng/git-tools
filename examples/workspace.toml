@@ -1,0 +1,43 @@
+# One daemon per user/trust boundary. Credentials stay in the environment.
+# Run `workspace init` for the configuration matching your installed binary.
+# Relative paths and shell/environment expansion are not supported here.
+# state_dir = "/absolute/path/to/private/workspace-state"
+
+[cache]
+upstream = "grpcs://YOUR_INSTANCE.buildbuddy.io"
+api_key_env = "BUILDBUDDY_API_KEY"
+max_bytes = 4294967296
+max_concurrent_fetches = 8
+# Bound simultaneous requests on each local cache connection.
+max_concurrent_rpcs_per_connection = 128
+max_inflight_bytes = 536870912
+max_blob_bytes = 536870912
+# No assumed upstream retention lease. Enable only with a suitable guarantee.
+action_cache_ttl_seconds = 0
+
+[git_proxy]
+listen = "127.0.0.1:8379"
+sync_to_cas = false
+
+[git_proxy.repositories]
+bazel = "https://github.com/bazelbuild/bazel.git"
+buildbuddy = "https://github.com/buildbuddy-io/buildbuddy.git"
+
+[bos]
+# Opt in to strictly lazy outputs; metadata publication is not yet batched.
+enabled = false
+
+[session]
+# Provision credentials, RBE execution platforms and toolchains outside mounts.
+# Select a Bazel including the Unix-socket authority fix (upstream 242563f1a1).
+# bazel = "/absolute/path/to/compatible/bazel"
+# bazelrc = "/absolute/path/to/provisioned.bazelrc"
+# repo_contents_cache = "/absolute/path/to/shared/repository-trees"
+remote_repo_contents_cache = true
+
+[reapi]
+connect_timeout_ms = 10000
+rpc_timeout_ms = 60000
+stream_idle_timeout_ms = 60000
+operation_timeout_ms = 120000
+presence_ttl_seconds = 0

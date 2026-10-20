@@ -7,6 +7,11 @@ license = "MIT"
 
 [dependencies]
 anyhow = "1"
+async-trait = "0.1"
+blake3 = "1"
+local-cas = { path = "../local-cas" }
+sha1 = "0.10"
+tokio = { version = "1", features = ["full"] }
 fjall = "=3.1.12"
 hex = "0.4"
 libc = "0.2"

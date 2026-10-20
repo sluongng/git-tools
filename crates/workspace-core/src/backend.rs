@@ -18,7 +18,7 @@ use size_cache::SizeCache;
 
 #[path = "blob_reader.rs"]
 mod blob_reader;
-use blob_reader::BlobReader;
+pub(crate) use blob_reader::BlobReader;
 
 #[path = "content_scheduler.rs"]
 mod content_scheduler;
@@ -99,6 +99,7 @@ pub struct GitRepo {
     cancellation: Option<BackgroundCancellation>,
     blob_reader: Option<BlobReader>,
     content: Option<ContentHandle>,
+    shared_cas: Option<Arc<crate::source_cas::SourceCas>>,
 }
 
 fn canonical_oid(oid: &str) -> Result<String> {
@@ -161,6 +162,7 @@ impl GitRepo {
             cancellation: None,
             blob_reader: None,
             content: None,
+            shared_cas: None,
         })
     }
 
@@ -190,9 +192,56 @@ impl GitRepo {
                 cancellation: Some(cancellation.clone()),
                 blob_reader: None,
                 content: self.content.clone(),
+                shared_cas: self.shared_cas.clone(),
             },
             cancellation,
         ))
+    }
+
+    /// Share immutable payloads with the daemon's output and REAPI caches.
+    /// Install before constructing the content scheduler so its readers inherit it.
+    pub fn set_shared_cas(&mut self, cache: Arc<crate::source_cas::SourceCas>) {
+        self.shared_cas = Some(cache);
+    }
+
+    pub(crate) fn shared_blob(
+        &self,
+        oid: &str,
+        allow_fetch: bool,
+    ) -> Result<Option<Arc<local_cas::CachedBlob>>> {
+        let Some(cache) = &self.shared_cas else {
+            return Ok(None);
+        };
+        let mapping = self
+            .cache_lock()?
+            .blake3_many(&[oid.to_owned()])?
+            .remove(oid);
+        let Some((size, hash)) = mapping else {
+            return Ok(None);
+        };
+        if !cache.readable(size) {
+            return Ok(None);
+        }
+        if !allow_fetch {
+            return cache.cached(cache.artifact(hash, size));
+        }
+        let source = Arc::new(crate::source_cas::GitBlobSource {
+            repository: self.repository.clone(),
+            binary: self.git_binary.clone(),
+            oid: oid.to_owned(),
+            fallback: cache.fallback(),
+            allow_fetch,
+        });
+        cache.content(cache.artifact(hash, size), source).map(Some)
+    }
+
+    pub(crate) fn learn_shared_blob(&self, oid: &str, size: u64, hash: [u8; 32]) -> Result<()> {
+        self.cache_lock()?
+            .persist_blake3(&HashMap::from([(oid.to_owned(), (size, hash))]))?;
+        // Native Git remains the recovery source after cache eviction. Content
+        // is admitted through its streaming reader, never copied into a Vec.
+        let _ = self.shared_blob(oid, true);
+        Ok(())
     }
 
     /// Installed only for mounted asynchronous reads and background prefetch.
@@ -655,9 +704,16 @@ impl GitRepo {
 
     pub fn read_blob(&mut self, oid: &str) -> Result<Vec<u8>> {
         let oid = canonical_oid(oid)?;
+        if let Ok(Some(blob)) = self.shared_blob(&oid, true) {
+            return std::fs::read(blob.path()).context("read shared source CAS blob");
+        }
         // Git's promisor machinery fetches missing objects; cat-file emits raw blob bytes.
         let data = self.raw_blob(&oid)?;
-        self.persist_sizes(&HashMap::from([(oid, data.len() as u64)]))?;
+        self.persist_sizes(&HashMap::from([(oid.clone(), data.len() as u64)]))?;
+        if self.shared_cas.is_some() {
+            let hash = crate::source_cas::verify_git_blob(&oid, &data)?;
+            self.learn_shared_blob(&oid, data.len() as u64, hash)?;
+        }
         Ok(data)
     }
 

@@ -608,14 +608,23 @@ async fn same_inode_readers_share_one_foreground_admission_budget() {
 async fn independent_namespaces_share_content_cache_without_sharing_writable_authority() {
     let root = tempfile::tempdir().unwrap();
     let source = Arc::new(Source::default());
+    let default_source = Arc::new(Source::default());
     let cache = LocalCas::open(
         root.path().join("shared-cas"),
-        source.clone(),
+        default_source.clone(),
         CacheConfig::default(),
     )
     .unwrap();
-    let first = Tree::open_with_cache(root.path().join("first"), "test", cache.clone()).unwrap();
-    let second = Tree::open_with_cache(root.path().join("second"), "test", cache).unwrap();
+    let first = Tree::open_with_cache_and_source(
+        root.path().join("first"),
+        "test",
+        cache.clone(),
+        source.clone(),
+    )
+    .unwrap();
+    let second =
+        Tree::open_with_cache_and_source(root.path().join("second"), "test", cache, source.clone())
+            .unwrap();
     let artifact = source.artifact(b"shared clean output");
     let first_node = first.stage("out", artifact.clone()).await.unwrap();
     let second_node = second.stage("different/path", artifact).await.unwrap();
@@ -628,6 +637,11 @@ async fn independent_namespaces_share_content_cache_without_sharing_writable_aut
         b"shared clean output"
     );
     assert_eq!(source.calls.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        default_source.calls.load(Ordering::SeqCst),
+        0,
+        "namespace hydration must use its authorized source, not the cache default"
+    );
     first.write(first_node.id, 0, b"edited").await.unwrap();
     first.clean("").await.unwrap();
     assert_eq!(

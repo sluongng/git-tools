@@ -1,15 +1,12 @@
 use anyhow::{Context, Result, bail};
 use clap::{Args, Parser, Subcommand, ValueEnum};
-use fuser::MountOption;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use workspace_fuse::backend::{GitRepo, SizeFallback, SizeSource, SizeWarmOptions};
-use workspace_fuse::filesystem::{GitFs, Snapshot};
-use workspace_fuse::overlay::{Overlay, changes_since};
-use workspace_fuse::prefetch::{BazelPrefetchPolicy, prefetch_bazel_with_policy};
-use workspace_fuse::worktree::WorkingTree;
-use workspace_fuse::writable::WritableGitFs;
+use workspace_fuse::filesystem::Snapshot;
+use workspace_fuse::overlay::changes_since;
+use workspace_fuse::prefetch::BazelPrefetchPolicy;
 
 use workspace_fuse::cas_digest;
 
@@ -292,68 +289,13 @@ fn clone_repository(
     }))
 }
 
-// Own dispatch separately from mount detachment: client descriptors can outlive
-// a lazy unmount, but must not prevent our filesystem/database teardown.
-struct MountedSession {
-    unmount: fuser::SessionUnmounter,
-    worker: Option<std::thread::JoinHandle<std::io::Result<()>>>,
-    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
-    cancellation: workspace_fuse::backend::BackgroundCancellation,
-}
-
-impl MountedSession {
-    fn shutdown(&mut self) -> Result<()> {
-        self.cancellation.cancel();
-        let unmount = self.unmount.unmount();
-        // Let dispatch service any final unmount requests before stopping it.
-        // A lazy detach may leave client handles alive, so it is not itself a
-        // termination signal for the receive loop.
-        self.stop.store(true, std::sync::atomic::Ordering::Release);
-        let dispatch = self.worker.take().map(|worker| worker.join());
-        unmount.context("unmount git-vfs")?;
-        if let Some(dispatch) = dispatch {
-            dispatch
-                .map_err(|_| anyhow::anyhow!("git-vfs dispatch thread panicked"))?
-                .context("stop git-vfs dispatch")?;
-        }
-        Ok(())
-    }
-}
-
-impl Drop for MountedSession {
-    fn drop(&mut self) {
-        let _ = self.shutdown();
-    }
-}
-
-fn spawn_session<F: fuser::Filesystem + Send + 'static>(
-    fs: F,
-    mountpoint: &Path,
-    options: &[MountOption],
-    cancellation: workspace_fuse::backend::BackgroundCancellation,
-) -> std::io::Result<MountedSession> {
-    let mut session = fuser::Session::new(fs, mountpoint, options)?;
-    let unmount = session.unmount_callable();
-    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let worker_stop = stop.clone();
-    let worker = std::thread::Builder::new()
-        .name("git-vfs-dispatch".into())
-        .spawn(move || session.run_until(&worker_stop))?;
-    Ok(MountedSession {
-        unmount,
-        worker: Some(worker),
-        stop,
-        cancellation,
-    })
-}
-
 struct MountRuntime {
     blake3: bool,
     content: workspace_fuse::backend::ContentConfig,
 }
 
 fn mount(
-    mut repo: GitRepo,
+    repo: GitRepo,
     snapshot: Snapshot,
     mountpoint: &Path,
     read_only: bool,
@@ -361,161 +303,40 @@ fn mount(
     prefetch: Option<BazelPrefetchPolicy>,
     runtime: MountRuntime,
 ) -> Result<()> {
-    let MountRuntime {
-        blake3,
-        content: content_config,
-    } = runtime;
-    let mountpoint = mountpoint
-        .canonicalize()
-        .context("mountpoint must already exist")?;
-    if !mountpoint.is_dir() || mountpoint.read_dir()?.next().is_some() {
-        bail!("mountpoint must be an empty directory");
-    }
-    let repository = repo.repository_path().canonicalize()?;
-    if repository.starts_with(&mountpoint) || mountpoint.starts_with(&repository) {
-        bail!("mountpoint and bare repository must not overlap");
-    }
     let (sender, receiver) = std::sync::mpsc::channel();
     ctrlc::set_handler(move || {
         let _ = sender.send(());
     })?;
-    let commit = snapshot.commit.clone();
-    // Demand-only mounts need the same native-process cancellation scope as
-    // prefetch mounts before we can safely join their dispatch thread.
-    let content_owner = workspace_fuse::backend::ContentScheduler::new(&mut repo, content_config)?;
-    let content = content_owner.handle();
-    repo.set_content_handle(content.clone());
-    let (background_repo, mount_cancellation) = repo.background_handle()?;
-    let background = prefetch
-        .map(|policy| {
-            policy.validate(&snapshot)?;
-            Ok::<_, anyhow::Error>((
-                background_repo,
-                snapshot.clone(),
-                policy,
-                mount_cancellation.clone(),
-            ))
-        })
-        .transpose()?;
-    let mut options = vec![
-        MountOption::NoDev,
-        MountOption::NoSuid,
-        MountOption::DefaultPermissions,
-        MountOption::FSName("git-vfs".into()),
-    ];
-    let stats = std::sync::Arc::new(workspace_fuse::blake3_xattr::Blake3XattrStats::default());
-    let working;
-    let mut session = if read_only {
-        options.push(MountOption::RO);
-        working = None;
-        {
-            let fs = GitFs::new(snapshot, repo).with_content_scheduler(content_owner);
-            let fs = if blake3 {
-                fs.with_blake3(stats.clone())
-            } else {
-                fs
-            };
-            spawn_session(fs, &mountpoint, &options, mount_cancellation.clone())
-        }
-    } else {
-        options.push(MountOption::RW);
-        let directory = overlay_path
-            .map(Path::to_owned)
-            .unwrap_or_else(|| repository.join("git-vfs-overlays").join(&commit));
-        let state = WorkingTree::lock(&directory)?;
-        if state.directory.starts_with(&mountpoint) || mountpoint.starts_with(&state.directory) {
-            bail!("mountpoint and writable overlay must not overlap");
-        }
-        let overlay = Overlay::open(&state.directory, &snapshot, &state.gitdir)?;
-        state.prepare(&repo, &snapshot, &mountpoint, &std::env::current_exe()?)?;
-        eprintln!("Writable overlay: {}", state.directory.display());
-        working = Some(state);
-        drop(snapshot);
-        {
-            let fs = WritableGitFs::new(overlay, repo).with_content_scheduler(content_owner);
-            let fs = if blake3 {
-                fs.with_blake3(stats.clone())
-            } else {
-                fs
-            };
-            spawn_session(fs, &mountpoint, &options, mount_cancellation.clone())
-        }
-    }
-    .context("mounting git-vfs (check /dev/fuse and fusermount3)")?;
-    // The mount is live before speculative content transfer starts. This uses a
-    // second in-process backend: a separate CLI would conflict with Fjall's lock.
-    let background = background.map(|(mut repo, snapshot, policy, cancellation)| {
-        let worker_cancellation = cancellation.clone();
-        let worker = std::thread::spawn(move || {
-            let started = std::time::Instant::now();
-            match prefetch_bazel_with_policy(&mut repo, &snapshot, &policy) {
-                Ok(report) => eprintln!(
-                    "Background prefetch: {}",
-                    serde_json::json!({"seconds": started.elapsed().as_secs_f64(), "report": report})
-                ),
-                Err(_) => eprintln!(
-                    "Background prefetch failed: {}",
-                    serde_json::json!({"seconds": started.elapsed().as_secs_f64(), "cancelled": worker_cancellation.is_cancelled()})
-                ),
-            }
-        });
-        BackgroundPrefetch { cancellation, worker: Some(worker) }
-    });
-    eprintln!(
-        "Mounted commit {commit} at {} ({}). Ctrl-C unmounts.",
-        mountpoint.display(),
-        if read_only {
-            "read-only"
-        } else {
-            "read-write; native git status enabled"
-        }
-    );
+    let mut host = workspace_fuse::host::SourceMount::start(
+        repo,
+        snapshot,
+        workspace_fuse::host::MountConfig {
+            mountpoint: mountpoint.to_owned(),
+            read_only,
+            overlay: overlay_path.map(Path::to_owned),
+            prefetch,
+            blake3: runtime.blake3,
+            content: runtime.content,
+            git_vfs_executable: std::env::current_exe()?,
+        },
+    )?;
+    eprintln!("Mounted at {}. Ctrl-C unmounts.", mountpoint.display());
     loop {
         match receiver.recv_timeout(std::time::Duration::from_millis(200)) {
             Ok(()) => break,
-            Err(std::sync::mpsc::RecvTimeoutError::Timeout)
-                if session
-                    .worker
-                    .as_ref()
-                    .is_some_and(|worker| worker.is_finished()) =>
-            {
-                break;
-            }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) if host.is_finished() => break,
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
             Err(error) => return Err(error).context("waiting for shutdown signal"),
         }
     }
-    // Cancel and reap native Git commands before releasing the FUSE session:
-    // an early read might be waiting for its in-flight batch.
-    content.cancel();
-    mount_cancellation.cancel();
-    drop(background);
-    session.shutdown()?;
-    let content_state = content.stats();
-    anyhow::ensure!(content_state.worker_failures == 0, "content worker failed");
-    anyhow::ensure!(
-        content_state.outstanding_requests == 0 && content_state.inflight_oids == 0,
-        "content requests remain after dispatch shutdown"
-    );
-    drop(working);
-    if blake3 {
-        eprintln!("BLAKE3 xattrs: {}", serde_json::to_string(&stats.report())?);
+    host.shutdown()?;
+    if runtime.blake3 {
+        eprintln!(
+            "BLAKE3 xattrs: {}",
+            serde_json::to_string(&host.blake3_report())?
+        );
     }
     Ok(())
-}
-
-struct BackgroundPrefetch {
-    cancellation: workspace_fuse::backend::BackgroundCancellation,
-    worker: Option<std::thread::JoinHandle<()>>,
-}
-
-impl Drop for BackgroundPrefetch {
-    fn drop(&mut self) {
-        self.cancellation.cancel();
-        if let Some(worker) = self.worker.take() {
-            let _ = worker.join();
-        }
-    }
 }
 
 fn main() -> Result<()> {

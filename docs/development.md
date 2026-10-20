@@ -4,7 +4,7 @@ Bazelisk selects pinned Bazel/Rust/LLVM toolchains and Cargo dependencies.
 Bazel's execution target is Linux x86-64.
 
 ```sh
-bazel build --config=rbe //:workspace-fuse //:git-proxy //:git-output-service
+bazel build --config=rbe //:workspace
 bazel test --config=rbe //...
 ```
 

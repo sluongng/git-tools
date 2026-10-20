@@ -4,3 +4,5 @@ pub use workspace_overlay::{overlay, worktree};
 pub mod blake3_xattr;
 pub mod filesystem;
 pub mod writable;
+
+pub mod host;

@@ -3305,3 +3305,52 @@ fn mounted_blake3_xattrs_use_cached_base_and_current_same_size_overlay_bytes() {
     );
     assert_eq!(consumption["local_hashes"], 0);
 }
+
+#[test]
+#[ignore = "requires Linux /dev/fuse and fusermount3"]
+fn in_process_mounts_isolate_edits_and_stop_independently() {
+    use workspace_fuse::host::{MountConfig, SourceMount};
+    let first = Fixture::with_blob_count(1);
+    let second = Fixture::with_blob_count(1);
+    let start = |fixture: &Fixture| {
+        let repo = fixture.repo(SizeFallback::Fetch);
+        let snapshot = Snapshot::load(&repo, "HEAD").unwrap();
+        SourceMount::start(
+            repo,
+            snapshot,
+            MountConfig {
+                mountpoint: fixture.mount.clone(),
+                read_only: false,
+                overlay: Some(fixture._temp.path().join("overlay")),
+                prefetch: None,
+                blake3: false,
+                content: Default::default(),
+                git_vfs_executable: PathBuf::from(env!("CARGO_BIN_EXE_git-vfs")),
+            },
+        )
+        .unwrap()
+    };
+    let mut first_host = start(&first);
+    let mut second_host = start(&second);
+    fs::write(first.mount.join("hello.txt"), b"private first edit").unwrap();
+    assert_eq!(
+        fs::read(second.mount.join("hello.txt")).unwrap(),
+        b"hello from git-vfs\n"
+    );
+    first_host.shutdown().unwrap();
+    first_host.shutdown().unwrap();
+    assert!(first_host.is_finished());
+    assert!(fs::read_dir(&first.mount).unwrap().next().is_none());
+    assert!(!second_host.is_finished());
+    fs::write(second.mount.join("hello.txt"), b"private second edit").unwrap();
+    second_host.shutdown().unwrap();
+    drop(first_host);
+    drop(second_host);
+    // Restart the first namespace, proving mount shutdown preserved edits.
+    let mut first_host = start(&first);
+    assert_eq!(
+        fs::read(first.mount.join("hello.txt")).unwrap(),
+        b"private first edit"
+    );
+    first_host.shutdown().unwrap();
+}

@@ -8,7 +8,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io::Write;
 use std::os::fd::AsRawFd;
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
@@ -201,6 +201,7 @@ impl WorkingTree {
                 )?;
             }
         }
+        self.prepare_http_auth(repo, mountpoint, &local_config)?;
         let hook = hooks.join("git-vfs-fsmonitor");
         let mut script = b"#!/bin/sh\nexec ".to_vec();
         script.extend(shell_quote(executable.as_os_str()));
@@ -277,6 +278,109 @@ impl WorkingTree {
                 Some(paths),
             )?;
             fs::write(&ready, format!("{}\n", snapshot.commit))?;
+        }
+        Ok(())
+    }
+
+    /// Promisor credentials belong in a private config include, never helper
+    /// argv. Replace our include on every remount, so rotation/removal and a
+    /// different source backend cannot retain stale managed credentials.
+    fn prepare_http_auth(
+        &self,
+        repo: &GitRepo,
+        mountpoint: &Path,
+        local_config: &[u8],
+    ) -> Result<()> {
+        let source = repo.git_output(&["config", "--local", "--null", "--list"], false)?;
+        let mut auth = Vec::new();
+        for record in source.split(|b| *b == 0).filter(|r| !r.is_empty()) {
+            let Some(split) = record.iter().position(|b| *b == b'\n') else {
+                continue;
+            };
+            let (key, value) = (&record[..split], &record[split + 1..]);
+            if key.len() <= 17
+                || !key[..5].eq_ignore_ascii_case(b"http.")
+                || !key[key.len() - 12..].eq_ignore_ascii_case(b".extraheader")
+            {
+                continue;
+            }
+            let scope = &key[5..key.len() - 12];
+            ensure!(
+                (scope.starts_with(b"http://") || scope.starts_with(b"https://"))
+                    && !scope
+                        .iter()
+                        .any(|b| b.is_ascii_whitespace() || b.is_ascii_control()),
+                "invalid scoped HTTP auth configuration"
+            );
+            ensure!(
+                !value.contains(&b'\r') && !value.contains(&b'\n'),
+                "HTTP extraHeader must not contain line breaks"
+            );
+            auth.extend_from_slice(b"[http ");
+            config_quote(&mut auth, scope);
+            auth.extend_from_slice(b"]\n\textraHeader = ");
+            config_quote(&mut auth, value);
+            auth.push(b'\n');
+        }
+        let path = self.gitdir.join("git-vfs-http-auth.config");
+        let temporary = self.gitdir.join(format!(
+            ".git-vfs-http-auth-{}-{}.tmp",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)?
+                .as_nanos()
+        ));
+        let write = (|| -> Result<()> {
+            let mut file = OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(&temporary)?;
+            file.write_all(&auth)?;
+            file.sync_all()?;
+            fs::rename(&temporary, &path)?;
+            File::open(&self.gitdir)?.sync_all()?;
+            Ok(())
+        })();
+        if write.is_err() {
+            let _ = fs::remove_file(&temporary);
+        }
+        write?;
+        // A first mount interrupted after installing the include has no ready
+        // marker. Read actual config then rather than adding a duplicate path.
+        let current;
+        let config = if local_config.is_empty() {
+            current = self.git(
+                repo,
+                mountpoint,
+                &[
+                    "config".into(),
+                    "--local".into(),
+                    "--null".into(),
+                    "--list".into(),
+                ],
+                None,
+            )?;
+            current.as_slice()
+        } else {
+            local_config
+        };
+        let included = config.split(|b| *b == 0).any(|record| {
+            record.strip_prefix(b"include.path\n") == Some(path.as_os_str().as_bytes())
+        });
+        if !included {
+            self.git(
+                repo,
+                mountpoint,
+                &[
+                    "config".into(),
+                    "--local".into(),
+                    "--add".into(),
+                    "include.path".into(),
+                    path.as_os_str().to_owned(),
+                ],
+                None,
+            )?;
         }
         Ok(())
     }
@@ -395,6 +499,23 @@ fn run(
     Ok(output.stdout)
 }
 
+fn config_quote(output: &mut Vec<u8>, value: &[u8]) {
+    output.push(b'"');
+    for byte in value {
+        match byte {
+            b'\\' | b'"' => {
+                output.push(b'\\');
+                output.push(*byte);
+            }
+            b'\t' => output.extend_from_slice(b"\\t"),
+            b'\x08' => output.extend_from_slice(b"\\b"),
+            b'\n' => output.extend_from_slice(b"\\n"),
+            _ => output.push(*byte),
+        }
+    }
+    output.push(b'"');
+}
+
 fn shell_quote(text: &OsStr) -> Vec<u8> {
     let mut result = vec![b'\''];
     for &byte in text.as_bytes() {
@@ -406,4 +527,231 @@ fn shell_quote(text: &OsStr) -> Vec<u8> {
     }
     result.push(b'\'');
     result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::backend::SizeFallback;
+    use std::io::{BufRead, BufReader};
+
+    struct Server(std::process::Child);
+    impl Drop for Server {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
+    fn git(path: &Path, args: &[&str]) -> Vec<u8> {
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(path)
+            .args(args)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "Git fixture command failed");
+        output.stdout
+    }
+
+    #[test]
+    fn projected_native_git_hydrates_with_private_scoped_auth_and_refreshes_it() {
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("source.git");
+        let checkout = root.path().join("source");
+        fs::create_dir(&checkout).unwrap();
+        git(&checkout, &["init", "--quiet", "--initial-branch=main"]);
+        git(&checkout, &["config", "user.name", "Fixture"]);
+        git(
+            &checkout,
+            &["config", "user.email", "fixture@example.invalid"],
+        );
+        for name in ["first", "second", "third"] {
+            fs::write(checkout.join(name), name).unwrap();
+        }
+        git(&checkout, &["add", "."]);
+        git(&checkout, &["commit", "--quiet", "-m", "fixture"]);
+        git(
+            root.path(),
+            &[
+                "clone",
+                "--quiet",
+                "--bare",
+                checkout.to_str().unwrap(),
+                source.to_str().unwrap(),
+            ],
+        );
+        git(&source, &["config", "uploadpack.allowFilter", "true"]);
+        git(
+            &source,
+            &["config", "uploadpack.allowAnySHA1InWant", "true"],
+        );
+        let token_file = root.path().join("expected-token");
+        fs::write(&token_file, "fixture-one").unwrap();
+        let script = r#"
+import http.server,os,pathlib,subprocess,sys
+root=pathlib.Path(sys.argv[1]); token=pathlib.Path(sys.argv[2])
+class Handler(http.server.BaseHTTPRequestHandler):
+ def log_message(self,*args): pass
+ def do_GET(self): self.serve()
+ def do_POST(self): self.serve()
+ def serve(self):
+  if self.headers.get('Authorization') != 'Bearer '+token.read_text():
+   self.send_response(401); self.end_headers(); return
+  path,_,query=self.path.partition('?')
+  size=int(self.headers.get('Content-Length','0'))
+  env=dict(os.environ,GIT_PROJECT_ROOT=str(root),GIT_HTTP_EXPORT_ALL='1',REQUEST_METHOD=self.command,PATH_INFO=path,QUERY_STRING=query,CONTENT_TYPE=self.headers.get('Content-Type',''),CONTENT_LENGTH=str(size),REMOTE_USER='fixture',SERVER_PROTOCOL='HTTP/1.1')
+  data=subprocess.run(['git','http-backend'],input=self.rfile.read(size),stdout=subprocess.PIPE,stderr=subprocess.DEVNULL,env=env).stdout
+  headers,_,body=data.partition(b'\r\n\r\n'); parsed=[]; status=200
+  for line in headers.split(b'\r\n'):
+   key,_,value=line.partition(b':'); key=key.decode(); value=value.strip().decode()
+   if key.lower()=='status': status=int(value.split()[0])
+   elif key: parsed.append((key,value))
+  self.send_response(status)
+  for key,value in parsed: self.send_header(key,value)
+  self.send_header('Content-Length',str(len(body))); self.end_headers(); self.wfile.write(body)
+server=http.server.HTTPServer(('127.0.0.1',0),Handler)
+print(server.server_port,flush=True); server.serve_forever()
+"#;
+        let child = Command::new("python3")
+            .args(["-u", "-c", script])
+            .arg(root.path())
+            .arg(&token_file)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let mut server = Server(child);
+        let mut port = String::new();
+        BufReader::new(server.0.stdout.take().unwrap())
+            .read_line(&mut port)
+            .unwrap();
+        let origin = format!("http://127.0.0.1:{}/", port.trim());
+        let url = format!("{origin}source.git");
+        let bare = root.path().join("clone.git");
+        let clone = Command::new("git")
+            .args(["clone", "--quiet", "--bare", "--filter=blob:none"])
+            .arg(&url)
+            .arg(&bare)
+            .env("GIT_CONFIG_COUNT", "1")
+            .env("GIT_CONFIG_KEY_0", format!("http.{origin}.extraHeader"))
+            .env("GIT_CONFIG_VALUE_0", "Authorization: Bearer fixture-one")
+            .output()
+            .unwrap();
+        assert!(
+            clone.status.success(),
+            "authenticated blobless fixture clone failed"
+        );
+        let configure_auth = |token: &str| {
+            let mut file = OpenOptions::new()
+                .append(true)
+                .open(bare.join("config"))
+                .unwrap();
+            writeln!(
+                file,
+                "\n[http \"{origin}\"]\n\textraHeader = Authorization: Bearer {token}"
+            )
+            .unwrap();
+        };
+        configure_auth("fixture-one");
+        let wrapper = root.path().join("git-wrapper");
+        fs::write(&wrapper, r#"#!/usr/bin/env python3
+import json,os,pathlib,sys
+with pathlib.Path(__file__).with_suffix('.argv').open('a') as f: f.write(json.dumps(sys.argv[1:])+'\n')
+os.execvp('git',['git',*sys.argv[1:]])
+"#).unwrap();
+        fs::set_permissions(&wrapper, fs::Permissions::from_mode(0o755)).unwrap();
+        let repo = GitRepo::open(&bare, &wrapper, "origin", SizeFallback::Error).unwrap();
+        let snapshot = Snapshot::load(&repo, "HEAD").unwrap();
+        let mount = root.path().join("mount");
+        fs::create_dir(&mount).unwrap();
+        let working = WorkingTree::lock(&root.path().join("overlay")).unwrap();
+        let _overlay =
+            crate::overlay::Overlay::open(&working.directory, &snapshot, &working.gitdir).unwrap();
+        working
+            .prepare(&repo, &snapshot, &mount, Path::new("/bin/true"))
+            .unwrap();
+        let auth_file = working.gitdir.join("git-vfs-http-auth.config");
+        assert_eq!(
+            fs::metadata(&auth_file).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        let native_show = |name: &str| {
+            Command::new(&wrapper)
+                .arg("--git-dir")
+                .arg(&working.gitdir)
+                .args(["show", &format!("HEAD:{name}")])
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .env("GIT_TERMINAL_PROMPT", "0")
+                .output()
+                .unwrap()
+        };
+        assert_eq!(native_show("first").stdout, b"first");
+        git(
+            &bare,
+            &[
+                "config",
+                "--unset-all",
+                &format!("http.{origin}.extraHeader"),
+            ],
+        );
+        configure_auth("fixture-two");
+        fs::write(&token_file, "fixture-two").unwrap();
+        // Preserve unrelated user config and includes while replacing managed auth.
+        let extra = root.path().join("user.config");
+        fs::write(&extra, "[user]\n\tname = Preserved\n").unwrap();
+        git(
+            &working.gitdir,
+            &["config", "--add", "include.path", extra.to_str().unwrap()],
+        );
+        working
+            .prepare(&repo, &snapshot, &mount, Path::new("/bin/true"))
+            .unwrap();
+        assert_eq!(native_show("second").stdout, b"second");
+        assert_eq!(
+            git(&working.gitdir, &["config", "--includes", "user.name"]),
+            b"Preserved\n"
+        );
+        let includes = git(
+            &working.gitdir,
+            &["config", "--local", "--get-all", "include.path"],
+        );
+        assert_eq!(
+            includes
+                .split(|b| *b == b'\n')
+                .filter(|p| *p == auth_file.as_os_str().as_bytes())
+                .count(),
+            1
+        );
+        git(
+            &bare,
+            &[
+                "config",
+                "--unset-all",
+                &format!("http.{origin}.extraHeader"),
+            ],
+        );
+        working
+            .prepare(&repo, &snapshot, &mount, Path::new("/bin/true"))
+            .unwrap();
+        assert!(fs::read(&auth_file).unwrap().is_empty());
+        assert!(
+            !native_show("third").status.success(),
+            "removed auth must not remain effective"
+        );
+        let argv = fs::read(wrapper.with_extension("argv")).unwrap();
+        assert!(
+            !argv
+                .windows(b"fixture-one".len())
+                .any(|x| x == b"fixture-one")
+        );
+        assert!(
+            !argv
+                .windows(b"fixture-two".len())
+                .any(|x| x == b"fixture-two")
+        );
+    }
 }

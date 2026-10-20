@@ -1,4 +1,4 @@
-exports_files(["Cargo.toml", "Cargo.lock", "examples/bazel-output-service.toml"])
+exports_files(["Cargo.toml", "Cargo.lock", "examples/bazel-output-service.toml", "examples/workspace.toml"])
 
 platform(
     name = "rbe_linux_x86_64",
@@ -10,6 +10,7 @@ platform(
 )
 
 alias(name = "workspace-fuse", actual = "//crates/workspace-fuse:git-vfs-bin", visibility = ["//visibility:public"])
+alias(name = "workspace", actual = "//crates/workspace-daemon:workspace", visibility = ["//visibility:public"])
 alias(name = "agent-session", actual = "//crates/agent-session:agent-session-bin", visibility = ["//visibility:public"])
 alias(name = "git-proxy", actual = "//crates/git-proxy:git-proxy-bin", visibility = ["//visibility:public"])
 alias(name = "workspace-nfs", actual = "//crates/workspace-nfs:git-nfs-bin", visibility = ["//visibility:public"])

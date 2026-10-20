@@ -206,6 +206,7 @@ impl CasSync {
     pub(crate) fn new(
         config: CasSyncConfig,
         cache_dir: &Path,
+        shared_cache: Option<(Arc<LocalCas>, String)>,
     ) -> Result<(Arc<Self>, mpsc::Receiver<Job>, watch::Receiver<bool>)> {
         ensure!(
             config.staging_limit_bytes > 0,
@@ -219,37 +220,50 @@ impl CasSync {
         // retaining values in Debug-printable server configuration.
         config.policy.validate()?;
         let client = config.client_config()?;
-        ensure!(
-            config.cache_max_bytes >= config.staging_limit_bytes,
-            "CAS content cache must fit the staging byte budget"
-        );
-        let mut scope = blake3::Hasher::new();
-        scope.update(b"git-proxy-cas-content-v1");
-        for value in std::iter::once(client.endpoint.as_str())
-            .chain(std::iter::once(client.instance_name.as_str()))
-            .chain(
-                client
-                    .headers
-                    .iter()
-                    .flat_map(|(name, value)| [name.as_str(), value.as_str()]),
-            )
-        {
-            scope.update(&(value.len() as u64).to_le_bytes());
-            scope.update(value.as_bytes());
-        }
-        let backend = scope.finalize().to_hex().to_string();
-        let cache = LocalCas::open(
-            cache_dir.join("cas-content-v1"),
-            Arc::new(NoDefaultSource),
-            CacheConfig {
-                max_bytes: config.cache_max_bytes,
-                max_inflight_bytes: config.staging_limit_bytes,
-                max_oversized_inflight_bytes: 0,
-                max_concurrent_fetches: 1,
-                operation_timeout: config.policy.background_timeout(),
-                fetch_timeout: config.policy.background_timeout(),
-            },
-        )?;
+        let (cache, backend) = if let Some((cache, backend)) = shared_cache {
+            ensure!(
+                !backend.is_empty(),
+                "shared CAS backend identity is required"
+            );
+            ensure!(
+                cache.config().max_bytes >= config.staging_limit_bytes,
+                "shared CAS must fit the staging byte budget"
+            );
+            (cache, backend)
+        } else {
+            ensure!(
+                config.cache_max_bytes >= config.staging_limit_bytes,
+                "CAS content cache must fit the staging byte budget"
+            );
+            let mut scope = blake3::Hasher::new();
+            scope.update(b"git-proxy-cas-content-v1");
+            for value in std::iter::once(client.endpoint.as_str())
+                .chain(std::iter::once(client.instance_name.as_str()))
+                .chain(
+                    client
+                        .headers
+                        .iter()
+                        .flat_map(|(name, value)| [name.as_str(), value.as_str()]),
+                )
+            {
+                scope.update(&(value.len() as u64).to_le_bytes());
+                scope.update(value.as_bytes());
+            }
+            let backend = scope.finalize().to_hex().to_string();
+            let cache = LocalCas::open(
+                cache_dir.join("cas-content-v1"),
+                Arc::new(NoDefaultSource),
+                CacheConfig {
+                    max_bytes: config.cache_max_bytes,
+                    max_inflight_bytes: config.staging_limit_bytes,
+                    max_oversized_inflight_bytes: 0,
+                    max_concurrent_fetches: 1,
+                    operation_timeout: config.policy.background_timeout(),
+                    fetch_timeout: config.policy.background_timeout(),
+                },
+            )?;
+            (cache, backend)
+        };
         let (sender, receiver) = mpsc::channel(QUEUED_JOBS);
         let (shutdown, cancelled) = watch::channel(false);
         Ok((
@@ -745,8 +759,15 @@ mod tests {
     impl HttpServer {
         async fn start(config: Config) -> Self {
             let (router, cas) = crate::router_with_cas_shutdown(config).unwrap();
+            Self::start_router(router, cas, "").await
+        }
+        async fn start_router(
+            router: axum::Router,
+            cas: Option<CasShutdown>,
+            prefix: &str,
+        ) -> Self {
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-            let origin = format!("http://{}", listener.local_addr().unwrap());
+            let origin = format!("http://{}{prefix}", listener.local_addr().unwrap());
             let (done, stopped) = tokio::sync::oneshot::channel();
             let task = tokio::spawn(async move {
                 axum::serve(listener, router)
@@ -881,6 +902,68 @@ mod tests {
             "first_publish_seconds":first_seconds, "all_present_seconds":present_seconds, "republish_seconds":elapsed})
         );
         server.stop().await;
+    }
+
+    #[tokio::test]
+    async fn hosted_publication_uses_callers_cache_scope_and_nested_route() {
+        let root = tempfile::tempdir().unwrap();
+        let (source, oids, digests) = fixture(root.path());
+        let remote = wire::server(false, 2 * 1024 * 1024, "no-auth").await;
+        let config = configuration(
+            root.path(),
+            &source,
+            remote.endpoint.clone(),
+            Duration::ZERO,
+        );
+        // Own the exact path standalone mode would try to open: hosting must
+        // inject this handle, not create a competing owner or another cache.
+        let cache = LocalCas::open(
+            config.cache_dir.join("cas-content-v1"),
+            Arc::new(NoDefaultSource),
+            CacheConfig::default(),
+        )
+        .unwrap();
+        let backend = "shared-authorized-backend".to_owned();
+        let (router, shutdown) =
+            crate::router_with_shared_cache(config.clone(), cache.clone(), backend.clone())
+                .unwrap();
+        let server = HttpServer::start_router(
+            axum::Router::new().nest("/private-capability", router),
+            shutdown,
+            "/private-capability",
+        )
+        .await;
+        server.post("cas-sync", json!({"oids":oids})).await;
+        let stats = server.settled().await;
+        assert_eq!(stats["failed_jobs"], 0);
+        assert_eq!(stats["uploaded_objects"], 2);
+        // Simulate another daemon consumer. The default source always fails;
+        // success proves publication populated the caller's exact cache scope.
+        for digest in &digests {
+            let artifact = Artifact {
+                backend: backend.clone(),
+                instance: "test/instance".into(),
+                digest_function: 9,
+                hash: digest.hash.clone(),
+                size: digest.size_bytes as u64,
+            };
+            let blob = cache.clone().content(artifact).await.unwrap();
+            assert_eq!(
+                std::fs::metadata(blob.path()).unwrap().len(),
+                digest.size_bytes as u64
+            );
+            assert!(remote.contains(digest));
+        }
+        server.stop().await;
+        // Shutting down the Git host must not release the daemon's CAS owner.
+        assert!(
+            LocalCas::open(
+                config.cache_dir.join("cas-content-v1"),
+                Arc::new(NoDefaultSource),
+                CacheConfig::default(),
+            )
+            .is_err()
+        );
     }
 
     #[tokio::test]
@@ -1070,7 +1153,7 @@ mod tests {
     async fn bounded_queue_force_conflicts_and_owner_drop_cancel_pending_work() {
         let config = CasSyncConfig::new("http://127.0.0.1:1".into());
         let cache_root = tempfile::tempdir().unwrap();
-        let (sync, jobs, cancelled) = CasSync::new(config, cache_root.path()).unwrap();
+        let (sync, jobs, cancelled) = CasSync::new(config, cache_root.path(), None).unwrap();
         // No receiver is started yet, making queue/backpressure deterministic.
         let first = vec!["a".repeat(40)];
         assert_eq!(

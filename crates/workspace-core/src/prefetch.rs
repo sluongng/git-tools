@@ -747,6 +747,92 @@ common --other="--downloader_config=not-a-flag.cfg"
     }
 
     #[test]
+    fn merge_snapshot_metadata_does_not_hydrate_rename_candidates() {
+        use std::io::Write;
+        use std::process::Stdio;
+
+        let directory = tempfile::tempdir().unwrap();
+        let bare = directory.path().join("repo.git");
+        let global_config = directory.path().join("empty.gitconfig");
+        std::fs::write(&global_config, "").unwrap();
+        let git = |args: &[&str], input: &[u8]| {
+            let mut child = Command::new("git")
+                .arg("--git-dir")
+                .arg(&bare)
+                .args(args)
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .env("GIT_CONFIG_GLOBAL", &global_config)
+                .env("GIT_AUTHOR_NAME", "Fixture")
+                .env("GIT_AUTHOR_EMAIL", "fixture@example.invalid")
+                .env("GIT_COMMITTER_NAME", "Fixture")
+                .env("GIT_COMMITTER_EMAIL", "fixture@example.invalid")
+                .env("GIT_AUTHOR_DATE", "1700000000 +0000")
+                .env("GIT_COMMITTER_DATE", "1700000000 +0000")
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .unwrap();
+            child.stdin.take().unwrap().write_all(input).unwrap();
+            let output = child.wait_with_output().unwrap();
+            assert!(output.status.success(), "Git metadata fixture failed");
+            String::from_utf8(output.stdout).unwrap().trim().to_owned()
+        };
+        git(&["init", "--bare", "-q"], b"");
+        let mut blobs = HashSet::new();
+        let mut commit = |path: &str, text: &[u8], parents: &[&str]| {
+            let blob = git(&["hash-object", "-w", "--stdin"], text);
+            blobs.insert(blob.clone());
+            let tree = git(
+                &["mktree"],
+                format!("100644 blob {blob}\t{path}\n").as_bytes(),
+            );
+            let mut args = vec!["commit-tree", tree.as_str()];
+            for parent in parents {
+                args.extend(["-p", *parent]);
+            }
+            git(&args, b"fixture\n")
+        };
+        let base = commit("old.txt", b"one\ntwo\nthree\n", &[]);
+        let renamed = commit("new.txt", b"one\ntwo\nthree\n", &[&base]);
+        let modified = commit("old.txt", b"one\ntwo\nchanged\n", &[&base]);
+        let merged = commit("new.txt", b"one\ntwo\nmerged\n", &[&renamed, &modified]);
+        // Preserve commits and trees, but omit every blob as a blob:none clone
+        // does. A nonexistent promisor prevents accidental network recovery.
+        git(&["update-ref", "HEAD", &merged], b"");
+        git(&["config", "remote.origin.promisor", "true"], b"");
+        git(
+            &[
+                "config",
+                "remote.origin.url",
+                "file:///nonexistent-metadata-fixture",
+            ],
+            b"",
+        );
+        for oid in blobs {
+            std::fs::remove_file(bare.join("objects").join(&oid[..2]).join(&oid[2..])).unwrap();
+        }
+        let repo = GitRepo::open(&bare, "git", "origin", SizeFallback::Error).unwrap();
+        let snapshot = Snapshot::load(&repo, "HEAD").unwrap();
+        assert_eq!(snapshot.commit, merged);
+        assert_eq!(
+            snapshot.timestamp(),
+            std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000)
+        );
+        let entries = snapshot.entries();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].path, "new.txt");
+        assert!(
+            repo.git_output(
+                &["cat-file", "-e", entries[0].oid.as_deref().unwrap()],
+                false
+            )
+            .is_err(),
+            "metadata loading must leave the promisor blob absent"
+        );
+    }
+
+    #[test]
     fn public_prefetch_discovers_recursive_rc_and_module_inputs_without_unrelated_files() {
         let (_dir, mut repo, snapshot) = fixture();
         let report = prefetch_bazel_metadata(&mut repo, &snapshot).unwrap();

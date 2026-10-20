@@ -5,3 +5,5 @@ pub mod filesystem;
 mod github_sizes;
 pub mod prefetch;
 pub mod storage;
+
+pub mod source_cas;

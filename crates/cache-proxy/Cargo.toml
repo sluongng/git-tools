@@ -1,0 +1,22 @@
+[package]
+name = "cache-proxy"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+description = "Host-local verified REAPI cache proxy"
+
+[dependencies]
+anyhow = "1"
+async-trait = "0.1"
+async-compression = { version = "0.4", features = ["tokio", "zstd"] }
+tempfile = "3"
+async-stream = "0.3"
+blake3 = "1"
+futures-core = "0.3"
+local-cas = { path = "../local-cas" }
+prost = "0.14"
+reapi = { path = "../reapi" }
+sha2 = "0.10"
+tokio = { version = "1", features = ["full"] }
+tokio-stream = { version = "0.1", features = ["net"] }
+tonic = { version = "0.14", features = ["tls-ring", "tls-webpki-roots", "gzip"] }

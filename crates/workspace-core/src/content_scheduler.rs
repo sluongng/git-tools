@@ -1154,6 +1154,41 @@ fn read_local(
     waiters: &[Waiter],
     large: bool,
 ) -> Result<Option<Vec<Vec<u8>>>> {
+    if repo.shared_cas.is_some() {
+        if !large
+            && repo
+                .cache_lock()?
+                .blake3_many(&[oid.to_owned()])?
+                .get(oid)
+                .is_some_and(|(size, _)| *size > 1 << 20)
+        {
+            return Err(DeferLarge.into());
+        }
+        match repo.shared_blob(oid, false) {
+            Ok(Some(blob)) => {
+                let file = File::open(blob.path())?;
+                let length = file.metadata()?.len();
+                if !large && length > 1 << 20 {
+                    return Err(DeferLarge.into());
+                }
+                let output = waiters
+                    .iter()
+                    .map(|w| read_range(&file, w.offset, w.size, length))
+                    .collect::<Result<Vec<_>>>()?;
+                handle
+                    .0
+                    .counters
+                    .cache_hits
+                    .fetch_add(waiters.len() as u64, Ordering::Relaxed);
+                return Ok(Some(output));
+            }
+            Ok(None) => {}
+            // Cache capacity, corruption and misses never strand an otherwise
+            // readable Git object. Native streaming below verifies its Git
+            // identity and detects conflicting mappings before publication.
+            Err(_) => {}
+        }
+    }
     let cached = cache.lock().unwrap_or_else(|e| e.into_inner()).take(oid);
     if let Some(entry) = cached {
         handle
@@ -1183,10 +1218,25 @@ fn read_local(
         .map(|w| Vec::with_capacity(w.size as usize))
         .collect::<Vec<_>>();
     let mut staged = None;
+    let mut blake3 = repo.shared_cas.as_ref().map(|_| blake3::Hasher::new());
+    let mut git_sha1 = repo
+        .shared_cas
+        .as_ref()
+        .map(|_| <sha1::Sha1 as sha1::Digest>::new());
     let result = reader
         .as_mut()
         .unwrap()
         .stream_local(oid, |size, position, bytes| {
+            if let Some(hash) = &mut blake3 {
+                hash.update(bytes);
+            }
+            if let Some(hash) = &mut git_sha1 {
+                use sha1::Digest;
+                if bytes.is_empty() {
+                    hash.update(format!("blob {size}\0"));
+                }
+                hash.update(bytes);
+            }
             if bytes.is_empty() {
                 if !large && size > 1 << 20 {
                     return Err(DeferLarge.into());
@@ -1234,6 +1284,14 @@ fn read_local(
         })?;
     if result.is_none() {
         return Ok(None);
+    }
+    if let (Some(hash), Some(git)) = (blake3, git_sha1) {
+        use sha1::Digest;
+        ensure!(
+            hex::encode(git.finalize()) == oid,
+            "Git blob SHA1 verification failed"
+        );
+        repo.learn_shared_blob(oid, result.unwrap(), *hash.finalize().as_bytes())?;
     }
     if let Some(entry) = staged {
         cache

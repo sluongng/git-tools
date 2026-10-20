@@ -1,113 +1,76 @@
 ---
 name: cloud-bazel-agent
-description: Start and resume isolated Linux coding-agent sessions for Bazel using agent-session, a shared Git proxy, and provisioned RBE plus remote repository contents caching instead of worktrees.
+description: Start and resume private Linux coding-agent workspaces for Bazel RBE through the shared workspace daemon, without Git worktrees.
 ---
 
 # Cloud Bazel agent
 
-Give every agent private source, overlay and Bazel roots. Share the warm Git
-proxy, RBE and remote caches—not mutable workspaces or output bases.
+Use `workspace` as the entry point. One host daemon shares Git transport,
+immutable source/output bytes and a BuildBuddy cache connection. Each agent owns
+its source edits, Git admin state and Bazel output base; do not share those.
 
-## Provisioning
+## Provision once per trusted host
 
-Use Linux with `/dev/fuse`, `fusermount3`, `agent-session`, `git-vfs`, native Git
-supporting `cat-file remote-object-info`, and compatible Bazel with BLAKE3 digest
-xattrs and r2c2 (shown workflow targets Bazel 9.2). The proxy needs the configured
-repository and trusted BLAKE3 mappings warmed. Mirror preparation is available
-through `POST /api/v1/repos/ALIAS/prepare`; it does not populate every mapping or
-prove CAS residency. Keep the unauthenticated proxy on a trusted network.
+Use Linux with `/dev/fuse`, `fusermount3`, native Git supporting
+`cat-file remote-object-info`, and the `workspace` binary. Bazel needs BLAKE3,
+digest xattrs, r2c2 and the [Unix-socket authority fix](https://github.com/bazelbuild/bazel/commit/242563f1a14378801725e5f6b0ee397ef0d307f2).
+An older repository-pinned client, including 9.3.0rc2, is not sufficient.
 
-Obtain these inputs from the scheduler or provisioned environment:
+Provision [workspace TOML](../../workspace.toml) outside all mounts: repository
+aliases, BuildBuddy upstream, credential environment-variable name, compatible
+`session.bazel`, and an external `session.bazelrc` enabling RBE with the correct
+execution platforms. Never copy credentials into a repository or put them in
+command arguments. The CLI does not provision SDKs or prove that RBE was used.
 
-- `PROXY_URL`: HTTP(S) origin without credentials; `PROXY_REPO`: configured alias.
-- `TASK_REF`: clone branch/tag; `TASK_REVISION`: full immutable commit SHA.
-- `TASK_TARGET`: narrow build target.
-- `AGENT_SESSION`: new absolute private session path outside all mounts.
-- `AGENT_BAZELRC`: existing absolute-path rc outside the repository, configuring
-  RBE, a BLAKE3-capable cache, r2c2 and compatible execution platforms.
-- `AGENT_REPO_CONTENTS_CACHE`: existing absolute host directory for this trusted
-  agent pool, outside all sessions; preseed separately when low startup latency matters.
+The first Git request prepares a full mirror; prewarm it when agent startup
+latency matters, and account for that cost separately. An optional host-shared
+repository-tree cache must be provisioned outside sessions. Remote r2c2 stays
+on by default, but remote hits do not populate that extracted-tree cache.
 
-Use existing credential helpers/secret files, never keys in URLs or flags.
-Provision SDKs and generated execution-platform configuration in the agent image;
-r2c2 does not make host SDK detection or arbitrary generators reproducible.
-Report missing provisioning rather than claiming RBE/r2c2 is active.
+## Start work
 
-## Create and build
+Inputs: a new absolute `AGENT_SESSION`, repository alias `PROXY_REPO`, branch/tag
+`TASK_REF`, immutable full commit `TASK_REVISION`, and `TASK_TARGET`.
 
 ```sh
-set -eu
-: "${PROXY_URL:?}" "${PROXY_REPO:?}" "${TASK_REF:?}" "${TASK_REVISION:?}"
-: "${AGENT_SESSION:?}" "${AGENT_BAZELRC:?}" "${TASK_TARGET:?}"
-: "${AGENT_REPO_CONTENTS_CACHE:?}"
-agent-session create "$AGENT_SESSION" \
-  --proxy-url "$PROXY_URL" --proxy-repo "$PROXY_REPO" \
-  --reference "$TASK_REF" --revision "$TASK_REVISION" \
-  --bazelrc "$AGENT_BAZELRC" \
-  --repo-contents-cache "$AGENT_REPO_CONTENTS_CACHE" \
-  --remote-repo-contents-cache=true
-agent-session build "$AGENT_SESSION" -- "$TASK_TARGET"
+workspace create "$AGENT_SESSION" --repo "$PROXY_REPO" \
+  --reference "$TASK_REF" --revision "$TASK_REVISION"
+workspace build "$AGENT_SESSION" -- "$TASK_TARGET"
 cd "$AGENT_SESSION/workspace"
 git status --short
 ```
 
-Create requires a nonexistent session directory; do not clone over retained
-state. If the provisioned rc uses a named config, pass it after `--` in `build`.
-The CLI supplies private Bazel roots and BLAKE3/r2c2 startup flags. Results are
-JSON; subprocess output goes to stderr. `status` exposes edit readiness and
-retained phase timings; a successful mount does not prove a successful RBE build.
-Inspect the first invocation's execution/cache evidence. Avoid broad queries when
-the task already provides a target.
+`create` starts the shared daemon automatically. Use global `--config FILE` for
+an explicitly provisioned host configuration. If the external bazelrc requires
+a named config, pass it after `--` in `build`/`test`. Inspect the first invocation
+for actual execution/cache evidence; mount readiness is not build success.
 
-Size/mapping import remains blocking metadata work. Likely Bazel inputs and
-symlink blobs prefetch asynchronously after mount; other contents load on demand.
-For task-specific prefetch scopes, use the component CLI described in the
-[VFS reference](../../../docs/vfs-reference.md), not an invented session flag.
+Likely Bazel inputs prefetch asynchronously after mount. Other contents load
+lazily. BOS is opt-in (`bos.enabled = true`); its outputs stay lazy, but current
+metadata staging can slow builds. A digest mapping or queued upload is not proof
+of remote CAS residency; Bazel/proxy still ensure inputs reach BuildBuddy.
 
-## Save, stop and resume
-
-Stage only the intended changes, then commit when requested:
+## Iterate and retain work
 
 ```sh
+workspace test "$AGENT_SESSION" -- //path/to:tests
+# Stage only intended changes when a commit is requested.
 git add path/to/changed-file
-agent-session save "$AGENT_SESSION" -- -m 'Describe the change'
-agent-session stop "$AGENT_SESSION"
-agent-session resume "$AGENT_SESSION"
+workspace save "$AGENT_SESSION" -- -m 'Describe the change'
+workspace stop "$AGENT_SESSION"
+workspace resume "$AGENT_SESSION"
 ```
 
-`save` is native Git commit: hooks, signing and staged/unstaged semantics remain
-native. It does not stage, export or push automatically. Stock Git may hydrate
-all missing indexed blobs during commit; do not promise a lazy save. Retain a
-patch instead when that is the requested deliverable. JJ is a separate workflow.
+`save` is native Git commit, not automatic staging or pushing. A first commit
+can hydrate missing indexed blobs. General checkout/merge/rebase and native JJ
+session orchestration are not supported by this lifecycle command.
 
-Stop preserves edits, index and local commits, shutting down only this session's
-Bazel and verified VFS. Resume uses the original clone/overlay/revision. Never
-delete the overlay or stop the shared proxy as routine cleanup. A copied session
-manifest cannot claim the original process; inspect ownership failures manually.
-The session CLI is currently Linux-only; native NFS/ProjFS frontends have their
-own lifecycle commands. See [session limits](../../../crates/agent-session/README.md).
+Stop retains edits, index, commits and caches. Do not delete overlays or shut down
+the shared daemon as routine agent cleanup. After a crash, run
+`workspace recover "$AGENT_SESSION"` before resume. Recovery refuses live or unverified mounts;
+do not bypass that check or claim transparent recovery.
 
-## Cache policy
-
-On a trusted host, provision an existing shared directory outside every session
-and add `--repo-contents-cache /absolute/host/repo-contents` to `create`. Source,
-overlay and output roots remain private; cached dependencies are symlink-shared
-and must not be edited. Remote r2c2 stays on independently; disable it only with
-`--remote-repo-contents-cache=false` at creation, not by disabling all remote
-action-cache reads. Endpoint/auth/instance remain in the provisioned rc.
-
-Remote hits do not fill the local extracted-directory cache. A separate shared
-Bazel `--disk_cache` can reuse lazy remote blobs within a trusted scope; configure
-its GC budget. Bazel 9.2 ignores that disk cache with remote output service enabled.
-If the host cache is preseeded, record that preparation separately. Populate full
-trees with a separate r2c2-off build/session; ordinary agents keep r2c2 enabled.
-
-Provision Bazel's remote TTL from the backend's actual retention contract. It is
-an operator assumption, not a REAPI lease; omitting it keeps Bazel's own default,
-not zero. Proxy presence suppression is separate and defaults to zero (recheck).
-Never infer either policy from the other's interval or a successful upload.
-
-Base digests reuse trusted mappings; edited files hash current overlay bytes.
-A mapping is not remote CAS residency: Bazel still uploads missing inputs.
-[Proxy CAS sync](../../../docs/proxy-cas-sync.md) is optional asynchronous
-publication; queueing is not completion. Preserve these distinctions in reports.
+Only disposable verified bytes enter the shared LRU CAS. Native Git packs and
+repository trees have separate cleanup policies. Action-result TTL and positive
+presence hints default to zero; configure longer retention only from an actual
+backend contract, not inferred from a successful upload.

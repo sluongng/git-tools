@@ -31,6 +31,8 @@ use tonic::{
     transport::{Channel, ClientTlsConfig, Endpoint},
 };
 
+pub mod host;
+
 pub mod proto {
     tonic::include_proto!("bazel_output_service");
 }
@@ -58,6 +60,7 @@ pub struct OutputService {
     root: Arc<Dir>,
     root_path: PathBuf,
     backend: Backend,
+    client_cache_endpoint: String,
     projection: Option<Arc<dyn Projection>>,
     projection_tree: Option<Arc<output_core::Tree>>,
     // Registry operations never await; each output base owns its lifecycle lock.
@@ -265,6 +268,28 @@ fn origin(value: &str) -> Result<String, Status> {
         uri.scheme_str().unwrap(),
         uri.authority().unwrap()
     ))
+}
+
+/// Local transport alias only. Never used to select or authorize an upstream.
+fn client_cache_endpoint(value: &str) -> Result<String, Status> {
+    if let Some(path) = value.strip_prefix("unix:") {
+        let path = std::path::Path::new(path);
+        if !path.is_absolute()
+            || path.components().any(|part| {
+                matches!(
+                    part,
+                    std::path::Component::ParentDir | std::path::Component::CurDir
+                )
+            })
+            || value.chars().any(char::is_control)
+        {
+            return Err(Status::invalid_argument(
+                "local cache socket must be an absolute Unix path",
+            ));
+        }
+        return Ok(value.to_owned());
+    }
+    origin(value)
 }
 fn unpack<T: Message + Default>(any: Option<prost_types::Any>, name: &str) -> Result<T, Status> {
     let any = any.ok_or_else(|| Status::invalid_argument("missing protocol arguments"))?;
@@ -693,7 +718,18 @@ impl BlobSource for Backend {
 }
 impl OutputService {
     pub async fn new(config: Config) -> anyhow::Result<Self> {
+        let endpoint = config.cas_endpoint.clone();
+        Self::new_with_client_endpoint(config, &endpoint).await
+    }
+    /// Configure the exact cache origin Bazel is allowed to name independently
+    /// of the upstream transport. This is an operator-selected alias, not a
+    /// caller-selected forwarding target. Upstream credentials retain their scope.
+    pub async fn new_with_client_endpoint(
+        config: Config,
+        client_cache_endpoint: &str,
+    ) -> anyhow::Result<Self> {
         config.policy.validate()?;
+        let client_cache_endpoint = self::client_cache_endpoint(client_cache_endpoint)?;
         let endpoint = origin(&config.cas_endpoint)?;
         if config.instance_name.starts_with('/')
             || config.instance_name.ends_with('/')
@@ -736,6 +772,7 @@ impl OutputService {
                 zstd_read_requests: Arc::new(AtomicU64::new(0)),
                 cas_read_wire_bytes: Arc::new(AtomicU64::new(0)),
             },
+            client_cache_endpoint,
             projection: None,
             projection_tree: None,
             state: Arc::new(StdMutex::new(Registry::default())),
@@ -1040,7 +1077,7 @@ impl BazelOutputService for OutputService {
             }
             let args = unpack::<rev2::StartBuildArgs>(req.args, ARGS_TYPE)?;
             Hasher::new(args.digest_function)?;
-            if origin(&args.remote_cache)? != self.backend.endpoint
+            if client_cache_endpoint(&args.remote_cache)? != self.client_cache_endpoint
                 || args.instance_name != self.backend.instance
             {
                 return Err(Status::permission_denied(
