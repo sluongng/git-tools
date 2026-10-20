@@ -1,71 +1,32 @@
-# Asynchronous workspace CAS sync
+# Background workspace CAS sync
 
-The proxy can publish Git blob contents to a BLAKE3 REAPI CAS while agents start
-working. Use the same cache endpoint, instance and authorization namespace as
-Bazel. The VFS still owns a private writable overlay per agent; r2c2 handles
-external repositories, while this uploader handles main-workspace Git blobs.
+The proxy can publish Git blob content to a **BLAKE3 REAPI CAS** while agents
+start. Use Bazel's same endpoint, instance and authorization namespace. This is
+main-workspace content; r2c2 handles external repositories separately.
 
-## Configure
+## Enable
 
-Have the host's secret manager provide `AGENT_CAS_KEY`. Pass its **variable name**,
-not the key value. Start a dedicated proxy owner:
+Supply the selected secret through `AGENT_CAS_KEY`; pass its name, not value:
 
 ```sh
-target/release/git-proxy --cache-dir /var/tmp/git-proxy \
+git-proxy --cache-dir /var/tmp/git-proxy \
   --repo bazel=https://github.com/bazelbuild/bazel.git --enable-blake3 \
-  --cas-endpoint https://CACHE_HOST \
-  --cas-instance-name INSTANCE \
+  --cas-endpoint https://CACHE_HOST --cas-instance-name INSTANCE \
   --cas-header-env x-buildbuddy-api-key=AGENT_CAS_KEY \
   --config /etc/git-tools/reapi.toml
 ```
 
-An optional explicit TOML file configures the shared REAPI policy. Missing keys
-use conservative defaults; unknown keys/sections, invalid values and files over
-64 KiB fail startup. There is no implicit discovery or environment expansion.
-Endpoint, instance and credential selection remain explicit CLI arguments.
+The endpoint is an HTTP(S) origin equivalent to Bazel's grpc(s) cache address.
+The [shared TOML example](../examples/reapi-policy.toml) controls deadlines,
+retries and presence hints; see [policy](reapi-policy.md). No config discovery,
+environment expansion or credentials in TOML. Native Git children do not inherit
+selected CAS credentials. The unauthenticated Git frontend remains trusted-local.
 
-```toml
-[reapi]
-connect_timeout_ms = 10000
-rpc_timeout_ms = 60000
-stream_idle_timeout_ms = 60000
-operation_timeout_ms = 120000
-background_timeout_ms = 600000
-presence_ttl_seconds = 0
+BLAKE3 `/objects` requests automatically queue blob publication; `warm-blake3`
+therefore initiates work without awaiting uploads. Queue saturation does not break
+ordinary Git/mapping requests. Prewarm before an agent burst to avoid contention.
 
-[reapi.retry]
-max_attempts = 4
-initial_backoff_ms = 100
-max_backoff_ms = 5000
-```
-
-`max_attempts` includes the original call. Replay-safe transient failures use
-exponential full-jitter backoff within the original deadline; valid server retry
-hints are respected. Authentication, malformed responses, missing objects and
-integrity failures are not blindly retried. Partial batch uploads retry only
-transient failed entries, not acknowledged successes. Stream retries reopen the
-immutable spool with a new upload ID, restarting at offset zero.
-
-Unary attempts have their own timeout. ByteStream uploads instead use an idle
-watchdog, so ongoing progress can exceed the unary timeout. One foreground
-operation deadline includes local reads/verification and all retries; background
-publication has one separate job budget covering Git mapping, spooling and CAS
-work. Cancelling the job drops attempts/backoff and aborts bounded upload readers.
-`--cas-remote-ttl-seconds` explicitly overrides the TOML presence setting.
-
-The CAS endpoint is an HTTP(S) **origin**, equivalent to Bazel's `grpc(s)` cache
-address. This does not configure a remote executor or expose a new CAS server.
-Only explicitly selected environment variables supply credentials; their values
-are not logged, persisted in Git, or inherited by native Git subprocesses.
-Do not expose the unauthenticated Git/metadata frontend to untrusted clients.
-
-With CAS configured, a BLAKE3 `/objects` request automatically queues its blob
-IDs. `git-vfs warm-blake3` therefore starts publication without waiting for it.
-Git/mapping requests do not await CAS uploads; queue saturation leaves normal
-Git and digest lookup working. Background work can still compete for CPU, disk,
-and Git repository locks. Warm a shared proxy before launching a burst of agents.
-
-To queue selected blob IDs directly, without waiting for mapping generation:
+To queue IDs explicitly:
 
 ```sh
 curl --fail-with-body http://127.0.0.1:8082/api/v1/repos/bazel/cas-sync \
@@ -74,120 +35,72 @@ curl --fail-with-body http://127.0.0.1:8082/api/v1/repos/bazel/cas-sync \
 curl --fail-with-body http://127.0.0.1:8082/api/v1/cache/stats
 ```
 
-Requests permit up to 16,384 IDs / 2 MiB. A **202 means queued, not uploaded**.
-`cas_sync` stats expose accepted/completed/failed/cancelled jobs, pending objects,
-TTL hits, confirmed objects, uploads, size-limit omissions and transport calls.
-`last_error` is a fixed stage label, not server-supplied error text. A failed job
-may have successfully published earlier batches; it is not a successful full
-sync. `force:true` bypasses presence observations for the requested objects;
-it is rejected while those IDs are already pending. Reissue after completion
-when repairing a known remote loss.
+Limits: 16,384 IDs / 2MiB per request. **202 means queued, not uploaded.**
+Stats distinguish accepted/completed/failed/cancelled work, omissions, confirmed
+objects and transport calls. Jobs can partially succeed before failing.
+`force:true` rechecks known remote loss; it is rejected for already-pending IDs.
 
-## Upload policy
-
-The ordinary-blob batching heuristic follows BuildBuddy Executor:
+## Upload and reuse
 
 | Operation | Policy |
-|---|---|
-| FindMissingBlobs | At most 1,000 digests per request |
-| Small uploads | Sum uncompressed sizes up to 2 MiB; flush before overflow and at drain |
-| Large uploads | Raw size >2 MiB uses ByteStream, with bounded compressed/identity frames |
-| Advertised limits | Reduce batch limit and respect serialized gRPC-message bounds |
+| --- | --- |
+| FindMissingBlobs | Up to 1,000 digests/request |
+| Small upload batches | Up to 2MiB decoded bytes, flush before overflow/drain |
+| Larger blobs | ByteStream; honor advertised serialized-message limits |
+| Compression | Negotiate batch/stream ZSTD separately; metadata accepts gzip |
+| CDC | Negotiate FastCDC 2020 + unary SpliceBlob; otherwise upload whole blob |
 
-ZSTD is selected independently from the server's batch-update and ByteStream
-compressor capabilities. Advertised ZSTD is used even for small batch items;
-large blobs are compressed incrementally. CDC chunks and whole-blob
-fallback use the same policy. Digests, batching budgets and presence records
-always describe uncompressed content. Serialized protobuf size is checked
-separately. Uploads remain serialized; this is not the Executor's full parallel
-upload policy. Lookup failures fail the job rather than assuming presence.
+These follow BuildBuddy Executor's batching heuristic, not its complete parallel
+upload policy. Uploads are serialized. CDC uses advertised seed/normalization2,
+average/4 minimum and average*4 maximum, for blobs larger than average*4.
+Supported averages: 1KiB–4MiB; at most 32,768 chunks. Missing-chunk splice gets
+one recheck/repair; unsupported RPCs fall back, not authentication/corruption.
+Streaming-only REAPI chunk registration is not implemented.
 
-All metadata clients accept gzip responses. Metadata requests use gzip only after
-an explicit peer advertisement; a service rejecting that codec can trigger one
-identity retry within the original deadline. Authentication and method failures
-are not codec retries. Already-compressed payload RPCs are not compressed again
-at the gRPC layer. `uploaded_bytes` counts uncompressed confirmed content;
-`uploaded_wire_bytes` counts emitted application payload bytes, excluding
-protobuf/HTTP framing and potential transport gzip. `zstd_batch_blobs` and
-`zstd_stream_blobs` show actual compression use. Tiny compressed frames can be
-larger than identity; compression support alone is not a speedup claim.
+Git-extracted content is BLAKE3-verified in `cas-content-v1/` using
+[`local-cas`](../crates/local-cas/README.md). Upload/CDC/retry readers hold leases;
+LRU GC cannot unlink their bytes. `--cas-cache-max-bytes` defaults to 4GiB and must
+cover `--cas-staging-limit-bytes` (64MiB default). Larger individual blobs are
+omitted and fail this optimization's job; Bazel can upload them normally.
+Retained bytes can repair later remote eviction without another Git extraction,
+but a local hit **never replaces FindMissingBlobs or a successful upload**.
+This quota does not cap mirror/pack-response storage.
 
-GetCapabilities must advertise BLAKE3. For large eligible blobs, the client
-negotiates FastCDC 2020 parameters and unary SpliceBlob support. It uses the
-advertised seed, normalization2, minimum average/4 and maximum average*4; only
-blobs strictly larger than average*4 are chunked. Existing chunks are reused,
-missing chunks upload, and whole-blob presence is confirmed only after a valid
-splice acknowledgment. A missing-chunk splice gets one recheck/repair attempt.
-Unsupported CDC RPCs fall back to ordinary whole-blob uploads. Authentication,
-malformed responses, and digest mismatches never count as successful uploads.
+Digests, quota and `uploaded_bytes` describe decoded content.
+`uploaded_wire_bytes` is emitted application payload, not HTTP/protobuf traffic.
+Tiny ZSTD frames can exceed identity size; already-compressed payload RPCs do not
+add gRPC compression. Unary CDC capability flags matter, not only API version.
 
-The initial client supports the Bazel-compatible **unary** CDC profile, not
-streaming-only REAPI2.13 chunk registration. Capability booleans select it;
-BuildBuddy can advertise API2.11 while supporting those unary RPCs. FastCDC
-averages outside the supported 1KiB–4MiB range and mappings beyond 32,768 chunks
-fall back to whole blobs. Chunk upload transport is not a byte-for-byte copy of
-BuildBuddy's compression/parallel ByteStream policy.
+## Presence, deadlines and shutdown
 
-## TTL and completion
+Positive suppression defaults to **zero TTL**: recheck authoritative CAS state.
+A nonzero `presence_ttl_seconds` is advisory, not a lease or negotiated retention.
+Only use it with understood backend retention/repair; local hits do not extend it.
+Hints are process-local, scoped to endpoint/instance/auth/digest/size, and expire
+from request start. Restart rechecks. Mapping records persist separately.
+Bazel still checks missing inputs and uploads edits, directories and action protos.
+A Git symlink blob does not replace REAPI symlink metadata.
 
-Positive-presence suppression is **disabled by default** (`presence_ttl_seconds
-= 0`): every sync checks authoritative CAS state, including after an earlier
-successful upload. If enabling it, choose a short advisory interval below the
-backend's actual minimum retention guarantee. REAPI does **not** negotiate that
-guarantee. A local hit neither extends the observation nor refreshes remote
-access time; this hint is not a lease. Use `force:true` when repairing known loss.
-Bazel's independent remote-cache TTL is not automatically a safe proxy setting.
+Retries retain the original operation budget and partial batch successes. Stream
+retries reopen immutable content at offset zero with a new upload ID. Foreground
+and background budgets are separate; progress-based stream deadlines do not mean
+an unlimited job. Authentication, malformed acknowledgements and integrity errors
+never establish presence. See [the complete policy](reapi-policy.md).
 
-Positive observations are scoped to this process's configured endpoint,
-instance, credentials, BLAKE3 hash and raw size. They expire from **request start**,
-not response arrival. Within TTL, sync skips FindMissing; after expiry it checks
-again before reading/uploading content. Restart conservatively rechecks.
-Mapping entries are persistent; remote-presence observations are not.
+Queue: 8 jobs, 32,768 pending IDs, 65,536 presence observations. Pending work is
+best-effort, not durable: requeue after restart. Ctrl-C stops HTTP and cancels/joins
+workers and native Git process groups; cache ownership outlives admitted work.
+Embedders retain `router_with_cas_shutdown`'s owner and drain it; legacy `router`
+rejects CAS configuration. Do not manually clean active cache directories.
 
-Only a valid FindMissing response omitting a digest or a fully validated upload
-acknowledgment records presence. Queue acceptance, mapping generation, errors,
-and chunk upload before splice do not. All per-blob batch statuses and stream
-committed sizes are checked. Git content is verified against its mapped BLAKE3
-hash before upload. Bazel still performs its own missing-input checks, uploads
-edited/new files and directory/action protos, and repairs cache misses normally.
-Uploading a symlink's Git target-text blob is harmless but does not replace
-REAPI's symlink metadata.
+## Agent integration
 
-## Bounds and shutdown
+Use the [cloud-agent skill](../examples/skills/cloud-bazel-agent/SKILL.md).
+Bazel's r2c2/digest/xattr settings are startup options; executor/cache/instance
+settings are command options. Configure them independently of this daemon.
+A successful upload is useful preparation, not proof of a faster first build;
+see [measurements](benchmarks.md) and [reproduction](../tools/README.md).
 
-The process queues at most eight jobs and 32,768 pending IDs; observations are
-capped at 65,536 digests. A single worker stages at most 64MiB by default under
-`cas-spool/`, flushing before exceeding that budget. Set
-`--cas-staging-limit-bytes` to change it. Larger individual blobs are omitted
-from this optimization and fail the sync job; Bazel can upload them normally.
-Temporary files are removed on completion, failure or cancellation. Crashed
-processes can leave staging directories; clean those only with the proxy stopped.
-
-RPC deadlines cover response bodies as well as connection/header waits; the
-background job deadline also bounds staging and retries. Splice attempts allow
-max(60s, 250ms per chunk), capped at 10 minutes and the remaining job budget. Ctrl-C
-stops HTTP and cancels/joins the CAS worker, killing in-flight native Git process
-groups. Pending work is best-effort, not a durable queue: restart requires
-requeueing. Embedders must use `router_with_cas_shutdown` and retain its owner
-handle; the legacy `router` rejects CAS-enabled configurations. Dropping the
-owner also cancels work.
-
-## Agent startup and evidence
-
-Use [the cloud-agent skill](../examples/skills/cloud-bazel-agent/SKILL.md).
-Bazel's `--experimental_remote_repo_contents_cache`, `--digest_function=BLAKE3`
-and `--unix_digest_hash_attribute_name=user.blake3` are **startup** options.
-Cache/executor/instance/TTL settings are command options. R2c2 uses the ordinary
-remote AC/CAS configuration, not a separate dependency-cache URL. Its first miss
-may still evaluate a repository rule and upload synchronously.
-
-For a fair first-build benchmark, use private output bases and local repository
-contents caches, count actual remote actions/cache hits, and record proxy/CAS
-prewarming separately. Disabling `--remote_accept_cached` also disables r2c2
-reads in Bazel9.2; selective action `no-remote-cache` requirements are needed to
-force execution without disabling dependency reuse.
-
-Sources: [BuildBuddy uploader](https://github.com/buildbuddy-io/buildbuddy/blob/171043b63cb257653511c3ece31c7be62c7ab316/server/remote_cache/cachetools/cachetools.go),
-[Executor presence batches](https://github.com/buildbuddy-io/buildbuddy/blob/171043b63cb257653511c3ece31c7be62c7ab316/server/cache/dirtools/dirtools.go),
-[REAPI schema and pins](../crates/reapi/proto/SOURCES.md),
-[Bazel TTL](https://github.com/bazelbuild/bazel/blob/9.2.0/src/main/java/com/google/devtools/build/lib/remote/options/CommonRemoteOptions.java).
+Protocol/source provenance: [REAPI pins](../crates/reapi/proto/SOURCES.md),
+[BuildBuddy uploader](https://github.com/buildbuddy-io/buildbuddy/blob/171043b63cb257653511c3ece31c7be62c7ab316/server/remote_cache/cachetools/cachetools.go),
+[Executor presence batching](https://github.com/buildbuddy-io/buildbuddy/blob/171043b63cb257653511c3ece31c7be62c7ab316/server/cache/dirtools/dirtools.go).

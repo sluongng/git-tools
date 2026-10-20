@@ -94,4 +94,4 @@ Checks: `cargo test -p bazel-output-service`. Opt-in
 SHA256/BLAKE3, execution, restart, tamper repair and clean; use `--storage` to select
 native lazy mode. Environment-only credentials use `--credential-env NAME` with
 `--cas-endpoint`; generated helpers/rc files contain no key values.
-See [design and native evidence](../../docs/design/edenfs-platforms-and-outputs.md).
+See [platform support and acceptance limits](../../docs/platforms.md).

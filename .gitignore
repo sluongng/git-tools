@@ -6,3 +6,6 @@ __pycache__/
 
 /third_party/fuser/target/
 /third_party/nfsserve/target/
+
+# Local development plans and work-in-progress notes
+/dev-notes/

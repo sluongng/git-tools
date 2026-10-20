@@ -1,105 +1,64 @@
 # Benchmark tools
 
-Run from the project root. Use a fresh output directory and independently
-verified release binaries. Commands below are dry runs; add `--run` to execute.
-Do not run matrices concurrently with builds, profilers, or other benchmarks.
+Run from the repository root with frozen release binaries and a **fresh output
+directory**. Scripts default to dry runs; add `--run` after checking the plan.
+Use `--help` for options and [the measurement checklist](../docs/benchmark-reference.md)
+for cache boundaries, provenance, output correctness and cleanup.
 
-## Direct GitHub: checkout versus VFS
+## Choose a workload
 
-Copy [the example config](benchmark_github_bazel.example.json), set actual Git,
-Bazel, VFS binary, shared repository cache, and output-root paths, then verify a
-Bazel/dependency pilot. The pinned workload requires Bazel 9.2.0.
+| Question | Harness |
+| --- | --- |
+| Direct GitHub clone → query/build | `benchmark_github_bazel.py` |
+| SHA1 → BLAKE3 generation, warm lookup, restart | `benchmark_proxy_mapping.py` |
+| Warm proxy: checkout vs VFS vs digest xattrs | `benchmark_warm_proxy_bazel.py` |
+| Fresh agent → first BuildBuddy RBE build | `benchmark_proxy_agent_rbe.py` |
+| Repeated source edit/status/RBE build | `benchmark_iterative_agent_rbe.py` |
+| Two private agents sharing a proxy | `benchmark_concurrent_agents.py` (correctness smoke, not throughput) |
+| Local VFS subsystem costs | `benchmark_vfs_{iteration,ranges,journal,metadata,hydration,content}.py` |
+| This project's local/RBE Rust build iteration | `benchmark_developer_build.py` |
+
+## Common commands
+
+Copy [the example JSON](benchmark_github_bazel.example.json); set actual Git,
+Bazel, VFS binary, cache and output-root paths. Verify dependency/toolchain
+readiness separately. The historical pinned workload uses Bazel 9.2.0.
 
 ```sh
 python3 tools/benchmark_github_bazel.py \
   --config CONFIG.json --output FRESH_OUTPUT --native-probe
 ```
 
-Default: five rotated pairs, fresh source/overlay/output bases, three warm
-queries. `prefetch_mode` selects blocking `before-mount` or async `after-mount`.
-For true clone-to-first-build, use `--workflow build-first --warm-builds 3` and
-configure a build target plus nonempty output-path manifest.
+Use `prefetch_mode: after-mount` for async prefetch. Add `--workflow build-first
+--warm-builds 3` plus a target/nonempty output manifest for true first-build timing.
 
-## Proxy mapping generation and reuse
-
-Supply a closed, full, self-contained bare mirror and optionally a matching
-query-presence manifest from the VFS harness:
+Proxy experiments require a **closed, self-contained full mirror**:
 
 ```sh
-python3 tools/benchmark_proxy_mapping.py \
-  --output FRESH_OUTPUT --proxy-binary target/release/git-proxy --git /usr/bin/git \
-  --mirror CLOSED_CACHE/bazel.git --source-revision VERIFIED_BINARY_SOURCE_SHA \
-  --subset-json QUERY_PRESENCE.json --trials 3 --metadata-baseline
-```
+python3 tools/benchmark_proxy_mapping.py --output FRESH_OUTPUT \
+  --proxy-binary target/release/git-proxy --git /usr/bin/git \
+  --mirror CLOSED_CACHE/bazel.git --source-revision VERIFIED_SOURCE_SHA --trials 3
 
-Each trial measures cold mapping creation, three warm requests, and persisted
-reuse after restart. The mirror is warm; mapping databases start empty.
-Mirror population/copy and correctness checks are outside HTTP request timings.
-The optional metadata baseline warms sizes/types before mapping creation.
-Reported logical MiB/s includes extraction and persistence, not just hashing.
+python3 tools/benchmark_warm_proxy_bazel.py --config CONFIG.json \
+  --output FRESH_OUTPUT --mirror CLOSED_CACHE/bazel.git --trials 3 --build-proof
 
-## Warm proxy + BLAKE3 Bazel
-
-Use the same config, add an absolute `proxy_binary` path, and verify dependency
-cache warmth before setting `pilot_dependencies_warm_verified`.
-
-```sh
-python3 tools/benchmark_warm_proxy_bazel.py \
-  --config CONFIG.json --output FRESH_OUTPUT --mirror CLOSED_CACHE/bazel.git \
-  --trials 3 --warm-queries 1 --build-proof
-```
-
-Rotates checkout, VFS normal hashing, and VFS digest-xattr arms, all with BLAKE3.
-Both VFS arms import identical mappings and use blocking content prefetch.
-Mirror population and server prewarming are excluded from fresh-client latency.
-`--build-proof` checks matched outputs and a same-size edit/rebuild after queries.
-Digest counters distinguish actual reuse from merely configuring BLAKE3.
-
-## Fresh-agent BuildBuddy RBE
-
-Use a config with a verified provisioned RBE toolchain and matching manifest:
-
-```sh
-python3 tools/benchmark_proxy_agent_rbe.py \
-  --config CONFIG.json --output FRESH_OUTPUT --mirror CLOSED_CACHE/bazel.git \
+python3 tools/benchmark_proxy_agent_rbe.py --config CONFIG.json \
+  --output FRESH_OUTPUT --mirror CLOSED_CACHE/bazel.git \
   --credential-rc EXISTING_PRIVATE_RC --trials 3 --proxy-cas-sync
 ```
 
-Rotates the same three arms with async prefetch and a build **before any query**.
-Every cell has a fresh local r2c2 cache, verifies three uncached remote BLAKE3
-C++ actions and compares output bytes. Proxy/mapping/CAS preparation is separate.
-The rc selects one existing BuildBuddy credential; it is never copied into output.
-Private RPC logs become sanitized status/count summaries, then are removed.
-See [agent startup results](../docs/proxy-agent-startup.md) for scope and setup.
+Warm-proxy arms exclude mirror population/server preparation. RBE requires a
+provisioned compatible toolchain; each cell must execute the intended uncached
+actions and compare exact outputs. Repeated-edit harnesses additionally require
+verified baseline/candidate binaries and commits. Run the two-agent smoke after,
+not during, serial timing matrices.
 
-## Iterative workspaces
+Local CAS component measurement:
 
-[Lifecycle results and protocol](../docs/vfs-iteration-benchmarks.md) cover the
-`benchmark_vfs_{iteration,ranges,journal,metadata,hydration,content}.py` local
-harnesses. Each takes frozen baseline/candidate binaries; use `--help` for its
-workload and strict-counter flags. Three rotated trials are the default.
+```sh
+bazel run --config=rbe //crates/local-cas:cache_benchmark -- /tmp/fresh-cas-bench candidate
+```
 
-`benchmark_iterative_agent_rbe.py` uses the fresh-agent setup above and adds
-`--baseline-vfs`, `--candidate-vfs`, their verified source commits, and `--cycles 8`.
-Primary runs require at least three trials. `--functional-pilot` explicitly marks
-short readiness checks as non-headline evidence.
-
-## Evidence and interpretation
-
-For this project's own local versus BuildBuddy Rust build matrix, use
-`benchmark_developer_build.py --config rbe --output FRESH_OUTPUT --source-edit
-crates/workspace-fuse/src/main.rs crates/workspace-core/src/backend.rs`. Add `--run`
-after reviewing the dry run. It separates clean-output reuse, no-op and
-metadata-changing edits; see [developer build setup](../docs/development.md).
-
-Harnesses retain frozen binary hashes, raw commands/logs, TRACE2, object-presence
-manifests, profiles, and checkpointed results on success or failure.
-Do not call logical blob bytes network bytes. Keep failures/outliers; do not
-extend timeouts, filter workloads, or retry cells to produce a passing matrix.
-Warm archive caches do not prevent mutable external catalogue downloads.
-
-See [the full protocol reference](../docs/benchmark-reference.md) for cache
-boundaries, provenance, audit fields, no-op verification, and resource accounting.
-Results: [GitHub query](../docs/github-bazel-async-prefetch.md),
-[first build](../docs/github-bazel-performance.md),
-[proxy/BLAKE3](../docs/proxy-blake3-benchmarks.md).
+Do not run matrices alongside compilation/profiling. Keep failures/outliers and
+raw receipts; never label logical blob sizes as network bytes or no-op cache
+hits as executed remote work. See [historical results and tradeoffs](../docs/benchmarks.md).

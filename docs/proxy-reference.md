@@ -1,6 +1,6 @@
 # Proxy reference
 
-[Quick start](../crates/git-proxy/README.md) · [Design](proxy-design.md)
+[Quick start](../crates/git-proxy/README.md) · [Design](architecture.md)
 
 ## Repository configuration
 
@@ -165,7 +165,7 @@ there is no reverse-proxy-grade rate limiting, mirror disk quota, retry policy, 
 
 ## Validation
 
-`cargo test -p git-proxy` runs local-only integration tests: actual smart HTTP
+`cargo test -p git-proxy` runs loopback integration tests: actual smart HTTP
 blobless shallow clone and native object-info query, concurrent first touch,
 owner-lock rejection, pinned-object fetch without ref mutation, offline cache reuse within TTL, ref and default-branch refresh, metadata
 validation/missing objects, push/dumb-read rejection, persistent BLAKE3 results,

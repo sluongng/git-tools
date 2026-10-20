@@ -28,4 +28,4 @@ not proof that admitted work stopped. Public leases must still be dropped.
 Store **only disposable, immutable CAS blobs** here. Writable workspace/output
 payloads and namespace databases must remain separate. `output-core` supports
 `Tree::open_with_cache` to reuse content without sharing writable authority.
-See [eviction design, reuse boundaries and benchmark protocol](../../docs/design/local-cas-eviction.md).
+See [cache ownership and eviction policy](../../docs/architecture.md).

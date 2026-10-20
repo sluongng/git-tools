@@ -36,7 +36,8 @@ metadata API works independently of it.
 Eligible complete protocol-v2 fetch responses share a Packhorse-inspired cache.
 The producer streams while filling; matching followers wait for completion.
 Unknown requests and intermediate negotiation bypass it; partial/error responses
-are never cached. Restart discards response files, not mirrors/digest mappings.
+are never cached. Completed responses survive restart with original TTL and verified body integrity;
+mirrors and digest mappings persist separately.
 
 | Option | Default |
 |---|---:|
@@ -92,8 +93,8 @@ No push or dumb-HTTP file serving is exposed.
 
 - [Full reference](../../docs/proxy-reference.md): API validation, auth,
   cancellation, resource limits, durability, and tests.
-- [Design and research](../../docs/proxy-design.md): Goblet, Origin,
+- [Architecture and research](../../docs/architecture.md): Goblet, Origin,
   Gitretriever, and Packhorse.
-- [Mapping benchmarks](../../docs/proxy-blake3-benchmarks.md).
+- [Mapping benchmarks](../../docs/benchmarks.md).
 - Test: `cargo test -p git-pack-cache -p reapi -p git-proxy`;
   select Git with `GIT_PROXY_TEST_GIT`.

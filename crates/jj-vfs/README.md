@@ -33,9 +33,9 @@ Real-mount verification:
 
 ```sh
 GIT_VFS_BIN="$PWD/target/debug/git-vfs" \
-  cargo +1.98.1 test -p jj-vfs --test lifecycle -- --ignored
+  cargo test --locked -p jj-vfs --test lifecycle -- --ignored
 # Or compile with Bazel/RBE and run the mount fixture on this Linux host:
-bazel test --config=rbe //crates/jj-vfs:lifecycle --test_arg=--ignored
+bazel test --config=rbe //crates/jj-vfs:mounted_tests --test_output=all
 ```
 
 Upstream extension API: [custom working copy example](https://github.com/jj-vcs/jj/blob/v0.46.0/cli/examples/custom-working-copy/main.rs).

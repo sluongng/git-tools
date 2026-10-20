@@ -1,128 +1,70 @@
 # git-tools
 
-Rust tools for starting work on Git repositories without a full checkout.
+Start coding on Git repositories without checking out every file. Experimental
+Rust tools for private, writable agent workspaces and Bazel remote execution.
 
-- [`git-proxy`](crates/git-proxy/): shared Git mirror, fetch-response cache,
-  batch object sizes, and optional Git SHA1 → BLAKE3 mappings.
-- [`workspace-fuse`](crates/workspace-fuse/): writable Linux FUSE view of a blobless clone,
-  with lazy reads and persistent per-agent edits.
+| Tool | What it does |
+| --- | --- |
+| [`git-vfs`](crates/workspace-fuse/README.md) | Linux FUSE workspace: lazy Git reads, persistent edits, native Git status |
+| [`git-proxy`](crates/git-proxy/README.md) | Shared Git mirror and fetch cache, object sizes, BLAKE3 mappings, optional CAS uploads |
+| [`git-output-service`](crates/bazel-output-service/README.md) | Lazy Bazel outputs backed by a BuildBuddy/REAPI CAS |
 
-Additional crates: [`workspace-nfs`](crates/workspace-nfs/) for macOS NFS,
-[`workspace-projfs`](crates/workspace-projfs/) for Windows,
-[`jj-vfs`](crates/jj-vfs/) for Jujutsu working copies, and
-[`bazel-output-service`](crates/bazel-output-service/) for BuildBuddy-backed Bazel outputs.
-These are experimental; native macOS NFS acceptance passes without sudo.
-The output service defaults to native lazy outputs (Linux FUSE, macOS NFS,
-Windows ProjFS), backed by a reusable verified local CAS with bounded LRU eviction
-([setup and limits](crates/bazel-output-service/README.md)).
-Crate names describe responsibilities; executable names remain `git-vfs`,
-`git-nfs`, `git-projfs`, `git-jj`, and `git-output-service` for compatibility.
+macOS uses [NFS](crates/workspace-nfs/README.md); Windows uses
+[ProjFS](crates/workspace-projfs/README.md). [Jujutsu](crates/jj-vfs/README.md)
+requires our custom `git-jj` CLI. Native acceptance and restrictions differ by
+platform; see [platform support](docs/platforms.md).
 
-Native Git stores and transfers objects; Fjall stores local metadata.
-The VFS also works directly with GitHub, without a proxy.
+## Quick start: Linux workspace
 
-## Quick start
-
-Requires the pinned Rust toolchain, native Git, Linux `/dev/fuse`,
-and `fusermount3` (usually the `fuse3` package).
-Run commands from this repository's root.
-
-**Shared proxy — run once, in its own terminal:**
+Requires native Git, `/dev/fuse`, `fusermount3`, and the pinned Rust toolchain.
+Run from this repository:
 
 ```sh
-cargo build --release -p git-proxy -p workspace-fuse
-target/release/git-proxy --cache-dir /tmp/git-tools-proxy \
-  --repo bazel=https://github.com/bazelbuild/bazel.git --enable-blake3
+cargo build --release -p workspace-fuse
+target/release/git-vfs clone https://github.com/bazelbuild/bazel.git /tmp/agent.git --depth 1
+mkdir -p /tmp/agent
+target/release/git-vfs mount --repo /tmp/agent.git \
+  --overlay /tmp/agent-state --prefetch-bazel /tmp/agent
 ```
 
-The first request creates a **full all-refs mirror**; it is not a cheap cold start.
-Later agents share the mirror and eligible cached fetch responses.
-The unauthenticated proxy defaults to loopback; keep it on a trusted network.
-
-**Per agent — use fresh clone/overlay paths and an empty mount directory:**
+The foreground process owns the mount; Ctrl-C unmounts. In another terminal:
 
 ```sh
-target/release/git-vfs clone http://127.0.0.1:8082/git/bazel.git \
-  /tmp/agent-bazel.git --depth 1
-mkdir -p /tmp/agent-bazel
-target/release/git-vfs mount --repo /tmp/agent-bazel.git \
-  --overlay /tmp/agent-bazel-overlay --prefetch-bazel \
-  --blake3-proxy-url http://127.0.0.1:8082 --blake3-proxy-repo bazel \
-  /tmp/agent-bazel
-```
-
-The mount stays in the foreground; Ctrl-C unmounts it.
-BLAKE3 mapping import is blocking metadata work; content prefetch runs after mount.
-Other contents load on demand. Remount the same overlay to retain edits and index.
-For direct GitHub use, change the clone URL and omit both BLAKE3 proxy options.
-See the [VFS guide](crates/workspace-fuse/README.md) for metadata-provider requirements.
-
-**Another terminal — Git and Bazel:**
-
-```sh
-git -C /tmp/agent-bazel status --short
-cd /tmp/agent-bazel
+git -C /tmp/agent status --short
+cd /tmp/agent
 bazel --output_user_root=/tmp/agent-bazel-user \
-  --output_base=/tmp/agent-bazel-output --digest_function=BLAKE3 \
-  --unix_digest_hash_attribute_name=user.blake3 query //...
+  --output_base=/tmp/agent-bazel-output query //...
 ```
 
-Use the repository's supported Bazel version with digest-xattr startup support
-(8.7+ on 8.x, 9.2+ on 9.x). Keep outputs and caches outside the mount.
-Configure remote execution/cache and external-dependency caching separately.
-Digest mappings alone neither upload blobs nor prove remote CAS residency.
+GitHub size metadata loads before mount; likely Bazel inputs prefetch afterward.
+Other contents load on demand. Remount the same clone and overlay to retain edits.
+**The overlay contains your work, not disposable cache data.** Base commits are
+fixed per mount. Basic Git commit/log work, but a first commit can hydrate the
+whole indexed snapshot; general checkout/merge/rebase are not supported.
 
-## Measured performance
+## Multiple agents and remote builds
 
-Pinned `bazel.git`, warm dependency caches, fresh clients and Bazel output bases:
+Run one [proxy](crates/git-proxy/README.md), then give each agent a private clone,
+overlay, mount and Bazel output base. The first proxy request creates a **full
+all-refs mirror**; prewarm it rather than charging that cost to every agent.
 
-| Experiment | Shallow checkout | VFS |
-|---|---:|---:|
-| Direct GitHub, background-prefetch query (Oct 16, five pairs) | 8.384 s | 4.964 s |
-| Warm local proxy, BLAKE3-xattr query (Oct 19, three trials) | 3.277 s | 2.896 s |
-| Warm proxy/CAS, first narrow RBE build (Oct 19, three trials) | 24.969 s | 24.316 s |
+Use the [cloud-agent example skill](examples/skills/cloud-bazel-agent/SKILL.md)
+for BLAKE3 digest reuse, BuildBuddy RBE and remote repository-content caching
+(r2c2). [CAS sync](docs/proxy-cas-sync.md) can publish workspace blobs in the
+background. A mapping or queued upload is not proof of remote CAS residency.
+Keep build outputs and caches outside the source mount.
 
-These are clone-to-query/build medians under different cache conditions.
-The RBE difference is only 2.62%, with overlapping ranges; see
-[agent-startup results](docs/proxy-agent-startup.md) for phases and caveats.
-Proxy experiments exclude mirror population/server prewarming. In the query
-experiment, xattrs saved only 27 ms versus normal VFS hashing, not a reliable win.
-Full-snapshot BLAKE3 mapping creation took 12.481 s; warm lookup took 86 ms.
-See [direct-GitHub results](docs/github-bazel-async-prefetch.md),
-[BLAKE3 results and caveats](docs/proxy-blake3-benchmarks.md), and
-[benchmark reproduction](tools/README.md).
+## Learn more
 
-For repeated edits, see the [VFS iteration results](docs/vfs-iteration-benchmarks.md),
-including reclamation, rename/digest work and real incremental RBE builds.
+- [VFS options, prefetch and storage](docs/vfs-reference.md)
+- [Proxy API and cache behavior](docs/proxy-reference.md)
+- [Bazel output-service setup and TOML](crates/bazel-output-service/README.md)
+- [Timeouts, retries and presence TTL](docs/reapi-policy.md)
+- [Architecture and cache ownership](docs/architecture.md)
+- [Benchmarks and tradeoffs](docs/benchmarks.md) · [Reproduce measurements](tools/README.md)
+- [Build and test with RBE](docs/development.md)
 
-## Guides and limits
-
-- [Cloud Bazel agent example skill](examples/skills/cloud-bazel-agent/SKILL.md)
-- [VFS guide](crates/workspace-fuse/README.md) / [full reference](docs/vfs-reference.md)
-- [Proxy guide](crates/git-proxy/README.md) / [full reference](docs/proxy-reference.md)
-- [Proxy design and research](docs/proxy-design.md)
-- [REAPI timeout, retry and presence policy](docs/reapi-policy.md)
-- [VFS lifecycle design and measurements](docs/design/vfs-iteration-lifecycle.md)
-
-This is a source-tree prototype: SHA1 repositories, fixed base commit per mount,
-no general checkout/merge/rebase guarantee. Basic Git commit/log work, but a first
-commit can hydrate the entire indexed snapshot. The overlay contains uncommitted
-and staged work: **do not delete it as a cache**.
-
-For background workspace publication, see [CAS sync](docs/proxy-cas-sync.md).
-It complements r2c2 external-repository caching; neither a digest mapping nor a
-queued upload proves that a remote CAS holds the content.
-
-## Development
-
-Bazel uses pinned Rust/LLVM toolchains and the same Cargo lockfile:
-
-```sh
-bazel build //:workspace-fuse //:git-proxy
-bazel test --config=rbe //...
-```
-
-Put BuildBuddy credentials in the **gitignored** `user.bazelrc`.
-See [build setup and crate boundaries](docs/development.md) and
-[local/RBE build measurements](docs/developer-build-benchmarks.md), plus
-[next EdenFS lessons](docs/design/edenfs-next-steps.md).
+Measured direct-GitHub clone-to-query median: **4.964s VFS vs 8.384s shallow
+checkout** in five paired trials. A warm-proxy narrow RBE build was **24.316s vs
+24.969s**, with overlapping ranges: no reliable broad RBE speedup is established.
+These are different pinned workloads/cache conditions, not general guarantees.
