@@ -89,12 +89,20 @@ agent_bazel() {
     --digest_function=BLAKE3 --unix_digest_hash_attribute_name=user.blake3 "$@"
 }
 : "${TASK_TARGET:?}"
-agent_bazel build "$TASK_TARGET" --experimental_remote_cache_ttl=3h
-# Keep the same remote TTL on subsequent build/test commands.
+agent_bazel build "$TASK_TARGET"
 git status --short
 ```
 
-The three-hour remote TTL matches the proxy CAS-sync default (10,800 seconds).
+Bazel's `--experimental_remote_cache_ttl` is an assumption about the backend's
+minimum retention, not a lease or a value negotiated through REAPI. Omitting
+the flag retains Bazel's own default (three hours in the shown Bazel 9.2), not
+zero. Provision `AGENT_BAZELRC` with an explicit value justified by the backend's
+actual retention policy; if that policy is unknown, report the provisioning gap
+rather than guessing. Do not derive the value from the proxy's presence-cache
+interval. Proxy CAS presence suppression defaults to off
+(`presence_ttl_seconds = 0`), so each sync rechecks CAS state. A nonzero advisory
+interval neither guarantees residency nor refreshes remote access times. Keep
+these policies independent.
 Check the first invocation's execution/cache evidence before claiming RBE or
 r2c2 is used. Avoid a broad query when the task already identifies narrow targets.
 Base-file digests come from cached mappings; edited files hash current overlay
