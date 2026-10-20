@@ -6,6 +6,8 @@ license = "MIT"
 description = "Read-only native Git pull-through cache and object metadata service"
 
 [dependencies]
+local-cas = { path = "../local-cas" }
+async-trait = "0.1"
 git-pack-cache = { path = "../git-pack-cache" }
 reapi = { path = "../reapi" }
 anyhow = "1"

@@ -100,6 +100,7 @@ pub struct CasClient {
     deadline: Option<Instant>,
     grpc_compression: Arc<::reapi::compression::GrpcCompression>,
     stats: Arc<Mutex<UploadStats>>,
+    chunk_workers: Arc<Mutex<Vec<tokio::task::JoinHandle<()>>>>,
 }
 #[derive(Clone)]
 struct Part {
@@ -238,6 +239,7 @@ impl CasClient {
             deadline: None,
             grpc_compression: Arc::new(Default::default()),
             stats: Arc::new(Mutex::new(Default::default())),
+            chunk_workers: Arc::new(Mutex::new(Vec::new())),
         };
         let response = client
             .policy
@@ -275,6 +277,12 @@ impl CasClient {
         let mut client = self.clone();
         client.deadline = Some(deadline);
         client
+    }
+    pub(crate) async fn wait_for_chunk_idle(&self) {
+        let workers = std::mem::take(&mut *self.chunk_workers.lock().unwrap());
+        for worker in workers {
+            let _ = worker.await;
+        }
     }
     pub fn capabilities(&self) -> &reapi::CacheCapabilities {
         &self.caps
@@ -422,11 +430,31 @@ impl CasClient {
     }
     /// Upload blobs already known to be missing. The caller owns presence TTLs and initial FindMissing.
     pub async fn upload_missing(&self, blobs: &[UploadBlob]) -> Result<UploadStats> {
+        self.upload_missing_leased(blobs, &[]).await
+    }
+    /// Internal retained-payload publication keeps CDC blocking readers pinned
+    /// even if the caller's upload future is cancelled.
+    pub(crate) async fn upload_missing_leased(
+        &self,
+        blobs: &[UploadBlob],
+        leases: &[Arc<local_cas::CachedBlob>],
+    ) -> Result<UploadStats> {
+        ensure!(
+            leases.is_empty()
+                || (leases.len() == blobs.len()
+                    && leases
+                        .iter()
+                        .zip(blobs)
+                        .all(|(lease, blob)| lease.path() == blob.path)),
+            "CAS upload leases must match their payload paths"
+        );
         let mut operation = self.clone();
         operation.deadline = Some(self.deadline());
-        let result =
-            tokio::time::timeout_at(operation.deadline(), operation.upload_missing_inner(blobs))
-                .await;
+        let result = tokio::time::timeout_at(
+            operation.deadline(),
+            operation.upload_missing_inner(blobs, leases),
+        )
+        .await;
         if Instant::now() >= operation.deadline() {
             return Err(rpc_error(
                 "Upload",
@@ -441,13 +469,17 @@ impl CasClient {
         })?
     }
 
-    async fn upload_missing_inner(&self, blobs: &[UploadBlob]) -> Result<UploadStats> {
+    async fn upload_missing_inner(
+        &self,
+        blobs: &[UploadBlob],
+        leases: &[Arc<local_cas::CachedBlob>],
+    ) -> Result<UploadStats> {
         let mut stats = UploadStats::default();
         let mut pending = Vec::new();
         let mut pending_bytes = 0;
         let mut seen = HashSet::new();
         let limit = self.batch_limit();
-        for blob in blobs {
+        for (index, blob) in blobs.iter().enumerate() {
             validate_digest(&blob.digest)?;
             if !seen.insert(key(&blob.digest)) {
                 continue;
@@ -468,7 +500,8 @@ impl CasClient {
             if let Some(params) = self.cdc_params(blob.digest.size_bytes) {
                 self.flush_batch(&mut pending, false, &mut stats).await?;
                 pending_bytes = 0;
-                self.upload_cdc(blob, params, &mut stats).await?;
+                self.upload_cdc(blob, params, &mut stats, leases.get(index).cloned())
+                    .await?;
             } else {
                 let part = Part {
                     digest: blob.digest.clone(),
@@ -915,8 +948,9 @@ impl CasClient {
         blob: &UploadBlob,
         params: reapi::FastCdc2020Params,
         stats: &mut UploadStats,
+        lease: Option<Arc<local_cas::CachedBlob>>,
     ) -> Result<()> {
-        match self.upload_cdc_inner(blob, params, stats).await {
+        match self.upload_cdc_inner(blob, params, stats, lease).await {
             Err(error)
                 if error
                     .downcast_ref::<RpcError>()
@@ -948,15 +982,24 @@ impl CasClient {
         blob: &UploadBlob,
         params: reapi::FastCdc2020Params,
         stats: &mut UploadStats,
+        lease: Option<Arc<local_cas::CachedBlob>>,
     ) -> Result<()> {
         let source = blob.clone();
         let cancelled = Arc::new(AtomicBool::new(false));
         let _cancel = CancelChunkOnDrop(cancelled.clone());
         let deadline = self.deadline();
-        let parts =
-            tokio::task::spawn_blocking(move || chunk_file(source, params, &cancelled, deadline))
-                .await
-                .context("CAS chunk task failed")??;
+        let (sent, result) = tokio::sync::oneshot::channel();
+        let worker = tokio::task::spawn_blocking(move || {
+            let _lease = lease;
+            let value = chunk_file(source, params, &cancelled, deadline);
+            let _ = sent.send(value);
+        });
+        {
+            let mut workers = self.chunk_workers.lock().unwrap();
+            workers.retain(|worker| !worker.is_finished());
+            workers.push(worker);
+        }
+        let parts = result.await.context("CAS chunk task failed")??;
         let mut digests = Vec::new();
         let mut unique = HashSet::new();
         for p in &parts {

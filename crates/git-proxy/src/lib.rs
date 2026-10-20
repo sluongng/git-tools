@@ -141,7 +141,7 @@ pub fn router_with_cas_shutdown(mut config: Config) -> Result<(Router, Option<Ca
     let sync = config
         .cas_sync
         .clone()
-        .map(cas_sync::CasSync::new)
+        .map(|sync| cas_sync::CasSync::new(sync, &config.cache_dir))
         .transpose()?;
     let cas_sync = sync.as_ref().map(|(sync, _, _)| sync.clone());
     let storage_accounting = storage_accounting::StorageAccounting::new(
@@ -175,8 +175,11 @@ fn valid_oid(s: &str) -> bool {
     s.len() == 40 && s.bytes().all(|b| b.is_ascii_hexdigit())
 }
 fn git(app: &App, path: Option<&Path>) -> Command {
-    let mut command = Command::new(&app.config.git);
-    if let Some(cas) = &app.config.cas_sync {
+    git_config(&app.config, path)
+}
+fn git_config(config: &Config, path: Option<&Path>) -> Command {
+    let mut command = Command::new(&config.git);
+    if let Some(cas) = &config.cas_sync {
         for (_, variable) in &cas.header_env {
             command.env_remove(variable);
         }
@@ -534,6 +537,11 @@ async fn handle(State(app): State<Arc<App>>, request: Request) -> Result<Respons
             let mut text = String::new();
             for (name, value) in stats["pack_cache"].as_object().unwrap() {
                 text.push_str(&format!("git_proxy_pack_cache_{name} {value}\n"));
+            }
+            if let Some(cache) = stats["cas_sync"]["local_cache"].as_object() {
+                for (name, value) in cache {
+                    text.push_str(&format!("git_proxy_local_cas_{name} {value}\n"));
+                }
             }
             text.push_str(&format!(
                 "git_proxy_http_backend_calls {}\ngit_proxy_fetch_generations {}\ngit_proxy_pack_identity_failures {}\n",

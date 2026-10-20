@@ -32,6 +32,9 @@ struct Args {
     cas_remote_ttl_seconds: Option<u64>,
     #[arg(long, default_value_t = 64 * 1024 * 1024)]
     cas_staging_limit_bytes: u64,
+    /// Retained verified raw CAS payload bytes, separate from Git and pack caches.
+    #[arg(long, default_value_t = 4 * 1024 * 1024 * 1024)]
+    cas_cache_max_bytes: u64,
     /// Maximum completed and reserved generated-response bytes; 0 disables caching.
     #[arg(long, default_value_t = 1024 * 1024 * 1024)]
     pack_cache_max_bytes: u64,
@@ -88,6 +91,7 @@ async fn main() -> Result<()> {
                 header_env,
                 policy: policy.clone(),
                 staging_limit_bytes: args.cas_staging_limit_bytes,
+                cache_max_bytes: args.cas_cache_max_bytes,
             })
         })
         .transpose()?;

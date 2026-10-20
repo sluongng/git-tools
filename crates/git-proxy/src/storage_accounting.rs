@@ -63,6 +63,7 @@ impl StorageAccounting {
             (cache.join("generated-packs"), "generated_responses"),
             (cache.join("digests.fjall"), "digest_database"),
             (cache.join("cas-spool"), "auxiliary"),
+            (cache.join("cas-content-v1"), "cas_content"),
             (cache.join("owner.lock"), "auxiliary"),
         ]);
         Self {
@@ -275,6 +276,7 @@ fn scan(roots: Vec<(PathBuf, &'static str)>, entry_limit: u64, timeout: Duration
                 "mirror_auxiliary",
                 "generated_responses",
                 "digest_database",
+                "cas_content",
                 "auxiliary",
             ]
             .into_iter()
@@ -309,6 +311,7 @@ mod tests {
             repo.join("objects/ab"),
             cache.join("generated-packs/schema-v2"),
             cache.join("digests.fjall"),
+            cache.join("cas-content-v1"),
         ] {
             fs::create_dir_all(directory).unwrap();
         }
@@ -321,6 +324,7 @@ mod tests {
         fs::write(nested.join("e".repeat(38)), [0; 9]).unwrap();
         fs::write(cache.join("generated-packs/schema-v2/a.response"), [0; 11]).unwrap();
         fs::write(cache.join("digests.fjall/data"), [0; 13]).unwrap();
+        fs::write(cache.join("cas-content-v1/blob"), [0; 17]).unwrap();
         fs::write(temp.path().join("private"), [0; 100]).unwrap();
         symlink(temp.path().join("private"), repo.join("secret-link")).unwrap();
         symlink(temp.path(), repo.join("directory-link")).unwrap();
@@ -339,6 +343,7 @@ mod tests {
         assert_eq!(result.categories["mirror_auxiliary"].logical_bytes, 14);
         assert_eq!(result.categories["generated_responses"].logical_bytes, 11);
         assert_eq!(result.categories["digest_database"].logical_bytes, 13);
+        assert_eq!(result.categories["cas_content"].logical_bytes, 17);
         assert_eq!(result.symlinks_skipped, 2);
         assert_eq!(result.duplicate_files_skipped, 1);
         let json = serde_json::to_string(&result).unwrap();

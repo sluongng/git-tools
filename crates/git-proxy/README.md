@@ -64,10 +64,22 @@ BLAKE3 hashes raw blob content, excluding Git's header; persisted mappings survi
 restart. Mapping generation alone does not prove CAS residency. Optional
 [asynchronous CAS sync](../../docs/proxy-cas-sync.md) publishes raw blobs using
 REAPI, negotiated FastCDC, and bounded Executor-style upload batches.
-Use `--cas-endpoint` to opt in; its presence TTL must match Bazel configuration.
+Use `--cas-endpoint` to opt in. Presence observations default to zero TTL
+(recheck each sync); only configure a positive TTL when remote retention permits it.
+
+CAS publication retains verified raw payloads in a separate `cas-content-v1`
+[local-cas](../local-cas/README.md) cache: `--cas-cache-max-bytes` defaults to
+4 GiB and must be at least `--cas-staging-limit-bytes` (default 64 MiB).
+Remote eviction can reuse these bytes without another Git extraction; it still
+requires FindMissingBlobs and successful upload. Upload/CDC/retry readers hold
+leases, so LRU GC cannot remove their files. Restart re-verifies retained content.
+This budget does **not** cap Git mirrors or the generated pack-response cache;
+those have different formats and ownership. Cache keys include hashed remote
+authorization scope, never plaintext credentials.
 
 `GET /api/v1/cache/stats` returns cache JSON; `GET /metrics` exposes Prometheus
-metrics. Fetches report `X-Git-Proxy-Pack-Cache` as `MISS`, `HIT`, `COALESCED`, or
+metrics, including local CAS hits, fetches, bytes and evictions. `/api/v1/storage`
+accounts retained payloads separately as `cas_content`. Fetches report `X-Git-Proxy-Pack-Cache` as `MISS`, `HIT`, `COALESCED`, or
 `BYPASS`.
 
 ## Deployment boundary
