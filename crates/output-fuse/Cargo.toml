@@ -1,0 +1,20 @@
+[package]
+name = "output-fuse"
+version = "0.1.0"
+edition = "2024"
+description = "Lazy writable CAS outputs over Linux FUSE"
+license = "MIT"
+
+[dependencies]
+anyhow = "1"
+async-trait = "0.1"
+output-core = { path = "../output-core" }
+tokio = { version = "1", features = ["rt-multi-thread", "sync", "time", "macros"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+fuser = { version = "0.16", default-features = false, features = ["abi-7-31"] }
+libc = "0.2"
+
+[dev-dependencies]
+blake3 = "1"
+tempfile = "3"

@@ -334,9 +334,26 @@ impl Hasher {
 }
 impl Backend {
     fn identity(&self) -> String {
-        blake3::hash(format!("{}\0{}", self.endpoint, self.instance).as_bytes())
-            .to_hex()
-            .to_string()
+        // Cache and persisted namespace authority must not cross credential
+        // scopes, even when two clients use the same endpoint and instance.
+        let mut hash = blake3::Hasher::new();
+        hash.update(b"git-tools-bos-backend-v2\0");
+        for value in [self.endpoint.as_bytes(), self.instance.as_bytes()] {
+            hash.update(&(value.len() as u64).to_le_bytes());
+            hash.update(value);
+        }
+        match &self.api_key {
+            Some(key) => {
+                hash.update(&[1]);
+                let value = key.as_encoded_bytes();
+                hash.update(&(value.len() as u64).to_le_bytes());
+                hash.update(value);
+            }
+            None => {
+                hash.update(&[0]);
+            }
+        }
+        hash.finalize().to_hex().to_string()
     }
     fn request_with_timeout<T>(&self, value: T, budget: Duration) -> Request<T> {
         let mut req = Request::new(value);

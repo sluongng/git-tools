@@ -8,6 +8,7 @@ description = "Bazel Remote Output Service with a BuildBuddy-compatible CAS back
 [dependencies]
 reapi = { path = "../reapi" }
 output-core = { path = "../output-core" }
+local-cas = { path = "../local-cas" }
 anyhow = "1"
 async-trait = "0.1"
 blake3 = "1"
@@ -26,6 +27,9 @@ uuid = { version = "1", features = ["v4"] }
 
 [target.'cfg(unix)'.dependencies]
 output-nfs = { path = "../output-nfs" }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+output-fuse = { path = "../output-fuse" }
 
 [target.'cfg(windows)'.dependencies]
 output-projfs = { path = "../output-projfs" }

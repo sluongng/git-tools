@@ -13,6 +13,8 @@ members = [
     "crates/output-core",
     "crates/output-nfs",
     "crates/output-projfs",
+    "crates/local-cas",
+    "crates/output-fuse",
 ]
 exclude = ["third_party/fuser", "third_party/nfsserve"]
 resolver = "3"

@@ -8,6 +8,7 @@ BuildBuddy / REAPI CAS. This manages **build outputs**, not the Git source VFS.
 export BUILDBUDDY_API_KEY
 cargo run -p bazel-output-service -- \
   --root "$HOME/.cache/bazel-outputs" \
+  --state-dir "$HOME/.cache/bazel-output-state" \
   --cas-endpoint grpcs://YOUR_INSTANCE.buildbuddy.io
 
 bazel --digest_function=BLAKE3 build //:target \
@@ -24,16 +25,36 @@ Explicit CLI overrides take precedence. No file is loaded automatically.
 
 ## Storage
 
-- `--storage eager` (default): stream and verify every staged blob before atomic
-  publication to an ordinary local directory.
-- `--storage nfs` (macOS) or `--storage projfs` (Windows): publish CAS metadata,
-  fetch and verify a whole blob on first access. Add
-  `--state-dir "$HOME/.cache/bazel-output-state"` outside `--root`. NFS needs an
-  empty mountpoint and no sudo; Windows needs ProjFS enabled. Keep the daemon
-  running while accessing lazy outputs. Restart NFS by unmount/remount, not takeover.
+- `--storage lazy` (default): Linux FUSE, macOS NFS or Windows ProjFS. Staging,
+  directory listing and untouched-file stat publish/read metadata only. First
+  content access asynchronously fetches and verifies a whole blob; concurrent
+  readers share that fetch. `--storage fuse`, `nfs` and `projfs` select explicitly.
+- Lazy storage requires `--state-dir` outside `--root`, and an empty mountpoint.
+  Linux needs `/dev/fuse` and `fusermount3`; macOS NFS needs no sudo; Windows
+  needs ProjFS enabled. Keep the daemon running while accessing outputs.
+  Restart by unmount/remount, not takeover. There is no silent eager fallback.
+- `--storage eager` remains an explicit compatibility/debugging option: stream
+  and verify every staged blob before publication to an ordinary directory.
+
+Bazel currently supplies flattened output paths and digests, including tree
+children; BOS creates their parent directories without another CAS download.
+It does not recursively prefetch file payloads. Each new build still checks
+retained remote objects before acknowledging `StartBuild`, as the protocol requires.
 
 Lazy state includes authoritative edits: **do not delete it as a cache**.
-The verified cache defaults to 4 GiB; a blob must also fit the 256 MiB in-flight
+The shared [`local-cas`](../local-cas/) crate keeps only verified immutable bytes
+and evicts least-recently-used, unpinned entries. Active read leases and in-flight
+downloads are protected. It defaults to `--state-dir/cache`; use `--cas-cache-dir`
+to separate disposable cache bytes from authoritative state. One process owns a
+cache directory; library consumers share its `Arc<LocalCas>`, not independent
+writers/GC. Recency ranking is process-local; retained bytes are reverified after restart.
+
+Backend identity now includes a credential fingerprint. Old namespace state or
+a changed endpoint/instance/API key fails closed: use a fresh state directory,
+and preserve/export any local edits from the old state rather than deleting it.
+
+The verified cache defaults to 4 GiB. Metadata can describe larger blobs without
+fetching them; a content read must fit both the cache and the 256 MiB in-flight
 budget. Adjust `--max-cache-bytes`, `--max-inflight-bytes` and
 `--max-concurrent-fetches` for the workload. Metadata staging does not prove CAS
 residency; each build checks presence and requests conservative revalidation.
@@ -49,11 +70,11 @@ frames can be larger than the original content.
 Local changes never retain a trusted remote digest. Staged files are executable
 because the protocol has no executable bit.
 
-Native acceptance: both lazy adapters pass the 12-phase real Bazel/CAS workflow
+Historical native acceptance: NFS and ProjFS pass the 12-phase real Bazel/CAS workflow
 with zero-download initial cached builds. First consumption pays the whole-blob
 verification cost; this is not an established eager-versus-lazy speedup.
 
-**Limits:** experimental native mounts, independent source/output caches,
+**Limits:** experimental native mounts, native Git object storage remains separate,
 serialized lifecycle/staging per output base, no TreeArtifactLocator staging or modification
 journal. Retired IDs/local payloads are retained conservatively; cache leases do
 not guarantee an indefinitely open NFS descriptor works after CAS expiration.

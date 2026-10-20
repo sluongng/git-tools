@@ -51,9 +51,11 @@ def main():
     parser.add_argument("--execute-remotely", action="store_true", help="also force warm-cache genrules onto the selected BuildBuddy RBE backend")
     parser.add_argument("--container-image", default="docker://gcr.io/flame-public/rbe-ubuntu22-04@sha256:0d84a80bb0fc36ba5381942adcf6493249594dcc9044845c617b78c9b621cae3")
     parser.add_argument("--artifacts", required=True, type=Path)
-    parser.add_argument("--storage", choices=("eager", "nfs", "projfs"), default="eager")
+    parser.add_argument("--storage", choices=("lazy", "fuse", "eager", "nfs", "projfs"), default="lazy")
     parser.add_argument("--keep-scratch", action="store_true", help="retain owned non-secret fixture for native failure diagnosis")
     args = parser.parse_args()
+    if args.storage == "lazy":
+        args.storage = "projfs" if os.name == "nt" else "nfs" if sys.platform == "darwin" else "fuse"
     def selection():
         if args.credential_rc is not None:
             if args.cas_endpoint is not None:
@@ -283,7 +285,7 @@ def main():
                 checkpoint = [path.read_bytes() for path in outputs]
                 old_pid = service.pid
                 stop_service(service)
-                if args.storage != "nfs":
+                if args.storage not in ("nfs", "fuse"):
                     assert [path.read_bytes() for path in outputs] == checkpoint, "daemon shutdown removed outputs"
                 service = start_service()
                 assert service.pid != old_pid, "smoke did not create a new daemon process"

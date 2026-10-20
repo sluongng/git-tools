@@ -62,8 +62,9 @@ The remote execution platform pins a standard BuildBuddy Ubuntu image by digest.
 | `workspace-projfs` | Windows ProjFS provider and native Git admin | `workspace-core` |
 | `jj-vfs` | Custom Jujutsu CLI/working-copy backend | `workspace-overlay` |
 | `bazel-output-service` | Bazel output-tree lifecycle and operator-selected CAS | `reapi`, `output-core`, native adapter |
-| `output-core` | Durable output generations, local mutations and bounded verified CAS cache | Fjall |
-| `output-nfs` / `output-projfs` | Native lazy output publication, reads and mutations | `output-core` |
+| `local-cas` | Verified immutable blobs, coalesced reads, byte limits and lease-safe LRU GC | None |
+| `output-core` | Durable output generations and authoritative local mutations | Fjall, `local-cas` |
+| `output-fuse` / `output-nfs` / `output-projfs` | Native lazy output publication, reads and mutations | `output-core` |
 
 Each frontend has a root executable alias and crate-local verification instructions.
 See [platform contracts and acceptance](design/platform-frontends.md); compiling

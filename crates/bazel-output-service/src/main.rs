@@ -8,12 +8,15 @@ use std::{net::SocketAddr, path::PathBuf, sync::Arc, time::Duration};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
 enum Storage {
+    /// Select the native lazy backend for this operating system.
+    Lazy,
+    Fuse,
     Eager,
     Nfs,
     Projfs,
 }
 
-/// Local Bazel Remote Output Service with verified eager or native lazy outputs.
+/// Local Bazel Remote Output Service with verified, demand-loaded outputs.
 #[derive(Parser)]
 struct Args {
     #[arg(long, default_value = "127.0.0.1:8377")]
@@ -35,11 +38,15 @@ struct Args {
     /// Override the per-attempt unary RPC timeout (not the total operation budget).
     #[arg(long)]
     rpc_timeout_secs: Option<u64>,
-    #[arg(long, value_enum, default_value_t = Storage::Eager)]
+    #[arg(long, value_enum, default_value_t = Storage::Lazy)]
     storage: Storage,
     /// Durable namespace, writable payloads and verified cache; outside --root.
     #[arg(long)]
     state_dir: Option<PathBuf>,
+    /// Optional verified CAS directory, separate from authoritative namespace state.
+    /// One owner holds this directory; library consumers can share its cache handle.
+    #[arg(long)]
+    cas_cache_dir: Option<PathBuf>,
     /// Maximum verified CAS cache bytes. A single blob must fit this budget.
     #[arg(long, default_value_t = 4_294_967_296)]
     max_cache_bytes: u64,
@@ -53,9 +60,10 @@ struct Args {
 }
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    let args = Args::parse();
+    let mut args = Args::parse();
     // Reject invalid policy before inspecting or mounting native storage.
     let policy = args.policy()?;
+    args.storage = args.storage.resolve()?;
     anyhow::ensure!(
         args.listen.ip().is_loopback(),
         "unauthenticated service must bind loopback"
@@ -150,6 +158,22 @@ async fn main() -> anyhow::Result<()> {
     result
 }
 
+impl Storage {
+    fn resolve(self) -> anyhow::Result<Self> {
+        if self != Self::Lazy {
+            return Ok(self);
+        }
+        #[cfg(target_os = "linux")]
+        return Ok(Self::Fuse);
+        #[cfg(target_os = "macos")]
+        return Ok(Self::Nfs);
+        #[cfg(windows)]
+        return Ok(Self::Projfs);
+        #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
+        anyhow::bail!("no native lazy output backend for this platform")
+    }
+}
+
 impl Args {
     fn policy(&self) -> anyhow::Result<Policy> {
         let mut policy = match &self.config {
@@ -203,7 +227,6 @@ fn write_metrics(path: &std::path::Path, service: &OutputService) -> anyhow::Res
     Ok(())
 }
 
-#[cfg(any(target_os = "macos", windows))]
 async fn mount_projection(
     args: &Args,
     service: &OutputService,
@@ -219,9 +242,22 @@ async fn mount_projection(
         !state.starts_with(&root) && !root.starts_with(&state),
         "state directory and output mount must not overlap"
     );
-    let namespace = Tree::open(
-        &state,
-        service.backend_identity(),
+    let cache = args
+        .cas_cache_dir
+        .clone()
+        .unwrap_or_else(|| state.join("cache"));
+    std::fs::create_dir_all(&cache)?;
+    let cache = std::fs::canonicalize(cache)?;
+    anyhow::ensure!(
+        !cache.starts_with(&root) && !root.starts_with(&cache),
+        "CAS cache directory and output mount must not overlap"
+    );
+    anyhow::ensure!(
+        cache != state && !state.starts_with(&cache),
+        "CAS cache directory must not contain authoritative namespace state"
+    );
+    let cache = local_cas::LocalCas::open(
+        &cache,
         service.blob_source(),
         output_core::CacheConfig {
             max_bytes: args.max_cache_bytes,
@@ -231,7 +267,18 @@ async fn mount_projection(
             fetch_timeout: service.policy().operation_timeout(),
         },
     )?;
+    let namespace = Tree::open_with_cache(&state, service.backend_identity(), cache)?;
     let projection: Arc<dyn Projection> = match args.storage {
+        Storage::Fuse => {
+            #[cfg(target_os = "linux")]
+            {
+                output_fuse::start(namespace.clone(), &root).await?
+            }
+            #[cfg(not(target_os = "linux"))]
+            {
+                anyhow::bail!("FUSE lazy output storage requires Linux")
+            }
+        }
         Storage::Nfs => {
             #[cfg(target_os = "macos")]
             {
@@ -254,17 +301,9 @@ async fn mount_projection(
                 anyhow::bail!("ProjFS lazy storage requires native Windows with ProjFS enabled")
             }
         }
-        Storage::Eager => unreachable!(),
+        Storage::Eager | Storage::Lazy => unreachable!(),
     };
     Ok((projection, namespace))
-}
-
-#[cfg(not(any(target_os = "macos", windows)))]
-async fn mount_projection(
-    _args: &Args,
-    _service: &OutputService,
-) -> anyhow::Result<(Arc<dyn Projection>, Arc<Tree>)> {
-    anyhow::bail!("native lazy output mounts require macOS NFS or Windows ProjFS")
 }
 
 #[cfg(test)]
@@ -304,6 +343,23 @@ mod tests {
         assert_eq!(overridden.rpc_timeout(), Duration::from_secs(7));
         assert_eq!(overridden.operation_timeout(), Duration::from_secs(91));
         assert_eq!(args(&[]).policy().unwrap(), Policy::default());
+    }
+
+    #[test]
+    fn native_lazy_storage_is_default_and_eager_requires_selection() {
+        let defaults = args(&[]);
+        assert_eq!(defaults.storage, Storage::Lazy);
+        let native = defaults.storage.resolve().unwrap();
+        #[cfg(target_os = "linux")]
+        assert_eq!(native, Storage::Fuse);
+        #[cfg(target_os = "macos")]
+        assert_eq!(native, Storage::Nfs);
+        #[cfg(windows)]
+        assert_eq!(native, Storage::Projfs);
+        assert_eq!(
+            args(&["--storage", "eager"]).storage.resolve().unwrap(),
+            Storage::Eager
+        );
     }
 
     #[test]

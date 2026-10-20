@@ -1095,7 +1095,7 @@ async fn lazy_bos_stages_metadata_reads_verified_content_and_prunes_expired_cas(
         .client
         .batch_stat(proto::BatchStatRequest {
             build_id: "lazy".into(),
-            paths: vec!["nested/output".into()],
+            paths: vec!["nested/output".into(), "nested".into()],
         })
         .await
         .unwrap()
@@ -1117,6 +1117,10 @@ async fn lazy_bos_stages_metadata_reads_verified_content_and_prunes_expired_cas(
             .unwrap(),
         digest
     );
+    assert!(matches!(
+        stats.responses[1].stat.as_ref().unwrap().r#type,
+        Some(proto::batch_stat_response::stat::Type::Directory(_))
+    ));
     assert!(
         fixture.cas.reads.lock().unwrap().is_empty(),
         "stage and stat must not fetch payloads"
@@ -1822,4 +1826,32 @@ async fn canonical_empty_outputs_are_verified_locally_for_eager_and_lazy_reads()
         assert_eq!(fixture.cas.capabilities_queries.load(Ordering::SeqCst), 0);
         assert_eq!(fixture.service.metrics().zstd_read_requests, 0);
     }
+}
+
+#[tokio::test]
+async fn backend_authority_separates_credentials_and_is_stable_across_state_paths() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut identities = Vec::new();
+    for (name, key) in [
+        ("first", Some("scope-a")),
+        ("second", Some("scope-b")),
+        ("anonymous", None),
+        ("same-scope", Some("scope-a")),
+    ] {
+        let service = OutputService::new(Config {
+            root: dir.path().join(name),
+            cas_endpoint: "grpc://127.0.0.1:1985".into(),
+            instance_name: "fixture".into(),
+            api_key: key.map(str::to_owned),
+            max_blob_bytes: 1024,
+            policy: reapi::policy::Policy::default(),
+        })
+        .await
+        .unwrap();
+        identities.push(service.backend_identity());
+    }
+    assert_ne!(identities[0], identities[1]);
+    assert_ne!(identities[0], identities[2]);
+    assert_ne!(identities[1], identities[2]);
+    assert_eq!(identities[0], identities[3]);
 }

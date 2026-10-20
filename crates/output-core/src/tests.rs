@@ -1,5 +1,8 @@
 use super::*;
+use async_trait::async_trait;
 use std::sync::atomic::AtomicBool;
+use std::sync::atomic::AtomicU64;
+use std::time::Duration;
 use tempfile::TempDir;
 #[derive(Default)]
 struct Source {
@@ -209,7 +212,7 @@ async fn shared_fetch_expiry_releases_temporary_bytes_and_allows_retry() {
     let error = tree.content(&artifact).await.err().unwrap();
     assert!(error.downcast_ref::<CacheTimeoutError>().is_some());
     assert_eq!(tree.cache_metrics().timed_out_fetches, 1);
-    assert_eq!(fs::read_dir(dir.path().join("cache")).unwrap().count(), 0);
+    assert_eq!(fs::read_dir(dir.path().join("cache")).unwrap().count(), 1);
     let bytes = tree.content(&artifact).await.unwrap();
     assert_eq!(fs::read(bytes.path()).unwrap(), b"bounded fetch");
     assert_eq!(source.calls.load(Ordering::SeqCst), 2);
@@ -250,7 +253,7 @@ async fn corrupt_payload_is_not_published_and_retry_is_possible() {
     let n = tree.stage("out", a).await.unwrap();
     source.corrupt.store(true, Ordering::SeqCst);
     assert!(tree.read(n.id, 0, 99).await.is_err());
-    assert_eq!(fs::read_dir(dir.path().join("cache")).unwrap().count(), 0);
+    assert_eq!(fs::read_dir(dir.path().join("cache")).unwrap().count(), 1);
     source.corrupt.store(false, Ordering::SeqCst);
     assert_eq!(tree.read(n.id, 0, 99).await.unwrap(), b"valid");
 }
@@ -341,14 +344,32 @@ async fn cache_budget_respects_leases_without_reclaiming_dirty_files() {
         ..Default::default()
     });
     let oversized = source.artifact(b"too large");
+    let oversized_node = tree.stage("oversized", oversized.clone()).await.unwrap();
+    assert_eq!(
+        tree.stat("oversized", 9).await.unwrap(),
+        Some(TreeStat::File {
+            artifact: Some(oversized)
+        })
+    );
     assert!(
-        tree.prepare_stage("oversized", oversized)
+        tree.read(oversized_node.id, 0, 9)
             .await
             .unwrap_err()
             .downcast_ref::<CacheLimitError>()
             .is_some()
     );
-    assert!(tree.resolve("oversized").is_err());
+    assert_eq!(source.calls.load(Ordering::SeqCst), 0);
+    tree.setattr(
+        oversized_node.id,
+        SetAttr {
+            size: Some(0),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    assert!(tree.read(oversized_node.id, 0, 9).await.unwrap().is_empty());
+    assert_eq!(source.calls.load(Ordering::SeqCst), 0);
     let a = source.artifact(b"first");
     let b = source.artifact(b"other");
     let local = tree.create(1, "local", 0o600).await.unwrap();
@@ -361,7 +382,7 @@ async fn cache_budget_respects_leases_without_reclaiming_dirty_files() {
     drop(lease);
     let second = tree.content(&b).await.unwrap();
     assert_eq!(fs::read(second.path()).unwrap(), b"other");
-    assert_eq!(fs::read_dir(dir.path().join("cache")).unwrap().count(), 1);
+    assert_eq!(fs::read_dir(dir.path().join("cache")).unwrap().count(), 2);
     assert_eq!(
         tree.read(local.id, 0, 99).await.unwrap(),
         b"authoritative local bytes"
@@ -580,4 +601,37 @@ async fn same_inode_readers_share_one_foreground_admission_budget() {
     .expect("inode admission must not multiply the foreground budget");
     assert_eq!(source.calls.load(Ordering::SeqCst), 1);
     source.release.notify_one();
+}
+
+#[tokio::test]
+async fn independent_namespaces_share_content_cache_without_sharing_writable_authority() {
+    let root = tempfile::tempdir().unwrap();
+    let source = Arc::new(Source::default());
+    let cache = LocalCas::open(
+        root.path().join("shared-cas"),
+        source.clone(),
+        CacheConfig::default(),
+    )
+    .unwrap();
+    let first = Tree::open_with_cache(root.path().join("first"), "test", cache.clone()).unwrap();
+    let second = Tree::open_with_cache(root.path().join("second"), "test", cache).unwrap();
+    let artifact = source.artifact(b"shared clean output");
+    let first_node = first.stage("out", artifact.clone()).await.unwrap();
+    let second_node = second.stage("different/path", artifact).await.unwrap();
+    assert_eq!(
+        first.read(first_node.id, 0, 99).await.unwrap(),
+        b"shared clean output"
+    );
+    assert_eq!(
+        second.read(second_node.id, 0, 99).await.unwrap(),
+        b"shared clean output"
+    );
+    assert_eq!(source.calls.load(Ordering::SeqCst), 1);
+    first.write(first_node.id, 0, b"edited").await.unwrap();
+    first.clean("").await.unwrap();
+    assert_eq!(
+        second.read(second_node.id, 0, 99).await.unwrap(),
+        b"shared clean output"
+    );
+    assert!(second.resolve("different/path").is_ok());
 }

@@ -275,7 +275,9 @@ dependencies = [
  "h2",
  "http",
  "libc",
+ "local-cas",
  "output-core",
+ "output-fuse",
  "output-nfs",
  "output-projfs",
  "prost",
@@ -3126,6 +3128,20 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4744e383959f0db86ede514b809b1c53251889093803c05267acc7d4e7030d70"
 
 [[package]]
+name = "local-cas"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "blake3",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "tempfile",
+ "tokio",
+]
+
+[[package]]
 name = "lock_api"
 version = "0.4.14"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3525,12 +3541,27 @@ dependencies = [
  "blake3",
  "fjall",
  "im",
+ "local-cas",
  "serde",
  "serde_json",
  "sha2 0.10.9",
  "tempfile",
  "tokio",
  "uuid",
+]
+
+[[package]]
+name = "output-fuse"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "blake3",
+ "fuser",
+ "libc",
+ "output-core",
+ "tempfile",
+ "tokio",
 ]
 
 [[package]]
