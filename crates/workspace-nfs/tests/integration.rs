@@ -54,11 +54,14 @@ fn fixture() -> tempfile::TempDir {
     dir
 }
 fn open(dir: &Path) -> GitNfs {
-    let repo = GitRepo::open(dir.join("repo.git"), "git", "origin", SizeFallback::Fetch).unwrap();
+    open_with_git(dir, Path::new("git"))
+}
+fn open_with_git(dir: &Path, git: &Path) -> GitNfs {
+    let repo = GitRepo::open(dir.join("repo.git"), git, "origin", SizeFallback::Fetch).unwrap();
     let snapshot = Snapshot::load(&repo, "HEAD").unwrap();
     let working = WorkingTree::lock(&dir.join("state")).unwrap();
     let overlay = Overlay::open(&working.directory, &snapshot, &working.gitdir).unwrap();
-    GitNfs::new(repo, overlay, working)
+    GitNfs::new(repo, overlay, working).unwrap()
 }
 fn word(out: &mut Vec<u8>, n: u32) {
     out.extend_from_slice(&n.to_be_bytes());
@@ -594,4 +597,83 @@ async fn completed_rpc_capacity_turns_over_and_recent_replay_survives() {
     drop(stream);
     stop.send(()).unwrap();
     thread.join().unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cold_hydration_does_not_lock_namespace_and_revalidates_mutations() {
+    use std::os::unix::fs::PermissionsExt;
+    use std::time::Duration;
+    let dir = fixture();
+    let wrapper = dir.path().join("controlled-git");
+    // The fixture wrapper gates only network fetch, not local object extraction.
+    std::fs::write(
+        &wrapper,
+        r#"#!/bin/sh
+root=$(dirname "$0")
+case " $* " in
+  *" fetch "*)
+    touch "$root/started"
+    while test ! -e "$root/release"; do sleep .01; done
+    ;;
+esac
+exec git "$@"
+"#,
+    )
+    .unwrap();
+    std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let fs = open_with_git(dir.path(), &wrapper);
+    let cold = fs.lookup(1, &b"cold.bin"[..].into()).await.unwrap();
+    // Warm a separate local mutable file, without fetching an immutable blob.
+    let (warm, _) = fs
+        .create(1, &b"warm"[..].into(), sattr3::default())
+        .await
+        .unwrap();
+    fs.write(warm, 0, b"warm").await.unwrap();
+    let reader = fs.clone();
+    let pending = tokio::spawn(async move { reader.read(cold, 0, 4096).await });
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while !dir.path().join("started").exists() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("cold fetch did not start");
+    tokio::time::timeout(Duration::from_secs(2), async {
+        assert!(matches!(fs.getattr(1).await.unwrap().ftype, ftype3::NF3DIR));
+        assert_eq!(fs.read(warm, 0, 4).await.unwrap().0, b"warm");
+        fs.write(warm, 0, b"WARM").await.unwrap();
+        // The same inode is renamed while its immutable read is in flight.
+        fs.rename(1, &b"cold.bin"[..].into(), 1, &b"renamed"[..].into())
+            .await
+            .unwrap();
+        // Truncate-to-zero does not need old contents. The stale reply must not
+        // resurrect the original bytes after this authoritative local edit.
+        let mut attr = sattr3::default();
+        attr.size = set_size3::size(0);
+        fs.setattr(cold, attr).await.unwrap();
+        fs.write(cold, 0, b"new").await.unwrap();
+    })
+    .await
+    .expect("namespace operation blocked behind a cold fetch");
+    std::fs::write(dir.path().join("release"), b"").unwrap();
+    assert_eq!(pending.await.unwrap().unwrap(), (b"new".to_vec(), true));
+    assert_eq!(fs.lookup(1, &b"renamed"[..].into()).await.unwrap(), cold);
+}
+
+#[tokio::test]
+async fn repeated_immutable_ranges_reuse_the_verified_spool() {
+    let dir = fixture();
+    let fs = open(dir.path());
+    let cold = fs.lookup(1, &b"cold.bin"[..].into()).await.unwrap();
+    assert_eq!(
+        fs.read(cold, 0, 4096).await.unwrap(),
+        (vec![23; 4096], false)
+    );
+    let extracted = fs.content_stats().local_bytes;
+    assert_eq!(extracted, 128 * 1024);
+    for offset in [4096, 8192, 120 * 1024] {
+        assert_eq!(fs.read(cold, offset, 4096).await.unwrap().0, vec![23; 4096]);
+    }
+    assert_eq!(fs.content_stats().local_bytes, extracted);
+    assert!(fs.content_stats().cache_hits >= 3);
 }

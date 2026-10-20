@@ -7,8 +7,8 @@ use std::io::Write;
 use std::os::unix::ffi::OsStrExt;
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
-use workspace_core::backend::GitRepo;
-use workspace_overlay::overlay::{Kind, Overlay};
+use workspace_core::backend::{ContentConfig, ContentScheduler, ContentStats, GitRepo};
+use workspace_overlay::overlay::{Kind, Overlay, Payload};
 use workspace_overlay::worktree::WorkingTree;
 
 struct State {
@@ -21,6 +21,8 @@ struct State {
 #[derive(Clone)]
 pub struct GitNfs {
     state: Arc<Mutex<State>>,
+    // Mount-scoped workers outlive every cloned RPC endpoint.
+    content: Arc<ContentScheduler>,
 }
 
 fn status(error: anyhow::Error) -> nfsstat3 {
@@ -145,14 +147,17 @@ fn retire_exclusive_record(state: &State, parent: u64, name: &OsStr) {
     }
 }
 impl GitNfs {
-    pub fn new(repo: GitRepo, overlay: Overlay, working: WorkingTree) -> Self {
-        Self {
+    pub fn new(mut repo: GitRepo, overlay: Overlay, working: WorkingTree) -> anyhow::Result<Self> {
+        let content = Arc::new(ContentScheduler::new(&mut repo, ContentConfig::default())?);
+        repo.set_content_handle(content.handle());
+        Ok(Self {
             state: Arc::new(Mutex::new(State {
                 repo,
                 overlay,
                 _working: working,
             })),
-        }
+            content,
+        })
     }
     async fn run<T: Send + 'static>(
         &self,
@@ -165,6 +170,41 @@ impl GitNfs {
         })
         .await
         .map_err(|_| nfsstat3::NFS3ERR_SERVERFAULT)?
+    }
+    /// Wait for immutable availability before entering the serialized mutation.
+    /// Another mutation may win meanwhile; the action must always use the current
+    /// entry, never publish the captured base identity over mutable contents.
+    async fn prepare_copy_up(&self, id: u64) -> Result<(), nfsstat3> {
+        let oid = self
+            .run(move |s| {
+                let entry = s.overlay.content_entry(id).map_err(status)?;
+                if !entry.linked {
+                    return Err(nfsstat3::NFS3ERR_STALE);
+                }
+                Ok(if matches!(entry.payload, Payload::Base) {
+                    entry.base_oid.clone()
+                } else {
+                    None
+                })
+            })
+            .await?;
+        if let Some(oid) = oid {
+            let handle = self.content.handle();
+            tokio::task::spawn_blocking(move || handle.ensure_available(&[oid]))
+                .await
+                .map_err(|_| nfsstat3::NFS3ERR_SERVERFAULT)?
+                .map_err(|e| status(e.into()))?;
+        }
+        Ok(())
+    }
+    /// Stop admission and interrupt mount-owned Git before draining RPCs/flush.
+    /// Cancels the mount, not an individual request or a shared external Git.
+    pub fn cancel_content(&self) {
+        self.content.cancel();
+    }
+    /// Immutable hydration counters, independent of mutable overlay storage.
+    pub fn content_stats(&self) -> ContentStats {
+        self.content.handle().stats()
     }
     pub async fn sync(&self) -> Result<(), nfsstat3> {
         self.run(|state| state.overlay.sync().map_err(status)).await
@@ -245,6 +285,10 @@ impl NFSFileSystem for GitNfs {
         attr: sattr3,
         guard: Option<nfstime3>,
     ) -> Result<fattr3, nfsstat3> {
+        validate_attrs(&attr)?;
+        if matches!(attr.size, set_size3::size(size) if size != 0) {
+            self.prepare_copy_up(id).await?;
+        }
         self.run(move |s| {
             if let Some(guard) = guard {
                 let current = attrs(s, id)?.ctime;
@@ -262,25 +306,71 @@ impl NFSFileSystem for GitNfs {
         if count > 1024 * 1024 {
             return Err(nfsstat3::NFS3ERR_INVAL);
         }
+        let base = self
+            .run(move |s| {
+                let entry = s.overlay.content_entry(id).map_err(status)?;
+                if !entry.linked {
+                    return Err(nfsstat3::NFS3ERR_STALE);
+                }
+                if entry.kind != Kind::File {
+                    return Err(nfsstat3::NFS3ERR_INVAL);
+                }
+                Ok(if matches!(entry.payload, Payload::Base) {
+                    entry.base_oid.clone()
+                } else {
+                    None
+                })
+            })
+            .await?;
+        let fetched = if let Some(oid) = &base {
+            // Dropping this RPC only drops its receiver. Shared work and other
+            // callers remain valid; mount shutdown is the cancellation boundary.
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            let _ = self
+                .content
+                .handle()
+                .read(oid, offset, count, move |result| {
+                    let _ = tx.send(result);
+                });
+            Some(
+                rx.await
+                    .map_err(|_| nfsstat3::NFS3ERR_SERVERFAULT)?
+                    .map_err(|e| status(e.into()))?,
+            )
+        } else {
+            None
+        };
         self.run(move |s| {
-            if s.overlay.entry(id).map_err(status)?.kind != Kind::File {
-                return Err(nfsstat3::NFS3ERR_INVAL);
+            let current = s.overlay.content_entry(id).map_err(status)?;
+            if !current.linked {
+                return Err(nfsstat3::NFS3ERR_STALE);
             }
+            // Rename preserves inode and base identity. A racing write wins:
+            // read its current local generation instead of returning old bytes.
+            let unchanged = matches!(current.payload, Payload::Base) && current.base_oid == base;
+            let data = if unchanged {
+                fetched
+                    .expect("base read has scheduler reply")
+                    .as_ref()
+                    .to_vec()
+            } else {
+                s.overlay
+                    .read_range(id, offset, count as usize, &mut s.repo)
+                    .map_err(status)?
+            };
             let size = s.overlay.size(id, &mut s.repo).map_err(status)?;
-            let data = s
-                .overlay
-                .read_range(id, offset, count as usize, &mut s.repo)
-                .map_err(status)?;
             let eof = offset.saturating_add(data.len() as u64) >= size;
             Ok((data, eof))
         })
         .await
     }
+
     async fn write(&self, id: u64, offset: u64, data: &[u8]) -> Result<fattr3, nfsstat3> {
         if data.len() > 1024 * 1024 {
             return Err(nfsstat3::NFS3ERR_INVAL);
         }
         let data = data.to_vec();
+        self.prepare_copy_up(id).await?;
         self.run(move |s| {
             if s.overlay.entry(id).map_err(status)?.kind != Kind::File {
                 return Err(nfsstat3::NFS3ERR_INVAL);
@@ -504,7 +594,11 @@ impl NFSFileSystem for GitNfs {
         .await
     }
     async fn readlink(&self, id: u64) -> Result<nfspath3, nfsstat3> {
+        self.prepare_copy_up(id).await?;
         self.run(move |s| {
+            if !s.overlay.entry(id).map_err(status)?.linked {
+                return Err(nfsstat3::NFS3ERR_STALE);
+            }
             if s.overlay.entry(id).map_err(status)?.kind != Kind::Symlink {
                 return Err(nfsstat3::NFS3ERR_INVAL);
             }

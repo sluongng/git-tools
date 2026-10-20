@@ -101,16 +101,24 @@ async fn main() -> Result<()> {
     }
     let overlay = Overlay::open(&working.directory, &snapshot, &working.gitdir)?;
     working.prepare(&repo, &snapshot, &mountpoint, &std::env::current_exe()?)?;
-    let fs = GitNfs::new(repo, overlay, working);
+    let fs = GitNfs::new(repo, overlay, working)?;
     let server = NFSTcpListener::bind(&args.listen.to_string(), fs.clone()).await?;
     let port = server.get_listen_port();
     eprintln!(
         "NFS export ready on 127.0.0.1:{port}; macOS mount: mount_nfs -o vers=3,tcp,locallocks,noresvport,port={port},mountport={port},nobrowse,nosuid,nodev 127.0.0.1:/ {}",
         mountpoint.display()
     );
-    tokio::select! {
-        result = server.handle_forever() => result?,
-        result = tokio::signal::ctrl_c() => { result?; fs.sync().await.map_err(|e| anyhow::anyhow!("flush NFS overlay: {e:?}"))?; }
-    }
+    let result = tokio::select! {
+        result = server.handle_forever() => result.map_err(anyhow::Error::from),
+        result = tokio::signal::ctrl_c() => result.map_err(anyhow::Error::from),
+    };
+    // Release stalled demand/copy-up work before waiting for the namespace lock.
+    fs.cancel_content();
+    let flushed = fs
+        .sync()
+        .await
+        .map_err(|e| anyhow::anyhow!("flush NFS overlay: {e:?}"));
+    result?;
+    flushed?;
     Ok(())
 }

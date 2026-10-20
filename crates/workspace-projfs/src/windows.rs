@@ -23,7 +23,10 @@ use windows_sys::{
     core::{GUID, HRESULT},
 };
 use workspace_core::{
-    backend::{BackgroundCancellation, GitRepo, SizeFallback, SizeWarmOptions},
+    backend::{
+        BackgroundCancellation, ContentConfig, ContentScheduler, GitRepo, SizeFallback,
+        SizeWarmOptions,
+    },
     filesystem::{Kind, Snapshot},
 };
 
@@ -83,6 +86,7 @@ struct Enumeration {
 struct Provider {
     namespace: Namespace,
     repo: Mutex<GitRepo>,
+    content: ContentScheduler,
     enumerations: Mutex<HashMap<[u8; 16], Enumeration>>,
     timestamp: i64,
     lookup_order: Vec<(Vec<u16>, usize)>,
@@ -208,8 +212,13 @@ pub struct Projection {
 }
 impl Drop for Projection {
     fn drop(&mut self) {
+        // Drain queued scheduler replies before ProjFS waits for callbacks.
+        // Cancelling only native Git leaves queued read_blocking callers waiting
+        // until scheduler Drop, which cannot run until StopVirtualizing returns.
+        self._provider.content.cancel();
         self.cancellation.cancel();
         unsafe { PrjStopVirtualizing(self.context) };
+        // Provider Drop joins the workers after the kernel drains callbacks.
     }
 }
 
@@ -352,6 +361,7 @@ pub fn start_with_size_options(
         lookup_order,
         children,
         namespace,
+        content: ContentScheduler::new(&mut repo, ContentConfig::default())?,
         repo: Mutex::new(repo),
         enumerations: Mutex::new(HashMap::new()),
         timestamp: i64::try_from(timestamp)?
@@ -632,12 +642,6 @@ unsafe extern "system" fn hydrate(
             if length == 0 {
                 return Ok(S_OK);
             }
-            let Some(entry) = provider.lookup(&string(data.FilePathName)) else {
-                return Ok(hr(ERROR_FILE_NOT_FOUND));
-            };
-            if entry.kind != Kind::File {
-                return Ok(hr(ERROR_INVALID_PARAMETER));
-            }
             // DataStreamId and ContentID identify the original blob after a rename.
             let oid = if !data.VersionInfo.is_null() {
                 let bytes = &(&*data.VersionInfo).ContentID[..40];
@@ -648,13 +652,24 @@ unsafe extern "system" fn hydrate(
                 );
                 oid
             } else {
+                let Some(entry) = provider.lookup(&string(data.FilePathName)) else {
+                    return Ok(hr(ERROR_FILE_NOT_FOUND));
+                };
+                if entry.kind != Kind::File {
+                    return Ok(hr(ERROR_INVALID_PARAMETER));
+                }
                 entry.oid.as_deref().context("file without object ID")?
             };
-            let bytes = provider
+            // Metadata was preseeded at startup. Payload extraction is owned by
+            // the shared bounded scheduler and never holds the repository lock.
+            let size = provider
                 .repo
                 .lock()
                 .map_err(|_| anyhow::anyhow!("repository lock poisoned"))?
-                .read_blob(oid)?;
+                .blob_sizes(&[oid.to_owned()])?
+                .get(oid)
+                .copied()
+                .context("missing placeholder object size")?;
             let mut instance = PRJ_VIRTUALIZATION_INSTANCE_INFO::default();
             let result = PrjGetVirtualizationInstanceInfo(
                 data.NamespaceVirtualizationContext,
@@ -663,12 +678,8 @@ unsafe extern "system" fn hydrate(
             if result < 0 {
                 return Ok(result);
             }
-            let (mut start, end) = crate::hydration_range(
-                offset,
-                length,
-                bytes.len() as u64,
-                instance.WriteAlignment,
-            )?;
+            let (mut start, end) =
+                crate::hydration_range(offset, length, size, instance.WriteAlignment)?;
             let alignment = instance.WriteAlignment as u64;
             let capacity = (1024 * 1024u64 / alignment).max(1) * alignment;
             let capacity = capacity.min(u32::MAX as u64 / alignment * alignment);
@@ -682,12 +693,17 @@ unsafe extern "system" fn hydrate(
             }
             while start < end {
                 let length = (end - start).min(capacity) as u32;
-                ptr::copy_nonoverlapping(
-                    bytes[usize::try_from(start)?..usize::try_from(start + length as u64)?]
-                        .as_ptr(),
-                    buffer.0.cast(),
-                    length as usize,
+                let bytes = provider
+                    .content
+                    .handle()
+                    .read_blocking(oid, start, length)?;
+                ensure!(
+                    bytes.len() == length as usize,
+                    "short immutable hydration read"
                 );
+                // The kernel retains authority for NTFS edits and stream lifetime:
+                // writing uses the callback's original DataStreamId, not a path.
+                ptr::copy_nonoverlapping(bytes.as_ptr(), buffer.0.cast(), length as usize);
                 let result = PrjWriteFileData(
                     data.NamespaceVirtualizationContext,
                     &data.DataStreamId,

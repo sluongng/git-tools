@@ -449,6 +449,22 @@ impl ContentHandle {
         Ok(())
     }
 
+    /// Synchronous adapter for native callbacks. Never call from a scheduler
+    /// callback or while holding a namespace/repository lock. Dropping a caller
+    /// does not cancel shared work; only the mount owner cancels the scheduler.
+    pub fn read_blocking(
+        &self,
+        oid: &str,
+        offset: u64,
+        size: u32,
+    ) -> std::result::Result<ContentData, ContentError> {
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+        let _ = self.read(oid, offset, size, move |result| {
+            let _ = tx.send(result);
+        });
+        rx.recv().unwrap_or(Err(ContentError::Io))
+    }
+
     /// Best-effort speculative admission. Returns the number newly queued.
     /// A large selection is admitted incrementally rather than retained unbounded.
     pub fn prefetch(&self, oids: &[String]) -> std::result::Result<usize, ContentError> {
@@ -2035,7 +2051,6 @@ os.execvp('git',['git',*sys.argv[1:]])
 mod portable_tests {
     use super::*;
     use std::process::{Command, Stdio};
-    use std::sync::mpsc;
 
     #[test]
     fn native_git_cached_ranges_and_shutdown_remove_spool_files() {
@@ -2072,20 +2087,24 @@ mod portable_tests {
             (bytes.len() - 7, 64),
             (bytes.len() + 1, 8),
         ] {
-            let (tx, rx) = mpsc::channel();
-            handle
-                .read(&oid, offset as u64, requested, move |value| {
-                    let _ = tx.send(value);
-                })
+            let data = handle
+                .read_blocking(&oid, offset as u64, requested)
                 .unwrap();
-            let data = rx.recv_timeout(Duration::from_secs(10)).unwrap().unwrap();
             let start = offset.min(bytes.len());
             let end = offset.saturating_add(requested as usize).min(bytes.len());
             assert_eq!(data.as_ref(), &bytes[start..end]);
         }
         assert_eq!(handle.stats().cache_files, 1);
         assert!(handle.stats().cache_hits >= 3);
+        assert!(matches!(
+            handle.read_blocking("not-an-oid", 0, 1),
+            Err(ContentError::Invalid)
+        ));
         scheduler.shutdown().unwrap();
+        assert!(matches!(
+            handle.read_blocking(&oid, 0, 1),
+            Err(ContentError::Cancelled)
+        ));
         assert_eq!(handle.stats().cache_total_bytes, 0);
         assert!(
             !std::fs::read_dir(&bare).unwrap().any(|entry| entry
