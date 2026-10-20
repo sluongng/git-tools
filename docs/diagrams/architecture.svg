@@ -1,0 +1,84 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 900" role="img" aria-labelledby="gt-arch-title gt-arch-desc" class="gt-arch-map">
+<title id="gt-arch-title">git-tools architecture</title>
+<desc id="gt-arch-desc">Purple components are built in this project: git-proxy, source VFS, output VFS, local-cas and the Linux agent-session orchestrator. Gray components are external. Cylinders are storage. Each agent owns writable source and output state; host dependencies and the proxy are shared. Bazel sends Execute to the BuildBuddy execution service, which schedules tasks onto workers. Optional background CAS upload is dashed.</desc>
+<style>
+.gt-arch-map{font-family:system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;background:#fafbf8;color:#293241}
+.gt-arch-map text{fill:#293241}.gt-arch-map .gt-arch-scope{fill:#f2f4f2;stroke:#d4d9d5;stroke-width:1.5}.gt-arch-map .gt-arch-agent{fill:#fffefa;stroke:#aab4ae;stroke-width:1.5;stroke-dasharray:7 5}.gt-arch-map .gt-arch-cloud{fill:#f2f4f7;stroke:#c8d0da;stroke-width:1.5}
+.gt-arch-map .gt-arch-node .gt-arch-shape{fill:#f5f6f8;stroke:#9aa6b5;stroke-width:1.6}.gt-arch-map .gt-arch-node.gt-arch-ours .gt-arch-shape{fill:#eee8ff;stroke:#8064b2;stroke-width:1.8}.gt-arch-map .gt-arch-ours .gt-arch-title{fill:#422c6a}
+.gt-arch-map .gt-arch-heading{font-size:16px;font-weight:700;letter-spacing:.8px}.gt-arch-map .gt-arch-title{font-size:23px;font-weight:700}.gt-arch-map .gt-arch-body{font-size:17px;fill:#586575}.gt-arch-map .gt-arch-note{font-size:16px;fill:#586575}.gt-arch-map .gt-arch-edge{fill:none;stroke:#64748b;stroke-width:2.5;stroke-linejoin:round}.gt-arch-map .gt-arch-edge.gt-arch-optional{stroke:#a66b16;stroke-dasharray:7 5}.gt-arch-map .gt-arch-edge-label rect{fill:#fafbf8;stroke:none}.gt-arch-map .gt-arch-edge-label text{font-weight:550;font-size:17px}.gt-arch-map [data-flow]{transition:opacity .12s}.gt-arch-map.gt-arch-focused [data-flow]{opacity:.23}.gt-arch-map.gt-arch-focused [data-flow].gt-arch-active{opacity:1}.gt-arch-map .gt-arch-legend{font-size:17px}
+@media(prefers-reduced-motion:reduce){.gt-arch-map [data-flow]{transition:none}}
+</style>
+<defs>
+<marker id="gt-arch-arrow-normal" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M1 1 L9 5 L1 9" fill="none" stroke="#64748b" stroke-width="1.6"/></marker>
+<marker id="gt-arch-arrow-optional" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M1 1 L9 5 L1 9" fill="none" stroke="#a66b16" stroke-width="1.6"/></marker>
+</defs>
+<rect width="1200" height="900" fill="#fafbf8"/>
+<text x="355" y="65" class="gt-arch-title">Shared preparation. Private agent work.</text>
+<rect x="20" y="130" width="820" height="660" rx="15" class="gt-arch-scope"/>
+<text x="355" y="155" class="gt-arch-heading">HOST / AGENT POOL</text>
+<rect x="330" y="180" width="485" height="590" rx="12" class="gt-arch-agent"/>
+<text x="355" y="202" class="gt-arch-heading">PER AGENT</text>
+<rect x="542" y="178" width="245" height="28" rx="7" fill="#eee8ff" stroke="#8064b2"/>
+<text x="664" y="198" text-anchor="middle" font-size="16" fill="#422c6a">agent-session (Linux)</text>
+<rect x="875" y="130" width="305" height="660" rx="15" class="gt-arch-cloud"/>
+<text x="900" y="163" class="gt-arch-heading">BUILDBUDDY</text>
+<g id="gt-arch-edge-fetch" data-flow="source"><path d="M167 95 V205" class="gt-arch-edge gt-arch-normal" marker-end="url(#gt-arch-arrow-normal)"/></g>
+<g id="gt-arch-edge-clone" data-flow="source build"><path d="M290 250 H355" class="gt-arch-edge gt-arch-normal" marker-end="url(#gt-arch-arrow-normal)"/></g>
+<g id="gt-arch-edge-spool" data-flow="build"><path d="M167 295 V350" class="gt-arch-edge gt-arch-optional" marker-end="url(#gt-arch-arrow-optional)"/></g>
+<g id="gt-arch-edge-upload" data-flow="build"><path d="M45 395 H30 V815 H1038 V675" class="gt-arch-edge gt-arch-optional" marker-end="url(#gt-arch-arrow-optional)"/></g>
+<g id="gt-arch-edge-source-read" data-flow="source build"><path d="M572 305 V400" class="gt-arch-edge gt-arch-normal" marker-end="url(#gt-arch-arrow-normal)"/></g>
+<g id="gt-arch-edge-local-tree" data-flow="deps"><path d="M290 600 H320 V450 H355" class="gt-arch-edge gt-arch-normal" marker-end="url(#gt-arch-arrow-normal)" marker-start="url(#gt-arch-arrow-normal)"/></g>
+<g id="gt-arch-edge-execute" data-flow="build"><path d="M790 425 H850 V270 H900" class="gt-arch-edge gt-arch-normal" marker-end="url(#gt-arch-arrow-normal)" marker-start="url(#gt-arch-arrow-normal)"/></g>
+<g id="gt-arch-edge-remote-cache" data-flow="deps build"><path d="M790 458 H865 V610 H900" class="gt-arch-edge gt-arch-normal" marker-end="url(#gt-arch-arrow-normal)" marker-start="url(#gt-arch-arrow-normal)"/></g>
+<g id="gt-arch-edge-dispatch" data-flow="build"><path d="M1038 320 V378" class="gt-arch-edge gt-arch-normal" marker-end="url(#gt-arch-arrow-normal)"/></g>
+<g id="gt-arch-edge-worker-cas" data-flow="build"><path d="M1038 470 V575" class="gt-arch-edge gt-arch-normal" marker-end="url(#gt-arch-arrow-normal)" marker-start="url(#gt-arch-arrow-normal)"/></g>
+<g id="gt-arch-edge-stage" data-flow="outputs"><path d="M572 480 V560" class="gt-arch-edge gt-arch-normal" marker-end="url(#gt-arch-arrow-normal)"/></g>
+<g id="gt-arch-edge-output-read" data-flow="outputs"><path d="M900 625 H850 V610 H790" class="gt-arch-edge gt-arch-normal" marker-end="url(#gt-arch-arrow-normal)" marker-start="url(#gt-arch-arrow-normal)"/></g>
+<g id="gt-arch-edge-cache-read" data-flow="outputs"><path d="M572 650 V685" class="gt-arch-edge gt-arch-normal" marker-end="url(#gt-arch-arrow-normal)" marker-start="url(#gt-arch-arrow-normal)"/></g>
+<g id="gt-arch-node-origin" data-flow="source" class="gt-arch-node"><rect class="gt-arch-shape" x="45" y="30" width="245" height="65" rx="10"/><text x="61" y="62" class="gt-arch-title">Git origin</text>
+<text x="61" y="87" class="gt-arch-body">GitHub · Gerrit · other</text>
+</g>
+<g id="gt-arch-node-proxy" data-flow="source build" class="gt-arch-node gt-arch-ours"><rect class="gt-arch-shape" x="45" y="205" width="245" height="90" rx="10"/><text x="61" y="237" class="gt-arch-title">git-proxy</text>
+<text x="61" y="262" class="gt-arch-body">Git fetch · sizes · BLAKE3</text>
+</g>
+<g id="gt-arch-node-proxycas" data-flow="build" class="gt-arch-node gt-arch-ours"><path class="gt-arch-shape gt-arch-cylinder" d="M45 356 A122.5 6 0 0 1 290 356 V434 A122.5 6 0 0 1 45 434 Z"/><ellipse class="gt-arch-shape" cx="167.5" cy="356" rx="122.5" ry="6"/><text x="61" y="382" class="gt-arch-title">local-cas</text>
+<text x="61" y="407" class="gt-arch-body">Proxy upload cache</text>
+</g>
+<g id="gt-arch-node-repocache" data-flow="deps" class="gt-arch-node"><path class="gt-arch-shape gt-arch-cylinder" d="M45 561 A122.5 6 0 0 1 290 561 V639 A122.5 6 0 0 1 45 639 Z"/><ellipse class="gt-arch-shape" cx="167.5" cy="561" rx="122.5" ry="6"/><text x="61" y="587" class="gt-arch-title">Host repo cache</text>
+<text x="61" y="612" class="gt-arch-body">Shared dependency trees</text>
+</g>
+<g id="gt-arch-node-source" data-flow="source build" class="gt-arch-node gt-arch-ours"><rect class="gt-arch-shape" x="355" y="215" width="435" height="90" rx="10"/><text x="371" y="247" class="gt-arch-title">Source VFS</text>
+<text x="371" y="272" class="gt-arch-body">Git · optional jj</text>
+</g>
+<g id="gt-arch-node-bazel" data-flow="source deps build outputs" class="gt-arch-node"><rect class="gt-arch-shape" x="355" y="400" width="435" height="80" rx="10"/><text x="371" y="432" class="gt-arch-title">Bazel</text>
+<text x="371" y="457" class="gt-arch-body">Private output base</text>
+</g>
+<g id="gt-arch-node-bos" data-flow="outputs" class="gt-arch-node gt-arch-ours"><rect class="gt-arch-shape" x="355" y="560" width="435" height="90" rx="10"/><text x="371" y="592" class="gt-arch-title">Output VFS</text>
+<text x="371" y="617" class="gt-arch-body">bazel-output-service · optional</text>
+</g>
+<g id="gt-arch-node-boscas" data-flow="outputs" class="gt-arch-node gt-arch-ours"><path class="gt-arch-shape gt-arch-cylinder" d="M355 691 A217.5 6 0 0 1 790 691 V749 A217.5 6 0 0 1 355 749 Z"/><ellipse class="gt-arch-shape" cx="572.5" cy="691" rx="217.5" ry="6"/><text x="371" y="717" class="gt-arch-title">local-cas</text>
+<text x="371" y="742" class="gt-arch-body">Output blob cache</text>
+</g>
+<g id="gt-arch-node-scheduler" data-flow="build" class="gt-arch-node"><rect class="gt-arch-shape" x="900" y="230" width="275" height="90" rx="10"/><text x="916" y="262" class="gt-arch-title">Execution API</text>
+<text x="916" y="287" class="gt-arch-body">+ scheduler</text>
+</g>
+<g id="gt-arch-node-executor" data-flow="build" class="gt-arch-node"><rect class="gt-arch-shape" x="912" y="378" width="255" height="80" rx="10"/><rect class="gt-arch-shape" x="906" y="384" width="255" height="80" rx="10"/><rect class="gt-arch-shape" x="900" y="390" width="255" height="80" rx="10"/><text x="916" y="422" class="gt-arch-title">RBE workers</text>
+</g>
+<g id="gt-arch-node-remote" data-flow="deps build outputs" class="gt-arch-node"><path class="gt-arch-shape gt-arch-cylinder" d="M900 581 A137.5 6 0 0 1 1175 581 V669 A137.5 6 0 0 1 900 669 Z"/><ellipse class="gt-arch-shape" cx="1037.5" cy="581" rx="137.5" ry="6"/><text x="916" y="607" class="gt-arch-title">Action Cache + CAS</text>
+<text x="916" y="632" class="gt-arch-body">Includes remote r2c2</text>
+</g>
+<g class="gt-arch-edge-label" data-flow="source"><rect x="171.5" y="137" width="77.1" height="23" rx="4"/><text x="210" y="154" text-anchor="middle">refresh</text></g>
+<g class="gt-arch-edge-label" data-flow="build"><rect x="490.9" y="800" width="158.2" height="23" rx="4"/><text x="570" y="817" text-anchor="middle">async CAS upload</text></g>
+<g class="gt-arch-edge-label" data-flow="source build"><rect x="497.4" y="339" width="149.2" height="23" rx="4"/><text x="572" y="356" text-anchor="middle">files / digests</text></g>
+<g class="gt-arch-edge-label" data-flow="deps"><rect x="290.5" y="507" width="59.1" height="23" rx="4"/><text x="320" y="524" text-anchor="middle">reuse</text></g>
+<g class="gt-arch-edge-label" data-flow="build"><rect x="811.5" y="335" width="77.1" height="23" rx="4"/><text x="850" y="352" text-anchor="middle">Execute</text></g>
+<g class="gt-arch-edge-label" data-flow="deps build"><rect x="800.4" y="481" width="149.2" height="23" rx="4"/><text x="875" y="498" text-anchor="middle">AC / CAS / r2c2</text></g>
+<g class="gt-arch-edge-label" data-flow="build"><rect x="995.0" y="340" width="86.1" height="23" rx="4"/><text x="1038" y="357" text-anchor="middle">dispatch</text></g>
+<g class="gt-arch-edge-label" data-flow="build"><rect x="1008.5" y="507" width="59.1" height="23" rx="4"/><text x="1038" y="524" text-anchor="middle">blobs</text></g>
+<g class="gt-arch-edge-label" data-flow="outputs"><rect x="497.4" y="507" width="149.2" height="23" rx="4"/><text x="572" y="524" text-anchor="middle">output metadata</text></g>
+<g class="gt-arch-edge-label" data-flow="outputs"><rect x="798.0" y="626" width="104.1" height="23" rx="4"/><text x="850" y="643" text-anchor="middle">lazy fetch</text></g>
+<rect x="45" y="857" width="24" height="20" rx="4" fill="#eee8ff" stroke="#8064b2"/><text x="80" y="874" class="gt-arch-legend">Built here</text>
+<rect x="230" y="857" width="24" height="20" rx="4" fill="#f5f6f8" stroke="#9aa6b5"/><text x="265" y="874" class="gt-arch-legend">External</text>
+<text x="450" y="874" class="gt-arch-legend">Cylinders = storage</text>
+<path d="M740 868 H785" class="gt-arch-edge gt-arch-optional"/><text x="798" y="874" class="gt-arch-legend">Optional upload</text>
+</svg>

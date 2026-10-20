@@ -4,15 +4,26 @@ Git provides transport, object storage and history. Fjall stores metadata and
 writable namespace state. Native filesystem adapters expose the workspace;
 BuildBuddy supplies remote execution and CAS separately.
 
-```mermaid
-flowchart LR
-    Origin[Git origin] --> Proxy[git-proxy: mirror and fetch cache]
-    Proxy --> Source[Private blobless clone + writable mount]
-    Proxy -->|optional async publication| CAS[BuildBuddy / REAPI CAS]
-    Source --> Bazel[Bazel + r2c2]
-    Bazel -->|output metadata| BOS[Bazel output service]
-    CAS -->|first output read| BOS
-```
+![Architecture: private agents, shared caches and BuildBuddy](diagrams/architecture.svg)
+
+The diagram is a logical ownership map, not a required deployment topology.
+Purple components are built in this project; gray components are external.
+Cylinders represent storage; boxes represent services and mount frontends.
+Each agent keeps writable source, Git admin and Bazel output roots private.
+`agent-session` orchestrates Linux source/Bazel lifecycle; BOS is started separately.
+Native source/output adapters also support macOS NFS and Windows ProjFS.
+
+- **Source:** the proxy serves filtered Git fetches and object metadata; edits
+  remain in the agent's private overlay/admin state. Native commit can hydrate blobs.
+- **Dependencies:** a primed host repository-tree cache and remote r2c2 are
+  independent. Remote hits stay lazy and do not populate the host tree cache.
+  Bazel's optional disk cache is separate and is ignored with BOS in Bazel 9.2.
+- **Execution:** Bazel sends `Execute` to BuildBuddy’s execution service; the
+  scheduler dispatches tasks to RBE workers. Optional proxy CAS sync publishes
+  main-workspace blobs asynchronously; queued is not uploaded.
+- **Outputs:** Bazel sends BOS paths/digests, not payloads. BOS checks remote
+  presence, then fetches and verifies complete blobs on first content access.
+  Proxy and BOS reuse `local-cas` code but own separate cache directories.
 
 ## What can be evicted?
 
@@ -25,7 +36,7 @@ flowchart LR
 | Generated Git responses | Separate request/ref-view cache; quota/TTL/LRU skip active readers |
 | `local-cas` payloads | Verified immutable bytes; byte-bounded LRU skips active leases/download reservations |
 
-Each cache directory has **one process owner**. Library consumers share
+Each `local-cas` directory has **one process owner**. Library consumers share
 `Arc<LocalCas>`; separate proxy/BOS processes need separate directories.
 Cache quotas cover logical payloads, not metadata, filesystem blocks or RSS.
 
