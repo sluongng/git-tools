@@ -667,6 +667,11 @@ fn gated_git(root: &Path) -> PathBuf {
 case " $* " in
   *" ls-remote "*)
     if [ -f {fail} ]; then exit 1; fi ;;
+  *" fetch "*)
+    if [ -f {block_refresh} ]; then
+      touch {refresh_started}
+      while [ ! -f {release_refresh} ]; do sleep 0.01; done
+    fi ;;
   *" http-backend "*)
     if [ "$REQUEST_METHOD" = POST ] && [ -f {block} ]; then
       request=$(mktemp {request}) || exit 1
@@ -685,6 +690,9 @@ esac
 exec {git} "$@"
 "#,
         fail = quote(root.join("fail-head").to_str().unwrap()),
+        block_refresh = quote(root.join("block-refresh").to_str().unwrap()),
+        refresh_started = quote(root.join("refresh-started").to_str().unwrap()),
+        release_refresh = quote(root.join("release-refresh").to_str().unwrap()),
         block = quote(root.join("block-fetch").to_str().unwrap()),
         request = quote(root.join("request.XXXXXX").to_str().unwrap()),
         started = quote(root.join("fetch-started").to_str().unwrap()),
@@ -939,4 +947,216 @@ exec '{}' "$@"
         "Git must work without inheriting the CAS credential"
     );
     assert!(!std::fs::read_to_string(observed).unwrap().is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn explicit_preparation_coalesces_and_keeps_cached_metadata_observable_during_refresh() {
+    let temp = tempfile::tempdir().unwrap();
+    let (upstream, blob, _) = upstream(temp.path()).await;
+    let mut cfg = config(temp.path(), &upstream, 0);
+    cfg.git = gated_git(temp.path());
+    let (url, server) = serve(cfg.clone()).await;
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .build()
+        .unwrap();
+    let status_url = format!("{url}/api/v1/repos/test/status");
+    let prepare_url = format!("{url}/api/v1/repos/test/prepare");
+    let initial: serde_json::Value = client
+        .get(&status_url)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(initial["ready"], false);
+    assert!(initial["ref_age_seconds"].is_null());
+    assert_eq!(client.get(&prepare_url).send().await.unwrap().status(), 405);
+    assert_eq!(
+        client.post(&prepare_url).send().await.unwrap().status(),
+        200
+    );
+    std::fs::write(temp.path().join("block-refresh"), "").unwrap();
+    let first = {
+        let client = client.clone();
+        let url = prepare_url.clone();
+        tokio::spawn(async move { client.post(url).send().await.unwrap() })
+    };
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while !temp.path().join("refresh-started").exists() {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let second = {
+        let client = client.clone();
+        let url = prepare_url.clone();
+        tokio::spawn(async move { client.post(url).send().await.unwrap() })
+    };
+    let during: serde_json::Value = client
+        .get(&status_url)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(during["ready"], true);
+    assert_eq!(during["preparation_in_progress"], true);
+    assert_eq!(during["completed_attempts"], 1);
+    // A warm SHA1 lookup must not wait for the mutex held by network refresh.
+    let response = tokio::time::timeout(
+        Duration::from_secs(2),
+        client
+            .post(format!("{url}/api/v1/repos/test/objects"))
+            .json(&json!({"oids":[blob]}))
+            .send(),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(response.status(), 200);
+    assert_eq!(
+        response.json::<ObjectResponse>().await.unwrap().objects[0].size_bytes,
+        12
+    );
+    assert!(!first.is_finished());
+    assert!(!second.is_finished());
+    // Observe the second request actually waiting, not a timing guess about
+    // when its HTTP task might reach the held operation.
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let status: serde_json::Value = client
+                .get(&status_url)
+                .send()
+                .await
+                .unwrap()
+                .json()
+                .await
+                .unwrap();
+            if status["preparation_waiters"] == 1 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    })
+    .await
+    .unwrap();
+    std::fs::write(temp.path().join("release-refresh"), "").unwrap();
+    assert_eq!(first.await.unwrap().status(), 200);
+    assert_eq!(second.await.unwrap().status(), 200);
+    let complete: serde_json::Value = client
+        .get(&status_url)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(complete["completed_attempts"], 2);
+    assert_eq!(complete["last_outcome"], "success");
+    std::fs::write(temp.path().join("fail-head"), "").unwrap();
+    std::fs::remove_file(temp.path().join("release-refresh")).unwrap();
+    std::fs::remove_file(temp.path().join("refresh-started")).unwrap();
+    let failed_first = {
+        let client = client.clone();
+        let url = prepare_url.clone();
+        tokio::spawn(async move { client.post(url).send().await.unwrap() })
+    };
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while !temp.path().join("refresh-started").exists() {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let failed_second = {
+        let client = client.clone();
+        let url = prepare_url.clone();
+        tokio::spawn(async move { client.post(url).send().await.unwrap() })
+    };
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let status: serde_json::Value = client
+                .get(&status_url)
+                .send()
+                .await
+                .unwrap()
+                .json()
+                .await
+                .unwrap();
+            if status["preparation_waiters"] == 1 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    })
+    .await
+    .unwrap();
+    std::fs::write(temp.path().join("release-refresh"), "").unwrap();
+    assert_eq!(failed_first.await.unwrap().status(), 502);
+    assert_eq!(failed_second.await.unwrap().status(), 502);
+    let failed: serde_json::Value = client
+        .get(&status_url)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(failed["ready"], true);
+    assert_eq!(failed["failed_attempts"], 1);
+    assert_eq!(failed["last_outcome"], "failed");
+    assert!(
+        !failed.to_string().contains(upstream.to_str().unwrap()),
+        "status must not reveal origin credentials or stderr"
+    );
+    server.stop().await;
+    let (url, server) = serve(cfg).await;
+    let restarted: serde_json::Value = client
+        .get(format!("{url}/api/v1/repos/test/status"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        restarted["ready"], false,
+        "restart must validate the persisted origin binding"
+    );
+    // A metadata-only validation must not mark persisted refs fresh. The next
+    // advertisement/preparation still contacts origin and observes its error.
+    assert_eq!(
+        client
+            .post(format!("{url}/api/v1/repos/test/objects"))
+            .json(&json!({"oids":[blob]}))
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        200
+    );
+    let validated: serde_json::Value = client
+        .get(format!("{url}/api/v1/repos/test/status"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(validated["ready"], true);
+    assert!(validated["ref_age_seconds"].is_null());
+    assert_eq!(
+        client
+            .post(format!("{url}/api/v1/repos/test/prepare"))
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        502
+    );
+    server.stop().await;
 }

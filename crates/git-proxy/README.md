@@ -29,6 +29,27 @@ share it. Mirrors have no disk quota, eviction, or garbage-collection policy.
 
 Advertisements refresh refs after `--refresh-ttl-seconds` (default 10).
 Refresh failures fail the request; restart resets freshness and contacts origin.
+Prewarm before assigning agents, rather than paying mirror population on their
+first clone:
+
+```sh
+curl --fail -X POST http://127.0.0.1:8082/api/v1/repos/bazel/prepare
+curl --fail http://127.0.0.1:8082/api/v1/repos/bazel/status
+```
+
+Preparation uses the advertisement freshness policy and coalesces overlapping
+attempts, including failures. It is request-owned, not a detached background job.
+Status is nonblocking and reports validated `ready`, `preparation_in_progress`,
+`preparation_waiters`, `ref_age_seconds`, attempt/failure counts and a sanitized
+`last_outcome`.
+Ready means the local mirror is usable, **not** that refs are fresh; age is unknown
+until this process successfully clones or refreshes. Restart validates origin
+binding again. Existing-object metadata stays available during refresh, but smart
+HTTP still waits for the ref-view gate to preserve response-cache correctness.
+Refresh failure never silently serves a stale advertisement. Graceful shutdown
+drains active requests; native Git operations retain their timeout/cancellation
+limits. No automatic Git maintenance or mirror eviction is performed.
+
 Native Git handles negotiation, filtering, shallow clones, and pack production.
 Native `object-info` requires a Git build implementing that extension; the JSON
 metadata API works independently of it.

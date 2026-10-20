@@ -52,9 +52,71 @@ struct Repository {
     upstream: String,
     path: PathBuf,
     refreshed: Mutex<Option<Instant>>,
+    preparation: Mutex<()>,
+    lifecycle: std::sync::Mutex<Lifecycle>,
     epoch: AtomicU64,
     refs_gate: Arc<RwLock<()>>,
     pack_identity: Mutex<Option<(u64, String)>>,
+}
+// Independent from the long-running native Git mutex: readiness and cached
+// metadata remain observable while a refresh waits on the network/ref leases.
+#[derive(Default)]
+struct Lifecycle {
+    ready: bool,
+    in_progress: bool,
+    waiters: u64,
+    completed: u64,
+    failures: u64,
+    last_success: Option<Instant>,
+    last_outcome: Option<&'static str>,
+    last_attempt_refresh: bool,
+}
+#[derive(Serialize)]
+struct RepositoryStatus {
+    ready: bool,
+    preparation_in_progress: bool,
+    preparation_waiters: u64,
+    completed_attempts: u64,
+    failed_attempts: u64,
+    ref_age_seconds: Option<f64>,
+    last_outcome: Option<&'static str>,
+}
+impl Repository {
+    fn status(&self) -> RepositoryStatus {
+        let state = self.lifecycle.lock().unwrap();
+        RepositoryStatus {
+            ready: state.ready,
+            preparation_in_progress: state.in_progress,
+            preparation_waiters: state.waiters,
+            completed_attempts: state.completed,
+            failed_attempts: state.failures,
+            ref_age_seconds: state.last_success.map(|time| time.elapsed().as_secs_f64()),
+            last_outcome: state.last_outcome,
+        }
+    }
+}
+struct PreparationWaiter<'a>(&'a Repository);
+impl Drop for PreparationWaiter<'_> {
+    fn drop(&mut self) {
+        self.0.lifecycle.lock().unwrap().waiters -= 1;
+    }
+}
+struct Preparation<'a> {
+    repository: &'a Repository,
+    outcome: &'static str,
+}
+impl Drop for Preparation<'_> {
+    fn drop(&mut self) {
+        let mut state = self.repository.lifecycle.lock().unwrap();
+        state.in_progress = false;
+        state.completed += 1;
+        state.last_outcome = Some(self.outcome);
+        if self.outcome == "success" {
+            state.ready = true;
+        } else {
+            state.failures += 1;
+        }
+    }
 }
 // A native fetch can update refs before a later error or cancellation. Invalidate
 // cached responses on every exit path, not only after all refresh steps succeed.
@@ -119,6 +181,8 @@ pub fn router_with_cas_shutdown(mut config: Config) -> Result<(Router, Option<Ca
                 upstream: upstream.clone(),
                 path: config.cache_dir.join(format!("{alias}.git")),
                 refreshed: Mutex::new(None),
+                preparation: Mutex::new(()),
+                lifecycle: std::sync::Mutex::new(Lifecycle::default()),
                 epoch: AtomicU64::new(0),
                 refs_gate: Arc::new(RwLock::new(())),
                 pack_identity: Mutex::new(None),
@@ -277,9 +341,49 @@ async fn checked(mut command: Command) -> Result<Vec<u8>> {
 }
 
 async fn ensure_repo(app: &App, repo: &Repository, refresh: bool) -> Result<()> {
+    let completed = {
+        let state = repo.lifecycle.lock().unwrap();
+        if state.ready
+            && (!refresh
+                || state
+                    .last_success
+                    .is_some_and(|time| time.elapsed() < app.config.refresh_ttl))
+        {
+            return Ok(());
+        }
+        state.completed
+    };
+    repo.lifecycle.lock().unwrap().waiters += 1;
+    let waiter = PreparationWaiter(repo);
+    let _operation = repo.preparation.lock().await;
+    drop(waiter);
+    {
+        let mut state = repo.lifecycle.lock().unwrap();
+        // Callers that overlapped one operation share its result, including a
+        // failure (and TTL=0). New requests may explicitly retry afterward.
+        if state.completed != completed && (!refresh || state.last_attempt_refresh) {
+            ensure!(
+                state.last_outcome == Some("success"),
+                "concurrent repository preparation failed"
+            );
+            return Ok(());
+        }
+        state.in_progress = true;
+        state.last_attempt_refresh = refresh;
+    }
+    let mut attempt = Preparation {
+        repository: repo,
+        outcome: "cancelled",
+    };
+    let result = prepare_repo(app, repo, refresh).await;
+    attempt.outcome = if result.is_ok() { "success" } else { "failed" };
+    result
+}
+async fn prepare_repo(app: &App, repo: &Repository, refresh: bool) -> Result<()> {
     {
         let refreshed = repo.refreshed.lock().await;
         if refreshed.is_some_and(|t| !refresh || t.elapsed() < app.config.refresh_ttl) {
+            repo.lifecycle.lock().unwrap().last_success = *refreshed;
             return Ok(());
         }
     }
@@ -289,6 +393,7 @@ async fn ensure_repo(app: &App, repo: &Repository, refresh: bool) -> Result<()> 
     let _refs_write = repo.refs_gate.write().await;
     let mut refreshed = repo.refreshed.lock().await;
     if refreshed.is_some_and(|t| !refresh || t.elapsed() < app.config.refresh_ttl) {
+        repo.lifecycle.lock().unwrap().last_success = *refreshed;
         return Ok(());
     }
     if !repo.path.exists() {
@@ -401,6 +506,7 @@ async fn ensure_repo(app: &App, repo: &Repository, refresh: bool) -> Result<()> 
         }
         *refreshed = Some(Instant::now());
     }
+    repo.lifecycle.lock().unwrap().last_success = *refreshed;
     Ok(())
 }
 // Hash potentially large ref inventories without capturing them in memory. The
@@ -553,6 +659,23 @@ async fn handle(State(app): State<Arc<App>>, request: Request) -> Result<Respons
         }
         return Ok(axum::Json(stats).into_response());
     }
+    let path = request.uri().path();
+    if let Some(alias) = path
+        .strip_prefix("/api/v1/repos/")
+        .and_then(|path| path.strip_suffix("/status"))
+    {
+        let repo = app
+            .repositories
+            .get(alias)
+            .ok_or_else(|| HttpError(StatusCode::NOT_FOUND, "unknown repository\n".into()))?;
+        if request.method() != "GET" {
+            return Err(HttpError(
+                StatusCode::METHOD_NOT_ALLOWED,
+                "GET required\n".into(),
+            ));
+        }
+        return Ok(axum::Json(repo.status()).into_response());
+    }
     let permit = app.slots.clone().try_acquire_owned().map_err(|_| {
         HttpError(
             StatusCode::SERVICE_UNAVAILABLE,
@@ -560,6 +683,25 @@ async fn handle(State(app): State<Arc<App>>, request: Request) -> Result<Respons
         )
     })?;
     let path = request.uri().path().to_owned();
+    if let Some(alias) = path
+        .strip_prefix("/api/v1/repos/")
+        .and_then(|path| path.strip_suffix("/prepare"))
+    {
+        let repo = app
+            .repositories
+            .get(alias)
+            .ok_or_else(|| HttpError(StatusCode::NOT_FOUND, "unknown repository\n".into()))?;
+        if request.method() != "POST" {
+            return Err(HttpError(
+                StatusCode::METHOD_NOT_ALLOWED,
+                "POST required\n".into(),
+            ));
+        }
+        // A preparation request refreshes stale refs using the same conservative
+        // policy as an advertisement; it never silently opts clients into stale refs.
+        ensure_repo(&app, repo, true).await.map_err(internal)?;
+        return Ok(axum::Json(repo.status()).into_response());
+    }
     if let Some(alias) = path
         .strip_prefix("/api/v1/repos/")
         .and_then(|s| s.strip_suffix("/cas-sync"))
