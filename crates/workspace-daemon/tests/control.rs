@@ -125,6 +125,41 @@ async fn private_control_retains_registry_and_excludes_second_owner() -> Result<
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
     let status = call(socket.clone(), ControlRequest::Status).await?;
+    // A proof from another daemon/version must fail before a destructive
+    // operation dispatch; the original daemon remains available afterward.
+    let mismatch = call(
+        socket.clone(),
+        ControlRequest::Scoped {
+            version: 0,
+            digest: "invalid-proof".into(),
+            request: Box::new(ControlRequest::Shutdown),
+        },
+    )
+    .await
+    .unwrap_err();
+    assert!(mismatch.to_string().contains("credential scope mismatch"));
+    assert_eq!(
+        call(socket.clone(), ControlRequest::Status).await?["pid"],
+        status["pid"]
+    );
+    // Repositories are configured here: session.git is captured by the
+    // long-lived Git proxy, unlike the genuinely per-session tools.
+    let mut changed_git = config.clone();
+    changed_git.session.git = "different-git".into();
+    let mismatch = tokio::task::spawn_blocking(move || {
+        workspace_daemon::control::ScopedClient::new(&changed_git).validate_identity()
+    })
+    .await?
+    .unwrap_err();
+    assert!(mismatch.to_string().contains("credential scope mismatch"));
+    let mut changed_session = config.clone();
+    changed_session.session.bazel = "different-bazel".into();
+    changed_session.session.git_vfs = "different-vfs".into();
+    changed_session.session.bazelrc = Some("/unused/fixture.bazelrc".into());
+    tokio::task::spawn_blocking(move || {
+        workspace_daemon::control::ScopedClient::new(&changed_session).validate_identity()
+    })
+    .await??;
     assert_eq!(status["cache"]["resident_bytes"], 0);
     assert!(status["bos_endpoint"].is_null());
     assert_eq!(status["bes_endpoint"], config.bes_endpoint());
@@ -356,6 +391,205 @@ async fn offline_upstream_does_not_prevent_durable_bes_admission_startup() -> Re
     assert_eq!(status["bes_endpoint"], config.bes_endpoint());
     call(socket, ControlRequest::Shutdown).await?;
     tokio::time::timeout(Duration::from_secs(5), task).await???;
+    Ok(())
+}
+
+#[test]
+fn cli_reuse_binds_effective_config_and_credentials_but_not_session_settings() -> Result<()> {
+    use std::process::Command;
+    let executable = PathBuf::from(env!("CARGO_BIN_EXE_workspace"));
+    let dir = tempfile::tempdir()?;
+    let unavailable = std::net::TcpListener::bind("127.0.0.1:0")?;
+    let upstream = format!("grpc://{}", unavailable.local_addr()?);
+    // Keep this listener alive without serving: no real backend or credentials.
+    let state = dir.path().join("host");
+    let other_state = dir.path().join("other-host");
+    struct Cleanup(Vec<PathBuf>);
+    impl Drop for Cleanup {
+        fn drop(&mut self) {
+            for root in &self.0 {
+                let _ = Client {
+                    socket: root.join("control.sock"),
+                }
+                .call(ControlRequest::Shutdown);
+            }
+        }
+    }
+    let _cleanup = Cleanup(vec![state.clone(), other_state.clone()]);
+    let write_config = |name: &str,
+                        root: &std::path::Path,
+                        endpoint: &str,
+                        instance: &str,
+                        selector: &str,
+                        bes: bool,
+                        extra: &str|
+     -> Result<PathBuf> {
+        let path = dir.path().join(format!("{name}.toml"));
+        std::fs::write(
+            &path,
+            format!(
+                "state_dir = {:?}\n[cache]\nupstream = {endpoint:?}\ninstance_name = {instance:?}\napi_key_env = {selector:?}\n[bes]\nenabled = {bes}\n{extra}\n",
+                root.to_str().unwrap(),
+            ),
+        )?;
+        Ok(path)
+    };
+    let run = |path: &std::path::Path,
+               operation: &str,
+               credential: &str|
+     -> Result<std::process::Output> {
+        Ok(Command::new(&executable)
+            .arg("--config")
+            .arg(path)
+            .arg(operation)
+            .env("WORKSPACE_FIXTURE_KEY", credential)
+            .env("WORKSPACE_FIXTURE_OTHER_KEY", credential)
+            .output()?)
+    };
+    let a = write_config(
+        "a",
+        &state,
+        &upstream,
+        "scope-a",
+        "WORKSPACE_FIXTURE_KEY",
+        true,
+        "",
+    )?;
+    let first = run(&a, "retry-bes", "synthetic-credential-a")?;
+    assert!(
+        first.status.success(),
+        "{}",
+        String::from_utf8_lossy(&first.stderr)
+    );
+    let initial: serde_json::Value =
+        serde_json::from_slice(&run(&a, "status", "synthetic-credential-a")?.stdout)?;
+    let pid = initial["report"]["pid"].clone();
+    assert!(pid.is_u64());
+    assert!(initial["report"].get("identity").is_none());
+    assert!(!initial.to_string().contains("synthetic-credential"));
+    struct Case<'a> {
+        name: &'a str,
+        endpoint: &'a str,
+        instance: &'a str,
+        selector: &'a str,
+        bes: bool,
+        credential: &'a str,
+        extra: &'a str,
+        compatible: bool,
+    }
+    for case in [
+        Case {
+            name: "instance scope",
+            instance: "scope-b",
+            ..Case::default(&upstream)
+        },
+        Case {
+            name: "upstream",
+            endpoint: "grpc://127.0.0.1:1",
+            ..Case::default(&upstream)
+        },
+        Case {
+            name: "BES enablement",
+            bes: false,
+            ..Case::default(&upstream)
+        },
+        Case {
+            name: "credential selector",
+            selector: "WORKSPACE_FIXTURE_OTHER_KEY",
+            ..Case::default(&upstream)
+        },
+        Case {
+            name: "credential rotation",
+            credential: "synthetic-credential-b",
+            ..Case::default(&upstream)
+        },
+        Case {
+            name: "BES credential selector",
+            extra: "api_key_env = 'WORKSPACE_FIXTURE_OTHER_KEY'",
+            ..Case::default(&upstream)
+        },
+        Case {
+            name: "BES credential inheritance",
+            extra: "api_key_env = 'WORKSPACE_FIXTURE_KEY'",
+            compatible: true,
+            ..Case::default(&upstream)
+        },
+        Case {
+            name: "session executable choices",
+            extra: "[session]\ngit = 'different-git'\nbazel = 'different-bazel'\ngit_vfs = 'different-vfs'\nbazelrc = '/unused/fixture.bazelrc'",
+            compatible: true,
+            ..Case::default(&upstream)
+        },
+    ] {
+        let candidate = write_config(
+            "candidate",
+            &state,
+            case.endpoint,
+            case.instance,
+            case.selector,
+            case.bes,
+            case.extra,
+        )?;
+        let output = run(&candidate, "retry-bes", case.credential)?;
+        assert_eq!(
+            output.status.success(),
+            case.compatible,
+            "{}: {}",
+            case.name,
+            String::from_utf8_lossy(&output.stderr)
+        );
+        if !case.compatible {
+            assert!(
+                String::from_utf8_lossy(&output.stderr)
+                    .contains("daemon configuration or credential scope mismatch"),
+                "{}",
+                case.name
+            );
+            // Read-only and destructive commands must not silently select A either.
+            for operation in ["status", "shutdown"] {
+                let output = run(&candidate, operation, case.credential)?;
+                assert!(!output.status.success(), "{}: {operation}", case.name);
+            }
+        }
+        assert!(!String::from_utf8_lossy(&output.stdout).contains("synthetic-credential"));
+        assert!(!String::from_utf8_lossy(&output.stderr).contains("synthetic-credential"));
+    }
+    impl<'a> Case<'a> {
+        fn default(endpoint: &'a str) -> Self {
+            Self {
+                name: "same scope",
+                endpoint,
+                instance: "scope-a",
+                selector: "WORKSPACE_FIXTURE_KEY",
+                bes: true,
+                credential: "synthetic-credential-a",
+                extra: "",
+                compatible: false,
+            }
+        }
+    }
+    let b = write_config(
+        "b",
+        &other_state,
+        &upstream,
+        "scope-b",
+        "WORKSPACE_FIXTURE_OTHER_KEY",
+        true,
+        "",
+    )?;
+    assert!(
+        run(&b, "retry-bes", "synthetic-credential-b")?
+            .status
+            .success()
+    );
+    let status_b: serde_json::Value =
+        serde_json::from_slice(&run(&b, "status", "synthetic-credential-b")?.stdout)?;
+    assert_eq!(status_b["report"]["instance_name"], "scope-b");
+    assert_ne!(status_b["report"]["pid"], pid);
+    let final_a: serde_json::Value =
+        serde_json::from_slice(&run(&a, "status", "synthetic-credential-a")?.stdout)?;
+    assert_eq!(final_a["report"]["pid"], pid);
+    assert_eq!(final_a["report"]["instance_name"], "scope-a");
     Ok(())
 }
 

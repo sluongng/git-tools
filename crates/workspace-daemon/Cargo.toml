@@ -18,6 +18,7 @@ axum = "0.8"
 git-proxy = { path = "../git-proxy" }
 cache-proxy = { path = "../cache-proxy" }
 bes-proxy = { path = "../bes-proxy" }
+blake3 = "1"
 local-cas = { path = "../local-cas" }
 reapi = { path = "../reapi" }
 clap = { version = "4.5", features = ["derive"] }

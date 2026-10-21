@@ -7,7 +7,7 @@ use std::{
 };
 use workspace_daemon::config::{Config, EXAMPLE};
 #[cfg(unix)]
-use workspace_daemon::control::{Client, Request};
+use workspace_daemon::control::{Request, ScopedClient};
 #[derive(Parser)]
 #[command(
     version,
@@ -91,15 +91,13 @@ enum Operation {
     Shutdown,
 }
 #[cfg(unix)]
-fn client(config: &Config) -> Client {
-    Client {
-        socket: config.socket(),
-    }
+fn client(config: &Config) -> ScopedClient {
+    ScopedClient::new(config)
 }
 #[cfg(unix)]
 fn ensure_daemon(path: &Path, config: &Config) -> Result<()> {
-    if client(config).call(Request::Status).is_ok() {
-        return Ok(());
+    if client(config).available() {
+        return client(config).validate_identity();
     }
     // The child holds a state-directory lock; concurrent startups are harmless.
     use std::os::unix::fs::OpenOptionsExt;
@@ -122,8 +120,8 @@ fn ensure_daemon(path: &Path, config: &Config) -> Result<()> {
     let mut child = command.spawn().context("starting workspace daemon")?;
     let start = Instant::now();
     loop {
-        if client(config).call(Request::Status).is_ok() {
-            return Ok(());
+        if client(config).available() {
+            return client(config).validate_identity();
         }
         if child.try_wait()?.is_some() {
             anyhow::bail!("daemon startup failed; inspect private daemon.log")
@@ -160,6 +158,7 @@ async fn run(cli: Cli) -> Result<serde_json::Value> {
             .transpose()?;
         let controller = client(&config);
         if std::os::unix::net::UnixStream::connect(config.socket()).is_ok() {
+            controller.validate_identity()?;
             return controller.call(Request::Recover { session });
         }
         return workspace_daemon::daemon::recover_offline(config, session.as_deref());
@@ -170,6 +169,8 @@ async fn run(cli: Cli) -> Result<serde_json::Value> {
     }
     if !matches!(cli.command, Operation::Status { .. } | Operation::Shutdown) {
         ensure_daemon(&cli.config, &config)?;
+    } else {
+        client(&config).validate_identity()?;
     }
     let controller = client(&config);
     // Session orchestration is synchronous and must not block the async runtime

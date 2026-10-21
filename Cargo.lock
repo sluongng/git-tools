@@ -6177,6 +6177,7 @@ dependencies = [
  "axum",
  "bazel-output-service",
  "bes-proxy",
+ "blake3",
  "cache-proxy",
  "clap",
  "fs2",

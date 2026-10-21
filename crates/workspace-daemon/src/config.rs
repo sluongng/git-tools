@@ -1,5 +1,5 @@
 use anyhow::{Context, Result, ensure};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::{
     net::SocketAddr,
     path::{Path, PathBuf},
@@ -16,7 +16,7 @@ pub struct Config {
     pub session: Session,
     pub reapi: reapi::policy::Policy,
 }
-#[derive(Clone, Deserialize)]
+#[derive(Clone, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Cache {
     pub listen: SocketAddr,
@@ -40,13 +40,13 @@ pub struct Cache {
     /// Zero leaves execution lifetime to the caller, not the cache RPC policy.
     pub execution_timeout_ms: u64,
 }
-#[derive(Clone, Deserialize)]
+#[derive(Clone, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Bos {
     pub enabled: bool,
 }
 /// Durable BES is not a cache: unacknowledged events cannot be evicted.
-#[derive(Clone, Deserialize)]
+#[derive(Clone, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Bes {
     pub enabled: bool,
@@ -90,7 +90,7 @@ impl Default for Bes {
         }
     }
 }
-#[derive(Clone, Deserialize)]
+#[derive(Clone, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct GitProxy {
     pub listen: SocketAddr,

@@ -36,6 +36,7 @@ type Mount = workspace_fuse::host::SourceMount;
 struct Mount;
 struct State {
     config: Config,
+    identity: crate::identity::Identity,
     cache: Arc<LocalCas>,
     proxy: cache_proxy::CacheProxy,
     bes: Option<bes_proxy::BesProxy>,
@@ -466,6 +467,8 @@ pub async fn serve(mut config: Config) -> Result<()> {
         .open(config.state_dir.join("daemon.lock"))?;
     lock.try_lock_exclusive()
         .context("another workspace daemon owns this state directory")?;
+    let credentials = crate::identity::Credentials::load(&config)?;
+    let identity = crate::identity::Identity::new(&config, &credentials)?;
     let token = token(&config)?;
     let mut registry: Registry = match std::fs::read(config.state_dir.join("mounts.json")) {
         Ok(bytes) => {
@@ -497,11 +500,7 @@ pub async fn serve(mut config: Config) -> Result<()> {
     let listener = UnixListener::bind(&socket)?;
     use std::os::unix::fs::PermissionsExt;
     std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o600))?;
-    let api_key = match std::env::var(&config.cache.api_key_env) {
-        Ok(value) if !value.is_empty() => Some(value),
-        Ok(_) | Err(std::env::VarError::NotPresent) => None,
-        Err(_) => anyhow::bail!("credential environment variable must be UTF-8"),
-    };
+    let api_key = credentials.cache.clone();
     let service_config = || bazel_output_service::Config {
         root: config.state_dir.join("outputs"),
         cas_endpoint: config.cache.upstream.clone(),
@@ -556,16 +555,7 @@ pub async fn serve(mut config: Config) -> Result<()> {
     let mut rbe_router = proxy.clone().unix_router();
     let bes = if config.bes.enabled {
         let settings = &config.bes;
-        let key_env = if settings.api_key_env.is_empty() {
-            &config.cache.api_key_env
-        } else {
-            &settings.api_key_env
-        };
-        let bes_key = match std::env::var(key_env) {
-            Ok(value) if !value.is_empty() => Some(value),
-            Ok(_) | Err(std::env::VarError::NotPresent) => None,
-            Err(_) => anyhow::bail!("BES credential environment variable must be UTF-8"),
-        };
+        let bes_key = credentials.bes.clone();
         let spool = config.state_dir.join("bes");
         private_dir(&spool)?;
         let bes = bes_proxy::BesProxy::open(
@@ -720,6 +710,7 @@ pub async fn serve(mut config: Config) -> Result<()> {
     )?;
     let state = State {
         config,
+        identity,
         cache,
         proxy: proxy.clone(),
         bes,
@@ -751,6 +742,15 @@ pub async fn serve(mut config: Config) -> Result<()> {
             let request = match read_result {
                 Ok(Ok(_)) if bytes.len() <= 65536 => serde_json::from_slice::<Request>(&bytes).map_err(anyhow::Error::from),
                 _ => Err(anyhow::anyhow!("invalid or oversized control request")),
+            };
+            // Validate and execute against this same owned state. A client that
+            // connected to a replacement daemon cannot reuse an old proof.
+            let request = match request {
+                Ok(Request::Scoped { version, digest, request }) => {
+                    state_slot.as_ref().unwrap().identity.validate(version, &digest)
+                        .map(|()| *request)
+                }
+                other => other,
             };
             let mut shutdown = false;
             // Native Git, reqwest::blocking metadata and FUSE lifecycle work
@@ -784,6 +784,8 @@ pub async fn serve(mut config: Config) -> Result<()> {
                     let(returned,result)=tokio::task::spawn_blocking(move||{let result=match session{Some(session)=>state.recover(&session),None=>Err(anyhow::anyhow!("daemon is live; use workspace shutdown, not recovery, for its output mount"))};(state,result)}).await.context("recovery worker panicked")?;
                     state_slot=Some(returned);result
                 }
+                Ok(Request::IdentityChallenge) => serde_json::to_value(state_slot.as_ref().unwrap().identity.challenge()).map_err(Into::into),
+                Ok(Request::Scoped { .. }) => Err(anyhow::anyhow!("nested scoped request is invalid")),
                 Ok(Request::Status) => Ok(state_slot.as_ref().unwrap().status()),
                 Ok(Request::RetryBes) => match state_slot.as_ref().unwrap().bes.as_ref() {
                     Some(bes) => bes.retry_blocked().await.map(|count| json!({"streams_retried":count})),

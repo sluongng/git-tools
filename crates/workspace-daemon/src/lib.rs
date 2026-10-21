@@ -7,3 +7,6 @@ pub mod daemon;
 
 #[cfg(unix)]
 pub mod recovery;
+
+#[cfg(unix)]
+pub mod identity;
