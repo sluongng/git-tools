@@ -17,6 +17,9 @@ workspace status
 
 `create` starts the daemon automatically; `workspace serve` runs in the foreground.
 Use `--config /path/to/private/config.toml` for an isolated trust scope.
+For a standalone Git proxy, leave `git_proxy.repositories` empty and pass
+`--proxy-url http://127.0.0.1:8082` to `workspace create`. Each process must own
+separate cache storage.
 Stage intended changes with Git before `save`; commits and edits are never
 cache-eviction candidates. Keep the state directory across restarts.
 

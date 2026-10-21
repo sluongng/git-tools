@@ -1,132 +1,145 @@
 <?xml version='1.0' encoding='utf-8'?>
-<svg xmlns="http://www.w3.org/2000/svg" width="1283pt" height="469pt" viewBox="0.00 0.00 1283.00 469.00" role="img" aria-labelledby="architecture-title architecture-description">
-<title id="architecture-title">git-tools high-level architecture</title><desc id="architecture-description">Purple nodes are git-tools components in the workspace daemon; gray nodes are external tools or services. Bazel reads source and output mounts and sends RPCs through the proxy. Execute requests reach a remote scheduler before the worker stack. Mounts and the proxy share a local CAS. Cylinders represent storage. Logical request paths, not a deployment topology.</desc><g id="graph0" class="graph" transform="scale(1 1) rotate(0) translate(21.6 447.71)">
+<svg xmlns="http://www.w3.org/2000/svg" width="1283pt" height="519pt" viewBox="0.00 0.00 1283.00 519.00" role="img" aria-labelledby="architecture-title architecture-description">
+<title id="architecture-title">git-tools high-level architecture</title><desc id="architecture-description">Purple nodes are git-tools components or managed storage; gray nodes are external. The Git proxy and its cache can run separately from the workspace daemon, which hosts lazy source/output mounts, RPC forwarding and a shared local CAS. Embedding the Git proxy remains an optional convenience mode. Execute requests pass through the local proxy and remote scheduler before workers. Cylinders are storage. Logical request paths, not a deployment topology.</desc><g id="graph0" class="graph" transform="scale(1 1) rotate(0) translate(21.6 497.71)">
 <title>architecture</title>
-<polygon fill="white" stroke="none" points="-21.6,21.6 -21.6,-447.71 1261.58,-447.71 1261.58,21.6 -21.6,21.6" />
+<polygon fill="white" stroke="none" points="-21.6,21.6 -21.6,-497.71 1261.58,-497.71 1261.58,21.6 -21.6,21.6" />
 <g id="clust1" class="cluster">
 <title>cluster_workspace</title>
-<path fill="white" stroke="#b8a2d4" d="M224.67,-196.11C224.67,-196.11 727.14,-196.11 727.14,-196.11 733.14,-196.11 739.14,-202.11 739.14,-208.11 739.14,-208.11 739.14,-406.11 739.14,-406.11 739.14,-412.11 733.14,-418.11 727.14,-418.11 727.14,-418.11 224.67,-418.11 224.67,-418.11 218.67,-418.11 212.67,-412.11 212.67,-406.11 212.67,-406.11 212.67,-208.11 212.67,-208.11 212.67,-202.11 218.67,-196.11 224.67,-196.11" />
-<text xml:space="preserve" text-anchor="middle" x="309.17" y="-397.01" font-family="DejaVu Sans" font-size="18.00" fill="#553580">workspace daemon</text>
+<path fill="white" stroke="#b8a2d4" d="M224.67,-266.11C224.67,-266.11 727.14,-266.11 727.14,-266.11 733.14,-266.11 739.14,-272.11 739.14,-278.11 739.14,-278.11 739.14,-456.11 739.14,-456.11 739.14,-462.11 733.14,-468.11 727.14,-468.11 727.14,-468.11 224.67,-468.11 224.67,-468.11 218.67,-468.11 212.67,-462.11 212.67,-456.11 212.67,-456.11 212.67,-278.11 212.67,-278.11 212.67,-272.11 218.67,-266.11 224.67,-266.11" />
+<text xml:space="preserve" text-anchor="middle" x="309.17" y="-447.01" font-family="DejaVu Sans" font-size="18.00" fill="#553580">workspace daemon</text>
 </g>
 
 <g id="node1" class="node">
 <title>agents</title>
-<path fill="#f1f3f5" stroke="#82909f" stroke-width="1.5" d="M137.67,-305.22C137.67,-305.22 12,-305.22 12,-305.22 6,-305.22 0,-299.22 0,-293.22 0,-293.22 0,-279 0,-279 0,-273 6,-267 12,-267 12,-267 137.67,-267 137.67,-267 143.67,-267 149.67,-273 149.67,-279 149.67,-279 149.67,-293.22 149.67,-293.22 149.67,-299.22 143.67,-305.22 137.67,-305.22" />
-<text xml:space="preserve" text-anchor="middle" x="74.84" y="-280.66" font-family="DejaVu Sans" font-size="16.00" fill="#243142">Agents + Bazel</text>
+<path fill="#f1f3f5" stroke="#82909f" stroke-width="1.5" d="M137.67,-375.22C137.67,-375.22 12,-375.22 12,-375.22 6,-375.22 0,-369.22 0,-363.22 0,-363.22 0,-349 0,-349 0,-343 6,-337 12,-337 12,-337 137.67,-337 137.67,-337 143.67,-337 149.67,-343 149.67,-349 149.67,-349 149.67,-363.22 149.67,-363.22 149.67,-369.22 143.67,-375.22 137.67,-375.22" />
+<text xml:space="preserve" text-anchor="middle" x="74.84" y="-350.66" font-family="DejaVu Sans" font-size="16.00" fill="#243142">Agents + Bazel</text>
 </g>
 
-<g id="node3" class="node">
+<g id="node5" class="node">
 <title>mounts</title>
-<path fill="#eee7fa" stroke="#8b6bb2" stroke-width="1.5" d="M439.09,-346.22C439.09,-346.22 246.67,-346.22 246.67,-346.22 240.67,-346.22 234.67,-340.22 234.67,-334.22 234.67,-334.22 234.67,-320 234.67,-320 234.67,-314 240.67,-308 246.67,-308 246.67,-308 439.09,-308 439.09,-308 445.09,-308 451.09,-314 451.09,-320 451.09,-320 451.09,-334.22 451.09,-334.22 451.09,-340.22 445.09,-346.22 439.09,-346.22" />
-<text xml:space="preserve" text-anchor="middle" x="342.88" y="-321.66" font-family="DejaVu Sans" font-size="16.00" fill="#422b62">Source / output mounts</text>
+<path fill="#eee7fa" stroke="#8b6bb2" stroke-width="1.5" d="M439.09,-416.22C439.09,-416.22 246.67,-416.22 246.67,-416.22 240.67,-416.22 234.67,-410.22 234.67,-404.22 234.67,-404.22 234.67,-390 234.67,-390 234.67,-384 240.67,-378 246.67,-378 246.67,-378 439.09,-378 439.09,-378 445.09,-378 451.09,-384 451.09,-390 451.09,-390 451.09,-404.22 451.09,-404.22 451.09,-410.22 445.09,-416.22 439.09,-416.22" />
+<text xml:space="preserve" text-anchor="middle" x="342.88" y="-391.66" font-family="DejaVu Sans" font-size="16.00" fill="#422b62">Source / output mounts</text>
+</g>
+
+<g id="edge3" class="edge">
+<title>agents-&gt;mounts</title>
+<path fill="none" stroke="#67768a" d="M150.3,-367.59C173.74,-371.2 200.21,-375.28 225.83,-379.23" />
+<polygon fill="#67768a" stroke="#67768a" points="225.33,-381.63 232.62,-380.27 226.07,-376.78 225.33,-381.63" />
+<text xml:space="preserve" text-anchor="middle" x="189.67" y="-378.23" font-family="DejaVu Sans" font-size="12.00" fill="#43536a">files</text>
+</g>
+
+<g id="node6" class="node">
+<title>proxy</title>
+<path fill="#eee7fa" stroke="#8b6bb2" stroke-width="1.5" d="M419.97,-345.97C419.97,-345.97 265.8,-345.97 265.8,-345.97 259.8,-345.97 253.8,-339.97 253.8,-333.97 253.8,-333.97 253.8,-300.25 253.8,-300.25 253.8,-294.25 259.8,-288.25 265.8,-288.25 265.8,-288.25 419.97,-288.25 419.97,-288.25 425.97,-288.25 431.97,-294.25 431.97,-300.25 431.97,-300.25 431.97,-333.97 431.97,-333.97 431.97,-339.97 425.97,-345.97 419.97,-345.97" />
+<text xml:space="preserve" text-anchor="middle" x="342.88" y="-321.41" font-family="DejaVu Sans" font-size="16.00" fill="#422b62">REAPI + BES proxy</text>
+<text xml:space="preserve" text-anchor="middle" x="342.88" y="-301.91" font-family="DejaVu Sans" font-size="16.00" fill="#422b62">rbe.sock</text>
 </g>
 
 <g id="edge4" class="edge">
-<title>agents-&gt;mounts</title>
-<path fill="none" stroke="#67768a" d="M150.3,-297.59C173.74,-301.2 200.21,-305.28 225.83,-309.23" />
-<polygon fill="#67768a" stroke="#67768a" points="225.33,-311.63 232.62,-310.27 226.07,-306.78 225.33,-311.63" />
-<text xml:space="preserve" text-anchor="middle" x="189.67" y="-308.23" font-family="DejaVu Sans" font-size="12.00" fill="#43536a">files</text>
-</g>
-
-<g id="node4" class="node">
-<title>proxy</title>
-<path fill="#eee7fa" stroke="#8b6bb2" stroke-width="1.5" d="M419.97,-275.97C419.97,-275.97 265.8,-275.97 265.8,-275.97 259.8,-275.97 253.8,-269.97 253.8,-263.97 253.8,-263.97 253.8,-230.25 253.8,-230.25 253.8,-224.25 259.8,-218.25 265.8,-218.25 265.8,-218.25 419.97,-218.25 419.97,-218.25 425.97,-218.25 431.97,-224.25 431.97,-230.25 431.97,-230.25 431.97,-263.97 431.97,-263.97 431.97,-269.97 425.97,-275.97 419.97,-275.97" />
-<text xml:space="preserve" text-anchor="middle" x="342.88" y="-251.41" font-family="DejaVu Sans" font-size="16.00" fill="#422b62">REAPI + BES proxy</text>
-<text xml:space="preserve" text-anchor="middle" x="342.88" y="-231.91" font-family="DejaVu Sans" font-size="16.00" fill="#422b62">rbe.sock</text>
-</g>
-
-<g id="edge5" class="edge">
 <title>agents-&gt;proxy</title>
-<path fill="none" stroke="#67768a" d="M150.24,-270.11C164.28,-267.09 174.67,-264.86 174.67,-264.86 174.67,-264.86 208.03,-261.32 244.95,-257.4" />
-<polygon fill="#67768a" stroke="#67768a" points="245.17,-259.84 251.87,-256.66 244.65,-254.97 245.17,-259.84" />
-<text xml:space="preserve" text-anchor="middle" x="189.67" y="-267.71" font-family="DejaVu Sans" font-size="12.00" fill="#43536a">RPCs</text>
+<path fill="none" stroke="#67768a" d="M150.24,-340.11C164.28,-337.09 174.67,-334.86 174.67,-334.86 174.67,-334.86 208.03,-331.32 244.95,-327.4" />
+<polygon fill="#67768a" stroke="#67768a" points="245.17,-329.84 251.87,-326.66 244.65,-324.97 245.17,-329.84" />
+<text xml:space="preserve" text-anchor="middle" x="189.67" y="-337.71" font-family="DejaVu Sans" font-size="12.00" fill="#43536a">RPCs</text>
 </g>
 
 <g id="node2" class="node">
 <title>origin</title>
-<path fill="#f1f3f5" stroke="#82909f" stroke-width="1.5" d="M909.81,-366.22C909.81,-366.22 832.89,-366.22 832.89,-366.22 826.89,-366.22 820.89,-360.22 820.89,-354.22 820.89,-354.22 820.89,-340 820.89,-340 820.89,-334 826.89,-328 832.89,-328 832.89,-328 909.81,-328 909.81,-328 915.81,-328 921.81,-334 921.81,-340 921.81,-340 921.81,-354.22 921.81,-354.22 921.81,-360.22 915.81,-366.22 909.81,-366.22" />
-<text xml:space="preserve" text-anchor="middle" x="871.35" y="-341.66" font-family="DejaVu Sans" font-size="16.00" fill="#243142">Git origin</text>
+<path fill="#f1f3f5" stroke="#82909f" stroke-width="1.5" d="M909.81,-328.22C909.81,-328.22 832.89,-328.22 832.89,-328.22 826.89,-328.22 820.89,-322.22 820.89,-316.22 820.89,-316.22 820.89,-302 820.89,-302 820.89,-296 826.89,-290 832.89,-290 832.89,-290 909.81,-290 909.81,-290 915.81,-290 921.81,-296 921.81,-302 921.81,-302 921.81,-316.22 921.81,-316.22 921.81,-322.22 915.81,-328.22 909.81,-328.22" />
+<text xml:space="preserve" text-anchor="middle" x="871.35" y="-303.66" font-family="DejaVu Sans" font-size="16.00" fill="#243142">Git origin</text>
 </g>
 
-<g id="node5" class="node">
+<g id="node3" class="node">
 <title>git</title>
-<path fill="#eee7fa" stroke="#8b6bb2" stroke-width="1.5" d="M672.89,-366.22C672.89,-366.22 597.47,-366.22 597.47,-366.22 591.47,-366.22 585.47,-360.22 585.47,-354.22 585.47,-354.22 585.47,-340 585.47,-340 585.47,-334 591.47,-328 597.47,-328 597.47,-328 672.89,-328 672.89,-328 678.89,-328 684.89,-334 684.89,-340 684.89,-340 684.89,-354.22 684.89,-354.22 684.89,-360.22 678.89,-366.22 672.89,-366.22" />
-<text xml:space="preserve" text-anchor="middle" x="635.18" y="-341.66" font-family="DejaVu Sans" font-size="16.00" fill="#422b62">Git proxy</text>
+<path fill="#eee7fa" stroke="#8b6bb2" stroke-width="1.5" d="M672.89,-244.22C672.89,-244.22 597.47,-244.22 597.47,-244.22 591.47,-244.22 585.47,-238.22 585.47,-232.22 585.47,-232.22 585.47,-218 585.47,-218 585.47,-212 591.47,-206 597.47,-206 597.47,-206 672.89,-206 672.89,-206 678.89,-206 684.89,-212 684.89,-218 684.89,-218 684.89,-232.22 684.89,-232.22 684.89,-238.22 678.89,-244.22 672.89,-244.22" />
+<text xml:space="preserve" text-anchor="middle" x="635.18" y="-219.66" font-family="DejaVu Sans" font-size="16.00" fill="#422b62">Git proxy</text>
 </g>
 
-<g id="edge1" class="edge">
+<g id="edge6" class="edge">
+<title>git-&gt;origin</title>
+<path fill="none" stroke="#67768a" d="M685.54,-240.93C711.97,-249.4 739.14,-258.11 739.14,-258.11 739.14,-258.11 777.3,-272.94 812.46,-286.61" />
+<polygon fill="#67768a" stroke="#67768a" points="811.54,-288.88 818.96,-289.14 813.32,-284.32 811.54,-288.88" />
+<text xml:space="preserve" text-anchor="middle" x="765.14" y="-277.46" font-family="DejaVu Sans" font-size="12.00" fill="#43536a">fetch</text>
+</g>
+
+<g id="node4" class="node">
+<title>git_store</title>
+<path fill="#eee7fa" stroke="#8b6bb2" stroke-width="1.5" d="M922.56,-253.61C922.56,-256.24 899.6,-258.39 871.35,-258.39 843.09,-258.39 820.14,-256.24 820.14,-253.61 820.14,-253.61 820.14,-210.61 820.14,-210.61 820.14,-207.98 843.09,-205.83 871.35,-205.83 899.6,-205.83 922.56,-207.98 922.56,-210.61 922.56,-210.61 922.56,-253.61 922.56,-253.61" />
+<path fill="none" stroke="#8b6bb2" stroke-width="1.5" d="M922.56,-253.61C922.56,-250.97 899.6,-248.83 871.35,-248.83 843.09,-248.83 820.14,-250.97 820.14,-253.61" />
+<text xml:space="preserve" text-anchor="middle" x="871.35" y="-226.66" font-family="DejaVu Sans" font-size="16.00" fill="#422b62">Git cache</text>
+</g>
+
+<g id="edge7" class="edge">
+<title>git-&gt;git_store</title>
+<path fill="none" stroke="#67768a" d="M685.55,-226.59C722.26,-227.68 772.49,-229.18 811.32,-230.35" />
+<polygon fill="#67768a" stroke="#67768a" points="810.84,-232.78 817.91,-230.54 810.98,-227.88 810.84,-232.78" />
+</g>
+
+<g id="edge5" class="edge">
 <title>mounts-&gt;git</title>
-<path fill="none" stroke="#67768a" d="M451.56,-334.53C493.99,-337.45 541,-340.69 576.69,-343.15" />
-<polygon fill="#67768a" stroke="#67768a" points="576.39,-345.58 583.54,-343.62 576.73,-340.7 576.39,-345.58" />
-<text xml:space="preserve" text-anchor="middle" x="500.09" y="-342.34" font-family="DejaVu Sans" font-size="12.00" fill="#43536a">source</text>
-</g>
-
-<g id="node6" class="node">
-<title>cas</title>
-<path fill="#eee7fa" stroke="#8b6bb2" stroke-width="1.5" d="M717.14,-281.61C717.14,-284.24 680.4,-286.39 635.18,-286.39 589.95,-286.39 553.22,-284.24 553.22,-281.61 553.22,-281.61 553.22,-238.61 553.22,-238.61 553.22,-235.98 589.95,-233.83 635.18,-233.83 680.4,-233.83 717.14,-235.98 717.14,-238.61 717.14,-238.61 717.14,-281.61 717.14,-281.61" />
-<path fill="none" stroke="#8b6bb2" stroke-width="1.5" d="M717.14,-281.61C717.14,-278.97 680.4,-276.83 635.18,-276.83 589.95,-276.83 553.22,-278.97 553.22,-281.61" />
-<text xml:space="preserve" text-anchor="middle" x="635.18" y="-254.66" font-family="DejaVu Sans" font-size="16.00" fill="#422b62">Shared local CAS</text>
-</g>
-
-<g id="edge2" class="edge">
-<title>mounts-&gt;cas</title>
-<path fill="none" stroke="#67768a" d="M429.8,-307.28C466.02,-298.92 508.17,-289.19 544.75,-280.75" />
-<polygon fill="#67768a" stroke="#67768a" points="545.21,-283.16 551.48,-279.2 544.11,-278.38 545.21,-283.16" />
-<text xml:space="preserve" text-anchor="middle" x="500.09" y="-298.47" font-family="DejaVu Sans" font-size="12.00" fill="#43536a">bytes</text>
-</g>
-
-<g id="edge3" class="edge">
-<title>proxy-&gt;cas</title>
-<path fill="none" stroke="#67768a" d="M432.43,-246.94C456.52,-246.9 476.09,-246.86 476.09,-246.86 476.09,-246.86 524.09,-246.86 524.09,-246.86 524.09,-246.86 532.35,-247.85 544.35,-249.3" />
-<polygon fill="#67768a" stroke="#67768a" points="543.98,-251.72 551.22,-250.13 544.57,-246.86 543.98,-251.72" />
-<text xml:space="preserve" text-anchor="middle" x="500.09" y="-249.71" font-family="DejaVu Sans" font-size="12.00" fill="#43536a">bytes</text>
+<path fill="none" stroke="#67768a" d="M404.69,-377.26C428.89,-369.36 451.09,-362.11 451.09,-362.11 451.09,-362.11 476.09,-315.86 476.09,-315.86 476.09,-315.86 549.09,-258.11 549.09,-258.11 549.09,-258.11 561.77,-253.19 577.34,-247.15" />
+<polygon fill="#67768a" stroke="#67768a" points="578.12,-249.48 583.76,-244.66 576.35,-244.91 578.12,-249.48" />
+<text xml:space="preserve" text-anchor="middle" x="500.09" y="-318.71" font-family="DejaVu Sans" font-size="12.00" fill="#43536a">source</text>
 </g>
 
 <g id="node7" class="node">
+<title>cas</title>
+<path fill="#eee7fa" stroke="#8b6bb2" stroke-width="1.5" d="M717.14,-382.61C717.14,-385.24 680.4,-387.39 635.18,-387.39 589.95,-387.39 553.22,-385.24 553.22,-382.61 553.22,-382.61 553.22,-339.61 553.22,-339.61 553.22,-336.98 589.95,-334.83 635.18,-334.83 680.4,-334.83 717.14,-336.98 717.14,-339.61 717.14,-339.61 717.14,-382.61 717.14,-382.61" />
+<path fill="none" stroke="#8b6bb2" stroke-width="1.5" d="M717.14,-382.61C717.14,-379.97 680.4,-377.83 635.18,-377.83 589.95,-377.83 553.22,-379.97 553.22,-382.61" />
+<text xml:space="preserve" text-anchor="middle" x="635.18" y="-355.66" font-family="DejaVu Sans" font-size="16.00" fill="#422b62">Shared local CAS</text>
+</g>
+
+<g id="edge1" class="edge">
+<title>mounts-&gt;cas</title>
+<path fill="none" stroke="#67768a" d="M451.56,-383.76C482.09,-379.97 515,-375.89 544.35,-372.25" />
+<polygon fill="#67768a" stroke="#67768a" points="544.39,-374.71 551.03,-371.42 543.78,-369.85 544.39,-374.71" />
+<text xml:space="preserve" text-anchor="middle" x="500.09" y="-383.04" font-family="DejaVu Sans" font-size="12.00" fill="#43536a">bytes</text>
+</g>
+
+<g id="edge2" class="edge">
+<title>proxy-&gt;cas</title>
+<path fill="none" stroke="#67768a" d="M432.56,-330.55C468.05,-335.93 508.89,-342.12 544.49,-347.52" />
+<polygon fill="#67768a" stroke="#67768a" points="543.69,-349.87 550.98,-348.5 544.42,-345.03 543.69,-349.87" />
+<text xml:space="preserve" text-anchor="middle" x="500.09" y="-347.19" font-family="DejaVu Sans" font-size="12.00" fill="#43536a">bytes</text>
+</g>
+
+<g id="node8" class="node">
 <title>scheduler</title>
 <path fill="#f1f3f5" stroke="#82909f" stroke-width="1.5" d="M709.26,-174.22C709.26,-174.22 561.09,-174.22 561.09,-174.22 555.09,-174.22 549.09,-168.22 549.09,-162.22 549.09,-162.22 549.09,-148 549.09,-148 549.09,-142 555.09,-136 561.09,-136 561.09,-136 709.26,-136 709.26,-136 715.26,-136 721.26,-142 721.26,-148 721.26,-148 721.26,-162.22 721.26,-162.22 721.26,-168.22 715.26,-174.22 709.26,-174.22" />
 <text xml:space="preserve" text-anchor="middle" x="635.18" y="-149.66" font-family="DejaVu Sans" font-size="16.00" fill="#243142">Remote scheduler</text>
 </g>
 
-<g id="edge7" class="edge">
+<g id="edge8" class="edge">
 <title>proxy-&gt;scheduler</title>
-<path fill="none" stroke="#67768a" d="M432.56,-219.01C474.76,-205.63 524.51,-189.86 564.04,-177.34" />
-<polygon fill="#67768a" stroke="#67768a" points="564.42,-179.79 570.36,-175.34 562.94,-175.11 564.42,-179.79" />
-<text xml:space="preserve" text-anchor="middle" x="500.09" y="-206.72" font-family="DejaVu Sans" font-size="12.00" fill="#43536a">Execute</text>
+<path fill="none" stroke="#67768a" d="M376.9,-287.58C416.06,-252.55 476.09,-198.86 476.09,-198.86 476.09,-198.86 515.3,-188.01 554.67,-177.11" />
+<polygon fill="#67768a" stroke="#67768a" points="554.98,-179.57 561.07,-175.34 553.67,-174.85 554.98,-179.57" />
+<text xml:space="preserve" text-anchor="middle" x="500.09" y="-201.71" font-family="DejaVu Sans" font-size="12.00" fill="#43536a">Execute</text>
 </g>
 
-<g id="node9" class="node">
+<g id="node10" class="node">
 <title>remote_cas</title>
 <path fill="#f1f3f5" stroke="#82909f" stroke-width="1.5" d="M1239.98,-135.61C1239.98,-138.24 1203.41,-140.39 1158.39,-140.39 1113.37,-140.39 1076.81,-138.24 1076.81,-135.61 1076.81,-135.61 1076.81,-92.61 1076.81,-92.61 1076.81,-89.98 1113.37,-87.83 1158.39,-87.83 1203.41,-87.83 1239.98,-89.98 1239.98,-92.61 1239.98,-92.61 1239.98,-135.61 1239.98,-135.61" />
 <path fill="none" stroke="#82909f" stroke-width="1.5" d="M1239.98,-135.61C1239.98,-132.97 1203.41,-130.83 1158.39,-130.83 1113.37,-130.83 1076.81,-132.97 1076.81,-135.61" />
 <text xml:space="preserve" text-anchor="middle" x="1158.39" y="-108.66" font-family="DejaVu Sans" font-size="16.00" fill="#243142">Remote AC / CAS</text>
 </g>
 
-<g id="edge9" class="edge">
+<g id="edge10" class="edge">
 <title>proxy-&gt;remote_cas</title>
-<path fill="none" stroke="#67768a" d="M391.48,-217.65C452.1,-180.14 549.09,-120.11 549.09,-120.11 549.09,-120.11 898.78,-116.66 1067.89,-114.99" />
+<path fill="none" stroke="#67768a" d="M371.92,-287.63C410.73,-246.83 476.09,-178.11 476.09,-178.11 476.09,-178.11 549.09,-120.11 549.09,-120.11 549.09,-120.11 898.78,-116.66 1067.89,-114.99" />
 <polygon fill="#67768a" stroke="#67768a" points="1067.81,-117.44 1074.78,-114.92 1067.76,-112.54 1067.81,-117.44" />
 <text xml:space="preserve" text-anchor="middle" x="765.14" y="-120.98" font-family="DejaVu Sans" font-size="12.00" fill="#43536a">cache</text>
 </g>
 
-<g id="node10" class="node">
+<g id="node11" class="node">
 <title>bes</title>
 <path fill="#f1f3f5" stroke="#82909f" stroke-width="1.5" d="M685.26,-38.22C685.26,-38.22 585.09,-38.22 585.09,-38.22 579.09,-38.22 573.09,-32.22 573.09,-26.22 573.09,-26.22 573.09,-12 573.09,-12 573.09,-6 579.09,0 585.09,0 585.09,0 685.26,0 685.26,0 691.26,0 697.26,-6 697.26,-12 697.26,-12 697.26,-26.22 697.26,-26.22 697.26,-32.22 691.26,-38.22 685.26,-38.22" />
 <text xml:space="preserve" text-anchor="middle" x="635.18" y="-13.66" font-family="DejaVu Sans" font-size="16.00" fill="#243142">Remote BES</text>
 </g>
 
-<g id="edge11" class="edge">
+<g id="edge12" class="edge">
 <title>proxy-&gt;bes</title>
-<path fill="none" stroke="#67768a" d="M363.39,-217.71C400.16,-162.29 476.09,-47.86 476.09,-47.86 476.09,-47.86 522.09,-39.49 564.47,-31.79" />
+<path fill="none" stroke="#67768a" d="M358.41,-287.53C392.75,-217.58 476.09,-47.86 476.09,-47.86 476.09,-47.86 522.09,-39.49 564.47,-31.79" />
 <polygon fill="#67768a" stroke="#67768a" points="564.66,-34.24 571.11,-30.58 563.79,-29.42 564.66,-34.24" />
 <text xml:space="preserve" text-anchor="middle" x="500.09" y="-50.71" font-family="DejaVu Sans" font-size="12.00" fill="#43536a">events</text>
-</g>
-
-<g id="edge6" class="edge">
-<title>git-&gt;origin</title>
-<path fill="none" stroke="#67768a" d="M685.55,-347.11C722.51,-347.11 773.17,-347.11 812.11,-347.11" />
-<polygon fill="#67768a" stroke="#67768a" points="811.72,-349.56 818.72,-347.11 811.72,-344.66 811.72,-349.56" />
-<text xml:space="preserve" text-anchor="middle" x="765.14" y="-349.96" font-family="DejaVu Sans" font-size="12.00" fill="#43536a">fetch</text>
 </g>
 
 <g id="worker-stack" class="node">
@@ -135,13 +148,13 @@
 <text xml:space="preserve" text-anchor="middle" x="871.35" y="-149.66" font-family="DejaVu Sans" font-size="16.00" fill="#243142">RBE workers</text>
 </g>
 
-<g id="edge8" class="edge">
+<g id="edge9" class="edge">
 <title>scheduler-&gt;workers</title>
 <path fill="none" stroke="#67768a" d="M721.71,-155.11C747.07,-155.11 774.57,-155.11 798.93,-155.11" />
 <polygon fill="#67768a" stroke="#67768a" points="798.9,-157.56 805.9,-155.11 798.9,-152.66 798.9,-157.56" />
 </g>
 
-<g id="edge10" class="edge">
+<g id="edge11" class="edge">
 <title>workers-&gt;remote_cas</title>
 <path fill="none" stroke="#67768a" d="M935.25,-146.06C974.22,-140.46 1024.88,-133.17 1067.98,-126.97" />
 <polygon fill="#67768a" stroke="#67768a" points="1068.13,-129.42 1074.71,-126 1067.44,-124.57 1068.13,-129.42" />

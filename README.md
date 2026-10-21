@@ -12,15 +12,17 @@ without sharing source edits, Git state, or Bazel output bases.
 Cylinders are storage; workers are a stack. This is a logical request map, not
 a deployment topology.
 
-`workspace` is the main entry point. One host daemon manages lazy mounts, a Git
-proxy and a shared content-addressable store (CAS). Bazel uses one `rbe.sock`
+`workspace` is the main entry point. One host daemon manages lazy mounts and a
+shared content-addressable store (CAS). The Git proxy can run independently, as
+shown, or be embedded for single-command setup. Bazel uses one `rbe.sock`
 for cache, execution, remote downloader, build events and optional output service.
 Execution stays remote: the proxy forwards requests to the scheduler, then workers.
 
 Source inputs prefetch asynchronously; other files and enabled output mounts load
 on demand. Only disposable, verified bytes enter the LRU cache. Source edits,
 commits and unacknowledged build events are retained separately. Git mirrors and
-packs are not covered by the CAS quota.
+packs are not covered by the CAS quota. A standalone Git proxy owns separate
+cache storage; processes must not open the same local CAS directory concurrently.
 
 ## Quick start
 
