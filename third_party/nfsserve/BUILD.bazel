@@ -14,7 +14,7 @@ rust_library(
         "@crates//:filetime-0.2.29",
         "@crates//:num-derive-0.4.2",
         "@crates//:num-traits-0.2.19",
-        "@crates//:tokio-1.53.3",
+        "@crates//:tokio-1.54.0",
         "@crates//:tracing-0.1.44",
     ],
     visibility = ["//visibility:public"],

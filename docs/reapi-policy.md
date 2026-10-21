@@ -118,7 +118,11 @@ consume the pending-stream quota; there is no automatic orphan discard or expiry
 These timeouts do not change Bazel's own flags or remote CAS policy.
 
 The default BES spool admits 1 GiB of pending encoded payloads, 128 streams and
-16 concurrent upstream streams. Limits reject new data before ACK; they never
+16 concurrent upstream streams. Admission groups up to 64 ready events /
+256 KiB per fsync, with no wait to fill a batch. An individual larger event
+commits alone. Configure `batch_max_events`, `batch_max_bytes` and
+`batch_max_delay_ms` in `[bes]`; an event limit of 1 disables grouping.
+Limits reject new data before ACK; they never
 evict pending events. Upstream ACKs logically delete payloads; Fjall compaction
 reclaims physical disk space later. Small completed receipts are retained for up
 to one day / 4096 streams for reconnects. These are logical limits, not a total

@@ -1,7 +1,7 @@
 # Benchmark tools
 
 Run from the repository root with frozen release binaries and a **fresh output
-directory**. Scripts default to dry runs; add `--run` after checking the plan.
+directory**. Most scripts default to dry runs; add `--run` after checking the plan.
 Use `--help` for options and [the measurement checklist](../docs/benchmark-reference.md)
 for cache boundaries, provenance, output correctness and cleanup.
 
@@ -16,6 +16,7 @@ for cache boundaries, provenance, output correctness and cleanup.
 | Repeated source edit/status/RBE build | `benchmark_iterative_agent_rbe.py` |
 | Private agents sharing a proxy | `benchmark_concurrent_agents.py` (smoke or opt-in paired performance) |
 | Direct remote cache vs shared-daemon cache | `benchmark_shared_daemon.py` |
+| BES durable ACK throughput/latency | `benchmark_bes_group_commit.py` (runs immediately; local fake upstream) |
 | Local VFS subsystem costs | `benchmark_vfs_{iteration,ranges,journal,metadata,hydration,content}.py` |
 | This project's local/RBE Rust build iteration | `benchmark_developer_build.py` |
 
@@ -94,3 +95,11 @@ upload warnings even when Bazel exits successfully.
 Do not run matrices alongside compilation/profiling. Keep failures/outliers and
 raw receipts; never label logical blob sizes as network bytes or no-op cache
 hits as executed remote work. See [historical results and tradeoffs](../docs/benchmarks.md).
+
+BES group commit (component only, no production backend): build
+`//crates/bes-proxy:integration_tests` with `--config=rbe`, then run
+`python3 tools/benchmark_bes_group_commit.py --binary
+bazel-bin/crates/bes-proxy/integration_tests --output FRESH_OUTPUT`. Use a
+disk-backed output path: it also holds the measured spool, not `/tmp` tmpfs.
+The harness compares per-event, ready-event and 1 ms coalesced commits; reports
+local admission/ACK latency, separate upstream drain, CPU and peak RSS.

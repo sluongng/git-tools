@@ -22,3 +22,5 @@ tonic = { version = "0.14", features = ["tls-ring", "tls-webpki-roots", "gzip"] 
 
 [dev-dependencies]
 tempfile = "3"
+hyper-util = { version = "0.1", features = ["tokio"] }
+tower = { version = "0.5", features = ["util"] }

@@ -298,12 +298,16 @@ impl Drop for Harness {
 }
 impl Harness {
     async fn new(ttl: Duration) -> Self {
+        Self::with_upstream_stream_limit(ttl, None).await
+    }
+    async fn with_upstream_stream_limit(ttl: Duration, limit: Option<u32>) -> Self {
         let backend = Backend::default();
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let upstream_addr = listener.local_addr().unwrap();
         let fake = backend.clone();
         let task = tokio::spawn(async move {
             Server::builder()
+                .max_concurrent_streams(limit)
                 .add_service(
                     ByteStreamServer::new(fake.clone())
                         .accept_compressed(tonic::codec::CompressionEncoding::Gzip)
@@ -908,43 +912,63 @@ async fn forwards_only_bounded_request_attribution_and_daemon_credentials() {
 
 #[tokio::test]
 async fn concurrent_streaming_uploads_do_not_starve_admitted_writers_of_connection_credit() {
-    let h = Harness::new(Duration::ZERO).await;
-    let client = ByteStreamClient::connect(h.url.clone()).await.unwrap();
-    let mut base = Vec::with_capacity(512 * 1024);
-    for i in 0..16384u32 {
-        base.extend_from_slice(blake3::hash(&i.to_le_bytes()).as_bytes());
-    }
-    let mut uploads = tokio::task::JoinSet::new();
-    for index in 0..32u32 {
-        let mut bytes = base.clone();
-        bytes[..4].copy_from_slice(&index.to_le_bytes());
-        let d = digest(&bytes);
-        let resource = format!(
-            "repo/uploads/concurrent-{index}/blobs/blake3/{}/{}",
-            d.hash, d.size_bytes
+    // The one-stream backend forces h2's pending_open path (Buck2 #1123 /
+    // h2 #860): unopened streams must not steal active connection credit.
+    for (name, limit) in [
+        ("normal backend", None),
+        ("queued unopened streams", Some(1)),
+    ] {
+        let h = Harness::with_upstream_stream_limit(Duration::ZERO, limit).await;
+        let mut client = ByteStreamClient::connect(h.url.clone()).await.unwrap();
+        // Complete the first exchange before the burst so the client has
+        // received the upstream's advertised concurrent-stream limit.
+        let resource = format!("repo/uploads/warmup/blobs/blake3/{}/1", digest(b"x").hash);
+        assert_eq!(
+            client
+                .query_write_status(h.request(bs::QueryWriteStatusRequest {
+                    resource_name: resource
+                }))
+                .await
+                .unwrap_err()
+                .code(),
+            tonic::Code::NotFound
         );
-        let chunks: Vec<_> = bytes
-            .chunks(128 * 1024)
-            .enumerate()
-            .map(|(i, data)| bs::WriteRequest {
-                resource_name: resource.clone(),
-                write_offset: (i * 128 * 1024) as i64,
-                data: data.to_vec(),
-                finish_write: (i + 1) * 128 * 1024 == bytes.len(),
-            })
-            .collect();
-        let mut client = client.clone();
-        let request = h.request(tokio_stream::iter(chunks));
-        uploads.spawn(async move {
-            client.write(request).await.unwrap();
-        });
-    }
-    tokio::time::timeout(Duration::from_secs(10), async {
-        while let Some(result) = uploads.join_next().await {
-            result.unwrap();
+        let mut base = Vec::with_capacity(512 * 1024);
+        for i in 0..16384u32 {
+            base.extend_from_slice(blake3::hash(&i.to_le_bytes()).as_bytes());
         }
-    })
-    .await
-    .expect("streaming uploads stalled behind unread queued request bodies");
-    assert_eq!(h.backend.blobs.lock().unwrap().len(), 32);
+        let mut uploads = tokio::task::JoinSet::new();
+        for index in 0..32u32 {
+            let mut bytes = base.clone();
+            bytes[..4].copy_from_slice(&index.to_le_bytes());
+            let d = digest(&bytes);
+            let resource = format!(
+                "repo/uploads/concurrent-{index}/blobs/blake3/{}/{}",
+                d.hash, d.size_bytes
+            );
+            let chunks: Vec<_> = bytes
+                .chunks(128 * 1024)
+                .enumerate()
+                .map(|(i, data)| bs::WriteRequest {
+                    resource_name: resource.clone(),
+                    write_offset: (i * 128 * 1024) as i64,
+                    data: data.to_vec(),
+                    finish_write: (i + 1) * 128 * 1024 == bytes.len(),
+                })
+                .collect();
+            let mut client = client.clone();
+            let request = h.request(tokio_stream::iter(chunks));
+            uploads.spawn(async move {
+                client.write(request).await.unwrap();
+            });
+        }
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while let Some(result) = uploads.join_next().await {
+                result.unwrap();
+            }
+        })
+        .await
+        .expect(name);
+        assert_eq!(h.backend.blobs.lock().unwrap().len(), 32);
+    }
 }

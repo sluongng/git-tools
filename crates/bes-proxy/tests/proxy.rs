@@ -231,6 +231,67 @@ async fn wait(mut condition: impl FnMut() -> bool) {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn grouped_admission_commits_valid_prefix_and_replays_after_restart() -> Result<()> {
+    use prost::Message;
+    let dir = tempfile::tempdir()?;
+    let state = Backend::new(false);
+    let (url, upstream_task) = backend(state.clone()).await?;
+    let events = vec![
+        event("grouped", 1, false),
+        event("grouped", 2, false),
+        event("grouped", 3, true),
+    ];
+    let mut cfg = config(url);
+    cfg.batch_max_events = 64;
+    cfg.batch_max_delay_ms = 100;
+    cfg.max_pending_bytes = (events[0].encoded_len() * 2 - 1) as u64;
+    cfg.max_event_bytes = cfg.max_pending_bytes as usize;
+    let proxy = BesProxy::open(dir.path().join("bes"), cfg.clone()).await?;
+    let (mut client, task) = frontend(proxy.clone()).await?;
+    let mut reply = client
+        .publish_build_tool_event_stream(tokio_stream::iter(events.clone()))
+        .await?
+        .into_inner();
+    assert_eq!(reply.message().await?.unwrap().sequence_number, 1);
+    assert_eq!(
+        reply.message().await.unwrap_err().code(),
+        tonic::Code::ResourceExhausted
+    );
+    assert_eq!(proxy.metrics().pending_events, 1);
+    assert_eq!(proxy.metrics().admission_commits, 1);
+    drop(reply);
+    drop(client);
+    task.abort();
+    proxy.shutdown().await;
+    drop(proxy);
+    cfg.max_pending_bytes = 1024 * 1024;
+    // Force the collector's byte-limit lookahead path on replay. The first
+    // request above exercised a valid prefix and quota failure in one batch.
+    cfg.batch_max_bytes = events[0].encoded_len() * 2 - 1;
+    let proxy = BesProxy::open(dir.path().join("bes"), cfg).await?;
+    assert_eq!(proxy.metrics().pending_events, 1);
+    let (mut client, task) = frontend(proxy.clone()).await?;
+    let acks = publish(&mut client, events.clone()).await?;
+    assert_eq!(
+        acks.iter()
+            .map(|ack| ack.sequence_number)
+            .collect::<Vec<_>>(),
+        vec![1, 2, 3]
+    );
+    assert_eq!(proxy.metrics().pending_events, 3);
+    state.gate.send_replace(true);
+    wait(|| proxy.metrics().pending_events == 0).await;
+    for event in events {
+        assert!(state.events.lock().unwrap().contains(&event));
+    }
+    drop(client);
+    task.abort();
+    proxy.shutdown().await;
+    upstream_task.abort();
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn early_ack_concurrent_streams_survive_restart_until_upstream_ack_then_gc() -> Result<()> {
     let dir = tempfile::tempdir()?;
     let backend_state = Backend::new(false);
@@ -652,6 +713,190 @@ async fn restart_replays_only_unacknowledged_suffix_after_partial_upstream_ack()
         .collect::<Vec<_>>();
     assert_eq!(sequences, vec![1, 2, 3, 2, 3]);
     proxy.shutdown().await;
+    upstream_task.abort();
+    Ok(())
+}
+
+/// Component benchmark, not an RBE timing test. Build the optimized test binary
+/// with Bazel, then run it locally via tools/benchmark_bes_group_commit.py.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "opt-in local BES group-commit component benchmark"]
+async fn benchmark_group_commit() -> Result<()> {
+    use std::time::Instant;
+    fn number(name: &str, default: usize) -> usize {
+        std::env::var(name)
+            .ok()
+            .map(|s| s.parse().unwrap())
+            .unwrap_or(default)
+    }
+    let streams = number("BES_BENCH_STREAMS", 1);
+    let count = number("BES_BENCH_EVENTS", 4096);
+    let payload_size = number("BES_BENCH_PAYLOAD_BYTES", 1024);
+    let sparse = number("BES_BENCH_SPARSE", 0) != 0;
+    anyhow::ensure!(
+        streams > 0 && count > 0 && streams * count * payload_size <= 128 * 1024 * 1024
+    );
+    let mut random = 0x4d595df4d0f33173_u64;
+    let payload = (0..payload_size)
+        .map(|_| {
+            random ^= random << 13;
+            random ^= random >> 7;
+            random ^= random << 17;
+            random as u8
+        })
+        .collect::<Vec<_>>();
+    let setup = Instant::now();
+    let dir = tempfile::tempdir()?;
+    let state = Backend::new(false);
+    let (url, upstream_task) = backend(state.clone()).await?;
+    let mut cfg = config(url);
+    cfg.batch_max_events = number("BES_BENCH_BATCH_EVENTS", 1);
+    cfg.batch_max_bytes = number("BES_BENCH_BATCH_BYTES", 256 * 1024);
+    cfg.batch_max_delay_ms = number("BES_BENCH_DELAY_MS", 0) as u64;
+    let proxy = BesProxy::open(dir.path().join("bes"), cfg).await?;
+    let socket = dir.path().join("bes.sock");
+    let listener = tokio::net::UnixListener::bind(&socket)?;
+    let service = proxy.clone();
+    let frontend_task = tokio::spawn(service.serve_unix_listener(listener, std::future::pending()));
+    let channel = tonic::transport::Endpoint::from_static("http://localhost")
+        .connect_with_connector(tower::service_fn(move |_| {
+            let socket = socket.clone();
+            async move {
+                tokio::net::UnixStream::connect(socket)
+                    .await
+                    .map(hyper_util::rt::TokioIo::new)
+            }
+        }))
+        .await?;
+    let client = PublishBuildEventClient::new(channel)
+        .send_compressed(CompressionEncoding::Gzip)
+        .accept_compressed(CompressionEncoding::Gzip);
+    let events = (0..streams)
+        .map(|stream| {
+            (1..=count)
+                .map(|sequence| {
+                    let mut request = event(&format!("bench-{stream}"), sequence as i64, false);
+                    request
+                        .ordered_build_event
+                        .as_mut()
+                        .unwrap()
+                        .event
+                        .as_mut()
+                        .unwrap()
+                        .event = Some(build_event::Event::ConsoleOutput(
+                        build_event::ConsoleOutput {
+                            r#type: 1,
+                            output: Some(build_event::console_output::Output::BinaryOutput(
+                                payload.clone(),
+                            )),
+                        },
+                    ));
+                    // Final event has no payload, as in a real BES tool stream.
+                    if sequence == count {
+                        request = event(&format!("bench-{stream}"), sequence as i64, true);
+                    }
+                    request
+                })
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
+    let setup_seconds = setup.elapsed().as_secs_f64();
+    let started = Instant::now();
+    let mut tasks = tokio::task::JoinSet::new();
+    for events in events {
+        let mut client = client.clone();
+        tasks.spawn(async move {
+            let sent = Arc::new(Mutex::new(vec![None; events.len()]));
+            let marks = sent.clone();
+            let (tx, rx) = tokio::sync::mpsc::channel(1);
+            let outgoing_events = events.clone();
+            if sparse {
+                sent.lock().unwrap()[0] = Some(Instant::now());
+                tx.send(events[0].clone()).await?;
+            }
+            let mut response = if sparse {
+                client
+                    .publish_build_tool_event_stream(tokio_stream::wrappers::ReceiverStream::new(
+                        rx,
+                    ))
+                    .await?
+                    .into_inner()
+            } else {
+                client
+                    .publish_build_tool_event_stream(async_stream::stream! {
+                        for (index, event) in outgoing_events.into_iter().enumerate() {
+                            marks.lock().unwrap()[index] = Some(Instant::now());
+                            yield event;
+                        }
+                    })
+                    .await?
+                    .into_inner()
+            };
+            let mut latencies = Vec::with_capacity(events.len());
+            for (index, event) in events.into_iter().enumerate() {
+                if sparse && index > 0 {
+                    sent.lock().unwrap()[index] = Some(Instant::now());
+                    tx.send(event).await?;
+                }
+                let ack = response
+                    .message()
+                    .await?
+                    .ok_or_else(|| anyhow::anyhow!("missing local ACK"))?;
+                anyhow::ensure!(
+                    ack.sequence_number == index as i64 + 1,
+                    "ACK order mismatch"
+                );
+                latencies
+                    .push(sent.lock().unwrap()[index].unwrap().elapsed().as_secs_f64() * 1000.0);
+            }
+            drop(tx);
+            anyhow::ensure!(response.message().await?.is_none(), "unexpected extra ACK");
+            Ok::<_, anyhow::Error>(latencies)
+        });
+    }
+    let mut latencies = Vec::new();
+    while let Some(result) = tasks.join_next().await {
+        latencies.extend(result??);
+    }
+    let wall_seconds = started.elapsed().as_secs_f64();
+    let metrics = proxy.metrics();
+    assert_eq!(metrics.pending_events, (streams * count) as u64);
+    latencies.sort_by(f64::total_cmp);
+    let percentile = |p: f64| latencies[((latencies.len() - 1) as f64 * p) as usize];
+    state.gate.send_replace(true);
+    let drain = Instant::now();
+    tokio::time::timeout(Duration::from_secs(120), async {
+        while proxy.metrics().pending_events != 0 {
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+    })
+    .await?;
+    let drain_seconds = drain.elapsed().as_secs_f64();
+    // Validate upstream receipt and byte identity, not only the local ACK rate.
+    {
+        let received = state.events.lock().unwrap();
+        assert_eq!(received.len(), streams * count);
+        for event in received.iter() {
+            let ordered = event.ordered_build_event.as_ref().unwrap();
+            if ordered.sequence_number < count as i64 {
+                assert!(matches!(ordered.event.as_ref().unwrap().event.as_ref(),
+                Some(build_event::Event::ConsoleOutput(output)) if output.output.as_ref() == Some(&build_event::console_output::Output::BinaryOutput(payload.clone()))));
+            }
+        }
+    }
+    println!(
+        "BES_BENCH {}",
+        serde_json::json!({"streams":streams,"events_per_stream":count,
+        "payload_bytes":payload_size,"sparse":sparse,"wall_seconds":wall_seconds,
+        "events_per_second":(streams*count) as f64/wall_seconds,
+        "ack_p50_ms":percentile(0.50),"ack_p95_ms":percentile(0.95),"ack_p99_ms":percentile(0.99),
+        "admission_commits":metrics.admission_commits,"setup_seconds":setup_seconds,
+        "drain_seconds":drain_seconds,"admit_and_drain_seconds":wall_seconds+drain_seconds,
+        "validated_events":streams*count})
+    );
+    proxy.shutdown().await;
+    frontend_task.abort();
     upstream_task.abort();
     Ok(())
 }

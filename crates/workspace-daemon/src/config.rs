@@ -55,6 +55,9 @@ pub struct Bes {
     pub retry_max_attempts: u32,
     pub tombstone_ttl_seconds: u64,
     pub max_completed_streams: usize,
+    pub batch_max_events: usize,
+    pub batch_max_bytes: usize,
+    pub batch_max_delay_ms: u64,
 }
 impl Default for Bes {
     fn default() -> Self {
@@ -72,6 +75,9 @@ impl Default for Bes {
             retry_max_attempts: 4,
             tombstone_ttl_seconds: 86400,
             max_completed_streams: 4096,
+            batch_max_events: 64,
+            batch_max_bytes: 256 * 1024,
+            batch_max_delay_ms: 0,
         }
     }
 }
@@ -226,6 +232,9 @@ impl Config {
                     && (1..=600000).contains(&self.bes.lifecycle_timeout_ms)
                     && (1..=60000).contains(&self.bes.retry_initial_delay_ms)
                     && self.bes.retry_max_attempts <= 20
+                    && (1..=1024).contains(&self.bes.batch_max_events)
+                    && (1..=64 * 1024 * 1024).contains(&self.bes.batch_max_bytes)
+                    && self.bes.batch_max_delay_ms <= 100
                     && (1..=1_000_000).contains(&self.bes.max_completed_streams)
                     && (60..=604800).contains(&self.bes.tombstone_ttl_seconds),
                 "invalid BES spool, concurrency, timeout or retry limits"
@@ -277,6 +286,10 @@ enabled = true
 max_pending_bytes = 1073741824
 max_streams = 128
 max_concurrent_forwards = 16
+# Group ready events behind one fsync; never wait to fill a batch.
+batch_max_events = 64
+batch_max_bytes = 262144
+batch_max_delay_ms = 0
 # Bazel-compatible retry defaults (four retries after the first attempt).
 connect_timeout_ms = 10000
 lifecycle_timeout_ms = 15000
@@ -322,6 +335,9 @@ mod tests {
         assert!(config.session.remote_repo_contents_cache);
         assert!(config.bes.enabled);
         assert_eq!(config.bes.retry_max_attempts, 4);
+        assert_eq!(config.bes.batch_max_events, 64);
+        assert_eq!(config.bes.batch_max_bytes, 262144);
+        assert_eq!(config.bes.batch_max_delay_ms, 0);
     }
     #[test]
     fn cache_rpc_connection_limit_accepts_overrides_and_rejects_invalid_bounds() {

@@ -34,6 +34,10 @@ struct Lifecycle {
     attribution: Option<Vec<u8>>,
 }
 type LifecycleDelivery = (Vec<u8>, PublishLifecycleEventRequest, Option<Vec<u8>>);
+pub(crate) struct Admission {
+    pub acks: Vec<Ack>,
+    pub error: Option<Status>,
+}
 pub(crate) struct Spool {
     streams: fjall::SingleWriterTxKeyspace,
     events: fjall::SingleWriterTxKeyspace,
@@ -88,7 +92,7 @@ fn key(id: &str, sequence: i64) -> Vec<u8> {
     key.extend_from_slice(&sequence.to_be_bytes());
     key
 }
-fn terminal(event: &Event) -> bool {
+pub(crate) fn terminal(event: &Event) -> bool {
     matches!(event.ordered_build_event.as_ref().and_then(|e| e.event.as_ref()).and_then(|e| e.event.as_ref()),
         Some(bes::build_event::Event::ComponentStreamFinished(finish)) if finish.r#type == 1)
 }
@@ -223,94 +227,123 @@ impl Spool {
     pub fn acknowledged(&self, id: &str) -> Result<i64, Status> {
         Ok(self.stream(id)?.acked)
     }
-    pub fn append(&mut self, event: Event, attribution: Option<Vec<u8>>) -> Result<Ack, Status> {
-        let id = event_id(&event)?;
-        let ordered = event.ordered_build_event.as_ref().unwrap();
-        let sequence = ordered.sequence_number;
-        let stream = ordered.stream_id.as_ref().unwrap();
-        let payload = event.encode_to_vec();
-        if payload.len() > self.config.max_event_bytes {
-            return Err(Status::resource_exhausted(
-                "BES event exceeds configured limit",
-            ));
-        }
+    pub fn append_batch(
+        &mut self,
+        events: Vec<Event>,
+        attribution: Option<Vec<u8>>,
+    ) -> Result<Admission, Status> {
+        let mut metrics = self.metrics.clone();
         let mut tx = self
             .owner
             .write_tx()
             .durability(Some(fjall::PersistMode::SyncAll));
-        let existing = tx.get(&self.streams, &id).map_err(internal)?;
-        let mut state = if let Some(ref bytes) = existing {
-            serde_json::from_slice::<State>(bytes).map_err(internal)?
-        } else {
-            if self.metrics.pending_streams >= self.config.max_streams {
-                return Err(Status::resource_exhausted(
-                    "BES pending stream limit reached",
-                ));
-            }
-            State {
-                stream: stream.encode_to_vec(),
-                accepted: 0,
-                acked: 0,
-                terminal: None,
-                attribution,
-                completed_at: None,
-            }
-        };
-        if sequence <= state.accepted {
-            if sequence > state.acked {
-                let previous = tx
-                    .get(&self.events, key(&id, sequence))
-                    .map_err(internal)?
-                    .ok_or_else(|| Status::internal("BES pending event missing"))?;
-                let previous = Event::decode(previous.as_ref()).map_err(internal)?;
-                // Retry attempt metadata may legitimately differ; event identity may not.
-                if previous.ordered_build_event != event.ordered_build_event {
-                    return Err(Status::already_exists(
-                        "conflicting BES event for existing sequence",
+        let mut acks = Vec::with_capacity(events.len());
+        let mut error = None;
+        for event in events {
+            let result = (|| -> Result<Ack, Status> {
+                let id = event_id(&event)?;
+                let ordered = event.ordered_build_event.as_ref().unwrap();
+                let sequence = ordered.sequence_number;
+                let stream = ordered.stream_id.as_ref().unwrap();
+                let payload = event.encode_to_vec();
+                if payload.len() > self.config.max_event_bytes {
+                    return Err(Status::resource_exhausted(
+                        "BES event exceeds configured limit",
                     ));
                 }
+                let existing = tx.get(&self.streams, &id).map_err(internal)?;
+                let mut state = if let Some(ref bytes) = existing {
+                    serde_json::from_slice::<State>(bytes).map_err(internal)?
+                } else {
+                    if metrics.pending_streams >= self.config.max_streams {
+                        return Err(Status::resource_exhausted(
+                            "BES pending stream limit reached",
+                        ));
+                    }
+                    State {
+                        stream: stream.encode_to_vec(),
+                        accepted: 0,
+                        acked: 0,
+                        terminal: None,
+                        attribution: attribution.clone(),
+                        completed_at: None,
+                    }
+                };
+                if sequence <= state.accepted {
+                    if sequence > state.acked {
+                        let previous = tx
+                            .get(&self.events, key(&id, sequence))
+                            .map_err(internal)?
+                            .ok_or_else(|| Status::internal("BES pending event missing"))?;
+                        let previous = Event::decode(previous.as_ref()).map_err(internal)?;
+                        // Retry attempt metadata may legitimately differ; event identity may not.
+                        if previous.ordered_build_event != event.ordered_build_event {
+                            return Err(Status::already_exists(
+                                "conflicting BES event for existing sequence",
+                            ));
+                        }
+                    }
+                    return Ok(Ack {
+                        stream_id: Some(stream.clone()),
+                        sequence_number: sequence,
+                    });
+                }
+                if state.terminal.is_some() || state.accepted.checked_add(1) != Some(sequence) {
+                    return Err(Status::invalid_argument(
+                        "BES events must be consecutive and cannot follow terminal",
+                    ));
+                }
+                if metrics.pending_bytes.saturating_add(payload.len() as u64)
+                    > self.config.max_pending_bytes
+                {
+                    return Err(Status::resource_exhausted(
+                        "BES durable spool is full; pending events cannot be evicted",
+                    ));
+                }
+                state.accepted = sequence;
+                if terminal(&event) {
+                    state.terminal = Some(sequence);
+                }
+                tx.insert(&self.events, key(&id, sequence), &payload);
+                tx.insert(
+                    &self.streams,
+                    &id,
+                    serde_json::to_vec(&state).map_err(internal)?,
+                );
+                metrics.pending_bytes += payload.len() as u64;
+                metrics.pending_events += 1;
+                if existing.is_none() {
+                    metrics.pending_streams += 1;
+                }
+                Ok(Ack {
+                    stream_id: Some(stream.clone()),
+                    sequence_number: sequence,
+                })
+            })();
+            match result {
+                Ok(ack) => acks.push(ack),
+                Err(status)
+                    if matches!(
+                        status.code(),
+                        tonic::Code::InvalidArgument
+                            | tonic::Code::AlreadyExists
+                            | tonic::Code::ResourceExhausted
+                    ) =>
+                {
+                    error = Some(status);
+                    break;
+                }
+                Err(status) => return Err(status),
             }
-            return Ok(Ack {
-                stream_id: Some(stream.clone()),
-                sequence_number: sequence,
-            });
         }
-        if state.terminal.is_some() || state.accepted.checked_add(1) != Some(sequence) {
-            return Err(Status::invalid_argument(
-                "BES events must be consecutive and cannot follow terminal",
-            ));
+        if metrics.pending_events != self.metrics.pending_events {
+            tx.commit().map_err(internal)?;
+            metrics.admission_commits += 1;
+            self.metrics = metrics;
         }
-        if self
-            .metrics
-            .pending_bytes
-            .saturating_add(payload.len() as u64)
-            > self.config.max_pending_bytes
-        {
-            return Err(Status::resource_exhausted(
-                "BES durable spool is full; pending events cannot be evicted",
-            ));
-        }
-        state.accepted = sequence;
-        if terminal(&event) {
-            state.terminal = Some(sequence);
-        }
-        tx.insert(&self.events, key(&id, sequence), &payload);
-        tx.insert(
-            &self.streams,
-            &id,
-            serde_json::to_vec(&state).map_err(internal)?,
-        );
-        tx.commit().map_err(internal)?;
-        // The transaction's SyncAll precedes every local ACK, including first event.
-        self.metrics.pending_bytes += payload.len() as u64;
-        self.metrics.pending_events += 1;
-        if existing.is_none() {
-            self.metrics.pending_streams += 1;
-        }
-        Ok(Ack {
-            stream_id: Some(stream.clone()),
-            sequence_number: sequence,
-        })
+        // No ACK escapes until the whole accepted prefix is fsync-safe. A bad
+        // later event cannot roll back events whose ACKs have already escaped.
+        Ok(Admission { acks, error })
     }
     pub fn event(&self, id: &str, sequence: i64) -> Result<Option<(Event, bool)>, Status> {
         let value = self

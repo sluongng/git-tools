@@ -580,7 +580,9 @@ pub async fn serve(mut config: Config) -> Result<()> {
                 retry_max_attempts: settings.retry_max_attempts,
                 tombstone_ttl_seconds: settings.tombstone_ttl_seconds,
                 max_completed_streams: settings.max_completed_streams,
-                ..Default::default()
+                batch_max_events: settings.batch_max_events,
+                batch_max_bytes: settings.batch_max_bytes,
+                batch_max_delay_ms: settings.batch_max_delay_ms,
             },
         )
         .await?;

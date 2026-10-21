@@ -4,6 +4,7 @@ mod spool;
 
 use anyhow::{Context, Result, ensure};
 use futures_core::Stream;
+use prost::Message;
 use reapi::bes::{
     PublishBuildToolEventStreamRequest as Event, PublishBuildToolEventStreamResponse as Ack,
     PublishLifecycleEventRequest,
@@ -44,6 +45,12 @@ pub struct Config {
     pub retry_max_attempts: u32,
     pub tombstone_ttl_seconds: u64,
     pub max_completed_streams: usize,
+    /// Commit up to this many immediately available events together (1 disables).
+    pub batch_max_events: usize,
+    /// Target encoded-byte bound; a larger individual event commits alone.
+    pub batch_max_bytes: usize,
+    /// Optional coalescing wait. Zero never waits for another event.
+    pub batch_max_delay_ms: u64,
 }
 impl Default for Config {
     fn default() -> Self {
@@ -60,6 +67,9 @@ impl Default for Config {
             retry_max_attempts: 4,
             tombstone_ttl_seconds: 86_400,
             max_completed_streams: 4096,
+            batch_max_events: 64,
+            batch_max_bytes: 256 * 1024,
+            batch_max_delay_ms: 0,
         }
     }
 }
@@ -91,6 +101,12 @@ impl Config {
         );
         let url = endpoint_url(&self.upstream);
         ensure!(
+            (1..=1024).contains(&self.batch_max_events)
+                && (1..=64 * 1024 * 1024).contains(&self.batch_max_bytes)
+                && self.batch_max_delay_ms <= 100,
+            "invalid BES group-commit limits"
+        );
+        ensure!(
             url.starts_with("http://") || url.starts_with("https://"),
             "BES upstream must be an explicit gRPC endpoint"
         );
@@ -100,6 +116,8 @@ impl Config {
 
 #[derive(Clone, Default, Serialize)]
 pub struct Metrics {
+    /// Runtime admission commits; all events in a group share one SyncAll.
+    pub admission_commits: u64,
     pub pending_bytes: u64,
     pub pending_events: u64,
     pub pending_streams: usize,
@@ -362,11 +380,19 @@ impl PublishBuildEvent for BesProxy {
             let _permit = permit;
             let mut stream_id = None;
             let mut attachment = Attachment { inner: inner.clone(), id: None };
+            let mut pending = None;
+            let mut eof = false;
             loop {
-                let next = tokio::select! {
-                    _ = stop.wait_for(|v| *v) => Err(Status::unavailable("BES daemon shutting down")),
-                    next = input.message() => next,
-                }?;
+                let next = if pending.is_some() {
+                    pending.take()
+                } else if eof {
+                    None
+                } else {
+                    tokio::select! {
+                        _ = stop.wait_for(|v| *v) => Err(Status::unavailable("BES daemon shutting down")),
+                        next = input.message() => next,
+                    }?
+                };
                 let Some(event) = next else { break };
                 let id = spool::event_id(&event)?;
                 if stream_id.as_ref().is_some_and(|current| current != &id) {
@@ -376,11 +402,51 @@ impl PublishBuildEvent for BesProxy {
                     *inner.attached.lock().unwrap().entry(id.clone()).or_default() += 1;
                     attachment.id = Some(id.clone());
                 }
-                stream_id = Some(id);
+                stream_id = Some(id.clone());
+                let mut bytes = event.encoded_len();
+                let mut batch = vec![event];
+                let mut input_error = None;
+                let deadline = tokio::time::Instant::now()
+                    + Duration::from_millis(inner.config.batch_max_delay_ms);
+                while batch.len() < inner.config.batch_max_events
+                    && bytes < inner.config.batch_max_bytes
+                    && !spool::terminal(batch.last().unwrap()) {
+                    // A zero delay drains only immediately available messages;
+                    // it never waits for a sparse publisher to form a batch.
+                    let next = if inner.config.batch_max_delay_ms == 0 {
+                        tokio::select! {
+                            biased;
+                            next = input.message() => Some(next),
+                            _ = std::future::ready(()) => None,
+                        }
+                    } else {
+                        tokio::time::timeout_at(deadline, input.message()).await.ok()
+                    };
+                    match next {
+                        Some(Ok(Some(event))) => {
+                            match spool::event_id(&event) {
+                                Ok(next_id) if next_id == id => {},
+                                Ok(_) => {input_error = Some(Status::invalid_argument("one BES RPC must contain only one stream")); break;},
+                                Err(error) => {input_error = Some(error); break;},
+                            }
+                            let size = event.encoded_len();
+                            if bytes.saturating_add(size) > inner.config.batch_max_bytes {
+                                pending = Some(event);
+                                break;
+                            }
+                            bytes += size;
+                            batch.push(event);
+                        }
+                        Some(Ok(None)) => {eof = true; break;},
+                        Some(Err(error)) => {input_error = Some(error); break;},
+                        None => break,
+                    }
+                }
                 let attribution = attribution.clone();
-                let ack = storage(&inner, move |spool| spool.append(event, attribution)).await?;
+                let admission = storage(&inner, move |spool| spool.append_batch(batch, attribution)).await?;
                 inner.changed.notify_waiters();
-                yield ack;
+                for ack in admission.acks {yield ack;}
+                if let Some(error) = admission.error.or(input_error) {Err(error)?;}
             }
         };
         Ok(Response::new(Box::pin(output)))

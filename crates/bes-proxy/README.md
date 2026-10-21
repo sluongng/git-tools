@@ -2,7 +2,9 @@
 
 Durable BuildBuddy BES relay hosted by the [`workspace` daemon](../workspace-daemon/README.md).
 Concurrent streams receive ordered local ACKs only after a Fjall `SyncAll`
-transaction. Forwarding continues independently; matching upstream ACKs delete
+transaction, grouping up to 64 ready events / 256 KiB without waiting.
+`[bes].batch_max_events = 1` disables grouping; ACKs still require fsync.
+Forwarding continues independently; matching upstream ACKs delete
 payloads atomically with their replay checkpoints. Pending data is never LRU-evicted.
 
 Streams stay open until their terminal event; disconnects cancel incomplete
