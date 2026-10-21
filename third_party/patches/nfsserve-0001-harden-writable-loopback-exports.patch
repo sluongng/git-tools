@@ -1,0 +1,650 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Son Luong Ngoc <26684313+sluongng@users.noreply.github.com>
+Date: Wed, 21 Oct 2026 12:38:30 +0200
+Subject: [PATCH] nfsserve: harden writable loopback exports
+
+Writable NFS projections need mutation checks and replay behavior that
+do not lose acknowledged changes or repeat completed requests. Forward
+directory cookies and exclusive-create verifiers, distinguish file and
+directory removal, and delegate guarded mutations to atomic filesystem
+callbacks.  Reject directory buffers too small for the first entry.
+
+Bound record decoding, allocations, connections and globally
+admitted RPCs.  Keep response forwarding independent of request
+backpressure. Cache completed replies within a bounded replay window,
+release failed parsing reservations, and allow retryable JUKEBOX
+responses to run again rather than become sticky failures. Filesystems
+can raise bounded admission to reserve metadata capacity while lazy
+content waits.
+
+Filesystem implementations must provide the new guarded-mutation
+and rmdir callbacks and accept the exclusive-create verifier and
+directory cookie.  This remains a single-user loopback transport,
+not an authenticated NFS service or a distributed lock manager.
+---
+ src/context.rs             |  1 +
+ src/nfs_handlers.rs        | 73 ++++++++++++++++----------------------
+ src/rpc.rs                 |  4 +--
+ src/rpcwire.rs             | 56 +++++++++++++++++++++--------
+ src/tcp.rs                 | 72 +++++++++++--------------------------
+ src/transaction_tracker.rs | 50 +++++++++++++++++++-------
+ src/vfs.rs                 | 18 ++++++++--
+ src/xdr.rs                 |  2 ++
+ 8 files changed, 151 insertions(+), 125 deletions(-)
+
+diff --git a/src/context.rs b/src/context.rs
+index b86c8d2..8fc694d 100644
+--- a/src/context.rs
++++ b/src/context.rs
+@@ -9,6 +9,7 @@ use crate::vfs::NFSFileSystem;
+ #[derive(Clone)]
+ pub struct RPCContext {
+     pub local_port: u16,
++    pub requests: Arc<tokio::sync::Semaphore>,
+     pub client_addr: String,
+     pub auth: crate::rpc::auth_unix,
+     pub vfs: Arc<dyn NFSFileSystem + Send + Sync>,
+diff --git a/src/nfs_handlers.rs b/src/nfs_handlers.rs
+index 53572e3..0eab029 100644
+--- a/src/nfs_handlers.rs
++++ b/src/nfs_handlers.rs
+@@ -143,8 +143,8 @@ pub async fn handle_nfs(
+         NFSProgram::NFSPROC3_WRITE => nfsproc3_write(xid, input, output, context).await?,
+         NFSProgram::NFSPROC3_CREATE => nfsproc3_create(xid, input, output, context).await?,
+         NFSProgram::NFSPROC3_SETATTR => nfsproc3_setattr(xid, input, output, context).await?,
+-        NFSProgram::NFSPROC3_REMOVE => nfsproc3_remove(xid, input, output, context).await?,
+-        NFSProgram::NFSPROC3_RMDIR => nfsproc3_remove(xid, input, output, context).await?,
++        NFSProgram::NFSPROC3_REMOVE => nfsproc3_remove(xid, input, output, context, false).await?,
++        NFSProgram::NFSPROC3_RMDIR => nfsproc3_remove(xid, input, output, context, true).await?,
+         NFSProgram::NFSPROC3_RENAME => nfsproc3_rename(xid, input, output, context).await?,
+         NFSProgram::NFSPROC3_MKDIR => nfsproc3_mkdir(xid, input, output, context).await?,
+         NFSProgram::NFSPROC3_SYMLINK => nfsproc3_symlink(xid, input, output, context).await?,
+@@ -778,6 +778,15 @@ pub async fn nfsproc3_readdirplus(
+ ) -> Result<(), anyhow::Error> {
+     let mut args = READDIRPLUS3args::default();
+     args.deserialize(input)?;
++    // Enforce a documented minimum before accounting; prevents underflow and
++    // zero-progress responses. Kernel clients normally request many KiB.
++    if args.maxcount < 1024 || args.dircount < 512 {
++        make_success_reply(xid).serialize(output)?;
++        nfs::nfsstat3::NFS3ERR_TOOSMALL.serialize(output)?;
++        nfs::post_op_attr::Void.serialize(output)?;
++        return Ok(());
++    }
++
+     debug!("nfsproc3_readdirplus({:?},{:?}) ", xid, args);
+ 
+     let dirid = context.vfs.fh_to_id(&args.dir);
+@@ -866,7 +875,7 @@ pub async fn nfsproc3_readdirplus(
+         return Ok(());
+     }*/
+     // subtract off the final entryplus* field (which must be false) and the eof
+-    let max_bytes_allowed = args.maxcount as usize - 128;
++    let max_bytes_allowed = (args.maxcount as usize).saturating_sub(128);
+     // args.dircount is bytes of just fileid, name, cookie.
+     // This is hard to ballpark, so we just divide it by 16
+     let estimated_max_results = args.dircount / 16;
+@@ -963,6 +972,15 @@ pub async fn nfsproc3_readdir(
+ ) -> Result<(), anyhow::Error> {
+     let mut args = READDIR3args::default();
+     args.deserialize(input)?;
++    // Enforce a documented minimum before accounting; prevents underflow and
++    // zero-progress responses. Kernel clients normally request many KiB.
++    if args.dircount < 512 {
++        make_success_reply(xid).serialize(output)?;
++        nfs::nfsstat3::NFS3ERR_TOOSMALL.serialize(output)?;
++        nfs::post_op_attr::Void.serialize(output)?;
++        return Ok(());
++    }
++
+     debug!("nfsproc3_readdirplus({:?},{:?}) ", xid, args);
+ 
+     let dirid = context.vfs.fh_to_id(&args.dir);
+@@ -991,12 +1009,12 @@ pub async fn nfsproc3_readdir(
+     debug!(" -- Dir version {:?}", dirversion);
+     let has_version = args.cookieverf != nfs::cookieverf3::default();
+     // subtract off the final entryplus* field (which must be false) and the eof
+-    let max_bytes_allowed = args.dircount as usize - 128;
++    let max_bytes_allowed = (args.dircount as usize).saturating_sub(128);
+     // args.dircount is bytes of just fileid, name, cookie.
+     // This is hard to ballpark, so we just divide it by 16
+     let estimated_max_results = args.dircount / 16;
+     let mut ctr = 0;
+-    match context.vfs.readdir_simple(dirid, estimated_max_results as usize).await {
++    match context.vfs.readdir_simple(dirid, args.cookie, estimated_max_results as usize).await {
+         Ok(result) => {
+             // we count dir_count seperately as it is just a subset of fields
+             let mut accumulated_dircount: usize = 0;
+@@ -1316,6 +1334,7 @@ pub async fn nfsproc3_create(
+         },
+     };
+     let mut target_attributes = nfs::sattr3::default();
++    let mut exclusive_verifier = [0u8; 8];
+ 
+     match createhow {
+         createmode3::UNCHECKED => {
+@@ -1325,26 +1344,9 @@ pub async fn nfsproc3_create(
+         createmode3::GUARDED => {
+             target_attributes.deserialize(input)?;
+             debug!("create guarded {:?}", target_attributes);
+-            if context.vfs.lookup(dirid, &dirops.name).await.is_ok() {
+-                // file exists. Fail with NFS3ERR_EXIST.
+-                // Re-read dir attributes
+-                // for post op attr
+-                let post_dir_attr = match context.vfs.getattr(dirid).await {
+-                    Ok(v) => nfs::post_op_attr::attributes(v),
+-                    Err(_) => nfs::post_op_attr::Void,
+-                };
+-
+-                make_success_reply(xid).serialize(output)?;
+-                nfs::nfsstat3::NFS3ERR_EXIST.serialize(output)?;
+-                nfs::wcc_data {
+-                    before: pre_dir_attr,
+-                    after: post_dir_attr,
+-                }
+-                .serialize(output)?;
+-                return Ok(());
+-            }
+         },
+         createmode3::EXCLUSIVE => {
++            input.read_exact(&mut exclusive_verifier)?;
+             debug!("create exclusive");
+         },
+     }
+@@ -1355,11 +1357,11 @@ pub async fn nfsproc3_create(
+     if matches!(createhow, createmode3::EXCLUSIVE) {
+         // the API for exclusive is very slightly different
+         // We are not returning a post op attribute
+-        fid = context.vfs.create_exclusive(dirid, &dirops.name).await;
++        fid = context.vfs.create_exclusive(dirid, &dirops.name, exclusive_verifier).await;
+         postopattr = nfs::post_op_attr::Void;
+     } else {
+         // create!
+-        let res = context.vfs.create(dirid, &dirops.name, target_attributes).await;
++        let res = if matches!(createhow,createmode3::GUARDED) { context.vfs.create_guarded(dirid,&dirops.name,target_attributes).await } else { context.vfs.create(dirid, &dirops.name, target_attributes).await };
+         fid = res.map(|x| x.0);
+         postopattr = if let Ok((_, fattr)) = res {
+             nfs::post_op_attr::attributes(fattr)
+@@ -1477,8 +1479,6 @@ pub async fn nfsproc3_setattr(
+     }
+     let id = id.unwrap();
+ 
+-    let ctime;
+-
+     let pre_op_attr = match context.vfs.getattr(id).await {
+         Ok(v) => {
+             let wccattr = nfs::wcc_attr {
+@@ -1486,7 +1486,6 @@ pub async fn nfsproc3_setattr(
+                 mtime: v.mtime,
+                 ctime: v.ctime,
+             };
+-            ctime = v.ctime;
+             nfs::pre_op_attr::attributes(wccattr)
+         },
+         Err(stat) => {
+@@ -1496,19 +1495,8 @@ pub async fn nfsproc3_setattr(
+             return Ok(());
+         },
+     };
+-    // handle the guard
+-    match args.guard {
+-        sattrguard3::Void => {},
+-        sattrguard3::obj_ctime(c) => {
+-            if c.seconds != ctime.seconds || c.nseconds != ctime.nseconds {
+-                make_success_reply(xid).serialize(output)?;
+-                nfs::nfsstat3::NFS3ERR_NOT_SYNC.serialize(output)?;
+-                nfs::wcc_data::default().serialize(output)?;
+-            }
+-        },
+-    }
+-
+-    match context.vfs.setattr(id, args.new_attribute).await {
++    let guard = match args.guard { sattrguard3::Void => None, sattrguard3::obj_ctime(c) => Some(c) };
++    match context.vfs.setattr_guarded(id, args.new_attribute,guard).await {
+         Ok(post_op_attr) => {
+             debug!(" setattr success {:?} --> {:?}", xid, post_op_attr);
+             let wcc_res = nfs::wcc_data {
+@@ -1559,6 +1547,7 @@ pub async fn nfsproc3_remove(
+     input: &mut impl Read,
+     output: &mut impl Write,
+     context: &RPCContext,
++    directory: bool,
+ ) -> Result<(), anyhow::Error> {
+     // if we do not have write capabilities
+     if !matches!(context.vfs.capabilities(), VFSCapabilities::ReadWrite) {
+@@ -1606,7 +1595,7 @@ pub async fn nfsproc3_remove(
+     };
+ 
+     // delete!
+-    let res = context.vfs.remove(dirid, &dirops.name).await;
++    let res = if directory { context.vfs.rmdir(dirid, &dirops.name).await } else { context.vfs.remove(dirid, &dirops.name).await };
+ 
+     // Re-read dir attributes for post op attr
+     let post_dir_attr = match context.vfs.getattr(dirid).await {
+diff --git a/src/rpc.rs b/src/rpc.rs
+index 2e2ead6..e38d2a3 100644
+--- a/src/rpc.rs
++++ b/src/rpc.rs
+@@ -78,9 +78,9 @@ pub enum auth_stat {
+     AUTH_BADCRED = 1,
+     /// client must begin new session
+     AUTH_REJECTEDCRED = 2,
+-    /// bad verifier (seal broken)    
++    /// bad verifier (seal broken)
+     AUTH_BADVERF = 3,
+-    /// verifier expired or replayed  
++    /// verifier expired or replayed
+     AUTH_REJECTEDVERF = 4,
+     /// rejected for security reasons
+     AUTH_TOOWEAK = 5,
+diff --git a/src/rpcwire.rs b/src/rpcwire.rs
+index 33200c6..44302a8 100644
+--- a/src/rpcwire.rs
++++ b/src/rpcwire.rs
+@@ -37,35 +37,59 @@ async fn handle_rpc(
+             return Ok(true);
+         }
+ 
+-        if context.transaction_tracker.is_retransmission(xid, &context.client_addr) {
++        if let Some(reply) = context.transaction_tracker.completed_response(xid, &context.client_addr) {
++            output.write_all(&reply)?;
++            return Ok(true);
++        }
++        if context.transaction_tracker.is_retransmission(xid, &context.client_addr)? {
+             // This is a retransmission
+             // Drop the message and return
+             debug!("Retransmission detected, xid: {}, client_addr: {}, call: {:?}", xid, context.client_addr, call);
+             return Ok(false);
+         }
+ 
++        // Only NFSv3 procedures 1..21 have an nfsstat3 result. NULL and
++        // unrelated RPC services must retain their ordinary replay behavior.
++        let nfs_status_reply = call.prog == nfs::PROGRAM && call.vers == 3 && (1..=21).contains(&call.proc);
++        let mut response = Vec::new();
++        let destination = &mut response;
+         let res = {
+             if call.prog == nfs::PROGRAM {
+-                nfs_handlers::handle_nfs(xid, call, input, output, &context).await
++                nfs_handlers::handle_nfs(xid, call, input, destination, &context).await
+             } else if call.prog == portmap::PROGRAM {
+-                portmap_handlers::handle_portmap(xid, call, input, output, &context)
++                portmap_handlers::handle_portmap(xid, call, input, destination, &context)
+             } else if call.prog == mount::PROGRAM {
+-                mount_handlers::handle_mount(xid, call, input, output, &context).await
++                mount_handlers::handle_mount(xid, call, input, destination, &context).await
+             } else if call.prog == NFS_ACL_PROGRAM
+                 || call.prog == NFS_ID_MAP_PROGRAM
+                 || call.prog == NFS_METADATA_PROGRAM
+             {
+                 trace!("ignoring NFS_ACL packet");
+-                prog_unavail_reply_message(xid).serialize(output)?;
++                prog_unavail_reply_message(xid).serialize(destination)?;
+                 Ok(())
+             } else {
+                 warn!("Unknown RPC Program number {} != {}", call.prog, nfs::PROGRAM);
+-                prog_unavail_reply_message(xid).serialize(output)?;
++                prog_unavail_reply_message(xid).serialize(destination)?;
+                 Ok(())
+             }
+         }
+         .map(|_| true);
+-        context.transaction_tracker.mark_processed(xid, &context.client_addr);
++        if res.is_ok() {
++            output.write_all(&response)?;
++            // The emitted success envelope uses an empty AUTH_NULL verifier.
++            // Check every discriminant before inspecting its NFS status: a
++            // successful mutation payload must never be mistaken for overload.
++            let success_header = [xid, 1, 0, 0, 0, 0].map(u32::to_be_bytes);
++            let transient = nfs_status_reply
++                && response.get(..24) == Some(success_header.as_flattened())
++                && response.get(24..28) == Some((nfs::nfsstat3::NFS3ERR_JUKEBOX as u32).to_be_bytes().as_slice());
++            if transient {
++                context.transaction_tracker.abandon(xid, &context.client_addr);
++            } else {
++                context.transaction_tracker.mark_processed(xid, &context.client_addr, response);
++            }
++        }
++        if res.is_err() { context.transaction_tracker.abandon(xid,&context.client_addr); }
+         res
+     } else {
+         error!("Unexpectedly received a Reply instead of a Call");
+@@ -99,13 +123,15 @@ async fn read_fragment(socket: &mut DuplexStream, append_to: &mut Vec<u8>) -> Re
+     let length = (fragment_header & ((1 << 31) - 1)) as usize;
+     trace!("Reading fragment length:{}, last:{}", length, is_last);
+     let start_offset = append_to.len();
+-    append_to.resize(append_to.len() + length, 0);
++    let total = append_to.len().checked_add(length).filter(|n| *n <= 2 * 1024 * 1024)
++        .ok_or_else(|| anyhow!("RPC record exceeds 2 MiB limit"))?;
++    append_to.resize(total, 0);
+     socket.read_exact(&mut append_to[start_offset..]).await?;
+     trace!("Finishing Reading fragment length:{}, last:{}", length, is_last);
+     Ok(is_last)
+ }
+ 
+-pub async fn write_fragment(socket: &mut tokio::net::TcpStream, buf: &[u8]) -> Result<(), anyhow::Error> {
++pub async fn write_fragment(socket: &mut (impl tokio::io::AsyncWrite + Unpin), buf: &[u8]) -> Result<(), anyhow::Error> {
+     // TODO: split into many fragments
+     assert!(buf.len() < (1 << 31));
+     // set the last flag
+@@ -126,15 +152,15 @@ pub type SocketMessageType = Result<Vec<u8>, anyhow::Error>;
+ pub struct SocketMessageHandler {
+     cur_fragment: Vec<u8>,
+     socket_receive_channel: DuplexStream,
+-    reply_send_channel: mpsc::UnboundedSender<SocketMessageType>,
++    reply_send_channel: mpsc::Sender<SocketMessageType>,
+     context: RPCContext,
+ }
+ 
+ impl SocketMessageHandler {
+     /// Creates a new SocketMessageHandler with the receiver for queued message replies
+-    pub fn new(context: &RPCContext) -> (Self, DuplexStream, mpsc::UnboundedReceiver<SocketMessageType>) {
++    pub fn new(context: &RPCContext) -> (Self, DuplexStream, mpsc::Receiver<SocketMessageType>) {
+         let (socksend, sockrecv) = tokio::io::duplex(256000);
+-        let (msgsend, msgrecv) = mpsc::unbounded_channel();
++        let (msgsend, msgrecv) = mpsc::channel(2);
+         (
+             Self {
+                 cur_fragment: Vec::new(),
+@@ -151,21 +177,23 @@ impl SocketMessageHandler {
+     pub async fn read(&mut self) -> Result<(), anyhow::Error> {
+         let is_last = read_fragment(&mut self.socket_receive_channel, &mut self.cur_fragment).await?;
+         if is_last {
++            let permit = self.context.requests.clone().acquire_owned().await?;
+             let fragment = std::mem::take(&mut self.cur_fragment);
+             let context = self.context.clone();
+             let send = self.reply_send_channel.clone();
+             tokio::spawn(async move {
++                let _permit = permit;
+                 let mut write_buf: Vec<u8> = Vec::new();
+                 let mut write_cursor = Cursor::new(&mut write_buf);
+                 let maybe_reply = handle_rpc(&mut Cursor::new(fragment), &mut write_cursor, context).await;
+                 match maybe_reply {
+                     Err(e) => {
+                         error!("RPC Error: {:?}", e);
+-                        let _ = send.send(Err(e));
++                        let _ = send.send(Err(e)).await;
+                     },
+                     Ok(true) => {
+                         let _ = std::io::Write::flush(&mut write_cursor);
+-                        let _ = send.send(Ok(write_buf));
++                        let _ = send.send(Ok(write_buf)).await;
+                     },
+                     Ok(false) => {
+                         // do not reply
+diff --git a/src/tcp.rs b/src/tcp.rs
+index 08f1c8e..d6a13ff 100644
+--- a/src/tcp.rs
++++ b/src/tcp.rs
+@@ -5,10 +5,9 @@ use std::time::Duration;
+ 
+ use anyhow;
+ use async_trait::async_trait;
+-use tokio::io::AsyncWriteExt;
+ use tokio::net::TcpListener;
+ use tokio::sync::mpsc;
+-use tracing::{debug, error, info};
++use tracing::{debug, info};
+ 
+ use crate::context::RPCContext;
+ use crate::rpcwire::*;
+@@ -30,58 +29,24 @@ pub fn generate_host_ip(hostnum: u16) -> String {
+ }
+ 
+ /// processes an established socket
+-async fn process_socket(mut socket: tokio::net::TcpStream, context: RPCContext) -> Result<(), anyhow::Error> {
+-    let (mut message_handler, mut socksend, mut msgrecvchan) = SocketMessageHandler::new(&context);
++async fn process_socket(socket: tokio::net::TcpStream, context: RPCContext) -> Result<(), anyhow::Error> {
++    let (mut message_handler, mut socksend, mut replies) = SocketMessageHandler::new(&context);
+     let _ = socket.set_nodelay(true);
+-
+-    tokio::spawn(async move {
+-        loop {
+-            if let Err(e) = message_handler.read().await {
+-                debug!("Message loop broken due to {:?}", e);
+-                break;
+-            }
+-        }
++    let (mut reader,mut writer) = socket.into_split();
++    // Independent forwarding prevents request backpressure from starving replies.
++    let reader_task = tokio::spawn(async move { let _ = tokio::io::copy(&mut reader,&mut socksend).await; });
++    let parser_task = tokio::spawn(async move {
++        while message_handler.read().await.is_ok() {}
+     });
+-    loop {
+-        tokio::select! {
+-            _ = socket.readable() => {
+-                let mut buf = [0; 128000];
+-
+-                match socket.try_read(&mut buf) {
+-                    Ok(0) => {
+-                        return Ok(());
+-                    }
+-                    Ok(n) => {
+-                        let _ = socksend.write_all(&buf[..n]).await;
+-                    }
+-                    Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
+-                        continue;
+-                    }
+-                    Err(e) => {
+-                        debug!("Message handling closed : {:?}", e);
+-                        return Err(e.into());
+-                    }
+-                }
+-
+-            },
+-            reply = msgrecvchan.recv() => {
+-                match reply {
+-                    Some(Err(e)) => {
+-                        debug!("Message handling closed : {:?}", e);
+-                        return Err(e);
+-                    }
+-                    Some(Ok(msg)) => {
+-                        if let Err(e) = write_fragment(&mut socket, &msg).await {
+-                            error!("Write error {:?}", e);
+-                        }
+-                    }
+-                    None => {
+-                        return Err(anyhow::anyhow!("Unexpected socket context termination"));
+-                    }
+-                }
+-            }
++    let result = async {
++        while let Some(reply) = replies.recv().await {
++            write_fragment(&mut writer,&reply?).await?;
+         }
+-    }
++        Ok(())
++    }.await;
++    reader_task.abort();
++    parser_task.abort();
++    result
+ }
+ 
+ #[async_trait]
+@@ -194,10 +159,14 @@ impl<T: NFSFileSystem + Send + Sync + 'static> NFSTcp for NFSTcpListener<T> {
+ 
+     /// Loops forever and never returns handling all incoming connections.
+     async fn handle_forever(&self) -> io::Result<()> {
++        let connections = Arc::new(tokio::sync::Semaphore::new(16));
++        let requests = Arc::new(tokio::sync::Semaphore::new(self.arcfs.max_inflight_requests().clamp(1, 1024)));
+         loop {
++            let connection = connections.clone().acquire_owned().await.map_err(io::Error::other)?;
+             let (socket, _) = self.listener.accept().await?;
+             let context = RPCContext {
+                 local_port: self.port,
++                requests: requests.clone(),
+                 client_addr: socket.peer_addr().unwrap().to_string(),
+                 auth: crate::rpc::auth_unix::default(),
+                 vfs: self.arcfs.clone(),
+@@ -208,6 +177,7 @@ impl<T: NFSFileSystem + Send + Sync + 'static> NFSTcp for NFSTcpListener<T> {
+             info!("Accepting connection from {}", context.client_addr);
+             debug!("Accepting socket {:?} {:?}", socket, context);
+             tokio::spawn(async move {
++                let _connection = connection;
+                 let _ = process_socket(socket, context).await;
+             });
+         }
+diff --git a/src/transaction_tracker.rs b/src/transaction_tracker.rs
+index ed44af0..8f75ddb 100644
+--- a/src/transaction_tracker.rs
++++ b/src/transaction_tracker.rs
+@@ -1,4 +1,4 @@
+-use std::collections::{hash_map, HashMap};
++use std::collections::HashMap;
+ use std::sync::Mutex;
+ use std::time::{Duration, SystemTime};
+ 
+@@ -19,26 +19,50 @@ impl TransactionTracker {
+     /// Checks if the transaction is a retransmission.
+     /// If it's a new transaction, it is marked as `InProgress`.
+     ///
+-    /// Returns `true` if the transaction is a retransmission, `false` otherwise.
+-    pub fn is_retransmission(&self, xid: u32, client_addr: &str) -> bool {
++    /// Returns true only for an existing transaction. At capacity, evict the
++    /// oldest completed replay; never evict in-progress work. All-in-progress
++    /// saturation is an explicit error, causing the caller to close the socket
++    /// so a client can retry, rather than silently treating new work as duplicate.
++    pub fn is_retransmission(&self, xid: u32, client_addr: &str) -> std::io::Result<bool> {
+         let key = (xid, client_addr.to_string());
+-        let mut transactions = self.transactions.lock().expect("unable to unlock transactions mutex");
++        let mut transactions = self.transactions.lock().map_err(|_| std::io::Error::other("RPC replay table poisoned"))?;
+         housekeeping(&mut transactions, self.retention_period);
+-        if let hash_map::Entry::Vacant(e) = transactions.entry(key) {
+-            e.insert(TransactionState::InProgress);
+-            false
+-        } else {
+-            true
++        if transactions.contains_key(&key) { return Ok(true); }
++        while transactions.len() >= 4096 {
++            let oldest = transactions.iter().filter_map(|(key,state)| match state {
++                TransactionState::Completed(time,_) => Some((key.clone(),*time)),
++                TransactionState::InProgress => None,
++            }).min_by_key(|(_,time)|*time).map(|(key,_)|key);
++            if let Some(key) = oldest { transactions.remove(&key); } else {
++                return Err(std::io::Error::new(std::io::ErrorKind::WouldBlock,"RPC replay table has no completed entries to evict"));
++            }
+         }
++        transactions.insert(key,TransactionState::InProgress);
++        Ok(false)
+     }
+ 
+     /// Marks the transaction as processed.
+-    pub fn mark_processed(&self, xid: u32, client_addr: &str) {
++    pub fn completed_response(&self, xid: u32, client_addr: &str) -> Option<Vec<u8>> {
++        let mut transactions = self.transactions.lock().ok()?;
++        housekeeping(&mut transactions, self.retention_period);
++        match transactions.get(&(xid,client_addr.to_string())) { Some(TransactionState::Completed(_,reply)) => Some(reply.clone()), _ => None }
++    }
++
++    pub fn abandon(&self,xid:u32,client_addr:&str) {
++        if let Ok(mut transactions) = self.transactions.lock() { transactions.remove(&(xid,client_addr.to_string())); }
++    }
++
++    pub fn mark_processed(&self, xid: u32, client_addr: &str, reply: Vec<u8>) {
+         let key = (xid, client_addr.to_string());
+         let completion_time = SystemTime::now();
+         let mut transactions = self.transactions.lock().expect("unable to unlock transactions mutex");
+         if let Some(tx) = transactions.get_mut(&key) {
+-            *tx = TransactionState::Completed(completion_time);
++            *tx = TransactionState::Completed(completion_time,reply);
++        }
++        // Bound replay storage independently of request rate and response size.
++        while transactions.values().map(|state| match state { TransactionState::Completed(_,bytes) => bytes.len(), _ => 0 }).sum::<usize>() > 16 * 1024 * 1024 || transactions.len() > 4096 {
++            let oldest = transactions.iter().filter_map(|(key,state)| match state { TransactionState::Completed(time,_) => Some((key.clone(),*time)),_=>None }).min_by_key(|(_,time)|*time).map(|(key,_)|key);
++            if let Some(key) = oldest { transactions.remove(&key); } else { break; }
+         }
+     }
+ }
+@@ -47,11 +71,11 @@ fn housekeeping(transactions: &mut HashMap<(u32, String), TransactionState>, max
+     let mut cutoff = SystemTime::now() - max_age;
+     transactions.retain(|_, v| match v {
+         TransactionState::InProgress => true,
+-        TransactionState::Completed(completion_time) => completion_time >= &mut cutoff,
++        TransactionState::Completed(completion_time, _) => completion_time >= &mut cutoff,
+     });
+ }
+ 
+ pub enum TransactionState {
+     InProgress,
+-    Completed(SystemTime),
++    Completed(SystemTime, Vec<u8>),
+ }
+diff --git a/src/vfs.rs b/src/vfs.rs
+index 0c48838..5c224a9 100644
+--- a/src/vfs.rs
++++ b/src/vfs.rs
+@@ -93,6 +93,10 @@ pub enum VFSCapabilities {
+ ///  The 0 fileid is reserved and should not be used
+ #[async_trait]
+ pub trait NFSFileSystem: Sync {
++    /// Bounded global RPC admission. Implementations that independently bound
++    /// payload waits may reserve more slots for metadata/publication traffic.
++    fn max_inflight_requests(&self) -> usize { 16 }
++
+     /// Returns the set of capabilities supported
+     fn capabilities(&self) -> VFSCapabilities;
+     /// Returns the ID the of the root directory "/"
+@@ -114,6 +118,9 @@ pub trait NFSFileSystem: Sync {
+     /// this should return Err(nfsstat3::NFS3ERR_ROFS) if readonly
+     async fn setattr(&self, id: fileid3, setattr: sattr3) -> Result<fattr3, nfsstat3>;
+ 
++    /// Atomically compare ctime and apply attributes.
++    async fn setattr_guarded(&self, id:fileid3, attr:sattr3, guard:Option<nfstime3>) -> Result<fattr3,nfsstat3>;
++
+     /// Reads the contents of a file returning (bytes, EOF)
+     /// Note that offset/count may go past the end of the file and that
+     /// in that case, all bytes till the end of file are returned.
+@@ -132,9 +139,12 @@ pub trait NFSFileSystem: Sync {
+     /// this should return Err(nfsstat3::NFS3ERR_ROFS)
+     async fn create(&self, dirid: fileid3, filename: &filename3, attr: sattr3) -> Result<(fileid3, fattr3), nfsstat3>;
+ 
++    /// Atomically fail if a name already exists, otherwise create it.
++    async fn create_guarded(&self, dirid:fileid3, filename:&filename3, attr:sattr3) -> Result<(fileid3,fattr3),nfsstat3>;
++
+     /// Creates a file if it does not already exist
+     /// this should return Err(nfsstat3::NFS3ERR_ROFS)
+-    async fn create_exclusive(&self, dirid: fileid3, filename: &filename3) -> Result<fileid3, nfsstat3>;
++    async fn create_exclusive(&self, dirid: fileid3, filename: &filename3, verifier: [u8; 8]) -> Result<fileid3, nfsstat3>;
+ 
+     /// Makes a directory with the following attributes.
+     /// If not supported dur to readonly file system
+@@ -149,6 +159,8 @@ pub trait NFSFileSystem: Sync {
+     /// Removes a file.
+     /// If not supported due to readonly file system
+     /// this should return Err(nfsstat3::NFS3ERR_ROFS)
++    async fn rmdir(&self, dirid: fileid3, filename: &filename3) -> Result<(), nfsstat3>;
++
+     async fn rename(
+         &self,
+         from_dirid: fileid3,
+@@ -174,8 +186,8 @@ pub trait NFSFileSystem: Sync {
+ 
+     /// Simple version of readdir.
+     /// Only need to return filename and id
+-    async fn readdir_simple(&self, dirid: fileid3, count: usize) -> Result<ReadDirSimpleResult, nfsstat3> {
+-        Ok(ReadDirSimpleResult::from_readdir_result(&self.readdir(dirid, 0, count).await?))
++    async fn readdir_simple(&self, dirid: fileid3, start_after: fileid3, count: usize) -> Result<ReadDirSimpleResult, nfsstat3> {
++        Ok(ReadDirSimpleResult::from_readdir_result(&self.readdir(dirid, start_after, count).await?))
+     }
+ 
+     /// Makes a symlink with the following attributes.
+diff --git a/src/xdr.rs b/src/xdr.rs
+index 8f4f93c..c6ce4ac 100644
+--- a/src/xdr.rs
++++ b/src/xdr.rs
+@@ -120,6 +120,7 @@ impl XDR for Vec<u8> {
+     fn deserialize<R: Read>(&mut self, src: &mut R) -> std::io::Result<()> {
+         let mut length: u32 = 0;
+         length.deserialize(src)?;
++        if length as usize > 2 * 1024 * 1024 { return Err(std::io::Error::new(std::io::ErrorKind::InvalidData,"XDR byte array exceeds 2 MiB")); }
+         self.resize(length as usize, 0);
+         src.read_exact(self)?;
+         // read padding
+@@ -152,6 +153,7 @@ impl XDR for Vec<u32> {
+     fn deserialize<R: Read>(&mut self, src: &mut R) -> std::io::Result<()> {
+         let mut length: u32 = 0;
+         length.deserialize(src)?;
++        if length as usize > (2 * 1024 * 1024) / 4 { return Err(std::io::Error::new(std::io::ErrorKind::InvalidData,"XDR integer array exceeds 2 MiB")); }
+         self.resize(length as usize, 0);
+         for i in self {
+             i.deserialize(src)?;

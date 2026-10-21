@@ -5,11 +5,11 @@ clone. Reads load files lazily; edits persist in a copy-on-write overlay.
 Native `git status` uses the durable change journal through fsmonitor.
 
 ```sh
-cargo build --release -p workspace-fuse
-target/release/git-vfs clone https://github.com/bazelbuild/bazel.git \
+bazel build --config=rbe //:workspace-fuse
+bazel-bin/crates/workspace-fuse/git-vfs-bin clone https://github.com/bazelbuild/bazel.git \
   /tmp/project.git --depth 1
 mkdir -p /tmp/project
-target/release/git-vfs mount --repo /tmp/project.git \
+bazel-bin/crates/workspace-fuse/git-vfs-bin mount --repo /tmp/project.git \
   --overlay /tmp/project-overlay --prefetch-bazel /tmp/project
 ```
 

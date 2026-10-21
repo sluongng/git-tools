@@ -5,10 +5,10 @@ single-user loopback NFSv3 server for the native macOS client; no macFUSE requir
 Keep the bare blobless clone and persistent overlay outside the mount.
 
 ```sh
-cargo build -p workspace-nfs
+# Use a native macOS git-nfs binary on PATH.
 # Create repo.git with git clone --bare --filter=blob:none URL repo.git first.
 mkdir -p /tmp/git-workspace
-target/debug/git-nfs --repo repo.git --overlay state --mountpoint /tmp/git-workspace
+git-nfs --repo repo.git --overlay state --mountpoint /tmp/git-workspace
 # In another macOS terminal:
 mount_nfs -o vers=3,tcp,locallocks,noresvport,port=11111,mountport=11111,nobrowse,nosuid,nodev \
   127.0.0.1:/ /tmp/git-workspace

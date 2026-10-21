@@ -16,7 +16,7 @@ rust_library(
         "//crates/workspace-core",
         "//crates/workspace-overlay",
     ] + [
-        "//third_party/nfsserve",
+        "@crates//:nfsserve",
         "@crates//:anyhow",
         "@crates//:async-trait",
         "@crates//:blake3",
@@ -37,7 +37,7 @@ rust_binary(
         "//crates/workspace-core",
         "//crates/workspace-overlay",
     ] + [
-        "//third_party/nfsserve",
+        "@crates//:nfsserve",
         "@crates//:anyhow",
         "@crates//:async-trait",
         "@crates//:blake3",
@@ -59,7 +59,7 @@ rust_test(
         ":workspace-nfs",
         "//crates/workspace-core",
         "//crates/workspace-overlay",
-        "//third_party/nfsserve",
+        "@crates//:nfsserve",
         "@crates//:tempfile",
         "@crates//:tokio",
     ],

@@ -9,7 +9,7 @@ license = "MIT"
 anyhow = "1"
 async-trait = "0.1"
 libc = "0.2"
-nfsserve = { version = "=0.11.0", path = "../../third_party/nfsserve" }
+nfsserve = "=0.11.0"
 output-core = { path = "../output-core" }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "sync", "time", "process", "io-util"] }
 

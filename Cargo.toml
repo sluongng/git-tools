@@ -20,8 +20,4 @@ members = [
     "crates/local-cas",
     "crates/output-fuse",
 ]
-exclude = ["third_party/fuser", "third_party/nfsserve"]
 resolver = "3"
-
-[patch.crates-io]
-fuser = { path = "third_party/fuser" }

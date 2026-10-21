@@ -4,12 +4,10 @@ load("@rules_rs//rs:rust_library.bzl", "rust_library")
 load("@rules_rs//rs:rust_test.bzl", "rust_test")
 load("//build_defs:fixture_test.bzl", "fixture_test")
 
-# Keep the patched path crate's generated dependency off the action graph;
-# its generic importer also includes ignored Cargo build output.
 _VFS_DEPS = [
     "//crates/workspace-overlay",
     "//crates/workspace-core",
-    "//third_party/fuser",
+    "@crates//:fuser",
     "@crates//:anyhow",
     "@crates//:blake3",
     "@crates//:clap",

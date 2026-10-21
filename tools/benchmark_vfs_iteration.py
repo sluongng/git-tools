@@ -3,7 +3,7 @@
 
 Example:
   python3 tools/benchmark_vfs_iteration.py --baseline /path/old/git-vfs \
-    --candidate target/release/git-vfs --git /path/git --output artifacts/churn \
+    --candidate bazel-bin/crates/workspace-fuse/git-vfs-bin --git /path/git --output artifacts/churn \
     --baseline-source c0687ee --candidate-source working-tree --trials 3 --run
 
 RSS and allocated disk include Fjall/cache/WAL effects, not just dead payload.

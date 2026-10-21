@@ -1,0 +1,26 @@
+crate = use_extension("@rules_rs//rs:extensions.bzl", "crate")
+
+# Crate archives and checksums come from Cargo.lock. Keep local source changes
+# in mail-format patches instead of maintaining vendored source trees.
+crate.annotation(
+    crate = "fuser",
+    version = "0.16.0",
+    patches = [
+        "//third_party/patches:fuser-bounded-shutdown.patch",
+        "//third_party/patches:fuser-busy-unmount.patch",
+    ],
+    patch_args = ["-p1"],
+    # Match the Linux pure-Rust mount implementation without probing host libfuse.
+    gen_build_script = "off",
+    rustc_flags = [
+        '--cfg=fuser_mount_impl="pure-rust"',
+        '--check-cfg=cfg(fuser_mount_impl, values("pure-rust", "libfuse2", "libfuse3"))',
+    ],
+)
+
+crate.annotation(
+    crate = "nfsserve",
+    version = "0.11.0",
+    patches = ["//third_party/patches:nfsserve-0001-harden-writable-loopback-exports.patch"],
+    patch_args = ["-p1"],
+)

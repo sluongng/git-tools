@@ -1,5 +1,5 @@
 //! Deterministic, network-free public-API benchmark. Run an optimized binary:
-//! cargo run --release -p local-cas --example cache_benchmark -- OUTPUT_DIR LABEL
+//! bazel run --config=rbe //crates/local-cas:cache_benchmark -- OUTPUT_DIR LABEL
 //! OUTPUT_DIR must not exist. Receipts are JSON; keep them outside the checkout.
 use anyhow::{Context, Result, ensure};
 use async_trait::async_trait;

@@ -42,7 +42,7 @@
   ],
   "git": "git",
   "bazel": "bazel",
-  "vfs_binary": "target/release/git-vfs",
+  "vfs_binary": "bazel-bin/crates/workspace-fuse/git-vfs-bin",
   "repository_cache": "/tmp/git-vfs-benchmark/repository-cache",
   "output_user_root": "/tmp/git-vfs-benchmark/bazel-root",
   "pilot_dependencies_warm_verified": false,

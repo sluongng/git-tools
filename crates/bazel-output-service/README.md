@@ -2,11 +2,12 @@
 
 Library and `git-output-service` executable implementing Bazel's remote output
 service (BOS) over a configured REAPI CAS. This projects build outputs, not sources.
+Run a native `git-output-service` binary on the target host.
 
 ```sh
 # Provision the credential in your environment through your normal secret mechanism.
 export BUILDBUDDY_API_KEY
-cargo run -p bazel-output-service -- --config /path/to/private/output-service.toml
+git-output-service --config /path/to/private/output-service.toml
 
 bazel --digest_function=BLAKE3 build //:target \
   --remote_cache=grpcs://YOUR_INSTANCE.buildbuddy.io \

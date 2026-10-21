@@ -1,0 +1,34 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Son Luong Ngoc <26684313+sluongng@users.noreply.github.com>
+Date: Wed, 21 Oct 2026 12:37:46 +0200
+Subject: [PATCH 2/2] fuser: detach busy Linux mounts on unmount
+
+Stopping a session after an unsuccessful unmount can leave a dead
+mount attached when Linux reports EBUSY, including for root callers.
+
+Route that result through the existing helper and lazy-detach fallback,
+as permission failures already do. Keep non-Linux behavior unchanged.
+---
+ src/mnt/fuse_pure.rs | 9 ++++++---
+ 1 file changed, 6 insertions(+), 3 deletions(-)
+
+diff --git a/src/mnt/fuse_pure.rs b/src/mnt/fuse_pure.rs
+index 2e0916e153acaad8cb2eeb38fd826f80f86bb586..0ecb9cfbf67f0fdd2ff446e4cea2b7d232daa411 100644
+--- a/src/mnt/fuse_pure.rs
++++ b/src/mnt/fuse_pure.rs
+@@ -64,9 +64,12 @@ impl Drop for Mount {
+             return;
+         }
+         if let Err(err) = super::libc_umount(&self.mountpoint) {
+-            if err.kind() == PermissionDenied {
+-                // Linux always returns EPERM for non-root users.  We have to let the
+-                // library go through the setuid-root "fusermount -u" to unmount.
++            if err.kind() == PermissionDenied
++                || (cfg!(target_os = "linux") && err.raw_os_error() == Some(libc::EBUSY))
++            {
++                // Non-root Linux callers need the setuid helper. A busy Linux mount
++                // also needs the existing lazy-detach path, even when owned by root;
++                // otherwise stopping the session can leave a dead attached mount.
+                 fuse_unmount_pure(&self.mountpoint)
+             } else {
+                 error!("Unmount failed: {}", err)

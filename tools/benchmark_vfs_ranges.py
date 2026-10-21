@@ -3,7 +3,7 @@
 
 Example:
   python3 tools/benchmark_vfs_ranges.py --baseline /path/old/git-vfs \
-    --candidate target/release/git-vfs --git /path/git --output artifacts/ranges \
+    --candidate bazel-bin/crates/workspace-fuse/git-vfs-bin --git /path/git --output artifacts/ranges \
     --baseline-source c0687ee --candidate-source working-tree --trials 3 --run
 
 First copy-up is separate from warm 4KiB reads/appends. No network, cache drops,

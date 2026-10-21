@@ -6,7 +6,7 @@ package(default_visibility = ["//visibility:public"])
 
 _DEPS = [
     "//crates/output-core",
-    "//third_party/fuser",
+    "@crates//:fuser",
     "@crates//:anyhow",
     "@crates//:async-trait",
     "@crates//:libc",

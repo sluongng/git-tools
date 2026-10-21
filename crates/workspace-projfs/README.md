@@ -5,8 +5,9 @@ Requires Windows 10 2004+, NTFS and the **Client-ProjFS** optional feature.
 The CLI does not enable that OS feature. NTFS retains local edits and tombstones.
 
 ```powershell
+# Use a native Windows git-projfs.exe on PATH.
 git clone --bare --filter=blob:none https://github.com/bazelbuild/bazel.git C:\cache\bazel.git
-cargo run -p workspace-projfs -- mount --repo C:\cache\bazel.git --root C:\work\bazel --state C:\state\bazel
+git-projfs.exe mount --repo C:\cache\bazel.git --root C:\work\bazel --state C:\state\bazel
 Get-Content C:\work\bazel\MODULE.bazel
 ```
 

@@ -1,0 +1,229 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Son Luong Ngoc <26684313+sluongng@users.noreply.github.com>
+Date: Wed, 21 Oct 2026 12:37:46 +0200
+Subject: [PATCH 1/2] fuser: support bounded session shutdown
+
+An idle FUSE session can wait indefinitely for the next request,
+keeping its filesystem state alive after its owner asks it to stop.
+
+Add a Linux run_until entry point that checks cancellation between
+bounded poll waits. Keep descriptor ownership while restoring its
+original flags, and leave running callbacks, unmounting and thread
+joining to the caller.  The existing run loop and other platforms
+remain unchanged.
+---
+ src/channel.rs |  43 +++++++++++++++
+ src/session.rs | 138 +++++++++++++++++++++++++++++++++++++++++++++++++
+ 2 files changed, 181 insertions(+)
+
+diff --git a/src/channel.rs b/src/channel.rs
+index fbc4ded3157044d9bc1295f4457cfdaa827f9e9a..85e73f31cf37a442d0d74d0404760a1c6d34e191 100644
+--- a/src/channel.rs
++++ b/src/channel.rs
+@@ -48,6 +48,17 @@ impl Channel {
+         }
+     }
+ 
++    /// Set nonblocking reads for a bounded, poll-driven session loop.
++    #[cfg(target_os = "linux")]
++    pub(crate) fn nonblocking(&self) -> io::Result<NonblockingGuard> {
++        let flags = retry_fcntl(self.0.as_raw_fd(), libc::F_GETFL, 0)?;
++        retry_fcntl(self.0.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK)?;
++        Ok(NonblockingGuard {
++            device: self.0.clone(),
++            flags,
++        })
++    }
++
+     /// Returns a sender object for this channel. The sender object can be
+     /// used to send to the channel. Multiple sender objects can be used
+     /// and they can safely be sent to other threads.
+@@ -83,3 +94,35 @@ impl ReplySender for ChannelSender {
+         BackingId::create(&self.0, fd)
+     }
+ }
++
++/// Owns a descriptor reference so flag restoration cannot race descriptor reuse.
++#[cfg(target_os = "linux")]
++#[derive(Debug)]
++pub(crate) struct NonblockingGuard {
++    device: Arc<File>,
++    flags: c_int,
++}
++
++#[cfg(target_os = "linux")]
++impl Drop for NonblockingGuard {
++    fn drop(&mut self) {
++        if let Err(err) = retry_fcntl(self.device.as_raw_fd(), libc::F_SETFL, self.flags) {
++            log::warn!("Failed to restore FUSE file status flags: {err}");
++        }
++    }
++}
++
++#[cfg(target_os = "linux")]
++fn retry_fcntl(fd: c_int, command: c_int, flags: c_int) -> io::Result<c_int> {
++    loop {
++        // The caller keeps the file open for the duration of the operation.
++        let result = unsafe { libc::fcntl(fd, command, flags) };
++        if result >= 0 {
++            return Ok(result);
++        }
++        let err = io::Error::last_os_error();
++        if err.raw_os_error() != Some(libc::EINTR) {
++            return Err(err);
++        }
++    }
++}
+diff --git a/src/session.rs b/src/session.rs
+index 1b989b5adb48921eb118645f9ef2ca600cab4fcc..a8ebf46e53590e8c765dd9e73b7aa5eeab60fd3a 100644
+--- a/src/session.rs
++++ b/src/session.rs
+@@ -177,6 +177,84 @@ impl<FS: Filesystem> Session<FS> {
+         Ok(())
+     }
+ 
++    /// Run until `stop` is set or the kernel closes the FUSE connection (Linux only).
++    ///
++    /// An idle session observes cancellation within 100 ms. Ready requests are
++    /// dispatched without that delay. Cancellation does not interrupt a filesystem
++    /// callback already in progress, and does not unmount the filesystem. The caller
++    /// must unmount and join its session thread before releasing filesystem state.
++    ///
++    /// This temporarily enables `O_NONBLOCK` on the FUSE file description and restores
++    /// its original flags on return or unwind. Reply senders share that description;
++    /// Linux FUSE reply writes do not wait for incoming requests. Do not concurrently
++    /// change its status flags or run another receiver on this session's descriptor.
++    #[cfg(target_os = "linux")]
++    pub fn run_until(&mut self, stop: &std::sync::atomic::AtomicBool) -> io::Result<()> {
++        use std::os::fd::AsRawFd;
++        use std::sync::atomic::Ordering;
++
++        let _nonblocking = self.ch.nonblocking()?;
++        let mut buffer = vec![0; BUFFER_SIZE];
++        let buf = aligned_sub_buf(
++            buffer.deref_mut(),
++            std::mem::align_of::<abi::fuse_in_header>(),
++        );
++        while !stop.load(Ordering::Acquire) {
++            let mut pollfd = libc::pollfd {
++                fd: self.ch.as_fd().as_raw_fd(),
++                events: libc::POLLIN,
++                revents: 0,
++            };
++            // The descriptor is owned by the session throughout this call.
++            let ready = unsafe { libc::poll(&mut pollfd, 1, 100) };
++            if stop.load(Ordering::Acquire) {
++                break;
++            }
++            if ready < 0 {
++                let err = io::Error::last_os_error();
++                if err.raw_os_error() == Some(EINTR) {
++                    continue;
++                }
++                return Err(err);
++            }
++            if ready == 0 {
++                continue;
++            }
++            if pollfd.revents & libc::POLLNVAL != 0 {
++                return Err(io::Error::from_raw_os_error(libc::EBADF));
++            }
++            if pollfd.revents & (libc::POLLIN | libc::POLLERR) == 0 {
++                if pollfd.revents & libc::POLLHUP != 0 {
++                    break;
++                }
++                return Err(io::Error::other("FUSE poll returned no readable request"));
++            }
++            match self.ch.receive(buf) {
++                Ok(0) => break,
++                Ok(size) => {
++                    if stop.load(Ordering::Acquire) {
++                        break;
++                    }
++                    match Request::new(self.ch.sender(), &buf[..size]) {
++                        Some(req) => req.dispatch(self),
++                        None => break,
++                    }
++                }
++                Err(err) => match err.raw_os_error() {
++                    Some(ENOENT) | Some(EINTR) => continue,
++                    Some(EAGAIN) => {
++                        if pollfd.revents & (libc::POLLHUP | libc::POLLERR) != 0 {
++                            return Err(io::Error::other("FUSE connection closed while receiving"));
++                        }
++                    }
++                    Some(ENODEV) => break,
++                    _ => return Err(err),
++                },
++            }
++        }
++        Ok(())
++    }
++
+     /// Unmount the filesystem
+     pub fn unmount(&mut self) {
+         drop(std::mem::take(&mut *self.mount.lock().unwrap()));
+@@ -290,3 +368,63 @@ impl fmt::Debug for BackgroundSession {
+         write!(f, "BackgroundSession {{ guard: JoinGuard<()> }}",)
+     }
+ }
++
++#[cfg(all(test, target_os = "linux"))]
++mod run_until_tests {
++    use super::*;
++    use std::io::Write;
++    use std::os::fd::AsRawFd;
++    use std::os::unix::net::UnixStream;
++    use std::sync::atomic::{AtomicBool, Ordering};
++    use std::time::{Duration, Instant};
++
++    struct EmptyFilesystem;
++    impl Filesystem for EmptyFilesystem {}
++
++    fn flags(fd: &impl AsRawFd) -> i32 {
++        // All test callers retain ownership of the descriptor.
++        let flags = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_GETFL) };
++        assert!(flags >= 0);
++        flags
++    }
++
++    #[test]
++    fn idle_cancellation_restores_shared_descriptor_flags() {
++        let (receiver, _peer) = UnixStream::pair().unwrap();
++        let observer = receiver.try_clone().unwrap();
++        let original_flags = flags(&observer);
++        let mut session = Session::from_fd(EmptyFilesystem, receiver.into(), SessionACL::Owner);
++        let stop = AtomicBool::new(false);
++        let started = Instant::now();
++        thread::scope(|scope| {
++            scope.spawn(|| {
++                thread::sleep(Duration::from_millis(25));
++                stop.store(true, Ordering::Release);
++            });
++            session.run_until(&stop).unwrap();
++        });
++        assert!(started.elapsed() < Duration::from_secs(2));
++        assert_eq!(flags(&observer), original_flags);
++    }
++
++    #[test]
++    fn peer_close_finishes_without_waiting_for_cancellation() {
++        let (receiver, peer) = UnixStream::pair().unwrap();
++        let mut session = Session::from_fd(EmptyFilesystem, receiver.into(), SessionACL::Owner);
++        drop(peer);
++        session.run_until(&AtomicBool::new(false)).unwrap();
++    }
++
++    #[test]
++    fn cancellation_does_not_consume_a_ready_request() {
++        let (receiver, mut peer) = UnixStream::pair().unwrap();
++        let observer = receiver.try_clone().unwrap();
++        peer.write_all(b"request").unwrap();
++        let mut session = Session::from_fd(EmptyFilesystem, receiver.into(), SessionACL::Owner);
++        session.run_until(&AtomicBool::new(true)).unwrap();
++        let mut bytes = [0; 7];
++        use std::io::Read;
++        (&observer).read_exact(&mut bytes).unwrap();
++        assert_eq!(&bytes, b"request");
++    }
++}

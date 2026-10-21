@@ -5,8 +5,8 @@ cached fetch responses serve multiple clients; object metadata APIs expose
 sizes and optional persistent Git SHA1 → BLAKE3 mappings.
 
 ```sh
-cargo build --release -p git-proxy
-target/release/git-proxy --cache-dir /var/tmp/git-proxy \
+bazel build --config=rbe //:git-proxy
+bazel-bin/crates/git-proxy/git-proxy-bin --cache-dir /var/tmp/git-proxy \
   --repo bazel=https://github.com/bazelbuild/bazel.git --enable-blake3
 
 git clone --depth 1 --filter=blob:none --no-checkout \

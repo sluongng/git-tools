@@ -1,0 +1,15 @@
+load("@rules_rs//rs:rust_test.bzl", "rust_test")
+
+exports_files(glob(["*.patch"]))
+
+# Run the patched crate's existing tests, for cancellable-session shutdown.
+rust_test(
+    name = "fuser_shutdown_tests",
+    args = ["session::run_until_tests"],
+    crate = "@crates//:fuser",
+    deps = ["@crates//:tempfile"],
+    rustc_flags = [
+        '--cfg=fuser_mount_impl="pure-rust"',
+        '--check-cfg=cfg(fuser_mount_impl, values("pure-rust", "libfuse2", "libfuse3"))',
+    ],
+)
