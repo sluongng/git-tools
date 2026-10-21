@@ -142,7 +142,7 @@ impl WritableGitFs {
             ino: inode,
             size,
             blocks: size.div_ceil(512),
-            atime: n.mtime,
+            atime: n.atime,
             mtime: n.mtime,
             ctime: n.ctime,
             crtime: n.ctime,
@@ -285,7 +285,7 @@ impl Filesystem for WritableGitFs {
         uid: Option<u32>,
         gid: Option<u32>,
         size: Option<u64>,
-        _atime: Option<TimeOrNow>,
+        atime: Option<TimeOrNow>,
         mtime: Option<TimeOrNow>,
         _ctime: Option<SystemTime>,
         fh: Option<u64>,
@@ -318,12 +318,17 @@ impl Filesystem for WritableGitFs {
             } else if size.is_some() {
                 self.check_access(req, ino, libc::W_OK)?;
             }
+            let now = SystemTime::now();
+            let atime = atime.map(|t| match t {
+                TimeOrNow::SpecificTime(t) => t,
+                TimeOrNow::Now => now,
+            });
             let mtime = mtime.map(|t| match t {
                 TimeOrNow::SpecificTime(t) => t,
-                TimeOrNow::Now => SystemTime::now(),
+                TimeOrNow::Now => now,
             });
             self.overlay
-                .setattr(ino, mode, size, mtime, &mut self.repo)?;
+                .setattr_with_atime(ino, mode, size, atime, mtime, &mut self.repo)?;
             self.attr(ino)
         })();
         match result {

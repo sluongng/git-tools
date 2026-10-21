@@ -79,7 +79,7 @@ fn attrs(state: &mut State, id: u64) -> Result<fattr3, nfsstat3> {
         rdev: specdata3::default(),
         fsid: 1,
         fileid: id,
-        atime: timestamp(entry.mtime),
+        atime: timestamp(entry.atime),
         mtime: timestamp(entry.mtime),
         ctime: timestamp(entry.ctime),
     })
@@ -93,7 +93,9 @@ fn validate_attrs(attr: &sattr3) -> Result<(), nfsstat3> {
     if matches!(attr.size,set_size3::size(size) if size > i64::MAX as u64) {
         return Err(nfsstat3::NFS3ERR_FBIG);
     }
-    if matches!(attr.mtime,set_mtime::SET_TO_CLIENT_TIME(t) if t.nseconds >= 1_000_000_000) {
+    if matches!(attr.mtime,set_mtime::SET_TO_CLIENT_TIME(t) if t.nseconds >= 1_000_000_000)
+        || matches!(attr.atime,set_atime::SET_TO_CLIENT_TIME(t) if t.nseconds >= 1_000_000_000)
+    {
         return Err(nfsstat3::NFS3ERR_INVAL);
     }
     Ok(())
@@ -108,18 +110,26 @@ fn apply_attrs(state: &mut State, id: u64, attr: sattr3) -> Result<(), nfsstat3>
         set_size3::size(v) => Some(v),
         _ => None,
     };
+    let now = SystemTime::now();
+    let atime = match attr.atime {
+        set_atime::DONT_CHANGE => None,
+        set_atime::SET_TO_SERVER_TIME => Some(now),
+        set_atime::SET_TO_CLIENT_TIME(t) if t.nseconds < 1_000_000_000 => {
+            Some(UNIX_EPOCH + std::time::Duration::new(t.seconds.into(), t.nseconds))
+        }
+        _ => return Err(nfsstat3::NFS3ERR_INVAL),
+    };
     let mtime = match attr.mtime {
         set_mtime::DONT_CHANGE => None,
-        set_mtime::SET_TO_SERVER_TIME => Some(SystemTime::now()),
+        set_mtime::SET_TO_SERVER_TIME => Some(now),
         set_mtime::SET_TO_CLIENT_TIME(t) if t.nseconds < 1_000_000_000 => {
             Some(UNIX_EPOCH + std::time::Duration::new(t.seconds.into(), t.nseconds))
         }
         _ => return Err(nfsstat3::NFS3ERR_INVAL),
     };
-    // atime is not tracked: reads deliberately do not dirty the workspace.
     state
         .overlay
-        .setattr(id, mode, size, mtime, &mut state.repo)
+        .setattr_with_atime(id, mode, size, atime, mtime, &mut state.repo)
         .map_err(status)
 }
 fn name(bytes: &filename3) -> Result<&OsStr, nfsstat3> {

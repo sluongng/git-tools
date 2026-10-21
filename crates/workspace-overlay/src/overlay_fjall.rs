@@ -64,8 +64,14 @@ fn encode_entry(entry: &Entry) -> Result<Vec<u8>> {
         entry.base_oid.as_ref().map_or(0, String::len),
         match &entry.payload {
             Payload::Inline(bytes) => bytes.len(),
-            _ => 17,
+            _ => 0,
         },
+        match &entry.payload {
+            Payload::Base | Payload::None => 1,
+            Payload::Inline(_) => 9,
+            Payload::File { .. } => 17,
+        },
+        super::timestamp(entry.atime).len(),
         super::timestamp(entry.mtime).len(),
         super::timestamp(entry.ctime).len(),
     ];
@@ -168,6 +174,7 @@ impl Store {
                     } else {
                         Payload::None
                     },
+                    atime: snapshot.timestamp(),
                     mtime: snapshot.timestamp(),
                     ctime: snapshot.timestamp(),
                     linked: true,
@@ -320,6 +327,7 @@ impl Store {
                 mode: 0o444,
                 base_oid: None,
                 payload: Payload::None,
+                atime: snapshot.timestamp(),
                 mtime: snapshot.timestamp(),
                 ctime: snapshot.timestamp(),
                 linked: true,
@@ -508,7 +516,7 @@ impl Store {
             .get(&handles.entries, entry.inode.to_be_bytes())?
             .context("redo inode missing")?;
         ensure!(
-            encode(&decode_exact(&current)?) == intent.before_entry,
+            encode(&decode_exact(&current)?) == encode(&decode_exact(&intent.before_entry)?),
             "redo entry generation conflict"
         );
         tx.insert(
@@ -591,7 +599,10 @@ impl Store {
                 generation == intent.before_generation,
                 "redo journal generation conflict"
             );
-            ensure!(current == intent.before_entry, "redo pre-state conflict");
+            ensure!(
+                current == encode(&decode_exact(&intent.before_entry)?),
+                "redo pre-state conflict"
+            );
             drop(tx);
             files.apply(entry.inode, intent.before_size, size, &intent.operation)?;
             Self::publish(handles, &intent)?;
@@ -1451,6 +1462,23 @@ mod tests {
         let mut entry = overlay.entry(ino).unwrap().clone();
         entry.payload = Payload::Inline(vec![4; 128 * 1024]);
         let root = overlay.entry(1).unwrap().clone();
+        assert_eq!(
+            decode_exact(&legacy_record(&entry)).unwrap().atime,
+            entry.mtime
+        );
+        let mut record = encode_entry(&entry).unwrap();
+        assert_eq!(decode_exact(&record).unwrap().atime, entry.atime);
+        record.pop();
+        assert!(
+            decode_exact(&record).is_err(),
+            "truncated access time must fail closed"
+        );
+        let mut record = encode_entry(&entry).unwrap();
+        record[0] = 4;
+        assert!(
+            decode_exact(&record).is_err(),
+            "unknown record version must fail closed"
+        );
         let (token, _) = super::changes_since(&directory, "").unwrap();
         drop(overlay);
         let handles = Handles::open(&directory, false).unwrap();
@@ -1493,7 +1521,7 @@ mod tests {
             tx.get(&handles.entries, 1u64.to_be_bytes())
                 .unwrap()
                 .unwrap()[0],
-            2
+            3
         );
         assert_eq!(
             tx.get(&handles.entries, ino.to_be_bytes())
@@ -1517,6 +1545,22 @@ mod tests {
         let mut overlay = Overlay::open(&directory, &snapshot, &gitdir).unwrap();
         assert_eq!(overlay.stats().payload_copy_bytes, 0);
         assert_eq!(overlay.read_range(ino, 0, 1, &mut repo).unwrap(), [4]);
+        assert_eq!(overlay.entry(ino).unwrap().atime, entry.mtime);
+        let atime = std::time::UNIX_EPOCH + Duration::new(1_600_000_000, 123_456_789);
+        overlay
+            .setattr_with_atime(ino, None, None, Some(atime), None, &mut repo)
+            .unwrap();
+        assert_eq!(overlay.entry(ino).unwrap().mtime, entry.mtime);
+        let (token, _) = super::changes_since(&directory, "").unwrap();
+        assert_eq!(overlay.read_range(ino, 0, 1, &mut repo).unwrap(), [4]);
+        assert_eq!(
+            super::changes_since(&directory, &token).unwrap(),
+            (token, vec![])
+        );
+        drop(overlay);
+        let overlay = Overlay::open(&directory, &snapshot, &gitdir).unwrap();
+        assert_eq!(overlay.entry(ino).unwrap().atime, atime);
+        assert_eq!(overlay.entry(ino).unwrap().mtime, entry.mtime);
     }
 
     #[test]
@@ -2136,8 +2180,20 @@ mod tests {
             })
             .collect();
         assert_eq!(journal_after, journal_before);
-        // Repair only the explicitly injected metadata to continue the existing
-        // valid replay / repeated failure checks using the original intent.
+        // Repair only the explicitly injected metadata, then model a v2 writer
+        // interrupted with a durable intent. Recovery must compare decoded
+        // pre-state, not reject it solely because the current encoder is newer.
+        let mut intent = intent;
+        for record in [&mut intent.before_entry, &mut intent.after_entry] {
+            let entry = decode_exact(record).unwrap();
+            record.truncate(record.len() - 8 - super::super::timestamp(entry.atime).len());
+            record[0] = 2;
+        }
+        tx.insert(
+            &handles.meta,
+            b"payload_intent",
+            serde_json::to_vec(&intent).unwrap(),
+        );
         tx.insert(
             &handles.entries,
             ino.to_be_bytes(),

@@ -2471,8 +2471,13 @@ fn writable_file_handles_truncation_and_directory_rename_preserve_identity() {
         .open(&child_path)
         .unwrap();
     let old_mtime = std::time::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+    let old_atime = std::time::UNIX_EPOCH + Duration::new(1_600_000_000, 123_456_789);
     child
-        .set_times(fs::FileTimes::new().set_modified(old_mtime))
+        .set_times(
+            fs::FileTimes::new()
+                .set_accessed(old_atime)
+                .set_modified(old_mtime),
+        )
         .unwrap();
     assert_eq!(
         fs::metadata(&child_path).unwrap().modified().unwrap(),
@@ -2482,6 +2487,7 @@ fn writable_file_handles_truncation_and_directory_rename_preserve_identity() {
     let modified = fs::metadata(&child_path).unwrap();
     assert_eq!(modified.len(), 14);
     assert_ne!(modified.modified().unwrap(), old_mtime);
+    assert_eq!(modified.accessed().unwrap(), old_atime);
     assert_eq!(fs::read(&child_path).unwrap(), b"CHILD appended");
     let calculated = git(
         &fixture.mount,
@@ -2568,6 +2574,52 @@ fn writable_file_handles_truncation_and_directory_rename_preserve_identity() {
     );
     fs::remove_dir(fixture.mount.join("new-parent")).unwrap();
     assert_eq!(fs::metadata(&fixture.mount).unwrap().nlink(), root_links);
+    // An explicit atime-only utimensat must preserve mtime. Automatic reads
+    // remain noatime: neither stored metadata nor the journal changes.
+    let path = fixture.mount.join("hello.txt");
+    fs::OpenOptions::new()
+        .write(true)
+        .open(&path)
+        .unwrap()
+        .set_times(
+            fs::FileTimes::new()
+                .set_accessed(old_atime)
+                .set_modified(old_mtime),
+        )
+        .unwrap();
+    let before = fs::metadata(&path).unwrap();
+    assert_eq!(before.modified().unwrap(), old_mtime);
+    let explicit_atime = std::time::UNIX_EPOCH + Duration::new(1_600_000_001, 123_456_789);
+    let native = CString::new(path.as_os_str().as_bytes()).unwrap();
+    let times = [
+        libc::timespec {
+            tv_sec: 1_600_000_001,
+            tv_nsec: 123_456_789,
+        },
+        libc::timespec {
+            tv_sec: 0,
+            tv_nsec: libc::UTIME_OMIT,
+        },
+    ];
+    assert_eq!(
+        unsafe { libc::utimensat(libc::AT_FDCWD, native.as_ptr(), times.as_ptr(), 0) },
+        0
+    );
+    let (token, _) = workspace_fuse::overlay::changes_since(&overlay, "").unwrap();
+    assert!(!fs::read(&path).unwrap().is_empty());
+    std::thread::sleep(Duration::from_millis(1100));
+    let after = fs::metadata(&path).unwrap();
+    assert_eq!(after.accessed().unwrap(), explicit_atime);
+    assert_eq!(after.modified().unwrap(), before.modified().unwrap());
+    assert_eq!(
+        workspace_fuse::overlay::changes_since(&overlay, &token).unwrap(),
+        (token, vec![])
+    );
+    drop(mounted);
+    let mounted = writable_mount(&fixture, &overlay);
+    let reopened = fs::metadata(&path).unwrap();
+    assert_eq!(reopened.accessed().unwrap(), explicit_atime);
+    assert_eq!(reopened.modified().unwrap(), before.modified().unwrap());
     drop(mounted);
 }
 

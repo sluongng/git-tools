@@ -60,6 +60,7 @@ impl SourceMount {
             })
             .transpose()?;
         let mut options = vec![
+            MountOption::NoAtime,
             MountOption::NoDev,
             MountOption::NoSuid,
             MountOption::DefaultPermissions,

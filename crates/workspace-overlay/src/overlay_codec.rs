@@ -16,7 +16,7 @@ fn put_bytes(out: &mut Vec<u8>, bytes: Option<&[u8]>) {
     }
 }
 pub(super) fn encode(e: &Entry) -> Vec<u8> {
-    let mut out = vec![2];
+    let mut out = vec![3];
     for n in [e.inode, e.parent, e.kind.code() as u64, e.mode as u64] {
         out.extend_from_slice(&n.to_be_bytes());
     }
@@ -39,6 +39,7 @@ pub(super) fn encode(e: &Entry) -> Vec<u8> {
     }
     put_bytes(&mut out, Some(timestamp(e.mtime).as_bytes()));
     put_bytes(&mut out, Some(timestamp(e.ctime).as_bytes()));
+    put_bytes(&mut out, Some(timestamp(e.atime).as_bytes()));
     out
 }
 struct Decoder<'a>(&'a [u8]);
@@ -80,7 +81,7 @@ fn decode(bytes: &[u8], prune: bool) -> Result<(Entry, Option<u64>)> {
     let mut d = Decoder(bytes);
     let version = d.take(1)?[0];
     ensure!(
-        matches!(version, 1 | 2),
+        matches!(version, 1 | 2 | 3),
         "unsupported overlay entry version"
     );
     let inode = d.number()?;
@@ -112,6 +113,7 @@ fn decode(bytes: &[u8], prune: bool) -> Result<(Entry, Option<u64>)> {
                         mode,
                         base_oid,
                         payload: Payload::None,
+                        atime: mtime,
                         mtime,
                         ctime,
                         linked,
@@ -156,6 +158,11 @@ fn decode(bytes: &[u8], prune: bool) -> Result<(Entry, Option<u64>)> {
     };
     let mtime = parse_time(std::str::from_utf8(d.required()?)?.to_owned())?;
     let ctime = parse_time(std::str::from_utf8(d.required()?)?.to_owned())?;
+    let atime = if version >= 3 {
+        parse_time(std::str::from_utf8(d.required()?)?.to_owned())?
+    } else {
+        mtime
+    };
     ensure!(d.0.is_empty(), "trailing overlay entry data");
     Ok((
         Entry {
@@ -166,6 +173,7 @@ fn decode(bytes: &[u8], prune: bool) -> Result<(Entry, Option<u64>)> {
             mode,
             base_oid,
             payload,
+            atime,
             mtime,
             ctime,
             linked,

@@ -60,6 +60,7 @@ pub struct Entry {
     pub mode: u32,
     pub base_oid: Option<String>,
     pub payload: Payload,
+    pub atime: SystemTime,
     pub mtime: SystemTime,
     pub ctime: SystemTime,
     pub linked: bool,
@@ -1008,6 +1009,7 @@ impl Overlay {
             } else {
                 Payload::Inline(data.unwrap_or_default())
             },
+            atime: now,
             mtime: now,
             ctime: now,
             linked: true,
@@ -1103,6 +1105,18 @@ impl Overlay {
         mtime: Option<SystemTime>,
         repo: &mut GitRepo,
     ) -> Result<()> {
+        self.setattr_with_atime(ino, mode, size, None, mtime, repo)
+    }
+    /// Apply explicit timestamps without making reads update access time.
+    pub fn setattr_with_atime(
+        &mut self,
+        ino: u64,
+        mode: Option<u32>,
+        size: Option<u64>,
+        atime: Option<SystemTime>,
+        mtime: Option<SystemTime>,
+        repo: &mut GitRepo,
+    ) -> Result<()> {
         let mut e = self.content_entry(ino)?.clone();
         if e.control {
             return Err(error(libc::EPERM));
@@ -1126,6 +1140,9 @@ impl Overlay {
         }
         if let Some(mode) = mode {
             e.mode = mode & 0o7777;
+        }
+        if let Some(atime) = atime {
+            e.atime = atime;
         }
         if let Some(mtime) = mtime {
             e.mtime = mtime;

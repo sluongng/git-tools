@@ -198,6 +198,41 @@ async fn real_tcp_nfs_reads_and_file_sync_writes_persist() {
         &2u32.to_be_bytes()
     ); // FILE_SYNC
     missing(); // The unaccessed 128 KiB blob was never hydrated.
+    // Real SETATTR RPC: distinct explicit times survive reads and restart.
+    let mut args = Vec::new();
+    opaque(&mut args, &fh);
+    for value in [
+        0,
+        0,
+        0,
+        0,
+        2,
+        1_600_000_000,
+        123_456_789,
+        2,
+        1_700_000_000,
+        987_654_321,
+        0,
+    ] {
+        word(&mut args, value);
+    }
+    assert_eq!(&rpc(port, 2, args).await[..4], &[0; 4]);
+    let explicit = fs.getattr(id).await.unwrap();
+    assert_eq!(explicit.atime.seconds, 1_600_000_000);
+    assert_eq!(explicit.atime.nseconds, 123_456_789);
+    assert_eq!(explicit.mtime.seconds, 1_700_000_000);
+    assert_eq!(explicit.mtime.nseconds, 987_654_321);
+    let mut args = Vec::new();
+    opaque(&mut args, &fh);
+    for value in [0, 0, 0, 0, 2, 1_600_000_000, 1_000_000_000, 0, 0] {
+        word(&mut args, value);
+    }
+    assert_eq!(&rpc(port, 2, args).await[..4], &22u32.to_be_bytes());
+    let unchanged = fs.getattr(id).await.unwrap();
+    assert_eq!(
+        (unchanged.atime.seconds, unchanged.atime.nseconds),
+        (explicit.atime.seconds, explicit.atime.nseconds)
+    );
     stop_tx.send(()).unwrap();
     server_thread.join().unwrap();
     drop(fs);
@@ -205,6 +240,15 @@ async fn real_tcp_nfs_reads_and_file_sync_writes_persist() {
     assert_eq!(
         reopened.read(id, 0, 100).await.unwrap(),
         (b"HELLO from Git\n".to_vec(), true)
+    );
+    let persisted = reopened.getattr(id).await.unwrap();
+    assert_eq!(
+        (persisted.atime.seconds, persisted.atime.nseconds),
+        (explicit.atime.seconds, explicit.atime.nseconds)
+    );
+    assert_eq!(
+        (persisted.mtime.seconds, persisted.mtime.nseconds),
+        (explicit.mtime.seconds, explicit.mtime.nseconds)
     );
 }
 
