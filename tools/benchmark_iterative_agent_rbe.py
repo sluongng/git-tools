@@ -23,7 +23,7 @@ import sys
 import time
 import traceback
 
-from benchmark_agent_rbe import credential_helper, grpc_log_summary, terminate_owned_bazel, workspace_log_summary
+from benchmark_agent_rbe import credential_helper, grpc_log_summary, rbe_settings, terminate_owned_bazel, workspace_log_summary
 from benchmark_github_bazel import COMMIT, SOURCE, dump, sha256
 from benchmark_proxy_agent_rbe import AgentRbeBenchmark, TARGET
 
@@ -58,9 +58,17 @@ def validate_config(config):
         raise ValueError("Require provisioned toolchain manifest and verified warm dependency pilot")
     if config.get("build_target") != TARGET or not config.get("build_output_paths"):
         raise ValueError("Require the pinned strings target and nonempty output manifest paths")
-    extra = config.get("rbe_extra_flags", [])
-    if not extra or any(not isinstance(flag, str) or not flag.startswith("--override_repository=") for flag in extra):
-        raise ValueError("rbe_extra_flags may contain only the provisioned repository override")
+    _, _, extra = rbe_settings(config)
+    toolchain_flags = {"--override_repository", "--config", "--platforms", "--host_platform",
+                       "--extra_execution_platforms", "--extra_toolchains",
+                       "--remote_default_exec_properties"}
+    if (not any(flag.startswith("--override_repository=") for flag in extra)
+            or any(flag.partition("=")[0] not in toolchain_flags
+                   or not flag.partition("=")[2] for flag in extra)):
+        raise ValueError("rbe_extra_flags require a provisioned repository override and only explicit toolchain/platform settings")
+    # Named configs are frozen with the pinned workload. Accepted results still
+    # require the measured uncached remote action set and matching output hashes;
+    # direct cache, execution-strategy, digest and isolation overrides stay banned.
     # These config files are copied to artifacts. Credentials belong ONLY in the
     # existing host-scoped helper, never config/argv, even for a diagnostic run.
     def inspect(value):
@@ -493,7 +501,7 @@ def main():
             "note": "No binaries, credentials, network or FUSE accessed; execute only with --run"}, indent=2))
         return
     try:
-        with credential_helper(args.credential_rc) as helper:
+        with credential_helper(args.credential_rc, endpoint=bench.rbe_endpoint) as helper:
             bench.credential = helper
             bench.load_proxy_credential()
             bench.freeze()

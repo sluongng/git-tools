@@ -243,7 +243,8 @@ def make_performance_agent(args, config, directory, identity, barrier, edits,
     agent.shared_repo_contents_cache = shared_cache
     agent.seed_local_repositories = seed_local_repositories
     agent.require_shared_reuse = require_shared_reuse
-    agent.credential = contexts.enter_context(credential_helper(args.credential_rc, args.credential_config))
+    agent.credential = contexts.enter_context(credential_helper(
+        args.credential_rc, args.credential_config, endpoint=agent.rbe_endpoint))
     agent.freeze()
     agent.origin, agent.clone_url = server.origin, server.clone_url
     agent.config["source"] = server.clone_url
@@ -278,7 +279,8 @@ def performance(args, config, expected):
     try:
         with ExitStack() as contexts:
             server = AgentRbeBenchmark(arguments_for(args, args.config, root / "server"))
-            server.credential = contexts.enter_context(credential_helper(args.credential_rc, args.credential_config))
+            server.credential = contexts.enter_context(credential_helper(
+                args.credential_rc, args.credential_config, endpoint=server.rbe_endpoint))
             server.load_proxy_credential()
             server.freeze()
             setup_start = time.perf_counter()
@@ -566,7 +568,8 @@ def main():
     try:
         with ExitStack() as contexts:
             server = AgentRbeBenchmark(arguments_for(args, args.config, root / "server"))
-            server.credential = contexts.enter_context(credential_helper(args.credential_rc, args.credential_config))
+            server.credential = contexts.enter_context(credential_helper(
+                args.credential_rc, args.credential_config, endpoint=server.rbe_endpoint))
             server.load_proxy_credential()
             server.freeze()
             server.prepare_proxy()
@@ -579,7 +582,8 @@ def main():
                 config_path = root / (identity + "-config.json")
                 dump(config_path, agent_config)
                 agent = IsolatedAgent(arguments_for(args, config_path, root / identity), identity, barrier)
-                agent.credential = contexts.enter_context(credential_helper(args.credential_rc, args.credential_config))
+                agent.credential = contexts.enter_context(credential_helper(
+                    args.credential_rc, args.credential_config, endpoint=agent.rbe_endpoint))
                 agent.freeze()
                 agent.origin, agent.clone_url = server.origin, server.clone_url
                 agent.config["source"] = server.clone_url

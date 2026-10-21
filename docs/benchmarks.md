@@ -37,6 +37,11 @@ attempt was stopped at a cold compiler graph; do not compare older-client full
 self-build timings with this matrix. Raw failures and private reports stay
 outside Git; reproduce endpoint cells with `benchmark_shared_daemon.py`.
 
+The agent RBE benchmark JSON config accepts `rbe_endpoint`,
+`rbe_instance_name`, and `rbe_extra_flags`. Defaults use the public endpoint
+`grpcs://remote.buildbuddy.io` and an empty instance; supply your own toolchain
+flags through `rbe_extra_flags`. Keep site settings and credentials outside Git.
+
 ### Full source/output path
 
 Forced real remote work, identical output hashes; command plus first output read:

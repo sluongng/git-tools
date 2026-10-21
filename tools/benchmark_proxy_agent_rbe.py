@@ -14,13 +14,11 @@ import time
 import traceback
 
 from benchmark_agent_rbe import (
-    credential_helper, grpc_log_summary, json_records, pilot_environment, rbe_flags, workspace_log_summary,
+    credential_helper, grpc_log_summary, json_records, pilot_environment, rbe_flags, rbe_settings, workspace_log_summary,
 )
 from benchmark_github_bazel import COMMIT, sha256
 from benchmark_warm_proxy_bazel import ARMS, WarmProxyBenchmark
 
-CAS_ORIGIN = "https://remote.buildbuddy.io"
-CAS_INSTANCE = ""
 KEY_ENV = "GIT_TOOLS_PROXY_CAS_KEY"
 TARGET = "//src/main/cpp/util:strings"
 
@@ -36,15 +34,15 @@ class AgentRbeBenchmark(WarmProxyBenchmark):
         self.env = dict(pilot_environment(), GIT_NO_LAZY_FETCH="1")
         self.credential = None
         self.cas_key = None
-        extra = self.config.get("rbe_extra_flags", [])
-        if not isinstance(extra, list) or any(not isinstance(flag, str) for flag in extra):
-            raise ValueError("rbe_extra_flags must be a list of public Bazel flags")
+        self.rbe_endpoint, self.cas_instance, self.rbe_extra_flags = rbe_settings(self.config)
+        scheme, authority = self.rbe_endpoint.split("://", 1)
+        self.cas_origin = ("https://" if scheme == "grpcs" else "http://") + authority
         self.result["environment"].update({
             "timing": "continuous clone launch through first successful RBE build exit; no prior query or timed object audits; warm-blake3 and async prefetch/mount included",
             "prefetch_mode": "after-mount",
             "prefetch_timing": "mount-owned background prefetch overlaps first build; never an additive blocking client phase",
             "cache_policy": "warm owned proxy mirror/packs/mappings; optional prewarmed remote workspace CAS; shared archive cache verified warm by prerequisite pilot; fresh source/overlay/output base/local repo-contents cache per cell; r2c2 reads enabled, hits measured rather than assumed; OS caches not dropped",
-            "remote": {"endpoint": CAS_ORIGIN, "instance": CAS_INSTANCE, "digest": "BLAKE3", "remote_ttl_seconds": 10800,
+            "remote": {"endpoint": self.cas_origin, "instance": self.cas_instance, "digest": "BLAKE3", "remote_ttl_seconds": 10800,
                        "action_policy": "remote_accept_cached=true preserves r2c2; CppCompile/CppArchive/CppLink bypass action-cache results and execute remotely"},
             "query_scope": "optional golden query occurs only after successful first build; digest counters then cover build plus query",
             "credential_policy": "one explicitly selected local credential via host-restricted helper; proxy receives key only in its own environment; no secret configuration/argv/artifacts",
@@ -61,7 +59,7 @@ class AgentRbeBenchmark(WarmProxyBenchmark):
     def proxy_extra_args(self):
         if not self.args.proxy_cas_sync:
             return []
-        return ["--cas-endpoint", CAS_ORIGIN, "--cas-instance-name", CAS_INSTANCE,
+        return ["--cas-endpoint", self.cas_origin, "--cas-instance-name", self.cas_instance,
                 "--cas-header-env", "x-buildbuddy-api-key=" + KEY_ENV,
                 "--cas-remote-ttl-seconds", "10800"]
 
@@ -69,7 +67,7 @@ class AgentRbeBenchmark(WarmProxyBenchmark):
         if not self.args.proxy_cas_sync:
             return
         # Never log helper stdout, stderr, or parse errors containing its response.
-        reply = subprocess.run([str(self.credential)], input=json.dumps({"uri": CAS_ORIGIN}).encode(),
+        reply = subprocess.run([str(self.credential)], input=json.dumps({"uri": self.cas_origin}).encode(),
                                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
                                timeout=15, env=pilot_environment())
         try:
@@ -153,8 +151,8 @@ class AgentRbeBenchmark(WarmProxyBenchmark):
     def remote_build_command(self, base, name, contents_cache, raw_workspace_log, raw_grpc_log):
         return self.bazel_args(base) + ["build", TARGET, *rbe_flags(
             self.credential, force_execution=True, repo_contents_cache=contents_cache,
-            accept_remote_cache=True, repository_cache=self.config["repository_cache"]),
-            *self.config.get("rbe_extra_flags", []),
+            accept_remote_cache=True, repository_cache=self.config["repository_cache"],
+            endpoint=self.rbe_endpoint, instance=self.cas_instance, extra_flags=self.rbe_extra_flags),
             "--watchfs", "--noshow_progress", "--color=no", "--curses=no",
             "--build_event_publish_all_actions",
             "--profile=" + str(self.root / (name + "-first_build.profile.gz")),
@@ -229,8 +227,9 @@ class AgentRbeBenchmark(WarmProxyBenchmark):
             if self.args.post_build_query:
                 flags = ["--output=label", "--lockfile_mode=off", "--watchfs", "--noshow_progress", "--color=no", "--curses=no"]
                 # Preserve the same RBE/r2c2 context for repository resolution.
-                flags += rbe_flags(self.credential, True, contents, True, self.config["repository_cache"])
-                flags += self.config.get("rbe_extra_flags", [])
+                flags += rbe_flags(self.credential, True, contents, True, self.config["repository_cache"],
+                                   endpoint=self.rbe_endpoint, instance=self.cas_instance,
+                                   extra_flags=self.rbe_extra_flags)
                 row["phases"]["post_build_query"] = self.run(self.bazel_args(base) + ["query", self.config["query_expression"], *flags], name + "-post_build_query", cwd=cwd)
                 row.update(self.verify_labels(name, "post_build_query"))
             self.stop_bazel(base, cwd, name)
@@ -314,7 +313,7 @@ def main():
             "prefetch": "asynchronous after mount", "output": str(bench.root)}, indent=2))
         return
     try:
-        with credential_helper(args.credential_rc) as helper:
+        with credential_helper(args.credential_rc, endpoint=bench.rbe_endpoint) as helper:
             bench.credential = helper
             bench.load_proxy_credential()
             bench.freeze()

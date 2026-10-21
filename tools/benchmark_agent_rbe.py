@@ -11,6 +11,9 @@ import signal
 import subprocess
 import tempfile
 import time
+from urllib.parse import urlsplit
+
+DEFAULT_RBE_ENDPOINT = "grpcs://remote.buildbuddy.io"
 
 HELPER = r'''#!/usr/bin/env python3
 import json, shlex, sys
@@ -18,7 +21,10 @@ from pathlib import Path
 from urllib.parse import urlsplit
 try:
     request = json.load(sys.stdin)
-    if urlsplit(request["uri"]).hostname != "remote.buildbuddy.io":
+    uri = urlsplit(request["uri"])
+    if (uri.hostname != __CREDENTIAL_HOST__ or (uri.port or (443 if uri.scheme in ("https", "grpcs") else 80)) != __CREDENTIAL_PORT__
+            or uri.scheme not in __CREDENTIAL_SCHEMES__ or uri.username is not None
+            or uri.password is not None):
         raise ValueError("unsupported host")
     selected = []
     for line in Path(__CREDENTIAL_RC__).open():
@@ -39,30 +45,67 @@ except Exception:
 
 
 @contextmanager
-def credential_helper(rc_path, config="remote-shared"):
+def credential_helper(rc_path, config="remote-shared", *, endpoint=DEFAULT_RBE_ENDPOINT):
     """Yield a host-restricted helper; the selected credential never leaves memory."""
     if config not in {"remote-shared", "rbe"}:
         raise ValueError("Unknown credential configuration class")
+    endpoint_uri = urlsplit(validate_rbe_endpoint(endpoint))
+    secure = endpoint_uri.scheme == "grpcs"
+    port = endpoint_uri.port or (443 if secure else 80)
+    schemes = ("grpcs", "https") if secure else ("grpc", "http")
     with tempfile.TemporaryDirectory(prefix="git-tools-rbe-credential-") as directory:
         helper_dir = Path(directory)
         os.chmod(helper_dir, 0o700)
         helper = helper_dir / "credential-helper"
         helper.write_text(HELPER.replace("__CREDENTIAL_RC__", repr(str(Path(rc_path).resolve())))
-                          .replace("__CREDENTIAL_CONFIG__", repr("common:" + config)))
+                          .replace("__CREDENTIAL_CONFIG__", repr("common:" + config))
+                          .replace("__CREDENTIAL_HOST__", repr(endpoint_uri.hostname))
+                          .replace("__CREDENTIAL_PORT__", repr(port))
+                          .replace("__CREDENTIAL_SCHEMES__", repr(schemes)))
         helper.chmod(0o700)
         yield helper
 
 
+def validate_rbe_endpoint(endpoint):
+    """Accept a single gRPC authority, never userinfo or URL routing suffixes."""
+    if not isinstance(endpoint, str) or any(c.isspace() for c in endpoint):
+        raise ValueError("rbe_endpoint must be a gRPC URL")
+    uri = urlsplit(endpoint)
+    if (uri.scheme not in {"grpc", "grpcs"} or not uri.hostname
+            or uri.username is not None or uri.password is not None
+            or uri.path or uri.query or uri.fragment):
+        raise ValueError("rbe_endpoint must contain only a gRPC scheme and authority")
+    # Accessing port rejects malformed/out-of-range port numbers.
+    uri.port
+    return endpoint
+
+
+def rbe_settings(config):
+    """Read portable benchmark settings from the existing private JSON config."""
+    endpoint = validate_rbe_endpoint(config.get("rbe_endpoint", DEFAULT_RBE_ENDPOINT))
+    instance = config.get("rbe_instance_name", "")
+    extra = config.get("rbe_extra_flags", [])
+    if not isinstance(instance, str) or any(c in instance for c in "\r\n"):
+        raise ValueError("rbe_instance_name must be a single-line string")
+    if not isinstance(extra, list) or any(not isinstance(flag, str) for flag in extra):
+        raise ValueError("rbe_extra_flags must be a list of Bazel flags")
+    connection_flags = ("--remote_executor", "--remote_cache", "--remote_instance_name", "--credential_helper")
+    if any(flag.split("=", 1)[0] in connection_flags for flag in extra):
+        raise ValueError("Configure RBE connections with rbe_endpoint and rbe_instance_name, not rbe_extra_flags")
+    return endpoint, instance, extra
+
+
 def rbe_flags(helper, force_execution=True, repo_contents_cache=None,
-              accept_remote_cache=True, repository_cache=None):
+              accept_remote_cache=True, repository_cache=None, *,
+              endpoint=DEFAULT_RBE_ENDPOINT, instance="", extra_flags=()):
     """Public pilot configuration; caller owns fresh output/contents directories."""
     if force_execution:
         accept_remote_cache = True  # Do not disable r2c2 while bypassing action results.
+    endpoint = validate_rbe_endpoint(endpoint)
     flags = ["--nogoogle_default_credentials",
-             "--remote_executor=grpcs://remote.buildbuddy.io",
-             "--remote_cache=grpcs://remote.buildbuddy.io", "--remote_instance_name=",
-             
-             f"--credential_helper=remote.buildbuddy.io={helper}",
+             "--remote_executor=" + endpoint,
+             "--remote_cache=" + endpoint, "--remote_instance_name=" + instance,
+             f"--credential_helper={urlsplit(endpoint).hostname}={helper}",
              "--strategy=CppCompile=remote", "--strategy=CppLink=remote",
              "--remote_accept_cached=" + str(accept_remote_cache).lower(),
              "--remote_download_toplevel", "--experimental_remote_cache_ttl=3h",
@@ -74,7 +117,7 @@ def rbe_flags(helper, force_execution=True, repo_contents_cache=None,
         flags.append(f"--repository_cache={repository_cache}")
     if repo_contents_cache is not None:
         flags.append(f"--repo_contents_cache={repo_contents_cache}")
-    return flags
+    return flags + list(extra_flags)
 
 
 def pilot_environment():
@@ -279,13 +322,14 @@ def main():
     if args.force_execution:
         args.accept_remote_cache = True
     config = json.loads(args.config.read_text())
+    endpoint, instance, extra_flags = rbe_settings(config)
     workspace = args.workspace.resolve()
     root = args.output.resolve()
     if root == workspace or root.is_relative_to(workspace):
         p.error("output must be outside workspace")
     if not args.run:
         print(json.dumps({"mode": "dry-run", "workspace": str(workspace), "output": str(root),
-                          "target": "//src/main/cpp/util:strings", "endpoint": "grpcs://remote.buildbuddy.io",
+                          "target": "//src/main/cpp/util:strings", "endpoint": endpoint,
                           "arm": args.arm, "cache_reads": args.accept_remote_cache, "force_execution": args.force_execution, "execution": "forced remote CppCompile and CppLink"}, indent=2))
         return
     if root.exists() and any(root.iterdir()):
@@ -297,8 +341,8 @@ def main():
         p.error("pilot requires checkout without an imported user.bazelrc")
     root.mkdir(parents=True, exist_ok=True)
     result = {"status": "started", "purpose": "single RBE readiness pilot, not comparative latency evidence",
-              "revision": revision, "workspace": str(workspace), "endpoint": "grpcs://remote.buildbuddy.io",
-              "instance": "", "arm": args.arm, "force_execution": args.force_execution, "target": "//src/main/cpp/util:strings",
+              "revision": revision, "workspace": str(workspace), "endpoint": endpoint,
+              "instance": instance, "arm": args.arm, "force_execution": args.force_execution, "target": "//src/main/cpp/util:strings",
               "cache_policy": "fresh local output base; existing repository cache; remote action/r2c2 reads " + ("enabled" if args.accept_remote_cache else "disabled") + "; executor/CAS state unspecified",
               "credential_source": "one existing common:remote-shared remote_header via host-restricted helper; no credential values persisted"}
     baseline = {}
@@ -312,7 +356,7 @@ def main():
     result["preexisting_local_output_reference"] = baseline
     def save():
         (root / "results.json").write_text(json.dumps(result, indent=2) + "\n")
-    with credential_helper(args.credential_rc) as helper:
+    with credential_helper(args.credential_rc, endpoint=endpoint) as helper:
         startup = [config["bazel"], "--nosystem_rc", "--nohome_rc",
                    f"--output_user_root={root / 'bazel-user'}", f"--output_base={root / 'bazel-output'}",
                    "--experimental_remote_repo_contents_cache", "--digest_function=BLAKE3",
@@ -320,7 +364,8 @@ def main():
         contents_cache = root / "repository-contents-cache" if args.fresh_repo_contents_cache else None
         raw_workspace_log = helper.parent / "workspace-events.bin"
         command = startup + ["build", result["target"]] + rbe_flags(
-            helper, args.force_execution, contents_cache, args.accept_remote_cache, config["repository_cache"])
+            helper, args.force_execution, contents_cache, args.accept_remote_cache, config["repository_cache"],
+            endpoint=endpoint, instance=instance, extra_flags=extra_flags)
         command += ["--noshow_progress", "--color=no", "--curses=no",
                     f"--build_event_json_file={root / 'build.bep.jsonl'}", "--build_event_publish_all_actions",
                     f"--profile={root / 'build.profile.gz'}", f"--execution_log_json_file={root / 'build.execution.json'}",
