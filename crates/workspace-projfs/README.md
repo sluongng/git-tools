@@ -1,65 +1,25 @@
 # workspace-projfs
 
-Windows 10 **2004+**, NTFS and the **Client-ProjFS** optional feature are required.
-This is a writable, fixed-commit projection: Git reads blobs lazily through the
-shared `workspace-core` backend; NTFS/ProjFS retain local writes, renames and
-deletion tombstones. Stopping the provider does not remove local data.
+Library and `git-projfs` executable for writable, fixed-commit Git projections.
+Requires Windows 10 2004+, NTFS and the **Client-ProjFS** optional feature.
+The CLI does not enable that OS feature. NTFS retains local edits and tombstones.
 
 ```powershell
 git clone --bare --filter=blob:none https://github.com/bazelbuild/bazel.git C:\cache\bazel.git
 cargo run -p workspace-projfs -- mount --repo C:\cache\bazel.git --root C:\work\bazel --state C:\state\bazel
-# In another terminal:
 Get-Content C:\work\bazel\MODULE.bazel
-cargo run -p workspace-projfs -- digest C:\work\bazel\MODULE.bazel
 ```
 
-Before starting the provider, sizes are batch-warmed from the durable cache,
-local Git, GitHub tree API (for github.com), or protocol-v2 object-info. Missing
-metadata fails rather than downloading file blobs merely to list a directory.
-This metadata phase is blocking; file-content hydration remains lazy. For private
-GitHub repos pass `--github-token-env GITHUB_TOKEN` (token value never in flags).
+Sizes are warmed before serving from local metadata, GitHub's tree API or native
+object-info; missing sizes fail rather than download contents for a listing.
+Private GitHub metadata uses `--github-token-env NAME`. Content remains lazy.
+Start with an empty root; keep the clone and state outside it. Restart the same
+root/state/base to retain edits, Git index and local commits. Use a new root/state
+for a changed base; general checkout/merge/rebase is unsupported.
 
-The root must initially be empty. Keep state and the bare repository outside the
-root. Restart with the same root, state and resolved commit; a changed base is
-rejected to protect local edits. Use a new pair of directories for another base.
-The provider never calls destructive placeholder-update APIs. Native `git status`,
-`git add`, `git commit`, and `git log` use an isolated admin directory and index
-in state, with a `.git` pointer in the root and alternates to the source objects.
-Restart preserves staged changes and local commits; source refs are unchanged.
-Commits do not rebase the fixed projected base: use a new root/state to mount
-another base. Checkout, merge and rebase are not supported.
-
-Directory renames and hardlinks are deliberately rejected: preserving all lazy
-children after those operations needs a view-rebasing design. File renames are
-supported, including renamed placeholders that have not yet hydrated. Symlink
-placeholders use the native ProjFS 2004+ API; only relative, snapshot-resolvable targets
-are supported. Direct directory targets are typed correctly, and direct symlink chains are
-depth/cycle checked. Intermediate symlink components, dangling/external targets
-and non-UTF-8/Windows-ambiguous targets are rejected on access. Gitlinks are empty
-directories; submodules are not mounted. Invalid Win32 names and case collisions fail at
-startup. Digests hash actual file bytes, so computing one hydrates that file and
-never returns the old digest for an edited file. A concurrent same-size write
-can race digest computation, as with normal filesystem hashing.
-
-## Native smoke check
-
-On a Windows machine with Client-ProjFS already enabled, run:
-
-```powershell
-cargo test -p workspace-projfs
-cargo test -p workspace-projfs --test native -- --ignored --nocapture
-```
-
-The ignored test starts the **real** provider on a temporary NTFS directory. It
-checks enumeration, lazy reads, native writes, rename-before-hydration, delete,
-and provider restart persistence. Linux unit tests and cross-compilation do not
-substitute for this test. Enabling the optional Windows feature is an OS change
-and is intentionally not done by the CLI or test.
-
-API references: [ProjFS callbacks](https://learn.microsoft.com/en-us/windows/win32/projfs/projfs-callback-functions),
-[file data and symlinks](https://learn.microsoft.com/en-us/windows/win32/projfs/providing-file-data),
-[on-disk states](https://learn.microsoft.com/en-us/windows/win32/projfs/file-states-and-operations).
-
-The native Git admin test can run without the ProjFS feature installed:
-`cargo test -p workspace-projfs --no-default-features --test worktree`. This checks Git
-index/ref preservation only, not projection callbacks.
+Native Git status/add/commit/log use private admin state. Directory renames and
+hardlinks are unsupported; file renames are supported. Symlinks must be relative
+and snapshot-resolvable; dangling/external targets and intermediate symlink components are rejected.
+Invalid Win32 names and case collisions fail at startup; submodules are not mounted.
+The digest command hashes actual bytes and hydrates that file, including edits.
+See [platform setup and native checks](../../docs/platforms.md).

@@ -1,176 +1,84 @@
-# Proxy reference
+# Git proxy reference
 
-[Quick start](../crates/git-proxy/README.md) · [Design](architecture.md)
+[Setup](../crates/git-proxy/README.md) · [Architecture](../README.md#architecture)
 
-## Repository configuration
+## Repository and access model
 
-`--repo ALIAS=UPSTREAM` is repeatable. Aliases contain only ASCII letters, digits,
-`-` and `_`; clients cannot supply an upstream URL or filesystem path. Cache
-ownership is enforced by a nonblocking OS file lock, including across processes.
-Changing an existing alias's upstream is rejected rather than mixing objects or
-serving a previous repository under a new identity.
+Repeat `--repo ALIAS=UPSTREAM` for allowed repositories. Aliases accept ASCII
+letters, digits, `-` and `_`; clients cannot choose upstream URLs or disk paths.
+Changing an alias's upstream is rejected. A nonblocking process lock gives each
+cache directory one owner.
 
-## Cache and consistency
+The first request creates a **full all-refs bare mirror** without checkout.
+This costs a full mirror transfer before clients benefit from shared content.
+Mirrors have no automatic quota or eviction. Ref advertisements refresh after
+`--refresh-ttl-seconds` (default 10); refresh failure fails the request rather than
+silently advertising stale refs. Requests within the TTL can use an offline origin.
 
-The first request clones a **full bare mirror**, without checkout, into a temporary
-directory and atomically renames it into place. Concurrent requests share one
-in-process repository lock. This does **not** reduce first-touch upstream transfer
-compared to a full mirror; the benefit is sharing subsequent reads and providing
-server-side metadata. Generated fetch responses have a separate bounded cache
-described below. Bare mirrors themselves have no eviction or garbage-collection
-policy; distributed replication and repository deduplication are not implemented.
+This is a **trusted-local, unauthenticated** service, listening on
+`127.0.0.1:8082` by default. Every frontend client can read all objects in configured
+repositories, including unreachable cached objects. Origin credentials belong to
+the server's native Git transport, not the client; interactive prompts are disabled
+and global/system Git config is not read. Do not expose private caches to untrusted
+clients. TLS, multi-tenant authorization and reverse-proxy-grade rate limits are
+not provided.
 
-Advertisements atomically refresh all refs and update symbolic HEAD after `--refresh-ttl-seconds` (default 10).
-Objects are fetched before refs become visible by Git's normal fetch transaction.
-Refresh failures fail that request rather than silently advertising stale refs.
-Requests inside the TTL can use an offline origin. TTLs reset after process
-restart; a fresh advertisement then contacts origin. The upstream default branch is queried explicitly after each successful refresh.
+## Endpoints
 
-The only Git endpoints are `GET /git/ALIAS.git/info/refs?service=git-upload-pack`
-and `POST /git/ALIAS.git/git-upload-pack`. No pushes or dumb HTTP filesystem
-reads are exposed. `Git-Protocol` is forwarded to native `git http-backend` as
-`GIT_PROTOCOL`. Native Git implements negotiation, shallow clones, filtering,
-object-info, pack production, and backpressure. Response packs are streamed in
-64 KiB chunks, not accumulated in Rust memory. Missing full-SHA1 `want` requests
-trigger an object-only upstream fetch with ref-preserving flags, then native Git
-serves the request. This permits pinned commits no longer present in current refs
-when upstream policy permits fetching them.
+| Endpoint | Purpose |
+| --- | --- |
+| `GET /git/ALIAS.git/info/refs?service=git-upload-pack` | Advertise refs/capabilities |
+| `POST /git/ALIAS.git/git-upload-pack` | Native smart Git fetch |
+| `POST /api/v1/repos/ALIAS/objects` | Batch object sizes and optional BLAKE3 mappings |
+| `POST /api/v1/repos/ALIAS/cas-sync` | Queue optional [CAS publication](proxy-cas-sync.md) |
+| `GET /api/v1/cache/stats`, `GET /metrics` | JSON/Prometheus cache metrics |
+| `GET /api/v1/storage` | Bounded storage accounting; check `complete` and errors |
+
+Pushes and dumb filesystem HTTP reads are rejected. Native Git handles filtering,
+shallow negotiation, pack generation and object-info. A missing pinned SHA1 may
+be fetched without moving mirror refs, subject to upstream policy. Protocol
+object-info requires support in the selected native Git; the JSON API does not.
+
+```sh
+curl --fail-with-body http://127.0.0.1:8082/api/v1/repos/project/objects \
+  -H 'Content-Type: application/json' \
+  -d '{"oids":["FULL_40_HEX_OBJECT_ID"],"blake3":true}'
+```
+
+Requests accept at most 16,384 full SHA1 IDs, deduplicate them and return objects
+in first-occurrence order. Invalid requests return 400; a missing object fails
+the whole batch with 404. Sizes exclude Git's object header. LFS/annex pointer
+sizes describe the pointer, not its external payload.
+
+BLAKE3 requires server `--enable-blake3` and request `"blake3":true`. Only blobs
+receive a digest; Fjall persists `(hash, size_bytes)` mappings across restart.
+The digest hashes raw content, not Git headers. A mapping neither proves remote
+CAS presence nor waits for a queued upload.
 
 ## Generated fetch-response cache
 
-The Packhorse-inspired cache reuses **complete generated Git responses**, not
-arbitrary POST bodies or individual on-disk Git packs. Eligible protocol-v2 fetches
-with full object-ID wants and a final `done` share a producer. The first client
-streams the native response while it is written to a temporary file; matching
-concurrent clients wait for successful completion, then read the published file.
-Later requests avoid `git http-backend` and pack generation entirely.
+The Packhorse-inspired cache stores complete successful protocol-v2 fetch
+responses. Matching requests reuse generation; concurrent followers wait for
+completion. Keys include repository/ref identity and exact negotiation arguments.
+Unsupported or intermediate negotiation bypasses the cache. Failed, partial and
+oversize responses are not published; capacity failures fall back to native serving.
 
-Keys include a stable repository/ref-view identity, protocol capabilities,
-and exact fetch arguments, including wants, haves, shallow/deepen state, filters,
-and pack options. Only top-level agent/session IDs are ignored. Unknown extensions,
-intermediate negotiation rounds, ref-name wants, and packfile-URI requests bypass
-the cache. Under a ref read lease, the identity includes the configured upstream,
-refs, HEAD, local Git configuration and selected Git version. Refresh attempts
-invalidate the process-local identity memo even on failure; unchanged views can
-reuse completed responses across refreshes and restarts.
+| Option | Default |
+| --- | ---: |
+| `--pack-cache-max-bytes` | 1GiB |
+| `--pack-cache-max-entry-bytes` | 64MiB |
+| `--pack-cache-max-entries` | 1,024 |
+| `--pack-cache-ttl-seconds` | 300 |
 
-Admission requires HTTP 200, Git's upload-pack content type, successful native Git
-exit, complete packet framing and pack section, and no protocol error. This framing
-validation is not an independent pack checksum verification. Partial/error responses
-are never published. A disconnected first client can leave a useful fill running;
-the fill retains its HTTP slot and has a 600-second absolute deadline, including
-time blocked by that client's backpressure. Oversize responses, disk errors, and
-quota exhaustion fall back to uncached serving without truncating a valid response.
-Followers of a failed fill generate their own uncached response.
+Zero byte/entry capacity disables caching. TTL/LRU skip active readers. Completed
+responses survive restart after validation without renewing expiry. Headers expose
+`X-Git-Proxy-Pack-Cache: MISS`, `HIT`, `COALESCED` or `BYPASS`.
 
-| Option | Default | Meaning |
-| --- | --- | --- |
-| `--pack-cache-max-bytes` | 1 GiB | Completed files plus reserved in-flight capacity; `0` disables caching. |
-| `--pack-cache-max-entry-bytes` | 64 MiB | Maximum response size, reserved before generation. |
-| `--pack-cache-max-entries` | 1,024 | Completed entries plus in-flight producers; `0` disables caching. |
-| `--pack-cache-ttl-seconds` | 300 | Completed-entry lifetime. |
+Mirror objects, digest metadata and old cache schemas are outside this response
+quota; it is not a filesystem-wide disk limit. Remove obsolete schemas only while
+unused. Storage accounting is an estimate, not exclusive physical usage.
+The cache does not provide object-storage offload or `packfile-uris`.
 
-LRU eviction and TTL expiry skip files pinned by active readers. Completed
-responses persist in `generated-packs/schema-v2/` with bounded per-response
-manifests. Publication syncs the body and manifest, then atomically commits the
-manifest and syncs the directory. Restart validates headers, length, BLAKE3 body
-integrity and the original wall-clock TTL; it does not renew entry lifetime.
-Recovery admits only entries within current limits, hashes at most the configured
-cache-byte budget and rejects directories exceeding 100,000 entries. Invalid,
-expired and incomplete owned schema-v2 files are removed. Older schema directories
-are untouched and **outside the active cache quota**; remove obsolete data only
-while no process uses it. Recovery adds startup reads/checksumming; durable fills
-add sync I/O. Mirrors and Fjall digest mappings persist separately. The process
-owner lock also covers detached fills and readers. This is the local cache/coalescing part of the
-Packhorse approach; object-storage offload via `packfile-uris` and live fan-out to
-followers are not implemented.
-
-Responses expose `X-Git-Proxy-Pack-Cache: MISS`, `HIT`, `COALESCED`, or `BYPASS`.
-`GET /api/v1/cache/stats` returns JSON; `GET /metrics` exposes Prometheus counters
-and gauges. These include hits, misses, coalesced requests, capacity/disabled-cache
-bypasses, bytes generated/served, evictions, errors, entries, reserved/completed
-bytes, in-flight fills, native HTTP backend calls, and eligible fetch generations.
-Unrecognized/non-fetch requests bypass without entering these cache counters.
-
-The mirrors set `uploadpack.allowFilter=true`,
-`uploadpack.allowAnySHA1InWant=true`, and `transfer.advertiseObjectInfo=true`.
-Object-info depends on a native Git version implementing that extension; use the
-same Git build as git-vfs's `remote-object-info` implementation. The service does
-not reimplement this wire extension in Rust. The JSON API below works independently
-of whether the selected Git advertises object-info.
-
-## Storage accounting
-
-`GET /api/v1/storage` reports file counts, logical bytes and allocated-byte
-estimates for mirror packs/indexes/loose objects, auxiliary mirror files,
-generated responses, digest databases and proxy auxiliary files. It is accounting
-only: there is no new eviction, retention or repository-lease policy.
-
-Snapshots are cached for five seconds. Each scan is limited to 100,000 visited
-entries, two seconds and depth 64; concurrent uncached scans return 503. Check
-`complete` and errors before interpreting totals. Symlinks are skipped and hard
-links deduplicated. Allocated bytes are estimates, not exclusive physical usage:
-filesystem compression, shared extents, directory metadata and unrecognized paths
-are not fully represented. This does not count writable VFS overlays or agent
-commits, and does not make them disposable caches.
-
-## Batch object metadata API
-
-```sh
-curl -s http://127.0.0.1:8082/api/v1/repos/bazel/objects \
-  -H 'Content-Type: application/json' \
-  -d '{"oids":["0123456789012345678901234567890123456789"],"blake3":true}'
-```
-
-```json
-{"objects":[{"oid":"0123456789012345678901234567890123456789","size_bytes":123,"object_type":"blob","blake3":{"hash":"64 lowercase hexadecimal characters","size_bytes":123}}]}
-```
-
-At most 16,384 full 40-hex SHA1 IDs per request. IDs are canonicalized to lowercase,
-deduplicated, and returned in first-occurrence order. Unknown fields or invalid
-IDs return 400; a missing object returns 404 for the entire batch, never a partial
-success. Objects absent locally are requested from the configured upstream.
-Sizes describe the **raw Git object content**, excluding Git's object header.
-For LFS/annex pointers, that means the pointer blob, not external payload content.
-
-BLAKE3 must be explicitly enabled on the server (`--enable-blake3`) and requested
-with `"blake3":true`. Only blobs receive a digest; trees/commits/tags return null.
-Hashing reads raw blob content through `git cat-file`, bounded to 64 KiB at a time,
-with no Git header. The result is the REAPI BLAKE3 digest `(hash, size_bytes)`;
-returning it does not prove CAS presence or wait for publication. An optional
-[CAS sync worker](proxy-cas-sync.md) queues background uploads when configured.
-Fjall stores raw 20-byte Git SHA1 keys and 40-byte values (32-byte BLAKE3 plus big-endian u64 size),
-using synchronous durable commits. Persisted mappings are reused after restart.
-
-## Operational boundary
-
-Default listen address is **127.0.0.1:8082**. This is a trusted-local prototype,
-not a multi-tenant or authenticated hosting service. Each configured upstream is
-trusted and all its cached objects are readable by frontend clients, including
-objects not reachable from advertised refs. No client credentials or authorization
-headers are forwarded. Origin access uses the server Git process's own configured
-transport identity; interactive credential prompts are disabled and global/system
-Git config is intentionally not read. SSH configuration remains server-local.
-Do not expose a private upstream cache to untrusted clients.
-
-Limits: 16 active HTTP requests, 2 MiB buffered request bodies, 16,384 IDs/wants, 30-second request-body deadline,
-32 KiB CGI headers (8 KiB per line), 30-second CGI header timeout, and 600-second
-Git operation/stream deadlines. Gzip request bodies are decoded with the same 2 MiB limit.
-Cache-mutating operations are serialized per repo;
-read requests can run concurrently. Child process groups are killed on cancellation,
-timeout, or response disconnect, except for bounded shared cache fills described above. Origin errors return 502 with details confined to
-server logs. Stream deadlines are checked when the body is polled. A stalled client under
-backpressure can retain its slot until polling resumes or it disconnects;
-there is no reverse-proxy-grade rate limiting, mirror disk quota, retry policy, or TLS.
-
-## Validation
-
-`cargo test -p git-proxy` runs loopback integration tests: actual smart HTTP
-blobless shallow clone and native object-info query, concurrent first touch,
-owner-lock rejection, pinned-object fetch without ref mutation, offline cache reuse within TTL, ref and default-branch refresh, metadata
-validation/missing objects, push/dumb-read rejection, persistent BLAKE3 results,
-and correctness in the presence of Git replacement refs. Cache tests cover real
-clone reuse, filter isolation, decoded gzip equivalence, concurrent coalescing,
-oversize fallback, refresh-failure invalidation, malformed/error responses,
-deadline/disconnect behavior, reader pinning, quotas, LRU/TTL, and disk failure.
-Set `GIT_PROXY_TEST_GIT` to override the native Git executable used by the tests.
+Requests are bounded to 16 active operations and 2MiB bodies; native Git operations
+have a 600s deadline. Slow clients can retain slots under backpressure. Keep free
+disk space and frontend access controlled independently of these logical limits.

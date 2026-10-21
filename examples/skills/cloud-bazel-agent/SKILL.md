@@ -71,6 +71,7 @@ the shared daemon as routine agent cleanup. After a crash, run
 do not bypass that check or claim transparent recovery.
 
 Only disposable verified bytes enter the shared LRU CAS. Native Git packs and
-repository trees have separate cleanup policies. Action-result TTL and positive
-presence hints default to zero; configure longer retention only from an actual
-backend contract, not inferred from a successful upload.
+repository trees have separate cleanup policies. The daemon defaults to a fixed one-hour action-result TTL and best-effort
+background retention maintenance. Without an upstream retention assumption, set
+`cache.action_cache_ttl_seconds` and `cache.upstream_retention_seconds` to zero;
+a successful upload is not a retention guarantee.

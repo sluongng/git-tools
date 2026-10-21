@@ -1,12 +1,8 @@
 # git-proxy
 
-Read-only Git smart-HTTP pull-through cache backed by native Git bare mirrors.
-It shares generated fetch responses and serves batch object sizes plus optional
-persistent Git SHA1 → BLAKE3 content digests. Fjall is the only database.
-
-## Run
-
-From the project root:
+Library and read-only smart-HTTP Git proxy executable. Native bare mirrors and
+cached fetch responses serve multiple clients; object metadata APIs expose
+sizes and optional persistent Git SHA1 → BLAKE3 mappings.
 
 ```sh
 cargo build --release -p git-proxy
@@ -17,105 +13,24 @@ git clone --depth 1 --filter=blob:none --no-checkout \
   http://127.0.0.1:8082/git/bazel.git
 ```
 
-`--repo ALIAS=UPSTREAM` is repeatable; clients cannot choose arbitrary upstreams.
-Use `--git /path/to/git` to select native Git. Cache directories have one owner;
-changing an existing alias's upstream is rejected.
+`--repo ALIAS=UPSTREAM` is repeatable; clients cannot select arbitrary origins.
+The first request creates a **full all-refs mirror**, even for a shallow clone.
+Prepare it before assigning agents with `POST /api/v1/repos/ALIAS/prepare`;
+`GET /api/v1/repos/ALIAS/status` reports readiness and ref age. A usable mirror
+is not necessarily fresh, and failed ref refreshes do not silently serve stale ads.
 
-## Cache behavior
+Mirrors and digest mappings persist separately from the bounded TTL/LRU fetch
+response cache. Mirrors have no disk quota or automatic GC. Cache directories
+have one owner; changing an existing alias's origin is rejected.
 
-The first request creates a **full all-refs bare mirror**, even for shallow
-clients. Initial population can be slower than direct cloning; later clients
-share it. Mirrors have no disk quota, eviction, or garbage-collection policy.
+`POST /api/v1/repos/ALIAS/objects` accepts batched object IDs and optional BLAKE3
+lookup. LFS/annex metadata describes pointer blobs, not external payloads.
+Mappings do not prove remote CAS residency. Optional [CAS sync](../../docs/proxy-cas-sync.md)
+publishes raw contents; its verified local CAS has a separate byte quota.
+`GET /api/v1/cache/stats`, `/api/v1/storage` and `/metrics` expose usage.
 
-Advertisements refresh refs after `--refresh-ttl-seconds` (default 10).
-Refresh failures fail the request; restart resets freshness and contacts origin.
-Prewarm before assigning agents, rather than paying mirror population on their
-first clone:
-
-```sh
-curl --fail -X POST http://127.0.0.1:8082/api/v1/repos/bazel/prepare
-curl --fail http://127.0.0.1:8082/api/v1/repos/bazel/status
-```
-
-Preparation uses the advertisement freshness policy and coalesces overlapping
-attempts, including failures. It is request-owned, not a detached background job.
-Status is nonblocking and reports validated `ready`, `preparation_in_progress`,
-`preparation_waiters`, `ref_age_seconds`, attempt/failure counts and a sanitized
-`last_outcome`.
-Ready means the local mirror is usable, **not** that refs are fresh; age is unknown
-until this process successfully clones or refreshes. Restart validates origin
-binding again. Existing-object metadata stays available during refresh, but smart
-HTTP still waits for the ref-view gate to preserve response-cache correctness.
-Refresh failure never silently serves a stale advertisement. Graceful shutdown
-drains active requests; native Git operations retain their timeout/cancellation
-limits. No automatic Git maintenance or mirror eviction is performed.
-
-Native Git handles negotiation, filtering, shallow clones, and pack production.
-Native `object-info` requires a Git build implementing that extension; the JSON
-metadata API works independently of it.
-
-Eligible complete protocol-v2 fetch responses share a Packhorse-inspired cache.
-The producer streams while filling; matching followers wait for completion.
-Unknown requests and intermediate negotiation bypass it; partial/error responses
-are never cached. Completed responses survive restart with original TTL and verified body integrity;
-mirrors and digest mappings persist separately.
-
-| Option | Default |
-|---|---:|
-| `--pack-cache-max-bytes` | 1 GiB |
-| `--pack-cache-max-entry-bytes` | 64 MiB |
-| `--pack-cache-max-entries` | 1,024 |
-| `--pack-cache-ttl-seconds` | 300 |
-
-A zero byte/entry quota disables response caching. TTL/LRU eviction skips active
-readers. See [cache admission and consistency](../../docs/proxy-reference.md#generated-fetch-response-cache)
-for keying, deadlines, coalescing, and fallback guarantees.
-
-## Object metadata and monitoring
-
-```sh
-curl -s http://127.0.0.1:8082/api/v1/repos/bazel/objects \
-  -H 'Content-Type: application/json' \
-  -d '{"oids":["FULL_40_HEX_OBJECT_ID"],"blake3":true}'
-```
-
-Up to 16,384 SHA1 IDs / 2 MiB request. Responses contain `oid`, `size_bytes`,
-`object_type`, and optional `blake3: {hash, size_bytes}`. Missing objects fail the
-whole batch. LFS/annex sizes describe pointer blobs, not external payloads.
-BLAKE3 hashes raw blob content, excluding Git's header; persisted mappings survive
-restart. Mapping generation alone does not prove CAS residency. Optional
-[asynchronous CAS sync](../../docs/proxy-cas-sync.md) publishes raw blobs using
-REAPI, negotiated FastCDC, and bounded Executor-style upload batches.
-Use `--cas-endpoint` to opt in. Presence observations default to zero TTL
-(recheck each sync); only configure a positive TTL when remote retention permits it.
-
-CAS publication retains verified raw payloads in a separate `cas-content-v1`
-[local-cas](../local-cas/README.md) cache: `--cas-cache-max-bytes` defaults to
-4 GiB and must be at least `--cas-staging-limit-bytes` (default 64 MiB).
-Remote eviction can reuse these bytes without another Git extraction; it still
-requires FindMissingBlobs and successful upload. Upload/CDC/retry readers hold
-leases, so LRU GC cannot remove their files. Restart re-verifies retained content.
-This budget does **not** cap Git mirrors or the generated pack-response cache;
-those have different formats and ownership. Cache keys include hashed remote
-authorization scope, never plaintext credentials.
-
-`GET /api/v1/cache/stats` returns cache JSON; `GET /metrics` exposes Prometheus
-metrics, including local CAS hits, fetches, bytes and evictions. `/api/v1/storage`
-accounts retained payloads separately as `cas_content`. Fetches report `X-Git-Proxy-Pack-Cache` as `MISS`, `HIT`, `COALESCED`, or
-`BYPASS`.
-
-## Deployment boundary
-
-Defaults to **127.0.0.1:8082**, without TLS or frontend authentication.
+The default loopback listener has **no frontend authentication or TLS**.
 All cached objects, including unreachable ones, are readable by clients.
-Keep private upstreams on trusted networks. No frontend credentials are forwarded;
-origin access uses server-local transport identity with interactive prompts off.
-No push or dumb-HTTP file serving is exposed.
-
-- [Full reference](../../docs/proxy-reference.md): API validation, auth,
-  cancellation, resource limits, durability, and tests.
-- [Architecture and research](../../docs/architecture.md): Goblet, Origin,
-  Gitretriever, and Packhorse.
-- [Mapping benchmarks](../../docs/benchmarks.md).
-- Test: `cargo test -p git-pack-cache -p reapi -p git-proxy`;
-  select Git with `GIT_PROXY_TEST_GIT`.
+Use only within a trusted boundary. Origin access uses server-local transport
+identity; frontend credentials are not forwarded. Push and dumb HTTP are unsupported.
+See the [API/configuration reference](../../docs/proxy-reference.md) and `--help`.

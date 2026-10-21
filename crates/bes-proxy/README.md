@@ -1,17 +1,15 @@
 # bes-proxy
 
-Durable BuildBuddy BES relay hosted by the [`workspace` daemon](../workspace-daemon/README.md).
-Concurrent streams receive ordered local ACKs only after a Fjall `SyncAll`
-transaction, grouping up to 64 ready events / 256 KiB without waiting.
-`[bes].batch_max_events = 1` disables grouping; ACKs still require fsync.
-Forwarding continues independently; matching upstream ACKs delete
-payloads atomically with their replay checkpoints. Pending data is never LRU-evicted.
+Library providing the [`workspace`](../workspace-daemon/README.md) daemon's durable
+BuildBuddy BES relay. Multiple streams receive ordered ACKs only after durable
+local persistence; forwarding proceeds independently.
 
-Streams stay open until their terminal event; disconnects cancel incomplete
-attempts without finalizing them. Restart replays complete pending streams;
-unfinished streams wait for their client to reconnect. Exhausted retries retain
-the backlog for `workspace retry-bes`. Completed receipts have bounded retention.
+Upstream ACKs atomically remove payloads and advance replay checkpoints.
+Pending data is never LRU-evicted. Restart replays complete streams; unfinished
+streams wait for reconnection. Exhausted retries retain the backlog for
+`workspace retry-bes`. Keep the state directory across restarts.
 
-See [`[bes]` configuration](../../examples/workspace.toml) and
-[retry/timeout semantics](../../docs/reapi-policy.md#bes-is-a-separate-policy).
+Configure batching, limits and upstream settings in [`[bes]`](../../examples/workspace.toml).
+Setting `batch_max_events = 1` disables grouping, not durability.
+See [retry/timeout policy](../../docs/reapi-policy.md).
 This is a BuildBuddy-targeted relay, not a generic lifecycle-ordering gateway.

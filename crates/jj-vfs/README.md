@@ -1,13 +1,10 @@
 # jj-vfs
 
-Compiled Jujutsu 0.46 working-copy backend for an active writable `git-vfs`
-mount. Initialize from the mount root. Stock `jj` cannot load this backend: use `git-jj` for all commands in
-these workspaces.
-For native Git origins, mount with `--size-source=git` to batch size metadata
-before the initial status scan. That metadata phase is included in mount startup.
+Jujutsu working-copy library plus the custom `git-jj` executable for an active
+writable Linux `git-vfs` mount. Stock `jj` cannot load this backend.
 
 ```sh
-# Start git-vfs mount with --overlay /state/agent first, then:
+# Start git-vfs with --overlay /state/agent first.
 cd /workspace/agent
 git-jj init-vfs --overlay /state/agent
 git-jj status
@@ -15,27 +12,13 @@ git-jj describe -m 'Implement change'
 git-jj new
 ```
 
-The backend adopts the mount's base without checking it out, consults its
-bounded change journal, and reuses **base-only** SHA-1 metadata. Dirty/new
-contents are stored in jj's Git backend before a snapshot is committed.
-Checkout uses jj's differential disk implementation, so the mount can keep
-its original base while changed files live in the durable overlay. Keep both
-`.jj` state and overlay; neither is disposable cache.
+The backend adopts the mounted base without checkout, reads the change journal,
+and stores changed contents in jj's Git backend before committing a snapshot.
+Keep `.jj` state and the overlay: neither is disposable cache.
+For native Git origins, `--size-source=git` warms size metadata before mounting.
 
-Initial scope: Linux writable mounts, UTF-8 paths, regular files, executable
-bits and symlinks. Repositories containing Git submodules are rejected before
-initialization. Sparse checkout and `workspace add` are rejected. Conflicted
-paths cannot yet be snapshotted; do not use this backend for merge/conflict
-resolution. Journal overflow safely falls back to a metadata walk. This is not
-a general stock-jj plugin or a guarantee that all jj commands are supported.
-
-Real-mount verification:
-
-```sh
-GIT_VFS_BIN="$PWD/target/debug/git-vfs" \
-  cargo test --locked -p jj-vfs --test lifecycle -- --ignored
-# Or compile with Bazel/RBE and run the mount fixture on this Linux host:
-bazel test --config=rbe //crates/jj-vfs:mounted_tests --test_output=all
-```
-
-Upstream extension API: [custom working copy example](https://github.com/jj-vcs/jj/blob/v0.46.0/cli/examples/custom-working-copy/main.rs).
+Supports UTF-8 regular files, executable bits and symlinks. Submodules, sparse
+checkout, `workspace add`, and snapshotting conflicts are unsupported; this is
+not a general merge/conflict-resolution backend. Journal overflow falls back to
+a metadata walk. See [platform support](../../docs/platforms.md) and
+[build/test instructions](../../docs/development.md).

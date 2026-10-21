@@ -1,37 +1,23 @@
-# Local CAS
+# local-cas
 
-Reusable verified SHA256/BLAKE3 disk cache. Open a directory once with
-`LocalCas::open(path, source, config)` and share its `Arc<LocalCas>` across
-consumers. `BlobSource` supplies remote bytes; `content(artifact).await` returns
-an `Arc<CachedBlob>` lease whose path is safe to read until the lease is dropped.
+Reusable verified SHA256/BLAKE3 disk-cache library. Open a directory once with
+`LocalCas::open(path, source, config)` and share its `Arc<LocalCas>` across consumers.
+`BlobSource` supplies bytes; `content(artifact).await` returns a verified
+`Arc<CachedBlob>` lease whose file remains readable until the lease is dropped.
+
+Byte-bounded LRU eviction skips active leases and reserves in-flight bytes.
+Concurrent fetches coalesce; count, byte and timeout budgets are configurable.
+Retained bytes are reverified after restart. Recency hints survive graceful
+shutdown, but crashes may lose recent touches. Keys include authorization scope,
+instance and digest; callers must assign distinct identities to distinct scopes.
+
+`cached_content` probes verified local bytes without fetching;
+`cached_content_for_maintenance` also suppresses user-access notifications.
+`content_from` supplies a per-request source such as native Git extraction.
+Stop producers and callers, then await `wait_for_idle()` before shutdown;
+caller timeout alone does not prove background work has stopped.
+
+A directory has one owning process; independent processes need separate directories.
+Store **only disposable immutable blobs** here, never edits or namespace databases.
 The [`workspace` daemon](../workspace-daemon/README.md) shares this owner across
-source mounts, BOS, Git uploads and its REAPI cache front end.
-
-- Exact hash/size verification and atomic publication; retained bytes are
-  reverified after restart.
-- Byte-bounded LRU eviction skips active leases and reserves in-flight bytes;
-  maintained byte totals and an ordered index avoid full-cache victim scans.
-- Concurrent reads coalesce; a cancelled/timed-out waiter does not cancel another
-  reader's admitted fetch. Concurrency, byte and timeout budgets are configurable.
-- `cached_content` returns a verified lease or a miss without creating/joining a
-  fetch. Use it for local-only probes so their misses cannot fail another source.
-  `cached_content_for_maintenance` also suppresses user-access notifications, so
-  background uploads cannot keep themselves eligible for further maintenance.
-- Keys include backend authorization scope, instance, digest function, hash and
-  size. Callers must give distinct backend identities to distinct auth scopes.
-- One owner holds the cache directory lock, including outstanding leases and
-  verification work. Independent processes need separate directories; this is a
-  shared library/handle, not a multi-process cache daemon.
-- Recency hints are checkpointed at most once per five seconds and on graceful
-  last-owner drop. Restart restores hints, not verification authority. Use
-  `flush_recency()` for an explicit checkpoint; crashes can lose recent touches.
-
-`content_from(artifact, source)` supports an owned per-request source, such as
-Git extraction for proxy uploads. Shutdown must stop submissions, cancel/drain
-its producers and callers, then await `wait_for_idle()`; timing out a caller is
-not proof that admitted work stopped. Public leases must still be dropped.
-
-Store **only disposable, immutable CAS blobs** here. Writable workspace/output
-payloads and namespace databases must remain separate. `output-core` supports
-`Tree::open_with_cache` to reuse content without sharing writable authority.
-See [cache ownership and eviction policy](../../docs/architecture.md).
+source/output services, Git uploads and its REAPI cache front end.
