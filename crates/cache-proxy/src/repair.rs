@@ -156,10 +156,14 @@ impl Upstream {
         self.observe_gzip(RpcMethod::WriteByteStream, &response);
         let committed = response.into_inner().committed_size;
         if (!compressed && committed == expected_size)
-            || (compressed
-                && (committed == -1
-                    || (finished.load(Ordering::Acquire)
-                        && committed == wire.load(Ordering::Relaxed) as i64)))
+            || (compressed && committed == -1)
+            || (finished.load(Ordering::Acquire)
+                && reapi::upload_ack::valid_completed_write_ack(
+                    compressed,
+                    committed,
+                    expected_size,
+                    wire.load(Ordering::Relaxed),
+                ))
         {
             Ok(())
         } else {

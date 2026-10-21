@@ -931,10 +931,14 @@ impl CasClient {
                 .context("CAS upload reader timed out")?
                 .context("CAS upload reader task failed")??;
             ensure!(
-                response.committed_size == produced,
+                ::reapi::upload_ack::valid_completed_write_ack(
+                    compressed,
+                    response.committed_size,
+                    expected_size,
+                    produced as u64,
+                ),
                 "CAS ByteStream committed_size mismatch"
             );
-            ensure!(compressed, "CAS ByteStream committed_size mismatch");
         }
         let done = UploadStats {
             uploaded_bytes: expected_size as u64,
@@ -1516,9 +1520,17 @@ pub(crate) mod tests {
                 } else {
                     assert!(r.resource_name.is_empty());
                 }
-                if self.0.lock().unwrap().mode == "early-complete" {
+                let mode = self.0.lock().unwrap().mode;
+                if matches!(
+                    mode,
+                    "early-complete" | "early-logical-size" | "early-wire-size"
+                ) {
                     return Ok(Response::new(bs::WriteResponse {
-                        committed_size: if resource.contains("/compressed-blobs/") {
+                        committed_size: if mode == "early-wire-size" {
+                            r.data.len() as i64
+                        } else if mode == "early-complete"
+                            && resource.contains("/compressed-blobs/")
+                        {
                             -1
                         } else {
                             resource.rsplit('/').next().unwrap().parse().unwrap()
@@ -1559,8 +1571,12 @@ pub(crate) mod tests {
             Ok(Response::new(bs::WriteResponse {
                 committed_size: if s.mode == "stream-minus-one" {
                     -1
-                } else if s.mode == "wrong-compressed-size" {
+                } else if s.mode == "logical-compressed-size" {
                     d.size_bytes
+                } else if s.mode == "negative-compressed-size" {
+                    -2
+                } else if s.mode == "wrong-compressed-size" {
+                    d.size_bytes + wire_len + 1
                 } else {
                     (if compressed { wire_len } else { d.size_bytes })
                         - if s.mode == "short-write" { 1 } else { 0 }
@@ -2162,6 +2178,7 @@ pub(crate) mod tests {
         for (mode, compressed) in [
             ("", true),
             ("stream-minus-one", true),
+            ("logical-compressed-size", true),
             ("early-complete", true),
             ("early-complete", false),
         ] {
@@ -2183,16 +2200,39 @@ pub(crate) mod tests {
                 assert!(stats.uploaded_wire_bytes < stats.uploaded_bytes / 100);
             }
         }
-        let running = compressed_server(false, 1, "wrong-compressed-size", false, true).await;
-        assert!(
-            running
-                .client
-                .upload_missing(&[b])
+        for mode in [
+            "wrong-compressed-size",
+            "negative-compressed-size",
+            "short-write",
+        ] {
+            let running = compressed_server(false, 1, mode, false, true).await;
+            assert!(
+                running
+                    .client
+                    .upload_missing(std::slice::from_ref(&b))
+                    .await
+                    .unwrap_err()
+                    .to_string()
+                    .contains("committed_size"),
+                "{mode}"
+            );
+        }
+        // Only the dedup marker may end a compressed upload before the verified
+        // producer completes. Neither logical size nor a partial wire count is
+        // evidence that the unread portion of the spool was valid.
+        for mode in ["early-logical-size", "early-wire-size"] {
+            let running = compressed_server(false, 1, mode, false, true).await;
+            assert!(
+                tokio::time::timeout(
+                    Duration::from_secs(2),
+                    running.client.upload_missing(std::slice::from_ref(&early)),
+                )
                 .await
-                .unwrap_err()
-                .to_string()
-                .contains("committed_size")
-        );
+                .expect("early non-dedup response must not hang the producer")
+                .is_err(),
+                "{mode}"
+            );
+        }
     }
     #[tokio::test]
     async fn grpc_zstd_cdc_chunks_use_batch_or_stream_and_compress_fallback() {

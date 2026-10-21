@@ -1,6 +1,7 @@
 //! Pinned Remote Execution API, ByteStream and Build Event Service bindings.
 pub mod compression;
 pub mod policy;
+pub mod upload_ack;
 #[allow(clippy::doc_lazy_continuation)]
 pub mod proto {
     pub mod google {
