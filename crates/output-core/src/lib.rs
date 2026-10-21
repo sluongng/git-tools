@@ -734,11 +734,13 @@ impl Tree {
             let ids: Vec<_> = ns
                 .state
                 .retired
-                .range((
-                    std::ops::Bound::Excluded(ns.gc_cursor),
-                    std::ops::Bound::Unbounded,
-                ))
-                .chain(ns.state.retired.range(..=ns.gc_cursor))
+                // Children normally have newer IDs than their parents. Prefer
+                // them first, avoiding one whole sweep per directory level.
+                // Renames can reverse that order; boundary collection still
+                // repeats complete rounds until no dependency progress occurs.
+                .range(..ns.gc_cursor)
+                .rev()
+                .chain(ns.state.retired.range(ns.gc_cursor..).rev())
                 .take(budget)
                 .copied()
                 .collect();

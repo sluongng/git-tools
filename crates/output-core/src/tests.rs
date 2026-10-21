@@ -811,6 +811,24 @@ async fn collection_skips_inflight_io_pending_publication_and_retained_parents()
     tree.clean("nested").await.unwrap();
     let collected = tree.reclaim_retired_at_boundary(2).unwrap();
     assert_eq!(collected.reclaimed_nodes, 66);
+    assert!(
+        collected.visited <= 132,
+        "a natural directory chain must not require quadratic candidate visits"
+    );
+    assert_eq!(tree.retirement_metrics().retained_nodes, 0);
+    // Renames can make a parent newer than its child. Traversal preference is
+    // not a dependency guarantee; complete rounds must still reclaim both.
+    let old_parent = tree.ensure_dir("old/child").await.unwrap().parent;
+    let newer_parent = tree.ensure_dir("new").await.unwrap();
+    tree.rename(old_parent, "child", newer_parent.id, "child")
+        .await
+        .unwrap();
+    tree.clean("old").await.unwrap();
+    tree.clean("new").await.unwrap();
+    assert_eq!(
+        tree.reclaim_retired_at_boundary(2).unwrap().reclaimed_nodes,
+        3
+    );
     assert_eq!(tree.retirement_metrics().retained_nodes, 0);
 }
 
