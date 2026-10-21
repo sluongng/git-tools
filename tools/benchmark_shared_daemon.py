@@ -3,6 +3,14 @@
 
 The plan JSON contains cwd, source_revision, and command (an argv array). Use
 {output_base}, {output_user_root}, {artifacts}, and {endpoint} placeholders.
+The command must use --output_base={output_base} before build/test and exactly
+one --remote_cache={endpoint}. Optional --remote_executor must match (or be
+empty for local execution). Endpoint options are moved after other build
+options, including --config. Startup --bazelrc files and Bazel-compatible
+executable wrappers are trusted; shell command strings are unsupported.
+Use --name=value for build/test options not listed by this harness. Common
+boolean options and split values such as --config NAME and --test_arg VALUE
+are supported; ambiguous bare options are rejected before execution.
 Each invocation owns a new output root. --noop additionally measures the same
 server with local state; it is not another remote-cache reuse sample. This does
 not purge remote/OS/repository caches and never claims they are cold.
@@ -15,6 +23,7 @@ import glob
 import json
 import os
 import platform
+import re
 from pathlib import Path
 import subprocess
 import statistics
@@ -23,19 +32,147 @@ import time
 from benchmark_developer_build import bep_metrics, redact, sanitize_artifact
 
 
+STARTUP_VALUES = set(('bazelrc command_port connect_timeout_secs '
+    'local_startup_timeout_secs digest_function unix_digest_hash_attribute_name '
+    'server_javabase host_jvm_args host_jvm_profile io_nice_level install_base '
+    'macos_qos_class max_idle_secs output_base output_user_root server_jvm_out '
+    'failure_detail_out experimental_cgroup_parent extra_classpath').split())
+STARTUP_BOOLS = set(('batch batch_cpu_scheduling block_for_lock quiet client_debug '
+    'preemptible fatal_event_bus_exceptions host_jvm_debug autodetect_server_javabase '
+    'idle_server_tasks shutdown_on_low_sys_mem '
+    'ignore_all_rc_files unlimit_coredumps write_command_log windows_enable_symlinks '
+    'experimental_remote_repo_contents_cache '
+    'experimental_run_in_user_cgroup home_rc system_rc workspace_rc').split())
+# Bazel 9.2 FlagInfo.requires_value=false includes boolean, TriState,
+# BoolOrEnumConverter (subcommands), and Void expansion options.
+BUILD_NULLARY = set(('show_progress show_loading_progress subcommands '
+    'sandbox_debug verbose_failures keep_going '
+    'build_event_publish_all_actions '
+    'remote_accept_cached remote_upload_local_results remote_cache_compression '
+    'remote_download_toplevel remote_download_minimal remote_download_all '
+    'google_default_credentials '
+    'test_keep_going cache_test_results build_tests_only check_up_to_date '
+    'check_tests_up_to_date').split())
+BUILD_VALUES = set(('config test_arg test_env test_filter test_output test_timeout '
+    'show_result '
+    'test_size_filters test_tag_filters build_tag_filters runs_per_test '
+    'profile build_event_json_file build_event_binary_file build_event_text_file '
+    'execution_log_json_file execution_log_binary_file execution_log_compact_file '
+    'repository_cache repo_contents_cache disk_cache jobs color curses '
+    'remote_instance_name remote_timeout remote_download_outputs credential_helper '
+    'strategy spawn_strategy compilation_mode platform_suffix platforms '
+    'extra_execution_platforms extra_toolchains modify_execution_info '
+    'experimental_remote_cache_ttl experimental_workspace_rules_log_file').split())
+
+
+def owned_commands(plan, values):
+    """Validate the Bazel argv interface, not an arbitrary shell command.
+
+    A direct executable may be Bazelisk or a trusted Bazel-compatible wrapper.
+    Transparent env assignments are supported; shell/interpreter command prefixes
+    are not. RC files remain caller-trusted (including credential helpers).
+    """
+    if not values['endpoint']:
+        raise ValueError('A nonempty remote cache endpoint is required')
+    raw = plan.get('command')
+    if (not isinstance(raw, list) or not raw or not all(isinstance(x, str) for x in raw)
+            or not raw[0]):
+        raise ValueError('command must be a nonempty argv array')
+    command = [value.format_map(values) for value in raw]
+    if any(x.split('=', 1)[0] in ('--remote_header', '--remote_cache_header',
+            '--remote_exec_header', '--bes_header') for x in command):
+        raise ValueError('Use credential helpers, never credentials in argv')
+    index = 1
+    if Path(command[0]).name == 'env':
+        while index < len(command) and re.fullmatch(r'[A-Za-z_][A-Za-z_0-9]*=.*', command[index], re.DOTALL):
+            index += 1
+        if index == len(command) or not command[index] or command[index].startswith('-'):
+            raise ValueError('env prefix must contain only assignments and a Bazel executable')
+        index += 1
+    startup = {}
+    while index < len(command) and command[index].startswith('--'):
+        option, separator, value = command[index][2:].partition('=')
+        boolean = option in STARTUP_BOOLS or (option.startswith('no') and option[2:] in STARTUP_BOOLS)
+        if boolean and not separator:
+            if option == 'batch':
+                raise ValueError('Fresh-server cells require server mode, not --batch')
+            index += 1
+            continue
+        if option not in STARTUP_VALUES:
+            raise ValueError('Unsupported Bazel startup option; use a Bazel-compatible argv interface')
+        if not separator:
+            index += 1
+            if index == len(command) or command[index].startswith('--'):
+                raise ValueError('Missing Bazel startup option value')
+            value = command[index]
+        startup.setdefault(option, []).append(value)
+        index += 1
+    if index == len(command) or command[index] not in ('build', 'test'):
+        raise ValueError('command must invoke Bazel build or test after startup options')
+    for option in ('output_base', 'output_user_root'):
+        supplied = startup.get(option, [])
+        if (option == 'output_base' or supplied) and supplied != [values[option]]:
+            raise ValueError(f'--{option} must select its owned placeholder exactly once')
+    prefix = command[:index]
+    build = command[index:]
+    # Parse arity before moving endpoints: Bazel consumes the next token as a
+    # value even when it looks like an option or the -- target separator.
+    selected = {}
+    retained, targets = [build[0]], []
+    index = 1
+    while index < len(build):
+        item = build[index]
+        if item == '--':
+            targets = build[index:]
+            break
+        option, separator, value = item.partition('=')
+        if option in ('--output_base', '--output_user_root', '--invocation_policy', '--flagfile'):
+            raise ValueError('Ownership/startup or opaque option overrides are not supported after build/test')
+        if option in ('--remote_cache', '--remote_executor'):
+            if not separator:
+                index += 1
+                if index == len(build):
+                    raise ValueError('Missing remote endpoint value')
+                value = build[index]
+            selected.setdefault(option, []).append(value)
+        else:
+            retained.append(item)
+            if item.startswith('-'):
+                name = option.removeprefix('--')
+                boolean = name in BUILD_NULLARY or (name.startswith('no') and name[2:] in BUILD_NULLARY)
+                if not item.startswith('--'):
+                    raise ValueError('Use long --name=value build/test options, not short options')
+                if not separator and name in BUILD_VALUES:
+                    index += 1
+                    if index == len(build):
+                        raise ValueError('Missing build/test option value')
+                    retained.append(build[index])
+                elif not separator and not boolean:
+                    raise ValueError('Ambiguous build/test option; use --name=value form')
+        index += 1
+    if selected.get('--remote_cache') != [values['endpoint']]:
+        raise ValueError('--remote_cache must select the cell endpoint exactly once')
+    if '--remote_executor' in selected and selected['--remote_executor'] not in ([values['endpoint']], ['']):
+        raise ValueError('--remote_executor must match the cell endpoint exactly once')
+    command = prefix + retained + [f'{key}={items[0]}' for key, items in selected.items()] + targets
+    shutdown = prefix + ['shutdown']
+    if 'shutdown_command' in plan:
+        supplied = plan['shutdown_command']
+        if (not isinstance(supplied, list) or not all(isinstance(x, str) for x in supplied)
+                or [x.format_map(values) for x in supplied] != shutdown):
+            raise ValueError('shutdown_command must equal the validated owned startup plus shutdown')
+    return command, shutdown
+
+
 def run(args):
     plan = json.loads(args.plan.read_text())
-    if not isinstance(plan.get('command'), list) or not all(isinstance(x, str) for x in plan['command']):
-        raise ValueError('command must be an argv array')
     root = args.output.resolve()
     values = {'output_base': str(root / 'output-base'),
               'output_user_root': str(root / 'output-user-root'),
               'artifacts': str(root), 'endpoint': args.endpoint}
-    command = [value.format_map(values) for value in plan['command']]
-    if any(any(flag in x for flag in ('--remote_header=', '--remote_cache_header=', '--remote_exec_header=', '--bes_header=')) for x in command):
-        raise ValueError('Use credential helpers, never credentials in argv')
+    command, shutdown = owned_commands(plan, values)
     result = {'schema_version': 1, 'label': args.label, 'source_revision': plan['source_revision'],
-              'cwd': plan['cwd'], 'endpoint': args.endpoint, 'command': command,
+              'cwd': plan['cwd'], 'endpoint': args.endpoint, 'command': command, 'shutdown_command': shutdown,
               'plan_sha256': hashlib.sha256(args.plan.read_bytes()).hexdigest(),
               'harness_sha256': hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
               'cache_state': args.cache_state, 'samples': [],
@@ -172,9 +309,6 @@ def run(args):
             execute(command, 'same-server-noop')
     finally:
         # Only our own root: no bazel clean, no main-checkout server disruption.
-        index = next(i for i,x in enumerate(command) if x in ('build','test'))
-        shutdown = ([value.format_map(values) for value in plan['shutdown_command']]
-                    if 'shutdown_command' in plan else command[:index] + ['shutdown'])
         start = time.perf_counter()
         with (root / 'shutdown.log').open('wb') as output:
             stopped = subprocess.run(shutdown, cwd=plan['cwd'], stdout=output, stderr=subprocess.STDOUT,

@@ -256,6 +256,15 @@ def sha256(path):
     return h.hexdigest()
 
 
+def resolve_bazel(executable):
+    """Freeze PATH selection before provenance capture and command execution."""
+    resolved = shutil.which(executable)
+    if resolved is None:
+        raise ValueError('Bazel executable not found or not executable: ' + str(executable))
+    # Keep the selected launcher path (including symlinks): wrappers can use argv[0].
+    return Path(resolved).absolute()
+
+
 def json_records(path):
     if not path.exists():
         return []
@@ -322,6 +331,10 @@ def main():
     if args.force_execution:
         args.accept_remote_cache = True
     config = json.loads(args.config.read_text())
+    try:
+        bazel = resolve_bazel(config['bazel'])
+    except ValueError as exc:
+        p.error(str(exc))
     endpoint, instance, extra_flags = rbe_settings(config)
     workspace = args.workspace.resolve()
     root = args.output.resolve()
@@ -351,13 +364,13 @@ def main():
         if candidate.is_file():
             baseline[relative] = {"size_bytes": candidate.stat().st_size, "sha256": sha256(candidate)}
     result["provenance"] = {"harness_sha256": sha256(Path(__file__)), "config_sha256": sha256(args.config),
-                            "bazel_sha256": sha256(Path(config["bazel"]).resolve()),
+                            "bazel_sha256": sha256(bazel),
                             "git_sha256": sha256(Path(shutil.which(config["git"]) or config["git"]).resolve())}
     result["preexisting_local_output_reference"] = baseline
     def save():
         (root / "results.json").write_text(json.dumps(result, indent=2) + "\n")
     with credential_helper(args.credential_rc, endpoint=endpoint) as helper:
-        startup = [config["bazel"], "--nosystem_rc", "--nohome_rc",
+        startup = [str(bazel), "--nosystem_rc", "--nohome_rc",
                    f"--output_user_root={root / 'bazel-user'}", f"--output_base={root / 'bazel-output'}",
                    "--experimental_remote_repo_contents_cache", "--digest_function=BLAKE3",
                    "--unix_digest_hash_attribute_name=" + ("user.blake3" if args.arm == "vfs-blake3-xattr" else "")]

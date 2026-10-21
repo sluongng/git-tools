@@ -1,0 +1,15 @@
+load("@rules_python//python:defs.bzl", "py_test")
+
+py_test(
+    name = "benchmark_harness_test",
+    size = "small",
+    srcs = [
+        "benchmark_harness_test.py",
+        "benchmark_shared_daemon.py",
+        "benchmark_agent_rbe.py",
+        "benchmark_developer_build.py",
+    ],
+    imports = ["."],
+    legacy_create_init = False,
+    main = "benchmark_harness_test.py",
+)
