@@ -116,7 +116,18 @@ pub trait Projection: Send + Sync {
     async fn stat(&self, path: &str, digest_function: i32) -> Result<Option<TreeStat>>;
     async fn refresh(&self, prefix: &str) -> Result<()>;
     async fn clean(&self, prefix: &str) -> Result<()>;
+    /// The caller must quiesce native filesystem users and RPC admission.
+    /// This is an explicit maintenance boundary, not build finalization.
+    async fn maintain_quiescent(&self, _transaction_budget: usize) -> Result<MaintenanceOutcome> {
+        Ok(MaintenanceOutcome::Unsupported)
+    }
     async fn shutdown(&self) -> Result<()>;
+}
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MaintenanceOutcome {
+    Unsupported,
+    BusyRetained,
+    Rotated { collection: Collection },
 }
 #[derive(Clone, Serialize, Deserialize)]
 struct Record {

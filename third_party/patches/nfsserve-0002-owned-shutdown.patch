@@ -1,0 +1,218 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Son Luong Ngoc <26684313+sluongng@users.noreply.github.com>
+Date: Wed, 21 Oct 2026 13:00:00 +0000
+Subject: [PATCH] nfsserve: own and drain serving tasks at shutdown
+
+A listener is not the lifetime of its detached connections or nested RPC
+workers. Filesystem generations cannot be reclaimed merely by aborting
+accept. Add explicit stop-aware serving that owns all spawned work, stops
+new task admission, and aborts and joins every worker before returning.
+Retain the existing forever-serving API as a compatibility wrapper.
+Reap completed workers while serving to keep task ownership bounded.
+---
+diff --git a/src/context.rs b/src/context.rs
+--- a/src/context.rs
++++ b/src/context.rs
+@@ -9,6 +9,7 @@
+ #[derive(Clone)]
+ pub struct RPCContext {
+     pub local_port: u16,
++    pub(crate) tasks: Arc<crate::task_group::TaskGroup>,
+     pub requests: Arc<tokio::sync::Semaphore>,
+     pub client_addr: String,
+     pub auth: crate::rpc::auth_unix,
+diff --git a/src/lib.rs b/src/lib.rs
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -1,6 +1,7 @@
+ #![cfg_attr(feature = "strict", deny(warnings))]
+ 
+ mod context;
++mod task_group;
+ mod rpc;
+ mod rpcwire;
+ mod write_counter;
+diff --git a/src/rpcwire.rs b/src/rpcwire.rs
+--- a/src/rpcwire.rs
++++ b/src/rpcwire.rs
+@@ -181,7 +181,7 @@
+             let fragment = std::mem::take(&mut self.cur_fragment);
+             let context = self.context.clone();
+             let send = self.reply_send_channel.clone();
+-            tokio::spawn(async move {
++            let _ = self.context.tasks.spawn(async move {
+                 let _permit = permit;
+                 let mut write_buf: Vec<u8> = Vec::new();
+                 let mut write_cursor = Cursor::new(&mut write_buf);
+diff --git a/src/tcp.rs b/src/tcp.rs
+--- a/src/tcp.rs
++++ b/src/tcp.rs
+@@ -10,6 +10,7 @@
+ use tracing::{debug, info};
+ 
+ use crate::context::RPCContext;
++use crate::task_group::{TaskGroup, StopOnDrop};
+ use crate::rpcwire::*;
+ use crate::transaction_tracker::TransactionTracker;
+ use crate::vfs::NFSFileSystem;
+@@ -34,8 +35,8 @@
+     let _ = socket.set_nodelay(true);
+     let (mut reader,mut writer) = socket.into_split();
+     // Independent forwarding prevents request backpressure from starving replies.
+-    let reader_task = tokio::spawn(async move { let _ = tokio::io::copy(&mut reader,&mut socksend).await; });
+-    let parser_task = tokio::spawn(async move {
++    let reader_task = context.tasks.spawn(async move { let _ = tokio::io::copy(&mut reader,&mut socksend).await; });
++    let parser_task = context.tasks.spawn(async move {
+         while message_handler.read().await.is_ok() {}
+     });
+     let result = async {
+@@ -44,8 +45,8 @@
+         }
+         Ok(())
+     }.await;
+-    reader_task.abort();
+-    parser_task.abort();
++    if let Some(task) = reader_task { task.abort(); }
++    if let Some(task) = parser_task { task.abort(); }
+     result
+ }
+ 
+@@ -159,27 +160,60 @@
+ 
+     /// Loops forever and never returns handling all incoming connections.
+     async fn handle_forever(&self) -> io::Result<()> {
++        let (_sender, receiver) = tokio::sync::watch::channel(false);
++        self.handle_until_shutdown(receiver).await
++    }
++}
++
++impl<T: NFSFileSystem + Send + Sync + 'static> NFSTcpListener<T> {
++    /// Serve until the owner signals true (or drops the sender). Before return,
++    /// abort and join every connection, parser, reader and RPC worker. Call only
++    /// after native clients have unmounted when retiring filesystem generations.
++    pub async fn handle_until_shutdown(
++        &self,
++        mut shutdown: tokio::sync::watch::Receiver<bool>,
++    ) -> io::Result<()> {
++        let tasks = Arc::new(TaskGroup::default());
++        let _stop_on_drop = StopOnDrop(tasks.clone());
+         let connections = Arc::new(tokio::sync::Semaphore::new(16));
+-        let requests = Arc::new(tokio::sync::Semaphore::new(self.arcfs.max_inflight_requests().clamp(1, 1024)));
+-        loop {
+-            let connection = connections.clone().acquire_owned().await.map_err(io::Error::other)?;
+-            let (socket, _) = self.listener.accept().await?;
+-            let context = RPCContext {
+-                local_port: self.port,
+-                requests: requests.clone(),
+-                client_addr: socket.peer_addr().unwrap().to_string(),
+-                auth: crate::rpc::auth_unix::default(),
+-                vfs: self.arcfs.clone(),
+-                mount_signal: self.mount_signal.clone(),
+-                export_name: self.export_name.clone(),
+-                transaction_tracker: self.transaction_tracker.clone(),
+-            };
+-            info!("Accepting connection from {}", context.client_addr);
+-            debug!("Accepting socket {:?} {:?}", socket, context);
+-            tokio::spawn(async move {
+-                let _connection = connection;
+-                let _ = process_socket(socket, context).await;
+-            });
++        let requests = Arc::new(tokio::sync::Semaphore::new(
++            self.arcfs.max_inflight_requests().clamp(1, 1024),
++        ));
++        let result = async {
++            loop {
++                let incoming = async {
++                    let connection = connections
++                        .clone()
++                        .acquire_owned()
++                        .await
++                        .map_err(io::Error::other)?;
++                    let (socket, _) = self.listener.accept().await?;
++                    Ok::<_, io::Error>((connection, socket))
++                };
++                let (connection, socket) = tokio::select! {
++                    biased;
++                    _ = shutdown.wait_for(|stopped| *stopped) => return Ok(()),
++                    incoming = incoming => incoming?,
++                };
++                let context = RPCContext {
++                    local_port: self.port,
++                    tasks: tasks.clone(),
++                    requests: requests.clone(),
++                    client_addr: socket.peer_addr()?.to_string(),
++                    auth: crate::rpc::auth_unix::default(),
++                    vfs: self.arcfs.clone(),
++                    mount_signal: self.mount_signal.clone(),
++                    export_name: self.export_name.clone(),
++                    transaction_tracker: self.transaction_tracker.clone(),
++                };
++                let _ = tasks.spawn(async move {
++                    let _connection = connection;
++                    let _ = process_socket(socket, context).await;
++                });
++            }
+         }
+-    }
+-}
++        .await;
++        tasks.shutdown().await;
++        result
++    }
++}
+diff --git a/src/task_group.rs b/src/task_group.rs
+new file mode 100644
+--- /dev/null
++++ b/src/task_group.rs
+@@ -0,0 +1,51 @@
++use std::{
++    future::Future,
++    sync::{Arc, Mutex},
++};
++use tokio::task::{AbortHandle, JoinSet};
++
++#[derive(Default)]
++struct State {
++    stopped: bool,
++    tasks: JoinSet<()>,
++}
++
++/// One serving invocation owns all connections and their nested parser/reader
++/// and RPC workers. Stopping admission and taking the set is one atomic step.
++#[derive(Default)]
++pub(crate) struct TaskGroup {
++    state: Mutex<State>,
++}
++impl TaskGroup {
++    pub(crate) fn spawn(
++        &self,
++        future: impl Future<Output = ()> + Send + 'static,
++    ) -> Option<AbortHandle> {
++        let mut state = self.state.lock().unwrap();
++        if state.stopped {
++            return None;
++        }
++        // Reap finished requests during ordinary serving: shutdown ownership
++        // must not turn a long-lived server into an unbounded task archive.
++        while state.tasks.try_join_next().is_some() {}
++        Some(state.tasks.spawn(future))
++    }
++    fn stop(&self) -> JoinSet<()> {
++        let mut state = self.state.lock().unwrap();
++        state.stopped = true;
++        state.tasks.abort_all();
++        std::mem::take(&mut state.tasks)
++    }
++    pub(crate) async fn shutdown(&self) {
++        let mut tasks = self.stop();
++        while tasks.join_next().await.is_some() {}
++    }
++}
++/// Cancellation still closes every task. Explicit shutdown additionally joins
++/// them, proving filesystem references have ended before a generation is freed.
++pub(crate) struct StopOnDrop(pub(crate) Arc<TaskGroup>);
++impl Drop for StopOnDrop {
++    fn drop(&mut self) {
++        drop(self.0.stop());
++    }
++}

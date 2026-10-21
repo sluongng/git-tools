@@ -1,6 +1,8 @@
 //! Lazy, writable CAS outputs over single-user loopback NFSv3.
 //! Server restart requires unmount/remount: process-generation handles expire.
-use anyhow::{Context, Result, bail, ensure};
+#[cfg(target_os = "macos")]
+use anyhow::ensure;
+use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
 #[cfg(target_os = "macos")]
 use nfsserve::tcp::{NFSTcp, NFSTcpListener};
@@ -20,6 +22,7 @@ pub struct OutputNfs {
     tree: Arc<Tree>,
     // NFSv3 exposes no client CLOSE. Every clone shares the server-generation fence.
     _generation: Arc<GenerationLease>,
+    handle_generation: [u64; 2],
     invalidating: Arc<Mutex<HashSet<u64>>>,
     hydration: Arc<Semaphore>,
 }
@@ -154,6 +157,24 @@ fn convert_attr(attr: sattr3) -> std::result::Result<SetAttr, nfsstat3> {
         mtime,
     })
 }
+fn new_handle_generation() -> [u64; 2] {
+    use std::{
+        hash::BuildHasher,
+        sync::{
+            OnceLock,
+            atomic::{AtomicU64, Ordering},
+        },
+    };
+    static PROCESS: OnceLock<u64> = OnceLock::new();
+    static NEXT: AtomicU64 = AtomicU64::new(1);
+    let process = *PROCESS.get_or_init(|| {
+        std::collections::hash_map::RandomState::new()
+            .hash_one((std::process::id(), std::time::SystemTime::now()))
+    });
+    let generation = NEXT.fetch_add(1, Ordering::Relaxed);
+    assert!(generation != 0, "NFS handle generations exhausted");
+    [process, generation]
+}
 impl OutputNfs {
     pub fn new(tree: Arc<Tree>) -> Self {
         Self::with_read_limit(tree, 64)
@@ -166,6 +187,7 @@ impl OutputNfs {
         );
         Self {
             _generation: Arc::new(tree.pin_generation()),
+            handle_generation: new_handle_generation(),
             tree,
             invalidating: Arc::new(Mutex::new(HashSet::new())),
             hydration: Arc::new(Semaphore::new(limit)),
@@ -227,6 +249,30 @@ impl NFSFileSystem for OutputNfs {
     }
     fn root_dir(&self) -> u64 {
         self.tree.root_id()
+    }
+    fn id_to_fh(&self, id: fileid3) -> nfs_fh3 {
+        let mut data = Vec::with_capacity(24);
+        for value in [self.handle_generation[0], self.handle_generation[1], id] {
+            data.extend_from_slice(&value.to_le_bytes());
+        }
+        nfs_fh3 { data }
+    }
+    fn fh_to_id(&self, handle: &nfs_fh3) -> std::result::Result<fileid3, nfsstat3> {
+        if handle.data.len() != 24 {
+            return Err(nfsstat3::NFS3ERR_BADHANDLE);
+        }
+        let values: Vec<_> = handle
+            .data
+            .chunks_exact(8)
+            .map(|bytes| u64::from_le_bytes(bytes.try_into().unwrap()))
+            .collect();
+        if values[..2] != self.handle_generation {
+            return Err(nfsstat3::NFS3ERR_STALE);
+        }
+        Ok(values[2])
+    }
+    fn serverid(&self) -> cookieverf3 {
+        (self.handle_generation[0] ^ self.handle_generation[1]).to_le_bytes()
     }
     async fn lookup(
         &self,
@@ -600,384 +646,5 @@ pub fn ensure_unmounted(root: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Owns both the server and native mount. Call shutdown before dropping it.
-/// Failed unmount leaves the server alive rather than stranding a mounted client.
-pub struct NfsMount {
-    fs: OutputNfs,
-    root: PathBuf,
-    #[cfg(target_os = "macos")]
-    identity: MountIdentity,
-    control: Arc<AsyncMutex<()>>,
-    server: Mutex<Option<tokio::task::JoinHandle<std::io::Result<()>>>>,
-}
-impl NfsMount {
-    pub async fn start(tree: Arc<Tree>, root: impl AsRef<Path>) -> Result<Self> {
-        #[cfg(not(target_os = "macos"))]
-        {
-            let _ = (tree, root);
-            bail!("output-nfs native mounting is supported only on macOS")
-        }
-        #[cfg(target_os = "macos")]
-        {
-            ensure_unmounted(root.as_ref())?;
-            std::fs::create_dir_all(root.as_ref())?;
-            let root = root.as_ref().canonicalize()?;
-            ensure!(
-                std::fs::read_dir(&root)?.next().is_none(),
-                "output mountpoint must be empty"
-            );
-            // The old native mount is gone, so its process-generation handles
-            // cannot return. Never do this while an NFS server lease is alive.
-            tree.reclaim_retired_at_boundary(64)?;
-            let fs = OutputNfs::new(tree);
-            let listener = NFSTcpListener::bind("127.0.0.1:0", fs.clone()).await?;
-            let port = listener.get_listen_port();
-            let server = tokio::spawn(async move { listener.handle_forever().await });
-            let options = format!(
-                "vers=3,tcp,locallocks,noresvport,port={port},mountport={port},retrycnt=0,nobrowse,nosuid,nodev"
-            );
-            let result = tokio::process::Command::new("/sbin/mount_nfs")
-                .args(["-o", &options, "127.0.0.1:/"])
-                .arg(&root)
-                .output()
-                .await;
-            match result {
-                Ok(result) if result.status.success() => {}
-                Ok(result) => {
-                    server.abort();
-                    bail!("mount_nfs: {}", String::from_utf8_lossy(&result.stderr))
-                }
-                Err(error) => {
-                    server.abort();
-                    return Err(error.into());
-                }
-            }
-            let mut matches = mounted_exports()?
-                .into_iter()
-                .filter(|(path, _)| path == &root);
-            let identity = matches
-                .next()
-                .context("mounted NFS export absent from mount table")?
-                .1;
-            ensure!(
-                matches.next().is_none(),
-                "multiple mounts appeared at output root"
-            );
-            Ok(Self {
-                identity,
-                fs,
-                root,
-                control: Arc::new(AsyncMutex::new(())),
-                server: Mutex::new(Some(server)),
-            })
-        }
-    }
-    // Admission is cancellable. Once admitted, namespace publication and the
-    // complete native invalidation barrier retain their guard independently of
-    // the caller: dropping a JoinHandle does not abort its task.
-    async fn complete<F, Fut>(&self, operation: F) -> Result<()>
-    where
-        F: FnOnce(NfsPublisher) -> Fut + Send + 'static,
-        Fut: std::future::Future<Output = Result<()>> + Send + 'static,
-    {
-        let guard = self.control.clone().lock_owned().await;
-        let publisher = NfsPublisher {
-            fs: self.fs.clone(),
-            root: self.root.clone(),
-        };
-        tokio::spawn(async move {
-            let _guard = guard;
-            operation(publisher).await
-        })
-        .await
-        .context("native publication task failed")?
-    }
-}
-#[derive(Clone)]
-struct NfsPublisher {
-    fs: OutputNfs,
-    root: PathBuf,
-}
-impl NfsPublisher {
-    // chmod re-enters the server. Never hold Tree namespace locks here.
-    async fn invalidate(&self, paths: Vec<(String, Node)>) -> Result<()> {
-        let mut failure = None;
-        for (relative, node) in paths {
-            let _marker = self.fs.mark(vec![node.id])?;
-            let root = self.root.clone();
-            let mode = node.mode;
-            let result =
-                tokio::task::spawn_blocking(move || invalidate_no_follow(&root, &relative, mode))
-                    .await;
-            if let Err(error) = result
-                .context("native invalidation task failed")
-                .and_then(|result| result)
-            {
-                if failure.is_none() {
-                    failure = Some(error);
-                }
-            }
-        }
-        match failure {
-            Some(error) => Err(error),
-            None => Ok(()),
-        }
-    }
-    async fn publish(&self, path: &str, node: Option<Node>) -> Result<()> {
-        let ancestors = self.ancestor_nodes(path)?;
-        // A newly created ancestor may itself have a cached ENOENT. Refresh
-        // from the nearest visible ancestor before traversing deeper paths.
-        let mut before = ancestors.clone();
-        before.reverse();
-        if let Some(node) = node {
-            before.push((path.to_owned(), node));
-        }
-        before.extend(ancestors);
-        self.invalidate(before).await
-    }
-    fn ancestor_nodes(&self, path: &str) -> Result<Vec<(String, Node)>> {
-        let mut current = Path::new(path).parent();
-        let mut nodes = Vec::new();
-        while let Some(parent) = current {
-            let relative = parent.to_str().context("non-UTF8 path")?;
-            nodes.push((relative.to_owned(), self.fs.tree.resolve(relative)?));
-            current = parent.parent();
-        }
-        Ok(nodes)
-    }
-}
-#[async_trait]
-impl Projection for NfsMount {
-    fn root(&self) -> &Path {
-        &self.root
-    }
-    async fn ensure_dir(&self, path: &str) -> Result<()> {
-        let path = path.to_owned();
-        self.complete(move |publisher| async move {
-            publisher.fs.tree.ensure_dir(&path).await?;
-            publisher.publish(&path, None).await
-        })
-        .await
-    }
-    async fn stage(&self, path: &str, artifact: Artifact) -> Result<()> {
-        let path = path.to_owned();
-        self.complete(move |publisher| async move {
-            let previous = publisher.fs.tree.resolve(&path).ok();
-            publisher.fs.tree.stage(&path, artifact).await?;
-            let node = publisher.fs.tree.resolve(&path)?;
-            // Keep the retired generation marked through every native cache barrier.
-            let _old_marker = publisher
-                .fs
-                .mark(previous.iter().map(|node| node.id).collect())?;
-            publisher.publish(&path, Some(node)).await
-        })
-        .await
-    }
-    async fn stat(&self, path: &str, digest_function: i32) -> Result<Option<TreeStat>> {
-        self.fs.tree.stat(path, digest_function).await
-    }
-    async fn refresh(&self, prefix: &str) -> Result<()> {
-        // Remote presence checks must not block publication for other bases.
-        let plan = self.fs.tree.prepare_refresh(prefix).await?;
-        self.complete(move |publisher| async move {
-            let removed = publisher.fs.tree.apply_refresh(plan).await?;
-            let mut nodes = Vec::new();
-            let mut seen = HashSet::new();
-            for path in removed {
-                for item in publisher.ancestor_nodes(&path)? {
-                    if seen.insert(item.1.id) {
-                        nodes.push(item);
-                    }
-                }
-            }
-            nodes.sort_by_key(|(path, _)| std::cmp::Reverse(Path::new(path).components().count()));
-            publisher.invalidate(nodes).await
-        })
-        .await
-    }
-    async fn clean(&self, prefix: &str) -> Result<()> {
-        let prefix = prefix.to_owned();
-        self.complete(move |publisher| async move {
-            publisher.fs.tree.clean(&prefix).await?;
-            let mut nodes = publisher.ancestor_nodes(&prefix)?;
-            if nodes.is_empty() {
-                nodes.push(("".to_owned(), publisher.fs.tree.get(1)?));
-            }
-            publisher.invalidate(nodes).await
-        })
-        .await
-    }
-    async fn shutdown(&self) -> Result<()> {
-        let _guard = self.control.lock().await;
-        if self
-            .server
-            .lock()
-            .map_err(|_| anyhow::anyhow!("server lock poisoned"))?
-            .is_none()
-        {
-            return Ok(());
-        }
-        #[cfg(target_os = "macos")]
-        {
-            let matches: Vec<_> = mounted_exports()?
-                .into_iter()
-                .filter(|(path, _)| path == &self.root)
-                .collect();
-            if !matches
-                .iter()
-                .any(|(_, identity)| identity == &self.identity)
-            {
-                // A manual unmount already removed our export. A replacement
-                // mount belongs to somebody else and must not be unmounted.
-                if let Some(server) = self
-                    .server
-                    .lock()
-                    .map_err(|_| anyhow::anyhow!("server lock poisoned"))?
-                    .take()
-                {
-                    server.abort()
-                }
-                return Ok(());
-            }
-            ensure!(
-                matches.len() == 1,
-                "output root is covered by another mount; refusing to unmount it"
-            );
-        }
-        let result = tokio::time::timeout(
-            std::time::Duration::from_secs(10),
-            tokio::process::Command::new("/sbin/umount")
-                .arg(&self.root)
-                .kill_on_drop(true)
-                .output(),
-        )
-        .await
-        .context("unmount timed out; server retained for the mounted client")??;
-        ensure!(
-            result.status.success(),
-            "unmount {}: {}",
-            self.root.display(),
-            String::from_utf8_lossy(&result.stderr)
-        );
-        if let Some(server) = self
-            .server
-            .lock()
-            .map_err(|_| anyhow::anyhow!("server lock poisoned"))?
-            .take()
-        {
-            server.abort()
-        }
-        Ok(())
-    }
-}
-
-#[cfg(test)]
-mod publication_tests {
-    use super::*;
-    use std::{
-        io::Write,
-        sync::atomic::{AtomicBool, Ordering},
-        time::Duration,
-    };
-
-    struct Source;
-    #[async_trait]
-    impl output_core::BlobSource for Source {
-        async fn fetch(&self, _: &Artifact, _: &mut std::fs::File) -> Result<()> {
-            bail!("publication must not fetch content")
-        }
-        async fn missing(&self, _: &[Artifact]) -> Result<Vec<Artifact>> {
-            Ok(vec![])
-        }
-    }
-    fn artifact(hash: &str) -> Artifact {
-        Artifact {
-            backend: "fixture".into(),
-            instance: "".into(),
-            digest_function: 1,
-            hash: hash.repeat(64),
-            size: 1,
-        }
-    }
-    // Use a local directory for the native barrier, without needing an NFS mount.
-    // The delayed blocking callback has the same non-abortable lifetime as chmod.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn cancelled_publication_retains_markers_and_excludes_following_mutation() {
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path().join("view");
-        std::fs::create_dir(&root).unwrap();
-        std::fs::File::create(root.join("file"))
-            .unwrap()
-            .write_all(b"x")
-            .unwrap();
-        let tree = Tree::open(
-            dir.path().join("state"),
-            "fixture",
-            Arc::new(Source),
-            output_core::CacheConfig::default(),
-        )
-        .unwrap();
-        tree.stage("file", artifact("1")).await.unwrap();
-        let old = tree.resolve("file").unwrap();
-        let mount = Arc::new(NfsMount {
-            fs: OutputNfs::new(tree.clone()),
-            root,
-            #[cfg(target_os = "macos")]
-            identity: MountIdentity {
-                fsid: [0, 0],
-                source: vec![],
-            },
-            control: Arc::new(AsyncMutex::new(())),
-            server: Mutex::new(None),
-        });
-        let entered = Arc::new(tokio::sync::Notify::new());
-        let (release, blocked) = std::sync::mpsc::channel();
-        let task_mount = mount.clone();
-        let task_entered = entered.clone();
-        let caller = tokio::spawn(async move {
-            task_mount
-                .complete(move |publisher| async move {
-                    let _marker = publisher.fs.mark(vec![old.id])?;
-                    publisher.fs.tree.stage("file", artifact("2")).await?;
-                    task_entered.notify_one();
-                    tokio::task::spawn_blocking(move || blocked.recv()).await??;
-                    let node = publisher.fs.tree.resolve("file")?;
-                    publisher.publish("file", Some(node)).await
-                })
-                .await
-        });
-        tokio::time::timeout(Duration::from_secs(2), entered.notified())
-            .await
-            .unwrap();
-        caller.abort();
-        let _ = caller.await;
-        assert!(mount.fs.invalidating.lock().unwrap().contains(&old.id));
-        let finished = Arc::new(AtomicBool::new(false));
-        let next_mount = mount.clone();
-        let next_finished = finished.clone();
-        let mut next = tokio::spawn(async move {
-            next_mount.stage("file", artifact("3")).await.unwrap();
-            next_finished.store(true, Ordering::SeqCst);
-        });
-        assert!(
-            tokio::time::timeout(Duration::from_millis(40), &mut next)
-                .await
-                .is_err()
-        );
-        assert!(!finished.load(Ordering::SeqCst));
-        assert_eq!(
-            tree.resolve("file").unwrap().remote.unwrap().hash,
-            artifact("2").hash
-        );
-        release.send(()).unwrap();
-        tokio::time::timeout(Duration::from_secs(2), next)
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(
-            tree.resolve("file").unwrap().remote.unwrap().hash,
-            artifact("3").hash
-        );
-        assert!(!mount.fs.invalidating.lock().unwrap().contains(&old.id));
-    }
-}
+mod mount;
+pub use mount::{NfsMount, NfsMountState, NfsStartError};

@@ -22,6 +22,9 @@ crate.annotation(
 crate.annotation(
     crate = "nfsserve",
     version = "0.11.0",
-    patches = ["//third_party/patches:nfsserve-0001-harden-writable-loopback-exports.patch"],
+    patches = [
+        "//third_party/patches:nfsserve-0001-harden-writable-loopback-exports.patch",
+        "//third_party/patches:nfsserve-0002-owned-shutdown.patch",
+    ],
     patch_args = ["-p1"],
 )

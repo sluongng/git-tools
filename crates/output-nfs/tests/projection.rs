@@ -197,10 +197,17 @@ async fn native_publication_and_mutation() {
             source.fetches.load(Ordering::SeqCst) == 0,
             "metadata staging fetched bytes"
         );
-        let mut held = std::fs::File::open(root.join("file"))?;
+        let held_id = tree.resolve("file")?.id;
+        let mut held = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(root.join("file"))?;
         let mut old = String::new();
         held.read_to_string(&mut old)?;
         anyhow::ensure!(old == "first", "held handle contents: {old}");
+        held.seek(SeekFrom::Start(0))?;
+        std::io::Write::write_all(&mut held, b"edit!")?;
+        held.sync_all()?;
         mount.stage("file", artifact(b"other")).await?;
         anyhow::ensure!(
             std::fs::read(root.join("file"))? == b"other",
@@ -209,8 +216,107 @@ async fn native_publication_and_mutation() {
         held.seek(SeekFrom::Start(0))?;
         old.clear();
         held.read_to_string(&mut old)?;
-        anyhow::ensure!(old == "first", "held handle contents: {old}");
+        anyhow::ensure!(old == "edit!", "held local edit changed: {old}");
+        anyhow::ensure!(
+            matches!(
+                mount.maintain_quiescent(2).await?,
+                output_core::MaintenanceOutcome::BusyRetained
+            ),
+            "ordinary unmount must retain the busy old generation"
+        );
+        anyhow::ensure!(
+            mount.state() == output_nfs::NfsMountState::Mounted,
+            "busy maintenance stopped serving"
+        );
+        held.seek(SeekFrom::Start(0))?;
+        old.clear();
+        held.read_to_string(&mut old)?;
+        anyhow::ensure!(old == "edit!", "busy maintenance lost held edit");
+        anyhow::ensure!(
+            std::fs::read(root.join("file"))? == b"other",
+            "busy maintenance lost replacement"
+        );
         drop(held);
+        let collected = match mount.maintain_quiescent(2).await? {
+            output_core::MaintenanceOutcome::Rotated { collection } => collection,
+            other => anyhow::bail!("released generation did not rotate: {other:?}"),
+        };
+        anyhow::ensure!(
+            collected.reclaimed_local_bytes >= 5 && tree.get(held_id).is_err(),
+            "old payload/metadata not reclaimed"
+        );
+        anyhow::ensure!(
+            std::fs::read(root.join("file"))? == b"other",
+            "fresh mount lost replacement"
+        );
+        // Collection failure must still restore native access to linked edits.
+        std::fs::write(root.join("kept-local"), b"unuploaded native edit")?;
+        let failed = tree.create(1, "retirement-failure", 0o644).await?;
+        tree.write(failed.id, 0, b"retired payload").await?;
+        tree.unlink(1, "retirement-failure").await?;
+        let payload = tree.state_dir().join("local").join(failed.id.to_string());
+        std::fs::remove_file(&payload)?;
+        std::fs::create_dir(&payload)?;
+        anyhow::ensure!(
+            mount.maintain_quiescent(2).await.is_err(),
+            "injected deletion failure was hidden"
+        );
+        anyhow::ensure!(
+            mount.state() == output_nfs::NfsMountState::Mounted,
+            "GC error left client unmounted"
+        );
+        anyhow::ensure!(
+            std::fs::read(root.join("kept-local"))? == b"unuploaded native edit",
+            "GC failure lost live authority"
+        );
+        std::fs::remove_dir(&payload)?;
+        std::fs::write(&payload, b"known retired payload")?;
+        anyhow::ensure!(
+            matches!(
+                mount.maintain_quiescent(2).await?,
+                output_core::MaintenanceOutcome::Rotated { .. }
+            ),
+            "repaired maintenance did not recover"
+        );
+        anyhow::ensure!(!payload.exists(), "repaired ledger was not drained");
+        std::fs::remove_file(root.join("kept-local"))?;
+        mount.maintain_quiescent(64).await?;
+        let collect_iterations = std::env::var("OUTPUT_NFS_ITERATION_GC").as_deref() != Ok("0");
+        let bytes = vec![0x5a; 32 * 1024];
+        std::fs::write(root.join("iteration-live"), &bytes)?;
+        let iterations_started = std::time::Instant::now();
+        let mut rotation_us = 0;
+        let mut peak_retired_bytes = 0;
+        for iteration in 0..16 {
+            std::fs::write(root.join("iteration-retired"), &bytes)?;
+            std::fs::remove_file(root.join("iteration-retired"))?;
+            peak_retired_bytes = peak_retired_bytes.max(tree.retirement_metrics().retained_local_bytes);
+            if collect_iterations && iteration % 4 == 3 {
+                let started = std::time::Instant::now();
+                anyhow::ensure!(matches!(mount.maintain_quiescent(64).await?, output_core::MaintenanceOutcome::Rotated { .. }), "iteration boundary did not rotate");
+                rotation_us += started.elapsed().as_micros();
+            }
+            anyhow::ensure!(std::fs::read(root.join("iteration-live"))? == bytes, "iteration GC evicted linked edits");
+        }
+        let wall_us = iterations_started.elapsed().as_micros();
+        let retained = tree.retirement_metrics();
+        let local_bytes: u64 = std::fs::read_dir(tree.state_dir().join("local"))?
+            .map(|entry| Ok::<_, anyhow::Error>(entry?.metadata()?.len())).collect::<anyhow::Result<Vec<_>>>()?.into_iter().sum();
+        eprintln!("NFS_ITERATIONS collect={} count=16 payload_bytes=32768 wall_us={} rotation_us={} peak_retired_bytes={} retained_local_bytes={} local_payload_bytes={} linked_edit_bytes=32768",
+            collect_iterations, wall_us, rotation_us, peak_retired_bytes, retained.retained_local_bytes, local_bytes);
+        anyhow::ensure!(retained.retained_local_bytes == if collect_iterations { 0 } else { 16 * 32768 }, "unexpected iteration retirement occupancy");
+        std::fs::remove_file(root.join("iteration-live"))?;
+        mount.maintain_quiescent(64).await?;
+        // Poll once to admit the owned operation, then cancel its caller. A
+        // subsequent operation waits for complete drain/remount, not a lost
+        // guard or an unmounted root with an apparently successful response.
+        let mut cancelled = Box::pin(mount.maintain_quiescent(64));
+        let first = std::future::poll_fn(|cx| std::task::Poll::Ready(std::future::Future::poll(cancelled.as_mut(), cx))).await;
+        drop(cancelled);
+        eprintln!("NFS_MAINTENANCE_CANCEL admitted_pending={}", first.is_pending());
+        if let std::task::Poll::Ready(result) = first { result?; }
+        anyhow::ensure!(matches!(mount.maintain_quiescent(64).await?, output_core::MaintenanceOutcome::Rotated { .. }), "cancelled admitted maintenance lost session ownership");
+        anyhow::ensure!(mount.state() == output_nfs::NfsMountState::Mounted, "cancelled maintenance left recovery state");
         mount.stage("missing", artifact(b"first")).await?;
         anyhow::ensure!(
             std::fs::read(root.join("missing"))? == b"first",
@@ -538,4 +644,58 @@ async fn stateless_handles_pin_server_generation_until_all_server_clones_end() {
     assert_eq!(tree.reclaim_retired(64).unwrap().reclaimed_local_bytes, 10);
     assert!(tree.get(old).is_err());
     assert_eq!(tree.read(replacement.id, 0, 99).await.unwrap(), b"first");
+}
+
+#[tokio::test]
+async fn owned_transport_shutdown_drains_nested_work_and_expires_file_handles() {
+    use nfsserve::tcp::{NFSTcp, NFSTcpListener};
+    use tokio::io::AsyncReadExt;
+    let (_dir, tree, source) = fixture();
+    let delay = Arc::new(Delay {
+        hash: artifact(b"slow!").hash,
+        started: tokio::sync::Notify::new(),
+        release: tokio::sync::Notify::new(),
+    });
+    *source.delay.lock().unwrap() = Some(delay.clone());
+    let old = tree.stage("file", artifact(b"slow!")).await.unwrap();
+    let fs = OutputNfs::new(tree.clone());
+    let old_handle = fs.id_to_fh(old.id);
+    let server = NFSTcpListener::bind("127.0.0.1:0", fs).await.unwrap();
+    let port = server.get_listen_port();
+    let (stop, receiver) = tokio::sync::watch::channel(false);
+    let serving = tokio::spawn(async move { server.handle_until_shutdown(receiver).await });
+    let mut stream = tokio::net::TcpStream::connect(("127.0.0.1", port))
+        .await
+        .unwrap();
+    send_call(&mut stream, 1, 6, &old_handle.data).await;
+    delay.started.notified().await;
+    let replacement = tree.stage("file", artifact(b"first")).await.unwrap();
+    assert_eq!(tree.reclaim_retired(64).unwrap().reclaimed_nodes, 0);
+    stop.send(true).unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(5), serving)
+        .await
+        .expect("shutdown must not wait for abandoned hydration")
+        .unwrap()
+        .unwrap();
+    let mut byte = [0];
+    assert!(
+        matches!(stream.read(&mut byte).await, Ok(0) | Err(_)),
+        "owned connection remained live"
+    );
+    assert_eq!(
+        tree.reclaim_retired_at_boundary(4).unwrap().reclaimed_nodes,
+        1,
+        "nested RPC/context clones must release the old generation fence"
+    );
+    delay.release.notify_one();
+    let fresh = OutputNfs::new(tree.clone());
+    assert!(matches!(
+        fresh.fh_to_id(&old_handle),
+        Err(nfsstat3::NFS3ERR_STALE)
+    ));
+    assert_eq!(
+        fresh.fh_to_id(&fresh.id_to_fh(replacement.id)).unwrap(),
+        replacement.id
+    );
+    assert_eq!(fresh.read(replacement.id, 0, 99).await.unwrap().0, b"first");
 }

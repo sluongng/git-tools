@@ -128,6 +128,15 @@ impl OutputHost {
     pub fn tree(&self) -> Arc<Tree> {
         self.tree.clone()
     }
+    /// Explicit native maintenance. Stop RPC admission and quiesce all Bazel
+    /// and other filesystem users first: a successful rotation briefly unmounts
+    /// the root. Build finalization alone does not establish this condition.
+    pub async fn maintain_quiescent(
+        &self,
+        transaction_budget: usize,
+    ) -> Result<output_core::MaintenanceOutcome> {
+        self.projection.maintain_quiescent(transaction_budget).await
+    }
     /// Stop RPC admission before calling. A busy mount returns an error and is
     /// retained: the caller must keep the runtime alive and retry shutdown.
     pub async fn shutdown(&self) -> Result<()> {
