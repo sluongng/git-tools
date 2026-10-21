@@ -14,7 +14,10 @@ try:
     buffer=c.create_string_buffer(4096)
     count=w.DWORD()
     if k.ReadFile(h,buffer,len(buffer),c.byref(count),None):
-        print("Old generation read:",buffer.raw[:count.value])
+        data=buffer.raw[:count.value]
+        print("Old generation read:",data)
+        if len(sys.argv)>2:
+            assert data==sys.argv[2].encode(), "old handle returned another generation or sparse bytes"
     else:
         print("Old generation read invalidated:",c.get_last_error())
 finally:

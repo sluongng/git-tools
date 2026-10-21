@@ -151,13 +151,18 @@ async fn lazy_native_generations_edits_restart_and_clean() -> Result<()> {
     assert_eq!(source.fetches.load(Ordering::SeqCst), 2);
     eprintln!("phase rename");
     mount.stage("out/before", c.clone()).await?;
+    let retired_renamed = tree.resolve("out/before")?.id;
     std::fs::metadata(root.join("out/before"))?;
     rename_external(&root.join("out/before"), &root.join("out/after"))?;
+    // The original path now publishes another generation, while the native
+    // renamed placeholder must keep its own old locator across GC and restart.
+    mount.stage("out/before", a.clone()).await?;
+    assert!(tree.get(retired_renamed).is_err());
     assert_eq!(
-        std::fs::read(root.join("out/after"))?,
-        b"renamed without hydration\n"
+        source.fetches.load(Ordering::SeqCst),
+        2,
+        "collection is metadata-only"
     );
-    assert_eq!(source.fetches.load(Ordering::SeqCst), 3);
     assert!(
         matches!(
             mount.stat("out/after", 1).await?,
@@ -220,6 +225,17 @@ async fn lazy_native_generations_edits_restart_and_clean() -> Result<()> {
     mount.stage("out/offline-b", b.clone()).await?;
     std::fs::metadata(root.join("out/offline-a"))?;
     std::fs::metadata(root.join("out/offline-b"))?;
+    for _ in 0..128 {
+        mount.stage("out/compaction", a.clone()).await?;
+    }
+    assert_eq!(tree.retirement_metrics().retained_nodes, 0);
+    assert!(
+        std::fs::read(state.join("native-identities.log"))?
+            .split(|byte| *byte == b'\n')
+            .count()
+            < 128,
+        "retired fingerprints must not accumulate one log entry per generation"
+    );
     eprintln!("phase stop and offline edit");
     mount.shutdown().await?;
     drop(mount);
@@ -244,6 +260,16 @@ async fn lazy_native_generations_edits_restart_and_clean() -> Result<()> {
         log.write_all(b"{partial-tail")?;
     }
     let mount = output_projfs::start(tree.clone(), &root, &state).await?;
+    assert!(tree.get(retired_renamed).is_err());
+    assert_eq!(
+        std::fs::read(root.join("out/after"))?,
+        b"renamed without hydration\n",
+        "old persisted placeholder hydrates without retired inode metadata"
+    );
+    assert!(
+        matches!(mount.stat("out/compaction",1).await?, Some(TreeStat::File { artifact: Some(ref got) }) if got == &a),
+        "the compacted identity journal retains live digest authority across restart"
+    );
     assert!(
         matches!(mount.stat("out/negative",1).await?,Some(TreeStat::File{artifact:Some(ref artifact)})if artifact==&a),
         "clean fingerprint survives restart and incomplete log tail"
@@ -519,14 +545,16 @@ async fn late_old_hydration_cannot_replace_new_generation() -> Result<()> {
     )?;
     let root = temp.path().join("mount");
     let state = temp.path().join("provider");
-    let mount = output_projfs::start(tree, &root, &state).await?;
+    let mount = output_projfs::start(tree.clone(), &root, &state).await?;
     mount.stage("race", a).await?;
+    let old_node = tree.resolve("race")?.id;
     source.delay.store(1000, Ordering::SeqCst);
     let before = source.fetches.load(Ordering::SeqCst);
     let mut child = std::process::Command::new(python()?)
         .arg("-c")
         .arg(include_str!("support/read_once.py"))
         .arg(root.join("race"))
+        .arg("old generation A payload")
         .spawn()?;
     for _ in 0..200 {
         if source.fetches.load(Ordering::SeqCst) > before {
@@ -539,6 +567,12 @@ async fn late_old_hydration_cannot_replace_new_generation() -> Result<()> {
         "old generation must be fetching"
     );
     let publication = mount.stage("race", b.clone()).await;
+    if publication.is_ok() {
+        assert!(
+            tree.get(old_node).is_err(),
+            "pending read owns its locator, not inode metadata"
+        );
+    }
     eprintln!("B publication during A fetch: {publication:?}");
     let mut status = None;
     for _ in 0..200 {

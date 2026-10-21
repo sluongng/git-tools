@@ -1,4 +1,5 @@
 //! Native output projection. Callback pointers never escape their invocation.
+use crate::identity::{Content, MAX_ORIGINS, Origin, validate_origins};
 use anyhow::{Context, Result, bail, ensure};
 use async_trait::async_trait;
 use output_core::{Artifact, Node, NodeKind, PreparedStage, Projection, Tree, TreeStat};
@@ -108,12 +109,16 @@ fn info(n: &Node) -> PRJ_PLACEHOLDER_INFO {
     i
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 struct Manifest {
     version: u32,
     root: PathBuf,
     instance: [u8; 16],
     tree_identity: String,
+    #[serde(default)]
+    legacy_ceiling: Option<u64>,
+    #[serde(default)]
+    origins: Vec<Origin>,
 }
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 struct Fingerprint {
@@ -123,6 +128,8 @@ struct Fingerprint {
 struct Fingerprints {
     records: HashMap<u64, Fingerprint>,
     log: File,
+    path: PathBuf,
+    entries: usize,
 }
 impl Fingerprints {
     fn open(path: &Path) -> Result<Self> {
@@ -136,6 +143,7 @@ impl Fingerprints {
         log.read_to_end(&mut bytes)?;
         let mut records = HashMap::new();
         let mut valid = 0;
+        let mut entries = 0;
         for line in bytes.split_inclusive(|b| *b == b'\n') {
             if line.last() != Some(&b'\n') {
                 break;
@@ -143,9 +151,15 @@ impl Fingerprints {
             let (node, fingerprint): (u64, Fingerprint) = serde_json::from_slice(line)?;
             records.insert(node, fingerprint);
             valid += line.len();
+            entries += 1;
         }
         log.set_len(valid as u64)?;
-        Ok(Self { records, log })
+        Ok(Self {
+            records,
+            log,
+            path: path.to_owned(),
+            entries,
+        })
     }
     fn record(&mut self, id: u64, fingerprint: Fingerprint) -> Result<()> {
         if self.records.get(&id) == Some(&fingerprint) {
@@ -158,6 +172,25 @@ impl Fingerprints {
         // Losing a trailing identity record only disables digest reuse after a
         // crash; it cannot authorize stale bytes. Avoid a disk fsync per stat.
         self.records.insert(id, fingerprint);
+        self.entries += 1;
+        Ok(())
+    }
+    fn collect(&mut self, tree: &Tree) -> Result<()> {
+        self.records.retain(|id, _| tree.get(*id).is_ok());
+        // Bound stale log growth without rewriting the whole live identity set
+        // for each staged output. Losing a trailing identity disables reuse;
+        // it never authorizes a different file's payload digest.
+        if self.entries <= self.records.len().saturating_mul(2).saturating_add(64) {
+            return Ok(());
+        }
+        let mut bytes = Vec::new();
+        for (id, fingerprint) in &self.records {
+            serde_json::to_writer(&mut bytes, &(id, fingerprint))?;
+            bytes.push(b'\n');
+        }
+        durable_replace(&self.path, &bytes)?;
+        self.log = OpenOptions::new().read(true).write(true).open(&self.path)?;
+        self.entries = self.records.len();
         Ok(())
     }
 }
@@ -213,6 +246,8 @@ struct Request {
 struct Provider {
     tree: Arc<Tree>,
     root: PathBuf,
+    manifest: Mutex<Manifest>,
+    manifest_file: PathBuf,
     context: Mutex<usize>,
     stopping: AtomicBool,
     draining: AtomicBool,
@@ -228,6 +263,55 @@ struct Provider {
     runtime: tokio::runtime::Handle,
 }
 impl Provider {
+    fn placeholder_info(&self, node: &Node) -> Result<PRJ_PLACEHOLDER_INFO> {
+        let mut result = info(node);
+        if node.kind == NodeKind::Directory {
+            // Directories never hydrate bytes through ContentID.
+            return Ok(result);
+        }
+        let Some(artifact) = &node.remote else {
+            // Native edited/full files stay authoritative in NTFS. Do not
+            // publish a sparse core-local file that has no immutable locator.
+            bail!("core-local file projection is unsupported; preserve the original local payload");
+        };
+        self.tree.validate_artifact(artifact)?;
+        let mut manifest = self.manifest.lock().unwrap();
+        let origin = if let Some(origin) = manifest.origins.iter().find(|origin| {
+            origin.backend == artifact.backend && origin.instance == artifact.instance
+        }) {
+            origin.clone()
+        } else {
+            ensure!(
+                manifest.origins.len() < MAX_ORIGINS,
+                "placeholder origin limit reached"
+            );
+            let mut id = GUID::default();
+            check(unsafe { CoCreateGuid(&mut id) }, "create origin GUID")?;
+            let origin = Origin {
+                key: guid_key(&id),
+                backend: artifact.backend.clone(),
+                instance: artifact.instance.clone(),
+            };
+            let mut next = manifest.clone();
+            next.origins.push(origin.clone());
+            validate_origins(&next.origins)?;
+            // No placeholder can name this key until the complete origin
+            // security scope is durably available across provider restarts.
+            durable_replace(&self.manifest_file, &serde_json::to_vec(&next)?)?;
+            *manifest = next;
+            origin
+        };
+        let (provider, content) =
+            Content::remote(node.id, node.generation, &origin, artifact)?.encode()?;
+        result.VersionInfo.ProviderID = provider;
+        result.VersionInfo.ContentID = content;
+        Ok(result)
+    }
+    fn collect_retired(&self) -> Result<()> {
+        self.tree.reclaim_retired_at_boundary(64)?;
+        self.fingerprints.lock().unwrap().collect(&self.tree)?;
+        Ok(())
+    }
     fn rename_epoch(&self, path: &str) -> u64 {
         let wanted = wide(path.replace('/', "\\"));
         self.distrust.lock().unwrap().paths.iter().find(|(p,_)|unsafe{PrjFileNameCompare(wide(p.replace('/', "\\")).as_ptr(),wanted.as_ptr())}==0).map_or(0,|(_,epoch)|*epoch)
@@ -483,12 +567,13 @@ impl ProjfsMount {
         let before = native_fingerprint(&absolute)?;
         let mut created = false;
         let native = wide(prepared.path.replace('/', "\\"));
+        let info = self.provider.placeholder_info(&prepared.node)?;
         self.provider.context_call(|context| unsafe {
             let mut reason = 0;
             let result = PrjUpdateFileIfNeeded(
                 context,
                 native.as_ptr(),
-                &info(&prepared.node),
+                &info,
                 std::mem::size_of::<PRJ_PLACEHOLDER_INFO>() as u32,
                 PRJ_UPDATE_ALLOW_TOMBSTONE | PRJ_UPDATE_ALLOW_DIRTY_METADATA,
                 &mut reason,
@@ -497,7 +582,7 @@ impl ProjfsMount {
                 let result = PrjWritePlaceholderInfo(
                     context,
                     native.as_ptr(),
-                    &info(&prepared.node),
+                    &info,
                     std::mem::size_of::<PRJ_PLACEHOLDER_INFO>() as u32,
                 );
                 if result >= 0 {
@@ -613,11 +698,44 @@ pub async fn start(tree: Arc<Tree>, root: &Path, state: &Path) -> Result<ProjfsM
     }
     let path = state.join("instance.json");
     let manifest: Manifest = if path.exists() {
-        let m: Manifest = serde_json::from_slice(&std::fs::read(&path)?)?;
+        let mut bytes = Vec::new();
+        File::open(&path)?
+            .take(16 * 1024 * 1024 + 1)
+            .read_to_end(&mut bytes)?;
         ensure!(
-            m.version == 2 && m.root == root && m.tree_identity == tree.identity(),
+            bytes.len() <= 16 * 1024 * 1024,
+            "projection manifest exceeds supported size"
+        );
+        let mut m: Manifest = serde_json::from_slice(&bytes)?;
+        ensure!(
+            matches!(m.version, 2 | 3) && m.root == root && m.tree_identity == tree.identity(),
             "projection root does not match durable state"
         );
+        if m.version == 2 {
+            ensure!(
+                m.origins.is_empty() && m.legacy_ceiling.is_none(),
+                "ambiguous legacy projection manifest"
+            );
+            m.version = 3;
+            m.legacy_ceiling = Some(tree.allocation_highwater());
+            // Provider callbacks are not running. Preserve the legacy domain
+            // durably before changing the core's all-generations fence.
+            durable_replace(&path, &serde_json::to_vec(&m)?)?;
+        }
+        ensure!(
+            m.legacy_ceiling.is_some(),
+            "missing legacy placeholder boundary"
+        );
+        validate_origins(&m.origins)?;
+        for origin in &m.origins {
+            tree.validate_artifact(&Artifact {
+                backend: origin.backend.clone(),
+                instance: origin.instance.clone(),
+                digest_function: 1,
+                hash: "0".repeat(64),
+                size: 0,
+            })?;
+        }
         m
     } else {
         ensure!(
@@ -631,10 +749,12 @@ pub async fn start(tree: Arc<Tree>, root: &Path, state: &Path) -> Result<ProjfsM
         let mut id = GUID::default();
         check(unsafe { CoCreateGuid(&mut id) }, "create projection GUID")?;
         let m = Manifest {
-            version: 2,
+            version: 3,
             root: root.clone(),
             instance: guid_key(&id),
             tree_identity: tree.identity().to_owned(),
+            legacy_ceiling: Some(0),
+            origins: Vec::new(),
         };
         durable_publish(&path, &serde_json::to_vec(&m)?)?;
         m
@@ -656,13 +776,15 @@ pub async fn start(tree: Arc<Tree>, root: &Path, state: &Path) -> Result<ProjfsM
             "mark ProjFS root",
         )?;
     }
-    // Native placeholder ContentIDs persist across provider restart. A stopped
-    // callback is not proof that an old stream/placeholder can never hydrate.
-    // Retain core metadata durably; native full-file edits remain owned by NTFS.
-    tree.retain_placeholder_generations()?;
+    // The original manifest is required for an already-marked root. Its synced
+    // upgrade precedes this finite fence; legacy IDs remain protected forever,
+    // while new remote placeholders carry their own immutable CAS locators.
+    tree.enable_immutable_placeholder_locators(manifest.legacy_ceiling.unwrap())?;
     let provider = Arc::new(Provider {
         tree,
         root,
+        manifest: Mutex::new(manifest),
+        manifest_file: path,
         context: Mutex::new(0),
         stopping: AtomicBool::new(false),
         draining: AtomicBool::new(false),
@@ -725,6 +847,7 @@ pub async fn start(tree: Arc<Tree>, root: &Path, state: &Path) -> Result<ProjfsM
         publication: tokio::sync::Mutex::new(()),
     };
     mount.recover_publication().await?;
+    mount.provider.collect_retired()?;
     Ok(mount)
 }
 
@@ -777,6 +900,7 @@ impl Projection for ProjfsMount {
         self.provider.trust_path(path, rename_epoch)?;
         self.provider.flush()?;
         std::fs::remove_file(journal)?;
+        self.provider.collect_retired()?;
         Ok(())
     }
     async fn stat(&self, path: &str, digest_function: i32) -> Result<Option<TreeStat>> {
@@ -885,7 +1009,8 @@ impl Projection for ProjfsMount {
                 }
             })?;
         }
-        self.provider.flush()
+        self.provider.flush()?;
+        self.provider.collect_retired()
     }
     async fn clean(&self, prefix: &str) -> Result<()> {
         let _guard = self.publication.lock().await;
@@ -959,7 +1084,8 @@ impl Projection for ProjfsMount {
                 }
             })?;
         }
-        self.provider.flush()
+        self.provider.flush()?;
+        self.provider.collect_retired()
     }
     async fn shutdown(&self) -> Result<()> {
         // Cached paging reads are not reliably cancellable on Windows. Complete
@@ -1183,10 +1309,11 @@ unsafe extern "system" fn placeholder(d: *const PRJ_CALLBACK_DATA) -> HRESULT {
                 Err(_) => return Ok(hr(ERROR_FILE_NOT_FOUND)),
             };
             ensure!(n.kind != NodeKind::Symlink, "remote symlinks unsupported");
+            let info = p.placeholder_info(&n)?;
             let result = PrjWritePlaceholderInfo(
                 d.NamespaceVirtualizationContext,
                 wide(&path).as_ptr(),
-                &info(&n),
+                &info,
                 std::mem::size_of::<PRJ_PLACEHOLDER_INFO>() as u32,
             );
             if result >= 0
@@ -1207,8 +1334,7 @@ impl Drop for Aligned {
 }
 struct ReadRequest {
     id: i32,
-    node: u64,
-    generation: u64,
+    artifact: Artifact,
     stream: [u8; 16],
     offset: u64,
     length: u32,
@@ -1231,14 +1357,23 @@ unsafe extern "system" fn hydrate(
                 "hydration requires immutable content identity"
             );
             let v = &*d.VersionInfo;
-            ensure!(
-                &v.ProviderID[..16] == b"cas-output-v0001",
-                "unknown placeholder provider"
-            );
+            let content = Content::decode(&v.ProviderID, &v.ContentID)?;
+            let artifact = match &content {
+                Content::Legacy { node, generation } => {
+                    let node = p.tree.get(*node)?;
+                    ensure!(
+                        node.generation == *generation && node.kind == NodeKind::File,
+                        "legacy placeholder generation mismatch"
+                    );
+                    node.remote
+                        .context("legacy placeholder missing immutable artifact")?
+                }
+                Content::Remote { .. } => content.artifact(&p.manifest.lock().unwrap().origins)?,
+            };
+            p.tree.validate_artifact(&artifact)?;
             let request = ReadRequest {
                 id: d.CommandId,
-                node: u64::from_le_bytes(v.ContentID[..8].try_into().unwrap()),
-                generation: u64::from_le_bytes(v.ContentID[8..16].try_into().unwrap()),
+                artifact,
                 stream: guid_key(&d.DataStreamId),
                 offset,
                 length,
@@ -1321,13 +1456,9 @@ async fn read_request(p: &Provider, r: &ReadRequest, cancel: &Request) -> Result
     if cancel.canceled.load(Ordering::Acquire) {
         return Ok(hr(ERROR_OPERATION_ABORTED));
     }
-    let n = p.tree.get(r.node)?;
-    ensure!(
-        n.generation == r.generation,
-        "placeholder generation mismatch"
-    );
-    let artifact = n.remote.context("placeholder missing immutable artifact")?;
-    let blob = p.tree.content(&artifact).await?;
+    // Remote v2 identities remain sufficient after their retired inode metadata
+    // is collected, including after provider restart or native rename.
+    let blob = p.tree.content(&r.artifact).await?;
     if cancel.canceled.load(Ordering::Acquire) {
         return Ok(hr(ERROR_OPERATION_ABORTED));
     }
@@ -1352,10 +1483,10 @@ async fn read_request(p: &Provider, r: &ReadRequest, cancel: &Request) -> Result
         .offset
         .checked_add(r.length as u64)
         .context("range overflow")?;
-    ensure!(end <= n.size, "range beyond immutable output");
+    ensure!(end <= r.artifact.size, "range beyond immutable output");
     let mut position = r.offset / alignment * alignment;
-    let end = end.checked_add(alignment - 1).unwrap_or(n.size) / alignment * alignment;
-    let end = end.min(n.size);
+    let end = end.checked_add(alignment - 1).unwrap_or(r.artifact.size) / alignment * alignment;
+    let end = end.min(r.artifact.size);
     let capacity = 1024 * 1024 / alignment * alignment;
     let buffer = {
         let context = p.context.lock().unwrap();

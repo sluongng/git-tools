@@ -18,7 +18,9 @@ replays only owned payload deletions after restart. IDs are never reused.
 FUSE supplies real lookup/open lifetimes and collects retired generations after
 release. NFSv3 retains every generation for the entire server session; collection
 is safe only after unmount/remount expires its handles, not after an idle period
-or BOS finalization. ProjFS conservatively retains generations across restart
-because persisted placeholders may still hydrate them; native edited files are
-never cache-evicted. These retention domains are not a total disk quota.
+or BOS finalization. ProjFS retains legacy placeholder IDs across restart; new
+remote placeholders carry immutable CAS locators so retired metadata can be
+reclaimed without deleting native edits. Namespace schema 3 reads schema 2 but
+cannot be opened by older binaries; preserve state rather than downgrading it.
+These retention domains are not a total disk quota.
 See [BOS setup](../bazel-output-service/README.md).

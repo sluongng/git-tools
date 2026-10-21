@@ -694,15 +694,31 @@ async fn delayed_oversized_read_does_not_occupy_normal_byte_admission() {
 #[tokio::test]
 #[ignore = "explicit iteration/disk benchmark"]
 async fn retired_output_iteration_measurement() {
-    let (dir, _source, tree) = setup(CacheConfig::default());
+    let (dir, source, tree) = setup(CacheConfig::default());
     let started = std::time::Instant::now();
     let payload = vec![0x5a; 32 * 1024];
     let mut ids = Vec::new();
     let collect = std::env::var_os("OUTPUT_RETIREMENT_GC").is_some();
+    let placeholders = std::env::var("OUTPUT_PLACEHOLDER_LOCATORS").ok();
+    let remote = placeholders.as_ref().map(|mode| {
+        match mode.as_str() {
+            "legacy" => tree.retain_placeholder_generations().unwrap(),
+            "immutable" => {
+                tree.enable_immutable_placeholder_locators(0).unwrap();
+            }
+            _ => panic!("unknown explicit placeholder benchmark mode"),
+        }
+        source.artifact(&payload)
+    });
     let mut gc_us = 0;
     for _ in 0..128 {
-        let n = tree.create(1, "output", 0o644).await.unwrap();
-        tree.write(n.id, 0, &payload).await.unwrap();
+        let n = if let Some(artifact) = &remote {
+            tree.stage("output", artifact.clone()).await.unwrap()
+        } else {
+            let n = tree.create(1, "output", 0o644).await.unwrap();
+            tree.write(n.id, 0, &payload).await.unwrap();
+            n
+        };
         tree.unlink(1, "output").await.unwrap();
         ids.push(n.id);
         if collect {
@@ -716,6 +732,11 @@ async fn retired_output_iteration_measurement() {
         .map(|e| e.unwrap().metadata().unwrap().len())
         .sum();
     let retained = ids.iter().filter(|id| tree.get(**id).is_ok()).count();
+    assert_eq!(
+        source.calls.load(Ordering::SeqCst),
+        0,
+        "metadata iterations never fetch content"
+    );
     fn disk(path: &Path) -> u64 {
         fs::read_dir(path)
             .unwrap()
@@ -897,7 +918,67 @@ async fn server_generation_and_persisted_placeholder_fences_are_not_request_coun
     drop(generation);
     tree.retain_placeholder_generations().unwrap();
     drop(tree);
-    let tree = Tree::open(dir.path(), "test", source, CacheConfig::default()).unwrap();
+    {
+        // Compatibility fixture: the prior schema had only an all-generations
+        // boolean. Its omission of a finite boundary must remain conservative.
+        let db = SingleWriterTxDatabase::builder(dir.path().join("namespace.fjall"))
+            .open()
+            .unwrap();
+        let keyspace = db
+            .keyspace("namespace", KeyspaceCreateOptions::default)
+            .unwrap();
+        let mut header: serde_json::Value =
+            serde_json::from_slice(&keyspace.get(b"header").unwrap().unwrap()).unwrap();
+        header["version"] = 2.into();
+        header
+            .as_object_mut()
+            .unwrap()
+            .remove("placeholder_legacy_ceiling");
+        let mut tx = db.write_tx().durability(Some(PersistMode::SyncAll));
+        tx.insert(&keyspace, b"header", serde_json::to_vec(&header).unwrap());
+        tx.commit().unwrap();
+    }
+    let tree = Tree::open(dir.path(), "test", source.clone(), CacheConfig::default()).unwrap();
     assert_eq!(tree.reclaim_retired(64).unwrap().reclaimed_nodes, 0);
+    assert_eq!(tree.read(node.id, 0, 99).await.unwrap(), b"old handle");
+
+    // A synced provider manifest enables self-contained locators only after it
+    // captures the old domain. All→finite conversion covers current highwater,
+    // even when the supplied manifest ceiling is older.
+    assert_eq!(
+        tree.enable_immutable_placeholder_locators(0).unwrap(),
+        node.id
+    );
+    let old_artifact = source.artifact(b"immutable old remote");
+    let remote = tree.stage("remote", old_artifact.clone()).await.unwrap();
+    tree.stage("remote", source.artifact(b"new remote"))
+        .await
+        .unwrap();
+    assert_eq!(
+        tree.reclaim_retired_at_boundary(2).unwrap().reclaimed_nodes,
+        1
+    );
+    assert!(tree.get(remote.id).is_err());
+    let blob = tree.content(&old_artifact).await.unwrap();
+    assert_eq!(fs::read(blob.path()).unwrap(), b"immutable old remote");
+    assert_eq!(tree.read(node.id, 0, 99).await.unwrap(), b"old handle");
+    // Explicit non-self-contained publication raises protection before native
+    // exposure. Lower subsequent ceilings cannot revoke that ownership.
+    let local = tree.create(1, "legacy-local", 0o644).await.unwrap();
+    tree.write(local.id, 0, b"native legacy").await.unwrap();
+    tree.retain_placeholder_inode(local.id).unwrap();
+    tree.unlink(1, "legacy-local").await.unwrap();
+    assert_eq!(
+        tree.enable_immutable_placeholder_locators(0).unwrap(),
+        local.id
+    );
+    drop(blob);
+    drop(tree);
+    let tree = Tree::open(dir.path(), "test", source, CacheConfig::default()).unwrap();
+    assert_eq!(
+        tree.reclaim_retired_at_boundary(1).unwrap().reclaimed_nodes,
+        0
+    );
+    assert_eq!(tree.read(local.id, 0, 99).await.unwrap(), b"native legacy");
     assert_eq!(tree.read(node.id, 0, 99).await.unwrap(), b"old handle");
 }

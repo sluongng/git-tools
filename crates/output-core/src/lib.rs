@@ -171,6 +171,7 @@ struct State {
     backend: String,
     next_id: u64,
     retain_placeholders: bool,
+    placeholder_legacy_ceiling: u64,
     nodes: Table<Record>,
     pending: Table<Pending>,
     garbage: Table<()>,
@@ -188,6 +189,8 @@ struct Header {
     next_id: u64,
     #[serde(default)]
     retain_placeholders: bool,
+    #[serde(default)]
+    placeholder_legacy_ceiling: u64,
 }
 fn index_remove(s: &mut State, n: &Node) {
     if n.linked && n.id != 1 {
@@ -393,7 +396,7 @@ impl Tree {
         let mut state = if let Some(bytes) = keyspace.get(b"header")? {
             let header: Header = serde_json::from_slice(&bytes)?;
             ensure!(
-                header.version == 2 && header.backend == backend,
+                matches!(header.version, 2 | 3) && header.backend == backend,
                 "output state backend/version mismatch"
             );
             let mut state = State {
@@ -405,6 +408,7 @@ impl Tree {
                 backend: backend.clone(),
                 next_id: header.next_id,
                 retain_placeholders: header.retain_placeholders,
+                placeholder_legacy_ceiling: header.placeholder_legacy_ceiling,
                 nodes: Table::default(),
                 pending: Table::default(),
                 garbage: Table::default(),
@@ -465,6 +469,7 @@ impl Tree {
                 backend: backend.clone(),
                 next_id: 2,
                 retain_placeholders: false,
+                placeholder_legacy_ceiling: 0,
                 nodes,
                 pending: Table::default(),
                 garbage: Table::default(),
@@ -579,10 +584,11 @@ impl Tree {
             b"header",
             serde_json::to_vec(&Header {
                 identity: next.identity.clone(),
-                version: 2,
+                version: 3,
                 backend: next.backend.clone(),
                 next_id: next.next_id,
                 retain_placeholders: next.retain_placeholders,
+                placeholder_legacy_ceiling: next.placeholder_legacy_ceiling,
             })?,
         );
         for id in &next.nodes.dirty {
@@ -642,6 +648,43 @@ impl Tree {
     pub fn retain_placeholder_generations(&self) -> Result<()> {
         self.change(|s| {
             s.retain_placeholders = true;
+            Ok(())
+        })
+    }
+    /// Capture while the native provider is stopped or holds its publication
+    /// barrier. Persist the corresponding provider manifest before enabling
+    /// self-contained immutable locators; this value protects older formats.
+    pub fn allocation_highwater(&self) -> u64 {
+        self.namespace.lock().unwrap().state.next_id - 1
+    }
+    /// The caller owns the provider and its publication barrier. Its durable
+    /// manifest must already identify self-contained locators and record the
+    /// legacy ceiling. Old-format publishers must retain an inode before they
+    /// expose it. Existing finite protection can only grow, never shrink.
+    pub fn enable_immutable_placeholder_locators(&self, legacy_ceiling: u64) -> Result<u64> {
+        self.change(|s| {
+            ensure!(
+                legacy_ceiling < s.next_id,
+                "legacy placeholder ceiling exceeds allocated IDs"
+            );
+            let ceiling = if s.retain_placeholders {
+                // A legacy provider may have used this tree after an earlier
+                // manifest was written. Cover all IDs it could have published.
+                s.next_id - 1
+            } else {
+                legacy_ceiling
+            };
+            s.placeholder_legacy_ceiling = s.placeholder_legacy_ceiling.max(ceiling);
+            s.retain_placeholders = false;
+            Ok(s.placeholder_legacy_ceiling)
+        })
+    }
+    /// Persist protection before publishing a non-self-contained placeholder.
+    /// Native full/edited files are not claimed or removed by this operation.
+    pub fn retain_placeholder_inode(&self, id: u64) -> Result<()> {
+        self.change(|s| {
+            record(s, id)?;
+            s.placeholder_legacy_ceiling = s.placeholder_legacy_ceiling.max(id);
             Ok(())
         })
     }
@@ -759,6 +802,7 @@ impl Tree {
             let mut ns = self.namespace.lock().unwrap();
             if ns.generations != 0
                 || ns.state.retain_placeholders
+                || id <= ns.state.placeholder_legacy_ceiling
                 || ns.pins.contains_key(&id)
                 || ns.lookups.contains_key(&id)
                 || ns.state.pending.get(&id).is_some()
