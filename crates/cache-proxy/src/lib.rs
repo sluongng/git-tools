@@ -1,6 +1,8 @@
 //! One-user REAPI cache front end. Local CAS residence never implies RBE-side
 //! presence: writes and presence queries always reach the configured backend.
+mod asset;
 mod download;
+mod execution;
 
 use anyhow::{Context, Result, ensure};
 use async_trait::async_trait;
@@ -45,7 +47,13 @@ const REQUEST_METADATA: &str = "build.bazel.remote.execution.v2.requestmetadata-
 /// Explicit attribution only. Authorization and transport metadata are never
 /// copied from the caller; the daemon supplies upstream credentials.
 #[derive(Clone, Default)]
-struct CallerMetadata(Option<MetadataValue<tonic::metadata::Binary>>);
+struct CallerMetadata(
+    Option<MetadataValue<tonic::metadata::Binary>>,
+    Vec<(
+        MetadataKey<tonic::metadata::Ascii>,
+        MetadataValue<tonic::metadata::Ascii>,
+    )>,
+);
 impl CallerMetadata {
     fn capture<T>(request: &Request<T>) -> Result<Self, Status> {
         let Some(value) = request.metadata().get_bin(REQUEST_METADATA) else {
@@ -57,7 +65,25 @@ impl CallerMetadata {
         if bytes.len() > 8192 {
             return Err(Status::resource_exhausted("request metadata exceeds 8 KiB"));
         }
-        Ok(Self(Some(value.clone())))
+        Ok(Self(Some(value.clone()), Vec::new()))
+    }
+    fn execution<T>(request: &Request<T>) -> Result<Self, Status> {
+        let mut result = Self::capture(request)?;
+        let mut bytes = 0;
+        for value in request.metadata().iter() {
+            if let tonic::metadata::KeyAndValueRef::Ascii(key, value) = value
+                && key.as_str().starts_with("x-buildbuddy-platform.")
+            {
+                bytes += key.as_str().len() + value.as_bytes().len();
+                if bytes > 8192 || result.1.len() >= 64 {
+                    return Err(Status::resource_exhausted(
+                        "execution routing metadata exceeds limit",
+                    ));
+                }
+                result.1.push((key.clone(), value.clone()));
+            }
+        }
+        Ok(result)
     }
 }
 
@@ -77,6 +103,11 @@ pub struct ProxyConfig {
     /// Zero is safe with backends whose eviction policy is unknown.
     pub action_cache_ttl: Duration,
     pub max_action_cache_entries: usize,
+    pub asset_cache_ttl: Duration,
+    pub max_asset_cache_entries: usize,
+    pub max_asset_cache_bytes: usize,
+    pub max_execution_streams: usize,
+    pub execution_timeout: Option<Duration>,
 }
 impl Default for ProxyConfig {
     fn default() -> Self {
@@ -92,6 +123,11 @@ impl Default for ProxyConfig {
             max_concurrent_rpcs_per_connection: 128,
             action_cache_ttl: Duration::ZERO,
             max_action_cache_entries: 4096,
+            asset_cache_ttl: Duration::from_secs(60),
+            max_asset_cache_entries: 4096,
+            max_asset_cache_bytes: 8 * 1024 * 1024,
+            max_execution_streams: 256,
+            execution_timeout: None,
         }
     }
 }
@@ -100,12 +136,20 @@ struct Counters {
     ac_hits: AtomicU64,
     ac_upstream: AtomicU64,
     blob_reads: AtomicU64,
+    asset_hits: AtomicU64,
+    asset_upstream: AtomicU64,
+    execution_requests: AtomicU64,
+    execution_waits: AtomicU64,
 }
 #[derive(Clone, Copy, Debug)]
 pub struct ProxyMetrics {
     pub action_cache_hits: u64,
     pub action_cache_upstream: u64,
     pub blob_reads: u64,
+    pub asset_cache_hits: u64,
+    pub asset_upstream_requests: u64,
+    pub execution_requests: u64,
+    pub execution_waits: u64,
 }
 #[derive(Clone)]
 pub struct CacheProxy {
@@ -114,15 +158,50 @@ pub struct CacheProxy {
     ac: Arc<Mutex<ActionEntries>>,
     metrics: Arc<Counters>,
     writes: Arc<tokio::sync::Semaphore>,
+    executions: Arc<tokio::sync::Semaphore>,
+    assets: Arc<Mutex<asset::Mappings>>,
+    stop: tokio::sync::watch::Sender<bool>,
 }
 /// Reusable default source for `LocalCas::open`, sharing the proxy's security scope.
 pub struct Upstream {
     config: ProxyConfig,
     channel: Channel,
+    stream_channel: Channel,
+    asset_channel: Channel,
+    operations_channel: Channel,
+    gzip_requests: std::sync::atomic::AtomicU16,
     zstd_capability: tokio::sync::OnceCell<bool>,
     zstd_disabled: std::sync::atomic::AtomicBool,
 }
+#[derive(Clone, Copy)]
+enum RpcMethod {
+    Execute,
+    WaitExecution,
+    ListOperations,
+    GetOperation,
+    DeleteOperation,
+    CancelOperation,
+    WaitOperation,
+    FetchBlob,
+    FetchDirectory,
+}
 impl Upstream {
+    fn send_gzip(&self, method: RpcMethod) -> bool {
+        self.gzip_requests.load(Ordering::Relaxed) & (1 << (method as u32)) != 0
+    }
+    fn observe_gzip<T>(&self, method: RpcMethod, response: &Response<T>) {
+        let supported = response
+            .metadata()
+            .get("grpc-accept-encoding")
+            .and_then(|value| value.to_str().ok())
+            .is_some_and(|value| value.split(',').any(|encoding| encoding.trim() == "gzip"));
+        let mask = 1 << (method as u32);
+        if supported {
+            self.gzip_requests.fetch_or(mask, Ordering::Relaxed);
+        } else {
+            self.gzip_requests.fetch_and(!mask, Ordering::Relaxed);
+        }
+    }
     pub async fn connect(config: ProxyConfig) -> Result<Arc<Self>> {
         config.policy.validate()?;
         ensure!(
@@ -145,6 +224,16 @@ impl Upstream {
             config.action_cache_ttl <= Duration::from_secs(3600),
             "action cache TTL exceeds one hour"
         );
+        ensure!(
+            config.asset_cache_ttl <= Duration::from_secs(3600)
+                && config.max_asset_cache_entries <= 1_000_000
+                && config.max_asset_cache_bytes <= 64 * 1024 * 1024
+                && (1..=1024).contains(&config.max_execution_streams)
+                && config
+                    .execution_timeout
+                    .is_none_or(|d| !d.is_zero() && d <= Duration::from_secs(86400)),
+            "invalid asset-cache or execution limits"
+        );
         for (key, value) in &config.upstream_headers {
             let _: MetadataKey<tonic::metadata::Ascii> =
                 key.parse().context("invalid upstream header name")?;
@@ -159,8 +248,7 @@ impl Upstream {
         let use_tls = url.starts_with("https://");
         let endpoint = Endpoint::from_shared(url)
             .map_err(|_| anyhow::anyhow!("invalid upstream endpoint"))?
-            .connect_timeout(config.policy.connect_timeout())
-            .timeout(config.policy.rpc_timeout());
+            .connect_timeout(config.policy.connect_timeout());
         let endpoint = if use_tls {
             endpoint
                 .tls_config(tonic::transport::ClientTlsConfig::new().with_webpki_roots())
@@ -171,10 +259,17 @@ impl Upstream {
         // Shared daemon startup and its durable BES admission must not depend
         // on the remote cache being reachable. RPCs keep their own deadlines;
         // a cold/offline backend fails those callers, not unrelated services.
-        let channel = endpoint.connect_lazy();
+        let stream_channel = endpoint.clone().connect_lazy();
+        let asset_channel = endpoint.clone().connect_lazy();
+        let operations_channel = endpoint.clone().connect_lazy();
+        let channel = endpoint.timeout(config.policy.rpc_timeout()).connect_lazy();
         Ok(Arc::new(Self {
             config,
             channel,
+            stream_channel,
+            asset_channel,
+            operations_channel,
+            gzip_requests: std::sync::atomic::AtomicU16::new(0),
             zstd_capability: tokio::sync::OnceCell::new(),
             zstd_disabled: std::sync::atomic::AtomicBool::new(false),
         }))
@@ -196,6 +291,16 @@ impl Upstream {
             request
                 .metadata_mut()
                 .insert_bin(REQUEST_METADATA, value.clone());
+        }
+        for (key, value) in &metadata.1 {
+            if !self
+                .config
+                .upstream_headers
+                .iter()
+                .any(|(configured, _)| configured.eq_ignore_ascii_case(key.as_str()))
+            {
+                request.metadata_mut().append(key.clone(), value.clone());
+            }
         }
         request
     }
@@ -369,19 +474,32 @@ impl CacheProxy {
         Ok(Self::new(Upstream::connect(config).await?, cache))
     }
     pub fn new(upstream: Arc<Upstream>, cache: Arc<LocalCas>) -> Self {
+        let execution_limit = upstream.config.max_execution_streams;
         Self {
             upstream,
             cache,
             ac: Default::default(),
             metrics: Arc::new(Counters::default()),
             writes: Arc::new(tokio::sync::Semaphore::new(4)),
+            executions: Arc::new(tokio::sync::Semaphore::new(execution_limit)),
+            assets: Default::default(),
+            stop: tokio::sync::watch::channel(false).0,
         }
+    }
+    /// Close scheduler forwarding streams before draining the listener. This
+    /// disconnects clients; it does not cancel execution at the remote scheduler.
+    pub fn stop_forwarding(&self) {
+        self.stop.send_replace(true);
     }
     pub fn metrics(&self) -> ProxyMetrics {
         ProxyMetrics {
             action_cache_hits: self.metrics.ac_hits.load(Ordering::Relaxed),
             action_cache_upstream: self.metrics.ac_upstream.load(Ordering::Relaxed),
             blob_reads: self.metrics.blob_reads.load(Ordering::Relaxed),
+            asset_cache_hits: self.metrics.asset_hits.load(Ordering::Relaxed),
+            asset_upstream_requests: self.metrics.asset_upstream.load(Ordering::Relaxed),
+            execution_requests: self.metrics.execution_requests.load(Ordering::Relaxed),
+            execution_waits: self.metrics.execution_waits.load(Ordering::Relaxed),
         }
     }
     pub async fn serve(
@@ -401,10 +519,14 @@ impl CacheProxy {
             listener.local_addr()?.ip().is_loopback(),
             "cache proxy must listen on loopback"
         );
+        let stopping = self.clone();
         self.router(true)
             .serve_with_incoming_shutdown(
                 tokio_stream::wrappers::TcpListenerStream::new(listener),
-                shutdown,
+                async move {
+                    shutdown.await;
+                    stopping.stop_forwarding();
+                },
             )
             .await?;
         Ok(())
@@ -417,13 +539,21 @@ impl CacheProxy {
         listener: tokio::net::UnixListener,
         shutdown: impl Future<Output = ()> + Send + 'static,
     ) -> Result<()> {
+        let stopping = self.clone();
         self.router(false)
             .serve_with_incoming_shutdown(
                 tokio_stream::wrappers::UnixListenerStream::new(listener),
-                shutdown,
+                async move {
+                    shutdown.await;
+                    stopping.stop_forwarding();
+                },
             )
             .await?;
         Ok(())
+    }
+    /// Compose additional daemon services on this private, per-user transport.
+    pub fn unix_router(self) -> tonic::transport::server::Router {
+        self.router(false)
     }
     fn router(self, enforce_bearer: bool) -> tonic::transport::server::Router {
         let limit = self.upstream.config.max_batch_bytes + 1024 * 1024;
@@ -487,6 +617,32 @@ impl CacheProxy {
                 capabilities_server::CapabilitiesServer::new(self.clone())
                     .accept_compressed(CompressionEncoding::Gzip)
                     .send_compressed(CompressionEncoding::Gzip),
+                auth.clone(),
+            ))
+            .add_service(InterceptedService::new(
+                execution_server::ExecutionServer::new(self.clone())
+                    .accept_compressed(CompressionEncoding::Gzip)
+                    .send_compressed(CompressionEncoding::Gzip)
+                    .max_decoding_message_size(limit)
+                    .max_encoding_message_size(limit),
+                auth.clone(),
+            ))
+            .add_service(InterceptedService::new(
+                reapi::proto::google::longrunning::operations_server::OperationsServer::new(
+                    self.clone(),
+                )
+                .accept_compressed(CompressionEncoding::Gzip)
+                .send_compressed(CompressionEncoding::Gzip)
+                .max_decoding_message_size(limit)
+                .max_encoding_message_size(limit),
+                auth.clone(),
+            ))
+            .add_service(InterceptedService::new(
+                reapi::asset::fetch_server::FetchServer::new(self.clone())
+                    .accept_compressed(CompressionEncoding::Gzip)
+                    .send_compressed(CompressionEncoding::Gzip)
+                    .max_decoding_message_size(limit)
+                    .max_encoding_message_size(limit),
                 auth.clone(),
             ))
             .add_service(InterceptedService::new(
@@ -893,12 +1049,29 @@ impl capabilities_server::Capabilities for CacheProxy {
             .upstream
             .replay(|| async {
                 capabilities_client::CapabilitiesClient::new(self.upstream.channel.clone())
+                    .accept_compressed(CompressionEncoding::Gzip)
                     .get_capabilities(self.upstream.request_with_metadata(req.clone(), &metadata))
                     .await
             })
             .await?;
         let capabilities = response.get_mut();
-        capabilities.execution_capabilities = None;
+        if let Some(execution) = capabilities.execution_capabilities.as_mut() {
+            if !execution.digest_functions.is_empty() {
+                execution.digest_functions.retain(|f| matches!(f, 1 | 9));
+                if let Some(first) = execution.digest_functions.first().copied() {
+                    if !execution
+                        .digest_functions
+                        .contains(&execution.digest_function)
+                    {
+                        execution.digest_function = first;
+                    }
+                } else {
+                    execution.exec_enabled = false;
+                }
+            } else if !matches!(execution.digest_function, 1 | 9) {
+                execution.exec_enabled = false;
+            }
+        }
         if let Some(cache) = capabilities.cache_capabilities.as_mut() {
             cache.digest_functions.retain(|f| matches!(f, 1 | 9));
             cache.max_batch_total_size_bytes = if cache.max_batch_total_size_bytes > 0 {

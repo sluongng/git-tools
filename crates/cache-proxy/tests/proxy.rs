@@ -3,11 +3,13 @@ use cache_proxy::{CacheProxy, ProxyConfig, Upstream};
 use futures_core::Stream;
 use local_cas::{CacheConfig, LocalCas};
 use reapi::{
+    asset,
     proto::google::bytestream::{
         self as bs,
         byte_stream_client::ByteStreamClient,
         byte_stream_server::{ByteStream, ByteStreamServer},
     },
+    proto::google::longrunning as lro,
     reapi::*,
 };
 use std::{
@@ -34,8 +36,29 @@ struct Backend {
     reads: Arc<AtomicU64>,
     ac_reads: Arc<AtomicU64>,
     reject_writes: Arc<Mutex<bool>>,
+    execution_calls: Arc<AtomicU64>,
+    grpc_gzip: Arc<AtomicBool>,
+    operations_success: Arc<AtomicBool>,
+    execution_capabilities: Arc<Mutex<Option<ExecutionCapabilities>>>,
+    execution_live: Arc<AtomicU64>,
+    execution_delay_ms: Arc<AtomicU64>,
+    execution_error: Arc<AtomicBool>,
+    operation_names: Arc<Mutex<Vec<String>>>,
+    fetch_calls: Arc<AtomicU64>,
+    fetch_error: Arc<AtomicU64>,
+    fetch_expired: Arc<AtomicBool>,
+    fetch_requests: Arc<Mutex<Vec<asset::FetchBlobRequest>>>,
 }
 impl Backend {
+    fn response<T>(&self, value: T) -> Response<T> {
+        let mut response = Response::new(value);
+        if self.grpc_gzip.load(Ordering::Relaxed) {
+            response
+                .metadata_mut()
+                .insert("grpc-accept-encoding", "gzip".parse().unwrap());
+        }
+        response
+    }
     fn observe<T>(&self, method: &str, request: &Request<T>) {
         self.observed_metadata
             .lock()
@@ -161,6 +184,18 @@ impl capabilities_server::Capabilities for Backend {
         _: Request<GetCapabilitiesRequest>,
     ) -> Result<Response<ServerCapabilities>, Status> {
         let response = ServerCapabilities {
+            execution_capabilities: Some(
+                self.execution_capabilities
+                    .lock()
+                    .unwrap()
+                    .clone()
+                    .unwrap_or(ExecutionCapabilities {
+                        digest_function: 9,
+                        digest_functions: vec![1, 9, 2],
+                        exec_enabled: true,
+                        ..Default::default()
+                    }),
+            ),
             cache_capabilities: Some(CacheCapabilities {
                 digest_functions: vec![1, 9, 2],
                 supported_compressors: if self.identity_only.load(Ordering::Relaxed) {
@@ -188,6 +223,11 @@ impl capabilities_server::Capabilities for Backend {
         response
             .metadata_mut()
             .insert("content-length", length.to_string().parse().unwrap());
+        if self.grpc_gzip.load(Ordering::Relaxed) {
+            response
+                .metadata_mut()
+                .insert("grpc-accept-encoding", "gzip".parse().unwrap());
+        }
         Ok(response)
     }
 }
@@ -281,6 +321,169 @@ impl content_addressable_storage_server::ContentAddressableStorage for Backend {
         Ok(Response::new(Default::default()))
     }
 }
+const OPERATION_NAME: &str = "repo:region/uploads/task-1/blobs/opaque/1";
+struct ExecutionLease(Arc<AtomicU64>);
+impl Drop for ExecutionLease {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+impl Backend {
+    fn execution(&self) -> Response<S<lro::Operation>> {
+        self.execution_live.fetch_add(1, Ordering::SeqCst);
+        let lease = ExecutionLease(self.execution_live.clone());
+        let this = self.clone();
+        let stream: S<lro::Operation> = Box::pin(async_stream::try_stream! {
+            let _lease=lease;
+            yield lro::Operation {name:OPERATION_NAME.into(),..Default::default()};
+            tokio::time::sleep(Duration::from_millis(this.execution_delay_ms.load(Ordering::SeqCst))).await;
+            if this.execution_error.load(Ordering::SeqCst) {Err(Status::with_details(tonic::Code::Unavailable,"fixture disconnected",vec![8,7].into()))?;}
+            yield lro::Operation {name:OPERATION_NAME.into(),done:true,..Default::default()};
+        });
+        self.response(stream)
+    }
+}
+#[tonic::async_trait]
+impl execution_server::Execution for Backend {
+    type ExecuteStream = S<lro::Operation>;
+    type WaitExecutionStream = S<lro::Operation>;
+    async fn execute(
+        &self,
+        request: Request<ExecuteRequest>,
+    ) -> Result<Response<Self::ExecuteStream>, Status> {
+        self.observe("execute", &request);
+        self.execution_calls.fetch_add(1, Ordering::SeqCst);
+        Ok(self.execution())
+    }
+    async fn wait_execution(
+        &self,
+        request: Request<WaitExecutionRequest>,
+    ) -> Result<Response<Self::WaitExecutionStream>, Status> {
+        self.observe("wait_execution", &request);
+        self.operation_names
+            .lock()
+            .unwrap()
+            .push(request.into_inner().name);
+        Ok(self.execution())
+    }
+}
+#[tonic::async_trait]
+impl lro::operations_server::Operations for Backend {
+    async fn get_operation(
+        &self,
+        request: Request<lro::GetOperationRequest>,
+    ) -> Result<Response<lro::Operation>, Status> {
+        self.observe("get_operation", &request);
+        self.operation_names
+            .lock()
+            .unwrap()
+            .push(request.into_inner().name);
+        if self.operations_success.load(Ordering::SeqCst) {
+            return Ok(self.response(Default::default()));
+        }
+        Err(Status::unimplemented("fixture operation unsupported"))
+    }
+    async fn list_operations(
+        &self,
+        request: Request<lro::ListOperationsRequest>,
+    ) -> Result<Response<lro::ListOperationsResponse>, Status> {
+        self.observe("list_operations", &request);
+        self.operation_names
+            .lock()
+            .unwrap()
+            .push(request.into_inner().name);
+        if self.operations_success.load(Ordering::SeqCst) {
+            return Ok(self.response(Default::default()));
+        }
+        Err(Status::unimplemented("fixture operation unsupported"))
+    }
+    async fn delete_operation(
+        &self,
+        request: Request<lro::DeleteOperationRequest>,
+    ) -> Result<Response<()>, Status> {
+        self.observe("delete_operation", &request);
+        self.operation_names
+            .lock()
+            .unwrap()
+            .push(request.into_inner().name);
+        if self.operations_success.load(Ordering::SeqCst) {
+            return Ok(self.response(Default::default()));
+        }
+        Err(Status::unimplemented("fixture operation unsupported"))
+    }
+    async fn cancel_operation(
+        &self,
+        request: Request<lro::CancelOperationRequest>,
+    ) -> Result<Response<()>, Status> {
+        self.observe("cancel_operation", &request);
+        self.operation_names
+            .lock()
+            .unwrap()
+            .push(request.into_inner().name);
+        if self.operations_success.load(Ordering::SeqCst) {
+            return Ok(self.response(Default::default()));
+        }
+        Err(Status::unimplemented("fixture operation unsupported"))
+    }
+    async fn wait_operation(
+        &self,
+        request: Request<lro::WaitOperationRequest>,
+    ) -> Result<Response<lro::Operation>, Status> {
+        self.observe("wait_operation", &request);
+        self.operation_names
+            .lock()
+            .unwrap()
+            .push(request.into_inner().name);
+        if self.operations_success.load(Ordering::SeqCst) {
+            return Ok(self.response(Default::default()));
+        }
+        Err(Status::unimplemented("fixture operation unsupported"))
+    }
+}
+#[tonic::async_trait]
+impl asset::fetch_server::Fetch for Backend {
+    async fn fetch_blob(
+        &self,
+        request: Request<asset::FetchBlobRequest>,
+    ) -> Result<Response<asset::FetchBlobResponse>, Status> {
+        self.observe("fetch_blob", &request);
+        self.fetch_calls.fetch_add(1, Ordering::SeqCst);
+        let request = request.into_inner();
+        self.fetch_requests.lock().unwrap().push(request.clone());
+        if self.fetch_error.load(Ordering::SeqCst) == 2 {
+            return Err(Status::unavailable("fixture origin unavailable"));
+        }
+        let uri = request.uris.first().cloned().unwrap_or_default();
+        let bytes = format!("asset-body:{uri}").repeat(16).into_bytes();
+        let d = digest(&bytes);
+        self.blobs.lock().unwrap().insert(d.hash.clone(), bytes);
+        let mut response = asset::FetchBlobResponse {
+            uri,
+            blob_digest: Some(d),
+            digest_function: 9,
+            qualifiers: request.qualifiers,
+            ..Default::default()
+        };
+        if self.fetch_error.load(Ordering::SeqCst) == 1 {
+            response.status = Some(reapi::proto::google::rpc::Status {
+                code: 5,
+                message: "fixture inline absence".into(),
+                ..Default::default()
+            });
+        }
+        if self.fetch_expired.load(Ordering::SeqCst) {
+            response.expires_at = Some(Default::default());
+        }
+        Ok(self.response(response))
+    }
+    async fn fetch_directory(
+        &self,
+        request: Request<asset::FetchDirectoryRequest>,
+    ) -> Result<Response<asset::FetchDirectoryResponse>, Status> {
+        self.observe("fetch_directory", &request);
+        Err(Status::unimplemented("fixture directory unsupported"))
+    }
+}
 struct Harness {
     backend: Backend,
     url: String,
@@ -301,11 +504,49 @@ impl Harness {
         Self::with_upstream_stream_limit(ttl, None).await
     }
     async fn with_upstream_stream_limit(ttl: Duration, limit: Option<u32>) -> Self {
+        Self::configured(ttl, limit, |_| {}, CacheConfig::default()).await
+    }
+    async fn configured(
+        ttl: Duration,
+        limit: Option<u32>,
+        configure: impl FnOnce(&mut ProxyConfig),
+        cache_config: CacheConfig,
+    ) -> Self {
+        Self::with_transport(ttl, limit, configure, cache_config, true).await
+    }
+    async fn with_transport(
+        ttl: Duration,
+        limit: Option<u32>,
+        configure: impl FnOnce(&mut ProxyConfig),
+        cache_config: CacheConfig,
+        gzip: bool,
+    ) -> Self {
         let backend = Backend::default();
+        backend.grpc_gzip.store(gzip, Ordering::Relaxed);
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let upstream_addr = listener.local_addr().unwrap();
         let fake = backend.clone();
         let task = tokio::spawn(async move {
+            let execution = execution_server::ExecutionServer::new(fake.clone());
+            let operations = lro::operations_server::OperationsServer::new(fake.clone());
+            let fetch = asset::fetch_server::FetchServer::new(fake.clone());
+            let capabilities = capabilities_server::CapabilitiesServer::new(fake.clone());
+            let (execution, operations, fetch, capabilities) = if gzip {
+                (
+                    execution
+                        .accept_compressed(tonic::codec::CompressionEncoding::Gzip)
+                        .send_compressed(tonic::codec::CompressionEncoding::Gzip),
+                    operations
+                        .accept_compressed(tonic::codec::CompressionEncoding::Gzip)
+                        .send_compressed(tonic::codec::CompressionEncoding::Gzip),
+                    fetch
+                        .accept_compressed(tonic::codec::CompressionEncoding::Gzip)
+                        .send_compressed(tonic::codec::CompressionEncoding::Gzip),
+                    capabilities.accept_compressed(tonic::codec::CompressionEncoding::Gzip),
+                )
+            } else {
+                (execution, operations, fetch, capabilities)
+            };
             Server::builder()
                 .max_concurrent_streams(limit)
                 .add_service(
@@ -314,15 +555,20 @@ impl Harness {
                         .send_compressed(tonic::codec::CompressionEncoding::Gzip),
                 )
                 .add_service(action_cache_server::ActionCacheServer::new(fake.clone()))
-                .add_service(capabilities_server::CapabilitiesServer::new(fake.clone()))
+                .add_service(capabilities)
                 .add_service(
-                    content_addressable_storage_server::ContentAddressableStorageServer::new(fake),
+                    content_addressable_storage_server::ContentAddressableStorageServer::new(
+                        fake.clone(),
+                    ),
                 )
+                .add_service(execution)
+                .add_service(operations)
+                .add_service(fetch)
                 .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(listener))
                 .await
                 .unwrap();
         });
-        let config = ProxyConfig {
+        let mut config = ProxyConfig {
             upstream: format!("http://{upstream_addr}"),
             backend_identity: "test-security-scope".into(),
             instance_name: "repo".into(),
@@ -331,9 +577,10 @@ impl Harness {
             local_bearer_token: Some("test-token".into()),
             ..Default::default()
         };
+        configure(&mut config);
         let upstream = Upstream::connect(config).await.unwrap();
         let dir = tempfile::tempdir().unwrap();
-        let cache = LocalCas::open(dir.path(), upstream.clone(), CacheConfig::default()).unwrap();
+        let cache = LocalCas::open(dir.path(), upstream.clone(), cache_config).unwrap();
         let proxy = CacheProxy::new(upstream, cache.clone());
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -971,4 +1218,576 @@ async fn concurrent_streaming_uploads_do_not_starve_admitted_writers_of_connecti
         .expect(name);
         assert_eq!(h.backend.blobs.lock().unwrap().len(), 32);
     }
+}
+
+#[tokio::test]
+async fn scheduler_streams_preserve_policy_metadata_and_leave_cache_headroom() {
+    let h = Harness::configured(
+        Duration::ZERO,
+        None,
+        |c| {
+            c.policy.rpc_timeout_ms = 30;
+            c.policy.operation_timeout_ms = 40;
+            c.policy.stream_idle_timeout_ms = 10;
+            c.max_execution_streams = 1;
+        },
+        CacheConfig::default(),
+    )
+    .await;
+    h.backend.execution_delay_ms.store(150, Ordering::SeqCst);
+    let channel = tonic::transport::Endpoint::from_shared(h.url.clone())
+        .unwrap()
+        .connect()
+        .await
+        .unwrap();
+    let mut client = execution_client::ExecutionClient::new(channel.clone())
+        .send_compressed(tonic::codec::CompressionEncoding::Gzip)
+        .accept_compressed(tonic::codec::CompressionEncoding::Gzip);
+    let mut request = h.request(ExecuteRequest {
+        instance_name: "repo".into(),
+        ..Default::default()
+    });
+    request
+        .metadata_mut()
+        .insert("x-buildbuddy-api-key", "caller-key".parse().unwrap());
+    request
+        .metadata_mut()
+        .append("x-buildbuddy-platform.pool", "pool-a".parse().unwrap());
+    request
+        .metadata_mut()
+        .append("x-buildbuddy-platform.pool", "pool-b".parse().unwrap());
+    request
+        .metadata_mut()
+        .insert("x-untrusted-header", "drop-me".parse().unwrap());
+    let mut stream = client.execute(request).await.unwrap().into_inner();
+    assert_eq!(
+        stream.message().await.unwrap().unwrap().name,
+        OPERATION_NAME
+    );
+    let queued_request = h.request(ExecuteRequest {
+        instance_name: "repo".into(),
+        ..Default::default()
+    });
+    let mut queued_client = client.clone();
+    let queued = tokio::spawn(async move { queued_client.execute(queued_request).await });
+    tokio::task::yield_now().await;
+    assert!(
+        !queued.is_finished(),
+        "excess scheduler requests wait instead of exhausting client retries"
+    );
+    let mut caps = capabilities_client::CapabilitiesClient::new(channel.clone());
+    let execution_caps = caps
+        .get_capabilities(h.request(GetCapabilitiesRequest {
+            instance_name: "repo".into(),
+        }))
+        .await
+        .unwrap()
+        .into_inner()
+        .execution_capabilities
+        .unwrap();
+    assert!(execution_caps.exec_enabled);
+    assert_eq!(execution_caps.digest_functions, vec![1, 9]);
+    assert!(stream.message().await.unwrap().unwrap().done);
+    assert!(stream.message().await.unwrap().is_none());
+    let mut second = queued.await.unwrap().unwrap().into_inner();
+    while second.message().await.unwrap().is_some() {}
+
+    assert_eq!(h.backend.execution_calls.load(Ordering::SeqCst), 2);
+    {
+        let seen = h.backend.observed_metadata.lock().unwrap();
+        let headers = &seen.iter().find(|(name, _)| name == "execute").unwrap().1;
+        assert_eq!(headers.get("x-buildbuddy-api-key").unwrap(), "daemon-key");
+        assert_eq!(
+            headers
+                .get_all("x-buildbuddy-platform.pool")
+                .iter()
+                .map(|v| v.to_str().unwrap())
+                .collect::<Vec<_>>(),
+            vec!["pool-a", "pool-b"]
+        );
+        assert!(!headers.contains_key("x-untrusted-header"));
+        assert!(
+            !headers.contains_key("grpc-timeout"),
+            "cache timeout must not become execution deadline"
+        );
+    }
+    h.backend.execution_error.store(true, Ordering::SeqCst);
+    let mut resumed = client
+        .wait_execution(h.request(WaitExecutionRequest {
+            name: OPERATION_NAME.into(),
+        }))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(
+        resumed.message().await.unwrap().unwrap().name,
+        OPERATION_NAME
+    );
+    let error = resumed.message().await.unwrap_err();
+    assert_eq!(error.code(), tonic::Code::Unavailable);
+    assert_eq!(error.details(), &[8, 7]);
+    assert_eq!(
+        h.backend.execution_calls.load(Ordering::SeqCst),
+        2,
+        "proxy must not replay Execute"
+    );
+    let mut operations = lro::operations_client::OperationsClient::new(channel);
+    assert_eq!(
+        operations
+            .cancel_operation(h.request(lro::CancelOperationRequest {
+                name: OPERATION_NAME.into()
+            }))
+            .await
+            .unwrap_err()
+            .code(),
+        tonic::Code::Unimplemented
+    );
+    assert!(
+        h.backend
+            .operation_names
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|name| name == OPERATION_NAME)
+    );
+}
+
+#[tokio::test]
+async fn scheduler_caller_deadline_and_disconnect_release_streams() {
+    let h = Harness::new(Duration::ZERO).await;
+    h.backend.execution_delay_ms.store(5000, Ordering::SeqCst);
+    let mut client = execution_client::ExecutionClient::connect(h.url.clone())
+        .await
+        .unwrap();
+    let mut request = h.request(ExecuteRequest {
+        instance_name: "repo".into(),
+        ..Default::default()
+    });
+    request.set_timeout(Duration::from_millis(80));
+    let mut stream = client.execute(request).await.unwrap().into_inner();
+    assert!(!stream.message().await.unwrap().unwrap().done);
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(1), stream.message())
+            .await
+            .unwrap()
+            .unwrap_err()
+            .code(),
+        tonic::Code::DeadlineExceeded
+    );
+    drop(stream);
+    let mut stream = client
+        .wait_execution(h.request(WaitExecutionRequest {
+            name: OPERATION_NAME.into(),
+        }))
+        .await
+        .unwrap()
+        .into_inner();
+    stream.message().await.unwrap().unwrap();
+    drop(stream);
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while h.backend.execution_live.load(Ordering::SeqCst) != 0 {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(h.backend.execution_calls.load(Ordering::SeqCst), 1);
+}
+
+fn fetch_request(uri: &str) -> asset::FetchBlobRequest {
+    asset::FetchBlobRequest {
+        instance_name: "repo".into(),
+        uris: vec![uri.into()],
+        digest_function: 9,
+        ..Default::default()
+    }
+}
+async fn read_asset(h: &Harness, d: Digest) {
+    let mut client = ByteStreamClient::connect(h.url.clone()).await.unwrap();
+    let mut body = client
+        .read(h.request(bs::ReadRequest {
+            resource_name: format!("repo/blobs/blake3/{}/{}", d.hash, d.size_bytes),
+            ..Default::default()
+        }))
+        .await
+        .unwrap()
+        .into_inner();
+    while body.message().await.unwrap().is_some() {}
+}
+#[tokio::test]
+async fn downloader_mapping_uses_shared_cas_and_eviction_without_hiding_remote_absence() {
+    let h = Harness::configured(
+        Duration::ZERO,
+        None,
+        |_| {},
+        CacheConfig {
+            max_bytes: 600,
+            max_inflight_bytes: 600,
+            ..Default::default()
+        },
+    )
+    .await;
+    let mut client = asset::fetch_client::FetchClient::connect(h.url.clone())
+        .await
+        .unwrap()
+        .send_compressed(tonic::codec::CompressionEncoding::Gzip)
+        .accept_compressed(tonic::codec::CompressionEncoding::Gzip);
+    let request = fetch_request("https://example.invalid/a");
+    let value = client
+        .fetch_blob(h.request(request.clone()))
+        .await
+        .unwrap()
+        .into_inner();
+    let d = value.blob_digest.unwrap();
+    read_asset(&h, d.clone()).await;
+    client.fetch_blob(h.request(request.clone())).await.unwrap();
+    assert_eq!(h.backend.fetch_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(h.proxy.metrics().asset_cache_hits, 1);
+    let another = client
+        .fetch_blob(h.request(fetch_request("https://example.invalid/b")))
+        .await
+        .unwrap()
+        .into_inner()
+        .blob_digest
+        .unwrap();
+    read_asset(&h, another).await;
+    assert!(h.cache.metrics().evictions > 0);
+    client.fetch_blob(h.request(request.clone())).await.unwrap();
+    assert_eq!(
+        h.backend.fetch_calls.load(Ordering::SeqCst),
+        3,
+        "evicted bytes invalidate metadata reuse"
+    );
+    read_asset(&h, d.clone()).await;
+    h.backend.blobs.lock().unwrap().remove(&d.hash);
+    client.fetch_blob(h.request(request)).await.unwrap();
+    assert_eq!(
+        h.backend.fetch_calls.load(Ordering::SeqCst),
+        4,
+        "local bytes must not claim upstream availability"
+    );
+}
+
+#[tokio::test]
+async fn downloader_preserves_request_identity_freshness_and_inline_errors() {
+    let h = Harness::new(Duration::ZERO).await;
+    let mut client = asset::fetch_client::FetchClient::connect(h.url.clone())
+        .await
+        .unwrap();
+    let request = fetch_request("https://example.invalid/asset");
+    let d = client
+        .fetch_blob(h.request(request.clone()))
+        .await
+        .unwrap()
+        .into_inner()
+        .blob_digest
+        .unwrap();
+    read_asset(&h, d).await;
+    let mut variants = Vec::new();
+    let mut indexed = request.clone();
+    indexed.uris.push("https://mirror.invalid/asset".into());
+    indexed.qualifiers.push(asset::Qualifier {
+        name: "http_header_url:0:Authorization".into(),
+        value: "fixture-value".into(),
+    });
+    variants.push(indexed.clone());
+    indexed.uris.reverse();
+    variants.push(indexed);
+    let mut fresh = request.clone();
+    fresh.oldest_content_accepted = Some(Default::default());
+    variants.push(fresh.clone());
+    variants.push(fresh);
+    for req in &variants {
+        client.fetch_blob(h.request(req.clone())).await.unwrap();
+    }
+    assert_eq!(
+        &h.backend.fetch_requests.lock().unwrap()[1..],
+        variants.as_slice()
+    );
+    assert_eq!(h.backend.fetch_calls.load(Ordering::SeqCst), 5);
+    h.backend.fetch_error.store(1, Ordering::SeqCst);
+    for _ in 0..2 {
+        assert_eq!(
+            client
+                .fetch_blob(h.request(fetch_request("https://example.invalid/missing")))
+                .await
+                .unwrap()
+                .into_inner()
+                .status
+                .unwrap()
+                .code,
+            5
+        );
+    }
+    h.backend.fetch_error.store(2, Ordering::SeqCst);
+    assert_eq!(
+        client
+            .fetch_blob(h.request(fetch_request("https://example.invalid/outage")))
+            .await
+            .unwrap_err()
+            .code(),
+        tonic::Code::Unavailable
+    );
+    assert_eq!(
+        h.backend.fetch_calls.load(Ordering::SeqCst),
+        8,
+        "transport failure must not trigger proxy retries"
+    );
+    assert_eq!(
+        client
+            .fetch_directory(h.request(asset::FetchDirectoryRequest {
+                instance_name: "repo".into(),
+                uris: request.uris,
+                ..Default::default()
+            }))
+            .await
+            .unwrap_err()
+            .code(),
+        tonic::Code::Unimplemented
+    );
+    assert_eq!(
+        client
+            .fetch_blob(h.request(asset::FetchBlobRequest {
+                instance_name: "other-scope".into(),
+                ..Default::default()
+            }))
+            .await
+            .unwrap_err()
+            .code(),
+        tonic::Code::PermissionDenied
+    );
+}
+
+#[tokio::test]
+async fn downloader_mapping_expiry_and_metadata_lru_force_upstream_fetch() {
+    let h = Harness::configured(
+        Duration::ZERO,
+        None,
+        |c| {
+            c.asset_cache_ttl = Duration::from_millis(100);
+            c.max_asset_cache_entries = 1;
+        },
+        CacheConfig::default(),
+    )
+    .await;
+    let mut client = asset::fetch_client::FetchClient::connect(h.url.clone())
+        .await
+        .unwrap();
+    let a = fetch_request("https://example.invalid/a");
+    let b = fetch_request("https://example.invalid/b");
+    for request in [&a, &b, &a] {
+        let d = client
+            .fetch_blob(h.request(request.clone()))
+            .await
+            .unwrap()
+            .into_inner()
+            .blob_digest
+            .unwrap();
+        read_asset(&h, d).await;
+    }
+    assert_eq!(h.backend.fetch_calls.load(Ordering::SeqCst), 3);
+    tokio::time::sleep(Duration::from_millis(120)).await;
+    client.fetch_blob(h.request(a.clone())).await.unwrap();
+    assert_eq!(h.backend.fetch_calls.load(Ordering::SeqCst), 4);
+    h.backend.fetch_expired.store(true, Ordering::SeqCst);
+    for _ in 0..2 {
+        client.fetch_blob(h.request(b.clone())).await.unwrap();
+    }
+    assert_eq!(h.backend.fetch_calls.load(Ordering::SeqCst), 6);
+}
+
+#[tokio::test]
+async fn execution_capabilities_prefer_modern_digest_list_and_disable_unsupported_backends() {
+    let h = Harness::new(Duration::ZERO).await;
+    let mut client = capabilities_client::CapabilitiesClient::connect(h.url.clone())
+        .await
+        .unwrap();
+    for (name, legacy, modern, enabled, selected) in [
+        (
+            "modern list overrides unsupported legacy",
+            2,
+            vec![2, 1],
+            true,
+            1,
+        ),
+        ("legacy supported without modern list", 9, vec![], true, 9),
+        ("modern list has no supported digest", 1, vec![2], false, 1),
+        (
+            "legacy unsupported without modern list",
+            2,
+            vec![],
+            false,
+            2,
+        ),
+    ] {
+        *h.backend.execution_capabilities.lock().unwrap() = Some(ExecutionCapabilities {
+            digest_function: legacy,
+            digest_functions: modern,
+            exec_enabled: true,
+            ..Default::default()
+        });
+        let caps = client
+            .get_capabilities(h.request(GetCapabilitiesRequest {
+                instance_name: "repo".into(),
+            }))
+            .await
+            .unwrap()
+            .into_inner()
+            .execution_capabilities
+            .unwrap();
+        assert_eq!(caps.exec_enabled, enabled, "{name}");
+        assert_eq!(caps.digest_function, selected, "{name}");
+    }
+}
+
+#[tokio::test]
+async fn configured_execution_deadline_and_shutdown_close_quiet_streams() {
+    for (name, lifetime, shutdown, code) in [
+        (
+            "configured lifetime",
+            Some(Duration::from_millis(80)),
+            false,
+            tonic::Code::DeadlineExceeded,
+        ),
+        ("explicit shutdown", None, true, tonic::Code::Unavailable),
+    ] {
+        let h = Harness::configured(
+            Duration::ZERO,
+            None,
+            |c| c.execution_timeout = lifetime,
+            CacheConfig::default(),
+        )
+        .await;
+        h.backend.execution_delay_ms.store(5000, Ordering::SeqCst);
+        let mut client = execution_client::ExecutionClient::connect(h.url.clone())
+            .await
+            .unwrap();
+        let mut stream = client
+            .execute(h.request(ExecuteRequest {
+                instance_name: "repo".into(),
+                ..Default::default()
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        stream.message().await.unwrap().unwrap();
+        if shutdown {
+            h.proxy.stop_forwarding();
+        }
+        let error = tokio::time::timeout(Duration::from_secs(1), stream.message())
+            .await
+            .unwrap()
+            .unwrap_err();
+        assert_eq!(error.code(), code, "{name}");
+        assert_eq!(h.backend.execution_calls.load(Ordering::SeqCst), 1);
+    }
+}
+
+#[tokio::test]
+async fn scheduler_and_downloader_negotiate_upstream_compression_without_replay() {
+    for gzip in [false, true] {
+        let h = Harness::with_transport(Duration::ZERO, None, |_| {}, CacheConfig::default(), gzip)
+            .await;
+        h.backend.operations_success.store(true, Ordering::SeqCst);
+        let mut caps = capabilities_client::CapabilitiesClient::connect(h.url.clone())
+            .await
+            .unwrap();
+        caps.get_capabilities(h.request(GetCapabilitiesRequest {
+            instance_name: "repo".into(),
+        }))
+        .await
+        .unwrap();
+
+        let mut client = execution_client::ExecutionClient::connect(h.url.clone())
+            .await
+            .unwrap()
+            .send_compressed(tonic::codec::CompressionEncoding::Gzip)
+            .accept_compressed(tonic::codec::CompressionEncoding::Gzip);
+        let mut fetch = asset::fetch_client::FetchClient::connect(h.url.clone())
+            .await
+            .unwrap()
+            .send_compressed(tonic::codec::CompressionEncoding::Gzip)
+            .accept_compressed(tonic::codec::CompressionEncoding::Gzip);
+        let mut operations = lro::operations_client::OperationsClient::connect(h.url.clone())
+            .await
+            .unwrap();
+        for _ in 0..2 {
+            let mut stream = client
+                .execute(h.request(ExecuteRequest {
+                    instance_name: "repo".into(),
+                    ..Default::default()
+                }))
+                .await
+                .unwrap()
+                .into_inner();
+            while stream.message().await.unwrap().is_some() {}
+            fetch
+                .fetch_blob(h.request(fetch_request("https://example.invalid/archive")))
+                .await
+                .unwrap();
+            operations
+                .get_operation(h.request(lro::GetOperationRequest {
+                    name: OPERATION_NAME.into(),
+                }))
+                .await
+                .unwrap();
+        }
+        assert_eq!(h.backend.execution_calls.load(Ordering::SeqCst), 2);
+        let seen = h.backend.observed_metadata.lock().unwrap();
+        for method in ["execute", "fetch_blob", "get_operation"] {
+            let encodings = seen
+                .iter()
+                .filter(|(name, _)| name == method)
+                .map(|(_, headers)| headers.get("grpc-encoding").and_then(|v| v.to_str().ok()))
+                .collect::<Vec<_>>();
+            assert_eq!(
+                encodings,
+                vec![None, if gzip { Some("gzip") } else { None }],
+                "{method}, advertised gzip={gzip}"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn long_scheduler_stream_does_not_block_downloader_or_operation_control() {
+    let h = Harness::with_upstream_stream_limit(Duration::ZERO, Some(1)).await;
+    h.backend.execution_delay_ms.store(5000, Ordering::SeqCst);
+    let mut execution = execution_client::ExecutionClient::connect(h.url.clone())
+        .await
+        .unwrap();
+    let mut stream = execution
+        .execute(h.request(ExecuteRequest {
+            instance_name: "repo".into(),
+            ..Default::default()
+        }))
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(!stream.message().await.unwrap().unwrap().done);
+    tokio::time::timeout(Duration::from_secs(1), async {
+        let mut fetch = asset::fetch_client::FetchClient::connect(h.url.clone())
+            .await
+            .unwrap();
+        fetch
+            .fetch_blob(h.request(fetch_request("https://example.invalid/archive")))
+            .await
+            .unwrap();
+        let mut operations = lro::operations_client::OperationsClient::connect(h.url.clone())
+            .await
+            .unwrap();
+        assert_eq!(
+            operations
+                .cancel_operation(h.request(lro::CancelOperationRequest {
+                    name: OPERATION_NAME.into()
+                }))
+                .await
+                .unwrap_err()
+                .message(),
+            "fixture operation unsupported"
+        );
+    })
+    .await
+    .expect("long execution must not occupy the downloader/control connection");
+    drop(stream);
 }

@@ -84,7 +84,7 @@ bazel run --config=rbe //crates/local-cas:cache_benchmark -- /tmp/fresh-cas-benc
 For the shared daemon, supply a private plan JSON with `cwd`, `source_revision`
 and a Bazel `command` argv array. Placeholders are `{output_base}`,
 `{output_user_root}`, `{artifacts}` and `{endpoint}`. Run the same plan against
-the upstream endpoint and `unix:/absolute/state/cache.sock`, with fresh output
+the upstream endpoint and `unix:/absolute/state/rbe.sock`, with fresh output
 directories. Keep credentials in a helper/private rc, never the command array.
 `--noop` measures a separate same-server incremental build; it is not another
 remote-cache sample. Record mirror population and daemon cache priming separately.

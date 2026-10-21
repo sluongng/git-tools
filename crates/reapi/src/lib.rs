@@ -27,6 +27,11 @@ pub mod proto {
                 tonic::include_proto!("build.bazel.semver");
             }
             pub mod remote {
+                pub mod asset {
+                    pub mod v1 {
+                        tonic::include_proto!("build.bazel.remote.asset.v1");
+                    }
+                }
                 pub mod execution {
                     pub mod v2 {
                         tonic::include_proto!("build.bazel.remote.execution.v2");
@@ -36,6 +41,7 @@ pub mod proto {
         }
     }
 }
+pub use proto::build::bazel::remote::asset::v1 as asset;
 pub use proto::build::bazel::remote::execution::v2 as reapi;
 pub use proto::google::devtools::build::v1 as bes;
 pub use reapi::Digest;

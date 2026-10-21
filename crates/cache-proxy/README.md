@@ -1,6 +1,6 @@
 # cache-proxy
 
-Private Unix-socket REAPI cache for the workspace daemon, with optional
+Private Unix-socket REAPI cache, scheduler and Remote Asset proxy for the workspace daemon, with optional
 bearer-authenticated loopback TCP. Share one
 `Arc<local_cas::LocalCas>` with source/output services; `Upstream` supplies verified
 CAS hydration. The daemon owns listener, credentials, cache scope and shutdown.
@@ -9,12 +9,20 @@ CAS hydration. The daemon owns listener, credentials, cache scope and shutdown.
 - Reads reuse locally verified blobs. Writes are verified and committed upstream
   before success. `FindMissingBlobs` always checks upstream, not local residence,
   so direct-to-BuildBuddy execution cannot mistake local-only inputs for uploads.
-- Action-result caching defaults to **off**. Configure a positive TTL only with
+- Embedded action-result caching defaults to **off** (the workspace daemon selects
+  a short configurable TTL). Configure a positive TTL only with
   an upstream retention guarantee; entries include inline request options and
   are bounded by count and 64 MiB. Blob eviction uses shared CAS policy.
 - ByteStream uploads stage bounded temporary files (four admitted uploads), then
   verify and forward. Incomplete uploads restart at offset zero; staging is not
   a persistent resumable-upload service. Completed status is forwarded upstream.
+
+Execution streams preserve caller deadlines without cache-derived idle timeouts
+or hidden retries. Operations are forwarded unchanged, including `UNIMPLEMENTED`.
+Bounded routing metadata is forwarded; upstream credentials remain daemon-owned.
+Downloader mapping hits require verified local CAS bytes and upstream presence;
+metadata has fixed TTL/count/byte bounds and LRU eviction. No blob leases are
+retained. Freshness-constrained requests and directory requests always forward.
 
 Unix sockets must live in a private per-user directory; their filesystem
 permissions replace bearer authentication. Configure a local bearer token for

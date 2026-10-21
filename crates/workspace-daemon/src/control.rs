@@ -92,6 +92,8 @@ impl agent_session::MountController for Client {
             .context("missing cache endpoint")?;
         let mut args = vec![
             format!("--remote_cache={endpoint}"),
+            format!("--remote_executor={endpoint}"),
+            format!("--experimental_remote_downloader={endpoint}"),
             format!(
                 "--remote_bytestream_uri_prefix={}",
                 status["bytestream_uri_prefix"]

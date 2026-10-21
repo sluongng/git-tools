@@ -109,7 +109,7 @@ impl State {
     fn status(&self) -> serde_json::Value {
         let metrics = self.cache.metrics();
         let proxy = self.proxy.metrics();
-        json!({"pid":std::process::id(),"cache_endpoint":self.config.cache_endpoint(),"bytestream_uri_prefix":self.config.bytestream_uri_prefix(),"instance_name":self.config.cache.instance_name,"bes_endpoint":self.bes.as_ref().map(|_|self.config.bes_endpoint()),"bes":self.bes.as_ref().map(|bes|bes.metrics()),"bos_endpoint":if self.config.bos.enabled {Some(format!("unix:{}",self.config.state_dir.join("bos.sock").display()))}else{None},"output_path_prefix":self.config.state_dir.join("outputs"),"mounts":self.registry.mounts.iter().map(|(path,record)|json!({"session":path,"state":record.state})).collect::<Vec<_>>(),"proxy":{"action_cache_hits":proxy.action_cache_hits,"action_cache_upstream":proxy.action_cache_upstream,"blob_reads":proxy.blob_reads},"cache":{"hits":metrics.hits,"fetches":metrics.fetches,"resident_bytes":metrics.resident_bytes,"reserved_bytes":metrics.reserved_bytes,"evictions":metrics.evictions,"evicted_bytes":metrics.evicted_bytes}})
+        json!({"pid":std::process::id(),"rbe_endpoint":self.config.rbe_endpoint(),"cache_endpoint":self.config.cache_endpoint(),"bytestream_uri_prefix":self.config.bytestream_uri_prefix(),"instance_name":self.config.cache.instance_name,"bes_endpoint":self.bes.as_ref().map(|_|self.config.bes_endpoint()),"bes":self.bes.as_ref().map(|bes|bes.metrics()),"bos_endpoint":if self.config.bos.enabled {Some(self.config.rbe_endpoint())}else{None},"output_path_prefix":self.config.state_dir.join("outputs"),"mounts":self.registry.mounts.iter().map(|(path,record)|json!({"session":path,"state":record.state})).collect::<Vec<_>>(),"proxy":{"action_cache_hits":proxy.action_cache_hits,"action_cache_upstream":proxy.action_cache_upstream,"blob_reads":proxy.blob_reads,"asset_cache_hits":proxy.asset_cache_hits,"asset_upstream_requests":proxy.asset_upstream_requests,"execution_requests":proxy.execution_requests,"execution_waits":proxy.execution_waits},"cache":{"hits":metrics.hits,"fetches":metrics.fetches,"resident_bytes":metrics.resident_bytes,"reserved_bytes":metrics.reserved_bytes,"evictions":metrics.evictions,"evicted_bytes":metrics.evicted_bytes}})
     }
     fn mounted(&self, path: &Path) -> bool {
         #[cfg(target_os = "linux")]
@@ -527,6 +527,12 @@ pub async fn serve(mut config: Config) -> Result<()> {
         max_batch_bytes: 4 * 1024 * 1024,
         action_cache_ttl: Duration::from_secs(config.cache.action_cache_ttl_seconds),
         max_action_cache_entries: config.cache.max_action_cache_entries,
+        asset_cache_ttl: Duration::from_secs(config.cache.asset_cache_ttl_seconds),
+        max_asset_cache_entries: config.cache.max_asset_cache_entries,
+        max_asset_cache_bytes: config.cache.max_asset_cache_bytes,
+        max_execution_streams: config.cache.max_execution_streams,
+        execution_timeout: (config.cache.execution_timeout_ms > 0)
+            .then(|| Duration::from_millis(config.cache.execution_timeout_ms)),
         max_concurrent_rpcs_per_connection: config.cache.max_concurrent_rpcs_per_connection,
         local_bearer_token: None,
     })
@@ -544,9 +550,7 @@ pub async fn serve(mut config: Config) -> Result<()> {
         },
     )?;
     let proxy = cache_proxy::CacheProxy::new(upstream, cache.clone());
-    let bes_socket = config.state_dir.join("bes.sock");
-    let mut bes_task = None;
-    let mut bes_shutdown = None;
+    let mut rbe_router = proxy.clone().unix_router();
     let bes = if config.bes.enabled {
         let settings = &config.bes;
         let key_env = if settings.api_key_env.is_empty() {
@@ -586,28 +590,13 @@ pub async fn serve(mut config: Config) -> Result<()> {
             },
         )
         .await?;
-        if bes_socket.exists() {
-            use std::os::unix::fs::FileTypeExt;
-            ensure!(
-                std::fs::symlink_metadata(&bes_socket)?
-                    .file_type()
-                    .is_socket(),
-                "BES transport path is not a socket"
-            );
-            std::fs::remove_file(&bes_socket)?;
-        }
-        let listener = UnixListener::bind(&bes_socket)?;
-        std::fs::set_permissions(&bes_socket, std::fs::Permissions::from_mode(0o600))?;
-        let (tx, rx) = tokio::sync::oneshot::channel();
-        let service = bes.clone();
-        bes_task = Some(tokio::spawn(async move {
-            service
-                .serve_unix_listener(listener, async {
-                    let _ = rx.await;
-                })
-                .await
-        }));
-        bes_shutdown = Some(tx);
+        rbe_router = rbe_router.add_service(
+            reapi::bes::publish_build_event_server::PublishBuildEventServer::new(bes.clone())
+                .accept_compressed(tonic::codec::CompressionEncoding::Gzip)
+                .send_compressed(tonic::codec::CompressionEncoding::Gzip)
+                .max_decoding_message_size(settings.max_event_bytes)
+                .max_encoding_message_size(settings.max_event_bytes),
+        );
         Some(bes)
     } else {
         None
@@ -667,8 +656,6 @@ pub async fn serve(mut config: Config) -> Result<()> {
         git_cas_shutdown = cas_shutdown;
     }
     let mut output_host = None;
-    let mut bos_task = None;
-    let mut bos_shutdown = None;
     if config.bos.enabled {
         use bazel_output_service::{
             host::{HostConfig, LazyStorage, OutputHost},
@@ -690,37 +677,14 @@ pub async fn serve(mut config: Config) -> Result<()> {
             crate::recovery::identity(&config.state_dir.join("outputs"))?
                 .context("BOS mount identity missing")?,
         )?;
-        let path = config.state_dir.join("bos.sock");
-        if path.exists() {
-            use std::os::unix::fs::FileTypeExt;
-            ensure!(
-                std::fs::symlink_metadata(&path)?.file_type().is_socket(),
-                "BOS transport path is not a socket"
-            );
-            std::fs::remove_file(&path)?;
-        }
-        let listener = UnixListener::bind(path)?;
-        let (tx, rx) = tokio::sync::oneshot::channel();
-        let service = host.service();
-        bos_task = Some(tokio::spawn(async move {
-            tonic::transport::Server::builder()
-                .add_service(
-                    BazelOutputServiceServer::new(service)
-                        .accept_compressed(tonic::codec::CompressionEncoding::Gzip)
-                        .send_compressed(tonic::codec::CompressionEncoding::Gzip),
-                )
-                .serve_with_incoming_shutdown(
-                    tokio_stream::wrappers::UnixListenerStream::new(listener),
-                    async {
-                        let _ = rx.await;
-                    },
-                )
-                .await
-        }));
-        bos_shutdown = Some(tx);
+        rbe_router = rbe_router.add_service(
+            BazelOutputServiceServer::new(host.service())
+                .accept_compressed(tonic::codec::CompressionEncoding::Gzip)
+                .send_compressed(tonic::codec::CompressionEncoding::Gzip),
+        );
         output_host = Some(host);
     }
-    let cache_socket = config.state_dir.join("cache.sock");
+    let cache_socket = config.state_dir.join("rbe.sock");
     if cache_socket.exists() {
         use std::os::unix::fs::FileTypeExt;
         ensure!(
@@ -734,9 +698,17 @@ pub async fn serve(mut config: Config) -> Result<()> {
     let cache_listener = UnixListener::bind(&cache_socket)?;
     std::fs::set_permissions(&cache_socket, std::fs::Permissions::from_mode(0o600))?;
     let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
-    let mut proxy_task = tokio::spawn(proxy.clone().serve_unix_listener(cache_listener, async {
-        let _ = shutdown_rx.await;
-    }));
+    let mut proxy_task = tokio::spawn(async move {
+        rbe_router
+            .serve_with_incoming_shutdown(
+                tokio_stream::wrappers::UnixListenerStream::new(cache_listener),
+                async {
+                    let _ = shutdown_rx.await;
+                },
+            )
+            .await
+            .map_err(anyhow::Error::from)
+    });
     #[cfg(target_os = "linux")]
     let source_cas = workspace_core::source_cas::SourceCas::new(
         cache.clone(),
@@ -766,11 +738,7 @@ pub async fn serve(mut config: Config) -> Result<()> {
                     output_host=None;break;
                 },
                 result = &mut proxy_task => { proxy_completed=true; result??; anyhow::bail!("cache proxy stopped unexpectedly") }
-                result = async { match bes_task.as_mut() {Some(task)=>task.await, None=>std::future::pending().await} } => {
-                    bes_task = None;
-                    result??;
-                    anyhow::bail!("BES proxy stopped unexpectedly")
-                }
+
             };
             let (read, mut write) = stream.into_split();
             let mut reader = BufReader::new(read);
@@ -858,33 +826,21 @@ pub async fn serve(mut config: Config) -> Result<()> {
     if let Some(task) = git_task {
         let _ = tokio::time::timeout(Duration::from_secs(10), task).await;
     }
-    if let Some(tx) = bos_shutdown {
-        let _ = tx.send(());
-    }
-    if let Some(task) = bos_task {
-        let _ = tokio::time::timeout(Duration::from_secs(10), task).await;
-    }
     if let Some(host) = output_host {
         host.shutdown().await?;
     }
+    state.proxy.stop_forwarding();
     let _ = shutdown_tx.send(());
-    if let Some(tx) = bes_shutdown {
-        let _ = tx.send(());
-    }
-    if let Some(mut task) = bes_task {
-        if tokio::time::timeout(Duration::from_secs(10), &mut task)
-            .await
-            .is_err()
-        {
-            task.abort();
-            let _ = task.await;
-        }
-    }
     if let Some(bes) = &state.bes {
         bes.shutdown().await;
     }
-    if !proxy_completed {
-        let _ = tokio::time::timeout(Duration::from_secs(10), &mut proxy_task).await;
+    if !proxy_completed
+        && tokio::time::timeout(Duration::from_secs(10), &mut proxy_task)
+            .await
+            .is_err()
+    {
+        proxy_task.abort();
+        let _ = proxy_task.await;
     }
     if let Some(shutdown) = git_cas_shutdown {
         shutdown.shutdown().await;
@@ -896,7 +852,6 @@ pub async fn serve(mut config: Config) -> Result<()> {
     state.cache.flush_recency()?;
     let _ = std::fs::remove_file(socket);
     let _ = std::fs::remove_file(cache_socket);
-    let _ = std::fs::remove_file(bes_socket);
     drop(lock);
     run
 }

@@ -30,6 +30,12 @@ pub struct Cache {
     pub max_blob_bytes: u64,
     pub action_cache_ttl_seconds: u64,
     pub max_action_cache_entries: usize,
+    pub asset_cache_ttl_seconds: u64,
+    pub max_asset_cache_entries: usize,
+    pub max_asset_cache_bytes: usize,
+    pub max_execution_streams: usize,
+    /// Zero leaves execution lifetime to the caller, not the cache RPC policy.
+    pub execution_timeout_ms: u64,
 }
 #[derive(Clone, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -126,8 +132,13 @@ impl Default for Cache {
             max_concurrent_rpcs_per_connection: 128,
             max_inflight_bytes: 512 * 1024 * 1024,
             max_blob_bytes: 512 * 1024 * 1024,
-            action_cache_ttl_seconds: 0,
+            action_cache_ttl_seconds: 60,
             max_action_cache_entries: 100_000,
+            asset_cache_ttl_seconds: 60,
+            max_asset_cache_entries: 4096,
+            max_asset_cache_bytes: 8 * 1024 * 1024,
+            max_execution_streams: 256,
+            execution_timeout_ms: 0,
         }
     }
 }
@@ -210,6 +221,14 @@ impl Config {
             "action cache limits outside supported range"
         );
         self.reapi.validate()?;
+        ensure!(
+            self.cache.asset_cache_ttl_seconds <= 3600
+                && self.cache.max_asset_cache_entries <= 1_000_000
+                && self.cache.max_asset_cache_bytes <= 64 * 1024 * 1024
+                && (1..=1024).contains(&self.cache.max_execution_streams)
+                && self.cache.execution_timeout_ms <= 86_400_000,
+            "invalid downloader-cache or execution limits"
+        );
         if self.bes.enabled {
             let upstream = if self.bes.upstream.is_empty() {
                 &self.cache.upstream
@@ -245,11 +264,14 @@ impl Config {
     pub fn socket(&self) -> PathBuf {
         self.state_dir.join("control.sock")
     }
+    pub fn rbe_endpoint(&self) -> String {
+        format!("unix:{}", self.state_dir.join("rbe.sock").display())
+    }
     pub fn cache_endpoint(&self) -> String {
-        format!("unix:{}", self.state_dir.join("cache.sock").display())
+        self.rbe_endpoint()
     }
     pub fn bes_endpoint(&self) -> String {
-        format!("unix:{}", self.state_dir.join("bes.sock").display())
+        self.rbe_endpoint()
     }
 
     pub fn bytestream_uri_prefix(&self) -> String {
@@ -275,8 +297,14 @@ api_key_env = "BUILDBUDDY_API_KEY"
 max_bytes = 4294967296
 # Bound simultaneous requests on each local cache connection.
 max_concurrent_rpcs_per_connection = 128
-# Zero revalidates action results against upstream on every lookup.
-action_cache_ttl_seconds = 0
+# Short fixed AC TTL; set zero when no backend-retention assumption is available.
+action_cache_ttl_seconds = 60
+asset_cache_ttl_seconds = 60
+max_asset_cache_entries = 4096
+max_asset_cache_bytes = 8388608
+max_execution_streams = 256
+# Zero preserves caller deadlines without imposing a cache-derived lifetime.
+execution_timeout_ms = 0
 
 [bes]
 # Durable local ACKs; pending events are NOT part of the disposable CAS/LRU.
@@ -330,7 +358,7 @@ mod tests {
             toml::from_str(&EXAMPLE.replace("enabled = false", "enabled = true")).unwrap();
         enabled.validate().unwrap();
         assert!(enabled.bos.enabled);
-        assert_eq!(config.cache.action_cache_ttl_seconds, 0);
+        assert_eq!(config.cache.action_cache_ttl_seconds, 60);
         assert_eq!(config.cache.max_concurrent_rpcs_per_connection, 128);
         assert!(config.session.remote_repo_contents_cache);
         assert!(config.bes.enabled);

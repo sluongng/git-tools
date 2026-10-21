@@ -10,8 +10,9 @@ The diagram is a logical ownership map, not a required deployment topology.
 Purple components are built in this project; gray components are external.
 Cylinders represent storage; boxes represent services and mount frontends.
 Each agent keeps writable source, Git admin and Bazel output roots private.
-`workspace` hosts Linux source mounts, BOS, Git transport, durable BES forwarding and the REAPI cache
-front end in one daemon; `agent-session` remains the standalone lifecycle client.
+`workspace` hosts Linux source mounts, BOS, Git transport, durable BES forwarding
+and a cache/execution/downloader front end on one private `rbe.sock`;
+`agent-session` remains the standalone lifecycle client.
 Native source/output adapters also support macOS NFS and Windows ProjFS.
 
 - **Source:** the proxy serves filtered Git fetches and object metadata; edits
@@ -19,8 +20,8 @@ Native source/output adapters also support macOS NFS and Windows ProjFS.
 - **Dependencies:** a primed host repository-tree cache and remote r2c2 are
   independent. Remote hits stay lazy and do not populate the host tree cache.
   Bazel's optional disk cache is separate and is ignored with BOS in Bazel 9.2.
-- **Execution:** Bazel sends `Execute` to BuildBuddy’s execution service; the
-  scheduler dispatches tasks to RBE workers. Optional proxy CAS sync publishes
+- **Execution:** the daemon forwards Bazel's `Execute` to the configured upstream
+  scheduler. Optional proxy CAS sync publishes
   main-workspace blobs asynchronously; queued is not uploaded.
 - **Outputs:** Bazel sends BOS paths/digests, not payloads. BOS checks remote
   presence, then fetches and verifies complete blobs on first content access.
@@ -42,8 +43,8 @@ Native source/output adapters also support macOS NFS and Windows ProjFS.
 Each `local-cas` directory has **one process owner**. Library consumers share
 `Arc<LocalCas>`; separate proxy/BOS processes need separate directories.
 Cache quotas cover logical payloads, not metadata, filesystem blocks or RSS.
-The daemon's AC metadata cache is separate, memory-bounded, and disabled by
-default (TTL zero). Configuring a positive TTL requires a retention assumption.
+The daemon's AC metadata cache is separate, memory-bounded, and uses a fixed
+60-second TTL. Set it to zero without an upstream retention assumption.
 CAS writes and `FindMissingBlobs` reach the upstream before claiming availability
 to Bazel: a local hit alone cannot satisfy a remote executor's input requirement.
 

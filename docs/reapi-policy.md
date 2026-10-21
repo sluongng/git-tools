@@ -102,6 +102,30 @@ discovered from REAPI capabilities.
 Configure Bazel and the backend separately rather than assuming this TOML file
 changes either one.
 
+## Unified execution and downloader transport
+
+The daemon exposes cache, Execution/Operations, Remote Asset, BES and optional BOS
+on `rbe.sock`. Cache, downloader and operation control use separate upstream
+connections so long execution streams cannot block them. Execution uses no cache-derived
+RPC or message-idle deadline. Caller deadlines cover the complete response stream;
+`cache.execution_timeout_ms` optionally caps lifetime (zero leaves it to the caller).
+Execution admission queues under the caller budget and shutdown signal; it does
+not reject ordinary bursts to consume the client retry budget. The global stream
+cap is configurable independently of per-connection HTTP/2 limits.
+Execute/WaitExecution and Operations are forwarded once; Bazel owns retries/resume.
+Requests use gzip only after that RPC method advertises support; response compression
+is accepted independently. No execution is replayed to probe compression.
+
+Downloader fetches preserve inline errors, qualifiers, mirror order and freshness
+constraints. Blob mappings have fixed TTL and bounded LRU metadata. Reuse requires
+verified local bytes and an upstream presence check; CAS eviction forces another
+fetch. Normal CAS reads populate the shared byte cache lazily. Directory fetches
+always forward; a cached root does not prove full-tree availability.
+
+Daemon AC metadata uses a fixed 60-second TTL, not renewed by local hits. This is
+an operator retention assumption, not independent validation of referenced blobs.
+Set `cache.action_cache_ttl_seconds = 0` to revalidate every result upstream.
+
 ## BES is a separate policy
 
 The unified daemon's `[bes]` table uses Bazel BES defaults, not the REAPI policy

@@ -21,6 +21,61 @@ impl Capabilities for Backend {
         Ok(Response::new(ServerCapabilities::default()))
     }
 }
+#[tonic::async_trait]
+impl reapi::reapi::execution_server::Execution for Backend {
+    type ExecuteStream = std::pin::Pin<
+        Box<
+            dyn tokio_stream::Stream<
+                    Item = Result<reapi::proto::google::longrunning::Operation, Status>,
+                > + Send,
+        >,
+    >;
+    type WaitExecutionStream = Self::ExecuteStream;
+    async fn execute(
+        &self,
+        request: Request<reapi::reapi::ExecuteRequest>,
+    ) -> Result<Response<Self::ExecuteStream>, Status> {
+        if request.into_inner().skip_cache_lookup {
+            let first = tokio_stream::iter([Ok(reapi::proto::google::longrunning::Operation {
+                name: "opaque-quiet-operation".into(),
+                ..Default::default()
+            })]);
+            return Ok(Response::new(Box::pin(tokio_stream::StreamExt::chain(
+                first,
+                tokio_stream::pending(),
+            ))));
+        }
+        Err(Status::unavailable("fixture scheduler reached"))
+    }
+    async fn wait_execution(
+        &self,
+        _: Request<reapi::reapi::WaitExecutionRequest>,
+    ) -> Result<Response<Self::WaitExecutionStream>, Status> {
+        Err(Status::unavailable("fixture scheduler resume reached"))
+    }
+}
+#[tonic::async_trait]
+impl reapi::asset::fetch_server::Fetch for Backend {
+    async fn fetch_blob(
+        &self,
+        _: Request<reapi::asset::FetchBlobRequest>,
+    ) -> Result<Response<reapi::asset::FetchBlobResponse>, Status> {
+        Ok(Response::new(reapi::asset::FetchBlobResponse {
+            status: Some(reapi::proto::google::rpc::Status {
+                code: 5,
+                message: "fixture downloader reached".into(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }))
+    }
+    async fn fetch_directory(
+        &self,
+        _: Request<reapi::asset::FetchDirectoryRequest>,
+    ) -> Result<Response<reapi::asset::FetchDirectoryResponse>, Status> {
+        Err(Status::unimplemented("fixture directory reached"))
+    }
+}
 fn config(dir: PathBuf, port: u16, upstream: u16) -> Config {
     let mut config = Config::default();
     config.state_dir = dir;
@@ -40,6 +95,14 @@ async fn private_control_retains_registry_and_excludes_second_owner() -> Result<
     let server = tokio::spawn(
         tonic::transport::Server::builder()
             .add_service(CapabilitiesServer::new(Backend))
+            .add_service(
+                reapi::reapi::execution_server::ExecutionServer::new(Backend)
+                    .accept_compressed(tonic::codec::CompressionEncoding::Gzip),
+            )
+            .add_service(
+                reapi::asset::fetch_server::FetchServer::new(Backend)
+                    .accept_compressed(tonic::codec::CompressionEncoding::Gzip),
+            )
             .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(upstream)),
     );
     let available = std::net::TcpListener::bind("127.0.0.1:0")?;
@@ -66,12 +129,83 @@ async fn private_control_retains_registry_and_excludes_second_owner() -> Result<
     assert!(status["bos_endpoint"].is_null());
     assert_eq!(status["bes_endpoint"], config.bes_endpoint());
     assert!(status["bes"].is_object());
+    let path = config.state_dir.join("rbe.sock");
+    let channel = tonic::transport::Endpoint::from_static("http://localhost")
+        .connect_with_connector(tower::service_fn(move |_| {
+            let path = path.clone();
+            async move {
+                tokio::net::UnixStream::connect(path)
+                    .await
+                    .map(hyper_util::rt::TokioIo::new)
+            }
+        }))
+        .await?;
+    let mut caps = reapi::reapi::capabilities_client::CapabilitiesClient::new(channel.clone());
+    caps.get_capabilities(GetCapabilitiesRequest::default())
+        .await?;
+    let mut execution = reapi::reapi::execution_client::ExecutionClient::new(channel.clone());
+    let error = execution
+        .execute(reapi::reapi::ExecuteRequest::default())
+        .await
+        .unwrap_err();
+    assert_eq!(error.code(), tonic::Code::Unavailable);
+    assert_eq!(error.message(), "fixture scheduler reached");
+    let mut downloader = reapi::asset::fetch_client::FetchClient::new(channel.clone());
+    assert_eq!(
+        downloader
+            .fetch_blob(reapi::asset::FetchBlobRequest {
+                uris: vec!["https://example.invalid/archive".into()],
+                ..Default::default()
+            })
+            .await?
+            .into_inner()
+            .status
+            .unwrap()
+            .message,
+        "fixture downloader reached"
+    );
+    let mut events = reapi::bes::publish_build_event_client::PublishBuildEventClient::new(channel);
+    let event = reapi::bes::PublishBuildToolEventStreamRequest {
+        ordered_build_event: Some(reapi::bes::OrderedBuildEvent {
+            stream_id: Some(reapi::bes::StreamId {
+                build_id: "neutral-build".into(),
+                invocation_id: "neutral-invocation".into(),
+                component: 3,
+            }),
+            sequence_number: 1,
+            event: Some(reapi::bes::BuildEvent {
+                event: Some(reapi::bes::build_event::Event::ComponentStreamFinished(
+                    reapi::bes::build_event::BuildComponentStreamFinished { r#type: 1 },
+                )),
+                ..Default::default()
+            }),
+        }),
+        ..Default::default()
+    };
+    let mut acks = events
+        .publish_build_tool_event_stream(tokio_stream::iter([event]))
+        .await?
+        .into_inner();
+    assert_eq!(acks.message().await?.unwrap().sequence_number, 1);
+    assert!(acks.message().await?.is_none());
+    for old in ["cache.sock", "bes.sock", "bos.sock"] {
+        assert!(!config.state_dir.join(old).exists());
+    }
+
     use agent_session::MountController;
     let cli = Client {
         socket: socket.clone(),
     };
     let args = tokio::task::spawn_blocking(move || cli.bazel_args()).await??;
     assert!(args.contains(&format!("--bes_backend={}", config.bes_endpoint())));
+    assert_eq!(status["rbe_endpoint"], config.rbe_endpoint());
+    for flag in [
+        "remote_cache",
+        "remote_executor",
+        "experimental_remote_downloader",
+    ] {
+        assert!(args.contains(&format!("--{flag}={}", config.rbe_endpoint())));
+    }
     assert_eq!(
         call(socket.clone(), ControlRequest::RetryBes).await?["streams_retried"],
         0
@@ -138,7 +272,7 @@ async fn private_control_retains_registry_and_excludes_second_owner() -> Result<
         0o600
     );
     assert_eq!(
-        std::fs::metadata(config.state_dir.join("bes.sock"))?
+        std::fs::metadata(config.state_dir.join("rbe.sock"))?
             .permissions()
             .mode()
             & 0o777,
@@ -167,11 +301,26 @@ async fn private_control_retains_registry_and_excludes_second_owner() -> Result<
         call(socket.clone(), ControlRequest::Unmount { session: bogus }).await?,
         true
     );
+    let mut quiet = execution
+        .execute(reapi::reapi::ExecuteRequest {
+            skip_cache_lookup: true,
+            ..Default::default()
+        })
+        .await?
+        .into_inner();
+    assert_eq!(
+        quiet.message().await?.unwrap().name,
+        "opaque-quiet-operation"
+    );
     call(socket, ControlRequest::Shutdown).await?;
+    assert_eq!(
+        quiet.message().await.unwrap_err().code(),
+        tonic::Code::Unavailable
+    );
     tokio::time::timeout(Duration::from_secs(5), task).await???;
     assert!(config.state_dir.join("mounts.json").is_file());
     assert!(!config.socket().exists());
-    assert!(!config.state_dir.join("bes.sock").exists());
+    assert!(!config.state_dir.join("rbe.sock").exists());
     server.abort();
     Ok(())
 }

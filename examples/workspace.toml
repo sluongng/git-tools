@@ -12,8 +12,15 @@ max_concurrent_fetches = 8
 max_concurrent_rpcs_per_connection = 128
 max_inflight_bytes = 536870912
 max_blob_bytes = 536870912
-# No assumed upstream retention lease. Enable only with a suitable guarantee.
-action_cache_ttl_seconds = 0
+# Short fixed AC TTL; set zero when no backend-retention assumption is available.
+action_cache_ttl_seconds = 60
+# Mapping metadata is disposable; fetched bytes share the CAS/LRU budget.
+asset_cache_ttl_seconds = 60
+max_asset_cache_entries = 4096
+max_asset_cache_bytes = 8388608
+max_execution_streams = 256
+# Zero preserves caller deadlines; quiet execution streams have no idle timeout.
+execution_timeout_ms = 0
 
 [bes]
 # ACK locally only after durable persistence; delete after BuildBuddy ACKs.

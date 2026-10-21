@@ -1,7 +1,7 @@
 # workspace
 
 One host process owns source mounts, lazy Bazel output mounts, the Git proxy,
-an authenticated REAPI cache proxy and a durable BuildBuddy BES relay. Each session retains its own writable overlay,
+an authenticated REAPI cache/execution/downloader proxy and a durable BuildBuddy BES relay. Each session retains its own writable overlay,
 Git state and Bazel output base. Only verified immutable bytes enter the shared,
 LRU-evicted CAS; edits and commits are never eviction candidates.
 
@@ -40,12 +40,15 @@ which is absent from 9.3.0rc2. BLAKE3/xattr/r2c2 support is also required.
   outside LRU eviction; upstream ACKs delete payloads. `workspace status` shows
   the backlog and forwarding failures; `workspace retry-bes` retries blocked
   delivery without stopping mounts. Keep the state directory across restarts.
-- Remote AC results are revalidated on every lookup (`action_cache_ttl_seconds=0`).
-  Nonzero TTL needs a backend retention guarantee; it is not a presence lease.
+- Remote AC metadata has a fixed 60-second TTL; local hits do not renew it.
+  Set `cache.action_cache_ttl_seconds = 0` without a backend-retention assumption.
+- Downloader mappings have bounded TTL/LRU metadata and require verified local
+  bytes plus upstream presence. Bytes share CAS eviction; freshness requests and
+  directory fetches always reach upstream. Execution retries remain Bazel-owned.
 - Source prefetch runs after mounting. Native Git packs and repository metadata
   have their own storage policies and are **not** covered by the CAS byte quota.
-- Control, BOS, BES and the cache proxy use private Unix sockets (no cache token in
-  Bazel process arguments). Git uses a private capability URL. State must be owned by the
+- Cache, Execution/Operations, Remote Asset, BES and optional BOS share `rbe.sock`;
+  the CLI alone uses `control.sock` (no cache token in Bazel process arguments). Git uses a private capability URL. State must be owned by the
   current user with mode `0700`; status does not print credentials.
 - Mount lifecycle changes are serialized; cache/download RPCs remain concurrent.
   Stop source sessions before `workspace shutdown`. After a crash, registry
