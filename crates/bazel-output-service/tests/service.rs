@@ -42,6 +42,8 @@ struct Cas {
     metadata_rejection: Arc<AtomicUsize>,
     wire_override: Arc<Mutex<Option<Vec<u8>>>>,
     read_fragment_bytes: Arc<AtomicUsize>,
+    reject_uploads: Arc<AtomicBool>,
+    rejected_uploads: Arc<Mutex<Vec<Vec<bs::WriteRequest>>>>,
 }
 
 #[tonic::async_trait]
@@ -247,9 +249,18 @@ impl bs::byte_stream_server::ByteStream for Cas {
     }
     async fn write(
         &self,
-        _: Request<tonic::Streaming<bs::WriteRequest>>,
+        request: Request<tonic::Streaming<bs::WriteRequest>>,
     ) -> Result<Response<bs::WriteResponse>, Status> {
-        Err(Status::unimplemented("readonly fixture"))
+        if !self.reject_uploads.load(Ordering::SeqCst) {
+            return Err(Status::unimplemented("readonly fixture"));
+        }
+        let mut stream = request.into_inner();
+        let mut messages = Vec::new();
+        while let Some(message) = stream.message().await? {
+            messages.push(message);
+        }
+        self.rejected_uploads.lock().unwrap().push(messages);
+        Err(Status::unavailable("injected completed-upload rejection"))
     }
     async fn query_write_status(
         &self,
@@ -1174,7 +1185,49 @@ async fn lazy_bos_stages_metadata_reads_verified_content_and_prunes_expired_cas(
         dirty.hash, digest.hash,
         "local edits must invalidate remote digest authority"
     );
+    // Model the Bazel client reading an edited output and attempting its CAS
+    // upload. BOS does not upload files itself. A real failed ByteStream RPC
+    // must not turn authoritative local bytes into disposable remote content.
+    let lease = projection.tree.pin(node.id).unwrap();
+    let dirty_bytes = projection.tree.read(node.id, 0, 100).await.unwrap();
+    assert_eq!(dirty.hash, blake3::hash(&dirty_bytes).to_hex().to_string());
+    fixture.cas.reject_uploads.store(true, Ordering::SeqCst);
+    let upload = bs::WriteRequest {
+        resource_name: format!(
+            "fixture/uploads/00000000-0000-4000-8000-000000000001/blobs/blake3/{}/{}",
+            dirty.hash, dirty.size_bytes
+        ),
+        write_offset: 0,
+        finish_write: true,
+        data: dirty_bytes.clone(),
+    };
+    let mut uploader = bs::byte_stream_client::ByteStreamClient::connect(fixture.endpoint.clone())
+        .await
+        .unwrap();
+    let error = uploader
+        .write(tokio_stream::iter(vec![upload.clone()]))
+        .await
+        .unwrap_err();
+    assert_eq!(error.code(), tonic::Code::Unavailable);
+    assert_eq!(
+        *fixture.cas.rejected_uploads.lock().unwrap(),
+        vec![vec![upload]],
+        "the upstream must receive the complete finished upload before failing"
+    );
+    assert!(!fixture.cas.data.lock().unwrap().contains_key(&format!(
+        "fixture/blobs/blake3/{}/{}",
+        dirty.hash, dirty.size_bytes
+    )));
+    projection.tree.reclaim_retired_at_boundary(2).unwrap();
+    assert_eq!(
+        projection.tree.read(node.id, 0, 100).await.unwrap(),
+        dirty_bytes
+    );
     assert_eq!(fixture.stage("lazy", "expires", digest).await, 0);
+    let expired = projection
+        .tree
+        .resolve(&format!("{prefix}/expires"))
+        .unwrap();
     fixture.cas.data.lock().unwrap().clear();
     fixture
         .client
@@ -1199,6 +1252,25 @@ async fn lazy_bos_stages_metadata_reads_verified_content_and_prunes_expired_cas(
         stats.responses[1].stat.is_some(),
         "authoritative local output must be retained"
     );
+    assert!(
+        projection
+            .tree
+            .reclaim_retired_at_boundary(2)
+            .unwrap()
+            .reclaimed_nodes
+            > 0,
+        "collection must reclaim the expired remote record, not merely do no work"
+    );
+    assert!(projection.tree.get(expired.id).is_err());
+    assert_eq!(
+        projection.tree.resolve(&path).unwrap().id,
+        node.id,
+        "failed upload must not replace the authoritative local inode"
+    );
+    assert_eq!(
+        projection.tree.read(node.id, 0, 100).await.unwrap(),
+        dirty_bytes
+    );
     fixture
         .client
         .clean(proto::CleanRequest {
@@ -1207,6 +1279,15 @@ async fn lazy_bos_stages_metadata_reads_verified_content_and_prunes_expired_cas(
         .await
         .unwrap();
     assert!(projection.tree.resolve(&prefix).is_err());
+    projection.tree.reclaim_retired_at_boundary(2).unwrap();
+    assert_eq!(
+        projection.tree.read(node.id, 0, 100).await.unwrap(),
+        dirty_bytes,
+        "even explicit clean must preserve the retained reader until release"
+    );
+    drop(lease);
+    projection.tree.reclaim_retired_at_boundary(2).unwrap();
+    assert!(projection.tree.get(node.id).is_err());
 }
 
 #[tokio::test]
