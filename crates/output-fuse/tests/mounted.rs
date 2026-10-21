@@ -140,6 +140,7 @@ async fn mounted_outputs_are_lazy_writable_and_generation_safe() {
     let negative = root.join("base/nested");
     io(move || assert!(!negative.exists())).await;
     mount.stage("base/nested/file", old.clone()).await.unwrap();
+    let old_id = tree.resolve("base/nested/file").unwrap().id;
     assert!(
         matches!(mount.stat("base/nested/file", 9).await.unwrap(), Some(TreeStat::File {artifact: Some(a)}) if a == old)
     );
@@ -197,7 +198,39 @@ async fn mounted_outputs_are_lazy_writable_and_generation_safe() {
         old_handle
     })
     .await;
+    // Native RELEASE/FORGET, not path replacement or a quiet RPC queue, is
+    // the retirement barrier. Old writable descriptors still own their bytes.
+    tree.reclaim_retired(64).unwrap();
+    assert_eq!(tree.read(old_id, 0, 99).await.unwrap(), b"OLD bytes");
+    assert!(
+        fixture
+            .path()
+            .join("state/local")
+            .join(old_id.to_string())
+            .exists()
+    );
     drop(old_handle);
+    let until = std::time::Instant::now() + Duration::from_secs(3);
+    while tree.get(old_id).is_ok()
+        || fixture
+            .path()
+            .join("state/local")
+            .join(old_id.to_string())
+            .exists()
+    {
+        assert!(
+            std::time::Instant::now() < until,
+            "released retired generation was not collected"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(
+        !fixture
+            .path()
+            .join("state/local")
+            .join(old_id.to_string())
+            .exists()
+    );
     let metadata_only = source.artifact(b"do not fetch me");
     mount.stage("base/truncate", metadata_only).await.unwrap();
     let fetches = source.fetches.load(Ordering::SeqCst);

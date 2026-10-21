@@ -5,7 +5,9 @@ use async_trait::async_trait;
 #[cfg(target_os = "macos")]
 use nfsserve::tcp::{NFSTcp, NFSTcpListener};
 use nfsserve::{nfs::*, vfs::*};
-use output_core::{Artifact, CoreError, Node, NodeKind, Projection, SetAttr, Tree, TreeStat};
+use output_core::{
+    Artifact, CoreError, GenerationLease, Node, NodeKind, Projection, SetAttr, Tree, TreeStat,
+};
 use std::{
     collections::HashSet,
     path::{Path, PathBuf},
@@ -16,6 +18,8 @@ use tokio::sync::{Mutex as AsyncMutex, OwnedSemaphorePermit, Semaphore};
 #[derive(Clone)]
 pub struct OutputNfs {
     tree: Arc<Tree>,
+    // NFSv3 exposes no client CLOSE. Every clone shares the server-generation fence.
+    _generation: Arc<GenerationLease>,
     invalidating: Arc<Mutex<HashSet<u64>>>,
     hydration: Arc<Semaphore>,
 }
@@ -161,6 +165,7 @@ impl OutputNfs {
             "payload admission must be 1..=64"
         );
         Self {
+            _generation: Arc::new(tree.pin_generation()),
             tree,
             invalidating: Arc::new(Mutex::new(HashSet::new())),
             hydration: Arc::new(Semaphore::new(limit)),
@@ -621,6 +626,9 @@ impl NfsMount {
                 std::fs::read_dir(&root)?.next().is_none(),
                 "output mountpoint must be empty"
             );
+            // The old native mount is gone, so its process-generation handles
+            // cannot return. Never do this while an NFS server lease is alive.
+            tree.reclaim_retired_at_boundary(64)?;
             let fs = OutputNfs::new(tree);
             let listener = NFSTcpListener::bind("127.0.0.1:0", fs.clone()).await?;
             let port = listener.get_listen_port();

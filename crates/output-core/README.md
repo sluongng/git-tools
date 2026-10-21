@@ -11,5 +11,14 @@ in-flight bytes are bounded; oversized files can stage but fail read admission.
 
 Adapters implement `Projection` publication and native mutations.
 **Preserve namespace state and local edits**; only immutable cache bytes are
-disposable. Retired state is conservatively retained, and cache leases do not
-guarantee indefinitely open NFS handles. See [BOS setup](../bazel-output-service/README.md).
+disposable. Explicit bounded retirement collection requires inode/lookup leases;
+linked local edits and pending publication are never collected. A durable ledger
+replays only owned payload deletions after restart. IDs are never reused.
+
+FUSE supplies real lookup/open lifetimes and collects retired generations after
+release. NFSv3 retains every generation for the entire server session; collection
+is safe only after unmount/remount expires its handles, not after an idle period
+or BOS finalization. ProjFS conservatively retains generations across restart
+because persisted placeholders may still hydrate them; native edited files are
+never cache-evicted. These retention domains are not a total disk quota.
+See [BOS setup](../bazel-output-service/README.md).

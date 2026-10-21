@@ -3,4 +3,4 @@
 #[cfg(target_os = "linux")]
 mod linux;
 #[cfg(target_os = "linux")]
-pub use linux::{FuseMount, start};
+pub use linux::{FuseMount, start, start_with_retirement_budget};

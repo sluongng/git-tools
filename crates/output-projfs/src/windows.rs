@@ -656,6 +656,10 @@ pub async fn start(tree: Arc<Tree>, root: &Path, state: &Path) -> Result<ProjfsM
             "mark ProjFS root",
         )?;
     }
+    // Native placeholder ContentIDs persist across provider restart. A stopped
+    // callback is not proof that an old stream/placeholder can never hydrate.
+    // Retain core metadata durably; native full-file edits remain owned by NTFS.
+    tree.retain_placeholder_generations()?;
     let provider = Arc::new(Provider {
         tree,
         root,

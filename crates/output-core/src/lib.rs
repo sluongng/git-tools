@@ -1,6 +1,6 @@
 //! Generation-aware output metadata and a verified, bounded disk cache.
 //! Namespace records are authoritative; clean CAS bytes are expendable. Retired
-//! records remain addressable so an old kernel handle never resolves a new path.
+//! records remain addressable until explicit lifetime-aware reclamation. IDs are never reused.
 use anyhow::{Context, Result, ensure};
 use async_trait::async_trait;
 use fjall::{
@@ -170,8 +170,12 @@ struct State {
     identity: String,
     backend: String,
     next_id: u64,
+    retain_placeholders: bool,
     nodes: Table<Record>,
     pending: Table<Pending>,
+    garbage: Table<()>,
+    retired: im::OrdSet<u64>,
+    dependents: im::OrdMap<u64, usize>,
     names: im::OrdMap<(u64, String), u64>,
     children: im::OrdMap<(u64, u64), ()>,
 }
@@ -182,6 +186,8 @@ struct Header {
     version: u32,
     backend: String,
     next_id: u64,
+    #[serde(default)]
+    retain_placeholders: bool,
 }
 fn index_remove(s: &mut State, n: &Node) {
     if n.linked && n.id != 1 {
@@ -201,6 +207,11 @@ struct Namespace {
     state: State,
     db: SingleWriterTxDatabase,
     keyspace: SingleWriterTxKeyspace,
+    pins: HashMap<u64, u64>,
+    lookups: HashMap<u64, u64>,
+    generations: usize,
+    gc_cursor: u64,
+    failed: bool,
 }
 pub struct Tree {
     identity: String,
@@ -210,6 +221,50 @@ pub struct Tree {
     source: Arc<dyn BlobSource>,
     cache: Arc<LocalCas>,
     mutation_locks: Mutex<HashMap<u64, Weak<AsyncMutex<()>>>>,
+}
+/// A frontend-owned reference to one immutable entry ID. Reclamation cannot
+/// remove its metadata or local payload until the last lease has been dropped.
+pub struct NodeLease {
+    tree: Weak<Tree>,
+    id: u64,
+}
+impl Drop for NodeLease {
+    fn drop(&mut self) {
+        if let Some(tree) = self.tree.upgrade() {
+            let mut ns = tree.namespace.lock().unwrap();
+            if let Some(count) = ns.pins.get_mut(&self.id) {
+                *count -= 1;
+                if *count == 0 {
+                    ns.pins.remove(&self.id);
+                }
+            }
+        }
+    }
+}
+/// NFSv3 has no CLOSE/last-handle signal. This lease protects the entire server
+/// generation, not merely requests currently executing. ProjFS also needs this
+/// fence while persisted placeholders may issue hydration callbacks.
+pub struct GenerationLease {
+    tree: Weak<Tree>,
+}
+impl Drop for GenerationLease {
+    fn drop(&mut self) {
+        if let Some(tree) = self.tree.upgrade() {
+            tree.namespace.lock().unwrap().generations -= 1;
+        }
+    }
+}
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct RetirementMetrics {
+    pub retained_nodes: usize,
+    pub retained_local_bytes: u64,
+    pub pending_payload_deletions: usize,
+}
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct Collection {
+    pub visited: usize,
+    pub reclaimed_nodes: usize,
+    pub reclaimed_local_bytes: u64,
 }
 fn now() -> u64 {
     SystemTime::now()
@@ -349,8 +404,12 @@ impl Tree {
                 },
                 backend: backend.clone(),
                 next_id: header.next_id,
+                retain_placeholders: header.retain_placeholders,
                 nodes: Table::default(),
                 pending: Table::default(),
+                garbage: Table::default(),
+                retired: im::OrdSet::new(),
+                dependents: im::OrdMap::new(),
                 names: im::OrdMap::new(),
                 children: im::OrdMap::new(),
             };
@@ -365,6 +424,12 @@ impl Tree {
                 let id = u64::from_be_bytes(key[1..].try_into()?);
                 state.pending.insert(id, serde_json::from_slice(&bytes)?);
             }
+            for item in db.read_tx().prefix(&keyspace, b"g") {
+                let (key, _) = item.into_inner()?;
+                let id = u64::from_be_bytes(key[1..].try_into()?);
+                state.garbage.insert(id, ());
+            }
+            state.garbage.dirty.clear();
             state.nodes.dirty.clear();
             state.pending.dirty.clear();
             state
@@ -399,12 +464,24 @@ impl Tree {
                 identity: uuid::Uuid::new_v4().to_string(),
                 backend: backend.clone(),
                 next_id: 2,
+                retain_placeholders: false,
                 nodes,
                 pending: Table::default(),
+                garbage: Table::default(),
+                retired: im::OrdSet::new(),
+                dependents: im::OrdMap::new(),
                 names: im::OrdMap::new(),
                 children: im::OrdMap::new(),
             }
         };
+        for record in state.nodes.values() {
+            if !record.node.linked {
+                state.retired.insert(record.node.id);
+            }
+            if record.node.id != 1 {
+                *state.dependents.entry(record.node.parent).or_insert(0) += 1;
+            }
+        }
         // A crash can leave a local payload whose namespace commit did not land.
         // Never reuse its identity on restart.
         for entry in fs::read_dir(dir.join("local"))? {
@@ -444,6 +521,11 @@ impl Tree {
                 state,
                 db,
                 keyspace,
+                pins: HashMap::new(),
+                lookups: HashMap::new(),
+                generations: 0,
+                gc_cursor: 0,
+                failed: false,
             }),
             state_dir: dir,
             backend,
@@ -452,21 +534,43 @@ impl Tree {
             mutation_locks: Mutex::new(HashMap::new()),
         });
         tree.change(|_| Ok(()))?;
+        tree.drain_retired_payloads(usize::MAX)?;
         Ok(tree)
     }
     fn change<T>(&self, f: impl FnOnce(&mut State) -> Result<T>) -> Result<T> {
         let mut ns = self.namespace.lock().unwrap();
+        Self::change_locked(&mut ns, f)
+    }
+    fn change_locked<T>(ns: &mut Namespace, f: impl FnOnce(&mut State) -> Result<T>) -> Result<T> {
+        ensure!(
+            !ns.failed,
+            "output namespace commit failed; reopen for recovery"
+        );
         let mut next = ns.state.clone();
         let result = f(&mut next)?;
         let changed: Vec<_> = next.nodes.dirty.iter().copied().collect();
         for id in &changed {
             if let Some(old) = ns.state.nodes.get(id) {
                 index_remove(&mut next, &old.node);
+                next.retired.remove(id);
+                if old.node.id != 1 {
+                    let count = next.dependents.get_mut(&old.node.parent).unwrap();
+                    *count -= 1;
+                    if *count == 0 {
+                        next.dependents.remove(&old.node.parent);
+                    }
+                }
             }
         }
         for id in &changed {
             if let Some(new) = next.nodes.get(id).map(|r| r.node.clone()) {
                 index_insert(&mut next, &new);
+                if !new.linked {
+                    next.retired.insert(new.id);
+                }
+                if new.id != 1 {
+                    *next.dependents.entry(new.parent).or_insert(0) += 1;
+                }
             }
         }
         let mut tx = ns.db.write_tx().durability(Some(PersistMode::SyncAll));
@@ -478,6 +582,7 @@ impl Tree {
                 version: 2,
                 backend: next.backend.clone(),
                 next_id: next.next_id,
+                retain_placeholders: next.retain_placeholders,
             })?,
         );
         for id in &next.nodes.dirty {
@@ -498,9 +603,24 @@ impl Tree {
                 tx.remove(&ns.keyspace, key);
             }
         }
-        tx.commit()?;
+        for id in &next.garbage.dirty {
+            let mut key = vec![b'g'];
+            key.extend_from_slice(&id.to_be_bytes());
+            if next.garbage.get(id).is_some() {
+                tx.insert(&ns.keyspace, key, []);
+            } else {
+                tx.remove(&ns.keyspace, key);
+            }
+        }
+        if let Err(error) = tx.commit() {
+            // Durability errors may be ambiguous. Do not resurrect a removed
+            // record over its persisted deletion intent in a later transaction.
+            ns.failed = true;
+            return Err(error.into());
+        }
         next.nodes.dirty.clear();
         next.pending.dirty.clear();
+        next.garbage.dirty.clear();
         ns.state = next;
         Ok(result)
     }
@@ -515,6 +635,221 @@ impl Tree {
     }
     fn local_path(&self, id: u64) -> PathBuf {
         self.state_dir.join("local").join(id.to_string())
+    }
+    /// Persisted ProjFS placeholders survive provider restart. Until native
+    /// reconciliation proves them retired, preserve every generation, including
+    /// across later opens. This does not grant ownership of native edited files.
+    pub fn retain_placeholder_generations(&self) -> Result<()> {
+        self.change(|s| {
+            s.retain_placeholders = true;
+            Ok(())
+        })
+    }
+    pub fn pin(self: &Arc<Self>, id: u64) -> Result<NodeLease> {
+        let mut ns = self.namespace.lock().unwrap();
+        ensure!(
+            !ns.failed,
+            "output namespace commit failed; reopen for recovery"
+        );
+        record(&ns.state, id)?;
+        let count = ns.pins.entry(id).or_insert(0);
+        *count = count
+            .checked_add(1)
+            .context("inode lease count exhausted")?;
+        Ok(NodeLease {
+            tree: Arc::downgrade(self),
+            id,
+        })
+    }
+    pub fn pin_generation(self: &Arc<Self>) -> GenerationLease {
+        let mut ns = self.namespace.lock().unwrap();
+        ns.generations = ns
+            .generations
+            .checked_add(1)
+            .expect("generation lease count exhausted");
+        GenerationLease {
+            tree: Arc::downgrade(self),
+        }
+    }
+    /// Record the kernel reference in the same critical section as lookup.
+    pub fn lookup_referenced(&self, parent: u64, name: &str) -> Result<Node> {
+        component(name)?;
+        let mut ns = self.namespace.lock().unwrap();
+        directory(&ns.state, parent)?;
+        let id = child(&ns.state, parent, name).ok_or(CoreError::NotFound)?;
+        let node = record(&ns.state, id)?.node.clone();
+        Self::retain_lookup_locked(&mut ns, id)?;
+        Ok(node)
+    }
+    fn retain_lookup_locked(ns: &mut Namespace, id: u64) -> Result<()> {
+        record(&ns.state, id)?;
+        let count = ns.lookups.entry(id).or_insert(0);
+        *count = count
+            .checked_add(1)
+            .context("kernel lookup count exhausted")?;
+        Ok(())
+    }
+    pub fn retain_lookup(&self, id: u64) -> Result<()> {
+        Self::retain_lookup_locked(&mut self.namespace.lock().unwrap(), id)
+    }
+    pub fn forget(&self, id: u64, count: u64) {
+        let mut ns = self.namespace.lock().unwrap();
+        if let Some(current) = ns.lookups.get_mut(&id) {
+            *current = current.saturating_sub(count);
+            if *current == 0 {
+                ns.lookups.remove(&id);
+            }
+        }
+    }
+    pub fn retirement_metrics(&self) -> RetirementMetrics {
+        let ns = self.namespace.lock().unwrap();
+        RetirementMetrics {
+            retained_nodes: ns.state.retired.len(),
+            retained_local_bytes: ns
+                .state
+                .retired
+                .iter()
+                .filter_map(|id| ns.state.nodes.get(id))
+                .filter(|r| r.node.kind == NodeKind::File && r.node.remote.is_none())
+                .map(|r| r.node.size)
+                .sum(),
+            pending_payload_deletions: ns.state.garbage.map.len(),
+        }
+    }
+    /// Explicit lifetime boundary. Raw-ID users must retain leases before
+    /// calling this; it is never run implicitly by Tree mutations or reopen.
+    /// Native NFS may call it only after unmount/remount invalidates old handles.
+    /// ProjFS must not call it across restart: persisted placeholders retain IDs.
+    /// The budget bounds candidates visited and deletion work, not live edits.
+    pub fn reclaim_retired(&self, budget: usize) -> Result<Collection> {
+        let candidates = {
+            let mut ns = self.namespace.lock().unwrap();
+            ensure!(
+                !ns.failed,
+                "output namespace commit failed; reopen for recovery"
+            );
+            if ns.generations != 0 || ns.state.retain_placeholders || budget == 0 {
+                return Ok(Collection::default());
+            }
+            let ids: Vec<_> = ns
+                .state
+                .retired
+                .range((
+                    std::ops::Bound::Excluded(ns.gc_cursor),
+                    std::ops::Bound::Unbounded,
+                ))
+                .chain(ns.state.retired.range(..=ns.gc_cursor))
+                .take(budget)
+                .copied()
+                .collect();
+            if let Some(id) = ids.last() {
+                ns.gc_cursor = *id;
+            }
+            ids
+        };
+        let mut result = Collection::default();
+        for id in candidates {
+            result.visited += 1;
+            let lock = self.inode_lock(id);
+            let Ok(_guard) = lock.try_lock() else {
+                continue;
+            };
+            let mut ns = self.namespace.lock().unwrap();
+            if ns.generations != 0
+                || ns.state.retain_placeholders
+                || ns.pins.contains_key(&id)
+                || ns.lookups.contains_key(&id)
+                || ns.state.pending.get(&id).is_some()
+                || ns.state.pending.values().any(|p| p.previous == Some(id))
+                || ns.state.dependents.get(&id).copied().unwrap_or(0) != 0
+            {
+                continue;
+            }
+            let Some(node) = ns.state.nodes.get(&id).map(|r| r.node.clone()) else {
+                continue;
+            };
+            if node.linked || id == 1 {
+                continue;
+            }
+            let bytes = if node.kind == NodeKind::File && node.remote.is_none() {
+                node.size
+            } else {
+                0
+            };
+            Self::change_locked(&mut ns, |s| {
+                s.nodes.remove(&id);
+                // Every removed ID authorizes deletion of its own payload only.
+                // This also covers a remote-to-local copy whose metadata commit
+                // lost the crash race, without guessing about unknown files.
+                s.garbage.insert(id, ());
+                Ok(())
+            })?;
+            self.mutation_locks.lock().unwrap().remove(&id);
+            result.reclaimed_nodes += 1;
+            result.reclaimed_local_bytes += bytes;
+        }
+        self.drain_retired_payloads(budget)?;
+        Ok(result)
+    }
+    /// Drain reclaimable entries at an explicit frontend lifetime boundary.
+    /// Each transaction remains bounded, but the complete operation may require
+    /// multiple rounds: retired parents cannot disappear before their children.
+    /// A pinned prefix must not hide later candidates from the first round.
+    pub fn reclaim_retired_at_boundary(&self, transaction_budget: usize) -> Result<Collection> {
+        let mut total = Collection::default();
+        if transaction_budget == 0 {
+            return Ok(total);
+        }
+        loop {
+            let pending_before = self.namespace.lock().unwrap().state.garbage.map.len();
+            // Retry an already-authorized deletion even when its metadata was
+            // the last retired entry. A transient unlink failure must not need
+            // a new retired inode (or restart) to make maintenance progress.
+            self.drain_retired_payloads(transaction_budget)?;
+            let mut remaining = self.namespace.lock().unwrap().state.retired.len();
+            let mut progress = 0;
+            while remaining != 0 {
+                let result = self.reclaim_retired(transaction_budget.min(remaining))?;
+                if result.visited == 0 {
+                    break;
+                }
+                remaining -= result.visited;
+                progress += result.reclaimed_nodes;
+                total.visited += result.visited;
+                total.reclaimed_nodes += result.reclaimed_nodes;
+                total.reclaimed_local_bytes += result.reclaimed_local_bytes;
+                std::thread::yield_now();
+            }
+            let pending_after = self.namespace.lock().unwrap().state.garbage.map.len();
+            if progress == 0 && (pending_after == 0 || pending_after >= pending_before) {
+                return Ok(total);
+            }
+        }
+    }
+    fn drain_retired_payloads(&self, budget: usize) -> Result<()> {
+        let ids: Vec<_> = self
+            .namespace
+            .lock()
+            .unwrap()
+            .state
+            .garbage
+            .map
+            .keys()
+            .take(budget)
+            .copied()
+            .collect();
+        for id in ids {
+            match fs::remove_file(self.local_path(id)) {
+                Ok(()) => sync_directory(&self.state_dir.join("local"))?,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => return Err(e.into()),
+            }
+            self.change(|s| {
+                s.garbage.remove(&id);
+                Ok(())
+            })?;
+        }
+        Ok(())
     }
     pub fn identity(&self) -> &str {
         &self.identity
@@ -534,9 +869,12 @@ impl Tree {
         1
     }
     pub fn get(&self, id: u64) -> Result<Node> {
-        Ok(record(&self.namespace.lock().unwrap().state, id)?
-            .node
-            .clone())
+        let ns = self.namespace.lock().unwrap();
+        ensure!(
+            !ns.failed,
+            "output namespace commit failed; reopen for recovery"
+        );
+        Ok(record(&ns.state, id)?.node.clone())
     }
     pub fn lookup(&self, parent: u64, name: &str) -> Result<Node> {
         component(name)?;

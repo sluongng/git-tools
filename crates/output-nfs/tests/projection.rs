@@ -516,3 +516,26 @@ async fn cold_read_overload_preserves_metadata_and_same_xid_retry() {
     assert_eq!(source.fetches.load(Ordering::SeqCst), 1);
     task.abort();
 }
+
+#[tokio::test]
+async fn stateless_handles_pin_server_generation_until_all_server_clones_end() {
+    let (_dir, tree, _source) = fixture();
+    let node = tree.create(1, "output", 0o644).await.unwrap();
+    tree.write(node.id, 0, b"local edit").await.unwrap();
+    let fs = OutputNfs::new(tree.clone());
+    let connection = fs.clone();
+    let old = fs.lookup(1, &b"output"[..].into()).await.unwrap();
+    tree.unlink(1, "output").await.unwrap();
+    let replacement = tree.stage("output", artifact(b"first")).await.unwrap();
+    assert_eq!(tree.reclaim_retired(64).unwrap().reclaimed_nodes, 0);
+    assert_eq!(fs.read(old, 0, 99).await.unwrap().0, b"local edit");
+    drop(fs);
+    assert_eq!(tree.reclaim_retired(64).unwrap().reclaimed_nodes, 0);
+    assert_eq!(connection.read(old, 0, 99).await.unwrap().0, b"local edit");
+    drop(connection);
+    // The transport owner has ended the whole server generation. There is no
+    // inference here from zero executing RPCs, an idle timeout, or fake CLOSE.
+    assert_eq!(tree.reclaim_retired(64).unwrap().reclaimed_local_bytes, 10);
+    assert!(tree.get(old).is_err());
+    assert_eq!(tree.read(replacement.id, 0, 99).await.unwrap(), b"first");
+}

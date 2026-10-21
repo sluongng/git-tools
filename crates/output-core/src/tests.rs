@@ -690,3 +690,196 @@ async fn delayed_oversized_read_does_not_occupy_normal_byte_admission() {
     assert_eq!(source.calls.load(Ordering::SeqCst), 2);
     assert_eq!(tree.cache_metrics().resident_bytes, 12);
 }
+
+#[tokio::test]
+#[ignore = "explicit iteration/disk benchmark"]
+async fn retired_output_iteration_measurement() {
+    let (dir, _source, tree) = setup(CacheConfig::default());
+    let started = std::time::Instant::now();
+    let payload = vec![0x5a; 32 * 1024];
+    let mut ids = Vec::new();
+    let collect = std::env::var_os("OUTPUT_RETIREMENT_GC").is_some();
+    let mut gc_us = 0;
+    for _ in 0..128 {
+        let n = tree.create(1, "output", 0o644).await.unwrap();
+        tree.write(n.id, 0, &payload).await.unwrap();
+        tree.unlink(1, "output").await.unwrap();
+        ids.push(n.id);
+        if collect {
+            let gc = std::time::Instant::now();
+            tree.reclaim_retired(64).unwrap();
+            gc_us += gc.elapsed().as_micros();
+        }
+    }
+    let local_bytes: u64 = fs::read_dir(dir.path().join("local"))
+        .unwrap()
+        .map(|e| e.unwrap().metadata().unwrap().len())
+        .sum();
+    let retained = ids.iter().filter(|id| tree.get(**id).is_ok()).count();
+    fn disk(path: &Path) -> u64 {
+        fs::read_dir(path)
+            .unwrap()
+            .map(|e| {
+                let e = e.unwrap();
+                let m = e.metadata().unwrap();
+                if m.is_dir() { disk(&e.path()) } else { m.len() }
+            })
+            .sum()
+    }
+    eprintln!(
+        "OUTPUT_ITERATIONS count=128 payload_bytes=32768 wall_us={} local_bytes={} state_bytes={} retained_nodes={} gc_us={}",
+        started.elapsed().as_micros(),
+        local_bytes,
+        disk(dir.path()),
+        retained,
+        gc_us
+    );
+}
+
+#[tokio::test]
+async fn collection_preserves_leases_lookup_counts_and_authoritative_edits() {
+    let (dir, source, tree) = setup(CacheConfig::default());
+    let old = tree
+        .stage("output", source.artifact(b"remote"))
+        .await
+        .unwrap();
+    let lease = tree.pin(old.id).unwrap();
+    let looked_up = tree.lookup_referenced(1, "output").unwrap();
+    assert_eq!(looked_up.id, old.id);
+    tree.write(old.id, 0, b"edited").await.unwrap();
+    // No remaining remote copy: neither retention nor GC may assume an upload
+    // succeeded merely because the old entry once had a CAS digest.
+    source.data.lock().unwrap().clear();
+    let replacement = tree.create(1, "replacement", 0o644).await.unwrap();
+    tree.write(replacement.id, 0, b"unpublished edit")
+        .await
+        .unwrap();
+    tree.rename(1, "replacement", 1, "output").await.unwrap();
+    assert_eq!(tree.reclaim_retired(64).unwrap().reclaimed_nodes, 0);
+    assert_eq!(tree.read(old.id, 0, 99).await.unwrap(), b"edited");
+    drop(lease);
+    assert_eq!(tree.reclaim_retired(64).unwrap().reclaimed_nodes, 0);
+    tree.forget(old.id, 1);
+    assert_eq!(tree.reclaim_retired(64).unwrap().reclaimed_local_bytes, 6);
+    assert!(tree.get(old.id).is_err());
+    assert!(!dir.path().join("local").join(old.id.to_string()).exists());
+    assert_eq!(
+        tree.read(replacement.id, 0, 99).await.unwrap(),
+        b"unpublished edit"
+    );
+    assert_eq!(tree.resolve("output").unwrap().id, replacement.id);
+    let newest = tree.stage("output", source.artifact(b"new")).await.unwrap();
+    assert!(
+        newest.id > replacement.id,
+        "retired IDs must never alias replacements"
+    );
+}
+
+#[tokio::test]
+async fn collection_skips_inflight_io_pending_publication_and_retained_parents() {
+    let (_dir, source, tree) = setup(CacheConfig::default());
+    let old = tree
+        .stage("parent/output", source.artifact(b"old"))
+        .await
+        .unwrap();
+    source.delay.store(true, Ordering::SeqCst);
+    let reader = {
+        let tree = tree.clone();
+        tokio::spawn(async move { tree.read(old.id, 0, 3).await.unwrap() })
+    };
+    source.entered.notified().await;
+    let prepared = tree
+        .prepare_stage("parent/output", source.artifact(b"new"))
+        .await
+        .unwrap();
+    assert_eq!(tree.reclaim_retired(64).unwrap().reclaimed_nodes, 0);
+    tree.commit_stage(prepared).await.unwrap();
+    tree.clean("parent").await.unwrap();
+    tree.reclaim_retired(64).unwrap();
+    assert!(tree.get(old.id).is_ok(), "in-flight reader owns old bytes");
+    source.release.notify_one();
+    assert_eq!(reader.await.unwrap(), b"old");
+    tree.reclaim_retired_at_boundary(2).unwrap();
+    assert_eq!(tree.retirement_metrics().retained_nodes, 0);
+    // A prefix larger than a collection batch consists entirely of parents.
+    // Stopping after that batch makes every later restart miss the leaf too.
+    let deep = (0..65).map(|_| "nested").collect::<Vec<_>>().join("/");
+    tree.ensure_dir(&deep).await.unwrap();
+    tree.stage(&format!("{deep}/leaf"), source.artifact(b"leaf"))
+        .await
+        .unwrap();
+    tree.clean("nested").await.unwrap();
+    let collected = tree.reclaim_retired_at_boundary(2).unwrap();
+    assert_eq!(collected.reclaimed_nodes, 66);
+    assert_eq!(tree.retirement_metrics().retained_nodes, 0);
+}
+
+#[tokio::test]
+async fn failed_payload_deletion_recovers_from_owned_ledger_without_guessing() {
+    let (dir, source, tree) = setup(CacheConfig::default());
+    let n = tree.create(1, "output", 0o644).await.unwrap();
+    tree.write(n.id, 0, b"retired").await.unwrap();
+    tree.unlink(1, "output").await.unwrap();
+    let payload = dir.path().join("local").join(n.id.to_string());
+    fs::remove_file(&payload).unwrap();
+    fs::create_dir(&payload).unwrap();
+    assert!(tree.reclaim_retired(64).is_err());
+    assert!(
+        tree.get(n.id).is_err(),
+        "metadata retirement precedes unlink"
+    );
+    assert_eq!(tree.retirement_metrics().pending_payload_deletions, 1);
+    fs::remove_dir(&payload).unwrap();
+    fs::write(&payload, b"known retired payload").unwrap();
+    tree.reclaim_retired_at_boundary(1).unwrap();
+    assert!(
+        !payload.exists(),
+        "an empty retired index still retries its ledger"
+    );
+    assert_eq!(tree.retirement_metrics().pending_payload_deletions, 0);
+    // Repeat the distinct recovery path with the persisted intent left behind.
+    let n = tree.create(1, "recovery", 0o644).await.unwrap();
+    tree.write(n.id, 0, b"retired").await.unwrap();
+    tree.unlink(1, "recovery").await.unwrap();
+    let payload = dir.path().join("local").join(n.id.to_string());
+    fs::remove_file(&payload).unwrap();
+    fs::create_dir(&payload).unwrap();
+    assert!(tree.reclaim_retired(64).is_err());
+    drop(tree);
+    fs::remove_dir(&payload).unwrap();
+    fs::write(&payload, b"known retired payload").unwrap();
+    let unknown = dir.path().join("local/9999");
+    fs::write(&unknown, b"unknown ownership").unwrap();
+    let tree = Tree::open(dir.path(), "test", source, CacheConfig::default()).unwrap();
+    assert!(!payload.exists(), "durable retirement is replayed");
+    assert_eq!(fs::read(&unknown).unwrap(), b"unknown ownership");
+    assert_eq!(tree.retirement_metrics().pending_payload_deletions, 0);
+    let newest = tree.create(1, "new", 0o644).await.unwrap();
+    assert!(newest.id > 9999);
+    tree.unlink(1, "new").await.unwrap();
+    assert_eq!(tree.reclaim_retired(1).unwrap().reclaimed_nodes, 1);
+    drop(tree);
+    let source = Arc::new(Source::default());
+    let tree = Tree::open(dir.path(), "test", source, CacheConfig::default()).unwrap();
+    assert!(
+        tree.create(1, "after-reopen", 0o644).await.unwrap().id > newest.id,
+        "the durable highwater, not extant payload files, prevents identity reuse"
+    );
+}
+
+#[tokio::test]
+async fn server_generation_and_persisted_placeholder_fences_are_not_request_counts() {
+    let (dir, source, tree) = setup(CacheConfig::default());
+    let node = tree.create(1, "output", 0o644).await.unwrap();
+    tree.write(node.id, 0, b"old handle").await.unwrap();
+    let generation = tree.pin_generation();
+    tree.unlink(1, "output").await.unwrap();
+    assert_eq!(tree.reclaim_retired(64).unwrap().reclaimed_nodes, 0);
+    assert_eq!(tree.read(node.id, 0, 99).await.unwrap(), b"old handle");
+    drop(generation);
+    tree.retain_placeholder_generations().unwrap();
+    drop(tree);
+    let tree = Tree::open(dir.path(), "test", source, CacheConfig::default()).unwrap();
+    assert_eq!(tree.reclaim_retired(64).unwrap().reclaimed_nodes, 0);
+    assert_eq!(tree.read(node.id, 0, 99).await.unwrap(), b"old handle");
+}

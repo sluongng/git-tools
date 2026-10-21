@@ -1,8 +1,12 @@
 use anyhow::{Context, Result, ensure};
 use async_trait::async_trait;
 use fuser::*;
-use output_core::{Artifact, CoreError, Node, NodeKind, Projection, SetAttr, Tree, TreeStat};
+use output_core::{
+    Artifact, CoreError, GenerationLease, Node, NodeKind, NodeLease, Projection, SetAttr, Tree,
+    TreeStat,
+};
 use std::{
+    collections::HashMap,
     ffi::OsStr,
     future::Future,
     path::{Path, PathBuf},
@@ -115,11 +119,83 @@ impl Pending {
         }
     }
 }
-struct RequestTicket(Arc<Pending>);
+struct RequestTicket {
+    pending: Arc<Pending>,
+    _generation: GenerationLease,
+}
 impl Drop for RequestTicket {
     fn drop(&mut self) {
-        self.0.count.fetch_sub(1, Ordering::SeqCst);
-        self.0.changed.notify_waiters();
+        self.pending.count.fetch_sub(1, Ordering::SeqCst);
+        self.pending.changed.notify_waiters();
+    }
+}
+
+#[derive(Default)]
+struct Maintenance {
+    running: bool,
+    requested: bool,
+}
+
+#[derive(Default)]
+struct References {
+    lookups: HashMap<u64, u64>,
+    opens: HashMap<u64, Vec<NodeLease>>,
+}
+struct KernelReferences {
+    tree: Arc<Tree>,
+    references: Mutex<References>,
+}
+impl KernelReferences {
+    fn entry(&self, node: &Node, already_retained: bool) -> Result<()> {
+        let mut refs = self.references.lock().unwrap();
+        if !already_retained {
+            self.tree.retain_lookup(node.id)?;
+        }
+        *refs.lookups.entry(node.id).or_insert(0) += 1;
+        Ok(())
+    }
+    fn open(&self, id: u64) -> Result<()> {
+        let pin = self.tree.pin(id)?;
+        self.references
+            .lock()
+            .unwrap()
+            .opens
+            .entry(id)
+            .or_default()
+            .push(pin);
+        Ok(())
+    }
+    fn forget(&self, id: u64, count: u64) {
+        let mut refs = self.references.lock().unwrap();
+        if let Some(current) = refs.lookups.get_mut(&id) {
+            let forgotten = count.min(*current);
+            *current -= forgotten;
+            self.tree.forget(id, forgotten);
+            if *current == 0 {
+                refs.lookups.remove(&id);
+            }
+        }
+    }
+    fn release(&self, id: u64) {
+        let mut refs = self.references.lock().unwrap();
+        if let Some(pins) = refs.opens.get_mut(&id) {
+            pins.pop();
+            if pins.is_empty() {
+                refs.opens.remove(&id);
+            }
+        }
+    }
+    fn clear(&self) {
+        let mut refs = self.references.lock().unwrap();
+        for (id, count) in refs.lookups.drain() {
+            self.tree.forget(id, count);
+        }
+        refs.opens.clear();
+    }
+}
+impl Drop for KernelReferences {
+    fn drop(&mut self) {
+        self.clear();
     }
 }
 
@@ -136,11 +212,15 @@ struct Adapter {
     payload: Arc<Semaphore>,
     pending: Arc<Pending>,
     stopped: Arc<AtomicBool>,
+    references: Arc<KernelReferences>,
+    maintenance: Arc<Mutex<Maintenance>>,
+    retirement_budget: usize,
 }
 impl Adapter {
     fn dispatch<F: Future<Output = ()> + Send + 'static>(&self, work: F) {
         let runtime = self.runtime.clone();
         let payload = self.payload.clone();
+        let adapter = self.clone();
         self.runtime.spawn(async move {
             let _admission = payload
                 .acquire_owned()
@@ -149,6 +229,39 @@ impl Adapter {
             tokio::task::spawn_blocking(move || runtime.block_on(work))
                 .await
                 .ok();
+            adapter.collect();
+        });
+    }
+    fn collect(&self) {
+        if self.retirement_budget == 0 {
+            return;
+        }
+        {
+            let mut maintenance = self.maintenance.lock().unwrap();
+            maintenance.requested = true;
+            if maintenance.running {
+                return;
+            }
+            maintenance.running = true;
+        }
+        let adapter = self.clone();
+        self.runtime.spawn_blocking(move || {
+            loop {
+                adapter.maintenance.lock().unwrap().requested = false;
+                // Full rounds prevent pinned early IDs or parent dependencies from
+                // starving reclaimable leaves/ancestors when no later RPC arrives.
+                if let Err(error) = adapter
+                    .tree
+                    .reclaim_retired_at_boundary(adapter.retirement_budget)
+                {
+                    eprintln!("output retirement deferred: {error:#}");
+                }
+                let mut maintenance = adapter.maintenance.lock().unwrap();
+                if !maintenance.requested {
+                    maintenance.running = false;
+                    break;
+                }
+            }
         });
     }
     fn enter(&self) -> Result<RequestTicket, i32> {
@@ -156,7 +269,10 @@ impl Adapter {
         // two atomics excludes store-buffering: shutdown cannot observe zero
         // while this callback observes the pre-shutdown admission flag.
         self.pending.count.fetch_add(1, Ordering::SeqCst);
-        let ticket = RequestTicket(self.pending.clone());
+        let ticket = RequestTicket {
+            pending: self.pending.clone(),
+            _generation: self.tree.pin_generation(),
+        };
         if self.stopped.load(Ordering::SeqCst) {
             return Err(libc::EIO);
         }
@@ -171,11 +287,43 @@ impl Filesystem for Adapter {
         Ok(())
     }
     fn lookup(&mut self, _: &Request<'_>, parent: u64, name_: &OsStr, reply: ReplyEntry) {
-        let result = name(name_).and_then(|n| self.tree.lookup(parent, &n));
+        let result = name(name_).and_then(|n| self.tree.lookup_referenced(parent, &n));
         match result {
-            Ok(n) => reply.entry(&TTL, &attrs(&n), n.generation),
+            Ok(n) => match self.references.entry(&n, true) {
+                Ok(()) => reply.entry(&TTL, &attrs(&n), n.generation),
+                Err(e) => reply.error(errno(e)),
+            },
             Err(e) => reply.error(errno(e)),
         }
+    }
+    fn forget(&mut self, _: &Request<'_>, ino: u64, count: u64) {
+        self.references.forget(ino, count);
+        self.collect();
+    }
+    fn opendir(&mut self, _: &Request<'_>, ino: u64, _: i32, reply: ReplyOpen) {
+        match self.references.open(ino) {
+            Ok(()) => reply.opened(ino, 0),
+            Err(e) => reply.error(errno(e)),
+        }
+    }
+    fn release(
+        &mut self,
+        _: &Request<'_>,
+        ino: u64,
+        _: u64,
+        _: i32,
+        _: Option<u64>,
+        _: bool,
+        reply: ReplyEmpty,
+    ) {
+        self.references.release(ino);
+        self.collect();
+        reply.ok();
+    }
+    fn releasedir(&mut self, _: &Request<'_>, ino: u64, _: u64, _: i32, reply: ReplyEmpty) {
+        self.references.release(ino);
+        self.collect();
+        reply.ok();
     }
     fn getattr(&mut self, _: &Request<'_>, ino: u64, _: Option<u64>, reply: ReplyAttr) {
         match self.tree.get(ino) {
@@ -262,7 +410,10 @@ impl Filesystem for Adapter {
                 ));
                 return;
             }
-            reply.opened(ino, 0);
+            match self.references.open(ino) {
+                Ok(()) => reply.opened(ino, 0),
+                Err(e) => reply.error(errno(e)),
+            }
             return;
         }
         let permit = match self.enter() {
@@ -273,6 +424,7 @@ impl Filesystem for Adapter {
             }
         };
         let tree = self.tree.clone();
+        let references = self.references.clone();
         self.dispatch(async move {
             let _permit = permit;
             match tree
@@ -285,7 +437,10 @@ impl Filesystem for Adapter {
                 )
                 .await
             {
-                Ok(_) => reply.opened(ino, 0),
+                Ok(_) => match references.open(ino) {
+                    Ok(()) => reply.opened(ino, 0),
+                    Err(e) => reply.error(errno(e)),
+                },
                 Err(e) => reply.error(errno(e)),
             }
         });
@@ -434,10 +589,17 @@ impl Filesystem for Adapter {
             }
         };
         let tree = self.tree.clone();
+        let references = self.references.clone();
         self.dispatch(async move {
             let _permit = permit;
             match tree.create(parent, &filename, mode & !umask & 0o7777).await {
-                Ok(n) => reply.created(&TTL, &attrs(&n), n.generation, n.id, 0),
+                Ok(n) => match references
+                    .entry(&n, false)
+                    .and_then(|_| references.open(n.id))
+                {
+                    Ok(()) => reply.created(&TTL, &attrs(&n), n.generation, n.id, 0),
+                    Err(e) => reply.error(errno(e)),
+                },
                 Err(e) => reply.error(errno(e)),
             }
         });
@@ -471,10 +633,14 @@ impl Filesystem for Adapter {
             }
         };
         let tree = self.tree.clone();
+        let references = self.references.clone();
         self.dispatch(async move {
             let _permit = permit;
             match tree.create(parent, &filename, mode & !umask & 0o7777).await {
-                Ok(n) => reply.entry(&TTL, &attrs(&n), n.generation),
+                Ok(n) => match references.entry(&n, false) {
+                    Ok(()) => reply.entry(&TTL, &attrs(&n), n.generation),
+                    Err(e) => reply.error(errno(e)),
+                },
                 Err(e) => reply.error(errno(e)),
             }
         });
@@ -503,10 +669,14 @@ impl Filesystem for Adapter {
             }
         };
         let tree = self.tree.clone();
+        let references = self.references.clone();
         self.dispatch(async move {
             let _permit = permit;
             match tree.mkdir(parent, &filename, mode & !umask & 0o7777).await {
-                Ok(n) => reply.entry(&TTL, &attrs(&n), n.generation),
+                Ok(n) => match references.entry(&n, false) {
+                    Ok(()) => reply.entry(&TTL, &attrs(&n), n.generation),
+                    Err(e) => reply.error(errno(e)),
+                },
                 Err(e) => reply.error(errno(e)),
             }
         });
@@ -541,10 +711,14 @@ impl Filesystem for Adapter {
             }
         };
         let tree = self.tree.clone();
+        let references = self.references.clone();
         self.dispatch(async move {
             let _permit = permit;
             match tree.symlink(parent, &filename, &target).await {
-                Ok(n) => reply.entry(&TTL, &attrs(&n), n.generation),
+                Ok(n) => match references.entry(&n, false) {
+                    Ok(()) => reply.entry(&TTL, &attrs(&n), n.generation),
+                    Err(e) => reply.error(errno(e)),
+                },
                 Err(e) => reply.error(errno(e)),
             }
         });
@@ -816,6 +990,15 @@ pub struct FuseMount {
 /// Mount a single-user writable view. The caller must keep the Tokio runtime
 /// alive through shutdown. State/cache must not be inside the projected root.
 pub async fn start(tree: Arc<Tree>, root: &Path) -> Result<Arc<FuseMount>> {
+    start_with_retirement_budget(tree, root, 64).await
+}
+/// Configure the per-transaction retirement budget. Zero disables automatic
+/// collection, retaining the conservative raw-ID behavior for diagnostics.
+pub async fn start_with_retirement_budget(
+    tree: Arc<Tree>,
+    root: &Path,
+    retirement_budget: usize,
+) -> Result<Arc<FuseMount>> {
     let root = root.to_owned();
     let runtime = Handle::current();
     tokio::task::spawn_blocking(move || {
@@ -833,8 +1016,18 @@ pub async fn start(tree: Arc<Tree>, root: &Path) -> Result<Arc<FuseMount>> {
             std::fs::read_dir(&root)?.next().is_none(),
             "output mountpoint must be empty"
         );
+        // Starting a new empty kernel mount ends the old handle generation.
+        // Explicit external Tree users must pin any IDs they retain themselves.
+        tree.reclaim_retired_at_boundary(retirement_budget)?;
+        let references = Arc::new(KernelReferences {
+            tree: tree.clone(),
+            references: Mutex::new(References::default()),
+        });
         let adapter = Adapter {
             tree,
+            references,
+            maintenance: Arc::new(Mutex::new(Maintenance::default())),
+            retirement_budget,
             atomic_truncate: false,
             runtime,
             payload: Arc::new(Semaphore::new(PAYLOAD_SLOTS)),
@@ -899,6 +1092,7 @@ impl FuseMount {
         let guard = self.control.clone().lock_owned().await;
         let runtime = self.adapter.runtime.clone();
         let stopped = self.adapter.stopped.clone();
+        let adapter = self.adapter.clone();
         tokio::task::spawn_blocking(move || {
             runtime.block_on(async move {
                 let _guard = guard;
@@ -906,7 +1100,11 @@ impl FuseMount {
                     !stopped.load(Ordering::Acquire),
                     "output projection stopped"
                 );
-                operation(tree, notifier).await
+                let generation = tree.pin_generation();
+                let result = operation(tree, notifier).await;
+                drop(generation);
+                adapter.collect();
+                result
             })
         })
         .await
@@ -1051,6 +1249,7 @@ impl Projection for FuseMount {
         let stopped = self.adapter.stopped.clone();
         let payload = self.adapter.payload.clone();
         let pending = self.adapter.pending.clone();
+        let references = self.adapter.references.clone();
         tokio::task::spawn_blocking(move || {
             runtime.block_on(async move {
                 let _guard = guard;
@@ -1074,6 +1273,7 @@ impl Projection for FuseMount {
                             .map_err(|_| anyhow::anyhow!("FUSE receiver panicked"))??;
                     }
                     slot.take();
+                    references.clear();
                 }
                 Ok::<_, anyhow::Error>(())
             })
