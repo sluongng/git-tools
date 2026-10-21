@@ -554,12 +554,36 @@ async fn relay_with_retries(inner: Arc<Inner>, id: String) -> Result<(), Status>
         }
     }
 }
+/// Cancellation must not depend on the request body being polled: an upstream
+/// that stops reading can exhaust HTTP/2 send capacity and park that producer.
+async fn ingress_detached(inner: Arc<Inner>, id: String) -> Status {
+    loop {
+        let changed = inner.changed.notified();
+        tokio::pin!(changed);
+        changed.as_mut().enable();
+        let state = match inner.spool.lock().unwrap().stream(&id) {
+            Ok(state) => state,
+            Err(error) => return error,
+        };
+        if state.terminal.is_some() {
+            // A durably admitted terminal stream is daemon-owned and must
+            // finish forwarding even after its local publisher disconnects.
+            return std::future::pending().await;
+        }
+        if !inner.attached.lock().unwrap().contains_key(&id) {
+            return Status::cancelled("BES ingress detached");
+        }
+        changed.await;
+    }
+}
 async fn relay_once(inner: Arc<Inner>, id: String) -> Result<(), Status> {
     let state = inner.spool.lock().unwrap().stream(&id)?;
     if state.complete() {
         return Ok(());
     }
     let start = state.acked + 1;
+    let detached = ingress_detached(inner.clone(), id.clone());
+    tokio::pin!(detached);
     let sent = Arc::new(AtomicI64::new(state.acked));
     let sent_stream = sent.clone();
     let (errors_tx, mut errors_rx) = tokio::sync::mpsc::channel::<Status>(1);
@@ -575,12 +599,6 @@ async fn relay_once(inner: Arc<Inner>, id: String) -> Result<(), Status> {
             tokio::pin!(notified);
             notified.as_mut().enable();
             let id = send_id.clone();
-            let state = send_inner.spool.lock().unwrap().stream(&id);
-            if state.as_ref().is_ok_and(|state| state.terminal.is_none())
-                && !send_inner.attached.lock().unwrap().contains_key(&id) {
-                let _ = errors_tx.send(Status::cancelled("BES ingress detached")).await;
-                std::future::pending::<()>().await;
-            }
             let result = storage(&send_inner, move |spool| spool.event(&id, sequence)).await;
             match result {
                 Ok(Some((event, terminal))) => {
@@ -602,11 +620,13 @@ async fn relay_once(inner: Arc<Inner>, id: String) -> Result<(), Status> {
     let response = tokio::select! {
         result = client.publish_build_tool_event_stream(request(&inner, outgoing, state.attribution.as_deref())) => result?,
         error = errors_rx.recv() => return Err(error.unwrap_or_else(|| Status::internal("BES sender stopped"))),
+        error = &mut detached => return Err(error),
     };
     let mut responses = response.into_inner();
     loop {
         let ack = tokio::select! {
             response = responses.message() => response?,
+            error = &mut detached => return Err(error),
             error = errors_rx.recv() => {
                 if let Some(error) = error { return Err(error); }
                 // A successful terminal send drops the error channel.

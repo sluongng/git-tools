@@ -31,6 +31,7 @@ struct Backend {
     attempts: Arc<AtomicUsize>,
     lifecycle: Arc<AtomicUsize>,
     lifecycle_gate: watch::Sender<bool>,
+    read_gate: watch::Sender<bool>,
     headers: ObservedHeaders,
     gate: watch::Sender<bool>,
     failures: Arc<AtomicUsize>,
@@ -45,6 +46,7 @@ impl Backend {
             attempts: Default::default(),
             lifecycle: Default::default(),
             lifecycle_gate: watch::channel(true).0,
+            read_gate: watch::channel(true).0,
             headers: Default::default(),
             gate: watch::channel(allow_ack).0,
             failures: Default::default(),
@@ -83,6 +85,8 @@ impl PublishBuildEvent for Backend {
         let this = self.clone();
         let mut input = request.into_inner();
         Ok(Response::new(Box::pin(async_stream::try_stream! {
+            this.read_gate.subscribe().wait_for(|v| *v).await
+                .map(|_| ()).map_err(|_| Status::cancelled("fixture stopped"))?;
             let mut events = Vec::new();
             while let Some(event) = input.message().await? {
                 this.events.lock().unwrap().push(event.clone());
@@ -366,6 +370,67 @@ async fn incomplete_disconnected_stream_does_not_finalize_or_starve_other_builds
         2
     );
     wait(|| proxy.metrics().pending_events == 0).await;
+    proxy.shutdown().await;
+    frontend_task.abort();
+    upstream_task.abort();
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn detached_stream_releases_forwarding_slot_when_upstream_stops_reading() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let state = Backend::new(true);
+    state.read_gate.send_replace(false);
+    let (url, upstream_task) = backend(state.clone()).await?;
+    let mut cfg = config(url);
+    cfg.max_concurrent_forwards = 1;
+    let proxy = BesProxy::open(dir.path().join("bes"), cfg).await?;
+    let (mut client, frontend_task) = frontend(proxy.clone()).await?;
+    // Incompressible bytes exceed the transport's send windows/buffers even
+    // with gzip enabled. The upstream deliberately never polls its input.
+    let mut random = 0x4d595df4d0f33173_u64;
+    let events = (1..=32)
+        .map(|sequence| {
+            let bytes = (0..256 * 1024)
+                .map(|_| {
+                    random ^= random << 13;
+                    random ^= random >> 7;
+                    random ^= random << 17;
+                    random as u8
+                })
+                .collect();
+            let mut request = event("stalled", sequence, false);
+            request
+                .ordered_build_event
+                .as_mut()
+                .unwrap()
+                .event
+                .as_mut()
+                .unwrap()
+                .event = Some(build_event::Event::ConsoleOutput(
+                build_event::ConsoleOutput {
+                    r#type: 1,
+                    output: Some(build_event::console_output::Output::BinaryOutput(bytes)),
+                },
+            ));
+            request
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(publish(&mut client, events).await?.len(), 32);
+    wait(|| state.attempts.load(Ordering::SeqCst) > 0).await;
+    wait(|| proxy.metrics().forwarding_streams == 0).await;
+    assert_eq!(proxy.metrics().pending_events, 32);
+    assert_eq!(proxy.metrics().blocked_streams, 0);
+    assert_eq!(state.ended.load(Ordering::SeqCst), 0);
+    state.read_gate.send_replace(true);
+    assert_eq!(
+        publish(&mut client, vec![event("ready", 1, true)])
+            .await?
+            .len(),
+        1
+    );
+    wait(|| proxy.metrics().completed_streams == 1).await;
+    assert_eq!(proxy.metrics().pending_events, 32);
     proxy.shutdown().await;
     frontend_task.abort();
     upstream_task.abort();
