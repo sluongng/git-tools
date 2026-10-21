@@ -44,7 +44,9 @@ Each `local-cas` directory has **one process owner**. Library consumers share
 `Arc<LocalCas>`; separate proxy/BOS processes need separate directories.
 Cache quotas cover logical payloads, not metadata, filesystem blocks or RSS.
 The daemon's AC metadata cache is separate, memory-bounded, and uses a fixed
-60-second TTL. Set it to zero without an upstream retention assumption.
+one-hour TTL. Used AC entries and shared-CAS blobs have bounded, best-effort
+background retention maintenance. Without an upstream retention assumption,
+disable both AC reuse and maintenance in the daemon configuration.
 CAS writes and `FindMissingBlobs` reach the upstream before claiming availability
 to Bazel: a local hit alone cannot satisfy a remote executor's input requirement.
 

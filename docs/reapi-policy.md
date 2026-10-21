@@ -122,9 +122,37 @@ verified local bytes and an upstream presence check; CAS eviction forces another
 fetch. Normal CAS reads populate the shared byte cache lazily. Directory fetches
 always forward; a cached root does not prove full-tree availability.
 
-Daemon AC metadata uses a fixed 60-second TTL, not renewed by local hits. This is
-an operator retention assumption, not independent validation of referenced blobs.
-Set `cache.action_cache_ttl_seconds = 0` to revalidate every result upstream.
+## Background retention maintenance
+
+The daemon defaults to a fixed one-hour AC TTL after an upstream read; local hits
+do not slide it. Used entries may be renewed in the background every three hours,
+along with recently accessed shared-CAS bytes. Foreground upstream reads count
+toward this interval; required AC revalidation is never delayed until maintenance.
+Output references receive an initial asynchronous check, then use their own
+refresh clock so hourly AC reads cannot postpone output maintenance. While AC
+metadata is fresh, output-only checks reuse it without another AC lookup or
+extending its expiry.
+
+`[cache]` configures `action_cache_ttl_seconds = 3600`,
+`upstream_retention_seconds = 14400`, `retention_refresh_seconds = 10800` and
+`retention_max_entries = 16384`. Retention is an operator assumption, not a
+server-reported lease. The refresh interval must be shorter than that window.
+Without a suitable assumption, set both TTL and upstream retention to zero.
+
+One background worker uses a separate connection, bounded metadata/work sets,
+batched presence checks, configured retry policy and a 30-second maximum operation
+budget (also capped by the configured background budget and retention headroom).
+No foreground read waits for it. AC renewal checks direct outputs, stdout/stderr,
+Tree contents and Directory closure, downloading bounded metadata only. CAS hits
+notify the worker even through a per-read source override, including lazy BOS.
+No output payload is eagerly fetched or pinned against local LRU eviction.
+
+Only successful upstream confirmation renews timestamps. Failures preserve the
+old expiry; missing outputs invalidate cached AC metadata, not verified local
+bytes. Refresh is not repair, and cannot restore an evicted remote object. The
+bounded hot set is in memory; restart begins with unknown remote retention.
+The worker is cancelled on shutdown. REAPI defines no standard cache-RPC urgency
+field: low priority is local scheduling, not a server-priority guarantee.
 
 ## BES is a separate policy
 

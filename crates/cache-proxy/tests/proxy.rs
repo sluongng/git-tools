@@ -35,6 +35,10 @@ struct Backend {
     blobs: Arc<Mutex<HashMap<String, Vec<u8>>>>,
     reads: Arc<AtomicU64>,
     ac_reads: Arc<AtomicU64>,
+    ac_result: Arc<Mutex<Option<ActionResult>>>,
+    ac_error: Arc<AtomicBool>,
+    missing_requests: Arc<Mutex<Vec<FindMissingBlobsRequest>>>,
+    missing_delay_ms: Arc<AtomicU64>,
     reject_writes: Arc<Mutex<bool>>,
     execution_calls: Arc<AtomicU64>,
     grpc_gzip: Arc<AtomicBool>,
@@ -158,7 +162,13 @@ impl action_cache_server::ActionCache for Backend {
     ) -> Result<Response<ActionResult>, Status> {
         self.observe("get_action_result", &req);
         self.ac_reads.fetch_add(1, Ordering::Relaxed);
-        Ok(Response::new(ActionResult {
+        if self.ac_error.load(Ordering::Relaxed) {
+            return Err(Status::unavailable("fixture AC unavailable"));
+        }
+        if let Some(value) = self.ac_result.lock().unwrap().clone() {
+            return Ok(self.response(value));
+        }
+        Ok(self.response(ActionResult {
             stdout_raw: if req.into_inner().inline_stdout {
                 b"inline".to_vec()
             } else {
@@ -238,7 +248,15 @@ impl content_addressable_storage_server::ContentAddressableStorage for Backend {
         req: Request<FindMissingBlobsRequest>,
     ) -> Result<Response<FindMissingBlobsResponse>, Status> {
         self.observe("find_missing_blobs", &req);
-        Ok(Response::new(FindMissingBlobsResponse {
+        self.missing_requests
+            .lock()
+            .unwrap()
+            .push(req.get_ref().clone());
+        tokio::time::sleep(Duration::from_millis(
+            self.missing_delay_ms.load(Ordering::Relaxed),
+        ))
+        .await;
+        Ok(self.response(FindMissingBlobsResponse {
             missing_blob_digests: req
                 .into_inner()
                 .blob_digests
@@ -547,6 +565,20 @@ impl Harness {
             } else {
                 (execution, operations, fetch, capabilities)
             };
+            let ac = action_cache_server::ActionCacheServer::new(fake.clone());
+            let cas = content_addressable_storage_server::ContentAddressableStorageServer::new(
+                fake.clone(),
+            );
+            let (ac, cas) = if gzip {
+                (
+                    ac.accept_compressed(tonic::codec::CompressionEncoding::Gzip)
+                        .send_compressed(tonic::codec::CompressionEncoding::Gzip),
+                    cas.accept_compressed(tonic::codec::CompressionEncoding::Gzip)
+                        .send_compressed(tonic::codec::CompressionEncoding::Gzip),
+                )
+            } else {
+                (ac, cas)
+            };
             Server::builder()
                 .max_concurrent_streams(limit)
                 .add_service(
@@ -554,13 +586,9 @@ impl Harness {
                         .accept_compressed(tonic::codec::CompressionEncoding::Gzip)
                         .send_compressed(tonic::codec::CompressionEncoding::Gzip),
                 )
-                .add_service(action_cache_server::ActionCacheServer::new(fake.clone()))
+                .add_service(ac)
                 .add_service(capabilities)
-                .add_service(
-                    content_addressable_storage_server::ContentAddressableStorageServer::new(
-                        fake.clone(),
-                    ),
-                )
+                .add_service(cas)
                 .add_service(execution)
                 .add_service(operations)
                 .add_service(fetch)
@@ -612,6 +640,473 @@ fn digest(bytes: &[u8]) -> Digest {
         hash: blake3::hash(bytes).to_hex().to_string(),
         size_bytes: bytes.len() as i64,
     }
+}
+fn retention_policy(config: &mut ProxyConfig) {
+    config.upstream_retention = Duration::from_secs(5);
+    config.retention_refresh_interval = Duration::from_millis(300);
+    config.policy.retry.max_attempts = 1;
+}
+struct LocalBytes(&'static [u8]);
+#[async_trait::async_trait]
+impl local_cas::BlobSource for LocalBytes {
+    async fn fetch(&self, _: &local_cas::Artifact, file: &mut std::fs::File) -> Result<()> {
+        use std::io::Write;
+        file.write_all(self.0)?;
+        Ok(())
+    }
+    async fn missing(&self, artifacts: &[local_cas::Artifact]) -> Result<Vec<local_cas::Artifact>> {
+        Ok(artifacts.to_vec())
+    }
+}
+fn action_request() -> GetActionResultRequest {
+    GetActionResultRequest {
+        instance_name: "repo".into(),
+        action_digest: Some(digest(b"retained-action")),
+        digest_function: 9,
+        ..Default::default()
+    }
+}
+async fn eventually(mut condition: impl FnMut() -> bool) {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while !condition() {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("background retention progress");
+}
+#[tokio::test]
+async fn retention_keeps_ac_validity_fixed_and_refreshes_complete_output_references() {
+    use prost::Message;
+    let h = Harness::configured(
+        Duration::from_millis(600),
+        None,
+        |c| {
+            retention_policy(c);
+            c.retention_refresh_interval = Duration::from_millis(1500);
+        },
+        CacheConfig::default(),
+    )
+    .await;
+    let mut expected = vec![];
+    let mut store = |bytes: &[u8]| {
+        let d = digest(bytes);
+        expected.push(d.clone());
+        h.backend
+            .blobs
+            .lock()
+            .unwrap()
+            .insert(d.hash.clone(), bytes.to_vec());
+        d
+    };
+    let direct = store(b"direct");
+    let stdout = store(b"stdout");
+    let stderr = store(b"stderr");
+    let nested = store(b"nested");
+    let file = |d: Digest| FileNode {
+        name: "file".into(),
+        digest: Some(d),
+        ..Default::default()
+    };
+    let tree_child = Directory {
+        files: vec![file(nested)],
+        ..Default::default()
+    };
+    let tree = Tree {
+        root: Some(Directory {
+            directories: vec![DirectoryNode {
+                name: "child".into(),
+                digest: Some(digest(&tree_child.encode_to_vec())),
+            }],
+            ..Default::default()
+        }),
+        children: vec![tree_child],
+    };
+    let td = store(&tree.encode_to_vec());
+    let child = Directory {
+        files: vec![file(store(b"directory file"))],
+        ..Default::default()
+    };
+    let cd = store(&child.encode_to_vec());
+    let root = Directory {
+        directories: vec![DirectoryNode {
+            name: "child".into(),
+            digest: Some(cd),
+        }],
+        ..Default::default()
+    };
+    let rd = store(&root.encode_to_vec());
+    *h.backend.ac_result.lock().unwrap() = Some(ActionResult {
+        output_files: vec![OutputFile {
+            path: "direct".into(),
+            digest: Some(direct),
+            ..Default::default()
+        }],
+        output_directories: vec![
+            OutputDirectory {
+                path: "tree".into(),
+                tree_digest: Some(td),
+                ..Default::default()
+            },
+            OutputDirectory {
+                path: "directories".into(),
+                root_directory_digest: Some(rd),
+                ..Default::default()
+            },
+        ],
+        stdout_digest: Some(stdout),
+        stderr_digest: Some(stderr),
+        ..Default::default()
+    });
+    let mut ac = action_cache_client::ActionCacheClient::connect(h.url.clone())
+        .await
+        .unwrap();
+    ac.get_action_result(h.request(action_request()))
+        .await
+        .unwrap();
+    eventually(|| h.proxy.metrics().retention.output_refreshes >= 1).await;
+    assert_eq!(
+        h.backend.ac_reads.load(Ordering::Relaxed),
+        1,
+        "first output validation does not duplicate the AC RPC"
+    );
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    ac.get_action_result(h.request(action_request()))
+        .await
+        .unwrap();
+    assert_eq!(h.backend.ac_reads.load(Ordering::Relaxed), 1);
+    tokio::time::sleep(Duration::from_millis(600)).await;
+    ac.get_action_result(h.request(action_request()))
+        .await
+        .unwrap();
+    assert_eq!(
+        h.backend.ac_reads.load(Ordering::Relaxed),
+        2,
+        "local hits never slide AC expiry"
+    );
+    ac.get_action_result(h.request(action_request()))
+        .await
+        .unwrap();
+    eventually(|| h.proxy.metrics().retention.action_refreshes >= 1).await;
+    assert_eq!(h.backend.ac_reads.load(Ordering::Relaxed), 3);
+    {
+        let requests = h.backend.missing_requests.lock().unwrap();
+        for d in expected {
+            assert!(
+                requests.iter().any(|r| r.blob_digests.contains(&d)),
+                "unrefreshed digest {d:?}"
+            );
+        }
+    }
+    assert_eq!(
+        h.backend.reads.load(Ordering::Relaxed),
+        6,
+        "only Tree/Directory metadata was downloaded during two closure checks"
+    );
+    assert_eq!(h.cache.metrics().fetches, 0, "no eager output hydration");
+    for _ in 0..8 {
+        ac.get_action_result(h.request(action_request()))
+            .await
+            .unwrap();
+    }
+    assert_eq!(
+        h.backend.ac_reads.load(Ordering::Relaxed),
+        3,
+        "renewed entries deduplicate refreshes"
+    );
+}
+#[tokio::test]
+async fn retention_failure_does_not_extend_ac_and_missing_outputs_invalidate_it() {
+    for missing in [false, true] {
+        let h = Harness::configured(
+            Duration::from_millis(700),
+            None,
+            retention_policy,
+            CacheConfig::default(),
+        )
+        .await;
+        *h.backend.ac_result.lock().unwrap() = Some(ActionResult {
+            stdout_digest: Some(digest(b"absent log")),
+            ..Default::default()
+        });
+        if !missing {
+            let log = digest(b"absent log");
+            h.backend
+                .blobs
+                .lock()
+                .unwrap()
+                .insert(log.hash, b"absent log".to_vec());
+        }
+        let mut ac = action_cache_client::ActionCacheClient::connect(h.url.clone())
+            .await
+            .unwrap();
+        ac.get_action_result(h.request(action_request()))
+            .await
+            .unwrap();
+        if !missing {
+            eventually(|| h.proxy.metrics().retention.output_refreshes >= 1).await;
+            h.backend.ac_error.store(true, Ordering::Relaxed);
+            for _ in 0..8 {
+                ac.get_action_result(h.request(action_request()))
+                    .await
+                    .unwrap();
+            }
+        }
+        eventually(|| h.proxy.metrics().retention.failures >= 1).await;
+        if missing {
+            let before = h.backend.ac_reads.load(Ordering::Relaxed);
+            ac.get_action_result(h.request(action_request()))
+                .await
+                .unwrap();
+            assert_eq!(
+                h.backend.ac_reads.load(Ordering::Relaxed),
+                before + 1,
+                "known missing output invalidates still-young AC metadata"
+            );
+        } else {
+            tokio::time::sleep(Duration::from_millis(750)).await;
+            let before = h.backend.ac_reads.load(Ordering::Relaxed);
+            assert_eq!(
+                ac.get_action_result(h.request(action_request()))
+                    .await
+                    .unwrap_err()
+                    .code(),
+                tonic::Code::Unavailable
+            );
+            assert!(
+                h.backend.ac_reads.load(Ordering::Relaxed) > before,
+                "failed maintenance cannot postpone foreground validation"
+            );
+        }
+    }
+}
+#[tokio::test]
+async fn hourly_ac_revalidation_does_not_postpone_output_maintenance() {
+    let h = Harness::configured(
+        Duration::ZERO,
+        None,
+        |c| {
+            retention_policy(c);
+            c.action_cache_ttl = Duration::from_millis(30);
+        },
+        CacheConfig::default(),
+    )
+    .await;
+    let log = digest(b"retained log");
+    h.backend
+        .blobs
+        .lock()
+        .unwrap()
+        .insert(log.hash.clone(), b"retained log".to_vec());
+    *h.backend.ac_result.lock().unwrap() = Some(ActionResult {
+        stdout_digest: Some(log.clone()),
+        ..Default::default()
+    });
+    let mut ac = action_cache_client::ActionCacheClient::connect(h.url.clone())
+        .await
+        .unwrap();
+    for _ in 0..10 {
+        ac.get_action_result(h.request(action_request()))
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(70)).await;
+    }
+    let checks = h
+        .backend
+        .missing_requests
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|r| r.blob_digests.contains(&log))
+        .count();
+    assert!(
+        checks >= 2,
+        "a second output check must complete while foreground revalidation is still active; the initial check alone is insufficient"
+    );
+}
+#[tokio::test]
+async fn input_presence_does_not_crowd_outputs_out_of_retention_tracking() {
+    let h = Harness::configured(
+        Duration::ZERO,
+        None,
+        |c| {
+            retention_policy(c);
+            c.retention_max_entries = 1;
+        },
+        CacheConfig::default(),
+    )
+    .await;
+    let input = digest(b"input");
+    h.backend
+        .blobs
+        .lock()
+        .unwrap()
+        .insert(input.hash.clone(), b"input".to_vec());
+    let mut cas =
+        content_addressable_storage_client::ContentAddressableStorageClient::connect(h.url.clone())
+            .await
+            .unwrap();
+    // Large, valid mixed-presence boundary: observation must remain linear,
+    // and none of these input-only identities may occupy the local-read hot set.
+    let mut inputs = (0..50_000u64)
+        .map(|n| digest(&n.to_le_bytes()))
+        .collect::<Vec<_>>();
+    inputs.push(input);
+    let result = tokio::time::timeout(
+        Duration::from_secs(5),
+        cas.find_missing_blobs(h.request(FindMissingBlobsRequest {
+            instance_name: "repo".into(),
+            digest_function: 9,
+            blob_digests: inputs,
+        })),
+    )
+    .await
+    .expect("large foreground presence response must remain bounded")
+    .unwrap();
+    assert_eq!(result.into_inner().missing_blob_digests.len(), 50_000);
+    h.backend.missing_requests.lock().unwrap().clear();
+    let d = digest(b"output");
+    h.backend
+        .blobs
+        .lock()
+        .unwrap()
+        .insert(d.hash.clone(), b"output".to_vec());
+    let a = local_cas::Artifact {
+        backend: "test-security-scope".into(),
+        instance: "repo".into(),
+        digest_function: 9,
+        hash: d.hash.clone(),
+        size: d.size_bytes as u64,
+    };
+    drop(h.cache.clone().content(a).await.unwrap());
+    eventually(|| {
+        h.backend
+            .missing_requests
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|r| r.blob_digests.contains(&d))
+    })
+    .await;
+    assert_eq!(h.proxy.metrics().retention.dropped, 0);
+}
+#[tokio::test]
+async fn shared_cas_hits_refresh_in_batches_without_blocking_or_pinning_outputs() {
+    let h = Harness::configured(
+        Duration::ZERO,
+        None,
+        |c| {
+            retention_policy(c);
+            c.retention_refresh_interval = Duration::from_millis(700);
+        },
+        CacheConfig {
+            max_bytes: 8,
+            ..Default::default()
+        },
+    )
+    .await;
+    let mut artifacts = vec![];
+    for bytes in [b"aaaa", b"bbbb"] {
+        let d = digest(bytes);
+        h.backend
+            .blobs
+            .lock()
+            .unwrap()
+            .insert(d.hash.clone(), bytes.to_vec());
+        let a = local_cas::Artifact {
+            backend: "test-security-scope".into(),
+            instance: "repo".into(),
+            digest_function: 9,
+            hash: d.hash,
+            size: 4,
+        };
+        drop(h.cache.clone().content(a.clone()).await.unwrap());
+        artifacts.push(a);
+    }
+    let mut cas =
+        content_addressable_storage_client::ContentAddressableStorageClient::connect(h.url.clone())
+            .await
+            .unwrap();
+    cas.find_missing_blobs(
+        h.request(FindMissingBlobsRequest {
+            instance_name: "repo".into(),
+            digest_function: 9,
+            blob_digests: artifacts
+                .iter()
+                .map(|a| Digest {
+                    hash: a.hash.clone(),
+                    size_bytes: a.size as i64,
+                })
+                .collect(),
+        }),
+    )
+    .await
+    .unwrap();
+    h.backend.missing_requests.lock().unwrap().clear();
+    for a in &artifacts {
+        drop(h.cache.clone().cached_content(a.clone()).await.unwrap());
+    }
+    eventually(|| h.proxy.metrics().retention.blob_refreshes >= 2).await;
+    assert!(
+        h.backend
+            .missing_requests
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|r| r.blob_digests.len() == 2),
+        "ready outputs share one presence batch"
+    );
+    let before = h.backend.missing_requests.lock().unwrap().len();
+    for _ in 0..10 {
+        drop(
+            h.cache
+                .clone()
+                .cached_content(artifacts[0].clone())
+                .await
+                .unwrap(),
+        );
+    }
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert_eq!(h.backend.missing_requests.lock().unwrap().len(), before);
+    h.backend.missing_delay_ms.store(500, Ordering::Relaxed);
+    eventually(|| h.backend.missing_requests.lock().unwrap().len() > before).await;
+    let lease = tokio::time::timeout(
+        Duration::from_millis(150),
+        h.cache.clone().content(artifacts[0].clone()),
+    )
+    .await
+    .expect("foreground read cannot wait for maintenance")
+    .unwrap();
+    assert_eq!(std::fs::read(lease.path()).unwrap(), b"aaaa");
+    drop(lease);
+    h.backend.blobs.lock().unwrap().clear();
+    eventually(|| h.proxy.metrics().retention.missing_blobs > 0).await;
+    assert!(
+        h.cache
+            .clone()
+            .cached_content(artifacts[0].clone())
+            .await
+            .unwrap()
+            .is_some(),
+        "immutable local bytes remain usable even after upstream eviction"
+    );
+    let bytes = b"cccc";
+    let d = digest(bytes);
+    h.backend
+        .blobs
+        .lock()
+        .unwrap()
+        .insert(d.hash.clone(), bytes.to_vec());
+    let a = local_cas::Artifact {
+        hash: d.hash,
+        ..artifacts[0].clone()
+    };
+    drop(h.cache.clone().content(a).await.unwrap());
+    assert!(
+        h.cache.metrics().evictions > 0,
+        "maintenance cannot pin output bytes against LRU"
+    );
+    h.proxy.stop_forwarding();
 }
 #[tokio::test]
 async fn verified_shared_reads_do_not_advertise_local_only_blobs_to_rbe() {
@@ -813,7 +1308,16 @@ async fn action_cache_defaults_revalidate_and_inline_variants_are_distinct() {
 }
 #[tokio::test]
 async fn auth_scope_capabilities_and_corruption_are_enforced() {
-    let h = Harness::new(Duration::ZERO).await;
+    let h = Harness::configured(
+        Duration::ZERO,
+        None,
+        |c| {
+            retention_policy(c);
+            c.retention_refresh_interval = Duration::from_secs(3);
+        },
+        CacheConfig::default(),
+    )
+    .await;
     let mut client = capabilities_client::CapabilitiesClient::connect(h.url.clone())
         .await
         .unwrap();
@@ -895,6 +1399,23 @@ async fn auth_scope_capabilities_and_corruption_are_enforced() {
             .code(),
         tonic::Code::DataLoss
     );
+    let a = local_cas::Artifact {
+        backend: "test-security-scope".into(),
+        instance: "repo".into(),
+        digest_function: 9,
+        hash: d.hash.clone(),
+        size: d.size_bytes as u64,
+    };
+    drop(
+        h.cache
+            .clone()
+            .content_from(a, Arc::new(LocalBytes(b"correct")))
+            .await
+            .unwrap(),
+    );
+    tokio::time::timeout(Duration::from_secs(1), async {
+        eventually(|| h.backend.missing_requests.lock().unwrap().iter().any(|r| r.blob_digests.contains(&d))).await;
+    }).await.expect("corrupt fetch must not defer the first verified-local-read presence check for three seconds");
 }
 
 #[tokio::test]

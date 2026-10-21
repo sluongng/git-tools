@@ -3,6 +3,7 @@
 mod asset;
 mod download;
 mod execution;
+mod retention;
 
 use anyhow::{Context, Result, ensure};
 use async_trait::async_trait;
@@ -39,7 +40,7 @@ use tonic::{
     transport::{Channel, Endpoint, Server},
 };
 
-type ActionEntries = HashMap<Vec<u8>, (Instant, ActionResult)>;
+use retention::Actions;
 
 type RpcStream<T> = Pin<Box<dyn Stream<Item = Result<T, Status>> + Send>>;
 
@@ -103,6 +104,11 @@ pub struct ProxyConfig {
     /// Zero is safe with backends whose eviction policy is unknown.
     pub action_cache_ttl: Duration,
     pub max_action_cache_entries: usize,
+    /// Assumed backend retention after a confirmed upstream access; zero disables
+    /// best-effort background retention maintenance.
+    pub upstream_retention: Duration,
+    pub retention_refresh_interval: Duration,
+    pub retention_max_entries: usize,
     pub asset_cache_ttl: Duration,
     pub max_asset_cache_entries: usize,
     pub max_asset_cache_bytes: usize,
@@ -123,6 +129,9 @@ impl Default for ProxyConfig {
             max_concurrent_rpcs_per_connection: 128,
             action_cache_ttl: Duration::ZERO,
             max_action_cache_entries: 4096,
+            upstream_retention: Duration::ZERO,
+            retention_refresh_interval: Duration::from_secs(10800),
+            retention_max_entries: 16384,
             asset_cache_ttl: Duration::from_secs(60),
             max_asset_cache_entries: 4096,
             max_asset_cache_bytes: 8 * 1024 * 1024,
@@ -150,12 +159,13 @@ pub struct ProxyMetrics {
     pub asset_upstream_requests: u64,
     pub execution_requests: u64,
     pub execution_waits: u64,
+    pub retention: retention::Metrics,
 }
 #[derive(Clone)]
 pub struct CacheProxy {
     upstream: Arc<Upstream>,
     cache: Arc<LocalCas>,
-    ac: Arc<Mutex<ActionEntries>>,
+    ac: Arc<Mutex<Actions>>,
     metrics: Arc<Counters>,
     writes: Arc<tokio::sync::Semaphore>,
     executions: Arc<tokio::sync::Semaphore>,
@@ -169,6 +179,8 @@ pub struct Upstream {
     stream_channel: Channel,
     asset_channel: Channel,
     operations_channel: Channel,
+    maintenance_channel: Channel,
+    retention: Arc<retention::Retention>,
     gzip_requests: std::sync::atomic::AtomicU16,
     zstd_capability: tokio::sync::OnceCell<bool>,
     zstd_disabled: std::sync::atomic::AtomicBool,
@@ -184,6 +196,8 @@ enum RpcMethod {
     WaitOperation,
     FetchBlob,
     FetchDirectory,
+    GetActionResult,
+    FindMissingBlobs,
 }
 impl Upstream {
     fn send_gzip(&self, method: RpcMethod) -> bool {
@@ -225,6 +239,16 @@ impl Upstream {
             "action cache TTL exceeds one hour"
         );
         ensure!(
+            config.upstream_retention <= Duration::from_secs(30 * 86400)
+                && config.retention_refresh_interval <= Duration::from_secs(30 * 86400)
+                && config.retention_max_entries <= 1_000_000
+                && (config.upstream_retention.is_zero()
+                    || (!config.retention_refresh_interval.is_zero()
+                        && config.retention_refresh_interval < config.upstream_retention
+                        && config.action_cache_ttl <= config.upstream_retention)),
+            "invalid upstream retention or refresh policy"
+        );
+        ensure!(
             config.asset_cache_ttl <= Duration::from_secs(3600)
                 && config.max_asset_cache_entries <= 1_000_000
                 && config.max_asset_cache_bytes <= 64 * 1024 * 1024
@@ -262,17 +286,22 @@ impl Upstream {
         let stream_channel = endpoint.clone().connect_lazy();
         let asset_channel = endpoint.clone().connect_lazy();
         let operations_channel = endpoint.clone().connect_lazy();
+        let maintenance_channel = endpoint.clone().connect_lazy();
         let channel = endpoint.timeout(config.policy.rpc_timeout()).connect_lazy();
-        Ok(Arc::new(Self {
+        let upstream = Arc::new_cyclic(|owner| Self {
+            retention: retention::Retention::new(owner.clone(), &config),
             config,
             channel,
             stream_channel,
             asset_channel,
             operations_channel,
+            maintenance_channel,
             gzip_requests: std::sync::atomic::AtomicU16::new(0),
             zstd_capability: tokio::sync::OnceCell::new(),
             zstd_disabled: std::sync::atomic::AtomicBool::new(false),
-        }))
+        });
+        upstream.retention.start();
+        Ok(upstream)
     }
     fn request<T>(&self, value: T) -> Request<T> {
         let mut req = Request::new(value);
@@ -427,6 +456,12 @@ impl BlobSource for Upstream {
     async fn fetch(&self, a: &Artifact, target: &mut File) -> Result<()> {
         self.fetch_transport(a, target).await
     }
+    fn verified(&self, artifact: &Artifact, started: Instant) {
+        self.retention.confirm(artifact, started, true);
+    }
+    fn accessed(&self, artifact: &Artifact) {
+        self.retention.accessed(artifact);
+    }
     async fn missing(&self, artifacts: &[Artifact]) -> Result<Vec<Artifact>> {
         if artifacts.is_empty() {
             return Ok(vec![]);
@@ -440,6 +475,7 @@ impl BlobSource for Upstream {
                     && a.digest_function == function),
             "mixed CAS scope"
         );
+        let started = Instant::now();
         let response = self
             .cas()
             .find_missing_blobs(
@@ -457,6 +493,8 @@ impl BlobSource for Upstream {
             )
             .await?
             .into_inner();
+        self.retention
+            .observe_presence(artifacts, &response.missing_blob_digests, started);
         Ok(artifacts
             .iter()
             .filter(|a| {
@@ -475,10 +513,11 @@ impl CacheProxy {
     }
     pub fn new(upstream: Arc<Upstream>, cache: Arc<LocalCas>) -> Self {
         let execution_limit = upstream.config.max_execution_streams;
+        let ac = upstream.retention.actions.clone();
         Self {
             upstream,
             cache,
-            ac: Default::default(),
+            ac,
             metrics: Arc::new(Counters::default()),
             writes: Arc::new(tokio::sync::Semaphore::new(4)),
             executions: Arc::new(tokio::sync::Semaphore::new(execution_limit)),
@@ -490,6 +529,7 @@ impl CacheProxy {
     /// disconnects clients; it does not cancel execution at the remote scheduler.
     pub fn stop_forwarding(&self) {
         self.stop.send_replace(true);
+        self.upstream.retention.stop();
     }
     pub fn metrics(&self) -> ProxyMetrics {
         ProxyMetrics {
@@ -500,6 +540,7 @@ impl CacheProxy {
             asset_upstream_requests: self.metrics.asset_upstream.load(Ordering::Relaxed),
             execution_requests: self.metrics.execution_requests.load(Ordering::Relaxed),
             execution_waits: self.metrics.execution_waits.load(Ordering::Relaxed),
+            retention: self.upstream.retention.metrics(),
         }
     }
     pub async fn serve(
@@ -719,12 +760,15 @@ impl action_cache_server::ActionCache for CacheProxy {
         let req = req.into_inner();
         self.upstream.scope(&req.instance_name)?;
         let key = req.encode_to_vec();
-        if let Some((expiry, value)) = self.ac.lock().unwrap().get(&key)
-            && *expiry > Instant::now()
+        if let Some(entry) = self.ac.lock().unwrap().entries.get_mut(&key)
+            && entry.expires > Instant::now()
         {
+            self.upstream.retention.action_hit(entry);
             self.metrics.ac_hits.fetch_add(1, Ordering::Relaxed);
-            return Ok(Response::new(value.clone()));
+            return Ok(Response::new(entry.value.clone()));
         }
+        let generation = self.ac.lock().unwrap().generation;
+        let started = Instant::now();
         self.metrics.ac_upstream.fetch_add(1, Ordering::Relaxed);
         let value = self
             .upstream
@@ -744,41 +788,9 @@ impl action_cache_server::ActionCache for CacheProxy {
                 },
             )
             .await?;
-        let config = &self.upstream.config;
-        if !config.action_cache_ttl.is_zero() && config.max_action_cache_entries > 0 {
-            let mut cache = self.ac.lock().unwrap();
-            let now = Instant::now();
-            cache.retain(|_, (expires, _)| *expires > now);
-            if cache.len() >= config.max_action_cache_entries
-                && let Some(key) = cache
-                    .iter()
-                    .min_by_key(|(_, (expiry, _))| *expiry)
-                    .map(|(k, _)| k.clone())
-            {
-                cache.remove(&key);
-            }
-            let entry_bytes = key.len() + value.encoded_len();
-            const MAX_AC_BYTES: usize = 64 * 1024 * 1024;
-            while cache
-                .values()
-                .map(|(_, value)| value.encoded_len())
-                .sum::<usize>()
-                + cache.keys().map(Vec::len).sum::<usize>()
-                + entry_bytes
-                > MAX_AC_BYTES
-                && !cache.is_empty()
-            {
-                let key = cache
-                    .iter()
-                    .min_by_key(|(_, (expiry, _))| *expiry)
-                    .map(|(key, _)| key.clone())
-                    .unwrap();
-                cache.remove(&key);
-            }
-            if entry_bytes <= MAX_AC_BYTES {
-                cache.insert(key, (now + config.action_cache_ttl, value.clone()));
-            }
-        }
+        self.upstream
+            .retention
+            .store_action(key, value.clone(), started, generation, None);
         Ok(Response::new(value))
     }
     async fn update_action_result(
@@ -789,7 +801,7 @@ impl action_cache_server::ActionCache for CacheProxy {
         let req = req.into_inner();
         self.upstream.scope(&req.instance_name)?;
         // Invalidate all inline variants. Never acknowledge a local-only update.
-        self.ac.lock().unwrap().clear();
+        self.upstream.retention.clear_actions();
         self.upstream
             .replay(|| async {
                 self.upstream
@@ -812,18 +824,27 @@ impl content_addressable_storage_server::ContentAddressableStorage for CacheProx
         let metadata = CallerMetadata::capture(&req)?;
         let req = req.into_inner();
         self.upstream.scope(&req.instance_name)?;
-        for d in &req.blob_digests {
-            self.upstream.artifact(d, req.digest_function)?;
-        }
-        self.upstream
+        let artifacts = req
+            .blob_digests
+            .iter()
+            .map(|d| self.upstream.artifact(d, req.digest_function))
+            .collect::<Result<Vec<_>, _>>()?;
+        let started = Instant::now();
+        let response = self
+            .upstream
             .replay(|| async {
                 self.upstream
                     .cas()
                     .find_missing_blobs(self.upstream.request_with_metadata(req.clone(), &metadata))
                     .await
             })
-            .await
-            .map(clean_response)
+            .await?;
+        self.upstream.retention.observe_presence(
+            &artifacts,
+            &response.get_ref().missing_blob_digests,
+            started,
+        );
+        Ok(clean_response(response))
     }
     async fn batch_read_blobs(
         &self,

@@ -12,8 +12,12 @@ max_concurrent_fetches = 8
 max_concurrent_rpcs_per_connection = 128
 max_inflight_bytes = 536870912
 max_blob_bytes = 536870912
-# Short fixed AC TTL; set zero when no backend-retention assumption is available.
-action_cache_ttl_seconds = 60
+# Fixed validity after an upstream AC read; local hits do not slide it.
+action_cache_ttl_seconds = 3600
+# Operator retention assumption, not a server-reported lease. Zero disables touches.
+upstream_retention_seconds = 14400
+retention_refresh_seconds = 10800
+retention_max_entries = 16384
 # Mapping metadata is disposable; fetched bytes share the CAS/LRU budget.
 asset_cache_ttl_seconds = 60
 max_asset_cache_entries = 4096

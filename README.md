@@ -46,8 +46,9 @@ workspace stop /tmp/agent-1
 Defaults: 4 GiB verified-byte LRU cache, eight fetches and one private `rbe.sock` for cache, execution, downloader, BES and BOS.
 Linux BOS is opt-in (`[bos] enabled = true`) and strictly lazy when enabled;
 its current metadata-publication overhead can outweigh download savings.
-Action-result metadata has a fixed 60-second TTL; set it to zero without a
-backend-retention assumption. **Edits and commits are not disposable cache data.** Native
+Action-result metadata has a fixed one-hour TTL. Best-effort background touches
+use a configurable retention assumption; disable both without one.
+**Edits and commits are not disposable cache data.** Native
 commit can hydrate indexed files; general checkout/merge/rebase are not supported.
 BES events are ACKed after durable local persistence, forwarded asynchronously
 to BuildBuddy and deleted only after its ACK. Pending events are never LRU-evicted;

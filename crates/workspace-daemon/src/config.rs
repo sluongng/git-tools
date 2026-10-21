@@ -30,6 +30,9 @@ pub struct Cache {
     pub max_blob_bytes: u64,
     pub action_cache_ttl_seconds: u64,
     pub max_action_cache_entries: usize,
+    pub upstream_retention_seconds: u64,
+    pub retention_refresh_seconds: u64,
+    pub retention_max_entries: usize,
     pub asset_cache_ttl_seconds: u64,
     pub max_asset_cache_entries: usize,
     pub max_asset_cache_bytes: usize,
@@ -132,8 +135,11 @@ impl Default for Cache {
             max_concurrent_rpcs_per_connection: 128,
             max_inflight_bytes: 512 * 1024 * 1024,
             max_blob_bytes: 512 * 1024 * 1024,
-            action_cache_ttl_seconds: 60,
+            action_cache_ttl_seconds: 3600,
             max_action_cache_entries: 100_000,
+            upstream_retention_seconds: 14400,
+            retention_refresh_seconds: 10800,
+            retention_max_entries: 16384,
             asset_cache_ttl_seconds: 60,
             max_asset_cache_entries: 4096,
             max_asset_cache_bytes: 8 * 1024 * 1024,
@@ -222,6 +228,18 @@ impl Config {
         );
         self.reapi.validate()?;
         ensure!(
+            self.cache.upstream_retention_seconds <= 30 * 86400
+                && self.cache.retention_refresh_seconds <= 30 * 86400
+                && self.cache.retention_max_entries <= 1_000_000
+                && (self.cache.upstream_retention_seconds == 0
+                    || (self.cache.retention_refresh_seconds > 0
+                        && self.cache.retention_refresh_seconds
+                            < self.cache.upstream_retention_seconds
+                        && self.cache.action_cache_ttl_seconds
+                            <= self.cache.upstream_retention_seconds)),
+            "invalid upstream retention or refresh policy"
+        );
+        ensure!(
             self.cache.asset_cache_ttl_seconds <= 3600
                 && self.cache.max_asset_cache_entries <= 1_000_000
                 && self.cache.max_asset_cache_bytes <= 64 * 1024 * 1024
@@ -297,8 +315,12 @@ api_key_env = "BUILDBUDDY_API_KEY"
 max_bytes = 4294967296
 # Bound simultaneous requests on each local cache connection.
 max_concurrent_rpcs_per_connection = 128
-# Short fixed AC TTL; set zero when no backend-retention assumption is available.
-action_cache_ttl_seconds = 60
+# Fixed validity after an upstream AC read; local hits do not slide it.
+action_cache_ttl_seconds = 3600
+# Assumed backend retention. Zero disables background retention maintenance.
+upstream_retention_seconds = 14400
+retention_refresh_seconds = 10800
+retention_max_entries = 16384
 asset_cache_ttl_seconds = 60
 max_asset_cache_entries = 4096
 max_asset_cache_bytes = 8388608
@@ -358,7 +380,17 @@ mod tests {
             toml::from_str(&EXAMPLE.replace("enabled = false", "enabled = true")).unwrap();
         enabled.validate().unwrap();
         assert!(enabled.bos.enabled);
-        assert_eq!(config.cache.action_cache_ttl_seconds, 60);
+        assert_eq!(config.cache.action_cache_ttl_seconds, 3600);
+        assert_eq!(config.cache.upstream_retention_seconds, 14400);
+        assert_eq!(config.cache.retention_refresh_seconds, 10800);
+        let mut invalid = config.clone();
+        invalid.cache.retention_refresh_seconds = invalid.cache.upstream_retention_seconds;
+        assert!(
+            invalid.validate().is_err(),
+            "refresh requires retention headroom"
+        );
+        invalid.cache.upstream_retention_seconds = 0;
+        assert!(invalid.validate().is_ok(), "zero disables maintenance");
         assert_eq!(config.cache.max_concurrent_rpcs_per_connection, 128);
         assert!(config.session.remote_repo_contents_cache);
         assert!(config.bes.enabled);

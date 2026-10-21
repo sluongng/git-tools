@@ -4,6 +4,7 @@ use std::{io::Write, process::Command, sync::atomic::AtomicBool};
 #[derive(Default)]
 struct Source {
     calls: AtomicU64,
+    accesses: AtomicU64,
     reject: AtomicBool,
 }
 #[async_trait]
@@ -21,6 +22,9 @@ impl BlobSource for Source {
     }
     async fn missing(&self, _: &[Artifact]) -> Result<Vec<Artifact>> {
         Ok(vec![])
+    }
+    fn accessed(&self, _: &Artifact) {
+        self.accesses.fetch_add(1, Ordering::Relaxed);
     }
 }
 fn artifact(bytes: &[u8]) -> Artifact {
@@ -431,6 +435,19 @@ async fn source_override_survives_cancelled_waiter_and_coalesces_without_default
     );
     assert_eq!(cache.metrics().fetches, 1);
     assert_eq!(default_source.calls.load(Ordering::Relaxed), 0);
+    assert_eq!(
+        default_source.accesses.load(Ordering::Relaxed),
+        1,
+        "a source override still notifies the shared cache's access observer"
+    );
+    drop(
+        cache
+            .clone()
+            .cached_content(artifact(b"aaaa"))
+            .await
+            .unwrap(),
+    );
+    assert_eq!(default_source.accesses.load(Ordering::Relaxed), 2);
 }
 
 struct FailedSource;

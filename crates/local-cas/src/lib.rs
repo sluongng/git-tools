@@ -79,6 +79,12 @@ pub trait BlobSource: Send + Sync {
     /// independently verifies both complete hash and exact final size.
     async fn fetch(&self, artifact: &Artifact, target: &mut File) -> Result<()>;
     async fn missing(&self, artifacts: &[Artifact]) -> Result<Vec<Artifact>>;
+    /// Best-effort notification after a verified local read. Implementations
+    /// must not block or treat this as evidence of upstream presence.
+    fn accessed(&self, _artifact: &Artifact) {}
+    /// Called on the fetch source only after full hash/size verification and
+    /// publication. An unused per-request source receives no confirmation.
+    fn verified(&self, _artifact: &Artifact, _fetch_started: std::time::Instant) {}
 }
 #[derive(Clone, Debug)]
 pub struct CacheConfig {
@@ -697,14 +703,21 @@ impl LocalCas {
         source: Arc<dyn BlobSource>,
     ) -> Result<Arc<CachedBlob>> {
         let deadline = tokio::time::Instant::now() + self.config.operation_timeout;
-        match tokio::time::timeout_at(deadline, self.clone().content_inner(artifact, source)).await
-        {
-            Ok(result) if tokio::time::Instant::now() < deadline => result,
-            _ => {
-                self.timed_out_waiters.fetch_add(1, Ordering::Relaxed);
-                Err(CacheTimeoutError.into())
-            }
+        let observed = artifact.clone();
+        let result =
+            match tokio::time::timeout_at(deadline, self.clone().content_inner(artifact, source))
+                .await
+            {
+                Ok(result) if tokio::time::Instant::now() < deadline => result,
+                _ => {
+                    self.timed_out_waiters.fetch_add(1, Ordering::Relaxed);
+                    Err(CacheTimeoutError.into())
+                }
+            };
+        if result.is_ok() {
+            self.source.accessed(&observed);
         }
+        result
     }
     async fn content_inner(
         self: Arc<Self>,
@@ -876,7 +889,7 @@ impl LocalCas {
     ) -> Result<Option<Arc<CachedBlob>>> {
         artifact.validate()?;
         let deadline = tokio::time::Instant::now() + self.config.operation_timeout;
-        tokio::time::timeout_at(deadline, async {
+        let result = tokio::time::timeout_at(deadline, async {
             let request = Arc::new(
                 self.requests
                     .clone()
@@ -884,10 +897,16 @@ impl LocalCas {
                     .await
                     .context("cache shutting down")?,
             );
-            self.cached_inner(&artifact, deadline, request).await
+            self.clone()
+                .cached_inner(&artifact, deadline, request)
+                .await
         })
         .await
-        .map_err(|_| anyhow::Error::from(CacheTimeoutError))?
+        .map_err(|_| anyhow::Error::from(CacheTimeoutError))?;
+        if result.as_ref().is_ok_and(|blob| blob.is_some()) {
+            self.source.accessed(&artifact);
+        }
+        result
     }
     async fn cached_inner(
         self: Arc<Self>,
@@ -1003,6 +1022,7 @@ impl LocalCas {
             .create_new(true)
             .open(&temp_path)?;
         self.fetches.fetch_add(1, Ordering::Relaxed);
+        let fetch_started = std::time::Instant::now();
         source.fetch(artifact, &mut target).await?;
         target.sync_all()?;
         drop(target);
@@ -1047,6 +1067,7 @@ impl LocalCas {
             state.changed();
         }
         self.verified_bytes.fetch_add(size, Ordering::Relaxed);
+        source.verified(artifact, fetch_started);
         Ok(Arc::new(CachedBlob {
             path,
             cache: self.clone(),

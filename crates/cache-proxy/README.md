@@ -23,6 +23,10 @@ Bounded routing metadata is forwarded; upstream credentials remain daemon-owned.
 Downloader mapping hits require verified local CAS bytes and upstream presence;
 metadata has fixed TTL/count/byte bounds and LRU eviction. No blob leases are
 retained. Freshness-constrained requests and directory requests always forward.
+Optional retention maintenance uses one separate background connection for used
+AC entries and shared-CAS reads. Renewal validates output references; failures
+never extend validity. Local blob leases and foreground presence semantics are
+unchanged. See [policy](../../docs/reapi-policy.md#background-retention-maintenance).
 
 Unix sockets must live in a private per-user directory; their filesystem
 permissions replace bearer authentication. Configure a local bearer token for

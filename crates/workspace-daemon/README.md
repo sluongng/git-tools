@@ -40,8 +40,11 @@ which is absent from 9.3.0rc2. BLAKE3/xattr/r2c2 support is also required.
   outside LRU eviction; upstream ACKs delete payloads. `workspace status` shows
   the backlog and forwarding failures; `workspace retry-bes` retries blocked
   delivery without stopping mounts. Keep the state directory across restarts.
-- Remote AC metadata has a fixed 60-second TTL; local hits do not renew it.
-  Set `cache.action_cache_ttl_seconds = 0` without a backend-retention assumption.
+- Remote AC metadata has a fixed one-hour TTL; local hits do not slide it.
+  Used AC entries and shared-CAS reads are eligible for asynchronous retention
+  refresh every three hours under a configurable upstream-retention assumption.
+  Without one, set both `cache.action_cache_ttl_seconds` and
+  `cache.upstream_retention_seconds` to zero.
 - Downloader mappings have bounded TTL/LRU metadata and require verified local
   bytes plus upstream presence. Bytes share CAS eviction; freshness requests and
   directory fetches always reach upstream. Execution retries remain Bazel-owned.
