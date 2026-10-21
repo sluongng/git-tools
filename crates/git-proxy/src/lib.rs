@@ -134,6 +134,10 @@ struct App {
     config: Config,
     repositories: HashMap<String, Repository>,
     digests: std::sync::Mutex<DigestCache>,
+    digest_work: Mutex<()>,
+    digest_batches: AtomicU64,
+    digest_objects: AtomicU64,
+    digest_transactions: AtomicU64,
     slots: Arc<Semaphore>,
     packs: Arc<pack_cache::PackCache>,
     storage_accounting: storage_accounting::StorageAccounting,
@@ -243,6 +247,10 @@ fn create_router(
         config,
         repositories,
         digests: std::sync::Mutex::new(DigestCache { keyspace, db }),
+        digest_work: Mutex::new(()),
+        digest_batches: AtomicU64::new(0),
+        digest_objects: AtomicU64::new(0),
+        digest_transactions: AtomicU64::new(0),
         slots: Arc::new(Semaphore::new(16)),
         packs,
         storage_accounting,
@@ -406,6 +414,59 @@ async fn ensure_repo(app: &App, repo: &Repository, refresh: bool) -> Result<()> 
     attempt.outcome = if result.is_ok() { "success" } else { "failed" };
     result
 }
+async fn mirror_has_refs(app: &App, path: &Path) -> Result<bool> {
+    Ok(!checked({
+        let mut c = git(app, Some(path));
+        c.args(["for-each-ref", "--count=1", "--format=%(refname)"]);
+        c
+    })
+    .await?
+    .is_empty())
+}
+
+// A successful fetch/prune can erase the last evidence that this mirror once
+// resolved HEAD or contained refs. Keep that fact durable before mutation, across failed retries
+// and service restarts. Only a fresh clone may establish unborn provenance.
+fn head_provenance(path: &Path) -> Result<Option<bool>> {
+    let marker = path.join("gitproxy-head-state");
+    let bytes = match std::fs::read(&marker) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
+    match bytes.as_slice() {
+        b"unborn\n" => Ok(Some(false)),
+        b"resolved\n" => Ok(Some(true)),
+        _ => anyhow::bail!("invalid persistent HEAD provenance"),
+    }
+}
+fn persist_head_provenance(path: &Path, resolved: bool) -> Result<()> {
+    if head_provenance(path)? == Some(resolved) {
+        // A prior rename may have succeeded before its directory sync failed.
+        // Matching bytes alone must not waive that barrier before ref pruning.
+        File::open(path)?.sync_all()?;
+        return Ok(());
+    }
+    ensure!(
+        !matches!(head_provenance(path)?, Some(true)) || resolved,
+        "cannot downgrade resolved HEAD provenance"
+    );
+    let temp = path.join("gitproxy-head-state.tmp");
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(true)
+        .write(true)
+        .open(&temp)?;
+    std::io::Write::write_all(
+        &mut file,
+        if resolved { b"resolved\n" } else { b"unborn\n" },
+    )?;
+    file.sync_all()?;
+    std::fs::rename(&temp, path.join("gitproxy-head-state"))?;
+    File::open(path)?.sync_all()?;
+    Ok(())
+}
+
 async fn prepare_repo(app: &App, repo: &Repository, refresh: bool) -> Result<()> {
     {
         let refreshed = repo.refreshed.lock().await;
@@ -469,6 +530,9 @@ async fn prepare_repo(app: &App, repo: &Repository, refresh: bool) -> Result<()>
             .await?;
         }
         std::fs::rename(&temp, &repo.path)?;
+        let nonempty = batch_info(app, repo, &["HEAD".to_owned()]).await?[0].is_some()
+            || mirror_has_refs(app, &repo.path).await?;
+        persist_head_provenance(&repo.path, nonempty)?;
         repo.epoch.fetch_add(1, Ordering::Release);
         *refreshed = Some(Instant::now());
     }
@@ -483,11 +547,18 @@ async fn prepare_repo(app: &App, repo: &Repository, refresh: bool) -> Result<()>
         "cached repository belongs to another upstream"
     );
     if refresh && refreshed.is_none_or(|t| t.elapsed() >= app.config.refresh_ttl) {
-        let mutation = RefMutation(&repo.epoch);
+        // This is read under the write lease, before pruning can make a formerly
+        // resolved symbolic HEAD look unborn. Native parse/command errors fail.
+        let head_was_unborn = batch_info(app, repo, &["HEAD".to_owned()]).await?[0].is_none();
+        if !head_was_unborn || mirror_has_refs(app, &repo.path).await? {
+            persist_head_provenance(&repo.path, true)?;
+        }
+        let _mutation = RefMutation(&repo.epoch);
         let fetched = checked({
             let mut c = git(app, Some(&repo.path));
             c.args([
                 "fetch",
+                "--no-auto-maintenance",
                 "--atomic",
                 "--prune",
                 "--no-tags",
@@ -500,8 +571,12 @@ async fn prepare_repo(app: &App, repo: &Repository, refresh: bool) -> Result<()>
             c
         })
         .await;
-        drop(mutation);
         fetched?;
+        // A ref-bearing mirror with unresolved HEAD is ambiguous, not a
+        // genuinely empty origin. Preserve that evidence before any retry.
+        if mirror_has_refs(app, &repo.path).await? {
+            persist_head_provenance(&repo.path, true)?;
+        }
         let remote_head = checked({
             let mut c = git(app, None);
             c.args(["ls-remote", "--symref"])
@@ -510,10 +585,30 @@ async fn prepare_repo(app: &App, repo: &Repository, refresh: bool) -> Result<()>
             c
         })
         .await?;
-        if let Some(target) = std::str::from_utf8(&remote_head)?.lines().find_map(|line| {
-            line.strip_prefix("ref: ")
-                .and_then(|s| s.strip_suffix("\tHEAD"))
-        }) {
+        let text = std::str::from_utf8(&remote_head)?;
+        let mut symbolic = None;
+        let mut detached = None;
+        for line in text.lines() {
+            let value = line
+                .strip_suffix("\tHEAD")
+                .context("invalid upstream HEAD record")?;
+            if let Some(target) = value.strip_prefix("ref: ") {
+                ensure!(
+                    symbolic.replace(target).is_none(),
+                    "duplicate symbolic HEAD"
+                );
+            } else {
+                ensure!(valid_oid(value), "invalid upstream HEAD object ID");
+                ensure!(
+                    detached.replace(value).is_none(),
+                    "duplicate HEAD object ID"
+                );
+            }
+        }
+        if detached.is_some() {
+            persist_head_provenance(&repo.path, true)?;
+        }
+        if let Some(target) = symbolic {
             ensure!(
                 target.starts_with("refs/"),
                 "invalid upstream symbolic HEAD"
@@ -527,6 +622,62 @@ async fn prepare_repo(app: &App, repo: &Repository, refresh: bool) -> Result<()>
             checked({
                 let mut c = git(app, Some(&repo.path));
                 c.args(["symbolic-ref", "HEAD", target]);
+                c
+            })
+            .await?;
+        } else if let Some(oid) = detached {
+            // HEAD need not be reachable through any advertised ref. Hydrate it
+            // without updating refs or FETCH_HEAD while holding the write lease.
+            if batch_info(app, repo, &[oid.to_owned()]).await?[0].is_none() {
+                checked({
+                    let mut c = git(app, Some(&repo.path));
+                    c.args([
+                        "fetch",
+                        "--no-auto-maintenance",
+                        "--no-tags",
+                        "--no-write-fetch-head",
+                        "--recurse-submodules=no",
+                        "--refmap=",
+                    ])
+                    .arg(&repo.upstream)
+                    .arg(oid);
+                    c
+                })
+                .await?;
+            }
+            checked({
+                let mut c = git(app, Some(&repo.path));
+                c.args(["update-ref", "--no-deref", "HEAD", oid]);
+                c
+            })
+            .await?;
+        } else {
+            // ls-remote cannot name an unborn target when the server omits it.
+            // An already-empty mirror may retain the unborn symref established
+            // by clone, but never bless an old resolved HEAD as fresh.
+            ensure!(
+                head_was_unborn && head_provenance(&repo.path)? == Some(false),
+                "upstream HEAD is absent without trustworthy unborn provenance"
+            );
+            ensure!(
+                batch_info(app, repo, &["HEAD".to_owned()]).await?[0].is_none(),
+                "upstream HEAD is absent but local HEAD resolves"
+            );
+            ensure!(
+                !mirror_has_refs(app, &repo.path).await?,
+                "upstream HEAD is absent in a nonempty mirror"
+            );
+            let target = checked({
+                let mut c = git(app, Some(&repo.path));
+                c.args(["symbolic-ref", "HEAD"]);
+                c
+            })
+            .await?;
+            let target = std::str::from_utf8(&target)?.trim_end_matches('\n');
+            ensure!(target.starts_with("refs/"), "invalid unborn symbolic HEAD");
+            checked({
+                let mut c = git(app, Some(&repo.path));
+                c.args(["check-ref-format", target]);
                 c
             })
             .await?;
@@ -661,6 +812,9 @@ async fn handle(State(app): State<Arc<App>>, request: Request) -> Result<Respons
         }
         let stats = serde_json::json!({
             "pack_cache": app.packs.snapshot(),
+            "digest_batches": app.digest_batches.load(Ordering::Relaxed),
+            "digest_objects": app.digest_objects.load(Ordering::Relaxed),
+            "digest_transactions": app.digest_transactions.load(Ordering::Relaxed),
             "http_backend_calls": app.http_backend_calls.load(Ordering::Relaxed),
             "fetch_generations": app.fetch_generations.load(Ordering::Relaxed),
             "pack_identity_failures": app.pack_identity_failures.load(Ordering::Relaxed),
@@ -1233,6 +1387,7 @@ async fn fetch_absent(app: &App, repo: &Repository, oids: &[String]) -> Result<(
     command
         .args([
             "fetch",
+            "--no-auto-maintenance",
             "--no-prune",
             "--no-prune-tags",
             "--no-tags",
@@ -1316,87 +1471,146 @@ async fn metadata(
     for (oid, info) in oids.into_iter().zip(info) {
         let (object_type, size_bytes) = info
             .ok_or_else(|| HttpError(StatusCode::NOT_FOUND, format!("object {oid} not found\n")))?;
-        let blake3 = if query.blake3 && object_type == "blob" {
-            Some(
-                blob_digest(app, repo, &oid, size_bytes)
-                    .await
-                    .map_err(internal)?,
-            )
-        } else {
-            None
-        };
         objects.push(ObjectMetadata {
             oid,
             size_bytes,
             object_type,
-            blake3,
+            blake3: None,
         });
+    }
+    if query.blake3 {
+        blob_digests(app, repo, &mut objects)
+            .await
+            .map_err(internal)?;
     }
     Ok(objects)
 }
-async fn blob_digest(app: &App, repo: &Repository, oid: &str, size: u64) -> Result<Blake3Digest> {
-    let key = hex::decode(oid)?;
-    {
-        let cache = app
-            .digests
-            .lock()
-            .map_err(|_| anyhow::anyhow!("digest cache lock poisoned"))?;
-        if let Some(value) = cache.db.read_tx().get(&cache.keyspace, &key)? {
-            ensure!(value.len() == 40, "invalid cached digest");
-            ensure!(
-                u64::from_be_bytes(value[32..].try_into()?) == size,
-                "cached size mismatch"
-            );
-            return Ok(Blake3Digest {
-                hash: hex::encode(&value[..32]),
-                size_bytes: size,
-            });
-        }
-    }
-    let mut command = git(app, Some(&repo.path));
-    command
-        .args(["cat-file", "blob", oid])
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null());
-    let mut child: Child = command.spawn()?;
-    let _group = group(&child);
-    let mut stdout = child.stdout.take().unwrap();
-    let mut hasher = blake3::Hasher::new();
-    let mut total = 0u64;
-    let deadline = tokio::time::Instant::now() + GIT_TIMEOUT;
-    let mut buffer = [0u8; 64 * 1024];
-    loop {
-        let n = tokio::time::timeout_at(deadline, stdout.read(&mut buffer)).await??;
-        if n == 0 {
-            break;
-        }
-        total += n as u64;
-        ensure!(total <= size, "blob exceeded reported size");
-        hasher.update(&buffer[..n]);
-    }
-    ensure!(
-        tokio::time::timeout_at(deadline, child.wait())
-            .await??
-            .success()
-            && total == size,
-        "incomplete blob"
-    );
-    let hash = hasher.finalize();
-    let mut value = hash.as_bytes().to_vec();
-    value.extend_from_slice(&size.to_be_bytes());
+
+fn cached_digests(app: &App, objects: &mut [ObjectMetadata]) -> Result<Vec<usize>> {
     let cache = app
         .digests
         .lock()
         .map_err(|_| anyhow::anyhow!("digest cache lock poisoned"))?;
-    let mut tx = cache
-        .db
-        .write_tx()
-        .durability(Some(fjall::PersistMode::SyncAll));
-    tx.insert(&cache.keyspace, key, value);
-    tx.commit()?;
-    Ok(Blake3Digest {
-        hash: hash.to_hex().to_string(),
-        size_bytes: size,
+    let tx = cache.db.read_tx();
+    let mut missing = Vec::new();
+    for (index, object) in objects.iter_mut().enumerate() {
+        if object.object_type != "blob" || object.blake3.is_some() {
+            continue;
+        }
+        if let Some(value) = tx.get(&cache.keyspace, hex::decode(&object.oid)?)? {
+            ensure!(value.len() == 40, "invalid cached digest");
+            ensure!(
+                u64::from_be_bytes(value[32..].try_into()?) == object.size_bytes,
+                "cached size mismatch"
+            );
+            object.blake3 = Some(Blake3Digest {
+                hash: hex::encode(&value[..32]),
+                size_bytes: object.size_bytes,
+            });
+        } else {
+            missing.push(index);
+        }
+    }
+    Ok(missing)
+}
+
+// One cold producer owns the read/compute/publish interval. Followers recheck
+// by immutable OID after acquiring the gate, including partially overlapping
+// batches. Warm lookups never wait for native reads. Cancellation drops both
+// the gate and native process group; only completed durable chunks survive.
+async fn blob_digests(app: &App, repo: &Repository, objects: &mut [ObjectMetadata]) -> Result<()> {
+    if cached_digests(app, objects)?.is_empty() {
+        return Ok(());
+    }
+    let _work = app.digest_work.lock().await;
+    let missing = cached_digests(app, objects)?;
+    if missing.is_empty() {
+        return Ok(());
+    }
+    let mut command = git(app, Some(&repo.path));
+    command
+        .args(["cat-file", "--batch"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+    let mut child = command.spawn()?;
+    let _group = group(&child);
+    app.digest_batches.fetch_add(1, Ordering::Relaxed);
+    let mut stdin = child.stdin.take().unwrap();
+    let mut stdout = BufReader::new(child.stdout.take().unwrap());
+    let deadline = tokio::time::Instant::now() + GIT_TIMEOUT;
+    tokio::time::timeout_at(deadline, async {
+        let mut buffer = [0u8; 64 * 1024];
+        // The request admission cap bounds pending hashes, never blob bytes.
+        let mut mappings = Vec::with_capacity(missing.len());
+        for &index in &missing {
+            let object = &objects[index];
+            stdin
+                .write_all(format!("{}\n", object.oid).as_bytes())
+                .await?;
+            let mut header = Vec::new();
+            (&mut stdout)
+                .take(128)
+                .read_until(b'\n', &mut header)
+                .await?;
+            ensure!(
+                header == format!("{} blob {}\n", object.oid, object.size_bytes).as_bytes(),
+                "invalid cat-file blob header"
+            );
+            let mut remaining = object.size_bytes;
+            let mut hasher = blake3::Hasher::new();
+            while remaining > 0 {
+                let limit = remaining.min(buffer.len() as u64) as usize;
+                let n = stdout.read(&mut buffer[..limit]).await?;
+                ensure!(n != 0, "incomplete blob");
+                hasher.update(&buffer[..n]);
+                remaining -= n as u64;
+            }
+            ensure!(
+                stdout.read_u8().await? == b'\n',
+                "invalid cat-file blob terminator"
+            );
+            let hash = hasher.finalize();
+            let mut value = hash.as_bytes().to_vec();
+            value.extend_from_slice(&object.size_bytes.to_be_bytes());
+            mappings.push((index, hex::decode(&object.oid)?, value, hash));
+        }
+        drop(stdin);
+        ensure!(
+            stdout
+                .read_u8()
+                .await
+                .is_err_and(|error| error.kind() == std::io::ErrorKind::UnexpectedEof),
+            "unexpected cat-file trailing output"
+        );
+        ensure!(child.wait().await?.success(), "cat-file failed");
+        app.digest_objects
+            .fetch_add(mappings.len() as u64, Ordering::Relaxed);
+        // Publish only after native Git has completed successfully. Bound each
+        // durable transaction independently of the request's object count.
+        for chunk in mappings.chunks(256) {
+            let cache = app
+                .digests
+                .lock()
+                .map_err(|_| anyhow::anyhow!("digest cache lock poisoned"))?;
+            let mut tx = cache
+                .db
+                .write_tx()
+                .durability(Some(fjall::PersistMode::SyncAll));
+            for (_, key, value, _) in chunk {
+                tx.insert(&cache.keyspace, key, value);
+            }
+            tx.commit()?;
+            app.digest_transactions.fetch_add(1, Ordering::Relaxed);
+        }
+        for (index, _, _, hash) in mappings {
+            objects[index].blake3 = Some(Blake3Digest {
+                hash: hash.to_hex().to_string(),
+                size_bytes: objects[index].size_bytes,
+            });
+        }
+        Ok::<_, anyhow::Error>(())
     })
+    .await
+    .context("Git digest batch timed out")?
 }

@@ -100,7 +100,8 @@ pub(crate) fn endpoint(origin: &str, alias: &str) -> Result<Url> {
     Ok(url)
 }
 
-pub const BATCH_SIZE: usize = 16_384;
+// Bound cold-start work per request independently of the server admission cap.
+pub const BATCH_SIZE: usize = 1024;
 
 pub fn lookup_batch(
     origin: &str,

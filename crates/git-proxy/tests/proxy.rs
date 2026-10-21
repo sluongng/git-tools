@@ -261,7 +261,8 @@ async fn metadata_blake3_persistence_validation_and_ref_refresh() {
         &replacement,
     ])
     .await;
-    let cfg = config(temp.path(), &upstream, 0);
+    let mut cfg = config(temp.path(), &upstream, 0);
+    cfg.git = gated_git(temp.path());
     let (url, task) = serve(cfg.clone()).await;
     let client = reqwest::Client::new();
     let endpoint = format!("{url}/api/v1/repos/test/objects");
@@ -281,6 +282,31 @@ async fn metadata_blake3_persistence_validation_and_ref_refresh() {
         blake3::hash(b"hello world\n").to_hex().to_string()
     );
     assert!(response.objects[1].blake3.is_none());
+    // A new unreachable blob exercises successful missing-OID hydration,
+    // independently of ref refresh and detached-HEAD hydration below.
+    let late_file = temp.path().join("late-blob");
+    std::fs::write(&late_file, b"late blob\n").unwrap();
+    let late = run(&[
+        "-C",
+        upstream.to_str().unwrap(),
+        "hash-object",
+        "-w",
+        late_file.to_str().unwrap(),
+    ])
+    .await;
+    let response: ObjectResponse = client
+        .post(&endpoint)
+        .json(&json!({"oids":[late], "blake3":true}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        response.objects[0].blake3.as_ref().unwrap().hash,
+        blake3::hash(b"late blob\n").to_hex().to_string()
+    );
     for body in [
         json!({"oids":["--help"]}),
         json!({"oids":["a".repeat(39)]}),
@@ -418,7 +444,524 @@ async fn metadata_blake3_persistence_validation_and_ref_refresh() {
         blake3::hash(b"hello world\n").to_hex().to_string()
     );
     task.stop().await;
+    assert_no_automatic_maintenance(temp.path());
 }
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn refresh_tracks_detached_only_head_and_fails_closed_for_unborn_head() {
+    let temp = tempfile::tempdir().unwrap();
+    let (upstream, _, original) = upstream(temp.path()).await;
+    let mut cfg = config(temp.path(), &upstream, 0);
+    cfg.git = gated_git(temp.path());
+    let (url, server) = serve(cfg.clone()).await;
+    let remote = format!("{url}/git/test.git");
+    assert!(
+        run(&["ls-remote", "--symref", &remote, "HEAD"])
+            .await
+            .starts_with("ref: refs/heads/main\tHEAD")
+    );
+    let tree = run(&["-C", upstream.to_str().unwrap(), "rev-parse", "HEAD^{tree}"]).await;
+    let detached = run(&[
+        "-C",
+        upstream.to_str().unwrap(),
+        "commit-tree",
+        &tree,
+        "-p",
+        &original,
+        "-m",
+        "detached-only",
+    ])
+    .await;
+    // No branch references this commit, so fetching refs/* cannot hydrate it.
+    run(&[
+        "-C",
+        upstream.to_str().unwrap(),
+        "update-ref",
+        "--no-deref",
+        "HEAD",
+        &detached,
+    ])
+    .await;
+    assert_eq!(
+        run(&["ls-remote", "--symref", &remote, "HEAD"]).await,
+        format!("{detached}\tHEAD")
+    );
+    let clone = temp.path().join("detached-clone");
+    run(&["clone", &remote, clone.to_str().unwrap()]).await;
+    assert_eq!(
+        run(&["-C", clone.to_str().unwrap(), "rev-parse", "HEAD"]).await,
+        detached
+    );
+    run(&[
+        "-C",
+        upstream.to_str().unwrap(),
+        "symbolic-ref",
+        "HEAD",
+        "refs/heads/main",
+    ])
+    .await;
+    let advertised = run(&["ls-remote", "--symref", &remote, "HEAD"]).await;
+    assert_eq!(
+        advertised,
+        format!("ref: refs/heads/main\tHEAD\n{original}\tHEAD")
+    );
+    let clone = temp.path().join("symbolic-clone");
+    run(&["clone", &remote, clone.to_str().unwrap()]).await;
+    assert_eq!(
+        run(&["-C", clone.to_str().unwrap(), "symbolic-ref", "HEAD"]).await,
+        "refs/heads/main"
+    );
+    assert_eq!(
+        run(&["-C", clone.to_str().unwrap(), "rev-parse", "HEAD"]).await,
+        original
+    );
+    run(&[
+        "-C",
+        upstream.to_str().unwrap(),
+        "symbolic-ref",
+        "HEAD",
+        "refs/heads/unborn",
+    ])
+    .await;
+    let client = reqwest::Client::new();
+    assert_eq!(
+        client
+            .post(format!("{url}/api/v1/repos/test/prepare"))
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        502
+    );
+    let status: serde_json::Value = client
+        .get(format!("{url}/api/v1/repos/test/status"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(status["last_outcome"], "failed");
+    // Pruning the last ref must not turn an ambiguous, formerly populated
+    // mirror into a trustworthy empty origin on retry or process restart.
+    run(&[
+        "-C",
+        upstream.to_str().unwrap(),
+        "update-ref",
+        "-d",
+        "refs/heads/main",
+    ])
+    .await;
+    for _ in 0..2 {
+        assert_eq!(
+            client
+                .post(format!("{url}/api/v1/repos/test/prepare"))
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            502
+        );
+    }
+    assert!(
+        run(&[
+            "--git-dir",
+            temp.path().join("cache/test.git").to_str().unwrap(),
+            "for-each-ref"
+        ])
+        .await
+        .is_empty()
+    );
+    server.stop().await;
+    let (url, server) = serve(cfg).await;
+    let remote = format!("{url}/git/test.git");
+    for _ in 0..2 {
+        assert_eq!(
+            client
+                .post(format!("{url}/api/v1/repos/test/prepare"))
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            502
+        );
+        assert_eq!(
+            client
+                .get(format!("{remote}/info/refs?service=git-upload-pack"))
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            502
+        );
+    }
+    run(&[
+        "-C",
+        upstream.to_str().unwrap(),
+        "update-ref",
+        "refs/heads/main",
+        &original,
+    ])
+    .await;
+    run(&[
+        "-C",
+        upstream.to_str().unwrap(),
+        "symbolic-ref",
+        "HEAD",
+        "refs/heads/main",
+    ])
+    .await;
+    assert!(
+        run(&["ls-remote", "--symref", &remote, "HEAD"])
+            .await
+            .starts_with("ref: refs/heads/main")
+    );
+    let clone = temp.path().join("recovered-clone");
+    run(&["clone", &remote, clone.to_str().unwrap()]).await;
+    assert_eq!(
+        run(&["-C", clone.to_str().unwrap(), "rev-parse", "HEAD"]).await,
+        original
+    );
+    server.stop().await;
+    assert_no_automatic_maintenance(temp.path());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn empty_origin_can_refresh_and_clone_before_becoming_populated() {
+    let temp = tempfile::tempdir().unwrap();
+    let upstream = temp.path().join("empty-upstream");
+    run(&["init", "-b", "main", upstream.to_str().unwrap()]).await;
+    let (url, server) = serve(config(temp.path(), &upstream, 0)).await;
+    let remote = format!("{url}/git/test.git");
+    let client = reqwest::Client::new();
+    for _ in 0..2 {
+        assert_eq!(
+            client
+                .post(format!("{url}/api/v1/repos/test/prepare"))
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            200
+        );
+        assert!(run(&["ls-remote", "--symref", &remote]).await.is_empty());
+    }
+    let clone = temp.path().join("empty-clone");
+    run(&["clone", &remote, clone.to_str().unwrap()]).await;
+    assert_eq!(
+        run(&["-C", clone.to_str().unwrap(), "symbolic-ref", "HEAD"]).await,
+        "refs/heads/main"
+    );
+    run(&[
+        "-C",
+        upstream.to_str().unwrap(),
+        "config",
+        "user.name",
+        "Test",
+    ])
+    .await;
+    run(&[
+        "-C",
+        upstream.to_str().unwrap(),
+        "config",
+        "user.email",
+        "test@example.invalid",
+    ])
+    .await;
+    std::fs::write(upstream.join("hello"), b"populated\n").unwrap();
+    run(&["-C", upstream.to_str().unwrap(), "add", "."]).await;
+    run(&[
+        "-C",
+        upstream.to_str().unwrap(),
+        "commit",
+        "-m",
+        "populate empty repository",
+    ])
+    .await;
+    let oid = run(&["-C", upstream.to_str().unwrap(), "rev-parse", "HEAD"]).await;
+    assert_eq!(
+        run(&["ls-remote", "--symref", &remote, "HEAD"]).await,
+        format!("ref: refs/heads/main\tHEAD\n{oid}\tHEAD")
+    );
+    let clone = temp.path().join("populated-clone");
+    run(&["clone", &remote, clone.to_str().unwrap()]).await;
+    assert_eq!(
+        run(&["-C", clone.to_str().unwrap(), "rev-parse", "HEAD"]).await,
+        oid
+    );
+    server.stop().await;
+}
+
+// Exercise cancellation at the public router boundary, so dropping the task
+// deterministically drops native ownership rather than relying on TCP timing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cold_mapping_batches_coalesce_overlap_and_cancel_retry() {
+    use std::os::unix::fs::PermissionsExt;
+    let temp = tempfile::tempdir().unwrap();
+    let (upstream, blob, _) = upstream(temp.path()).await;
+    let mut batch_oids = vec![blob.clone()];
+    let mut contents = std::collections::HashMap::from([(blob.clone(), b"hello world\n".to_vec())]);
+    for index in 0..513 {
+        std::fs::write(
+            upstream.join(format!("batch-{index}")),
+            format!("batch content {index}\n"),
+        )
+        .unwrap();
+    }
+    run(&["-C", upstream.to_str().unwrap(), "add", "."]).await;
+    run(&[
+        "-C",
+        upstream.to_str().unwrap(),
+        "commit",
+        "-m",
+        "batch fixtures",
+    ])
+    .await;
+    for line in run(&["-C", upstream.to_str().unwrap(), "ls-files", "-s"])
+        .await
+        .lines()
+    {
+        let oid = line.split_whitespace().nth(1).unwrap();
+        if oid != blob {
+            batch_oids.push(oid.to_owned());
+        }
+        let path = line.split_once('\t').unwrap().1;
+        contents.insert(oid.to_owned(), std::fs::read(upstream.join(path)).unwrap());
+    }
+    let file = temp.path().join("other");
+    std::fs::write(&file, b"another blob\n").unwrap();
+    let other = run(&[
+        "-C",
+        upstream.to_str().unwrap(),
+        "hash-object",
+        "-w",
+        file.to_str().unwrap(),
+    ])
+    .await;
+    contents.insert(other.clone(), b"another blob\n".to_vec());
+    let mut cfg = config(temp.path(), &upstream, 3600);
+    let wrapper = temp.path().join("batch-git");
+    fn quote(path: &Path) -> String {
+        format!("'{}'", path.to_str().unwrap().replace('\'', "'\\''"))
+    }
+    std::fs::write(
+        &wrapper,
+        format!(
+            r#"#!/bin/sh
+case " $* " in
+  *" cat-file --batch "*)
+    echo $$ >> {batches}
+    while [ -f {block} ]; do sleep 0.01; done
+    if [ -f {malformed} ]; then printf 'invalid header\n'; exit 0; fi
+    while IFS= read -r oid; do
+      printf '%s\n' "$oid" >> {requests}
+      printf '%s\n' "$oid"
+    done | {git} "$@"
+    result=$?
+    if [ -f {fail} ]; then exit 1; fi
+    exit "$result" ;;
+  *" cat-file --batch-check="*) echo check >> {checks} ;;
+esac
+exec {git} "$@"
+"#,
+            batches = quote(&temp.path().join("batches")),
+            block = quote(&temp.path().join("block")),
+            checks = quote(&temp.path().join("checks")),
+            requests = quote(&temp.path().join("requests")),
+            malformed = quote(&temp.path().join("malformed")),
+            fail = quote(&temp.path().join("fail")),
+            git = quote(&git())
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o700)).unwrap();
+    cfg.git = wrapper;
+    let app = git_proxy::router(cfg).unwrap();
+    fn request(
+        mut app: axum::Router,
+        oids: Vec<String>,
+    ) -> tokio::task::JoinHandle<axum::response::Response> {
+        tokio::spawn(async move {
+            let request = axum::http::Request::builder()
+                .method("POST")
+                .uri("/api/v1/repos/test/objects")
+                .header("content-type", "application/json")
+                .body(axum::body::Body::from(
+                    json!({"oids":oids,"blake3":true}).to_string(),
+                ))
+                .unwrap();
+            tonic::codegen::Service::call(&mut app, request)
+                .await
+                .unwrap()
+        })
+    }
+    async fn wait_lines(path: &Path, count: usize) {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                if std::fs::read_to_string(path)
+                    .unwrap_or_default()
+                    .lines()
+                    .count()
+                    >= count
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+    }
+    assert_eq!(request(app.clone(), vec![]).await.unwrap().status(), 200);
+    std::fs::write(temp.path().join("block"), "").unwrap();
+    let first = request(app.clone(), batch_oids.clone());
+    wait_lines(&temp.path().join("batches"), 1).await;
+    let follower = request(app.clone(), vec![blob.clone(), other.clone()]);
+    // Each request finishes both metadata reads before it can reach the cold gate.
+    wait_lines(&temp.path().join("checks"), 4).await;
+    std::fs::remove_file(temp.path().join("block")).unwrap();
+    for task in [first, follower] {
+        let response = task.await.unwrap();
+        assert_eq!(response.status(), 200);
+        let bytes = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let response: ObjectResponse = serde_json::from_slice(&bytes).unwrap();
+        for object in response.objects {
+            let expected = &contents[&object.oid];
+            assert_eq!(object.size_bytes, expected.len() as u64);
+            assert_eq!(
+                object.blake3.unwrap().hash,
+                blake3::hash(expected).to_hex().to_string()
+            );
+        }
+    }
+    // The first producer reads blob once; the overlapping follower reads only
+    // its distinct OID, not a second copy of the first producer's blob.
+    assert_eq!(
+        std::fs::read_to_string(temp.path().join("batches"))
+            .unwrap()
+            .lines()
+            .count(),
+        2
+    );
+    let read_oids = std::fs::read_to_string(temp.path().join("requests")).unwrap();
+    assert_eq!(read_oids.lines().count(), batch_oids.len() + 1);
+    let unique: std::collections::HashSet<_> = read_oids.lines().collect();
+    assert_eq!(
+        unique.len(),
+        read_oids.lines().count(),
+        "overlapping OIDs must be read once"
+    );
+    let mut stats_app = app.clone();
+    let response = tonic::codegen::Service::call(
+        &mut stats_app,
+        axum::http::Request::builder()
+            .uri("/api/v1/cache/stats")
+            .body(axum::body::Body::empty())
+            .unwrap(),
+    )
+    .await
+    .unwrap();
+    let bytes = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+        .await
+        .unwrap();
+    let stats: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(stats["digest_objects"], batch_oids.len() + 1);
+    assert_eq!(stats["digest_transactions"], 4);
+    assert_eq!(
+        request(app.clone(), vec![blob, other])
+            .await
+            .unwrap()
+            .status(),
+        200
+    );
+    assert_eq!(
+        std::fs::read_to_string(temp.path().join("batches"))
+            .unwrap()
+            .lines()
+            .count(),
+        2
+    );
+    std::fs::write(&file, b"cancel then retry\n").unwrap();
+    let cancelled_oid = run(&[
+        "-C",
+        upstream.to_str().unwrap(),
+        "hash-object",
+        "-w",
+        file.to_str().unwrap(),
+    ])
+    .await;
+    std::fs::write(temp.path().join("block"), "").unwrap();
+    let cancelled = request(app.clone(), vec![cancelled_oid.clone()]);
+    wait_lines(&temp.path().join("batches"), 3).await;
+    let pid: i32 = std::fs::read_to_string(temp.path().join("batches"))
+        .unwrap()
+        .lines()
+        .last()
+        .unwrap()
+        .parse()
+        .unwrap();
+    cancelled.abort();
+    assert!(cancelled.await.unwrap_err().is_cancelled());
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while unsafe { libc::kill(pid, 0) } == 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    std::fs::remove_file(temp.path().join("block")).unwrap();
+    let response = request(app.clone(), vec![cancelled_oid.clone()])
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    let bytes = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+        .await
+        .unwrap();
+    let response: ObjectResponse = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(response.objects[0].oid, cancelled_oid);
+    assert_eq!(
+        response.objects[0].blake3.as_ref().unwrap().hash,
+        blake3::hash(b"cancel then retry\n").to_hex().to_string()
+    );
+    assert_eq!(
+        std::fs::read_to_string(temp.path().join("batches"))
+            .unwrap()
+            .lines()
+            .count(),
+        4
+    );
+    std::fs::write(&file, b"native failure then retry\n").unwrap();
+    let failed_oid = run(&[
+        "-C",
+        upstream.to_str().unwrap(),
+        "hash-object",
+        "-w",
+        file.to_str().unwrap(),
+    ])
+    .await;
+    for failure in ["malformed", "fail"] {
+        std::fs::write(temp.path().join(failure), "").unwrap();
+        assert_eq!(
+            request(app.clone(), vec![failed_oid.clone()])
+                .await
+                .unwrap()
+                .status(),
+            502
+        );
+        std::fs::remove_file(temp.path().join(failure)).unwrap();
+    }
+    // Even complete content followed by native failure must not publish a map.
+    assert_eq!(request(app, vec![failed_oid]).await.unwrap().status(), 200);
+    assert_eq!(
+        std::fs::read_to_string(temp.path().join("batches"))
+            .unwrap()
+            .lines()
+            .count(),
+        7
+    );
+}
+
 #[test]
 fn rejects_alias_path_traversal() {
     let temp = tempfile::tempdir().unwrap();
@@ -656,6 +1199,28 @@ async fn large_ref_inventory_is_cacheable_and_survives_restart() {
     task.stop().await;
 }
 
+fn assert_no_automatic_maintenance(root: &Path) {
+    let events: Vec<serde_json::Value> = std::fs::read_to_string(root.join("git-trace.jsonl"))
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert!(
+        events.iter().any(|event| event["event"] == "start"
+            && event["argv"]
+                .as_array()
+                .is_some_and(|args| args.iter().any(|arg| arg == "fetch"))),
+        "the native trace must include real fetch work"
+    );
+    assert!(
+        !events.iter().any(|event| event["event"] == "child_start"
+            && event["argv"]
+                .as_array()
+                .is_some_and(|args| args.iter().any(|arg| arg == "maintenance" || arg == "gc"))),
+        "proxy fetches must not start unowned automatic maintenance"
+    );
+}
+
 fn gated_git(root: &Path) -> PathBuf {
     use std::os::unix::fs::PermissionsExt;
     fn quote(s: &str) -> String {
@@ -664,6 +1229,7 @@ fn gated_git(root: &Path) -> PathBuf {
     let path = root.join("git-wrapper");
     let script = format!(
         r#"#!/bin/sh
+export GIT_TRACE2_EVENT={trace}
 case " $* " in
   *" ls-remote "*)
     if [ -f {fail} ]; then exit 1; fi ;;
@@ -689,6 +1255,7 @@ case " $* " in
 esac
 exec {git} "$@"
 "#,
+        trace = quote(root.join("git-trace.jsonl").to_str().unwrap()),
         fail = quote(root.join("fail-head").to_str().unwrap()),
         block_refresh = quote(root.join("block-refresh").to_str().unwrap()),
         refresh_started = quote(root.join("refresh-started").to_str().unwrap()),

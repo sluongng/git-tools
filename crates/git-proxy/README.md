@@ -20,8 +20,16 @@ Prepare it before assigning agents with `POST /api/v1/repos/ALIAS/prepare`;
 is not necessarily fresh, and failed ref refreshes do not silently serve stale ads.
 
 Mirrors and digest mappings persist separately from the bounded TTL/LRU fetch
-response cache. Mirrors have no disk quota or automatic GC. Cache directories
-have one owner; changing an existing alias's origin is rejected.
+response cache; that quota does not bound total filesystem usage. Mirrors and
+digest mappings have no service-managed disk quota or eviction, and the proxy
+does not run mirror GC. Proxy fetches disable native Git automatic maintenance.
+Stop the cache owner before running offline mirror maintenance.
+
+Cache directories have one owner; changing an existing alias's origin is
+rejected. A legacy empty mirror without trustworthy HEAD provenance fails
+refresh rather than guessing its default branch. With the cache owner stopped,
+recreate only that disposable repository mirror to establish fresh provenance;
+leave the other cache databases intact.
 
 `POST /api/v1/repos/ALIAS/objects` accepts batched object IDs and optional BLAKE3
 lookup. LFS/annex metadata describes pointer blobs, not external payloads.
