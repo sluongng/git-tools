@@ -458,8 +458,37 @@ fn protected_git_routes(router: axum::Router, token: &str) -> axum::Router {
         .merge(authorized)
 }
 
+// The daemon accepts gRPC aliases, while the Git CAS client deliberately takes
+// HTTP(S) origins. Translate only the scheme at this integration boundary.
+fn git_cas_endpoint(upstream: &str) -> Result<String> {
+    let endpoint = if let Some(authority) = upstream.strip_prefix("grpcs://") {
+        format!("https://{authority}")
+    } else if let Some(authority) = upstream.strip_prefix("grpc://") {
+        format!("http://{authority}")
+    } else if upstream.starts_with("https://") || upstream.starts_with("http://") {
+        upstream.to_owned()
+    } else {
+        anyhow::bail!("Git CAS upstream requires an explicit gRPC or HTTP(S) origin");
+    };
+    let uri: axum::http::Uri = endpoint
+        .parse()
+        .map_err(|_| anyhow::anyhow!("invalid Git CAS upstream origin"))?;
+    ensure!(
+        uri.authority().is_some_and(|a| !a.as_str().contains('@'))
+            && uri.path() == "/"
+            && uri.query().is_none(),
+        "Git CAS upstream must be an origin without credentials, path or query"
+    );
+    Ok(endpoint)
+}
+
 pub async fn serve(mut config: Config) -> Result<()> {
     config.validate()?;
+    let git_cas_endpoint = config
+        .git_proxy
+        .sync_to_cas
+        .then(|| git_cas_endpoint(&config.cache.upstream))
+        .transpose()?;
     private_dir(&config.state_dir)?;
     config.state_dir = config.state_dir.canonicalize()?;
     let lock = OpenOptions::new()
@@ -602,9 +631,9 @@ pub async fn serve(mut config: Config) -> Result<()> {
     let mut git_shutdown = None;
     let mut git_cas_shutdown = None;
     if !config.git_proxy.repositories.is_empty() {
-        let cas_sync = if config.git_proxy.sync_to_cas {
+        let cas_sync = if let Some(endpoint) = git_cas_endpoint {
             Some(git_proxy::CasSyncConfig {
-                endpoint: config.cache.upstream.clone(),
+                endpoint,
                 instance_name: config.cache.instance_name.clone(),
                 header_env: if api_key.is_some() {
                     vec![(
@@ -864,4 +893,47 @@ pub async fn serve(mut config: Config) -> Result<()> {
     let _ = std::fs::remove_file(cache_socket);
     drop(lock);
     run
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn git_cas_endpoint_translates_only_supported_scheme_aliases() {
+        for (behavior, upstream, expected) in [
+            (
+                "plain gRPC",
+                "grpc://example.invalid:8080",
+                "http://example.invalid:8080",
+            ),
+            (
+                "TLS gRPC",
+                "grpcs://example.invalid:443/",
+                "https://example.invalid:443/",
+            ),
+            (
+                "HTTP unchanged",
+                "http://grpc.example.invalid:8080/",
+                "http://grpc.example.invalid:8080/",
+            ),
+            (
+                "HTTPS unchanged",
+                "https://grpcs.example.invalid/",
+                "https://grpcs.example.invalid/",
+            ),
+        ] {
+            assert_eq!(git_cas_endpoint(upstream).unwrap(), expected, "{behavior}");
+        }
+        for upstream in [
+            "ftp://example.invalid",
+            "unix:/tmp/fixture.sock",
+            "example.invalid",
+            "http://example.invalid/grpcs://path",
+            "grpc://user@example.invalid",
+            "grpcs://example.invalid?query",
+        ] {
+            assert!(git_cas_endpoint(upstream).is_err());
+        }
+    }
 }

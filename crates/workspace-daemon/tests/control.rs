@@ -861,3 +861,275 @@ async fn crashed_daemon_recovers_source_and_outputs_without_losing_staged_edits(
     server.abort();
     Ok(())
 }
+
+#[derive(Default)]
+struct SyncState {
+    capabilities: std::sync::atomic::AtomicUsize,
+    find_missing: std::sync::atomic::AtomicUsize,
+    uploads: std::sync::atomic::AtomicUsize,
+    blob: std::sync::Mutex<Option<Vec<u8>>>,
+}
+#[derive(Clone, Default)]
+struct SyncBackend(std::sync::Arc<SyncState>);
+#[tonic::async_trait]
+impl Capabilities for SyncBackend {
+    async fn get_capabilities(
+        &self,
+        request: Request<GetCapabilitiesRequest>,
+    ) -> Result<Response<ServerCapabilities>, Status> {
+        assert_eq!(request.into_inner().instance_name, "fixture/cas");
+        self.0
+            .capabilities
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Ok(Response::new(ServerCapabilities {
+            cache_capabilities: Some(reapi::reapi::CacheCapabilities {
+                digest_functions: vec![reapi::reapi::digest_function::Value::Blake3 as i32],
+                max_batch_total_size_bytes: 1024 * 1024,
+                max_cas_blob_size_bytes: 1024 * 1024,
+                ..Default::default()
+            }),
+            ..Default::default()
+        }))
+    }
+}
+#[tonic::async_trait]
+impl reapi::reapi::content_addressable_storage_server::ContentAddressableStorage for SyncBackend {
+    async fn find_missing_blobs(
+        &self,
+        request: Request<reapi::reapi::FindMissingBlobsRequest>,
+    ) -> Result<Response<reapi::reapi::FindMissingBlobsResponse>, Status> {
+        let request = request.into_inner();
+        assert_eq!(request.instance_name, "fixture/cas");
+        assert_eq!(
+            request.digest_function,
+            reapi::reapi::digest_function::Value::Blake3 as i32
+        );
+        self.0
+            .find_missing
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Ok(Response::new(reapi::reapi::FindMissingBlobsResponse {
+            missing_blob_digests: if self.0.blob.lock().unwrap().is_none() {
+                request.blob_digests
+            } else {
+                vec![]
+            },
+        }))
+    }
+    async fn batch_update_blobs(
+        &self,
+        request: Request<reapi::reapi::BatchUpdateBlobsRequest>,
+    ) -> Result<Response<reapi::reapi::BatchUpdateBlobsResponse>, Status> {
+        let request = request.into_inner();
+        assert_eq!(request.instance_name, "fixture/cas");
+        assert_eq!(
+            request.digest_function,
+            reapi::reapi::digest_function::Value::Blake3 as i32
+        );
+        assert_eq!(request.requests.len(), 1);
+        let mut responses = Vec::new();
+        for upload in request.requests {
+            assert_eq!(upload.compressor, 0);
+            let digest = upload.digest.unwrap();
+            assert_eq!(digest.hash, blake3::hash(&upload.data).to_hex().to_string());
+            assert_eq!(digest.size_bytes, upload.data.len() as i64);
+            *self.0.blob.lock().unwrap() = Some(upload.data);
+            self.0
+                .uploads
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            responses.push(reapi::reapi::batch_update_blobs_response::Response {
+                digest: Some(digest),
+                status: Some(reapi::proto::google::rpc::Status::default()),
+            });
+        }
+        Ok(Response::new(reapi::reapi::BatchUpdateBlobsResponse {
+            responses,
+        }))
+    }
+    async fn batch_read_blobs(
+        &self,
+        _: Request<reapi::reapi::BatchReadBlobsRequest>,
+    ) -> Result<Response<reapi::reapi::BatchReadBlobsResponse>, Status> {
+        Err(Status::unimplemented("unused"))
+    }
+    type GetTreeStream = tokio_stream::Empty<Result<reapi::reapi::GetTreeResponse, Status>>;
+    async fn get_tree(
+        &self,
+        _: Request<reapi::reapi::GetTreeRequest>,
+    ) -> Result<Response<Self::GetTreeStream>, Status> {
+        Err(Status::unimplemented("unused"))
+    }
+    async fn split_blob(
+        &self,
+        _: Request<reapi::reapi::SplitBlobRequest>,
+    ) -> Result<Response<reapi::reapi::SplitBlobResponse>, Status> {
+        Err(Status::unimplemented("unused"))
+    }
+    async fn splice_blob(
+        &self,
+        _: Request<reapi::reapi::SpliceBlobRequest>,
+    ) -> Result<Response<reapi::reapi::SpliceBlobResponse>, Status> {
+        Err(Status::unimplemented("unused"))
+    }
+    type GetChunkMappingStream =
+        tokio_stream::Empty<Result<reapi::reapi::GetChunkMappingResponse, Status>>;
+    async fn get_chunk_mapping(
+        &self,
+        _: Request<reapi::reapi::GetChunkMappingRequest>,
+    ) -> Result<Response<Self::GetChunkMappingStream>, Status> {
+        Err(Status::unimplemented("unused"))
+    }
+    async fn register_chunk_mapping(
+        &self,
+        _: Request<tonic::Streaming<reapi::reapi::RegisterChunkMappingRequest>>,
+    ) -> Result<Response<reapi::reapi::RegisterChunkMappingResponse>, Status> {
+        Err(Status::unimplemented("unused"))
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn grpc_alias_config_publishes_git_mapping_to_cas() -> Result<()> {
+    use std::sync::atomic::Ordering;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let dir = tempfile::tempdir()?;
+    let git = PathBuf::from(std::env::var_os("GIT_PROXY_TEST_GIT").expect("declared Git fixture"));
+    async fn git_run(git: &std::path::Path, args: &[&str]) -> Result<String> {
+        let output = tokio::process::Command::new(git)
+            .args(args)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .output()
+            .await?;
+        anyhow::ensure!(output.status.success(), "fixture Git failed");
+        Ok(String::from_utf8(output.stdout)?.trim().to_owned())
+    }
+    let repository = dir.path().join("origin");
+    let repository = repository.to_str().unwrap();
+    git_run(&git, &["init", "-b", "main", repository]).await?;
+    git_run(&git, &["-C", repository, "config", "user.name", "Test"]).await?;
+    git_run(
+        &git,
+        &[
+            "-C",
+            repository,
+            "config",
+            "user.email",
+            "test@example.invalid",
+        ],
+    )
+    .await?;
+    let content = b"mapping upload fixture\n";
+    std::fs::write(std::path::Path::new(repository).join("hello"), content)?;
+    git_run(&git, &["-C", repository, "add", "."]).await?;
+    git_run(&git, &["-C", repository, "commit", "-m", "fixture"]).await?;
+    let oid = git_run(&git, &["-C", repository, "rev-parse", "HEAD:hello"]).await?;
+    let upstream = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let upstream_port = upstream.local_addr()?.port();
+    let backend = SyncBackend::default();
+    let server = tokio::spawn(
+        tonic::transport::Server::builder()
+            .add_service(CapabilitiesServer::new(backend.clone()))
+            .add_service(reapi::reapi::content_addressable_storage_server::ContentAddressableStorageServer::new(backend.clone()))
+            .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(upstream)),
+    );
+    let cache_listener = std::net::TcpListener::bind("127.0.0.1:0")?;
+    let cache_port = cache_listener.local_addr()?.port();
+    let git_listener = std::net::TcpListener::bind("127.0.0.1:0")?;
+    let git_port = git_listener.local_addr()?.port();
+    drop((cache_listener, git_listener));
+    let state = dir.path().join("host");
+    let text = format!(
+        "state_dir = {:?}\n[cache]\nlisten = '127.0.0.1:{cache_port}'\nupstream = 'grpc://127.0.0.1:{upstream_port}'\ninstance_name = 'fixture/cas'\napi_key_env = 'UNSET_FIXTURE_CAS_KEY'\n[bos]\nenabled = false\n[bes]\nenabled = false\n[git_proxy]\nlisten = '127.0.0.1:{git_port}'\nsync_to_cas = true\n[git_proxy.repositories]\nfixture = {repository:?}\n[session]\ngit = {:?}\n",
+        state, git,
+    );
+    let config_file = dir.path().join("config.toml");
+    std::fs::write(&config_file, &text)?;
+    let config = Config::load(&config_file)?;
+    let mut unsupported = config.clone();
+    unsupported.state_dir = dir.path().join("unsupported");
+    unsupported.cache.upstream = "grpc://example.invalid/path".into();
+    unsupported.validate()?;
+    let error = workspace_daemon::daemon::serve(unsupported.clone())
+        .await
+        .unwrap_err();
+    assert_eq!(
+        error.to_string(),
+        "Git CAS upstream must be an origin without credentials, path or query"
+    );
+    assert!(
+        !unsupported.state_dir.exists(),
+        "reject before producer admission"
+    );
+    assert_eq!(backend.0.capabilities.load(Ordering::SeqCst), 0);
+    let socket = config.socket();
+    let task = tokio::spawn(workspace_daemon::daemon::serve(config.clone()));
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            if call(socket.clone(), ControlRequest::Status).await.is_ok() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await?;
+    let token = std::fs::read_to_string(config.state_dir.join("cache.token"))?;
+    async fn request(
+        addr: std::net::SocketAddr,
+        token: &str,
+        body: Option<serde_json::Value>,
+    ) -> Result<serde_json::Value> {
+        let (method, path, body) = match body {
+            Some(body) => (
+                "POST",
+                "/api/v1/repos/fixture/objects",
+                serde_json::to_string(&body)?,
+            ),
+            None => ("GET", "/api/v1/cache/stats", String::new()),
+        };
+        let mut stream = tokio::net::TcpStream::connect(addr).await?;
+        stream.write_all(format!("{method} {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\nAuthorization: Bearer {token}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}", body.len()).as_bytes()).await?;
+        let mut response = String::new();
+        stream.read_to_string(&mut response).await?;
+        anyhow::ensure!(
+            response.starts_with("HTTP/1.1 200"),
+            "fixture HTTP request failed"
+        );
+        let (_, body) = response.split_once("\r\n\r\n").unwrap();
+        Ok(serde_json::from_str(body)?)
+    }
+    let mapping = request(
+        config.git_proxy.listen,
+        &token,
+        Some(serde_json::json!({"oids":[oid],"blake3":true})),
+    )
+    .await?;
+    assert_eq!(
+        mapping["objects"][0]["blake3"]["hash"],
+        blake3::hash(content).to_hex().to_string()
+    );
+    let stats = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let stats = request(config.git_proxy.listen, &token, None)
+                .await
+                .unwrap();
+            if stats["cas_sync"]["pending_objects"] == 0 {
+                break stats;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await?;
+    assert_eq!(stats["cas_sync"]["failed_jobs"], 0);
+    assert_eq!(stats["cas_sync"]["confirmed_objects"], 1);
+    assert_eq!(stats["cas_sync"]["uploaded_objects"], 1);
+    assert!(backend.0.capabilities.load(Ordering::SeqCst) >= 1);
+    assert!(backend.0.find_missing.load(Ordering::SeqCst) >= 1);
+    assert_eq!(backend.0.uploads.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        backend.0.blob.lock().unwrap().as_deref(),
+        Some(content.as_slice())
+    );
+    call(socket, ControlRequest::Shutdown).await?;
+    tokio::time::timeout(Duration::from_secs(10), task).await???;
+    server.abort();
+    Ok(())
+}

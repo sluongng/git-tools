@@ -2,6 +2,7 @@ load("@crates//:defs.bzl", "aliases", "all_crate_deps")
 load("@rules_rs//rs:rust_binary.bzl", "rust_binary")
 load("@rules_rs//rs:rust_library.bzl", "rust_library")
 load("@rules_rs//rs:rust_test.bzl", "rust_test")
+load("//build_defs:fixture_test.bzl", "fixture_test")
 
 package(default_visibility = ["//visibility:public"])
 
@@ -34,11 +35,18 @@ rust_test(
 )
 
 rust_test(
-    name = "control_tests",
+    name = "control_tests_binary",
+    tags = ["manual"],
     srcs = ["tests/control.rs"],
     data = [":workspace"],
     rustc_env = {"CARGO_BIN_EXE_workspace": "$(rootpath :workspace)"},
     aliases = aliases(),
     edition = "2024",
     deps = [":workspace-daemon"] + all_crate_deps(normal = True, normal_dev = True),
+)
+
+fixture_test(
+    name = "control_tests",
+    binary = ":control_tests_binary",
+    git = True,
 )
