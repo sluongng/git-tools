@@ -1,7 +1,10 @@
-# Protocol provenance
+# Bazel output-service protocols
 
-`bazel_output_service*.proto` are unmodified from
+Pinned protocol inputs for the [`bazel-output-service`](../README.md) library
+and `git-output-service` executable, not a separate crate or service.
+
+`bazel_output_service*.proto` come from
 [Bazel 9.2.0](https://github.com/bazelbuild/bazel/tree/9.2.0/src/main/protobuf),
-Apache-2.0; see `LICENSE.bazel` and each file's copyright header.
-Imports use the pinned `reapi/proto` definitions; generated REAPI and
-`google.rpc` Rust types are reused from `reapi` (not duplicated).
+under Apache-2.0; see [LICENSE.bazel](LICENSE.bazel) and the copyright headers.
+Build-time generation uses the pinned [`reapi` protocols](../../reapi/proto/)
+and reuses that crate's REAPI and `google.rpc` Rust types.
