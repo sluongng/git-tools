@@ -510,8 +510,13 @@ impl LockedVfsWorkingCopy {
         }
         let tree = builder.write_tree().await?;
         self.wc.tree = tree.clone();
-        self.wc.state.token = token;
-        self.wc.state.snapshot_policy = policy;
+        // Untracked paths are not cached in the tree. Keep revisiting their
+        // journal range until they are tracked or removed. Retain the policy
+        // too: a policy-triggered full scan may find paths older than the token.
+        if stats.untracked_paths.is_empty() {
+            self.wc.state.token = token;
+            self.wc.state.snapshot_policy = policy;
+        }
         Ok((tree, stats))
     }
 }

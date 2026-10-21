@@ -181,6 +181,33 @@ fn projected_jj_preserves_dirty_data_and_does_not_hash_untouched_blobs() {
         !present(&bare, &untouched),
         "jj initialization/status fetched an untouched file"
     );
+    // Each command reloads persisted working-copy state. Deliberately untracked
+    // paths must remain visible even when no new journal entries mention them.
+    let untracked_status = ["--config", "snapshot.auto-track=\"none()\"", "status"];
+    fs::write(mount.join("untracked.txt"), "not tracked\n").unwrap();
+    for _ in 0..2 {
+        let status = text(jj(&mount, &untracked_status));
+        assert!(status.contains("? untracked.txt"), "{status}");
+    }
+    fs::write(mount.join("untracked.txt"), "modified but not tracked\n").unwrap();
+    for _ in 0..2 {
+        let status = text(jj(&mount, &untracked_status));
+        assert!(status.contains("? untracked.txt"), "{status}");
+    }
+    let files = text(jj(
+        &mount,
+        &["--config", "snapshot.auto-track=\"none()\"", "file", "list"],
+    ));
+    assert!(!files.contains("untracked.txt"), "{files}");
+    assert_eq!(
+        fs::read_to_string(mount.join("untracked.txt")).unwrap(),
+        "modified but not tracked\n"
+    );
+    fs::remove_file(mount.join("untracked.txt")).unwrap();
+    for _ in 0..2 {
+        let status = text(jj(&mount, &untracked_status));
+        assert!(!status.contains("untracked.txt"), "{status}");
+    }
     fs::write(mount.join("new.txt"), "new committed content\n").unwrap();
     fs::create_dir(mount.join("ignored")).unwrap();
     fs::write(mount.join("ignored/output"), "not tracked\n").unwrap();
