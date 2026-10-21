@@ -26,7 +26,7 @@ use std::{
     pin::Pin,
     sync::{
         Arc, Mutex,
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
     time::{Duration, Instant},
 };
@@ -811,6 +811,16 @@ impl action_cache_server::ActionCache for CacheProxy {
         self.upstream.scope(&req.instance_name)?;
         // Invalidate all inline variants. Never acknowledge a local-only update.
         self.upstream.retention.clear_actions();
+        // Reads overlapping the remote attempt can observe its old value. A
+        // second generation change excludes them even on ambiguous failures
+        // (or cancellation), where the backend may already have committed.
+        struct InvalidateOnCompletion<'a>(&'a retention::Retention);
+        impl Drop for InvalidateOnCompletion<'_> {
+            fn drop(&mut self) {
+                self.0.clear_actions();
+            }
+        }
+        let _invalidate = InvalidateOnCompletion(&self.upstream.retention);
         self.upstream
             .replay(|| async {
                 self.upstream
@@ -1010,38 +1020,52 @@ impl content_addressable_storage_server::ContentAddressableStorage for CacheProx
         &self,
         req: Request<tonic::Streaming<RegisterChunkMappingRequest>>,
     ) -> Result<Response<RegisterChunkMappingResponse>, Status> {
-        let metadata = CallerMetadata::capture(&req)?;
-        let mut input = req.into_inner();
-        let first = input
-            .message()
-            .await?
+        let deadline =
+            tokio::time::Instant::now() + self.upstream.config.policy.operation_timeout();
+        let operation = reapi::policy::timeout(deadline, async {
+            let metadata = CallerMetadata::capture(&req)?;
+            let mut input = req.into_inner();
+            let idle = self.upstream.config.policy.stream_idle_timeout();
+            let first = tokio::time::timeout_at(
+                deadline.min(tokio::time::Instant::now() + idle),
+                input.message(),
+            )
+            .await
+            .map_err(|_| Status::deadline_exceeded("chunk mapping stream idle timeout"))??
             .ok_or_else(|| Status::invalid_argument("empty chunk mapping stream"))?;
-        self.upstream.scope(&first.instance_name)?;
-        // REAPI specifies that scope and blob identity come from the first
-        // message only; later instance fields must be ignored, not reinterpreted.
-        let failure = Arc::new(Mutex::new(None));
-        let observed = failure.clone();
-        let idle = self.upstream.config.policy.stream_idle_timeout();
-        let stream = async_stream::stream! {
-            yield first;
-            loop {
-                match tokio::time::timeout(idle, input.message()).await {
-                    Ok(Ok(Some(message))) => yield message,
-                    Ok(Ok(None)) => break,
-                    Ok(Err(status)) => { *observed.lock().unwrap() = Some(status); break; }
-                    Err(_) => { *observed.lock().unwrap() = Some(Status::deadline_exceeded("chunk mapping stream idle timeout")); break; }
+            self.upstream.scope(&first.instance_name)?;
+            // REAPI specifies that scope and blob identity come from the first
+            // message only; later instance fields must be ignored, not reinterpreted.
+            let failure = Arc::new(Mutex::new(None));
+            let observed = failure.clone();
+            let idle = self.upstream.config.policy.stream_idle_timeout();
+            let stream = async_stream::stream! {
+                yield first;
+                loop {
+                    match tokio::time::timeout(idle, input.message()).await {
+                        Ok(Ok(Some(message))) => yield message,
+                        Ok(Ok(None)) => break,
+                        Ok(Err(status)) => { *observed.lock().unwrap() = Some(status); break; }
+                        Err(_) => { *observed.lock().unwrap() = Some(Status::deadline_exceeded("chunk mapping stream idle timeout")); break; }
+                    }
                 }
+            };
+            let result = self
+                .upstream
+                .cas()
+                .register_chunk_mapping(self.upstream.request_with_metadata(stream, &metadata))
+                .await;
+            if let Some(status) = failure.lock().unwrap().take() {
+                return Err(status);
             }
-        };
-        let result = self
-            .upstream
-            .cas()
-            .register_chunk_mapping(self.upstream.request_with_metadata(stream, &metadata))
-            .await;
-        if let Some(status) = failure.lock().unwrap().take() {
-            return Err(status);
+            result.map(clean_response)
+        });
+        let mut stop = self.stop.subscribe();
+        tokio::select! {
+            biased;
+            _ = async { if !*stop.borrow_and_update() { let _ = stop.changed().await; } } => Err(Status::unavailable("proxy shutting down")),
+            result = operation => result,
         }
-        result.map(clean_response)
     }
 }
 fn verify(bytes: &[u8], artifact: &Artifact) -> Result<(), Status> {
@@ -1311,9 +1335,19 @@ impl ByteStream for CacheProxy {
             let hash = if artifact.digest_function == 9 { blake.finalize().to_hex().to_string() } else { format!("{:x}", sha.finalize()) };
             if hash != artifact.hash { return Err(Status::invalid_argument("blob digest mismatch")); }
             let mut file = tokio::fs::File::open(encoded.path()).await.map_err(|_| Status::internal("opening staged upload"))?;
-            let upload = async_stream::stream! { let mut offset = 0u64; let mut data = vec![0; 64 * 1024]; while let Ok(n) = file.read(&mut data).await { let finish = n == 0; yield bs::WriteRequest { resource_name: name.clone(), write_offset: offset as i64, finish_write: finish, data: data[..n].to_vec() }; offset += n as u64; if finish { break; } } };
+            let upload_complete = Arc::new(AtomicBool::new(false));
+            let completed = upload_complete.clone();
+            let upload = async_stream::stream! { let mut offset = 0u64; let mut data = vec![0; 64 * 1024]; while let Ok(n) = file.read(&mut data).await { let finish = n == 0; if finish { completed.store(true, Ordering::Release); } yield bs::WriteRequest { resource_name: name.clone(), write_offset: offset as i64, finish_write: finish, data: data[..n].to_vec() }; offset += n as u64; if finish { break; } } };
             let response = self.upstream.bytes().write(self.upstream.request_with_metadata(upload, &metadata)).await?;
-            if !compressed && response.get_ref().committed_size != artifact.size as i64 { return Err(Status::data_loss("upstream did not commit complete blob")); }
+            let committed = response.get_ref().committed_size;
+            let valid = if upload_complete.load(Ordering::Acquire) {
+                reapi::upload_ack::valid_completed_write_ack(compressed, committed, artifact.size as i64, offset)
+            } else {
+                // An upstream may finish early only when the verified blob
+                // already exists; it has not consumed the encoded byte count.
+                if compressed { committed == -1 } else { committed == artifact.size as i64 }
+            };
+            if !valid { return Err(Status::data_loss("upstream did not commit complete blob")); }
             let _ = self.cache.clone().content_from(artifact, Arc::new(FileSource(decoded.path().to_path_buf()))).await;
             Ok(clean_response(response))
         }).await

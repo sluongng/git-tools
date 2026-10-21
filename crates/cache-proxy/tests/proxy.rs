@@ -34,6 +34,12 @@ struct Backend {
     identity_only: Arc<AtomicBool>,
     blobs: Arc<Mutex<HashMap<String, Vec<u8>>>>,
     reads: Arc<AtomicU64>,
+    read_body_fault: Arc<AtomicU64>,
+    ac_update_entered: Arc<tokio::sync::Notify>,
+    ac_update_release: Arc<tokio::sync::Notify>,
+    ac_update_block: Arc<AtomicBool>,
+    ac_update_fail: Arc<AtomicBool>,
+    write_ack_mode: Arc<AtomicU64>,
     ac_reads: Arc<AtomicU64>,
     ac_result: Arc<Mutex<Option<ActionResult>>>,
     ac_error: Arc<AtomicBool>,
@@ -84,7 +90,7 @@ impl ByteStream for Backend {
         req: Request<bs::ReadRequest>,
     ) -> Result<Response<Self::ReadStream>, Status> {
         self.observe("read", &req);
-        self.reads.fetch_add(1, Ordering::Relaxed);
+        let read_call = self.reads.fetch_add(1, Ordering::Relaxed);
         let name = req.into_inner().resource_name;
         let hash = name.split('/').rev().nth(1).unwrap();
         let bytes = self
@@ -117,6 +123,17 @@ impl ByteStream for Backend {
             bytes
         };
 
+        let fault = self.read_body_fault.load(Ordering::Relaxed);
+        if fault != 0 && (read_call == 0 || fault == 3) {
+            return Ok(Response::new(Box::pin(async_stream::try_stream! {
+                yield bs::ReadResponse { data: bytes[..bytes.len() / 2].to_vec() };
+                if fault == 1 {
+                    Err(Status::unavailable("fixture interrupted body"))?;
+                } else {
+                    std::future::pending::<()>().await;
+                }
+            })));
+        }
         Ok(Response::new(Box::pin(tokio_stream::iter(vec![Ok(
             bs::ReadResponse { data: bytes },
         )]))))
@@ -169,12 +186,18 @@ impl ByteStream for Backend {
         } else {
             bytes
         };
+        let logical_size = bytes.len() as i64;
         self.blobs.lock().unwrap().insert(hash, bytes);
         Ok(Response::new(bs::WriteResponse {
             committed_size: if self.bad_write_ack.load(Ordering::Relaxed) {
                 -2
             } else if compressed {
-                -1
+                match self.write_ack_mode.load(Ordering::Relaxed) {
+                    1 => logical_size,
+                    2 => size as i64,
+                    3 => logical_size + size as i64 + 1,
+                    _ => -1,
+                }
             } else {
                 size as i64
             },
@@ -216,9 +239,18 @@ impl action_cache_server::ActionCache for Backend {
         req: Request<UpdateActionResultRequest>,
     ) -> Result<Response<ActionResult>, Status> {
         self.observe("update_action_result", &req);
-        Ok(Response::new(
-            req.into_inner().action_result.unwrap_or_default(),
-        ))
+        if self.ac_update_block.load(Ordering::Relaxed) {
+            self.ac_update_entered.notify_one();
+            self.ac_update_release.notified().await;
+        }
+        let value = req.into_inner().action_result.unwrap_or_default();
+        *self.ac_result.lock().unwrap() = Some(value.clone());
+        if self.ac_update_fail.load(Ordering::Relaxed) {
+            return Err(Status::unavailable(
+                "fixture committed without acknowledgment",
+            ));
+        }
+        Ok(Response::new(value))
     }
 }
 #[tonic::async_trait]
@@ -1158,11 +1190,13 @@ fn local_artifact(bytes: &[u8], function: i32) -> local_cas::Artifact {
 }
 #[tokio::test]
 async fn local_hits_repair_missing_upstream_blobs_without_blocking_readers() {
-    for (name, function, identity, reject_zstd, transient) in [
-        ("compressed BLAKE3", 9, false, false, 0),
-        ("identity SHA256", 1, true, false, 0),
-        ("advertised codec fallback", 9, false, true, 0),
-        ("transient retry", 9, false, false, 1),
+    for (name, function, identity, reject_zstd, transient, ack) in [
+        ("compressed dedup acknowledgment", 9, false, false, 0, 0),
+        ("compressed logical acknowledgment", 9, false, false, 0, 1),
+        ("compressed wire acknowledgment", 9, false, false, 0, 2),
+        ("identity SHA256", 1, true, false, 0, 0),
+        ("advertised codec fallback", 9, false, true, 0, 0),
+        ("transient retry", 9, false, false, 1, 0),
     ] {
         let h = Harness::configured(
             Duration::ZERO,
@@ -1176,6 +1210,7 @@ async fn local_hits_repair_missing_upstream_blobs_without_blocking_readers() {
             CacheConfig::default(),
         )
         .await;
+        h.backend.write_ack_mode.store(ack, Ordering::Relaxed);
         h.backend.identity_only.store(identity, Ordering::Relaxed);
         h.backend
             .reject_compressed_writes
@@ -1243,7 +1278,7 @@ async fn local_hits_repair_missing_upstream_blobs_without_blocking_readers() {
 }
 #[tokio::test]
 async fn failed_repair_does_not_confirm_retention_or_replace_local_content() {
-    for bad_ack in [false, true] {
+    for (reject, bad_ack, ack_mode) in [(true, false, 0), (false, true, 0), (false, false, 3)] {
         let h = Harness::configured(
             Duration::ZERO,
             None,
@@ -1251,8 +1286,9 @@ async fn failed_repair_does_not_confirm_retention_or_replace_local_content() {
             CacheConfig::default(),
         )
         .await;
-        *h.backend.reject_writes.lock().unwrap() = !bad_ack;
+        *h.backend.reject_writes.lock().unwrap() = reject;
         h.backend.bad_write_ack.store(bad_ack, Ordering::Relaxed);
+        h.backend.write_ack_mode.store(ack_mode, Ordering::Relaxed);
         let data = b"retained local bytes".to_vec();
         let a = local_artifact(&data, 9);
         drop(
@@ -1496,6 +1532,31 @@ async fn byte_stream_zstd_write_and_partial_read() {
     .await
     .unwrap()
     .unwrap();
+    for (ack_mode, bad_ack, success) in [
+        (1, false, true),
+        (2, false, true),
+        (3, false, false),
+        (0, true, false),
+    ] {
+        h.backend.write_ack_mode.store(ack_mode, Ordering::Relaxed);
+        h.backend.bad_write_ack.store(bad_ack, Ordering::Relaxed);
+        let result = client
+            .write(h.request(tokio_stream::iter(vec![bs::WriteRequest {
+                resource_name: format!(
+                    "repo/uploads/ack/compressed-blobs/zstd/blake3/{}/{}",
+                    d.hash, d.size_bytes
+                ),
+                write_offset: 0,
+                finish_write: true,
+                data: reapi::compression::encode_zstd(bytes).unwrap(),
+            }])))
+            .await;
+        if success {
+            result.unwrap();
+        } else {
+            assert_eq!(result.unwrap_err().code(), tonic::Code::DataLoss);
+        }
+    }
     drop(sender);
     assert_eq!(h.backend.blobs.lock().unwrap()[&d.hash], bytes);
     let mut response = client
@@ -2565,4 +2626,239 @@ async fn long_scheduler_stream_does_not_block_downloader_or_operation_control() 
     .await
     .expect("long execution must not occupy the downloader/control connection");
     drop(stream);
+}
+
+#[tokio::test]
+async fn action_update_completion_invalidates_overlapping_inline_reads_even_on_ambiguous_failure() {
+    for fail in [false, true] {
+        let h = Harness::configured(
+            Duration::from_secs(30),
+            None,
+            |c| {
+                c.policy.retry.max_attempts = 1;
+            },
+            CacheConfig::default(),
+        )
+        .await;
+        let old = ActionResult {
+            exit_code: 1,
+            ..Default::default()
+        };
+        let new = ActionResult {
+            exit_code: 2,
+            ..Default::default()
+        };
+        *h.backend.ac_result.lock().unwrap() = Some(old.clone());
+        h.backend.ac_update_block.store(true, Ordering::Relaxed);
+        h.backend.ac_update_fail.store(fail, Ordering::Relaxed);
+        let mut client = action_cache_client::ActionCacheClient::connect(h.url.clone())
+            .await
+            .unwrap();
+        let variants: Vec<_> = (0..8)
+            .map(|bits| GetActionResultRequest {
+                instance_name: "repo".into(),
+                action_digest: Some(digest(b"action-update")),
+                digest_function: 9,
+                inline_stdout: bits & 1 != 0,
+                inline_stderr: bits & 2 != 0,
+                inline_output_files: if bits & 4 != 0 {
+                    vec!["output".into()]
+                } else {
+                    vec![]
+                },
+                ..Default::default()
+            })
+            .collect();
+        let mut updating = client.clone();
+        let request = h.request(UpdateActionResultRequest {
+            instance_name: "repo".into(),
+            action_digest: Some(digest(b"action-update")),
+            digest_function: 9,
+            action_result: Some(new.clone()),
+            ..Default::default()
+        });
+        let task = tokio::spawn(async move { updating.update_action_result(request).await });
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            h.backend.ac_update_entered.notified(),
+        )
+        .await
+        .unwrap();
+        for req in &variants {
+            assert_eq!(
+                client
+                    .get_action_result(h.request(req.clone()))
+                    .await
+                    .unwrap()
+                    .into_inner(),
+                old
+            );
+        }
+        h.backend.ac_update_release.notify_one();
+        assert_eq!(task.await.unwrap().is_err(), fail);
+        let calls = h.backend.ac_reads.load(Ordering::Relaxed);
+        for req in variants {
+            assert_eq!(
+                client
+                    .get_action_result(h.request(req))
+                    .await
+                    .unwrap()
+                    .into_inner(),
+                new
+            );
+        }
+        assert_eq!(h.backend.ac_reads.load(Ordering::Relaxed), calls + 8);
+    }
+}
+
+#[tokio::test]
+async fn interrupted_download_replays_complete_body_and_decoder_with_bounded_budget() {
+    for compressed in [false, true] {
+        for fault in [1, 2, 3] {
+            let h = Harness::configured(
+                Duration::ZERO,
+                None,
+                |c| {
+                    c.policy.retry.max_attempts = if fault == 3 { 16 } else { 2 };
+                    c.policy.retry.initial_backoff_ms = 1;
+                    c.policy.retry.max_backoff_ms = 1;
+                    c.policy.stream_idle_timeout_ms = 80;
+                    c.policy.operation_timeout_ms = if fault == 3 { 180 } else { 2000 };
+                },
+                CacheConfig::default(),
+            )
+            .await;
+            h.backend
+                .identity_only
+                .store(!compressed, Ordering::Relaxed);
+            h.backend.read_body_fault.store(fault, Ordering::Relaxed);
+            let data: Vec<_> = (0..200_000).map(|n| (n % 251) as u8).collect();
+            let d = digest(&data);
+            h.backend
+                .blobs
+                .lock()
+                .unwrap()
+                .insert(d.hash.clone(), data.clone());
+            let a = local_artifact(&data, 9);
+            let start = tokio::time::Instant::now();
+            let fetched = h.cache.clone().content(a.clone()).await;
+            if fault == 3 {
+                assert!(fetched.is_err());
+                assert!(start.elapsed() < Duration::from_secs(1));
+                assert!(h.backend.reads.load(Ordering::Relaxed) <= 3);
+                // A failed partial replay must not become a verified cache hit.
+                h.backend.read_body_fault.store(0, Ordering::Relaxed);
+                let before = h.backend.reads.load(Ordering::Relaxed);
+                let blob = h.cache.clone().content(a).await.unwrap();
+                assert_eq!(std::fs::read(blob.path()).unwrap(), data);
+                assert_eq!(h.backend.reads.load(Ordering::Relaxed), before + 1);
+            } else {
+                assert_eq!(std::fs::read(fetched.unwrap().path()).unwrap(), data);
+                assert_eq!(h.backend.reads.load(Ordering::Relaxed), 2);
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn chunk_mapping_initial_receive_and_forwarding_share_a_finite_budget() {
+    let h = Harness::configured(
+        Duration::ZERO,
+        Some(1),
+        |c| {
+            c.policy.stream_idle_timeout_ms = 60;
+            c.policy.operation_timeout_ms = 100;
+        },
+        CacheConfig::default(),
+    )
+    .await;
+    let channel = tonic::transport::Endpoint::from_shared(h.url.clone())
+        .unwrap()
+        .concurrency_limit(1)
+        .connect()
+        .await
+        .unwrap();
+    let mut cas = content_addressable_storage_client::ContentAddressableStorageClient::new(channel);
+    for send_first in [false, true] {
+        let (sender, receiver) = tokio::sync::mpsc::channel(1);
+        if send_first {
+            sender
+                .send(RegisterChunkMappingRequest {
+                    instance_name: "repo".into(),
+                    ..Default::default()
+                })
+                .await
+                .unwrap();
+        }
+        let start = tokio::time::Instant::now();
+        let error = tokio::time::timeout(
+            Duration::from_secs(1),
+            cas.register_chunk_mapping(
+                h.request(tokio_stream::wrappers::ReceiverStream::new(receiver)),
+            ),
+        )
+        .await
+        .unwrap()
+        .unwrap_err();
+        assert_eq!(error.code(), tonic::Code::DeadlineExceeded);
+        assert!(start.elapsed() < Duration::from_millis(500));
+        // Keep the original sender open while verifying useful traffic recovers.
+        cas.register_chunk_mapping(h.request(tokio_stream::iter(vec![
+            RegisterChunkMappingRequest {
+                instance_name: "repo".into(),
+                ..Default::default()
+            },
+        ])))
+        .await
+        .unwrap();
+        drop(sender);
+    }
+
+    // A stream that stays active must still exhaust the original operation
+    // budget instead of resetting it for every received message.
+    let active = async_stream::stream! {
+        loop {
+            yield RegisterChunkMappingRequest { instance_name: "repo".into(), ..Default::default() };
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    };
+    let error = tokio::time::timeout(
+        Duration::from_secs(1),
+        cas.register_chunk_mapping(h.request(active)),
+    )
+    .await
+    .unwrap()
+    .unwrap_err();
+    assert_eq!(error.code(), tonic::Code::DeadlineExceeded);
+
+    // Shutdown also cancels an already-forwarded stream, independently of its
+    // receive timeout. Observe upstream entry before initiating shutdown.
+    h.backend.observed_metadata.lock().unwrap().clear();
+    let (sender, receiver) = tokio::sync::mpsc::channel(1);
+    sender
+        .send(RegisterChunkMappingRequest {
+            instance_name: "repo".into(),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    let request = h.request(tokio_stream::wrappers::ReceiverStream::new(receiver));
+    let task = tokio::spawn(async move { cas.register_chunk_mapping(request).await });
+    eventually(|| {
+        h.backend
+            .observed_metadata
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|(method, _)| method == "register_chunk_mapping")
+    })
+    .await;
+    h.proxy.stop_forwarding();
+    let error = tokio::time::timeout(Duration::from_secs(1), task)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap_err();
+    assert_eq!(error.code(), tonic::Code::Unavailable);
+    drop(sender);
 }
