@@ -11,6 +11,7 @@ use std::{
 #[serde(tag = "operation", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Request {
     Status,
+    RetryBes,
     Endpoints,
     Mount {
         request: agent_session::MountRequest,
@@ -104,6 +105,9 @@ impl agent_session::MountController for Client {
                     .context("missing cache instance")?
             ),
         ];
+        if let Some(endpoint) = status["bes_endpoint"].as_str() {
+            args.push(format!("--bes_backend={endpoint}"));
+        }
         if let Some(endpoint) = status["bos_endpoint"].as_str() {
             args.push(format!("--experimental_remote_output_service={endpoint}"));
             let prefix = status["output_path_prefix"]

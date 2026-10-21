@@ -1,7 +1,7 @@
 # workspace
 
-One host process owns source mounts, lazy Bazel output mounts, the Git proxy and
-an authenticated REAPI cache proxy. Each session retains its own writable overlay,
+One host process owns source mounts, lazy Bazel output mounts, the Git proxy,
+an authenticated REAPI cache proxy and a durable BuildBuddy BES relay. Each session retains its own writable overlay,
 Git state and Bazel output base. Only verified immutable bytes enter the shared,
 LRU-evicted CAS; edits and commits are never eviction candidates.
 
@@ -33,11 +33,18 @@ which is absent from 9.3.0rc2. BLAKE3/xattr/r2c2 support is also required.
 - Source mounts and the shared cache are enabled by default. BOS is opt-in
   (`bos.enabled = true`) until metadata publication is batched; when enabled,
   outputs remain strictly lazy with no eager fallback. All run in this process.
+- BES is enabled by default, inheriting the cache upstream and credential
+  environment variable unless `[bes]` overrides them. Multiple builds upload
+  independently. Bazel receives ACKs only after local durable persistence; this
+  means **locally accepted**, not yet visible in BuildBuddy. Pending events stay
+  outside LRU eviction; upstream ACKs delete payloads. `workspace status` shows
+  the backlog and forwarding failures; `workspace retry-bes` retries blocked
+  delivery without stopping mounts. Keep the state directory across restarts.
 - Remote AC results are revalidated on every lookup (`action_cache_ttl_seconds=0`).
   Nonzero TTL needs a backend retention guarantee; it is not a presence lease.
 - Source prefetch runs after mounting. Native Git packs and repository metadata
   have their own storage policies and are **not** covered by the CAS byte quota.
-- Control, BOS and the cache proxy use private Unix sockets (no cache token in
+- Control, BOS, BES and the cache proxy use private Unix sockets (no cache token in
   Bazel process arguments). Git uses a private capability URL. State must be owned by the
   current user with mode `0700`; status does not print credentials.
 - Mount lifecycle changes are serialized; cache/download RPCs remain concurrent.

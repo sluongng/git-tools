@@ -64,6 +64,18 @@ async fn private_control_retains_registry_and_excludes_second_owner() -> Result<
     let status = call(socket.clone(), ControlRequest::Status).await?;
     assert_eq!(status["cache"]["resident_bytes"], 0);
     assert!(status["bos_endpoint"].is_null());
+    assert_eq!(status["bes_endpoint"], config.bes_endpoint());
+    assert!(status["bes"].is_object());
+    use agent_session::MountController;
+    let cli = Client {
+        socket: socket.clone(),
+    };
+    let args = tokio::task::spawn_blocking(move || cli.bazel_args()).await??;
+    assert!(args.contains(&format!("--bes_backend={}", config.bes_endpoint())));
+    assert_eq!(
+        call(socket.clone(), ControlRequest::RetryBes).await?["streams_retried"],
+        0
+    );
     // Native Git's plain endpoint is never public; metadata clients may keep
     // using the capability prefix without placing it in any subprocess argv.
     let token = std::fs::read_to_string(config.state_dir.join("cache.token"))?;
@@ -125,6 +137,13 @@ async fn private_control_retains_registry_and_excludes_second_owner() -> Result<
         std::fs::metadata(&socket)?.permissions().mode() & 0o777,
         0o600
     );
+    assert_eq!(
+        std::fs::metadata(config.state_dir.join("bes.sock"))?
+            .permissions()
+            .mode()
+            & 0o777,
+        0o600
+    );
     assert!(
         workspace_daemon::daemon::serve(config.clone())
             .await
@@ -152,6 +171,7 @@ async fn private_control_retains_registry_and_excludes_second_owner() -> Result<
     tokio::time::timeout(Duration::from_secs(5), task).await???;
     assert!(config.state_dir.join("mounts.json").is_file());
     assert!(!config.socket().exists());
+    assert!(!config.state_dir.join("bes.sock").exists());
     server.abort();
     Ok(())
 }
@@ -163,6 +183,30 @@ async fn public_state_directory_is_rejected_before_binding() -> Result<()> {
     let config = config(dir.path().to_path_buf(), 8378, 1);
     let error = workspace_daemon::daemon::serve(config).await.unwrap_err();
     assert!(error.to_string().contains("mode 0700"));
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn offline_upstream_does_not_prevent_durable_bes_admission_startup() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let unavailable = std::net::TcpListener::bind("127.0.0.1:0")?;
+    let upstream_port = unavailable.local_addr()?.port();
+    drop(unavailable);
+    let config = config(dir.path().join("host"), 8378, upstream_port);
+    let socket = config.socket();
+    let task = tokio::spawn(workspace_daemon::daemon::serve(config.clone()));
+    let status = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if let Ok(status) = call(socket.clone(), ControlRequest::Status).await {
+                break status;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await?;
+    assert_eq!(status["bes_endpoint"], config.bes_endpoint());
+    call(socket, ControlRequest::Shutdown).await?;
+    tokio::time::timeout(Duration::from_secs(5), task).await???;
     Ok(())
 }
 

@@ -38,6 +38,7 @@ struct State {
     config: Config,
     cache: Arc<LocalCas>,
     proxy: cache_proxy::CacheProxy,
+    bes: Option<bes_proxy::BesProxy>,
     registry: Registry,
     mounts: BTreeMap<PathBuf, Mount>,
     #[cfg(target_os = "linux")]
@@ -108,7 +109,7 @@ impl State {
     fn status(&self) -> serde_json::Value {
         let metrics = self.cache.metrics();
         let proxy = self.proxy.metrics();
-        json!({"pid":std::process::id(),"cache_endpoint":self.config.cache_endpoint(),"bytestream_uri_prefix":self.config.bytestream_uri_prefix(),"instance_name":self.config.cache.instance_name,"bos_endpoint":if self.config.bos.enabled {Some(format!("unix:{}",self.config.state_dir.join("bos.sock").display()))}else{None},"output_path_prefix":self.config.state_dir.join("outputs"),"mounts":self.registry.mounts.iter().map(|(path,record)|json!({"session":path,"state":record.state})).collect::<Vec<_>>(),"proxy":{"action_cache_hits":proxy.action_cache_hits,"action_cache_upstream":proxy.action_cache_upstream,"blob_reads":proxy.blob_reads},"cache":{"hits":metrics.hits,"fetches":metrics.fetches,"resident_bytes":metrics.resident_bytes,"reserved_bytes":metrics.reserved_bytes,"evictions":metrics.evictions,"evicted_bytes":metrics.evicted_bytes}})
+        json!({"pid":std::process::id(),"cache_endpoint":self.config.cache_endpoint(),"bytestream_uri_prefix":self.config.bytestream_uri_prefix(),"instance_name":self.config.cache.instance_name,"bes_endpoint":self.bes.as_ref().map(|_|self.config.bes_endpoint()),"bes":self.bes.as_ref().map(|bes|bes.metrics()),"bos_endpoint":if self.config.bos.enabled {Some(format!("unix:{}",self.config.state_dir.join("bos.sock").display()))}else{None},"output_path_prefix":self.config.state_dir.join("outputs"),"mounts":self.registry.mounts.iter().map(|(path,record)|json!({"session":path,"state":record.state})).collect::<Vec<_>>(),"proxy":{"action_cache_hits":proxy.action_cache_hits,"action_cache_upstream":proxy.action_cache_upstream,"blob_reads":proxy.blob_reads},"cache":{"hits":metrics.hits,"fetches":metrics.fetches,"resident_bytes":metrics.resident_bytes,"reserved_bytes":metrics.reserved_bytes,"evictions":metrics.evictions,"evicted_bytes":metrics.evicted_bytes}})
     }
     fn mounted(&self, path: &Path) -> bool {
         #[cfg(target_os = "linux")]
@@ -543,6 +544,72 @@ pub async fn serve(mut config: Config) -> Result<()> {
         },
     )?;
     let proxy = cache_proxy::CacheProxy::new(upstream, cache.clone());
+    let bes_socket = config.state_dir.join("bes.sock");
+    let mut bes_task = None;
+    let mut bes_shutdown = None;
+    let bes = if config.bes.enabled {
+        let settings = &config.bes;
+        let key_env = if settings.api_key_env.is_empty() {
+            &config.cache.api_key_env
+        } else {
+            &settings.api_key_env
+        };
+        let bes_key = match std::env::var(key_env) {
+            Ok(value) if !value.is_empty() => Some(value),
+            Ok(_) | Err(std::env::VarError::NotPresent) => None,
+            Err(_) => anyhow::bail!("BES credential environment variable must be UTF-8"),
+        };
+        let spool = config.state_dir.join("bes");
+        private_dir(&spool)?;
+        let bes = bes_proxy::BesProxy::open(
+            &spool,
+            bes_proxy::Config {
+                upstream: if settings.upstream.is_empty() {
+                    config.cache.upstream.clone()
+                } else {
+                    settings.upstream.clone()
+                },
+                api_key: bes_key,
+                max_pending_bytes: settings.max_pending_bytes,
+                max_event_bytes: settings.max_event_bytes,
+                max_streams: settings.max_streams,
+                max_concurrent_forwards: settings.max_concurrent_forwards,
+                connect_timeout_ms: settings.connect_timeout_ms,
+                lifecycle_timeout_ms: settings.lifecycle_timeout_ms,
+                retry_initial_delay_ms: settings.retry_initial_delay_ms,
+                retry_max_attempts: settings.retry_max_attempts,
+                tombstone_ttl_seconds: settings.tombstone_ttl_seconds,
+                max_completed_streams: settings.max_completed_streams,
+                ..Default::default()
+            },
+        )
+        .await?;
+        if bes_socket.exists() {
+            use std::os::unix::fs::FileTypeExt;
+            ensure!(
+                std::fs::symlink_metadata(&bes_socket)?
+                    .file_type()
+                    .is_socket(),
+                "BES transport path is not a socket"
+            );
+            std::fs::remove_file(&bes_socket)?;
+        }
+        let listener = UnixListener::bind(&bes_socket)?;
+        std::fs::set_permissions(&bes_socket, std::fs::Permissions::from_mode(0o600))?;
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let service = bes.clone();
+        bes_task = Some(tokio::spawn(async move {
+            service
+                .serve_unix_listener(listener, async {
+                    let _ = rx.await;
+                })
+                .await
+        }));
+        bes_shutdown = Some(tx);
+        Some(bes)
+    } else {
+        None
+    };
     let mut git_task = None;
     let mut git_shutdown = None;
     let mut git_cas_shutdown = None;
@@ -678,6 +745,7 @@ pub async fn serve(mut config: Config) -> Result<()> {
         config,
         cache,
         proxy: proxy.clone(),
+        bes,
         registry,
         mounts: BTreeMap::new(),
         #[cfg(target_os = "linux")]
@@ -696,6 +764,11 @@ pub async fn serve(mut config: Config) -> Result<()> {
                     output_host=None;break;
                 },
                 result = &mut proxy_task => { proxy_completed=true; result??; anyhow::bail!("cache proxy stopped unexpectedly") }
+                result = async { match bes_task.as_mut() {Some(task)=>task.await, None=>std::future::pending().await} } => {
+                    bes_task = None;
+                    result??;
+                    anyhow::bail!("BES proxy stopped unexpectedly")
+                }
             };
             let (read, mut write) = stream.into_split();
             let mut reader = BufReader::new(read);
@@ -739,6 +812,10 @@ pub async fn serve(mut config: Config) -> Result<()> {
                     state_slot=Some(returned);result
                 }
                 Ok(Request::Status) => Ok(state_slot.as_ref().unwrap().status()),
+                Ok(Request::RetryBes) => match state_slot.as_ref().unwrap().bes.as_ref() {
+                    Some(bes) => bes.retry_blocked().await.map(|count| json!({"streams_retried":count})),
+                    None => Err(anyhow::anyhow!("BES proxy is disabled")),
+                },
                 Ok(Request::Endpoints) => {let state=state_slot.as_ref().unwrap();Ok(json!({"git_proxy_url": if state.config.git_proxy.repositories.is_empty() {None} else {Some(format!("http://{}/{token}", state.config.git_proxy.listen))}}))},
                 Ok(Request::Mounted { session }) => Ok(json!(state_slot.as_ref().unwrap().mounted(&session))),
                 Ok(Request::Shutdown) => {
@@ -789,6 +866,21 @@ pub async fn serve(mut config: Config) -> Result<()> {
         host.shutdown().await?;
     }
     let _ = shutdown_tx.send(());
+    if let Some(tx) = bes_shutdown {
+        let _ = tx.send(());
+    }
+    if let Some(mut task) = bes_task {
+        if tokio::time::timeout(Duration::from_secs(10), &mut task)
+            .await
+            .is_err()
+        {
+            task.abort();
+            let _ = task.await;
+        }
+    }
+    if let Some(bes) = &state.bes {
+        bes.shutdown().await;
+    }
     if !proxy_completed {
         let _ = tokio::time::timeout(Duration::from_secs(10), &mut proxy_task).await;
     }
@@ -802,6 +894,7 @@ pub async fn serve(mut config: Config) -> Result<()> {
     state.cache.flush_recency()?;
     let _ = std::fs::remove_file(socket);
     let _ = std::fs::remove_file(cache_socket);
+    let _ = std::fs::remove_file(bes_socket);
     drop(lock);
     run
 }

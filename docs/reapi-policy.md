@@ -101,3 +101,33 @@ Bazel's remote-cache TTL is also an operator retention assumption, not a value
 discovered from REAPI capabilities.
 Configure Bazel and the backend separately rather than assuming this TOML file
 changes either one.
+
+## BES is a separate policy
+
+The unified daemon's `[bes]` table uses Bazel BES defaults, not the REAPI policy
+above: **four retries after the first attempt**, delays of 1s, 1.6s, 2.56s and
+4.096s without jitter, and a 15-second unary lifecycle timeout. Streaming has no
+deadline or ACK-idle timeout: BuildBuddy normally ACKs only after request EOF.
+`connect_timeout_ms` defaults to 10 seconds. `retry_max_attempts` counts retries,
+unlike `[reapi.retry].max_attempts`, which counts total attempts.
+`INVALID_ARGUMENT`, `PERMISSION_DENIED` and `FAILED_PRECONDITION` stop retries.
+Delivery failures retain locally ACKed data; inspect `workspace status` and run
+`workspace retry-bes` after correcting the cause. Restart retries complete pending
+streams. Unfinished streams wait for their publisher to reconnect and still
+consume the pending-stream quota; there is no automatic orphan discard or expiry.
+These timeouts do not change Bazel's own flags or remote CAS policy.
+
+The default BES spool admits 1 GiB of pending encoded payloads, 128 streams and
+16 concurrent upstream streams. Limits reject new data before ACK; they never
+evict pending events. Upstream ACKs logically delete payloads; Fjall compaction
+reclaims physical disk space later. Small completed receipts are retained for up
+to one day / 4096 streams for reconnects. These are logical limits, not a total
+filesystem quota. Protect free disk space independently.
+
+Keep `bes_results_url` pointed at the real BuildBuddy UI in the provisioned
+Bazelrc; only `bes_backend` is redirected to the local private socket. Changing
+the upstream or credential scope while data is pending is rejected. Delivery is
+at least once across failures. BuildBuddy's current reconnect window for an
+already-started incomplete invocation is four hours; durable spooling cannot
+override that backend rule. This relay targets BuildBuddy; generic BES backends
+with strict lifecycle/tool-stream ordering are not yet supported.

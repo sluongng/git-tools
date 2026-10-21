@@ -168,10 +168,10 @@ impl Upstream {
         } else {
             endpoint
         };
-        let channel = endpoint
-            .connect()
-            .await
-            .context("connecting cache upstream")?;
+        // Shared daemon startup and its durable BES admission must not depend
+        // on the remote cache being reachable. RPCs keep their own deadlines;
+        // a cold/offline backend fails those callers, not unrelated services.
+        let channel = endpoint.connect_lazy();
         Ok(Arc::new(Self {
             config,
             channel,

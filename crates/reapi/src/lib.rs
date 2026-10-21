@@ -1,9 +1,16 @@
-//! Pinned Remote Execution API and ByteStream protocol bindings.
+//! Pinned Remote Execution API, ByteStream and Build Event Service bindings.
 pub mod compression;
 pub mod policy;
 #[allow(clippy::doc_lazy_continuation)]
 pub mod proto {
     pub mod google {
+        pub mod devtools {
+            pub mod build {
+                pub mod v1 {
+                    tonic::include_proto!("google.devtools.build.v1");
+                }
+            }
+        }
         pub mod rpc {
             tonic::include_proto!("google.rpc");
         }
@@ -30,4 +37,5 @@ pub mod proto {
     }
 }
 pub use proto::build::bazel::remote::execution::v2 as reapi;
+pub use proto::google::devtools::build::v1 as bes;
 pub use reapi::Digest;

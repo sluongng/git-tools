@@ -15,6 +15,23 @@ max_blob_bytes = 536870912
 # No assumed upstream retention lease. Enable only with a suitable guarantee.
 action_cache_ttl_seconds = 0
 
+[bes]
+# ACK locally only after durable persistence; delete after BuildBuddy ACKs.
+enabled = true
+# Empty upstream/api_key_env inherit [cache]; override for a separate BES host.
+# upstream = "grpcs://YOUR_INSTANCE.buildbuddy.io"
+# api_key_env = "BUILDBUDDY_BES_API_KEY"
+max_pending_bytes = 1073741824
+max_event_bytes = 4194304
+max_streams = 128
+max_concurrent_forwards = 16
+connect_timeout_ms = 10000
+lifecycle_timeout_ms = 15000
+retry_initial_delay_ms = 1000
+retry_max_attempts = 4
+tombstone_ttl_seconds = 86400
+max_completed_streams = 4096
+
 [git_proxy]
 listen = "127.0.0.1:8379"
 sync_to_cas = false

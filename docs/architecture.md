@@ -10,7 +10,7 @@ The diagram is a logical ownership map, not a required deployment topology.
 Purple components are built in this project; gray components are external.
 Cylinders represent storage; boxes represent services and mount frontends.
 Each agent keeps writable source, Git admin and Bazel output roots private.
-`workspace` hosts Linux source mounts, BOS, Git transport and the REAPI cache
+`workspace` hosts Linux source mounts, BOS, Git transport, durable BES forwarding and the REAPI cache
 front end in one daemon; `agent-session` remains the standalone lifecycle client.
 Native source/output adapters also support macOS NFS and Windows ProjFS.
 
@@ -33,6 +33,7 @@ Native source/output adapters also support macOS NFS and Windows ProjFS.
 | --- | --- |
 | Workspace overlay, private Git admin, local commits | Authoritative user work; never delete as a cache |
 | BOS state and locally edited outputs | Authoritative mutations; retain across restart; explicit Bazel clean is destructive |
+| Pending BES events | Authoritative delivery spool, outside CAS/LRU; delete payloads only after matching upstream ACKs |
 | Git object databases/mirrors | Native Git format; no proxy mirror quota/automatic eviction; use Git-aware maintenance |
 | Fjall size/BLAKE3 mappings | Disposable immutable metadata; remove only while no owner uses it |
 | Generated Git responses | Separate request/ref-view cache; quota/TTL/LRU skip active readers |

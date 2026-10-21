@@ -8,6 +8,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 "proto/build/bazel/remote/execution/v2/remote_execution.proto",
             ),
             std::path::PathBuf::from("proto/google/bytestream/bytestream.proto"),
+            std::path::PathBuf::from("proto/google/devtools/build/v1/publish_build_event.proto"),
         ],
         &[
             std::path::PathBuf::from("proto"),

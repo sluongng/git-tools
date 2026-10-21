@@ -50,6 +50,8 @@ enum Operation {
     Status {
         session: Option<PathBuf>,
     },
+    /// Retry retained BES events after a forwarding failure, without stopping mounts.
+    RetryBes,
     /// Create a private writable source workspace; pin a full commit SHA.
     Create {
         session: PathBuf,
@@ -174,6 +176,7 @@ async fn run(cli: Cli) -> Result<serde_json::Value> {
     // used by an in-process service. The CLI does not host any mount itself.
     let report = match cli.command {
         Operation::Status { session: None } => return controller.call(Request::Status),
+        Operation::RetryBes => return controller.call(Request::RetryBes),
         Operation::Shutdown => return controller.call(Request::Shutdown),
         Operation::Status {
             session: Some(session),

@@ -5,7 +5,7 @@ Rust tools for private, writable agent workspaces and Bazel remote execution.
 
 | Tool | What it does |
 | --- | --- |
-| [`workspace`](crates/workspace-daemon/README.md) | One entry point: private sessions, shared Git/REAPI proxy, lazy source/output mounts and bounded local CAS |
+| [`workspace`](crates/workspace-daemon/README.md) | One entry point: private sessions, shared Git/REAPI/BES proxies, lazy mounts and bounded local CAS |
 | [`agent-session`](crates/agent-session/README.md) | Create, resume, build, save and stop private Linux agent sessions |
 | [`git-vfs`](crates/workspace-fuse/README.md) | Linux FUSE workspace: lazy Git reads, persistent edits, native Git status |
 | [`git-proxy`](crates/git-proxy/README.md) | Shared Git mirror and fetch cache, object sizes, BLAKE3 mappings, optional CAS uploads |
@@ -49,6 +49,9 @@ its current metadata-publication overhead can outweigh download savings.
 Action-result TTL is zero unless an operator supplies a
 retention guarantee. **Edits and commits are not disposable cache data.** Native
 commit can hydrate indexed files; general checkout/merge/rebase are not supported.
+BES events are ACKed after durable local persistence, forwarded asynchronously
+to BuildBuddy and deleted only after its ACK. Pending events are never LRU-evicted;
+check `workspace status` and use `workspace retry-bes` after a forwarding failure.
 
 Bazel must include the [Unix-socket authority fix](https://github.com/bazelbuild/bazel/commit/242563f1a14378801725e5f6b0ee397ef0d307f2)
 as well as BLAKE3/xattr/r2c2 support. Bazel 9.3.0rc2 lacks this fix; select a

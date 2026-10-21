@@ -10,6 +10,7 @@ use std::{
 pub struct Config {
     pub state_dir: PathBuf,
     pub cache: Cache,
+    pub bes: Bes,
     pub bos: Bos,
     pub git_proxy: GitProxy,
     pub session: Session,
@@ -34,6 +35,45 @@ pub struct Cache {
 #[serde(default, deny_unknown_fields)]
 pub struct Bos {
     pub enabled: bool,
+}
+/// Durable BES is not a cache: unacknowledged events cannot be evicted.
+#[derive(Clone, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct Bes {
+    pub enabled: bool,
+    /// Empty inherits the cache endpoint; override when BES is hosted separately.
+    pub upstream: String,
+    /// Empty inherits cache.api_key_env. Values are never written to the spool.
+    pub api_key_env: String,
+    pub max_pending_bytes: u64,
+    pub max_event_bytes: usize,
+    pub max_streams: usize,
+    pub max_concurrent_forwards: usize,
+    pub connect_timeout_ms: u64,
+    pub lifecycle_timeout_ms: u64,
+    pub retry_initial_delay_ms: u64,
+    pub retry_max_attempts: u32,
+    pub tombstone_ttl_seconds: u64,
+    pub max_completed_streams: usize,
+}
+impl Default for Bes {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            upstream: String::new(),
+            api_key_env: String::new(),
+            max_pending_bytes: 1024 * 1024 * 1024,
+            max_event_bytes: 4 * 1024 * 1024,
+            max_streams: 128,
+            max_concurrent_forwards: 16,
+            connect_timeout_ms: 10000,
+            lifecycle_timeout_ms: 15000,
+            retry_initial_delay_ms: 1000,
+            retry_max_attempts: 4,
+            tombstone_ttl_seconds: 86400,
+            max_completed_streams: 4096,
+        }
+    }
 }
 #[derive(Clone, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -60,6 +100,7 @@ impl Default for Config {
         Self {
             state_dir: home.join(".cache/workspace"),
             cache: Cache::default(),
+            bes: Bes::default(),
             bos: Bos::default(),
             git_proxy: GitProxy::default(),
             session: Session::default(),
@@ -163,6 +204,33 @@ impl Config {
             "action cache limits outside supported range"
         );
         self.reapi.validate()?;
+        if self.bes.enabled {
+            let upstream = if self.bes.upstream.is_empty() {
+                &self.cache.upstream
+            } else {
+                &self.bes.upstream
+            };
+            ensure!(
+                ["grpcs://", "grpc://", "https://", "http://"]
+                    .iter()
+                    .any(|prefix| upstream.starts_with(prefix)),
+                "bes.upstream must be an explicit gRPC endpoint"
+            );
+            ensure!(
+                self.bes.max_pending_bytes > 0
+                    && self.bes.max_event_bytes > 0
+                    && self.bes.max_event_bytes as u64 <= self.bes.max_pending_bytes
+                    && (1..=1024).contains(&self.bes.max_streams)
+                    && (1..=self.bes.max_streams).contains(&self.bes.max_concurrent_forwards)
+                    && (1..=600000).contains(&self.bes.connect_timeout_ms)
+                    && (1..=600000).contains(&self.bes.lifecycle_timeout_ms)
+                    && (1..=60000).contains(&self.bes.retry_initial_delay_ms)
+                    && self.bes.retry_max_attempts <= 20
+                    && (1..=1_000_000).contains(&self.bes.max_completed_streams)
+                    && (60..=604800).contains(&self.bes.tombstone_ttl_seconds),
+                "invalid BES spool, concurrency, timeout or retry limits"
+            );
+        }
         Ok(())
     }
     pub fn socket(&self) -> PathBuf {
@@ -170,6 +238,9 @@ impl Config {
     }
     pub fn cache_endpoint(&self) -> String {
         format!("unix:{}", self.state_dir.join("cache.sock").display())
+    }
+    pub fn bes_endpoint(&self) -> String {
+        format!("unix:{}", self.state_dir.join("bes.sock").display())
     }
 
     pub fn bytestream_uri_prefix(&self) -> String {
@@ -197,6 +268,20 @@ max_bytes = 4294967296
 max_concurrent_rpcs_per_connection = 128
 # Zero revalidates action results against upstream on every lookup.
 action_cache_ttl_seconds = 0
+
+[bes]
+# Durable local ACKs; pending events are NOT part of the disposable CAS/LRU.
+enabled = true
+# Empty upstream/api_key_env inherit [cache]. Override for a separate BES host.
+# upstream = "grpcs://YOUR_INSTANCE.buildbuddy.io"
+max_pending_bytes = 1073741824
+max_streams = 128
+max_concurrent_forwards = 16
+# Bazel-compatible retry defaults (four retries after the first attempt).
+connect_timeout_ms = 10000
+lifecycle_timeout_ms = 15000
+retry_initial_delay_ms = 1000
+retry_max_attempts = 4
 
 [bos]
 # Opt in to strictly lazy outputs; metadata publication is not yet batched.
@@ -235,6 +320,8 @@ mod tests {
         assert_eq!(config.cache.action_cache_ttl_seconds, 0);
         assert_eq!(config.cache.max_concurrent_rpcs_per_connection, 128);
         assert!(config.session.remote_repo_contents_cache);
+        assert!(config.bes.enabled);
+        assert_eq!(config.bes.retry_max_attempts, 4);
     }
     #[test]
     fn cache_rpc_connection_limit_accepts_overrides_and_rejects_invalid_bounds() {

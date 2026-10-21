@@ -317,6 +317,26 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3a8241f3ebb85c056b509d4327ad0358fbbba6ffb340bf388f26350aeda225b1"
 
 [[package]]
+name = "bes-proxy"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-stream",
+ "fjall",
+ "futures-core",
+ "libc",
+ "prost",
+ "reapi",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "tempfile",
+ "tokio",
+ "tokio-stream",
+ "tonic",
+]
+
+[[package]]
 name = "bit-set"
 version = "0.5.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6149,6 +6169,7 @@ dependencies = [
  "async-trait",
  "axum",
  "bazel-output-service",
+ "bes-proxy",
  "cache-proxy",
  "clap",
  "fs2",
