@@ -8,6 +8,7 @@ crate.annotation(
     patches = [
         "//third_party/patches:fuser-bounded-shutdown.patch",
         "//third_party/patches:fuser-busy-unmount.patch",
+        "//third_party/patches:fuser-mount-ownership.patch",
     ],
     patch_args = ["-p1"],
     # Match the Linux pure-Rust mount implementation without probing host libfuse.

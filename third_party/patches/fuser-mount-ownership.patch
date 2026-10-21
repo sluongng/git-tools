@@ -1,0 +1,132 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Son Luong Ngoc <26684313+sluongng@users.noreply.github.com>
+Date: Wed, 21 Oct 2026 14:00:00 +0200
+Subject: [PATCH] fuser: leave replacement mounts attached
+
+A lazy-detached FUSE connection can stay alive through open file
+handles. If another filesystem is mounted at the old path, dropping
+the original session can unmount that replacement instead.
+
+Record the Linux mount ID before starting the receiver, and require
+that exact, uncovered mount before automatic pathname unmounting.
+Fail closed when ownership is missing, ambiguous, or unreadable. This
+also protects cleanup after an independent receiver exit. Keep the
+helper-owned AutoUnmount mode and non-Linux behavior unchanged.
+
+Mount-ID checks cannot make pathname unmounting atomic with external
+remounts; callers must still coordinate changes to their mount roots.
+---
+diff --git a/src/mnt/fuse_pure.rs b/src/mnt/fuse_pure.rs
+--- a/src/mnt/fuse_pure.rs
++++ b/src/mnt/fuse_pure.rs
+@@ -7,7 +7,7 @@
+ #![allow(missing_docs)]
+ 
+ use super::is_mounted;
+-use super::mount_options::{MountOption, option_to_string};
++use super::mount_options::{option_to_string, MountOption};
+ use libc::c_int;
+ use log::{debug, error};
+ use std::ffi::{CStr, CString, OsStr};
+@@ -32,21 +32,76 @@
+     mountpoint: CString,
+     auto_unmount_socket: Option<UnixStream>,
+     fuse_device: Arc<File>,
++    #[cfg(target_os = "linux")]
++    mount_id: Option<u64>,
+ }
+ impl Mount {
+     pub fn new(mountpoint: &Path, options: &[MountOption]) -> io::Result<(Arc<File>, Mount)> {
+         let mountpoint = mountpoint.canonicalize()?;
+         let (file, sock) = fuse_mount_pure(mountpoint.as_os_str(), options)?;
+         let file = Arc::new(file);
++        // Do not stat/open the root here: INIT needs a running receiver first.
++        // A missing/ambiguous identity fails closed when the mount is dropped.
++        #[cfg(target_os = "linux")]
++        let mount_id = unique_mount_id(mountpoint.as_os_str()).ok().flatten();
++        #[cfg(target_os = "linux")]
++        if mount_id.is_none() {
++            log::warn!("Cannot establish FUSE mount identity; automatic unmount disabled");
++        }
+         Ok((
+             file.clone(),
+             Mount {
+                 mountpoint: CString::new(mountpoint.as_os_str().as_bytes())?,
+                 auto_unmount_socket: sock,
+                 fuse_device: file,
++                #[cfg(target_os = "linux")]
++                mount_id,
+             },
+         ))
+     }
++
++    #[cfg(target_os = "linux")]
++    fn owns_mountpoint(&self) -> bool {
++        self.mount_id.is_some()
++            && unique_mount_id(OsStr::from_bytes(self.mountpoint.to_bytes()))
++                .ok()
++                .flatten()
++                == self.mount_id
++    }
++}
++
++/// Return an identity only for a unique mount at this exact path. A retained
++/// descriptor can keep a lazy-detached connection alive, so is_mounted() alone
++/// does not establish ownership of the pathname. Covered mounts fail closed.
++#[cfg(target_os = "linux")]
++fn unique_mount_id(mountpoint: &OsStr) -> io::Result<Option<u64>> {
++    let mut encoded = Vec::new();
++    for byte in mountpoint.as_bytes() {
++        match byte {
++            b' ' => encoded.extend_from_slice(b"\\040"),
++            b'\t' => encoded.extend_from_slice(b"\\011"),
++            b'\n' => encoded.extend_from_slice(b"\\012"),
++            b'\\' => encoded.extend_from_slice(b"\\134"),
++            other => encoded.push(*other),
++        }
++    }
++    let table = std::fs::read("/proc/self/mountinfo")?;
++    let mut found = None;
++    for line in table.split(|b| *b == b'\n') {
++        let mut fields = line.split(|b| *b == b' ');
++        let id = fields.next().unwrap_or_default();
++        if fields.nth(3) != Some(encoded.as_slice()) {
++            continue;
++        }
++        let id = std::str::from_utf8(id)
++            .ok()
++            .and_then(|id| id.parse().ok())
++            .ok_or_else(|| Error::new(ErrorKind::InvalidData, "invalid mount identity"))?;
++        if found.replace(id).is_some() {
++            return Ok(None);
++        }
++    }
++    Ok(found)
+ }
+ 
+ impl Drop for Mount {
+@@ -63,6 +118,12 @@
+             // fusermount in auto-unmount mode, no more work to do.
+             return;
+         }
++        // AutoUnmount is owned by the helper above. For ordinary sessions,
++        // never unmount a replacement at a formerly owned pathname.
++        #[cfg(target_os = "linux")]
++        if !self.owns_mountpoint() {
++            return;
++        }
+         if let Err(err) = super::libc_umount(&self.mountpoint) {
+             if err.kind() == PermissionDenied
+                 || (cfg!(target_os = "linux") && err.raw_os_error() == Some(libc::EBUSY))
+@@ -70,6 +131,11 @@
+                 // Non-root Linux callers need the setuid helper. A busy Linux mount
+                 // also needs the existing lazy-detach path, even when owned by root;
+                 // otherwise stopping the session can leave a dead attached mount.
++                // Recheck after the failed syscall before invoking a helper.
++                #[cfg(target_os = "linux")]
++                if !self.owns_mountpoint() {
++                    return;
++                }
+                 fuse_unmount_pure(&self.mountpoint)
+             } else {
+                 error!("Unmount failed: {}", err)

@@ -339,3 +339,165 @@ async fn refuses_overlapping_state_and_nonempty_mountpoints_before_mounting() {
     assert_eq!(fs::read(occupied.join("preserve")).unwrap(), b"local");
     assert_eq!(source.fetches.load(Ordering::SeqCst), 0);
 }
+
+fn mount_id(path: &std::path::Path) -> u64 {
+    let path = std::ffi::CString::new(path.as_os_str().as_encoded_bytes()).unwrap();
+    let mut stat: libc::statx = unsafe { std::mem::zeroed() };
+    assert_eq!(
+        unsafe {
+            libc::statx(
+                libc::AT_FDCWD,
+                path.as_ptr(),
+                0,
+                libc::STATX_MNT_ID,
+                &mut stat,
+            )
+        },
+        0,
+        "{}",
+        std::io::Error::last_os_error()
+    );
+    assert_ne!(stat.stx_mask & libc::STATX_MNT_ID, 0);
+    stat.stx_mnt_id
+}
+
+async fn lazy_detach(root: &std::path::Path) -> File {
+    let root = root.to_owned();
+    io(move || {
+        // Retain the detached connection: closing this before old-session
+        // cleanup would hide the original stale-owner destructor failure.
+        let held = File::open(&root).unwrap();
+        let status = std::process::Command::new("fusermount3")
+            .args(["-u", "-z", "--"])
+            .arg(&root)
+            .status()
+            .unwrap();
+        assert!(status.success());
+        held
+    })
+    .await
+}
+
+async fn wait_for_connection_close(held: &File) {
+    let until = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let held = held.try_clone().unwrap();
+        if io(move || held.metadata().is_err()).await {
+            return;
+        }
+        assert!(std::time::Instant::now() < until, "old receiver retained");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires usable /dev/fuse and fusermount3"]
+async fn replacement_mount_survives_old_shutdown_and_final_owner_drop() {
+    for explicit_shutdown in [true, false] {
+        let fixture = tempfile::tempdir().unwrap();
+        // Exercise mountinfo escaping, not just simple temporary paths.
+        let root = fixture.path().join("outputs with space\\tab\tline\n");
+        let source = Arc::new(Source::new());
+        let old_tree = Tree::open(
+            fixture.path().join("old-state"),
+            "test",
+            source.clone(),
+            CacheConfig::default(),
+        )
+        .unwrap();
+        let old = output_fuse::start(old_tree, &root).await.unwrap();
+        let held = lazy_detach(&root).await;
+        let new_tree = Tree::open(
+            fixture.path().join("new-state"),
+            "test",
+            source.clone(),
+            CacheConfig::default(),
+        )
+        .unwrap();
+        let replacement = output_fuse::start(new_tree, &root).await.unwrap();
+        let before = mount_id(&root);
+        if explicit_shutdown {
+            old.shutdown().await.unwrap();
+        }
+        drop(old);
+        wait_for_connection_close(&held).await;
+        assert_eq!(mount_id(&root), before, "replacement was detached");
+        let path = root.join("new-local");
+        io(move || {
+            fs::write(&path, b"replacement survives").unwrap();
+            assert_eq!(fs::read(&path).unwrap(), b"replacement survives");
+        })
+        .await;
+        drop(held);
+        replacement.shutdown().await.unwrap();
+    }
+}
+
+struct RootOnly;
+impl fuser::Filesystem for RootOnly {
+    fn getattr(
+        &mut self,
+        _: &fuser::Request<'_>,
+        ino: u64,
+        _: Option<u64>,
+        reply: fuser::ReplyAttr,
+    ) {
+        assert_eq!(ino, 1);
+        reply.attr(
+            &Duration::ZERO,
+            &fuser::FileAttr {
+                ino: 1,
+                size: 0,
+                blocks: 0,
+                atime: UNIX_EPOCH,
+                mtime: UNIX_EPOCH,
+                ctime: UNIX_EPOCH,
+                crtime: UNIX_EPOCH,
+                kind: fuser::FileType::Directory,
+                perm: 0o700,
+                nlink: 2,
+                uid: unsafe { libc::geteuid() },
+                gid: unsafe { libc::getegid() },
+                rdev: 0,
+                blksize: 4096,
+                flags: 0,
+            },
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires usable /dev/fuse and fusermount3"]
+async fn replacement_survives_independent_fuser_receiver_exit() {
+    let fixture = tempfile::tempdir().unwrap();
+    let root = fixture.path().join("outputs");
+    fs::create_dir(&root).unwrap();
+    // No NativeSession owns this receiver: protection must be in fuser's
+    // destructor, not merely in the output adapter's shutdown/drop methods.
+    let mut session = fuser::Session::new(RootOnly, &root, &[]).unwrap();
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let receiver_stop = stop.clone();
+    let worker = std::thread::spawn(move || session.run_until(&receiver_stop));
+    let held = lazy_detach(&root).await;
+    let source = Arc::new(Source::new());
+    let tree = Tree::open(
+        fixture.path().join("state"),
+        "test",
+        source,
+        CacheConfig::default(),
+    )
+    .unwrap();
+    let replacement = output_fuse::start(tree, &root).await.unwrap();
+    let before = mount_id(&root);
+    stop.store(true, Ordering::Release);
+    io(move || worker.join().unwrap().unwrap()).await;
+    assert_eq!(mount_id(&root), before, "replacement was detached");
+    let path = root.join("still-live");
+    io(move || {
+        fs::write(&path, b"independent exit").unwrap();
+        assert_eq!(fs::read(&path).unwrap(), b"independent exit");
+    })
+    .await;
+    drop(held);
+    replacement.shutdown().await.unwrap();
+}
