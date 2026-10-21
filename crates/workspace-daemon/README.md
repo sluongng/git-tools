@@ -22,6 +22,8 @@ bazelrc choices may differ, except `session.git` also selects the daemon's Git
 executable when `git_proxy.repositories` is configured. To change service settings
 or rotate credentials, shut down with the original configuration and credentials
 first, or select a separate `state_dir`. Selecting a different config file alone does not isolate it.
+Before upgrading an active daemon across identity versions, shut it down with its
+existing binary and configuration.
 For a standalone Git proxy, leave `git_proxy.repositories` empty and pass
 `--proxy-url http://127.0.0.1:8082` to `workspace create`. Each process must own
 separate cache storage.

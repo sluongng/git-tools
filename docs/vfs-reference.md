@@ -96,8 +96,14 @@ size/digest mappings can be rebuilt safely. Fjall permits one process owner:
 inspect/warm its databases before mounting or after unmounting.
 
 `--content-cache-bytes` and `--content-reply-bytes` independently default to 64MiB.
-Zero disables decoded-content caching; oversize blobs bypass it. Saturated reply
-budgets can return `EAGAIN`. These are not whole-process memory limits: namespace
+Oversize blobs use a separate, mount-owned anonymous disk spool, bounded to
+512MiB total by default. `--content-large-blob-spool-bytes` sets its independent
+total/per-object bound; zero disables it. Setting `--content-cache-bytes=0`
+disables both pools unless the spool bound is explicitly supplied. Files remain
+charged while being written or read, are evicted under the byte/file limits, and
+close on shutdown. Blobs exceeding both budgets stream without retained storage
+and may require repeated decoding for range reads. Saturated reply budgets can
+return `EAGAIN`. These are not whole-process memory limits: namespace
 indexes, Git extraction and first-write copy-up have separate costs.
 
 `list`, `digest`, `stat`, `cat` and `cas-digest` inspect the base snapshot, not mounted

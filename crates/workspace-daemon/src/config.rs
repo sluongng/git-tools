@@ -14,7 +14,15 @@ pub struct Config {
     pub bos: Bos,
     pub git_proxy: GitProxy,
     pub session: Session,
+    pub source: Source,
     pub reapi: reapi::policy::Policy,
+}
+
+#[derive(Clone, Default, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct Source {
+    /// None uses the content scheduler's default; Some(0) disables disk spooling.
+    pub large_blob_spool_bytes: Option<u64>,
 }
 #[derive(Clone, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
@@ -122,6 +130,7 @@ impl Default for Config {
             bos: Bos::default(),
             git_proxy: GitProxy::default(),
             session: Session::default(),
+            source: Source::default(),
             reapi: Default::default(),
         }
     }
@@ -250,6 +259,12 @@ impl Config {
                 && self.cache.execution_timeout_ms <= 86_400_000,
             "invalid downloader-cache or execution limits"
         );
+        ensure!(
+            self.source
+                .large_blob_spool_bytes
+                .is_none_or(|limit| limit <= i64::MAX as u64),
+            "source.large_blob_spool_bytes exceeds supported file offsets"
+        );
         if self.bes.enabled {
             let upstream = if self.bes.upstream.is_empty() {
                 &self.cache.upstream
@@ -352,6 +367,11 @@ post_half_close_timeout_ms = 300000
 retry_initial_delay_ms = 1000
 retry_max_attempts = 4
 
+[source]
+# Separate bounded disk spooling for large Git blobs; zero disables it.
+# Default: 512 MiB per mount with decoded-content caching enabled.
+# large_blob_spool_bytes = 536870912
+
 [bos]
 # Opt in to strictly lazy outputs; metadata publication is not yet batched.
 enabled = false
@@ -405,6 +425,14 @@ mod tests {
         assert_eq!(config.bes.batch_max_events, 64);
         assert_eq!(config.bes.batch_max_bytes, 262144);
         assert_eq!(config.bes.batch_max_delay_ms, 0);
+        assert_eq!(config.source.large_blob_spool_bytes, None);
+        let disabled: Config = toml::from_str(&EXAMPLE.replace(
+            "# large_blob_spool_bytes = 536870912",
+            "large_blob_spool_bytes = 0",
+        ))
+        .unwrap();
+        disabled.validate().unwrap();
+        assert_eq!(disabled.source.large_blob_spool_bytes, Some(0));
         let mut watchdog = config.clone();
         watchdog.bes.post_half_close_timeout_ms = 0;
         assert!(

@@ -248,7 +248,10 @@ impl State {
                 overlay: Some(request.overlay.clone()),
                 prefetch: Some(BazelPrefetchPolicy::new(&[])?),
                 blake3: true,
-                content: ContentConfig::default(),
+                content: ContentConfig {
+                    large_blob_spool_bytes: self.config.source.large_blob_spool_bytes,
+                    ..ContentConfig::default()
+                },
                 git_vfs_executable: std::env::current_exe()?,
             },
         )

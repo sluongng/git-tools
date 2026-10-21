@@ -116,9 +116,12 @@ enum Commands {
         /// Skip literal MODULE/rc discovery in background prefetch.
         #[arg(long, requires = "prefetch_bazel")]
         prefetch_no_discover: bool,
-        /// Maximum logical bytes in immutable content cache files (0 disables admission).
+        /// Maximum logical bytes in the small-blob content cache (0 also disables the default large-blob spool).
         #[arg(long, default_value_t = 67108864)]
         content_cache_bytes: u64,
+        /// Separate anonymous large-blob spool limit; defaults to 512 MiB when the content cache is enabled, otherwise 0. An explicit value enables this pool independently; 0 disables it.
+        #[arg(long)]
+        content_large_blob_spool_bytes: Option<u64>,
         /// Maximum bytes reserved by outstanding immutable read replies (at least 16 MiB).
         #[arg(long, default_value_t = 67108864, value_parser = clap::value_parser!(u64).range(16777216..))]
         content_reply_bytes: u64,
@@ -360,6 +363,7 @@ fn main() -> Result<()> {
             prefetch_include,
             prefetch_no_discover,
             content_cache_bytes,
+            content_large_blob_spool_bytes,
             content_reply_bytes,
         } => {
             let mut repo = open(&repository, &cli.git)?;
@@ -401,6 +405,7 @@ fn main() -> Result<()> {
                     blake3,
                     content: workspace_fuse::backend::ContentConfig {
                         cache_bytes: content_cache_bytes,
+                        large_blob_spool_bytes: content_large_blob_spool_bytes,
                         reply_bytes: content_reply_bytes,
                         ..workspace_fuse::backend::ContentConfig::default()
                     },

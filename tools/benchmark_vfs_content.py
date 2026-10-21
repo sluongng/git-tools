@@ -3,8 +3,9 @@
 
 20 distinct 4MiB blobs exceed the default 64MiB shared disk-content cache.
 Sequential 4KiB ranges run forward/reverse/forward, followed by one range at the
-tail of an 80MiB blob. The tail forces a full native Git stream without requiring
-a whole-blob VFS buffer. No network, Cargo, retries, edits or global cache drops.
+tail of an 80MiB blob. The first tail read forces a full native Git stream without
+a whole-blob VFS buffer; the separate bounded large-blob disk spool may retain it.
+No network, Cargo, retries, edits or global cache drops.
 RSS is sampled for the owned VFS PID, not native-Git children or cgroup memory.
 """
 from __future__ import annotations
@@ -27,14 +28,18 @@ import benchmark_vfs_iteration as common
 
 BLOCK = 256 * 1024
 CACHE_BYTES = 64 * 1024 * 1024
+SPOOL_BYTES = 512 * 1024 * 1024
 CONTENT_FIELDS = ('outstanding_requests', 'reply_bytes', 'cache_resident_bytes',
     'cache_pinned_bytes', 'cache_inflight_bytes', 'cache_total_bytes', 'cache_peak_bytes',
-    'cache_files', 'coalesced_requests', 'foreground_promotions', 'cache_hits',
+    'cache_files', 'large_blob_spool_bytes', 'large_blob_spool_limit_bytes',
+    'large_blob_spool_peak_bytes', 'large_blob_spool_files',
+    'coalesced_requests', 'foreground_promotions', 'cache_hits',
     'cache_bypasses', 'fetch_batches', 'fetched_objects', 'local_bytes',
     'rejected_requests', 'callback_panics', 'worker_failures', 'queued_local',
     'queued_large', 'queued_foreground', 'queued_speculative', 'inflight_oids')
 DRAINED_FIELDS = ('outstanding_requests', 'reply_bytes', 'cache_resident_bytes',
     'cache_pinned_bytes', 'cache_inflight_bytes', 'cache_total_bytes', 'cache_files',
+    'large_blob_spool_bytes', 'large_blob_spool_files',
     'queued_local', 'queued_large', 'queued_foreground', 'queued_speculative', 'inflight_oids')
 
 
@@ -236,6 +241,7 @@ class ContentCell(common.Cell):
         required = self.args.require_candidate_stats and self.result['arm'] == 'candidate'
         proof = {'required': required, 'passed': None, 'checks': {},
                  'shared_disk_content_cache_limit_bytes': CACHE_BYTES,
+                 'separate_large_blob_disk_spool_limit_bytes': SPOOL_BYTES,
                  'separate_reply_admission_limit_bytes': CACHE_BYTES,
                  'rss_contract': 'Observed VFS-only RSS/20ms peaks are reported, not conflated with logical disk-cache bytes. No default allocator-dependent RSS assertion.'}
         self.result['mechanism_validation'] = proof
@@ -254,8 +260,15 @@ class ContentCell(common.Cell):
                 'oversize_object_exceeds_cache_budget': self.args.oversize_bytes > CACHE_BYTES,
                 'all_final_charges_and_queues_drained': all(state[field] == 0 for state in reports for field in DRAINED_FIELDS),
                 'shared_cache_peak_within_limit': all(state['cache_peak_bytes'] <= CACHE_BYTES for state in reports),
+                'large_blob_spool_peak_within_separate_limit': all(
+                    state['large_blob_spool_limit_bytes'] == SPOOL_BYTES and
+                    state['large_blob_spool_peak_bytes'] <= state['large_blob_spool_limit_bytes']
+                    for state in reports),
                 'warm_content_cache_hit_observed': initial['cache_hits'] > 0,
-                'oversize_bypass_observed': initial['cache_bypasses'] > 0,
+                'oversize_spool_or_bypass_observed': (
+                    initial['large_blob_spool_peak_bytes'] >= self.args.oversize_bytes
+                    if self.args.oversize_bytes <= initial['large_blob_spool_limit_bytes']
+                    else initial['cache_bypasses'] > 0),
                 'input_stream_accounted': initial['local_bytes'] >= self.result['input_blob_bytes'],
                 'no_remote_fetches_for_local_fixture': all(state['fetch_batches'] == state['fetched_objects'] == 0 for state in reports),
                 'sequential_fixture_no_rejections': all(state['rejected_requests'] == 0 for state in reports),
@@ -308,7 +321,7 @@ def main():
         'harness_sha256': common.sha256(Path(__file__)), 'helper_sha256': common.sha256(helper),
         'host': {'system': platform.system(), 'release': platform.release(), 'machine': platform.machine(), 'python': platform.python_version()},
         'timing_contract': 'phase wall includes sequential open/pread/close and byte comparisons; payload generation outside phase; raw pread timers exclude comparison',
-        'memory_contract': '20ms sampled VFS PID RSS excludes Git children; shared cache is disk content, not a RAM-sized Vec; separate64MiB reply admission budget'}
+        'memory_contract': '20ms sampled VFS PID RSS excludes Git children; shared cache is disk content, not a RAM-sized Vec; separate64MiB reply admission budget; new binaries also expose an independent512MiB anonymous disk spool (older reports omit those metrics)'}
     if not args.run:
         print(json.dumps(result, indent=2))
         return 0

@@ -21,6 +21,11 @@ pub struct ContentConfig {
     pub max_requests: usize,
     pub reply_bytes: u64,
     pub cache_bytes: u64,
+    /// Separate mount-owned anonymous storage for blobs exceeding cache_bytes.
+    /// None allows 512 MiB when the cache is enabled, and no spool when it is
+    /// disabled. Some(0) disables this pool; Some(n) explicitly bounds its total
+    /// reserved bytes (and therefore each object), including with cache_bytes=0.
+    pub large_blob_spool_bytes: Option<u64>,
     pub cache_entries: usize,
     pub max_prefetch: usize,
     pub fetch_batch: usize,
@@ -31,10 +36,17 @@ impl Default for ContentConfig {
             max_requests: 64,
             reply_bytes: 64 << 20,
             cache_bytes: 64 << 20,
+            large_blob_spool_bytes: None,
             cache_entries: 256,
             max_prefetch: 256,
             fetch_batch: 32,
         }
+    }
+}
+impl ContentConfig {
+    fn large_blob_spool_limit(&self) -> u64 {
+        self.large_blob_spool_bytes
+            .unwrap_or(if self.cache_bytes == 0 { 0 } else { 512 << 20 })
     }
 }
 
@@ -75,6 +87,9 @@ struct Counters {
     cache_total: AtomicU64,
     cache_items: AtomicU64,
     cache_peak: AtomicU64,
+    spool_total: AtomicU64,
+    spool_peak: AtomicU64,
+    spool_items: AtomicU64,
     coalesced: AtomicU64,
     promotions: AtomicU64,
     cache_hits: AtomicU64,
@@ -133,6 +148,12 @@ pub struct ContentStats {
     pub cache_inflight_bytes: u64,
     pub cache_total_bytes: u64,
     pub cache_peak_bytes: u64,
+    /// Reserved anonymous large-blob storage, independent of cache_total_bytes.
+    /// In-flight writes and pinned readers remain charged until their file closes.
+    pub large_blob_spool_bytes: u64,
+    pub large_blob_spool_limit_bytes: u64,
+    pub large_blob_spool_peak_bytes: u64,
+    pub large_blob_spool_files: u64,
     pub coalesced_requests: u64,
     pub foreground_promotions: u64,
     pub cache_hits: u64,
@@ -658,6 +679,10 @@ impl ContentHandle {
             cache_inflight_bytes: get(&c.cache_inflight),
             cache_total_bytes: get(&c.cache_total),
             cache_peak_bytes: get(&c.cache_peak),
+            large_blob_spool_bytes: get(&c.spool_total),
+            large_blob_spool_limit_bytes: self.0.config.large_blob_spool_limit(),
+            large_blob_spool_peak_bytes: get(&c.spool_peak),
+            large_blob_spool_files: get(&c.spool_items),
             coalesced_requests: get(&c.coalesced),
             foreground_promotions: get(&c.promotions),
             cache_hits: get(&c.cache_hits),
@@ -860,6 +885,7 @@ struct CachePermit {
     size: u64,
     counters: Arc<Counters>,
     category: Category,
+    spool: bool,
 }
 impl CachePermit {
     fn counter(&self) -> &AtomicU64 {
@@ -870,6 +896,9 @@ impl CachePermit {
         }
     }
     fn change(&mut self, category: Category) {
+        if self.spool {
+            return;
+        }
         self.counter().fetch_sub(self.size, Ordering::Relaxed);
         self.category = category;
         self.counter().fetch_add(self.size, Ordering::Relaxed);
@@ -877,6 +906,13 @@ impl CachePermit {
 }
 impl Drop for CachePermit {
     fn drop(&mut self) {
+        if self.spool {
+            self.counters
+                .spool_total
+                .fetch_sub(self.size, Ordering::Relaxed);
+            self.counters.spool_items.fetch_sub(1, Ordering::Relaxed);
+            return;
+        }
         self.counter().fetch_sub(self.size, Ordering::Relaxed);
         self.counters
             .cache_total
@@ -896,17 +932,26 @@ struct Cache {
 }
 impl Cache {
     fn begin(&mut self, oid: &str, size: u64) -> Result<Option<Cached>> {
-        if self.inner.config.cache_bytes == 0 || size > self.inner.config.cache_bytes {
+        let spool = self.inner.config.cache_bytes == 0 || size > self.inner.config.cache_bytes;
+        let limit = if spool {
+            self.inner.config.large_blob_spool_limit()
+        } else {
+            self.inner.config.cache_bytes
+        };
+        if limit == 0 || size > limit {
             return Ok(None);
         }
-        while self
-            .inner
-            .counters
-            .cache_total
+        let c = Arc::clone(&self.inner.counters);
+        let total_counter = if spool {
+            &c.spool_total
+        } else {
+            &c.cache_total
+        };
+        while total_counter
             .load(Ordering::Relaxed)
-            .saturating_add(size)
-            > self.inner.config.cache_bytes
-            || self.inner.counters.cache_items.load(Ordering::Relaxed)
+            .checked_add(size)
+            .is_none_or(|total| total > limit)
+            || c.cache_items.load(Ordering::Relaxed) + c.spool_items.load(Ordering::Relaxed)
                 >= self.inner.config.cache_entries as u64
         {
             if self.entries.pop_front().is_none() {
@@ -914,11 +959,15 @@ impl Cache {
             }
         }
         let file = self.directory.anonymous()?;
-        let c = Arc::clone(&self.inner.counters);
-        let total = c.cache_total.fetch_add(size, Ordering::Relaxed) + size;
-        c.cache_peak.fetch_max(total, Ordering::Relaxed);
-        c.cache_inflight.fetch_add(size, Ordering::Relaxed);
-        c.cache_items.fetch_add(1, Ordering::Relaxed);
+        let total = total_counter.fetch_add(size, Ordering::Relaxed) + size;
+        if spool {
+            c.spool_peak.fetch_max(total, Ordering::Relaxed);
+            c.spool_items.fetch_add(1, Ordering::Relaxed);
+        } else {
+            c.cache_peak.fetch_max(total, Ordering::Relaxed);
+            c.cache_inflight.fetch_add(size, Ordering::Relaxed);
+            c.cache_items.fetch_add(1, Ordering::Relaxed);
+        }
         Ok(Some(Cached {
             oid: oid.into(),
             file,
@@ -926,6 +975,7 @@ impl Cache {
                 size,
                 counters: c,
                 category: Category::Inflight,
+                spool,
             },
         }))
     }
@@ -1616,6 +1666,88 @@ os.execvp('git',['git',*sys.argv[1:]])
         scheduler.shutdown().unwrap();
     }
 
+    // Run explicitly with --ignored --nocapture. The fixture uses native Git,
+    // serialized callbacks and no shared CAS, so neither coalescing nor a mapped
+    // shared object can hide repeated native decoding.
+    #[test]
+    #[ignore = "native Git range-read benchmark"]
+    fn oversized_native_git_range_benchmark() {
+        fn cpu_seconds() -> f64 {
+            let mut total = 0.0;
+            for who in [libc::RUSAGE_SELF, libc::RUSAGE_CHILDREN] {
+                let mut usage = std::mem::MaybeUninit::<libc::rusage>::uninit();
+                assert_eq!(unsafe { libc::getrusage(who, usage.as_mut_ptr()) }, 0);
+                let usage = unsafe { usage.assume_init() };
+                for time in [usage.ru_utime, usage.ru_stime] {
+                    total += time.tv_sec as f64 + time.tv_usec as f64 / 1_000_000.0;
+                }
+            }
+            total
+        }
+        const LENGTH: usize = 8 << 20;
+        const RANGE: u32 = 128 << 10;
+        for (cache_bytes, large_blob_spool_bytes) in
+            [(0, None), (512 << 10, None), (0, Some(16 << 20))]
+        {
+            for pattern in ["sequential", "random"] {
+                let mut fixture = Fixture::new();
+                let bytes = (0..LENGTH)
+                    .map(|offset| ((offset / 4096 + offset % 251) % 256) as u8)
+                    .collect::<Vec<_>>();
+                let path = fixture.root.path().join("benchmark-blob");
+                std::fs::write(&path, &bytes).unwrap();
+                let oid = String::from_utf8(git(
+                    fixture.repo.repository_path(),
+                    &["hash-object", "-w", path.to_str().unwrap()],
+                ))
+                .unwrap()
+                .trim()
+                .to_owned();
+                let mut scheduler = ContentScheduler::new(
+                    &mut fixture.repo,
+                    ContentConfig {
+                        cache_bytes,
+                        large_blob_spool_bytes,
+                        ..ContentConfig::default()
+                    },
+                )
+                .unwrap();
+                let handle = scheduler.handle();
+                let cpu = cpu_seconds();
+                let started = Instant::now();
+                for index in 0..LENGTH / RANGE as usize {
+                    // Odd multiplication permutes all 64 chunks deterministically.
+                    let chunk = if pattern == "random" {
+                        (index * 37) % 64
+                    } else {
+                        index
+                    };
+                    let offset = chunk * RANGE as usize;
+                    let data = receive(&request(&handle, &oid, offset as u64, RANGE));
+                    assert_eq!(&*data, &bytes[offset..offset + RANGE as usize]);
+                }
+                let wall_seconds = started.elapsed().as_secs_f64();
+                let stats = handle.stats();
+                scheduler.shutdown().unwrap();
+                eprintln!(
+                    "OVERSIZED_BENCH {}",
+                    serde_json::json!({
+                        "cache_bytes": cache_bytes, "pattern": pattern,
+                    "configured_spool_bytes": large_blob_spool_bytes,
+                        "blob_bytes": LENGTH, "range_bytes": RANGE, "reads": 64,
+                        "wall_seconds": wall_seconds, "cpu_seconds": cpu_seconds() - cpu,
+                        "decoded_bytes": stats.local_bytes,
+                        "cache_peak_bytes": stats.cache_peak_bytes,
+                    "spool_peak_bytes": stats.large_blob_spool_peak_bytes,
+                        "cache_hits": stats.cache_hits,
+                        "post_shutdown_bytes": handle.stats().cache_total_bytes,
+                    "post_shutdown_spool_bytes": handle.stats().large_blob_spool_bytes,
+                    })
+                );
+            }
+        }
+    }
+
     #[test]
     fn shutdown_cancels_blocked_fetch_and_completes_accepted_callbacks() {
         let mut fixture = Fixture::new();
@@ -2016,23 +2148,24 @@ os.execvp('git',['git',*sys.argv[1:]])
 
     #[test]
     fn large_local_stream_does_not_occupy_small_or_cached_read_lane() {
-        let mut fixture = Fixture::new();
-        fixture.release();
-        // Hydrate the object before replacing the wrapper with a controlled local
-        // batch protocol. The scheduling boundary is body streaming, not network.
-        let large_oid = String::from_utf8(git(
-            &fixture.root.path().join("source"),
-            &["rev-parse", "HEAD:large"],
-        ))
-        .unwrap()
-        .trim()
-        .to_owned();
-        fixture.repo.read_blob(&large_oid).unwrap();
-        let wrapper = fixture.root.path().join("controlled-git");
-        // Delay the real fixture's 2 MiB body after its valid header; ordinary
-        // OIDs are still read by native no-lazy Git from the fixture.
-        let script = format!(
-            r#"#!/usr/bin/env python3
+        for complete_stream in [true, false] {
+            let mut fixture = Fixture::new();
+            fixture.release();
+            // Hydrate the object before replacing the wrapper with a controlled local
+            // batch protocol. The scheduling boundary is body streaming, not network.
+            let large_oid = String::from_utf8(git(
+                &fixture.root.path().join("source"),
+                &["rev-parse", "HEAD:large"],
+            ))
+            .unwrap()
+            .trim()
+            .to_owned();
+            fixture.repo.read_blob(&large_oid).unwrap();
+            let wrapper = fixture.root.path().join("controlled-git");
+            // Delay the real fixture's 2 MiB body after its valid header; ordinary
+            // OIDs are still read by native no-lazy Git from the fixture.
+            let script = format!(
+                r#"#!/usr/bin/env python3
 import os,pathlib,subprocess,sys,time
 root=pathlib.Path(__file__).parent
 if sys.argv[-2:]==['cat-file','--batch'] and os.environ.get('GIT_NO_LAZY_FETCH')=='1':
@@ -2051,37 +2184,62 @@ if sys.argv[-2:]==['cat-file','--batch'] and os.environ.get('GIT_NO_LAZY_FETCH')
     sys.exit(0)
 os.execvp('git',['git',*sys.argv[1:]])
 "#,
-            oid = serde_json::to_string(&large_oid).unwrap()
-        );
-        std::fs::write(&wrapper, script).unwrap();
-        let mut scheduler =
-            ContentScheduler::new(&mut fixture.repo, ContentConfig::default()).unwrap();
-        let handle = scheduler.handle();
-        let large = request(&handle, &large_oid, 2097140, 12);
-        let deadline = Instant::now() + Duration::from_secs(5);
-        loop {
-            let headers = std::fs::read_to_string(fixture.root.path().join("large-attempts"))
-                .unwrap_or_default()
-                .lines()
-                .count();
-            if headers >= 2 {
-                break;
-            }
-            assert!(
-                Instant::now() < deadline,
-                "large worker never acquired deferred stream"
+                oid = serde_json::to_string(&large_oid).unwrap()
             );
-            std::thread::sleep(Duration::from_millis(5));
+            std::fs::write(&wrapper, script).unwrap();
+            let mut scheduler = ContentScheduler::new(
+                &mut fixture.repo,
+                ContentConfig {
+                    cache_bytes: 512 << 10,
+                    large_blob_spool_bytes: Some(2 << 20),
+                    ..ContentConfig::default()
+                },
+            )
+            .unwrap();
+            let handle = scheduler.handle();
+            let large = request(&handle, &large_oid, 2097140, 12);
+            let deadline = Instant::now() + Duration::from_secs(5);
+            loop {
+                let headers = std::fs::read_to_string(fixture.root.path().join("large-attempts"))
+                    .unwrap_or_default()
+                    .lines()
+                    .count();
+                if headers >= 2 {
+                    break;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "large worker never acquired deferred stream"
+                );
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            let local = request(&handle, &fixture.local, 0, 4);
+            assert_eq!(
+                &*local.recv_timeout(Duration::from_secs(1)).unwrap().unwrap(),
+                b"alre"
+            );
+            assert!(large.try_recv().is_err());
+            while handle.stats().large_blob_spool_bytes != 2 << 20 {
+                assert!(
+                    Instant::now() < deadline,
+                    "large stream did not reserve its spool budget"
+                );
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            if complete_stream {
+                std::fs::write(fixture.root.path().join("large-release"), b"ok").unwrap();
+                assert_eq!(&*receive(&large), &[b'x'; 12]);
+            } else {
+                scheduler.shutdown().unwrap();
+                assert!(matches!(
+                    large.recv_timeout(Duration::from_secs(1)).unwrap(),
+                    Err(ContentError::Cancelled)
+                ));
+            }
+            scheduler.shutdown().unwrap();
+            assert_eq!(handle.stats().large_blob_spool_bytes, 0);
+            assert_eq!(handle.stats().large_blob_spool_files, 0);
         }
-        let local = request(&handle, &fixture.local, 0, 4);
-        assert_eq!(
-            &*local.recv_timeout(Duration::from_secs(1)).unwrap().unwrap(),
-            b"alre"
-        );
-        assert!(large.try_recv().is_err());
-        std::fs::write(fixture.root.path().join("large-release"), b"ok").unwrap();
-        assert_eq!(&*receive(&large), &[b'x'; 12]);
-        scheduler.shutdown().unwrap();
     }
     #[test]
     fn stale_spool_directories_do_not_prevent_restart_or_get_deleted() {
@@ -2122,55 +2280,170 @@ mod portable_tests {
             .status()
             .unwrap();
         assert!(status.success());
-        let bytes: Vec<_> = (0..(256 * 1024)).map(|i| (i % 251) as u8).collect();
-        let mut child = Command::new("git")
-            .arg("--git-dir")
-            .arg(&bare)
-            .args(["hash-object", "-w", "--stdin"])
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .spawn()
-            .unwrap();
-        child.stdin.take().unwrap().write_all(&bytes).unwrap();
-        let output = child.wait_with_output().unwrap();
-        assert!(output.status.success());
-        let oid = String::from_utf8(output.stdout).unwrap().trim().to_owned();
-        let mut repo =
-            GitRepo::open(&bare, "git", "origin", super::super::SizeFallback::Error).unwrap();
-        let mut scheduler = ContentScheduler::new(&mut repo, ContentConfig::default()).unwrap();
-        let handle = scheduler.handle();
-        for (offset, requested) in [
-            (0, 512),
-            (65_529, 64),
-            (bytes.len() - 7, 64),
-            (bytes.len() + 1, 8),
-        ] {
-            let data = handle
-                .read_blocking(&oid, offset as u64, requested)
+        let bytes: Vec<_> = (0..(2 * 1024 * 1024)).map(|i| (i % 251) as u8).collect();
+        let store = |contents: &[u8]| {
+            let mut child = Command::new("git")
+                .arg("--git-dir")
+                .arg(&bare)
+                .args(["hash-object", "-w", "--stdin"])
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .spawn()
                 .unwrap();
-            let start = offset.min(bytes.len());
-            let end = offset.saturating_add(requested as usize).min(bytes.len());
-            assert_eq!(data.as_ref(), &bytes[start..end]);
+            child.stdin.take().unwrap().write_all(contents).unwrap();
+            let output = child.wait_with_output().unwrap();
+            assert!(output.status.success());
+            String::from_utf8(output.stdout).unwrap().trim().to_owned()
+        };
+        let oid = store(&bytes);
+        let mut other_bytes = bytes.clone();
+        other_bytes[0] = 255;
+        let other = store(&other_bytes);
+        struct Case {
+            name: &'static str,
+            config: ContentConfig,
+            cached: bool,
+            spooled: bool,
         }
-        assert_eq!(handle.stats().cache_files, 1);
-        assert!(handle.stats().cache_hits >= 3);
-        assert!(matches!(
-            handle.read_blocking("not-an-oid", 0, 1),
-            Err(ContentError::Invalid)
-        ));
-        scheduler.shutdown().unwrap();
-        assert!(matches!(
-            handle.read_blocking(&oid, 0, 1),
-            Err(ContentError::Cancelled)
-        ));
-        assert_eq!(handle.stats().cache_total_bytes, 0);
-        assert!(
-            !std::fs::read_dir(&bare).unwrap().any(|entry| entry
-                .unwrap()
-                .file_name()
-                .to_string_lossy()
-                .starts_with("vfs-content-")),
-            "shutdown must close delete-on-close handles before removing the spool directory"
-        );
+        for case in [
+            Case {
+                name: "ordinary cache",
+                config: ContentConfig::default(),
+                cached: true,
+                spooled: false,
+            },
+            Case {
+                name: "oversized default spool",
+                config: ContentConfig {
+                    cache_bytes: 4096,
+                    cache_entries: 1,
+                    ..ContentConfig::default()
+                },
+                cached: false,
+                spooled: true,
+            },
+            Case {
+                name: "explicit spool with cache disabled",
+                config: ContentConfig {
+                    cache_bytes: 0,
+                    large_blob_spool_bytes: Some(bytes.len() as u64),
+                    ..ContentConfig::default()
+                },
+                cached: false,
+                spooled: true,
+            },
+            Case {
+                name: "all caching disabled",
+                config: ContentConfig {
+                    cache_bytes: 0,
+                    ..ContentConfig::default()
+                },
+                cached: false,
+                spooled: false,
+            },
+            Case {
+                name: "oversized spool explicitly disabled",
+                config: ContentConfig {
+                    cache_bytes: 4096,
+                    large_blob_spool_bytes: Some(0),
+                    ..ContentConfig::default()
+                },
+                cached: false,
+                spooled: false,
+            },
+            Case {
+                name: "object exceeds spool limit",
+                config: ContentConfig {
+                    cache_bytes: 4096,
+                    large_blob_spool_bytes: Some(4096),
+                    ..ContentConfig::default()
+                },
+                cached: false,
+                spooled: false,
+            },
+        ] {
+            let mut repo =
+                GitRepo::open(&bare, "git", "origin", super::super::SizeFallback::Error).unwrap();
+            let cache_limit = case.config.cache_bytes;
+            let spool_limit = case.config.large_blob_spool_limit();
+            let mut scheduler = ContentScheduler::new(&mut repo, case.config).unwrap();
+            let handle = scheduler.handle();
+            for (offset, requested) in [
+                (0, 512),
+                (65_529, 64),
+                (bytes.len() - 7, 64),
+                (bytes.len() + 1, 8),
+            ] {
+                let data = handle
+                    .read_blocking(&oid, offset as u64, requested)
+                    .unwrap();
+                let start = offset.min(bytes.len());
+                let end = offset.saturating_add(requested as usize).min(bytes.len());
+                assert_eq!(data.as_ref(), &bytes[start..end]);
+            }
+            let stats = handle.stats();
+            assert_eq!(stats.cache_files, u64::from(case.cached), "{}", case.name);
+            assert_eq!(
+                stats.large_blob_spool_files,
+                u64::from(case.spooled),
+                "{}",
+                case.name
+            );
+            assert_eq!(
+                stats.cache_hits,
+                if case.cached || case.spooled { 3 } else { 0 },
+                "{}",
+                case.name
+            );
+            assert_eq!(
+                stats.local_bytes,
+                bytes.len() as u64 * if case.cached || case.spooled { 1 } else { 4 },
+                "{}",
+                case.name
+            );
+            assert!(stats.cache_peak_bytes <= cache_limit, "{}", case.name);
+            assert!(
+                stats.large_blob_spool_peak_bytes <= spool_limit,
+                "{}",
+                case.name
+            );
+            if case.spooled {
+                assert_eq!(handle.read_blocking(&other, 0, 1).unwrap().as_ref(), &[255]);
+                assert_eq!(handle.read_blocking(&oid, 0, 1).unwrap().as_ref(), &[0]);
+                let evicted = handle.stats();
+                assert_eq!(evicted.local_bytes, 3 * bytes.len() as u64, "{}", case.name);
+                assert_eq!(evicted.large_blob_spool_files, 1, "{}", case.name);
+                assert_eq!(
+                    evicted.large_blob_spool_bytes,
+                    bytes.len() as u64,
+                    "{}",
+                    case.name
+                );
+                assert!(
+                    evicted.large_blob_spool_peak_bytes <= spool_limit,
+                    "{}",
+                    case.name
+                );
+            }
+            assert!(matches!(
+                handle.read_blocking("not-an-oid", 0, 1),
+                Err(ContentError::Invalid)
+            ));
+            scheduler.shutdown().unwrap();
+            assert!(matches!(
+                handle.read_blocking(&oid, 0, 1),
+                Err(ContentError::Cancelled)
+            ));
+            assert_eq!(handle.stats().cache_total_bytes, 0);
+            assert_eq!(handle.stats().large_blob_spool_bytes, 0);
+            assert!(
+                !std::fs::read_dir(&bare).unwrap().any(|entry| entry
+                    .unwrap()
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with("vfs-content-")),
+                "shutdown must close delete-on-close handles before removing the spool directory"
+            );
+        }
     }
 }

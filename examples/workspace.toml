@@ -49,6 +49,10 @@ retry_max_attempts = 4
 tombstone_ttl_seconds = 86400
 max_completed_streams = 4096
 
+[source]
+# Separate bounded large-blob disk spool per mount; zero disables it.
+# large_blob_spool_bytes = 536870912
+
 [git_proxy]
 listen = "127.0.0.1:8379"
 sync_to_cas = false

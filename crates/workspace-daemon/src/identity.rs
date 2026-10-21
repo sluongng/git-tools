@@ -4,7 +4,7 @@ use crate::config::Config;
 use anyhow::{Result, ensure};
 use serde::{Deserialize, Serialize};
 
-const VERSION: u32 = 1;
+const VERSION: u32 = 2;
 
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -57,7 +57,7 @@ impl Challenge {
     pub(crate) fn digest(&self, config: &Config, credentials: &Credentials) -> Result<String> {
         ensure!(
             self.version == VERSION,
-            "daemon identity version mismatch; use the matching configuration to shut down and restart the daemon"
+            "daemon identity version mismatch; shut down using the matching binary and configuration before restarting"
         );
         let mut bes = serde_json::to_value(&config.bes)?;
         if config.bes.enabled {
@@ -81,6 +81,7 @@ impl Challenge {
             "bes": bes,
             "bes_credential": credentials.bes,
             "bos": config.bos,
+            "source": config.source,
             "git_proxy": config.git_proxy,
             // The Git proxy captures this executable at daemon startup. When
             // disabled it is only a session setting and may vary per client.
@@ -167,7 +168,10 @@ mod tests {
             }),
             ("RPC policy", |c| c.reapi.rpc_timeout_ms += 1),
             ("retry policy", |c| c.reapi.retry.max_attempts += 1),
-        ] as [Change; 6]
+            ("source disk budget", |c| {
+                c.source.large_blob_spool_bytes = Some(0)
+            }),
+        ] as [Change; 7]
         {
             let mut candidate = config.clone();
             change(&mut candidate);
