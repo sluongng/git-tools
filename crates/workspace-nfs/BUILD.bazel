@@ -8,7 +8,10 @@ package(default_visibility = ["//visibility:public"])
 
 rust_library(
     name = "workspace-nfs",
-    srcs = glob(["src/**/*.rs"], exclude = ["src/main.rs"]),
+    srcs = glob(
+        ["src/**/*.rs"],
+        exclude = ["src/main.rs"],
+    ),
     aliases = aliases(),
     crate_name = "workspace_nfs",
     edition = "2024",
@@ -16,12 +19,12 @@ rust_library(
         "//crates/workspace-core",
         "//crates/workspace-overlay",
     ] + [
-        "@crates//:nfsserve",
         "@crates//:anyhow",
         "@crates//:async-trait",
         "@crates//:blake3",
         "@crates//:clap",
         "@crates//:libc",
+        "@crates//:nfsserve",
         "@crates//:tokio",
     ],
 )
@@ -37,12 +40,12 @@ rust_binary(
         "//crates/workspace-core",
         "//crates/workspace-overlay",
     ] + [
-        "@crates//:nfsserve",
         "@crates//:anyhow",
         "@crates//:async-trait",
         "@crates//:blake3",
         "@crates//:clap",
         "@crates//:libc",
+        "@crates//:nfsserve",
         "@crates//:tokio",
     ],
 )
@@ -69,4 +72,20 @@ fixture_test(
     name = "integration_tests",
     binary = ":integration_tests_binary",
     git = True,
+)
+
+# The actual macOS kernel client, with declared Git and Python subprocesses.
+fixture_test(
+    name = "native_tests",
+    binary = ":git-nfs-bin",
+    binary_env = "GIT_NFS_BIN",
+    exec_compatible_with = ["@platforms//os:macos"],
+    git = True,
+    python = True,
+    script = "scripts/macos-smoke.sh",
+    tags = [
+        "local",
+        "manual",
+    ],
+    target_compatible_with = ["@platforms//os:macos"],
 )

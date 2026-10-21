@@ -69,7 +69,17 @@ def _fixture_test_impl(ctx):
         script += 'export PATH="%s:${PATH}"\n' % tool_dir
     if ctx.attr.git_tool:
         script += 'export GIT_PROXY_TEST_GIT="%s/git"\n' % tool_dir
-    script += 'exec "%s" "$@"\n' % _runfile(binary)
+    if ctx.file.script:
+        if not ctx.attr.binary_env:
+            fail("script fixtures require binary_env")
+        files.append(ctx.file.script)
+
+        # Native mount utilities live in sbin on macOS; do not inherit host PATH.
+        script += 'export PATH="${PATH}:/usr/sbin:/sbin"\n'
+        script += 'export %s="%s"\n' % (ctx.attr.binary_env, _runfile(binary))
+        script += 'exec /bin/sh "%s" "$@"\n' % _runfile(ctx.file.script)
+    else:
+        script += 'exec "%s" "$@"\n' % _runfile(binary)
     ctx.actions.write(launcher, script, is_executable = True)
     return [DefaultInfo(
         executable = launcher,
@@ -80,6 +90,8 @@ _fixture_test = rule(
     implementation = _fixture_test_impl,
     attrs = {
         "binary": attr.label(executable = True, cfg = "target", mandatory = True),
+        "script": attr.label(allow_single_file = True),
+        "binary_env": attr.string(),
         "git_tool": attr.label(executable = True, cfg = "target"),
         "git_http": attr.label(executable = True, cfg = "target"),
         "git_https": attr.label(executable = True, cfg = "target"),

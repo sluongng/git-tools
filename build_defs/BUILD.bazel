@@ -2,3 +2,37 @@ exports_files([
     "reapi_build.rs",
     "git-upstream.patch",
 ])
+
+config_setting(
+    name = "macos_aarch64",
+    constraint_values = [
+        "@platforms//os:macos",
+        "@platforms//cpu:aarch64",
+    ],
+)
+
+config_setting(
+    name = "macos_x86_64",
+    constraint_values = [
+        "@platforms//os:macos",
+        "@platforms//cpu:x86_64",
+    ],
+)
+
+config_setting(
+    name = "windows",
+    constraint_values = ["@platforms//os:windows"],
+)
+
+# Consumers put this label in tools, selecting the execution OS rather than the
+# output binary's target OS when cross-compiling.
+alias(
+    name = "protoc",
+    actual = select({
+        ":macos_aarch64": "@crates//:protoc_macos_aarch64",
+        ":macos_x86_64": "@crates//:protoc_macos_x86_64",
+        ":windows": "@crates//:protoc_windows",
+        "//conditions:default": "@crates//:protoc",
+    }),
+    visibility = ["//visibility:public"],
+)

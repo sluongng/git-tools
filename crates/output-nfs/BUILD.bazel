@@ -1,6 +1,7 @@
 load("@crates//:defs.bzl", "aliases", "all_crate_deps")
 load("@rules_rs//rs:rust_library.bzl", "rust_library")
 load("@rules_rs//rs:rust_test.bzl", "rust_test")
+load("//build_defs:fixture_test.bzl", "fixture_test")
 
 package(default_visibility = ["//visibility:public"])
 
@@ -35,4 +36,20 @@ rust_test(
         normal = True,
         normal_dev = True,
     ),
+)
+
+fixture_test(
+    name = "native_tests",
+    args = [
+        "--ignored",
+        "--exact",
+        "native_publication_and_mutation",
+    ],
+    binary = ":integration_tests",
+    exec_compatible_with = ["@platforms//os:macos"],
+    tags = [
+        "local",
+        "manual",
+    ],
+    target_compatible_with = ["@platforms//os:macos"],
 )

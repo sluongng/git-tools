@@ -8,6 +8,23 @@ bazel_dep(name = "rules_rs", version = "0.1.0")
 bazel_dep(name = "llvm", version = "0.8.25")
 bazel_dep(name = "platforms", version = "1.1.0")
 
+# Git's macOS fsmonitor uses CoreServices and its framework dependencies, outside
+# LLVM's minimal SDK defaults.
+osx = use_extension("@llvm//extensions:osx.bzl", "osx")
+osx.frameworks(names = [
+    "CFNetwork",
+    "CoreFoundation",
+    "CoreServices",
+    "DiskArbitration",
+    "DriverKit",
+    "Foundation",
+    "IOKit",
+    "Kernel",
+    "OSLog",
+    "Security",
+    "SystemConfiguration",
+])
+
 # Declared fixture tools; tests must not depend on the host Git or Python.
 bazel_dep(name = "git", version = "2.55.0")
 
@@ -41,7 +58,12 @@ crate.from_cargo(
     name = "crates",
     cargo_lock = "//:Cargo.lock",
     cargo_toml = "//:Cargo.toml",
-    platform_triples = ["x86_64-unknown-linux-gnu"],
+    platform_triples = [
+        "x86_64-unknown-linux-gnu",
+        "aarch64-apple-darwin",
+        "x86_64-apple-darwin",
+        "x86_64-pc-windows-msvc",
+    ],
 )
 use_repo(crate, "crates")
 
@@ -60,4 +82,19 @@ filegroup(name = "headers", srcs = glob(["include/**"]), visibility = ["//visibi
         "protoc_headers": "headers",
         "protoc_descriptor": "include/google/protobuf/descriptor.proto",
     },
+)
+crate.annotation(
+    additive_build_file_content = 'exports_files(["bin/protoc"])',
+    crate = "protoc-bin-vendored-macos-aarch_64",
+    extra_aliased_targets = {"protoc_macos_aarch64": "bin/protoc"},
+)
+crate.annotation(
+    additive_build_file_content = 'exports_files(["bin/protoc"])',
+    crate = "protoc-bin-vendored-macos-x86_64",
+    extra_aliased_targets = {"protoc_macos_x86_64": "bin/protoc"},
+)
+crate.annotation(
+    additive_build_file_content = 'exports_files(["bin/protoc.exe"])',
+    crate = "protoc-bin-vendored-win32",
+    extra_aliased_targets = {"protoc_windows": "bin/protoc.exe"},
 )

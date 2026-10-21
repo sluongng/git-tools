@@ -27,3 +27,63 @@ Keep a busy NFS server running until unmount succeeds.
 
 Use each crate's native acceptance commands on the actual platform. Linux
 protocol tests or cross-compilation are not substitutes.
+
+## Native Bazel builds and acceptance
+
+Dependency resolution includes Linux x86-64, macOS ARM64/x86-64 and Windows
+x86-64 MSVC. Rust and LLVM versions remain pinned by the repository. The LLVM
+macOS toolchain downloads an Apple SDK; Windows MSVC uses the Microsoft runtime
+and Windows SDK. Cross-compilation is useful build evidence, not native acceptance.
+
+### macOS
+
+Install Bazelisk and use a native macOS terminal. For Apple Silicon:
+
+```sh
+bazel build --platforms=@llvm//platforms:macos_aarch64 \
+  //:git-nfs //:git-output-service
+bazel test --platforms=@llvm//platforms:macos_aarch64 \
+  --extra_execution_platforms=@llvm//platforms:macos_aarch64 \
+  //crates/workspace-nfs:native_tests //crates/output-nfs:native_tests --test_output=all
+```
+
+On Intel Macs replace `macos_aarch64` with `macos_x86_64`. To inspect the output
+acceptance case first, select only `//crates/output-nfs:native_tests` and append
+`--test_arg=--list`; expect `native_publication_and_mutation` (one ignored native
+case). Source acceptance runs the existing smoke script with declared Git/Python
+fixtures and the Bazel-built NFS server. Both checks use the actual macOS kernel
+NFS client; keep the server alive if unmount fails.
+
+### Windows
+
+Use native Windows x86-64, NTFS, Bazelisk and Bazel's required MSYS2 Bash setup.
+Enable the Windows optional feature `Client-ProjFS` before provider acceptance.
+The pinned LLVM MSVC toolchain requires explicit acceptance of the Microsoft
+Visual Studio runtime and Windows SDK licenses. After accepting those licenses,
+set the following repository environment options for each build/test command
+(or in ignored local Bazel configuration):
+
+```text
+--repo_env=BAZEL_MSVC_RUNTIME_VISUAL_STUDIO_EULA=1
+--repo_env=BAZEL_WINDOWS_SDK_EULA=1
+```
+
+Then use PowerShell (the license options above must also be supplied):
+
+```powershell
+bazel build --platforms=@llvm//platforms:windows_x86_64_msvc //:git-projfs //:git-output-service
+$env:OUTPUT_PROJFS_TEST_PYTHON = (Get-Command python).Source
+bazel test --platforms=@llvm//platforms:windows_x86_64_msvc `
+  --extra_execution_platforms=@llvm//platforms:windows_x86_64_msvc `
+  //crates/workspace-projfs:native_tests //crates/output-projfs:native_tests `
+  --test_output=all
+```
+
+Native acceptance intentionally inherits PATH for installed Git/Python and the
+Windows system tools; ordinary portable tests still use declared fixtures.
+Git must be on PATH and Python must be native Python 3. Append
+`--test_arg=--list` before acceptance: expect one source case and three output
+cases, not zero. The source target explicitly enables the `native` feature.
+These manual, Windows-constrained targets run ignored provider tests only and
+are excluded from wildcard test runs. A successful build/list without running
+the cases does not verify ProjFS behavior.

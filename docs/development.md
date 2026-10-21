@@ -3,7 +3,9 @@
 Bazelisk selects the pinned Bazel/Rust/LLVM toolchains. `Cargo.toml` and
 `Cargo.lock` supply dependency metadata to `rules_rs`; native Cargo builds are
 not supported because local dependency patches are applied by Bzlmod.
-The configured Bazel execution target is Linux x86-64.
+The `rbe` configuration executes on Linux x86-64. Native macOS and Windows
+builds use the platform selections in [platforms.md](platforms.md); do not
+combine those native test commands with `--config=rbe`.
 
 ```sh
 bazel build --config=rbe //:workspace
@@ -34,8 +36,7 @@ bazel test --config=rbe \
 ```
 
 Compilation can still run remotely. Native macOS/Windows adapters require a
-binary built for that target; the Linux RBE configuration is not a native
-build recipe. Follow the [platform guides](platforms.md) for NFS/ProjFS;
+binary built for that target and native execution for provider tests. Follow the [platform guides](platforms.md) for NFS/ProjFS;
 cross-compilation and protocol tests do not establish native acceptance.
 Keep development plans, benchmark records and private evidence in ignored
 `dev-notes/`, not user documentation.

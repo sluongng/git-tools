@@ -25,3 +25,30 @@ rust_test(
         normal_dev = True,
     ),
 )
+
+# Uses the actual NTFS provider and external native clients.
+rust_test(
+    name = "native_tests",
+    srcs = ["tests/native.rs"],
+    aliases = aliases(),
+    args = ["--ignored"],
+    compile_data = glob(["tests/support/*.py"]),
+    edition = "2024",
+    env_inherit = [
+        "OUTPUT_PROJFS_TEST_PYTHON",
+        "PATH",
+        "SYSTEMROOT",
+        "TEMP",
+        "TMP",
+    ],
+    exec_compatible_with = ["@platforms//os:windows"],
+    tags = [
+        "local",
+        "manual",
+    ],
+    target_compatible_with = ["@platforms//os:windows"],
+    deps = [":output-projfs"] + all_crate_deps(
+        normal = True,
+        normal_dev = True,
+    ),
+)
