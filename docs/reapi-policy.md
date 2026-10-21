@@ -73,7 +73,10 @@ exhaustion rejects new data before ACK. Delivery is at least once across failure
 
 Defaults: four retries after the first attempt, exponential delays from 1s with
 factor 1.6, 10s connection and 15s lifecycle RPC timeouts. Streaming has no ACK-idle
-timeout because the upstream may ACK only after request EOF. Invalid requests,
+timeout because the upstream may ACK only after request EOF. After terminal EOF,
+`post_half_close_timeout_ms` bounds completion to five minutes per attempt by
+default; `0` disables it. Expiry retries unacknowledged events without deleting
+them. Invalid requests,
 permission failures and failed preconditions stop retries.
 
 Inspect `workspace status`; correct forwarding failures and run `workspace retry-bes`.

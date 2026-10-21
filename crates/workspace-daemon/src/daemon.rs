@@ -573,6 +573,7 @@ pub async fn serve(mut config: Config) -> Result<()> {
                 max_concurrent_forwards: settings.max_concurrent_forwards,
                 connect_timeout_ms: settings.connect_timeout_ms,
                 lifecycle_timeout_ms: settings.lifecycle_timeout_ms,
+                post_half_close_timeout_ms: settings.post_half_close_timeout_ms,
                 retry_initial_delay_ms: settings.retry_initial_delay_ms,
                 retry_max_attempts: settings.retry_max_attempts,
                 tombstone_ttl_seconds: settings.tombstone_ttl_seconds,

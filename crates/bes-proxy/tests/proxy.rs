@@ -36,6 +36,8 @@ struct Backend {
     gate: watch::Sender<bool>,
     failures: Arc<AtomicUsize>,
     partial_failures: Arc<AtomicUsize>,
+    completion_hangs: Arc<AtomicUsize>,
+    header_hangs: Arc<AtomicUsize>,
     bad_ack: bool,
 }
 impl Backend {
@@ -51,6 +53,8 @@ impl Backend {
             gate: watch::channel(allow_ack).0,
             failures: Default::default(),
             partial_failures: Default::default(),
+            completion_hangs: Default::default(),
+            header_hangs: Default::default(),
             bad_ack: false,
         }
     }
@@ -84,6 +88,17 @@ impl PublishBuildEvent for Backend {
         }
         let this = self.clone();
         let mut input = request.into_inner();
+        if this
+            .header_hangs
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+            .is_ok()
+        {
+            while let Some(event) = input.message().await? {
+                this.events.lock().unwrap().push(event);
+            }
+            this.ended.fetch_add(1, Ordering::SeqCst);
+            return std::future::pending().await;
+        }
         Ok(Response::new(Box::pin(async_stream::try_stream! {
             this.read_gate.subscribe().wait_for(|v| *v).await
                 .map(|_| ()).map_err(|_| Status::cancelled("fixture stopped"))?;
@@ -93,6 +108,11 @@ impl PublishBuildEvent for Backend {
                 events.push(event);
             }
             this.ended.fetch_add(1, Ordering::SeqCst);
+            if this.completion_hangs.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1)).is_ok() {
+                let ordered = events[0].ordered_build_event.as_ref().unwrap();
+                yield Ack { stream_id: ordered.stream_id.clone(), sequence_number: ordered.sequence_number };
+                std::future::pending::<()>().await;
+            }
             let mut gate = this.gate.subscribe();
             gate.wait_for(|v| *v).await.map(|_| ()).map_err(|_| Status::cancelled("fixture stopped"))?;
             let fail_after_first = this.partial_failures.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1)).is_ok();
@@ -394,6 +414,7 @@ async fn incomplete_disconnected_stream_does_not_finalize_or_starve_other_builds
     let (url, upstream_task) = backend(state.clone()).await?;
     let mut cfg = config(url);
     cfg.max_concurrent_forwards = 1;
+    cfg.post_half_close_timeout_ms = 100;
     let proxy = BesProxy::open(dir.path().join("bes"), cfg).await?;
     let (mut client, frontend_task) = frontend(proxy.clone()).await?;
     let (tx, rx) = tokio::sync::mpsc::channel(1);
@@ -404,6 +425,11 @@ async fn incomplete_disconnected_stream_does_not_finalize_or_starve_other_builds
         .into_inner();
     assert_eq!(response.message().await?.unwrap().sequence_number, 1);
     wait(|| !state.events.lock().unwrap().is_empty()).await;
+    // An attached request without terminal EOF has no completion deadline,
+    // even though this backend buffers all ACKs until EOF.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(state.attempts.load(Ordering::SeqCst), 1);
+    assert_eq!(proxy.metrics().blocked_streams, 0);
     assert_eq!(state.ended.load(Ordering::SeqCst), 0);
     drop(tx);
     assert!(response.message().await?.is_none());
@@ -521,6 +547,118 @@ async fn retry_exhaustion_retains_events_and_explicit_retry_recovers() -> Result
     proxy.shutdown().await;
     frontend_task.abort();
     upstream_task.abort();
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn completion_timeout_retries_only_unacknowledged_suffix() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let state = Backend::new(false);
+    state.completion_hangs.store(1, Ordering::SeqCst);
+    let (url, upstream_task) = backend(state.clone()).await?;
+    let mut cfg = config(url);
+    cfg.post_half_close_timeout_ms = 1_000;
+    let proxy = BesProxy::open(dir.path().join("bes"), cfg).await?;
+    let (mut client, frontend_task) = frontend(proxy.clone()).await?;
+    assert_eq!(
+        publish(
+            &mut client,
+            vec![
+                event("completion", 1, false),
+                event("completion", 2, false),
+                event("completion", 3, true),
+            ],
+        )
+        .await?
+        .len(),
+        3,
+    );
+    wait(|| proxy.metrics().pending_events == 2).await;
+    wait(|| state.ended.load(Ordering::SeqCst) == 2).await;
+    assert_eq!(proxy.metrics().pending_events, 2);
+    assert!(proxy.metrics().pending_bytes > 0);
+    assert_eq!(proxy.metrics().completed_streams, 0);
+    let sequences = state
+        .events
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|event| event.ordered_build_event.as_ref().unwrap().sequence_number)
+        .collect::<Vec<_>>();
+    assert_eq!(sequences, vec![1, 2, 3, 2, 3]);
+    state.gate.send_replace(true);
+    wait(|| proxy.metrics().pending_events == 0 && proxy.metrics().forwarding_streams == 0).await;
+    assert_eq!(proxy.metrics().completed_streams, 1);
+    assert_eq!(proxy.metrics().blocked_streams, 0);
+    proxy.shutdown().await;
+    frontend_task.abort();
+    upstream_task.abort();
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn completion_timeout_before_headers_retains_events_and_releases_forwarding_slot()
+-> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let state = Backend::new(true);
+    state.header_hangs.store(1, Ordering::SeqCst);
+    let (url, upstream_task) = backend(state.clone()).await?;
+    let mut cfg = config(url);
+    cfg.max_concurrent_forwards = 1;
+    cfg.retry_max_attempts = 0;
+    cfg.post_half_close_timeout_ms = 500;
+    let proxy = BesProxy::open(dir.path().join("bes"), cfg).await?;
+    let (mut client, frontend_task) = frontend(proxy.clone()).await?;
+    assert_eq!(
+        publish(&mut client, vec![event("hung-headers", 1, true)])
+            .await?
+            .len(),
+        1,
+    );
+    wait(|| proxy.metrics().blocked_streams == 1 && proxy.metrics().forwarding_streams == 0).await;
+    assert_eq!(state.ended.load(Ordering::SeqCst), 1);
+    assert_eq!(proxy.metrics().pending_events, 1);
+    assert!(proxy.metrics().pending_bytes > 0);
+    assert_eq!(proxy.metrics().completed_streams, 0);
+    assert_eq!(
+        proxy.metrics().failures.values().collect::<Vec<_>>(),
+        vec!["DeadlineExceeded"],
+    );
+    // The single slot must admit another stream despite the retained backlog.
+    publish(&mut client, vec![event("other", 1, true)]).await?;
+    wait(|| proxy.metrics().completed_streams == 1).await;
+    assert_eq!(proxy.metrics().pending_events, 1);
+    assert_eq!(proxy.retry_blocked().await?, 1);
+    wait(|| proxy.metrics().pending_events == 0 && proxy.metrics().completed_streams == 2).await;
+    assert_eq!(state.attempts.load(Ordering::SeqCst), 3);
+    proxy.shutdown().await;
+    frontend_task.abort();
+    upstream_task.abort();
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn shutdown_cancels_disabled_and_long_completion_waits_without_gc() -> Result<()> {
+    for timeout_ms in [0, 60_000] {
+        let dir = tempfile::tempdir()?;
+        let state = Backend::new(false);
+        let (url, upstream_task) = backend(state.clone()).await?;
+        let mut cfg = config(url);
+        cfg.post_half_close_timeout_ms = timeout_ms;
+        let proxy = BesProxy::open(dir.path().join("bes"), cfg).await?;
+        let (mut client, frontend_task) = frontend(proxy.clone()).await?;
+        publish(&mut client, vec![event("shutdown", 1, true)]).await?;
+        wait(|| state.ended.load(Ordering::SeqCst) == 1).await;
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        assert_eq!(proxy.metrics().forwarding_streams, 1);
+        assert_eq!(proxy.metrics().blocked_streams, 0);
+        tokio::time::timeout(Duration::from_secs(1), proxy.shutdown()).await?;
+        assert_eq!(proxy.metrics().forwarding_streams, 0);
+        assert_eq!(proxy.metrics().pending_events, 1);
+        assert!(proxy.metrics().pending_bytes > 0);
+        frontend_task.abort();
+        upstream_task.abort();
+    }
     Ok(())
 }
 

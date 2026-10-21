@@ -60,6 +60,8 @@ pub struct Bes {
     pub max_concurrent_forwards: usize,
     pub connect_timeout_ms: u64,
     pub lifecycle_timeout_ms: u64,
+    /// Budget after terminal request EOF; zero disables the completion watchdog.
+    pub post_half_close_timeout_ms: u64,
     pub retry_initial_delay_ms: u64,
     pub retry_max_attempts: u32,
     pub tombstone_ttl_seconds: u64,
@@ -80,6 +82,7 @@ impl Default for Bes {
             max_concurrent_forwards: 16,
             connect_timeout_ms: 10000,
             lifecycle_timeout_ms: 15000,
+            post_half_close_timeout_ms: 300000,
             retry_initial_delay_ms: 1000,
             retry_max_attempts: 4,
             tombstone_ttl_seconds: 86400,
@@ -267,6 +270,7 @@ impl Config {
                     && (1..=self.bes.max_streams).contains(&self.bes.max_concurrent_forwards)
                     && (1..=600000).contains(&self.bes.connect_timeout_ms)
                     && (1..=600000).contains(&self.bes.lifecycle_timeout_ms)
+                    && self.bes.post_half_close_timeout_ms <= 604800000
                     && (1..=60000).contains(&self.bes.retry_initial_delay_ms)
                     && self.bes.retry_max_attempts <= 20
                     && (1..=1024).contains(&self.bes.batch_max_events)
@@ -343,6 +347,8 @@ batch_max_delay_ms = 0
 # Bazel-compatible retry defaults (four retries after the first attempt).
 connect_timeout_ms = 10000
 lifecycle_timeout_ms = 15000
+# Allow EOF-buffered ACKs; bound the final upstream wait. Zero disables it.
+post_half_close_timeout_ms = 300000
 retry_initial_delay_ms = 1000
 retry_max_attempts = 4
 
@@ -395,9 +401,18 @@ mod tests {
         assert!(config.session.remote_repo_contents_cache);
         assert!(config.bes.enabled);
         assert_eq!(config.bes.retry_max_attempts, 4);
+        assert_eq!(config.bes.post_half_close_timeout_ms, 300000);
         assert_eq!(config.bes.batch_max_events, 64);
         assert_eq!(config.bes.batch_max_bytes, 262144);
         assert_eq!(config.bes.batch_max_delay_ms, 0);
+        let mut watchdog = config.clone();
+        watchdog.bes.post_half_close_timeout_ms = 0;
+        assert!(
+            watchdog.validate().is_ok(),
+            "completion watchdog may be disabled"
+        );
+        watchdog.bes.post_half_close_timeout_ms = 604800001;
+        assert!(watchdog.validate().is_err(), "completion budget is bounded");
     }
     #[test]
     fn cache_rpc_connection_limit_accepts_overrides_and_rejects_invalid_bounds() {

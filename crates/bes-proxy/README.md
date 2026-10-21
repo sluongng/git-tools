@@ -11,5 +11,10 @@ streams wait for reconnection. Exhausted retries retain the backlog for
 
 Configure batching, limits and upstream settings in [`[bes]`](../../examples/workspace.toml).
 Setting `batch_max_events = 1` disables grouping, not durability.
+`post_half_close_timeout_ms` bounds each forwarding attempt's upstream completion
+wait after request EOF (default five minutes; `0` disables; maximum seven days).
+It covers response headers and final ACKs/EOF, not ACK inactivity while sending,
+so upstreams may buffer ACKs until EOF. Expiry uses normal suffix retry; exhausted
+retries release the forwarding slot and retain unacknowledged data for retry.
 See [retry/timeout policy](../../docs/reapi-policy.md).
 This is a BuildBuddy-targeted relay, not a generic lifecycle-ordering gateway.

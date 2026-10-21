@@ -40,6 +40,9 @@ pub struct Config {
     pub max_concurrent_forwards: usize,
     pub connect_timeout_ms: u64,
     pub lifecycle_timeout_ms: u64,
+    /// Per-attempt completion budget starting at request EOF, not ACK inactivity.
+    /// Zero disables it for upstreams with unbounded finalization latency.
+    pub post_half_close_timeout_ms: u64,
     pub retry_initial_delay_ms: u64,
     /// Number of retries after the first RPC, matching --bes_upload_max_retries.
     pub retry_max_attempts: u32,
@@ -63,6 +66,7 @@ impl Default for Config {
             max_concurrent_forwards: 16,
             connect_timeout_ms: 10_000,
             lifecycle_timeout_ms: 15_000,
+            post_half_close_timeout_ms: 300_000,
             retry_initial_delay_ms: 1_000,
             retry_max_attempts: 4,
             tombstone_ttl_seconds: 86_400,
@@ -95,6 +99,7 @@ impl Config {
         ensure!(
             self.connect_timeout_ms > 0
                 && self.lifecycle_timeout_ms > 0
+                && self.post_half_close_timeout_ms <= 604_800_000
                 && self.retry_initial_delay_ms > 0
                 && self.retry_max_attempts <= 100,
             "invalid BES timeout/retry policy"
@@ -658,6 +663,27 @@ async fn relay_once(inner: Arc<Inner>, id: String) -> Result<(), Status> {
     let _errors_keepalive = errors_tx.clone();
     let send_inner = inner.clone();
     let send_id = id.clone();
+    let (half_closed_tx, half_closed_rx) = tokio::sync::oneshot::channel();
+    // Start one absolute timer at EOF, including time waiting for response
+    // headers. Never impose an ACK-idle timeout on an open request stream:
+    // upstreams may legitimately buffer every ACK until the terminal EOF.
+    let completion = async {
+        if inner.config.post_half_close_timeout_ms == 0 {
+            return std::future::pending::<Status>().await;
+        }
+        if let Ok(at) = half_closed_rx.await {
+            tokio::time::sleep_until(
+                at + Duration::from_millis(inner.config.post_half_close_timeout_ms),
+            )
+            .await;
+            Status::deadline_exceeded("BES post-half-close completion deadline exceeded")
+        } else {
+            // Sender cancellation/storage failure is handled by the existing
+            // ingress/error paths, not by manufacturing a clean half-close.
+            std::future::pending().await
+        }
+    };
+    tokio::pin!(completion);
     let outgoing = async_stream::stream! {
         let mut sequence = start;
         loop {
@@ -671,7 +697,10 @@ async fn relay_once(inner: Arc<Inner>, id: String) -> Result<(), Status> {
                     sent_stream.store(sequence, Ordering::SeqCst);
                     yield event;
                     sequence += 1;
-                    if terminal { break; }
+                    if terminal {
+                        let _ = half_closed_tx.send(tokio::time::Instant::now());
+                        break;
+                    }
                 }
                 Ok(None) => notified.await,
                 Err(error) => {
@@ -687,12 +716,14 @@ async fn relay_once(inner: Arc<Inner>, id: String) -> Result<(), Status> {
         result = client.publish_build_tool_event_stream(request(&inner, outgoing, state.attribution.as_deref())) => result?,
         error = errors_rx.recv() => return Err(error.unwrap_or_else(|| Status::internal("BES sender stopped"))),
         error = &mut detached => return Err(error),
+        error = &mut completion => return Err(error),
     };
     let mut responses = response.into_inner();
     loop {
         let ack = tokio::select! {
             response = responses.message() => response?,
             error = &mut detached => return Err(error),
+            error = &mut completion => return Err(error),
             error = errors_rx.recv() => {
                 if let Some(error) = error { return Err(error); }
                 // A successful terminal send drops the error channel.
