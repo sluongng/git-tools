@@ -186,8 +186,10 @@ fn failed_mount_is_resumable_without_reclone_and_stop_preserves_private_state() 
         temp.path(),
         "vfs",
         &format!(
-            "#!/bin/sh\nset -eu\ngit=$2\nshift 2\ncase \"$1\" in\nclone) shift; shift 4; \"$git\" clone --bare -- '{}' \"$2\" ;;\nwarm-blake3) exit 0 ;;\nmount) if test -f '{}'; then exec sleep 30; fi; exit 23 ;;\n*) exit 44 ;;\nesac\n",
+            "#!/bin/sh\nset -eu\ngit=$2\nshift 2\ncase \"$1\" in\nclone) shift; shift 4; \"$git\" clone --bare -- '{}' \"$2\" ;;\nwarm-blake3) exit 0 ;;\nmount) if test -f '{}'; then sleep \"$(cat '{}')\"; exec sleep 30; fi; if test -f '{}'; then exec sleep 30; fi; exit 23 ;;\n*) exit 44 ;;\nesac\n",
             source.display(),
+            temp.path().join("delayed-exec").display(),
+            temp.path().join("delayed-exec").display(),
             temp.path().join("inject-startup-failure").display()
         ),
     );
@@ -256,6 +258,44 @@ fn failed_mount_is_resumable_without_reclone_and_stop_preserves_private_state() 
         "user edit"
     );
     assert!(root.join("overlay/git/index").exists());
+
+    // Exercise exec both before and after the readiness timeout. The second
+    // iteration also proves a stopped session can restart without recloning.
+    for delay in ["0.3", "1.3"] {
+        fs::write(temp.path().join("delayed-exec"), delay).unwrap();
+        let error = resume(&root).unwrap_err().to_string();
+        assert!(error.contains("mount readiness timed out"), "{error}");
+        let durable: serde_json::Value =
+            serde_json::from_slice(&fs::read(root.join("session.json")).unwrap()).unwrap();
+        let owned = PinnedProcess::from_receipt(&durable["mount"]);
+        let original_exe = PathBuf::from(durable["mount"]["executable"].as_str().unwrap());
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while fs::read_link(format!("/proc/{}/exe", owned.pid)).unwrap() == original_exe {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "launcher did not exec"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(status(&root).unwrap().process_verified);
+        assert!(
+            resume(&root)
+                .unwrap_err()
+                .to_string()
+                .contains("still alive")
+        );
+        let stopped = stop(&root);
+        assert!(
+            owned.exited(),
+            "stop abandoned its live delayed-exec child: {stopped:?}"
+        );
+        assert_eq!(stopped.unwrap().phase, "stopped");
+        let durable: serde_json::Value =
+            serde_json::from_slice(&fs::read(root.join("session.json")).unwrap()).unwrap();
+        assert!(durable["mount"].is_null());
+        assert!(root.join("repo.git/reclone-sentinel").exists());
+    }
+    fs::remove_file(temp.path().join("delayed-exec")).unwrap();
 
     // Force only the ownership-bearing manifest write to exceed RLIMIT_FSIZE.
     // Earlier null-mount phase writes fit; the larger process record does not.
@@ -430,7 +470,8 @@ fn owned_process_stop_signals_only_verified_child() {
     let manifest = serde_json::json!({
         "version":1, "session_root": root,
         "settings": { "proxy_url":"http://host", "proxy_repo":"repo", "reference":"main", "revision":"a".repeat(40), "bazelrc":"/rc", "git_vfs":"/vfs", "git":"/git", "bazel":"/bazel", "mount_timeout_seconds":1 },
-        "phase":"mounting", "mount": { "pid":pid, "start_ticks":start_ticks, "executable":executable }
+        "phase":"mounting", "mount": { "pid":pid, "start_ticks":start_ticks, "executable":executable,
+            "boot_id":fs::read_to_string("/proc/sys/kernel/random/boot_id").unwrap().trim() }
     });
     fs::write(
         temp.path().join("session.json"),
@@ -450,6 +491,53 @@ fn owned_process_stop_signals_only_verified_child() {
         child.try_wait().unwrap().is_none(),
         "copied manifest signalled original process"
     );
+    for (field, mismatch) in [
+        ("boot_id", serde_json::json!("different-boot")),
+        ("start_ticks", serde_json::json!(start_ticks + 1)),
+    ] {
+        let mut stale = manifest.clone();
+        stale["mount"][field] = mismatch;
+        fs::write(
+            root.join("session.json"),
+            serde_json::to_vec(&stale).unwrap(),
+        )
+        .unwrap();
+        assert!(!status(root).unwrap().process_verified);
+        assert_eq!(stop(root).unwrap().phase, "stopped");
+        assert!(
+            child.try_wait().unwrap().is_none(),
+            "stale {field} was signalled"
+        );
+    }
+    // Legacy receipts cannot prove which boot created the PID/start pair.
+    // Retain the live receipt, do not signal or silently replace its process.
+    let mut legacy = manifest.clone();
+    legacy["mount"].as_object_mut().unwrap().remove("boot_id");
+    fs::write(
+        root.join("session.json"),
+        serde_json::to_vec(&legacy).unwrap(),
+    )
+    .unwrap();
+    assert!(!status(root).unwrap().process_verified);
+    let refused = stop(root).unwrap_err().to_string();
+    assert!(refused.contains("lacks boot identity"), "{refused}");
+    assert!(
+        resume(root)
+            .unwrap_err()
+            .to_string()
+            .contains("still alive")
+    );
+    assert!(child.try_wait().unwrap().is_none());
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&fs::read(root.join("session.json")).unwrap())
+            .unwrap(),
+        legacy
+    );
+    fs::write(
+        root.join("session.json"),
+        serde_json::to_vec(&manifest).unwrap(),
+    )
+    .unwrap();
     let result = stop(temp.path());
     // Always reap on assertion failure too, so failed validation cannot leak a fixture.
     if result.is_err() {
@@ -574,4 +662,65 @@ fn startup_persistence_failure_fixture() {
         "{error}"
     );
     fs::write(root.join("startup-failure-receipt"), error).unwrap();
+}
+
+// Cleanup uses only a pidfd acquired and revalidated against this fixture's
+// durable birth identity. Never signal a numeric PID loaded from a stale file.
+struct PinnedProcess {
+    pid: u32,
+    fd: std::os::fd::OwnedFd,
+}
+
+impl PinnedProcess {
+    fn from_receipt(receipt: &serde_json::Value) -> Self {
+        use std::os::fd::FromRawFd;
+        let pid = receipt["pid"].as_u64().unwrap() as u32;
+        let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) };
+        assert!(fd >= 0, "pidfd_open: {}", std::io::Error::last_os_error());
+        let fd = unsafe { std::os::fd::OwnedFd::from_raw_fd(fd as i32) };
+        let stat = fs::read_to_string(format!("/proc/{pid}/stat")).unwrap();
+        assert_eq!(
+            stat.rsplit_once(") ")
+                .unwrap()
+                .1
+                .split_whitespace()
+                .nth(19)
+                .unwrap()
+                .parse::<u64>()
+                .unwrap(),
+            receipt["start_ticks"].as_u64().unwrap()
+        );
+        assert_eq!(
+            fs::read_to_string("/proc/sys/kernel/random/boot_id")
+                .unwrap()
+                .trim(),
+            receipt["boot_id"].as_str().unwrap()
+        );
+        Self { pid, fd }
+    }
+
+    fn exited(&self) -> bool {
+        use std::os::fd::AsRawFd;
+        let mut event = libc::pollfd {
+            fd: self.fd.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        unsafe { libc::poll(&mut event, 1, 1000) > 0 && event.revents & libc::POLLIN != 0 }
+    }
+}
+
+impl Drop for PinnedProcess {
+    fn drop(&mut self) {
+        use std::os::fd::AsRawFd;
+        unsafe {
+            libc::syscall(
+                libc::SYS_pidfd_send_signal,
+                self.fd.as_raw_fd(),
+                libc::SIGKILL,
+                std::ptr::null::<libc::siginfo_t>(),
+                0,
+            );
+        }
+    }
 }

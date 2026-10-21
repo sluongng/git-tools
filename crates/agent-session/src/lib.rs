@@ -64,7 +64,10 @@ fn remote_repo_contents_cache_default() -> bool {
 struct Process {
     pid: u32,
     start_ticks: u64,
+    // Diagnostic only: a launcher may exec without ending its process lifetime.
     executable: PathBuf,
+    #[serde(default)]
+    boot_id: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -473,7 +476,13 @@ impl Session {
             return self.persist();
         }
         ensure!(
-            !self.manifest.mount.as_ref().is_some_and(process_matches),
+            !self
+                .manifest
+                .mount
+                .as_ref()
+                .map(process_alive)
+                .transpose()?
+                .unwrap_or(false),
             "previous VFS process is still alive without a mount; stop it before resume"
         );
         ensure!(
@@ -584,8 +593,9 @@ impl Session {
         if let Err(error) = ownership {
             return Err(pending.startup_failed(error));
         }
-        // Ownership is now durable. Later readiness failures intentionally leave
-        // the process available to the normal verified stop/resume workflow.
+        // Boot ID and start ticks identify this direct child's lifetime across
+        // exec, including exec after this operation returns. Ownership is now
+        // durable, so readiness failures leave it for verified stop/resume.
         let mut child = pending.child.take().expect("durable VFS child");
         loop {
             if let Some(status) = child.try_wait()? {
@@ -925,24 +935,25 @@ fn stop_inner(root: &Path, controller: Option<&dyn MountController>) -> Result<R
         session
             .timings
             .push(("vfs_shutdown".into(), started.elapsed().as_millis()));
-    } else if let Some(process) = session
-        .manifest
-        .mount
-        .as_ref()
-        .filter(|p| process_matches(p))
-    {
-        signal_owned(process)?;
-        let started = Instant::now();
-        while process_matches(process) || mounted(&session.root.join("workspace"))? {
+    } else if let Some(process) = session.manifest.mount.as_ref() {
+        if process_alive(process)? {
             ensure!(
-                started.elapsed() < Duration::from_secs(30),
-                "VFS shutdown timed out; state retained; no forced kill attempted"
+                process.boot_id.is_some(),
+                "live VFS receipt lacks boot identity; state retained; manual recovery required (no signal attempted)"
             );
-            std::thread::sleep(Duration::from_millis(50));
+            signal_owned(process)?;
+            let started = Instant::now();
+            while process_alive(process)? || mounted(&session.root.join("workspace"))? {
+                ensure!(
+                    started.elapsed() < Duration::from_secs(30),
+                    "VFS shutdown timed out; state retained; no forced kill attempted"
+                );
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            session
+                .timings
+                .push(("vfs_shutdown".into(), started.elapsed().as_millis()));
         }
-        session
-            .timings
-            .push(("vfs_shutdown".into(), started.elapsed().as_millis()));
     }
     ensure!(
         !mounted(&session.root.join("workspace"))?,
@@ -956,33 +967,68 @@ fn stop_inner(root: &Path, controller: Option<&dyn MountController>) -> Result<R
 }
 
 #[cfg(target_os = "linux")]
-fn process_identity(pid: u32) -> Result<Process> {
-    let stat = fs::read_to_string(format!("/proc/{pid}/stat"))?;
+fn process_start(pid: u32) -> Result<Option<u64>> {
+    let stat = match fs::read_to_string(format!("/proc/{pid}/stat")) {
+        Ok(stat) => stat,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error).context("reading VFS process identity"),
+    };
     let fields: Vec<_> = stat
         .rsplit_once(") ")
         .context("invalid process stat")?
         .1
         .split_whitespace()
         .collect();
-    ensure!(fields.first().copied() != Some("Z"), "process is a zombie");
-    let start_ticks = fields
-        .get(19)
-        .context("missing process start time")?
-        .parse()?;
+    if fields.first().copied() == Some("Z") {
+        return Ok(None);
+    }
+    Ok(Some(
+        fields
+            .get(19)
+            .context("missing process start time")?
+            .parse()?,
+    ))
+}
+
+#[cfg(target_os = "linux")]
+fn boot_id() -> Result<String> {
+    let id = fs::read_to_string("/proc/sys/kernel/random/boot_id")?;
+    ensure!(!id.trim().is_empty(), "missing boot identity");
+    Ok(id.trim().to_owned())
+}
+
+#[cfg(target_os = "linux")]
+fn process_identity(pid: u32) -> Result<Process> {
     Ok(Process {
         pid,
-        start_ticks,
+        start_ticks: process_start(pid)?.context("process exited")?,
         executable: fs::read_link(format!("/proc/{pid}/exe"))?,
+        boot_id: Some(boot_id()?),
     })
 }
 #[cfg(not(target_os = "linux"))]
 fn process_identity(_: u32) -> Result<Process> {
     bail!("Linux only")
 }
+
+// A missing boot identity cannot authorize a signal, but a live legacy receipt
+// must still block replacement/receipt deletion until explicitly recovered.
+#[cfg(target_os = "linux")]
+fn process_alive(process: &Process) -> Result<bool> {
+    if let Some(recorded) = &process.boot_id {
+        if *recorded != boot_id()? {
+            return Ok(false);
+        }
+    }
+    Ok(process_start(process.pid)? == Some(process.start_ticks))
+}
+#[cfg(not(target_os = "linux"))]
+fn process_alive(_: &Process) -> Result<bool> {
+    bail!("Linux only")
+}
+
 fn process_matches(process: &Process) -> bool {
-    process_identity(process.pid).is_ok_and(|current| {
-        current.start_ticks == process.start_ticks && current.executable == process.executable
-    })
+    process.boot_id.is_some() && process_alive(process).unwrap_or(false)
 }
 
 #[cfg(target_os = "linux")]

@@ -28,7 +28,9 @@ checkout/merge/rebase is unsupported. Stop/resume preserves edits and commits;
 never delete overlay state as cache cleanup. Keep outputs outside the source mount.
 
 Commands return JSON; subprocess output goes to stderr. Operations lock the
-session, and stop signals only the verified owned process. For a failed create,
-use a fresh directory rather than overwrite retained state. NFS/ProjFS session
+session, and stop signals only the verified owned process, including across launcher
+`exec` transitions. A live legacy receipt without a boot identity requires manual
+recovery; stop/resume retain it without signalling or replacing the process.
+For a failed create, use a fresh directory rather than overwrite retained state. NFS/ProjFS session
 orchestration is not implemented. See [platform support](../../docs/platforms.md)
 and the [cloud-agent workflow](../../examples/skills/cloud-bazel-agent/SKILL.md).
