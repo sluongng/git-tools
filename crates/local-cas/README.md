@@ -15,6 +15,8 @@ source mounts, BOS, Git uploads and its REAPI cache front end.
   reader's admitted fetch. Concurrency, byte and timeout budgets are configurable.
 - `cached_content` returns a verified lease or a miss without creating/joining a
   fetch. Use it for local-only probes so their misses cannot fail another source.
+  `cached_content_for_maintenance` also suppresses user-access notifications, so
+  background uploads cannot keep themselves eligible for further maintenance.
 - Keys include backend authorization scope, instance, digest function, hash and
   size. Callers must give distinct backend identities to distinct auth scopes.
 - One owner holds the cache directory lock, including outstanding leases and

@@ -23,7 +23,7 @@ impl BlobSource for Source {
     async fn missing(&self, _: &[Artifact]) -> Result<Vec<Artifact>> {
         Ok(vec![])
     }
-    fn accessed(&self, _: &Artifact) {
+    fn accessed(&self, _: &Artifact, _: Weak<LocalCas>) {
         self.accesses.fetch_add(1, Ordering::Relaxed);
     }
 }
@@ -448,9 +448,89 @@ async fn source_override_survives_cancelled_waiter_and_coalesces_without_default
             .unwrap(),
     );
     assert_eq!(default_source.accesses.load(Ordering::Relaxed), 2);
+    drop(
+        cache
+            .clone()
+            .cached_content_for_maintenance(
+                artifact(b"aaaa"),
+                tokio::time::Instant::now() + Duration::from_secs(1),
+            )
+            .await
+            .unwrap(),
+    );
+    assert_eq!(
+        default_source.accesses.load(Ordering::Relaxed),
+        2,
+        "background verification cannot manufacture another user access"
+    );
 }
 
 struct FailedSource;
+#[test]
+fn maintenance_verification_has_separate_admission_and_stops_when_cancelled() {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .max_blocking_threads(1)
+        .enable_all()
+        .build()
+        .unwrap();
+    runtime.block_on(async {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = LocalCas::open(
+            dir.path(),
+            Arc::new(Source::default()),
+            CacheConfig {
+                max_concurrent_fetches: 1,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let a = bytes(&cache, b"aaaa").await;
+        let path = a.path().to_owned();
+        drop(a);
+        drop(bytes(&cache, b"bbbb").await);
+        let before = cache.metrics().verification_bytes;
+        std::fs::write(path, b"aaaa").unwrap();
+        let (entered, started) = tokio::sync::oneshot::channel();
+        let (release, wait) = std::sync::mpsc::channel();
+        let blocker = tokio::task::spawn_blocking(move || {
+            entered.send(()).unwrap();
+            wait.recv().unwrap();
+        });
+        started.await.unwrap();
+        // Poll until verification is queued behind the deliberately occupied
+        // blocking lane. The resident cache file has a changed fingerprint.
+        let mut maintenance = Box::pin(cache.clone().cached_content_for_maintenance(
+            artifact(b"aaaa"),
+            tokio::time::Instant::now() + Duration::from_secs(1),
+        ));
+        std::future::poll_fn(|cx| {
+            assert!(std::future::Future::poll(maintenance.as_mut(), cx).is_pending());
+            std::task::Poll::Ready(())
+        })
+        .await;
+        let foreground = tokio::time::timeout(
+            Duration::from_millis(200),
+            cache.clone().cached_content(artifact(b"bbbb")),
+        )
+        .await;
+        drop(maintenance);
+        release.send(()).unwrap();
+        blocker.await.unwrap();
+        cache.wait_for_idle().await.unwrap();
+        assert!(
+            foreground
+                .expect("maintenance must not own the foreground admission slot")
+                .unwrap()
+                .is_some()
+        );
+        assert_eq!(
+            cache.metrics().verification_bytes,
+            before,
+            "cancelled queued verification must not hash the file after it starts"
+        );
+    });
+}
 #[async_trait]
 impl BlobSource for FailedSource {
     async fn fetch(&self, _: &Artifact, target: &mut File) -> Result<()> {

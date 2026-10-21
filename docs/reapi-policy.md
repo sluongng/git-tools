@@ -145,11 +145,20 @@ budget (also capped by the configured background budget and retention headroom).
 No foreground read waits for it. AC renewal checks direct outputs, stdout/stderr,
 Tree contents and Directory closure, downloading bounded metadata only. CAS hits
 notify the worker even through a per-read source override, including lazy BOS.
-No output payload is eagerly fetched or pinned against local LRU eviction.
+No output payload is eagerly fetched. If upstream reports a locally used CAS blob
+missing, the worker verifies and streams resident bytes back using the same
+background connection. It never hydrates an evicted local blob. Only an active
+upload holds a lease; queued work does not pin bytes against LRU eviction.
+Resident-byte re-verification has a separate single-slot admission lane and
+inherits the repair deadline; cancellation stops hashing between file-read chunks.
 
 Only successful upstream confirmation renews timestamps. Failures preserve the
 old expiry; missing outputs invalidate cached AC metadata, not verified local
-bytes. Refresh is not repair, and cannot restore an evicted remote object. The
+bytes. Missing CAS blobs can be repaired from verified resident bytes, but missing
+AC metadata is not republished. Uploads support zstd with identity fallback and
+bounded retries; repair batches use the configured background timeout, capped by
+retention headroom. Failed or mismatched upload acknowledgements do not advance
+confirmation. Maintenance reads do not generate new user-access notifications. The
 bounded hot set is in memory; restart begins with unknown remote retention.
 The worker is cancelled on shutdown. REAPI defines no standard cache-RPC urgency
 field: low priority is local scheduling, not a server-priority guarantee.

@@ -3,6 +3,7 @@
 mod asset;
 mod download;
 mod execution;
+mod repair;
 mod retention;
 
 use anyhow::{Context, Result, ensure};
@@ -198,6 +199,7 @@ enum RpcMethod {
     FetchDirectory,
     GetActionResult,
     FindMissingBlobs,
+    WriteByteStream,
 }
 impl Upstream {
     fn send_gzip(&self, method: RpcMethod) -> bool {
@@ -459,8 +461,8 @@ impl BlobSource for Upstream {
     fn verified(&self, artifact: &Artifact, started: Instant) {
         self.retention.confirm(artifact, started, true);
     }
-    fn accessed(&self, artifact: &Artifact) {
-        self.retention.accessed(artifact);
+    fn accessed(&self, artifact: &Artifact, cache: std::sync::Weak<LocalCas>) {
+        self.retention.accessed(artifact, cache);
     }
     async fn missing(&self, artifacts: &[Artifact]) -> Result<Vec<Artifact>> {
         if artifacts.is_empty() {
@@ -531,6 +533,11 @@ impl CacheProxy {
         self.stop.send_replace(true);
         self.upstream.retention.stop();
     }
+    /// After `stop_forwarding`, wait for maintenance futures and their upload
+    /// leases to drop. Then `LocalCas::wait_for_idle` drains blocking verification.
+    pub async fn wait_for_maintenance_shutdown(&self) {
+        self.upstream.retention.wait_stopped().await;
+    }
     pub fn metrics(&self) -> ProxyMetrics {
         ProxyMetrics {
             action_cache_hits: self.metrics.ac_hits.load(Ordering::Relaxed),
@@ -567,6 +574,7 @@ impl CacheProxy {
                 async move {
                     shutdown.await;
                     stopping.stop_forwarding();
+                    stopping.wait_for_maintenance_shutdown().await;
                 },
             )
             .await?;
@@ -587,6 +595,7 @@ impl CacheProxy {
                 async move {
                     shutdown.await;
                     stopping.stop_forwarding();
+                    stopping.wait_for_maintenance_shutdown().await;
                 },
             )
             .await?;

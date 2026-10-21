@@ -81,7 +81,7 @@ pub trait BlobSource: Send + Sync {
     async fn missing(&self, artifacts: &[Artifact]) -> Result<Vec<Artifact>>;
     /// Best-effort notification after a verified local read. Implementations
     /// must not block or treat this as evidence of upstream presence.
-    fn accessed(&self, _artifact: &Artifact) {}
+    fn accessed(&self, _artifact: &Artifact, _cache: Weak<LocalCas>) {}
     /// Called on the fetch source only after full hash/size verification and
     /// publication. An unused per-request source receives no confirmation.
     fn verified(&self, _artifact: &Artifact, _fetch_started: std::time::Instant) {}
@@ -141,7 +141,11 @@ fn hash_file_until(
     path: &Path,
     function: i32,
     deadline: Option<tokio::time::Instant>,
+    cancelled: &AtomicBool,
 ) -> Result<(String, u64)> {
+    if cancelled.load(Ordering::Acquire) {
+        return Err(CacheTimeoutError.into());
+    }
     let mut file = File::open(path)?;
     let mut sha = Sha256::new();
     let mut blake = blake3::Hasher::new();
@@ -151,7 +155,9 @@ fn hash_file_until(
     loop {
         // Blocking OS reads cannot be preempted, but an expired verification
         // must stop between chunks rather than continue detached over the file.
-        if deadline.is_some_and(|d| tokio::time::Instant::now() >= d) {
+        if cancelled.load(Ordering::Acquire)
+            || deadline.is_some_and(|d| tokio::time::Instant::now() >= d)
+        {
             return Err(CacheTimeoutError.into());
         }
         let n = file.read(&mut buf)?;
@@ -382,12 +388,19 @@ impl Drop for DirectoryOwnership {
         let _ = self.0.unlock();
     }
 }
+struct CancelVerification(Arc<AtomicBool>);
+impl Drop for CancelVerification {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::Release);
+    }
+}
 pub struct LocalCas {
     dir: PathBuf,
     _ownership: DirectoryOwnership,
     source: Arc<dyn BlobSource>,
     config: CacheConfig,
     requests: Arc<Semaphore>,
+    maintenance_requests: Arc<Semaphore>,
     bytes: Semaphore,
     byte_units: u32,
     oversized_bytes: Semaphore,
@@ -529,6 +542,7 @@ impl LocalCas {
             _ownership: ownership,
             source,
             requests: Arc::new(Semaphore::new(config.max_concurrent_fetches)),
+            maintenance_requests: Arc::new(Semaphore::new(1)),
             bytes: Semaphore::new(byte_units as usize),
             byte_units,
             oversized_bytes: Semaphore::new(oversized_byte_units as usize),
@@ -579,6 +593,12 @@ impl LocalCas {
             .requests
             .clone()
             .acquire_many_owned(self.config.max_concurrent_fetches as u32)
+            .await
+            .context("cache shutting down")?;
+        let _maintenance = self
+            .maintenance_requests
+            .clone()
+            .acquire_owned()
             .await
             .context("cache shutting down")?;
         Ok(())
@@ -715,7 +735,7 @@ impl LocalCas {
                 }
             };
         if result.is_ok() {
-            self.source.accessed(&observed);
+            self.source.accessed(&observed, Arc::downgrade(&self));
         }
         result
     }
@@ -869,8 +889,10 @@ impl LocalCas {
         // Tuple fields drop left-to-right, including during unwinding: cache
         // ownership ends before this verifier releases its request-slot clone.
         let ownership = (self.clone(), request);
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let _cancel = CancelVerification(cancelled.clone());
         let result = tokio::task::spawn_blocking(move || {
-            let result = hash_file_until(&path, function, Some(deadline));
+            let result = hash_file_until(&path, function, Some(deadline), &cancelled);
             drop(ownership);
             result
         })
@@ -887,12 +909,40 @@ impl LocalCas {
         self: Arc<Self>,
         artifact: Artifact,
     ) -> Result<Option<Arc<CachedBlob>>> {
-        artifact.validate()?;
         let deadline = tokio::time::Instant::now() + self.config.operation_timeout;
-        let result = tokio::time::timeout_at(deadline, async {
+        let result = self
+            .clone()
+            .cached_content_admitted(artifact.clone(), self.requests.clone(), deadline)
+            .await;
+        if result.as_ref().is_ok_and(|blob| blob.is_some()) {
+            self.source.accessed(&artifact, Arc::downgrade(&self));
+        }
+        result
+    }
+    /// Verify and lease resident bytes without hydration or a user-access
+    /// notification. Background uploads must not manufacture new retention use.
+    /// A separate single-slot lane preserves foreground admission. The caller's
+    /// deadline includes admission and cancellable verification.
+    pub async fn cached_content_for_maintenance(
+        self: Arc<Self>,
+        artifact: Artifact,
+        deadline: tokio::time::Instant,
+    ) -> Result<Option<Arc<CachedBlob>>> {
+        let deadline = deadline.min(tokio::time::Instant::now() + self.config.operation_timeout);
+        let admission = self.maintenance_requests.clone();
+        self.cached_content_admitted(artifact, admission, deadline)
+            .await
+    }
+    async fn cached_content_admitted(
+        self: Arc<Self>,
+        artifact: Artifact,
+        admission: Arc<Semaphore>,
+        deadline: tokio::time::Instant,
+    ) -> Result<Option<Arc<CachedBlob>>> {
+        artifact.validate()?;
+        tokio::time::timeout_at(deadline, async {
             let request = Arc::new(
-                self.requests
-                    .clone()
+                admission
                     .acquire_owned()
                     .await
                     .context("cache shutting down")?,
@@ -902,11 +952,7 @@ impl LocalCas {
                 .await
         })
         .await
-        .map_err(|_| anyhow::Error::from(CacheTimeoutError))?;
-        if result.as_ref().is_ok_and(|blob| blob.is_some()) {
-            self.source.accessed(&artifact);
-        }
-        result
+        .map_err(|_| anyhow::Error::from(CacheTimeoutError))?
     }
     async fn cached_inner(
         self: Arc<Self>,

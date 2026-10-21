@@ -1,5 +1,5 @@
 //! Best-effort retention touches, never a substitute for authoritative presence.
-//! One bounded worker has its own connection and never holds local blob leases.
+//! One bounded worker has its own connection; leases exist only during repairs.
 use super::*;
 use std::{collections::HashSet, sync::Weak};
 use tokio::sync::{Notify, watch};
@@ -14,12 +14,20 @@ struct ActionWork {
     generation: u64,
     refresh_metadata: bool,
 }
+struct WorkerFinished(watch::Sender<bool>);
+impl Drop for WorkerFinished {
+    fn drop(&mut self) {
+        self.0.send_replace(true);
+    }
+}
 
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Metrics {
     pub action_refreshes: u64,
     pub output_refreshes: u64,
     pub blob_refreshes: u64,
+    pub blob_repairs: u64,
+    pub blob_repair_failures: u64,
     pub failures: u64,
     pub missing_blobs: u64,
     pub dropped: u64,
@@ -29,6 +37,8 @@ struct Counters {
     actions: AtomicU64,
     outputs: AtomicU64,
     blobs: AtomicU64,
+    repairs: AtomicU64,
+    repair_failures: AtomicU64,
     failures: AtomicU64,
     missing: AtomicU64,
     dropped: AtomicU64,
@@ -56,6 +66,7 @@ struct Touch {
     attempted: Option<Instant>,
     used: bool,
     busy: bool,
+    cache: Weak<LocalCas>,
 }
 pub(super) struct Retention {
     owner: Weak<Upstream>,
@@ -63,6 +74,7 @@ pub(super) struct Retention {
     blobs: Mutex<HashMap<Artifact, Touch>>,
     notify: Notify,
     stop: watch::Sender<bool>,
+    finished: watch::Sender<bool>,
     enabled: bool,
     interval: Duration,
     window: Duration,
@@ -82,6 +94,7 @@ impl Retention {
             blobs: Default::default(),
             notify: Notify::new(),
             stop: watch::channel(false).0,
+            finished: watch::channel(config.upstream_retention.is_zero()).0,
             enabled: !config.upstream_retention.is_zero(),
             interval: config.retention_refresh_interval,
             window: config.upstream_retention,
@@ -94,6 +107,8 @@ impl Retention {
             action_refreshes: self.counters.actions.load(Ordering::Relaxed),
             output_refreshes: self.counters.outputs.load(Ordering::Relaxed),
             blob_refreshes: self.counters.blobs.load(Ordering::Relaxed),
+            blob_repairs: self.counters.repairs.load(Ordering::Relaxed),
+            blob_repair_failures: self.counters.repair_failures.load(Ordering::Relaxed),
             failures: self.counters.failures.load(Ordering::Relaxed),
             missing_blobs: self.counters.missing.load(Ordering::Relaxed),
             dropped: self.counters.dropped.load(Ordering::Relaxed),
@@ -102,13 +117,21 @@ impl Retention {
     pub fn stop(&self) {
         self.stop.send_replace(true);
     }
+    pub async fn wait_stopped(&self) {
+        let mut finished = self.finished.subscribe();
+        while !*finished.borrow_and_update() {
+            if finished.changed().await.is_err() {
+                break;
+            }
+        }
+    }
     fn due(&self, confirmed: Option<Instant>, attempted: Option<Instant>, now: Instant) -> bool {
         confirmed.is_none_or(|at| now.duration_since(at) >= self.interval)
             && attempted.is_none_or(|at| {
                 now.duration_since(at) >= self.interval.min(Duration::from_secs(60))
             })
     }
-    pub fn accessed(&self, artifact: &Artifact) {
+    pub fn accessed(&self, artifact: &Artifact, cache: Weak<LocalCas>) {
         if !self.enabled || *self.stop.borrow() {
             return;
         }
@@ -132,8 +155,10 @@ impl Retention {
             attempted: None,
             used: true,
             busy: false,
+            cache: Weak::new(),
         });
         touch.accessed = now;
+        touch.cache = cache;
         touch.used = true;
         if !touch.busy && self.due(touch.confirmed, touch.attempted, now) {
             self.notify.notify_one();
@@ -153,6 +178,7 @@ impl Retention {
             attempted: None,
             used: false,
             busy: false,
+            cache: Weak::new(),
         });
         if touch.confirmed.is_none_or(|at| at <= started) {
             touch.confirmed = Some(started);
@@ -289,7 +315,11 @@ impl Retention {
             return;
         }
         let worker = self.clone();
-        tokio::spawn(async move { worker.run().await });
+        let finished = WorkerFinished(self.finished.clone());
+        tokio::spawn(async move {
+            let _finished = finished;
+            worker.run().await
+        });
     }
     async fn run(self: Arc<Self>) {
         let mut stop = self.stop.subscribe();
@@ -405,27 +435,75 @@ impl Retention {
             ),
         )
         .await;
+        let mut repairs = HashMap::new();
+        let mut unresolved = Vec::new();
+        if let Ok(Ok(missing)) = &result {
+            self.counters
+                .missing
+                .fetch_add(missing.len() as u64, Ordering::Relaxed);
+            // One batch shares the background budget, including verification,
+            // retries and upload. Never hydrate a blob missing from local CAS.
+            let repair_deadline = tokio::time::Instant::now()
+                + upstream
+                    .config
+                    .policy
+                    .background_timeout()
+                    .min(self.window - self.interval);
+            for artifact in missing {
+                let cache = self
+                    .blobs
+                    .lock()
+                    .unwrap()
+                    .get(artifact)
+                    .and_then(|t| t.cache.upgrade());
+                let repair_started = Instant::now();
+                let repair = async {
+                    let cache = cache
+                        .ok_or_else(|| Status::not_found("repair cache no longer available"))?;
+                    let lease = cache
+                        .cached_content_for_maintenance(artifact.clone(), repair_deadline)
+                        .await
+                        .map_err(cache_status)?
+                        .ok_or_else(|| Status::not_found("repair bytes already evicted"))?;
+                    upstream
+                        .repair_blob(artifact, lease.path(), repair_deadline)
+                        .await
+                    // Lease drops on completion, failure, timeout or cancellation.
+                };
+                match tokio::time::timeout_at(repair_deadline, repair).await {
+                    Ok(Ok(())) => {
+                        repairs.insert(artifact.clone(), repair_started);
+                        self.counters.repairs.fetch_add(1, Ordering::Relaxed);
+                    }
+                    _ => {
+                        unresolved.push(artifact.clone());
+                        self.counters
+                            .repair_failures
+                            .fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+            }
+        }
         let mut blobs = self.blobs.lock().unwrap();
         match result {
-            Ok(Ok(missing)) => {
-                self.counters
-                    .blobs
-                    .fetch_add((artifacts.len() - missing.len()) as u64, Ordering::Relaxed);
-                self.counters
-                    .missing
-                    .fetch_add(missing.len() as u64, Ordering::Relaxed);
+            Ok(Ok(_)) => {
+                self.counters.blobs.fetch_add(
+                    (artifacts.len() - unresolved.len()) as u64,
+                    Ordering::Relaxed,
+                );
                 for a in artifacts {
                     if let Some(t) = blobs.get_mut(a) {
                         t.busy = false;
                         // Do not let an older background result overwrite a
                         // newer foreground confirmation.
-                        if t.confirmed.is_none_or(|at| at <= started) {
-                            t.confirmed = (!missing.contains(a)).then_some(started);
-                            t.used = t.accessed > started;
+                        let confirmed = repairs.get(a).copied().unwrap_or(started);
+                        if t.confirmed.is_none_or(|at| at <= confirmed) {
+                            t.confirmed = (!unresolved.contains(a)).then_some(confirmed);
+                            t.used = t.accessed > confirmed;
                         }
                     }
                 }
-                if !missing.is_empty() {
+                if !unresolved.is_empty() {
                     drop(blobs);
                     self.clear_actions();
                 }

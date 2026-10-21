@@ -40,6 +40,12 @@ struct Backend {
     missing_requests: Arc<Mutex<Vec<FindMissingBlobsRequest>>>,
     missing_delay_ms: Arc<AtomicU64>,
     reject_writes: Arc<Mutex<bool>>,
+    write_calls: Arc<AtomicU64>,
+    write_delay_ms: Arc<AtomicU64>,
+    write_transient: Arc<AtomicU64>,
+    bad_write_ack: Arc<AtomicBool>,
+    write_resources: Arc<Mutex<Vec<String>>>,
+    reject_compressed_writes: Arc<AtomicBool>,
     execution_calls: Arc<AtomicU64>,
     grpc_gzip: Arc<AtomicBool>,
     operations_success: Arc<AtomicBool>,
@@ -120,30 +126,58 @@ impl ByteStream for Backend {
         req: Request<tonic::Streaming<bs::WriteRequest>>,
     ) -> Result<Response<bs::WriteResponse>, Status> {
         self.observe("write", &req);
+        self.write_calls.fetch_add(1, Ordering::Relaxed);
+        if self
+            .write_transient
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_sub(1))
+            .is_ok()
+        {
+            return Err(Status::unavailable("fixture transient upload"));
+        }
+        tokio::time::sleep(Duration::from_millis(
+            self.write_delay_ms.load(Ordering::Relaxed),
+        ))
+        .await;
         if *self.reject_writes.lock().unwrap() {
             return Err(Status::permission_denied("write blocked"));
         }
         let mut stream = req.into_inner();
         let mut bytes = vec![];
         let mut name = String::new();
+        let mut finished = false;
         while let Some(req) = stream.message().await? {
             name = req.resource_name;
+            finished |= req.finish_write;
             bytes.extend(req.data);
         }
+        if !finished {
+            return Err(Status::invalid_argument("fixture upload incomplete"));
+        }
+        self.write_resources.lock().unwrap().push(name.clone());
         let hash = name.split('/').rev().nth(1).unwrap().to_string();
         let compressed = name.contains("compressed-blobs");
-        if compressed && self.identity_only.load(Ordering::Relaxed) {
+        if compressed
+            && (self.identity_only.load(Ordering::Relaxed)
+                || self.reject_compressed_writes.load(Ordering::Relaxed))
+        {
             return Err(Status::unimplemented("zstd unsupported"));
         }
         let size = bytes.len();
         let bytes = if compressed {
-            reapi::compression::decode_zstd(&bytes, 1 << 20).unwrap()
+            reapi::compression::decode_zstd(&bytes, 1 << 20)
+                .map_err(|_| Status::data_loss("fixture invalid compressed upload"))?
         } else {
             bytes
         };
         self.blobs.lock().unwrap().insert(hash, bytes);
         Ok(Response::new(bs::WriteResponse {
-            committed_size: if compressed { -1 } else { size as i64 },
+            committed_size: if self.bad_write_ack.load(Ordering::Relaxed) {
+                -2
+            } else if compressed {
+                -1
+            } else {
+                size as i64
+            },
         }))
     }
     async fn query_write_status(
@@ -646,12 +680,12 @@ fn retention_policy(config: &mut ProxyConfig) {
     config.retention_refresh_interval = Duration::from_millis(300);
     config.policy.retry.max_attempts = 1;
 }
-struct LocalBytes(&'static [u8]);
+struct LocalBytes(Vec<u8>);
 #[async_trait::async_trait]
 impl local_cas::BlobSource for LocalBytes {
     async fn fetch(&self, _: &local_cas::Artifact, file: &mut std::fs::File) -> Result<()> {
         use std::io::Write;
-        file.write_all(self.0)?;
+        file.write_all(&self.0)?;
         Ok(())
     }
     async fn missing(&self, artifacts: &[local_cas::Artifact]) -> Result<Vec<local_cas::Artifact>> {
@@ -1108,6 +1142,226 @@ async fn shared_cas_hits_refresh_in_batches_without_blocking_or_pinning_outputs(
     );
     h.proxy.stop_forwarding();
 }
+fn local_artifact(bytes: &[u8], function: i32) -> local_cas::Artifact {
+    use sha2::{Digest as _, Sha256};
+    local_cas::Artifact {
+        backend: "test-security-scope".into(),
+        instance: "repo".into(),
+        digest_function: function,
+        hash: if function == 9 {
+            digest(bytes).hash
+        } else {
+            format!("{:x}", Sha256::digest(bytes))
+        },
+        size: bytes.len() as u64,
+    }
+}
+#[tokio::test]
+async fn local_hits_repair_missing_upstream_blobs_without_blocking_readers() {
+    for (name, function, identity, reject_zstd, transient) in [
+        ("compressed BLAKE3", 9, false, false, 0),
+        ("identity SHA256", 1, true, false, 0),
+        ("advertised codec fallback", 9, false, true, 0),
+        ("transient retry", 9, false, false, 1),
+    ] {
+        let h = Harness::configured(
+            Duration::ZERO,
+            None,
+            |c| {
+                retention_policy(c);
+                c.retention_refresh_interval = Duration::from_secs(2);
+                c.policy.retry.max_attempts = 3;
+                c.policy.retry.initial_backoff_ms = 1;
+            },
+            CacheConfig::default(),
+        )
+        .await;
+        h.backend.identity_only.store(identity, Ordering::Relaxed);
+        h.backend
+            .reject_compressed_writes
+            .store(reject_zstd, Ordering::Relaxed);
+        h.backend
+            .write_transient
+            .store(transient, Ordering::Relaxed);
+        h.backend.write_delay_ms.store(300, Ordering::Relaxed);
+        let data = vec![b'k'; 200_000];
+        let a = local_artifact(&data, function);
+        drop(
+            h.cache
+                .clone()
+                .content_from(a.clone(), Arc::new(LocalBytes(data.clone())))
+                .await
+                .unwrap(),
+        );
+        eventually(|| h.backend.write_calls.load(Ordering::Relaxed) > transient).await;
+        let lease = tokio::time::timeout(
+            Duration::from_millis(200),
+            h.cache.clone().content(a.clone()),
+        )
+        .await
+        .expect("local readers must not await a repair")
+        .unwrap();
+        assert_eq!(std::fs::read(lease.path()).unwrap(), data, "{name}");
+        drop(lease);
+        eventually(|| h.proxy.metrics().retention.blob_repairs == 1).await;
+        assert_eq!(h.backend.blobs.lock().unwrap()[&a.hash], data, "{name}");
+        assert_eq!(
+            h.backend.reads.load(Ordering::Relaxed),
+            0,
+            "repair must never hydrate from upstream"
+        );
+        {
+            let resources = h.backend.write_resources.lock().unwrap();
+            assert!(
+                resources
+                    .last()
+                    .unwrap()
+                    .contains(if identity || reject_zstd {
+                        "/blobs/"
+                    } else {
+                        "/compressed-blobs/zstd/"
+                    }),
+                "{name}"
+            );
+        }
+        let calls = h.backend.write_calls.load(Ordering::Relaxed);
+        for _ in 0..8 {
+            drop(h.cache.clone().content(a.clone()).await.unwrap());
+        }
+        assert_eq!(
+            h.backend.write_calls.load(Ordering::Relaxed),
+            calls,
+            "local hits deduplicate repair within the interval"
+        );
+        assert_eq!(
+            h.proxy.metrics().retention.blob_repair_failures,
+            0,
+            "{name}"
+        );
+        h.proxy.stop_forwarding();
+    }
+}
+#[tokio::test]
+async fn failed_repair_does_not_confirm_retention_or_replace_local_content() {
+    for bad_ack in [false, true] {
+        let h = Harness::configured(
+            Duration::ZERO,
+            None,
+            retention_policy,
+            CacheConfig::default(),
+        )
+        .await;
+        *h.backend.reject_writes.lock().unwrap() = !bad_ack;
+        h.backend.bad_write_ack.store(bad_ack, Ordering::Relaxed);
+        let data = b"retained local bytes".to_vec();
+        let a = local_artifact(&data, 9);
+        drop(
+            h.cache
+                .clone()
+                .content_from(a.clone(), Arc::new(LocalBytes(data.clone())))
+                .await
+                .unwrap(),
+        );
+        eventually(|| h.proxy.metrics().retention.blob_repair_failures == 1).await;
+        let metrics = h.proxy.metrics().retention;
+        assert_eq!(metrics.blob_repairs, 0);
+        assert_eq!(metrics.blob_refreshes, 0);
+        let lease = h
+            .cache
+            .clone()
+            .cached_content_for_maintenance(a, tokio::time::Instant::now() + Duration::from_secs(1))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(std::fs::read(lease.path()).unwrap(), data);
+        h.proxy.stop_forwarding();
+    }
+}
+#[tokio::test]
+async fn repair_skips_evicted_or_corrupt_local_bytes_without_fetching() {
+    for corrupt in [false, true] {
+        let h = Harness::configured(
+            Duration::ZERO,
+            None,
+            retention_policy,
+            CacheConfig {
+                max_bytes: 4,
+                ..Default::default()
+            },
+        )
+        .await;
+        h.backend.missing_delay_ms.store(300, Ordering::Relaxed);
+        let a = local_artifact(b"aaaa", 9);
+        let lease = h
+            .cache
+            .clone()
+            .content_from(a.clone(), Arc::new(LocalBytes(b"aaaa".to_vec())))
+            .await
+            .unwrap();
+        let path = lease.path().to_owned();
+        drop(lease);
+        eventually(|| !h.backend.missing_requests.lock().unwrap().is_empty()).await;
+        if corrupt {
+            std::fs::write(path, b"oops").unwrap();
+        } else {
+            drop(
+                h.cache
+                    .clone()
+                    .content_from(
+                        local_artifact(b"bbbb", 9),
+                        Arc::new(LocalBytes(b"bbbb".to_vec())),
+                    )
+                    .await
+                    .unwrap(),
+            );
+        }
+        eventually(|| h.proxy.metrics().retention.blob_repair_failures > 0).await;
+        assert_eq!(h.backend.write_calls.load(Ordering::Relaxed), 0);
+        assert_eq!(h.backend.reads.load(Ordering::Relaxed), 0);
+        h.proxy.stop_forwarding();
+    }
+}
+#[tokio::test]
+async fn shutdown_cancels_repair_and_releases_its_temporary_lease() {
+    let h = Harness::configured(
+        Duration::ZERO,
+        None,
+        retention_policy,
+        CacheConfig {
+            max_bytes: 8,
+            ..Default::default()
+        },
+    )
+    .await;
+    h.backend.write_delay_ms.store(2000, Ordering::Relaxed);
+    let a = local_artifact(b"aaaa", 9);
+    drop(
+        h.cache
+            .clone()
+            .content_from(a, Arc::new(LocalBytes(b"aaaa".to_vec())))
+            .await
+            .unwrap(),
+    );
+    eventually(|| h.backend.write_calls.load(Ordering::Relaxed) == 1).await;
+    h.proxy.stop_forwarding();
+    h.proxy.wait_for_maintenance_shutdown().await;
+    h.cache.wait_for_idle().await.unwrap();
+    let lease = h
+        .cache
+        .clone()
+        .content_from(
+            local_artifact(b"bbbbbbbb", 9),
+            Arc::new(LocalBytes(b"bbbbbbbb".to_vec())),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        std::fs::read(lease.path()).unwrap(),
+        b"bbbbbbbb",
+        "an abandoned repair must not retain its CAS lease"
+    );
+    assert_eq!(h.proxy.metrics().retention.blob_repairs, 0);
+}
 #[tokio::test]
 async fn verified_shared_reads_do_not_advertise_local_only_blobs_to_rbe() {
     let h = Harness::new(Duration::ZERO).await;
@@ -1409,7 +1663,7 @@ async fn auth_scope_capabilities_and_corruption_are_enforced() {
     drop(
         h.cache
             .clone()
-            .content_from(a, Arc::new(LocalBytes(b"correct")))
+            .content_from(a, Arc::new(LocalBytes(b"correct".to_vec())))
             .await
             .unwrap(),
     );

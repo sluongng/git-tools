@@ -24,9 +24,12 @@ Downloader mapping hits require verified local CAS bytes and upstream presence;
 metadata has fixed TTL/count/byte bounds and LRU eviction. No blob leases are
 retained. Freshness-constrained requests and directory requests always forward.
 Optional retention maintenance uses one separate background connection for used
-AC entries and shared-CAS reads. Renewal validates output references; failures
-never extend validity. Local blob leases and foreground presence semantics are
-unchanged. See [policy](../../docs/reapi-policy.md#background-retention-maintenance).
+AC entries and shared-CAS reads. Missing upstream blobs are repaired from verified
+resident bytes; only the active upload holds a lease. Failed uploads never renew
+confirmation. Foreground presence semantics are unchanged. See
+[policy](../../docs/reapi-policy.md#background-retention-maintenance).
+Embedders stop forwarding, await `wait_for_maintenance_shutdown`, then drain
+`LocalCas::wait_for_idle` before releasing the shared cache owner.
 
 Unix sockets must live in a private per-user directory; their filesystem
 permissions replace bearer authentication. Configure a local bearer token for
