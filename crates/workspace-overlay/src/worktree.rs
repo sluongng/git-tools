@@ -52,6 +52,13 @@ impl WorkingTree {
     ) -> Result<()> {
         let ready = self.directory.join("git-ready");
         let fresh = !ready.exists();
+        // A missing side marker never authorizes resetting existing Git state.
+        // Only an empty directory or a provably pristine bare init can resume.
+        if fresh && fs::read_dir(&self.gitdir)?.next().is_some() {
+            self.validate_pristine_admin(repo).context(
+                "Git admin exists without git-ready; preserve it and recover initialization before mounting",
+            )?;
+        }
         if !self.gitdir.join("config").exists() {
             run(
                 repo.git_binary(),
@@ -78,8 +85,8 @@ impl WorkingTree {
             format == b"sha1\n",
             "writable overlay Git admin must use SHA-1 objects"
         );
-        // Rebind independently of init/config existence. This also recovers an
-        // interrupted first initialization and permits moving a same-commit clone.
+        // Rebind on valid remounts and pristine interrupted initialization,
+        // permitting a moved same-commit clone without resetting native state.
         let objects = repo.repository_path().join("objects");
         let mut alternate = objects.as_os_str().as_bytes().to_vec();
         ensure!(
@@ -110,8 +117,7 @@ impl WorkingTree {
                     File::open(&self.gitdir)?.sync_all()?;
                 }
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                    // Recover a first initialization interrupted before git-ready,
-                    // even if the source was unshallowed in the meantime.
+                    // A fresh admin must match the source's lack of a boundary.
                     match fs::remove_file(self.gitdir.join("shallow")) {
                         Ok(()) => File::open(&self.gitdir)?.sync_all()?,
                         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
@@ -277,8 +283,128 @@ impl WorkingTree {
                 ],
                 Some(paths),
             )?;
-            fs::write(&ready, format!("{}\n", snapshot.commit))?;
+            // Publish readiness only after all initialization state is durable.
+            // A crash can leave either a ready admin or a preserved incomplete
+            // admin, never permission to rerun destructive initialization.
+            sync_tree(&self.gitdir)?;
+            let temporary = self.directory.join(".git-ready.tmp");
+            let mut marker = File::create(&temporary)?;
+            writeln!(marker, "{}", snapshot.commit)?;
+            marker.sync_all()?;
+            fs::rename(&temporary, &ready)?;
+            File::open(&self.directory)?.sync_all()?;
         }
+        Ok(())
+    }
+
+    fn validate_pristine_admin(&self, repo: &GitRepo) -> Result<()> {
+        // Ref enumeration alone is insufficient: Git can ignore malformed loose
+        // refs. First require the physical shape of a bare `git init`, with no
+        // index, ref/log/reftable files, object data, locks, or unknown artifacts.
+        fn empty_directories(path: &Path) -> Result<()> {
+            ensure!(
+                fs::symlink_metadata(path)?.is_dir(),
+                "unexpected Git admin artifact"
+            );
+            for entry in fs::read_dir(path)? {
+                let entry = entry?;
+                ensure!(entry.file_type()?.is_dir(), "Git admin contains state");
+                empty_directories(&entry.path())?;
+            }
+            Ok(())
+        }
+        for entry in fs::read_dir(&self.gitdir)? {
+            let entry = entry?;
+            let kind = entry.file_type()?;
+            match entry.file_name().as_bytes() {
+                b"HEAD" | b"config" | b"description" => {
+                    ensure!(kind.is_file(), "unexpected Git admin artifact");
+                }
+                b"refs" | b"objects" | b"branches" => empty_directories(&entry.path())?,
+                b"hooks" | b"info" => {
+                    ensure!(kind.is_dir(), "unexpected Git admin artifact");
+                    for child in fs::read_dir(entry.path())? {
+                        let child = child?;
+                        ensure!(
+                            child.file_type()?.is_file(),
+                            "unexpected Git init template artifact"
+                        );
+                        let name = child.file_name();
+                        ensure!(
+                            (entry.file_name() == "hooks" && name.as_bytes().ends_with(b".sample"))
+                                || (entry.file_name() == "info" && name == "exclude"),
+                            "Git admin contains non-pristine template state"
+                        );
+                    }
+                }
+                _ => bail!("Git admin contains state beyond a pristine bare init"),
+            }
+        }
+        let config = run(
+            repo.git_binary(),
+            Some(&self.gitdir),
+            None,
+            &[
+                "config".into(),
+                "--local".into(),
+                "--null".into(),
+                "--list".into(),
+            ],
+            None,
+        )?;
+        for record in config
+            .split(|b| *b == 0)
+            .filter(|record| !record.is_empty())
+        {
+            let name = record.split(|b| *b == b'\n').next().unwrap();
+            ensure!(
+                [
+                    b"core.repositoryformatversion".as_slice(),
+                    b"core.filemode",
+                    b"core.bare",
+                    b"core.ignorecase",
+                    b"core.precomposeunicode"
+                ]
+                .iter()
+                .any(|allowed| name.eq_ignore_ascii_case(allowed)),
+                "Git admin has non-pristine configuration"
+            );
+        }
+        ensure!(
+            config_value_matches(&config, "core.bare", OsStr::new("true"))
+                && config_value_matches(&config, "core.repositoryformatversion", OsStr::new("0")),
+            "Git admin is not a pristine bare repository"
+        );
+        let head = fs::read(self.gitdir.join("HEAD"))?;
+        let target = head
+            .strip_prefix(b"ref: ")
+            .and_then(|head| head.strip_suffix(b"\n"))
+            .context("Git admin HEAD is not symbolic unborn state")?;
+        ensure!(
+            target.starts_with(b"refs/heads/"),
+            "Git admin HEAD is not a branch"
+        );
+        run(
+            repo.git_binary(),
+            None,
+            None,
+            &[
+                "check-ref-format".into(),
+                OsStr::from_bytes(target).to_owned(),
+            ],
+            None,
+        )?;
+        ensure!(
+            run(
+                repo.git_binary(),
+                Some(&self.gitdir),
+                None,
+                &["for-each-ref".into()],
+                None
+            )?
+            .is_empty(),
+            "Git admin contains refs"
+        );
         Ok(())
     }
 
@@ -499,6 +625,23 @@ fn run(
     Ok(output.stdout)
 }
 
+// Fresh Git initialization contains only regular files and directories. Refuse
+// unexpected links rather than following them while establishing durability.
+fn sync_tree(directory: &Path) -> Result<()> {
+    for entry in fs::read_dir(directory)? {
+        let entry = entry?;
+        let kind = entry.file_type()?;
+        if kind.is_dir() {
+            sync_tree(&entry.path())?;
+        } else {
+            ensure!(kind.is_file(), "unexpected Git initialization artifact");
+            File::open(entry.path())?.sync_all()?;
+        }
+    }
+    File::open(directory)?.sync_all()?;
+    Ok(())
+}
+
 fn config_quote(output: &mut Vec<u8>, value: &[u8]) {
     output.push(b'"');
     for byte in value {
@@ -670,6 +813,44 @@ os.execvp('git',['git',*sys.argv[1:]])
         let working = WorkingTree::lock(&root.path().join("overlay")).unwrap();
         let _overlay =
             crate::overlay::Overlay::open(&working.directory, &snapshot, &working.gitdir).unwrap();
+        // A pristine bare init is a supported interrupted first initialization.
+        git(
+            &working.gitdir,
+            &["init", "--bare", "--object-format=sha1", "--template="],
+        );
+        // Conventional Git templates may include these inert artifacts.
+        fs::create_dir_all(working.gitdir.join("branches")).unwrap();
+        fs::create_dir_all(working.gitdir.join("hooks")).unwrap();
+        fs::create_dir_all(working.gitdir.join("info")).unwrap();
+        fs::write(working.gitdir.join("hooks/pre-commit.sample"), b"sample").unwrap();
+        fs::write(working.gitdir.join("info/exclude"), b"# excludes\n").unwrap();
+        let original_head = fs::read(working.gitdir.join("HEAD")).unwrap();
+        let original_config = fs::read(working.gitdir.join("config")).unwrap();
+        for (path, bytes) in [
+            ("index", b"staged index".as_slice()),
+            ("refs/heads/existing", b"malformed ref\n".as_slice()),
+            ("packed-refs", b"malformed packed refs\n".as_slice()),
+            ("HEAD", snapshot.commit.as_bytes()),
+            ("HEAD", b"ref: refs/heads/invalid..branch\n".as_slice()),
+        ] {
+            fs::write(working.gitdir.join(path), bytes).unwrap();
+            assert!(
+                working
+                    .prepare(&repo, &snapshot, &mount, Path::new("/bin/true"))
+                    .is_err(),
+                "{path}"
+            );
+            assert_eq!(fs::read(working.gitdir.join(path)).unwrap(), bytes);
+            assert_eq!(
+                fs::read(working.gitdir.join("config")).unwrap(),
+                original_config
+            );
+            if path == "HEAD" {
+                fs::write(working.gitdir.join(path), &original_head).unwrap();
+            } else {
+                fs::remove_file(working.gitdir.join(path)).unwrap();
+            }
+        }
         working
             .prepare(&repo, &snapshot, &mount, Path::new("/bin/true"))
             .unwrap();
@@ -741,6 +922,66 @@ os.execvp('git',['git',*sys.argv[1:]])
         assert!(
             !native_show("third").status.success(),
             "removed auth must not remain effective"
+        );
+        // Native Git may advance HEAD and independently stage a different tree.
+        // Losing only the side marker must never authorize resetting either.
+        git(
+            &working.gitdir,
+            &["config", "user.email", "fixture@example.invalid"],
+        );
+        let tree = git(&working.gitdir, &["rev-parse", "HEAD^{tree}"]);
+        let commit = git(
+            &working.gitdir,
+            &[
+                "commit-tree",
+                std::str::from_utf8(&tree).unwrap().trim(),
+                "-p",
+                &snapshot.commit,
+                "-m",
+                "native commit",
+            ],
+        );
+        git(
+            &working.gitdir,
+            &[
+                "update-ref",
+                "--no-deref",
+                "HEAD",
+                std::str::from_utf8(&commit).unwrap().trim(),
+            ],
+        );
+        git(
+            &working.gitdir,
+            &[
+                "-c",
+                "core.fsmonitor=false",
+                "update-index",
+                "--force-remove",
+                "first",
+            ],
+        );
+        let index = fs::read(working.gitdir.join("index")).unwrap();
+        let config = fs::read(working.gitdir.join("config")).unwrap();
+        fs::remove_file(working.directory.join("git-ready")).unwrap();
+        let error = working
+            .prepare(&repo, &snapshot, &mount, Path::new("/bin/true"))
+            .unwrap_err();
+        assert!(error.to_string().contains("without git-ready"));
+        assert_eq!(git(&working.gitdir, &["rev-parse", "HEAD"]), commit);
+        assert_eq!(fs::read(working.gitdir.join("index")).unwrap(), index);
+        assert_eq!(fs::read(working.gitdir.join("config")).unwrap(), config);
+        assert!(
+            !git(
+                &working.gitdir,
+                &[
+                    "-c",
+                    "core.fsmonitor=false",
+                    "diff",
+                    "--cached",
+                    "--name-only"
+                ]
+            )
+            .is_empty()
         );
         let argv = fs::read(wrapper.with_extension("argv")).unwrap();
         assert!(

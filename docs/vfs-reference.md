@@ -20,6 +20,9 @@ the writable `.git` view. Keep the base clone available: private Git uses altern
 **Never delete the overlay to clear a cache.** Status/add/basic commit/log work;
 a first commit can hydrate the indexed snapshot. General checkout/merge/rebase
 are not supported workflows. Ctrl-C or `fusermount3 -u MOUNTPOINT` unmounts FUSE.
+If readiness metadata is missing, only a provably pristine Git admin can resume
+initialization. Existing commits/index state is preserved and mounting fails
+closed; do not delete that state or invent a readiness marker to force recovery.
 
 ## Sizes and digests
 

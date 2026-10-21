@@ -2259,7 +2259,7 @@ fn writable_mount_native_git_status_uses_journal_and_survives_remount() {
 
 #[test]
 #[ignore = "requires Linux /dev/fuse and permission to mount"]
-fn writable_trimmed_history_bootstrap_still_reports_all_edits_after_crash() {
+fn writable_trimmed_history_and_missing_readiness_preserve_edits_after_crash() {
     let fixture = Fixture::with_blob_count(2);
     let overlay = fixture._temp.path().join("trimmed-bootstrap");
     let mut mounted = writable_mount(&fixture, &overlay);
@@ -2297,7 +2297,10 @@ fn writable_trimmed_history_bootstrap_still_reports_all_edits_after_crash() {
             "missing {path:?}: {expected:?}"
         );
     }
-    // Model an interrupted first index setup, preserving every other state file.
+    // A lost readiness marker must not authorize resetting an existing index.
+    // Preserve its known-valid receipt so this fixture can deliberately recover
+    // after checking that the ambiguous state is refused without mutation.
+    let ready = fs::read(overlay.join("git-ready")).unwrap();
     mounted.child.kill().unwrap();
     assert!(
         Command::new("fusermount3")
@@ -2309,6 +2312,33 @@ fn writable_trimmed_history_bootstrap_still_reports_all_edits_after_crash() {
     );
     drop(mounted);
     fs::remove_file(overlay.join("git-ready")).unwrap();
+    let admin = overlay.join("git");
+    let before: Vec<_> = ["HEAD", "index", "config"]
+        .map(|name| (name, fs::read(admin.join(name)).unwrap()))
+        .into();
+    let rejected = cli(&[
+        "mount",
+        "--repo",
+        fixture.clone.to_str().unwrap(),
+        "--overlay",
+        overlay.to_str().unwrap(),
+        fixture.mount.to_str().unwrap(),
+    ]);
+    assert!(!rejected.status.success());
+    assert!(
+        String::from_utf8_lossy(&rejected.stderr).contains("Git admin exists without git-ready"),
+        "{}",
+        String::from_utf8_lossy(&rejected.stderr)
+    );
+    for (name, bytes) in before {
+        assert_eq!(fs::read(admin.join(name)).unwrap(), bytes, "{name} changed");
+    }
+    fs::write(overlay.join("git-ready"), ready).unwrap();
+    fs::File::open(overlay.join("git-ready"))
+        .unwrap()
+        .sync_all()
+        .unwrap();
+    fs::File::open(&overlay).unwrap().sync_all().unwrap();
     let mounted = writable_mount(&fixture, &overlay);
     assert_eq!(
         fs::read(fixture.mount.join("hello.txt")).unwrap(),

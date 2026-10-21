@@ -39,6 +39,7 @@ struct Handles {
     journal_v3: SingleWriterTxKeyspace,
     dirty_paths: SingleWriterTxKeyspace,
     retired_payloads: SingleWriterTxKeyspace,
+    unpublished_payloads: SingleWriterTxKeyspace,
     db: Arc<SingleWriterTxDatabase>,
 }
 pub(super) struct Store {
@@ -88,6 +89,8 @@ impl Handles {
         let journal_v3 = db.keyspace("journal_v3", KeyspaceCreateOptions::default)?;
         let dirty_paths = db.keyspace("dirty_paths", KeyspaceCreateOptions::default)?;
         let retired_payloads = db.keyspace("retired_payloads", KeyspaceCreateOptions::default)?;
+        let unpublished_payloads =
+            db.keyspace("unpublished_payloads", KeyspaceCreateOptions::default)?;
         Ok(Self {
             entries,
             meta,
@@ -95,6 +98,7 @@ impl Handles {
             journal_v3,
             dirty_paths,
             retired_payloads,
+            unpublished_payloads,
             db,
         })
     }
@@ -201,6 +205,7 @@ impl Store {
         let baseline_seconds = started.elapsed().as_secs_f64();
         let files = Files::open(directory)?;
         Self::recover(&handles, &files)?;
+        Self::recover_unpublished(&handles, &files)?;
         journal::initialize(&handles)?;
         retirement::Retirements::drain(&handles, &files)?;
         let mut control_entry = None;
@@ -624,13 +629,79 @@ impl Store {
         else {
             anyhow::bail!("invalid initial copy-up generation")
         };
-        self.files
-            .prepare_unpublished(before.inode, old, size, write)?;
-        // Until this durable publication, the old Base/Inline record remains
-        // authoritative. Failure before it needs no redo and loses no edits.
-        failure("before_copyup_commit")?;
-        self.commit(std::slice::from_ref(after), paths)
+        self.files.ensure_unpublished_absent(before.inode)?;
+        let h = self.handles.as_ref().context("overlay closed")?;
+        // Ownership must survive before the final backing name can exist. The
+        // pre-state permits exclusive recovery to prove no File references it.
+        let mut tx = h.db.write_tx().durability(Some(PersistMode::SyncAll));
+        ensure!(
+            tx.get(&h.unpublished_payloads, before.inode.to_be_bytes())?
+                .is_none(),
+            "unpublished payload already pending"
+        );
+        tx.insert(
+            &h.unpublished_payloads,
+            before.inode.to_be_bytes(),
+            encode_entry(before)?,
+        );
+        self.poisoned.set(true);
+        self.metadata_syncs.set(self.metadata_syncs.get() + 1);
+        tx.commit()?;
+        self.poisoned.set(false);
+        let prepared = (|| -> Result<()> {
+            failure("after_copyup_intent")?;
+            self.files
+                .prepare_unpublished(before.inode, old, size, write)?;
+            failure("before_copyup_commit")
+        })();
+        if let Err(error) = prepared {
+            // No publication was attempted. Keep ownership and poison the
+            // writer if cleanup itself fails; reopen can safely retry it.
+            self.poisoned.set(true);
+            self.metadata_syncs.set(self.metadata_syncs.get() + 1);
+            Self::recover_unpublished(h, &self.files)?;
+            self.poisoned.set(false);
+            return Err(error);
+        }
+        // commit atomically promotes ownership with the File entry. On any
+        // uncertain outcome it poisons the writer and leaves recovery to open.
+        let result = self.commit(std::slice::from_ref(after), paths);
+        if result.is_err() {
+            // Even transaction-construction errors leave durable ownership.
+            // Do not allow later namespace edits to invalidate its pre-state.
+            self.poisoned.set(true);
+        }
+        result
     }
+    fn recover_unpublished(handles: &Handles, files: &Files) -> Result<()> {
+        loop {
+            let read = handles.db.read_tx();
+            let next = read.iter(&handles.unpublished_payloads).next();
+            let Some(next) = next else { return Ok(()) };
+            let (key, before) = next.into_inner()?;
+            let inode = number(&key)?;
+            let entry = decode_exact(&before)?;
+            ensure!(
+                entry.inode == inode
+                    && !entry.control
+                    && !matches!(entry.payload, Payload::File { .. }),
+                "invalid unpublished payload ownership"
+            );
+            let current = read
+                .get(&handles.entries, &key)?
+                .context("unpublished payload inode missing")?;
+            ensure!(
+                encode(&decode_exact(&current)?) == encode(&entry),
+                "unpublished payload pre-state conflict"
+            );
+            drop(read);
+            files.remove(inode)?;
+            let mut tx = handles.db.write_tx().durability(Some(PersistMode::SyncAll));
+            tx.remove(&handles.unpublished_payloads, &*key);
+            tx.commit()?;
+        }
+    }
+
     pub(super) fn mutate(
         &self,
         before: &Entry,
@@ -699,6 +770,9 @@ impl Store {
         let mut tx = h.db.write_tx().durability(Some(PersistMode::SyncAll));
         for entry in changed {
             tx.insert(&h.entries, entry.inode.to_be_bytes(), encode_entry(entry)?);
+            if matches!(entry.payload, Payload::File { .. }) {
+                tx.remove(&h.unpublished_payloads, entry.inode.to_be_bytes());
+            }
         }
         Self::append_history(&mut tx, h, paths)?;
         let highwater = changed
@@ -1788,6 +1862,7 @@ mod tests {
     #[test]
     fn unpublished_first_copyup_failure_preserves_authoritative_bytes() {
         for point in [
+            "after_copyup_intent",
             "after_copyup_old",
             "after_copyup_data",
             "before_copyup_directory_sync",
@@ -1816,15 +1891,65 @@ mod tests {
                     super::changes_since(&directory, &token).unwrap(),
                     (token, vec![])
                 );
+                if from_base && point == "after_copyup_intent" {
+                    // A legacy/unknown final name is not ours merely because
+                    // its inode has never published a File reference.
+                    let unowned = directory.join(format!("payloads/{ino:016x}.data"));
+                    std::fs::write(&unowned, b"unknown authoritative bytes").unwrap();
+                    assert!(overlay.write(ino, 3, &[7; 4], &mut repo).is_err());
+                    assert_eq!(
+                        std::fs::read(&unowned).unwrap(),
+                        b"unknown authoritative bytes"
+                    );
+                    assert_eq!(overlay.read(ino, &mut repo).unwrap(), old);
+                    std::fs::remove_file(unowned).unwrap(); // Only fixture-owned bytes.
+                }
                 overlay.write(ino, 3, &[7; 4], &mut repo).unwrap();
                 let mut expected = old;
                 expected.resize(expected.len().max(7), 0);
                 expected[3..7].fill(7);
                 assert_eq!(overlay.read(ino, &mut repo).unwrap(), expected);
                 assert_eq!(overlay.stats().recovered_operations, 0);
+                // Abandon a separate first write instead of retrying it. A live
+                // published payload and an unknown file must survive collection.
+                let abandoned = if from_base {
+                    let parent = overlay.lookup(1, OsStr::new("base-dir")).unwrap();
+                    overlay.lookup(parent, OsStr::new("child")).unwrap()
+                } else {
+                    overlay
+                        .create(1, OsStr::new("abandoned"), Kind::File, 0o600, None)
+                        .unwrap()
+                };
+                let abandoned_entry = overlay.entry(abandoned).unwrap().clone();
+                let unknown = directory.join("payloads/unknown.data");
+                std::fs::write(&unknown, b"preserve unknown").unwrap();
+                fail_next(point);
+                assert!(
+                    overlay
+                        .write(abandoned, 0, b"abandoned bytes", &mut repo)
+                        .is_err()
+                );
+                overlay
+                    .unlink(abandoned_entry.parent, &abandoned_entry.name, false)
+                    .unwrap();
+                overlay.reclaim_unreferenced().unwrap();
+                overlay.drain_maintenance().unwrap();
+                assert!(
+                    !directory
+                        .join(format!("payloads/{abandoned:016x}.data"))
+                        .exists()
+                );
+                assert_eq!(overlay.read(ino, &mut repo).unwrap(), expected);
+                assert_eq!(std::fs::read(&unknown).unwrap(), b"preserve unknown");
                 drop(overlay);
                 let mut overlay = Overlay::open(&directory, &snapshot, &gitdir).unwrap();
                 assert_eq!(overlay.read(ino, &mut repo).unwrap(), expected);
+                assert!(
+                    !directory
+                        .join(format!("payloads/{abandoned:016x}.data"))
+                        .exists()
+                );
+                assert_eq!(std::fs::read(&unknown).unwrap(), b"preserve unknown");
             }
         }
         for (point, committed) in [
@@ -2122,8 +2247,10 @@ mod tests {
             let mut repo = GitRepo::open(&gitdir, "git", "origin", SizeFallback::Error).unwrap();
             let snapshot = Snapshot::load(&repo, "HEAD").unwrap();
             let mut overlay = Overlay::open(&root.join("overlay"), &snapshot, &gitdir).unwrap();
-            if std::env::var("GIT_VFS_TEST_ACTION").as_deref() == Ok("mutate") {
-                let ino = overlay.lookup(1, OsStr::new("edited")).unwrap();
+            let action = std::env::var("GIT_VFS_TEST_ACTION").unwrap();
+            if action == "mutate" || action == "copyup" {
+                let name = if action == "copyup" { "base" } else { "edited" };
+                let ino = overlay.lookup(1, OsStr::new(name)).unwrap();
                 overlay
                     .write(ino, 32 * 1024, &vec![2; 128 * 1024], &mut repo)
                     .unwrap();
@@ -2135,18 +2262,27 @@ mod tests {
             "after_first_write",
             "after_payload_sync",
             "after_final_commit",
+            "after_copyup_intent",
+            "after_copyup_sync",
+            "before_copyup_commit",
+            "after_namespace_commit",
         ] {
+            let first_copyup = point.contains("copyup") || point == "after_namespace_commit";
             let (temp, repo, snapshot, directory, gitdir) = fixture();
             let mut overlay = Overlay::open(&directory, &snapshot, &gitdir).unwrap();
-            let ino = overlay
-                .create(
-                    1,
-                    OsStr::new("edited"),
-                    Kind::File,
-                    0o600,
-                    Some(vec![1; 192 * 1024]),
-                )
-                .unwrap();
+            let ino = if first_copyup {
+                overlay.lookup(1, OsStr::new("base")).unwrap()
+            } else {
+                overlay
+                    .create(
+                        1,
+                        OsStr::new("edited"),
+                        Kind::File,
+                        0o600,
+                        Some(vec![1; 192 * 1024]),
+                    )
+                    .unwrap()
+            };
             let (token, _) = super::changes_since(&directory, "").unwrap();
             drop(overlay);
             drop(repo); // The child owns the private Git size-cache database too.
@@ -2177,18 +2313,44 @@ mod tests {
                 child.kill().unwrap();
                 assert!(!child.wait().unwrap().success());
             };
-            kill_at(point, "mutate");
+            kill_at(point, if first_copyup { "copyup" } else { "mutate" });
             if point == "after_first_write" {
                 // Kill a second process in the middle of replaying the same intent.
                 kill_at("after_first_write", "recover");
             }
             let mut repo = GitRepo::open(&gitdir, "git", "origin", SizeFallback::Error).unwrap();
             let mut overlay = Overlay::open(&directory, &snapshot, &gitdir).unwrap();
-            let mut expected = vec![1; 192 * 1024];
+            if first_copyup && point != "after_namespace_commit" {
+                assert_eq!(overlay.read(ino, &mut repo).unwrap(), b"base bytes");
+                assert!(!directory.join(format!("payloads/{ino:016x}.data")).exists());
+                overlay.unlink(1, OsStr::new("base"), false).unwrap();
+                overlay.reclaim_unreferenced().unwrap();
+                overlay.drain_maintenance().unwrap();
+                drop(overlay);
+                let _overlay = Overlay::open(&directory, &snapshot, &gitdir).unwrap();
+                assert!(!directory.join(format!("payloads/{ino:016x}.data")).exists());
+                continue;
+            }
+            let mut expected = if first_copyup {
+                vec![0; 160 * 1024]
+            } else {
+                vec![1; 192 * 1024]
+            };
+            if first_copyup {
+                expected[..10].copy_from_slice(b"base bytes");
+            }
             expected[32 * 1024..160 * 1024].fill(2);
             assert_eq!(overlay.read(ino, &mut repo).unwrap(), expected, "{point}");
             let (new, paths) = super::changes_since(&directory, &token).unwrap();
-            assert_eq!(paths, [b"edited".to_vec()], "{point}");
+            assert_eq!(
+                paths,
+                [if first_copyup {
+                    b"base".to_vec()
+                } else {
+                    b"edited".to_vec()
+                }],
+                "{point}"
+            );
             let generation = |s: &str| s.rsplit(':').next().unwrap().parse::<u64>().unwrap();
             assert_eq!(generation(&new), generation(&token) + 1, "{point}");
         }

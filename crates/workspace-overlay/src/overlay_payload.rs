@@ -153,6 +153,13 @@ impl Files {
         self.sync_directory()?;
         failure("after_install_sync")
     }
+    pub fn ensure_unpublished_absent(&self, inode: u64) -> Result<()> {
+        match std::fs::symlink_metadata(self.path(inode)) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error.into()),
+            Ok(_) => anyhow::bail!("unowned backing file exists; refusing copy-up"),
+        }
+    }
     pub fn prepare_unpublished(
         &self,
         inode: u64,
