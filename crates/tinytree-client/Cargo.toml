@@ -1,0 +1,33 @@
+[package]
+name = "tinytree-client"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+description = "Bounded verifying native repository gRPC client"
+
+[dependencies]
+async-stream = "0.3"
+blake3 = "1"
+bytes = "1"
+http = "1"
+hyper-util = { version = "0.1", features = ["tokio"] }
+prost = "0.14"
+reapi = { path = "../reapi" }
+serde = { version = "1", features = ["derive"] }
+tempfile = "3"
+tinytree-model = { path = "../tinytree-model" }
+tinytree-proto = { path = "../tinytree-proto" }
+tokio = { version = "1", features = ["full"] }
+toml = "1.1"
+tonic = { version = "0.14", features = ["zstd", "tls-ring"] }
+tower = { version = "0.5", features = ["util"] }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[dev-dependencies]
+futures-util = "0.3"
+tinytree-server = { path = "../tinytree-server" }
+tinytree-store = { path = "../tinytree-store" }
+tinytree-fixture = { path = "../tinytree-fixture" }
+tokio-stream = { version = "0.1", features = ["net"] }

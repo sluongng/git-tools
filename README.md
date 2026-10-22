@@ -88,6 +88,7 @@ entry points. Most also expose Rust libraries; `jj-native-cli` is executable-onl
 | [`local-cas`](crates/local-cas) | Verified local blob storage with bounded LRU eviction. |
 | [`tinytree-model`](crates/tinytree-model) | Canonical jj-native objects, typed IDs and bounded verification. |
 | [`tinytree-proto`](crates/tinytree-proto) | Native repository gRPC bindings; not a server implementation. |
+| [`tinytree-client`](crates/tinytree-client) | Bounded, verifying native RPCs and immutable transfer snapshots. |
 | [`tinytree-store`](crates/tinytree-store) | Authoritative native objects, durable refs and reachability GC; not LRU. |
 | [`jj-native-backend`](crates/jj-native-backend) | Local native jj Backend; retains all objects pending client retention integration. |
 | [`git-pack-cache`](crates/git-pack-cache) | Reusable Git fetch/pack responses. |

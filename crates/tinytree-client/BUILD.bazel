@@ -1,0 +1,40 @@
+load("@crates//:defs.bzl", "aliases", "all_crate_deps")
+load("@rules_rs//rs:rust_library.bzl", "rust_library")
+load("@rules_rs//rs:rust_test.bzl", "rust_test")
+
+package(default_visibility = ["//visibility:public"])
+
+rust_library(
+    name = "tinytree-client",
+    srcs = glob(["src/**/*.rs"]),
+    aliases = aliases(),
+    crate_name = "tinytree_client",
+    crate_root = "src/lib.rs",
+    edition = "2024",
+    version = "0.1.0",
+    deps = all_crate_deps(normal = True),
+)
+
+rust_test(
+    name = "rpc_tests",
+    srcs = ["tests/rpc.rs"],
+    aliases = aliases(),
+    data = [
+        "//crates/tinytree-server:tests/fixtures/ca.pem",
+        "//crates/tinytree-server:tests/fixtures/server.pem",
+        "//crates/tinytree-server:tests/fixtures/server-key.pem",
+        "//crates/tinytree-server:tests/fixtures/wrong-ca.pem",
+    ],
+    edition = "2024",
+    env = {"TINYTREE_CLIENT_TEST_TOKEN": "client-loopback-test-token-not-a-secret"},
+    rustc_env = {
+        "TLS_CA_CERT": "$(rootpath //crates/tinytree-server:tests/fixtures/ca.pem)",
+        "TLS_SERVER_CERT": "$(rootpath //crates/tinytree-server:tests/fixtures/server.pem)",
+        "TLS_SERVER_KEY": "$(rootpath //crates/tinytree-server:tests/fixtures/server-key.pem)",
+        "TLS_WRONG_CA_CERT": "$(rootpath //crates/tinytree-server:tests/fixtures/wrong-ca.pem)",
+    },
+    deps = [":tinytree-client"] + all_crate_deps(
+        normal = True,
+        normal_dev = True,
+    ),
+)

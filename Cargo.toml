@@ -14,6 +14,7 @@ members = [
     "crates/tinytree-fixture",
     "crates/tinytree-store",
     "crates/tinytree-server",
+    "crates/tinytree-client",
     "crates/jj-native-backend",
     "crates/jj-native-cli",
     "crates/git-proxy",

@@ -5263,6 +5263,33 @@ dependencies = [
 ]
 
 [[package]]
+name = "tinytree-client"
+version = "0.1.0"
+dependencies = [
+ "async-stream",
+ "blake3",
+ "bytes",
+ "futures-util",
+ "http",
+ "hyper-util",
+ "libc",
+ "prost",
+ "reapi",
+ "serde",
+ "tempfile",
+ "tinytree-fixture",
+ "tinytree-model",
+ "tinytree-proto",
+ "tinytree-server",
+ "tinytree-store",
+ "tokio",
+ "tokio-stream",
+ "toml",
+ "tonic",
+ "tower",
+]
+
+[[package]]
 name = "tinytree-fixture"
 version = "0.1.0"
 dependencies = [

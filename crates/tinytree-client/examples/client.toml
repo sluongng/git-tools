@@ -1,0 +1,20 @@
+endpoint = "http://127.0.0.1:8093"
+repository_id = "example"
+token_env = "TINYTREE_AGENT_TOKEN"
+compression = true
+
+[limits]
+max_inflight = 4
+max_buffered_bytes = 268435456
+max_temporary_bytes = 1073741824
+
+# Other TCP endpoints require TLS with certificate-name verification.
+# [tls]
+# ca_certificate = "/path/to/ca.pem"
+# domain_name = "repository.example"
+
+[rpc]
+connect_timeout_ms = 10000
+rpc_timeout_ms = 60000
+stream_idle_timeout_ms = 60000
+operation_timeout_ms = 120000
