@@ -70,6 +70,14 @@ slots and the per-connection RPC limit. Admission uses the existing operation
 budget; active streams retain their slot until the file closes. This is not a
 process-wide file-descriptor quota: sockets and other services need headroom too.
 
+The daemon best-effort raises only its own soft open-file limit to
+`runtime.target_open_files = 16384`, clamped to the inherited hard limit. It
+never lowers a higher limit or changes the hard limit; `0` retains the inherited
+limit. `workspace status` reports the requested and effective limits and warnings.
+Socket accepts retry descriptor exhaustion with bounded backoff instead of
+terminating the service. Status separates accept exhaustion and serving-read
+failures from download failures; these observations are not unique failed blobs.
+
 ## Durable build events
 
 BES uses the separate `[bes]` policy, not REAPI retry settings. Events are ACKed

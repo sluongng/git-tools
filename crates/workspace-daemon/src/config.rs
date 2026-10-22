@@ -9,6 +9,7 @@ use std::{
 #[serde(default, deny_unknown_fields)]
 pub struct Config {
     pub state_dir: PathBuf,
+    pub runtime: Runtime,
     pub cache: Cache,
     pub bes: Bes,
     pub bos: Bos,
@@ -16,6 +17,21 @@ pub struct Config {
     pub session: Session,
     pub source: Source,
     pub reapi: reapi::policy::Policy,
+}
+
+#[derive(Clone, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct Runtime {
+    /// Raise only the daemon's soft descriptor limit, capped by its inherited
+    /// hard limit. Zero preserves the inherited soft limit.
+    pub target_open_files: u64,
+}
+impl Default for Runtime {
+    fn default() -> Self {
+        Self {
+            target_open_files: 16_384,
+        }
+    }
 }
 
 #[derive(Clone, Default, Deserialize, Serialize)]
@@ -126,6 +142,7 @@ impl Default for Config {
             .unwrap_or_else(|| PathBuf::from("."));
         Self {
             state_dir: home.join(".cache/workspace"),
+            runtime: Runtime::default(),
             cache: Cache::default(),
             bes: Bes::default(),
             bos: Bos::default(),
@@ -205,6 +222,10 @@ impl Config {
         Ok(config)
     }
     pub fn validate(&self) -> Result<()> {
+        ensure!(
+            self.runtime.target_open_files <= 1_048_576,
+            "runtime.target_open_files must be 0..=1048576"
+        );
         ensure!(self.state_dir.is_absolute(), "state_dir must be absolute");
         ensure!(
             self.cache.listen.ip().is_loopback() && self.git_proxy.listen.ip().is_loopback(),
@@ -333,6 +354,9 @@ impl Config {
 }
 pub const EXAMPLE: &str = r#"# One daemon per user/trust boundary. Keep credentials in the environment.
 # state_dir defaults to $HOME/.cache/workspace (no expansion inside TOML values).
+[runtime]
+# Soft descriptor headroom, capped by the inherited hard limit; 0 preserves it.
+target_open_files = 16384
 [cache]
 upstream = "grpcs://YOUR_INSTANCE.buildbuddy.io"
 api_key_env = "BUILDBUDDY_API_KEY"
@@ -414,6 +438,8 @@ mod tests {
             toml::from_str(&EXAMPLE.replace("enabled = false", "enabled = true")).unwrap();
         enabled.validate().unwrap();
         assert!(enabled.bos.enabled);
+        assert_eq!(config.runtime.target_open_files, 16_384);
+        assert_eq!(Config::default().runtime.target_open_files, 16_384);
         assert_eq!(config.cache.action_cache_ttl_seconds, 3600);
         assert_eq!(config.cache.upstream_retention_seconds, 14400);
         assert_eq!(config.cache.retention_refresh_seconds, 10800);
@@ -476,6 +502,31 @@ mod tests {
             let input = EXAMPLE.replace(&format!("{setting} = 128\n"), "");
             assert_eq!(value(&toml::from_str::<Config>(&input).unwrap().cache), 128);
         }
+    }
+    #[test]
+    fn process_headroom_accepts_inheritance_and_bounded_overrides() {
+        for (name, target, valid) in [
+            ("inherit", 0, true),
+            ("small explicit target", 512, true),
+            ("maximum target", 1_048_576, true),
+            ("above maximum", 1_048_577, false),
+        ] {
+            let input = EXAMPLE.replace(
+                "target_open_files = 16384",
+                &format!("target_open_files = {target}"),
+            );
+            let config: Config = toml::from_str(&input).unwrap();
+            assert_eq!(config.runtime.target_open_files, target, "{name}");
+            assert_eq!(config.validate().is_ok(), valid, "{name}");
+        }
+        let input = EXAMPLE.replace("target_open_files = 16384\n", "");
+        assert_eq!(
+            toml::from_str::<Config>(&input)
+                .unwrap()
+                .runtime
+                .target_open_files,
+            16_384
+        );
     }
     #[test]
     fn refuses_public_listener_and_unknown_fields() {

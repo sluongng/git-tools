@@ -76,6 +76,7 @@ impl Challenge {
         let material = serde_json::to_vec(&serde_json::json!({
             "version": VERSION,
             "state_dir": config.state_dir.canonicalize()?,
+            "runtime": config.runtime,
             "cache": config.cache,
             "cache_credential": credentials.cache,
             "bes": bes,
@@ -162,6 +163,9 @@ mod tests {
             ("cache reader admission", |c| {
                 c.cache.max_concurrent_reads += 1
             }),
+            ("daemon descriptor headroom", |c| {
+                c.runtime.target_open_files += 1
+            }),
             ("BES quota", |c| c.bes.max_pending_bytes += 1),
             ("BOS enablement", |c| c.bos.enabled = !c.bos.enabled),
             ("repository origin", |c| {
@@ -174,7 +178,7 @@ mod tests {
             ("source disk budget", |c| {
                 c.source.large_blob_spool_bytes = Some(0)
             }),
-        ] as [Change; 8]
+        ] as [Change; 9]
         {
             let mut candidate = config.clone();
             change(&mut candidate);

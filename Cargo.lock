@@ -4362,7 +4362,10 @@ dependencies = [
 name = "reapi"
 version = "0.1.0"
 dependencies = [
+ "async-stream",
  "fastrand",
+ "futures-core",
+ "libc",
  "prost",
  "prost-types",
  "protoc-bin-vendored",

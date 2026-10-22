@@ -595,6 +595,282 @@ fn cli_reuse_binds_effective_config_and_credentials_but_not_session_settings() -
     Ok(())
 }
 
+// Exercise the public daemon in a separate process: changing this test runner's
+// descriptor limit would also affect unrelated tests running concurrently.
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn daemon_recovers_from_child_only_descriptor_exhaustion() -> Result<()> {
+    use anyhow::{Context, ensure};
+    use std::{
+        os::unix::process::CommandExt,
+        process::{Child, Command, Stdio},
+    };
+    use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+
+    const CHILD_SOFT_LIMIT: u64 = 128;
+    const ACCEPT_EXHAUSTED: &str =
+        "local descriptor budget exhausted while accepting connections; retrying";
+
+    struct OwnedChild(Child);
+    impl Drop for OwnedChild {
+        fn drop(&mut self) {
+            if !matches!(self.0.try_wait(), Ok(Some(_))) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+    }
+
+    async fn bounded_call(
+        socket: &std::path::Path,
+        request: ControlRequest,
+    ) -> Result<serde_json::Value> {
+        tokio::time::timeout(Duration::from_millis(500), async {
+            let mut stream = tokio::net::UnixStream::connect(socket).await?;
+            let mut bytes = serde_json::to_vec(&request)?;
+            bytes.push(b'\n');
+            stream.write_all(&bytes).await?;
+            let mut bytes = Vec::new();
+            BufReader::new(stream.take(1024 * 1024 + 1))
+                .read_until(b'\n', &mut bytes)
+                .await?;
+            ensure!(bytes.len() <= 1024 * 1024, "control response too large");
+            let response: workspace_daemon::control::Response = serde_json::from_slice(&bytes)?;
+            ensure!(response.ok, "control request failed: {:?}", response.error);
+            Ok(response.result)
+        })
+        .await
+        .context("bounded public control request timed out")?
+    }
+
+    let mut inherited = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    // SAFETY: read-only query into an initialized, correctly sized structure.
+    ensure!(
+        unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut inherited) } == 0,
+        "query inherited descriptor hard limit"
+    );
+    ensure!(
+        inherited.rlim_max >= 512,
+        "startup raise fixture needs hard limit >= 512"
+    );
+    for (name, target, expected_soft, expected_raise, exhaust_descriptors) in [
+        (
+            "inherited limit recovers from exhaustion",
+            0,
+            CHILD_SOFT_LIMIT,
+            false,
+            true,
+        ),
+        (
+            "configured startup raises the soft limit",
+            512,
+            512,
+            true,
+            false,
+        ),
+    ] {
+        let dir = tempfile::tempdir()?;
+        // The upstream is deliberately idle. Startup and accepting an idle local
+        // HTTP/2 connection must not require backend traffic or credentials.
+        let upstream = std::net::TcpListener::bind("127.0.0.1:0")?;
+        // Reserve distinct nonzero compatibility addresses. This fixture serves
+        // RBE over Unix only and does not enable any Git proxy repositories.
+        let cache_address = std::net::TcpListener::bind("127.0.0.1:0")?;
+        let git_address = std::net::TcpListener::bind("127.0.0.1:0")?;
+        let state = dir.path().join("host");
+        let configuration = dir.path().join("workspace.toml");
+        std::fs::write(
+            &configuration,
+            format!(
+                "state_dir = {state:?}\n\
+             [runtime]\ntarget_open_files = {target}\n\
+             [cache]\nlisten = \"{}\"\nupstream = \"grpc://{}\"\n\
+             api_key_env = \"WORKSPACE_FIXTURE_UNUSED_KEY\"\n\
+             [bes]\nenabled = false\n[bos]\nenabled = false\n\
+             [git_proxy]\nlisten = \"{}\"\n",
+                cache_address.local_addr()?,
+                upstream.local_addr()?,
+                git_address.local_addr()?,
+            ),
+        )?;
+        let stderr_path = dir.path().join("daemon.stderr");
+        let mut command = Command::new(std::fs::canonicalize(env!("CARGO_BIN_EXE_workspace"))?);
+        command
+            .arg("--config")
+            .arg(&configuration)
+            .arg("serve")
+            .env_remove("WORKSPACE_FIXTURE_UNUSED_KEY")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(std::fs::File::create(&stderr_path)?);
+        // SAFETY: this child-only pre-exec closure invokes only libc limit calls
+        // and constructs OS errors; it never touches the parent process's limit.
+        unsafe {
+            command.pre_exec(|| {
+                let mut limit = libc::rlimit {
+                    rlim_cur: 0,
+                    rlim_max: 0,
+                };
+                if libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                if limit.rlim_max < CHILD_SOFT_LIMIT as libc::rlim_t {
+                    return Err(std::io::Error::from_raw_os_error(libc::EINVAL));
+                }
+                limit.rlim_cur = CHILD_SOFT_LIMIT as libc::rlim_t;
+                if libc::setrlimit(libc::RLIMIT_NOFILE, &limit) != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        let mut child = OwnedChild(command.spawn()?);
+        let pid = child.0.id();
+        let socket = state.join("control.sock");
+        let status = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                ensure!(
+                    child.0.try_wait()?.is_none(),
+                    "daemon exited during startup: {}",
+                    std::fs::read_to_string(&stderr_path)?
+                );
+                if let Ok(status) = bounded_call(&socket, ControlRequest::Status).await {
+                    break Ok::<_, anyhow::Error>(status);
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .context("daemon startup timed out")??;
+        assert_eq!(status["pid"], pid);
+        let limits = &status["runtime"]["open_files"];
+        assert_eq!(limits["requested_target"], target, "{name}");
+        assert_eq!(limits["initial_soft"], CHILD_SOFT_LIMIT);
+        assert_eq!(limits["effective_soft"], expected_soft, "{name}");
+        assert_eq!(limits["attempted_raise"], expected_raise, "{name}");
+        assert_eq!(limits["hard"], inherited.rlim_max as u64, "{name}");
+        assert!(limits["warning"].is_null(), "{name}");
+        assert!(limits["raw_os_error"].is_null(), "{name}");
+
+        // Independently observe the live process limits: the status hard limit
+        // is a startup snapshot, not a second query after the attempted raise.
+        let process_limits = std::fs::read_to_string(format!("/proc/{pid}/limits"))?;
+        let open_files = process_limits
+            .lines()
+            .find_map(|line| line.strip_prefix("Max open files"))
+            .context("child process has no open-file limit record")?;
+        let mut fields = open_files.split_whitespace();
+        let parse_limit = |value: Option<&str>| -> Result<u64> {
+            match value.context("child open-file limit record is incomplete")? {
+                "unlimited" => Ok(libc::RLIM_INFINITY as u64),
+                value => value.parse().context("parse child open-file limit"),
+            }
+        };
+        assert_eq!(parse_limit(fields.next())?, expected_soft, "{name}");
+        assert_eq!(
+            parse_limit(fields.next())?,
+            inherited.rlim_max as u64,
+            "{name}"
+        );
+
+        if exhaust_descriptors {
+            let mut held_connections = Vec::new();
+            let child_descriptors = format!("/proc/{pid}/fd");
+            for _ in 0..CHILD_SOFT_LIMIT * 2 {
+                if std::fs::read_to_string(&stderr_path)?.contains(ACCEPT_EXHAUSTED) {
+                    break;
+                }
+                match tokio::time::timeout(
+                    Duration::from_millis(200),
+                    tokio::net::UnixStream::connect(state.join("rbe.sock")),
+                )
+                .await
+                {
+                    Ok(Ok(connection)) => held_connections.push(connection),
+                    Ok(Err(error)) => return Err(error).context("connect idle RBE client"),
+                    Err(_) => break,
+                }
+                // Count only, without inspecting descriptor targets or process data.
+                if std::fs::read_dir(&child_descriptors)?.count() >= CHILD_SOFT_LIMIT as usize {
+                    // One more incoming connection makes accept observe the full table.
+                    if let Ok(Ok(connection)) = tokio::time::timeout(
+                        Duration::from_millis(200),
+                        tokio::net::UnixStream::connect(state.join("rbe.sock")),
+                    )
+                    .await
+                    {
+                        held_connections.push(connection);
+                    }
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+            ensure!(
+                !held_connections.is_empty(),
+                "no idle connections were held"
+            );
+            tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    ensure!(
+                        child.0.try_wait()?.is_none(),
+                        "daemon exited under descriptor pressure: {}",
+                        std::fs::read_to_string(&stderr_path)?
+                    );
+                    if std::fs::read_to_string(&stderr_path)?.contains(ACCEPT_EXHAUSTED) {
+                        break Ok::<_, anyhow::Error>(());
+                    }
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+            })
+            .await
+            .context("accept did not report actual descriptor exhaustion")??;
+
+            drop(held_connections);
+            let recovered = tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    ensure!(
+                        child.0.try_wait()?.is_none(),
+                        "daemon exited instead of recovering"
+                    );
+                    if let Ok(status) = bounded_call(&socket, ControlRequest::Status).await {
+                        break Ok::<_, anyhow::Error>(status);
+                    }
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+            })
+            .await
+            .context("control did not recover after releasing connections")??;
+            assert_eq!(recovered["pid"], pid);
+            assert_eq!(
+                recovered["runtime"]["open_files"]["effective_soft"],
+                CHILD_SOFT_LIMIT
+            );
+            assert!(
+                recovered["proxy"]["accept_resource_exhaustions"]
+                    .as_u64()
+                    .unwrap()
+                    > 0
+            );
+        }
+        bounded_call(&socket, ControlRequest::Shutdown).await?;
+        let exit = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if let Some(exit) = child.0.try_wait()? {
+                    break Ok::<_, std::io::Error>(exit);
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .context("daemon shutdown timed out")??;
+        assert!(exit.success(), "daemon did not shut down cleanly: {exit}");
+    }
+    Ok(())
+}
+
 // Requires a native unprivileged FUSE mount, not a hermetic RBE sandbox.
 #[cfg(target_os = "linux")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

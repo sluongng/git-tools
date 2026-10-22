@@ -15,6 +15,7 @@ pub(super) struct Admission {
     slots: Arc<Semaphore>,
     limit: u32,
     queued: AtomicU64,
+    failures: FailureDiagnostics,
 }
 struct Queued(Arc<Admission>);
 impl Drop for Queued {
@@ -28,7 +29,11 @@ impl Admission {
             slots: Arc::new(Semaphore::new(limit)),
             limit: limit as u32,
             queued: AtomicU64::new(0),
+            failures: Default::default(),
         }
+    }
+    pub(super) fn failure_diagnostics(&self) -> FailureDiagnostics {
+        self.failures.clone()
     }
     pub(super) fn in_use(&self) -> u64 {
         self.limit as u64 - self.slots.available_permits() as u64
@@ -68,14 +73,15 @@ impl Admission {
         offset: u64,
     ) -> Result<Reader, Status> {
         let permit = self.acquire(stop).await?;
+        let failures = self.failures.clone();
         // The queued/running blocking job owns BOTH the cache lease and permit.
         // Dropping its JoinHandle never releases admission while it can open a
         // descriptor; an abandoned output drops the complete owner at finish.
         let owner = tokio::task::spawn_blocking(move || {
-            let mut file =
-                File::open(blob.path()).map_err(|error| io_status(&error, "opening cache blob"))?;
+            let mut file = File::open(blob.path())
+                .map_err(|error| record_io(&failures, &error, "opening cache blob"))?;
             file.seek(SeekFrom::Start(offset))
-                .map_err(|error| io_status(&error, "seeking cache blob"))?;
+                .map_err(|error| record_io(&failures, &error, "seeking cache blob"))?;
             Ok::<_, Status>(Owner {
                 file,
                 _blob: blob,
@@ -90,6 +96,7 @@ impl Admission {
             bytes: vec![],
             position: 0,
             eof: false,
+            failures: self.failures.clone(),
         })
     }
     pub(super) async fn read_all(
@@ -98,9 +105,10 @@ impl Admission {
         stop: watch::Receiver<bool>,
     ) -> Result<Vec<u8>, Status> {
         let permit = self.acquire(stop).await?;
+        let failures = self.failures.clone();
         tokio::task::spawn_blocking(move || {
             let file = File::open(blob.path())
-                .map_err(|error| io_status(&error, "reading verified cache blob"))?;
+                .map_err(|error| record_io(&failures, &error, "reading verified cache blob"))?;
             let mut owner = Owner {
                 file,
                 _blob: blob,
@@ -110,7 +118,7 @@ impl Admission {
             let result = owner
                 .file
                 .read_to_end(&mut bytes)
-                .map_err(|error| io_status(&error, "reading verified cache blob"));
+                .map_err(|error| record_io(&failures, &error, "reading verified cache blob"));
             // Close the descriptor before releasing the pin and read permit,
             // including when the asynchronous caller has already cancelled.
             drop(owner);
@@ -134,6 +142,7 @@ pub(super) struct Reader {
     bytes: Vec<u8>,
     position: usize,
     eof: bool,
+    failures: FailureDiagnostics,
 }
 impl AsyncRead for Reader {
     fn poll_read(
@@ -183,6 +192,7 @@ impl AsyncRead for Reader {
                 .take()
                 .expect("live cache reader owns a descriptor");
             let size = output.remaining().min(64 * 1024);
+            let failures = this.failures.clone();
             this.pending = Some(tokio::task::spawn_blocking(move || {
                 let mut bytes = vec![0; size];
                 // Match Tokio's blocking-file behavior: an interrupted syscall
@@ -198,6 +208,9 @@ impl AsyncRead for Reader {
                     bytes.truncate(n);
                     bytes
                 });
+                if let Err(error) = &result {
+                    observe_io(&failures, error);
+                }
                 (owner, result)
             }));
         }
@@ -219,6 +232,7 @@ async fn stopped(stop: &mut watch::Receiver<bool>) {
 pub(super) fn body(
     reader: Pin<Box<dyn AsyncRead + Send>>,
     mut stop: watch::Receiver<bool>,
+    failures: FailureDiagnostics,
 ) -> RpcStream<bs::ReadResponse> {
     let (send, mut receive) = tokio::sync::mpsc::channel(1);
     let mut response_stop = stop.clone();
@@ -236,7 +250,7 @@ pub(super) fn body(
                 Ok(0) => (BodyMessage::Finished(Ok(())), true),
                 Ok(n) => (BodyMessage::Data(bytes[..n].to_vec()), false),
                 Err(error) => (
-                    BodyMessage::Finished(Err(io_status(&error, "reading cache blob"))),
+                    BodyMessage::Finished(Err(record_io(&failures, &error, "reading cache blob"))),
                     true,
                 ),
             };
@@ -282,16 +296,20 @@ pub(super) fn body(
     })
 }
 
-pub(super) fn descriptor_exhausted(error: &std::io::Error) -> bool {
-    #[cfg(unix)]
-    {
-        matches!(error.raw_os_error(), Some(libc::EMFILE | libc::ENFILE))
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = error;
-        false
-    }
+// These are boundary observations, not deduplicated failures: an underlying
+// read error can also be observed by its response codec's terminal boundary.
+fn observe_io(failures: &FailureDiagnostics, error: &io::Error) {
+    failures.record(FailureDiagnostic::from_io(
+        FailureStage::Unattributed,
+        error,
+    ));
+}
+fn record_io(failures: &FailureDiagnostics, error: &io::Error, message: &'static str) -> Status {
+    observe_io(failures, error);
+    io_status(error, message)
+}
+pub(super) fn descriptor_exhausted(error: &io::Error) -> bool {
+    reapi::server_io::is_descriptor_exhaustion(error)
 }
 pub(super) fn io_status(error: &std::io::Error, message: &'static str) -> Status {
     if descriptor_exhausted(error) {
@@ -424,6 +442,54 @@ mod tests {
                 assert_eq!(admission.in_use(), 0);
                 assert!(lease.upgrade().is_none());
             });
+        }
+    }
+
+    #[tokio::test]
+    async fn response_terminal_io_records_only_authored_fields_before_status_mapping() {
+        use tokio_stream::StreamExt;
+        struct Fails(Option<io::Error>);
+        impl AsyncRead for Fails {
+            fn poll_read(
+                mut self: Pin<&mut Self>,
+                _: &mut Context<'_>,
+                _: &mut ReadBuf<'_>,
+            ) -> Poll<io::Result<()>> {
+                Poll::Ready(Err(self.0.take().expect("single terminal read")))
+            }
+        }
+        let mut cases = vec![(
+            io::Error::new(io::ErrorKind::InvalidData, "private fixture detail"),
+            tonic::Code::Internal,
+            None,
+        )];
+        #[cfg(unix)]
+        cases.push((
+            io::Error::from_raw_os_error(libc::EMFILE),
+            tonic::Code::ResourceExhausted,
+            Some(libc::EMFILE),
+        ));
+        for (error, code, errno) in cases {
+            let diagnostics = FailureDiagnostics::default();
+            let (stop, _) = watch::channel(false);
+            let mut response = body(
+                Box::pin(Fails(Some(error))),
+                stop.subscribe(),
+                diagnostics.clone(),
+            );
+            let status = response.next().await.unwrap().unwrap_err();
+            assert_eq!(status.code(), code);
+            assert!(!status.message().contains("private fixture detail"));
+            let metrics = diagnostics.metrics();
+            assert_eq!(metrics.total, 1);
+            let sample = metrics.recent.iter().flatten().next().unwrap();
+            assert!(matches!(sample.stage, FailureStage::Unattributed));
+            assert!(matches!(sample.class, FailureClass::Io));
+            assert_eq!(sample.raw_os_error, errno);
+            assert!(sample.digest_function.is_none());
+            assert!(sample.encoding.is_none());
+            assert!(!format!("{metrics:?}").contains("private fixture detail"));
+            assert!(response.next().await.is_none());
         }
     }
 

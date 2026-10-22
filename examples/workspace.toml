@@ -3,6 +3,11 @@
 # Relative paths and shell/environment expansion are not supported here.
 # state_dir = "/absolute/path/to/private/workspace-state"
 
+[runtime]
+# Raise this daemon's soft descriptor limit up to its inherited hard limit.
+# Never lowers an existing limit; 0 keeps the inherited soft limit.
+target_open_files = 16384
+
 [cache]
 upstream = "grpcs://YOUR_INSTANCE.buildbuddy.io"
 api_key_env = "BUILDBUDDY_API_KEY"

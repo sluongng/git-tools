@@ -36,6 +36,8 @@ type Mount = workspace_fuse::host::SourceMount;
 struct Mount;
 struct State {
     config: Config,
+    startup_limits: crate::runtime::StartupLimits,
+    control_accept: reapi::server_io::AcceptState,
     identity: crate::identity::Identity,
     cache: Arc<LocalCas>,
     proxy: cache_proxy::CacheProxy,
@@ -110,7 +112,7 @@ impl State {
     fn status(&self) -> serde_json::Value {
         let metrics = self.cache.metrics();
         let proxy = self.proxy.metrics();
-        json!({"pid":std::process::id(),"rbe_endpoint":self.config.rbe_endpoint(),"cache_endpoint":self.config.cache_endpoint(),"bytestream_uri_prefix":self.config.bytestream_uri_prefix(),"instance_name":self.config.cache.instance_name,"bes_endpoint":self.bes.as_ref().map(|_|self.config.bes_endpoint()),"bes":self.bes.as_ref().map(|bes|bes.metrics()),"bos_endpoint":if self.config.bos.enabled {Some(self.config.rbe_endpoint())}else{None},"output_path_prefix":self.config.state_dir.join("outputs"),"mounts":self.registry.mounts.iter().map(|(path,record)|json!({"session":path,"state":record.state})).collect::<Vec<_>>(),"proxy":{"download_failures":proxy.download_failures,"action_cache_hits":proxy.action_cache_hits,"action_cache_upstream":proxy.action_cache_upstream,"blob_reads":proxy.blob_reads,"read_slots_in_use":proxy.read_slots_in_use,"read_slots_queued":proxy.read_slots_queued,"asset_cache_hits":proxy.asset_cache_hits,"asset_upstream_requests":proxy.asset_upstream_requests,"execution_requests":proxy.execution_requests,"execution_waits":proxy.execution_waits,"retention":{"action_refreshes":proxy.retention.action_refreshes,"output_refreshes":proxy.retention.output_refreshes,"blob_refreshes":proxy.retention.blob_refreshes,"blob_repairs":proxy.retention.blob_repairs,"blob_repair_failures":proxy.retention.blob_repair_failures,"failures":proxy.retention.failures,"missing_blobs":proxy.retention.missing_blobs,"dropped":proxy.retention.dropped}},"cache":metrics})
+        json!({"pid":std::process::id(),"runtime":{"open_files":self.startup_limits,"control_accept_resource_exhaustions":self.control_accept.resource_exhaustions()},"rbe_endpoint":self.config.rbe_endpoint(),"cache_endpoint":self.config.cache_endpoint(),"bytestream_uri_prefix":self.config.bytestream_uri_prefix(),"instance_name":self.config.cache.instance_name,"bes_endpoint":self.bes.as_ref().map(|_|self.config.bes_endpoint()),"bes":self.bes.as_ref().map(|bes|bes.metrics()),"bos_endpoint":if self.config.bos.enabled {Some(self.config.rbe_endpoint())}else{None},"output_path_prefix":self.config.state_dir.join("outputs"),"mounts":self.registry.mounts.iter().map(|(path,record)|json!({"session":path,"state":record.state})).collect::<Vec<_>>(),"proxy":{"download_failures":proxy.download_failures,"serving_read_failures":proxy.serving_read_failures,"accept_resource_exhaustions":proxy.accept_resource_exhaustions,"action_cache_hits":proxy.action_cache_hits,"action_cache_upstream":proxy.action_cache_upstream,"blob_reads":proxy.blob_reads,"read_slots_in_use":proxy.read_slots_in_use,"read_slots_queued":proxy.read_slots_queued,"asset_cache_hits":proxy.asset_cache_hits,"asset_upstream_requests":proxy.asset_upstream_requests,"execution_requests":proxy.execution_requests,"execution_waits":proxy.execution_waits,"retention":{"action_refreshes":proxy.retention.action_refreshes,"output_refreshes":proxy.retention.output_refreshes,"blob_refreshes":proxy.retention.blob_refreshes,"blob_repairs":proxy.retention.blob_repairs,"blob_repair_failures":proxy.retention.blob_repair_failures,"failures":proxy.retention.failures,"missing_blobs":proxy.retention.missing_blobs,"dropped":proxy.retention.dropped}},"cache":metrics})
     }
     fn mounted(&self, path: &Path) -> bool {
         #[cfg(target_os = "linux")]
@@ -499,6 +501,7 @@ pub async fn serve(mut config: Config) -> Result<()> {
         .open(config.state_dir.join("daemon.lock"))?;
     lock.try_lock_exclusive()
         .context("another workspace daemon owns this state directory")?;
+    let startup_limits = crate::runtime::StartupLimits::apply(config.runtime.target_open_files);
     let credentials = crate::identity::Credentials::load(&config)?;
     let identity = crate::identity::Identity::new(&config, &credentials)?;
     let token = token(&config)?;
@@ -530,6 +533,7 @@ pub async fn serve(mut config: Config) -> Result<()> {
         std::fs::remove_file(&socket)?;
     }
     let listener = UnixListener::bind(&socket)?;
+    let control_accept = reapi::server_io::AcceptState::default();
     use std::os::unix::fs::PermissionsExt;
     std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o600))?;
     let api_key = credentials.cache.clone();
@@ -725,10 +729,11 @@ pub async fn serve(mut config: Config) -> Result<()> {
     let cache_listener = UnixListener::bind(&cache_socket)?;
     std::fs::set_permissions(&cache_socket, std::fs::Permissions::from_mode(0o600))?;
     let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+    let rbe_accept = proxy.accept_state();
     let mut proxy_task = tokio::spawn(async move {
         rbe_router
             .serve_with_incoming_shutdown(
-                tokio_stream::wrappers::UnixListenerStream::new(cache_listener),
+                reapi::server_io::unix_incoming(cache_listener, rbe_accept),
                 async {
                     let _ = shutdown_rx.await;
                 },
@@ -744,6 +749,8 @@ pub async fn serve(mut config: Config) -> Result<()> {
     )?;
     let state = State {
         config,
+        startup_limits,
+        control_accept: control_accept.clone(),
         identity,
         cache,
         proxy: proxy.clone(),
@@ -759,7 +766,7 @@ pub async fn serve(mut config: Config) -> Result<()> {
     let run: Result<()> = async {
         loop {
             let stream = tokio::select! {
-                result = listener.accept() => result?.0,
+                result = reapi::server_io::accept_unix(&listener, &control_accept) => result.context("accepting control connection")?,
                 _ = tokio::signal::ctrl_c() => {
                     if !state_slot.as_ref().unwrap().mounts.is_empty(){eprintln!("stop active sessions before daemon shutdown");continue;}
                     if let Some(host)=output_host.as_ref(){if let Err(error)=host.shutdown().await{eprintln!("output mount is busy; daemon remains running: {error}");continue;}}

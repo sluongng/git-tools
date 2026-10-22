@@ -170,6 +170,8 @@ pub struct ProxyMetrics {
     pub download_failures: FailureMetrics,
     pub read_slots_in_use: u64,
     pub read_slots_queued: u64,
+    pub accept_resource_exhaustions: u64,
+    pub serving_read_failures: FailureMetrics,
 }
 #[derive(Clone)]
 pub struct CacheProxy {
@@ -179,6 +181,7 @@ pub struct CacheProxy {
     metrics: Arc<Counters>,
     writes: Arc<tokio::sync::Semaphore>,
     reads: Arc<read::Admission>,
+    accept: reapi::server_io::AcceptState,
     executions: Arc<tokio::sync::Semaphore>,
     assets: Arc<Mutex<asset::Mappings>>,
     stop: tokio::sync::watch::Sender<bool>,
@@ -547,6 +550,7 @@ impl CacheProxy {
             metrics: Arc::new(Counters::default()),
             writes: Arc::new(tokio::sync::Semaphore::new(4)),
             reads: Arc::new(read::Admission::new(read_limit)),
+            accept: Default::default(),
             executions: Arc::new(tokio::sync::Semaphore::new(execution_limit)),
             assets: Default::default(),
             stop: tokio::sync::watch::channel(false).0,
@@ -574,6 +578,10 @@ impl CacheProxy {
         );
         self.reads.wait_for_idle().await
     }
+    /// Shared by standalone and composed listeners for accept recovery metrics.
+    pub fn accept_state(&self) -> reapi::server_io::AcceptState {
+        self.accept.clone()
+    }
     pub fn metrics(&self) -> ProxyMetrics {
         ProxyMetrics {
             action_cache_hits: self.metrics.ac_hits.load(Ordering::Relaxed),
@@ -587,6 +595,8 @@ impl CacheProxy {
             download_failures: self.upstream.download_failures.metrics(),
             read_slots_in_use: self.reads.in_use(),
             read_slots_queued: self.reads.queued(),
+            accept_resource_exhaustions: self.accept.resource_exhaustions(),
+            serving_read_failures: self.reads.failure_diagnostics().metrics(),
         }
     }
     pub async fn serve(
@@ -607,9 +617,10 @@ impl CacheProxy {
             "cache proxy must listen on loopback"
         );
         let stopping = self.clone();
+        let accept = self.accept_state();
         self.router(true)
             .serve_with_incoming_shutdown(
-                tokio_stream::wrappers::TcpListenerStream::new(listener),
+                reapi::server_io::tcp_incoming(listener, accept),
                 async move {
                     shutdown.await;
                     stopping.stop_forwarding();
@@ -628,9 +639,10 @@ impl CacheProxy {
         shutdown: impl Future<Output = ()> + Send + 'static,
     ) -> Result<()> {
         let stopping = self.clone();
+        let accept = self.accept_state();
         self.router(false)
             .serve_with_incoming_shutdown(
-                tokio_stream::wrappers::UnixListenerStream::new(listener),
+                reapi::server_io::unix_incoming(listener, accept),
                 async move {
                     shutdown.await;
                     stopping.stop_forwarding();
@@ -1369,7 +1381,11 @@ impl ByteStream for CacheProxy {
         } else {
             Box::pin(reader)
         };
-        Ok(Response::new(read::body(reader, self.stop.subscribe())))
+        Ok(Response::new(read::body(
+            reader,
+            self.stop.subscribe(),
+            self.reads.failure_diagnostics(),
+        )))
     }
 
     async fn write(

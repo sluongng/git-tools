@@ -4,6 +4,8 @@ pub mod config;
 pub mod control;
 #[cfg(unix)]
 pub mod daemon;
+#[cfg(unix)]
+mod runtime;
 
 #[cfg(unix)]
 pub mod recovery;
