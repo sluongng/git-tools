@@ -11,8 +11,9 @@ Retained bytes are reverified after restart. Recency hints survive graceful
 shutdown, but crashes may lose recent touches. Keys include authorization scope,
 instance and digest; callers must assign distinct identities to distinct scopes.
 
-`cached_content` probes verified local bytes without fetching;
-`cached_content_for_maintenance` also suppresses user-access notifications.
+`cached_content` probes verified local bytes without fetching. Lookups use a
+separate lane with the same count limit as fetches; known misses do not queue.
+`cached_content_for_maintenance` uses one slot and suppresses access notifications.
 `content_from` supplies a per-request source such as native Git extraction.
 Stop producers and callers, then await `wait_for_idle()` before shutdown;
 caller timeout alone does not prove background work has stopped.

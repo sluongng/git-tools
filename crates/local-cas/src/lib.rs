@@ -89,6 +89,8 @@ pub trait BlobSource: Send + Sync {
 #[derive(Clone, Debug)]
 pub struct CacheConfig {
     pub max_bytes: u64,
+    /// Hydration limit; foreground cache-only verification has a separate lane
+    /// with this same limit, while maintenance verification has one slot.
     pub max_concurrent_fetches: usize,
     pub max_inflight_bytes: u64,
     /// Separate disk/transfer admission lane for blobs larger than the normal
@@ -426,6 +428,7 @@ pub struct LocalCas {
     source: Arc<dyn BlobSource>,
     config: CacheConfig,
     requests: Arc<Semaphore>,
+    lookup_requests: Arc<Semaphore>,
     maintenance_requests: Arc<Semaphore>,
     bytes: Semaphore,
     byte_units: u32,
@@ -572,6 +575,7 @@ impl LocalCas {
             _ownership: ownership,
             source,
             requests: Arc::new(Semaphore::new(config.max_concurrent_fetches)),
+            lookup_requests: Arc::new(Semaphore::new(config.max_concurrent_fetches)),
             maintenance_requests: Arc::new(Semaphore::new(1)),
             bytes: Semaphore::new(byte_units as usize),
             byte_units,
@@ -621,14 +625,21 @@ impl LocalCas {
             recency_errors: self.recency_errors.load(Ordering::Relaxed),
         }
     }
-    /// Wait until admitted fetch workers release their ownership and permits.
+    /// Wait until admitted fetch and verification workers release ownership
+    /// and permits across the fetch, foreground lookup, and maintenance lanes.
     /// Callers must first stop submitting work and cancel/drain their own
     /// producers. This does not close admission, cancel other readers, or wait
-    /// for public blob leases. Unlike a waiter deadline, this proves fetch
-    /// teardown even when a shared fetch outlived its initiating caller.
+    /// for public blob leases. Unlike a waiter deadline, this proves worker
+    /// teardown even when a fetch or verifier outlived its initiating caller.
     pub async fn wait_for_idle(&self) -> Result<()> {
         let _idle = self
             .requests
+            .clone()
+            .acquire_many_owned(self.config.max_concurrent_fetches as u32)
+            .await
+            .context("cache shutting down")?;
+        let _lookups = self
+            .lookup_requests
             .clone()
             .acquire_many_owned(self.config.max_concurrent_fetches as u32)
             .await
@@ -925,7 +936,8 @@ impl LocalCas {
     ) -> Result<(String, u64)> {
         let path = path.to_owned();
         // Tuple fields drop left-to-right, including during unwinding: cache
-        // ownership ends before this verifier releases its request-slot clone.
+        // ownership ends before this verifier releases its fetch, foreground
+        // lookup, or maintenance lane permit clone.
         let ownership = (self.clone(), request);
         let cancelled = Arc::new(AtomicBool::new(false));
         let _cancel = CancelVerification(cancelled.clone());
@@ -946,6 +958,8 @@ impl LocalCas {
     /// Return an existing verified lease without joining or creating a hydration
     /// flight. A local-only consumer cannot publish its source's miss/failure to
     /// another consumer that can hydrate the same artifact from upstream.
+    /// A separate bounded foreground lane prevents upstream fetches from
+    /// blocking resident lookups; this path never fetches missing content.
     pub async fn cached_content(
         self: Arc<Self>,
         artifact: Artifact,
@@ -953,7 +967,7 @@ impl LocalCas {
         let deadline = tokio::time::Instant::now() + self.config.operation_timeout;
         let result = self
             .clone()
-            .cached_content_admitted(artifact.clone(), self.requests.clone(), deadline)
+            .cached_content_admitted(artifact.clone(), self.lookup_requests.clone(), deadline)
             .await;
         if result.as_ref().is_ok_and(|blob| blob.is_some()) {
             self.source.accessed(&artifact, Arc::downgrade(&self));
@@ -981,6 +995,16 @@ impl LocalCas {
         deadline: tokio::time::Instant,
     ) -> Result<Option<Arc<CachedBlob>>> {
         artifact.validate()?;
+        let path = self.dir.join(Self::key(&artifact)?);
+        if tokio::time::Instant::now() >= deadline {
+            return Err(CacheTimeoutError.into());
+        }
+        // A known miss needs no admission, filesystem I/O, or detached work.
+        // Entries may change while admission is queued: cached_inner rechecks
+        // and pins the resident entry before inspecting its fingerprint.
+        if !self.files.lock().unwrap().entries.contains_key(&path) {
+            return Ok(None);
+        }
         tokio::time::timeout_at(deadline, async {
             let request = Arc::new(
                 admission

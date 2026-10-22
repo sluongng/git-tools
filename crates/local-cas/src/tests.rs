@@ -386,6 +386,75 @@ impl BlobSource for HeldSource {
 }
 
 #[tokio::test]
+async fn cache_only_hits_and_misses_do_not_wait_for_saturated_fetch_admission() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = Arc::new(Source::default());
+    let cache = LocalCas::open(
+        dir.path(),
+        source.clone(),
+        CacheConfig {
+            max_concurrent_fetches: 2,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    drop(bytes(&cache, b"bbbb").await);
+    source.reject.store(true, Ordering::Relaxed);
+    let mut callers = Vec::new();
+    let mut releases = Vec::new();
+    for instance in ["held-a", "held-b"] {
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let mut held = artifact(b"aaaa");
+        held.instance = instance.into();
+        callers.push(tokio::spawn(cache.clone().content_from(
+            held,
+            Arc::new(HeldSource {
+                entered: entered.clone(),
+                release: release.clone(),
+                dropped: Arc::new(AtomicBool::new(false)),
+            }),
+        )));
+        // Each source reaching this barrier owns one distinct fetch slot.
+        entered.notified().await;
+        releases.push(release);
+    }
+    let before = cache.metrics();
+    let mut miss = Box::pin(cache.clone().cached_content(artifact(b"cccc")));
+    let mut hit = Box::pin(cache.clone().cached_content(artifact(b"bbbb")));
+    let miss_result = std::future::poll_fn(|cx| {
+        std::task::Poll::Ready(std::future::Future::poll(miss.as_mut(), cx))
+    })
+    .await;
+    let hit_result = std::future::poll_fn(|cx| {
+        std::task::Poll::Ready(std::future::Future::poll(hit.as_mut(), cx))
+    })
+    .await;
+    drop(miss);
+    drop(hit);
+    // Observe both outcomes before releasing any upstream fetch.
+    assert!(matches!(miss_result, std::task::Poll::Ready(Ok(None))));
+    let std::task::Poll::Ready(Ok(Some(hit))) = hit_result else {
+        panic!("a verified resident hit must not wait for upstream fetch admission");
+    };
+    assert_eq!(fs::read(hit.path()).unwrap(), b"bbbb");
+    assert_eq!(cache.metrics().fetches, before.fetches);
+    assert_eq!(
+        cache.metrics().verification_bytes,
+        before.verification_bytes
+    );
+    assert_eq!(source.calls.load(Ordering::Relaxed), 0);
+    assert_eq!(source.accesses.load(Ordering::Relaxed), 2);
+    for release in releases {
+        release.notify_one();
+    }
+    for caller in callers {
+        caller.await.unwrap().unwrap();
+    }
+    cache.wait_for_idle().await.unwrap();
+}
+
+#[tokio::test]
 async fn source_override_survives_cancelled_waiter_and_coalesces_without_default_source() {
     let dir = tempfile::tempdir().unwrap();
     let default_source = Arc::new(Source::default());
@@ -671,65 +740,99 @@ async fn idle_barrier_waits_for_fetch_teardown_after_its_waiter_times_out() {
 }
 
 #[test]
-fn idle_barrier_includes_blocking_verification_after_fetch_timeout() {
+fn idle_barrier_includes_blocking_verification_after_timeout() {
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .max_blocking_threads(1)
         .build()
         .unwrap();
-    let (release, blocked) = std::sync::mpsc::channel();
-    let (entered, started) = std::sync::mpsc::channel();
-    let blocker = runtime.spawn_blocking(move || {
-        entered.send(()).unwrap();
-        blocked.recv().unwrap();
-    });
-    started.recv().unwrap();
-    runtime.block_on(async {
-        let dir = tempfile::tempdir().unwrap();
-        let cache = LocalCas::open(
-            dir.path(),
-            Arc::new(Source::default()),
-            CacheConfig {
-                max_concurrent_fetches: 1,
-                operation_timeout: Duration::from_secs(2),
-                fetch_timeout: Duration::from_millis(20),
-                ..Default::default()
-            },
-        )
-        .unwrap();
-        // Fetch completes immediately, but verification queues behind blocker.
-        let error = cache
-            .clone()
-            .content(artifact(b"aaaa"))
-            .await
-            .err()
+    for (case, cache_only, operation_timeout, expected_fetches) in [
+        ("hydration verification", false, Duration::from_secs(2), 1),
+        ("resident verification", true, Duration::from_millis(20), 0),
+    ] {
+        runtime.block_on(async {
+            let dir = tempfile::tempdir().unwrap();
+            if cache_only {
+                let seed = LocalCas::open(
+                    dir.path(),
+                    Arc::new(Source::default()),
+                    CacheConfig::default(),
+                )
+                .unwrap();
+                drop(bytes(&seed, b"aaaa").await);
+                drop(seed);
+            }
+            let cache = LocalCas::open(
+                dir.path(),
+                Arc::new(Source::default()),
+                CacheConfig {
+                    max_concurrent_fetches: 1,
+                    operation_timeout,
+                    fetch_timeout: Duration::from_millis(20),
+                    ..Default::default()
+                },
+            )
             .unwrap();
-        assert!(error.downcast_ref::<CacheTimeoutError>().is_some());
-        assert_eq!(cache.metrics().fetches, 1);
-        assert_eq!(cache.metrics().timed_out_fetches, 1);
-        {
-            let idle = cache.wait_for_idle();
-            tokio::pin!(idle);
-            std::future::poll_fn(|cx| {
-                assert!(
-                    std::future::Future::poll(idle.as_mut(), cx).is_pending(),
-                    "a detached verifier must retain its fetch permit"
-                );
-                std::task::Poll::Ready(())
+            // Reopened resident bytes require verification without hydration.
+            let before = cache.metrics().verification_bytes;
+            let (release, blocked) = std::sync::mpsc::channel();
+            let (entered, started) = tokio::sync::oneshot::channel();
+            let blocker = tokio::task::spawn_blocking(move || {
+                entered.send(()).unwrap();
+                blocked.recv().unwrap();
+            });
+            started.await.unwrap();
+            // Both paths queue verification behind the occupied blocking lane.
+            let error = if cache_only {
+                cache.clone().cached_content(artifact(b"aaaa")).await.err()
+            } else {
+                cache.clone().content(artifact(b"aaaa")).await.err()
+            }
+            .unwrap();
+            assert!(error.downcast_ref::<CacheTimeoutError>().is_some());
+            assert_eq!(cache.metrics().fetches, expected_fetches, "{case}");
+            assert_eq!(
+                cache.metrics().timed_out_fetches,
+                expected_fetches,
+                "{case}"
+            );
+            let mut miss = Box::pin(cache.clone().cached_content(artifact(b"bbbb")));
+            let miss_result = std::future::poll_fn(|cx| {
+                std::task::Poll::Ready(std::future::Future::poll(miss.as_mut(), cx))
             })
             .await;
-            release.send(()).unwrap();
-            idle.await.unwrap();
-        }
-        blocker.await.unwrap();
-        drop(cache);
-        LocalCas::open(
-            dir.path(),
-            Arc::new(Source::default()),
-            CacheConfig::default(),
-        )
-        .unwrap();
-    });
+            drop(miss);
+            {
+                let idle = cache.wait_for_idle();
+                tokio::pin!(idle);
+                let pending = std::future::poll_fn(|cx| {
+                    std::task::Poll::Ready(
+                        std::future::Future::poll(idle.as_mut(), cx).is_pending(),
+                    )
+                })
+                .await;
+                release.send(()).unwrap();
+                idle.await.unwrap();
+                assert!(
+                    pending,
+                    "{case}: detached verifier must retain its lane permit"
+                );
+            }
+            blocker.await.unwrap();
+            assert!(
+                matches!(miss_result, std::task::Poll::Ready(Ok(None))),
+                "{case}"
+            );
+            assert_eq!(cache.metrics().verification_bytes, before);
+            drop(cache);
+            LocalCas::open(
+                dir.path(),
+                Arc::new(Source::default()),
+                CacheConfig::default(),
+            )
+            .unwrap();
+        });
+    }
 }
 
 #[tokio::test]
