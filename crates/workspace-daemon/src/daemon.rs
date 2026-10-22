@@ -110,7 +110,7 @@ impl State {
     fn status(&self) -> serde_json::Value {
         let metrics = self.cache.metrics();
         let proxy = self.proxy.metrics();
-        json!({"pid":std::process::id(),"rbe_endpoint":self.config.rbe_endpoint(),"cache_endpoint":self.config.cache_endpoint(),"bytestream_uri_prefix":self.config.bytestream_uri_prefix(),"instance_name":self.config.cache.instance_name,"bes_endpoint":self.bes.as_ref().map(|_|self.config.bes_endpoint()),"bes":self.bes.as_ref().map(|bes|bes.metrics()),"bos_endpoint":if self.config.bos.enabled {Some(self.config.rbe_endpoint())}else{None},"output_path_prefix":self.config.state_dir.join("outputs"),"mounts":self.registry.mounts.iter().map(|(path,record)|json!({"session":path,"state":record.state})).collect::<Vec<_>>(),"proxy":{"download_failures":proxy.download_failures,"action_cache_hits":proxy.action_cache_hits,"action_cache_upstream":proxy.action_cache_upstream,"blob_reads":proxy.blob_reads,"asset_cache_hits":proxy.asset_cache_hits,"asset_upstream_requests":proxy.asset_upstream_requests,"execution_requests":proxy.execution_requests,"execution_waits":proxy.execution_waits,"retention":{"action_refreshes":proxy.retention.action_refreshes,"output_refreshes":proxy.retention.output_refreshes,"blob_refreshes":proxy.retention.blob_refreshes,"blob_repairs":proxy.retention.blob_repairs,"blob_repair_failures":proxy.retention.blob_repair_failures,"failures":proxy.retention.failures,"missing_blobs":proxy.retention.missing_blobs,"dropped":proxy.retention.dropped}},"cache":metrics})
+        json!({"pid":std::process::id(),"rbe_endpoint":self.config.rbe_endpoint(),"cache_endpoint":self.config.cache_endpoint(),"bytestream_uri_prefix":self.config.bytestream_uri_prefix(),"instance_name":self.config.cache.instance_name,"bes_endpoint":self.bes.as_ref().map(|_|self.config.bes_endpoint()),"bes":self.bes.as_ref().map(|bes|bes.metrics()),"bos_endpoint":if self.config.bos.enabled {Some(self.config.rbe_endpoint())}else{None},"output_path_prefix":self.config.state_dir.join("outputs"),"mounts":self.registry.mounts.iter().map(|(path,record)|json!({"session":path,"state":record.state})).collect::<Vec<_>>(),"proxy":{"download_failures":proxy.download_failures,"action_cache_hits":proxy.action_cache_hits,"action_cache_upstream":proxy.action_cache_upstream,"blob_reads":proxy.blob_reads,"read_slots_in_use":proxy.read_slots_in_use,"read_slots_queued":proxy.read_slots_queued,"asset_cache_hits":proxy.asset_cache_hits,"asset_upstream_requests":proxy.asset_upstream_requests,"execution_requests":proxy.execution_requests,"execution_waits":proxy.execution_waits,"retention":{"action_refreshes":proxy.retention.action_refreshes,"output_refreshes":proxy.retention.output_refreshes,"blob_refreshes":proxy.retention.blob_refreshes,"blob_repairs":proxy.retention.blob_repairs,"blob_repair_failures":proxy.retention.blob_repair_failures,"failures":proxy.retention.failures,"missing_blobs":proxy.retention.missing_blobs,"dropped":proxy.retention.dropped}},"cache":metrics})
     }
     fn mounted(&self, path: &Path) -> bool {
         #[cfg(target_os = "linux")]
@@ -568,6 +568,7 @@ pub async fn serve(mut config: Config) -> Result<()> {
         execution_timeout: (config.cache.execution_timeout_ms > 0)
             .then(|| Duration::from_millis(config.cache.execution_timeout_ms)),
         max_concurrent_rpcs_per_connection: config.cache.max_concurrent_rpcs_per_connection,
+        max_concurrent_reads: config.cache.max_concurrent_reads,
         local_bearer_token: None,
     })
     .await?;
@@ -887,6 +888,7 @@ pub async fn serve(mut config: Config) -> Result<()> {
     if crate::recovery::identity(&state.config.state_dir.join("outputs"))?.is_none() {
         let _ = std::fs::remove_file(state.config.state_dir.join("bos-mount.json"));
     }
+    state.proxy.wait_for_reads_idle().await?;
     state.cache.wait_for_idle().await?;
     state.cache.flush_recency()?;
     let _ = std::fs::remove_file(socket);

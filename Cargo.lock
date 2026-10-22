@@ -489,6 +489,7 @@ dependencies = [
  "async-trait",
  "blake3",
  "futures-core",
+ "libc",
  "local-cas",
  "prost",
  "reapi",

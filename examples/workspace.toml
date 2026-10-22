@@ -10,6 +10,8 @@ max_bytes = 4294967296
 max_concurrent_fetches = 8
 # Bound simultaneous requests on each local cache connection.
 max_concurrent_rpcs_per_connection = 128
+# Bound CAS serving files across all connections, independently of fetch slots.
+max_concurrent_reads = 128
 max_inflight_bytes = 536870912
 max_blob_bytes = 536870912
 # Fixed validity after an upstream AC read; local hits do not slide it.

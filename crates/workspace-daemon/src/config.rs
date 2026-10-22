@@ -33,6 +33,7 @@ pub struct Cache {
     pub api_key_env: String,
     pub max_bytes: u64,
     pub max_concurrent_fetches: usize,
+    pub max_concurrent_reads: usize,
     pub max_concurrent_rpcs_per_connection: usize,
     pub max_inflight_bytes: u64,
     pub max_blob_bytes: u64,
@@ -144,6 +145,7 @@ impl Default for Cache {
             api_key_env: "BUILDBUDDY_API_KEY".into(),
             max_bytes: 4 * 1024 * 1024 * 1024,
             max_concurrent_fetches: 8,
+            max_concurrent_reads: 128,
             max_concurrent_rpcs_per_connection: 128,
             max_inflight_bytes: 512 * 1024 * 1024,
             max_blob_bytes: 512 * 1024 * 1024,
@@ -229,6 +231,10 @@ impl Config {
                 && self.cache.max_blob_bytes <= self.cache.max_inflight_bytes
                 && self.cache.max_concurrent_fetches > 0,
             "cache budgets must be positive; max_blob_bytes must fit cache and in-flight budgets"
+        );
+        ensure!(
+            (1..=1024).contains(&self.cache.max_concurrent_reads),
+            "cache.max_concurrent_reads must be 1..=1024"
         );
         ensure!(
             (1..=1024).contains(&self.cache.max_concurrent_rpcs_per_connection),
@@ -334,6 +340,8 @@ api_key_env = "BUILDBUDDY_API_KEY"
 max_bytes = 4294967296
 # Bound simultaneous requests on each local cache connection.
 max_concurrent_rpcs_per_connection = 128
+# Bound CAS serving files across connections, including streaming responses.
+max_concurrent_reads = 128
 # Fixed validity after an upstream AC read; local hits do not slide it.
 action_cache_ttl_seconds = 3600
 # Assumed backend retention. Zero disables background retention maintenance.
@@ -418,6 +426,7 @@ mod tests {
         invalid.cache.upstream_retention_seconds = 0;
         assert!(invalid.validate().is_ok(), "zero disables maintenance");
         assert_eq!(config.cache.max_concurrent_rpcs_per_connection, 128);
+        assert_eq!(config.cache.max_concurrent_reads, 128);
         assert!(config.session.remote_repo_contents_cache);
         assert!(config.bes.enabled);
         assert_eq!(config.bes.retry_max_attempts, 4);
@@ -443,33 +452,30 @@ mod tests {
         assert!(watchdog.validate().is_err(), "completion budget is bounded");
     }
     #[test]
-    fn cache_rpc_connection_limit_accepts_overrides_and_rejects_invalid_bounds() {
-        for (name, limit, valid) in [
-            ("single request", 1, true),
-            ("benchmark override", 32, true),
-            ("maximum supported", 1024, true),
-            ("disabled admission", 0, false),
-            ("above maximum", 1025, false),
-        ] {
-            let input = EXAMPLE.replace(
-                "max_concurrent_rpcs_per_connection = 128",
-                &format!("max_concurrent_rpcs_per_connection = {limit}"),
-            );
-            let config: Config = toml::from_str(&input).unwrap();
-            assert_eq!(
-                config.cache.max_concurrent_rpcs_per_connection, limit,
-                "{name}"
-            );
-            assert_eq!(config.validate().is_ok(), valid, "{name}");
+    fn cache_admission_limits_accept_overrides_and_reject_invalid_bounds() {
+        let settings: [(&str, fn(&Cache) -> usize); 2] = [
+            ("max_concurrent_rpcs_per_connection", |cache| {
+                cache.max_concurrent_rpcs_per_connection
+            }),
+            ("max_concurrent_reads", |cache| cache.max_concurrent_reads),
+        ];
+        for (setting, value) in settings {
+            for (name, limit, valid) in [
+                ("single request", 1, true),
+                ("benchmark override", 32, true),
+                ("maximum supported", 1024, true),
+                ("disabled admission", 0, false),
+                ("above maximum", 1025, false),
+            ] {
+                let input =
+                    EXAMPLE.replace(&format!("{setting} = 128"), &format!("{setting} = {limit}"));
+                let config: Config = toml::from_str(&input).unwrap();
+                assert_eq!(value(&config.cache), limit, "{setting}: {name}");
+                assert_eq!(config.validate().is_ok(), valid, "{setting}: {name}");
+            }
+            let input = EXAMPLE.replace(&format!("{setting} = 128\n"), "");
+            assert_eq!(value(&toml::from_str::<Config>(&input).unwrap().cache), 128);
         }
-        let input = EXAMPLE.replace("max_concurrent_rpcs_per_connection = 128\n", "");
-        assert_eq!(
-            toml::from_str::<Config>(&input)
-                .unwrap()
-                .cache
-                .max_concurrent_rpcs_per_connection,
-            128
-        );
     }
     #[test]
     fn refuses_public_listener_and_unknown_fields() {

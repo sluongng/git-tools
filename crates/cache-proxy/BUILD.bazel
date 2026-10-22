@@ -13,6 +13,13 @@ rust_library(
     deps = all_crate_deps(normal = True),
 )
 rust_test(
+    name = "unit_tests",
+    aliases = aliases(),
+    crate = ":cache-proxy",
+    edition = "2024",
+    deps = all_crate_deps(normal = True, normal_dev = True),
+)
+rust_test(
     name = "integration_tests",
     srcs = ["tests/proxy.rs"],
     aliases = aliases(),

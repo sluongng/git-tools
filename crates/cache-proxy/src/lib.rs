@@ -3,6 +3,7 @@
 mod asset;
 mod download;
 mod execution;
+mod read;
 mod repair;
 mod retention;
 
@@ -33,10 +34,7 @@ use std::{
     },
     time::{Duration, Instant},
 };
-use tokio::{
-    io::{AsyncReadExt, AsyncSeekExt},
-    net::TcpListener,
-};
+use tokio::{io::AsyncReadExt, net::TcpListener};
 use tonic::{
     Request, Response, Status,
     codec::CompressionEncoding,
@@ -104,6 +102,10 @@ pub struct ProxyConfig {
     pub max_blob_bytes: u64,
     pub max_batch_bytes: usize,
     pub max_concurrent_rpcs_per_connection: usize,
+    /// Shared cached-response descriptor admission across connections and RPCs.
+    /// Hydration finishes before consuming a slot; this is not an all-process
+    /// descriptor quota.
+    pub max_concurrent_reads: usize,
     /// Nonzero requires an operator-provided upstream retention guarantee.
     /// Zero is safe with backends whose eviction policy is unknown.
     pub action_cache_ttl: Duration,
@@ -131,6 +133,7 @@ impl Default for ProxyConfig {
             max_blob_bytes: 512 * 1024 * 1024,
             max_batch_bytes: 4 * 1024 * 1024,
             max_concurrent_rpcs_per_connection: 128,
+            max_concurrent_reads: 128,
             action_cache_ttl: Duration::ZERO,
             max_action_cache_entries: 4096,
             upstream_retention: Duration::ZERO,
@@ -165,6 +168,8 @@ pub struct ProxyMetrics {
     pub execution_waits: u64,
     pub retention: retention::Metrics,
     pub download_failures: FailureMetrics,
+    pub read_slots_in_use: u64,
+    pub read_slots_queued: u64,
 }
 #[derive(Clone)]
 pub struct CacheProxy {
@@ -173,6 +178,7 @@ pub struct CacheProxy {
     ac: Arc<Mutex<Actions>>,
     metrics: Arc<Counters>,
     writes: Arc<tokio::sync::Semaphore>,
+    reads: Arc<read::Admission>,
     executions: Arc<tokio::sync::Semaphore>,
     assets: Arc<Mutex<asset::Mappings>>,
     stop: tokio::sync::watch::Sender<bool>,
@@ -228,6 +234,10 @@ impl Upstream {
         ensure!(
             (1..=1024).contains(&config.max_concurrent_rpcs_per_connection),
             "RPC concurrency limit must be 1..1024"
+        );
+        ensure!(
+            (1..=1024).contains(&config.max_concurrent_reads),
+            "invalid shared cached-response read limit"
         );
         ensure!(
             !config.backend_identity.is_empty(),
@@ -457,6 +467,13 @@ fn cache_status(error: anyhow::Error) -> Status {
     if error.downcast_ref::<local_cas::CacheLimitError>().is_some() {
         return Status::resource_exhausted("blob exceeds local CAS budget");
     }
+    if error.chain().any(|cause| {
+        cause
+            .downcast_ref::<std::io::Error>()
+            .is_some_and(read::descriptor_exhausted)
+    }) {
+        return Status::resource_exhausted("local file descriptor limit reached");
+    }
     Status::data_loss("CAS fetch or verification failed")
 }
 #[async_trait]
@@ -521,6 +538,7 @@ impl CacheProxy {
     }
     pub fn new(upstream: Arc<Upstream>, cache: Arc<LocalCas>) -> Self {
         let execution_limit = upstream.config.max_execution_streams;
+        let read_limit = upstream.config.max_concurrent_reads;
         let ac = upstream.retention.actions.clone();
         Self {
             upstream,
@@ -528,6 +546,7 @@ impl CacheProxy {
             ac,
             metrics: Arc::new(Counters::default()),
             writes: Arc::new(tokio::sync::Semaphore::new(4)),
+            reads: Arc::new(read::Admission::new(read_limit)),
             executions: Arc::new(tokio::sync::Semaphore::new(execution_limit)),
             assets: Default::default(),
             stop: tokio::sync::watch::channel(false).0,
@@ -544,6 +563,17 @@ impl CacheProxy {
     pub async fn wait_for_maintenance_shutdown(&self) {
         self.upstream.retention.wait_stopped().await;
     }
+    /// Call after stop_forwarding and handler drain/cancellation. Admitted
+    /// blocking jobs retain their read slot and cache pin even after their RPC
+    /// future is dropped. The semaphore stays open so this barrier can acquire
+    /// every permit; the stop watch rejects any late handler admission.
+    pub async fn wait_for_reads_idle(&self) -> Result<()> {
+        ensure!(
+            *self.stop.borrow(),
+            "stop forwarding before waiting for cached reads"
+        );
+        self.reads.wait_for_idle().await
+    }
     pub fn metrics(&self) -> ProxyMetrics {
         ProxyMetrics {
             action_cache_hits: self.metrics.ac_hits.load(Ordering::Relaxed),
@@ -555,6 +585,8 @@ impl CacheProxy {
             execution_waits: self.metrics.execution_waits.load(Ordering::Relaxed),
             retention: self.upstream.retention.metrics(),
             download_failures: self.upstream.download_failures.metrics(),
+            read_slots_in_use: self.reads.in_use(),
+            read_slots_queued: self.reads.queued(),
         }
     }
     pub async fn serve(
@@ -714,10 +746,8 @@ impl CacheProxy {
         compressed: bool,
     ) -> batch_read_blobs_response::Response {
         let result: Result<(Vec<u8>, i32), Status> = async {
-            let blob = self.content(&digest, function).await?;
-            let data = tokio::fs::read(blob.path())
-                .await
-                .map_err(|_| Status::internal("reading verified cache blob"))?;
+            let blob = self.read_content(&digest, function).await?;
+            let data = self.reads.read_all(blob, self.stop.subscribe()).await?;
             if compressed {
                 Ok((
                     reapi::compression::encode_zstd(&data)
@@ -750,6 +780,21 @@ impl CacheProxy {
             data,
             compressor,
             status: Some(status),
+        }
+    }
+    async fn read_content(
+        &self,
+        digest: &Digest,
+        function: i32,
+    ) -> Result<Arc<local_cas::CachedBlob>, Status> {
+        let mut stop = self.stop.subscribe();
+        if *stop.borrow() {
+            return Err(Status::unavailable("proxy shutting down"));
+        }
+        tokio::select! {
+            biased;
+            _ = stop.changed() => Err(Status::unavailable("proxy shutting down")),
+            result = self.content(digest, function) => result,
         }
     }
     async fn content(
@@ -894,35 +939,44 @@ impl content_addressable_storage_server::ContentAddressableStorage for CacheProx
         &self,
         req: Request<BatchReadBlobsRequest>,
     ) -> Result<Response<BatchReadBlobsResponse>, Status> {
-        let req = req.into_inner();
-        self.upstream.scope(&req.instance_name)?;
-        let mut total = 0u64;
-        for digest in &req.digests {
-            total = total
-                .checked_add(self.upstream.artifact(digest, req.digest_function)?.size)
-                .ok_or_else(|| Status::invalid_argument("batch size overflow"))?;
-        }
-        if total > self.upstream.config.max_batch_bytes as u64 {
-            return Err(Status::invalid_argument("batch exceeds configured limit"));
-        }
-        let mut responses = Vec::with_capacity(req.digests.len());
-        let compressed = req.acceptable_compressors.contains(&1);
-        // Keep cold batches from becoming serial network round trips. A bounded
-        // window also prevents one large batch from flooding CAS admission.
-        for chunk in req.digests.chunks(8) {
-            let mut tasks = tokio::task::JoinSet::new();
-            for digest in chunk {
-                let proxy = self.clone();
-                let digest = digest.clone();
-                let function = req.digest_function;
-                tasks.spawn(async move { proxy.read_response(digest, function, compressed).await });
+        let deadline =
+            tokio::time::Instant::now() + self.upstream.config.policy.operation_timeout();
+        reapi::policy::timeout(deadline, async {
+            let req = req.into_inner();
+            self.upstream.scope(&req.instance_name)?;
+            let mut total = 0u64;
+            for digest in &req.digests {
+                total = total
+                    .checked_add(self.upstream.artifact(digest, req.digest_function)?.size)
+                    .ok_or_else(|| Status::invalid_argument("batch size overflow"))?;
             }
-            while let Some(response) = tasks.join_next().await {
-                responses.push(response.map_err(|_| Status::internal("batch read task failed"))?);
+            if total > self.upstream.config.max_batch_bytes as u64 {
+                return Err(Status::invalid_argument("batch exceeds configured limit"));
             }
-        }
-        Ok(Response::new(BatchReadBlobsResponse { responses }))
+            let mut responses = Vec::with_capacity(req.digests.len());
+            let compressed = req.acceptable_compressors.contains(&1);
+            // Keep cold batches from becoming serial network round trips. A bounded
+            // window also prevents one large batch from flooding CAS admission.
+            for chunk in req.digests.chunks(8) {
+                let mut tasks = tokio::task::JoinSet::new();
+                for digest in chunk {
+                    let proxy = self.clone();
+                    let digest = digest.clone();
+                    let function = req.digest_function;
+                    tasks.spawn(
+                        async move { proxy.read_response(digest, function, compressed).await },
+                    );
+                }
+                while let Some(response) = tasks.join_next().await {
+                    responses
+                        .push(response.map_err(|_| Status::internal("batch read task failed"))?);
+                }
+            }
+            Ok(Response::new(BatchReadBlobsResponse { responses }))
+        })
+        .await
     }
+
     async fn batch_update_blobs(
         &self,
         req: Request<BatchUpdateBlobsRequest>,
@@ -1271,48 +1325,53 @@ impl ByteStream for CacheProxy {
         &self,
         req: Request<bs::ReadRequest>,
     ) -> Result<Response<Self::ReadStream>, Status> {
-        let req = req.into_inner();
-        let (artifact, compressed) = self.upstream.parse_resource(&req.resource_name, false)?;
-        if compressed && req.read_limit != 0 {
-            return Err(Status::invalid_argument(
-                "compressed reads require read_limit zero",
-            ));
-        }
-        if req.read_offset < 0 || req.read_limit < 0 || req.read_offset as u64 > artifact.size {
-            return Err(Status::out_of_range("invalid blob read range"));
-        }
-        let blob = self
-            .content(
-                &Digest {
-                    hash: artifact.hash,
-                    size_bytes: artifact.size as i64,
-                },
-                artifact.digest_function,
-            )
-            .await?;
-        let mut file = tokio::fs::File::open(blob.path())
-            .await
-            .map_err(|_| Status::internal("opening cache blob"))?;
-        file.seek(std::io::SeekFrom::Start(req.read_offset as u64))
-            .await
-            .map_err(|_| Status::internal("seeking cache blob"))?;
-        let limit = if req.read_limit == 0 {
-            artifact.size - req.read_offset as u64
-        } else {
-            (req.read_limit as u64).min(artifact.size - req.read_offset as u64)
-        };
-        let reader = file.take(limit);
-        let mut reader: Pin<Box<dyn tokio::io::AsyncRead + Send>> = if compressed {
+        // One setup budget includes hydration, shared read admission and the
+        // blocking open/seek. Do not restart it after content becomes resident,
+        // or impose it on a long-lived response body.
+        let deadline =
+            tokio::time::Instant::now() + self.upstream.config.policy.operation_timeout();
+        let (reader, compressed) = reapi::policy::timeout(deadline, async {
+            let req = req.into_inner();
+            let (artifact, compressed) = self.upstream.parse_resource(&req.resource_name, false)?;
+            if compressed && req.read_limit != 0 {
+                return Err(Status::invalid_argument(
+                    "compressed reads require read_limit zero",
+                ));
+            }
+            if req.read_offset < 0 || req.read_limit < 0 || req.read_offset as u64 > artifact.size {
+                return Err(Status::out_of_range("invalid blob read range"));
+            }
+            let blob = self
+                .read_content(
+                    &Digest {
+                        hash: artifact.hash,
+                        size_bytes: artifact.size as i64,
+                    },
+                    artifact.digest_function,
+                )
+                .await?;
+            let reader = self
+                .reads
+                .open(blob, self.stop.subscribe(), req.read_offset as u64)
+                .await?;
+            let limit = if req.read_limit == 0 {
+                artifact.size - req.read_offset as u64
+            } else {
+                (req.read_limit as u64).min(artifact.size - req.read_offset as u64)
+            };
+            Ok((reader.take(limit), compressed))
+        })
+        .await?;
+        let reader: Pin<Box<dyn tokio::io::AsyncRead + Send>> = if compressed {
             Box::pin(async_compression::tokio::bufread::ZstdEncoder::new(
                 tokio::io::BufReader::new(reader),
             ))
         } else {
             Box::pin(reader)
         };
-        Ok(Response::new(Box::pin(
-            async_stream::try_stream! { let _lease = blob; let mut buffer = vec![0; 64 * 1024]; loop { let n = reader.read(&mut buffer).await.map_err(|_| Status::internal("reading cache blob"))?; if n == 0 { break; } yield bs::ReadResponse { data: buffer[..n].to_vec() }; } },
-        )))
+        Ok(Response::new(read::body(reader, self.stop.subscribe())))
     }
+
     async fn write(
         &self,
         req: Request<tonic::Streaming<bs::WriteRequest>>,

@@ -64,6 +64,12 @@ Downloader mappings have fixed TTL and bounded metadata. Reuse needs verified
 local bytes and an upstream presence check. Directory fetches always forward:
 a cached root does not prove availability of its contents.
 
+`cache.max_concurrent_reads = 128` bounds CAS serving-file operations across all
+connections, shared by streaming and batch reads. It is independent of download
+slots and the per-connection RPC limit. Admission uses the existing operation
+budget; active streams retain their slot until the file closes. This is not a
+process-wide file-descriptor quota: sockets and other services need headroom too.
+
 ## Durable build events
 
 BES uses the separate `[bes]` policy, not REAPI retry settings. Events are ACKed

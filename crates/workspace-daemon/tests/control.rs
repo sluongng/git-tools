@@ -161,6 +161,8 @@ async fn private_control_retains_registry_and_excludes_second_owner() -> Result<
     })
     .await??;
     assert_eq!(status["cache"]["resident_bytes"], 0);
+    assert_eq!(status["proxy"]["read_slots_in_use"], 0);
+    assert_eq!(status["proxy"]["read_slots_queued"], 0);
     assert!(status["bos_endpoint"].is_null());
     assert_eq!(status["bes_endpoint"], config.bes_endpoint());
     assert!(status["bes"].is_object());

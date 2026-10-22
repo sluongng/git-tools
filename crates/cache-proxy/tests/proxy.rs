@@ -2085,6 +2085,172 @@ async fn concurrent_byte_stream_readers_keep_independent_ranges_and_codecs() {
     }
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn cached_response_read_slots_are_shared_across_connections_and_batch_reads() {
+    async fn read_client(url: String) -> ByteStreamClient<tonic::transport::Channel> {
+        let channel = tonic::transport::Endpoint::from_shared(url)
+            .unwrap()
+            .initial_stream_window_size(65_535)
+            .initial_connection_window_size(65_535)
+            .connect()
+            .await
+            .unwrap();
+        ByteStreamClient::new(channel)
+    }
+    async fn read_all(mut stream: tonic::Streaming<bs::ReadResponse>) -> Vec<u8> {
+        let mut data = Vec::new();
+        while let Some(response) = stream.message().await.unwrap() {
+            data.extend(response.data);
+        }
+        data
+    }
+
+    let h = Harness::configured(
+        Duration::ZERO,
+        None,
+        |config| config.max_concurrent_reads = 2,
+        CacheConfig::default(),
+    )
+    .await;
+    let mut random = 0x8765_4321u32;
+    let large: Vec<_> = (0..2 * 1024 * 1024)
+        .map(|_| {
+            random ^= random << 13;
+            random ^= random >> 17;
+            random ^= random << 5;
+            random as u8
+        })
+        .collect();
+    let batch_data = [b"first batch item".to_vec(), b"second batch item".to_vec()];
+    for data in std::iter::once(&large).chain(batch_data.iter()) {
+        drop(
+            h.cache
+                .clone()
+                .content_from(local_artifact(data, 9), Arc::new(LocalBytes(data.clone())))
+                .await
+                .unwrap(),
+        );
+    }
+    let d = digest(&large);
+    let resource = format!("repo/blobs/blake3/{}/{}", d.hash, d.size_bytes);
+    let full = || bs::ReadRequest {
+        resource_name: resource.clone(),
+        ..Default::default()
+    };
+    let mut first_client = read_client(h.url.clone()).await;
+    let first_body = first_client
+        .read(h.request(full()))
+        .await
+        .unwrap()
+        .into_inner();
+    let mut second_client = read_client(h.url.clone()).await;
+    let second_body = second_client
+        .read(h.request(full()))
+        .await
+        .unwrap()
+        .into_inner();
+    // Each response is much larger than this independent connection's receive
+    // window. Keeping its body unread retains a server-side file owner.
+    eventually(|| h.proxy.metrics().read_slots_in_use == 2).await;
+
+    let mut range = full();
+    range.read_offset = 17;
+    range.read_limit = 31;
+    let request = h.request(range);
+    let url = h.url.clone();
+    let third = tokio::spawn(async move {
+        let mut client = read_client(url).await;
+        read_all(client.read(request).await.unwrap().into_inner()).await
+    });
+    eventually(|| h.proxy.metrics().read_slots_queued == 1).await;
+    let batch_digests: Vec<_> = batch_data.iter().map(|data| digest(data)).collect();
+    let request = h.request(BatchReadBlobsRequest {
+        instance_name: "repo".into(),
+        digests: batch_digests.clone(),
+        digest_function: 9,
+        acceptable_compressors: vec![1],
+    });
+    let url = h.url.clone();
+    let batch = tokio::spawn(async move {
+        let mut client =
+            content_addressable_storage_client::ContentAddressableStorageClient::connect(url)
+                .await
+                .unwrap();
+        client.batch_read_blobs(request).await.unwrap().into_inner()
+    });
+    // The two batch children use the same slots; there is no outer batch permit.
+    eventually(|| h.proxy.metrics().read_slots_queued == 3).await;
+
+    let request = h.request(full());
+    let url = h.url.clone();
+    let cancelled = tokio::spawn(async move {
+        let mut client = read_client(url).await;
+        client.read(request).await
+    });
+    eventually(|| h.proxy.metrics().read_slots_queued == 4).await;
+    cancelled.abort();
+    assert!(cancelled.await.unwrap_err().is_cancelled());
+    eventually(|| h.proxy.metrics().read_slots_queued == 3).await;
+    assert_eq!(h.proxy.metrics().read_slots_in_use, 2);
+
+    drop(first_body);
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(5), third)
+            .await
+            .unwrap()
+            .unwrap(),
+        large[17..48]
+    );
+    let response = tokio::time::timeout(Duration::from_secs(5), batch)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(response.responses.len(), batch_data.len());
+    let mut seen = vec![false; batch_data.len()];
+    for item in response.responses {
+        let position = batch_digests
+            .iter()
+            .position(|d| Some(d) == item.digest.as_ref())
+            .unwrap();
+        assert!(!seen[position], "each requested batch item appears once");
+        seen[position] = true;
+        assert_eq!(item.status.unwrap().code, 0);
+        assert_eq!(item.compressor, 1);
+        assert_eq!(
+            reapi::compression::decode_zstd(&item.data, batch_data[position].len() as u64).unwrap(),
+            batch_data[position]
+        );
+    }
+    assert!(seen.into_iter().all(|present| present));
+    eventually(|| {
+        h.proxy.metrics().read_slots_in_use == 1 && h.proxy.metrics().read_slots_queued == 0
+    })
+    .await;
+    // Keep the other backpressured body alive and unread. Shutdown must release
+    // its file owner independently of the client's next body poll or drop.
+    h.proxy.stop_forwarding();
+    h.proxy.wait_for_maintenance_shutdown().await;
+    tokio::time::timeout(Duration::from_secs(5), h.proxy.wait_for_reads_idle())
+        .await
+        .expect("shutdown must drain an unread response body")
+        .unwrap();
+    let mut late_client = read_client(h.url.clone()).await;
+    assert_eq!(
+        late_client
+            .read(h.request(full()))
+            .await
+            .err()
+            .expect("late cached read must be rejected")
+            .code(),
+        tonic::Code::Unavailable
+    );
+    drop(second_body);
+    h.cache.wait_for_idle().await.unwrap();
+    assert_eq!(h.proxy.metrics().read_slots_in_use, 0);
+    assert_eq!(h.proxy.metrics().read_slots_queued, 0);
+    assert_eq!(h.backend.reads.load(Ordering::Relaxed), 0);
+}
+
 #[tokio::test]
 async fn forwards_only_bounded_request_attribution_and_daemon_credentials() {
     use prost::Message;
