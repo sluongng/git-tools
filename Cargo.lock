@@ -5237,6 +5237,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "tinytree-fixture"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "blake3",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tinytree-model",
+]
+
+[[package]]
 name = "tinytree-model"
 version = "0.1.0"
 dependencies = [

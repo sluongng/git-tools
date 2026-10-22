@@ -84,12 +84,17 @@ workflow; the other executables are standalone entry points.
 | [`workspace-core`](crates/workspace-core) | Git-backed source tree, lazy reads and prefetch scheduling. |
 | [`workspace-overlay`](crates/workspace-overlay) | Persistent edits, writable namespace and change journal. |
 | [`local-cas`](crates/local-cas) | Verified local blob storage with bounded LRU eviction. |
+| [`tinytree-model`](crates/tinytree-model) | Canonical jj-native objects, typed IDs and bounded verification. |
+| [`tinytree-proto`](crates/tinytree-proto) | Native repository gRPC bindings; not a server implementation. |
 | [`git-pack-cache`](crates/git-pack-cache) | Reusable Git fetch/pack responses. |
 | [`reapi`](crates/reapi) | Remote Execution API protocols and client policy. |
 | [`cache-proxy`](crates/cache-proxy) | Cache, execution and remote-downloader forwarding. |
 | [`bes-proxy`](crates/bes-proxy) | Durable, concurrent build-event forwarding. |
 | [`output-core`](crates/output-core) | Lazy output namespace and metadata. |
 | [`output-fuse`](crates/output-fuse), [`output-nfs`](crates/output-nfs), [`output-projfs`](crates/output-projfs) | Linux, macOS and Windows output-mount adapters. |
+
+For native repository test seeds, [tinytree-fixture](crates/tinytree-fixture)
+provides a deterministic library and CLI without requiring Git conversion.
 
 ## Reference
 

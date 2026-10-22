@@ -11,6 +11,7 @@ members = [
     "crates/reapi",
     "crates/tinytree-proto",
     "crates/tinytree-model",
+    "crates/tinytree-fixture",
     "crates/git-proxy",
     "crates/workspace-projfs",
     "crates/bazel-output-service",

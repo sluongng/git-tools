@@ -1,0 +1,55 @@
+load("@crates//:defs.bzl", "aliases", "all_crate_deps")
+load("@rules_rs//rs:rust_binary.bzl", "rust_binary")
+load("@rules_rs//rs:rust_library.bzl", "rust_library")
+load("@rules_rs//rs:rust_test.bzl", "rust_test")
+
+package(default_visibility = ["//visibility:public"])
+
+rust_library(
+    name = "tinytree-fixture",
+    srcs = glob(
+        ["src/**/*.rs"],
+        exclude = ["src/main.rs"],
+    ),
+    aliases = aliases(),
+    crate_name = "tinytree_fixture",
+    crate_root = "src/lib.rs",
+    edition = "2024",
+    version = "0.1.0",
+    deps = all_crate_deps(normal = True),
+)
+
+rust_binary(
+    name = "tinytree-fixture-bin",
+    srcs = ["src/main.rs"],
+    aliases = aliases(),
+    crate_name = "tinytree_fixture",
+    edition = "2024",
+    version = "0.1.0",
+    deps = [":tinytree-fixture"] + all_crate_deps(normal = True),
+)
+
+rust_test(
+    name = "unit_tests",
+    aliases = aliases(),
+    crate = ":tinytree-fixture",
+    edition = "2024",
+    deps = all_crate_deps(
+        normal = True,
+        normal_dev = True,
+    ),
+)
+
+rust_test(
+    name = "cli_tests",
+    srcs = ["tests/cli.rs"],
+    aliases = aliases(),
+    data = [":tinytree-fixture-bin"],
+    edition = "2024",
+    rustc_env = {"CARGO_BIN_EXE_tinytree-fixture": "$(rootpath :tinytree-fixture-bin)"},
+    version = "0.1.0",
+    deps = [":tinytree-fixture"] + all_crate_deps(
+        normal = True,
+        normal_dev = True,
+    ),
+)
