@@ -1,0 +1,89 @@
+load("@crates//:defs.bzl", "aliases", "all_crate_deps")
+load("@rules_rs//rs:rust_binary.bzl", "rust_binary")
+load("@rules_rs//rs:rust_library.bzl", "rust_library")
+load("@rules_rs//rs:rust_test.bzl", "rust_test")
+
+package(default_visibility = ["//visibility:public"])
+
+rust_library(
+    name = "tinytree-server",
+    srcs = glob(
+        ["src/**/*.rs"],
+        exclude = ["src/main.rs"],
+    ),
+    aliases = aliases(),
+    crate_name = "tinytree_server",
+    crate_root = "src/lib.rs",
+    edition = "2024",
+    version = "0.1.0",
+    deps = all_crate_deps(normal = True),
+)
+
+rust_binary(
+    name = "tinytree",
+    srcs = ["src/main.rs"],
+    aliases = aliases(),
+    crate_name = "tinytree",
+    edition = "2024",
+    version = "0.1.0",
+    deps = [":tinytree-server"] + all_crate_deps(normal = True),
+)
+
+rust_test(
+    name = "unit_tests",
+    aliases = aliases(),
+    crate = ":tinytree-server",
+    edition = "2024",
+    deps = all_crate_deps(
+        normal = True,
+        normal_dev = True,
+    ),
+)
+
+rust_test(
+    name = "rpc_tests",
+    srcs = ["tests/rpc.rs"],
+    aliases = aliases(),
+    edition = "2024",
+    deps = [":tinytree-server"] + all_crate_deps(
+        normal = True,
+        normal_dev = True,
+    ),
+)
+
+rust_test(
+    name = "tls_tests",
+    srcs = ["tests/tls.rs"],
+    aliases = aliases(),
+    data = [
+        "tests/fixtures/ca.pem",
+        "tests/fixtures/server-key.pem",
+        "tests/fixtures/server.pem",
+        "tests/fixtures/wrong-ca.pem",
+    ],
+    edition = "2024",
+    env = {"TINYTREE_PUBLIC_TLS_TEST_TOKEN": "public-tls-test-token-not-a-secret"},
+    rustc_env = {
+        "TLS_CA_CERT": "$(rootpath tests/fixtures/ca.pem)",
+        "TLS_SERVER_CERT": "$(rootpath tests/fixtures/server.pem)",
+        "TLS_SERVER_KEY": "$(rootpath tests/fixtures/server-key.pem)",
+        "TLS_WRONG_CA_CERT": "$(rootpath tests/fixtures/wrong-ca.pem)",
+    },
+    deps = [":tinytree-server"] + all_crate_deps(
+        normal = True,
+        normal_dev = True,
+    ),
+)
+
+rust_test(
+    name = "unix_tests",
+    srcs = ["tests/unix.rs"],
+    aliases = aliases(),
+    data = [":tinytree"],
+    edition = "2024",
+    rustc_env = {"CARGO_BIN_EXE_tinytree": "$(rootpath :tinytree)"},
+    deps = [":tinytree-server"] + all_crate_deps(
+        normal = True,
+        normal_dev = True,
+    ),
+)

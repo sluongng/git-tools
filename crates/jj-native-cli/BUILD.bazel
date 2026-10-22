@@ -1,0 +1,26 @@
+load("@crates//:defs.bzl", "aliases", "all_crate_deps")
+load("@rules_rs//rs:rust_binary.bzl", "rust_binary")
+load("@rules_rs//rs:rust_test.bzl", "rust_test")
+
+package(default_visibility = ["//visibility:public"])
+
+rust_binary(
+    name = "tinytree-jj",
+    srcs = ["src/main.rs"],
+    aliases = aliases(),
+    crate_name = "tinytree_jj",
+    edition = "2024",
+    version = "0.1.0",
+    deps = all_crate_deps(normal = True),
+)
+
+rust_test(
+    name = "cli_tests",
+    srcs = ["tests/cli.rs"],
+    aliases = aliases(),
+    data = [":tinytree-jj"],
+    edition = "2024",
+    rustc_env = {"CARGO_BIN_EXE_tinytree-jj": "$(rootpath :tinytree-jj)"},
+    version = "0.1.0",
+    deps = all_crate_deps(normal_dev = True),
+)

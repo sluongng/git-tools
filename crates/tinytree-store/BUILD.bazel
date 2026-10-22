@@ -1,0 +1,60 @@
+load("@crates//:defs.bzl", "aliases", "all_crate_deps")
+load("@rules_rs//rs:rust_binary.bzl", "rust_binary")
+load("@rules_rs//rs:rust_library.bzl", "rust_library")
+load("@rules_rs//rs:rust_test.bzl", "rust_test")
+
+package(default_visibility = ["//visibility:public"])
+
+rust_library(
+    name = "tinytree-store",
+    srcs = glob(["src/**/*.rs"]),
+    aliases = aliases(),
+    crate_name = "tinytree_store",
+    crate_root = "src/lib.rs",
+    edition = "2024",
+    version = "0.1.0",
+    deps = all_crate_deps(normal = True),
+)
+
+rust_test(
+    name = "unit_tests",
+    aliases = aliases(),
+    crate = ":tinytree-store",
+    edition = "2024",
+    deps = all_crate_deps(normal_dev = True),
+)
+
+rust_binary(
+    name = "durability_driver",
+    testonly = True,
+    srcs = [
+        "tests/common/mod.rs",
+        "tests/durability_driver.rs",
+    ],
+    aliases = aliases(),
+    crate_root = "tests/durability_driver.rs",
+    edition = "2024",
+    visibility = ["//visibility:private"],
+    deps = [":tinytree-store"] + all_crate_deps(
+        normal = True,
+        normal_dev = True,
+    ),
+)
+
+rust_test(
+    name = "durability_tests",
+    size = "medium",
+    srcs = [
+        "tests/common/mod.rs",
+        "tests/durability.rs",
+    ],
+    aliases = aliases(),
+    crate_root = "tests/durability.rs",
+    data = [":durability_driver"],
+    edition = "2024",
+    rustc_env = {"CARGO_BIN_EXE_tinytree-durability-driver": "$(rootpath :durability_driver)"},
+    deps = [":tinytree-store"] + all_crate_deps(
+        normal = True,
+        normal_dev = True,
+    ),
+)

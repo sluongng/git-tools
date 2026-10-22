@@ -1,0 +1,17 @@
+[package]
+name = "jj-native-backend"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+description = "Local authoritative native object backend for Jujutsu"
+
+[dependencies]
+async-trait = "0.1"
+async-stream = "0.3"
+blake3 = "1"
+futures = "0.3"
+jj-lib = { version = "=0.46.0", default-features = false }
+tempfile = "3"
+tinytree-model = { path = "../tinytree-model" }
+tinytree-store = { path = "../tinytree-store" }
+tokio = { version = "1", features = ["rt-multi-thread", "sync"] }

@@ -63,8 +63,8 @@ For agent provisioning and saving changes, see the
 
 ### Executables and their libraries
 
-Each crate below also exposes a Rust library. Use `workspace` for the integrated
-workflow; the other executables are standalone entry points.
+Use `workspace` for the integrated workflow; the other executables are standalone
+entry points. Most also expose Rust libraries; `jj-native-cli` is executable-only.
 
 | Crate | Executable | Purpose |
 | --- | --- | --- |
@@ -75,6 +75,8 @@ workflow; the other executables are standalone entry points.
 | [`workspace-nfs`](crates/workspace-nfs) | `git-nfs` | macOS source mounts over loopback NFS. |
 | [`workspace-projfs`](crates/workspace-projfs) | `git-projfs` | Windows source mounts using ProjFS. |
 | [`jj-vfs`](crates/jj-vfs) | `git-jj` | Jujutsu working-copy integration with the source VFS. |
+| [`tinytree-server`](crates/tinytree-server) | `tinytree` | Separate jj-native object/ref server over compressed gRPC. |
+| [`jj-native-cli`](crates/jj-native-cli) | `tinytree-jj` | Local native jj prototype; no remote or mounted workflow yet. |
 | [`bazel-output-service`](crates/bazel-output-service) | `git-output-service` | Lazy Bazel output service backed by remote CAS. |
 
 ### Library-only crates
@@ -86,6 +88,8 @@ workflow; the other executables are standalone entry points.
 | [`local-cas`](crates/local-cas) | Verified local blob storage with bounded LRU eviction. |
 | [`tinytree-model`](crates/tinytree-model) | Canonical jj-native objects, typed IDs and bounded verification. |
 | [`tinytree-proto`](crates/tinytree-proto) | Native repository gRPC bindings; not a server implementation. |
+| [`tinytree-store`](crates/tinytree-store) | Authoritative native objects, durable refs and reachability GC; not LRU. |
+| [`jj-native-backend`](crates/jj-native-backend) | Local native jj Backend; retains all objects pending client retention integration. |
 | [`git-pack-cache`](crates/git-pack-cache) | Reusable Git fetch/pack responses. |
 | [`reapi`](crates/reapi) | Remote Execution API protocols and client policy. |
 | [`cache-proxy`](crates/cache-proxy) | Cache, execution and remote-downloader forwarding. |

@@ -1,0 +1,21 @@
+# Keep data/config outside the source checkout. Replace the storage location.
+storage = "/var/tmp/tinytree-data"
+listen = "127.0.0.1:8093"
+repositories = ["example"]
+gc_interval_seconds = 300
+
+[[principals]]
+id = "agent"
+token_env = "TINYTREE_AGENT_TOKEN"
+repositories = ["example"]
+write = true
+
+[service]
+max_inflight = 16
+max_inflight_per_repository = 4
+max_frame_bytes = 65536
+
+# Non-loopback TCP additionally requires TLS identities supplied separately.
+# [tls]
+# certificate = "/path/to/certificate.pem"
+# private_key = "/path/to/private-key.pem"

@@ -1,0 +1,40 @@
+[package]
+name = "tinytree-server"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+description = "Native repository gRPC service and standalone server"
+
+[dependencies]
+anyhow = "1"
+async-stream = "0.3"
+blake3 = "1"
+bytes = "1"
+http = "1"
+http-body = "1"
+tower = { version = "0.5", features = ["util"] }
+futures-core = "0.3"
+prost = "0.14"
+reapi = { path = "../reapi" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tinytree-model = { path = "../tinytree-model" }
+tinytree-proto = { path = "../tinytree-proto" }
+tinytree-store = { path = "../tinytree-store" }
+tokio = { version = "1", features = ["full"] }
+tokio-stream = { version = "0.1", features = ["net"] }
+toml = "1.1"
+tonic = { version = "0.14", features = ["zstd", "tls-ring"] }
+uuid = { version = "1", features = ["v4"] }
+
+[dev-dependencies]
+tonic-prost = "0.14"
+tempfile = "3"
+tinytree-fixture = { path = "../tinytree-fixture" }
+
+[[bin]]
+name = "tinytree"
+path = "src/main.rs"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"

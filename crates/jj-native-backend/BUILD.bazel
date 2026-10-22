@@ -1,0 +1,24 @@
+load("@crates//:defs.bzl", "aliases", "all_crate_deps")
+load("@rules_rs//rs:rust_library.bzl", "rust_library")
+load("@rules_rs//rs:rust_test.bzl", "rust_test")
+
+package(default_visibility = ["//visibility:public"])
+
+rust_library(
+    name = "jj-native-backend",
+    srcs = glob(["src/**/*.rs"]),
+    aliases = aliases(),
+    crate_name = "jj_native_backend",
+    crate_root = "src/lib.rs",
+    edition = "2024",
+    version = "0.1.0",
+    deps = all_crate_deps(normal = True),
+)
+
+rust_test(
+    name = "unit_tests",
+    aliases = aliases(),
+    crate = ":jj-native-backend",
+    edition = "2024",
+    deps = all_crate_deps(normal = True),
+)

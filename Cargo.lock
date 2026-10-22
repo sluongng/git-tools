@@ -3071,6 +3071,32 @@ dependencies = [
 ]
 
 [[package]]
+name = "jj-native-backend"
+version = "0.1.0"
+dependencies = [
+ "async-stream",
+ "async-trait",
+ "blake3",
+ "futures",
+ "jj-lib",
+ "tempfile",
+ "tinytree-model",
+ "tinytree-store",
+ "tokio",
+]
+
+[[package]]
+name = "jj-native-cli"
+version = "0.1.0"
+dependencies = [
+ "clap",
+ "jj-cli",
+ "jj-lib",
+ "jj-native-backend",
+ "tempfile",
+]
+
+[[package]]
 name = "jj-vfs"
 version = "0.1.0"
 dependencies = [
@@ -5264,6 +5290,50 @@ dependencies = [
  "tonic",
  "tonic-prost",
  "tonic-prost-build",
+]
+
+[[package]]
+name = "tinytree-server"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-stream",
+ "blake3",
+ "bytes",
+ "futures-core",
+ "http",
+ "http-body",
+ "libc",
+ "prost",
+ "reapi",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tinytree-fixture",
+ "tinytree-model",
+ "tinytree-proto",
+ "tinytree-store",
+ "tokio",
+ "tokio-stream",
+ "toml",
+ "tonic",
+ "tonic-prost",
+ "tower",
+ "uuid",
+]
+
+[[package]]
+name = "tinytree-store"
+version = "0.1.0"
+dependencies = [
+ "blake3",
+ "fjall",
+ "fs2",
+ "libc",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tinytree-model",
 ]
 
 [[package]]
