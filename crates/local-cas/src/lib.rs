@@ -122,7 +122,9 @@ impl CacheConfig {
         )
     }
 }
-#[derive(Clone, Copy, Debug, Default)]
+/// Elapsed nanosecond counters accumulate concurrent, failed and cancelled work;
+/// they are not an additive wall-time breakdown.
+#[derive(Clone, Copy, Debug, Default, Serialize)]
 pub struct CacheMetrics {
     pub fetches: u64,
     pub verified_bytes: u64,
@@ -131,6 +133,10 @@ pub struct CacheMetrics {
     pub timed_out_waiters: u64,
     pub timed_out_fetches: u64,
     pub admission_wait_ns: u64,
+    pub fetch_ns: u64,
+    pub sync_ns: u64,
+    pub verification_ns: u64,
+    pub publication_ns: u64,
     pub resident_bytes: u64,
     pub reserved_bytes: u64,
     pub evictions: u64,
@@ -360,11 +366,31 @@ struct Reservation {
     cache: Weak<LocalCas>,
     bytes: u64,
 }
-struct AdmissionTimer<'a> {
-    elapsed: &'a AtomicU64,
-    started: tokio::time::Instant,
+enum TimerStart {
+    Runtime(tokio::time::Instant),
+    Wall(std::time::Instant),
 }
-impl Drop for AdmissionTimer<'_> {
+impl TimerStart {
+    fn elapsed(&self) -> Duration {
+        match self {
+            Self::Runtime(started) => started.elapsed(),
+            Self::Wall(started) => started.elapsed(),
+        }
+    }
+}
+struct ElapsedTimer<'a> {
+    elapsed: &'a AtomicU64,
+    started: TimerStart,
+}
+impl<'a> ElapsedTimer<'a> {
+    fn start(elapsed: &'a AtomicU64) -> Self {
+        Self {
+            elapsed,
+            started: TimerStart::Wall(std::time::Instant::now()),
+        }
+    }
+}
+impl Drop for ElapsedTimer<'_> {
     fn drop(&mut self) {
         self.elapsed.fetch_add(
             self.started.elapsed().as_nanos().min(u64::MAX as u128) as u64,
@@ -415,6 +441,10 @@ pub struct LocalCas {
     timed_out_waiters: AtomicU64,
     timed_out_fetches: AtomicU64,
     admission_wait_ns: AtomicU64,
+    fetch_ns: AtomicU64,
+    sync_ns: AtomicU64,
+    verification_ns: AtomicU64,
+    publication_ns: AtomicU64,
     evictions: AtomicU64,
     evicted_bytes: AtomicU64,
     recency_errors: AtomicU64,
@@ -558,6 +588,10 @@ impl LocalCas {
             timed_out_waiters: AtomicU64::new(0),
             timed_out_fetches: AtomicU64::new(0),
             admission_wait_ns: AtomicU64::new(0),
+            fetch_ns: AtomicU64::new(0),
+            sync_ns: AtomicU64::new(0),
+            verification_ns: AtomicU64::new(0),
+            publication_ns: AtomicU64::new(0),
             evictions: AtomicU64::new(evictions),
             evicted_bytes: AtomicU64::new(evicted_bytes),
             recency_errors: AtomicU64::new(recency_errors),
@@ -576,6 +610,10 @@ impl LocalCas {
             timed_out_waiters: self.timed_out_waiters.load(Ordering::Relaxed),
             timed_out_fetches: self.timed_out_fetches.load(Ordering::Relaxed),
             admission_wait_ns: self.admission_wait_ns.load(Ordering::Relaxed),
+            fetch_ns: self.fetch_ns.load(Ordering::Relaxed),
+            sync_ns: self.sync_ns.load(Ordering::Relaxed),
+            verification_ns: self.verification_ns.load(Ordering::Relaxed),
+            publication_ns: self.publication_ns.load(Ordering::Relaxed),
             resident_bytes: files.resident,
             reserved_bytes: files.reserved,
             evictions: self.evictions.load(Ordering::Relaxed),
@@ -760,9 +798,9 @@ impl LocalCas {
         }
         // Admission happens before spawning; queued callers consume no detached
         // tasks or temporary files. Only one admitted task exists per key.
-        let admission = AdmissionTimer {
+        let admission = ElapsedTimer {
             elapsed: &self.admission_wait_ns,
-            started: tokio::time::Instant::now(),
+            started: TimerStart::Runtime(tokio::time::Instant::now()),
         };
         let request = self
             .requests
@@ -892,7 +930,10 @@ impl LocalCas {
         let cancelled = Arc::new(AtomicBool::new(false));
         let _cancel = CancelVerification(cancelled.clone());
         let result = tokio::task::spawn_blocking(move || {
-            let result = hash_file_until(&path, function, Some(deadline), &cancelled);
+            let result = {
+                let _verification = ElapsedTimer::start(&ownership.0.verification_ns);
+                hash_file_until(&path, function, Some(deadline), &cancelled)
+            };
             drop(ownership);
             result
         })
@@ -1069,8 +1110,14 @@ impl LocalCas {
             .open(&temp_path)?;
         self.fetches.fetch_add(1, Ordering::Relaxed);
         let fetch_started = std::time::Instant::now();
-        source.fetch(artifact, &mut target).await?;
-        target.sync_all()?;
+        {
+            let _fetch = ElapsedTimer::start(&self.fetch_ns);
+            source.fetch(artifact, &mut target).await?;
+        }
+        {
+            let _sync = ElapsedTimer::start(&self.sync_ns);
+            target.sync_all()?;
+        }
         drop(target);
         let (hash, size) = self
             .verify(
@@ -1087,13 +1134,16 @@ impl LocalCas {
         if tokio::time::Instant::now() >= deadline {
             return Err(CacheTimeoutError.into());
         }
-        fs::rename(&temp_path, &path)?;
-        #[cfg(unix)]
-        if let Err(error) = File::open(&self.dir).and_then(|dir| dir.sync_all()) {
-            let _ = fs::remove_file(&path);
-            return Err(error.into());
-        }
-        let verified = fingerprint(&path)?;
+        let verified = {
+            let _publication = ElapsedTimer::start(&self.publication_ns);
+            fs::rename(&temp_path, &path)?;
+            #[cfg(unix)]
+            if let Err(error) = File::open(&self.dir).and_then(|dir| dir.sync_all()) {
+                let _ = fs::remove_file(&path);
+                return Err(error.into());
+            }
+            fingerprint(&path)?
+        };
         {
             let mut state = self.files.lock().unwrap();
             let rank = state.rank();

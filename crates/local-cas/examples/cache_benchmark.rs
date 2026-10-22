@@ -104,7 +104,125 @@ fn metrics_delta(before: CacheMetrics, after: CacheMetrics) -> Value {
     json!({ "fetches": after.fetches - before.fetches, "hits": after.hits - before.hits,
         "downloaded_verified_bytes": after.verified_bytes - before.verified_bytes,
         "verification_bytes": after.verification_bytes - before.verification_bytes,
-        "admission_wait_ns": after.admission_wait_ns - before.admission_wait_ns })
+        "admission_wait_ns": after.admission_wait_ns - before.admission_wait_ns,
+        "fetch_ns": after.fetch_ns - before.fetch_ns,
+        "sync_ns": after.sync_ns - before.sync_ns,
+        "verification_ns": after.verification_ns - before.verification_ns,
+        "publication_ns": after.publication_ns - before.publication_ns,
+        "timed_out_fetches": after.timed_out_fetches - before.timed_out_fetches,
+        "timed_out_waiters": after.timed_out_waiters - before.timed_out_waiters })
+}
+
+async fn cold_fanout(root: &Path, label: &str) -> Result<()> {
+    const BLOBS: usize = 4096;
+    const BYTES: usize = 8192;
+    const READERS: usize = 16;
+    let (source, artifacts) = fixture(BLOBS, BYTES);
+    let artifacts = Arc::new(artifacts);
+    let mut rows = Vec::new();
+    for iteration in 0..3 {
+        let dir = root.join(format!("cold-{iteration}"));
+        let cache = LocalCas::open(&dir, source.clone(), config((BLOBS * BYTES) as u64))?;
+        let before = cache.metrics();
+        let fetched_before = source.fetches.load(Ordering::Relaxed);
+        let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
+        let heartbeat = tokio::spawn(async move {
+            let mut stopped = stopped;
+            let mut timer = tokio::time::interval_at(
+                tokio::time::Instant::now() + Duration::from_millis(5),
+                Duration::from_millis(5),
+            );
+            timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            let mut lag = Vec::new();
+            loop {
+                tokio::select! {
+                    biased;
+                    _ = &mut stopped => break,
+                    scheduled = timer.tick() => lag.push(
+                        scheduled.elapsed().as_nanos().min(u64::MAX as u128) as u64),
+                }
+            }
+            lag
+        });
+        let start = Instant::now();
+        let mut readers = tokio::task::JoinSet::new();
+        for reader in 0..READERS {
+            let cache = cache.clone();
+            let artifacts = artifacts.clone();
+            readers.spawn(async move {
+                let mut samples = Vec::new();
+                for index in (reader..BLOBS).step_by(READERS) {
+                    let one = Instant::now();
+                    drop(cache.clone().content(artifacts[index].clone()).await?);
+                    samples.push(one.elapsed().as_nanos() as u64);
+                }
+                Ok::<_, anyhow::Error>(samples)
+            });
+        }
+        let mut samples = Vec::new();
+        while let Some(reader) = readers.join_next().await {
+            samples.extend(reader??);
+        }
+        cache.wait_for_idle().await?;
+        let elapsed = start.elapsed();
+        let _ = stop.send(());
+        let mut lag = heartbeat.await?;
+        lag.sort_unstable();
+        let after = cache.metrics();
+        ensure!(samples.len() == BLOBS, "cold requests did not complete");
+        ensure!(
+            after.fetches - before.fetches == BLOBS as u64,
+            "cold fetch count mismatch"
+        );
+        ensure!(
+            source.fetches.load(Ordering::Relaxed) - fetched_before == BLOBS as u64,
+            "source fetch count mismatch"
+        );
+        ensure!(
+            after.verified_bytes - before.verified_bytes == (BLOBS * BYTES) as u64,
+            "cold bytes not fully verified"
+        );
+        ensure!(after.reserved_bytes == 0, "cold reservation leaked");
+        let mut row = result(
+            "cold_small_blob_fanout",
+            BLOBS,
+            iteration,
+            elapsed,
+            samples,
+            before,
+            &cache,
+            &dir,
+        )?;
+        ensure!(
+            row["disk_after"]["payload_files"].as_u64() == Some(BLOBS as u64),
+            "cold payload file count mismatch"
+        );
+        ensure!(
+            row["disk_after"]["temporary_bytes"].as_u64() == Some(0),
+            "cold temporary files leaked"
+        );
+        row["runtime_heartbeat"] = json!({"period_ns": 5_000_000,
+            "samples": lag.len(), "p95_lateness_ns": lag.get(lag.len().saturating_sub(1) * 95 / 100),
+            "max_lateness_ns": lag.last()});
+        // Read back outside the timed interval; each lease was hash/size verified.
+        for artifact in artifacts.iter() {
+            let blob = cache.clone().content(artifact.clone()).await?;
+            ensure!(
+                fs::read(blob.path())? == source.data[&artifact.hash],
+                "cold payload differs"
+            );
+        }
+        rows.push(row);
+    }
+    let receipt = json!({"schema_version": 1, "label": label,
+        "scenario": "cold_small_blob_fanout", "runtime_workers": 4, "readers": READERS,
+        "fetch_slots": 8, "blobs": BLOBS, "blob_bytes": BYTES, "repetitions": 3,
+        "note": "Network-free, fresh process-cache directories with warm OS history. Cold includes transfer into file, sync, hash and publication. Phase counters are cumulative concurrent time, not additive wall phases. Heartbeat reports scheduler delay, not network or control-RPC latency. Endpoint disk is not peak disk. Not an RBE build benchmark.",
+        "results": rows});
+    let encoded = serde_json::to_string_pretty(&receipt)?;
+    fs::write(root.join("receipt.json"), &encoded)?;
+    println!("{encoded}");
+    Ok(())
 }
 fn result(
     name: &str,
@@ -457,8 +575,7 @@ async fn oversized_streams(root: &Path, label: &str) -> Result<()> {
     Ok(())
 }
 
-#[tokio::main(flavor = "multi_thread", worker_threads = 8)]
-async fn main() -> Result<()> {
+fn main() -> Result<()> {
     let mut args = std::env::args().skip(1);
     let root = PathBuf::from(
         args.next()
@@ -467,13 +584,29 @@ async fn main() -> Result<()> {
     let label = args.next().context("missing receipt label")?;
     let mode = args.next();
     ensure!(
-        mode.as_deref().is_none_or(|mode| mode == "--oversized"),
-        "optional mode must be --oversized"
+        mode.as_deref()
+            .is_none_or(|mode| matches!(mode, "--oversized" | "--cold-fanout")),
+        "optional mode must be --oversized or --cold-fanout"
     );
     ensure!(args.next().is_none(), "unexpected arguments");
     ensure!(!root.exists(), "OUTPUT_DIR already exists");
     fs::create_dir_all(&root)?;
-    if mode.is_some() {
+    tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(if mode.as_deref() == Some("--cold-fanout") {
+            4
+        } else {
+            8
+        })
+        .enable_all()
+        .build()?
+        .block_on(run(root, label, mode))
+}
+
+async fn run(root: PathBuf, label: String, mode: Option<String>) -> Result<()> {
+    if mode.as_deref() == Some("--cold-fanout") {
+        return cold_fanout(&root, &label).await;
+    }
+    if mode.as_deref() == Some("--oversized") {
         return oversized_streams(&root, &label).await;
     }
     let start = Instant::now();
