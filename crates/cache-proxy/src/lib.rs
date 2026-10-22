@@ -9,7 +9,10 @@ mod retention;
 use anyhow::{Context, Result, ensure};
 use async_trait::async_trait;
 use futures_core::Stream;
-use local_cas::{Artifact, BlobSource, LocalCas};
+use local_cas::{
+    Artifact, BlobSource, FailureClass, FailureDiagnostic, FailureDiagnostics, FailureEncoding,
+    FailureMetrics, FailureStage, LocalCas,
+};
 use prost::Message;
 use reapi::proto::google::bytestream::{
     self as bs,
@@ -161,6 +164,7 @@ pub struct ProxyMetrics {
     pub execution_requests: u64,
     pub execution_waits: u64,
     pub retention: retention::Metrics,
+    pub download_failures: FailureMetrics,
 }
 #[derive(Clone)]
 pub struct CacheProxy {
@@ -185,6 +189,7 @@ pub struct Upstream {
     gzip_requests: std::sync::atomic::AtomicU16,
     zstd_capability: tokio::sync::OnceCell<bool>,
     zstd_disabled: std::sync::atomic::AtomicBool,
+    download_failures: FailureDiagnostics,
 }
 #[derive(Clone, Copy)]
 enum RpcMethod {
@@ -301,6 +306,7 @@ impl Upstream {
             gzip_requests: std::sync::atomic::AtomicU16::new(0),
             zstd_capability: tokio::sync::OnceCell::new(),
             zstd_disabled: std::sync::atomic::AtomicBool::new(false),
+            download_failures: FailureDiagnostics::default(),
         });
         upstream.retention.start();
         Ok(upstream)
@@ -548,6 +554,7 @@ impl CacheProxy {
             execution_requests: self.metrics.execution_requests.load(Ordering::Relaxed),
             execution_waits: self.metrics.execution_waits.load(Ordering::Relaxed),
             retention: self.upstream.retention.metrics(),
+            download_failures: self.upstream.download_failures.metrics(),
         }
     }
     pub async fn serve(
@@ -752,11 +759,29 @@ impl CacheProxy {
     ) -> Result<Arc<local_cas::CachedBlob>, Status> {
         self.metrics.blob_reads.fetch_add(1, Ordering::Relaxed);
         let a = self.upstream.artifact(digest, function)?;
+        let expected_size = a.size;
+        let digest_function = a.digest_function;
         self.cache
             .clone()
             .content_from(a, self.upstream.clone())
             .await
-            .map_err(cache_status)
+            .map_err(|error| {
+                // Includes failures before staged hydration (for example,
+                // reservation/admission). Keep unknown origins unattributed.
+                let mut diagnostic =
+                    FailureDiagnostic::from_error(FailureStage::Unattributed, &error);
+                if let Some(status) = error
+                    .chain()
+                    .find_map(|cause| cause.downcast_ref::<Status>())
+                {
+                    diagnostic.class = FailureClass::GrpcStatus;
+                    diagnostic.grpc_code = Some(status.code() as i32);
+                }
+                diagnostic.expected_size = Some(expected_size);
+                diagnostic.digest_function = Some(digest_function);
+                self.upstream.download_failures.record(diagnostic);
+                cache_status(error)
+            })
     }
 }
 #[tonic::async_trait]

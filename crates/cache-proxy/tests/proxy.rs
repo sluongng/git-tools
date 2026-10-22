@@ -25,6 +25,12 @@ use tokio::net::TcpListener;
 use tonic::{Request, Response, Status, transport::Server};
 
 type S<T> = Pin<Box<dyn Stream<Item = Result<T, Status>> + Send>>;
+#[derive(Clone)]
+struct ReadControl {
+    entered: Arc<tokio::sync::Semaphore>,
+    release: Arc<tokio::sync::Semaphore>,
+    chunk_bytes: usize,
+}
 #[derive(Clone, Default)]
 struct Backend {
     observed_metadata: Arc<Mutex<Vec<(String, tonic::metadata::MetadataMap)>>>,
@@ -35,6 +41,7 @@ struct Backend {
     blobs: Arc<Mutex<HashMap<String, Vec<u8>>>>,
     reads: Arc<AtomicU64>,
     read_body_fault: Arc<AtomicU64>,
+    read_control: Arc<Mutex<Option<ReadControl>>>,
     ac_update_entered: Arc<tokio::sync::Notify>,
     ac_update_release: Arc<tokio::sync::Notify>,
     ac_update_block: Arc<AtomicBool>,
@@ -91,7 +98,13 @@ impl ByteStream for Backend {
     ) -> Result<Response<Self::ReadStream>, Status> {
         self.observe("read", &req);
         let read_call = self.reads.fetch_add(1, Ordering::Relaxed);
-        let name = req.into_inner().resource_name;
+        let req = req.into_inner();
+        let control = self.read_control.lock().unwrap().clone();
+        if control.is_some() {
+            assert_eq!(req.read_offset, 0, "hydration starts at the blob beginning");
+            assert_eq!(req.read_limit, 0, "hydration requests the complete blob");
+        }
+        let name = req.resource_name;
         let hash = name.split('/').rev().nth(1).unwrap();
         let bytes = self
             .blobs
@@ -123,6 +136,11 @@ impl ByteStream for Backend {
             bytes
         };
 
+        if let Some(control) = &control {
+            control.entered.add_permits(1);
+            control.release.acquire().await.unwrap().forget();
+        }
+
         let fault = self.read_body_fault.load(Ordering::Relaxed);
         if fault != 0 && (read_call == 0 || fault == 3) {
             return Ok(Response::new(Box::pin(async_stream::try_stream! {
@@ -134,9 +152,22 @@ impl ByteStream for Backend {
                 }
             })));
         }
-        Ok(Response::new(Box::pin(tokio_stream::iter(vec![Ok(
-            bs::ReadResponse { data: bytes },
-        )]))))
+        let chunks = if let Some(control) = control {
+            // Split even the frame header; subsequent chunks exercise decoder
+            // progress and drain independently of HTTP/2 message boundaries.
+            let prefix = bytes.len().min(1);
+            std::iter::once(&bytes[..prefix])
+                .chain(bytes[prefix..].chunks(control.chunk_bytes))
+                .map(|chunk| {
+                    Ok(bs::ReadResponse {
+                        data: chunk.to_vec(),
+                    })
+                })
+                .collect::<Vec<_>>()
+        } else {
+            vec![Ok(bs::ReadResponse { data: bytes })]
+        };
+        Ok(Response::new(Box::pin(tokio_stream::iter(chunks))))
     }
     async fn write(
         &self,
@@ -1885,6 +1916,172 @@ async fn zstd_hydration_is_negotiated_and_falls_back_without_hiding_corruption()
             tonic::Code::DataLoss
         );
         assert_eq!(h.backend.reads.load(Ordering::Relaxed), 1);
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_byte_stream_readers_keep_independent_ranges_and_codecs() {
+    for (case, identity_upstream) in [("identity upstream", true), ("zstd upstream", false)] {
+        let h = Harness::new(Duration::ZERO).await;
+        h.backend
+            .identity_only
+            .store(identity_upstream, Ordering::Relaxed);
+        let control = ReadControl {
+            entered: Arc::new(tokio::sync::Semaphore::new(0)),
+            release: Arc::new(tokio::sync::Semaphore::new(0)),
+            chunk_bytes: 4093,
+        };
+        *h.backend.read_control.lock().unwrap() = Some(control.clone());
+        let mut random = 0x1234_5678u32;
+        let mut noise = |size| {
+            (0..size)
+                .map(|_| {
+                    random ^= random << 13;
+                    random ^= random >> 17;
+                    random ^= random << 5;
+                    random as u8
+                })
+                .collect::<Vec<_>>()
+        };
+        let corpus = [
+            noise(72),
+            noise(6047),
+            (0..64 * 1024).map(|n| (n % 251) as u8).collect(),
+            (0..200_013).map(|n| (n % 251) as u8).collect(),
+        ];
+        for data in &corpus {
+            h.backend
+                .blobs
+                .lock()
+                .unwrap()
+                .insert(digest(data).hash, data.clone());
+        }
+
+        let first = digest(&corpus[0]);
+        let mut cancelling_client = ByteStreamClient::connect(h.url.clone()).await.unwrap();
+        let request = h.request(bs::ReadRequest {
+            resource_name: format!("repo/blobs/blake3/{}/{}", first.hash, first.size_bytes),
+            ..Default::default()
+        });
+        let cancelled = tokio::spawn(async move { cancelling_client.read(request).await });
+        tokio::time::timeout(Duration::from_secs(5), control.entered.acquire())
+            .await
+            .unwrap()
+            .unwrap()
+            .forget();
+
+        let start = Arc::new(tokio::sync::Barrier::new(corpus.len() * 4 + 1));
+        let mut readers = Vec::new();
+        for data in &corpus {
+            let d = digest(data);
+            for (read_case, compressed, offset, limit) in [
+                ("identity full", false, 0usize, 0usize),
+                ("identity range", false, 19, 97),
+                ("negotiated full", !identity_upstream, 0, 0),
+                ("negotiated suffix", !identity_upstream, 31, 0),
+            ] {
+                let prefix = if compressed {
+                    "compressed-blobs/zstd"
+                } else {
+                    "blobs"
+                };
+                let request = h.request(bs::ReadRequest {
+                    resource_name: format!("repo/{prefix}/blake3/{}/{}", d.hash, d.size_bytes),
+                    read_offset: offset as i64,
+                    read_limit: limit as i64,
+                });
+                let end = if limit == 0 {
+                    data.len()
+                } else {
+                    (offset + limit).min(data.len())
+                };
+                let expected = data[offset..end].to_vec();
+                let url = h.url.clone();
+                let start = start.clone();
+                readers.push(tokio::spawn(async move {
+                    let mut client = ByteStreamClient::connect(url).await.unwrap();
+                    start.wait().await;
+                    let mut stream = client.read(request).await.unwrap().into_inner();
+                    let mut wire = Vec::new();
+                    while let Some(response) = stream.message().await.unwrap() {
+                        wire.extend(response.data);
+                    }
+                    let actual = if compressed {
+                        reapi::compression::decode_zstd(&wire, expected.len() as u64).unwrap()
+                    } else {
+                        wire
+                    };
+                    assert_eq!(actual, expected, "{case}: {read_case}");
+                    assert_eq!(blake3::hash(&actual), blake3::hash(&expected));
+                }));
+            }
+        }
+        start.wait().await;
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            control.entered.acquire_many((corpus.len() - 1) as u32),
+        )
+        .await
+        .unwrap()
+        .unwrap()
+        .forget();
+        // Each artifact is still unpublishable while its upstream body is held.
+        for data in &corpus {
+            assert!(
+                h.cache
+                    .clone()
+                    .cached_content(local_artifact(data, 9))
+                    .await
+                    .unwrap()
+                    .is_none(),
+                "{case}: an incomplete fetch must not be visible as a cache hit"
+            );
+        }
+        cancelled.abort();
+        assert!(cancelled.await.unwrap_err().is_cancelled());
+        control.release.add_permits(corpus.len());
+        tokio::time::timeout(Duration::from_secs(10), async {
+            for reader in readers {
+                reader.await.unwrap();
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            h.backend.reads.load(Ordering::Relaxed),
+            corpus.len() as u64,
+            "{case}: overlapping readers and cancellation share one hydration per artifact"
+        );
+        assert_eq!(
+            h.backend.compressed_reads.load(Ordering::Relaxed),
+            if identity_upstream {
+                0
+            } else {
+                corpus.len() as u64
+            },
+            "{case}: upstream negotiation must match the fixture capability"
+        );
+        h.proxy.stop_forwarding();
+        h.proxy.wait_for_maintenance_shutdown().await;
+        h.cache.wait_for_idle().await.unwrap();
+        assert_eq!(h.cache.metrics().reserved_bytes, 0);
+        assert!(!std::fs::read_dir(h._dir.path()).unwrap().any(|entry| {
+            entry
+                .unwrap()
+                .path()
+                .extension()
+                .is_some_and(|ext| ext == "tmp")
+        }));
+        for data in &corpus {
+            let blob = h
+                .cache
+                .clone()
+                .content(local_artifact(data, 9))
+                .await
+                .unwrap();
+            assert_eq!(std::fs::read(blob.path()).unwrap(), *data, "{case}");
+        }
+        assert_eq!(h.backend.reads.load(Ordering::Relaxed), corpus.len() as u64);
     }
 }
 

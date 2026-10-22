@@ -47,6 +47,222 @@ impl std::fmt::Display for CacheTimeoutError {
     }
 }
 impl std::error::Error for CacheTimeoutError {}
+/// Authored failure boundaries only: no artifact, path, endpoint or error text.
+#[derive(Clone, Copy, Debug, Serialize)]
+#[serde(rename_all = "snake_case")]
+#[repr(usize)]
+pub enum FailureStage {
+    CacheCreate,
+    CacheFetch,
+    CacheSync,
+    CacheVerificationRead,
+    CacheVerification,
+    CachePublicationRename,
+    CachePublicationSync,
+    CachePublicationFingerprint,
+    CacheLookupFingerprint,
+    CacheLookupVerification,
+    DownloadTargetClone,
+    DownloadTargetReset,
+    DownloadHeaders,
+    DownloadMessage,
+    DownloadWireSize,
+    DownloadDecoderStart,
+    DownloadDecode,
+    DownloadDecodeFinish,
+    DownloadWrite,
+    DownloadSize,
+    Unattributed,
+}
+const FAILURE_STAGES: [FailureStage; 21] = [
+    FailureStage::CacheCreate,
+    FailureStage::CacheFetch,
+    FailureStage::CacheSync,
+    FailureStage::CacheVerificationRead,
+    FailureStage::CacheVerification,
+    FailureStage::CachePublicationRename,
+    FailureStage::CachePublicationSync,
+    FailureStage::CachePublicationFingerprint,
+    FailureStage::CacheLookupFingerprint,
+    FailureStage::CacheLookupVerification,
+    FailureStage::DownloadTargetClone,
+    FailureStage::DownloadTargetReset,
+    FailureStage::DownloadHeaders,
+    FailureStage::DownloadMessage,
+    FailureStage::DownloadWireSize,
+    FailureStage::DownloadDecoderStart,
+    FailureStage::DownloadDecode,
+    FailureStage::DownloadDecodeFinish,
+    FailureStage::DownloadWrite,
+    FailureStage::DownloadSize,
+    FailureStage::Unattributed,
+];
+#[derive(Clone, Copy, Debug, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FailureClass {
+    Io,
+    Timeout,
+    Limit,
+    SizeMismatch,
+    DigestMismatch,
+    FingerprintChanged,
+    EncodedSizeLimit,
+    Decode,
+    GrpcStatus,
+    Unattributed,
+}
+#[derive(Clone, Copy, Debug, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FailureEncoding {
+    Identity,
+    Zstd,
+}
+#[derive(Clone, Copy, Debug, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FailureIoKind {
+    NotFound,
+    PermissionDenied,
+    AlreadyExists,
+    WouldBlock,
+    InvalidInput,
+    InvalidData,
+    TimedOut,
+    WriteZero,
+    Interrupted,
+    UnexpectedEof,
+    OutOfMemory,
+    StorageFull,
+    Other,
+}
+#[derive(Clone, Copy, Debug, Serialize)]
+pub struct FailureDiagnostic {
+    pub stage: FailureStage,
+    pub class: FailureClass,
+    pub io_error_kind: Option<FailureIoKind>,
+    pub raw_os_error: Option<i32>,
+    pub expected_size: Option<u64>,
+    pub actual_size: Option<u64>,
+    pub digest_function: Option<i32>,
+    pub encoding: Option<FailureEncoding>,
+    pub grpc_code: Option<i32>,
+}
+impl FailureDiagnostic {
+    pub fn new(stage: FailureStage, class: FailureClass) -> Self {
+        Self {
+            stage,
+            class,
+            io_error_kind: None,
+            raw_os_error: None,
+            expected_size: None,
+            actual_size: None,
+            digest_function: None,
+            encoding: None,
+            grpc_code: None,
+        }
+    }
+    pub fn from_io(stage: FailureStage, error: &std::io::Error) -> Self {
+        use std::io::ErrorKind;
+        let mut diagnostic = Self::new(stage, FailureClass::Io);
+        diagnostic.io_error_kind = Some(match error.kind() {
+            ErrorKind::NotFound => FailureIoKind::NotFound,
+            ErrorKind::PermissionDenied => FailureIoKind::PermissionDenied,
+            ErrorKind::AlreadyExists => FailureIoKind::AlreadyExists,
+            ErrorKind::WouldBlock => FailureIoKind::WouldBlock,
+            ErrorKind::InvalidInput => FailureIoKind::InvalidInput,
+            ErrorKind::InvalidData => FailureIoKind::InvalidData,
+            ErrorKind::TimedOut => FailureIoKind::TimedOut,
+            ErrorKind::WriteZero => FailureIoKind::WriteZero,
+            ErrorKind::Interrupted => FailureIoKind::Interrupted,
+            ErrorKind::UnexpectedEof => FailureIoKind::UnexpectedEof,
+            ErrorKind::OutOfMemory => FailureIoKind::OutOfMemory,
+            ErrorKind::StorageFull => FailureIoKind::StorageFull,
+            _ => FailureIoKind::Other,
+        });
+        diagnostic.raw_os_error = error.raw_os_error();
+        diagnostic
+    }
+    pub fn from_error(stage: FailureStage, error: &anyhow::Error) -> Self {
+        for cause in error.chain() {
+            if cause.is::<CacheTimeoutError>() {
+                return Self::new(stage, FailureClass::Timeout);
+            }
+            if cause.is::<CacheLimitError>() {
+                return Self::new(stage, FailureClass::Limit);
+            }
+            if let Some(error) = cause.downcast_ref::<std::io::Error>() {
+                return Self::from_io(stage, error);
+            }
+        }
+        Self::new(stage, FailureClass::Unattributed)
+    }
+}
+#[derive(Clone, Copy, Debug, Serialize)]
+pub struct FailureStageCount {
+    pub stage: FailureStage,
+    pub count: u64,
+}
+/// Fixed-size process-local observations, not unique failures or event logs.
+/// A propagated error can be observed at more than one boundary. Samples never
+/// retain an error chain or any caller-supplied string.
+#[derive(Clone, Copy, Debug, Serialize)]
+pub struct FailureMetrics {
+    pub total: u64,
+    pub stages: [FailureStageCount; 21],
+    pub recent: [Option<FailureDiagnostic>; 16],
+}
+impl Default for FailureMetrics {
+    fn default() -> Self {
+        Self {
+            total: 0,
+            stages: std::array::from_fn(|i| FailureStageCount {
+                stage: FAILURE_STAGES[i],
+                count: 0,
+            }),
+            recent: [None; 16],
+        }
+    }
+}
+struct FailureState {
+    total: u64,
+    counts: [u64; 21],
+    recent: [Option<FailureDiagnostic>; 16],
+    next: usize,
+}
+impl Default for FailureState {
+    fn default() -> Self {
+        Self {
+            total: 0,
+            counts: [0; 21],
+            recent: [None; 16],
+            next: 0,
+        }
+    }
+}
+#[derive(Clone, Default)]
+pub struct FailureDiagnostics(Arc<Mutex<FailureState>>);
+impl FailureDiagnostics {
+    pub fn record(&self, diagnostic: FailureDiagnostic) {
+        // Diagnostics must not turn an existing error into a poisoning panic.
+        let mut state = self.0.lock().unwrap_or_else(|error| error.into_inner());
+        state.total = state.total.saturating_add(1);
+        let count = &mut state.counts[diagnostic.stage as usize];
+        *count = count.saturating_add(1);
+        let next = state.next;
+        state.recent[next] = Some(diagnostic);
+        state.next = (next + 1) % 16;
+    }
+    pub fn metrics(&self) -> FailureMetrics {
+        let state = self.0.lock().unwrap_or_else(|error| error.into_inner());
+        FailureMetrics {
+            total: state.total,
+            stages: std::array::from_fn(|i| FailureStageCount {
+                stage: FAILURE_STAGES[i],
+                count: state.counts[i],
+            }),
+            recent: std::array::from_fn(|i| state.recent[(state.next + i) % 16]),
+        }
+    }
+}
 #[derive(Clone, Debug, Eq, PartialEq, Hash, Serialize, Deserialize)]
 pub struct Artifact {
     pub backend: String,
@@ -144,6 +360,7 @@ pub struct CacheMetrics {
     pub evictions: u64,
     pub evicted_bytes: u64,
     pub recency_errors: u64,
+    pub failures: FailureMetrics,
 }
 fn hash_file_until(
     path: &Path,
@@ -448,12 +665,45 @@ pub struct LocalCas {
     sync_ns: AtomicU64,
     verification_ns: AtomicU64,
     publication_ns: AtomicU64,
+    failures: FailureDiagnostics,
     evictions: AtomicU64,
     evicted_bytes: AtomicU64,
     recency_errors: AtomicU64,
     checkpoint: Mutex<Checkpoint>,
 }
 impl LocalCas {
+    fn observe_error(&self, stage: FailureStage, error: &anyhow::Error, artifact: &Artifact) {
+        let mut diagnostic = FailureDiagnostic::from_error(stage, error);
+        diagnostic.expected_size = Some(artifact.size);
+        diagnostic.digest_function = Some(artifact.digest_function);
+        self.failures.record(diagnostic);
+    }
+    fn observe_io(&self, stage: FailureStage, error: &std::io::Error, artifact: &Artifact) {
+        let mut diagnostic = FailureDiagnostic::from_io(stage, error);
+        diagnostic.expected_size = Some(artifact.size);
+        diagnostic.digest_function = Some(artifact.digest_function);
+        self.failures.record(diagnostic);
+    }
+    fn observe_verification(
+        &self,
+        stage: FailureStage,
+        artifact: &Artifact,
+        size: u64,
+        hash_matches: bool,
+    ) {
+        let class = if size != artifact.size {
+            FailureClass::SizeMismatch
+        } else if !hash_matches {
+            FailureClass::DigestMismatch
+        } else {
+            return;
+        };
+        let mut diagnostic = FailureDiagnostic::new(stage, class);
+        diagnostic.expected_size = Some(artifact.size);
+        diagnostic.actual_size = Some(size);
+        diagnostic.digest_function = Some(artifact.digest_function);
+        self.failures.record(diagnostic);
+    }
     /// Open an exclusively owned cache directory. Share the returned handle,
     /// rather than opening the same directory again, to reuse bytes across
     /// namespaces. The lock is retained by fetches and file leases too.
@@ -596,6 +846,7 @@ impl LocalCas {
             sync_ns: AtomicU64::new(0),
             verification_ns: AtomicU64::new(0),
             publication_ns: AtomicU64::new(0),
+            failures: FailureDiagnostics::default(),
             evictions: AtomicU64::new(evictions),
             evicted_bytes: AtomicU64::new(evicted_bytes),
             recency_errors: AtomicU64::new(recency_errors),
@@ -623,6 +874,7 @@ impl LocalCas {
             evictions: self.evictions.load(Ordering::Relaxed),
             evicted_bytes: self.evicted_bytes.load(Ordering::Relaxed),
             recency_errors: self.recency_errors.load(Ordering::Relaxed),
+            failures: self.failures.metrics(),
         }
     }
     /// Wait until admitted fetch and verification workers release ownership
@@ -946,6 +1198,12 @@ impl LocalCas {
                 let _verification = ElapsedTimer::start(&ownership.0.verification_ns);
                 hash_file_until(&path, function, Some(deadline), &cancelled)
             };
+            if let Err(error) = &result {
+                let mut diagnostic =
+                    FailureDiagnostic::from_error(FailureStage::CacheVerificationRead, error);
+                diagnostic.digest_function = Some(function);
+                ownership.0.failures.record(diagnostic);
+            }
             drop(ownership);
             result
         })
@@ -1045,17 +1303,48 @@ impl LocalCas {
             });
             // Hash only once per process/fingerprint, and never under the global
             // cache mutex. Range reads of a large verified blob are O(range).
-            let current = fingerprint(&path);
+            let current = fingerprint(&path).inspect_err(|error| {
+                self.observe_error(FailureStage::CacheLookupFingerprint, error, artifact);
+            });
             let valid = match current.as_ref() {
                 Ok(current) if known.as_ref() == Some(current) => true,
                 Ok(before) => match self
                     .verify(&path, artifact.digest_function, deadline, request.clone())
                     .await
                 {
-                    Ok((hash, size)) if hash == artifact.hash && size == artifact.size => {
-                        fingerprint(&path).as_ref().ok() == Some(before)
+                    Ok((hash, size)) => {
+                        self.observe_verification(
+                            FailureStage::CacheLookupVerification,
+                            artifact,
+                            size,
+                            hash == artifact.hash,
+                        );
+                        if hash == artifact.hash && size == artifact.size {
+                            let after = fingerprint(&path).inspect_err(|error| {
+                                self.observe_error(
+                                    FailureStage::CacheLookupFingerprint,
+                                    error,
+                                    artifact,
+                                );
+                            });
+                            let same = after.as_ref().ok() == Some(before);
+                            if !same && after.is_ok() {
+                                let mut diagnostic = FailureDiagnostic::new(
+                                    FailureStage::CacheLookupFingerprint,
+                                    FailureClass::FingerprintChanged,
+                                );
+                                diagnostic.digest_function = Some(artifact.digest_function);
+                                self.failures.record(diagnostic);
+                            }
+                            same
+                        } else {
+                            false
+                        }
                     }
-                    _ => false,
+                    Err(error) => {
+                        self.observe_error(FailureStage::CacheLookupVerification, &error, artifact);
+                        false
+                    }
                 },
                 Err(_) => false,
             };
@@ -1131,16 +1420,24 @@ impl LocalCas {
             .read(true)
             .write(true)
             .create_new(true)
-            .open(&temp_path)?;
+            .open(&temp_path)
+            .inspect_err(|error| self.observe_io(FailureStage::CacheCreate, error, artifact))?;
         self.fetches.fetch_add(1, Ordering::Relaxed);
         let fetch_started = std::time::Instant::now();
         {
             let _fetch = ElapsedTimer::start(&self.fetch_ns);
-            source.fetch(artifact, &mut target).await?;
+            source
+                .fetch(artifact, &mut target)
+                .await
+                .inspect_err(|error| {
+                    self.observe_error(FailureStage::CacheFetch, error, artifact)
+                })?;
         }
         {
             let _sync = ElapsedTimer::start(&self.sync_ns);
-            target.sync_all()?;
+            target
+                .sync_all()
+                .inspect_err(|error| self.observe_io(FailureStage::CacheSync, error, artifact))?;
         }
         drop(target);
         let (hash, size) = self
@@ -1151,6 +1448,12 @@ impl LocalCas {
                 request.clone(),
             )
             .await?;
+        self.observe_verification(
+            FailureStage::CacheVerification,
+            artifact,
+            size,
+            hash == artifact.hash,
+        );
         ensure!(
             size == artifact.size && hash == artifact.hash,
             "CAS blob digest or size mismatch"
@@ -1160,13 +1463,18 @@ impl LocalCas {
         }
         let verified = {
             let _publication = ElapsedTimer::start(&self.publication_ns);
-            fs::rename(&temp_path, &path)?;
+            fs::rename(&temp_path, &path).inspect_err(|error| {
+                self.observe_io(FailureStage::CachePublicationRename, error, artifact);
+            })?;
             #[cfg(unix)]
             if let Err(error) = File::open(&self.dir).and_then(|dir| dir.sync_all()) {
+                self.observe_io(FailureStage::CachePublicationSync, &error, artifact);
                 let _ = fs::remove_file(&path);
                 return Err(error.into());
             }
-            fingerprint(&path)?
+            fingerprint(&path).inspect_err(|error| {
+                self.observe_error(FailureStage::CachePublicationFingerprint, error, artifact);
+            })?
         };
         {
             let mut state = self.files.lock().unwrap();

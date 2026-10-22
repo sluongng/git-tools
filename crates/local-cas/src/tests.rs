@@ -37,6 +37,112 @@ fn artifact(bytes: &[u8]) -> Artifact {
     }
 }
 
+#[test]
+fn failure_diagnostics_are_bounded_and_omit_error_messages() {
+    let diagnostics = FailureDiagnostics::default();
+    let error = std::io::Error::new(
+        std::io::ErrorKind::PermissionDenied,
+        "private fixture detail that must not enter diagnostics",
+    );
+    for _ in 0..100 {
+        diagnostics.record(FailureDiagnostic::from_io(
+            FailureStage::CacheCreate,
+            &error,
+        ));
+    }
+    let metrics = diagnostics.metrics();
+    assert_eq!(metrics.total, 100);
+    assert_eq!(metrics.recent.iter().flatten().count(), 16);
+    let create = metrics
+        .stages
+        .iter()
+        .find(|row| matches!(row.stage, FailureStage::CacheCreate))
+        .unwrap();
+    assert_eq!(create.count, 100);
+    assert!(
+        metrics
+            .recent
+            .iter()
+            .flatten()
+            .all(|row| matches!(row.io_error_kind, Some(FailureIoKind::PermissionDenied)))
+    );
+    let serialized = serde_json::to_string(&metrics).unwrap();
+    assert!(!serialized.contains("private fixture detail"));
+    assert!(serialized.contains("permission_denied"));
+}
+
+#[tokio::test]
+async fn failed_hydration_keeps_original_error_and_reports_safe_verification_details() {
+    let dir = tempfile::tempdir().unwrap();
+    let cache = LocalCas::open(
+        dir.path(),
+        Arc::new(Source::default()),
+        CacheConfig::default(),
+    )
+    .unwrap();
+    let requested = artifact(b"zzzz");
+    let error = cache
+        .clone()
+        .content(requested.clone())
+        .await
+        .err()
+        .unwrap();
+    assert_eq!(error.to_string(), "CAS blob digest or size mismatch");
+    let metrics = cache.metrics();
+    let mismatch = metrics
+        .failures
+        .recent
+        .iter()
+        .flatten()
+        .find(|row| matches!(row.stage, FailureStage::CacheVerification))
+        .unwrap();
+    assert!(matches!(mismatch.class, FailureClass::DigestMismatch));
+    assert_eq!(mismatch.expected_size, Some(4));
+    assert_eq!(mismatch.actual_size, Some(4));
+    assert_eq!(mismatch.digest_function, Some(9));
+    assert_eq!(metrics.reserved_bytes, 0);
+    let serialized = serde_json::to_string(&metrics.failures).unwrap();
+    assert!(!serialized.contains(&requested.hash));
+    assert!(!serialized.contains(&requested.backend));
+    assert!(!serialized.contains(dir.path().to_str().unwrap()));
+}
+
+#[tokio::test]
+async fn source_io_error_type_survives_failure_observation_and_coalescing() {
+    struct Denied;
+    #[async_trait]
+    impl BlobSource for Denied {
+        async fn fetch(&self, _: &Artifact, _: &mut File) -> Result<()> {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "source permission failure",
+            )
+            .into())
+        }
+        async fn missing(&self, _: &[Artifact]) -> Result<Vec<Artifact>> {
+            Ok(vec![])
+        }
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let cache = LocalCas::open(dir.path(), Arc::new(Denied), CacheConfig::default()).unwrap();
+    let error = cache
+        .clone()
+        .content(artifact(b"aaaa"))
+        .await
+        .err()
+        .unwrap();
+    let io = error
+        .chain()
+        .find_map(|cause| cause.downcast_ref::<std::io::Error>())
+        .unwrap();
+    assert_eq!(io.kind(), std::io::ErrorKind::PermissionDenied);
+    assert_eq!(io.to_string(), "source permission failure");
+    assert!(cache.metrics().failures.recent.iter().flatten().any(|row| {
+        matches!(row.stage, FailureStage::CacheFetch)
+            && matches!(row.io_error_kind, Some(FailureIoKind::PermissionDenied))
+    }));
+}
+
 #[tokio::test]
 async fn shared_handles_apply_lru_without_evicting_live_leases() {
     let dir = tempfile::tempdir().unwrap();
