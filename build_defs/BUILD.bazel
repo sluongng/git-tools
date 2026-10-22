@@ -1,5 +1,6 @@
 exports_files([
     "reapi_build.rs",
+    "tinytree_build.rs",
     "git-upstream.patch",
 ])
 

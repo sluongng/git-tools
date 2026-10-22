@@ -1,0 +1,45 @@
+load("@crates//:defs.bzl", "aliases", "all_crate_deps")
+load("@rules_rs//rs:cargo_build_script.bzl", "cargo_build_script")
+load("@rules_rs//rs:rust_library.bzl", "rust_library")
+load("@rules_rs//rs:rust_test.bzl", "rust_test")
+
+package(default_visibility = ["//visibility:public"])
+
+filegroup(
+    name = "proto_files",
+    srcs = glob(["proto/**/*.proto"]),
+)
+
+cargo_build_script(
+    name = "build_script",
+    srcs = ["//build_defs:tinytree_build.rs"],
+    aliases = aliases(),
+    build_script_env = {
+        "PROTOC": "$(execpath //build_defs:protoc)",
+    },
+    data = [":proto_files"],
+    edition = "2024",
+    pkg_name = "tinytree-proto",
+    tools = ["//build_defs:protoc"],
+    version = "0.1.0",
+    deps = ["@crates//:tonic-prost-build"],
+)
+
+rust_library(
+    name = "tinytree-proto",
+    srcs = glob(["src/**/*.rs"]),
+    aliases = aliases(),
+    crate_name = "tinytree_proto",
+    crate_root = "src/lib.rs",
+    edition = "2024",
+    version = "0.1.0",
+    deps = [":build_script"] + all_crate_deps(normal = True),
+)
+
+rust_test(
+    name = "unit_tests",
+    aliases = aliases(),
+    crate = ":tinytree-proto",
+    edition = "2024",
+    deps = all_crate_deps(normal = True),
+)

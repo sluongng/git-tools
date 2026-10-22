@@ -1,0 +1,219 @@
+syntax = "proto3";
+
+package tinytree.v1;
+
+// DESIGN DRAFT, not an implemented or stable public API.
+// Native jj objects/references only. git-proxy owns Git storage and serving;
+// a future separate transformation component is outside this native service.
+// Native push completes at durable native reference publication, not Git push.
+// Authentication is transport metadata. Every method authorizes repository_id
+// before inspecting object existence. IDs never grant access by themselves.
+service Repository {
+  rpc OpenRepository(OpenRepositoryRequest) returns (RepositoryView);
+  rpc GetCommitGraph(GetCommitGraphRequest) returns (CommitGraphPage);
+  rpc BatchReadObjects(BatchReadObjectsRequest) returns (stream ObjectResult);
+  rpc FindMissingObjects(FindMissingObjectsRequest) returns (MissingObjects);
+  rpc ReadFile(ReadFileRequest) returns (stream FileFrame);
+  rpc WriteObject(stream WriteFrame) returns (WriteReceipt);
+  rpc PublishReference(PublishReferenceRequest) returns (Publication);
+  rpc GetPublication(GetPublicationRequest) returns (Publication);
+}
+
+enum ObjectKind {
+  OBJECT_KIND_UNSPECIFIED = 0;
+  FILE = 1;
+  TREE = 2;
+  COMMIT = 3;
+  SYMLINK = 4;
+  COPY_HISTORY = 5;
+}
+
+// Typed native identities, not Git object IDs. All hashes are 32 bytes.
+// FILE hashes raw bytes with unkeyed BLAKE3. Metadata hashes its versioned,
+// kind-tagged canonical envelope. Protobuf serialization is NOT that envelope.
+// COMMIT with a zero native_id is the intrinsic jj root, not stored content.
+// It has no ObjectDescriptor or upload payload. Graph traversal recognizes it
+// as an ancestry boundary; FindMissingObjects never reports it missing. An
+// explicit BatchReadObjects request for it returns INVALID_OBJECT.
+message ObjectKey {
+  ObjectKind kind = 1;
+  bytes native_id = 2;
+}
+
+// Describes the exact bytes stored in verified CAS, not just logical identity.
+// For FILE: content_blake3 == native_id. Metadata contains its kind/schema domain
+// inside the stored canonical envelope. Size is the uncompressed byte length.
+// Never construct a descriptor for the intrinsic zero commit.
+message ObjectDescriptor {
+  ObjectKey key = 1;
+  bytes content_blake3 = 2;
+  uint64 size_bytes = 3;
+  uint32 object_format_version = 4;
+}
+
+message OpenRepositoryRequest {
+  string repository_id = 1;
+  repeated string reference_names = 2;
+}
+
+message Reference {
+  string name = 1;
+  // Monotonic generation includes deletion/recreation (prevents ABA).
+  uint64 generation = 2;
+  // Missing commit means an absent reference; generation is still retained.
+  // Native v1 refs name stored non-root commits only. A new empty repository
+  // has absent refs; clients construct the intrinsic root locally.
+  optional ObjectDescriptor commit = 3;
+}
+
+message RepositoryView {
+  string repository_id = 1;
+  uint32 protocol_major = 2;
+  uint32 object_format_version = 3;
+  repeated Reference references = 4;
+  uint32 max_batch_items = 5;
+  uint64 max_request_bytes = 6;
+  uint32 max_frame_bytes = 7;
+  // Immutable reads tolerate later reference movement; no global oplog shared.
+  // This view is NOT a retention lease: if ref movement/GC removes a previously
+  // named closure, reads may return NOT_FOUND. Restart from fresh refs; never
+  // substitute newer object bytes under an old immutable ID. Bounded fetch
+  // retention leases are a possible later availability optimization.
+  // Return a consistent bounded view with an explicit result for every requested
+  // ref name, including absence; never substitute another/default reference.
+  // gRPC identity/zstd compression is negotiated by transport, not this field.
+}
+
+message BatchReadObjectsRequest {
+  string repository_id = 1;
+  repeated ObjectKey keys = 2;
+  // Bounded item count AND decoded bytes. FILE objects use ReadFile instead.
+}
+
+message GetCommitGraphRequest {
+  string repository_id = 1;
+  repeated ObjectKey heads = 2;
+  repeated ObjectKey common = 3;
+  uint32 page_size = 4;
+  string continuation = 5;
+  // Return ancestors(heads) minus ancestors(common). Unknown supplied heads or
+  // common nodes are an error, not permission to assume a truncated history.
+  // Continuation is bound to immutable inputs, authorization and schema.
+  // Zero commit is valid in heads/common and in parent keys, but is intrinsic,
+  // not unknown: do not emit a graph entry/descriptor for it. Root-only heads
+  // therefore produce an empty, complete page.
+}
+
+message CommitGraphEntry {
+  ObjectDescriptor commit = 1;
+  repeated ObjectKey parents = 2;
+}
+
+message CommitGraphPage {
+  repeated CommitGraphEntry entries = 1;
+  string continuation = 2; // Empty only when the graph difference is complete.
+}
+
+message FindMissingObjectsRequest {
+  string repository_id = 1;
+  repeated ObjectKey keys = 2;
+}
+
+message MissingObjects {
+  repeated ObjectKey keys = 1;
+  // Presence is not a lease or proof that a ref can publish. Revalidate closure
+  // against authoritative storage under publication/GC synchronization.
+}
+
+message ObjectResult {
+  uint32 request_index = 1;
+  ObjectKey key = 2;
+  oneof result {
+    ObjectData object = 3;
+    ItemError error = 4;
+  }
+  // Responses can arrive out of order. Retry only unfinished retryable items.
+}
+
+message ObjectData {
+  ObjectDescriptor descriptor = 1;
+  bytes canonical_envelope = 2;
+}
+
+message ItemError {
+  enum Code {
+    CODE_UNSPECIFIED = 0;
+    NOT_FOUND = 1;
+    RESOURCE_EXHAUSTED = 2;
+    UNAVAILABLE = 3;
+    INVALID_OBJECT = 4;
+  }
+  Code code = 1;
+  string message = 2;
+  // Authentication/authorization failure terminates the RPC, not a partial hit.
+}
+
+message ReadFileRequest {
+  string repository_id = 1;
+  bytes native_file_id = 2;
+  // v1 streams a complete verified file; ranged/chunk-manifest reads deferred.
+}
+
+message FileFrame {
+  oneof frame {
+    ObjectDescriptor header = 1;
+    DataChunk chunk = 2;
+  }
+  // Header first, contiguous offsets, then clean EOF at exact declared length.
+}
+
+message DataChunk {
+  uint64 offset = 1;
+  bytes data = 2;
+}
+
+message WriteFrame {
+  oneof frame {
+    WriteHeader header = 1;
+    DataChunk chunk = 2;
+  }
+  // Exactly one header first; bounded chunks, contiguous offsets, then EOF.
+}
+
+message WriteHeader {
+  string repository_id = 1;
+  ObjectDescriptor descriptor = 2;
+}
+
+message WriteReceipt {
+  ObjectDescriptor descriptor = 1;
+  // Returned only after complete size/hash/canonical-form validation AND durable
+  // authoritative object storage. This is an object receipt, not a ref publish.
+  // A server-held staging lease prevents GC before publication or expiry.
+  string staging_lease = 2;
+  int64 staging_lease_expiry_unix_seconds = 3;
+}
+
+message PublishReferenceRequest {
+  string repository_id = 1;
+  string idempotency_key = 2;
+  string reference_name = 3;
+  uint64 expected_generation = 4;
+  optional ObjectKey new_commit = 5; // Stored non-root COMMIT; absent deletes.
+  repeated string staging_leases = 6;
+  // Serialize against GC; validate all reachable native objects, including ALL
+  // positive/negative conflict terms. Atomically install ref+generation+receipt
+  // after closure is durable. No ordinary cache TTL applies to these roots.
+}
+
+message GetPublicationRequest {
+  string repository_id = 1;
+  string idempotency_key = 2;
+}
+
+message Publication {
+  string idempotency_key = 1;
+  Reference reference = 2;
+  // An immutable replay receipt. Reusing a key with different request fields is
+  // an error. A deadline after publish is resolved by GetPublication/replay.
+}
