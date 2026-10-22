@@ -17,5 +17,7 @@ with no symlink ancestors. Existing endpoints are never removed. Shutdown drains
 
 The service negotiates zstd and enforces byte/count/concurrency and operation/idle
 budgets. Configured GC retains published refs and staging/read leases; it is not
-LRU eviction. Native publication is not Git publication. `_tinytree/` is reserved
-for future owner-private retention, not ordinary bookmarks.
+LRU eviction. Native publication is not Git publication. With `retain = true`,
+principals can hold their own `_tinytree/hold/v1/<client>/<commit>` references
+without public-write permission. Holds persist until explicit release; quotas
+reject new promises, not existing ones. A historical receipt is not current proof.

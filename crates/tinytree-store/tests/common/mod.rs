@@ -89,3 +89,25 @@ pub fn publication(key: &str, generation: u64, head: Descriptor) -> PublishReque
         staging_leases: vec![],
     }
 }
+
+pub fn retention_publication(
+    key: &str,
+    generation: u64,
+    head: Descriptor,
+    acquire: bool,
+) -> PublishRequest {
+    PublishRequest {
+        reference_name: tinytree_store::retention_reference(
+            tinytree_store::RetentionOwner {
+                principal: [1; 32],
+                client: [2; 16],
+            },
+            tinytree_model::CommitId(head.key.id.0),
+        )
+        .unwrap(),
+        idempotency_key: key.to_owned(),
+        expected_generation: generation,
+        new_commit: acquire.then_some(tinytree_model::CommitId(head.key.id.0)),
+        staging_leases: vec![],
+    }
+}

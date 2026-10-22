@@ -237,3 +237,95 @@ fn real_child_write_failure_poisoning_recovers_atomic_reference_and_receipt() {
     assert_eq!(original_receipt.reference.generation, 1);
     assert_eq!(original_receipt.reference.commit, Some(initial.head));
 }
+
+#[test]
+#[cfg(unix)]
+fn real_private_hold_write_failure_recovers_atomic_accounting_and_reserved_release() {
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path().join("store");
+    let mut driver = Driver::start(&root, "retention-write-failure");
+    driver.checkpoint("BASELINE_DURABLE");
+    driver.checkpoint("REPLACEMENT_PREPARED");
+    driver.checkpoint("WRITE_FAILED_POISONED");
+    driver.kill_and_reap();
+    let store = Store::open_existing(&root, Config::default()).unwrap();
+    verify_initial(&store);
+    let initial = common::initial();
+    let owner = tinytree_store::RetentionOwner {
+        principal: [1; 32],
+        client: [2; 16],
+    };
+    let acquire = common::retention_publication("retention-attempt", 0, initial.head, true);
+    let current = store
+        .references(common::REPOSITORY, &[acquire.reference_name.clone()])
+        .unwrap()
+        .remove(0);
+    let receipt = store
+        .publication(common::REPOSITORY, "retention-attempt")
+        .unwrap();
+    if current.commit.is_some() {
+        assert_eq!(current.generation, 1);
+        assert_eq!(current.commit, Some(initial.head));
+        assert_eq!(receipt.unwrap().reference, current);
+    } else {
+        assert_eq!(current.generation, 0);
+        assert!(receipt.is_none());
+    }
+    let mut limits = tinytree_store::RetentionLimits {
+        max_known_clients_per_repository: 1,
+        max_known_clients_per_principal: 1,
+        max_root_records_per_repository: 1,
+        max_root_records_per_principal: 1,
+        max_root_records_per_client: 1,
+        max_live_roots_per_client: 1,
+        max_receipts_per_repository: 2,
+        max_receipts_per_principal: 2,
+        max_receipts_per_client: 2,
+        ..tinytree_store::RetentionLimits::default()
+    };
+    store
+        .publish_retention(common::REPOSITORY, owner, &acquire, &limits, 100)
+        .unwrap();
+    store
+        .publish_retention(
+            common::REPOSITORY,
+            owner,
+            &common::retention_publication("retention-release", 1, initial.head, false),
+            &limits,
+            100,
+        )
+        .unwrap();
+    limits.max_receipts_per_repository = 4;
+    limits.max_receipts_per_principal = 4;
+    limits.max_receipts_per_client = 4;
+    // The generation tombstone and exactly one known namespace/root survive;
+    // a stale live counter or partial first-admission counter would reject this.
+    store
+        .publish_retention(
+            common::REPOSITORY,
+            owner,
+            &common::retention_publication("retention-again", 2, initial.head, true),
+            &limits,
+            100,
+        )
+        .unwrap();
+    store
+        .publish_retention(
+            common::REPOSITORY,
+            owner,
+            &common::retention_publication("retention-release-again", 3, initial.head, false),
+            &limits,
+            100,
+        )
+        .unwrap();
+    assert!(matches!(
+        store.publish_retention(
+            common::REPOSITORY,
+            owner,
+            &common::retention_publication("retention-budget-exhausted", 4, initial.head, true),
+            &limits,
+            100
+        ),
+        Err(tinytree_store::Error::Limit(_))
+    ));
+}

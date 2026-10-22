@@ -2,7 +2,7 @@ syntax = "proto3";
 
 package tinytree.v1;
 
-// DESIGN DRAFT, not an implemented or stable public API.
+// Experimental native API; wire and object formats are not yet stable.
 // Native jj objects/references only. git-proxy owns Git storage and serving;
 // a future separate transformation component is outside this native service.
 // Native push completes at durable native reference publication, not Git push.
@@ -53,6 +53,10 @@ message ObjectDescriptor {
 
 message OpenRepositoryRequest {
   string repository_id = 1;
+  // Exact names only; this does not discover another client's references.
+  // Owner-private holds use _tinytree/hold/v1/<client>/<commit>, where client is
+  // 32 lowercase hex digits and commit is a nonzero 64-digit native commit ID.
+  // The authenticated stable principal supplies ownership, never a name segment.
   repeated string reference_names = 2;
 }
 
@@ -78,7 +82,8 @@ message RepositoryView {
   // This view is NOT a retention lease: if ref movement/GC removes a previously
   // named closure, reads may return NOT_FOUND. Restart from fresh refs; never
   // substitute newer object bytes under an old immutable ID. Bounded fetch
-  // retention leases are a possible later availability optimization.
+  // Durable private holds are explicit, separate references. A present hold
+  // confirms retention until explicit release; a historical receipt does not.
   // Return a consistent bounded view with an explicit result for every requested
   // ref name, including absence; never substitute another/default reference.
   // gRPC identity/zstd compression is negotiated by transport, not this field.
@@ -204,6 +209,13 @@ message PublishReferenceRequest {
   // Serialize against GC; validate all reachable native objects, including ALL
   // positive/negative conflict terms. Atomically install ref+generation+receipt
   // after closure is durable. No ordinary cache TTL applies to these roots.
+  // Private hold acquisition requires read+retain (not public write) permission.
+  // Its target must equal the commit in its name; release uses absent new_commit
+  // with generation CAS. Hold names map to the caller's principal on the server.
+  // Retargeting is forbidden. Admission quotas never evict existing holds, and
+  // no timeout or missed heartbeat releases one. Other _tinytree names are denied.
+  // Private holds require an empty staging_leases list; closure validation is
+  // authoritative and does not depend on client-supplied staging tokens.
 }
 
 message GetPublicationRequest {
@@ -216,4 +228,5 @@ message Publication {
   Reference reference = 2;
   // An immutable replay receipt. Reusing a key with different request fields is
   // an error. A deadline after publish is resolved by GetPublication/replay.
+  // This is historical evidence; check the exact current hold before offloading.
 }

@@ -23,11 +23,18 @@ struct Running {
 }
 impl Running {
     async fn start(store: Store, config: ServiceConfig) -> Self {
+        Self::start_with_peer_token(store, config, PEER).await
+    }
+    async fn start_with_peer_token(store: Store, config: ServiceConfig, peer_token: &str) -> Self {
         let principals = vec![
             Principal::new("alpha", ALPHA, vec!["alpha".into()], true).unwrap(),
             Principal::new("beta", BETA, vec!["beta".into()], true).unwrap(),
-            Principal::new("reader", READER, vec!["alpha".into()], false).unwrap(),
-            Principal::new("peer", PEER, vec!["alpha".into()], true).unwrap(),
+            Principal::new("reader", READER, vec!["alpha".into()], false)
+                .unwrap()
+                .with_retention(true),
+            Principal::new("peer", peer_token, vec!["alpha".into()], true)
+                .unwrap()
+                .with_retention(true),
         ];
         let service = RepositoryService::new(
             store,
@@ -958,6 +965,7 @@ async fn failed_startup_never_creates_storage_or_runs_gc() {
         token_env: format!("TINYTREE_MISSING_{}", uuid::Uuid::new_v4().simple()),
         repositories: vec!["default".into()],
         write: true,
+        retain: false,
     }];
     assert!(serve(config.clone(), std::future::pending()).await.is_err());
     assert!(!config.storage.exists());
@@ -1135,5 +1143,277 @@ async fn stalled_unary_graph_response_retains_admission_until_body_deadline() {
     drop(held);
     drop(raw);
     drop(second);
+    server.stop().await;
+}
+
+#[tokio::test]
+async fn private_retention_is_owner_scoped_durable_and_independent_of_public_writes() {
+    async fn lookup(
+        client: &mut RepositoryClient<Channel>,
+        token: &str,
+        name: &str,
+    ) -> p::Reference {
+        let view = client
+            .open_repository(request(
+                p::OpenRepositoryRequest {
+                    repository_id: "alpha".into(),
+                    reference_names: vec![name.into()],
+                },
+                token,
+            ))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(view.references.len(), 1);
+        assert_eq!(view.references[0].name, name);
+        view.references.into_iter().next().unwrap()
+    }
+    let (temporary, store) = setup();
+    let mut policy = ServiceConfig::default();
+    policy.retention.max_receipts_per_client = 2;
+    let server = Running::start(store.clone(), policy.clone()).await;
+    let mut client = server.client().await;
+    let fixture = fixture();
+    seed(&mut client, &fixture).await;
+    let head = root(&fixture);
+    client
+        .publish_reference(request(publish(head, "public-before-hold", 0), ALPHA))
+        .await
+        .unwrap();
+    let name = format!(
+        "_tinytree/hold/v1/{}/{}",
+        "01".repeat(16),
+        fixture.manifest.root_commit
+    );
+    let mut hold = publish(head, "acquire-private", 0);
+    hold.reference_name = name.clone();
+    let mut malformed = hold.clone();
+    malformed.reference_name = format!(
+        "_tinytree/hold/v1/{}/{}",
+        "AB".repeat(16),
+        fixture.manifest.root_commit
+    );
+    assert_eq!(
+        client
+            .publish_reference(request(malformed, READER))
+            .await
+            .unwrap_err()
+            .code(),
+        Code::InvalidArgument
+    );
+    let mut outside_scope = hold.clone();
+    outside_scope.repository_id = "unknown-repository".into();
+    assert_eq!(
+        client
+            .publish_reference(request(outside_scope, READER))
+            .await
+            .unwrap_err()
+            .code(),
+        Code::PermissionDenied
+    );
+    // Public write does not imply retain; retain does not imply public write.
+    assert_eq!(
+        client
+            .publish_reference(request(hold.clone(), ALPHA))
+            .await
+            .unwrap_err()
+            .code(),
+        Code::PermissionDenied
+    );
+    assert_eq!(
+        client
+            .publish_reference(request(publish(head, "reader-public", 1), READER))
+            .await
+            .unwrap_err()
+            .code(),
+        Code::PermissionDenied
+    );
+    let receipt = client
+        .publish_reference(request(hold.clone(), READER))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(receipt.reference.as_ref().unwrap().name, name);
+    assert_eq!(receipt.reference.as_ref().unwrap().generation, 1);
+    assert_eq!(
+        client
+            .publish_reference(request(hold.clone(), READER))
+            .await
+            .unwrap()
+            .into_inner(),
+        receipt
+    );
+    assert_eq!(
+        client
+            .get_publication(request(
+                p::GetPublicationRequest {
+                    repository_id: "alpha".into(),
+                    idempotency_key: "acquire-private".into(),
+                },
+                READER
+            ))
+            .await
+            .unwrap()
+            .into_inner(),
+        receipt
+    );
+    let unseen = lookup(&mut client, PEER, &name).await;
+    assert!(unseen.commit.is_none());
+    assert_eq!(unseen.generation, 0);
+    assert_eq!(
+        client
+            .get_publication(request(
+                p::GetPublicationRequest {
+                    repository_id: "alpha".into(),
+                    idempotency_key: "acquire-private".into(),
+                },
+                PEER
+            ))
+            .await
+            .unwrap_err()
+            .code(),
+        Code::NotFound
+    );
+    // Another principal may acquire the same wire name, but cannot release ours.
+    let mut unauthorized_release = hold.clone();
+    unauthorized_release.idempotency_key = "cannot-release-peer".into();
+    unauthorized_release.expected_generation = 1;
+    unauthorized_release.new_commit = None;
+    assert_eq!(
+        client
+            .publish_reference(request(unauthorized_release, PEER))
+            .await
+            .unwrap_err()
+            .code(),
+        Code::Aborted
+    );
+    client
+        .publish_reference(request(hold.clone(), PEER))
+        .await
+        .unwrap();
+    let mut forged = hold.clone();
+    forged.reference_name = format!(
+        "_tinytree/holds/v1/{}/{}/{}",
+        "02".repeat(32),
+        "01".repeat(16),
+        fixture.manifest.root_commit
+    );
+    forged.idempotency_key = "internal-name-denied".into();
+    assert_eq!(
+        client
+            .publish_reference(request(forged, READER))
+            .await
+            .unwrap_err()
+            .code(),
+        Code::PermissionDenied
+    );
+    let mut retarget = hold.clone();
+    retarget.idempotency_key = "retarget-denied".into();
+    retarget.new_commit = Some(wire_key(ObjectKey {
+        kind: Kind::Commit,
+        id: ObjectId([9; 32]),
+    }));
+    assert_eq!(
+        client
+            .publish_reference(request(retarget, READER))
+            .await
+            .unwrap_err()
+            .code(),
+        Code::InvalidArgument
+    );
+    let mut erase_public = publish(head, "erase-public", 1);
+    erase_public.new_commit = None;
+    client
+        .publish_reference(request(erase_public, ALPHA))
+        .await
+        .unwrap();
+    store.gc("alpha", i64::MAX - 1).unwrap();
+    assert!(store.descriptor("alpha", head).unwrap().is_some());
+    let mut release = hold.clone();
+    release.idempotency_key = "release-private".into();
+    release.expected_generation = 1;
+    release.new_commit = None;
+    let released = client
+        .publish_reference(request(release.clone(), READER))
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(released.reference.as_ref().unwrap().commit.is_none());
+    assert_eq!(released.reference.as_ref().unwrap().generation, 2);
+    // The reserved receipt slot permits release at the cap; later acquisitions fail.
+    let mut reacquire = hold.clone();
+    reacquire.idempotency_key = "over-receipt-quota".into();
+    reacquire.expected_generation = 2;
+    assert_eq!(
+        client
+            .publish_reference(request(reacquire, READER))
+            .await
+            .unwrap_err()
+            .code(),
+        Code::ResourceExhausted
+    );
+    assert_eq!(
+        client
+            .publish_reference(request(release.clone(), READER))
+            .await
+            .unwrap()
+            .into_inner(),
+        released
+    );
+    drop(client);
+    server.stop().await;
+    drop(store);
+
+    let reopened = Store::open_existing(temporary.path(), Default::default()).unwrap();
+    let rotated_peer = "rotated-peer-test-token-not-a-secret";
+    let server = Running::start_with_peer_token(reopened.clone(), policy, rotated_peer).await;
+    let mut client = server.client().await;
+    let absent = lookup(&mut client, READER, &name).await;
+    assert!(absent.commit.is_none());
+    assert_eq!(absent.generation, 2);
+    // Historical acquire receipts are replayable but are not proof of a current hold.
+    assert_eq!(
+        client
+            .get_publication(request(
+                p::GetPublicationRequest {
+                    repository_id: "alpha".into(),
+                    idempotency_key: "acquire-private".into(),
+                },
+                READER
+            ))
+            .await
+            .unwrap()
+            .into_inner(),
+        receipt
+    );
+    assert_eq!(
+        client
+            .open_repository(request(
+                p::OpenRepositoryRequest {
+                    repository_id: "alpha".into(),
+                    reference_names: vec![name.clone()],
+                },
+                PEER
+            ))
+            .await
+            .unwrap_err()
+            .code(),
+        Code::Unauthenticated
+    );
+    assert!(
+        lookup(&mut client, rotated_peer, &name)
+            .await
+            .commit
+            .is_some()
+    );
+    reopened.gc("alpha", i64::MAX - 1).unwrap();
+    assert!(reopened.descriptor("alpha", head).unwrap().is_some());
+    client
+        .publish_reference(request(release, rotated_peer))
+        .await
+        .unwrap();
+    reopened.gc("alpha", i64::MAX - 1).unwrap();
+    assert!(reopened.descriptor("alpha", head).unwrap().is_none());
+    drop(client);
     server.stop().await;
 }

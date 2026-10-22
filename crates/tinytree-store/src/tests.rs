@@ -801,3 +801,541 @@ fn object_pages_are_sorted_exclusive_kind_and_repository_scoped() {
         ));
     }
 }
+
+fn hold_owner(principal: u8, client: u8) -> RetentionOwner {
+    RetentionOwner {
+        principal: [principal; 32],
+        client: [client; 16],
+    }
+}
+fn hold_request(
+    owner: RetentionOwner,
+    head: Descriptor,
+    id: &str,
+    generation: u64,
+    acquire: bool,
+) -> PublishRequest {
+    PublishRequest {
+        reference_name: retention_reference(owner, CommitId(head.key.id.0)).unwrap(),
+        idempotency_key: id.to_owned(),
+        expected_generation: generation,
+        new_commit: acquire.then_some(CommitId(head.key.id.0)),
+        staging_leases: vec![],
+    }
+}
+
+#[test]
+fn private_hold_survives_public_rewrite_restart_and_gc_until_explicit_release() {
+    let (directory, store) = open();
+    let (file, _, old_head) = fixture(&store, "private retained history");
+    let owner = hold_owner(0xab, 0xcd);
+    let limits = RetentionLimits::default();
+    let acquire = hold_request(owner, old_head, "retain-old", 0, true);
+    assert_eq!(
+        parse_retention_reference(&acquire.reference_name),
+        Some((owner, CommitId(old_head.key.id.0)))
+    );
+    assert!(parse_retention_reference(&acquire.reference_name.to_uppercase()).is_none());
+    assert!(parse_retention_reference(&(acquire.reference_name.clone() + "/extra")).is_none());
+    assert!(retention_reference(owner, CommitId::ROOT).is_err());
+    assert!(store.publish("demo", &acquire, 0).is_err());
+    assert!(
+        store
+            .publish_retention("demo", hold_owner(1, 2), &acquire, &limits, 0)
+            .is_err()
+    );
+    let mut wrong_target = acquire.clone();
+    wrong_target.new_commit = Some(CommitId([7; 32]));
+    assert!(
+        store
+            .publish_retention("demo", owner, &wrong_target, &limits, 0)
+            .is_err()
+    );
+    store
+        .publish("demo", &request("public-old", 0, Some(old_head)), 0)
+        .unwrap();
+    let receipt = store
+        .publish_retention("demo", owner, &acquire, &limits, 0)
+        .unwrap();
+    let noop = hold_request(owner, old_head, "unneeded-new-key", 1, true);
+    assert!(
+        store
+            .publish_retention("demo", owner, &noop, &limits, 0)
+            .is_err()
+    );
+    assert!(
+        store
+            .publication("demo", "unneeded-new-key")
+            .unwrap()
+            .is_none()
+    );
+    let replacement = put_object(
+        &store,
+        Object::Commit(commit(
+            TreeId(tinytree_model::empty_tree().descriptor.key.id.0),
+            "public replacement without old bytes",
+        )),
+        1,
+    );
+    store
+        .publish("demo", &request("public-new", 1, Some(replacement)), 1)
+        .unwrap();
+    drop(store);
+    let store = Store::open_existing(directory.path(), config()).unwrap();
+    store.gc("demo", 100).unwrap();
+    assert_eq!(
+        store.descriptor("demo", old_head.key).unwrap(),
+        Some(old_head)
+    );
+    assert_eq!(store.descriptor("demo", file.key).unwrap(), Some(file));
+    let lowered = RetentionLimits {
+        max_known_clients_per_repository: 1,
+        max_known_clients_per_principal: 1,
+        max_root_records_per_repository: 1,
+        max_root_records_per_principal: 1,
+        max_root_records_per_client: 1,
+        max_receipts_per_repository: 1,
+        max_receipts_per_principal: 1,
+        max_receipts_per_client: 1,
+        max_live_roots_per_client: 1,
+        max_unique_bytes_per_client: 1,
+        max_unique_bytes_per_principal: 1,
+        max_quota_scan_roots: 1,
+    };
+    assert_eq!(
+        store
+            .publish_retention("demo", owner, &acquire, &lowered, 100)
+            .unwrap(),
+        receipt
+    );
+    let release = hold_request(owner, old_head, "release-old", 1, false);
+    let released = store
+        .publish_retention("demo", owner, &release, &lowered, 101)
+        .unwrap();
+    assert_eq!(released.reference.generation, 2);
+    assert_eq!(released.reference.commit, None);
+    store.gc("demo", 200).unwrap();
+    assert_eq!(store.descriptor("demo", old_head.key).unwrap(), None);
+    assert_eq!(store.descriptor("demo", file.key).unwrap(), None);
+    assert_eq!(
+        store
+            .publish_retention("demo", owner, &acquire, &lowered, 200)
+            .unwrap(),
+        receipt,
+        "a historical receipt is replayable, not a new retention promise"
+    );
+    assert_eq!(
+        store
+            .publish_retention("demo", owner, &release, &lowered, 200)
+            .unwrap(),
+        released
+    );
+    let stale = hold_request(owner, old_head, "stale-reacquire", 0, true);
+    assert!(matches!(
+        store.publish_retention("demo", owner, &stale, &limits, 200),
+        Err(Error::StaleReference(Reference { generation: 2, .. }))
+    ));
+}
+
+#[test]
+fn retention_quotas_reject_atomically_without_losing_reserved_release_capacity() {
+    #[derive(Clone, Copy, Debug)]
+    enum Quota {
+        RepositoryClients,
+        PrincipalClients,
+        RepositoryRoots,
+        PrincipalRoots,
+        ClientRoots,
+        LiveClientRoots,
+        RepositoryReceipts,
+        PrincipalReceipts,
+        ClientReceipts,
+        ClientBytes,
+        PrincipalBytes,
+        ScanWork,
+    }
+    for quota in [
+        Quota::RepositoryClients,
+        Quota::PrincipalClients,
+        Quota::RepositoryRoots,
+        Quota::PrincipalRoots,
+        Quota::ClientRoots,
+        Quota::LiveClientRoots,
+        Quota::RepositoryReceipts,
+        Quota::PrincipalReceipts,
+        Quota::ClientReceipts,
+        Quota::ClientBytes,
+        Quota::PrincipalBytes,
+        Quota::ScanWork,
+    ] {
+        let (_directory, store) = open();
+        let (_, _, first) = fixture(&store, "first");
+        let (_, _, next) = fixture(&store, "next");
+        let baseline_owner = hold_owner(1, 1);
+        let mut candidate_owner = baseline_owner;
+        let defaults = RetentionLimits::default();
+        store
+            .publish_retention(
+                "demo",
+                baseline_owner,
+                &hold_request(baseline_owner, first, "baseline", 0, true),
+                &defaults,
+                0,
+            )
+            .unwrap();
+        let baseline_bytes: u64 = store
+            .inner
+            .closure("demo", [first.key], true, false)
+            .unwrap()
+            .into_iter()
+            .map(|key| store.descriptor("demo", key).unwrap().unwrap().size_bytes)
+            .sum();
+        let mut limited = defaults.clone();
+        match quota {
+            Quota::RepositoryClients => {
+                limited.max_known_clients_per_repository = 1;
+                candidate_owner = hold_owner(2, 1);
+            }
+            Quota::PrincipalClients => {
+                limited.max_known_clients_per_principal = 1;
+                candidate_owner = hold_owner(1, 2);
+            }
+            Quota::RepositoryRoots => limited.max_root_records_per_repository = 1,
+            Quota::PrincipalRoots => limited.max_root_records_per_principal = 1,
+            Quota::ClientRoots => limited.max_root_records_per_client = 1,
+            Quota::LiveClientRoots => limited.max_live_roots_per_client = 1,
+            Quota::RepositoryReceipts => limited.max_receipts_per_repository = 3,
+            Quota::PrincipalReceipts => limited.max_receipts_per_principal = 3,
+            Quota::ClientReceipts => limited.max_receipts_per_client = 3,
+            Quota::ClientBytes => limited.max_unique_bytes_per_client = baseline_bytes,
+            Quota::PrincipalBytes => limited.max_unique_bytes_per_principal = baseline_bytes,
+            Quota::ScanWork => {
+                store
+                    .publish_retention(
+                        "demo",
+                        baseline_owner,
+                        &hold_request(baseline_owner, next, "second", 0, true),
+                        &defaults,
+                        0,
+                    )
+                    .unwrap();
+                limited.max_quota_scan_roots = 1;
+            }
+        }
+        let candidate = if matches!(quota, Quota::ScanWork) {
+            let (_, _, third) = fixture(&store, "third");
+            third
+        } else {
+            next
+        };
+        let request = hold_request(candidate_owner, candidate, "candidate", 0, true);
+        assert!(
+            matches!(
+                store.publish_retention("demo", candidate_owner, &request, &limited, 0),
+                Err(Error::Limit(_))
+            ),
+            "{quota:?}"
+        );
+        assert!(
+            store.publication("demo", "candidate").unwrap().is_none(),
+            "{quota:?}"
+        );
+        let current = store
+            .references("demo", &[request.reference_name.clone()])
+            .unwrap()
+            .remove(0);
+        assert_eq!(current.generation, 0, "{quota:?}");
+        store
+            .publish_retention("demo", candidate_owner, &request, &defaults, 0)
+            .unwrap();
+        store
+            .publish_retention(
+                "demo",
+                candidate_owner,
+                &hold_request(candidate_owner, candidate, "release-candidate", 1, false),
+                &limited,
+                0,
+            )
+            .unwrap();
+    }
+}
+
+#[test]
+fn retention_deduplicates_shared_history_and_persists_receipt_and_tombstone_caps() {
+    let (directory, store) = open();
+    let (file, tree, first) = fixture(&store, "shared ancestor");
+    let mut child = commit(TreeId(tree.key.id.0), "shared descendant");
+    child.parents = vec![CommitId(first.key.id.0)];
+    let second = put_object(&store, Object::Commit(child), 0);
+    let unique_bytes = file.size_bytes + tree.size_bytes + first.size_bytes + second.size_bytes;
+    let owner = hold_owner(1, 1);
+    let peer = hold_owner(1, 2);
+    let limits = RetentionLimits {
+        max_unique_bytes_per_client: unique_bytes,
+        max_unique_bytes_per_principal: unique_bytes,
+        ..RetentionLimits::default()
+    };
+    for (owner, head, id) in [
+        (owner, first, "a"),
+        (owner, second, "b"),
+        (peer, second, "peer"),
+    ] {
+        store
+            .publish_retention(
+                "demo",
+                owner,
+                &hold_request(owner, head, id, 0, true),
+                &limits,
+                0,
+            )
+            .unwrap();
+    }
+    drop(store);
+    let store = Store::open_existing(directory.path(), config()).unwrap();
+    let lowered = RetentionLimits {
+        max_receipts_per_repository: 1,
+        max_receipts_per_principal: 1,
+        max_receipts_per_client: 1,
+        max_unique_bytes_per_client: 1,
+        max_unique_bytes_per_principal: 1,
+        ..limits
+    };
+    store
+        .publish_retention(
+            "demo",
+            peer,
+            &hold_request(peer, second, "peer-release", 1, false),
+            &lowered,
+            0,
+        )
+        .unwrap();
+    drop(store);
+
+    let (_directory, store) = open();
+    let (_, _, head) = fixture(&store, "receipt churn");
+    let limits = RetentionLimits {
+        max_root_records_per_repository: 1,
+        max_root_records_per_principal: 1,
+        max_root_records_per_client: 1,
+        max_known_clients_per_repository: 1,
+        max_known_clients_per_principal: 1,
+        max_receipts_per_repository: 6,
+        max_receipts_per_principal: 6,
+        max_receipts_per_client: 6,
+        ..RetentionLimits::default()
+    };
+    for (generation, acquire, key) in [
+        (0, true, "acquire-1"),
+        (1, false, "release-1"),
+        (2, true, "acquire-2"),
+        (3, false, "release-2"),
+        (4, true, "acquire-3"),
+        (5, false, "release-3"),
+    ] {
+        store
+            .publish_retention(
+                "demo",
+                owner,
+                &hold_request(owner, head, key, generation, acquire),
+                &limits,
+                0,
+            )
+            .unwrap();
+    }
+    let blocked = hold_request(owner, head, "cap-exhausted", 6, true);
+    assert!(matches!(
+        store.publish_retention("demo", owner, &blocked, &limits, 0),
+        Err(Error::Limit("retention receipt quota"))
+    ));
+    assert!(
+        store
+            .publication("demo", "cap-exhausted")
+            .unwrap()
+            .is_none()
+    );
+    let new_client = hold_owner(1, 3);
+    assert!(matches!(
+        store.publish_retention(
+            "demo",
+            new_client,
+            &hold_request(new_client, head, "new-client-after-release", 0, true),
+            &limits,
+            0
+        ),
+        Err(Error::Limit(_))
+    ));
+    let (_, _, other) = fixture(&store, "different root record");
+    assert!(matches!(
+        store.publish_retention(
+            "demo",
+            owner,
+            &hold_request(owner, other, "new-root-after-release", 0, true),
+            &limits,
+            0
+        ),
+        Err(Error::Limit(_))
+    ));
+}
+
+#[test]
+fn retention_reopen_rejects_exact_accounting_and_history_mismatches_without_repair() {
+    enum Corruption {
+        Counter {
+            scope: &'static str,
+            field: &'static str,
+            value: u64,
+        },
+        MissingReceipt,
+        ReceiptOwner,
+        ExtraCounter,
+    }
+    for corruption in [
+        Corruption::Counter {
+            scope: "repository",
+            field: "receipts",
+            value: 2,
+        },
+        Corruption::Counter {
+            scope: "principal",
+            field: "clients",
+            value: 0,
+        },
+        Corruption::Counter {
+            scope: "client",
+            field: "roots",
+            value: 1,
+        },
+        Corruption::MissingReceipt,
+        Corruption::ReceiptOwner,
+        Corruption::ExtraCounter,
+    ] {
+        let (directory, store) = open();
+        let owner = hold_owner(1, 2);
+        let (_, _, first) = fixture(&store, "first held revision");
+        let (_, _, second) = fixture(&store, "second held revision");
+        let limits = RetentionLimits::default();
+        for request in [
+            hold_request(owner, first, "hold-first", 0, true),
+            hold_request(owner, first, "release-first", 1, false),
+            hold_request(owner, second, "hold-second", 0, true),
+        ] {
+            store
+                .publish_retention("demo", owner, &request, &limits, 0)
+                .unwrap();
+        }
+        let mut tx = store
+            .inner
+            .db
+            .write_tx()
+            .durability(Some(PersistMode::SyncAll));
+        let (changed_key, changed_value) = match corruption {
+            Corruption::Counter {
+                scope,
+                field,
+                value,
+            } => {
+                let suffix = match scope {
+                    "repository" => "retention/v1/repository".to_owned(),
+                    "principal" => format!("retention/v1/principal/{}", hex(&owner.principal)),
+                    "client" => format!(
+                        "retention/v1/client/{}/{}",
+                        hex(&owner.principal),
+                        hex(&owner.client)
+                    ),
+                    _ => unreachable!(),
+                };
+                let physical = key("demo", suffix.as_bytes());
+                let bytes = tx
+                    .get(&store.inner.spaces.meta, &physical)
+                    .unwrap()
+                    .unwrap();
+                let mut json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+                json[field] = value.into();
+                let changed = serde_json::to_vec(&json).unwrap();
+                tx.insert(&store.inner.spaces.meta, &physical, &changed);
+                (Some(physical), Some(changed))
+            }
+            Corruption::MissingReceipt => {
+                tx.remove(&store.inner.spaces.receipts, key("demo", b"hold-first"));
+                (None, None)
+            }
+            Corruption::ReceiptOwner => {
+                let physical = key("demo", b"hold-first");
+                let bytes = tx
+                    .get(&store.inner.spaces.receipts, &physical)
+                    .unwrap()
+                    .unwrap();
+                let mut record: ReceiptRecord = decode(&bytes).unwrap();
+                record.reference_name =
+                    retention_reference(hold_owner(3, 4), CommitId(first.key.id.0)).unwrap();
+                tx.insert(
+                    &store.inner.spaces.receipts,
+                    &physical,
+                    encode(&record).unwrap(),
+                );
+                (None, None)
+            }
+            Corruption::ExtraCounter => {
+                let physical = key("demo", b"retention/v1/principal/unknown");
+                let value = br#"{"clients":0,"roots":0,"receipts":0,"live":0}"#.to_vec();
+                tx.insert(&store.inner.spaces.meta, &physical, &value);
+                (Some(physical), Some(value))
+            }
+        };
+        store.inner.commit(tx).unwrap();
+        drop(store);
+        assert!(matches!(
+            Store::open_existing(directory.path(), config()),
+            Err(Error::Corrupt(_))
+        ));
+        // Inspect the raw engine only to prove failed validation did not reset
+        // a plausible-looking counter to its inferred value or delete it.
+        let db = SingleWriterTxDatabase::builder(directory.path().join("metadata"))
+            .manual_journal_persist(true)
+            .open()
+            .unwrap();
+        let meta = db.keyspace("meta", KeyspaceCreateOptions::default).unwrap();
+        if let (Some(key), Some(value)) = (changed_key, changed_value) {
+            assert_eq!(
+                db.read_tx().get(&meta, key).unwrap().unwrap().as_ref(),
+                value.as_slice()
+            );
+        }
+    }
+}
+
+#[test]
+fn retention_reopen_validation_budgets_include_public_records_and_fail_closed() {
+    let (directory, store) = open();
+    let (_, _, head) = fixture(&store, "public receipts also consume validation work");
+    store
+        .publish("demo", &request("public", 0, Some(head)), 0)
+        .unwrap();
+    drop(store);
+    let limits = [
+        Config {
+            max_retention_validation_records: 1,
+            ..config()
+        },
+        Config {
+            max_retention_validation_bytes: 1,
+            ..config()
+        },
+    ];
+    for config in limits {
+        assert!(matches!(
+            Store::open_existing(directory.path(), config),
+            Err(Error::Limit("retention reopen validation"))
+        ));
+    }
+    let store = Store::open_existing(directory.path(), config()).unwrap();
+    assert_eq!(
+        store
+            .publication("demo", "public")
+            .unwrap()
+            .unwrap()
+            .reference
+            .commit,
+        Some(head)
+    );
+}

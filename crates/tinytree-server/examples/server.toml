@@ -9,6 +9,7 @@ id = "agent"
 token_env = "TINYTREE_AGENT_TOKEN"
 repositories = ["example"]
 write = true
+retain = true
 
 [service]
 max_inflight = 16

@@ -81,6 +81,7 @@ async fn configured_tls_authenticates_principals_and_verifies_server_identity() 
             token_env: TOKEN_ENV.into(),
             repositories: vec!["alpha".into()],
             write: false,
+            retain: false,
         }],
         tls: Some(TlsConfig {
             certificate: PathBuf::from(env!("TLS_SERVER_CERT"))

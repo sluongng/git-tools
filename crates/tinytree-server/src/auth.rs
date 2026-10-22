@@ -7,6 +7,7 @@ pub struct Principal {
     pub id: String,
     pub repositories: Vec<String>,
     pub write: bool,
+    pub retain: bool,
     token_hash: [u8; 32],
 }
 impl Principal {
@@ -33,8 +34,14 @@ impl Principal {
             id,
             repositories,
             write,
+            retain: false,
             token_hash: *blake3::hash(token.as_bytes()).as_bytes(),
         })
+    }
+    /// Retention grants no upload or public-reference write permission.
+    pub fn with_retention(mut self, enabled: bool) -> Self {
+        self.retain = enabled;
+        self
     }
 }
 #[derive(Clone)]
@@ -74,6 +81,7 @@ impl Authorization {
                 id: "local-owner".into(),
                 repositories: self.repositories.clone(),
                 write: true,
+                retain: true,
             });
         }
         let header = metadata
@@ -93,6 +101,7 @@ impl Authorization {
             id: p.id.clone(),
             repositories: p.repositories.iter().cloned().collect(),
             write: p.write,
+            retain: p.retain,
         })
     }
 }
@@ -100,8 +109,16 @@ pub(crate) struct Identity {
     pub id: String,
     repositories: HashSet<String>,
     write: bool,
+    retain: bool,
 }
 impl Identity {
+    pub fn authorize_retention(&self, repo: &str) -> Result<(), Status> {
+        self.authorize(repo, false)?;
+        if !self.retain {
+            return Err(Status::permission_denied("native retention access denied"));
+        }
+        Ok(())
+    }
     pub fn authorize(&self, repo: &str, write: bool) -> Result<(), Status> {
         if !self.repositories.contains(repo) || (write && !self.write) {
             return Err(Status::permission_denied("native repository access denied"));

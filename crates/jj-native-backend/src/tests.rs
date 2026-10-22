@@ -1,5 +1,5 @@
 use super::*;
-use futures::{TryStreamExt, executor::block_on, io::Cursor};
+use futures::{AsyncReadExt, TryStreamExt, executor::block_on, io::Cursor};
 use jj_lib::{
     backend::{MillisSinceEpoch, Signature, Timestamp},
     conflict_labels::ConflictLabels,
@@ -662,4 +662,136 @@ fn copy_query_frontier_bytes_and_duplicate_edges_fail_with_explicit_budgets() {
             "per-name merge work must count even though there are no file records"
         );
     });
+}
+
+#[test]
+fn shared_provider_backends_use_one_authoritative_owner_and_copy_snapshot() {
+    block_on(async {
+        let directory = tempfile::tempdir().unwrap();
+        let config = Config::default();
+        let io = Arc::new(DirectObjectIo::init(directory.path(), config.clone()).unwrap());
+        let first = NativeBackend::from_io(io.clone(), config.clone())
+            .await
+            .unwrap();
+        let second = NativeBackend::from_io(io.clone(), config.clone())
+            .await
+            .unwrap();
+        let id = first
+            .write_file(RepoPath::root(), &mut Cursor::new(b"provider bytes"))
+            .await
+            .unwrap();
+        let mut bytes = Vec::new();
+        second
+            .read_file(RepoPath::root(), &id)
+            .await
+            .unwrap()
+            .read_to_end(&mut bytes)
+            .await
+            .unwrap();
+        assert_eq!(bytes, b"provider bytes");
+        let parent = first
+            .write_copy(&CopyHistory {
+                current_path: path("a"),
+                parents: vec![],
+                salt: vec![1],
+            })
+            .await
+            .unwrap();
+        let child = second
+            .write_copy(&CopyHistory {
+                current_path: path("b"),
+                parents: vec![parent.clone()],
+                salt: vec![2],
+            })
+            .await
+            .unwrap();
+        let related = first.get_related_copies(&parent).await.unwrap();
+        assert_eq!(related[0].id, child);
+        assert_eq!(related[1].id, parent);
+        let snapshot = io
+            .copy_catalog_snapshot(CopyCatalogLimits {
+                max_objects: 2,
+                max_metadata_bytes: 4096,
+                max_edges: 2,
+            })
+            .await
+            .unwrap();
+        assert_eq!(snapshot.into_entries().len(), 2);
+        assert!(
+            io.copy_catalog_snapshot(CopyCatalogLimits {
+                max_objects: 1,
+                max_metadata_bytes: 4096,
+                max_edges: 2
+            })
+            .await
+            .is_err()
+        );
+        assert!(
+            NativeBackend::load(directory.path(), config).is_err(),
+            "Direct still owns one process-exclusive store"
+        );
+    });
+}
+#[test]
+fn provider_attachment_requires_verified_bytes_not_a_descriptor_promise() {
+    #[derive(Debug)]
+    struct PromiseOnly;
+    #[async_trait]
+    impl NativeObjectIo for PromiseOnly {
+        async fn descriptor(&self, _: m::ObjectKey) -> BackendResult<Option<m::Descriptor>> {
+            Ok(Some(m::empty_tree().descriptor))
+        }
+        async fn read_metadata(&self, _: m::ObjectKey) -> BackendResult<VerifiedMetadata> {
+            Err(invalid("descriptor promise has no resident verified bytes"))
+        }
+        async fn write_metadata(&self, _: m::Object) -> BackendResult<m::Descriptor> {
+            Err(invalid("not implemented by fixture"))
+        }
+        async fn read_file(&self, _: m::FileId) -> BackendResult<FileRead> {
+            Err(invalid("not implemented by fixture"))
+        }
+        async fn write_file(
+            &self,
+            _: &mut (dyn AsyncRead + Send + Unpin),
+            _: u64,
+        ) -> BackendResult<m::FileId> {
+            Err(invalid("not implemented by fixture"))
+        }
+        async fn copy_catalog_snapshot(
+            &self,
+            _: CopyCatalogLimits,
+        ) -> BackendResult<CopyCatalogSnapshot> {
+            Err(invalid("not implemented by fixture"))
+        }
+    }
+    block_on(async {
+        let promise = Arc::new(PromiseOnly);
+        assert!(
+            promise
+                .descriptor(m::empty_tree().descriptor.key)
+                .await
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            NativeBackend::from_io(promise, Config::default())
+                .await
+                .is_err()
+        );
+    });
+    let encoded = m::empty_tree();
+    VerifiedMetadata::verify(
+        encoded.descriptor,
+        encoded.bytes.clone(),
+        m::Limits::default(),
+    )
+    .unwrap();
+    let mut wrong = encoded.descriptor;
+    wrong.key.id.0[0] ^= 1;
+    assert!(VerifiedMetadata::verify(wrong, encoded.bytes.clone(), m::Limits::default()).is_err());
+    let mut trailing = encoded.bytes;
+    trailing.push(0);
+    let mut descriptor = m::describe_file(&trailing);
+    descriptor.key.kind = m::Kind::Tree;
+    assert!(VerifiedMetadata::verify(descriptor, trailing, m::Limits::default()).is_err());
 }

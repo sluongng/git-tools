@@ -2,6 +2,7 @@ use crate::{
     Principal,
     auth::{Authorization, Identity},
     config::{ConfigError, ServiceConfig},
+    retention::{ReferenceScope, wire_name},
 };
 use async_stream::try_stream;
 use futures_core::Stream;
@@ -326,16 +327,17 @@ impl Repository for RepositoryService {
         self.bounded(request.get_ref())?;
         let input = request.into_inner();
         self.batch(input.reference_names.len())?;
-        for name in &input.reference_names {
-            public_reference(name)?;
-        }
         let admission = self
             .admit(&identity, &input.repository_id, false, deadline)
             .await?;
         let store = self.inner.store.clone();
         let repository_id = input.repository_id;
         let response_repo = repository_id.clone();
-        let names = input.reference_names;
+        let names = input
+            .reference_names
+            .iter()
+            .map(|name| ReferenceScope::parse(name, &identity)?.stored_name())
+            .collect::<Result<Vec<_>, Status>>()?;
         let response_admission = admission.clone();
         let refs = blocking(deadline, move || {
             let _admission = admission;
@@ -349,7 +351,10 @@ impl Repository for RepositoryService {
                 repository_id: response_repo,
                 protocol_major: 1,
                 object_format_version: tinytree_model::FORMAT_VERSION as u32,
-                references: refs.into_iter().map(reference).collect(),
+                references: refs
+                    .into_iter()
+                    .map(|value| reference(value, &identity))
+                    .collect::<Result<_, _>>()?,
                 max_batch_items: self.inner.config.max_batch_items as u32,
                 max_request_bytes: self.inner.config.max_request_bytes as u64,
                 max_frame_bytes: self.inner.config.max_frame_bytes as u32,
@@ -767,9 +772,18 @@ impl Repository for RepositoryService {
         self.bounded(request.get_ref())?;
         let input = request.into_inner();
         self.batch(input.staging_leases.len())?;
-        public_reference(&input.reference_name)?;
+        let scope = ReferenceScope::parse(&input.reference_name, &identity)?;
+        let public = matches!(&scope, ReferenceScope::Public(_));
+        if !public {
+            identity.authorize_retention(&input.repository_id)?;
+            if !input.staging_leases.is_empty() {
+                return Err(Status::invalid_argument(
+                    "native retention does not accept staging tokens",
+                ));
+            }
+        }
         let admission = self
-            .admit(&identity, &input.repository_id, true, deadline)
+            .admit(&identity, &input.repository_id, public, deadline)
             .await?;
         let commit = input.new_commit.as_ref().map(commit_key).transpose()?;
         if commit.is_some_and(|k| intrinsic(k)) {
@@ -777,11 +791,18 @@ impl Repository for RepositoryService {
                 "intrinsic root cannot be published",
             ));
         }
+        if let ReferenceScope::Hold { commit: target, .. } = &scope {
+            if commit.is_some_and(|key| key.id.0 != target.0) {
+                return Err(Status::invalid_argument(
+                    "native retention target cannot change",
+                ));
+            }
+        }
         let original_id = input.idempotency_key;
         let scoped_id = publication_key(&identity, &original_id)?;
         let req = tinytree_store::PublishRequest {
             idempotency_key: scoped_id,
-            reference_name: input.reference_name,
+            reference_name: scope.stored_name()?,
             expected_generation: input.expected_generation,
             new_commit: commit.map(|k| CommitId(k.id.0)),
             staging_leases: input.staging_leases,
@@ -789,13 +810,20 @@ impl Repository for RepositoryService {
         let store = self.inner.store.clone();
         let repo = input.repository_id;
         let now = now()?;
+        let limits = self.inner.config.retention.clone();
         let response_admission = admission.clone();
         let publication = blocking(deadline, move || {
             let _admission = admission;
-            store.publish(&repo, &req, now).map_err(store_status)
+            match scope {
+                ReferenceScope::Public(_) => store.publish(&repo, &req, now),
+                ReferenceScope::Hold { owner, .. } => {
+                    store.publish_retention(&repo, owner, &req, &limits, now)
+                }
+            }
+            .map_err(store_status)
         })
         .await?;
-        let mut publication = publication_wire(publication);
+        let mut publication = publication_wire(publication, &identity)?;
         publication.idempotency_key = original_id;
         self.response(publication, response_admission, None, deadline)
             .await
@@ -825,7 +853,7 @@ impl Repository for RepositoryService {
                 .ok_or_else(|| Status::not_found("native publication unavailable"))
         })
         .await?;
-        let mut publication = publication_wire(publication);
+        let mut publication = publication_wire(publication, &identity)?;
         publication.idempotency_key = original_id;
         self.response(publication, response_admission, None, deadline)
             .await
@@ -834,14 +862,6 @@ impl Repository for RepositoryService {
 
 fn timeout() -> Status {
     Status::deadline_exceeded("native operation deadline exceeded")
-}
-fn public_reference(name: &str) -> Result<(), Status> {
-    if name == "_tinytree" || name.starts_with("_tinytree/") {
-        return Err(Status::permission_denied(
-            "native internal reference namespace is reserved",
-        ));
-    }
-    Ok(())
 }
 fn publication_key(identity: &Identity, id: &str) -> Result<String, Status> {
     if id.is_empty()
@@ -998,18 +1018,24 @@ fn descriptor_wire(value: Descriptor) -> p::ObjectDescriptor {
         object_format_version: value.format_version as u32,
     }
 }
-fn reference(value: tinytree_store::Reference) -> p::Reference {
-    p::Reference {
-        name: value.name,
+fn reference(
+    value: tinytree_store::Reference,
+    identity: &Identity,
+) -> Result<p::Reference, Status> {
+    Ok(p::Reference {
+        name: wire_name(&value.name, identity)?,
         generation: value.generation,
         commit: value.commit.map(descriptor_wire),
-    }
+    })
 }
-fn publication_wire(value: tinytree_store::Publication) -> p::Publication {
-    p::Publication {
+fn publication_wire(
+    value: tinytree_store::Publication,
+    identity: &Identity,
+) -> Result<p::Publication, Status> {
+    Ok(p::Publication {
         idempotency_key: value.idempotency_key,
-        reference: Some(reference(value.reference)),
-    }
+        reference: Some(reference(value.reference, identity)?),
+    })
 }
 fn store_status(error: tinytree_store::Error) -> Status {
     use tinytree_store::Error as E;

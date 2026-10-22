@@ -24,6 +24,11 @@ use tempfile::NamedTempFile;
 use tinytree_model::{CommitId, Descriptor, Kind, Limits, ObjectId, ObjectKey};
 
 mod closure;
+mod retention;
+
+pub use retention::{
+    RetentionLimits, RetentionOwner, parse_retention_reference, retention_reference,
+};
 
 pub type Result<T> = std::result::Result<T, Error>;
 
@@ -88,6 +93,8 @@ pub struct Config {
     pub max_staging_bytes: u64,
     pub max_staging_uploads: usize,
     pub staging_ttl_seconds: i64,
+    pub max_retention_validation_records: usize,
+    pub max_retention_validation_bytes: u64,
 }
 impl Default for Config {
     fn default() -> Self {
@@ -103,6 +110,8 @@ impl Default for Config {
             max_staging_bytes: 1024 * 1024 * 1024,
             max_staging_uploads: 64,
             staging_ttl_seconds: 3600,
+            max_retention_validation_records: 2_000_000,
+            max_retention_validation_bytes: 1024 * 1024 * 1024,
         }
     }
 }
@@ -461,6 +470,8 @@ impl Store {
             || config.max_path_context_bytes == 0
             || config.max_staging_bytes == 0
             || config.max_staging_uploads == 0
+            || !(1..=10_000_000).contains(&config.max_retention_validation_records)
+            || config.max_retention_validation_bytes == 0
             || config.max_repository_bytes < tinytree_model::empty_tree().descriptor.size_bytes
             || config.max_objects_per_repository == 0
         {
@@ -539,7 +550,7 @@ impl Store {
                 .map_err(|e| Error::Io(e.error))?;
             sync_dir(&root)?;
         }
-        Ok(Self {
+        let store = Self {
             inner: Arc::new(Inner {
                 root,
                 config,
@@ -549,7 +560,11 @@ impl Store {
                 uncertain_commit: AtomicBool::new(false),
                 _owner: owner,
             }),
-        })
+        };
+        if !planned.fresh {
+            store.inner.validate_retention_on_reopen()?;
+        }
+        Ok(store)
     }
 
     pub fn create_repository(&self, repo: &str) -> Result<()> {
@@ -921,6 +936,42 @@ impl Store {
     }
 
     pub fn publish(&self, repo: &str, request: &PublishRequest, now: i64) -> Result<Publication> {
+        if request.reference_name == "_tinytree" || request.reference_name.starts_with("_tinytree/")
+        {
+            return Err(Error::Invalid("reserved native reference namespace"));
+        }
+        self.publish_inner(repo, request, now, None)
+    }
+
+    /// Publish an owner-scoped durable hold or release it. Holds never expire.
+    /// Authentication and stable principal-to-owner mapping belong to the caller.
+    pub fn publish_retention(
+        &self,
+        repo: &str,
+        owner: RetentionOwner,
+        request: &PublishRequest,
+        limits: &RetentionLimits,
+        now: i64,
+    ) -> Result<Publication> {
+        limits.validate()?;
+        if !request.staging_leases.is_empty() {
+            return Err(Error::Invalid("retention does not use staging leases"));
+        }
+        let (actual_owner, named_commit) = parse_retention_reference(&request.reference_name)
+            .ok_or(Error::Invalid("retention reference name"))?;
+        if actual_owner != owner || request.new_commit.is_some_and(|id| id != named_commit) {
+            return Err(Error::Invalid("retention owner or immutable target"));
+        }
+        self.publish_inner(repo, request, now, Some((owner, limits)))
+    }
+
+    fn publish_inner(
+        &self,
+        repo: &str,
+        request: &PublishRequest,
+        now: i64,
+        retention: Option<(RetentionOwner, &RetentionLimits)>,
+    ) -> Result<Publication> {
         request_token(&request.idempotency_key)?;
         reference_name(&request.reference_name)?;
         if request.staging_leases.len() > self.inner.config.max_closure_objects
@@ -991,6 +1042,12 @@ impl Store {
                 return Err(Error::Invalid("expired staging lease"));
             }
         }
+        let retention_update = retention
+            .map(|(owner, limits)| {
+                self.inner
+                    .retention_update(repo, owner, request, &current, limits)
+            })
+            .transpose()?;
         let stored = StoredReference {
             generation: current
                 .generation
@@ -1010,6 +1067,9 @@ impl Store {
             .durability(Some(PersistMode::SyncAll));
         tx.insert(&self.inner.spaces.refs, ref_key, encode(&stored)?);
         tx.insert(&self.inner.spaces.receipts, receipt_key, encode(&record)?);
+        if let Some(update) = retention_update {
+            update.write(&mut tx, &self.inner.spaces.meta)?;
+        }
         self.inner.commit(tx)?;
         publication(&request.idempotency_key, record)
     }

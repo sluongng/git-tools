@@ -7,6 +7,7 @@ mod auth;
 mod body_deadline;
 pub use body_deadline::DeadlineLayer;
 mod config;
+mod retention;
 mod service;
 
 pub use auth::Principal;
@@ -100,6 +101,7 @@ pub async fn serve(
                 let token = std::env::var(&p.token_env)
                     .map_err(|_| ConfigError("cannot resolve native principal token"))?;
                 Principal::new(p.id.clone(), &token, p.repositories.clone(), p.write)
+                    .map(|principal| principal.with_retention(p.retain))
             })
             .collect::<std::result::Result<Vec<_>, _>>()?;
         auth::Authorization::new(principals.clone(), &setup.repositories)?;
@@ -323,6 +325,7 @@ mod tests {
             token_env: "TINYTREE_TEST_TOKEN".into(),
             repositories: vec!["default".into()],
             write: true,
+            retain: false,
         });
         assert!(config.validate().is_err());
         config.tls = Some(TlsConfig {

@@ -34,7 +34,14 @@ impl NativeBackend {
         key: m::ObjectKey,
         budget: &mut Budget,
     ) -> BackendResult<m::Object> {
-        let descriptor = self.descriptor(key).await?;
+        let verified = self.io.read_metadata(key).await?;
+        if verified.descriptor().key != key {
+            return Err(invalid("native provider query key mismatch"));
+        }
+        self.charge_metadata(budget, verified.descriptor())?;
+        Ok(verified.into_object())
+    }
+    fn charge_metadata(&self, budget: &mut Budget, descriptor: m::Descriptor) -> BackendResult<()> {
         budget.reads = budget
             .reads
             .checked_add(1)
@@ -48,7 +55,7 @@ impl NativeBackend {
         {
             return Err(invalid("native query budget exceeded"));
         }
-        self.read_object(key).await
+        Ok(())
     }
     async fn query_commit(&self, id: m::CommitId, budget: &mut Budget) -> BackendResult<m::Commit> {
         if id == m::CommitId::ROOT {
@@ -345,30 +352,30 @@ impl NativeBackend {
         &self,
         requested: m::CopyId,
     ) -> BackendResult<Vec<RelatedCopy>> {
-        let _copy_guard = self.copy_gate.clone().lock_owned().await;
         let mut budget = Budget::new();
         self.query_copy(requested, &mut budget).await?;
+        let limits = CopyCatalogLimits {
+            max_objects: self
+                .config
+                .max_copy_histories
+                .min(self.config.max_query_objects - budget.reads),
+            max_metadata_bytes: self.config.max_query_metadata_bytes - budget.bytes,
+            max_edges: self.config.store.max_closure_edges - budget.edges,
+        };
+        let snapshot = self.io.copy_catalog_snapshot(limits).await?;
         let mut copies = BTreeMap::new();
-        let mut after = None;
-        loop {
-            let store = self.store.clone();
-            let page = io::blocking(move || {
-                store
-                    .list_objects(REPOSITORY, m::Kind::CopyHistory, after, 1024)
-                    .map_err(other)
-            })
-            .await?;
-            if page.is_empty() {
-                break;
-            }
-            for descriptor in &page {
-                let id = m::CopyId(descriptor.key.id.0);
-                if copies.len() >= self.config.max_copy_histories {
-                    return Err(invalid("native copy catalog budget exceeded"));
-                }
-                copies.insert(id, self.query_copy(id, &mut budget).await?);
-            }
-            after = page.last().map(|d| d.key.id);
+        for verified in snapshot.into_entries() {
+            let descriptor = verified.descriptor();
+            self.charge_metadata(&mut budget, descriptor)?;
+            let m::Object::CopyHistory(copy) = verified.into_object() else {
+                return Err(invalid("native copy catalog kind mismatch"));
+            };
+            copies.insert(m::CopyId(descriptor.key.id.0), copy);
+        }
+        if !copies.contains_key(&requested) {
+            return Err(invalid(
+                "native requested copy absent from provider snapshot",
+            ));
         }
         // Returning unrelated histories is explicitly permitted by jj. Include
         // the complete bounded local catalog so no descendant is silently lost.

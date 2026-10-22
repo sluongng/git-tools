@@ -34,10 +34,15 @@ impl Read for InterruptedUpload {
 }
 
 #[cfg(unix)]
-fn fail_publication(store: &Store) -> Result<(), Box<dyn std::error::Error>> {
+fn fail_publication(store: &Store, retention: bool) -> Result<(), Box<dyn std::error::Error>> {
     let replacement = common::replacement();
     common::upload(store, &replacement)?;
     checkpoint("REPLACEMENT_PREPARED")?;
+    let owner = tinytree_store::RetentionOwner {
+        principal: [1; 32],
+        client: [2; 16],
+    };
+    let hold = common::retention_publication("retention-attempt", 0, common::initial().head, true);
     // This process is disposable. Its own regular-file writes fail with EFBIG;
     // the parent, host filesystem capacity and pipe checkpoints are unaffected.
     unsafe {
@@ -52,13 +57,22 @@ fn fail_publication(store: &Store) -> Result<(), Box<dyn std::error::Error>> {
             return Err(io::Error::last_os_error().into());
         }
     }
-    let error = store
-        .publish(
+    let result = if retention {
+        store.publish_retention(
+            common::REPOSITORY,
+            owner,
+            &hold,
+            &tinytree_store::RetentionLimits::default(),
+            100,
+        )
+    } else {
+        store.publish(
             common::REPOSITORY,
             &common::publication("replacement", 1, replacement.head),
             100,
         )
-        .expect_err("RLIMIT_FSIZE must reject the actual journal write");
+    };
+    let error = result.expect_err("RLIMIT_FSIZE must reject the actual journal write");
     if !matches!(error, Error::Database(fjall::Error::Io(ref io)) if io.raw_os_error() == Some(libc::EFBIG))
     {
         return Err(format!("expected an actual journal EFBIG failure, got {error}").into());
@@ -110,7 +124,9 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             Err("interrupted upload must not finish".into())
         }
         #[cfg(unix)]
-        "write-failure" => fail_publication(&store),
+        "write-failure" => fail_publication(&store, false),
+        #[cfg(unix)]
+        "retention-write-failure" => fail_publication(&store, true),
         _ => Err("unsupported fixture mode".into()),
     }
 }

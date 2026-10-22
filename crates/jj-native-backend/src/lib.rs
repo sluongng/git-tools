@@ -4,9 +4,14 @@
 mod convert;
 mod copies;
 mod io;
+mod provider;
+pub use provider::{
+    CopyCatalogLimits, CopyCatalogSnapshot, DirectObjectIo, FileRead, NativeObjectIo,
+    VerifiedMetadata,
+};
 
 use async_trait::async_trait;
-use futures::{AsyncRead, AsyncReadExt, stream::BoxStream};
+use futures::{AsyncRead, stream::BoxStream};
 use jj_lib::{
     backend::{
         Backend, BackendError, BackendInitError, BackendLoadError, BackendResult, ChangeId, Commit,
@@ -17,15 +22,9 @@ use jj_lib::{
     repo::StoreFactories,
     repo_path::{RepoPath, RepoPathBuf, RepoPathComponentBuf},
 };
-use std::{
-    fmt, fs,
-    io::{Seek, SeekFrom, Write},
-    path::{Path, PathBuf},
-    pin::Pin,
-    sync::Arc,
-};
+use std::{fmt, path::Path, pin::Pin, sync::Arc};
 use tinytree_model as m;
-use tinytree_store::{Config as StoreConfig, Store};
+use tinytree_store::Config as StoreConfig;
 
 const REPOSITORY: &str = "local";
 #[derive(Clone, Debug)]
@@ -52,15 +51,11 @@ impl Default for Config {
     }
 }
 pub struct NativeBackend {
-    store: Arc<Store>,
-    path: PathBuf,
+    io: Arc<dyn NativeObjectIo>,
     config: Config,
     root_commit_id: CommitId,
     root_change_id: ChangeId,
     empty_tree_id: TreeId,
-    copy_gate: Arc<tokio::sync::Mutex<()>>,
-    staging_bytes: Arc<tokio::sync::Semaphore>,
-    staging_uploads: Arc<tokio::sync::Semaphore>,
 }
 impl fmt::Debug for NativeBackend {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -96,12 +91,22 @@ fn now() -> BackendResult<i64> {
 impl NativeBackend {
     pub const NAME: &'static str = "tinytree-native-v1";
     pub fn init(path: &Path, config: Config) -> Result<Self, BackendInitError> {
-        Self::open(path, config, true).map_err(|error| BackendInitError(Box::new(error)))
+        Self::validate_config(&config)
+            .and_then(|()| {
+                DirectObjectIo::init(path, config.clone())
+                    .map(|io| Self::assemble(Arc::new(io), config))
+            })
+            .map_err(|error| BackendInitError(Box::new(error)))
     }
     pub fn load(path: &Path, config: Config) -> Result<Self, BackendLoadError> {
-        Self::open(path, config, false).map_err(|error| BackendLoadError(Box::new(error)))
+        Self::validate_config(&config)
+            .and_then(|()| {
+                DirectObjectIo::load(path, config.clone())
+                    .map(|io| Self::assemble(Arc::new(io), config))
+            })
+            .map_err(|error| BackendLoadError(Box::new(error)))
     }
-    fn open(path: &Path, config: Config, fresh: bool) -> BackendResult<Self> {
+    fn validate_config(config: &Config) -> BackendResult<()> {
         if [
             config.max_graph_commits,
             config.max_tree_entries,
@@ -114,128 +119,49 @@ impl NativeBackend {
         {
             return Err(invalid("native graph budgets must be positive"));
         }
-        if config.store.max_staging_bytes > u32::MAX as u64
-            || config.store.max_staging_uploads > tokio::sync::Semaphore::MAX_PERMITS
-            || config
-                .store
-                .max_file_bytes
-                .checked_mul(2)
-                .is_none_or(|size| size > config.store.max_staging_bytes)
-        {
-            return Err(invalid(
-                "native staging requires room for both file spools and bounded semaphore counts",
-            ));
-        }
-        let native = path.join("native-objects");
-        let staging = path.join("native-file-staging");
-        if fresh {
-            if native.exists() || staging.exists() {
-                return Err(invalid(
-                    "native backend initialization requires fresh paths",
-                ));
-            }
-            fs::create_dir(&staging).map_err(other)?;
-            fs::File::open(path)
-                .and_then(|file| file.sync_all())
-                .map_err(other)?;
-        } else if !native.is_dir() || !fs::symlink_metadata(&staging).map_err(other)?.is_dir() {
-            return Err(invalid("native backend storage is missing"));
-        }
-        let store = if fresh {
-            Store::open(native, config.store.clone())
-        } else {
-            Store::open_existing(native, config.store.clone())
-        }
-        .map_err(other)?;
-        if fresh {
-            store.create_repository(REPOSITORY).map_err(other)?;
-        }
+        Ok(())
+    }
+    fn assemble(io: Arc<dyn NativeObjectIo>, config: Config) -> Self {
         let empty = m::empty_tree();
-        if store
-            .descriptor(REPOSITORY, empty.descriptor.key)
-            .map_err(other)?
-            != Some(empty.descriptor)
-        {
-            return Err(invalid("native empty tree unavailable"));
-        }
-        Ok(Self {
-            store: Arc::new(store),
-            path: staging,
-            staging_bytes: Arc::new(tokio::sync::Semaphore::new(
-                config.store.max_staging_bytes as usize,
-            )),
-            staging_uploads: Arc::new(tokio::sync::Semaphore::new(
-                config.store.max_staging_uploads,
-            )),
+        Self {
+            io,
             config,
             root_commit_id: CommitId::from_bytes(&[0; 32]),
             root_change_id: ChangeId::from_bytes(&[0; 16]),
             empty_tree_id: TreeId::from_bytes(&empty.descriptor.key.id.0),
-            copy_gate: Arc::new(tokio::sync::Mutex::new(())),
-        })
+        }
+    }
+    /// Attach to an authoritative provider only after checking ACTUAL verified
+    /// empty-tree bytes. A descriptor promise alone cannot initialize a Backend.
+    pub async fn from_io(io: Arc<dyn NativeObjectIo>, config: Config) -> BackendResult<Self> {
+        Self::validate_config(&config)?;
+        let empty = m::empty_tree();
+        let verified = io.read_metadata(empty.descriptor.key).await?;
+        if verified.descriptor() != empty.descriptor || verified.bytes() != empty.bytes {
+            return Err(invalid("native provider empty tree mismatch"));
+        }
+        Ok(Self::assemble(io, config))
     }
     async fn read_object(&self, object: m::ObjectKey) -> BackendResult<m::Object> {
-        let store = self.store.clone();
-        let limits = self.config.store.model_limits;
-        io::blocking(move || {
-            let (_, bytes) = store.read_metadata(REPOSITORY, object).map_err(other)?;
-            m::decode(&bytes, limits).map_err(other)
-        })
-        .await
-    }
-    async fn reserve_staging(
-        &self,
-        bytes: u64,
-    ) -> BackendResult<(
-        tokio::sync::OwnedSemaphorePermit,
-        tokio::sync::OwnedSemaphorePermit,
-    )> {
-        if bytes > self.config.store.max_staging_bytes {
-            return Err(invalid("native staging budget exceeded"));
+        let verified = self.io.read_metadata(object).await?;
+        if verified.descriptor().key != object {
+            return Err(invalid("native provider metadata key mismatch"));
         }
-        let slot = self
-            .staging_uploads
-            .clone()
-            .acquire_owned()
-            .await
-            .map_err(other)?;
-        let bytes = self
-            .staging_bytes
-            .clone()
-            .acquire_many_owned(u32::try_from(bytes).map_err(other)?)
-            .await
-            .map_err(other)?;
-        Ok((slot, bytes))
+        Ok(verified.into_object())
     }
     async fn put_object(&self, object: m::Object) -> BackendResult<m::Descriptor> {
-        let copy_guard = if matches!(&object, m::Object::CopyHistory(_)) {
-            Some(self.copy_gate.clone().lock_owned().await)
-        } else {
-            None
-        };
-        let limits = self.config.store.model_limits;
-        let encoded = io::blocking(move || m::encode(&object, limits).map_err(other)).await?;
-        let reservation = self.reserve_staging(encoded.descriptor.size_bytes).await?;
-        let store = self.store.clone();
-        io::blocking(move || {
-            let _copy_guard = copy_guard;
-            let _reservation = reservation;
-            store
-                .put(REPOSITORY, encoded.descriptor, &encoded.bytes, now()?)
-                .map_err(other)?;
-            Ok(encoded.descriptor)
-        })
-        .await
+        self.io.write_metadata(object).await
     }
     async fn descriptor(&self, object: m::ObjectKey) -> BackendResult<m::Descriptor> {
-        let store = self.store.clone();
-        io::blocking(move || {
-            store
-                .descriptor(REPOSITORY, object)
-                .map_err(other)?
-                .ok_or_else(|| invalid("native referenced object is unavailable"))
-        })
-        .await
+        let descriptor = self
+            .io
+            .descriptor(object)
+            .await?
+            .ok_or_else(|| invalid("native referenced object is unavailable"))?;
+        if descriptor.key != object || descriptor.format_version != m::FORMAT_VERSION {
+            return Err(invalid("native provider descriptor mismatch"));
+        }
+        Ok(descriptor)
     }
     async fn model_commit(&self, id: m::CommitId) -> BackendResult<m::Commit> {
         if id == m::CommitId::ROOT {
@@ -301,82 +227,29 @@ impl Backend for NativeBackend {
         _: &RepoPath,
         id: &FileId,
     ) -> BackendResult<Pin<Box<dyn AsyncRead + Send>>> {
-        let object = key(m::Kind::File, id.as_bytes())?;
-        let store = self.store.clone();
-        let lease = io::blocking(move || store.read(REPOSITORY, object).map_err(other)).await?;
-        if lease.descriptor().size_bytes > self.config.store.max_file_bytes {
-            return Err(invalid("native file exceeds configured limit"));
+        let id = m::FileId(model_id(id.as_bytes())?);
+        let (descriptor, reader) = self.io.read_file(id).await?.into_parts();
+        if descriptor.key
+            != (m::ObjectKey {
+                kind: m::Kind::File,
+                id: m::ObjectId(id.0),
+            })
+            || descriptor.size_bytes > self.config.store.max_file_bytes
+        {
+            return Err(invalid("native provider file descriptor mismatch or limit"));
         }
-        Ok(Box::pin(io::Reader::new(lease)))
+        Ok(reader)
     }
     async fn write_file(
         &self,
         _: &RepoPath,
         contents: &mut (dyn AsyncRead + Send + Unpin),
     ) -> BackendResult<FileId> {
-        let reservation = self
-            .reserve_staging(
-                self.config
-                    .store
-                    .max_file_bytes
-                    .checked_mul(2)
-                    .ok_or_else(|| invalid("native staging budget overflow"))?,
-            )
+        let id = self
+            .io
+            .write_file(contents, self.config.store.max_file_bytes)
             .await?;
-        let path = self.path.clone();
-        let mut temporary = io::blocking(move || {
-            Ok((
-                tempfile::NamedTempFile::new_in(path).map_err(other)?,
-                reservation,
-            ))
-        })
-        .await?;
-        let mut hash = blake3::Hasher::new();
-        let mut size = 0u64;
-        let mut buffer = vec![0; 64 * 1024];
-        loop {
-            let count = contents.read(&mut buffer).await.map_err(other)?;
-            if count == 0 {
-                break;
-            }
-            size = size
-                .checked_add(count as u64)
-                .ok_or_else(|| invalid("native file size overflow"))?;
-            if size > self.config.store.max_file_bytes {
-                return Err(invalid("native file exceeds configured limit"));
-            }
-            hash.update(&buffer[..count]);
-            let chunk = buffer[..count].to_vec();
-            temporary = io::blocking(move || {
-                temporary.0.write_all(&chunk).map_err(other)?;
-                Ok(temporary)
-            })
-            .await?;
-        }
-        let id = *hash.finalize().as_bytes();
-        let store = self.store.clone();
-        io::blocking(move || {
-            let mut staged = temporary;
-            staged
-                .0
-                .as_file_mut()
-                .seek(SeekFrom::Start(0))
-                .map_err(other)?;
-            let descriptor = m::Descriptor {
-                key: m::ObjectKey {
-                    kind: m::Kind::File,
-                    id: m::ObjectId(id),
-                },
-                size_bytes: size,
-                format_version: m::FORMAT_VERSION,
-            };
-            store
-                .put_stream(REPOSITORY, descriptor, staged.0.as_file_mut(), now()?)
-                .map_err(other)?;
-            Ok(())
-        })
-        .await?;
-        Ok(FileId::from_bytes(&id))
+        Ok(FileId::from_bytes(&id.0))
     }
     async fn read_symlink(&self, _: &RepoPath, id: &SymlinkId) -> BackendResult<String> {
         match self
@@ -401,10 +274,6 @@ impl Backend for NativeBackend {
         convert::copy(self.model_copy(m::CopyId(model_id(id.as_bytes())?)).await?)
     }
     async fn write_copy(&self, copy: &CopyHistory) -> BackendResult<CopyId> {
-        for parent in &copy.parents {
-            self.model_copy(m::CopyId(model_id(parent.as_bytes())?))
-                .await?;
-        }
         Ok(CopyId::from_bytes(
             &self
                 .put_object(m::Object::CopyHistory(convert::model_copy(copy)?))

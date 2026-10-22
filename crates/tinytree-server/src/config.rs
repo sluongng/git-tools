@@ -28,6 +28,7 @@ pub struct ServiceConfig {
     pub max_inflight_per_repository: usize,
     pub max_buffered_bytes: usize,
     pub rpc: reapi::policy::Policy,
+    pub retention: tinytree_store::RetentionLimits,
 }
 impl Default for ServiceConfig {
     fn default() -> Self {
@@ -42,11 +43,15 @@ impl Default for ServiceConfig {
             max_inflight_per_repository: 4,
             max_buffered_bytes: 128 * 1024 * 1024,
             rpc: Default::default(),
+            retention: Default::default(),
         }
     }
 }
 impl ServiceConfig {
     pub fn validate(&self) -> Result<(), ConfigError> {
+        self.retention
+            .validate()
+            .map_err(|_| ConfigError("invalid native retention limits"))?;
         self.rpc
             .validate()
             .map_err(|_| ConfigError("invalid native RPC policy"))?;
@@ -89,6 +94,8 @@ pub struct StoreConfig {
     pub max_closure_edges: usize,
     pub max_path_contexts: usize,
     pub max_path_context_bytes: usize,
+    pub max_retention_validation_records: usize,
+    pub max_retention_validation_bytes: u64,
     pub max_staging_bytes: u64,
     pub max_staging_uploads: usize,
     pub staging_ttl_seconds: i64,
@@ -104,6 +111,8 @@ impl Default for StoreConfig {
             max_closure_edges: c.max_closure_edges,
             max_path_contexts: c.max_path_contexts,
             max_path_context_bytes: c.max_path_context_bytes,
+            max_retention_validation_records: c.max_retention_validation_records,
+            max_retention_validation_bytes: c.max_retention_validation_bytes,
             max_staging_bytes: c.max_staging_bytes,
             max_staging_uploads: c.max_staging_uploads,
             staging_ttl_seconds: c.staging_ttl_seconds,
@@ -121,6 +130,8 @@ impl StoreConfig {
         config.max_closure_edges = self.max_closure_edges;
         config.max_path_contexts = self.max_path_contexts;
         config.max_path_context_bytes = self.max_path_context_bytes;
+        config.max_retention_validation_records = self.max_retention_validation_records;
+        config.max_retention_validation_bytes = self.max_retention_validation_bytes;
         config.max_staging_bytes = self.max_staging_bytes;
         config.max_staging_uploads = self.max_staging_uploads;
         config.staging_ttl_seconds = self.staging_ttl_seconds;
@@ -134,6 +145,8 @@ impl StoreConfig {
             || !(1..=10_000_000).contains(&self.max_closure_edges)
             || !(1..=1_000_000).contains(&self.max_path_contexts)
             || !(1..=1024 * 1024 * 1024).contains(&self.max_path_context_bytes)
+            || !(1..=10_000_000).contains(&self.max_retention_validation_records)
+            || !(1..=16 * 1024 * 1024 * 1024).contains(&self.max_retention_validation_bytes)
             || self.max_staging_bytes == 0
             || !(1..=1024).contains(&self.max_staging_uploads)
             || !(1..=30 * 86400).contains(&self.staging_ttl_seconds)
@@ -152,6 +165,8 @@ pub struct PrincipalConfig {
     pub repositories: Vec<String>,
     #[serde(default)]
     pub write: bool,
+    #[serde(default)]
+    pub retain: bool,
 }
 #[derive(Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
