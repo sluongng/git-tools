@@ -31,6 +31,7 @@ pub type RpcStream<T> = Pin<Box<dyn Stream<Item = Result<T, Status>> + Send + 's
 #[derive(Clone)]
 pub struct RepositoryService {
     inner: Arc<Inner>,
+    query: Option<Arc<crate::query_index::QueryHost>>,
 }
 struct Inner {
     store: tinytree_store::Store,
@@ -85,6 +86,7 @@ impl RepositoryService {
         continuation_key[..16].copy_from_slice(uuid::Uuid::new_v4().as_bytes());
         continuation_key[16..].copy_from_slice(uuid::Uuid::new_v4().as_bytes());
         Ok(Self {
+            query: None,
             inner: Arc::new(Inner {
                 store,
                 global: Arc::new(Semaphore::new(config.max_inflight)),
@@ -97,6 +99,47 @@ impl RepositoryService {
                 graph_read_pause: std::sync::Mutex::new(None),
             }),
         })
+    }
+    /// Install the rebuildable derived index. Scopes/warms use dedicated pools,
+    /// independent from canonical object admission and ACKs.
+    pub fn with_query_index(
+        mut self,
+        index: Arc<tinytree_index::Index>,
+    ) -> Result<Self, ConfigError> {
+        if self.query.is_some() {
+            return Err(ConfigError("query host already installed"));
+        }
+        self.query = Some(crate::query_index::QueryHost::new(
+            index,
+            self.inner.store.clone(),
+            &self.inner.config,
+        )?);
+        Ok(self)
+    }
+    pub fn query_service(&self) -> crate::QueryService {
+        crate::QueryService::new(self.clone())
+    }
+    pub fn query_grpc_service(&self) -> crate::QueryGrpcService {
+        crate::QueryGrpcService::new(self.clone())
+    }
+    pub(crate) fn service_config(&self) -> ServiceConfig {
+        self.inner.config.clone()
+    }
+    pub(crate) fn query_identity(
+        &self,
+        metadata: &tonic::metadata::MetadataMap,
+    ) -> Result<Identity, Status> {
+        self.inner.auth.identify(metadata)
+    }
+    pub(crate) fn query_deadline(
+        &self,
+        metadata: &tonic::metadata::MetadataMap,
+        streaming: bool,
+    ) -> Result<Instant, Status> {
+        self.deadline(metadata, streaming)
+    }
+    pub(crate) fn query_host(&self) -> Option<Arc<crate::query_index::QueryHost>> {
+        self.query.clone()
     }
     pub fn grpc_service(&self) -> RepositoryServer<Self> {
         RepositoryServer::new(self.clone())

@@ -7,8 +7,14 @@ mod auth;
 mod body_deadline;
 pub use body_deadline::DeadlineLayer;
 mod config;
+mod query_index;
+mod query_ingress;
+mod query_service;
 mod retention;
 mod service;
+pub use query_index::QueryConfig;
+pub use query_ingress::QueryGrpcService;
+pub use query_service::QueryService;
 
 pub use auth::Principal;
 pub use config::{Config, ConfigError, PrincipalConfig, ServiceConfig, StoreConfig, TlsConfig};
@@ -50,6 +56,7 @@ pub async fn serve_tcp(
         .layer(service.deadline_layer())
         .concurrency_limit_per_connection(service.maximum_inflight())
         .add_service(service.grpc_service())
+        .add_service(service.query_grpc_service())
         .serve_with_incoming_shutdown(
             tokio_stream::wrappers::TcpListenerStream::new(listener).map(|accepted| {
                 accepted.and_then(|stream| {
@@ -83,6 +90,7 @@ async fn run_unix(
         .layer(service.deadline_layer())
         .concurrency_limit_per_connection(service.maximum_inflight())
         .add_service(service.grpc_service())
+        .add_service(service.query_grpc_service())
         .serve_with_incoming_shutdown(
             tokio_stream::wrappers::UnixListenerStream::new(listener),
             shutdown,
@@ -166,12 +174,29 @@ pub async fn serve(
     })
     .await
     .context("native startup worker failed")??;
-    let service = RepositoryService::new(
+    let index_path = config.storage.join("derived-index");
+    let index_limits = config.service.query.index_limits();
+    let index =
+        tokio::task::spawn_blocking(move || tinytree_index::Index::open(index_path, &index_limits))
+            .await;
+    let mut service = RepositoryService::new(
         store.clone(),
         config.service,
         config.repositories.clone(),
         principals,
     )?;
+    // Derived state is rebuildable. Its failure must not disable authoritative
+    // object reads, durable uploads, or reference publication. Never repair by
+    // silently deleting a corrupt index; queries remain explicitly unavailable.
+    match index {
+        Ok(Ok(index)) => match service.clone().with_query_index(index) {
+            Ok(ready) => service = ready,
+            Err(_) => eprintln!(
+                "derived query host unavailable; canonical object service remains enabled"
+            ),
+        },
+        _ => eprintln!("derived query index unavailable; canonical object service remains enabled"),
+    }
     let (stop_sender, stop_receiver) = watch::channel(false);
     let gc_store = store.clone();
     let repositories = config.repositories;

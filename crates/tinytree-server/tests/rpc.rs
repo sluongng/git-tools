@@ -1,6 +1,7 @@
 use std::{net::SocketAddr, time::Duration};
 use tinytree_fixture::{Fixture, FixtureConfig, build_fixture};
 use tinytree_model::{CommitId, Descriptor, Kind, Limits, Object, ObjectId, ObjectKey, TreeId};
+use tinytree_proto::query_v1 as q;
 use tinytree_proto::v1::{self as p, repository_client::RepositoryClient};
 use tinytree_server::{Principal, RepositoryService, ServiceConfig, serve_tcp};
 use tinytree_store::Store;
@@ -26,6 +27,21 @@ impl Running {
         Self::start_with_peer_token(store, config, PEER).await
     }
     async fn start_with_peer_token(store: Store, config: ServiceConfig, peer_token: &str) -> Self {
+        Self::start_services(store, config, peer_token, None).await
+    }
+    async fn start_query(
+        store: Store,
+        config: ServiceConfig,
+        index: std::sync::Arc<tinytree_index::Index>,
+    ) -> Self {
+        Self::start_services(store, config, PEER, Some(index)).await
+    }
+    async fn start_services(
+        store: Store,
+        config: ServiceConfig,
+        peer_token: &str,
+        index: Option<std::sync::Arc<tinytree_index::Index>>,
+    ) -> Self {
         let principals = vec![
             Principal::new("alpha", ALPHA, vec!["alpha".into()], true).unwrap(),
             Principal::new("beta", BETA, vec!["beta".into()], true).unwrap(),
@@ -43,6 +59,10 @@ impl Running {
             principals,
         )
         .unwrap();
+        let service = match index {
+            Some(index) => service.with_query_index(index).unwrap(),
+            None => service,
+        };
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let (stop, stopped) = oneshot::channel();
@@ -66,6 +86,16 @@ impl Running {
             .send_compressed(CompressionEncoding::Zstd)
             .accept_compressed(CompressionEncoding::Zstd)
             .max_decoding_message_size(20 * 1024 * 1024)
+    }
+    async fn query_client(&self) -> q::repository_query_client::RepositoryQueryClient<Channel> {
+        let channel = Endpoint::from_shared(format!("http://{}", self.address))
+            .unwrap()
+            .connect()
+            .await
+            .unwrap();
+        q::repository_query_client::RepositoryQueryClient::new(channel)
+            .send_compressed(CompressionEncoding::Zstd)
+            .accept_compressed(CompressionEncoding::Zstd)
     }
     async fn stop(mut self) {
         let _ = self.stop.take().unwrap().send(());
@@ -1589,4 +1619,698 @@ async fn graph_multiple_packed_roots_do_not_reserve_a_packed_reader_per_root() {
     );
     drop(client);
     server.stop().await;
+}
+
+fn query_frames(roots: &[ObjectKey], replay: u8) -> Vec<q::OpenScopeFrame> {
+    let mut roots: Vec<_> = roots
+        .iter()
+        .map(|key| q::CommitId {
+            value: key.id.0.to_vec(),
+        })
+        .collect();
+    roots.sort_by(|a, b| a.value.cmp(&b.value));
+    vec![
+        q::OpenScopeFrame {
+            frame: Some(q::open_scope_frame::Frame::Header(q::ScopeHeader {
+                version: 1,
+                repository_id: "alpha".into(),
+                replay_key: vec![replay; 32],
+                roots,
+                overlay_object_count: 0,
+                overlay_bytes: 0,
+            })),
+        },
+        q::OpenScopeFrame {
+            frame: Some(q::open_scope_frame::Frame::ScopeEnd(q::ScopeEnd::default())),
+        },
+    ]
+}
+async fn query_ready(
+    client: &mut q::repository_query_client::RepositoryQueryClient<Channel>,
+    roots: &[ObjectKey],
+    replay: u8,
+) -> q::QueryScope {
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            match client
+                .open_scope(request(
+                    tokio_stream::iter(query_frames(roots, replay)),
+                    ALPHA,
+                ))
+                .await
+            {
+                Ok(response) => break response.into_inner(),
+                Err(error) if error.code() == Code::Unavailable => {
+                    tokio::time::sleep(Duration::from_millis(5)).await
+                }
+                Err(error) => panic!("query scope did not become ready: {error}"),
+            }
+        }
+    })
+    .await
+    .unwrap()
+}
+fn query_id(key: ObjectKey) -> q::CommitId {
+    q::CommitId {
+        value: key.id.0.to_vec(),
+    }
+}
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn root_query_service_warms_persistently_and_returns_exact_facts_and_prefixes() {
+    let (temporary, store) = setup();
+    let fixture = fixture();
+    for object in fixture.objects() {
+        store
+            .put("alpha", object.descriptor, &object.bytes, 0)
+            .unwrap();
+    }
+    let base = root(&fixture);
+    let Object::Commit(mut commit) = tinytree_model::decode(
+        &fixture
+            .objects()
+            .iter()
+            .find(|object| object.descriptor.key == base)
+            .unwrap()
+            .bytes,
+        Limits::default(),
+    )
+    .unwrap() else {
+        panic!()
+    };
+    commit.parents = vec![CommitId(base.id.0)];
+    commit.change_id = tinytree_model::ChangeId([42; 16]);
+    let mut heads = Vec::new();
+    for name in ["left", "right"] {
+        commit.description = name.into();
+        let encoded =
+            tinytree_model::encode(&Object::Commit(commit.clone()), Limits::default()).unwrap();
+        store
+            .put("alpha", encoded.descriptor, &encoded.bytes, 0)
+            .unwrap();
+        heads.push(encoded.descriptor.key);
+    }
+    let index_path = temporary.path().join("derived");
+    let index = tinytree_index::Index::open(&index_path, &Default::default()).unwrap();
+    let server = Running::start_query(store.clone(), ServiceConfig::default(), index).await;
+    let mut client = server.query_client().await;
+    let error = client
+        .open_scope(request(tokio_stream::iter(query_frames(&heads, 1)), ALPHA))
+        .await
+        .unwrap_err();
+    assert_eq!(
+        error.code(),
+        Code::Unavailable,
+        "first scope request schedules, never synchronously builds the graph"
+    );
+    let scope = query_ready(&mut client, &heads, 1).await;
+    let key = scope.key.clone().unwrap();
+    assert_eq!(scope.index_epoch.len(), 16);
+    assert!(scope.high_water >= 3);
+    let replay = client
+        .open_scope(request(tokio_stream::iter(query_frames(&heads, 1)), ALPHA))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(scope, replay);
+    let unknown = ObjectKey {
+        kind: Kind::Commit,
+        id: ObjectId([77; 32]),
+    };
+    let facts = vec![
+        q::GraphFact {
+            fact: Some(q::graph_fact::Fact::HasId(q::HasId {
+                commit: Some(query_id(base)),
+            })),
+        },
+        q::GraphFact {
+            fact: Some(q::graph_fact::Fact::HasId(q::HasId {
+                commit: Some(query_id(unknown)),
+            })),
+        },
+        q::GraphFact {
+            fact: Some(q::graph_fact::Fact::IsAncestor(q::IsAncestor {
+                ancestor: Some(query_id(base)),
+                descendant: Some(query_id(heads[0])),
+            })),
+        },
+        q::GraphFact {
+            fact: Some(q::graph_fact::Fact::Heads(q::Heads {
+                commits: vec![query_id(base), query_id(heads[0]), query_id(heads[1])],
+            })),
+        },
+        q::GraphFact {
+            fact: Some(q::graph_fact::Fact::CommonAncestors(q::CommonAncestors {
+                left: vec![query_id(heads[0])],
+                right: vec![query_id(heads[1])],
+            })),
+        },
+    ];
+    let answers = client
+        .query_facts(request(
+            q::QueryFactsRequest {
+                scope: Some(key.clone()),
+                facts,
+            },
+            ALPHA,
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(answers.answers.len(), 5);
+    assert_eq!(answers.scope_digest, scope.content_digest);
+    assert_eq!(answers.index_epoch, scope.index_epoch);
+    assert!(matches!(
+        answers.answers[0].answer,
+        Some(q::graph_fact_answer::Answer::HasId(true))
+    ));
+    assert!(matches!(
+        answers.answers[1].answer,
+        Some(q::graph_fact_answer::Answer::HasId(false))
+    ));
+    assert!(matches!(
+        answers.answers[2].answer,
+        Some(q::graph_fact_answer::Answer::IsAncestor(true))
+    ));
+    let Some(q::graph_fact_answer::Answer::Heads(result)) = &answers.answers[3].answer else {
+        panic!()
+    };
+    assert_eq!(result.commits.len(), 2);
+    let Some(q::graph_fact_answer::Answer::CommonAncestors(result)) = &answers.answers[4].answer
+    else {
+        panic!()
+    };
+    assert_eq!(result.commits, vec![query_id(base)]);
+    let resolved = client
+        .resolve_commit_prefix(request(
+            q::ResolveCommitPrefixRequest {
+                scope: Some(key.clone()),
+                hex_prefix: heads[0].id.0.iter().map(|b| format!("{b:02x}")).collect(),
+            },
+            ALPHA,
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(matches!(
+        resolved.result,
+        Some(q::commit_prefix_result::Result::Single(_))
+    ));
+    let changes = client
+        .resolve_change_prefix(request(
+            q::ResolveChangePrefixRequest {
+                scope: Some(key.clone()),
+                hex_prefix: "2a".repeat(16),
+                visible_heads: vec![query_id(heads[0])],
+            },
+            ALPHA,
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+    let Some(q::change_prefix_result::Result::Single(changes)) = changes.result else {
+        panic!()
+    };
+    assert_eq!(changes.targets.len(), 2);
+    assert_eq!(
+        changes
+            .targets
+            .iter()
+            .filter(|target| target.visible == Some(true))
+            .count(),
+        1
+    );
+    assert_eq!(
+        changes
+            .targets
+            .iter()
+            .filter(|target| target.visible == Some(false))
+            .count(),
+        1
+    );
+    let shortest = client
+        .shortest_prefix(request(
+            q::ShortestPrefixRequest {
+                scope: Some(key.clone()),
+                target: Some(q::shortest_prefix_request::Target::Commit(query_id(
+                    heads[0],
+                ))),
+                visible_heads: Vec::new(),
+            },
+            ALPHA,
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(shortest.hex_length <= 64);
+    assert_eq!(
+        client
+            .query_facts(request(
+                q::QueryFactsRequest {
+                    scope: Some(key.clone()),
+                    facts: Vec::new()
+                },
+                PEER
+            ))
+            .await
+            .unwrap_err()
+            .code(),
+        Code::PermissionDenied
+    );
+    assert_eq!(
+        client
+            .query_facts(request(
+                q::QueryFactsRequest {
+                    scope: Some(q::ScopeKey {
+                        repository_id: "alpha".into(),
+                        handle: vec![0; 32]
+                    }),
+                    facts: Vec::new()
+                },
+                BETA
+            ))
+            .await
+            .unwrap_err()
+            .code(),
+        Code::PermissionDenied
+    );
+    let mut overlay = query_frames(&heads, 2);
+    let Some(q::open_scope_frame::Frame::Header(header)) = &mut overlay[0].frame else {
+        panic!()
+    };
+    header.overlay_object_count = 1;
+    header.overlay_bytes = 1;
+    assert_eq!(
+        client
+            .open_scope(request(tokio_stream::iter(overlay), ALPHA))
+            .await
+            .unwrap_err()
+            .code(),
+        Code::Unimplemented
+    );
+    assert_eq!(
+        client
+            .evaluate(request(
+                q::EvaluateRequest {
+                    scope: Some(key.clone()),
+                    ..Default::default()
+                },
+                ALPHA
+            ))
+            .await
+            .unwrap_err()
+            .code(),
+        Code::Unimplemented
+    );
+    drop(client);
+    server.stop().await;
+    // Pending in-memory jobs are not replayed after restart. Persisted verified
+    // nodes make the same explicit root checkpoint ready without a history RPC.
+    let index = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let path = index_path.clone();
+            match tokio::task::spawn_blocking(move || {
+                tinytree_index::Index::open(path, &Default::default())
+            })
+            .await
+            .unwrap()
+            {
+                Ok(index) => break index,
+                Err(_) => tokio::time::sleep(Duration::from_millis(5)).await,
+            }
+        }
+    })
+    .await
+    .unwrap();
+    let restarted = Running::start_query(store, ServiceConfig::default(), index).await;
+    let mut client = restarted.query_client().await;
+    assert_eq!(
+        client
+            .query_facts(request(
+                q::QueryFactsRequest {
+                    scope: Some(key),
+                    facts: Vec::new()
+                },
+                ALPHA
+            ))
+            .await
+            .unwrap_err()
+            .code(),
+        Code::FailedPrecondition
+    );
+    let reopened = client
+        .open_scope(request(tokio_stream::iter(query_frames(&heads, 3)), ALPHA))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(reopened.index_epoch, scope.index_epoch);
+    drop(client);
+    restarted.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn query_scope_expiry_and_close_release_roots_without_future_requests() {
+    let (temporary, store) = setup();
+    let fixture = fixture();
+    let index =
+        tinytree_index::Index::open(temporary.path().join("derived"), &Default::default()).unwrap();
+    for object in fixture.objects() {
+        store
+            .put("alpha", object.descriptor, &object.bytes, 0)
+            .unwrap();
+        if object.descriptor.key.kind == Kind::Commit {
+            index
+                .ingest("alpha", object.descriptor, &object.bytes)
+                .unwrap();
+        }
+    }
+    let root = root(&fixture);
+    let mut config = ServiceConfig::default();
+    config.query.scope_ttl_seconds = 2;
+    config.query.expiry_interval_ms = 20;
+    config.query.max_scopes = 2;
+    config.query.max_scopes_per_principal = 2;
+    config.query.max_scopes_per_repository = 2;
+    let server = Running::start_query(store.clone(), config, index).await;
+    let mut client = server.query_client().await;
+    let first = query_ready(&mut client, &[root], 1).await;
+    let second = query_ready(&mut client, &[root], 2).await;
+    assert_eq!(
+        client
+            .open_scope(request(tokio_stream::iter(query_frames(&[root], 3)), ALPHA))
+            .await
+            .unwrap_err()
+            .code(),
+        Code::ResourceExhausted
+    );
+    let close = q::CloseScopeRequest { scope: first.key };
+    client
+        .close_scope(request(close.clone(), ALPHA))
+        .await
+        .unwrap();
+    client
+        .close_scope(request(close.clone(), ALPHA))
+        .await
+        .unwrap();
+    assert_eq!(
+        client
+            .close_scope(request(close, PEER))
+            .await
+            .unwrap_err()
+            .code(),
+        Code::PermissionDenied
+    );
+    store.gc("alpha", i64::MAX - 1).unwrap();
+    assert!(store.descriptor("alpha", root).unwrap().is_some());
+    tokio::time::sleep(Duration::from_millis(2300)).await;
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let store = store.clone();
+            let present = tokio::task::spawn_blocking(move || {
+                store.gc("alpha", i64::MAX - 1).unwrap();
+                store.descriptor("alpha", root).unwrap().is_some()
+            })
+            .await
+            .unwrap();
+            if !present {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(
+        client
+            .query_facts(request(
+                q::QueryFactsRequest {
+                    scope: second.key,
+                    facts: Vec::new()
+                },
+                ALPHA
+            ))
+            .await
+            .unwrap_err()
+            .code(),
+        Code::FailedPrecondition
+    );
+    let zero = ObjectKey {
+        kind: Kind::Commit,
+        id: ObjectId([0; 32]),
+    };
+    let scope = query_ready(&mut client, &[zero], 4).await;
+    let shortest = client
+        .shortest_prefix(request(
+            q::ShortestPrefixRequest {
+                scope: scope.key,
+                target: Some(q::shortest_prefix_request::Target::Commit(query_id(zero))),
+                visible_heads: Vec::new(),
+            },
+            ALPHA,
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(shortest.hex_length, 0);
+    drop(client);
+    server.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn query_warm_missing_parent_failure_is_explicit_and_retries_after_canonical_upload() {
+    let (temporary, store) = setup();
+    let mut commit = tinytree_model::synthetic_root();
+    commit.parents = vec![CommitId::ROOT];
+    commit.change_id = tinytree_model::ChangeId([51; 16]);
+    let parent =
+        tinytree_model::encode(&Object::Commit(commit.clone()), Limits::default()).unwrap();
+    commit.parents = vec![CommitId(parent.descriptor.key.id.0)];
+    commit.description = "staged child before parent".into();
+    let child = tinytree_model::encode(&Object::Commit(commit), Limits::default()).unwrap();
+    store
+        .put("alpha", child.descriptor, &child.bytes, 0)
+        .unwrap();
+    let index =
+        tinytree_index::Index::open(temporary.path().join("derived"), &Default::default()).unwrap();
+    let server = Running::start_query(store.clone(), ServiceConfig::default(), index).await;
+    let mut client = server.query_client().await;
+    let first = client
+        .open_scope(request(
+            tokio_stream::iter(query_frames(&[child.descriptor.key], 1)),
+            ALPHA,
+        ))
+        .await
+        .unwrap_err();
+    assert_eq!(first.code(), Code::Unavailable);
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            match client
+                .open_scope(request(
+                    tokio_stream::iter(query_frames(&[child.descriptor.key], 1)),
+                    ALPHA,
+                ))
+                .await
+            {
+                Err(error) if error.code() == Code::NotFound => break,
+                Err(error) if error.code() == Code::Unavailable => {
+                    tokio::time::sleep(Duration::from_millis(5)).await
+                }
+                other => {
+                    panic!("missing canonical parent must be an explicit warm failure: {other:?}")
+                }
+            }
+        }
+    })
+    .await
+    .unwrap();
+    store
+        .put("alpha", parent.descriptor, &parent.bytes, 0)
+        .unwrap();
+    let scope = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            match client
+                .open_scope(request(
+                    tokio_stream::iter(query_frames(&[child.descriptor.key], 1)),
+                    ALPHA,
+                ))
+                .await
+            {
+                Ok(scope) => break scope.into_inner(),
+                Err(error) if matches!(error.code(), Code::NotFound | Code::Unavailable) => {
+                    tokio::time::sleep(Duration::from_millis(20)).await
+                }
+                other => panic!("warm repair failed: {other:?}"),
+            }
+        }
+    })
+    .await
+    .unwrap();
+    let facts = client
+        .query_facts(request(
+            q::QueryFactsRequest {
+                scope: scope.key,
+                facts: vec![q::GraphFact {
+                    fact: Some(q::graph_fact::Fact::HasId(q::HasId {
+                        commit: Some(query_id(parent.descriptor.key)),
+                    })),
+                }],
+            },
+            ALPHA,
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(matches!(
+        facts.answers[0].answer,
+        Some(q::graph_fact_answer::Answer::HasId(true))
+    ));
+    drop(client);
+    server.stop().await;
+
+    // Both parents and their canonical merge are valid in authoritative Store.
+    // A tighter derived decoder is a configured resource boundary, not evidence
+    // of canonical corruption or an empty/partially ready query scope.
+    let (temporary, store) = setup();
+    let mut commit = tinytree_model::synthetic_root();
+    commit.parents = vec![CommitId::ROOT];
+    commit.change_id = tinytree_model::ChangeId([52; 16]);
+    let mut parents = Vec::new();
+    for name in ["left parent", "right parent"] {
+        commit.description = name.into();
+        let canonical =
+            tinytree_model::encode(&Object::Commit(commit.clone()), Limits::default()).unwrap();
+        store
+            .put("alpha", canonical.descriptor, &canonical.bytes, 0)
+            .unwrap();
+        parents.push(CommitId(canonical.descriptor.key.id.0));
+    }
+    commit.parents = parents;
+    commit.description = "two-parent merge".into();
+    let merge = tinytree_model::encode(&Object::Commit(commit), Limits::default()).unwrap();
+    store
+        .put("alpha", merge.descriptor, &merge.bytes, 0)
+        .unwrap();
+    let index =
+        tinytree_index::Index::open(temporary.path().join("derived"), &Default::default()).unwrap();
+    let mut config = ServiceConfig::default();
+    config.query.max_commit_parents = 1;
+    let server = Running::start_query(store, config, index).await;
+    let mut client = server.query_client().await;
+    assert_eq!(
+        client
+            .open_scope(request(
+                tokio_stream::iter(query_frames(&[merge.descriptor.key], 1)),
+                ALPHA
+            ))
+            .await
+            .unwrap_err()
+            .code(),
+        Code::Unavailable
+    );
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            match client
+                .open_scope(request(
+                    tokio_stream::iter(query_frames(&[merge.descriptor.key], 1)),
+                    ALPHA,
+                ))
+                .await
+            {
+                Err(error) if error.code() == Code::ResourceExhausted => {
+                    assert!(error.message().contains("configured limits"));
+                    break;
+                }
+                Err(error) if error.code() == Code::Unavailable => {
+                    tokio::time::sleep(Duration::from_millis(5)).await
+                }
+                other => {
+                    panic!("derived parent limit must not report canonical corruption: {other:?}")
+                }
+            }
+        }
+    })
+    .await
+    .unwrap();
+    drop(client);
+    server.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn unavailable_derived_index_does_not_prevent_production_object_service_startup() {
+    let temporary = tempfile::tempdir().unwrap();
+    let storage = temporary.path().join("objects");
+    let store = Store::open(&storage, Default::default()).unwrap();
+    store.create_repository("example").unwrap();
+    drop(store);
+    let derived = storage.join("derived-index");
+    std::fs::write(&derived, b"preserve unavailable derived state").unwrap();
+    let reservation = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = reservation.local_addr().unwrap();
+    drop(reservation);
+    let mut config = tinytree_server::Config::default();
+    config.storage = storage;
+    config.listen = address.to_string();
+    config.repositories = vec!["example".into()];
+    config.gc_interval_seconds = 0;
+    let (stop, stopped) = oneshot::channel();
+    let server = tokio::spawn(tinytree_server::serve(config, async {
+        let _ = stopped.await;
+    }));
+    let channel = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            match Endpoint::from_shared(format!("http://{address}"))
+                .unwrap()
+                .connect()
+                .await
+            {
+                Ok(channel) => break channel,
+                Err(_) => {
+                    assert!(
+                        !server.is_finished(),
+                        "derived failure must not terminate object startup"
+                    );
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            }
+        }
+    })
+    .await
+    .unwrap();
+    let mut objects = RepositoryClient::new(channel.clone());
+    objects
+        .open_repository(p::OpenRepositoryRequest {
+            repository_id: "example".into(),
+            reference_names: Vec::new(),
+        })
+        .await
+        .unwrap();
+    let mut query = q::repository_query_client::RepositoryQueryClient::new(channel);
+    let mut frames = query_frames(
+        &[ObjectKey {
+            kind: Kind::Commit,
+            id: ObjectId([0; 32]),
+        }],
+        1,
+    );
+    let Some(q::open_scope_frame::Frame::Header(header)) = &mut frames[0].frame else {
+        panic!()
+    };
+    header.repository_id = "example".into();
+    assert_eq!(
+        query
+            .open_scope(tokio_stream::iter(frames))
+            .await
+            .unwrap_err()
+            .code(),
+        Code::Unavailable
+    );
+    stop.send(()).unwrap();
+    tokio::time::timeout(Duration::from_secs(5), server)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        std::fs::read(derived).unwrap(),
+        b"preserve unavailable derived state"
+    );
 }

@@ -9,7 +9,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .build_client(true)
         .build_server(true)
         .file_descriptor_set_path(output.join("tinytree_descriptor.bin"))
-        .compile_with_config(prost, &["proto/tinytree/v1/repository.proto"], &["proto"])?;
+        .compile_with_config(
+            prost,
+            &[
+                "proto/tinytree/v1/repository.proto",
+                "proto/tinytree/query/v1/query.proto",
+            ],
+            &["proto"],
+        )?;
     println!("cargo:rerun-if-changed=proto/tinytree/v1/repository.proto");
+    println!("cargo:rerun-if-changed=proto/tinytree/query/v1/query.proto");
     Ok(())
 }

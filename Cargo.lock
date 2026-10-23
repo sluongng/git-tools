@@ -5536,6 +5536,7 @@ dependencies = [
  "blake3",
  "bytes",
  "futures-util",
+ "getrandom 0.3.4",
  "http",
  "hyper-util",
  "libc",
@@ -5545,6 +5546,7 @@ dependencies = [
  "serde",
  "tempfile",
  "tinytree-fixture",
+ "tinytree-index",
  "tinytree-model",
  "tinytree-proto",
  "tinytree-server",
@@ -5577,6 +5579,22 @@ dependencies = [
  "serde_json",
  "tempfile",
  "tinytree-model",
+]
+
+[[package]]
+name = "tinytree-index"
+version = "0.1.0"
+dependencies = [
+ "blake3",
+ "fjall",
+ "fs2",
+ "private-fs",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.21",
+ "tinytree-model",
+ "uuid",
 ]
 
 [[package]]
@@ -5616,6 +5634,7 @@ dependencies = [
  "serde_json",
  "tempfile",
  "tinytree-fixture",
+ "tinytree-index",
  "tinytree-model",
  "tinytree-proto",
  "tinytree-store",

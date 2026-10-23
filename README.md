@@ -88,6 +88,7 @@ entry points. Most also expose Rust libraries; `jj-native-cli` is executable-onl
 | [`local-cas`](crates/local-cas) | Verified local blob storage with bounded LRU eviction. |
 | [`packblob`](crates/packblob) | Indexed immutable blob packs with bounded dictionary compression and selective verified reads. |
 | [`tinytree-model`](crates/tinytree-model) | Canonical jj-native objects, typed IDs and bounded verification. |
+| [`tinytree-index`](crates/tinytree-index) | Rebuildable shared commit DAG and exact scoped graph facts; not a jj client index adapter. |
 | [`tinytree-cloud`](crates/tinytree-cloud) | Verified jj operation/view recovery codecs; not an automatic backup service. |
 | [`tinytree-proto`](crates/tinytree-proto) | Native repository gRPC bindings; not a server implementation. |
 | [`tinytree-client`](crates/tinytree-client) | Bounded, verifying native RPCs and immutable transfer snapshots. |

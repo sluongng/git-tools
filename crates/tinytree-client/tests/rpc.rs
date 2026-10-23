@@ -47,6 +47,7 @@ struct Running {
     graph: Arc<AtomicUsize>,
     canonical_bytes: Arc<AtomicUsize>,
     files: Arc<AtomicUsize>,
+    queries: Arc<QueryCounts>,
 }
 impl Running {
     async fn start(service: RepositoryService, mode: Mode) -> Self {
@@ -64,6 +65,15 @@ impl Running {
         let graph = Arc::new(AtomicUsize::new(0));
         let canonical_bytes = Arc::new(AtomicUsize::new(0));
         let files = Arc::new(AtomicUsize::new(0));
+        let queries = Arc::new(QueryCounts::default());
+        let query_service = RepositoryQueryServer::new(QueryFaults {
+            service: service.query_service(),
+            mode: QueryMode::Normal,
+            counts: queries.clone(),
+            first_scope: Arc::new(std::sync::Mutex::new(None)),
+        })
+        .accept_compressed(tonic::codec::CompressionEncoding::Zstd)
+        .send_compressed(tonic::codec::CompressionEncoding::Zstd);
         let faults = Faults {
             service,
             mode,
@@ -83,6 +93,7 @@ impl Running {
                         .max_decoding_message_size(20 * 1024 * 1024)
                         .max_encoding_message_size(20 * 1024 * 1024),
                 )
+                .add_service(query_service)
                 .serve_with_incoming_shutdown(
                     tokio_stream::wrappers::TcpListenerStream::new(listener).map(move |result| {
                         result.and_then(|stream| {
@@ -107,6 +118,7 @@ impl Running {
             graph,
             canonical_bytes,
             files,
+            queries,
         }
     }
     fn config(&self) -> Config {
@@ -1397,5 +1409,610 @@ async fn canonical_graph_payload_benchmark() {
             );
             running.stop().await;
         }
+    }
+}
+
+// Query fixtures exercise the real authenticated scope/index service. Faults
+// only alter the transport reply after ordinary scope admission/authorization.
+use q::repository_query_server::{RepositoryQuery, RepositoryQueryServer};
+use tinytree_client::{ChangePrefix, CommitPrefix, FactAnswer, PrefixTarget, QueryFact};
+use tinytree_proto::query_v1 as q;
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum QueryMode {
+    Normal,
+    RetryOpen,
+    MalformedScope,
+    MissingFact,
+    MissingAnswer,
+    WrongAnswer,
+    WrongDigest,
+    WrongEpoch,
+    RepeatedEmptyIds,
+    MissingVisibility,
+    DuplicateTarget,
+    WrongCommitWidth,
+    WrongShortestKind,
+    LongestOverflow,
+}
+#[derive(Default)]
+struct QueryCounts {
+    opens: Arc<AtomicUsize>,
+    closes: AtomicUsize,
+    facts: AtomicUsize,
+    commit_prefixes: AtomicUsize,
+    change_prefixes: AtomicUsize,
+    shortest_prefixes: AtomicUsize,
+}
+#[derive(Clone)]
+struct QueryFaults {
+    service: tinytree_server::QueryService,
+    mode: QueryMode,
+    counts: Arc<QueryCounts>,
+    first_scope: Arc<std::sync::Mutex<Option<q::QueryScope>>>,
+}
+#[tonic::async_trait]
+impl RepositoryQuery for QueryFaults {
+    async fn open_scope(
+        &self,
+        request: Request<Streaming<q::OpenScopeFrame>>,
+    ) -> Result<Response<q::QueryScope>, Status> {
+        let mut reply = self.service.open_scope(request).await?;
+        let attempt = self.counts.opens.fetch_add(1, Ordering::SeqCst);
+        if self.mode == QueryMode::RetryOpen {
+            if attempt == 0 {
+                *self.first_scope.lock().unwrap() = Some(reply.get_ref().clone());
+                return Err(Status::unavailable("scope ACK withheld for replay test"));
+            }
+            if attempt == 1 && self.first_scope.lock().unwrap().as_ref() != Some(reply.get_ref()) {
+                return Err(Status::data_loss("scope retry changed replay identity"));
+            }
+        }
+        if self.mode == QueryMode::MalformedScope {
+            reply.get_mut().key.as_mut().unwrap().handle.pop();
+        }
+        Ok(reply)
+    }
+    async fn fork_scope(
+        &self,
+        request: Request<Streaming<q::ForkScopeFrame>>,
+    ) -> Result<Response<q::QueryScope>, Status> {
+        self.service.fork_scope(request).await
+    }
+    async fn close_scope(
+        &self,
+        request: Request<q::CloseScopeRequest>,
+    ) -> Result<Response<q::CloseScopeResponse>, Status> {
+        self.counts.closes.fetch_add(1, Ordering::SeqCst);
+        self.service.close_scope(request).await
+    }
+    async fn query_facts(
+        &self,
+        request: Request<q::QueryFactsRequest>,
+    ) -> Result<Response<q::GraphFacts>, Status> {
+        self.counts.facts.fetch_add(1, Ordering::SeqCst);
+        let mut reply = self.service.query_facts(request).await?;
+        let value = reply.get_mut();
+        match self.mode {
+            QueryMode::MissingFact => {
+                value.answers.pop();
+            }
+            QueryMode::MissingAnswer => value.answers[0].answer = None,
+            QueryMode::WrongAnswer => {
+                value.answers[0].answer = Some(q::graph_fact_answer::Answer::IsAncestor(false))
+            }
+            QueryMode::WrongDigest => value.scope_digest[0] ^= 1,
+            QueryMode::WrongEpoch => value.index_epoch[0] ^= 1,
+            QueryMode::RepeatedEmptyIds => {
+                value.answers[0].answer = Some(q::graph_fact_answer::Answer::Heads(q::CommitSet {
+                    commits: vec![q::CommitId::default(); 257],
+                }))
+            }
+            _ => {}
+        }
+        Ok(reply)
+    }
+    async fn resolve_commit_prefix(
+        &self,
+        request: Request<q::ResolveCommitPrefixRequest>,
+    ) -> Result<Response<q::CommitPrefixResult>, Status> {
+        self.counts.commit_prefixes.fetch_add(1, Ordering::SeqCst);
+        let mut reply = self.service.resolve_commit_prefix(request).await?;
+        if self.mode == QueryMode::WrongCommitWidth {
+            if let Some(q::commit_prefix_result::Result::Single(value)) =
+                &mut reply.get_mut().result
+            {
+                value.commit.as_mut().unwrap().value.pop();
+            }
+        }
+        Ok(reply)
+    }
+    async fn resolve_change_prefix(
+        &self,
+        request: Request<q::ResolveChangePrefixRequest>,
+    ) -> Result<Response<q::ChangePrefixResult>, Status> {
+        self.counts.change_prefixes.fetch_add(1, Ordering::SeqCst);
+        let mut reply = self.service.resolve_change_prefix(request).await?;
+        if let Some(q::change_prefix_result::Result::Single(value)) = &mut reply.get_mut().result {
+            match self.mode {
+                QueryMode::MissingVisibility => value.targets[0].visible = None,
+                QueryMode::DuplicateTarget => value.targets.push(value.targets[0].clone()),
+                _ => {}
+            }
+        }
+        Ok(reply)
+    }
+    async fn shortest_prefix(
+        &self,
+        request: Request<q::ShortestPrefixRequest>,
+    ) -> Result<Response<q::ShortestPrefixResult>, Status> {
+        self.counts.shortest_prefixes.fetch_add(1, Ordering::SeqCst);
+        let mut reply = self.service.shortest_prefix(request).await?;
+        if self.mode == QueryMode::WrongShortestKind {
+            reply.get_mut().kind = q::PrefixKind::ChangePrefix as i32;
+        }
+        if self.mode == QueryMode::LongestOverflow {
+            reply.get_mut().hex_length = 65;
+        }
+        Ok(reply)
+    }
+    async fn evaluate(
+        &self,
+        request: Request<q::EvaluateRequest>,
+    ) -> Result<Response<q::EvaluatePage>, Status> {
+        self.service.evaluate(request).await
+    }
+}
+struct QueryRunning {
+    config: Config,
+    opens: Arc<AtomicUsize>,
+    stop: tokio::sync::oneshot::Sender<()>,
+    task: tokio::task::JoinHandle<()>,
+}
+impl QueryRunning {
+    async fn start(service: RepositoryService, mode: QueryMode) -> Self {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let counts = Arc::new(QueryCounts::default());
+        let opens = counts.opens.clone();
+        let faults = QueryFaults {
+            service: service.query_service(),
+            mode,
+            counts,
+            first_scope: Arc::new(std::sync::Mutex::new(None)),
+        };
+        let (stop, stopped) = tokio::sync::oneshot::channel();
+        let task = tokio::spawn(async move {
+            tonic::transport::Server::builder()
+                .add_service(
+                    RepositoryQueryServer::new(faults)
+                        .accept_compressed(tonic::codec::CompressionEncoding::Zstd)
+                        .send_compressed(tonic::codec::CompressionEncoding::Zstd),
+                )
+                .serve_with_incoming_shutdown(
+                    tokio_stream::wrappers::TcpListenerStream::new(listener),
+                    async {
+                        let _ = stopped.await;
+                    },
+                )
+                .await
+                .unwrap();
+        });
+        let mut config = Config::default();
+        config.endpoint = format!("http://{address}");
+        config.repository_id = "example".into();
+        config.token_env = Some("TINYTREE_CLIENT_TEST_TOKEN".into());
+        config.rpc.operation_timeout_ms = 3000;
+        config.rpc.rpc_timeout_ms = 1000;
+        config.rpc.retry.initial_backoff_ms = 1;
+        config.rpc.retry.max_backoff_ms = 5;
+        Self {
+            config,
+            opens,
+            stop,
+            task,
+        }
+    }
+    async fn client(&self) -> NativeClient {
+        NativeClient::connect(self.config.clone()).await.unwrap()
+    }
+    async fn stop(self) {
+        self.stop.send(()).unwrap();
+        self.task.await.unwrap();
+    }
+}
+fn setup_query() -> (
+    tempfile::TempDir,
+    tempfile::TempDir,
+    RepositoryService,
+    tinytree_model::CommitId,
+    tinytree_model::ChangeId,
+) {
+    let (store_dir, store, service) = setup();
+    let index_dir = private_tempdir();
+    let index = tinytree_index::Index::open(index_dir.path(), &Default::default()).unwrap();
+    let fixture = fixture();
+    let mut commit = None;
+    for object in fixture.objects() {
+        store
+            .put("example", object.descriptor, &object.bytes, 0)
+            .unwrap();
+        if object.descriptor.key.kind == Kind::Commit {
+            let node = index
+                .ingest("example", object.descriptor, &object.bytes)
+                .unwrap();
+            commit = Some((node.commit, node.change_id));
+        }
+    }
+    let (root, change) = commit.unwrap();
+    (
+        store_dir,
+        index_dir,
+        service.with_query_index(index).unwrap(),
+        root,
+        change,
+    )
+}
+fn change_hex(id: tinytree_model::ChangeId) -> String {
+    id.0.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+#[tokio::test]
+async fn compressed_query_scopes_replay_exact_facts_and_explicit_visibility() {
+    use tinytree_model::{ChangeId, CommitId};
+    let (_store, _index, service, root, change) = setup_query();
+    let running = QueryRunning::start(service, QueryMode::RetryOpen).await;
+    let client = running.client().await;
+    // The real server rejects noncanonical roots; the client canonicalizes sets.
+    let scope = client
+        .open_query_scope(vec![root, CommitId::ROOT, root])
+        .await
+        .unwrap();
+    assert_eq!(
+        running.opens.load(Ordering::SeqCst),
+        2,
+        "lost ACK retries the same immutable replay key"
+    );
+    assert_eq!(scope.repository_id(), "example");
+    let unknown = CommitId([99; 32]);
+    assert_eq!(
+        client
+            .query_facts(
+                &scope,
+                vec![
+                    QueryFact::HasId(root),
+                    QueryFact::HasId(unknown),
+                    QueryFact::IsAncestor {
+                        ancestor: CommitId::ROOT,
+                        descendant: root
+                    },
+                    QueryFact::Heads(vec![CommitId::ROOT, root]),
+                    QueryFact::CommonAncestors {
+                        left: vec![root],
+                        right: vec![CommitId::ROOT]
+                    },
+                ]
+            )
+            .await
+            .unwrap(),
+        vec![
+            FactAnswer::HasId(true),
+            FactAnswer::HasId(false),
+            FactAnswer::IsAncestor(true),
+            FactAnswer::Heads(vec![root]),
+            FactAnswer::CommonAncestors(vec![CommitId::ROOT])
+        ]
+    );
+    let text = blake3::Hash::from(root.0).to_hex().to_string();
+    assert_eq!(
+        client.resolve_commit_prefix(&scope, &text).await.unwrap(),
+        CommitPrefix::Single(root)
+    );
+    assert_eq!(
+        client.resolve_commit_prefix(&scope, "").await.unwrap(),
+        CommitPrefix::Ambiguous
+    );
+    assert_eq!(
+        client
+            .resolve_commit_prefix(&scope, &"99".repeat(32))
+            .await
+            .unwrap(),
+        CommitPrefix::NoMatch
+    );
+    let ChangePrefix::Single(found) = client
+        .resolve_change_prefix(&scope, &change_hex(change), vec![root])
+        .await
+        .unwrap()
+    else {
+        panic!("expected unique change");
+    };
+    assert_eq!(found.change, change);
+    assert_eq!(found.targets.len(), 1);
+    assert!(found.targets[0].visible);
+    let ChangePrefix::Single(hidden) = client
+        .resolve_change_prefix(&scope, &change_hex(change), vec![])
+        .await
+        .unwrap()
+    else {
+        panic!("expected hidden change target");
+    };
+    assert!(
+        !hidden.targets[0].visible,
+        "Some(false) is present, not an omitted field"
+    );
+    assert!(
+        client
+            .shortest_prefix(&scope, PrefixTarget::Commit(unknown), vec![])
+            .await
+            .unwrap()
+            <= 64
+    );
+    assert!(
+        client
+            .shortest_prefix(&scope, PrefixTarget::Change(ChangeId([88; 16])), vec![root])
+            .await
+            .unwrap()
+            <= 32
+    );
+    client.close_query_scope(&scope).await.unwrap();
+    assert_eq!(
+        client
+            .query_facts(&scope, vec![QueryFact::HasId(root)])
+            .await
+            .unwrap_err()
+            .code(),
+        Code::FailedPrecondition
+    );
+    let singleton = client.open_query_scope(vec![CommitId::ROOT]).await.unwrap();
+    assert_eq!(
+        client
+            .shortest_prefix(&singleton, PrefixTarget::Commit(CommitId::ROOT), vec![])
+            .await
+            .unwrap(),
+        0
+    );
+    client.close_query_scope(&singleton).await.unwrap();
+    running.stop().await;
+}
+
+#[tokio::test]
+async fn query_replies_reject_malformed_scopes_facts_prefixes_and_collection_shapes() {
+    use tinytree_model::CommitId;
+    for mode in [
+        QueryMode::MalformedScope,
+        QueryMode::MissingFact,
+        QueryMode::MissingAnswer,
+        QueryMode::WrongAnswer,
+        QueryMode::WrongDigest,
+        QueryMode::WrongEpoch,
+        QueryMode::RepeatedEmptyIds,
+        QueryMode::MissingVisibility,
+        QueryMode::DuplicateTarget,
+        QueryMode::WrongCommitWidth,
+        QueryMode::WrongShortestKind,
+        QueryMode::LongestOverflow,
+    ] {
+        let (_store, _index, service, root, change) = setup_query();
+        let running = QueryRunning::start(service, mode).await;
+        let client = running.client().await;
+        let scope = client.open_query_scope(vec![root]).await;
+        if mode == QueryMode::MalformedScope {
+            assert_eq!(scope.unwrap_err().code(), Code::DataLoss);
+        } else {
+            let scope = scope.unwrap();
+            let failure = match mode {
+                QueryMode::MissingVisibility | QueryMode::DuplicateTarget => client
+                    .resolve_change_prefix(&scope, &change_hex(change), vec![root])
+                    .await
+                    .unwrap_err(),
+                QueryMode::WrongCommitWidth => client
+                    .resolve_commit_prefix(&scope, &blake3::Hash::from(root.0).to_hex())
+                    .await
+                    .unwrap_err(),
+                QueryMode::WrongShortestKind | QueryMode::LongestOverflow => client
+                    .shortest_prefix(&scope, PrefixTarget::Commit(root), vec![])
+                    .await
+                    .unwrap_err(),
+                QueryMode::RepeatedEmptyIds => client
+                    .query_facts(&scope, vec![QueryFact::Heads(vec![root])])
+                    .await
+                    .unwrap_err(),
+                _ => client
+                    .query_facts(&scope, vec![QueryFact::HasId(CommitId([99; 32]))])
+                    .await
+                    .unwrap_err(),
+            };
+            assert!(
+                matches!(failure.code(), Code::DataLoss | Code::ResourceExhausted),
+                "{mode:?}: {failure}"
+            );
+            client.close_query_scope(&scope).await.unwrap();
+        }
+        running.stop().await;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "manual indexed-fact versus full-history workloads; not equivalent jj log/clone/Bazel latency"]
+async fn indexed_scope_fact_workload_benchmark() {
+    use tinytree_model::{ChangeId, CommitId};
+    for depth in [64usize, 512, 4096] {
+        let (_store_directory, store, service) = setup();
+        let index_directory = private_tempdir();
+        let empty = tinytree_model::empty_tree();
+        store
+            .put("example", empty.descriptor, &empty.bytes, 0)
+            .unwrap();
+        let mut commit = tinytree_model::synthetic_root();
+        let mut head = CommitId::ROOT;
+        let mut canonical = Vec::with_capacity(depth);
+        let mut source_commit_bytes = 0u64;
+        for position in 0..depth {
+            commit.parents = vec![head];
+            commit.description = format!("linear history commit {position}");
+            let mut change = [0u8; 16];
+            change[..8].copy_from_slice(&((position + 1) as u64).to_be_bytes());
+            commit.change_id = ChangeId(change);
+            let encoded = tinytree_model::encode(
+                &tinytree_model::Object::Commit(commit.clone()),
+                Default::default(),
+            )
+            .unwrap();
+            source_commit_bytes += encoded.bytes.len() as u64;
+            store
+                .put("example", encoded.descriptor, &encoded.bytes, 0)
+                .unwrap();
+            head = CommitId(encoded.descriptor.key.id.0);
+            canonical.push(encoded);
+        }
+        // Index readiness is paid once and reported separately, not hidden in
+        // first-scope latency or presented as a free cold-server operation.
+        let indexing_started = std::time::Instant::now();
+        let index =
+            tinytree_index::Index::open(index_directory.path(), &Default::default()).unwrap();
+        for encoded in &canonical {
+            index
+                .ingest("example", encoded.descriptor, &encoded.bytes)
+                .unwrap();
+        }
+        let indexing_ns = indexing_started.elapsed().as_nanos();
+        let service = service.with_query_index(index).unwrap();
+        // Same authenticated, zstd-enabled current server/channel for both
+        // workloads, with production-equivalent accepted TCP_NODELAY sockets.
+        let running = Running::start_with_socket_policy(service, Mode::Normal, true).await;
+        let client = running.client().await;
+        let mut full_graph_ns = Vec::new();
+        for _ in 0..3 {
+            let started = std::time::Instant::now();
+            let graph = client
+                .canonical_commit_summaries(
+                    vec![ObjectKey {
+                        kind: Kind::Commit,
+                        id: ObjectId(head.0),
+                    }],
+                    vec![],
+                )
+                .await
+                .unwrap();
+            full_graph_ns.push(started.elapsed().as_nanos());
+            assert_eq!(graph.entries.len(), depth);
+        }
+        let full_graph_rpcs = running.graph.load(Ordering::SeqCst);
+        let full_graph_canonical_bytes = running.canonical_bytes.load(Ordering::SeqCst);
+        let scope_started = std::time::Instant::now();
+        let scope = client.open_query_scope(vec![head]).await.unwrap();
+        let first_scope_ns = scope_started.elapsed().as_nanos();
+        let mut reopen_ns = Vec::new();
+        for _ in 0..3 {
+            let started = std::time::Instant::now();
+            let reopened = client.open_query_scope(vec![head]).await.unwrap();
+            reopen_ns.push(started.elapsed().as_nanos());
+            assert_eq!(reopened.content_digest(), scope.content_digest());
+            client.close_query_scope(&reopened).await.unwrap();
+        }
+        let mut facts_ns = Vec::new();
+        let mut prefix_ns = Vec::new();
+        let head_hex = blake3::Hash::from(head.0).to_hex().to_string();
+        let head_change_hex = change_hex(commit.change_id);
+        for _ in 0..3 {
+            let started = std::time::Instant::now();
+            let facts = client
+                .query_facts(
+                    &scope,
+                    vec![
+                        QueryFact::HasId(head),
+                        QueryFact::IsAncestor {
+                            ancestor: CommitId::ROOT,
+                            descendant: head,
+                        },
+                        QueryFact::Heads(vec![CommitId::ROOT, head]),
+                        QueryFact::CommonAncestors {
+                            left: vec![head],
+                            right: vec![CommitId::ROOT],
+                        },
+                    ],
+                )
+                .await
+                .unwrap();
+            facts_ns.push(started.elapsed().as_nanos());
+            assert_eq!(
+                facts,
+                vec![
+                    FactAnswer::HasId(true),
+                    FactAnswer::IsAncestor(true),
+                    FactAnswer::Heads(vec![head]),
+                    FactAnswer::CommonAncestors(vec![CommitId::ROOT])
+                ]
+            );
+            let started = std::time::Instant::now();
+            assert_eq!(
+                client
+                    .resolve_commit_prefix(&scope, &head_hex)
+                    .await
+                    .unwrap(),
+                CommitPrefix::Single(head)
+            );
+            assert!(matches!(
+                client
+                    .resolve_change_prefix(&scope, &head_change_hex, vec![head])
+                    .await
+                    .unwrap(),
+                ChangePrefix::Single(_)
+            ));
+            assert!(
+                client
+                    .shortest_prefix(&scope, PrefixTarget::Commit(head), vec![])
+                    .await
+                    .unwrap()
+                    <= 64
+            );
+            prefix_ns.push(started.elapsed().as_nanos());
+        }
+        client.close_query_scope(&scope).await.unwrap();
+        assert_eq!(running.files.load(Ordering::SeqCst), 0);
+        assert_eq!(running.metadata.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            running.graph.load(Ordering::SeqCst),
+            full_graph_rpcs,
+            "small query phase must not fetch canonical public ancestry"
+        );
+        assert_eq!(
+            running.canonical_bytes.load(Ordering::SeqCst),
+            full_graph_canonical_bytes
+        );
+        assert_eq!(running.queries.opens.load(Ordering::SeqCst), 4);
+        assert_eq!(running.queries.facts.load(Ordering::SeqCst), 3);
+        eprintln!(
+            concat!(
+                "{{\"schema\":1,\"benchmark\":\"indexed_scope_fact_workloads\",",
+                "\"comparison\":\"different_workloads_not_jj_log_clone_or_bazel_speedup\",",
+                "\"shape\":\"single_parent_unique_changes_empty_tree_no_files\",",
+                "\"history_commits\":{},\"source_commit_bytes\":{},\"trials\":3,",
+                "\"server_indexing_ns\":{},\"index_ready_before_requests\":true,",
+                "\"full_graph_samples_ns\":{:?},\"first_scope_ns\":{},\"reopen_samples_ns\":{:?},",
+                "\"four_fact_samples_ns\":{:?},\"three_prefix_rpc_samples_ns\":{:?},",
+                "\"full_graph_rpcs\":{},\"full_graph_canonical_envelope_bytes\":{},",
+                "\"scope_open_rpcs\":{},\"scope_close_rpcs\":{},\"fact_rpcs\":{},",
+                "\"commit_prefix_rpcs\":{},\"change_prefix_rpcs\":{},\"shortest_prefix_rpcs\":{},",
+                "\"query_phase_canonical_envelope_bytes\":0,\"metadata_rpcs\":0,\"file_rpcs\":0,",
+                "\"authenticated\":true,\"zstd\":true,\"tcp_nodelay\":true}}"
+            ),
+            depth,
+            source_commit_bytes,
+            indexing_ns,
+            full_graph_ns,
+            first_scope_ns,
+            reopen_ns,
+            facts_ns,
+            prefix_ns,
+            full_graph_rpcs,
+            full_graph_canonical_bytes,
+            running.queries.opens.load(Ordering::SeqCst),
+            running.queries.closes.load(Ordering::SeqCst),
+            running.queries.facts.load(Ordering::SeqCst),
+            running.queries.commit_prefixes.load(Ordering::SeqCst),
+            running.queries.change_prefixes.load(Ordering::SeqCst),
+            running.queries.shortest_prefixes.load(Ordering::SeqCst)
+        );
+        running.stop().await;
     }
 }

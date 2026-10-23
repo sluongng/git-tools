@@ -1,0 +1,21 @@
+[package]
+name = "tinytree-index"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+description = "Bounded persistent derived native commit graph queries"
+
+[dependencies]
+blake3 = "1"
+fjall = "=3.1.12"
+fs2 = "0.4"
+private-fs = { path = "../private-fs" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+tinytree-model = { path = "../tinytree-model" }
+
+uuid = { version = "1", features = ["v4"] }
+
+[dev-dependencies]
+tempfile = "3"

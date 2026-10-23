@@ -21,3 +21,8 @@ LRU eviction. Native publication is not Git publication. With `retain = true`,
 principals can hold their own `_tinytree/hold/v1/<client>/<commit>` references
 without public-write permission. Holds persist until explicit release; quotas
 reject new promises, not existing ones. A historical receipt is not current proof.
+
+The separate query service supports retained root scopes, exact graph facts and
+prefix resolution. Its rebuildable index warms asynchronously; unavailable
+coverage is an error, not an empty result. Scope TTLs and work limits are TOML
+configurable. Draft overlays and paged evaluation are not implemented yet.

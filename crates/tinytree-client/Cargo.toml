@@ -9,6 +9,7 @@ description = "Bounded verifying native repository gRPC client"
 private-fs = { path = "../private-fs" }
 async-stream = "0.3"
 blake3 = "1"
+getrandom = "0.3"
 bytes = "1"
 http = "1"
 hyper-util = { version = "0.1", features = ["tokio"] }
@@ -27,6 +28,7 @@ tower = { version = "0.5", features = ["util"] }
 libc = "0.2"
 
 [dev-dependencies]
+tinytree-index = { path = "../tinytree-index" }
 futures-util = "0.3"
 tinytree-server = { path = "../tinytree-server" }
 tinytree-store = { path = "../tinytree-store" }

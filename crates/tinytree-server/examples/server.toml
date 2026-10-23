@@ -16,6 +16,14 @@ max_inflight = 16
 max_inflight_per_repository = 4
 max_frame_bytes = 65536
 
+# Rebuildable graph index; queries never delay canonical uploads or publication.
+# Scope handles expire; clients reopen their immutable roots after expiry/restart.
+[service.query]
+scope_ttl_seconds = 300
+max_scopes_per_principal = 16
+max_pending_warms = 32
+max_warm_jobs = 1
+
 # Non-loopback TCP additionally requires TLS identities supplied separately.
 # [tls]
 # certificate = "/path/to/certificate.pem"

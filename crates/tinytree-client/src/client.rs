@@ -1,3 +1,5 @@
+#[path = "query.rs"]
+pub(crate) mod query;
 use crate::transport::Client as RepositoryClient;
 use crate::{
     CanonicalCommitSummaries, Config, MetadataOutcome, UploadSource, VerifiedFile,

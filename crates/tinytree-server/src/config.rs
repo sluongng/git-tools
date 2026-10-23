@@ -29,6 +29,7 @@ pub struct ServiceConfig {
     pub max_buffered_bytes: usize,
     pub rpc: reapi::policy::Policy,
     pub retention: tinytree_store::RetentionLimits,
+    pub query: crate::QueryConfig,
 }
 impl Default for ServiceConfig {
     fn default() -> Self {
@@ -44,11 +45,13 @@ impl Default for ServiceConfig {
             max_buffered_bytes: 128 * 1024 * 1024,
             rpc: Default::default(),
             retention: Default::default(),
+            query: Default::default(),
         }
     }
 }
 impl ServiceConfig {
     pub fn validate(&self) -> Result<(), ConfigError> {
+        self.query.validate(self.max_request_bytes)?;
         self.retention
             .validate()
             .map_err(|_| ConfigError("invalid native retention limits"))?;

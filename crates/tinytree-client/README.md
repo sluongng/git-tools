@@ -8,6 +8,10 @@ Presence and publication receipts are not retention leases.
 the completeness or reachability of the server-selected set. A history importer
 must traverse/verify the complete canonical closure before admitting history.
 
+Root-scoped graph facts and prefix queries use checked, expiring handles and
+bounded compressed RPCs. Exact negative answers trust the authenticated server.
+These APIs do not yet replace jj's local index or implement draft overlays.
+
 Load [the TOML example](examples/client.toml) with `Config::load`, then call
 `NativeClient::connect`. Plaintext is loopback-only; other TCP endpoints require
 explicit TLS roots. Unix endpoints must have private owner-controlled parents.

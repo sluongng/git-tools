@@ -3,7 +3,7 @@ use crate::Limits;
 use bytes::Buf;
 use prost::Message;
 use std::marker::PhantomData;
-use tinytree_proto::v1 as p;
+use tinytree_proto::{query_v1 as q, v1 as p};
 use tonic::{
     Request, Response, Status, Streaming,
     codec::{Codec, CompressionEncoding, DecodeBuf, Decoder, EncodeBuf, Encoder},
@@ -58,6 +58,83 @@ impl Client {
                 BoundedCodec::<T, U>::new(shape, self.limits.clone(), self.decode),
             )
             .await
+    }
+    pub async fn open_scope(
+        &mut self,
+        request: impl tonic::IntoStreamingRequest<Message = q::OpenScopeFrame>,
+    ) -> Result<Response<q::QueryScope>, Status> {
+        self.inner
+            .ready()
+            .await
+            .map_err(|_| Status::unavailable("native gRPC transport not ready"))?;
+        self.inner
+            .client_streaming(
+                request.into_streaming_request(),
+                http::uri::PathAndQuery::from_static(
+                    "/tinytree.query.v1.RepositoryQuery/OpenScope",
+                ),
+                BoundedCodec::<q::OpenScopeFrame, q::QueryScope>::new(
+                    Shape::QueryScope,
+                    self.limits.clone(),
+                    self.decode,
+                ),
+            )
+            .await
+    }
+    pub async fn close_scope(
+        &mut self,
+        r: Request<q::CloseScopeRequest>,
+    ) -> Result<Response<q::CloseScopeResponse>, Status> {
+        self.unary(
+            r,
+            "/tinytree.query.v1.RepositoryQuery/CloseScope",
+            Shape::QueryEmpty,
+        )
+        .await
+    }
+    pub async fn query_facts(
+        &mut self,
+        r: Request<q::QueryFactsRequest>,
+    ) -> Result<Response<q::GraphFacts>, Status> {
+        self.unary(
+            r,
+            "/tinytree.query.v1.RepositoryQuery/QueryFacts",
+            Shape::QueryFacts,
+        )
+        .await
+    }
+    pub async fn resolve_commit_prefix(
+        &mut self,
+        r: Request<q::ResolveCommitPrefixRequest>,
+    ) -> Result<Response<q::CommitPrefixResult>, Status> {
+        self.unary(
+            r,
+            "/tinytree.query.v1.RepositoryQuery/ResolveCommitPrefix",
+            Shape::CommitPrefix,
+        )
+        .await
+    }
+    pub async fn resolve_change_prefix(
+        &mut self,
+        r: Request<q::ResolveChangePrefixRequest>,
+    ) -> Result<Response<q::ChangePrefixResult>, Status> {
+        self.unary(
+            r,
+            "/tinytree.query.v1.RepositoryQuery/ResolveChangePrefix",
+            Shape::ChangePrefix,
+        )
+        .await
+    }
+    pub async fn shortest_prefix(
+        &mut self,
+        r: Request<q::ShortestPrefixRequest>,
+    ) -> Result<Response<q::ShortestPrefixResult>, Status> {
+        self.unary(
+            r,
+            "/tinytree.query.v1.RepositoryQuery/ShortestPrefix",
+            Shape::ShortestPrefix,
+        )
+        .await
     }
     pub async fn open_repository(
         &mut self,
@@ -169,6 +246,20 @@ impl Client {
 }
 #[derive(Clone, Copy)]
 enum Shape {
+    QueryScope,
+    ScopeKey,
+    QueryFacts,
+    FactAnswer,
+    CommitSet,
+    CommitId,
+    ChangeId,
+    CommitPrefix,
+    ChangePrefix,
+    CommitMatch,
+    ChangeMatch,
+    ChangeTarget,
+    ShortestPrefix,
+    QueryEmpty,
     View,
     Reference,
     Descriptor,
@@ -345,6 +436,17 @@ fn scan(
                 return Err(exhausted());
             }
             fields |= 1u32 << number;
+            if wire == 0
+                && matches!(
+                    (shape, number),
+                    (Shape::FactAnswer, 1 | 2) | (Shape::ChangeTarget, 2)
+                )
+            {
+                let mut offset = 0;
+                if varint(data, &mut offset)? > 1 {
+                    return Err(invalid());
+                }
+            }
             if wire == 2 {
                 if let Some(child) = child {
                     charge(budget, allocation)?;
@@ -355,6 +457,19 @@ fn scan(
                         return Err(exhausted());
                     }
                     charge(budget, data.len().saturating_mul(2))?;
+                    let exact = match (shape, number) {
+                        (Shape::QueryScope, 2)
+                        | (Shape::ScopeKey, 2)
+                        | (Shape::CommitId, 1)
+                        | (Shape::QueryFacts, 2) => Some(32),
+                        (Shape::QueryScope, 3) | (Shape::ChangeId, 1) | (Shape::QueryFacts, 3) => {
+                            Some(16)
+                        }
+                        _ => None,
+                    };
+                    if exact.is_some_and(|n| data.len() != n) {
+                        return Err(invalid());
+                    }
                     if matches!(shape, Shape::Key) && number == 2 && data.len() != 32 {
                         return Err(invalid());
                     }
@@ -369,6 +484,12 @@ fn scan(
         }
     }
     let required = match shape {
+        Shape::QueryScope => (1 << 1) | (1 << 2) | (1 << 3) | (1 << 5),
+        Shape::ScopeKey => (1 << 1) | (1 << 2),
+        Shape::QueryFacts => (1 << 2) | (1 << 3),
+        Shape::CommitId | Shape::ChangeId | Shape::CommitMatch | Shape::ChangeMatch => 1 << 1,
+        Shape::ChangeTarget => (1 << 1) | (1 << 2),
+        Shape::ShortestPrefix => 1 << 1,
         Shape::Reference => 1 << 1,
         Shape::Descriptor => (1 << 1) | (1 << 2) | (1 << 4),
         Shape::Key => (1 << 1) | (1 << 2),
@@ -380,6 +501,14 @@ fn scan(
         _ => 0,
     };
     if fields & required != required {
+        return Err(invalid());
+    }
+    let oneof_fields = match shape {
+        Shape::FactAnswer => 4,
+        Shape::CommitPrefix | Shape::ChangePrefix => 3,
+        _ => 0,
+    };
+    if oneof_fields > 0 && counts[1..=oneof_fields].iter().sum::<usize>() != 1 {
         return Err(invalid());
     }
     if matches!(shape, Shape::MetadataResult)
@@ -399,6 +528,36 @@ fn rule(shape: Shape, n: u32, l: &Limits) -> Option<(u8, Option<Shape>, usize, u
     let nested = |child| Some((2, Some(child), 1, 0));
     let repeated = |child, count, allocation| Some((2, Some(child), count, allocation));
     match (shape, n) {
+        (Shape::QueryScope, 1) => nested(Shape::ScopeKey),
+        (Shape::QueryScope, 2)
+        | (Shape::ScopeKey, 2)
+        | (Shape::CommitId, 1)
+        | (Shape::QueryFacts, 2) => text(32),
+        (Shape::QueryScope, 3) | (Shape::ChangeId, 1) | (Shape::QueryFacts, 3) => text(16),
+        (Shape::QueryScope, 4 | 5) | (Shape::ShortestPrefix, 1 | 2) => scalar(),
+        (Shape::ScopeKey, 1) => text(128),
+        (Shape::QueryFacts, 1) => repeated(
+            Shape::FactAnswer,
+            l.max_batch_items,
+            4 * std::mem::size_of::<q::GraphFactAnswer>(),
+        ),
+        (Shape::FactAnswer, 1 | 2) | (Shape::ChangeTarget, 2) => scalar(),
+        (Shape::FactAnswer, 3 | 4) => nested(Shape::CommitSet),
+        (Shape::CommitSet, 1) => repeated(
+            Shape::CommitId,
+            l.max_batch_items,
+            4 * std::mem::size_of::<q::CommitId>(),
+        ),
+        (Shape::CommitPrefix, 1 | 3) | (Shape::ChangePrefix, 1 | 3) => nested(Shape::QueryEmpty),
+        (Shape::CommitPrefix, 2) => nested(Shape::CommitMatch),
+        (Shape::ChangePrefix, 2) => nested(Shape::ChangeMatch),
+        (Shape::CommitMatch, 1) | (Shape::ChangeTarget, 1) => nested(Shape::CommitId),
+        (Shape::ChangeMatch, 1) => nested(Shape::ChangeId),
+        (Shape::ChangeMatch, 2) => repeated(
+            Shape::ChangeTarget,
+            l.max_batch_items,
+            4 * std::mem::size_of::<q::ChangeTarget>(),
+        ),
         (Shape::View, 1) => text(128),
         (Shape::View, 2 | 3 | 5 | 6 | 7) => scalar(),
         (Shape::View, 4) => repeated(

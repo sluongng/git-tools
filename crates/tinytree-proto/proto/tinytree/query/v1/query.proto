@@ -1,0 +1,265 @@
+syntax = "proto3";
+
+package tinytree.query.v1;
+
+import "tinytree/v1/repository.proto";
+
+// Experimental derived-index contract, separate from authoritative object I/O.
+// Bindings alone provide no authentication, validation, retention or resource
+// policy. Servers MUST authorize before inspecting IDs and recheck repository,
+// principal and scope ownership on every RPC; opaque handles are not credentials.
+// Scope installation/query execution require bounded admission before work or
+// allocation. Accepted physical jobs retain their guards after cancellation.
+service RepositoryQuery {
+  rpc OpenScope(stream OpenScopeFrame) returns (QueryScope);
+  rpc ForkScope(stream ForkScopeFrame) returns (QueryScope);
+  rpc CloseScope(CloseScopeRequest) returns (CloseScopeResponse);
+  rpc QueryFacts(QueryFactsRequest) returns (GraphFacts);
+  rpc ResolveCommitPrefix(ResolveCommitPrefixRequest) returns (CommitPrefixResult);
+  rpc ResolveChangePrefix(ResolveChangePrefixRequest) returns (ChangePrefixResult);
+  rpc ShortestPrefix(ShortestPrefixRequest) returns (ShortestPrefixResult);
+  rpc Evaluate(EvaluateRequest) returns (EvaluatePage);
+}
+
+message CommitId { bytes value = 1; } // Exactly 32 bytes; zero is intrinsic root.
+message ChangeId { bytes value = 1; } // Exactly 16 bytes, not a commit identity.
+message ScopeKey {
+  string repository_id = 1;
+  bytes handle = 2; // Opaque 32-byte handle, never an authorization credential.
+}
+message QueryScope {
+  ScopeKey key = 1;
+  bytes content_digest = 2; // Exactly 32 bytes, immutable logical scope identity.
+  bytes index_epoch = 3; // Exactly 16 bytes, durable index incarnation.
+  uint64 high_water = 4;
+  int64 expires_at_unix_seconds = 5; // Absolute expiry, not sliding access TTL.
+}
+
+// version MUST equal 1. Roots are sorted unique native commit IDs. Declared
+// overlay totals count only this stream's additions, not shared fork ancestry.
+// Replay binds principal/repository/version/roots/canonical overlay contents;
+// identical replay is idempotent, differing content under the same key errors.
+// Fork also binds the exact parent scope, never a moving/latest reference.
+// Overlay commits are parent-first: each parent is an earlier overlay node or a
+// member of the complete remote scoped graph. Validate canonical identities and
+// totals before installing atomically; this is not a backup/offload ACK.
+message ScopeHeader {
+  uint32 version = 1;
+  string repository_id = 2;
+  bytes replay_key = 3;
+  repeated CommitId roots = 4;
+  uint64 overlay_object_count = 5;
+  uint64 overlay_bytes = 6;
+}
+message ForkScopeHeader {
+  ScopeHeader scope = 1;
+  ScopeKey parent_scope = 2; // Same repository/principal; share immutable nodes.
+}
+message OverlayCommitHeader {
+  tinytree.v1.ObjectDescriptor descriptor = 1; // Non-root COMMIT only.
+}
+message OverlayCommitEnd {
+  uint64 size_bytes = 1;
+  bytes content_blake3 = 2; // Must match header and exact contiguous bytes.
+}
+message ScopeEnd {
+  uint64 overlay_object_count = 1;
+  uint64 overlay_bytes = 2; // Exact totals matching header and completed objects.
+}
+// Exactly one header first; then zero or more (commit, contiguous bounded chunks,
+// commit_end) groups; exactly one scope_end last followed by clean EOF. Missing,
+// duplicate, reordered, truncated or trailing frames error, including an unset
+// oneof. Header totals, frame sizes, roots, canonical decoding and full stream
+// bytes need explicit server limits; generated bindings enforce none of them.
+message OpenScopeFrame {
+  oneof frame {
+    ScopeHeader header = 1;
+    OverlayCommitHeader commit = 2;
+    tinytree.v1.DataChunk chunk = 3;
+    OverlayCommitEnd commit_end = 4;
+    ScopeEnd scope_end = 5;
+  }
+}
+message ForkScopeFrame {
+  oneof frame {
+    ForkScopeHeader header = 1;
+    OverlayCommitHeader commit = 2;
+    tinytree.v1.DataChunk chunk = 3;
+    OverlayCommitEnd commit_end = 4;
+    ScopeEnd scope_end = 5;
+  }
+}
+message CloseScopeRequest { ScopeKey scope = 1; }
+message CloseScopeResponse {}
+
+message HasId { CommitId commit = 1; }
+message IsAncestor { CommitId ancestor = 1; CommitId descendant = 2; }
+message Heads { repeated CommitId commits = 1; }
+message CommonAncestors { repeated CommitId left = 1; repeated CommitId right = 2; }
+message GraphFact {
+  oneof fact {
+    HasId has_id = 1;
+    IsAncestor is_ancestor = 2;
+    Heads heads = 3;
+    CommonAncestors common_ancestors = 4;
+  }
+}
+message CommitSet { repeated CommitId commits = 1; }
+message GraphFactAnswer {
+  oneof answer {
+    bool has_id = 1;
+    bool is_ancestor = 2;
+    CommitSet heads = 3;
+    CommitSet common_ancestors = 4;
+  }
+}
+message QueryFactsRequest { ScopeKey scope = 1; repeated GraphFact facts = 2; }
+message GraphFacts {
+  repeated GraphFactAnswer answers = 1; // Exact input order/count and variant.
+  bytes scope_digest = 2;
+  bytes index_epoch = 3;
+}
+
+message NoMatch {}
+message CommitMatch { CommitId commit = 1; }
+message AmbiguousCommits {} // Exact ambiguity, not early budget exhaustion.
+message ResolveCommitPrefixRequest { ScopeKey scope = 1; string hex_prefix = 2; }
+message CommitPrefixResult {
+  oneof result {
+    NoMatch no_match = 1;
+    CommitMatch single = 2;
+    AmbiguousCommits ambiguous = 3;
+  }
+}
+message ChangeTarget {
+  CommitId commit = 1;
+  optional bool visible = 2; // Required; membership in ancestors(request.visible_heads).
+}
+message ChangeMatch {
+  ChangeId change = 1;
+  repeated ChangeTarget targets = 2; // All scoped divergent targets, visible/hidden.
+}
+message AmbiguousChanges {} // Multiple distinct ChangeIds, not divergent commits.
+message ResolveChangePrefixRequest {
+  ScopeKey scope = 1;
+  string hex_prefix = 2;
+  repeated CommitId visible_heads = 3; // Explicit; never use ambient latest refs.
+}
+message ChangePrefixResult {
+  oneof result {
+    NoMatch no_match = 1;
+    ChangeMatch single = 2;
+    AmbiguousChanges ambiguous = 3;
+  }
+}
+message ShortestPrefixRequest {
+  ScopeKey scope = 1;
+  oneof target {
+    CommitId commit = 2;
+    ChangeId change = 3;
+  }
+  repeated CommitId visible_heads = 4;
+}
+enum PrefixKind { PREFIX_KIND_UNSPECIFIED = 0; COMMIT_PREFIX = 1; CHANGE_PREFIX = 2; }
+message ShortestPrefixResult {
+  PrefixKind kind = 1;
+  uint32 hex_length = 2; // Exact shortest unique length, never a guessed full width.
+}
+
+// Structural AST, not executable text. Every node version MUST equal 1. Servers
+// bound depth/nodes/literal IDs/decoded bytes before execution and all subsequent
+// scanned nodes/edges/frontier/replay memory. Unsupported operations return
+// UNIMPLEMENTED; clients must not silently hydrate complete local history.
+message GraphExpr {
+  uint32 version = 1;
+  oneof expression {
+    CommitSet commits = 2;
+    AncestorsExpr ancestors = 3;
+    RangeExpr range = 4;
+    DagRangeExpr dag_range = 5;
+    UnaryExpr heads = 6;
+    UnaryExpr roots = 7;
+    SetExpr union = 8;
+    SetExpr intersection = 9;
+    DifferenceExpr difference = 10;
+  }
+}
+// Half-open intervals. Absent end_exclusive means unbounded; present zero is
+// distinct from absence. start <= end when end is present. Absent range messages
+// mean all generations/parents. Generation zero is the seed itself; parent
+// ranges select zero-based canonical parent indices at each traversal step.
+message GenerationRange { uint64 start = 1; optional uint64 end_exclusive = 2; }
+message ParentRange { uint32 start = 1; optional uint32 end_exclusive = 2; }
+message AncestorsExpr { GraphExpr heads = 1; GenerationRange generations = 2; ParentRange parents = 3; }
+// ancestors(heads) minus ancestors(roots), with generations measured from heads.
+message RangeExpr { GraphExpr roots = 1; GraphExpr heads = 2; GenerationRange generations = 3; }
+// descendants(roots) intersect ancestors(heads), including matching endpoints.
+message DagRangeExpr { GraphExpr roots = 1; GraphExpr heads = 2; }
+message UnaryExpr { GraphExpr input = 1; }
+message SetExpr { repeated GraphExpr inputs = 1; }
+message DifferenceExpr { GraphExpr left = 1; GraphExpr right = 2; }
+
+enum Projection {
+  PROJECTION_UNSPECIFIED = 0;
+  IDS = 1;
+  GRAPH = 2;
+  CANONICAL = 3; // Graph row plus canonical commit payload, except intrinsic root.
+}
+message DirectEdge { CommitId target = 1; }
+message IndirectEdge { CommitId target = 1; }
+message MissingEdge { CommitId boundary = 1; }
+message SelectedEdge {
+  oneof edge {
+    DirectEdge direct = 1;
+    IndirectEdge indirect = 2;
+    MissingEdge missing = 3;
+  }
+}
+message GraphRow {
+  CommitId commit = 1;
+  ChangeId change = 2;
+  // Selected-set edges, NOT unfiltered canonical parent summaries. Direct joins
+  // a selected parent, indirect joins selected ancestry through omitted commits,
+  // missing marks a branch without a selected destination at its boundary.
+  repeated SelectedEdge edges = 3;
+  // Descriptor/hash/decoded commit and ChangeId must match this row. Canonical
+  // verification cannot prove completeness or detect omitted scoped results.
+  tinytree.v1.ObjectData canonical = 4; // Presence only for requested canonical projection.
+}
+message EvaluateRequest {
+  ScopeKey scope = 1;
+  bytes query_id = 2; // Replay identity bound to immutable request inputs.
+  GraphExpr expression = 3;
+  Projection projection = 4;
+  uint32 page_size = 5;
+  bytes cursor = 6; // Absent/empty starts; nonempty is opaque server state/token.
+}
+message EvaluatePage {
+  bytes scope_digest = 1;
+  bytes index_epoch = 2;
+  uint64 sequence = 3;
+  repeated GraphRow rows = 4;
+  bytes cursor = 5;
+  optional bool exhausted = 6; // Must be present; false is not missing/unknown.
+}
+
+// Scope/query handles expire absolutely; restart invalidates handles. Clients
+// reconstruct scopes from durable logical checkpoints, never ambient latest or
+// truncated fetched objects. OpenScope may enqueue index warming and return
+// UNAVAILABLE rather than synchronously hydrate complete ancestry.
+//
+// Facts, prefixes and shortest lengths are exact over COMPLETE scoped coverage.
+// Missing coverage, unsupported work and exhausted budgets are errors, never
+// false, NoMatch, ambiguity, empty complete results or guessed lengths. Incomplete
+// queries cannot return exhausted=true. Server status distinguishes UNAVAILABLE
+// (not ready), RESOURCE_EXHAUSTED (work/quotas), UNIMPLEMENTED and invalid inputs.
+//
+// Evaluate rows are globally children-before-parents across pages. Empty pages
+// with continuation may represent bounded progress. exhausted=true iff complete,
+// with empty cursor; exhausted=false requires a nonempty cursor. Stateful v1
+// cursors bind principal/repo/scope digest/epoch/query inputs/page_size/sequence/
+// expiry. Concurrent replay coalesces and progress commits with replayable page
+// bytes. Old/expired cursor replay is FAILED_PRECONDITION, never another page.
+// Limits/expiry cleanup, root pinning under GC, authorization, MACs, canonical
+// verification and replay persistence are implementation obligations, not things
+// this schema or generated bindings enforce.
