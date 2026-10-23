@@ -1,6 +1,11 @@
 //! Persistent derived graph hosting. Canonical object ACKs never wait for this
 //! queue. Process-local scope handles expire; durable verified nodes are reused.
-use crate::{ServiceConfig, config::ConfigError};
+use crate::{
+    ServiceConfig,
+    config::ConfigError,
+    query_overlay::{OverlayGraph, OverlayLimits},
+};
+use prost::Message;
 use std::{
     collections::{HashMap, HashSet},
     sync::{Arc, Mutex},
@@ -19,6 +24,9 @@ pub struct QueryConfig {
     pub max_scopes_per_principal: usize,
     pub max_scopes_per_repository: usize,
     pub max_scope_memory_bytes: usize,
+    pub max_scope_replays: usize,
+    pub max_scope_replays_per_principal: usize,
+    pub max_scope_replays_per_repository: usize,
     pub scope_ttl_seconds: u64,
     pub expiry_interval_ms: u64,
     pub max_roots: usize,
@@ -47,6 +55,10 @@ pub struct QueryConfig {
     pub max_index_record_bytes: usize,
     pub max_index_bytes: u64,
     pub index_rebuild_generation: u64,
+    pub max_overlay_memory_bytes: usize,
+    pub max_scope_overlay_bytes: usize,
+    pub max_scope_overlay_nodes: usize,
+    pub max_overlay_layers: usize,
 }
 impl Default for QueryConfig {
     fn default() -> Self {
@@ -55,6 +67,9 @@ impl Default for QueryConfig {
             max_scopes_per_principal: 16,
             max_scopes_per_repository: 64,
             max_scope_memory_bytes: 8 * 1024 * 1024,
+            max_scope_replays: 1024,
+            max_scope_replays_per_principal: 256,
+            max_scope_replays_per_repository: 512,
             scope_ttl_seconds: 300,
             expiry_interval_ms: 1000,
             max_roots: 64,
@@ -83,6 +98,10 @@ impl Default for QueryConfig {
             max_index_record_bytes: 1024 * 1024,
             max_index_bytes: 1024 * 1024 * 1024,
             index_rebuild_generation: 0,
+            max_overlay_memory_bytes: 128 * 1024 * 1024,
+            max_scope_overlay_bytes: 16 * 1024 * 1024,
+            max_scope_overlay_nodes: 4096,
+            max_overlay_layers: 32,
         }
     }
 }
@@ -94,6 +113,7 @@ impl QueryConfig {
             .saturating_add(self.max_frontier.saturating_mul(256))
             .saturating_add(self.max_response_bytes.saturating_mul(4))
             .saturating_add(self.max_index_record_bytes.saturating_mul(4))
+            .saturating_add(self.max_scope_overlay_bytes.saturating_mul(2))
             .saturating_add(8 * 1024 * 1024)
     }
     fn warm_memory(&self) -> usize {
@@ -110,6 +130,11 @@ impl QueryConfig {
             || self.max_scopes_per_principal > self.max_scopes
             || self.max_scopes_per_repository == 0
             || self.max_scopes_per_repository > self.max_scopes
+            || !(1..=65_536).contains(&self.max_scope_replays)
+            || self.max_scope_replays_per_principal == 0
+            || self.max_scope_replays_per_principal > self.max_scope_replays
+            || self.max_scope_replays_per_repository == 0
+            || self.max_scope_replays_per_repository > self.max_scope_replays
             || !(1024..=1024 * 1024 * 1024).contains(&self.max_scope_memory_bytes)
             || !(1..=86_400).contains(&self.scope_ttl_seconds)
             || !(10..=60_000).contains(&self.expiry_interval_ms)
@@ -151,6 +176,15 @@ impl QueryConfig {
             || self.max_index_bytes == 0
             || self.max_index_bytes > 64 * 1024 * 1024 * 1024
             || self.index_rebuild_generation > 1_000_000_000
+            || self.max_overlay_memory_bytes > 1024 * 1024 * 1024
+            || !(1..=64 * 1024 * 1024).contains(&self.max_scope_overlay_bytes)
+            || !(1..=65_536).contains(&self.max_scope_overlay_nodes)
+            || !(1..=128).contains(&self.max_overlay_layers)
+            || self
+                .max_scope_overlay_bytes
+                .saturating_mul(4)
+                .saturating_add(self.max_scope_overlay_nodes.saturating_mul(512))
+                > self.max_overlay_memory_bytes
         {
             return Err(ConfigError("invalid derived query limits"));
         }
@@ -210,19 +244,31 @@ pub(crate) fn index_error(error: tinytree_index::Error) -> Status {
 }
 pub(crate) struct Scoped {
     pub scope: Arc<Scope>,
+    graph: Option<Arc<OverlayGraph>>,
     pub wire: q::QueryScope,
+    parent: Option<Arc<Scoped>>,
+    depth: usize,
     roots: Vec<tinytree_store::RootReadGuard>,
-    memory: Option<OwnedSemaphorePermit>,
+    memory: Option<Arc<OwnedSemaphorePermit>>,
     cleanup: std::sync::mpsc::Sender<Cleanup>,
 }
+impl Scoped {
+    pub fn graph(&self) -> &Arc<OverlayGraph> {
+        self.graph.as_ref().expect("live scope graph")
+    }
+}
 struct Cleanup {
+    graph: Option<Arc<OverlayGraph>>,
+    parent: Option<Arc<Scoped>>,
     roots: Vec<tinytree_store::RootReadGuard>,
     scope: Arc<Scope>,
-    memory: Option<OwnedSemaphorePermit>,
+    memory: Option<Arc<OwnedSemaphorePermit>>,
 }
 impl Drop for Scoped {
     fn drop(&mut self) {
         let cleanup = Cleanup {
+            graph: self.graph.take(),
+            parent: self.parent.take(),
             roots: std::mem::take(&mut self.roots),
             scope: self.scope.clone(),
             memory: self.memory.take(),
@@ -238,13 +284,56 @@ impl Drop for Scoped {
         }
     }
 }
+pub(crate) struct OverlayMemory {
+    _permit: OwnedSemaphorePermit,
+}
+struct ChunkOwner {
+    _base: Arc<Scoped>,
+    _memory: Arc<OverlayMemory>,
+}
+pub(crate) struct Prepared {
+    pub base: Arc<Scoped>,
+    memory: Option<Arc<OverlayMemory>>,
+    binding: [u8; 32],
+    replayed: bool,
+    depth: usize,
+    expires_cap: Option<i64>,
+}
+impl Prepared {
+    pub fn digest(&self) -> blake3::Hasher {
+        let mut hash = blake3::Hasher::new();
+        hash.update(b"tinytree-overlay-scope-content-v1\0");
+        hash.update(&self.binding);
+        hash.update(&self.base.wire.content_digest);
+        hash
+    }
+}
+fn scope_binding(header: &q::ScopeHeader, parent: Option<&q::ScopeKey>) -> [u8; 32] {
+    let mut header = header.clone();
+    header.replay_key.clear();
+    let mut hash = blake3::Hasher::new();
+    hash.update(b"tinytree-overlay-scope-header-v1\0");
+    hash.update(&header.encode_to_vec());
+    match parent {
+        Some(parent) => {
+            hash.update(&[1]);
+            hash.update(&parent.encode_to_vec());
+        }
+        None => {
+            hash.update(&[0]);
+        }
+    }
+    *hash.finalize().as_bytes()
+}
 struct Record {
     owner: String,
     repository: String,
     replay: [u8; 32],
     digest: [u8; 32],
+    binding: [u8; 32],
     expires: i64,
     scope: Option<Arc<Scoped>>,
+    _memory: Arc<OwnedSemaphorePermit>,
 }
 #[derive(Default)]
 struct Registry {
@@ -276,6 +365,7 @@ pub(crate) struct QueryHost {
     pub store: tinytree_store::Store,
     registry: Mutex<Registry>,
     scope_memory: Arc<Semaphore>,
+    overlay_memory: Arc<Semaphore>,
     inflight: Arc<Semaphore>,
     memory: Arc<Semaphore>,
     request_memory: usize,
@@ -317,6 +407,8 @@ impl QueryHost {
                 while let Ok(batch) = cleanups.recv() {
                     // Root destruction can wait behind GC. Quota ownership remains
                     // charged until roots and the derived scope physically drop.
+                    drop(batch.graph);
+                    drop(batch.parent);
                     drop(batch.roots);
                     drop(batch.scope);
                     drop(batch.memory);
@@ -373,6 +465,7 @@ impl QueryHost {
             store,
             request_memory: config.request_memory(service.max_request_bytes),
             scope_memory: Arc::new(Semaphore::new(config.max_scope_memory_bytes)),
+            overlay_memory: Arc::new(Semaphore::new(config.max_overlay_memory_bytes)),
             inflight: Arc::new(Semaphore::new(config.max_inflight)),
             memory: Arc::new(Semaphore::new(config.max_request_memory_bytes)),
             config,
@@ -508,148 +601,392 @@ impl QueryHost {
         replay: [u8; 32],
         roots: Vec<m::CommitId>,
     ) -> Result<q::QueryScope, Status> {
-        self.store
-            .references(repository, &[])
-            .map_err(|_| Status::not_found("native repository unavailable"))?;
-        let mut hash = blake3::Hasher::new();
-        hash.update(b"tinytree-root-query-scope-v1\0");
-        hash.update(repository.as_bytes());
-        hash.update(&self.index.epoch());
-        for root in &roots {
-            hash.update(&root.0);
-        }
-        let digest = *hash.finalize().as_bytes();
-        let now = now()?;
-        self.expire(now);
-        {
-            let registry = self.registry.lock().unwrap();
-            if let Some(record) = registry.records.values().find(|record| {
-                record.owner == owner && record.repository == repository && record.replay == replay
-            }) {
-                if record.digest != digest {
-                    return Err(Status::already_exists(
-                        "scope replay key reused with different content",
-                    ));
-                }
-                return record
-                    .scope
-                    .as_ref()
-                    .map(|scope| scope.wire.clone())
-                    .ok_or_else(|| Status::failed_precondition("scope replay is closed"));
-            }
-        }
-        let mut pins = Vec::new();
-        for root in &roots {
-            if *root != m::CommitId::ROOT {
-                pins.push((
-                    *root,
-                    self.store
-                        .pin_root(
-                            repository,
-                            m::ObjectKey {
-                                kind: m::Kind::Commit,
-                                id: m::ObjectId(root.0),
-                            },
-                        )
-                        .map_err(|_| Status::not_found("query root unavailable"))?,
-                ));
-            }
-        }
-        let scope = match self.index.scope(repository, &roots) {
-            Ok(scope) => scope,
-            Err(tinytree_index::Error::NotReady) => {
-                for (root, pin) in pins {
-                    self.schedule(repository, root, pin)?;
-                }
-                return Err(Status::unavailable(
-                    "derived graph warming; retry the same logical roots",
-                ));
-            }
-            Err(error) => return Err(index_error(error)),
+        let header = q::ScopeHeader {
+            version: 1,
+            repository_id: repository.into(),
+            replay_key: replay.to_vec(),
+            roots: roots
+                .iter()
+                .map(|root| q::CommitId {
+                    value: root.0.to_vec(),
+                })
+                .collect(),
+            overlay_object_count: 0,
+            overlay_bytes: 0,
         };
-        let charge = roots
-            .len()
-            .saturating_mul(
-                4 * std::mem::size_of::<tinytree_store::RootReadGuard>()
-                    + 4 * std::mem::size_of::<m::CommitId>()
-                    + 128,
-            )
-            .saturating_add((owner.len() + repository.len()).saturating_mul(4))
-            .saturating_add(2048);
-        let memory = self
-            .scope_memory
-            .clone()
-            .try_acquire_many_owned(
-                u32::try_from(charge)
-                    .map_err(|_| Status::resource_exhausted("scope memory exceeded"))?,
-            )
-            .map_err(|_| Status::resource_exhausted("scope memory exceeded"))?;
-        let mut registry = self.registry.lock().unwrap();
-        if let Some(record) = registry.records.values().find(|record| {
-            record.owner == owner && record.repository == repository && record.replay == replay
-        }) {
-            if record.digest != digest {
-                return Err(Status::already_exists(
-                    "scope replay key reused with different content",
-                ));
-            }
-            return record
-                .scope
-                .as_ref()
-                .map(|scope| scope.wire.clone())
-                .ok_or_else(|| Status::failed_precondition("scope replay is closed"));
-        }
-        if registry.records.len() >= self.config.max_scopes
+        let prepared = self.prepare(owner, &header, roots, None)?;
+        let digest = *prepared.digest().finalize().as_bytes();
+        self.install(owner, &header, replay, prepared, Vec::new(), digest)
+            .map(|scope| scope.wire.clone())
+    }
+    fn room(&self, owner: &str, repository: &str, registry: &Registry) -> Result<(), Status> {
+        let active = |record: &&Record| record.scope.is_some();
+        if registry.records.values().filter(active).count() >= self.config.max_scopes
             || registry
                 .records
                 .values()
+                .filter(active)
                 .filter(|record| record.owner == owner)
                 .count()
                 >= self.config.max_scopes_per_principal
             || registry
                 .records
                 .values()
+                .filter(active)
                 .filter(|record| record.repository == repository)
                 .count()
                 >= self.config.max_scopes_per_repository
         {
-            return Err(Status::resource_exhausted("query scope quota exceeded"));
+            return Err(Status::resource_exhausted(
+                "active query scope quota exceeded",
+            ));
         }
+        if registry.records.len() >= self.config.max_scope_replays
+            || registry
+                .records
+                .values()
+                .filter(|record| record.owner == owner)
+                .count()
+                >= self.config.max_scope_replays_per_principal
+            || registry
+                .records
+                .values()
+                .filter(|record| record.repository == repository)
+                .count()
+                >= self.config.max_scope_replays_per_repository
+        {
+            return Err(Status::resource_exhausted(
+                "query scope replay history quota exceeded",
+            ));
+        }
+        Ok(())
+    }
+    fn replay(
+        &self,
+        owner: &str,
+        repository: &str,
+        replay: [u8; 32],
+        binding: [u8; 32],
+        digest: Option<[u8; 32]>,
+    ) -> Result<Option<Arc<Scoped>>, Status> {
+        let registry = self.registry.lock().unwrap();
+        let Some(record) = registry.records.values().find(|record| {
+            record.owner == owner && record.repository == repository && record.replay == replay
+        }) else {
+            return Ok(None);
+        };
+        if record.binding != binding || digest.is_some_and(|digest| record.digest != digest) {
+            return Err(Status::already_exists(
+                "scope replay key reused with different content",
+            ));
+        }
+        if record.expires <= now()? {
+            return Err(Status::failed_precondition("scope replay expired"));
+        }
+        record
+            .scope
+            .clone()
+            .map(Some)
+            .ok_or_else(|| Status::failed_precondition("scope replay is closed"))
+    }
+    pub fn prepare(
+        &self,
+        owner: &str,
+        header: &q::ScopeHeader,
+        roots: Vec<m::CommitId>,
+        parent: Option<q::ScopeKey>,
+    ) -> Result<Arc<Prepared>, Status> {
+        let repository = &header.repository_id;
+        self.store
+            .references(repository, &[])
+            .map_err(|_| Status::not_found("native repository unavailable"))?;
+        let replay: [u8; 32] = header
+            .replay_key
+            .as_slice()
+            .try_into()
+            .map_err(|_| Status::invalid_argument("invalid scope replay key"))?;
+        let binding = scope_binding(header, parent.as_ref());
+        let now = now()?;
+        self.expire(now);
+        if let Some(existing) = self.replay(owner, repository, replay, binding, None)? {
+            let base = existing
+                .parent
+                .clone()
+                .ok_or_else(|| Status::internal("scope replay anchor missing"))?;
+            return Ok(Arc::new(Prepared {
+                base,
+                memory: None,
+                binding,
+                replayed: true,
+                depth: existing.depth,
+                expires_cap: Some(existing.wire.expires_at_unix_seconds),
+            }));
+        }
+        self.room(owner, repository, &self.registry.lock().unwrap())?;
+        let (base, depth, expires_cap) = if let Some(parent) = parent {
+            if parent.repository_id != *repository {
+                return Err(Status::invalid_argument("fork parent repository differs"));
+            }
+            let base = self.lookup(owner, repository, &parent.handle)?;
+            if base.scope.roots() != roots.as_slice() {
+                return Err(Status::invalid_argument(
+                    "fork remote roots differ from parent",
+                ));
+            }
+            let depth = base
+                .depth
+                .checked_add(1)
+                .ok_or_else(|| Status::resource_exhausted("overlay layer overflow"))?;
+            let expires = base.wire.expires_at_unix_seconds;
+            (base, depth, Some(expires))
+        } else {
+            let mut pins = Vec::new();
+            for root in &roots {
+                if *root != m::CommitId::ROOT {
+                    pins.push((
+                        *root,
+                        self.store
+                            .pin_root(
+                                repository,
+                                m::ObjectKey {
+                                    kind: m::Kind::Commit,
+                                    id: m::ObjectId(root.0),
+                                },
+                            )
+                            .map_err(|_| Status::not_found("query root unavailable"))?,
+                    ));
+                }
+            }
+            let scope = match self.index.scope(repository, &roots) {
+                Ok(scope) => Arc::new(scope),
+                Err(tinytree_index::Error::NotReady) => {
+                    for (root, pin) in pins {
+                        self.schedule(repository, root, pin)?;
+                    }
+                    return Err(Status::unavailable(
+                        "derived graph warming; retry the same logical roots",
+                    ));
+                }
+                Err(error) => return Err(index_error(error)),
+            };
+            let charge = roots
+                .len()
+                .saturating_mul(
+                    4 * std::mem::size_of::<tinytree_store::RootReadGuard>()
+                        + 4 * std::mem::size_of::<m::CommitId>()
+                        + 128,
+                )
+                .saturating_add((owner.len() + repository.len()).saturating_mul(4))
+                .saturating_add(2048);
+            let memory = self
+                .scope_memory
+                .clone()
+                .try_acquire_many_owned(
+                    u32::try_from(charge)
+                        .map_err(|_| Status::resource_exhausted("scope memory exceeded"))?,
+                )
+                .map_err(|_| Status::resource_exhausted("scope memory exceeded"))?;
+            let mut hash = blake3::Hasher::new();
+            hash.update(b"tinytree-query-remote-anchor-v1\0");
+            hash.update(repository.as_bytes());
+            hash.update(&scope.epoch());
+            for root in &roots {
+                hash.update(&root.0);
+            }
+            let wire = q::QueryScope {
+                key: None,
+                content_digest: hash.finalize().as_bytes().to_vec(),
+                index_epoch: scope.epoch().to_vec(),
+                high_water: scope.high_water(),
+                expires_at_unix_seconds: now + self.config.scope_ttl_seconds as i64,
+            };
+            let graph = OverlayGraph::remote(scope.clone());
+            (
+                Arc::new(Scoped {
+                    scope,
+                    graph: Some(graph),
+                    wire,
+                    parent: None,
+                    depth: 0,
+                    roots: pins.into_iter().map(|(_, pin)| pin).collect(),
+                    memory: Some(Arc::new(memory)),
+                    cleanup: self.cleanup.clone(),
+                }),
+                usize::from(header.overlay_object_count > 0),
+                None,
+            )
+        };
+        if depth > self.config.max_overlay_layers
+            || base
+                .graph()
+                .node_count()
+                .saturating_add(header.overlay_object_count as usize)
+                > self.config.max_scope_overlay_nodes
+            || base
+                .graph()
+                .byte_count()
+                .saturating_add(header.overlay_bytes as usize)
+                > self.config.max_scope_overlay_bytes
+        {
+            return Err(Status::resource_exhausted(
+                "logical overlay limits exceeded",
+            ));
+        }
+        let memory = if header.overlay_object_count == 0 {
+            None
+        } else {
+            let charge = (header.overlay_bytes as usize)
+                .checked_mul(4)
+                .and_then(|bytes| {
+                    bytes.checked_add((header.overlay_object_count as usize).checked_mul(512)?)
+                })
+                .ok_or_else(|| Status::resource_exhausted("overlay memory overflow"))?;
+            Some(Arc::new(OverlayMemory {
+                _permit: self
+                    .overlay_memory
+                    .clone()
+                    .try_acquire_many_owned(
+                        u32::try_from(charge)
+                            .map_err(|_| Status::resource_exhausted("overlay memory exceeded"))?,
+                    )
+                    .map_err(|_| Status::resource_exhausted("overlay memory exceeded"))?,
+            }))
+        };
+        Ok(Arc::new(Prepared {
+            base,
+            memory,
+            binding,
+            replayed: false,
+            depth,
+            expires_cap,
+        }))
+    }
+    pub fn install(
+        &self,
+        owner: &str,
+        header: &q::ScopeHeader,
+        replay: [u8; 32],
+        prepared: Arc<Prepared>,
+        commits: Vec<(m::Descriptor, Arc<[u8]>)>,
+        digest: [u8; 32],
+    ) -> Result<Arc<Scoped>, Status> {
+        if let Some(scope) = self.replay(
+            owner,
+            &header.repository_id,
+            replay,
+            prepared.binding,
+            Some(digest),
+        )? {
+            return Ok(scope);
+        }
+        if prepared.replayed {
+            return Err(Status::failed_precondition(
+                "scope replay no longer available",
+            ));
+        }
+        let graph = if commits.is_empty() {
+            prepared.base.graph().clone()
+        } else {
+            let memory = prepared
+                .memory
+                .clone()
+                .ok_or_else(|| Status::internal("overlay reservation missing"))?;
+            let owner: Arc<dyn std::any::Any + Send + Sync> = Arc::new(ChunkOwner {
+                _base: prepared.base.clone(),
+                _memory: memory,
+            });
+            let limits = OverlayLimits {
+                max_depth: self.config.max_overlay_layers,
+                max_nodes: self.config.max_scope_overlay_nodes,
+                max_bytes: self.config.max_scope_overlay_bytes,
+                max_parents: self.config.max_commit_parents,
+                max_edges: self.config.max_work_edges as usize,
+                max_commit_bytes: self.config.max_commit_bytes,
+            };
+            OverlayGraph::extend(
+                prepared.base.graph().clone(),
+                commits,
+                &limits,
+                &mut self.config.budget(),
+                owner,
+            )
+            .map_err(index_error)?
+        };
+        let now = now()?;
+        let expires = (now + self.config.scope_ttl_seconds as i64)
+            .min(prepared.expires_cap.unwrap_or(i64::MAX));
+        if expires <= now {
+            return Err(Status::failed_precondition(
+                "fork parent expired during admission",
+            ));
+        }
+        let memory = self
+            .scope_memory
+            .clone()
+            .try_acquire_many_owned(
+                (2048usize
+                    .saturating_add(owner.len())
+                    .saturating_add(header.repository_id.len())) as u32,
+            )
+            .map_err(|_| Status::resource_exhausted("scope handle memory exceeded"))?;
+        let memory = Arc::new(memory);
+        let mut registry = self.registry.lock().unwrap();
+        if let Some(record) = registry.records.values().find(|record| {
+            record.owner == owner
+                && record.repository == header.repository_id
+                && record.replay == replay
+        }) {
+            if record.binding != prepared.binding || record.digest != digest {
+                return Err(Status::already_exists(
+                    "scope replay key reused with different content",
+                ));
+            }
+            if record.expires <= now {
+                return Err(Status::failed_precondition("scope replay expired"));
+            }
+            return record
+                .scope
+                .clone()
+                .ok_or_else(|| Status::failed_precondition("scope replay is closed"));
+        }
+        self.room(owner, &header.repository_id, &registry)?;
         let mut handle = [0; 32];
         handle[..16].copy_from_slice(uuid::Uuid::new_v4().as_bytes());
         handle[16..].copy_from_slice(uuid::Uuid::new_v4().as_bytes());
-        let expires = now
-            .checked_add(self.config.scope_ttl_seconds as i64)
-            .ok_or_else(|| Status::internal("scope expiry overflow"))?;
         let wire = q::QueryScope {
             key: Some(q::ScopeKey {
-                repository_id: repository.into(),
+                repository_id: header.repository_id.clone(),
                 handle: handle.to_vec(),
             }),
             content_digest: digest.to_vec(),
-            index_epoch: scope.epoch().to_vec(),
-            high_water: scope.high_water(),
+            index_epoch: prepared.base.scope.epoch().to_vec(),
+            high_water: prepared.base.scope.high_water(),
             expires_at_unix_seconds: expires,
         };
-        let scoped = Arc::new(Scoped {
-            scope: Arc::new(scope),
-            wire: wire.clone(),
-            roots: pins.into_iter().map(|(_, pin)| pin).collect(),
-            memory: Some(memory),
+        let scope = Arc::new(Scoped {
+            scope: prepared.base.scope.clone(),
+            graph: Some(graph),
+            wire,
+            parent: Some(prepared.base.clone()),
+            depth: prepared.depth,
+            roots: Vec::new(),
+            memory: Some(memory.clone()),
             cleanup: self.cleanup.clone(),
         });
         registry.records.insert(
             handle,
             Record {
                 owner: owner.into(),
-                repository: repository.into(),
+                repository: header.repository_id.clone(),
                 replay,
                 digest,
+                binding: prepared.binding,
                 expires,
-                scope: Some(scoped),
+                scope: Some(scope.clone()),
+                _memory: memory,
             },
         );
-        Ok(wire)
+        Ok(scope)
     }
     fn schedule(
         &self,

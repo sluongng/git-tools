@@ -130,7 +130,10 @@ impl WorkBudget {
     pub fn bytes_read(&self) -> u64 {
         self.bytes
     }
-    fn charge(&mut self, nodes: u64, edges: u64, bytes: u64) -> Result<()> {
+    /// Atomically account for record probes, traversed edges and bytes of read
+    /// work, including work performed by a host's private graph overlay.
+    /// Exhaustion leaves the accumulated counters unchanged.
+    pub fn charge(&mut self, nodes: u64, edges: u64, bytes: u64) -> Result<()> {
         let next = (
             self.nodes.checked_add(nodes),
             self.edges.checked_add(edges),
@@ -148,7 +151,9 @@ impl WorkBudget {
             _ => Err(Error::BudgetExceeded),
         }
     }
-    fn frontier(&self, size: usize) -> Result<()> {
+    /// Check an aggregate retained frontier before growing it. This is not a
+    /// memory reservation; the host still owns allocation and lifetime quotas.
+    pub fn frontier(&self, size: usize) -> Result<()> {
         if size > self.max_frontier {
             Err(Error::BudgetExceeded)
         } else {

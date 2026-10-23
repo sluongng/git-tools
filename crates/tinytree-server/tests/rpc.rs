@@ -1948,7 +1948,7 @@ async fn root_query_service_warms_persistently_and_returns_exact_facts_and_prefi
             .await
             .unwrap_err()
             .code(),
-        Code::Unimplemented
+        Code::InvalidArgument
     );
     assert_eq!(
         client
@@ -2033,6 +2033,9 @@ async fn query_scope_expiry_and_close_release_roots_without_future_requests() {
     config.query.max_scopes = 2;
     config.query.max_scopes_per_principal = 2;
     config.query.max_scopes_per_repository = 2;
+    config.query.max_scope_replays = 3;
+    config.query.max_scope_replays_per_principal = 3;
+    config.query.max_scope_replays_per_repository = 3;
     let server = Running::start_query(store.clone(), config, index).await;
     let mut client = server.query_client().await;
     let first = query_ready(&mut client, &[root], 1).await;
@@ -2061,6 +2064,33 @@ async fn query_scope_expiry_and_close_release_roots_without_future_requests() {
             .unwrap_err()
             .code(),
         Code::PermissionDenied
+    );
+    let replacement = query_ready(&mut client, &[root], 3).await;
+    assert_eq!(
+        client
+            .open_scope(request(tokio_stream::iter(query_frames(&[root], 1)), ALPHA))
+            .await
+            .unwrap_err()
+            .code(),
+        Code::FailedPrecondition
+    );
+    client
+        .close_scope(request(
+            q::CloseScopeRequest {
+                scope: replacement.key,
+            },
+            ALPHA,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        client
+            .open_scope(request(tokio_stream::iter(query_frames(&[root], 4)), ALPHA))
+            .await
+            .unwrap_err()
+            .code(),
+        Code::ResourceExhausted,
+        "closed replay bindings remain bounded until their absolute expiry"
     );
     store.gc("alpha", i64::MAX - 1).unwrap();
     assert!(store.descriptor("alpha", root).unwrap().is_some());
@@ -2644,4 +2674,531 @@ async fn production_index_generation_activation_reuses_ready_state_and_preserves
         previous_contents,
         "schema activation must not open or rewrite a previous format"
     );
+}
+
+fn private_query_frames(
+    roots: &[ObjectKey],
+    replay: u8,
+    objects: &[&tinytree_model::EncodedObject],
+) -> Vec<q::OpenScopeFrame> {
+    let mut frames = query_frames(roots, replay);
+    let bytes = objects.iter().map(|object| object.bytes.len() as u64).sum();
+    let Some(q::open_scope_frame::Frame::Header(header)) = &mut frames[0].frame else {
+        unreachable!()
+    };
+    header.overlay_object_count = objects.len() as u64;
+    header.overlay_bytes = bytes;
+    frames.pop();
+    for object in objects {
+        frames.push(q::OpenScopeFrame {
+            frame: Some(q::open_scope_frame::Frame::Commit(q::OverlayCommitHeader {
+                descriptor: Some(descriptor(object.descriptor)),
+            })),
+        });
+        frames.push(q::OpenScopeFrame {
+            frame: Some(q::open_scope_frame::Frame::Chunk(p::DataChunk {
+                offset: 0,
+                data: object.bytes.clone(),
+            })),
+        });
+        frames.push(q::OpenScopeFrame {
+            frame: Some(q::open_scope_frame::Frame::CommitEnd(q::OverlayCommitEnd {
+                size_bytes: object.bytes.len() as u64,
+                content_blake3: object.descriptor.key.id.0.to_vec(),
+            })),
+        });
+    }
+    frames.push(q::OpenScopeFrame {
+        frame: Some(q::open_scope_frame::Frame::ScopeEnd(q::ScopeEnd {
+            overlay_object_count: objects.len() as u64,
+            overlay_bytes: bytes,
+        })),
+    });
+    frames
+}
+fn private_fork_frames(
+    parent: q::ScopeKey,
+    frames: Vec<q::OpenScopeFrame>,
+) -> Vec<q::ForkScopeFrame> {
+    frames
+        .into_iter()
+        .map(|frame| q::ForkScopeFrame {
+            frame: frame.frame.map(|frame| match frame {
+                q::open_scope_frame::Frame::Header(scope) => {
+                    q::fork_scope_frame::Frame::Header(q::ForkScopeHeader {
+                        scope: Some(scope),
+                        parent_scope: Some(parent.clone()),
+                    })
+                }
+                q::open_scope_frame::Frame::Commit(v) => q::fork_scope_frame::Frame::Commit(v),
+                q::open_scope_frame::Frame::Chunk(v) => q::fork_scope_frame::Frame::Chunk(v),
+                q::open_scope_frame::Frame::CommitEnd(v) => {
+                    q::fork_scope_frame::Frame::CommitEnd(v)
+                }
+                q::open_scope_frame::Frame::ScopeEnd(v) => q::fork_scope_frame::Frame::ScopeEnd(v),
+            }),
+        })
+        .collect()
+}
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn private_query_scopes_share_forks_without_publishing_or_disclosing_drafts() {
+    let (temporary, store) = setup();
+    let index =
+        tinytree_index::Index::open(temporary.path().join("derived"), &Default::default()).unwrap();
+    let canonical = fixture();
+    let ancestor = root(&canonical);
+    let mut remote_commit = None;
+    for object in canonical.objects() {
+        store
+            .put("alpha", object.descriptor, &object.bytes, 0)
+            .unwrap();
+        if object.descriptor.key.kind == Kind::Commit {
+            index
+                .ingest("alpha", object.descriptor, &object.bytes)
+                .unwrap();
+            if object.descriptor.key == ancestor {
+                let Object::Commit(value) =
+                    tinytree_model::decode(&object.bytes, Limits::default()).unwrap()
+                else {
+                    unreachable!()
+                };
+                remote_commit = Some(value);
+            }
+        }
+    }
+    let mut commit = remote_commit.unwrap();
+    commit.parents = vec![CommitId(ancestor.id.0)];
+    commit.change_id = tinytree_model::ChangeId([70; 16]);
+    let remote =
+        tinytree_model::encode(&Object::Commit(commit.clone()), Limits::default()).unwrap();
+    store
+        .put("alpha", remote.descriptor, &remote.bytes, 0)
+        .unwrap();
+    index
+        .ingest("alpha", remote.descriptor, &remote.bytes)
+        .unwrap();
+    let checkpoint = remote.descriptor.key;
+    let server = Running::start_query(store.clone(), ServiceConfig::default(), index.clone()).await;
+    let mut client = server.query_client().await;
+    commit.parents = vec![CommitId(checkpoint.id.0)];
+    commit.change_id = tinytree_model::ChangeId([71; 16]);
+    let first = tinytree_model::encode(&Object::Commit(commit.clone()), Limits::default()).unwrap();
+    commit.description = "private divergent sibling".into();
+    let sibling =
+        tinytree_model::encode(&Object::Commit(commit.clone()), Limits::default()).unwrap();
+    let frames = private_query_frames(&[checkpoint], 10, &[&first, &sibling]);
+    let parent = client
+        .open_scope(request(tokio_stream::iter(frames.clone()), ALPHA))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(
+        client
+            .open_scope(request(tokio_stream::iter(frames.clone()), ALPHA))
+            .await
+            .unwrap()
+            .into_inner(),
+        parent
+    );
+    let base = query_ready(&mut client, &[checkpoint], 11).await;
+    for (scope, expected) in [(base.key.clone(), false), (parent.key.clone(), true)] {
+        let facts = client
+            .query_facts(request(
+                q::QueryFactsRequest {
+                    scope,
+                    facts: vec![q::GraphFact {
+                        fact: Some(q::graph_fact::Fact::HasId(q::HasId {
+                            commit: Some(query_id(first.descriptor.key)),
+                        })),
+                    }],
+                },
+                ALPHA,
+            ))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(
+            facts.answers[0].answer,
+            Some(q::graph_fact_answer::Answer::HasId(expected))
+        );
+    }
+    assert_eq!(
+        client
+            .query_facts(request(
+                q::QueryFactsRequest {
+                    scope: parent.key.clone(),
+                    facts: vec![]
+                },
+                PEER
+            ))
+            .await
+            .unwrap_err()
+            .code(),
+        Code::PermissionDenied
+    );
+    let changes = client
+        .resolve_change_prefix(request(
+            q::ResolveChangePrefixRequest {
+                scope: parent.key.clone(),
+                hex_prefix: "47".repeat(16),
+                visible_heads: vec![query_id(first.descriptor.key)],
+            },
+            ALPHA,
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+    let Some(q::change_prefix_result::Result::Single(changes)) = changes.result else {
+        panic!("private change must resolve")
+    };
+    assert_eq!(changes.targets.len(), 2);
+    assert_eq!(
+        changes
+            .targets
+            .iter()
+            .filter(|target| target.visible == Some(true))
+            .count(),
+        1
+    );
+    assert_eq!(
+        changes
+            .targets
+            .iter()
+            .filter(|target| target.visible == Some(false))
+            .count(),
+        1
+    );
+    client
+        .close_scope(request(q::CloseScopeRequest { scope: base.key }, ALPHA))
+        .await
+        .unwrap();
+    commit.parents = vec![CommitId(first.descriptor.key.id.0)];
+    commit.change_id = tinytree_model::ChangeId([72; 16]);
+    let child = tinytree_model::encode(&Object::Commit(commit.clone()), Limits::default()).unwrap();
+    let forks = private_fork_frames(
+        parent.key.clone().unwrap(),
+        private_query_frames(&[checkpoint], 12, &[&child]),
+    );
+    let fork = client
+        .fork_scope(request(tokio_stream::iter(forks.clone()), ALPHA))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(fork.index_epoch, parent.index_epoch);
+    assert_eq!(fork.high_water, parent.high_water);
+    assert!(fork.expires_at_unix_seconds <= parent.expires_at_unix_seconds);
+    client
+        .close_scope(request(
+            q::CloseScopeRequest {
+                scope: parent.key.clone(),
+            },
+            ALPHA,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        client
+            .fork_scope(request(tokio_stream::iter(forks), ALPHA))
+            .await
+            .unwrap()
+            .into_inner(),
+        fork,
+        "known replay must not need the now-closed parent handle"
+    );
+    assert_eq!(
+        client
+            .open_scope(request(tokio_stream::iter(frames), ALPHA))
+            .await
+            .unwrap_err()
+            .code(),
+        Code::FailedPrecondition
+    );
+    // No canonical refs or unexpired staging leases protect this checkpoint.
+    // Only the live private child retains the shared authoritative root pin.
+    store.gc("alpha", i64::MAX - 1).unwrap();
+    for key in [checkpoint, ancestor] {
+        assert!(
+            store.descriptor("alpha", key).unwrap().is_some(),
+            "fork must retain the nonintrinsic checkpoint and its ancestry"
+        );
+    }
+    let facts = client
+        .query_facts(request(
+            q::QueryFactsRequest {
+                scope: fork.key.clone(),
+                facts: vec![q::GraphFact {
+                    fact: Some(q::graph_fact::Fact::IsAncestor(q::IsAncestor {
+                        ancestor: Some(query_id(first.descriptor.key)),
+                        descendant: Some(query_id(child.descriptor.key)),
+                    })),
+                }],
+            },
+            ALPHA,
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(
+        facts.answers[0].answer,
+        Some(q::graph_fact_answer::Answer::IsAncestor(true))
+    );
+    for object in [&first, &sibling, &child] {
+        assert!(
+            store
+                .descriptor("alpha", object.descriptor.key)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            index
+                .node("alpha", CommitId(object.descriptor.key.id.0))
+                .unwrap()
+                .is_none()
+        );
+    }
+    // A different valid payload cannot reuse the installed fork replay key.
+    commit.description = "different private child".into();
+    let changed = tinytree_model::encode(&Object::Commit(commit), Limits::default()).unwrap();
+    let changed = private_fork_frames(
+        parent.key.unwrap(),
+        private_query_frames(&[checkpoint], 12, &[&changed]),
+    );
+    assert_eq!(
+        client
+            .fork_scope(request(tokio_stream::iter(changed), ALPHA))
+            .await
+            .unwrap_err()
+            .code(),
+        Code::AlreadyExists
+    );
+    client
+        .close_scope(request(q::CloseScopeRequest { scope: fork.key }, ALPHA))
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let store = store.clone();
+            let reclaimed = tokio::task::spawn_blocking(move || {
+                store.gc("alpha", i64::MAX - 1).unwrap();
+                [checkpoint, ancestor]
+                    .into_iter()
+                    .all(|key| store.descriptor("alpha", key).unwrap().is_none())
+            })
+            .await
+            .unwrap();
+            if reclaimed {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap();
+    drop(client);
+    server.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn private_query_streams_reject_incomplete_duplicate_and_nonmember_payloads_atomically() {
+    let (temporary, store) = setup();
+    let index =
+        tinytree_index::Index::open(temporary.path().join("derived"), &Default::default()).unwrap();
+    let server = Running::start_query(store, ServiceConfig::default(), index).await;
+    let mut client = server.query_client().await;
+    let zero = ObjectKey {
+        kind: Kind::Commit,
+        id: ObjectId([0; 32]),
+    };
+    let mut commit = tinytree_model::synthetic_root();
+    commit.parents = vec![CommitId::ROOT];
+    commit.change_id = tinytree_model::ChangeId([73; 16]);
+    let valid = tinytree_model::encode(&Object::Commit(commit.clone()), Limits::default()).unwrap();
+    let mut truncated = private_query_frames(&[zero], 20, &[&valid]);
+    truncated.pop();
+    let mut gap = private_query_frames(&[zero], 21, &[&valid]);
+    let Some(q::open_scope_frame::Frame::Chunk(chunk)) = &mut gap[2].frame else {
+        unreachable!()
+    };
+    chunk.offset = 1;
+    let duplicate = private_query_frames(&[zero], 22, &[&valid, &valid]);
+    commit.parents = vec![CommitId([93; 32])];
+    let unknown = tinytree_model::encode(&Object::Commit(commit), Limits::default()).unwrap();
+    let unknown = private_query_frames(&[zero], 23, &[&unknown]);
+    let mut oversized = query_frames(&[zero], 24);
+    let Some(q::open_scope_frame::Frame::Header(header)) = &mut oversized[0].frame else {
+        unreachable!()
+    };
+    header.overlay_object_count = 4097;
+    header.overlay_bytes = 1;
+    for (name, frames, code) in [
+        ("truncated", truncated, Code::InvalidArgument),
+        ("gap", gap, Code::InvalidArgument),
+        ("duplicate", duplicate, Code::InvalidArgument),
+        ("unknown parent", unknown, Code::InvalidArgument),
+        ("declaration limit", oversized, Code::ResourceExhausted),
+    ] {
+        assert_eq!(
+            client
+                .open_scope(request(tokio_stream::iter(frames), ALPHA))
+                .await
+                .unwrap_err()
+                .code(),
+            code,
+            "{name}"
+        );
+    }
+    // A failed stream installs neither a scope nor a replay tombstone.
+    client
+        .open_scope(request(
+            tokio_stream::iter(private_query_frames(&[zero], 20, &[&valid])),
+            ALPHA,
+        ))
+        .await
+        .unwrap();
+    drop(client);
+    server.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn private_query_reservations_follow_shared_physical_scope_lifetimes() {
+    let (temporary, store) = setup();
+    let index =
+        tinytree_index::Index::open(temporary.path().join("derived"), &Default::default()).unwrap();
+    let zero = ObjectKey {
+        kind: Kind::Commit,
+        id: ObjectId([0; 32]),
+    };
+    let mut commit = tinytree_model::synthetic_root();
+    commit.parents = vec![CommitId::ROOT];
+    commit.change_id = tinytree_model::ChangeId([74; 16]);
+    let object = tinytree_model::encode(&Object::Commit(commit), Limits::default()).unwrap();
+    let mut config = ServiceConfig::default();
+    config.query.max_scope_overlay_bytes = object.bytes.len();
+    config.query.max_scope_overlay_nodes = 1;
+    config.query.max_overlay_memory_bytes = object.bytes.len() * 4 + 512;
+    config.rpc.stream_idle_timeout_ms = 100;
+    let server = Running::start_query(store, config, index).await;
+    let mut client = server.query_client().await;
+    let frames = private_query_frames(&[zero], 30, &[&object]);
+    let parent = client
+        .open_scope(request(tokio_stream::iter(frames.clone()), ALPHA))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(
+        client
+            .open_scope(request(tokio_stream::iter(frames), ALPHA))
+            .await
+            .unwrap()
+            .into_inner(),
+        parent,
+        "replay does not allocate another private graph"
+    );
+    let fork = client
+        .fork_scope(request(
+            tokio_stream::iter(private_fork_frames(
+                parent.key.clone().unwrap(),
+                query_frames(&[zero], 31),
+            )),
+            ALPHA,
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+    client
+        .close_scope(request(q::CloseScopeRequest { scope: parent.key }, ALPHA))
+        .await
+        .unwrap();
+    assert_eq!(
+        client
+            .open_scope(request(
+                tokio_stream::iter(private_query_frames(&[zero], 32, &[&object])),
+                ALPHA
+            ))
+            .await
+            .unwrap_err()
+            .code(),
+        Code::ResourceExhausted,
+        "child retains the shared private reservation after parent close"
+    );
+    client
+        .close_scope(request(q::CloseScopeRequest { scope: fork.key }, ALPHA))
+        .await
+        .unwrap();
+    // Blocking cleanup, not CloseScope response timing, determines availability.
+    let recovered = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            match client
+                .open_scope(request(
+                    tokio_stream::iter(private_query_frames(&[zero], 32, &[&object])),
+                    ALPHA,
+                ))
+                .await
+            {
+                Ok(value) => break value.into_inner(),
+                Err(error) if error.code() == Code::ResourceExhausted => {
+                    tokio::time::sleep(Duration::from_millis(5)).await
+                }
+                other => panic!("reservation did not become available: {other:?}"),
+            }
+        }
+    })
+    .await
+    .unwrap();
+    client
+        .close_scope(request(
+            q::CloseScopeRequest {
+                scope: recovered.key,
+            },
+            ALPHA,
+        ))
+        .await
+        .unwrap();
+    // Incomplete accepted bodies have an idle deadline and cannot hold a
+    // preliminary anchor/reservation forever after a caller stops producing.
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let (sender, receiver) = mpsc::channel(1);
+            sender
+                .send(private_query_frames(&[zero], 33, &[&object]).remove(0))
+                .await
+                .unwrap();
+            let error = client
+                .open_scope(request(
+                    tokio_stream::wrappers::ReceiverStream::new(receiver),
+                    ALPHA,
+                ))
+                .await
+                .unwrap_err();
+            drop(sender);
+            match error.code() {
+                Code::DeadlineExceeded => break,
+                Code::ResourceExhausted => tokio::time::sleep(Duration::from_millis(5)).await,
+                other => panic!("accepted incomplete stream must expire: {other:?}"),
+            }
+        }
+    })
+    .await
+    .unwrap();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            match client
+                .open_scope(request(
+                    tokio_stream::iter(private_query_frames(&[zero], 34, &[&object])),
+                    ALPHA,
+                ))
+                .await
+            {
+                Ok(_) => break,
+                Err(error) if error.code() == Code::ResourceExhausted => {
+                    tokio::time::sleep(Duration::from_millis(5)).await
+                }
+                other => panic!("incomplete stream leaked its reservation: {other:?}"),
+            }
+        }
+    })
+    .await
+    .unwrap();
+    drop(client);
+    server.stop().await;
 }

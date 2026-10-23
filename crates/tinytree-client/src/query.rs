@@ -1,4 +1,4 @@
-//! Checked root-only query scopes. Exact negative/completeness answers trust the
+//! Checked immutable query scopes with private canonical draft overlays. Exact negative/completeness answers trust the
 //! authenticated server; canonical IDs cannot prove that results were not omitted.
 use super::*;
 use tinytree_model::{ChangeId, CommitId};
@@ -12,8 +12,13 @@ pub struct CheckedScopeHandle {
     epoch: [u8; 16],
     high_water: u64,
     expires_at: i64,
+    remote_roots: Arc<[CommitId]>,
 }
 impl CheckedScopeHandle {
+    /// Authoritative remote checkpoint roots, not private draft heads.
+    pub fn remote_roots(&self) -> &[CommitId] {
+        &self.remote_roots
+    }
     pub fn repository_id(&self) -> &str {
         &self.repository
     }
@@ -99,20 +104,115 @@ impl NativeClient {
         }
         Ok(())
     }
-    /// Opens an immutable root-only scope. Overlays, forks and evaluation are not
-    /// implemented by this client API; this is not an offload/backup receipt.
+    /// Opens an immutable remote-root scope without private drafts.
     pub async fn open_query_scope(
         &self,
-        mut roots: Vec<CommitId>,
+        roots: Vec<CommitId>,
     ) -> Result<CheckedScopeHandle, Status> {
-        let deadline = self.deadline();
+        self.open_query_scope_with_overlay(roots, Vec::new()).await
+    }
+    /// Admits private, parent-first canonical drafts into a query scope only.
+    /// This neither uploads authoritative objects nor publishes/backups changes.
+    /// Membership of external/inherited parents is checked by the server.
+    pub async fn open_query_scope_with_overlay(
+        &self,
+        mut roots: Vec<CommitId>,
+        overlay: Vec<VerifiedMetadata>,
+    ) -> Result<CheckedScopeHandle, Status> {
         self.batch(roots.len())?;
         roots.sort_unstable();
         roots.dedup();
         if roots.is_empty() {
             return Err(Status::invalid_argument("query scope requires roots"));
         }
-        let _budget = self.admit(deadline, self.unary_memory()).await?;
+        self.install_query_scope(roots.into(), overlay, None).await
+    }
+    /// Shares the parent's immutable remote checkpoint and private graph, adding
+    /// only these parent-first drafts. Forks cannot extend the parent's expiry.
+    pub async fn fork_query_scope(
+        &self,
+        parent: &CheckedScopeHandle,
+        overlay: Vec<VerifiedMetadata>,
+    ) -> Result<CheckedScopeHandle, Status> {
+        self.checked_scope(parent, false)?;
+        self.install_query_scope(parent.remote_roots.clone(), overlay, Some(parent))
+            .await
+    }
+    async fn install_query_scope(
+        &self,
+        roots: Arc<[CommitId]>,
+        overlay: Vec<VerifiedMetadata>,
+        parent: Option<&CheckedScopeHandle>,
+    ) -> Result<CheckedScopeHandle, Status> {
+        let deadline = self.deadline();
+        self.batch(overlay.len())?;
+        let limits = &self.inner.config.limits;
+        let mut total = 0usize;
+        for object in &overlay {
+            if object.descriptor.key.kind != Kind::Commit
+                || object.descriptor.key.id.0 == [0; 32]
+                || !matches!(&object.object, Object::Commit(_))
+                || object.bytes.len() > limits.max_metadata_bytes
+                || object.descriptor.size_bytes != object.bytes.len() as u64
+            {
+                return Err(Status::invalid_argument(
+                    "query overlay requires verified non-root commits",
+                ));
+            }
+            total = total
+                .checked_add(object.bytes.len())
+                .ok_or_else(|| Status::resource_exhausted("query overlay bytes exceed budget"))?;
+        }
+        if total > limits.max_batch_bytes {
+            return Err(Status::resource_exhausted(
+                "query overlay bytes exceed budget",
+            ));
+        }
+        let memory = total
+            .checked_mul(4)
+            .and_then(|n| {
+                overlay
+                    .len()
+                    .checked_mul(512)
+                    .and_then(|nodes| n.checked_add(nodes))
+            })
+            .and_then(|n| n.checked_add(self.unary_memory()))
+            .ok_or_else(|| Status::resource_exhausted("query overlay memory exceeds budget"))?;
+        let budget = self.admit(deadline, memory).await?;
+        let all: HashSet<_> = overlay
+            .iter()
+            .map(|object| object.descriptor.key.id)
+            .collect();
+        if all.len() != overlay.len() {
+            return Err(Status::invalid_argument("duplicate query overlay commit"));
+        }
+        let mut earlier = HashSet::with_capacity(overlay.len());
+        for object in &overlay {
+            let Object::Commit(commit) = &object.object else {
+                unreachable!()
+            };
+            for parent in &commit.parents {
+                let key = ObjectId(parent.0);
+                if all.contains(&key) && !earlier.contains(&key) {
+                    return Err(Status::invalid_argument(
+                        "query overlay commits must be parent-first",
+                    ));
+                }
+            }
+            earlier.insert(object.descriptor.key.id);
+        }
+        // Move canonical byte vectors once; retries share them without retaining
+        // a second decoded object graph or cloning complete payloads per attempt.
+        let overlay = Arc::new(Overlay {
+            total: total as u64,
+            commits: overlay
+                .into_iter()
+                .map(|object| OverlayCommit {
+                    descriptor: object.descriptor,
+                    bytes: object.bytes,
+                })
+                .collect(),
+        });
         let mut replay_key = [0u8; 32];
         getrandom::fill(&mut replay_key)
             .map_err(|_| Status::internal("cannot generate query replay identity"))?;
@@ -120,24 +220,73 @@ impl NativeClient {
             version: 1,
             repository_id: self.inner.config.repository_id.clone(),
             replay_key: replay_key.to_vec(),
-            roots: roots.into_iter().map(wire_commit).collect(),
-            overlay_object_count: 0,
-            overlay_bytes: 0,
+            roots: roots.iter().copied().map(wire_commit).collect(),
+            overlay_object_count: overlay.commits.len() as u64,
+            overlay_bytes: overlay.total,
         };
-        self.bounded(&header)?;
+        let frame_bytes = limits
+            .max_frame_bytes
+            .min(limits.max_request_bytes.saturating_sub(128));
+        if frame_bytes == 0 {
+            return Err(Status::resource_exhausted("query frame budget too small"));
+        }
+        let fork_header = parent.map(|parent| q::ForkScopeHeader {
+            scope: Some(header.clone()),
+            parent_scope: Some(parent.key()),
+        });
+        if let Some(header) = &fork_header {
+            self.bounded(&q::ForkScopeFrame {
+                frame: Some(q::fork_scope_frame::Frame::Header(header.clone())),
+            })?;
+        } else {
+            self.bounded(&q::OpenScopeFrame {
+                frame: Some(q::open_scope_frame::Frame::Header(header.clone())),
+            })?;
+        }
         self.retry(deadline, true, |allowance| {
             let mut grpc = self.inner.grpc.clone();
-            let header = header.clone();
-            let budget = _budget.clone();
+            let (header, fork_header, overlay, budget, roots) = (
+                header.clone(),
+                fork_header.clone(),
+                overlay.clone(),
+                budget.clone(),
+                roots.clone(),
+            );
             async move {
-                let frames = scope_frames(header, budget);
-                let scope = grpc
-                    .open_scope(self.request(frames, allowance))
+                let (done, finished) = tokio::sync::oneshot::channel();
+                let physical_owner = Arc::new((overlay.clone(), budget.clone()));
+                let scope = if let Some(header) = fork_header {
+                    grpc.fork_scope(
+                        self.request(
+                            fork_scope_frames(header, overlay, budget, frame_bytes, done),
+                            allowance,
+                        ),
+                        physical_owner,
+                    )
                     .await?
-                    .into_inner();
+                    .into_inner()
+                } else {
+                    grpc.open_scope(
+                        self.request(
+                            scope_frames(header, overlay, budget, frame_bytes, done),
+                            allowance,
+                        ),
+                        physical_owner,
+                    )
+                    .await?
+                    .into_inner()
+                };
+                reapi::policy::timeout(deadline, async { finished.await.map_err(|_| integrity()) })
+                    .await?;
                 let key = scope.key.ok_or_else(integrity)?;
                 if key.repository_id != self.inner.config.repository_id
                     || scope.expires_at_unix_seconds <= unix_seconds()?
+                    || parent.is_some_and(|parent| {
+                        key.handle.as_slice() == parent.handle
+                            || scope.expires_at_unix_seconds > parent.expires_at
+                            || scope.high_water != parent.high_water
+                            || scope.index_epoch.as_slice() != parent.epoch
+                    })
                 {
                     return Err(integrity());
                 }
@@ -148,6 +297,7 @@ impl NativeClient {
                     epoch: scope.index_epoch.try_into().map_err(|_| integrity())?,
                     high_water: scope.high_water,
                     expires_at: scope.expires_at_unix_seconds,
+                    remote_roots: roots,
                 })
             }
         })
@@ -430,15 +580,73 @@ impl NativeClient {
         .await
     }
 }
+struct OverlayCommit {
+    descriptor: Descriptor,
+    bytes: Vec<u8>,
+}
+struct Overlay {
+    commits: Vec<OverlayCommit>,
+    total: u64,
+}
+enum OverlayFrame {
+    Commit(q::OverlayCommitHeader),
+    Chunk(p::DataChunk),
+    CommitEnd(q::OverlayCommitEnd),
+    ScopeEnd(q::ScopeEnd),
+}
+fn overlay_frames(
+    overlay: Arc<Overlay>,
+    budget: Arc<Budget>,
+    frame_bytes: usize,
+) -> impl tonic::codegen::tokio_stream::Stream<Item = OverlayFrame> + Send + 'static {
+    async_stream::stream! {
+        let _budget = budget;
+        for commit in &overlay.commits {
+            yield OverlayFrame::Commit(q::OverlayCommitHeader { descriptor: Some(wire_descriptor(commit.descriptor)) });
+            for (index, bytes) in commit.bytes.chunks(frame_bytes).enumerate() {
+                yield OverlayFrame::Chunk(p::DataChunk { offset: (index * frame_bytes) as u64, data: bytes.to_vec() });
+            }
+            yield OverlayFrame::CommitEnd(q::OverlayCommitEnd { size_bytes: commit.descriptor.size_bytes, content_blake3: commit.descriptor.key.id.0.to_vec() });
+        }
+        yield OverlayFrame::ScopeEnd(q::ScopeEnd { overlay_object_count: overlay.commits.len() as u64, overlay_bytes: overlay.total });
+    }
+}
 fn scope_frames(
     header: q::ScopeHeader,
+    overlay: Arc<Overlay>,
     budget: Arc<Budget>,
+    frame_bytes: usize,
+    done: tokio::sync::oneshot::Sender<()>,
 ) -> impl tonic::codegen::tokio_stream::Stream<Item = q::OpenScopeFrame> + Send + 'static {
     async_stream::stream! {
-        // Tonic may retain the request body after its response waiter cancels.
-        let _budget = budget;
+        use tonic::codegen::tokio_stream::StreamExt;
+        let body = overlay_frames(overlay,budget,frame_bytes); tokio::pin!(body);
         yield q::OpenScopeFrame { frame: Some(q::open_scope_frame::Frame::Header(header)) };
-        yield q::OpenScopeFrame { frame: Some(q::open_scope_frame::Frame::ScopeEnd(q::ScopeEnd { overlay_object_count: 0, overlay_bytes: 0 })) };
+        while let Some(frame) = body.next().await {
+            use q::open_scope_frame::Frame;
+            let frame = match frame { OverlayFrame::Commit(v)=>Frame::Commit(v),OverlayFrame::Chunk(v)=>Frame::Chunk(v),OverlayFrame::CommitEnd(v)=>Frame::CommitEnd(v),OverlayFrame::ScopeEnd(v)=>Frame::ScopeEnd(v) };
+            yield q::OpenScopeFrame { frame: Some(frame) };
+        }
+        let _ = done.send(());
+    }
+}
+fn fork_scope_frames(
+    header: q::ForkScopeHeader,
+    overlay: Arc<Overlay>,
+    budget: Arc<Budget>,
+    frame_bytes: usize,
+    done: tokio::sync::oneshot::Sender<()>,
+) -> impl tonic::codegen::tokio_stream::Stream<Item = q::ForkScopeFrame> + Send + 'static {
+    async_stream::stream! {
+        use tonic::codegen::tokio_stream::StreamExt;
+        let body = overlay_frames(overlay,budget,frame_bytes); tokio::pin!(body);
+        yield q::ForkScopeFrame { frame: Some(q::fork_scope_frame::Frame::Header(header)) };
+        while let Some(frame) = body.next().await {
+            use q::fork_scope_frame::Frame;
+            let frame = match frame { OverlayFrame::Commit(v)=>Frame::Commit(v),OverlayFrame::Chunk(v)=>Frame::Chunk(v),OverlayFrame::CommitEnd(v)=>Frame::CommitEnd(v),OverlayFrame::ScopeEnd(v)=>Frame::ScopeEnd(v) };
+            yield q::ForkScopeFrame { frame: Some(frame) };
+        }
+        let _ = done.send(());
     }
 }
 

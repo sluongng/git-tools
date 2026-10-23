@@ -1,5 +1,5 @@
-//! Authenticated root-only query RPCs. Unsupported overlay/evaluation work is
-//! explicit; no partial graph is promoted into a complete scope.
+//! Authenticated immutable remote and private-draft query scopes.
+//! Evaluation remains explicit unsupported work.
 use crate::{
     RepositoryService,
     auth::Identity,
@@ -60,6 +60,196 @@ impl QueryService {
             ));
         }
         Ok(())
+    }
+    async fn upload<T: Message + Send + 'static>(
+        &self,
+        identity: Identity,
+        deadline: Instant,
+        host: Arc<QueryHost>,
+        work: Arc<Work>,
+        header: q::ScopeHeader,
+        parent: Option<q::ScopeKey>,
+        mut stream: Streaming<T>,
+        frame: impl Fn(T) -> UploadFrame,
+    ) -> Result<Response<q::QueryScope>, Status> {
+        if header.version != 1 {
+            return Err(Status::invalid_argument("unsupported query scope version"));
+        }
+        let replay: [u8; 32] = header
+            .replay_key
+            .as_slice()
+            .try_into()
+            .map_err(|_| Status::invalid_argument("scope replay key must be 32 bytes"))?;
+        if header.overlay_object_count > host.config.max_scope_overlay_nodes as u64
+            || header.overlay_bytes > host.config.max_scope_overlay_bytes as u64
+        {
+            return Err(Status::resource_exhausted(
+                "scope overlay declaration exceeds budget",
+            ));
+        }
+        if (header.overlay_object_count == 0) != (header.overlay_bytes == 0) {
+            return Err(Status::invalid_argument(
+                "inconsistent scope overlay declaration",
+            ));
+        }
+        let roots = ids(&header.roots, host.config.max_roots)?;
+        if roots.is_empty() || roots.windows(2).any(|pair| pair[0] >= pair[1]) {
+            return Err(Status::invalid_argument(
+                "scope roots must be nonempty sorted unique IDs",
+            ));
+        }
+        let prepare_header = header.clone();
+        let owner = identity.id.clone();
+        let (prepared, work) = execute(host.clone(), work, deadline, move |host, work| {
+            let prepared = host.prepare(&owner, &prepare_header, roots, parent)?;
+            work.scopes.lock().unwrap().push(prepared.base.clone());
+            Ok(prepared)
+        })
+        .await?;
+        let mut digest = prepared.digest();
+        let mut commits = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        let mut current: Option<(m::Descriptor, Vec<u8>)> = None;
+        let mut bytes = 0u64;
+        let mut wire_bytes = 0usize;
+        let max_wire = (header.overlay_bytes as usize)
+            .saturating_mul(2)
+            .saturating_add((header.overlay_object_count as usize).saturating_mul(512))
+            .saturating_add(1024);
+        let idle = std::time::Duration::from_millis(
+            self.repository.service_config().rpc.stream_idle_timeout_ms,
+        );
+        loop {
+            let value = next(&mut stream, deadline, idle)
+                .await?
+                .ok_or_else(|| Status::invalid_argument("scope stream truncated"))?;
+            let encoded = value.encoded_len();
+            if encoded
+                > self
+                    .repository
+                    .service_config()
+                    .max_frame_bytes
+                    .saturating_add(1024)
+            {
+                return Err(Status::resource_exhausted("overlay frame exceeds budget"));
+            }
+            wire_bytes = wire_bytes.saturating_add(encoded);
+            if wire_bytes > max_wire {
+                return Err(Status::resource_exhausted("overlay framing exceeds budget"));
+            }
+            match frame(value) {
+                UploadFrame::Commit(value) if current.is_none() => {
+                    if commits.len() as u64 >= header.overlay_object_count {
+                        return Err(Status::invalid_argument("overlay object count exceeded"));
+                    }
+                    let value = value
+                        .descriptor
+                        .ok_or_else(|| Status::invalid_argument("overlay descriptor missing"))?;
+                    let key = value
+                        .key
+                        .as_ref()
+                        .ok_or_else(|| Status::invalid_argument("overlay key missing"))?;
+                    let id: [u8; 32] = key
+                        .native_id
+                        .as_slice()
+                        .try_into()
+                        .map_err(|_| Status::invalid_argument("invalid overlay ID"))?;
+                    if key.kind != 3
+                        || id == [0; 32]
+                        || value.content_blake3 != id
+                        || value.object_format_version != m::FORMAT_VERSION as u32
+                        || value.size_bytes == 0
+                    {
+                        return Err(Status::invalid_argument(
+                            "invalid overlay commit descriptor",
+                        ));
+                    }
+                    if value.size_bytes > host.config.max_commit_bytes as u64
+                        || value.size_bytes > header.overlay_bytes.saturating_sub(bytes)
+                    {
+                        return Err(Status::resource_exhausted(
+                            "overlay object exceeds declaration or budget",
+                        ));
+                    }
+                    if !seen.insert(id) {
+                        return Err(Status::invalid_argument("duplicate overlay commit"));
+                    }
+                    digest.update(&id);
+                    digest.update(&value.size_bytes.to_be_bytes());
+                    digest.update(&value.object_format_version.to_be_bytes());
+                    current = Some((
+                        m::Descriptor {
+                            key: m::ObjectKey {
+                                kind: m::Kind::Commit,
+                                id: m::ObjectId(id),
+                            },
+                            size_bytes: value.size_bytes,
+                            format_version: m::FORMAT_VERSION,
+                        },
+                        Vec::with_capacity(value.size_bytes as usize),
+                    ));
+                }
+                UploadFrame::Chunk(value) => {
+                    let (descriptor, buffer) = current
+                        .as_mut()
+                        .ok_or_else(|| Status::invalid_argument("overlay chunk without commit"))?;
+                    if value.data.is_empty()
+                        || value.offset != buffer.len() as u64
+                        || value.data.len() > self.repository.service_config().max_frame_bytes
+                        || value.data.len() as u64
+                            > descriptor.size_bytes.saturating_sub(buffer.len() as u64)
+                    {
+                        return Err(Status::invalid_argument(
+                            "noncontiguous or oversized overlay chunk",
+                        ));
+                    }
+                    digest.update(&value.data);
+                    buffer.extend_from_slice(&value.data);
+                }
+                UploadFrame::CommitEnd(end) => {
+                    let (descriptor, buffer) = current
+                        .take()
+                        .ok_or_else(|| Status::invalid_argument("overlay end without commit"))?;
+                    if end.size_bytes != descriptor.size_bytes
+                        || buffer.len() as u64 != descriptor.size_bytes
+                        || end.content_blake3 != descriptor.key.id.0
+                        || blake3::hash(&buffer).as_bytes() != &descriptor.key.id.0
+                    {
+                        return Err(Status::data_loss(
+                            "overlay content does not match descriptor",
+                        ));
+                    }
+                    bytes += descriptor.size_bytes;
+                    commits.push((descriptor, Arc::<[u8]>::from(buffer)));
+                }
+                UploadFrame::End(end) if current.is_none() => {
+                    if end.overlay_object_count != header.overlay_object_count
+                        || end.overlay_bytes != header.overlay_bytes
+                        || commits.len() as u64 != header.overlay_object_count
+                        || bytes != header.overlay_bytes
+                    {
+                        return Err(Status::invalid_argument("scope overlay totals differ"));
+                    }
+                    if next(&mut stream, deadline, idle).await?.is_some() {
+                        return Err(Status::invalid_argument("scope has trailing frames"));
+                    }
+                    break;
+                }
+                _ => return Err(Status::invalid_argument("invalid overlay frame order")),
+            }
+        }
+        let digest = *digest.finalize().as_bytes();
+        let (value, work) = execute(host, work, deadline, move |host, work| {
+            let scope = host.install(&identity.id, &header, replay, prepared, commits, digest)?;
+            work.scopes.lock().unwrap().push(scope.clone());
+            Ok(scope.wire.clone())
+        })
+        .await?;
+        response(
+            value,
+            work,
+            self.repository.service_config().query.max_response_bytes,
+        )
     }
     async fn scoped<T: Message + Send + 'static>(
         &self,
@@ -183,7 +373,7 @@ fn prefix(text: &str, width: usize) -> Result<(), Status> {
 }
 fn visible(scope: &Scoped, heads: &[m::CommitId], budget: &mut WorkBudget) -> Result<(), Status> {
     for id in heads {
-        if !scope.scope.has_id(*id, budget).map_err(index_error)? {
+        if !scope.graph().has_id(*id, budget).map_err(index_error)? {
             return Err(Status::invalid_argument(
                 "visible head is outside query scope",
             ));
@@ -212,47 +402,23 @@ impl RepositoryQuery for QueryService {
             return Err(Status::invalid_argument("scope header must be first"));
         };
         identity.authorize(&header.repository_id, false)?;
-        if header.overlay_object_count != 0 || header.overlay_bytes != 0 {
-            return Err(Status::unimplemented("query overlays are not implemented"));
-        }
-        if header.version != 1 {
-            return Err(Status::invalid_argument("unsupported query scope version"));
-        }
-        let replay: [u8; 32] = header
-            .replay_key
-            .as_slice()
-            .try_into()
-            .map_err(|_| Status::invalid_argument("scope replay key must be 32 bytes"))?;
-        let roots = ids(&header.roots, host.config.max_roots)?;
-        if roots.is_empty() || roots.windows(2).any(|pair| pair[0] >= pair[1]) {
-            return Err(Status::invalid_argument(
-                "scope roots must be nonempty sorted unique IDs",
-            ));
-        }
-        let end = next(&mut stream, deadline, idle)
-            .await?
-            .ok_or_else(|| Status::invalid_argument("scope end missing"))?;
-        self.bounded(&end)?;
-        let Some(q::open_scope_frame::Frame::ScopeEnd(end)) = end.frame else {
-            return Err(Status::unimplemented(
-                "query overlay frames are not implemented",
-            ));
-        };
-        if end.overlay_object_count != 0 || end.overlay_bytes != 0 {
-            return Err(Status::invalid_argument("root-only scope totals differ"));
-        }
-        if next(&mut stream, deadline, idle).await?.is_some() {
-            return Err(Status::invalid_argument("scope has trailing frames"));
-        }
-        let (value, work) = execute(host, work, deadline, move |host, _| {
-            host.open(&identity.id, &header.repository_id, replay, roots)
-        })
-        .await?;
-        response(
-            value,
+        self.upload(
+            identity,
+            deadline,
+            host,
             work,
-            self.repository.service_config().query.max_response_bytes,
+            header,
+            None,
+            stream,
+            |frame| match frame.frame {
+                Some(q::open_scope_frame::Frame::Commit(v)) => UploadFrame::Commit(v),
+                Some(q::open_scope_frame::Frame::Chunk(v)) => UploadFrame::Chunk(v),
+                Some(q::open_scope_frame::Frame::CommitEnd(v)) => UploadFrame::CommitEnd(v),
+                Some(q::open_scope_frame::Frame::ScopeEnd(v)) => UploadFrame::End(v),
+                _ => UploadFrame::Invalid,
+            },
         )
+        .await
     }
     async fn fork_scope(
         &self,
@@ -260,7 +426,7 @@ impl RepositoryQuery for QueryService {
     ) -> Result<Response<q::QueryScope>, Status> {
         let (identity, deadline, host) = self.context(&request, true)?;
         let admission = request.extensions().get::<Arc<Work>>().cloned();
-        let _work = admitted(&host, deadline, admission).await?;
+        let work = admitted(&host, deadline, admission).await?;
         let idle = std::time::Duration::from_millis(
             self.repository.service_config().rpc.stream_idle_timeout_ms,
         );
@@ -272,13 +438,29 @@ impl RepositoryQuery for QueryService {
         let Some(q::fork_scope_frame::Frame::Header(header)) = first.frame else {
             return Err(Status::invalid_argument("fork header must be first"));
         };
-        let header = header
+        let header_scope = header
             .scope
             .ok_or_else(|| Status::invalid_argument("fork scope header missing"))?;
-        identity.authorize(&header.repository_id, false)?;
-        Err(Status::unimplemented(
-            "query scope forks are not implemented",
-        ))
+        identity.authorize(&header_scope.repository_id, false)?;
+        let parent = scope_key(header.parent_scope)?;
+        identity.authorize(&parent.repository_id, false)?;
+        self.upload(
+            identity,
+            deadline,
+            host,
+            work,
+            header_scope,
+            Some(parent),
+            stream,
+            |frame| match frame.frame {
+                Some(q::fork_scope_frame::Frame::Commit(v)) => UploadFrame::Commit(v),
+                Some(q::fork_scope_frame::Frame::Chunk(v)) => UploadFrame::Chunk(v),
+                Some(q::fork_scope_frame::Frame::CommitEnd(v)) => UploadFrame::CommitEnd(v),
+                Some(q::fork_scope_frame::Frame::ScopeEnd(v)) => UploadFrame::End(v),
+                _ => UploadFrame::Invalid,
+            },
+        )
+        .await
     }
     async fn close_scope(
         &self,
@@ -332,7 +514,7 @@ impl RepositoryQuery for QueryService {
                             inputs += 1;
                             q::graph_fact_answer::Answer::HasId(
                                 scope
-                                    .scope
+                                    .graph()
                                     .has_id(
                                         commit(value.commit.as_ref().ok_or_else(|| {
                                             Status::invalid_argument("commit ID missing")
@@ -346,7 +528,7 @@ impl RepositoryQuery for QueryService {
                             inputs += 2;
                             q::graph_fact_answer::Answer::IsAncestor(
                                 scope
-                                    .scope
+                                    .graph()
                                     .is_ancestor(
                                         commit(value.ancestor.as_ref().ok_or_else(|| {
                                             Status::invalid_argument("ancestor missing")
@@ -362,7 +544,7 @@ impl RepositoryQuery for QueryService {
                         q::graph_fact::Fact::Heads(value) => {
                             inputs = inputs.saturating_add(value.commits.len());
                             let values = scope
-                                .scope
+                                .graph()
                                 .heads(&ids(&value.commits, config.max_input_ids)?, budget)
                                 .map_err(index_error)?;
                             outputs = outputs.saturating_add(values.len());
@@ -373,7 +555,7 @@ impl RepositoryQuery for QueryService {
                                 .saturating_add(value.left.len())
                                 .saturating_add(value.right.len());
                             let values = scope
-                                .scope
+                                .graph()
                                 .common_ancestors(
                                     &ids(&value.left, config.max_input_ids)?,
                                     &ids(&value.right, config.max_input_ids)?,
@@ -423,7 +605,7 @@ impl RepositoryQuery for QueryService {
             key,
             move |scope, budget, _| {
                 let result = match scope
-                    .scope
+                    .graph()
                     .resolve_commit_prefix(&input.hex_prefix, budget)
                     .map_err(index_error)?
                 {
@@ -466,7 +648,7 @@ impl RepositoryQuery for QueryService {
                 let heads = ids(&input.visible_heads, config.max_input_ids)?;
                 visible(scope, &heads, budget)?;
                 let result = match scope
-                    .scope
+                    .graph()
                     .resolve_change_prefix(&input.hex_prefix, budget)
                     .map_err(index_error)?
                 {
@@ -487,7 +669,7 @@ impl RepositoryQuery for QueryService {
                             let mut found = false;
                             for head in &heads {
                                 if scope
-                                    .scope
+                                    .graph()
                                     .is_ancestor(target, *head, budget)
                                     .map_err(index_error)?
                                 {
@@ -540,14 +722,14 @@ impl RepositoryQuery for QueryService {
                     q::shortest_prefix_request::Target::Commit(id) => (
                         q::PrefixKind::CommitPrefix,
                         scope
-                            .scope
+                            .graph()
                             .shortest_commit_prefix(commit(&id)?, budget)
                             .map_err(index_error)?,
                     ),
                     q::shortest_prefix_request::Target::Change(id) => (
                         q::PrefixKind::ChangePrefix,
                         scope
-                            .scope
+                            .graph()
                             .shortest_change_prefix(change(&id)?, budget)
                             .map_err(index_error)?,
                     ),
@@ -572,6 +754,13 @@ impl RepositoryQuery for QueryService {
             "query evaluation and cursors are not implemented",
         ))
     }
+}
+enum UploadFrame {
+    Commit(q::OverlayCommitHeader),
+    Chunk(tinytree_proto::v1::DataChunk),
+    CommitEnd(q::OverlayCommitEnd),
+    End(q::ScopeEnd),
+    Invalid,
 }
 async fn next<T>(
     stream: &mut Streaming<T>,

@@ -25,7 +25,12 @@ reject new promises, not existing ones. A historical receipt is not current proo
 The separate query service supports retained root scopes, exact graph facts and
 prefix resolution. Its rebuildable index warms asynchronously; unavailable
 coverage is an error, not an empty result. Scope TTLs and work limits are TOML
-configurable. Draft overlays and paged evaluation are not implemented yet.
+configurable. Private parent-first draft overlays and immutable forks are scoped
+to the authenticated caller; they are ephemeral query data, not repository uploads
+or backup receipts. Closing a parent preserves live forks without extending
+their absolute expiry. Active-scope quotas
+and bounded replay-history quotas are separate; closed keys remain closed until
+their absolute expiry. Paged evaluation is not implemented yet.
 
 Derived state lives in `derived-index-v{schema}/generation-{index_rebuild_generation}`
 under storage. Restarting with the same generation reuses it; increment

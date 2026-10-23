@@ -35,13 +35,17 @@ message QueryScope {
   int64 expires_at_unix_seconds = 5; // Absolute expiry, not sliding access TTL.
 }
 
-// version MUST equal 1. Roots are sorted unique native commit IDs. Declared
-// overlay totals count only this stream's additions, not shared fork ancestry.
+// version MUST equal 1. Roots are sorted unique authoritative remote checkpoint
+// IDs, never private draft heads. The logical graph is their complete ancestry
+// union every admitted private draft, including hidden/divergent siblings.
+// Declared overlay totals count only this stream's additions, not shared ancestry.
 // Replay binds principal/repository/version/roots/canonical overlay contents;
 // identical replay is idempotent, differing content under the same key errors.
 // Fork also binds the exact parent scope, never a moving/latest reference.
-// Overlay commits are parent-first: each parent is an earlier overlay node or a
-// member of the complete remote scoped graph. Validate canonical identities and
+// Overlay commits are parent-first: each parent is an earlier overlay node, an
+// inherited private draft, or a member of the complete remote scoped graph.
+// Private overlay objects never become authoritative repository uploads merely
+// by opening a query scope. Validate canonical identities and
 // totals before installing atomically; this is not a backup/offload ACK.
 message ScopeHeader {
   uint32 version = 1;
@@ -54,6 +58,7 @@ message ScopeHeader {
 message ForkScopeHeader {
   ScopeHeader scope = 1;
   ScopeKey parent_scope = 2; // Same repository/principal; share immutable nodes.
+  // scope.roots must equal the parent's remote roots. Use OpenScope for a new base.
 }
 message OverlayCommitHeader {
   tinytree.v1.ObjectDescriptor descriptor = 1; // Non-root COMMIT only.

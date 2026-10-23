@@ -21,6 +21,11 @@ max_frame_bytes = 65536
 [service.query]
 scope_ttl_seconds = 300
 max_scopes_per_principal = 16
+max_scope_replays_per_principal = 256
+max_overlay_memory_bytes = 134217728
+max_scope_overlay_bytes = 16777216
+max_scope_overlay_nodes = 4096
+max_overlay_layers = 32
 max_pending_warms = 32
 max_warm_jobs = 1
 # Increment and restart for an explicit fresh index; old data is retained.

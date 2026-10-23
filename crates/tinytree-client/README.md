@@ -10,7 +10,11 @@ must traverse/verify the complete canonical closure before admitting history.
 
 Root-scoped graph facts and prefix queries use checked, expiring handles and
 bounded compressed RPCs. Exact negative answers trust the authenticated server.
-These APIs do not yet replace jj's local index or implement draft overlays.
+Private parent-first draft overlays and forks share an immutable remote checkpoint;
+they never upload objects or publish changes. Verify local drafts with
+`NativeClient::verify_metadata`, then use `open_query_scope_with_overlay` or
+`fork_query_scope`. Forks do not extend the parent scope's expiry. These APIs do
+not yet replace jj's local index or implement graph evaluation.
 
 Load [the TOML example](examples/client.toml) with `Config::load`, then call
 `NativeClient::connect`. Plaintext is loopback-only; other TCP endpoints require

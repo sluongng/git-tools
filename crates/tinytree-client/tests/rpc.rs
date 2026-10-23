@@ -1421,6 +1421,12 @@ use tinytree_proto::query_v1 as q;
 enum QueryMode {
     Normal,
     RetryOpen,
+    RetryOverlay,
+    PauseFork,
+    ForkWrongEpoch,
+    ForkWrongHighWater,
+    ForkExtendedExpiry,
+    ForkParentHandle,
     MalformedScope,
     MissingFact,
     MissingAnswer,
@@ -1437,6 +1443,9 @@ enum QueryMode {
 #[derive(Default)]
 struct QueryCounts {
     opens: Arc<AtomicUsize>,
+    forks: AtomicUsize,
+    fork_entered: tokio::sync::Notify,
+    fork_release: tokio::sync::Notify,
     closes: AtomicUsize,
     facts: AtomicUsize,
     commit_prefixes: AtomicUsize,
@@ -1458,7 +1467,7 @@ impl RepositoryQuery for QueryFaults {
     ) -> Result<Response<q::QueryScope>, Status> {
         let mut reply = self.service.open_scope(request).await?;
         let attempt = self.counts.opens.fetch_add(1, Ordering::SeqCst);
-        if self.mode == QueryMode::RetryOpen {
+        if matches!(self.mode, QueryMode::RetryOpen | QueryMode::RetryOverlay) {
             if attempt == 0 {
                 *self.first_scope.lock().unwrap() = Some(reply.get_ref().clone());
                 return Err(Status::unavailable("scope ACK withheld for replay test"));
@@ -1466,6 +1475,9 @@ impl RepositoryQuery for QueryFaults {
             if attempt == 1 && self.first_scope.lock().unwrap().as_ref() != Some(reply.get_ref()) {
                 return Err(Status::data_loss("scope retry changed replay identity"));
             }
+        }
+        if self.mode == QueryMode::ForkParentHandle {
+            *self.first_scope.lock().unwrap() = Some(reply.get_ref().clone());
         }
         if self.mode == QueryMode::MalformedScope {
             reply.get_mut().key.as_mut().unwrap().handle.pop();
@@ -1476,7 +1488,42 @@ impl RepositoryQuery for QueryFaults {
         &self,
         request: Request<Streaming<q::ForkScopeFrame>>,
     ) -> Result<Response<q::QueryScope>, Status> {
-        self.service.fork_scope(request).await
+        let attempt = self.counts.forks.fetch_add(1, Ordering::SeqCst);
+        if self.mode == QueryMode::PauseFork {
+            self.counts.fork_entered.notify_one();
+            self.counts.fork_release.notified().await;
+        }
+        let mut response = self.service.fork_scope(request).await?;
+        if self.mode == QueryMode::RetryOverlay {
+            if attempt == 0 {
+                *self.first_scope.lock().unwrap() = Some(response.get_ref().clone());
+                return Err(Status::unavailable("fork ACK withheld for replay test"));
+            }
+            if attempt == 1 && self.first_scope.lock().unwrap().as_ref() != Some(response.get_ref())
+            {
+                return Err(Status::data_loss("fork retry changed replay identity"));
+            }
+        }
+        match self.mode {
+            QueryMode::ForkWrongEpoch => response.get_mut().index_epoch[0] ^= 1,
+            QueryMode::ForkWrongHighWater => response.get_mut().high_water += 1,
+            QueryMode::ForkExtendedExpiry => response.get_mut().expires_at_unix_seconds += 86400,
+            QueryMode::ForkParentHandle => {
+                response.get_mut().key.as_mut().unwrap().handle = self
+                    .first_scope
+                    .lock()
+                    .unwrap()
+                    .as_ref()
+                    .unwrap()
+                    .key
+                    .as_ref()
+                    .unwrap()
+                    .handle
+                    .clone()
+            }
+            _ => {}
+        }
+        Ok(response)
     }
     async fn close_scope(
         &self,
@@ -1565,6 +1612,7 @@ impl RepositoryQuery for QueryFaults {
 struct QueryRunning {
     config: Config,
     opens: Arc<AtomicUsize>,
+    counts: Arc<QueryCounts>,
     stop: tokio::sync::oneshot::Sender<()>,
     task: tokio::task::JoinHandle<()>,
 }
@@ -1577,7 +1625,7 @@ impl QueryRunning {
         let faults = QueryFaults {
             service: service.query_service(),
             mode,
-            counts,
+            counts: counts.clone(),
             first_scope: Arc::new(std::sync::Mutex::new(None)),
         };
         let (stop, stopped) = tokio::sync::oneshot::channel();
@@ -1608,6 +1656,7 @@ impl QueryRunning {
         Self {
             config,
             opens,
+            counts,
             stop,
             task,
         }
@@ -1620,13 +1669,16 @@ impl QueryRunning {
         self.task.await.unwrap();
     }
 }
-fn setup_query() -> (
-    tempfile::TempDir,
-    tempfile::TempDir,
-    RepositoryService,
-    tinytree_model::CommitId,
-    tinytree_model::ChangeId,
-) {
+struct QueryFixture {
+    store_directory: tempfile::TempDir,
+    index_directory: tempfile::TempDir,
+    store: Store,
+    index: Arc<tinytree_index::Index>,
+    service: RepositoryService,
+    root: tinytree_model::CommitId,
+    change: tinytree_model::ChangeId,
+}
+fn setup_query_retained() -> QueryFixture {
     let (store_dir, store, service) = setup();
     let index_dir = private_tempdir();
     let index = tinytree_index::Index::open(index_dir.path(), &Default::default()).unwrap();
@@ -1644,14 +1696,34 @@ fn setup_query() -> (
         }
     }
     let (root, change) = commit.unwrap();
-    (
-        store_dir,
-        index_dir,
-        service.with_query_index(index).unwrap(),
+    QueryFixture {
+        store_directory: store_dir,
+        index_directory: index_dir,
+        store,
+        index: index.clone(),
+        service: service.with_query_index(index).unwrap(),
         root,
         change,
-    )
+    }
 }
+fn setup_query() -> (
+    tempfile::TempDir,
+    tempfile::TempDir,
+    RepositoryService,
+    tinytree_model::CommitId,
+    tinytree_model::ChangeId,
+) {
+    let QueryFixture {
+        store_directory,
+        index_directory,
+        service,
+        root,
+        change,
+        ..
+    } = setup_query_retained();
+    (store_directory, index_directory, service, root, change)
+}
+
 fn change_hex(id: tinytree_model::ChangeId) -> String {
     id.0.iter().map(|byte| format!("{byte:02x}")).collect()
 }
@@ -2012,6 +2084,472 @@ async fn indexed_scope_fact_workload_benchmark() {
             running.queries.commit_prefixes.load(Ordering::SeqCst),
             running.queries.change_prefixes.load(Ordering::SeqCst),
             running.queries.shortest_prefixes.load(Ordering::SeqCst)
+        );
+        running.stop().await;
+    }
+}
+
+fn private_draft(
+    parent: tinytree_model::CommitId,
+    change: tinytree_model::ChangeId,
+    description: &str,
+) -> tinytree_model::EncodedObject {
+    let mut commit = tinytree_model::synthetic_root();
+    commit.parents = vec![parent];
+    commit.change_id = change;
+    commit.description = description.into();
+    tinytree_model::encode(&tinytree_model::Object::Commit(commit), Default::default()).unwrap()
+}
+async fn checked_draft(
+    client: &NativeClient,
+    object: &tinytree_model::EncodedObject,
+) -> tinytree_client::VerifiedMetadata {
+    client
+        .verify_metadata(object.descriptor, object.bytes.clone())
+        .await
+        .unwrap()
+}
+#[tokio::test]
+async fn private_overlay_forks_replay_without_publication_and_preserve_hidden_divergence() {
+    use tinytree_model::{ChangeId, CommitId};
+    let fixture = setup_query_retained();
+    let running = QueryRunning::start(fixture.service.clone(), QueryMode::RetryOverlay).await;
+    let client = running.client().await;
+    let change = ChangeId([42; 16]);
+    let left = private_draft(fixture.root, change, "left private draft");
+    let right = private_draft(fixture.root, change, "divergent hidden draft");
+    let left_id = CommitId(left.descriptor.key.id.0);
+    let right_id = CommitId(right.descriptor.key.id.0);
+    let scope = client
+        .open_query_scope_with_overlay(
+            vec![fixture.root],
+            vec![
+                checked_draft(&client, &left).await,
+                checked_draft(&client, &right).await,
+            ],
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        running.opens.load(Ordering::SeqCst),
+        2,
+        "overlay Open replays exact immutable bytes after lost ACK"
+    );
+    assert_eq!(scope.remote_roots(), &[fixture.root]);
+    let ChangePrefix::Single(divergent) = client
+        .resolve_change_prefix(&scope, &change_hex(change), vec![left_id])
+        .await
+        .unwrap()
+    else {
+        panic!("expected divergent targets under one ChangeId");
+    };
+    let visibility: std::collections::BTreeMap<_, _> = divergent
+        .targets
+        .into_iter()
+        .map(|target| (target.commit, target.visible))
+        .collect();
+    assert_eq!(
+        visibility,
+        std::collections::BTreeMap::from([(left_id, true), (right_id, false)])
+    );
+    let child = private_draft(left_id, ChangeId([43; 16]), "child private draft");
+    let child_id = CommitId(child.descriptor.key.id.0);
+    let fork = client
+        .fork_query_scope(&scope, vec![checked_draft(&client, &child).await])
+        .await
+        .unwrap();
+    assert_eq!(
+        running.counts.forks.load(Ordering::SeqCst),
+        2,
+        "Fork replays parent-bound stream without installing another version"
+    );
+    assert_eq!(fork.remote_roots(), scope.remote_roots());
+    assert_eq!(fork.index_epoch(), scope.index_epoch());
+    assert_eq!(fork.high_water(), scope.high_water());
+    assert!(fork.expires_at_unix_seconds() <= scope.expires_at_unix_seconds());
+    assert_ne!(fork.content_digest(), scope.content_digest());
+    client.close_query_scope(&scope).await.unwrap();
+    assert_eq!(
+        client
+            .query_facts(
+                &fork,
+                vec![
+                    QueryFact::HasId(right_id),
+                    QueryFact::IsAncestor {
+                        ancestor: left_id,
+                        descendant: child_id
+                    },
+                    QueryFact::IsAncestor {
+                        ancestor: right_id,
+                        descendant: child_id
+                    }
+                ]
+            )
+            .await
+            .unwrap(),
+        vec![
+            FactAnswer::HasId(true),
+            FactAnswer::IsAncestor(true),
+            FactAnswer::IsAncestor(false)
+        ]
+    );
+    let remote = client.open_query_scope(vec![fixture.root]).await.unwrap();
+    assert_eq!(
+        client
+            .query_facts(
+                &remote,
+                vec![QueryFact::HasId(left_id), QueryFact::HasId(child_id)]
+            )
+            .await
+            .unwrap(),
+        vec![FactAnswer::HasId(false), FactAnswer::HasId(false)]
+    );
+    for object in [&left, &right, &child] {
+        assert!(
+            fixture
+                .store
+                .descriptor("example", object.descriptor.key)
+                .unwrap()
+                .is_none(),
+            "query drafts must never become authoritative objects"
+        );
+        assert!(
+            fixture
+                .index
+                .node("example", CommitId(object.descriptor.key.id.0))
+                .unwrap()
+                .is_none(),
+            "private drafts must not enter the global derived index"
+        );
+    }
+    client.close_query_scope(&remote).await.unwrap();
+    client.close_query_scope(&fork).await.unwrap();
+    running.stop().await;
+}
+
+#[tokio::test]
+async fn overlay_preflight_and_fork_reply_validation_fail_without_hydrating_or_publishing() {
+    use tinytree_model::{ChangeId, CommitId};
+    let (_store, _index, service, root, _change) = setup_query();
+    let running = QueryRunning::start(service, QueryMode::Normal).await;
+    let client = running.client().await;
+    let parent = private_draft(root, ChangeId([51; 16]), "parent draft");
+    let child = private_draft(
+        CommitId(parent.descriptor.key.id.0),
+        ChangeId([52; 16]),
+        "child draft",
+    );
+    for overlay in [
+        vec![
+            checked_draft(&client, &child).await,
+            checked_draft(&client, &parent).await,
+        ],
+        vec![
+            checked_draft(&client, &parent).await,
+            checked_draft(&client, &parent).await,
+        ],
+    ] {
+        assert_eq!(
+            client
+                .open_query_scope_with_overlay(vec![root], overlay)
+                .await
+                .unwrap_err()
+                .code(),
+            Code::InvalidArgument
+        );
+    }
+    assert_eq!(
+        running.opens.load(Ordering::SeqCst),
+        0,
+        "locally provable invalid overlay never starts an RPC"
+    );
+    let foreign = private_draft(
+        CommitId([81; 32]),
+        ChangeId([53; 16]),
+        "unknown scoped parent",
+    );
+    assert_eq!(
+        client
+            .open_query_scope_with_overlay(vec![root], vec![checked_draft(&client, &foreign).await])
+            .await
+            .unwrap_err()
+            .code(),
+        Code::InvalidArgument,
+        "unknown membership is rejected by server, not silently hydrated"
+    );
+    running.stop().await;
+    for mode in [
+        QueryMode::ForkWrongEpoch,
+        QueryMode::ForkWrongHighWater,
+        QueryMode::ForkExtendedExpiry,
+        QueryMode::ForkParentHandle,
+    ] {
+        let (_store, _index, service, root, _change) = setup_query();
+        let running = QueryRunning::start(service, mode).await;
+        let client = running.client().await;
+        let scope = client.open_query_scope(vec![root]).await.unwrap();
+        let draft = private_draft(root, ChangeId([54; 16]), "fork reply validation");
+        assert_eq!(
+            client
+                .fork_query_scope(&scope, vec![checked_draft(&client, &draft).await])
+                .await
+                .unwrap_err()
+                .code(),
+            Code::DataLoss,
+            "{mode:?}"
+        );
+        client.close_query_scope(&scope).await.unwrap();
+        running.stop().await;
+    }
+}
+
+#[tokio::test]
+async fn cancelled_overlay_fork_releases_client_owners_and_keeps_parent_usable() {
+    use tinytree_model::ChangeId;
+    let (_store, _index, service, root, _change) = setup_query();
+    let running = QueryRunning::start(service, QueryMode::PauseFork).await;
+    let client = running.client().await;
+    let scope = client.open_query_scope(vec![root]).await.unwrap();
+    let draft = private_draft(root, ChangeId([55; 16]), "cancelled private draft");
+    let verified = checked_draft(&client, &draft).await;
+    let dropped = Arc::new(AtomicUsize::new(0));
+    let guarded = client
+        .clone()
+        .with_lifetime_guard(Arc::new(LifetimeProbe(dropped.clone())));
+    let parent = scope.clone();
+    let task = tokio::spawn(async move { guarded.fork_query_scope(&parent, vec![verified]).await });
+    tokio::time::timeout(
+        Duration::from_secs(2),
+        running.counts.fork_entered.notified(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(dropped.load(Ordering::SeqCst), 0);
+    task.abort();
+    let _ = task.await;
+    running.counts.fork_release.notify_one();
+    assert_released(&dropped).await;
+    assert_eq!(
+        client
+            .query_facts(&scope, vec![QueryFact::HasId(root)])
+            .await
+            .unwrap(),
+        vec![FactAnswer::HasId(true)]
+    );
+    client.close_query_scope(&scope).await.unwrap();
+    running.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "manual private-overlay FullOpen versus shared Fork benchmark; not native jj startup"]
+async fn private_overlay_full_open_versus_incremental_fork_benchmark() {
+    use tinytree_model::{ChangeId, CommitId};
+    const PUBLIC_HISTORY: usize = 128;
+    const CLIENT_BATCH_ITEMS: usize = 1024;
+    for private_count in [10usize, 100, 1000] {
+        let (_store_directory, store, service) = setup();
+        let index_directory = private_tempdir();
+        let source_started = std::time::Instant::now();
+        let empty = tinytree_model::empty_tree();
+        store
+            .put("example", empty.descriptor, &empty.bytes, 0)
+            .unwrap();
+        let mut public = Vec::with_capacity(PUBLIC_HISTORY);
+        let mut remote_root = CommitId::ROOT;
+        for position in 0..PUBLIC_HISTORY {
+            let mut change = [0u8; 16];
+            change[..8].copy_from_slice(&((position + 1) as u64).to_be_bytes());
+            change[15] = 1;
+            let object = private_draft(
+                remote_root,
+                ChangeId(change),
+                &format!("public linear commit {position}"),
+            );
+            store
+                .put("example", object.descriptor, &object.bytes, 0)
+                .unwrap();
+            remote_root = CommitId(object.descriptor.key.id.0);
+            public.push(object);
+        }
+        let public_source_setup_ns = source_started.elapsed().as_nanos();
+        let indexing_started = std::time::Instant::now();
+        let index =
+            tinytree_index::Index::open(index_directory.path(), &Default::default()).unwrap();
+        for object in &public {
+            index
+                .ingest("example", object.descriptor, &object.bytes)
+                .unwrap();
+        }
+        let ready_index_ns = indexing_started.elapsed().as_nanos();
+        let service = service.with_query_index(index.clone()).unwrap();
+        let running = Running::start_with_socket_policy(service, Mode::Normal, true).await;
+        let mut config = running.config();
+        config.limits.max_batch_items = CLIENT_BATCH_ITEMS;
+        let client = NativeClient::connect(config).await.unwrap();
+        let mut drafts = Vec::with_capacity(private_count + 1);
+        let mut parent = remote_root;
+        for position in 0..=private_count {
+            let mut change = [0u8; 16];
+            change[..8].copy_from_slice(&((position + 1) as u64).to_be_bytes());
+            change[15] = 2;
+            let object = private_draft(
+                parent,
+                ChangeId(change),
+                &format!("private linear draft {position}"),
+            );
+            parent = CommitId(object.descriptor.key.id.0);
+            drafts.push(object);
+        }
+        let base_head = CommitId(drafts[private_count - 1].descriptor.key.id.0);
+        let final_head = CommitId(drafts[private_count].descriptor.key.id.0);
+        let base_bytes: usize = drafts[..private_count]
+            .iter()
+            .map(|object| object.bytes.len())
+            .sum();
+        let extension_bytes = drafts[private_count].bytes.len();
+        let first_verify_started = std::time::Instant::now();
+        let mut base_overlay = Vec::with_capacity(private_count);
+        for object in &drafts[..private_count] {
+            base_overlay.push(checked_draft(&client, object).await);
+        }
+        let first_base_verify_ns = first_verify_started.elapsed().as_nanos();
+        let first_base_started = std::time::Instant::now();
+        let base = client
+            .open_query_scope_with_overlay(vec![remote_root], base_overlay)
+            .await
+            .unwrap();
+        let first_base_open_ns = first_base_started.elapsed().as_nanos();
+        let expected = vec![
+            FactAnswer::HasId(true),
+            FactAnswer::IsAncestor(true),
+            FactAnswer::IsAncestor(true),
+        ];
+        let facts = || {
+            vec![
+                QueryFact::HasId(final_head),
+                QueryFact::IsAncestor {
+                    ancestor: remote_root,
+                    descendant: final_head,
+                },
+                QueryFact::IsAncestor {
+                    ancestor: base_head,
+                    descendant: final_head,
+                },
+            ]
+        };
+        let mut full_verify_ns = Vec::new();
+        let mut full_open_ns = Vec::new();
+        let mut fork_verify_ns = Vec::new();
+        let mut fork_ns = Vec::new();
+        let mut fact_validation_ns = Vec::new();
+        let mut scope_close_ns = Vec::new();
+        for _ in 0..3 {
+            let verify_started = std::time::Instant::now();
+            let mut overlay = Vec::with_capacity(drafts.len());
+            for object in &drafts {
+                overlay.push(checked_draft(&client, object).await);
+            }
+            full_verify_ns.push(verify_started.elapsed().as_nanos());
+            let started = std::time::Instant::now();
+            let full = client
+                .open_query_scope_with_overlay(vec![remote_root], overlay)
+                .await
+                .unwrap();
+            full_open_ns.push(started.elapsed().as_nanos());
+            let verify_started = std::time::Instant::now();
+            let addition = checked_draft(&client, &drafts[private_count]).await;
+            fork_verify_ns.push(verify_started.elapsed().as_nanos());
+            let started = std::time::Instant::now();
+            let fork = client
+                .fork_query_scope(&base, vec![addition])
+                .await
+                .unwrap();
+            fork_ns.push(started.elapsed().as_nanos());
+            let facts_started = std::time::Instant::now();
+            assert_eq!(client.query_facts(&full, facts()).await.unwrap(), expected);
+            assert_eq!(client.query_facts(&fork, facts()).await.unwrap(), expected);
+            assert_eq!(
+                client
+                    .query_facts(
+                        &base,
+                        vec![QueryFact::HasId(base_head), QueryFact::HasId(final_head)]
+                    )
+                    .await
+                    .unwrap(),
+                vec![FactAnswer::HasId(true), FactAnswer::HasId(false)]
+            );
+            fact_validation_ns.push(facts_started.elapsed().as_nanos());
+            // Fork binding can legitimately change a scope's content digest;
+            // compare exact graph facts, not representation-specific digests.
+            assert_eq!(fork.remote_roots(), base.remote_roots());
+            assert_eq!(fork.high_water(), base.high_water());
+            assert_eq!(fork.index_epoch(), base.index_epoch());
+            let close_started = std::time::Instant::now();
+            client.close_query_scope(&full).await.unwrap();
+            client.close_query_scope(&fork).await.unwrap();
+            scope_close_ns.push(close_started.elapsed().as_nanos());
+        }
+        let base_close_started = std::time::Instant::now();
+        client.close_query_scope(&base).await.unwrap();
+        let base_close_ns = base_close_started.elapsed().as_nanos();
+        for object in &drafts {
+            assert!(
+                store
+                    .descriptor("example", object.descriptor.key)
+                    .unwrap()
+                    .is_none()
+            );
+            assert!(
+                index
+                    .node("example", CommitId(object.descriptor.key.id.0))
+                    .unwrap()
+                    .is_none()
+            );
+        }
+        assert_eq!(running.graph.load(Ordering::SeqCst), 0);
+        assert_eq!(running.metadata.load(Ordering::SeqCst), 0);
+        assert_eq!(running.canonical_bytes.load(Ordering::SeqCst), 0);
+        assert_eq!(running.files.load(Ordering::SeqCst), 0);
+        assert_eq!(running.queries.opens.load(Ordering::SeqCst), 4);
+        assert_eq!(running.queries.forks.load(Ordering::SeqCst), 3);
+        assert_eq!(running.queries.closes.load(Ordering::SeqCst), 7);
+        assert_eq!(running.queries.facts.load(Ordering::SeqCst), 9);
+        eprintln!(
+            concat!(
+                "{{\"schema\":1,\"benchmark\":\"private_overlay_full_open_vs_fork\",",
+                "\"claim\":\"same_final_private_graph_not_native_jj_startup\",",
+                "\"shape\":\"linear_unique_changes_empty_tree_no_files\",",
+                "\"public_history_commits\":{},\"private_base_commits\":{},\"added_commits\":1,",
+                "\"client_max_batch_items\":{},\"trials\":3,\"index_ready_before_requests\":true,",
+                "\"public_source_setup_ns\":{},\"ready_index_ns\":{},",
+                "\"first_base_verify_ns\":{},\"first_base_open_ns\":{},",
+                "\"full_verify_samples_ns\":{:?},\"full_open_samples_ns\":{:?},",
+                "\"fork_verify_samples_ns\":{:?},\"fork_samples_ns\":{:?},",
+                "\"three_fact_validation_rpc_samples_ns\":{:?},\"two_scope_close_rpc_samples_ns\":{:?},\"base_close_ns\":{},",
+                "\"payload_measure\":\"logical_canonical_envelopes_not_zstd_wire_bytes\",",
+                "\"first_base_payload_bytes\":{},\"full_open_payload_bytes_per_trial\":{},\"fork_payload_bytes_per_trial\":{},",
+                "\"open_rpcs\":4,\"fork_rpcs\":3,\"close_rpcs\":7,\"fact_rpcs\":9,",
+                "\"public_canonical_envelope_bytes_fetched\":0,\"graph_rpcs\":0,\"metadata_rpcs\":0,\"file_rpcs\":0,",
+                "\"private_objects_published\":0,\"private_objects_global_indexed\":0,",
+                "\"authenticated\":true,\"zstd\":true,\"tcp_nodelay\":true}}"
+            ),
+            PUBLIC_HISTORY,
+            private_count,
+            CLIENT_BATCH_ITEMS,
+            public_source_setup_ns,
+            ready_index_ns,
+            first_base_verify_ns,
+            first_base_open_ns,
+            full_verify_ns,
+            full_open_ns,
+            fork_verify_ns,
+            fork_ns,
+            fact_validation_ns,
+            scope_close_ns,
+            base_close_ns,
+            base_bytes,
+            base_bytes + extension_bytes,
+            extension_bytes
         );
         running.stop().await;
     }

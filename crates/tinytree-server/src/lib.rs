@@ -10,6 +10,7 @@ mod config;
 mod derived_index;
 mod query_index;
 mod query_ingress;
+mod query_overlay;
 mod query_service;
 mod retention;
 mod service;

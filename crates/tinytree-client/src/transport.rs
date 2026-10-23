@@ -2,7 +2,8 @@
 use crate::Limits;
 use bytes::Buf;
 use prost::Message;
-use std::marker::PhantomData;
+use std::{any::Any, marker::PhantomData, sync::Arc};
+type PhysicalOwner = Arc<dyn Any + Send + Sync>;
 use tinytree_proto::{query_v1 as q, v1 as p};
 use tonic::{
     Request, Response, Status, Streaming,
@@ -62,6 +63,7 @@ impl Client {
     pub async fn open_scope(
         &mut self,
         request: impl tonic::IntoStreamingRequest<Message = q::OpenScopeFrame>,
+        owner: PhysicalOwner,
     ) -> Result<Response<q::QueryScope>, Status> {
         self.inner
             .ready()
@@ -77,7 +79,32 @@ impl Client {
                     Shape::QueryScope,
                     self.limits.clone(),
                     self.decode,
+                )
+                .with_owner(owner),
+            )
+            .await
+    }
+    pub async fn fork_scope(
+        &mut self,
+        request: impl tonic::IntoStreamingRequest<Message = q::ForkScopeFrame>,
+        owner: PhysicalOwner,
+    ) -> Result<Response<q::QueryScope>, Status> {
+        self.inner
+            .ready()
+            .await
+            .map_err(|_| Status::unavailable("native gRPC transport not ready"))?;
+        self.inner
+            .client_streaming(
+                request.into_streaming_request(),
+                http::uri::PathAndQuery::from_static(
+                    "/tinytree.query.v1.RepositoryQuery/ForkScope",
                 ),
+                BoundedCodec::<q::ForkScopeFrame, q::QueryScope>::new(
+                    Shape::QueryScope,
+                    self.limits.clone(),
+                    self.decode,
+                )
+                .with_owner(owner),
             )
             .await
     }
@@ -280,6 +307,7 @@ struct BoundedCodec<T, U> {
     limits: Limits,
     cap: usize,
     _type: PhantomData<(T, U)>,
+    owner: Option<PhysicalOwner>,
 }
 impl<T, U> BoundedCodec<T, U> {
     fn new(shape: Shape, limits: Limits, cap: usize) -> Self {
@@ -288,7 +316,12 @@ impl<T, U> BoundedCodec<T, U> {
             limits,
             cap,
             _type: PhantomData,
+            owner: None,
         }
+    }
+    fn with_owner(mut self, owner: PhysicalOwner) -> Self {
+        self.owner = Some(owner);
+        self
     }
 }
 impl<T: Message + Send + 'static, U: Message + Default + Send + 'static> Codec
@@ -299,7 +332,7 @@ impl<T: Message + Send + 'static, U: Message + Default + Send + 'static> Codec
     type Encoder = WireEncoder<T>;
     type Decoder = WireDecoder<U>;
     fn encoder(&mut self) -> Self::Encoder {
-        WireEncoder(PhantomData)
+        WireEncoder(PhantomData, self.owner.clone())
     }
     fn decoder(&mut self) -> Self::Decoder {
         WireDecoder {
@@ -307,14 +340,18 @@ impl<T: Message + Send + 'static, U: Message + Default + Send + 'static> Codec
             limits: self.limits.clone(),
             cap: self.cap,
             _type: PhantomData,
+            _owner: self.owner.clone(),
         }
     }
 }
-struct WireEncoder<T>(PhantomData<T>);
+// The encoder lives in Tonic's physical HTTP body after its fused source stream
+// reaches EOF. Keep owned buffers and admission there through final body drop.
+struct WireEncoder<T>(PhantomData<T>, Option<PhysicalOwner>);
 impl<T: Message> Encoder for WireEncoder<T> {
     type Item = T;
     type Error = Status;
     fn encode(&mut self, item: T, buf: &mut EncodeBuf<'_>) -> Result<(), Status> {
+        let _owner = &self.1;
         item.encode(buf)
             .map_err(|_| Status::internal("native request encoding failed"))
     }
@@ -324,6 +361,7 @@ struct WireDecoder<U> {
     limits: Limits,
     cap: usize,
     _type: PhantomData<U>,
+    _owner: Option<PhysicalOwner>,
 }
 impl<U: Message + Default> Decoder for WireDecoder<U> {
     type Item = U;
@@ -609,5 +647,85 @@ fn rule(shape: Shape, n: u32, l: &Limits) -> Option<(u8, Option<Shape>, usize, u
         (Shape::Publication, 1) => text(4096),
         (Shape::Publication, 2) => nested(Shape::Reference),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::{
+        pin::Pin,
+        sync::{
+            Arc,
+            atomic::{AtomicBool, AtomicUsize, Ordering},
+        },
+        task::{Context, Poll},
+    };
+    use tonic::{codec::EncodeBody, codegen::Body};
+
+    struct OwnerProbe(Arc<AtomicUsize>);
+    impl Drop for OwnerProbe {
+        fn drop(&mut self) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+    struct Source {
+        frame: Option<q::OpenScopeFrame>,
+        dropped: Arc<AtomicBool>,
+        _owner: PhysicalOwner,
+    }
+    impl tonic::codegen::tokio_stream::Stream for Source {
+        type Item = Result<q::OpenScopeFrame, Status>;
+        fn poll_next(mut self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+            Poll::Ready(self.frame.take().map(Ok))
+        }
+    }
+    impl Drop for Source {
+        fn drop(&mut self) {
+            self.dropped.store(true, Ordering::SeqCst);
+        }
+    }
+
+    #[tokio::test]
+    async fn physical_encoded_body_owns_admission_after_fused_source_eof() {
+        let drops = Arc::new(AtomicUsize::new(0));
+        let source_dropped = Arc::new(AtomicBool::new(false));
+        let owner: PhysicalOwner = Arc::new(OwnerProbe(drops.clone()));
+        let source = Source {
+            frame: Some(q::OpenScopeFrame {
+                frame: Some(q::open_scope_frame::Frame::ScopeEnd(q::ScopeEnd::default())),
+            }),
+            dropped: source_dropped.clone(),
+            _owner: owner.clone(),
+        };
+        let mut codec = BoundedCodec::<q::OpenScopeFrame, q::QueryScope>::new(
+            Shape::QueryScope,
+            Limits::default(),
+            1024,
+        )
+        .with_owner(owner.clone());
+        let encoder = codec.encoder();
+        drop(codec);
+        drop(owner);
+        let mut body = Box::pin(EncodeBody::new_client(
+            encoder,
+            source,
+            Some(CompressionEncoding::Zstd),
+            Some(1024),
+        ));
+        let mut frames = 0;
+        while let Some(frame) =
+            futures_util::future::poll_fn(|cx| body.as_mut().poll_frame(cx)).await
+        {
+            assert!(!frame.unwrap().into_data().unwrap().is_empty());
+            frames += 1;
+        }
+        assert!(frames > 0);
+        // This is the real Tonic Fuse boundary: the source no longer exists,
+        // while the physical body still owns its encoder and admitted buffers.
+        assert!(source_dropped.load(Ordering::SeqCst));
+        assert_eq!(drops.load(Ordering::SeqCst), 0);
+        drop(body);
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
     }
 }

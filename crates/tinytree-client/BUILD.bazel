@@ -16,6 +16,14 @@ rust_library(
 )
 
 rust_test(
+    name = "unit_tests",
+    aliases = aliases(),
+    crate = ":tinytree-client",
+    edition = "2024",
+    deps = all_crate_deps(normal_dev = True),
+)
+
+rust_test(
     name = "rpc_tests",
     srcs = ["tests/rpc.rs"],
     aliases = aliases(),
