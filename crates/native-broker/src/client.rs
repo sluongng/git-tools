@@ -91,39 +91,7 @@ impl BrokerObjectIo {
             config.validate()?;
             wire::id(&store)?;
             crate::transport::private_directory(&spool)?;
-            #[cfg(unix)]
-            let channel = {
-                crate::transport::validate_socket(&socket)?;
-                let uid = unsafe { libc::geteuid() };
-                tokio::time::timeout(
-                    config.policy.connect_timeout(),
-                    Endpoint::from_static("http://[::]:50051")
-                        .connect_timeout(config.policy.connect_timeout())
-                        .connect_with_connector(tower::service_fn(move |_: http::Uri| {
-                            let socket = socket.clone();
-                            async move {
-                                let stream = tokio::net::UnixStream::connect(socket).await?;
-                                if stream.peer_cred()?.uid() != uid {
-                                    return Err(std::io::Error::new(
-                                        std::io::ErrorKind::PermissionDenied,
-                                        "broker peer owner mismatch",
-                                    ));
-                                }
-                                Ok::<_, std::io::Error>(hyper_util::rt::TokioIo::new(stream))
-                            }
-                        })),
-                )
-                .await
-                .map_err(|_| Status::deadline_exceeded("native broker connect deadline exceeded"))?
-                .map_err(|_| Status::unavailable("cannot connect native broker"))?
-            };
-            #[cfg(not(unix))]
-            let channel: Channel = {
-                let _ = socket;
-                return Err(Status::unimplemented(
-                    "private native broker requires Unix transport",
-                ));
-            };
+            let channel = connect_channel(socket, &config).await?;
             Ok(Self {
                 inner: Arc::new(Inner {
                     channel,
@@ -700,5 +668,50 @@ impl AsyncRead for SpoolReader {
                 (state, result)
             }));
         }
+    }
+}
+
+pub(crate) async fn run_control<T: Send + 'static>(
+    future: impl Future<Output = Result<T, Status>> + Send + 'static,
+) -> Result<T, Status> {
+    let runtime = runtime().map_err(|_| Status::internal("native broker executor unavailable"))?;
+    let mut task = Task(runtime.spawn(future));
+    (&mut task.0)
+        .await
+        .map_err(|_| Status::internal("native broker control job failed"))?
+}
+pub(crate) async fn connect_channel(socket: PathBuf, config: &Config) -> Result<Channel, Status> {
+    #[cfg(unix)]
+    {
+        crate::transport::validate_socket(&socket)?;
+        let uid = unsafe { libc::geteuid() };
+        tokio::time::timeout(
+            config.policy.connect_timeout(),
+            Endpoint::from_static("http://[::]:50051")
+                .connect_timeout(config.policy.connect_timeout())
+                .connect_with_connector(tower::service_fn(move |_: http::Uri| {
+                    let socket = socket.clone();
+                    async move {
+                        let stream = tokio::net::UnixStream::connect(socket).await?;
+                        if stream.peer_cred()?.uid() != uid {
+                            return Err(std::io::Error::new(
+                                std::io::ErrorKind::PermissionDenied,
+                                "broker peer owner mismatch",
+                            ));
+                        }
+                        Ok::<_, std::io::Error>(hyper_util::rt::TokioIo::new(stream))
+                    }
+                })),
+        )
+        .await
+        .map_err(|_| Status::deadline_exceeded("native broker connect deadline exceeded"))?
+        .map_err(|_| Status::unavailable("cannot connect native broker"))
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (socket, config);
+        Err(Status::unimplemented(
+            "private native broker requires Unix transport",
+        ))
     }
 }

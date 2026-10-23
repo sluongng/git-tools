@@ -26,6 +26,7 @@ pub struct BrokerService {
 }
 struct Inner {
     stores: HashMap<String, Arc<dyn NativeObjectIo>>,
+    controls: HashMap<String, Arc<dyn crate::NativeRepositoryControl>>,
     config: Config,
     calls: Arc<Semaphore>,
     memory: Arc<Semaphore>,
@@ -59,11 +60,50 @@ impl BrokerService {
         Ok(Self {
             inner: Arc::new(Inner {
                 stores,
+                controls: HashMap::new(),
                 calls: Arc::new(Semaphore::new(config.max_inflight)),
                 memory: Arc::new(Semaphore::new(config.max_memory_bytes)),
                 staging: Arc::new(Semaphore::new(config.max_temporary_bytes as usize)),
                 config,
             }),
+        })
+    }
+    /// Attach host-supplied control only to existing aliases, before cloning or
+    /// exposing the service. No incoming RPC chooses an implementation/budget.
+    pub fn with_controls(
+        mut self,
+        controls: HashMap<String, Arc<dyn crate::NativeRepositoryControl>>,
+    ) -> Result<Self, Status> {
+        for (id, control) in &controls {
+            wire::id(id)?;
+            if !self.inner.stores.contains_key(id) {
+                return Err(Status::invalid_argument(
+                    "control alias has no native object provider",
+                ));
+            }
+            let required = control.resources();
+            if required.memory_bytes == 0
+                || required.memory_bytes > self.inner.config.max_memory_bytes as u64
+                || required.temporary_bytes > self.inner.config.max_temporary_bytes
+            {
+                return Err(Status::invalid_argument(
+                    "native control resource bounds exceed broker pools",
+                ));
+            }
+        }
+        Arc::get_mut(&mut self.inner)
+            .ok_or_else(|| {
+                Status::failed_precondition("attach native controls before sharing the service")
+            })?
+            .controls = controls;
+        Ok(self)
+    }
+    fn control(&self, id: &str) -> Result<Arc<dyn crate::NativeRepositoryControl>, Status> {
+        self.store(id)?;
+        self.inner.controls.get(id).cloned().ok_or_else(|| {
+            Status::failed_precondition(
+                "native repository control is not configured for this alias",
+            )
         })
     }
     fn store(&self, id: &str) -> Result<Arc<dyn NativeObjectIo>, Status> {
@@ -112,6 +152,33 @@ impl BrokerService {
                     .max(self.inner.config.max_frame_bytes)
                     + 4096,
             );
+        RpcService {
+            inner: self.wrap(raw),
+        }
+    }
+    /// This second service shares the exact ObjectIo pools, deadlines and drain.
+    pub fn control_rpc_service(&self) -> ControlRpcService {
+        let raw = p::repository_control_server::RepositoryControlServer::new(self.clone())
+            .accept_compressed(CompressionEncoding::Zstd)
+            .send_compressed(CompressionEncoding::Zstd)
+            .max_decoding_message_size(4096)
+            .max_encoding_message_size(4096);
+        ControlRpcService {
+            inner: self.wrap(raw),
+        }
+    }
+    fn wrap<S>(
+        &self,
+        raw: S,
+    ) -> tower::util::BoxCloneSyncService<HttpRequest<Body>, HttpResponse<Body>, Infallible>
+    where
+        S: Service<HttpRequest<Body>, Response = HttpResponse<Body>, Error = Infallible>
+            + Clone
+            + Send
+            + Sync
+            + 'static,
+        S::Future: Send + 'static,
+    {
         let gate = Gate {
             inner: raw,
             shared: self.inner.clone(),
@@ -125,14 +192,30 @@ impl BrokerService {
         let mapped = tower::ServiceBuilder::new()
             .map_response(|response: HttpResponse<_>| response.map(Body::new))
             .service(timed);
-        RpcService {
-            inner: tower::util::BoxCloneSyncService::new(mapped),
-        }
+        tower::util::BoxCloneSyncService::new(mapped)
     }
 }
 #[derive(Clone)]
 pub struct RpcService {
     inner: tower::util::BoxCloneSyncService<HttpRequest<Body>, HttpResponse<Body>, Infallible>,
+}
+#[derive(Clone)]
+pub struct ControlRpcService {
+    inner: tower::util::BoxCloneSyncService<HttpRequest<Body>, HttpResponse<Body>, Infallible>,
+}
+impl NamedService for ControlRpcService {
+    const NAME: &'static str = "native.broker.v1.RepositoryControl";
+}
+impl Service<HttpRequest<Body>> for ControlRpcService {
+    type Response = HttpResponse<Body>;
+    type Error = Infallible;
+    type Future = Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send>>;
+    fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        self.inner.poll_ready(cx)
+    }
+    fn call(&mut self, request: HttpRequest<Body>) -> Self::Future {
+        self.inner.call(request)
+    }
 }
 impl NamedService for RpcService {
     const NAME: &'static str = "native.broker.v1.ObjectIo";
@@ -169,7 +252,13 @@ where
     }
     fn call(&mut self, request: HttpRequest<Body>) -> Self::Future {
         let shared = self.shared.clone();
-        let memory = if request.uri().path().ends_with("/CopyCatalog") {
+        let is_control = request
+            .uri()
+            .path()
+            .starts_with("/native.broker.v1.RepositoryControl/");
+        let memory = if is_control {
+            shared.config.max_memory_bytes
+        } else if request.uri().path().ends_with("/CopyCatalog") {
             shared
                 .config
                 .catalog_memory()
@@ -203,9 +292,22 @@ where
                     .acquire_many_owned(memory as u32)
                     .await
                     .map_err(|_| Status::unavailable("broker draining"))?;
+                let staging = if is_control {
+                    Some(
+                        shared
+                            .staging
+                            .clone()
+                            .acquire_many_owned(shared.config.max_temporary_bytes as u32)
+                            .await
+                            .map_err(|_| Status::unavailable("broker staging admission closed"))?,
+                    )
+                } else {
+                    None
+                };
                 let work = Arc::new(Work {
                     _calls: calls,
                     _memory: bytes,
+                    _staging: staging,
                     deadline,
                 });
                 let mut request = request.map(|body| {
@@ -607,6 +709,7 @@ fn grpc_budget(
 struct Work {
     _calls: OwnedSemaphorePermit,
     _memory: OwnedSemaphorePermit,
+    _staging: Option<OwnedSemaphorePermit>,
     deadline: Instant,
 }
 struct InboundBody {
@@ -667,4 +770,148 @@ async fn send_read(
         .await
         .map_err(|_| Status::deadline_exceeded("broker file stream deadline exceeded"))?
         .map_err(|_| Status::cancelled("broker file consumer stopped"))
+}
+
+#[tonic::async_trait]
+impl p::repository_control_server::RepositoryControl for BrokerService {
+    async fn observe_reference(
+        &self,
+        request: Request<p::ObserveReferenceRequest>,
+    ) -> Result<Response<p::ReferenceSnapshot>, Status> {
+        let input = request.into_inner();
+        crate::control::reference_name(&input.name)?;
+        let control = self.control(&input.store_id)?;
+        let value = control
+            .observe_reference(&input.name)
+            .await
+            .map_err(crate::control::status)?;
+        if value.name != input.name || value.generation == 0 && value.head.is_some() {
+            return Err(Status::data_loss(
+                "native control returned an invalid reference observation",
+            ));
+        }
+        let head = value
+            .head
+            .map(|head| {
+                crate::control::commit(head.head).map_err(|_| {
+                    Status::data_loss("native control returned an invalid admitted head")
+                })?;
+                Ok::<_, Status>(p::AdmittedCommit {
+                    head: head.head.0.to_vec(),
+                    metadata_objects: head.metadata_objects,
+                })
+            })
+            .transpose()?;
+        Ok(Response::new(p::ReferenceSnapshot {
+            name: value.name,
+            generation: value.generation,
+            head,
+        }))
+    }
+    async fn admit_commit(
+        &self,
+        request: Request<p::AdmitCommitRequest>,
+    ) -> Result<Response<p::AdmittedCommit>, Status> {
+        let input = request.into_inner();
+        let head = request_commit(&input.head)?;
+        let value = self
+            .control(&input.store_id)?
+            .admit_commit(head)
+            .await
+            .map_err(crate::control::status)?;
+        if value.head != head {
+            return Err(Status::data_loss("native control admitted another head"));
+        }
+        Ok(Response::new(p::AdmittedCommit {
+            head: head.0.to_vec(),
+            metadata_objects: value.metadata_objects,
+        }))
+    }
+    async fn publish(
+        &self,
+        request: Request<p::PublishRequest>,
+    ) -> Result<Response<p::ConfirmedPublication>, Status> {
+        let input = request.into_inner();
+        crate::control::reference_name(&input.name)?;
+        crate::control::key(&input.idempotency_key)?;
+        let head = request_commit(&input.head)?;
+        let expected = input.expected_generation.ok_or_else(|| {
+            Status::invalid_argument("native publication requires an explicit expected generation")
+        })?;
+        let generation = expected
+            .checked_add(1)
+            .ok_or_else(|| Status::invalid_argument("native reference generation exhausted"))?;
+        let wanted = crate::PublishRequest {
+            name: input.name,
+            head,
+            expected_generation: expected,
+            idempotency_key: input.idempotency_key,
+        };
+        let value = self
+            .control(&input.store_id)?
+            .publish(wanted.clone())
+            .await
+            .map_err(crate::control::status)?;
+        if value.idempotency_key != wanted.idempotency_key
+            || value.name != wanted.name
+            || value.head != wanted.head
+            || value.generation != generation
+        {
+            return Err(Status::data_loss(
+                "native control publication does not match original intent",
+            ));
+        }
+        Ok(Response::new(control_publication(value)?))
+    }
+    async fn publication(
+        &self,
+        request: Request<p::PublicationRequest>,
+    ) -> Result<Response<p::PublicationReply>, Status> {
+        let input = request.into_inner();
+        crate::control::key(&input.idempotency_key)?;
+        let value = self
+            .control(&input.store_id)?
+            .publication(&input.idempotency_key)
+            .await
+            .map_err(crate::control::status)?;
+        if value
+            .as_ref()
+            .is_some_and(|v| v.idempotency_key != input.idempotency_key)
+        {
+            return Err(Status::data_loss("native control publication key mismatch"));
+        }
+        Ok(Response::new(p::PublicationReply {
+            publication: value.map(control_publication).transpose()?,
+        }))
+    }
+}
+fn request_commit(bytes: &[u8]) -> Result<crate::CommitId, Status> {
+    let head = crate::CommitId(
+        bytes
+            .try_into()
+            .map_err(|_| Status::invalid_argument("invalid native control commit ID"))?,
+    );
+    crate::control::commit(head)?;
+    Ok(head)
+}
+fn control_publication(
+    value: crate::ConfirmedPublication,
+) -> Result<p::ConfirmedPublication, Status> {
+    crate::control::reference_name(&value.name)
+        .map_err(|_| Status::data_loss("native control returned an invalid publication name"))?;
+    crate::control::key(&value.idempotency_key)
+        .map_err(|_| Status::data_loss("native control returned an invalid publication key"))?;
+    crate::control::commit(value.head)
+        .map_err(|_| Status::data_loss("native control returned an invalid publication head"))?;
+    if value.generation == 0 {
+        return Err(Status::data_loss(
+            "native control returned an invalid publication generation",
+        ));
+    }
+    Ok(p::ConfirmedPublication {
+        idempotency_key: value.idempotency_key,
+        name: value.name,
+        generation: value.generation,
+        head: value.head.0.to_vec(),
+    })
 }

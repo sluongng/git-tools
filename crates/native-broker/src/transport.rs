@@ -111,6 +111,7 @@ pub async fn serve_unix(
     });
     let result = tonic::transport::Server::builder()
         .add_service(service.rpc_service())
+        .add_service(service.control_rpc_service())
         .serve_with_incoming_shutdown(incoming, shutdown)
         .await
         .map_err(|_| Status::internal("native broker listener failed"));

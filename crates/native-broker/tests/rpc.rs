@@ -41,6 +41,9 @@ impl Running {
     async fn start(socket: &Path, provider: Arc<dyn NativeObjectIo>, config: Config) -> Self {
         let service =
             BrokerService::new(HashMap::from([("example".into(), provider)]), config).unwrap();
+        Self::start_service(socket, service).await
+    }
+    async fn start_service(socket: &Path, service: BrokerService) -> Self {
         let (stop, signal) = oneshot::channel();
         let path = socket.to_owned();
         let task = tokio::spawn(async move {
@@ -928,4 +931,373 @@ async fn write_staging_is_global_across_aliases_and_survives_client_cancellation
     assert_eq!(beta_metadata.load(Ordering::SeqCst), 1);
     drop(beta_client);
     host.stop().await;
+}
+
+#[derive(Debug)]
+struct FakeControl {
+    state: std::sync::Mutex<FakeReferences>,
+    observations: std::sync::atomic::AtomicUsize,
+    resources: native_broker::ControlResources,
+    admission_pause: Option<Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>>,
+    admission_started: Arc<std::sync::atomic::AtomicBool>,
+}
+#[derive(Debug)]
+struct FakeReferences {
+    references: HashMap<String, (u64, Option<native_broker::CommitId>)>,
+    publications: HashMap<
+        String,
+        (
+            native_broker::PublishRequest,
+            native_broker::ConfirmedPublication,
+        ),
+    >,
+    requests: Vec<native_broker::PublishRequest>,
+}
+impl FakeControl {
+    fn new() -> Self {
+        Self {
+            state: std::sync::Mutex::new(FakeReferences {
+                references: HashMap::from([
+                    ("main".into(), (3, Some(native_broker::CommitId([1; 32])))),
+                    ("absent".into(), (7, None)),
+                ]),
+                publications: HashMap::new(),
+                requests: vec![],
+            }),
+            observations: std::sync::atomic::AtomicUsize::new(0),
+            resources: native_broker::ControlResources {
+                memory_bytes: 4096,
+                temporary_bytes: 4096,
+            },
+            admission_pause: None,
+            admission_started: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        }
+    }
+}
+#[async_trait::async_trait]
+impl native_broker::NativeRepositoryControl for FakeControl {
+    fn resources(&self) -> native_broker::ControlResources {
+        self.resources
+    }
+    async fn observe_reference(
+        &self,
+        name: &str,
+    ) -> Result<native_broker::ReferenceSnapshot, tonic::Status> {
+        self.observations
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        if name == "offline" {
+            let mut error = tonic::Status::unavailable("fixture diagnostic must stay server-side");
+            error
+                .metadata_mut()
+                .insert("x-test-detail", "not-for-client".parse().unwrap());
+            return Err(error);
+        }
+        let state = self.state.lock().unwrap();
+        let (generation, head) = state.references.get(name).copied().unwrap_or((0, None));
+        Ok(native_broker::ReferenceSnapshot {
+            name: name.into(),
+            generation,
+            head: head.map(|head| native_broker::AdmittedCommit {
+                head,
+                metadata_objects: 2,
+            }),
+        })
+    }
+    async fn admit_commit(
+        &self,
+        head: native_broker::CommitId,
+    ) -> Result<native_broker::AdmittedCommit, tonic::Status> {
+        self.admission_started
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        if let Some(pause) = &self.admission_pause {
+            let pause = pause.clone();
+            tokio::task::spawn_blocking(move || {
+                let (lock, wake) = &*pause;
+                let mut released = lock.lock().unwrap();
+                while !*released {
+                    released = wake.wait(released).unwrap();
+                }
+            })
+            .await
+            .unwrap();
+        }
+        Ok(native_broker::AdmittedCommit {
+            head,
+            metadata_objects: 2,
+        })
+    }
+    async fn publish(
+        &self,
+        request: native_broker::PublishRequest,
+    ) -> Result<native_broker::ConfirmedPublication, tonic::Status> {
+        let mut state = self.state.lock().unwrap();
+        if let Some((original, receipt)) = state.publications.get(&request.idempotency_key) {
+            return if original == &request {
+                Ok(receipt.clone())
+            } else {
+                Err(tonic::Status::already_exists("another intent"))
+            };
+        }
+        state.requests.push(request.clone());
+        let (current, _) = state
+            .references
+            .get(&request.name)
+            .copied()
+            .unwrap_or((0, None));
+        if current != request.expected_generation {
+            return Err(tonic::Status::aborted("stale authoritative generation"));
+        }
+        let receipt = native_broker::ConfirmedPublication {
+            idempotency_key: request.idempotency_key.clone(),
+            name: request.name.clone(),
+            generation: current + 1,
+            head: request.head,
+        };
+        state
+            .references
+            .insert(request.name.clone(), (current + 1, Some(request.head)));
+        state
+            .publications
+            .insert(request.idempotency_key.clone(), (request, receipt.clone()));
+        Ok(receipt)
+    }
+    async fn publication(
+        &self,
+        key: &str,
+    ) -> Result<Option<native_broker::ConfirmedPublication>, tonic::Status> {
+        Ok(self
+            .state
+            .lock()
+            .unwrap()
+            .publications
+            .get(key)
+            .map(|(_, receipt)| receipt.clone()))
+    }
+}
+async fn control_fixture(root: &Path, control: Arc<FakeControl>) -> (Running, PathBuf) {
+    let backend = root.join("store");
+    private(&backend);
+    let provider: Arc<dyn NativeObjectIo> =
+        Arc::new(DirectObjectIo::init(&backend, backend_config()).unwrap());
+    let service = BrokerService::new(
+        HashMap::from([
+            ("example".into(), provider.clone()),
+            ("local-only".into(), provider),
+        ]),
+        config(),
+    )
+    .unwrap()
+    .with_controls(HashMap::from([(
+        "example".into(),
+        control as Arc<dyn native_broker::NativeRepositoryControl>,
+    )]))
+    .unwrap();
+    let socket = root.join("broker.sock");
+    (Running::start_service(&socket, service).await, socket)
+}
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn control_preserves_observation_generation_and_caller_cas_across_independent_processes() {
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path().canonicalize().unwrap();
+    private(&root);
+    let control = Arc::new(FakeControl::new());
+    let (host, socket) = control_fixture(&root, control.clone()).await;
+    let a = OwnedChild::spawn(&socket, &root.join("a"), "control-observe", &["main"]);
+    let b = OwnedChild::spawn(&socket, &root.join("b"), "control-observe", &["main"]);
+    let (a, b) = tokio::join!(a.finish(), b.finish());
+    assert_eq!(a, b);
+    assert!(a.starts_with("OBSERVED 3 "));
+    let head_a = "02".repeat(32);
+    let head_b = "03".repeat(32);
+    let a = OwnedChild::spawn(
+        &socket,
+        &root.join("a-push"),
+        "control-publish",
+        &["main", &head_a, "3", "intent-a"],
+    );
+    let b = OwnedChild::spawn(
+        &socket,
+        &root.join("b-push"),
+        "control-publish",
+        &["main", &head_b, "3", "intent-b"],
+    );
+    let (a, b) = tokio::join!(a.finish(), b.finish());
+    assert_eq!(
+        usize::from(a.starts_with("PUBLISHED 4 ")) + usize::from(b.starts_with("PUBLISHED 4 ")),
+        1
+    );
+    assert_eq!(usize::from(a == "STALE") + usize::from(b == "STALE"), 1);
+    {
+        let state = control.state.lock().unwrap();
+        assert_eq!(state.requests.len(), 2);
+        assert!(
+            state
+                .requests
+                .iter()
+                .all(|request| request.expected_generation == 3)
+        );
+    }
+    let client = native_broker::BrokerControlClient::connect(&socket, "example", config())
+        .await
+        .unwrap();
+    let absent = client.observe_reference("absent").await.unwrap();
+    assert_eq!(absent.generation, 7);
+    assert!(absent.head.is_none());
+    let admitted = client
+        .admit_commit(native_broker::CommitId([4; 32]))
+        .await
+        .unwrap();
+    assert_eq!(admitted.head, native_broker::CommitId([4; 32]));
+    let initial = native_broker::PublishRequest {
+        name: "new".into(),
+        head: admitted.head,
+        expected_generation: 0,
+        idempotency_key: "explicit-zero".into(),
+    };
+    let receipt = client.publish(initial.clone()).await.unwrap();
+    assert_eq!(receipt.generation, 1);
+    assert_eq!(client.publish(initial).await.unwrap(), receipt);
+    assert_eq!(
+        client.publication("explicit-zero").await.unwrap(),
+        Some(receipt)
+    );
+    assert!(client.publication("unconfirmed").await.unwrap().is_none());
+    let error = client.observe_reference("offline").await.unwrap_err();
+    assert_eq!(error.code(), tonic::Code::Unavailable);
+    assert!(!error.message().contains("fixture diagnostic"));
+    assert!(error.metadata().get("x-test-detail").is_none());
+    let local = native_broker::BrokerControlClient::connect(&socket, "local-only", config())
+        .await
+        .unwrap();
+    assert_eq!(
+        local.observe_reference("main").await.unwrap_err().code(),
+        tonic::Code::FailedPrecondition
+    );
+    let unknown = native_broker::BrokerControlClient::connect(&socket, "unknown", config())
+        .await
+        .unwrap();
+    assert_eq!(
+        unknown.observe_reference("main").await.unwrap_err().code(),
+        tonic::Code::NotFound
+    );
+    drop(unknown);
+    drop(local);
+    drop(client);
+    host.stop().await;
+}
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn control_registration_and_wire_requests_fail_before_adapter_work() {
+    use tonic::{codec::CompressionEncoding, transport::Endpoint};
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path().canonicalize().unwrap();
+    private(&root);
+    let backend = root.join("preflight-store");
+    private(&backend);
+    let provider: Arc<dyn NativeObjectIo> =
+        Arc::new(DirectObjectIo::init(&backend, backend_config()).unwrap());
+    let mut too_large = FakeControl::new();
+    too_large.resources.memory_bytes = config().max_memory_bytes as u64 + 1;
+    assert!(
+        BrokerService::new(
+            HashMap::from([("example".into(), provider.clone())]),
+            config()
+        )
+        .unwrap()
+        .with_controls(HashMap::from([(
+            "example".into(),
+            Arc::new(too_large) as Arc<dyn native_broker::NativeRepositoryControl>
+        )]))
+        .is_err()
+    );
+    let mut too_much_disk = FakeControl::new();
+    too_much_disk.resources.temporary_bytes = config().max_temporary_bytes + 1;
+    assert!(
+        BrokerService::new(HashMap::from([("example".into(), provider)]), config())
+            .unwrap()
+            .with_controls(HashMap::from([(
+                "example".into(),
+                Arc::new(too_much_disk) as Arc<dyn native_broker::NativeRepositoryControl>
+            )]))
+            .is_err()
+    );
+    let control = Arc::new(FakeControl::new());
+    let (host, socket) = control_fixture(&root, control.clone()).await;
+    let path = socket.clone();
+    let channel = Endpoint::from_static("http://[::]:50051")
+        .connect_with_connector(tower::service_fn(move |_: http::Uri| {
+            let path = path.clone();
+            async move {
+                Ok::<_, std::io::Error>(hyper_util::rt::TokioIo::new(
+                    tokio::net::UnixStream::connect(path).await?,
+                ))
+            }
+        }))
+        .await
+        .unwrap();
+    let mut raw =
+        native_broker::proto::repository_control_client::RepositoryControlClient::new(channel)
+            .send_compressed(CompressionEncoding::Zstd)
+            .accept_compressed(CompressionEncoding::Zstd);
+    let error = raw
+        .publish(native_broker::proto::PublishRequest {
+            store_id: "example".into(),
+            name: "new".into(),
+            head: vec![5; 32],
+            expected_generation: None,
+            idempotency_key: "missing-generation".into(),
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(error.code(), tonic::Code::InvalidArgument);
+    assert!(control.state.lock().unwrap().requests.is_empty());
+    drop(raw);
+    host.stop().await;
+}
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cancelled_control_drains_adapter_work_and_keeps_shared_object_pools_charged() {
+    use std::sync::atomic::Ordering;
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path().canonicalize().unwrap();
+    private(&root);
+    let spool = root.join("spool");
+    private(&spool);
+    let release = Release(Arc::new((
+        std::sync::Mutex::new(false),
+        std::sync::Condvar::new(),
+    )));
+    let mut fake = FakeControl::new();
+    fake.admission_pause = Some(release.0.clone());
+    let started = fake.admission_started.clone();
+    let control = Arc::new(fake);
+    let (host, socket) = control_fixture(&root, control).await;
+    let mut short = config();
+    short.policy.operation_timeout_ms = 100;
+    let client = native_broker::BrokerControlClient::connect(&socket, "example", short.clone())
+        .await
+        .unwrap();
+    assert!(
+        client
+            .admit_commit(native_broker::CommitId([6; 32]))
+            .await
+            .is_err()
+    );
+    assert!(started.load(Ordering::SeqCst));
+    let io = BrokerObjectIo::connect(&socket, "example", &spool, short)
+        .await
+        .unwrap();
+    assert!(
+        io.descriptor(tinytree_model::empty_tree().descriptor.key)
+            .await
+            .is_err()
+    );
+    drop(io);
+    drop(client);
+    let stopping = tokio::spawn(host.stop());
+    tokio::time::sleep(Duration::from_millis(40)).await;
+    assert!(
+        !stopping.is_finished(),
+        "transport shutdown discarded draining control ownership"
+    );
+    release.release();
+    stopping.await.unwrap();
 }

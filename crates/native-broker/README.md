@@ -22,5 +22,11 @@ This is a Unix local-I/O component, not a remote repository service, jj operatio
 store, retention implementation or garbage collector. Use [the native CLI](../jj-native-cli) with a configured private host.
 The direct provider still retains local objects.
 
+Optional `NativeRepositoryControl` adapters add observation, admission and public
+publication for an alias. `BrokerControlClient` uses explicit workspace-observed
+CAS generations; the host never substitutes its latest value. Control shares
+ObjectIo's pools and conservatively reserves the whole memory/staging budget,
+serializing host control work. Adapter limits are checked before registration.
+
 `//crates/native-broker:rpc_tests` uses actual independent client processes with
 Git unavailable, shared-store concurrency, host restart and cancellation tests.

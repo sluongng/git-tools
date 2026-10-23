@@ -56,6 +56,40 @@ fn main() {
         config.policy.stream_idle_timeout_ms = 100;
     }
     block_on(async {
+        if mode.starts_with("control-") {
+            let client =
+                native_broker::BrokerControlClient::connect(&socket, "example", config.clone())
+                    .await
+                    .unwrap();
+            if mode == "control-observe" {
+                let snapshot = client.observe_reference(&args[4]).await.unwrap();
+                println!(
+                    "OBSERVED {} {}",
+                    snapshot.generation,
+                    snapshot
+                        .head
+                        .map(|v| hex(&v.head.0))
+                        .unwrap_or_else(|| "absent".into())
+                );
+            } else {
+                let request = native_broker::PublishRequest {
+                    name: args[4].clone(),
+                    head: native_broker::CommitId(parse(&args[5])),
+                    expected_generation: args[6].parse().unwrap(),
+                    idempotency_key: args[7].clone(),
+                };
+                match client.publish(request).await {
+                    Ok(receipt) => {
+                        println!("PUBLISHED {} {}", receipt.generation, hex(&receipt.head.0))
+                    }
+                    Err(error) if error.code() == native_broker::ControlCode::Aborted => {
+                        println!("STALE")
+                    }
+                    Err(error) => panic!("unexpected control error: {error}"),
+                }
+            }
+            return;
+        }
         let provider = Arc::new(
             BrokerObjectIo::connect(
                 &socket,

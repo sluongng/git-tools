@@ -23,3 +23,26 @@ message WriteHeader { string store_id = 1; uint64 max_bytes = 2; }
 message WriteFrame { oneof frame { WriteHeader header = 1; Chunk chunk = 2; bool complete = 3; } }
 message CatalogRequest { string store_id = 1; uint64 max_objects = 2; uint64 max_bytes = 3; uint64 max_edges = 4; }
 message CatalogFrame { oneof frame { Metadata entry = 1; Complete complete = 2; } }
+
+// Separate optional host control for a configured alias. Expected generations
+// are explicit caller workspace observations, never host-global latest values.
+service RepositoryControl {
+  rpc ObserveReference(ObserveReferenceRequest) returns (ReferenceSnapshot);
+  rpc AdmitCommit(AdmitCommitRequest) returns (AdmittedCommit);
+  rpc Publish(PublishRequest) returns (ConfirmedPublication);
+  rpc Publication(PublicationRequest) returns (PublicationReply);
+}
+message ObserveReferenceRequest { string store_id = 1; string name = 2; }
+message AdmitCommitRequest { string store_id = 1; bytes head = 2; }
+message AdmittedCommit { bytes head = 1; uint64 metadata_objects = 2; }
+message ReferenceSnapshot { string name = 1; uint64 generation = 2; optional AdmittedCommit head = 3; }
+message PublishRequest {
+  string store_id = 1; string name = 2; bytes head = 3;
+  optional uint64 expected_generation = 4; string idempotency_key = 5;
+}
+message ConfirmedPublication { string idempotency_key = 1; string name = 2; uint64 generation = 3; bytes head = 4; }
+message PublicationRequest { string store_id = 1; string idempotency_key = 2; }
+message PublicationReply {
+  // Absence is no confirmed receipt, not proof that upstream did not commit.
+  optional ConfirmedPublication publication = 1;
+}

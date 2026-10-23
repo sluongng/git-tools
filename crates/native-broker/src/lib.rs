@@ -2,12 +2,21 @@
 //! remain in Tinytree; per-workspace jj operation/index/working-copy state stays local.
 mod client;
 mod config;
+mod control;
+mod control_client;
+pub use control::{
+    AdmittedCommit, ConfirmedPublication, ControlResources, NativeRepositoryControl,
+    PublishRequest, ReferenceSnapshot,
+};
+pub use control_client::BrokerControlClient;
+pub use tinytree_model::CommitId;
+pub use tonic::{Code as ControlCode, Status as ControlStatus};
 mod service;
 mod transport;
 mod wire;
 pub use client::BrokerObjectIo;
 pub use config::Config;
-pub use service::{BrokerService, RpcService};
+pub use service::{BrokerService, ControlRpcService, RpcService};
 #[cfg(unix)]
 pub use transport::serve_unix;
 pub mod proto {
