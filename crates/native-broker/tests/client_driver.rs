@@ -5,7 +5,7 @@ use jj_lib::{
     repo_path::{RepoPath, RepoPathBuf},
 };
 use jj_native_backend::{CopyCatalogLimits, NativeBackend, NativeObjectIo};
-use native_broker::{BrokerObjectIo, Config};
+use native_broker::{BrokerObjectIo, Config, LocalEndpoint};
 use std::{
     path::PathBuf,
     pin::Pin,
@@ -39,7 +39,11 @@ impl futures::AsyncRead for Never {
 }
 fn main() {
     let args: Vec<_> = std::env::args().collect();
-    let socket = PathBuf::from(&args[1]);
+    let endpoint = if cfg!(windows) {
+        LocalEndpoint::WindowsNamedPipe(args[1].clone())
+    } else {
+        LocalEndpoint::UnixSocket(PathBuf::from(&args[1]))
+    };
     let spool = PathBuf::from(&args[2]);
     let mode = &args[3];
     let mut config = Config {
@@ -57,10 +61,13 @@ fn main() {
     }
     block_on(async {
         if mode.starts_with("control-") {
-            let client =
-                native_broker::BrokerControlClient::connect(&socket, "example", config.clone())
-                    .await
-                    .unwrap();
+            let client = native_broker::BrokerControlClient::connect_local(
+                endpoint.clone(),
+                "example",
+                config.clone(),
+            )
+            .await
+            .unwrap();
             if mode == "control-observe" {
                 let snapshot = client.observe_reference(&args[4]).await.unwrap();
                 println!(
@@ -91,8 +98,8 @@ fn main() {
             return;
         }
         let provider = Arc::new(
-            BrokerObjectIo::connect(
-                &socket,
+            BrokerObjectIo::connect_local(
+                endpoint.clone(),
                 if mode == "unknown" {
                     "unknown"
                 } else {
@@ -129,7 +136,7 @@ fn main() {
             config.policy.operation_timeout_ms = 10_000;
             config.policy.stream_idle_timeout_ms = 10_000;
             Arc::new(
-                BrokerObjectIo::connect(&socket, "example", &spool, config)
+                BrokerObjectIo::connect_local(endpoint.clone(), "example", &spool, config)
                     .await
                     .unwrap(),
             )

@@ -1,18 +1,16 @@
-//! Native jj entry point. Source mounts remain separate work.
+//! Native jj entry point. User workspaces require daemon-owned lazy jj-vfs.
 mod broker;
 mod remote;
 mod remote_state;
-use std::path::{Path, PathBuf};
+mod roots;
+mod vfs;
+use std::path::PathBuf;
 
 use jj_cli::cli_util::{CliRunner, CommandHelper};
 use jj_cli::command_error::{CommandError, cli_error, user_error_with_message};
 use jj_cli::ui::Ui;
-use jj_lib::backend::{Backend, BackendInitError};
 use jj_lib::repo::StoreFactories;
-use jj_lib::settings::UserSettings;
-use jj_lib::signing_factory::signer_from_settings;
-use jj_lib::workspace::{Workspace, WorkspaceInitError};
-use jj_native_backend::{Config, NativeBackend};
+use jj_lib::workspace::Workspace;
 
 #[derive(clap::Parser, Clone, Debug)]
 enum NativeCommand {
@@ -25,7 +23,29 @@ enum NativeCommand {
 
 #[derive(clap::Subcommand, Clone, Debug)]
 enum TinytreeCommand {
-    /// Clone a selected native reference into an ordinary materialized workspace.
+    /// Resume a stopped or interrupted lazy workspace using its original identity.
+    Resume { destination: PathBuf },
+    /// Stop an explicit lazy mount; run from outside its directory.
+    Unmount { destination: PathBuf },
+    /// Reconcile pending native mutations against authoritative controller receipts.
+    Recover {
+        destination: PathBuf,
+        /// Full retained jj operation ID proving the applied workspace tree.
+        #[arg(long)]
+        operation: Option<String>,
+    },
+    /// Inspect retained native roots without snapshotting or collecting data.
+    Roots {
+        #[arg(long)]
+        json: bool,
+        #[arg(long, default_value_t = 10_000)]
+        max_operations: usize,
+        #[arg(long, default_value_t = 100_000)]
+        max_roots: usize,
+        #[arg(long, default_value_t = 8 * 1024 * 1024)]
+        max_file_bytes: usize,
+    },
+    /// Clone a selected native reference into a daemon-owned lazy workspace.
     Clone {
         destination: PathBuf,
         #[arg(long)]
@@ -54,7 +74,7 @@ enum TinytreeCommand {
         #[arg(long)]
         bookmark: String,
     },
-    /// Initialize a local native repository and ordinary materialized workspace.
+    /// Initialize a native repository through a daemon-owned lazy workspace.
     Init {
         #[arg(default_value = ".", value_hint = clap::ValueHint::DirPath)]
         destination: PathBuf,
@@ -73,6 +93,66 @@ async fn run_native_command(
     args: NativeCommand,
 ) -> Result<(), CommandError> {
     match args {
+        NativeCommand::Tinytree {
+            command: TinytreeCommand::Resume { destination },
+        } => vfs::resume(ui, command, &command.cwd().join(destination)).await,
+        NativeCommand::Tinytree {
+            command: TinytreeCommand::Unmount { destination },
+        } => vfs::unmount(command, &command.cwd().join(destination)),
+        NativeCommand::Tinytree {
+            command:
+                TinytreeCommand::Recover {
+                    destination,
+                    operation,
+                },
+        } => vfs::recover(command, &command.cwd().join(destination), operation).await,
+        NativeCommand::Tinytree {
+            command:
+                TinytreeCommand::Roots {
+                    json,
+                    max_operations,
+                    max_roots,
+                    max_file_bytes,
+                },
+        } => {
+            use std::io::Write as _;
+            if command.global_args().at_operation.is_some()
+                || command.global_args().ignore_working_copy
+                || command.global_args().no_integrate_operation
+            {
+                return Err(cli_error(
+                    "root inventory requires the actual current workspace",
+                ));
+            }
+            let limits = roots::CollectorLimits {
+                max_operations,
+                max_object_roots: max_roots,
+                max_file_bytes,
+                ..Default::default()
+            };
+            let workspace = load_audit_workspace(command, &limits)?;
+            let checkpoint = roots::collect(&workspace, &limits).await.map_err(|error| {
+                user_error_with_message("Cannot inventory native retention roots", error)
+            })?;
+            if json {
+                let bytes = serde_json::to_vec(&checkpoint.audit())
+                    .map_err(|_| cli_error("cannot encode native root inventory"))?;
+                ui.stdout().write_all(&bytes)?;
+                writeln!(ui.stdout())?;
+            } else {
+                writeln!(
+                    ui.stdout(),
+                    "{} retained operations, {} native object roots",
+                    checkpoint.retained_operations.len(),
+                    checkpoint.object_roots.len()
+                )?;
+                writeln!(
+                    ui.stdout(),
+                    "Read-only inventory; this does not authorize garbage collection."
+                )?;
+            }
+            Ok(())
+        }
         NativeCommand::Tinytree {
             command:
                 TinytreeCommand::Clone {
@@ -127,27 +207,24 @@ async fn run_native_command(
                     ));
                 }
             };
+            #[cfg(not(feature = "protocol-fixture"))]
+            if locator.is_none() {
+                return Err(cli_error(
+                    "native initialization requires --broker and --store for a lazy mount",
+                ));
+            }
             let destination = command.cwd().join(destination);
-            std::fs::create_dir_all(&destination)
+            vfs::prepare_destination(&destination)
                 .map_err(|error| user_error_with_message("Failed to create workspace", error))?;
             let destination = destination
                 .canonicalize()
                 .map_err(|error| user_error_with_message("Failed to resolve workspace", error))?;
-            let (settings, _) = command.settings_for_new_workspace(ui, &destination)?;
-            let initializer =
-                |_: &UserSettings, path: &Path| -> Result<Box<dyn Backend>, BackendInitError> {
-                    match &locator {
-                        Some(locator) => broker::init(path, locator.clone()),
-                        None => Ok(Box::new(NativeBackend::init(path, Config::default())?)),
-                    }
-                };
-            // Default local working-copy, operation, index and workspace stores
-            // remain owned by this workspace; only immutable object I/O changes.
-            Workspace::init_with_backend(
-                &settings,
+            vfs::initialize(
+                ui,
+                command,
                 &destination,
-                &initializer,
-                signer_from_settings(&settings).map_err(WorkspaceInitError::SignInit)?,
+                locator,
+                &jj_lib::backend::CommitId::new(vec![0; 32]),
             )
             .await?;
             Ok(())
@@ -155,10 +232,76 @@ async fn run_native_command(
     }
 }
 
+/// Construct the audit workspace through bounded persisted WC reads. Loading
+/// ordinary LocalWorkingCopy first would decode checkout before audit limits.
+#[cfg(feature = "protocol-fixture")]
+fn load_audit_workspace(
+    command: &CommandHelper,
+    limits: &roots::CollectorLimits,
+) -> Result<Workspace, CommandError> {
+    use jj_lib::local_working_copy::LocalWorkingCopy;
+    use jj_lib::repo::RepoLoader;
+    let loader = command.workspace_loader()?;
+    if loader.get_working_copy_type().map_err(|error| {
+        user_error_with_message("Cannot identify working-copy implementation", error)
+    })? != LocalWorkingCopy::NAME
+    {
+        return Err(cli_error(
+            "root inventory does not support this working-copy implementation",
+        ));
+    }
+    let mut factories = jj_lib::default_backend_factories::default_backend_factories();
+    broker::register(&mut factories);
+    let repo_loader =
+        RepoLoader::init_from_file_system(command.settings(), loader.repo_path(), &factories)
+            .map_err(|error| {
+                user_error_with_message("Cannot load native audit repository", error)
+            })?;
+    let root = loader.workspace_root().to_path_buf();
+    let working_copy = LocalWorkingCopy::load_readonly(
+        repo_loader.store().clone(),
+        root.clone(),
+        root.join(".jj/working_copy"),
+        command.settings(),
+        limits.max_file_bytes,
+        limits.max_decode_bytes,
+    )
+    .map_err(|error| user_error_with_message("Cannot read bounded working-copy state", error))?;
+    Workspace::new(
+        &root,
+        loader.repo_path().to_path_buf(),
+        Box::new(working_copy),
+        repo_loader,
+    )
+    .map_err(|error| user_error_with_message("Cannot construct native audit workspace", error))
+}
+
+#[cfg(not(feature = "protocol-fixture"))]
+fn load_audit_workspace(
+    command: &CommandHelper,
+    limits: &roots::CollectorLimits,
+) -> Result<Workspace, CommandError> {
+    roots::load_native_workspace(command, limits).map_err(|error| {
+        user_error_with_message("Cannot load bounded native root inventory", error)
+    })
+}
+
 fn main() -> std::process::ExitCode {
     let mut factories = StoreFactories::empty();
     broker::register(&mut factories);
-    CliRunner::init()
+    let runner = CliRunner::init();
+    #[cfg(not(feature = "protocol-fixture"))]
+    let runner = {
+        let mut working_copies = jj_lib::workspace::WorkingCopyFactories::new();
+        working_copies.insert(
+            jj_vfs::native::NAME.to_owned(),
+            Box::new(vfs::WorkingCopyFactory) as _,
+        );
+        runner
+            .set_workspace_loader_factory(Box::new(vfs::Loader))
+            .add_working_copy_factories(working_copies)
+    };
+    runner
         .version(env!("CARGO_PKG_VERSION"))
         .add_store_factories(factories)
         .add_subcommand(run_native_command)

@@ -1,7 +1,21 @@
 use super::*;
 #[cfg(not(target_os = "macos"))]
 use anyhow::ensure;
-use output_core::MaintenanceOutcome;
+use output_core::{
+    MaintenanceOutcome, SourceFrontendFence, SourceLimits, SourceManifest, SourceReceipt,
+    SourceSnapshot, SourceVersion,
+};
+
+/// Native source capture is deliberately disabled until the macOS client
+/// dirty-page flush/COMMIT barrier has passed real native acceptance.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct NfsSourceUnsupported;
+impl std::fmt::Display for NfsSourceUnsupported {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("NFS source capture/checkout is unsupported until the native client flush barrier is validated")
+    }
+}
+impl std::error::Error for NfsSourceUnsupported {}
 
 /// Caller-visible native availability. RecoveryRequired is never a healthy
 /// mount claim: explicit maintenance can retry after its reported cause clears.
@@ -141,10 +155,18 @@ impl NfsMount {
             .context("native maintenance task failed")?
         }
     }
-    async fn complete<F, Fut>(&self, operation: F) -> Result<()>
+    /// The caller must stop all native users before requesting capture. Tree's
+    /// mutation barrier cannot flush dirty pages retained by the NFS client.
+    /// This currently fails without freezing/changing the tree or rotating the
+    /// mount; metadata-only open+fsync/COMMIT needs native validation first.
+    pub async fn capture_source_quiescent(&self, _limits: SourceLimits) -> Result<SourceSnapshot> {
+        Err(NfsSourceUnsupported.into())
+    }
+    async fn complete<F, Fut, T>(&self, operation: F) -> Result<T>
     where
         F: FnOnce(NfsPublisher) -> Fut + Send + 'static,
-        Fut: std::future::Future<Output = Result<()>> + Send + 'static,
+        Fut: std::future::Future<Output = Result<T>> + Send + 'static,
+        T: Send + 'static,
     {
         let guard = self.control.clone().lock_owned().await;
         let fs = match &*self.session.lock().unwrap() {
@@ -509,6 +531,88 @@ pub(super) struct NfsPublisher {
     pub(super) root: PathBuf,
 }
 impl NfsPublisher {
+    // Foundation only: no public caller can enter this until native capture
+    // proves page-cache flush/COMMIT ordering. The embedding owner must have
+    // quiesced native users; this never claims Tree freezing flushes the client.
+    #[allow(dead_code)]
+    async fn publish_source_owned(
+        &self,
+        manifest: SourceManifest,
+        expected: SourceVersion,
+        request_id: String,
+        limits: SourceLimits,
+    ) -> Result<SourceReceipt> {
+        let old = self
+            .fs
+            .tree
+            .freeze_source(SourceFrontendFence::TreeOnly, &limits)?;
+        let mut old_ids = old
+            .entries()
+            .iter()
+            .map(|entry| entry.node.id)
+            .collect::<Vec<_>>();
+        old_ids.push(1);
+        drop(old);
+        let _old_marker = self.fs.mark(old_ids.clone())?;
+        let receipt =
+            self.fs
+                .tree
+                .install_source(manifest, Some(expected), &request_id, &limits)?;
+        let current = self
+            .fs
+            .tree
+            .freeze_source(SourceFrontendFence::TreeOnly, &limits)?;
+        let old_ids = old_ids.into_iter().collect::<HashSet<_>>();
+        let _new_marker = self.fs.mark(
+            current
+                .entries()
+                .iter()
+                .map(|entry| entry.node.id)
+                .filter(|id| !old_ids.contains(id))
+                .collect(),
+        )?;
+        let root_node = self.fs.tree.get(1)?;
+        let mut paths = vec![(String::new(), root_node.clone())];
+        let mut directories = current
+            .entries()
+            .iter()
+            .filter(|entry| entry.node.kind == NodeKind::Directory)
+            .map(|entry| (entry.path.clone(), entry.node.clone()))
+            .collect::<Vec<_>>();
+        directories.sort_by_key(|(path, _)| Path::new(path).components().count());
+        paths.extend(directories.iter().cloned());
+        paths.extend(
+            current
+                .entries()
+                .iter()
+                .filter(|entry| entry.node.kind == NodeKind::File)
+                .map(|entry| (entry.path.clone(), entry.node.clone())),
+        );
+        // Symlinks are invalidated through their containing directories; never
+        // chmod or open a symlink target while updating the mounted namespace.
+        directories.reverse();
+        paths.extend(directories);
+        paths.push((String::new(), root_node));
+        let mut failure = None;
+        for (relative, node) in paths {
+            let root = self.root.clone();
+            let result = tokio::task::spawn_blocking(move || {
+                invalidate_no_follow(&root, &relative, node.mode)
+            })
+            .await
+            .context("native source invalidation task failed")
+            .and_then(|result| result);
+            if let Err(error) = result {
+                if failure.is_none() {
+                    failure = Some(error);
+                }
+            }
+        }
+        if let Some(error) = failure {
+            return Err(error);
+        }
+        Ok(receipt)
+    }
     // chmod re-enters the server. Never hold Tree namespace locks here.
     pub(super) async fn invalidate(&self, paths: Vec<(String, Node)>) -> Result<()> {
         let mut failure = None;
@@ -582,6 +686,16 @@ impl Projection for NfsMount {
             publisher.publish(&path, Some(node)).await
         })
         .await
+    }
+    async fn publish_source(
+        &self,
+        _manifest: SourceManifest,
+        _expected: SourceVersion,
+        _request_id: String,
+        _limits: SourceLimits,
+    ) -> Result<SourceReceipt> {
+        // No metadata commit may precede a proven native dirty-page fence.
+        Err(NfsSourceUnsupported.into())
     }
     async fn stat(&self, path: &str, digest_function: i32) -> Result<Option<TreeStat>> {
         ensure!(
@@ -657,26 +771,7 @@ mod publication_tests {
             size: 1,
         }
     }
-    // Use a local directory for the native barrier, without needing an NFS mount.
-    // The delayed blocking callback has the same non-abortable lifetime as chmod.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn cancelled_publication_retains_markers_and_excludes_following_mutation() {
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path().join("view");
-        std::fs::create_dir(&root).unwrap();
-        std::fs::File::create(root.join("file"))
-            .unwrap()
-            .write_all(b"x")
-            .unwrap();
-        let tree = Tree::open(
-            dir.path().join("state"),
-            "fixture",
-            Arc::new(Source),
-            output_core::CacheConfig::default(),
-        )
-        .unwrap();
-        tree.stage("file", artifact("1")).await.unwrap();
-        let old = tree.resolve("file").unwrap();
+    fn mounted_fixture(tree: Arc<Tree>, root: PathBuf) -> Arc<NfsMount> {
         let fs = OutputNfs::new(tree.clone());
         let session = NativeSession {
             fs: fs.clone(),
@@ -697,12 +792,38 @@ mod publication_tests {
             #[cfg(target_os = "macos")]
             unmount_pending: None,
         };
-        let mount = Arc::new(NfsMount {
+        Arc::new(NfsMount {
             tree: tree.clone(),
             root,
             control: Arc::new(AsyncMutex::new(())),
             session: Arc::new(Mutex::new(SessionState::Mounted(session))),
-        });
+        })
+    }
+    // Use a local directory for the native barrier, without needing an NFS mount.
+    // The delayed blocking callback has the same non-abortable lifetime as chmod.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cancelled_publication_retains_markers_and_excludes_following_mutation() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("view");
+        std::fs::create_dir(&root).unwrap();
+        std::fs::File::create(root.join("file"))
+            .unwrap()
+            .write_all(b"x")
+            .unwrap();
+        let tree = Tree::open(
+            dir.path().join("state"),
+            "fixture",
+            Arc::new(Source),
+            output_core::CacheConfig::default(),
+        )
+        .unwrap();
+        tree.stage("file", artifact("1")).await.unwrap();
+        let old = tree.resolve("file").unwrap();
+        let mount = mounted_fixture(tree.clone(), root);
+        let fs = match &*mount.session.lock().unwrap() {
+            SessionState::Mounted(session) => session.fs.clone(),
+            _ => unreachable!(),
+        };
         let entered = Arc::new(tokio::sync::Notify::new());
         let (release, blocked) = std::sync::mpsc::channel();
         let task_mount = mount.clone();
@@ -752,6 +873,108 @@ mod publication_tests {
             artifact("3").hash
         );
         assert!(!fs.invalidating.lock().unwrap().contains(&old.id));
+    }
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn source_checkout_requires_native_capture_before_any_namespace_change() {
+        use output_core::{SourceContent, SourceEntry};
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("view");
+        std::fs::create_dir(&root).unwrap();
+        std::fs::write(root.join("file"), b"native cache fixture").unwrap();
+        let tree = Tree::open(
+            dir.path().join("state"),
+            "fixture",
+            Arc::new(Source),
+            output_core::CacheConfig::default(),
+        )
+        .unwrap();
+        let mut file = artifact("1");
+        file.digest_function = 9;
+        let manifest = SourceManifest {
+            identity: tree.identity().into(),
+            root: [1; 32],
+            entries: vec![SourceEntry {
+                path: "file".into(),
+                mode: 0o644,
+                content: SourceContent::File(file),
+            }],
+        };
+        let limits = SourceLimits::default();
+        let installed = tree
+            .install_source(manifest.clone(), None, "initial", &limits)
+            .unwrap();
+        let old = tree.resolve("file").unwrap();
+        let mount = mounted_fixture(tree.clone(), root);
+        let capture = mount.capture_source_quiescent(limits.clone()).await;
+        assert!(
+            capture
+                .err()
+                .unwrap()
+                .downcast_ref::<NfsSourceUnsupported>()
+                .is_some()
+        );
+        let mut next = manifest;
+        next.root = [2; 32];
+        let rejected = mount
+            .publish_source(
+                next.clone(),
+                installed.version.clone(),
+                "unsupported".into(),
+                limits.clone(),
+            )
+            .await;
+        assert!(
+            rejected
+                .err()
+                .unwrap()
+                .downcast_ref::<NfsSourceUnsupported>()
+                .is_some()
+        );
+        assert_eq!(tree.source_baseline().unwrap().0, [1; 32]);
+        assert!(tree.source_receipt("unsupported").unwrap().is_none());
+        assert_eq!(tree.resolve("file").unwrap().id, old.id);
+        // Exercise the future owned primitive with a local cache-barrier
+        // fixture only. This does not prove native NFS page-cache flushing.
+        tree.setattr(
+            old.id,
+            SetAttr {
+                size: Some(0),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        tree.write(old.id, 0, b"retained").await.unwrap();
+        let retained = tree.get(old.id).unwrap();
+        let fs = match &*mount.session.lock().unwrap() {
+            SessionState::Mounted(session) => session.fs.clone(),
+            _ => unreachable!(),
+        };
+        let old_handle = fs.id_to_fh(old.id);
+        let expected = tree
+            .freeze_source(SourceFrontendFence::TreeOnly, &limits)
+            .unwrap()
+            .version()
+            .clone();
+        let receipt = mount
+            .complete(move |publisher| async move {
+                publisher
+                    .publish_source_owned(next, expected, "prepared-primitive".into(), limits)
+                    .await
+            })
+            .await
+            .unwrap();
+        assert_eq!(receipt.root, [2; 32]);
+        assert_ne!(tree.resolve("file").unwrap().id, old.id);
+        let mut retired = retained;
+        retired.linked = false;
+        assert_eq!(tree.get(old.id).unwrap(), retired);
+        assert_eq!(fs.fh_to_id(&old_handle).unwrap(), old.id);
+        let attributes = fs.getattr(old.id).await.unwrap();
+        assert_eq!(attributes.size, retired.size);
+        assert_eq!(attributes.mode, retired.mode);
+        assert_eq!(fs.read(old.id, 0, 32).await.unwrap().0, b"retained");
+        assert_eq!(mount.state(), NfsMountState::Mounted);
     }
     #[test]
     #[ignore = "subprocess fixture invoked by owned_mount_child_is_reaped_after_cancel_and_retry"]

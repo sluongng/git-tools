@@ -23,7 +23,9 @@ use std::sync::{Arc, Mutex, MutexGuard, Weak};
 use tempfile::NamedTempFile;
 use tinytree_model::{CommitId, Descriptor, Kind, Limits, ObjectId, ObjectKey};
 
+mod client_gc;
 mod closure;
+pub use client_gc::{ClientGcEpoch, ClientGcLimits, ClientGcReport, ClientGcRequest};
 mod retention;
 
 pub use retention::{
@@ -168,6 +170,9 @@ struct Spaces {
     refs: SingleWriterTxKeyspace,
     receipts: SingleWriterTxKeyspace,
     staging: SingleWriterTxKeyspace,
+    client_ages: SingleWriterTxKeyspace,
+    client_revisions: SingleWriterTxKeyspace,
+    client_deletions: SingleWriterTxKeyspace,
 }
 #[derive(Default)]
 struct Runtime {
@@ -527,6 +532,9 @@ impl Store {
             refs: db.keyspace("refs", KeyspaceCreateOptions::default)?,
             receipts: db.keyspace("receipts", KeyspaceCreateOptions::default)?,
             staging: db.keyspace("staging", KeyspaceCreateOptions::default)?,
+            client_ages: db.keyspace("client-ages", KeyspaceCreateOptions::default)?,
+            client_revisions: db.keyspace("client-revisions", KeyspaceCreateOptions::default)?,
+            client_deletions: db.keyspace("client-deletions", KeyspaceCreateOptions::default)?,
         };
         let mut tx = db.write_tx().durability(Some(PersistMode::SyncAll));
         match tx.get(&spaces.meta, b"format")? {
@@ -857,6 +865,8 @@ impl Store {
                 tx.insert(&self.inner.spaces.repos, repo, encode(&repository)?);
             }
         }
+        self.inner
+            .touch_client_object(&mut tx, repo, descriptor.key, now)?;
         let staging_lease = lease_id(descriptor.key);
         let stage_key = key(repo, staging_lease.as_bytes());
         let expires_at = match tx.get(&self.inner.spaces.staging, &stage_key)? {
@@ -1159,7 +1169,9 @@ impl Store {
             .durability(Some(PersistMode::SyncAll));
         for (k, _) in &victims {
             tx.remove(&self.inner.spaces.objects, k.as_ref());
+            tx.remove(&self.inner.spaces.client_ages, k.as_ref());
         }
+        self.inner.advance_client_revision(&mut tx, repo)?;
         for k in expired {
             tx.remove(&self.inner.spaces.staging, k);
         }

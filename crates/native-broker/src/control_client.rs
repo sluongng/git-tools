@@ -30,12 +30,24 @@ impl BrokerControlClient {
         store: impl Into<String>,
         config: Config,
     ) -> Result<Self, Status> {
-        let socket = socket.as_ref().to_owned();
+        Self::connect_local(
+            crate::LocalEndpoint::UnixSocket(socket.as_ref().to_owned()),
+            store,
+            config,
+        )
+        .await
+    }
+    /// Connect through the configured native endpoint without a caller Tokio runtime.
+    pub async fn connect_local(
+        endpoint: crate::LocalEndpoint,
+        store: impl Into<String>,
+        config: Config,
+    ) -> Result<Self, Status> {
         let store = store.into();
         crate::client::run_control(async move {
             config.validate()?;
             crate::wire::id(&store)?;
-            let channel = crate::client::connect_channel(socket, &config).await?;
+            let channel = crate::transport::connect_local_channel(endpoint, &config).await?;
             Ok(Self {
                 inner: Arc::new(Inner {
                     channel,

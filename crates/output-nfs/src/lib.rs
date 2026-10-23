@@ -647,4 +647,4 @@ pub fn ensure_unmounted(root: &Path) -> Result<()> {
 }
 
 mod mount;
-pub use mount::{NfsMount, NfsMountState, NfsStartError};
+pub use mount::{NfsMount, NfsMountState, NfsSourceUnsupported, NfsStartError};

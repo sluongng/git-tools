@@ -43,6 +43,7 @@ struct State {
     proxy: cache_proxy::CacheProxy,
     bes: Option<bes_proxy::BesProxy>,
     native: Option<native_broker::BrokerService>,
+    native_workspaces: Option<crate::native_workspaces::Manager>,
     registry: Registry,
     mounts: BTreeMap<PathBuf, Mount>,
     #[cfg(target_os = "linux")]
@@ -113,7 +114,7 @@ impl State {
     fn status(&self) -> serde_json::Value {
         let metrics = self.cache.metrics();
         let proxy = self.proxy.metrics();
-        json!({"pid":std::process::id(),"runtime":{"open_files":self.startup_limits,"control_accept_resource_exhaustions":self.control_accept.resource_exhaustions()},"rbe_endpoint":self.config.rbe_endpoint(),"cache_endpoint":self.config.cache_endpoint(),"bytestream_uri_prefix":self.config.bytestream_uri_prefix(),"instance_name":self.config.cache.instance_name,"bes_endpoint":self.bes.as_ref().map(|_|self.config.bes_endpoint()),"bes":self.bes.as_ref().map(|bes|bes.metrics()),"native":{"endpoint":self.native.as_ref().map(|_|self.config.rbe_endpoint()),"repositories":self.config.native.repositories.keys().collect::<Vec<_>>()},"bos_endpoint":if self.config.bos.enabled {Some(self.config.rbe_endpoint())}else{None},"output_path_prefix":self.config.state_dir.join("outputs"),"mounts":self.registry.mounts.iter().map(|(path,record)|json!({"session":path,"state":record.state})).collect::<Vec<_>>(),"proxy":{"download_failures":proxy.download_failures,"serving_read_failures":proxy.serving_read_failures,"accept_resource_exhaustions":proxy.accept_resource_exhaustions,"action_cache_hits":proxy.action_cache_hits,"action_cache_upstream":proxy.action_cache_upstream,"blob_reads":proxy.blob_reads,"read_slots_in_use":proxy.read_slots_in_use,"read_slots_queued":proxy.read_slots_queued,"asset_cache_hits":proxy.asset_cache_hits,"asset_upstream_requests":proxy.asset_upstream_requests,"execution_requests":proxy.execution_requests,"execution_waits":proxy.execution_waits,"retention":{"action_refreshes":proxy.retention.action_refreshes,"output_refreshes":proxy.retention.output_refreshes,"blob_refreshes":proxy.retention.blob_refreshes,"blob_repairs":proxy.retention.blob_repairs,"blob_repair_failures":proxy.retention.blob_repair_failures,"failures":proxy.retention.failures,"missing_blobs":proxy.retention.missing_blobs,"dropped":proxy.retention.dropped}},"cache":metrics})
+        json!({"pid":std::process::id(),"runtime":{"open_files":self.startup_limits,"control_accept_resource_exhaustions":self.control_accept.resource_exhaustions()},"rbe_endpoint":self.config.rbe_endpoint(),"cache_endpoint":self.config.cache_endpoint(),"bytestream_uri_prefix":self.config.bytestream_uri_prefix(),"instance_name":self.config.cache.instance_name,"bes_endpoint":self.bes.as_ref().map(|_|self.config.bes_endpoint()),"bes":self.bes.as_ref().map(|bes|bes.metrics()),"native":{"endpoint":self.native.as_ref().map(|_|self.config.rbe_endpoint()),"repositories":self.config.native.repositories.keys().collect::<Vec<_>>(),"workspaces":self.native_workspaces.as_ref().map(|manager|manager.status())},"bos_endpoint":if self.config.bos.enabled {Some(self.config.rbe_endpoint())}else{None},"output_path_prefix":self.config.state_dir.join("outputs"),"mounts":self.registry.mounts.iter().map(|(path,record)|json!({"session":path,"state":record.state})).collect::<Vec<_>>(),"proxy":{"download_failures":proxy.download_failures,"serving_read_failures":proxy.serving_read_failures,"accept_resource_exhaustions":proxy.accept_resource_exhaustions,"action_cache_hits":proxy.action_cache_hits,"action_cache_upstream":proxy.action_cache_upstream,"blob_reads":proxy.blob_reads,"read_slots_in_use":proxy.read_slots_in_use,"read_slots_queued":proxy.read_slots_queued,"asset_cache_hits":proxy.asset_cache_hits,"asset_upstream_requests":proxy.asset_upstream_requests,"execution_requests":proxy.execution_requests,"execution_waits":proxy.execution_waits,"retention":{"action_refreshes":proxy.retention.action_refreshes,"output_refreshes":proxy.retention.output_refreshes,"blob_refreshes":proxy.retention.blob_refreshes,"blob_repairs":proxy.retention.blob_repairs,"blob_repair_failures":proxy.retention.blob_repair_failures,"failures":proxy.retention.failures,"missing_blobs":proxy.retention.missing_blobs,"dropped":proxy.retention.dropped}},"cache":metrics})
     }
     fn mounted(&self, path: &Path) -> bool {
         #[cfg(target_os = "linux")]
@@ -487,13 +488,25 @@ fn git_cas_endpoint(upstream: &str) -> Result<String> {
 
 /// Open each configured native store exactly once under daemon ownership.
 /// A partial/unrecognized existing directory is never guessed or reinitialized.
+#[cfg(test)]
 fn open_native_repositories(
     config: &Config,
     cache: &Arc<LocalCas>,
     native_ca: &BTreeMap<String, Arc<[u8]>>,
 ) -> Result<Option<native_broker::BrokerService>> {
+    Ok(open_native_host(config, cache, native_ca, &BTreeMap::new())?.0)
+}
+fn open_native_host(
+    config: &Config,
+    cache: &Arc<LocalCas>,
+    native_ca: &BTreeMap<String, Arc<[u8]>>,
+    native_credentials: &BTreeMap<String, Option<String>>,
+) -> Result<(
+    Option<native_broker::BrokerService>,
+    BTreeMap<String, crate::native_workspaces::Repository>,
+)> {
     if config.native.repositories.is_empty() {
-        return Ok(None);
+        return Ok((None, BTreeMap::new()));
     }
 
     let root = config.state_dir.join("native");
@@ -510,6 +523,7 @@ fn open_native_repositories(
         Arc<dyn native_broker::NativeRepositoryControl>,
     > = std::collections::HashMap::new();
 
+    let mut retained = BTreeMap::new();
     for (alias, settings) in &config.native.repositories {
         let path = root.join(alias);
         private_dir(&path)?;
@@ -549,10 +563,45 @@ fn open_native_repositories(
         }
     }
 
-    native_broker::BrokerService::new(stores, config.native.broker_config(&config.reapi))
-        .and_then(|broker| broker.with_controls(controls))
-        .map(Some)
-        .map_err(|_| anyhow::anyhow!("cannot configure native broker"))
+    for (alias, settings) in &config.native.repositories {
+        let store_path = root.join(alias).canonicalize()?;
+        let mut fingerprint = blake3::Hasher::new();
+        fingerprint.update(b"native-workspace-provider-scope-v1\0");
+        // Length-delimited private material is hashed in memory only. Neither
+        // credential values nor this material are recorded in public output.
+        for bytes in [
+            serde_json::to_vec(settings)?,
+            serde_json::to_vec(&store_path)?,
+            serde_json::to_vec(&config.reapi)?,
+            serde_json::to_vec(&native_credentials.get(alias))?,
+            native_ca
+                .get(alias)
+                .map_or_else(Vec::new, |bytes| bytes.to_vec()),
+        ] {
+            fingerprint.update(&(bytes.len() as u64).to_le_bytes());
+            fingerprint.update(&bytes);
+        }
+        let scope = native_workspace::Scope::from_configured_identity(
+            alias,
+            fingerprint.finalize().as_bytes(),
+        )?;
+        retained.insert(
+            alias.clone(),
+            crate::native_workspaces::Repository {
+                io: stores
+                    .get(alias)
+                    .expect("configured native provider")
+                    .clone(),
+                scope,
+                remote: settings.remote.is_some(),
+            },
+        );
+    }
+    let broker =
+        native_broker::BrokerService::new(stores, config.native.broker_config(&config.reapi))
+            .and_then(|broker| broker.with_controls(controls))
+            .map_err(|_| anyhow::anyhow!("cannot configure native broker"))?;
+    Ok((Some(broker), retained))
 }
 
 pub async fn serve(mut config: Config) -> Result<()> {
@@ -664,8 +713,14 @@ pub async fn serve(mut config: Config) -> Result<()> {
     let native_config = config.clone();
     let native_cache = cache.clone();
     let native_ca = credentials.native_ca.clone();
-    let native = tokio::task::spawn_blocking(move || {
-        open_native_repositories(&native_config, &native_cache, &native_ca)
+    let native_credentials = credentials.native.clone();
+    let (native, native_repositories) = tokio::task::spawn_blocking(move || {
+        open_native_host(
+            &native_config,
+            &native_cache,
+            &native_ca,
+            &native_credentials,
+        )
     })
     .await
     .context("native repository startup worker failed")??;
@@ -676,6 +731,19 @@ pub async fn serve(mut config: Config) -> Result<()> {
         rbe_router = rbe_router
             .add_service(broker.rpc_service())
             .add_service(broker.control_rpc_service());
+    }
+
+    let mut native_workspaces = if native_repositories.is_empty() {
+        None
+    } else {
+        Some(crate::native_workspaces::Manager::open(
+            config.clone(),
+            cache.clone(),
+            native_repositories,
+        )?)
+    };
+    if let Some(manager) = &native_workspaces {
+        rbe_router = rbe_router.add_service(manager.rpc());
     }
 
     let bes = if config.bes.enabled {
@@ -835,6 +903,9 @@ pub async fn serve(mut config: Config) -> Result<()> {
         backend_identity,
         config.cache.instance_name.clone(),
     )?;
+    if let Some(manager) = &mut native_workspaces {
+        manager.restore_ready().await;
+    }
     let state = State {
         config,
         startup_limits,
@@ -844,6 +915,7 @@ pub async fn serve(mut config: Config) -> Result<()> {
         proxy: proxy.clone(),
         bes,
         native,
+        native_workspaces,
         registry,
         mounts: BTreeMap::new(),
         #[cfg(target_os = "linux")]
@@ -857,7 +929,7 @@ pub async fn serve(mut config: Config) -> Result<()> {
             let stream = tokio::select! {
                 result = reapi::server_io::accept_unix(&listener, &control_accept) => result.context("accepting control connection")?,
                 _ = tokio::signal::ctrl_c() => {
-                    if !state_slot.as_ref().unwrap().mounts.is_empty(){eprintln!("stop active sessions before daemon shutdown");continue;}
+                    if !state_slot.as_ref().unwrap().mounts.is_empty() || state_slot.as_ref().unwrap().native_workspaces.as_ref().is_some_and(|manager| manager.active()){eprintln!("stop active sessions before daemon shutdown");continue;}
                     if let Some(host)=output_host.as_ref(){if let Err(error)=host.shutdown().await{eprintln!("output mount is busy; daemon remains running: {error}");continue;}}
                     output_host=None;break;
                 },
@@ -899,6 +971,24 @@ pub async fn serve(mut config: Config) -> Result<()> {
                     state_slot = Some(returned);
                     result.map(|()| json!(true))
                 }
+                Ok(Request::NativeMount { root, store, commit, workspace_id }) => {
+                    match state_slot.as_mut().unwrap().native_workspaces.as_mut() {
+                        Some(manager) => manager.create(root, store, commit, workspace_id).await.and_then(|value| serde_json::to_value(value).map_err(Into::into)),
+                        None => Err(anyhow::anyhow!("native repositories are not configured")),
+                    }
+                }
+                Ok(Request::NativeUnmount { workspace_id }) => {
+                    match state_slot.as_mut().unwrap().native_workspaces.as_mut() {
+                        Some(manager) => manager.stop(&workspace_id).await.map(|()| json!(true)),
+                        None => Err(anyhow::anyhow!("native repositories are not configured")),
+                    }
+                }
+                Ok(Request::NativeMounted { workspace_id }) => {
+                    match state_slot.as_ref().unwrap().native_workspaces.as_ref() {
+                        Some(manager) => manager.mounted(&workspace_id).map(|value| json!(value)),
+                        None => Ok(json!(false)),
+                    }
+                }
                 Ok(Request::Unmount { session }) => {
                     let mut state=state_slot.take().expect("owned daemon state");
                     let (returned, result) = tokio::task::spawn_blocking(move || {
@@ -924,7 +1014,7 @@ pub async fn serve(mut config: Config) -> Result<()> {
                 Ok(Request::Endpoints) => {let state=state_slot.as_ref().unwrap();Ok(json!({"git_proxy_url": if state.config.git_proxy.repositories.is_empty() {None} else {Some(format!("http://{}/{token}", state.config.git_proxy.listen))}}))},
                 Ok(Request::Mounted { session }) => Ok(json!(state_slot.as_ref().unwrap().mounted(&session))),
                 Ok(Request::Shutdown) => {
-                    if !state_slot.as_ref().unwrap().mounts.is_empty() {
+                    if !state_slot.as_ref().unwrap().mounts.is_empty() || state_slot.as_ref().unwrap().native_workspaces.as_ref().is_some_and(|manager| manager.active()) {
                         Err(anyhow::anyhow!("stop active sessions before daemon shutdown"))
                     } else if let Some(host) = output_host.as_ref() {
                         match host.shutdown().await {
@@ -950,6 +1040,9 @@ pub async fn serve(mut config: Config) -> Result<()> {
     }.await;
     let mut state =
         state_slot.context("mount worker lost daemon state; registry retained for recovery")?;
+    // Native provider ownership must be settled before any later fallible
+    // cleanup can return from serve() and drop the daemon state.
+    cleanup_native_workspaces(&mut state, &listener, &token).await;
     for path in state.mounts.keys().cloned().collect::<Vec<_>>() {
         if let Err(error) = state.unmount(&path) {
             eprintln!("mount shutdown failed for {}: {error}", path.display());
@@ -1019,6 +1112,102 @@ pub async fn serve(mut config: Config) -> Result<()> {
     run
 }
 
+/// An unexpected transport failure is not permission to drop a busy native
+/// provider. Keep the owner lock, cache, and same-user control listener alive
+/// until shutdown succeeds. No new work is accepted in this recovery-only loop.
+async fn cleanup_native_workspaces(state: &mut State, listener: &UnixListener, token: &str) {
+    if state.native_workspaces.is_none() {
+        return;
+    }
+    let _ = state.native_workspaces.as_mut().unwrap().stop_all().await;
+    let mut retry = tokio::time::interval(Duration::from_secs(1));
+    while state.native_workspaces.as_ref().unwrap().active() {
+        let stream = tokio::select! {
+            accepted = reapi::server_io::accept_unix(listener, &state.control_accept) => match accepted {
+                Ok(stream) => stream,
+                Err(_) => { retry.tick().await; let _ = state.native_workspaces.as_mut().unwrap().stop_all().await; continue; }
+            },
+            _ = retry.tick() => { let _ = state.native_workspaces.as_mut().unwrap().stop_all().await; continue; },
+            _ = tokio::signal::ctrl_c() => { eprintln!("native providers remain owned until recovery completes"); continue; },
+        };
+        let (read, mut write) = stream.into_split();
+        let mut reader = BufReader::new(read);
+        let mut bytes = Vec::new();
+        use tokio::io::AsyncReadExt;
+        let request = match tokio::time::timeout(
+            Duration::from_secs(10),
+            (&mut reader).take(65537).read_until(b'\n', &mut bytes),
+        )
+        .await
+        {
+            Ok(Ok(_)) if bytes.len() <= 65536 => {
+                serde_json::from_slice::<Request>(&bytes).map_err(anyhow::Error::from)
+            }
+            _ => Err(anyhow::anyhow!("invalid or oversized control request")),
+        };
+        let request = match request {
+            Ok(Request::Scoped {
+                version,
+                digest,
+                request,
+            }) => state.identity.validate(version, &digest).map(|()| *request),
+            other => other,
+        };
+        let result = match request {
+            Ok(Request::NativeUnmount { workspace_id }) => state
+                .native_workspaces
+                .as_mut()
+                .unwrap()
+                .stop(&workspace_id)
+                .await
+                .map(|()| json!(true)),
+            Ok(Request::NativeMounted { workspace_id }) => state
+                .native_workspaces
+                .as_ref()
+                .unwrap()
+                .mounted(&workspace_id)
+                .map(|mounted| json!(mounted)),
+            Ok(Request::Status) => {
+                let mut value = state.status();
+                value["recovery_only"] = json!(true);
+                Ok(value)
+            }
+            Ok(Request::Shutdown) => Err(anyhow::anyhow!(
+                "native providers remain owned; stop them before shutdown"
+            )),
+            Ok(_) => Err(anyhow::anyhow!(
+                "daemon is recovery-only; stop retained native providers"
+            )),
+            Err(error) => Err(error),
+        };
+        let response = match result {
+            Ok(result) => Response {
+                ok: true,
+                result,
+                error: None,
+            },
+            Err(error) => Response {
+                ok: false,
+                result: serde_json::Value::Null,
+                error: Some(error.to_string().replace(token, "[redacted]")),
+            },
+        };
+        if let Ok(mut bytes) = serde_json::to_vec(&response) {
+            if bytes.len() <= 1024 * 1024 {
+                bytes.push(b'\n');
+                let _ = write.write_all(&bytes).await;
+            }
+        }
+    }
+    // Global RPC producers have stopped. Retain ownership through the final
+    // stream/job barrier even if the transport exited unexpectedly.
+    if let Some(manager) = &state.native_workspaces {
+        while manager.drain().await.is_err() {
+            retry.tick().await;
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1060,6 +1249,72 @@ mod tests {
         drop(broker);
         let reopened = open_native_repositories(&config, &cache, &BTreeMap::new())?.unwrap();
         drop(reopened);
+
+        let (broker, providers) =
+            open_native_host(&config, &cache, &BTreeMap::new(), &BTreeMap::new())?;
+        assert_eq!(providers.len(), 1);
+        let scope = providers["example"].scope.backend().to_owned();
+        drop(broker);
+        assert!(
+            open_native_repositories(&config, &cache, &BTreeMap::new()).is_err(),
+            "retained workspace providers must share, not reopen, the same authoritative owner"
+        );
+        drop(providers);
+        let (broker, providers) =
+            open_native_host(&config, &cache, &BTreeMap::new(), &BTreeMap::new())?;
+        assert_eq!(providers["example"].scope.backend(), scope);
+        config.native.workspaces.registry_path = Some(directory.path().join("registry"));
+        let mut manager =
+            crate::native_workspaces::Manager::open(config.clone(), cache.clone(), providers)?;
+        assert!(!manager.active());
+        assert!(
+            !config
+                .native
+                .workspaces
+                .registry_path
+                .as_ref()
+                .unwrap()
+                .exists(),
+            "broker-only startup must not initialize a per-user workspace registry"
+        );
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?
+            .block_on(async {
+                assert!(
+                    manager
+                        .create(
+                            directory.path().join("mount"),
+                            "unconfigured".into(),
+                            "0".repeat(64),
+                            "1".repeat(64)
+                        )
+                        .await
+                        .is_err()
+                );
+                assert!(
+                    manager
+                        .create(
+                            directory.path().join("mount"),
+                            "example".into(),
+                            "0".repeat(64),
+                            "0".repeat(64)
+                        )
+                        .await
+                        .is_err()
+                );
+            });
+        assert!(
+            !config
+                .native
+                .workspaces
+                .registry_path
+                .as_ref()
+                .unwrap()
+                .exists()
+        );
+        drop(manager);
+        drop(broker);
 
         for partial in [false, true] {
             let root = directory

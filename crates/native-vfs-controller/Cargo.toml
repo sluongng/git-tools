@@ -1,0 +1,31 @@
+[package]
+name = "native-vfs-controller"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+description = "Durable native jj projection control and dirty-only source snapshots"
+
+[features]
+protocol-test-support = []
+
+[dependencies]
+anyhow = "1"
+async-trait = "0.1"
+blake3 = "1"
+fs2 = "0.4"
+futures = "0.3"
+jj-lib = { version = "=0.46.0", default-features = false }
+jj-native-backend = { path = "../jj-native-backend" }
+jj-vfs = { path = "../jj-vfs" }
+native-vfs = { path = "../native-vfs" }
+native-workspace = { path = "../native-workspace" }
+output-core = { path = "../output-core" }
+private-fs = { path = "../private-fs" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tinytree-model = { path = "../tinytree-model" }
+tokio = { version = "1", features = ["full"] }
+
+[dev-dependencies]
+local-cas = { path = "../local-cas" }
+tempfile = "3"

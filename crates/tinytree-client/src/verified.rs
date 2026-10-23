@@ -74,6 +74,10 @@ impl std::ops::Deref for OwnedTemporary {
 }
 impl Drop for OwnedTemporary {
     fn drop(&mut self) {
+        #[cfg(windows)]
+        {
+            let _ = private_fs::windows::remove_if_same(self.file.path(), self.file.as_file());
+        }
         #[cfg(unix)]
         {
             use std::os::unix::fs::MetadataExt;

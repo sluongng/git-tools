@@ -608,3 +608,361 @@ async fn late_old_hydration_cannot_replace_new_generation() -> Result<()> {
     drop(mount);
     Ok(())
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires enabled Windows ProjFS and NTFS directory/file oplocks"]
+async fn native_source_capture_uses_ntfs_edits_without_reading_untouched_payloads() -> Result<()> {
+    use output_core::{SourceContent, SourceEntry, SourceLimits, SourceManifest};
+    use output_projfs::{NativeCaptureError, NativeCaptureLimits, NativeSourceContent};
+    use private_fs::PrivateDir;
+    let temp = tempfile::tempdir()?;
+    let source = Arc::new(Source::default());
+    let artifact = |bytes: &[u8]| {
+        let hash = blake3::hash(bytes).to_hex().to_string();
+        source
+            .blobs
+            .lock()
+            .unwrap()
+            .insert(hash.clone(), bytes.to_vec());
+        Artifact {
+            backend: "fixture".into(),
+            instance: "native-source".into(),
+            digest_function: 9,
+            hash,
+            size: bytes.len() as u64,
+        }
+    };
+    let original = artifact(b"original native contents\n");
+    let untouched = Artifact {
+        backend: "fixture".into(),
+        instance: "native-source".into(),
+        digest_function: 9,
+        hash: "ab".repeat(32),
+        size: 8 * 1024 * 1024,
+    };
+    // Untouched content is deliberately unavailable: a metadata-only capture
+    // must not attempt hydration at all.
+    let tree = Tree::open(
+        temp.path().join("core"),
+        "fixture",
+        source.clone(),
+        CacheConfig::default(),
+    )?;
+    let limits = SourceLimits::default();
+    tree.install_source(
+        SourceManifest {
+            identity: tree.identity().into(),
+            root: [7; 32],
+            entries: vec![
+                SourceEntry {
+                    path: "delete-me".into(),
+                    mode: 0o644,
+                    content: SourceContent::File(original.clone()),
+                },
+                SourceEntry {
+                    path: "edit-me".into(),
+                    mode: 0o644,
+                    content: SourceContent::File(original.clone()),
+                },
+                SourceEntry {
+                    path: "rename-before".into(),
+                    mode: 0o644,
+                    content: SourceContent::File(original.clone()),
+                },
+                SourceEntry {
+                    path: "untouched".into(),
+                    mode: 0o755,
+                    content: SourceContent::File(untouched.clone()),
+                },
+            ],
+        },
+        None,
+        "initial-source".into(),
+        &limits,
+    )?;
+    tree.install_source_control(b"fixture-native-source-marker", &limits)?;
+    let root = PrivateDir::create(temp.path().join("mount"))?;
+    let state = PrivateDir::create(temp.path().join("provider"))?;
+    let captures = Arc::new(PrivateDir::create(temp.path().join("captures"))?);
+    let mount = Arc::new(output_projfs::start(tree.clone(), root.path(), state.path()).await?);
+    std::fs::metadata(root.path().join("delete-me"))?;
+    std::fs::metadata(root.path().join("rename-before"))?;
+    std::fs::remove_file(root.path().join("delete-me"))?;
+    std::fs::rename(
+        root.path().join("rename-before"),
+        root.path().join("rename-after"),
+    )?;
+    std::fs::write(root.path().join("edit-me"), b"changed! native contents\n")?;
+    std::fs::create_dir(root.path().join("untracked"))?;
+    std::fs::write(root.path().join("untracked/new"), b"new native file")?;
+    assert_eq!(
+        std::fs::read(root.path().join(".jj/native-workspace"))?,
+        b"fixture-native-source-marker",
+        "fresh control marker is real NTFS bytes"
+    );
+
+    let capture = mount
+        .capture_source(captures.clone(), NativeCaptureLimits::default())
+        .await?;
+    assert!(
+        capture
+            .entries()
+            .iter()
+            .all(|entry| entry.path != "delete-me"
+                && entry.path != "rename-before"
+                && !entry.path.starts_with(".jj"))
+    );
+    let unchanged = capture
+        .entries()
+        .iter()
+        .find(|entry| entry.path == "untouched")
+        .unwrap();
+    assert_eq!(unchanged.mode, 0o755);
+    assert!(matches!(&unchanged.content, NativeSourceContent::Remote(got) if got == &untouched));
+    let edited = capture
+        .entries()
+        .iter()
+        .find(|entry| entry.path == "edit-me")
+        .unwrap();
+    let held = match &edited.content {
+        NativeSourceContent::Local(file) => file.clone(),
+        _ => panic!("NTFS edit was omitted"),
+    };
+    let mut bytes = Vec::new();
+    std::io::Read::read_to_end(&mut held.open()?, &mut bytes)?;
+    assert_eq!(bytes, b"changed! native contents\n");
+    assert_eq!(held.blake3(), *blake3::hash(&bytes).as_bytes());
+    assert!(
+        capture
+            .entries()
+            .iter()
+            .any(|entry| entry.path == "untracked/new"
+                && matches!(entry.content, NativeSourceContent::Local(_)))
+    );
+    assert!(
+        capture
+            .entries()
+            .iter()
+            .any(|entry| entry.path == "rename-after")
+    );
+    assert_eq!(
+        source.fetches.load(Ordering::SeqCst),
+        1,
+        "only renamed original contents hydrate"
+    );
+    assert!(
+        std::fs::write(root.path().join("edit-me"), b"racing writer").is_err(),
+        "held capture must exclude writes to captured native files"
+    );
+    capture.validate_still_current()?;
+    // Directory R oplocks are advisory; a native namespace write is permitted
+    // but invalidates the whole capture, including provider-process writes.
+    std::fs::write(root.path().join("late-new-file"), b"late change")?;
+    let error = capture.validate_still_current().unwrap_err();
+    assert_eq!(
+        error.downcast_ref::<NativeCaptureError>(),
+        Some(&NativeCaptureError::Busy)
+    );
+    let expected = capture.version().clone();
+    let mut reader = held.open()?;
+    assert!(
+        capture
+            .acknowledge_root([8; 32], expected, "stale-capture".into(), &limits)
+            .is_err()
+    );
+    std::fs::write(root.path().join("edit-me"), b"after capture")?;
+    let mut retained = Vec::new();
+    std::io::Read::read_to_end(&mut reader, &mut retained)?;
+    assert_eq!(
+        retained, b"changed! native contents\n",
+        "private capture survives native mutation and guard drop"
+    );
+    drop(reader);
+    drop(held);
+    mount.shutdown().await?;
+    drop(mount);
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires enabled Windows ProjFS and NTFS directory/file oplocks"]
+async fn native_source_capture_rejects_active_writers_and_foreign_root_binding() -> Result<()> {
+    use output_core::{SourceContent, SourceEntry, SourceLimits, SourceManifest};
+    use output_projfs::{NativeCaptureLimits, SourceRootGuard};
+    use private_fs::PrivateDir;
+    let temp = tempfile::tempdir()?;
+    let source = Arc::new(Source::default());
+    let artifact = source.artifact(b"native source");
+    let tree = Tree::open(
+        temp.path().join("core"),
+        "fixture",
+        source,
+        CacheConfig::default(),
+    )?;
+    tree.install_source(
+        SourceManifest {
+            identity: tree.identity().into(),
+            root: [9; 32],
+            entries: vec![SourceEntry {
+                path: "file".into(),
+                mode: 0o644,
+                content: SourceContent::File(artifact),
+            }],
+        },
+        None,
+        "initial-source".into(),
+        &SourceLimits::default(),
+    )?;
+    tree.install_source_control(b"fixture-native-source-marker", &SourceLimits::default())?;
+    let root_path = temp.path().join("mount");
+    let root = PrivateDir::create(&root_path)?;
+    let state = PrivateDir::create(temp.path().join("provider"))?;
+    let captures = Arc::new(PrivateDir::create(temp.path().join("captures"))?);
+    let mount = Arc::new(output_projfs::start(tree.clone(), &root_path, state.path()).await?);
+    std::fs::write(root_path.join("file"), b"dirty")?;
+    let writer = std::fs::OpenOptions::new()
+        .write(true)
+        .open(root_path.join("file"))?;
+    assert!(
+        mount
+            .capture_source(captures, NativeCaptureLimits::default())
+            .await
+            .is_err()
+    );
+    drop(writer);
+    let binding = SourceRootGuard::open(&root_path, state.path(), tree.identity())?;
+    assert!(SourceRootGuard::open(&root_path, state.path(), "another-tree").is_err());
+    assert!(
+        std::fs::rename(&root_path, temp.path().join("moved")).is_err(),
+        "root identity is pinned"
+    );
+    drop(binding);
+    mount.shutdown().await?;
+    drop(mount);
+    drop(root);
+    let moved = temp.path().join("moved");
+    std::fs::rename(&root_path, &moved)?;
+    let replacement = PrivateDir::create(&root_path)?;
+    let id = windows_sys::core::GUID {
+        data1: 1,
+        data2: 2,
+        data3: 3,
+        data4: [4; 8],
+    };
+    use std::os::windows::ffi::OsStrExt;
+    let name: Vec<_> = root_path.as_os_str().encode_wide().chain(Some(0)).collect();
+    let result = unsafe {
+        windows_sys::Win32::Storage::ProjectedFileSystem::PrjMarkDirectoryAsPlaceholder(
+            name.as_ptr(),
+            std::ptr::null(),
+            std::ptr::null(),
+            &id,
+        )
+    };
+    assert!(result >= 0);
+    assert!(
+        SourceRootGuard::open(&root_path, state.path(), tree.identity()).is_err(),
+        "matching paths/manifest cannot adopt a replacement NTFS directory"
+    );
+    drop(replacement);
+    std::fs::remove_dir(&root_path)?;
+    std::fs::rename(&moved, &root_path)?;
+    let _restored = SourceRootGuard::open(&root_path, state.path(), tree.identity())?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires enabled Windows ProjFS and NTFS control-file oplocks"]
+async fn native_source_control_is_real_readable_and_tampering_never_repairs_silently() -> Result<()>
+{
+    use output_core::{SourceLimits, SourceManifest};
+    use private_fs::PrivateDir;
+    let temp = tempfile::tempdir()?;
+    let source = Arc::new(Source::default());
+    let tree = Tree::open(
+        temp.path().join("core"),
+        "fixture",
+        source.clone(),
+        CacheConfig::default(),
+    )?;
+    let limits = SourceLimits::default();
+    tree.install_source(
+        SourceManifest {
+            identity: tree.identity().into(),
+            root: [4; 32],
+            entries: vec![],
+        },
+        None,
+        "initial-source",
+        &limits,
+    )?;
+    let expected = b"opaque-native-source-control";
+    tree.install_source_control(expected, &limits)?;
+    let root = PrivateDir::create(temp.path().join("mount"))?;
+    let state = PrivateDir::create(temp.path().join("provider"))?;
+    let mount = Arc::new(output_projfs::start(tree.clone(), root.path(), state.path()).await?);
+    let marker = root.path().join(".jj/native-workspace");
+    assert_eq!(std::fs::read(&marker)?, expected);
+    assert_eq!(
+        source.fetches.load(Ordering::SeqCst),
+        0,
+        "marker is not a sparse CAS placeholder"
+    );
+    let captures = Arc::new(PrivateDir::create(temp.path().join("captures"))?);
+    let clean = mount
+        .capture_source(
+            captures.clone(),
+            output_projfs::NativeCaptureLimits::default(),
+        )
+        .await?;
+    assert!(
+        clean.entries().is_empty(),
+        "administration is not repository content"
+    );
+    drop(clean);
+    // These calls deliberately originate in the provider process too: kernel
+    // read/identity leases must enforce them without notification callbacks.
+    assert!(std::fs::write(&marker, b"truncated").is_err());
+    assert!(std::fs::remove_file(&marker).is_err());
+    assert!(std::fs::rename(&marker, root.path().join("moved-marker")).is_err());
+    assert!(
+        std::fs::rename(
+            root.path().join(".jj"),
+            root.path().join("moved-administration")
+        )
+        .is_err()
+    );
+    assert_eq!(std::fs::read(&marker)?, expected);
+    let extra = root.path().join(".jj/unexpected");
+    let _ = std::fs::write(&extra, b"unpreventable native administration change");
+    // Post-create denial semantics vary; if NTFS retains an entry despite a
+    // callback failure (or no provider-process callback), it must block capture.
+    if extra.try_exists()? {
+        assert!(
+            mount
+                .capture_source(captures, output_projfs::NativeCaptureLimits::default())
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            tree.source_baseline()?.0,
+            [4; 32],
+            "no acknowledgment after administration change"
+        );
+    }
+    mount.shutdown().await?;
+    drop(mount);
+    if extra.try_exists()? {
+        std::fs::remove_file(extra)?;
+    }
+    // Once the provider is stopped its kernel leases are gone. A recognized
+    // restart must reject changed bytes, not overwrite them from the core copy.
+    std::fs::write(&marker, b"changed while stopped")?;
+    assert!(
+        output_projfs::start(tree.clone(), root.path(), state.path())
+            .await
+            .is_err()
+    );
+    assert_eq!(std::fs::read(&marker)?, b"changed while stopped");
+    Ok(())
+}

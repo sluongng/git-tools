@@ -19,11 +19,7 @@ use tokio::{
     task::JoinHandle,
     time::Instant,
 };
-use tonic::{
-    Request, Status,
-    codec::CompressionEncoding,
-    transport::{Channel, Endpoint},
-};
+use tonic::{Request, Status, codec::CompressionEncoding, transport::Channel};
 fn runtime() -> BackendResult<&'static Runtime> {
     static RUNTIME: OnceLock<std::io::Result<Runtime>> = OnceLock::new();
     RUNTIME
@@ -62,6 +58,8 @@ struct Inner {
     store: String,
     spool: PathBuf,
     config: Config,
+    #[cfg(windows)]
+    _spool_directory: Arc<private_fs::PrivateDir>,
     calls: Arc<Semaphore>,
     memory: Arc<Semaphore>,
     disk: Arc<Semaphore>,
@@ -84,14 +82,34 @@ impl BrokerObjectIo {
         spool: impl AsRef<Path>,
         config: Config,
     ) -> BackendResult<Self> {
-        let socket = socket.as_ref().to_owned();
+        Self::connect_local(
+            crate::LocalEndpoint::UnixSocket(socket.as_ref().to_owned()),
+            store,
+            spool,
+            config,
+        )
+        .await
+    }
+    /// Connect using an explicit owner-authenticated local transport. This also
+    /// works without a caller Tokio runtime.
+    pub async fn connect_local(
+        endpoint: crate::LocalEndpoint,
+        store: impl Into<String>,
+        spool: impl AsRef<Path>,
+        config: Config,
+    ) -> BackendResult<Self> {
         let store = store.into();
         let spool = spool.as_ref().to_owned();
         run(async move {
             config.validate()?;
             wire::id(&store)?;
             crate::transport::private_directory(&spool)?;
-            let channel = connect_channel(socket, &config).await?;
+            #[cfg(windows)]
+            let spool_directory = Arc::new(
+                private_fs::PrivateDir::open_existing(&spool)
+                    .map_err(|_| Status::permission_denied("broker spool is not private"))?,
+            );
+            let channel = crate::transport::connect_local_channel(endpoint, &config).await?;
             Ok(Self {
                 inner: Arc::new(Inner {
                     channel,
@@ -101,6 +119,8 @@ impl BrokerObjectIo {
                     memory: Arc::new(Semaphore::new(config.max_memory_bytes)),
                     disk: Arc::new(Semaphore::new(config.max_temporary_bytes as usize)),
                     config,
+                    #[cfg(windows)]
+                    _spool_directory: spool_directory,
                 }),
             })
         })
@@ -256,6 +276,11 @@ impl NativeObjectIo for BrokerObjectIo {
                         .map_err(|_| Status::unavailable("broker client closed"))?,
                 );
                 let create_spool = inner.spool.clone();
+                // Retain the inspected directory chain in the physical worker,
+                // not only the caller future: cancellation can drop Inner while
+                // spawn_blocking is still queued or creating the tempfile.
+                #[cfg(windows)]
+                let create_directory = inner._spool_directory.clone();
                 let create_disk = disk.clone();
                 let create_budget = budget.clone();
                 let mut spool = tokio::task::spawn_blocking(move || {
@@ -267,6 +292,8 @@ impl NativeObjectIo for BrokerObjectIo {
                         file,
                         _disk: create_disk,
                         _reader_memory: None,
+                        #[cfg(windows)]
+                        _directory: create_directory,
                     })
                 })
                 .await
@@ -597,7 +624,11 @@ async fn next<T: prost::Message + Default>(
     .map_err(|_| Status::deadline_exceeded("broker stream idle deadline exceeded"))?
 }
 struct Spool {
+    // Fields drop in declaration order: the anonymous file closes (and its
+    // cleanup completes) while the inspected directory chain remains pinned.
     file: std::fs::File,
+    #[cfg(windows)]
+    _directory: Arc<private_fs::PrivateDir>,
     _disk: Arc<OwnedSemaphorePermit>,
     _reader_memory: Option<OwnedSemaphorePermit>,
 }
@@ -680,38 +711,146 @@ pub(crate) async fn run_control<T: Send + 'static>(
         .await
         .map_err(|_| Status::internal("native broker control job failed"))?
 }
-pub(crate) async fn connect_channel(socket: PathBuf, config: &Config) -> Result<Channel, Status> {
-    #[cfg(unix)]
-    {
-        crate::transport::validate_socket(&socket)?;
-        let uid = unsafe { libc::geteuid() };
-        tokio::time::timeout(
-            config.policy.connect_timeout(),
-            Endpoint::from_static("http://[::]:50051")
-                .connect_timeout(config.policy.connect_timeout())
-                .connect_with_connector(tower::service_fn(move |_: http::Uri| {
-                    let socket = socket.clone();
-                    async move {
-                        let stream = tokio::net::UnixStream::connect(socket).await?;
-                        if stream.peer_cred()?.uid() != uid {
-                            return Err(std::io::Error::new(
-                                std::io::ErrorKind::PermissionDenied,
-                                "broker peer owner mismatch",
-                            ));
-                        }
-                        Ok::<_, std::io::Error>(hyper_util::rt::TokioIo::new(stream))
-                    }
-                })),
-        )
-        .await
-        .map_err(|_| Status::deadline_exceeded("native broker connect deadline exceeded"))?
-        .map_err(|_| Status::unavailable("cannot connect native broker"))
+
+#[cfg(all(test, windows))]
+mod windows_tests {
+    use super::*;
+    use std::{
+        collections::HashMap,
+        sync::{Condvar, Mutex},
+        time::Duration,
+    };
+    struct Gate {
+        released: Mutex<bool>,
+        changed: Condvar,
     }
-    #[cfg(not(unix))]
-    {
-        let _ = (socket, config);
-        Err(Status::unimplemented(
-            "private native broker requires Unix transport",
-        ))
+    struct Release(Arc<Gate>);
+    impl Drop for Release {
+        fn drop(&mut self) {
+            *self.0.released.lock().unwrap() = true;
+            self.0.changed.notify_all();
+        }
+    }
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cancelled_queued_spool_creation_retains_directory_chain_until_physical_completion() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("private");
+        let _root = private_fs::PrivateDir::create(&root).unwrap();
+        let spool = root.join("spool");
+        drop(private_fs::PrivateDir::create(&spool).unwrap());
+        let mut config = Config::default();
+        config.policy.operation_timeout_ms = 100;
+        config.policy.stream_idle_timeout_ms = 100;
+        let provider: Arc<dyn NativeObjectIo> = Arc::new(
+            jj_native_backend::DirectObjectIo::init(
+                &root.join("store"),
+                jj_native_backend::Config::default(),
+            )
+            .unwrap(),
+        );
+        let service = crate::BrokerService::new(
+            HashMap::from([("example".into(), provider)]),
+            config.clone(),
+        )
+        .unwrap();
+        let endpoint = crate::LocalEndpoint::WindowsNamedPipe(format!(
+            r"\\.\pipe\native-broker-spool-cancel-{}",
+            std::process::id()
+        ));
+        let (stop, signal) = tokio::sync::oneshot::channel();
+        let address = endpoint.clone();
+        let server = tokio::spawn(async move {
+            crate::serve_local(&address, service, async {
+                let _ = signal.await;
+            })
+            .await
+        });
+        let client = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if let Ok(client) = BrokerObjectIo::connect_local(
+                    endpoint.clone(),
+                    "example",
+                    &spool,
+                    config.clone(),
+                )
+                .await
+                {
+                    break client;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        let gate = Arc::new(Gate {
+            released: Mutex::new(false),
+            changed: Condvar::new(),
+        });
+        let release = Release(gate.clone());
+        let (entered, receive) = std::sync::mpsc::channel();
+        let mut holders = Vec::new();
+        // Occupy the private runtime's complete blocking pool, without changing
+        // production dispatch policy or substituting a mock file provider.
+        for _ in 0..8 {
+            let gate = gate.clone();
+            let entered = entered.clone();
+            holders.push(runtime().unwrap().spawn_blocking(move || {
+                entered.send(()).unwrap();
+                let mut released = gate.released.lock().unwrap();
+                while !*released {
+                    released = gate.changed.wait(released).unwrap();
+                }
+            }));
+        }
+        tokio::task::spawn_blocking(move || {
+            for _ in 0..8 {
+                receive.recv_timeout(Duration::from_secs(5)).unwrap();
+            }
+        })
+        .await
+        .unwrap();
+        let retained = Arc::downgrade(&client.inner._spool_directory);
+        assert!(
+            client
+                .read_file(tinytree_model::FileId([4; 32]))
+                .await
+                .is_err()
+        );
+        drop(client);
+        assert!(
+            retained.upgrade().is_some(),
+            "queued worker must own the inspected chain"
+        );
+        assert_eq!(
+            std::fs::read_dir(&spool).unwrap().count(),
+            0,
+            "no child file may mask the directory-fence assertion"
+        );
+        let renamed = root.join("renamed");
+        assert!(
+            std::fs::rename(&spool, &renamed).is_err(),
+            "queued physical work must prevent directory replacement"
+        );
+        drop(release);
+        for holder in holders {
+            holder.await.unwrap();
+        }
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if retained.upgrade().is_none() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        std::fs::rename(&spool, &renamed).unwrap();
+        stop.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(5), server)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
     }
 }

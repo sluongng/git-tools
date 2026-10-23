@@ -6,8 +6,11 @@ store IDs to shared `NativeObjectIo` providers; clients never submit store paths
 processes, including callers without a Tokio runtime.
 
 Embed `rpc_service()` directly: it includes pre-decode admission and independent
-response-body deadlines. `serve_unix` binds only in a trusted owner-private
-directory and verifies peer ownership. Existing endpoints are never removed.
+response-body deadlines. `serve_local` takes an explicit `LocalEndpoint`: Unix
+sockets require a trusted owner-private directory; Windows named pipes require
+an owner-only protected DACL and same-user peers. Remote pipe names are rejected.
+Existing endpoints are never taken over or removed. `connect_local` selects the
+same transport for both clients; existing Unix convenience APIs remain available.
 All methods negotiate zstd and bound frames, metadata, catalogs and temporary
 bytes. File reads verify the complete stream in an anonymous private spool
 before exposing a pinned reader. Catalog streams carry a checked completion
@@ -18,7 +21,7 @@ across all store aliases. File writes reserve both temporary copies; metadata
 writes reserve their canonical byte length until provider work finishes, even
 after cancellation. Permanent store objects and external CAS are not covered.
 
-This is a Unix local-I/O component, not a remote repository service, jj operation
+This is a local-I/O component, not a remote repository service, jj operation
 store, retention implementation or garbage collector. Use [the native CLI](../jj-native-cli) with a configured private host.
 The direct provider still retains local objects.
 
@@ -30,3 +33,8 @@ serializing host control work. Adapter limits are checked before registration.
 
 `//crates/native-broker:rpc_tests` uses actual independent client processes with
 Git unavailable, shared-store concurrency, host restart and cancellation tests.
+
+`:endpoint_tests` checks endpoint validation. `:windows_ipc_tests` is a Windows
+native suite covering independent clients, protected-pipe connection, existing
+instance refusal, and insecure-server rejection. Cross-compilation alone is not
+native transport acceptance.

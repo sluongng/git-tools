@@ -3102,6 +3102,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "async-trait",
+ "blake3",
  "clap",
  "fs2",
  "futures",
@@ -3109,9 +3110,14 @@ dependencies = [
  "jj-lib",
  "jj-native-backend",
  "jj-native-remote",
+ "jj-vfs",
  "local-cas",
  "native-broker",
+ "native-vfs-rpc",
+ "native-workspace-admin",
+ "private-fs",
  "serde",
+ "serde_json",
  "tempfile",
  "tinytree-fixture",
  "tinytree-model",
@@ -3121,6 +3127,7 @@ dependencies = [
  "tokio-stream",
  "toml",
  "uuid",
+ "workspace-daemon",
 ]
 
 [[package]]
@@ -3139,6 +3146,9 @@ dependencies = [
  "libc",
  "local-cas",
  "native-broker",
+ "native-workspace",
+ "output-core",
+ "private-fs",
  "serde",
  "serde_json",
  "tempfile",
@@ -3165,10 +3175,13 @@ dependencies = [
  "futures",
  "jj-cli",
  "jj-lib",
+ "jj-native-backend",
+ "private-fs",
  "rustix",
  "serde",
  "serde_json",
  "tempfile",
+ "uuid",
  "workspace-overlay",
  "xattr",
 ]
@@ -3527,6 +3540,7 @@ dependencies = [
  "jj-lib",
  "jj-native-backend",
  "libc",
+ "private-fs",
  "prost",
  "reapi",
  "tempfile",
@@ -3537,6 +3551,147 @@ dependencies = [
  "tonic-prost",
  "tonic-prost-build",
  "tower",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "native-retention"
+version = "0.1.0"
+dependencies = [
+ "blake3",
+ "fjall",
+ "fs2",
+ "futures",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tinytree-model",
+ "tokio",
+ "uuid",
+]
+
+[[package]]
+name = "native-vfs"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "blake3",
+ "fs2",
+ "futures",
+ "jj-lib",
+ "jj-native-backend",
+ "local-cas",
+ "native-workspace",
+ "output-core",
+ "output-fuse",
+ "output-nfs",
+ "output-projfs",
+ "private-fs",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tinytree-model",
+ "tokio",
+]
+
+[[package]]
+name = "native-vfs-controller"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "blake3",
+ "fs2",
+ "futures",
+ "jj-lib",
+ "jj-native-backend",
+ "jj-vfs",
+ "local-cas",
+ "native-vfs",
+ "native-workspace",
+ "output-core",
+ "private-fs",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tinytree-model",
+ "tokio",
+]
+
+[[package]]
+name = "native-vfs-rpc"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-stream",
+ "async-trait",
+ "blake3",
+ "bytes",
+ "futures",
+ "grpc-transport",
+ "http",
+ "http-body",
+ "jj-lib",
+ "jj-native-backend",
+ "jj-vfs",
+ "local-cas",
+ "native-broker",
+ "native-vfs-controller",
+ "native-workspace",
+ "output-core",
+ "private-fs",
+ "prost",
+ "reapi",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tinytree-model",
+ "tokio",
+ "tokio-stream",
+ "tonic",
+ "tonic-prost",
+ "tonic-prost-build",
+ "tower",
+ "uuid",
+]
+
+[[package]]
+name = "native-workspace"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "blake3",
+ "futures",
+ "jj-lib",
+ "jj-native-backend",
+ "local-cas",
+ "output-core",
+ "serde",
+ "tempfile",
+ "tinytree-model",
+ "tokio",
+]
+
+[[package]]
+name = "native-workspace-admin"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "blake3",
+ "fs2",
+ "futures",
+ "getrandom 0.3.4",
+ "jj-lib",
+ "jj-native-backend",
+ "jj-vfs",
+ "native-broker",
+ "private-fs",
+ "serde",
+ "serde_json",
+ "tempfile",
 ]
 
 [[package]]
@@ -3761,7 +3916,9 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "async-trait",
+ "blake3",
  "output-core",
+ "private-fs",
  "serde",
  "serde_json",
  "sha2 0.10.9",
@@ -4036,6 +4193,15 @@ checksum = "479ca8adacdd7ce8f1fb39ce9ecccbfe93a3f1344b3d0d97f20bc0196208f62b"
 dependencies = [
  "proc-macro2",
  "syn 2.0.119",
+]
+
+[[package]]
+name = "private-fs"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "tempfile",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -5359,6 +5525,7 @@ dependencies = [
  "http",
  "hyper-util",
  "libc",
+ "private-fs",
  "prost",
  "reapi",
  "serde",
@@ -6404,9 +6571,18 @@ dependencies = [
  "hyper-util",
  "jj-native-backend",
  "jj-native-remote",
+ "jj-vfs",
  "libc",
  "local-cas",
  "native-broker",
+ "native-vfs",
+ "native-vfs-controller",
+ "native-vfs-rpc",
+ "native-workspace",
+ "native-workspace-admin",
+ "output-core",
+ "output-nfs",
+ "private-fs",
  "reapi",
  "serde",
  "serde_json",

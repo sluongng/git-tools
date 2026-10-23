@@ -10,6 +10,15 @@ name = "workspace"
 path = "src/main.rs"
 
 [dependencies]
+output-core = { path = "../output-core" }
+jj-vfs = { path = "../jj-vfs" }
+tinytree-model = { path = "../tinytree-model" }
+native-workspace = { path = "../native-workspace" }
+private-fs = { path = "../private-fs" }
+native-workspace-admin = { path = "../native-workspace-admin" }
+native-vfs-rpc = { path = "../native-vfs-rpc" }
+native-vfs-controller = { path = "../native-vfs-controller" }
+native-vfs = { path = "../native-vfs" }
 anyhow = "1"
 async-trait = "0.1"
 agent-session = { path = "../agent-session" }
@@ -45,3 +54,6 @@ tinytree-model = { path = "../tinytree-model" }
 tempfile = "3"
 hyper-util = { version = "0.1", features = ["tokio"] }
 tower = { version = "0.5", features = ["util"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+output-nfs = { path = "../output-nfs" }

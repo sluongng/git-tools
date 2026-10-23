@@ -5,7 +5,19 @@ edition = "2024"
 license = "MIT"
 description = "Jujutsu command-line entry point for native Tinytree repositories"
 
+[features]
+default = []
+protocol-fixture = []
+
 [dependencies]
+anyhow = "1"
+async-trait = "0.1"
+private-fs = { path = "../private-fs" }
+workspace-daemon = { path = "../workspace-daemon" }
+native-workspace-admin = { path = "../native-workspace-admin" }
+native-vfs-rpc = { path = "../native-vfs-rpc" }
+jj-vfs = { path = "../jj-vfs" }
+blake3 = "1"
 clap = { version = "4.5", features = ["derive"] }
 futures = "0.3"
 fs2 = "0.4"
@@ -15,10 +27,14 @@ jj-cli = { version = "=0.46.0", default-features = false }
 jj-lib = { version = "=0.46.0", default-features = false }
 jj-native-backend = { path = "../jj-native-backend" }
 native-broker = { path = "../native-broker" }
+tinytree-model = { path = "../tinytree-model" }
 serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 toml = "1.1"
 
 [dev-dependencies]
+futures = "0.3"
+serde_json = "1"
 toml = "1.1"
 anyhow = "1"
 async-trait = "0.1"

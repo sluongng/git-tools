@@ -1,0 +1,62 @@
+load("@crates//:defs.bzl", "aliases", "all_crate_deps")
+load("@rules_rs//rs:cargo_build_script.bzl", "cargo_build_script")
+load("@rules_rs//rs:rust_library.bzl", "rust_library")
+load("@rules_rs//rs:rust_test.bzl", "rust_test")
+
+package(default_visibility = ["//visibility:public"])
+
+filegroup(
+    name = "proto_files",
+    srcs = glob(["proto/**/*.proto"]),
+)
+
+cargo_build_script(
+    name = "build_script",
+    srcs = ["build.rs"],
+    aliases = aliases(),
+    build_script_env = {"PROTOC": "$(execpath //build_defs:protoc)"},
+    data = [":proto_files"],
+    edition = "2024",
+    pkg_name = "native-vfs-rpc",
+    tools = ["//build_defs:protoc"],
+    version = "0.1.0",
+    deps = ["@crates//:tonic-prost-build"],
+)
+
+rust_library(
+    name = "native-vfs-rpc",
+    srcs = glob(["src/**/*.rs"]),
+    aliases = aliases(),
+    crate_name = "native_vfs_rpc",
+    crate_root = "src/lib.rs",
+    edition = "2024",
+    version = "0.1.0",
+    deps = [":build_script"] + all_crate_deps(normal = True),
+)
+
+_PROTOCOL_ALIASES = dict(aliases())
+
+_PROTOCOL_ALIASES["//crates/native-vfs-controller:protocol-test-support"] = "native_vfs_controller"
+
+# Real controller and namespace with only the kernel mount replaced by an
+# explicit protocol fixture. This is not native-provider acceptance.
+rust_test(
+    name = "rpc_tests",
+    srcs = glob(["src/**/*.rs"]),
+    aliases = _PROTOCOL_ALIASES,
+    crate_features = ["protocol-test-support"],
+    crate_name = "native_vfs_rpc",
+    crate_root = "src/lib.rs",
+    edition = "2024",
+    deps = [
+        ":build_script",
+        "//crates/native-vfs-controller:protocol-test-support",
+    ] + [
+        dep
+        for dep in all_crate_deps(
+            normal = True,
+            normal_dev = True,
+        )
+        if "native-vfs-controller" not in str(dep)
+    ],
+)

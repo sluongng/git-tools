@@ -75,8 +75,12 @@ pub(crate) fn preflight(path: &Path, max_files: usize) -> Result<Plan> {
         orphans,
     })
 }
-pub(crate) fn open(path: &Path, plan: Plan) -> Result<Arc<File>> {
-    crate::private_directory(path)?;
+pub(crate) struct Owner {
+    _file: File,
+    _directory: private_fs::PrivateDir,
+}
+pub(crate) fn open(path: &Path, plan: Plan) -> Result<Arc<Owner>> {
+    let directory = crate::private_directory(path)?;
     let path = path.canonicalize()?;
     let owner = OpenOptions::new()
         .read(true)
@@ -87,19 +91,17 @@ pub(crate) fn open(path: &Path, plan: Plan) -> Result<Arc<File>> {
     fs2::FileExt::try_lock_exclusive(&owner)
         .map_err(|_| anyhow::anyhow!("native staging directory already owned"))?;
     if plan.fresh {
-        use std::io::Write;
-        let mut marker = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(path.join(MARKER))?;
-        marker.write_all(FORMAT)?;
-        marker.sync_all()?;
+        directory.replace(MARKER, FORMAT)?;
     }
     // Only verified owned disposable names were accepted during preflight; a
     // surviving owner lock prevents cleanup racing live client copy workers.
     for orphan in plan.orphans {
         std::fs::remove_file(path.join(orphan))?;
     }
+    #[cfg(unix)]
     File::open(&path)?.sync_all()?;
-    Ok(Arc::new(owner))
+    Ok(Arc::new(Owner {
+        _file: owner,
+        _directory: directory,
+    }))
 }

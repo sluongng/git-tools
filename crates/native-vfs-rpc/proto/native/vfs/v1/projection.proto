@@ -1,0 +1,14 @@
+syntax = "proto3";
+package native.vfs.v1;
+
+// Private owner-authenticated transport only. Each payload is a bounded,
+// versioned domain envelope; no filesystem paths select server resources.
+message Envelope {
+  bytes payload = 1;
+}
+service Projection {
+  rpc Inspect(Envelope) returns (Envelope);
+  rpc Receipt(Envelope) returns (Envelope);
+  rpc Acknowledge(Envelope) returns (Envelope);
+  rpc Session(stream Envelope) returns (stream Envelope);
+}

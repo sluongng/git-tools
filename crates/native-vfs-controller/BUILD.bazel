@@ -1,0 +1,41 @@
+load("@crates//:defs.bzl", "aliases", "all_crate_deps")
+load("@rules_rs//rs:rust_library.bzl", "rust_library")
+load("@rules_rs//rs:rust_test.bzl", "rust_test")
+
+package(default_visibility = ["//visibility:public"])
+
+rust_library(
+    name = "native-vfs-controller",
+    srcs = glob(["src/**/*.rs"]),
+    aliases = aliases(),
+    crate_name = "native_vfs_controller",
+    crate_root = "src/lib.rs",
+    edition = "2024",
+    version = "0.1.0",
+    deps = all_crate_deps(normal = True),
+)
+
+rust_test(
+    name = "unit_tests",
+    aliases = aliases(),
+    crate = ":native-vfs-controller",
+    edition = "2024",
+    deps = all_crate_deps(
+        normal = True,
+        normal_dev = True,
+    ),
+)
+
+# No native mount claim: only declared loopback/remote protocol fixtures use this.
+rust_library(
+    name = "protocol-test-support",
+    testonly = True,
+    srcs = glob(["src/**/*.rs"]),
+    aliases = aliases(),
+    crate_features = ["protocol-test-support"],
+    crate_name = "native_vfs_controller",
+    crate_root = "src/lib.rs",
+    edition = "2024",
+    version = "0.1.0",
+    deps = all_crate_deps(normal = True),
+)

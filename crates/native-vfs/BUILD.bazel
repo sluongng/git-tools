@@ -1,0 +1,42 @@
+load("@crates//:defs.bzl", "aliases", "all_crate_deps")
+load("@rules_rs//rs:rust_library.bzl", "rust_library")
+load("@rules_rs//rs:rust_test.bzl", "rust_test")
+load("//build_defs:fixture_test.bzl", "fixture_test")
+
+package(default_visibility = ["//visibility:public"])
+
+rust_library(
+    name = "native-vfs",
+    srcs = glob(["src/**/*.rs"]),
+    aliases = aliases(),
+    crate_name = "native_vfs",
+    crate_root = "src/lib.rs",
+    edition = "2024",
+    version = "0.1.0",
+    deps = all_crate_deps(normal = True),
+)
+
+rust_test(
+    name = "protocol_tests",
+    srcs = ["tests/protocol.rs", "tests/common/mod.rs"],
+    aliases = aliases(),
+    crate_root = "tests/protocol.rs",
+    edition = "2024",
+    deps = [":native-vfs"] + all_crate_deps(normal = True, normal_dev = True),
+)
+
+rust_test(
+    name = "mount_fixture",
+    srcs = ["tests/mounted.rs", "tests/common/mod.rs"],
+    aliases = aliases(),
+    crate_root = "tests/mounted.rs",
+    edition = "2024",
+    deps = [":native-vfs"] + all_crate_deps(normal = True, normal_dev = True),
+)
+
+fixture_test(
+    name = "mounted_tests",
+    binary = ":mount_fixture",
+    args = ["--ignored"],
+    tags = ["local", "manual"],
+)

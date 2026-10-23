@@ -5,6 +5,8 @@ use tinytree_model::{Object, TreeId, TreeValue};
 struct Budget {
     edges: usize,
     maximum: usize,
+    metadata_bytes: u64,
+    max_metadata_bytes: u64,
 }
 impl Budget {
     fn edge(&mut self) -> Result<()> {
@@ -26,6 +28,9 @@ fn enqueue(
     budget: &mut Budget,
     maximum: usize,
 ) -> Result<()> {
+    if key.kind == Kind::Commit && key.id.0 == CommitId::ROOT.0 {
+        return Ok(());
+    }
     budget.edge()?;
     // Deduplicate BEFORE queueing, not after popping: a repeated-edge chain must
     // not build a pending stack proportional to every duplicate edge.
@@ -46,24 +51,56 @@ impl Inner {
         strict: bool,
         verify_file_bytes: bool,
     ) -> Result<HashSet<ObjectKey>> {
+        self.closure_bounded(
+            repo,
+            roots,
+            strict,
+            verify_file_bytes,
+            &HashMap::new(),
+            &self.config,
+            u64::MAX,
+        )
+    }
+
+    pub(super) fn closure_bounded(
+        &self,
+        repo: &str,
+        roots: impl IntoIterator<Item = ObjectKey>,
+        strict: bool,
+        verify_file_bytes: bool,
+        promises: &HashMap<ObjectKey, Descriptor>,
+        config: &Config,
+        max_metadata_bytes: u64,
+    ) -> Result<HashSet<ObjectKey>> {
         let mut budget = Budget {
             edges: 0,
-            maximum: self.config.max_closure_edges,
+            maximum: config.max_closure_edges,
+            metadata_bytes: 0,
+            max_metadata_bytes,
         };
         let mut discovered = HashSet::new();
         let mut pending = Vec::new();
+        let mut explicit_tree_roots = HashSet::new();
         for root in roots {
+            if strict && root.kind == Kind::Tree {
+                explicit_tree_roots.insert(TreeId(root.id.0));
+            }
             enqueue(
                 root,
                 &mut discovered,
                 &mut pending,
                 &mut budget,
-                self.config.max_closure_objects,
+                config.max_closure_objects,
             )?;
         }
-        let mut tree_roots = HashSet::new();
+        let mut tree_roots = explicit_tree_roots;
         while let Some(key) = pending.pop() {
-            let Some(descriptor) = self.descriptor(repo, key)? else {
+            let descriptor = self.descriptor(repo, key)?.or_else(|| {
+                (key.kind == Kind::File)
+                    .then(|| promises.get(&key).copied())
+                    .flatten()
+            });
+            let Some(descriptor) = descriptor else {
                 if strict {
                     return Err(Error::MissingObject(key));
                 } else {
@@ -79,7 +116,7 @@ impl Inner {
                 }
                 continue;
             }
-            let object = self.metadata(repo, descriptor)?;
+            let object = self.budgeted_metadata(repo, descriptor, &mut budget)?;
             match &object {
                 Object::Tree(tree) => {
                     for entry in &tree.entries {
@@ -103,10 +140,14 @@ impl Inner {
                             TreeValue::Tree(_) => None,
                         };
                         if let Some((child, expected_size, symlink)) = expected {
-                            match self.descriptor(repo, child)? {
+                            match self.descriptor(repo, child)?.or_else(|| {
+                                (child.kind == Kind::File)
+                                    .then(|| promises.get(&child).copied())
+                                    .flatten()
+                            }) {
                                 Some(actual) => {
                                     let size = if symlink {
-                                        match self.metadata(repo, actual)? {
+                                        match self.budgeted_metadata(repo, actual, &mut budget)? {
                                             Object::Symlink(target) => target.len() as u64,
                                             _ => return Err(Error::Corrupt("symlink type")),
                                         }
@@ -128,7 +169,7 @@ impl Inner {
                     // EVERY positive and negative merge term supplies a root.
                     for id in &commit.root_tree.terms {
                         tree_roots.insert(*id);
-                        if tree_roots.len() > self.config.max_path_contexts {
+                        if tree_roots.len() > config.max_path_contexts {
                             return Err(Error::Limit("tree path contexts"));
                         }
                     }
@@ -141,14 +182,30 @@ impl Inner {
                     &mut discovered,
                     &mut pending,
                     &mut budget,
-                    self.config.max_closure_objects,
+                    config.max_closure_objects,
                 )?;
             }
         }
         if strict {
-            self.copy_paths(repo, tree_roots, &mut budget)?;
+            self.copy_paths(repo, tree_roots, &mut budget, config)?;
         }
         Ok(discovered)
+    }
+
+    fn budgeted_metadata(
+        &self,
+        repo: &str,
+        descriptor: Descriptor,
+        budget: &mut Budget,
+    ) -> Result<Object> {
+        budget.metadata_bytes = budget
+            .metadata_bytes
+            .checked_add(descriptor.size_bytes)
+            .ok_or(Error::Limit("closure metadata bytes"))?;
+        if budget.metadata_bytes > budget.max_metadata_bytes {
+            return Err(Error::Limit("closure metadata bytes"));
+        }
+        self.metadata(repo, descriptor)
     }
 
     fn metadata(&self, repo: &str, descriptor: Descriptor) -> Result<Object> {
@@ -163,7 +220,13 @@ impl Inner {
         Ok(tinytree_model::decode(&bytes, self.config.model_limits)?)
     }
 
-    fn copy_paths(&self, repo: &str, roots: HashSet<TreeId>, budget: &mut Budget) -> Result<()> {
+    fn copy_paths(
+        &self,
+        repo: &str,
+        roots: HashSet<TreeId>,
+        budget: &mut Budget,
+        config: &Config,
+    ) -> Result<()> {
         let mut seen: HashSet<(TreeId, Arc<str>)> = HashSet::new();
         let mut pending = Vec::new();
         let mut context_bytes = 0usize;
@@ -174,6 +237,7 @@ impl Inner {
                 &mut seen,
                 &mut pending,
                 &mut context_bytes,
+                config,
             )?;
         }
         while let Some((id, prefix)) = pending.pop() {
@@ -184,7 +248,7 @@ impl Inner {
             let descriptor = self
                 .descriptor(repo, key)?
                 .ok_or(Error::MissingObject(key))?;
-            let Object::Tree(tree) = self.metadata(repo, descriptor)? else {
+            let Object::Tree(tree) = self.budgeted_metadata(repo, descriptor, budget)? else {
                 return Err(Error::Corrupt("tree context type"));
             };
             for entry in tree.entries {
@@ -220,6 +284,7 @@ impl Inner {
                         &mut seen,
                         &mut pending,
                         &mut context_bytes,
+                        config,
                     )?,
                     TreeValue::File {
                         copy_id: Some(copy),
@@ -233,7 +298,9 @@ impl Inner {
                         let descriptor = self
                             .descriptor(repo, key)?
                             .ok_or(Error::MissingObject(key))?;
-                        let Object::CopyHistory(history) = self.metadata(repo, descriptor)? else {
+                        let Object::CopyHistory(history) =
+                            self.budgeted_metadata(repo, descriptor, budget)?
+                        else {
                             return Err(Error::Corrupt("copy history type"));
                         };
                         if history.current_path != path {
@@ -254,16 +321,17 @@ impl Inner {
         seen: &mut HashSet<(TreeId, Arc<str>)>,
         pending: &mut Vec<(TreeId, Arc<str>)>,
         bytes: &mut usize,
+        config: &Config,
     ) -> Result<()> {
         let context = (id, path);
         if !seen.contains(&context) {
-            if seen.len() >= self.config.max_path_contexts {
+            if seen.len() >= config.max_path_contexts {
                 return Err(Error::Limit("tree path contexts"));
             }
             *bytes = bytes
                 .checked_add(context.1.len())
                 .ok_or(Error::Limit("tree path context bytes"))?;
-            if *bytes > self.config.max_path_context_bytes {
+            if *bytes > config.max_path_context_bytes {
                 return Err(Error::Limit("tree path context bytes"));
             }
             seen.insert(context.clone());

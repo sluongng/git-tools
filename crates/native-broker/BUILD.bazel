@@ -60,3 +60,61 @@ rust_test(
         normal_dev = True,
     ),
 )
+
+rust_test(
+    name = "endpoint_tests",
+    srcs = ["tests/endpoints.rs"],
+    aliases = aliases(),
+    edition = "2024",
+    deps = [":native-broker"] + all_crate_deps(
+        normal = True,
+        normal_dev = True,
+    ),
+)
+
+# Exercises the actual Windows named-pipe kernel transport and owned processes.
+rust_test(
+    name = "windows_ipc_tests",
+    srcs = ["tests/windows_ipc.rs"],
+    aliases = aliases(),
+    data = [":client_driver"],
+    edition = "2024",
+    env_inherit = [
+        "SYSTEMROOT",
+        "TEMP",
+        "TMP",
+    ],
+    exec_compatible_with = ["@platforms//os:windows"],
+    rustc_env = {"BROKER_CLIENT_DRIVER": "$(rootpath :client_driver)"},
+    tags = [
+        "local",
+        "manual",
+    ],
+    target_compatible_with = ["@platforms//os:windows"],
+    deps = [":native-broker"] + all_crate_deps(
+        normal = True,
+        normal_dev = True,
+    ),
+)
+
+rust_test(
+    name = "windows_unit_tests",
+    aliases = aliases(),
+    crate = ":native-broker",
+    edition = "2024",
+    env_inherit = [
+        "SYSTEMROOT",
+        "TEMP",
+        "TMP",
+    ],
+    exec_compatible_with = ["@platforms//os:windows"],
+    tags = [
+        "local",
+        "manual",
+    ],
+    target_compatible_with = ["@platforms//os:windows"],
+    deps = all_crate_deps(
+        normal = True,
+        normal_dev = True,
+    ),
+)

@@ -152,6 +152,21 @@ pub trait NativeObjectIo: Send + Sync + fmt::Debug {
     async fn read_metadata(&self, key: m::ObjectKey) -> BackendResult<VerifiedMetadata>;
     async fn write_metadata(&self, object: m::Object) -> BackendResult<m::Descriptor>;
     async fn read_file(&self, id: m::FileId) -> BackendResult<FileRead>;
+    /// Delivery into an already admitted cache fetch. Implementations MUST NOT
+    /// hydrate through that cache (including under another artifact scope).
+    /// `owner` must follow physical work and pinned readers past cancellation.
+    /// Opt in only when this non-recursive delivery contract is implemented.
+    async fn read_file_for_cache(
+        &self,
+        _id: m::FileId,
+        _owner: Arc<dyn std::any::Any + Send + Sync>,
+    ) -> BackendResult<FileRead> {
+        Err(other(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "native provider does not support non-recursive cache delivery",
+        )))
+    }
+
     async fn write_file(
         &self,
         input: &mut (dyn AsyncRead + Send + Unpin),
@@ -330,6 +345,30 @@ impl NativeObjectIo for DirectObjectIo {
             return Err(invalid("native file exceeds configured limit"));
         }
         FileRead::from_preverified_pinned_source(descriptor, Box::pin(io::Reader::new(lease)))
+    }
+    async fn read_file_for_cache(
+        &self,
+        id: m::FileId,
+        owner: Arc<dyn std::any::Any + Send + Sync>,
+    ) -> BackendResult<FileRead> {
+        let store = self.store.clone();
+        let key = m::ObjectKey {
+            kind: m::Kind::File,
+            id: m::ObjectId(id.0),
+        };
+        let (lease, owner) = io::blocking(move || {
+            let result = store.read(REPOSITORY, key).map_err(other);
+            result.map(|lease| (lease, owner))
+        })
+        .await?;
+        let descriptor = lease.descriptor();
+        if descriptor.size_bytes > self.config.store.max_file_bytes {
+            return Err(invalid("native file exceeds configured limit"));
+        }
+        FileRead::from_preverified_pinned_source(
+            descriptor,
+            Box::pin(io::Reader::for_delivery(lease, owner)),
+        )
     }
     async fn write_file(
         &self,

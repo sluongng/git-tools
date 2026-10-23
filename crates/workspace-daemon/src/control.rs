@@ -25,6 +25,20 @@ pub enum Request {
     Unmount {
         session: PathBuf,
     },
+    /// Same-user native creation selects only configured repository aliases.
+    NativeMount {
+        root: PathBuf,
+        store: String,
+        commit: String,
+        workspace_id: String,
+    },
+    NativeUnmount {
+        workspace_id: String,
+    },
+    NativeMounted {
+        workspace_id: String,
+    },
+
     Mounted {
         session: PathBuf,
     },

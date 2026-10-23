@@ -18,9 +18,12 @@ cd project
 "$JJ" tinytree push --reference main --bookmark main
 ```
 
-Clone uses a normal **materialized** working copy, not a lazy mount. Native `init`
-remains available locally or with `--broker SOCKET --store ALIAS`. Fetch an absent
-reference explicitly before its first push. Native publication is not Git push.
+User workspaces always use a daemon-owned lazy jj-vfs mount. Both `init` and
+`clone` require `--broker SOCKET --store ALIAS`; there is no materialized or
+debug fallback. The mount contains an opaque `.jj/native-workspace` marker;
+operation, index and working-copy state live in private external administration.
+Fetch an absent reference explicitly before its first push. Native publication
+is not Git push.
 
 Push uses this workspace's durable observed generation, which jj undo cannot
 roll back. Interrupted pushes retain their original replay intent. Retry that
@@ -28,6 +31,12 @@ push to reconcile it; `fetch --abandon-pending-push` explicitly archives the loc
 intent before fetching. This does **not** cancel or roll back upstream work.
 Observations and replay archives are bounded; failures never silently discard them.
 
-Source mounts, client GC/offloading and standalone crash acceptance remain
-separate work. Tests use actual jj subprocesses without Git and real loopback
-native services; they do not establish mounted or full-stack acceptance.
+Use `tinytree unmount DEST` from outside the mount and `tinytree resume DEST`
+to stop and resume the original workspace without resetting edits. Interrupted
+mutations use `tinytree recover DEST`; an applied mutation may require its actual
+retained operation ID as proof.
+
+Linux FUSE is the current integrated provider. Native macOS/Windows mutation
+integration and acceptance remain incomplete; unsupported operations fail
+without creating a checkout. Client GC/offloading is not automatic. Protocol
+fixtures are separate test-only binaries, not proof of native mount acceptance.

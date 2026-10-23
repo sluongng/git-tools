@@ -12,3 +12,6 @@ pub mod recovery;
 
 #[cfg(unix)]
 pub mod identity;
+
+#[cfg(unix)]
+pub mod native_workspaces;

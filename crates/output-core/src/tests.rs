@@ -982,3 +982,422 @@ async fn server_generation_and_persisted_placeholder_fences_are_not_request_coun
     assert_eq!(tree.read(local.id, 0, 99).await.unwrap(), b"native legacy");
     assert_eq!(tree.read(node.id, 0, 99).await.unwrap(), b"old handle");
 }
+
+#[tokio::test]
+async fn source_manifest_is_atomic_lazy_durable_and_preserves_dirty_generations() {
+    use crate::source::*;
+    let (dir, source, tree) = setup(CacheConfig::default());
+    let limits = SourceLimits::default();
+    let artifact = source.artifact(b"base");
+    let manifest = SourceManifest {
+        identity: tree.identity().into(),
+        root: [1; 32],
+        entries: vec![
+            SourceEntry {
+                path: "dir".into(),
+                mode: 0o755,
+                content: SourceContent::Directory,
+            },
+            SourceEntry {
+                path: "dir/file".into(),
+                mode: 0o644,
+                content: SourceContent::File(artifact.clone()),
+            },
+            SourceEntry {
+                path: "link".into(),
+                mode: 0o777,
+                content: SourceContent::Symlink("dir/file".into()),
+            },
+        ],
+    };
+    let installed = tree
+        .install_source(manifest.clone(), None, "initial", &limits)
+        .unwrap();
+    assert_eq!(
+        source.calls.load(Ordering::SeqCst),
+        0,
+        "manifest must never hydrate files"
+    );
+    let file = tree.resolve("dir/file").unwrap();
+    assert_eq!(
+        tree.readlink(tree.resolve("link").unwrap().id).unwrap(),
+        "dir/file"
+    );
+    let pin = tree.pin(file.id).unwrap();
+    let mut invalid = manifest.clone();
+    invalid.entries.push(SourceEntry {
+        path: "invalid/child".into(),
+        mode: 0o644,
+        content: SourceContent::File(artifact.clone()),
+    });
+    assert!(
+        tree.install_source(invalid, Some(installed.version.clone()), "invalid", &limits)
+            .is_err()
+    );
+    assert_eq!(tree.resolve("dir/file").unwrap().id, file.id);
+    assert!(tree.resolve("invalid").is_err());
+    assert_eq!(source.calls.load(Ordering::SeqCst), 0);
+    let mut oversized = manifest.clone();
+    oversized.entries.push(SourceEntry {
+        path: "a/".repeat(100_000),
+        mode: 0o644,
+        content: SourceContent::File(artifact.clone()),
+    });
+    let low_limits = SourceLimits {
+        max_path_bytes: 16,
+        max_depth: 2,
+        ..limits.clone()
+    };
+    assert!(
+        tree.install_source(
+            oversized,
+            Some(installed.version.clone()),
+            "slash-rich",
+            &low_limits
+        )
+        .is_err()
+    );
+    assert_eq!(tree.resolve("dir/file").unwrap().id, file.id);
+    assert!(tree.source_receipt("slash-rich").unwrap().is_none());
+    tree.write(file.id, 0, b"edit").await.unwrap();
+    assert_eq!(tree.read(file.id, 0, 4).await.unwrap(), b"edit");
+    assert!(
+        tree.install_source(
+            manifest.clone(),
+            Some(installed.version.clone()),
+            "stale",
+            &limits
+        )
+        .is_err()
+    );
+    // Replaying a known request returns its original durable receipt, not a
+    // claim that this receipt still describes the current dirty namespace.
+    assert_eq!(
+        tree.install_source(manifest.clone(), None, "initial", &limits)
+            .unwrap(),
+        installed
+    );
+    let locator = tree
+        .install_source_control(b"opaque-locator", &limits)
+        .unwrap();
+    assert_eq!(
+        tree.install_source_control(b"opaque-locator", &limits)
+            .unwrap()
+            .id,
+        locator.id
+    );
+    assert!(tree.install_source_control(b"other", &limits).is_err());
+    assert!(tree.rename(1, ".jj", 1, "leaked-control").await.is_err());
+    assert!(tree.unlink(1, ".jj").await.is_err());
+    assert!(tree.write(locator.id, 0, b"modified").await.is_err());
+    let snapshot = tree
+        .freeze_source(SourceFrontendFence::TreeOnly, &limits)
+        .unwrap();
+    assert!(snapshot.version().revision > installed.version.revision);
+    assert_eq!(snapshot.read_local(file.id, 0, 4).unwrap(), b"edit");
+    assert!(
+        !snapshot
+            .entries()
+            .iter()
+            .any(|entry| entry.path.starts_with(".jj"))
+    );
+    assert!(tree.create(1, "racing", 0o644).await.is_err());
+    assert!(tree.write(file.id, 0, b"race").await.is_err());
+    assert!(tree.unlink(1, "link").await.is_err());
+    assert!(tree.rename(1, "link", 1, "moved").await.is_err());
+    assert!(
+        tree.setattr(
+            file.id,
+            SetAttr {
+                size: Some(0),
+                ..Default::default()
+            }
+        )
+        .await
+        .is_err()
+    );
+    assert_eq!(snapshot.read_local(file.id, 0, 4).unwrap(), b"edit");
+    let expected = snapshot.version().clone();
+    let mut next = manifest.clone();
+    next.root = [2; 32];
+    let switched = snapshot.install(next.clone(), "switch", &limits).unwrap();
+    assert_eq!(
+        switched.version.generation,
+        installed.version.generation + 1
+    );
+    assert_ne!(tree.resolve("dir/file").unwrap().id, file.id);
+    assert_eq!(
+        tree.read(file.id, 0, 4).await.unwrap(),
+        b"edit",
+        "old pinned generations retain local edits"
+    );
+    assert_eq!(tree.resolve(".jj/native-workspace").unwrap().id, locator.id);
+    assert_eq!(
+        tree.read(locator.id, 0, 32).await.unwrap(),
+        b"opaque-locator"
+    );
+    assert_eq!(
+        tree.install_source(next.clone(), Some(expected.clone()), "switch", &limits)
+            .unwrap(),
+        switched
+    );
+    let current = tree.resolve("dir/file").unwrap();
+    tree.write(current.id, 0, b"kept").await.unwrap();
+    let untracked = tree.create(1, "untracked", 0o600).await.unwrap();
+    tree.write(untracked.id, 0, b"ignored local bytes")
+        .await
+        .unwrap();
+    let snapshot = tree
+        .freeze_source(SourceFrontendFence::TreeOnly, &limits)
+        .unwrap();
+    let acknowledge_expected = snapshot.version().clone();
+    let acknowledged = snapshot
+        .acknowledge_root(
+            [3; 32],
+            acknowledge_expected.clone(),
+            "acknowledge",
+            &limits,
+        )
+        .unwrap();
+    assert_eq!(acknowledged.operation, SourceOperation::Acknowledge);
+    assert_eq!(acknowledged.root, [3; 32]);
+    assert_eq!(acknowledged.expected.as_ref(), Some(&acknowledge_expected));
+    assert_eq!(
+        tree.source_receipt("acknowledge").unwrap(),
+        Some(acknowledged.clone())
+    );
+    assert_eq!(tree.resolve("dir/file").unwrap().id, current.id);
+    assert!(tree.get(current.id).unwrap().remote.is_none());
+    assert_eq!(tree.read(current.id, 0, 4).await.unwrap(), b"kept");
+    assert_eq!(tree.resolve("untracked").unwrap().id, untracked.id);
+    assert_eq!(
+        tree.read(untracked.id, 0, 64).await.unwrap(),
+        b"ignored local bytes"
+    );
+    let snapshot = tree
+        .freeze_source(SourceFrontendFence::TreeOnly, &limits)
+        .unwrap();
+    assert_eq!(snapshot.base_root(), [3; 32]);
+    assert_eq!(
+        snapshot
+            .acknowledge_root(
+                [3; 32],
+                acknowledge_expected.clone(),
+                "acknowledge",
+                &limits
+            )
+            .unwrap(),
+        acknowledged
+    );
+    let snapshot = tree
+        .freeze_source(SourceFrontendFence::TreeOnly, &limits)
+        .unwrap();
+    assert!(
+        snapshot
+            .acknowledge_root([4; 32], acknowledge_expected, "acknowledge", &limits)
+            .is_err()
+    );
+    assert!(
+        tree.install_source(next.clone(), Some(expected.clone()), "acknowledge", &limits)
+            .is_err()
+    );
+    drop(pin);
+    let cache = tree.cache.clone();
+    drop(tree);
+    let reopened =
+        Tree::open_existing_with_cache_and_source(dir.path(), "test", cache, source.clone())
+            .unwrap();
+    assert_eq!(
+        reopened.source_receipt("acknowledge").unwrap(),
+        Some(acknowledged)
+    );
+    assert_eq!(reopened.resolve("untracked").unwrap().id, untracked.id);
+    assert_eq!(
+        reopened.read(untracked.id, 0, 64).await.unwrap(),
+        b"ignored local bytes"
+    );
+    assert_eq!(
+        reopened
+            .install_source(next, Some(expected), "switch", &limits)
+            .unwrap(),
+        switched
+    );
+    assert_eq!(
+        reopened
+            .read(reopened.resolve(".jj/native-workspace").unwrap().id, 0, 32)
+            .await
+            .unwrap(),
+        b"opaque-locator"
+    );
+    let mut reserved = manifest;
+    reserved.identity = reopened.identity().into();
+    reserved.entries.push(SourceEntry {
+        path: ".JJ".into(),
+        mode: 0o755,
+        content: SourceContent::Directory,
+    });
+    let version = reopened
+        .freeze_source(SourceFrontendFence::TreeOnly, &limits)
+        .unwrap()
+        .version()
+        .clone();
+    assert!(
+        reopened
+            .install_source(reserved, Some(version), "reserved", &limits)
+            .is_err()
+    );
+    let cache = reopened.cache.clone();
+    drop(reopened);
+    {
+        let db = SingleWriterTxDatabase::builder(dir.path().join("namespace.fjall"))
+            .open()
+            .unwrap();
+        let keyspace = db
+            .keyspace("namespace", KeyspaceCreateOptions::default)
+            .unwrap();
+        let mut tx = db.write_tx().durability(Some(PersistMode::SyncAll));
+        tx.remove(&keyspace, b"header");
+        tx.commit().unwrap();
+    }
+    assert!(
+        Tree::open_existing_with_cache_and_source(
+            dir.path(),
+            "test",
+            cache.clone(),
+            source.clone()
+        )
+        .is_err()
+    );
+    {
+        let db = SingleWriterTxDatabase::builder(dir.path().join("namespace.fjall"))
+            .open()
+            .unwrap();
+        let keyspace = db
+            .keyspace("namespace", KeyspaceCreateOptions::default)
+            .unwrap();
+        assert!(
+            keyspace.get(b"header").unwrap().is_none(),
+            "strict reopen must not reset a missing header"
+        );
+    }
+    let missing = dir.path().join("absent");
+    assert!(Tree::open_existing_with_cache_and_source(&missing, "test", cache, source).is_err());
+    assert!(
+        !missing.exists(),
+        "strict reopen must not create missing state"
+    );
+}
+
+#[tokio::test]
+async fn source_freeze_rejects_inflight_cow_and_nonempty_initial_namespace() {
+    use crate::source::*;
+    let (_dir, source, tree) = setup(CacheConfig::default());
+    let limits = SourceLimits::default();
+    let artifact = source.artifact(b"remote");
+    let manifest = SourceManifest {
+        identity: tree.identity().into(),
+        root: [3; 32],
+        entries: vec![SourceEntry {
+            path: "file".into(),
+            mode: 0o644,
+            content: SourceContent::File(artifact),
+        }],
+    };
+    let installed = tree
+        .install_source(manifest, None, "initial", &limits)
+        .unwrap();
+    let file = tree.resolve("file").unwrap();
+    source.delay.store(true, Ordering::SeqCst);
+    let writer_tree = tree.clone();
+    let write = tokio::spawn(async move { writer_tree.write(file.id, 0, b"local").await });
+    source.entered.notified().await;
+    assert!(
+        tree.freeze_source(SourceFrontendFence::TreeOnly, &limits)
+            .is_err()
+    );
+    assert!(
+        tree.retire_source_receipts(std::slice::from_ref(&installed), &limits)
+            .is_err()
+    );
+    assert_eq!(
+        tree.source_receipt("initial").unwrap(),
+        Some(installed.clone())
+    );
+    source.release.notify_one();
+    write.await.unwrap().unwrap();
+    let snapshot = tree
+        .freeze_source(SourceFrontendFence::TreeOnly, &limits)
+        .unwrap();
+    assert_eq!(snapshot.read_local(file.id, 0, 6).unwrap(), b"locale");
+    drop(snapshot);
+    let small = SourceLimits {
+        max_receipts: 3,
+        ..limits.clone()
+    };
+    // More iterations than the receipt quota remain possible once the trusted
+    // controller durably acknowledges and retires each completed receipt.
+    for index in 0..6 {
+        let snapshot = tree
+            .freeze_source(SourceFrontendFence::TreeOnly, &small)
+            .unwrap();
+        let expected = snapshot.version().clone();
+        let root = [10 + index; 32];
+        let request_id = format!("iteration-{index}");
+        let receipt = snapshot
+            .acknowledge_root(root, expected.clone(), &request_id, &small)
+            .unwrap();
+        let held = tree
+            .freeze_source(SourceFrontendFence::TreeOnly, &small)
+            .unwrap();
+        assert!(
+            tree.retire_source_receipts(std::slice::from_ref(&receipt), &small)
+                .is_err()
+        );
+        drop(held);
+        let mut missing = receipt.clone();
+        missing.request_id = "missing-receipt".into();
+        assert!(
+            tree.retire_source_receipts(&[receipt.clone(), missing], &small)
+                .is_err()
+        );
+        assert_eq!(
+            tree.source_receipt(&request_id).unwrap(),
+            Some(receipt.clone())
+        );
+        let baseline = tree.source_baseline().unwrap();
+        assert_eq!(
+            tree.retire_source_receipts(std::slice::from_ref(&receipt), &small)
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            tree.source_baseline().unwrap(),
+            baseline,
+            "receipt cleanup must not change source baseline"
+        );
+        assert!(tree.source_receipt(&request_id).unwrap().is_none());
+        let snapshot = tree
+            .freeze_source(SourceFrontendFence::TreeOnly, &small)
+            .unwrap();
+        assert!(
+            snapshot
+                .acknowledge_root(root, expected, &request_id, &small)
+                .is_err(),
+            "forgotten old intent must fail stale, not apply anew"
+        );
+        assert_eq!(tree.read(file.id, 0, 6).await.unwrap(), b"locale");
+    }
+    let (_other_dir, _, other) = setup(CacheConfig::default());
+    other.create(1, "existing", 0o644).await.unwrap();
+    let empty = SourceManifest {
+        identity: other.identity().into(),
+        root: [4; 32],
+        entries: vec![],
+    };
+    assert!(
+        other
+            .install_source(empty, None, "initial", &limits)
+            .is_err()
+    );
+    assert!(other.resolve("existing").is_ok());
+}

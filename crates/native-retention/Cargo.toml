@@ -1,0 +1,20 @@
+[package]
+name = "native-retention"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+description = "Durable workspace root checkpoints and command fencing"
+
+[dependencies]
+blake3 = "1"
+fjall = "=3.1.12"
+fs2 = "0.4"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tinytree-model = { path = "../tinytree-model" }
+tokio = { version = "1", features = ["full"] }
+uuid = { version = "1", features = ["v4"] }
+
+[dev-dependencies]
+futures = "0.3"
+tempfile = "3"

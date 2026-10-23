@@ -1,15 +1,30 @@
 load("@crates//:defs.bzl", "aliases", "all_crate_deps")
 load("@rules_rs//rs:rust_binary.bzl", "rust_binary")
 load("@rules_rs//rs:rust_test.bzl", "rust_test")
+load("//build_defs:fixture_test.bzl", "fixture_test")
 
 package(default_visibility = ["//visibility:public"])
 
 rust_binary(
     name = "tinytree-jj",
     srcs = glob(["src/**/*.rs"]),
-    crate_root = "src/main.rs",
     aliases = aliases(),
     crate_name = "tinytree_jj",
+    crate_root = "src/main.rs",
+    edition = "2024",
+    version = "0.1.0",
+    deps = all_crate_deps(normal = True),
+)
+
+# Lower-level repository/publication scenarios. Never the shipped CLI.
+rust_binary(
+    name = "protocol_fixture",
+    testonly = True,
+    srcs = glob(["src/**/*.rs"]),
+    aliases = aliases(),
+    crate_features = ["protocol-fixture"],
+    crate_name = "tinytree_protocol_fixture",
+    crate_root = "src/main.rs",
     edition = "2024",
     version = "0.1.0",
     deps = all_crate_deps(normal = True),
@@ -19,13 +34,72 @@ rust_test(
     name = "cli_tests",
     srcs = ["tests/cli.rs"],
     aliases = aliases(),
-    data = [":tinytree-jj"],
+    data = [":protocol_fixture"],
+    edition = "2024",
     env = {
         "TINYTREE_CLI_WRITER_TOKEN": "public-cli-writer-token-not-a-secret",
         "TINYTREE_CLI_READER_TOKEN": "public-cli-reader-token-not-a-secret",
     },
-    edition = "2024",
-    rustc_env = {"CARGO_BIN_EXE_tinytree-jj": "$(rootpath :tinytree-jj)"},
+    rustc_env = {"CARGO_BIN_EXE_tinytree-jj": "$(rootpath :protocol_fixture)"},
     version = "0.1.0",
     deps = all_crate_deps(normal_dev = True),
+)
+
+rust_test(
+    name = "unit_tests",
+    srcs = glob(["src/**/*.rs"]),
+    aliases = aliases(),
+    crate_features = ["protocol-fixture"],
+    crate_name = "tinytree_jj",
+    crate_root = "src/main.rs",
+    edition = "2024",
+    version = "0.1.0",
+    deps = all_crate_deps(
+        normal = True,
+        normal_dev = True,
+    ),
+)
+
+rust_test(
+    name = "mount_fixture",
+    srcs = ["tests/mounted.rs"],
+    aliases = aliases(),
+    data = [
+        ":tinytree-jj",
+        "//crates/workspace-daemon:workspace",
+    ],
+    edition = "2024",
+    rustc_env = {
+        "CARGO_BIN_EXE_tinytree-jj": "$(rootpath :tinytree-jj)",
+        "CARGO_BIN_EXE_workspace": "$(rootpath //crates/workspace-daemon:workspace)",
+    },
+    tags = ["manual"],
+    deps = all_crate_deps(
+        normal = True,
+        normal_dev = True,
+    ),
+)
+
+fixture_test(
+    name = "mounted_tests",
+    args = ["--ignored"],
+    binary = ":mount_fixture",
+    tags = [
+        "local",
+        "manual",
+    ],
+)
+
+rust_test(
+    name = "production_unit_tests",
+    srcs = glob(["src/**/*.rs"]),
+    aliases = aliases(),
+    crate_name = "tinytree_jj",
+    crate_root = "src/main.rs",
+    edition = "2024",
+    version = "0.1.0",
+    deps = all_crate_deps(
+        normal = True,
+        normal_dev = True,
+    ),
 )

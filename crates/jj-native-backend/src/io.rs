@@ -6,7 +6,7 @@ use std::{
     future::Future,
     io::{self, Read},
     pin::Pin,
-    sync::OnceLock,
+    sync::{Arc, OnceLock},
     task::{Context, Poll, ready},
 };
 use tinytree_store::ReadLease;
@@ -38,17 +38,33 @@ pub(crate) async fn blocking<T: Send + 'static>(
 ) -> BackendResult<T> {
     runtime()?.spawn_blocking(job).await.map_err(other)?
 }
+struct OwnedLease {
+    lease: ReadLease,
+    _delivery: Option<Arc<dyn std::any::Any + Send + Sync>>,
+}
 pub(crate) struct Reader {
-    lease: Option<ReadLease>,
-    pending: Option<JoinHandle<(ReadLease, io::Result<Vec<u8>>)>>,
+    lease: Option<OwnedLease>,
+    pending: Option<JoinHandle<(OwnedLease, io::Result<Vec<u8>>)>>,
     bytes: Vec<u8>,
     position: usize,
     eof: bool,
 }
 impl Reader {
     pub(crate) fn new(lease: ReadLease) -> Self {
+        Self::with_owner(lease, None)
+    }
+    pub(crate) fn for_delivery(
+        lease: ReadLease,
+        owner: Arc<dyn std::any::Any + Send + Sync>,
+    ) -> Self {
+        Self::with_owner(lease, Some(owner))
+    }
+    fn with_owner(lease: ReadLease, owner: Option<Arc<dyn std::any::Any + Send + Sync>>) -> Self {
         Self {
-            lease: Some(lease),
+            lease: Some(OwnedLease {
+                lease,
+                _delivery: owner,
+            }),
             pending: None,
             bytes: vec![],
             position: 0,
@@ -97,7 +113,7 @@ impl AsyncRead for Reader {
             this.pending = Some(runtime.spawn_blocking(move || {
                 let mut bytes = vec![0; count];
                 let result = loop {
-                    match lease.read(&mut bytes) {
+                    match lease.lease.read(&mut bytes) {
                         Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
                         result => {
                             break result.map(|count| {

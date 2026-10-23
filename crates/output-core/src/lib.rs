@@ -1,6 +1,7 @@
 //! Generation-aware output metadata and a verified, bounded disk cache.
 //! Namespace records are authoritative; clean CAS bytes are expendable. Retired
 //! records remain addressable until explicit lifetime-aware reclamation. IDs are never reused.
+pub mod source;
 use anyhow::{Context, Result, ensure};
 use async_trait::async_trait;
 use fjall::{
@@ -12,6 +13,10 @@ pub use local_cas::{
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+pub use source::{
+    SourceContent, SourceEntry, SourceFrontendFence, SourceLimits, SourceManifest, SourceOperation,
+    SourceReceipt, SourceSnapshot, SourceSnapshotEntry, SourceVersion,
+};
 use std::{
     collections::{HashMap, HashSet},
     fs::{self, File, OpenOptions},
@@ -116,10 +121,27 @@ pub trait Projection: Send + Sync {
     async fn stat(&self, path: &str, digest_function: i32) -> Result<Option<TreeStat>>;
     async fn refresh(&self, prefix: &str) -> Result<()>;
     async fn clean(&self, prefix: &str) -> Result<()>;
+    /// Publish a complete source root through the native frontend. Output-only
+    /// providers must fail explicitly rather than emulate checkout by staging
+    /// individual paths or exposing an unfenced namespace replacement.
+    async fn publish_source(
+        &self,
+        _manifest: SourceManifest,
+        _expected: SourceVersion,
+        _request_id: String,
+        _limits: SourceLimits,
+    ) -> Result<SourceReceipt> {
+        anyhow::bail!("native source publication is unsupported by this provider")
+    }
     /// The caller must quiesce native filesystem users and RPC admission.
     /// This is an explicit maintenance boundary, not build finalization.
     async fn maintain_quiescent(&self, _transaction_budget: usize) -> Result<MaintenanceOutcome> {
         Ok(MaintenanceOutcome::Unsupported)
+    }
+    /// Drain already-admitted source publication before an owner proves that
+    /// an unresolved request cannot still publish. This never cancels work.
+    async fn wait_source_idle(&self) -> Result<()> {
+        anyhow::bail!("native source publication drain is unsupported by this provider")
     }
     async fn shutdown(&self) -> Result<()>;
 }
@@ -129,7 +151,7 @@ pub enum MaintenanceOutcome {
     BusyRetained,
     Rotated { collection: Collection },
 }
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone, Eq, PartialEq, Serialize, Deserialize)]
 struct Record {
     node: Node,
     target: Option<String>,
@@ -178,6 +200,7 @@ impl<T: Clone> Table<T> {
 }
 #[derive(Clone)]
 struct State {
+    source: Option<source::SourceMeta>,
     identity: String,
     backend: String,
     next_id: u64,
@@ -193,6 +216,8 @@ struct State {
 }
 #[derive(Serialize, Deserialize)]
 struct Header {
+    #[serde(default)]
+    source: Option<source::SourceMeta>,
     #[serde(default)]
     identity: String,
     version: u32,
@@ -228,6 +253,7 @@ struct Namespace {
     failed: bool,
 }
 pub struct Tree {
+    source_gate: Arc<Mutex<source::Gate>>,
     identity: String,
     namespace: Mutex<Namespace>,
     state_dir: PathBuf,
@@ -398,19 +424,91 @@ impl Tree {
         cache: Arc<LocalCas>,
         source: Arc<dyn BlobSource>,
     ) -> Result<Arc<Self>> {
-        fs::create_dir_all(state_dir.as_ref())?;
-        let dir = state_dir.as_ref().canonicalize()?;
-        fs::create_dir_all(dir.join("local"))?;
+        Self::open_namespace(
+            state_dir.as_ref(),
+            backend_identity.into(),
+            cache,
+            source,
+            false,
+        )
+    }
+    /// Reopen a recognized namespace without creating missing directories,
+    /// keyspaces, headers, or root records. Partial/unrelated state is an error.
+    pub fn open_existing_with_cache_and_source(
+        state_dir: impl AsRef<Path>,
+        backend_identity: impl Into<String>,
+        cache: Arc<LocalCas>,
+        source: Arc<dyn BlobSource>,
+    ) -> Result<Arc<Self>> {
+        Self::open_namespace(
+            state_dir.as_ref(),
+            backend_identity.into(),
+            cache,
+            source,
+            true,
+        )
+    }
+    fn open_namespace(
+        state_dir: &Path,
+        backend_identity: String,
+        cache: Arc<LocalCas>,
+        source: Arc<dyn BlobSource>,
+        require_existing: bool,
+    ) -> Result<Arc<Self>> {
+        if require_existing {
+            for path in [
+                state_dir.to_owned(),
+                state_dir.join("local"),
+                state_dir.join("namespace.fjall"),
+            ] {
+                ensure!(
+                    fs::symlink_metadata(path)?.file_type().is_dir(),
+                    "existing namespace directory is missing or invalid"
+                );
+            }
+            // Fjall 3's builder creates a database if the version marker is
+            // absent. Mandatory format preflight prevents that create path.
+            let version_path = state_dir.join("namespace.fjall/version");
+            ensure!(
+                fs::symlink_metadata(&version_path)?.file_type().is_file(),
+                "existing namespace format marker missing"
+            );
+            let mut version = Vec::new();
+            File::open(version_path)?
+                .take(5)
+                .read_to_end(&mut version)?;
+            ensure!(
+                version == b"FJL\x03",
+                "unrecognized existing namespace database"
+            );
+        } else {
+            fs::create_dir_all(state_dir)?;
+            fs::create_dir_all(state_dir.join("local"))?;
+        }
+        let dir = state_dir.canonicalize()?;
         let db = SingleWriterTxDatabase::builder(dir.join("namespace.fjall")).open()?;
+        ensure!(
+            !require_existing || db.keyspace_exists("namespace"),
+            "existing namespace keyspace missing"
+        );
         let keyspace = db.keyspace("namespace", KeyspaceCreateOptions::default)?;
-        let backend = backend_identity.into();
+        ensure!(
+            !require_existing || keyspace.get(b"header")?.is_some(),
+            "existing namespace header missing"
+        );
+        let backend = backend_identity;
         let mut state = if let Some(bytes) = keyspace.get(b"header")? {
             let header: Header = serde_json::from_slice(&bytes)?;
+            ensure!(
+                !require_existing || !header.identity.is_empty(),
+                "existing namespace identity missing"
+            );
             ensure!(
                 matches!(header.version, 2 | 3) && header.backend == backend,
                 "output state backend/version mismatch"
             );
             let mut state = State {
+                source: header.source,
                 identity: if header.identity.is_empty() {
                     uuid::Uuid::new_v4().to_string()
                 } else {
@@ -476,6 +574,7 @@ impl Tree {
                 },
             );
             State {
+                source: None,
                 identity: uuid::Uuid::new_v4().to_string(),
                 backend: backend.clone(),
                 next_id: 2,
@@ -490,6 +589,21 @@ impl Tree {
                 children: im::OrdMap::new(),
             }
         };
+        if require_existing {
+            let root = state
+                .nodes
+                .get(&1)
+                .context("existing namespace root missing")?;
+            ensure!(
+                root.node.id == 1
+                    && root.node.parent == 1
+                    && root.node.name.is_empty()
+                    && root.node.kind == NodeKind::Directory
+                    && root.node.linked
+                    && root.node.remote.is_none(),
+                "invalid existing namespace root"
+            );
+        }
         for record in state.nodes.values() {
             if !record.node.linked {
                 state.retired.insert(record.node.id);
@@ -525,6 +639,10 @@ impl Tree {
                 .context("authoritative local payload missing")?
                 .len();
             if state.nodes.get(&id).unwrap().node.size != len {
+                ensure!(
+                    !require_existing,
+                    "existing authoritative local payload size mismatch"
+                );
                 let node = &mut state.nodes.get_mut(&id).unwrap().node;
                 node.size = len;
                 node.mtime = now();
@@ -532,6 +650,7 @@ impl Tree {
             }
         }
         let tree = Arc::new(Self {
+            source_gate: Arc::new(Mutex::new(source::Gate::default())),
             identity: state.identity.clone(),
             namespace: Mutex::new(Namespace {
                 state,
@@ -554,8 +673,15 @@ impl Tree {
         Ok(tree)
     }
     fn change<T>(&self, f: impl FnOnce(&mut State) -> Result<T>) -> Result<T> {
+        let gate = self.source_gate.lock().unwrap();
+        ensure!(!gate.frozen, "source namespace is frozen");
         let mut ns = self.namespace.lock().unwrap();
-        Self::change_locked(&mut ns, f)
+        Self::change_locked(&mut ns, |next| {
+            let previous = next.clone();
+            let result = f(next)?;
+            source::validate_control_change(&previous, next)?;
+            Ok(result)
+        })
     }
     fn change_locked<T>(ns: &mut Namespace, f: impl FnOnce(&mut State) -> Result<T>) -> Result<T> {
         ensure!(
@@ -564,6 +690,16 @@ impl Tree {
         );
         let mut next = ns.state.clone();
         let result = f(&mut next)?;
+        if !next.nodes.dirty.is_empty() {
+            if let (Some(old), Some(new)) = (&ns.state.source, &mut next.source) {
+                if new.revision == old.revision {
+                    new.revision = new
+                        .revision
+                        .checked_add(1)
+                        .context("source revision exhausted")?;
+                }
+            }
+        }
         let changed: Vec<_> = next.nodes.dirty.iter().copied().collect();
         for id in &changed {
             if let Some(old) = ns.state.nodes.get(id) {
@@ -594,6 +730,7 @@ impl Tree {
             &ns.keyspace,
             b"header",
             serde_json::to_vec(&Header {
+                source: next.source.clone(),
                 identity: next.identity.clone(),
                 version: 3,
                 backend: next.backend.clone(),
@@ -776,6 +913,7 @@ impl Tree {
     /// ProjFS must not call it across restart: persisted placeholders retain IDs.
     /// The budget bounds candidates visited and deletion work, not live edits.
     pub fn reclaim_retired(&self, budget: usize) -> Result<Collection> {
+        let _job = self.source_job()?;
         let candidates = {
             let mut ns = self.namespace.lock().unwrap();
             ensure!(
@@ -884,6 +1022,7 @@ impl Tree {
         }
     }
     fn drain_retired_payloads(&self, budget: usize) -> Result<()> {
+        let _job = self.source_job()?;
         let ids: Vec<_> = self
             .namespace
             .lock()
@@ -916,6 +1055,10 @@ impl Tree {
     }
     pub fn validate_artifact(&self, artifact: &Artifact) -> Result<()> {
         artifact.validate()?;
+        ensure!(
+            self.namespace.lock().unwrap().state.source.is_none() || artifact.digest_function == 9,
+            "source files require raw BLAKE3"
+        );
         ensure!(
             artifact.backend == self.backend,
             "CAS backend identity mismatch"
@@ -986,6 +1129,7 @@ impl Tree {
     }
     pub async fn ensure_dir(&self, path: &str) -> Result<Node> {
         let names = parts(path)?;
+        self.source_writable_path(path)?;
         {
             let ns = self.namespace.lock().unwrap();
             if let Some(id) = resolve_state(&ns.state, path)? {
@@ -1018,6 +1162,7 @@ impl Tree {
         verifier: Option<[u8; 8]>,
     ) -> Result<Node> {
         component(name)?;
+        self.source_writable_child(parent, name)?;
         self.change(|s| {
             directory(s, parent)?;
             if let Some(id) = child(s, parent, name) {
@@ -1155,6 +1300,7 @@ impl Tree {
         })
     }
     pub async fn prepare_stage(&self, path: &str, artifact: Artifact) -> Result<PreparedStage> {
+        self.source_writable_path(path)?;
         self.validate_artifact(&artifact)?;
         let names = parts(path)?;
         ensure!(!names.is_empty(), "cannot stage root");
@@ -1245,6 +1391,7 @@ impl Tree {
     /// Atomic namespace-only publication. Channels needing a pre-publication
     /// native update must instead use prepare_stage/commit_stage.
     pub async fn stage(&self, path: &str, artifact: Artifact) -> Result<Node> {
+        self.source_writable_path(path)?;
         self.validate_artifact(&artifact)?;
         let names = parts(path)?;
         require(!names.is_empty(), CoreError::InvalidInput)?;
@@ -1279,6 +1426,7 @@ impl Tree {
         deadline: tokio::time::Instant,
         future: impl std::future::Future<Output = Result<T>>,
     ) -> Result<T> {
+        let _job = self.source_job()?;
         match tokio::time::timeout_at(deadline, future).await {
             // Cache admission may report the same expiry in this poll. Keep
             // its typed result rather than counting one reader at both layers.
@@ -1323,7 +1471,9 @@ impl Tree {
             // The worker owns both the cache lease and unique temporary payload.
             // Cancelling the caller cannot unpin its source, reuse its path or
             // delete its destination while a detached copy is still writing.
+            let physical_job = self.source_job()?;
             let mut guard = tokio::task::spawn_blocking(move || {
+                let _physical_job = physical_job;
                 let guard = Temporary(temp);
                 let mut input = File::open(lease.path())?;
                 let mut output = OpenOptions::new()
@@ -1380,6 +1530,7 @@ impl Tree {
         bytes: &[u8],
         deadline: tokio::time::Instant,
     ) -> Result<usize> {
+        self.source_writable_node(id)?;
         let lock = self.inode_lock(id);
         let _guard = lock.lock().await;
         ensure!(self.get(id)?.kind == NodeKind::File, "not a regular file");
@@ -1423,6 +1574,7 @@ impl Tree {
         expected_ctime: Option<u64>,
         deadline: tokio::time::Instant,
     ) -> Result<Node> {
+        self.source_writable_node(id)?;
         let lock = self.inode_lock(id);
         let _guard = lock.lock().await;
         let node = self.get(id)?;
@@ -1641,7 +1793,9 @@ impl Tree {
                     }
                 } else {
                     let local = self.local_path(current.id);
+                    let physical_job = self.source_job()?;
                     let (hash, size) = tokio::task::spawn_blocking(move || {
+                        let _physical_job = physical_job;
                         hash_file_until(&local, digest_function, Some(deadline))
                     })
                     .await

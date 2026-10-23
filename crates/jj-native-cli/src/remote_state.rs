@@ -283,3 +283,79 @@ impl LockedState {
         Ok(())
     }
 }
+
+/// Read-only retention input. Keeping the bounded original bytes permits the
+/// collector to detect a sidecar changing during an inventory without creating
+/// a lock, an observation or a replay intent.
+#[derive(PartialEq, Eq)]
+pub(crate) struct RetentionInput {
+    pub commit_heads: Vec<String>,
+    pub active_operations: Vec<String>,
+    source: Vec<u8>,
+}
+impl RetentionInput {
+    pub fn encoded_bytes(&self) -> usize {
+        self.source.len()
+    }
+}
+pub(crate) fn retained_roots(
+    working_copy_state: &Path,
+    repo_path: &Path,
+) -> io::Result<Option<RetentionInput>> {
+    let path = working_copy_state.join("native-remote.toml");
+    let metadata = match fs::symlink_metadata(&path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    if !metadata.is_file() || metadata.len() > MAX_BYTES {
+        return Err(io::Error::other("invalid native remote retention state"));
+    }
+    let mut bytes = Vec::new();
+    File::open(&path)?
+        .take(MAX_BYTES + 1)
+        .read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > MAX_BYTES {
+        return Err(io::Error::other(
+            "native remote retention state exceeds byte limit",
+        ));
+    }
+    let state: State = toml::from_str(
+        std::str::from_utf8(&bytes)
+            .map_err(|_| io::Error::other("invalid native remote retention encoding"))?,
+    )
+    .map_err(|_| io::Error::other("invalid native remote retention schema"))?;
+    let locator = crate::broker::locator(&repo_path.join("store"))
+        .map_err(|_| io::Error::other("native remote retention locator is unavailable"))?;
+    state.validate(&locator)?;
+    let mut heads = state
+        .observations
+        .iter()
+        .filter_map(|observation| observation.head.clone())
+        .collect::<Vec<_>>();
+    heads.extend(
+        state
+            .pending
+            .iter()
+            .chain(&state.archived_pushes)
+            .filter_map(|intent| intent.head.clone()),
+    );
+    if heads
+        .iter()
+        .any(|head| head.bytes().all(|byte| byte == b'0'))
+    {
+        return Err(io::Error::other(
+            "native sidecar cannot retain an intrinsic commit as a publication target",
+        ));
+    }
+    let active_operations = state
+        .pending
+        .iter()
+        .map(|intent| intent.base_operation.clone())
+        .collect();
+    Ok(Some(RetentionInput {
+        commit_heads: heads,
+        active_operations,
+        source: bytes,
+    }))
+}

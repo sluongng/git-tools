@@ -109,10 +109,25 @@ pub(crate) async fn blocking<T: Send + 'static>(
     check_deadline()?;
     result
 }
+enum ReadOwner {
+    Cached {
+        file: std::fs::File,
+        _lease: Arc<CachedBlob>,
+    },
+    Verified(tinytree_client::VerifiedReader),
+}
+impl Read for ReadOwner {
+    fn read(&mut self, bytes: &mut [u8]) -> io::Result<usize> {
+        match self {
+            Self::Cached { file, .. } => file.read(bytes),
+            Self::Verified(reader) => reader.read(bytes),
+        }
+    }
+}
 struct OwnedFile {
-    file: std::fs::File,
-    _lease: Arc<CachedBlob>,
+    file: ReadOwner,
     _scope: Option<Arc<ControlScope>>,
+    _delivery: Option<Arc<dyn std::any::Any + Send + Sync>>,
 }
 pub(crate) struct Reader {
     source: Option<OwnedFile>,
@@ -122,14 +137,45 @@ pub(crate) struct Reader {
     eof: bool,
 }
 impl Reader {
+    pub fn verified(
+        reader: tinytree_client::VerifiedReader,
+        owner: Arc<dyn std::any::Any + Send + Sync>,
+    ) -> Self {
+        Self {
+            source: Some(OwnedFile {
+                file: ReadOwner::Verified(reader),
+                _scope: scope(),
+                _delivery: Some(owner),
+            }),
+            pending: None,
+            bytes: Vec::new(),
+            offset: 0,
+            eof: false,
+        }
+    }
     pub async fn open(lease: Arc<CachedBlob>) -> anyhow::Result<Self> {
+        Self::open_owned(lease, None).await
+    }
+    pub async fn open_for_delivery(
+        lease: Arc<CachedBlob>,
+        owner: Arc<dyn std::any::Any + Send + Sync>,
+    ) -> anyhow::Result<Self> {
+        Self::open_owned(lease, Some(owner)).await
+    }
+    async fn open_owned(
+        lease: Arc<CachedBlob>,
+        owner: Option<Arc<dyn std::any::Any + Send + Sync>>,
+    ) -> anyhow::Result<Self> {
         let scope = scope();
         let source = blocking(move || {
             let file = std::fs::File::open(lease.path())?;
             Ok(OwnedFile {
-                file,
-                _lease: lease,
+                file: ReadOwner::Cached {
+                    file,
+                    _lease: lease,
+                },
                 _scope: scope,
+                _delivery: owner,
             })
         })
         .await?;

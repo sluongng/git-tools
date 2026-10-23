@@ -19,6 +19,7 @@ pub use config::Config;
 pub use service::{BrokerService, ControlRpcService, RpcService};
 #[cfg(unix)]
 pub use transport::serve_unix;
+pub use transport::{LocalEndpoint, connect_local_channel, serve_local, serve_local_router};
 pub mod proto {
     tonic::include_proto!("native.broker.v1");
 }

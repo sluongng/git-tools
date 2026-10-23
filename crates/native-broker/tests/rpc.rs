@@ -16,6 +16,14 @@ fn private(path: &Path) {
     std::fs::create_dir_all(path).unwrap();
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).unwrap();
 }
+fn socket_ready(path: &Path) -> bool {
+    use std::os::unix::fs::{FileTypeExt, PermissionsExt};
+    // Binding publishes the inode before the server has applied its private
+    // permissions. Wait for the supported client-facing startup state.
+    std::fs::symlink_metadata(path).is_ok_and(|metadata| {
+        metadata.file_type().is_socket() && metadata.permissions().mode() & 0o777 == 0o600
+    })
+}
 fn config() -> Config {
     Config {
         max_metadata_bytes: 1024 * 1024,
@@ -64,7 +72,7 @@ impl Running {
                         out.task.take().unwrap().await
                     );
                 }
-                if socket.exists() {
+                if socket_ready(socket) {
                     break;
                 }
                 tokio::time::sleep(Duration::from_millis(5)).await;
@@ -856,7 +864,7 @@ async fn write_staging_is_global_across_aliases_and_survives_client_cancellation
         task: Some(task),
     };
     tokio::time::timeout(Duration::from_secs(2), async {
-        while !socket.exists() {
+        while !socket_ready(&socket) {
             tokio::time::sleep(Duration::from_millis(1)).await;
         }
     })

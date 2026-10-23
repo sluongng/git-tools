@@ -46,6 +46,7 @@ pub struct Source {
 #[serde(default, deny_unknown_fields)]
 pub struct Native {
     pub repositories: std::collections::BTreeMap<String, NativeRepository>,
+    pub workspaces: NativeWorkspaces,
     pub max_inflight: usize,
     pub max_memory_bytes: usize,
     pub max_temporary_bytes: u64,
@@ -55,12 +56,57 @@ impl Default for Native {
         let defaults = native_broker::Config::default();
         Self {
             repositories: Default::default(),
+            workspaces: NativeWorkspaces::default(),
             max_inflight: defaults.max_inflight,
             max_memory_bytes: defaults.max_memory_bytes,
             max_temporary_bytes: defaults.max_temporary_bytes,
         }
     }
 }
+#[derive(Clone, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct NativeWorkspaces {
+    /// None uses the per-user registry shared with the native jj client.
+    pub registry_path: Option<PathBuf>,
+    pub max_workspaces: usize,
+    pub max_entries: usize,
+    pub max_metadata_bytes: usize,
+    pub max_file_bytes: u64,
+    pub max_snapshot_bytes: u64,
+}
+impl Default for NativeWorkspaces {
+    fn default() -> Self {
+        Self {
+            registry_path: None,
+            max_workspaces: 128,
+            max_entries: 100_000,
+            max_metadata_bytes: 64 * 1024 * 1024,
+            max_file_bytes: 256 * 1024 * 1024,
+            max_snapshot_bytes: 1024 * 1024 * 1024,
+        }
+    }
+}
+impl NativeWorkspaces {
+    fn validate(&self) -> Result<()> {
+        ensure!(
+            (1..=4096).contains(&self.max_workspaces)
+                && (1..=1_000_000).contains(&self.max_entries)
+                && (4096..=1024 * 1024 * 1024).contains(&self.max_metadata_bytes)
+                && (1..=16 * 1024 * 1024 * 1024).contains(&self.max_file_bytes)
+                && self.max_snapshot_bytes >= self.max_file_bytes
+                && self.max_snapshot_bytes <= 64 * 1024 * 1024 * 1024,
+            "invalid native workspace limits"
+        );
+        if let Some(path) = &self.registry_path {
+            ensure!(
+                path.is_absolute() && path.as_os_str().len() <= 4096,
+                "native workspace registry must be a bounded absolute path"
+            );
+        }
+        Ok(())
+    }
+}
+
 #[derive(Clone, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct NativeRepository {
@@ -141,6 +187,7 @@ impl Native {
         }
     }
     fn validate(&self, policy: &reapi::policy::Policy) -> Result<()> {
+        self.workspaces.validate()?;
         ensure!(
             self.repositories.len() <= 1024,
             "too many native repository aliases"
@@ -683,6 +730,16 @@ mod tests {
     fn native_aliases_are_optional_portable_and_have_independent_budgets() {
         let old: Config = toml::from_str(EXAMPLE).unwrap();
         assert!(old.native.repositories.is_empty());
+        assert_eq!(old.native.workspaces.max_workspaces, 128);
+        assert!(old.native.workspaces.registry_path.is_none());
+        for value in [0, 4097] {
+            let mut invalid = old.clone();
+            invalid.native.workspaces.max_workspaces = value;
+            assert!(invalid.validate().is_err());
+        }
+        let mut invalid = old.clone();
+        invalid.native.workspaces.registry_path = Some("relative-registry".into());
+        assert!(invalid.validate().is_err());
         let input = format!(
             "{EXAMPLE}\n[native.repositories.example]\nmax_repository_bytes = 1073741824\n"
         );

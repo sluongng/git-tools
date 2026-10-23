@@ -1,0 +1,66 @@
+load("@crates//:defs.bzl", "aliases", "all_crate_deps")
+load("@rules_rs//rs:rust_binary.bzl", "rust_binary")
+load("@rules_rs//rs:rust_library.bzl", "rust_library")
+load("@rules_rs//rs:rust_test.bzl", "rust_test")
+
+package(default_visibility = ["//visibility:public"])
+
+rust_library(
+    name = "native-retention",
+    srcs = glob(["src/**/*.rs"]),
+    aliases = aliases(),
+    crate_name = "native_retention",
+    crate_root = "src/lib.rs",
+    edition = "2024",
+    version = "0.1.0",
+    deps = all_crate_deps(normal = True),
+)
+
+rust_test(
+    name = "unit_tests",
+    aliases = aliases(),
+    crate = ":native-retention",
+    edition = "2024",
+    deps = all_crate_deps(
+        normal = True,
+        normal_dev = True,
+    ),
+)
+
+rust_binary(
+    name = "restart_driver",
+    testonly = True,
+    srcs = ["tests/restart_driver.rs"],
+    aliases = aliases(),
+    edition = "2024",
+    visibility = ["//visibility:private"],
+    deps = [":native-retention"] + all_crate_deps(
+        normal = True,
+        normal_dev = True,
+    ),
+)
+
+rust_test(
+    name = "restart_tests",
+    srcs = ["tests/restart.rs"],
+    aliases = aliases(),
+    data = [":restart_driver"],
+    edition = "2024",
+    rustc_env = {"NATIVE_RETENTION_DRIVER": "$(rootpath :restart_driver)"},
+    deps = [":native-retention"] + all_crate_deps(
+        normal = True,
+        normal_dev = True,
+    ),
+)
+
+rust_test(
+    name = "checkpoint_benchmarks",
+    srcs = ["tests/checkpoint_benchmarks.rs"],
+    aliases = aliases(),
+    args = ["--nocapture"],
+    edition = "2024",
+    deps = [":native-retention"] + all_crate_deps(
+        normal = True,
+        normal_dev = True,
+    ),
+)

@@ -6,6 +6,7 @@ license = "MIT"
 description = "Bounded verifying native repository gRPC client"
 
 [dependencies]
+private-fs = { path = "../private-fs" }
 async-stream = "0.3"
 blake3 = "1"
 bytes = "1"

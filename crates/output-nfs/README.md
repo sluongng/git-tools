@@ -36,3 +36,12 @@ retry maintenance after resolving the cause. `NfsMount::state` reports the last
 lifecycle result. A failed start may return `NfsStartError`, whose `recovery()`
 handle owns any possibly-mounted server for an explicit retry or shutdown.
 Never replace a recovery-required root or discard its state directory.
+
+## Source trees
+
+Initial source projection is lazy and writable. Source capture and whole-root
+checkout currently fail with `NfsSourceUnsupported`: Tree's mutation barrier
+cannot flush dirty pages in the macOS NFS client. A native flush/COMMIT barrier
+must be validated before these operations can be enabled. There is no eager
+checkout or unmount/remount fallback. Protocol tests do not establish this native
+guarantee.

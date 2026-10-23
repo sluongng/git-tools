@@ -8,13 +8,16 @@ description = "Lazy CAS output projection through Windows ProjFS"
 [dependencies]
 anyhow = "1"
 async-trait = "0.1"
+blake3 = "1"
+tempfile = "3"
 output-core = { path = "../output-core" }
+private-fs = { path = "../private-fs" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokio = { version = "1", features = ["rt-multi-thread", "sync", "time", "macros"] }
 
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Storage_ProjectedFileSystem", "Win32_Storage_FileSystem", "Win32_System_Com", "Win32_System_IO"] }
+windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Storage_ProjectedFileSystem", "Win32_Storage_FileSystem", "Win32_System_Com", "Win32_System_IO", "Win32_System_Ioctl", "Win32_System_SystemServices", "Win32_System_Threading", "Win32_Security"] }
 
 [dev-dependencies]
 tempfile = "3"

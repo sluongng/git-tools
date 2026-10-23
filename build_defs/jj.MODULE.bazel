@@ -1,0 +1,10 @@
+crate = use_extension("@rules_rs//rs:extensions.bzl", "crate")
+
+# Native source retention needs every retained operation, including detached
+# operations kept by the operation store's age policy.
+crate.annotation(
+    crate = "jj-lib",
+    version = "0.46.0",
+    patches = ["//third_party/patches:jj-retained-operation-inventory.patch"],
+    patch_args = ["-p1"],
+)

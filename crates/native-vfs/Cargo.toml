@@ -1,0 +1,33 @@
+[package]
+name = "native-vfs"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+description = "Native source workspace ownership and platform projection lifecycle"
+
+[dependencies]
+anyhow = "1"
+blake3 = "1"
+fs2 = "0.4"
+jj-native-backend = { path = "../jj-native-backend" }
+local-cas = { path = "../local-cas" }
+native-workspace = { path = "../native-workspace" }
+output-core = { path = "../output-core" }
+private-fs = { path = "../private-fs" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tinytree-model = { path = "../tinytree-model" }
+tokio = { version = "1", features = ["full"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+output-fuse = { path = "../output-fuse" }
+[target.'cfg(target_os = "macos")'.dependencies]
+output-nfs = { path = "../output-nfs" }
+[target.'cfg(windows)'.dependencies]
+output-projfs = { path = "../output-projfs" }
+
+[dev-dependencies]
+async-trait = "0.1"
+futures = "0.3"
+jj-lib = { version = "=0.46.0", default-features = false }
+tempfile = "3"

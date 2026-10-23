@@ -105,6 +105,7 @@ pub(crate) struct Ledger {
     gate: Mutex<()>,
     config: Config,
     _owner: File,
+    _directory: private_fs::PrivateDir,
     pub client: [u8; 16],
     pub binding: Binding,
 }
@@ -171,7 +172,7 @@ impl Ledger {
                 );
             }
         }
-        crate::private_directory(path)?;
+        let directory = crate::private_directory(path)?;
         let path = path.canonicalize()?;
         let owner = OpenOptions::new()
             .read(true)
@@ -292,14 +293,7 @@ impl Ledger {
         tx.insert(&meta, b"client", client);
         tx.commit()?;
         if fresh {
-            use std::io::Write;
-            let mut marker = OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(path.join(MARKER))?;
-            marker.write_all(FORMAT)?;
-            marker.sync_all()?;
-            File::open(&path)?.sync_all()?;
+            directory.replace(MARKER, FORMAT)?;
         }
         Ok(Self {
             db,
@@ -312,6 +306,7 @@ impl Ledger {
             gate: Mutex::new(()),
             config: config.clone(),
             _owner: owner,
+            _directory: directory,
             client,
             binding,
         })

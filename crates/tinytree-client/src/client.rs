@@ -739,16 +739,20 @@ impl NativeClient {
         let guards = self.guards.clone();
         blocking(deadline, move || {
             let _budget = budget;
-            let parent = secure_directory(&parent)?;
+            let parent = Arc::new(secure_directory(&parent)?);
             let file = tempfile::Builder::new()
                 .prefix("tinytree-")
                 .disable_cleanup(true)
-                .tempfile_in(parent)
+                .tempfile_in(parent.path())
                 .map_err(|_| Status::internal("cannot create native temporary file"))?;
             Ok(Temporary {
                 file: Arc::new(OwnedTemporary::new(file)?),
                 _disk: disk,
-                _guards: guards,
+                _guards: {
+                    let mut guards = guards.as_ref().clone();
+                    guards.push(parent);
+                    Arc::new(guards)
+                },
             })
         })
         .await
@@ -1327,48 +1331,19 @@ async fn verify_metadata(
     })
     .await
 }
-fn secure_directory(path: &Path) -> Result<PathBuf, Status> {
+fn secure_directory(path: &Path) -> Result<private_fs::PrivateDir, Status> {
+    // Preserve Unix's established canonical temporary-root behavior (for example
+    // the OS-managed temporary-root alias). Windows checks the original path so
+    // no junction/reparse traversal is hidden by canonicalization.
+    #[cfg(unix)]
     let path = path
         .canonicalize()
         .map_err(|_| Status::failed_precondition("cannot resolve native temporary directory"))?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::{MetadataExt, PermissionsExt};
-        let uid = unsafe { libc::geteuid() };
-        let mut ancestor = PathBuf::new();
-        for component in path.components() {
-            ancestor.push(component.as_os_str());
-            let metadata = std::fs::symlink_metadata(&ancestor).map_err(|_| {
-                Status::failed_precondition("cannot inspect native temporary directory")
-            })?;
-            let mode = metadata.permissions().mode();
-            if !metadata.is_dir()
-                || metadata.file_type().is_symlink()
-                || !(metadata.uid() == 0 || metadata.uid() == uid)
-                || (mode & 0o022 != 0 && !(metadata.uid() == 0 && mode & 0o1000 != 0))
-            {
-                return Err(Status::failed_precondition(
-                    "untrusted native temporary directory",
-                ));
-            }
-        }
-        let metadata = std::fs::symlink_metadata(&path).map_err(|_| {
-            Status::failed_precondition("cannot inspect native temporary directory")
-        })?;
-        if metadata.uid() != uid || metadata.permissions().mode() & 0o077 != 0 {
-            return Err(Status::failed_precondition(
-                "native temporary directory must be owner-private",
-            ));
-        }
-    }
-    #[cfg(not(unix))]
-    {
-        return Err(Status::failed_precondition(
-            "private temporary-directory verification is unavailable on this platform",
-        ));
-    }
-    Ok(path)
+    private_fs::PrivateDir::open_existing(&path).map_err(|_| {
+        Status::failed_precondition("native temporary directory must be trusted and owner-private")
+    })
 }
+
 #[cfg(unix)]
 fn secure_unix(path: &Path) -> Result<(), Status> {
     use std::os::unix::fs::{MetadataExt, PermissionsExt};

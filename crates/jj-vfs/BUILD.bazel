@@ -8,9 +8,16 @@ package(default_visibility = ["//visibility:public"])
 
 rust_library(
     name = "jj-vfs",
-    srcs = ["src/lib.rs"],
+    srcs = glob(
+        ["src/**/*.rs"],
+        exclude = [
+            "src/main.rs",
+            "src/git_main.rs",
+        ],
+    ),
     aliases = aliases(),
     crate_name = "jj_vfs",
+    crate_root = "src/lib.rs",
     edition = "2024",
     version = "0.1.0",
     deps = all_crate_deps(normal = True),
@@ -18,9 +25,13 @@ rust_library(
 
 rust_binary(
     name = "git-jj-bin",
-    srcs = ["src/main.rs"],
+    srcs = [
+        "src/git_main.rs",
+        "src/main.rs",
+    ],
     aliases = aliases(),
     crate_name = "jj_vfs",
+    crate_root = "src/main.rs",
     edition = "2024",
     version = "0.1.0",
     deps = [":jj-vfs"] + all_crate_deps(normal = True),
@@ -60,4 +71,15 @@ fixture_test(
         "local",
         "manual",
     ],
+)
+
+rust_test(
+    name = "native_unit_tests",
+    aliases = aliases(),
+    crate = ":jj-vfs",
+    edition = "2024",
+    deps = all_crate_deps(
+        normal = True,
+        normal_dev = True,
+    ),
 )

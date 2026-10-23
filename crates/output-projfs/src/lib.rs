@@ -6,7 +6,31 @@ pub mod identity;
 #[cfg(windows)]
 mod windows;
 #[cfg(windows)]
-pub use windows::{Metrics, ProjfsMount, start};
+pub use windows::{
+    CapturedSourceFile, CapturedSourceReader, Metrics, NativeCaptureError, NativeCaptureLimits,
+    NativeSourceCapture, NativeSourceContent, NativeSourceEntry, ProjfsMount, SourceRootGuard,
+    start,
+};
+
+/// Read-only binding check for a recognized persisted source projection.
+/// This does not start, repair, adopt, or mutate a root. Callers needing lifetime
+/// protection retain `SourceRootGuard` instead of discarding this check's guard.
+pub fn validate_existing_binding(
+    root: &std::path::Path,
+    state: &std::path::Path,
+    tree_identity: &str,
+) -> anyhow::Result<()> {
+    #[cfg(windows)]
+    {
+        let _guard = SourceRootGuard::open(root, state, tree_identity)?;
+        Ok(())
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = (root, state, tree_identity);
+        anyhow::bail!("ProjFS source binding requires Windows")
+    }
+}
 
 /// Validate representable Win32 output components. Unlike a Git workspace,
 /// output projections do not reserve `.git` or short-name lookalikes.

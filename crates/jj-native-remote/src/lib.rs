@@ -34,7 +34,7 @@ pub(crate) struct Inner {
     pub ledger: Arc<ledger::Ledger>,
     pub connector: Arc<Connector>,
     pub staging: PathBuf,
-    pub staging_owner: Arc<std::fs::File>,
+    pub staging_owner: Arc<staging::Owner>,
     pub config: Config,
     pub control: Arc<tokio::sync::Semaphore>,
     pub spool: Arc<tokio::sync::Semaphore>,
@@ -169,7 +169,7 @@ pub(crate) struct Connector {
     config: tinytree_client::Config,
     credential: String,
     client: tokio::sync::OnceCell<NativeClient>,
-    owner: Arc<std::fs::File>,
+    owner: Arc<staging::Owner>,
     ca_certificate: Option<Arc<[u8]>>,
     online: bool,
 }
@@ -239,55 +239,28 @@ pub(crate) fn unhex<const N: usize>(text: &str) -> Result<[u8; N]> {
     }
     Ok(bytes)
 }
-pub(crate) fn private_directory(path: &Path) -> Result<()> {
+pub(crate) fn private_directory(path: &Path) -> Result<private_fs::PrivateDir> {
     ensure!(
         path.is_absolute() && path.as_os_str().len() <= 4096,
         "native private path must be bounded and absolute"
     );
-    if !path.exists() {
+    if std::fs::symlink_metadata(path)
+        .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound)
+    {
+        // Keep the established stricter creation policy: caller provisions a
+        // private parent before a new native storage child is created.
         let parent = path.parent().context("native private path has no parent")?;
-        check_private(parent)?;
-        let mut builder = std::fs::DirBuilder::new();
         #[cfg(unix)]
-        {
-            use std::os::unix::fs::DirBuilderExt;
-            builder.mode(0o700);
-        }
-        builder.create(path)?;
-        std::fs::File::open(parent)?.sync_all()?;
+        let parent = parent.canonicalize()?;
+        let parent = private_fs::PrivateDir::open_existing(parent)?;
+        let name = path
+            .file_name()
+            .context("native private path has no filename")?;
+        return Ok(private_fs::PrivateDir::create(parent.path().join(name))?);
     }
-    check_private(path)
-}
-fn check_private(path: &Path) -> Result<()> {
-    let path = path.canonicalize()?;
     #[cfg(unix)]
-    {
-        use std::os::unix::fs::{MetadataExt, PermissionsExt};
-        let uid = unsafe { libc::geteuid() };
-        let mut ancestor = PathBuf::new();
-        for component in path.components() {
-            ancestor.push(component.as_os_str());
-            let m = std::fs::symlink_metadata(&ancestor)?;
-            let mode = m.permissions().mode();
-            ensure!(
-                m.is_dir()
-                    && !m.file_type().is_symlink()
-                    && (m.uid() == 0 || m.uid() == uid)
-                    && (mode & 0o022 == 0 || (m.uid() == 0 && mode & 0o1000 != 0)),
-                "untrusted native storage ancestor"
-            );
-        }
-        let m = std::fs::symlink_metadata(path)?;
-        ensure!(
-            m.uid() == uid && m.permissions().mode() & 0o077 == 0,
-            "native broker storage must be owner-private"
-        );
-    }
-    #[cfg(not(unix))]
-    {
-        anyhow::bail!("private native storage ACL verification is unavailable on this platform");
-    }
-    Ok(())
+    let path = path.canonicalize()?;
+    Ok(private_fs::PrivateDir::open_existing(path)?)
 }
 
 fn read_ca(path: &Path) -> Result<Arc<[u8]>> {

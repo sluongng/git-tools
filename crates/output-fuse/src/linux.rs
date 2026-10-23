@@ -1161,6 +1161,16 @@ impl Projection for FuseMount {
     fn root(&self) -> &Path {
         &self.root
     }
+    async fn wait_source_idle(&self) -> Result<()> {
+        // Publication workers retain this mutex through physical completion and
+        // kernel notifications, even if their initiating future was dropped.
+        let _guard = self.control.lock().await;
+        ensure!(
+            !self.adapter.stopped.load(Ordering::Acquire),
+            "native source projection is stopped"
+        );
+        Ok(())
+    }
     async fn ensure_dir(&self, path: &str) -> Result<()> {
         let path = path.to_owned();
         self.complete(move |tree, notifier| {
@@ -1181,6 +1191,44 @@ impl Projection for FuseMount {
                     invalidate(&notifier, &old)?;
                 }
                 ancestors(&tree, &notifier, &path)
+            })
+        })
+        .await
+    }
+    async fn publish_source(
+        &self,
+        manifest: output_core::SourceManifest,
+        expected: output_core::SourceVersion,
+        request_id: String,
+        limits: output_core::SourceLimits,
+    ) -> Result<output_core::SourceReceipt> {
+        self.complete(move |tree, notifier| {
+            Box::pin(async move {
+                // Capture only metadata/local dirty state, never clean contents.
+                // The install rechecks the complete version under its own fence;
+                // a kernel writer in between makes the request stale, not lost.
+                let snapshot =
+                    tree.freeze_source(output_core::SourceFrontendFence::TreeOnly, &limits)?;
+                let old: Vec<_> = snapshot
+                    .entries()
+                    .iter()
+                    .map(|entry| entry.node.clone())
+                    .collect();
+                drop(snapshot);
+                let receipt =
+                    tree.install_source(manifest, Some(expected), &request_id, &limits)?;
+                // complete() owns a generation lease across publication and all
+                // notifications, including when the initiating RPC is cancelled.
+                for node in old {
+                    invalidate(&notifier, &node)?;
+                }
+                let current =
+                    tree.freeze_source(output_core::SourceFrontendFence::TreeOnly, &limits)?;
+                for entry in current.entries() {
+                    invalidate(&notifier, &entry.node)?;
+                }
+                invalidate(&notifier, &tree.get(tree.root_id())?)?;
+                Ok(receipt)
             })
         })
         .await

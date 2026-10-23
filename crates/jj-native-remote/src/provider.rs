@@ -6,7 +6,7 @@ use jj_lib::backend::BackendResult;
 use jj_native_backend::{
     CopyCatalogLimits, CopyCatalogSnapshot, FileRead, NativeObjectIo, VerifiedMetadata,
 };
-use local_cas::{Artifact, BlobSource};
+use local_cas::{Artifact, BlobSource, FetchContext};
 use std::sync::Arc;
 use tinytree_model as m;
 
@@ -92,6 +92,17 @@ impl RemoteObjectIo {
         {
             return Ok(blob);
         }
+        self.refresh_file_scope(descriptor).await?;
+        io::cached(self.inner.cache.clone().content_from(
+            artifact,
+            Arc::new(RemoteSource {
+                inner: self.inner.clone(),
+                scope: io::scope(),
+            }),
+        ))
+        .await
+    }
+    async fn refresh_file_scope(&self, descriptor: m::Descriptor) -> Result<()> {
         let ledger = self.inner.ledger.clone();
         let id = descriptor.key.id.0;
         let claim = io::blocking(move || ledger.claim(id))
@@ -109,14 +120,7 @@ impl RemoteObjectIo {
             .refresh_scope_hold(root_id)
             .await?;
         }
-        io::cached(self.inner.cache.clone().content_from(
-            artifact,
-            Arc::new(RemoteSource {
-                inner: self.inner.clone(),
-                scope: io::scope(),
-            }),
-        ))
-        .await
+        Ok(())
     }
 }
 #[async_trait]
@@ -159,6 +163,62 @@ impl NativeObjectIo for RemoteObjectIo {
         .await;
         result.map_err(backend_error)
     }
+    async fn read_file_for_cache(
+        &self,
+        id: m::FileId,
+        owner: Arc<dyn std::any::Any + Send + Sync>,
+    ) -> BackendResult<FileRead> {
+        let key = m::ObjectKey {
+            kind: m::Kind::File,
+            id: m::ObjectId(id.0),
+        };
+        if self.inner.local.descriptor(key).await?.is_some() {
+            return self.inner.local.read_file_for_cache(id, owner).await;
+        }
+        let deadline = io::scope().map_or_else(
+            || self.inner.deadline(),
+            |scope| scope.deadline.min(self.inner.deadline()),
+        );
+        let operation = async {
+            let descriptor = self
+                .promise(id)
+                .await?
+                .context("native file has no admitted canonical provenance")?;
+            let artifact = self.artifact(descriptor);
+            // HIT ONLY: this call may already own the same cache's sole fetch
+            // slot/byte reservation under the workspace's artifact scope.
+            if let Some(blob) =
+                io::cached(self.inner.cache.clone().cached_content(artifact)).await?
+            {
+                let reader = io::Reader::open_for_delivery(blob, owner.clone()).await?;
+                return FileRead::from_preverified_pinned_source(descriptor, Box::pin(reader))
+                    .map_err(backend);
+            }
+            self.refresh_file_scope(descriptor).await?;
+            let client = self
+                .inner
+                .connector
+                .get()
+                .await?
+                .with_lifetime_guard(Arc::new(owner.clone()));
+            let verified =
+                io::network(client.download_file(m::ObjectId(id.0), &self.inner.staging)).await?;
+            ensure!(
+                verified.descriptor() == descriptor,
+                "native fetched file differs from admitted tree"
+            );
+            // No second spool and no cache hydration. The verified temporary's
+            // reader owns client quota, staging ownership and delivery guards.
+            let reader = io::blocking(move || verified.open().map_err(anyhow::Error::from)).await?;
+            let reader = io::Reader::verified(reader, owner);
+            FileRead::from_preverified_pinned_source(descriptor, Box::pin(reader)).map_err(backend)
+        };
+        let result = tokio::time::timeout_at(deadline, operation)
+            .await
+            .map_err(|_| anyhow::anyhow!("native cache delivery deadline exceeded"))
+            .and_then(|result| result);
+        result.map_err(backend_error)
+    }
     async fn write_file(
         &self,
         input: &mut (dyn AsyncRead + Send + Unpin),
@@ -177,9 +237,13 @@ struct RemoteSource {
     inner: Arc<Inner>,
     scope: Option<Arc<io::ControlScope>>,
 }
-#[async_trait]
-impl BlobSource for RemoteSource {
-    async fn fetch(&self, artifact: &Artifact, target: &mut std::fs::File) -> Result<()> {
+impl RemoteSource {
+    async fn fetch_impl(
+        &self,
+        artifact: &Artifact,
+        target: &mut std::fs::File,
+        context: Option<FetchContext>,
+    ) -> Result<()> {
         let operation = async {
             let deadline = self.scope.as_ref().map_or_else(
                 || self.inner.deadline(),
@@ -194,6 +258,13 @@ impl BlobSource for RemoteSource {
                     "native cache artifact authorization scope mismatch"
                 );
                 let client = self.inner.connector.get().await?;
+                // NativeClient forwards this owner into download spools, pinned
+                // readers and its non-cancellable physical workers.
+                let client = if let Some(context) = context.clone() {
+                    client.with_lifetime_guard(Arc::new(context))
+                } else {
+                    client
+                };
                 let verified = io::network(
                     client.download_file(m::ObjectId(unhex(&artifact.hash)?), &self.inner.staging),
                 )
@@ -221,22 +292,25 @@ impl BlobSource for RemoteSource {
                 let _cancel = Cancel(cancelled.clone());
                 let inner = self.inner.clone();
                 let expected = artifact.size;
+                // Assemble one ordered owner BEFORE dispatch, including when a
+                // queued closure is discarded without ever starting its body.
+                struct Copy {
+                    reader: tinytree_client::VerifiedReader,
+                    target: std::fs::File,
+                    _quota: Arc<tokio::sync::OwnedSemaphorePermit>,
+                    _inner: Arc<Inner>,
+                    _context: Option<FetchContext>,
+                }
+                let copy = Copy {
+                    reader,
+                    target,
+                    _quota: quota,
+                    _inner: inner,
+                    _context: context.clone(),
+                };
                 io::blocking(move || {
                     use std::io::{Read, Write};
-                    // Field order closes both descriptors before releasing either the
-                    // native transfer budget or ownership of the shared cache directory.
-                    struct Copy {
-                        reader: tinytree_client::VerifiedReader,
-                        target: std::fs::File,
-                        _quota: Arc<tokio::sync::OwnedSemaphorePermit>,
-                        _inner: Arc<Inner>,
-                    }
-                    let mut copy = Copy {
-                        reader,
-                        target,
-                        _quota: quota,
-                        _inner: inner,
-                    };
+                    let mut copy = copy;
                     let mut buffer = vec![0; 65536];
                     let mut count = 0u64;
                     loop {
@@ -272,6 +346,20 @@ impl BlobSource for RemoteSource {
         } else {
             operation.await
         }
+    }
+}
+#[async_trait]
+impl BlobSource for RemoteSource {
+    async fn fetch(&self, artifact: &Artifact, target: &mut std::fs::File) -> Result<()> {
+        self.fetch_impl(artifact, target, None).await
+    }
+    async fn fetch_with_context(
+        &self,
+        artifact: &Artifact,
+        target: &mut std::fs::File,
+        context: FetchContext,
+    ) -> Result<()> {
+        self.fetch_impl(artifact, target, Some(context)).await
     }
     async fn missing(&self, artifacts: &[Artifact]) -> Result<Vec<Artifact>> {
         let client = self.inner.connector.get().await?;

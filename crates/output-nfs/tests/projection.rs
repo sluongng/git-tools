@@ -699,3 +699,142 @@ async fn owned_transport_shutdown_drains_nested_work_and_expires_file_handles() 
     );
     assert_eq!(fresh.read(replacement.id, 0, 99).await.unwrap().0, b"first");
 }
+
+#[tokio::test]
+async fn native_source_metadata_switch_preserves_nfs_generations_without_hydration() {
+    use output_core::{
+        SourceContent, SourceEntry, SourceFrontendFence, SourceLimits, SourceManifest,
+    };
+    let (_dir, tree, source) = fixture();
+    let limits = SourceLimits::default();
+    let remote = Artifact {
+        backend: "fixture".into(),
+        instance: "".into(),
+        digest_function: 9,
+        hash: "a".repeat(64),
+        size: 5,
+    };
+    let manifest = SourceManifest {
+        identity: tree.identity().into(),
+        root: [1; 32],
+        entries: vec![
+            SourceEntry {
+                path: "file".into(),
+                mode: 0o644,
+                content: SourceContent::File(remote),
+            },
+            SourceEntry {
+                path: "link".into(),
+                mode: 0o777,
+                content: SourceContent::Symlink("file".into()),
+            },
+        ],
+    };
+    tree.install_source(manifest.clone(), None, "initial", &limits)
+        .unwrap();
+    let fs = OutputNfs::new(tree.clone());
+    let old = fs.lookup(1, &b"file"[..].into()).await.unwrap();
+    let old_handle = fs.id_to_fh(old);
+    assert_eq!(fs.getattr(old).await.unwrap().size, 5);
+    let symlink = fs.lookup(1, &b"link"[..].into()).await.unwrap();
+    assert_eq!(fs.readlink(symlink).await.unwrap().0, b"file");
+    assert_eq!(source.fetches.load(Ordering::SeqCst), 0);
+    // Truncate locally without downloading the old blob, then retain this dirty
+    // generation through a full namespace switch (not per-file staging).
+    fs.setattr(
+        old,
+        sattr3 {
+            size: set_size3::size(0),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    fs.write(old, 0, b"local").await.unwrap();
+    let expected = tree
+        .freeze_source(SourceFrontendFence::TreeOnly, &limits)
+        .unwrap()
+        .version()
+        .clone();
+    let mut next = manifest;
+    next.root = [2; 32];
+    if let SourceContent::File(artifact) = &mut next.entries[0].content {
+        artifact.hash = "b".repeat(64);
+        artifact.size = 7;
+    }
+    tree.install_source(next, Some(expected), "next", &limits)
+        .unwrap();
+    let new = fs.lookup(1, &b"file"[..].into()).await.unwrap();
+    assert_ne!(new, old);
+    assert_eq!(fs.getattr(new).await.unwrap().size, 7);
+    assert_eq!(fs.fh_to_id(&old_handle).unwrap(), old);
+    assert_eq!(fs.read(old, 0, 5).await.unwrap().0, b"local");
+    assert_eq!(
+        source.fetches.load(Ordering::SeqCst),
+        0,
+        "source metadata publication must never read a blob"
+    );
+}
+
+#[cfg(target_os = "macos")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires actual macOS NFS client; source capture remains unsupported"]
+async fn native_source_dirty_page_flush_preparation_is_not_a_capture_proof() {
+    use output_core::{Projection, SourceContent, SourceEntry, SourceLimits, SourceManifest};
+    use output_nfs::{NfsMount, NfsSourceUnsupported};
+    let (dir, tree, source) = fixture();
+    let limits = SourceLimits::default();
+    tree.install_source(
+        SourceManifest {
+            identity: tree.identity().into(),
+            root: [1; 32],
+            entries: vec![SourceEntry {
+                path: "file".into(),
+                mode: 0o644,
+                content: SourceContent::File(Artifact {
+                    backend: "fixture".into(),
+                    instance: "".into(),
+                    digest_function: 9,
+                    hash: "a".repeat(64),
+                    size: 5,
+                }),
+            }],
+        },
+        None,
+        "initial",
+        &limits,
+    )
+    .unwrap();
+    let mount = NfsMount::start(tree.clone(), dir.path().join("source-mount"))
+        .await
+        .unwrap();
+    let result: anyhow::Result<()> = async {
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .truncate(true)
+            .open(mount.root().join("file"))?;
+        file.write_all(b"native dirty source bytes")?;
+        // This establishes this single descriptor's flush behavior only. It
+        // cannot prove a bounded whole-client/page-cache COMMIT barrier.
+        file.sync_all()?;
+        drop(file);
+        let node = tree.resolve("file")?;
+        anyhow::ensure!(tree.read(node.id, 0, 64).await? == b"native dirty source bytes");
+        let error = mount
+            .capture_source_quiescent(limits.clone())
+            .await
+            .err()
+            .unwrap();
+        anyhow::ensure!(error.downcast_ref::<NfsSourceUnsupported>().is_some());
+        anyhow::ensure!(tree.source_baseline()?.0 == [1; 32]);
+        anyhow::ensure!(
+            source.fetches.load(Ordering::SeqCst) == 0,
+            "metadata-only source path hydrated content"
+        );
+        Ok(())
+    }
+    .await;
+    let stopped = mount.shutdown().await;
+    result.unwrap();
+    stopped.unwrap();
+}

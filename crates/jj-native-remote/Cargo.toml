@@ -6,6 +6,7 @@ license = "MIT"
 description = "Broker-hosted lazy native repository I/O and durable remote admission"
 
 [dependencies]
+private-fs = { path = "../private-fs" }
 anyhow = "1"
 async-trait = "0.1"
 blake3 = "1"
@@ -30,6 +31,8 @@ uuid = { version = "1", features = ["v4"] }
 libc = "0.2"
 
 [dev-dependencies]
+output-core = { path = "../output-core" }
+native-workspace = { path = "../native-workspace" }
 async-stream = "0.3"
 tinytree-fixture = { path = "../tinytree-fixture" }
 tinytree-server = { path = "../tinytree-server" }

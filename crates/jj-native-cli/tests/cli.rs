@@ -99,6 +99,38 @@ impl Client {
         assert!(id.bytes().all(|c| c.is_ascii_hexdigit()));
         id
     }
+    fn roots(&self) -> serde_json::Value {
+        let encoded = self.success(&["tinytree", "roots", "--json"]);
+        let audit: serde_json::Value = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(audit["version"], 1);
+        assert!(encoded.len() <= audit["encoded_bytes_upper_bound"].as_u64().unwrap() as usize);
+        let roots = audit["object_roots"].as_array().unwrap();
+        let mut previous = None;
+        for root in roots {
+            let kind = root["kind"].as_str().unwrap();
+            let rank = match kind {
+                "file" => 1,
+                "tree" => 2,
+                "commit" => 3,
+                "symlink" => 4,
+                "copy_history" => 5,
+                _ => panic!("unexpected kind"),
+            };
+            let id = root["id"].as_str().unwrap();
+            assert_eq!(id.len(), 64);
+            assert!(
+                id.bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+            );
+            let key = (rank, id);
+            assert!(
+                previous.is_none_or(|old| old < key),
+                "roots must be unique and sorted"
+            );
+            previous = Some(key);
+        }
+        audit
+    }
     fn assert_native(&self) {
         assert_eq!(
             fs::read_to_string(self.root.join(".jj/repo/store/type")).unwrap(),
@@ -164,7 +196,160 @@ fn local_native_commands_snapshot_edit_restore_and_undo_without_git() {
             .trim(),
         "native child",
     );
+    // An abandoned operation remains physically retained until jj's operation
+    // GC. Its old view/native commit must remain in a read-only root inventory.
+    let old_operation = client.success(&["op", "log", "--no-graph", "-n", "1", "-T", "id"]);
+    client.success(&["describe", "-m", "rewritten child"]);
+    client.success(&["op", "abandon", old_operation.trim()]);
+    let audit = client.roots();
+    assert!(
+        audit["retained_operations"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|id| id == old_operation.trim())
+    );
+    assert!(
+        audit["object_roots"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|root| root["kind"] == "commit" && root["id"] == child)
+    );
+
+    // Audit must not snapshot unsaved filesystem edits or create operations.
+    let before = audit["operation_heads"].clone();
+    fs::write(client.root.join("hello.txt"), "not snapshotted by audit\n").unwrap();
+    let after = client.roots();
+    assert_eq!(after["operation_heads"], before);
+    assert_eq!(
+        after["working_copy_operation"],
+        audit["working_copy_operation"]
+    );
+    assert_eq!(after["object_roots"], audit["object_roots"]);
+    let rejected = client.run(&["tinytree", "roots", "--json", "--max-operations", "1"]);
+    assert!(!rejected.status.success());
+    assert!(
+        rejected.stdout.is_empty(),
+        "no partial audit after a failed budget"
+    );
+    assert_eq!(client.roots()["operation_heads"], before);
+    let oversized = client.run(&["tinytree", "roots", "--json", "--max-file-bytes", "16"]);
+    assert!(!oversized.status.success());
+    assert!(
+        oversized.stdout.is_empty(),
+        "no partial audit after a bounded read failure"
+    );
+    assert_eq!(client.roots()["operation_heads"], before);
+    assert_eq!(
+        fs::read_to_string(client.root.join("hello.txt")).unwrap(),
+        "not snapshotted by audit\n"
+    );
     client.assert_native();
+}
+
+#[test]
+fn native_root_audit_keeps_negative_working_copy_terms_and_fails_closed() {
+    use jj_native_backend::{DirectObjectIo, NativeObjectIo};
+    use tinytree_model::{Kind, Object, ObjectId, ObjectKey};
+    let client = Client::new();
+    client.success(&["tinytree", "init"]);
+    fs::write(client.root.join("conflict.txt"), "base\n").unwrap();
+    client.success(&["describe", "-m", "base"]);
+    let base = client.revision("@");
+    client.success(&["new", &base, "-m", "left"]);
+    fs::write(client.root.join("conflict.txt"), "left\n").unwrap();
+    client.success(&["status"]);
+    let left = client.revision("@");
+    client.success(&["new", &base, "-m", "right"]);
+    fs::write(client.root.join("conflict.txt"), "right\n").unwrap();
+    client.success(&["status"]);
+    let right = client.revision("@");
+    client.success(&["new", &left, &right]);
+    let merged = client.revision("@");
+    let bytes: Vec<u8> = (0..merged.len())
+        .step_by(2)
+        .map(|offset| u8::from_str_radix(&merged[offset..offset + 2], 16).unwrap())
+        .collect();
+    let provider = DirectObjectIo::load(
+        &client.root.join(".jj/repo/store"),
+        jj_native_backend::Config::default(),
+    )
+    .unwrap();
+    let metadata = futures::executor::block_on(provider.read_metadata(ObjectKey {
+        kind: Kind::Commit,
+        id: ObjectId(bytes.try_into().unwrap()),
+    }))
+    .unwrap();
+    let Object::Commit(commit) = metadata.into_object() else {
+        panic!("expected commit")
+    };
+    assert!(
+        commit.root_tree.terms.len() >= 3,
+        "fixture must have a negative tree term"
+    );
+    let negative = commit.root_tree.terms[1];
+    drop(provider);
+    let audit = client.roots();
+    for term in &commit.root_tree.terms {
+        let id: String = term.0.iter().map(|byte| format!("{byte:02x}")).collect();
+        assert!(
+            audit["object_roots"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|root| root["kind"] == "tree" && root["id"] == id)
+        );
+    }
+    assert_ne!(negative, commit.root_tree.terms[0]);
+    // Deliberately corrupt the retained operation fixture, including operations
+    // outside current ancestry. No root subset may escape after a missing view.
+    let views = client.root.join(".jj/repo/op_store/views");
+    let victims: Vec<_> = fs::read_dir(views)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .filter(|path| path.is_file())
+        .collect();
+    assert!(!victims.is_empty());
+    let originals: Vec<_> = victims.iter().map(|path| fs::read(path).unwrap()).collect();
+    // Malformed protobuf targets used to panic in jj's assumption-based view
+    // conversion before the audit could verify the semantic object identity.
+    for malformed in [&[0x4a, 0x00][..], &[0x4a, 0x02, 0x1a, 0x00][..]] {
+        for path in &victims {
+            fs::write(path, malformed).unwrap();
+        }
+        let rejected = client.run(&["tinytree", "roots", "--json"]);
+        assert_eq!(
+            rejected.status.code(),
+            Some(1),
+            "{}",
+            String::from_utf8_lossy(&rejected.stderr)
+        );
+        assert!(rejected.stdout.is_empty());
+        assert!(!String::from_utf8_lossy(&rejected.stderr).contains("panicked"));
+        for path in &victims {
+            assert_eq!(fs::read(path).unwrap(), malformed);
+        }
+        for (path, bytes) in victims.iter().zip(&originals) {
+            fs::write(path, bytes).unwrap();
+        }
+    }
+    let checkout = client.root.join(".jj/working_copy/checkout");
+    let original_checkout = fs::read(&checkout).unwrap();
+    let oversized = vec![0u8; 64 * 1024];
+    fs::write(&checkout, &oversized).unwrap();
+    let rejected = client.run(&["tinytree", "roots", "--json", "--max-file-bytes", "16"]);
+    assert_eq!(rejected.status.code(), Some(1));
+    assert!(rejected.stdout.is_empty());
+    assert!(!String::from_utf8_lossy(&rejected.stderr).contains("panicked"));
+    assert_eq!(fs::read(&checkout).unwrap(), oversized);
+    fs::write(&checkout, original_checkout).unwrap();
+    for victim in victims {
+        fs::remove_file(victim).unwrap();
+    }
+    let rejected = client.run(&["tinytree", "roots", "--json"]);
+    assert!(!rejected.status.success());
+    assert!(rejected.stdout.is_empty());
 }
 
 #[test]
@@ -957,6 +1142,31 @@ async fn readonly_failed_push_requires_explicit_bounded_local_replay_abandonment
     let original = fs::read_to_string(&path).unwrap();
     let mut boundary: toml::Value = toml::from_str(&original).unwrap();
     let intent = boundary["pending"].clone();
+    let active = client.roots();
+    assert!(
+        active["intent_operations"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|id| id.as_str() == intent["base_operation"].as_str())
+    );
+    assert!(
+        active["object_roots"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|root| root["kind"] == "commit" && root["id"].as_str() == intent["head"].as_str())
+    );
+    let mut missing_active = boundary.clone();
+    missing_active["pending"]["base_operation"] = toml::Value::String("ff".repeat(64));
+    fs::write(&path, toml::to_string(&missing_active).unwrap()).unwrap();
+    let rejected = client.run(&["tinytree", "roots", "--json"]);
+    assert!(
+        !rejected.status.success(),
+        "active recovery requires its base operation"
+    );
+    assert!(rejected.stdout.is_empty());
+    fs::write(&path, &original).unwrap();
     let archived = (0..128)
         .map(|index| {
             let mut intent = intent.clone();
@@ -987,6 +1197,25 @@ async fn readonly_failed_push_requires_explicit_bounded_local_replay_abandonment
     let state: toml::Value = toml::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
     assert!(state.get("pending").is_none());
     assert_eq!(state["archived_pushes"].as_array().unwrap().len(), 1);
+    // Archival retains the publication head, not an indefinitely required jj
+    // operation DAG. Operation GC may already have expired an archived base.
+    let mut expired_archive = state.clone();
+    expired_archive["archived_pushes"][0]["base_operation"] = toml::Value::String("ff".repeat(64));
+    fs::write(&path, toml::to_string(&expired_archive).unwrap()).unwrap();
+    let archived_audit = client.roots();
+    assert!(
+        archived_audit["intent_operations"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        archived_audit["object_roots"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|root| root["kind"] == "commit" && root["id"].as_str() == intent["head"].as_str())
+    );
     assert_eq!(
         client.success(&["file", "show", "local-only.txt"]),
         "readonly clients can edit locally\n"

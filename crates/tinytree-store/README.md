@@ -23,3 +23,11 @@ startup budget. A mismatch or exhausted budget fails closed, without repair.
 Callers must authorize repository access and protect local jj operation, undo and
 workspace roots. An upload receipt alone is not permission to discard local data.
 Process-crash/write-failure tests are not proof of machine power-loss durability.
+
+`client_gc` is a separate, bounded unreachable-only collector seam for lazy
+clients; it is not enabled by a broker or workspace API. Callers must fence the
+complete workspace/operation/in-flight root registry through completion. Exact
+remote FILE promises permit absent indexes, never corrupt indexed payloads or
+reachable offload. Durable ages protect recent/legacy objects; deletion records
+make interrupted unlink recoverable on a later successful collection. Its
+logical scan/deletion limits do not cap database or crash-orphan disk overhead.

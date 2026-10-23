@@ -9,20 +9,14 @@ use jj_cli::{
     ui::Ui,
 };
 use jj_lib::{
-    backend::{Backend, BackendInitError, CommitId},
+    backend::CommitId,
     object_id::ObjectId as _,
     op_store::{RefTarget, RemoteRef, RemoteRefState},
     ref_name::{RefNameBuf, RemoteName},
     repo::Repo as _,
-    settings::UserSettings,
-    signing_factory::signer_from_settings,
-    workspace::{Workspace, WorkspaceInitError},
 };
 use native_broker::{BrokerControlClient, ConfirmedPublication, PublishRequest, ReferenceSnapshot};
-use std::{
-    io::Write,
-    path::{Path, PathBuf},
-};
+use std::{io::Write, path::PathBuf};
 
 fn failure(error: impl std::fmt::Display) -> CommandError {
     user_error(format!("Native repository operation failed: {error}"))
@@ -106,8 +100,11 @@ fn open_state(command: &CommandHelper) -> Result<(Locator, LockedState), Command
     let loader = command.workspace_loader()?;
     let locator = broker::locator(&loader.repo_path().join("store"))
         .map_err(|_| user_error("native remote commands require a broker-backed workspace"))?;
-    let state = LockedState::open(&loader.workspace_root().join(".jj/working_copy"), &locator)
-        .map_err(failure)?;
+    let state = LockedState::open(
+        &crate::vfs::working_copy_path(loader.workspace_root()).map_err(failure)?,
+        &locator,
+    )
+    .map_err(failure)?;
     Ok((locator, state))
 }
 fn snapshot_observation(
@@ -365,26 +362,25 @@ pub(crate) async fn clone(
             }
         }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            std::fs::create_dir_all(&destination).map_err(failure)?
+            crate::vfs::prepare_destination(&destination).map_err(failure)?
         }
         Err(error) => return Err(failure(error)),
     }
     let destination = destination.canonicalize().map_err(failure)?;
-    let (settings, _) = command.settings_for_new_workspace(ui, &destination)?;
-    let initialize =
-        |_: &UserSettings, path: &Path| -> Result<Box<dyn Backend>, BackendInitError> {
-            broker::init(path, locator.clone())
-        };
-    let (workspace, repo) = Workspace::init_with_backend(
-        &settings,
-        &destination,
-        &initialize,
-        signer_from_settings(&settings).map_err(WorkspaceInitError::SignInit)?,
-    )
-    .await?;
+    let initial = parse_id(
+        observation
+            .head
+            .as_deref()
+            .expect("validated present native head"),
+    )?;
+    let (workspace, repo) =
+        crate::vfs::initialize(ui, command, &destination, Some(locator.clone()), &initial).await?;
     let mut helper = command.for_workable_repo(ui, workspace, repo)?;
-    let mut locked =
-        LockedState::open(&destination.join(".jj/working_copy"), &locator).map_err(failure)?;
+    let mut locked = LockedState::open(
+        &crate::vfs::working_copy_path(&destination).map_err(failure)?,
+        &locator,
+    )
+    .map_err(failure)?;
     locked
         .state
         .prepare(&reference, &bookmark)
@@ -398,7 +394,14 @@ pub(crate) async fn clone(
         &helper,
     ));
     locked.save().map_err(failure)?;
-    integrate_fetch(ui, &mut helper, &bookmark_name, &observation, true).await?;
+    integrate_fetch(
+        ui,
+        &mut helper,
+        &bookmark_name,
+        &observation,
+        cfg!(feature = "protocol-fixture"),
+    )
+    .await?;
     locked.state.record(observation).map_err(failure)?;
     locked.state.pending = None;
     locked.save().map_err(failure)?;

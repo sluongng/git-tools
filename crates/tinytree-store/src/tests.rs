@@ -1339,3 +1339,469 @@ fn retention_reopen_validation_budgets_include_public_records_and_fail_closed() 
         Some(head)
     );
 }
+
+fn client_collection(store: &Store, now: i64) -> ClientGcRequest {
+    ClientGcRequest {
+        epoch: store.client_gc_epoch("demo").unwrap(),
+        complete_roots: vec![],
+        transient_roots: vec![],
+        promised_files: vec![],
+        now,
+        grace_seconds: 0,
+        limits: ClientGcLimits::default(),
+    }
+}
+
+#[test]
+fn client_gc_keeps_lazy_canonical_closure_without_hydrating_promised_file() {
+    let (_directory, store) = open();
+    let file = tinytree_model::describe_file(b"remote bytes not downloaded");
+    let t = put_object(&store, Object::Tree(tree(file, file.size_bytes)), 0);
+    let c = put_object(
+        &store,
+        Object::Commit(commit(TreeId(t.key.id.0), "lazy")),
+        0,
+    );
+    let spare = tinytree_model::describe_file(b"unreachable bytes");
+    store.put("demo", spare, b"unreachable bytes", 0).unwrap();
+    let mut request = client_collection(&store, 100);
+    request.complete_roots = vec![
+        c.key,
+        ObjectKey {
+            kind: Kind::Commit,
+            id: ObjectId(CommitId::ROOT.0),
+        },
+    ];
+    request.promised_files = vec![file];
+    let report = store.client_gc("demo", &request).unwrap();
+    assert_eq!(report.deleted_objects, 1);
+    assert_eq!(report.deleted_bytes, spare.size_bytes);
+    assert_eq!(report.unlinked_payloads, 1);
+    assert_eq!(store.descriptor("demo", file.key).unwrap(), None);
+    assert!(!store.inner.path("demo", file.key).exists());
+    assert_eq!(store.descriptor("demo", t.key).unwrap(), Some(t));
+    assert_eq!(store.descriptor("demo", c.key).unwrap(), Some(c));
+    assert_eq!(store.descriptor("demo", spare.key).unwrap(), None);
+    assert!(!store.inner.path("demo", spare.key).exists());
+    // Even an explicit promise is NOT permission to offload reachable residents.
+    store
+        .put("demo", file, b"remote bytes not downloaded", 100)
+        .unwrap();
+    request.epoch = store.client_gc_epoch("demo").unwrap();
+    request.now = 200;
+    assert_eq!(
+        store.client_gc("demo", &request).unwrap().deleted_objects,
+        0
+    );
+    assert_eq!(store.descriptor("demo", file.key).unwrap(), Some(file));
+}
+
+#[test]
+fn client_gc_invalid_complete_graphs_fail_before_any_deletion() {
+    enum Failure {
+        Missing,
+        WrongLength,
+        IndexedMissing,
+        CorruptMetadata,
+        NegativeTerm,
+        Predecessor,
+    }
+    for failure in [
+        Failure::Missing,
+        Failure::WrongLength,
+        Failure::IndexedMissing,
+        Failure::CorruptMetadata,
+        Failure::NegativeTerm,
+        Failure::Predecessor,
+    ] {
+        let (_directory, store) = open();
+        let (file, t, c) = fixture(&store, "invalid");
+        let spare = tinytree_model::describe_file(b"must survive invalid mark");
+        store
+            .put("demo", spare, b"must survive invalid mark", 0)
+            .unwrap();
+        let mut request = client_collection(&store, 100);
+        request.complete_roots.push(c.key);
+        match failure {
+            Failure::Missing => {
+                let absent = tinytree_model::describe_file(b"not resident");
+                let t = put_object(&store, Object::Tree(tree(absent, absent.size_bytes)), 0);
+                request.complete_roots = vec![t.key];
+            }
+            Failure::WrongLength => {
+                let t = put_object(&store, Object::Tree(tree(file, file.size_bytes + 1)), 0);
+                request.complete_roots = vec![t.key];
+            }
+            Failure::IndexedMissing => {
+                fs::remove_file(store.inner.path("demo", file.key)).unwrap();
+                request.promised_files = vec![file];
+            }
+            Failure::CorruptMetadata => {
+                fs::write(
+                    store.inner.path("demo", t.key),
+                    vec![0; t.size_bytes as usize],
+                )
+                .unwrap();
+            }
+            Failure::NegativeTerm => {
+                let mut broken = commit(TreeId(t.key.id.0), "negative");
+                broken.root_tree = TreeMerge {
+                    terms: vec![TreeId(t.key.id.0), TreeId([8; 32]), TreeId(t.key.id.0)],
+                    labels: vec!["left".into(), "base".into(), "right".into()],
+                };
+                request.complete_roots = vec![put_object(&store, Object::Commit(broken), 0).key];
+            }
+            Failure::Predecessor => {
+                let mut broken = commit(TreeId(t.key.id.0), "predecessor");
+                broken.predecessors = vec![CommitId([9; 32])];
+                request.complete_roots = vec![put_object(&store, Object::Commit(broken), 0).key];
+            }
+        }
+        request.epoch = store.client_gc_epoch("demo").unwrap();
+        assert!(store.client_gc("demo", &request).is_err());
+        assert_eq!(store.descriptor("demo", spare.key).unwrap(), Some(spare));
+        assert!(store.inner.path("demo", spare.key).exists());
+        assert!(
+            store
+                .inner
+                .db
+                .read_tx()
+                .prefix(&store.inner.spaces.client_deletions, key("demo", b""))
+                .next()
+                .is_none()
+        );
+    }
+}
+
+#[test]
+fn client_gc_epoch_is_instance_repository_and_duplicate_write_sensitive() {
+    let (directory, store) = open();
+    let bytes = b"duplicate refreshes age";
+    let file = tinytree_model::describe_file(bytes);
+    store.put("demo", file, bytes, 0).unwrap();
+    let request = client_collection(&store, 100);
+    store.put("demo", file, bytes, 90).unwrap();
+    assert!(matches!(
+        store.client_gc("demo", &request),
+        Err(Error::Invalid("stale client GC epoch"))
+    ));
+    let mut fresh = client_collection(&store, 100);
+    fresh.grace_seconds = 20;
+    assert_eq!(store.client_gc("demo", &fresh).unwrap().deleted_objects, 0);
+    let old_instance = client_collection(&store, 200);
+    drop(store);
+    let store = Store::open_existing(directory.path(), config()).unwrap();
+    assert!(matches!(
+        store.client_gc("demo", &old_instance),
+        Err(Error::Invalid("stale client GC epoch"))
+    ));
+    store.create_repository("other").unwrap();
+    assert!(matches!(
+        store.client_gc("other", &client_collection(&store, 200)),
+        Err(Error::Invalid("stale client GC epoch"))
+    ));
+    assert_eq!(
+        store
+            .client_gc("demo", &client_collection(&store, 200))
+            .unwrap()
+            .deleted_objects,
+        1
+    );
+}
+
+#[test]
+fn client_gc_recent_incomplete_graph_and_active_reader_retain_old_descendants() {
+    let (_directory, store) = open();
+    let (file, t, c) = fixture(&store, "old base");
+    let mut unfinished = commit(TreeId([7; 32]), "unfinished write");
+    unfinished.parents = vec![CommitId(c.key.id.0)];
+    let unfinished = put_object(&store, Object::Commit(unfinished), 95);
+    let mut request = client_collection(&store, 100);
+    request.grace_seconds = 20;
+    assert_eq!(
+        store.client_gc("demo", &request).unwrap().deleted_objects,
+        0
+    );
+    for d in [file, t, c, unfinished] {
+        assert_eq!(store.descriptor("demo", d.key).unwrap(), Some(d));
+    }
+    let reader = store.read("demo", c.key).unwrap();
+    assert_eq!(
+        store
+            .client_gc("demo", &client_collection(&store, 200))
+            .unwrap()
+            .deleted_objects,
+        1
+    );
+    assert_eq!(store.descriptor("demo", file.key).unwrap(), Some(file));
+    drop(reader);
+    assert_eq!(
+        store
+            .client_gc("demo", &client_collection(&store, 300))
+            .unwrap()
+            .deleted_objects,
+        3
+    );
+}
+
+#[test]
+fn client_gc_legacy_unknown_ages_stamp_and_retain_before_reclamation() {
+    let (directory, store) = open();
+    let (_, _, c) = fixture(&store, "legacy");
+    // A pre-age-schema store has no age rows. Simulate only that historical
+    // metadata state; collection itself uses the public API after reopen.
+    let mut tx = store
+        .inner
+        .db
+        .write_tx()
+        .durability(Some(PersistMode::SyncAll));
+    for item in store
+        .inner
+        .db
+        .read_tx()
+        .prefix(&store.inner.spaces.client_ages, key("demo", b""))
+    {
+        tx.remove(
+            &store.inner.spaces.client_ages,
+            item.into_inner().unwrap().0,
+        );
+    }
+    store.inner.commit(tx).unwrap();
+    drop(store);
+    let store = Store::open_existing(directory.path(), config()).unwrap();
+    let first = store
+        .client_gc("demo", &client_collection(&store, 100))
+        .unwrap();
+    assert_eq!(first.deleted_objects, 0);
+    assert_eq!(first.stamped_unknown_objects, 4);
+    assert_eq!(store.descriptor("demo", c.key).unwrap(), Some(c));
+    let mut rollback = client_collection(&store, 90);
+    rollback.grace_seconds = 0;
+    assert_eq!(
+        store.client_gc("demo", &rollback).unwrap().deleted_objects,
+        0
+    );
+    assert_eq!(
+        store
+            .client_gc("demo", &client_collection(&store, 101))
+            .unwrap()
+            .deleted_objects,
+        3
+    );
+}
+
+#[test]
+fn client_gc_direct_tree_root_checks_contextual_copy_provenance() {
+    let (_directory, store) = open();
+    let file = tinytree_model::describe_file(b"promised copy source");
+    let history = put_object(
+        &store,
+        Object::CopyHistory(CopyHistory {
+            current_path: "wrong.txt".into(),
+            parents: vec![],
+            salt: vec![1],
+        }),
+        0,
+    );
+    let mut tree = tree(file, file.size_bytes);
+    let TreeValue::File { copy_id, .. } = &mut tree.entries[0].value else {
+        unreachable!()
+    };
+    *copy_id = Some(CopyId(history.key.id.0));
+    let root = put_object(&store, Object::Tree(tree), 0);
+    let spare = tinytree_model::describe_file(b"copy failure must preserve");
+    store
+        .put("demo", spare, b"copy failure must preserve", 0)
+        .unwrap();
+    let mut request = client_collection(&store, 100);
+    request.complete_roots = vec![root.key];
+    request.promised_files = vec![file];
+    assert!(matches!(
+        store.client_gc("demo", &request),
+        Err(Error::Invalid("copy history current path"))
+    ));
+    assert_eq!(store.descriptor("demo", spare.key).unwrap(), Some(spare));
+}
+
+#[test]
+fn client_gc_budget_failure_has_zero_deletions() {
+    enum Bound {
+        Catalog,
+        Marked,
+        Edges,
+        Metadata,
+        Deletions,
+        DeleteBytes,
+    }
+    for bound in [
+        Bound::Catalog,
+        Bound::Marked,
+        Bound::Edges,
+        Bound::Metadata,
+        Bound::Deletions,
+        Bound::DeleteBytes,
+    ] {
+        let (_directory, store) = open();
+        let (file, _, c) = fixture(&store, "budget");
+        let mut request = client_collection(&store, 100);
+        match bound {
+            Bound::Catalog => request.limits.max_catalog_records = 1,
+            Bound::Marked => {
+                request.complete_roots = vec![c.key];
+                request.limits.max_marked_objects = 1;
+            }
+            Bound::Edges => {
+                request.complete_roots = vec![c.key];
+                request.limits.max_edges = 1;
+            }
+            Bound::Metadata => {
+                request.complete_roots = vec![c.key];
+                request.limits.max_metadata_bytes = 1;
+            }
+            Bound::Deletions => request.limits.max_deleted_objects = 1,
+            Bound::DeleteBytes => request.limits.max_deleted_bytes = 1,
+        }
+        assert!(matches!(
+            store.client_gc("demo", &request),
+            Err(Error::Limit(_))
+        ));
+        assert_eq!(store.descriptor("demo", file.key).unwrap(), Some(file));
+        assert_eq!(store.descriptor("demo", c.key).unwrap(), Some(c));
+    }
+}
+
+// Materialize the exact durable boundary after index removal and before unlink.
+// This models that restart state; the process-crash suite separately exercises
+// actual journal/process behavior, not machine power-loss semantics.
+fn client_gc_pending_unlink(store: &Store, d: Descriptor, remove_index: bool) {
+    #[derive(Serialize)]
+    struct Pending {
+        object: StoredDescriptor,
+        revision: u64,
+    }
+    let _gate = store.inner.lock().unwrap();
+    let mut tx = store
+        .inner
+        .db
+        .write_tx()
+        .durability(Some(PersistMode::SyncAll));
+    let revision = store
+        .inner
+        .advance_client_revision(&mut tx, "demo")
+        .unwrap();
+    if remove_index {
+        tx.remove(&store.inner.spaces.objects, object_key("demo", d.key));
+        tx.remove(&store.inner.spaces.client_ages, object_key("demo", d.key));
+        let mut repo = store.inner.repository("demo").unwrap();
+        repo.bytes -= d.size_bytes;
+        repo.objects -= 1;
+        tx.insert(&store.inner.spaces.repos, "demo", encode(&repo).unwrap());
+    }
+    tx.insert(
+        &store.inner.spaces.client_deletions,
+        object_key("demo", d.key),
+        encode(&Pending {
+            object: d.into(),
+            revision,
+        })
+        .unwrap(),
+    );
+    store.inner.commit(tx).unwrap();
+}
+
+#[test]
+fn client_gc_restart_recovers_tombstone_but_never_unlinks_reinstalled_index() {
+    for reinstall in [false, true] {
+        let (directory, store) = open();
+        let bytes = b"pending physical unlink";
+        let file = tinytree_model::describe_file(bytes);
+        store.put("demo", file, bytes, 0).unwrap();
+        client_gc_pending_unlink(&store, file, true);
+        assert_eq!(store.descriptor("demo", file.key).unwrap(), None);
+        drop(store);
+        let store = Store::open_existing(directory.path(), config()).unwrap();
+        if reinstall {
+            store.put("demo", file, bytes, 99).unwrap();
+            // A crash may also leave a stale deletion record alongside an
+            // installed index. Recovery must cancel it, not unlink the bytes.
+            client_gc_pending_unlink(&store, file, false);
+        }
+        let mut request = client_collection(&store, 100);
+        if reinstall {
+            request.complete_roots.push(file.key);
+        }
+        let report = store.client_gc("demo", &request).unwrap();
+        assert_eq!(report.deleted_objects, 0);
+        assert_eq!(report.unlinked_payloads, u64::from(!reinstall));
+        assert_eq!(
+            store.descriptor("demo", file.key).unwrap(),
+            reinstall.then_some(file)
+        );
+        assert_eq!(store.inner.path("demo", file.key).exists(), reinstall);
+        assert!(
+            store
+                .inner
+                .db
+                .read_tx()
+                .prefix(&store.inner.spaces.client_deletions, key("demo", b""))
+                .next()
+                .is_none()
+        );
+    }
+}
+
+#[test]
+fn client_gc_recovery_defers_unindexed_leased_candidate_until_reader_drops() {
+    let (_directory, store) = open();
+    let bytes = b"writer candidate still leased";
+    let file = tinytree_model::describe_file(bytes);
+    store.put("demo", file, bytes, 0).unwrap();
+    let reader = store.read("demo", file.key).unwrap();
+    client_gc_pending_unlink(&store, file, true);
+    let report = store
+        .client_gc("demo", &client_collection(&store, 100))
+        .unwrap();
+    assert_eq!(report.deferred_deletions, 1);
+    assert_eq!(report.unlinked_payloads, 0);
+    assert!(store.inner.path("demo", file.key).exists());
+    drop(reader);
+    let report = store
+        .client_gc("demo", &client_collection(&store, 100))
+        .unwrap();
+    assert_eq!(report.deferred_deletions, 0);
+    assert_eq!(report.unlinked_payloads, 1);
+    assert!(!store.inner.path("demo", file.key).exists());
+}
+
+#[test]
+fn client_gc_repeated_edits_prune_expired_staging_with_a_small_scan_budget() {
+    let (_directory, store) = open();
+    for edit in 0..12 {
+        let now = edit * 20;
+        let bytes = format!("unique edit {edit}");
+        let file = tinytree_model::describe_file(bytes.as_bytes());
+        store.put("demo", file, bytes.as_bytes(), now).unwrap();
+        let mut request = client_collection(&store, now + 11);
+        // Exactly the permanent empty tree, this edit's file and its lease.
+        // Without pruning, a second edit already exceeds this scan budget.
+        request.limits.max_catalog_records = 3;
+        let report = store.client_gc("demo", &request).unwrap();
+        assert_eq!(report.expired_leases, 1);
+        assert_eq!(report.deleted_objects, 1);
+        assert_eq!(store.descriptor("demo", file.key).unwrap(), None);
+        assert!(
+            store
+                .inner
+                .db
+                .read_tx()
+                .prefix(&store.inner.spaces.staging, key("demo", b""))
+                .next()
+                .is_none()
+        );
+    }
+    let mut request = client_collection(&store, 300);
+    request.limits.max_catalog_records = 1;
+    let report = store.client_gc("demo", &request).unwrap();
+    assert_eq!(report.expired_leases, 0);
+    assert_eq!(report.deleted_objects, 0);
+}

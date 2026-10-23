@@ -696,5 +696,5 @@ impl RemoteRepositoryControl {
 struct Spool {
     file: Mutex<tempfile::NamedTempFile>,
     _quota: Arc<tokio::sync::OwnedSemaphorePermit>,
-    _staging_owner: Arc<std::fs::File>,
+    _staging_owner: Arc<crate::staging::Owner>,
 }

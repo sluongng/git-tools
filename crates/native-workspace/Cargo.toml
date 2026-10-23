@@ -1,0 +1,22 @@
+[package]
+name = "native-workspace"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+description = "Metadata-only native source manifests and pinned lazy file reads"
+
+[dependencies]
+anyhow = "1"
+async-trait = "0.1"
+blake3 = "1"
+futures = "0.3"
+jj-native-backend = { path = "../jj-native-backend" }
+local-cas = { path = "../local-cas" }
+output-core = { path = "../output-core" }
+serde = { version = "1", features = ["derive"] }
+tinytree-model = { path = "../tinytree-model" }
+tokio = { version = "1", features = ["full"] }
+
+[dev-dependencies]
+jj-lib = { version = "=0.46.0", default-features = false }
+tempfile = "3"

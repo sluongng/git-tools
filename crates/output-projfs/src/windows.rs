@@ -31,6 +31,15 @@ use windows_sys::{
     core::{GUID, HRESULT},
 };
 
+#[path = "source_capture.rs"]
+mod source_capture;
+#[path = "source_control.rs"]
+mod source_control;
+pub use source_capture::{
+    CapturedSourceFile, CapturedSourceReader, NativeCaptureError, NativeCaptureLimits,
+    NativeSourceCapture, NativeSourceContent, NativeSourceEntry,
+};
+
 fn wide(s: impl AsRef<OsStr>) -> Vec<u16> {
     s.as_ref().encode_wide().chain(Some(0)).collect()
 }
@@ -119,7 +128,84 @@ struct Manifest {
     legacy_ceiling: Option<u64>,
     #[serde(default)]
     origins: Vec<Origin>,
+    #[serde(default)]
+    root_fingerprint: Option<Fingerprint>,
 }
+/// Pinned binding for an already initialized native source root. Only the
+/// recognized ProjFS leaf may be a reparse point; all ancestors remain trusted
+/// non-reparse directories. State is independently owner-private.
+pub struct SourceRootGuard {
+    _ancestors: private_fs::WindowsTrustedDirectory,
+    _root: File,
+    _state: private_fs::PrivateDir,
+}
+impl SourceRootGuard {
+    pub fn open(root: &Path, state: &Path, tree_identity: &str) -> Result<Self> {
+        ensure!(
+            !tree_identity.is_empty() && tree_identity.len() <= 4096,
+            "invalid source tree identity"
+        );
+        let parent = root.parent().context("source root has no parent")?;
+        let ancestors = private_fs::WindowsTrustedDirectory::open(parent)?;
+        let file = OpenOptions::new()
+            .read(true)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
+            .open(root)?;
+        ensure!(file.metadata()?.is_dir(), "source root is not a directory");
+        unsafe { private_fs::windows::verify_private_handle(file.as_raw_handle()) }?;
+        let mut tag = FILE_ATTRIBUTE_TAG_INFO::default();
+        ensure!(
+            unsafe {
+                GetFileInformationByHandleEx(
+                    file.as_raw_handle(),
+                    FileAttributeTagInfo,
+                    (&mut tag as *mut FILE_ATTRIBUTE_TAG_INFO).cast(),
+                    std::mem::size_of::<FILE_ATTRIBUTE_TAG_INFO>() as u32,
+                )
+            } != 0,
+            "cannot inspect source root reparse tag"
+        );
+        ensure!(
+            tag.FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT != 0
+                && tag.ReparseTag
+                    == windows_sys::Win32::System::SystemServices::IO_REPARSE_TAG_PROJFS,
+            "source root is not a recognized ProjFS directory"
+        );
+        let state = private_fs::PrivateDir::open_existing(state)?;
+        let manifest: Manifest =
+            serde_json::from_slice(&state.read("instance.json", 16 * 1024 * 1024)?)?;
+        let canonical_root = root.canonicalize()?;
+        ensure!(
+            manifest.version == 4
+                && manifest.root == canonical_root
+                && manifest.tree_identity == tree_identity
+                && manifest.instance != [0; 16]
+                && manifest.legacy_ceiling.is_some(),
+            "source root manifest binding mismatch"
+        );
+        validate_origins(&manifest.origins)?;
+        ensure!(
+            manifest.root_fingerprint.as_ref() == Some(&file_fingerprint(&file)?),
+            "source root NTFS identity mismatch"
+        );
+        let mut flags = 0;
+        check(
+            unsafe { PrjGetOnDiskFileState(wide(&canonical_root).as_ptr(), &mut flags) },
+            "inspect source root state",
+        )?;
+        ensure!(
+            flags & PRJ_FILE_STATE_PLACEHOLDER != 0,
+            "source root is not a ProjFS placeholder"
+        );
+        Ok(Self {
+            _ancestors: ancestors,
+            _root: file,
+            _state: state,
+        })
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 struct Fingerprint {
     volume: u64,
@@ -205,6 +291,9 @@ fn native_fingerprint(path: &Path) -> Result<Option<Fingerprint>> {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(error) => return Err(error.into()),
     };
+    Ok(Some(file_fingerprint(&file)?))
+}
+fn file_fingerprint(file: &File) -> Result<Fingerprint> {
     let mut info = FILE_ID_INFO::default();
     if unsafe {
         GetFileInformationByHandleEx(
@@ -217,10 +306,10 @@ fn native_fingerprint(path: &Path) -> Result<Option<Fingerprint>> {
     {
         return Err(std::io::Error::last_os_error().into());
     }
-    Ok(Some(Fingerprint {
+    Ok(Fingerprint {
         volume: info.VolumeSerialNumber,
         file: info.FileId.Identifier,
-    }))
+    })
 }
 
 #[derive(Clone, Default, Serialize, Deserialize)]
@@ -259,6 +348,8 @@ struct Provider {
     early_cancellations: Mutex<VecDeque<i32>>,
     completed: AtomicU64,
     canceled: AtomicU64,
+    source_captures: std::sync::atomic::AtomicUsize,
+    source_control: Option<source_control::SourceControl>,
     budget: Arc<Semaphore>,
     runtime: tokio::runtime::Handle,
 }
@@ -645,11 +736,16 @@ impl ProjfsMount {
 impl Drop for ProjfsMount {
     fn drop(&mut self) {
         if !self.provider.stopping.load(Ordering::Acquire) {
-            self.provider.draining.store(true, Ordering::Release);
+            {
+                let _pending = self.provider.pending.lock().unwrap();
+                self.provider.draining.store(true, Ordering::Release);
+            }
             // The public shutdown is asynchronous. The synchronous fallback
             // keeps the multithread runtime progressing while draining page-in.
             let drain = || {
-                while !self.provider.pending.lock().unwrap().is_empty() {
+                while !self.provider.pending.lock().unwrap().is_empty()
+                    || self.provider.source_captures.load(Ordering::Acquire) != 0
+                {
                     std::thread::sleep(std::time::Duration::from_millis(1));
                 }
             };
@@ -697,7 +793,8 @@ pub async fn start(tree: Arc<Tree>, root: &Path, state: &Path) -> Result<ProjfsM
         }
     }
     let path = state.join("instance.json");
-    let manifest: Manifest = if path.exists() {
+    let fresh_projection = !path.try_exists()?;
+    let manifest: Manifest = if !fresh_projection {
         let mut bytes = Vec::new();
         File::open(&path)?
             .take(16 * 1024 * 1024 + 1)
@@ -708,9 +805,16 @@ pub async fn start(tree: Arc<Tree>, root: &Path, state: &Path) -> Result<ProjfsM
         );
         let mut m: Manifest = serde_json::from_slice(&bytes)?;
         ensure!(
-            matches!(m.version, 2 | 3) && m.root == root && m.tree_identity == tree.identity(),
+            matches!(m.version, 2 | 3 | 4) && m.root == root && m.tree_identity == tree.identity(),
             "projection root does not match durable state"
         );
+        if m.version == 4 {
+            ensure!(
+                m.root_fingerprint.as_ref() == native_fingerprint(&root)?.as_ref(),
+                "ProjFS root identity does not match durable state"
+            );
+            ensure!(m.root_fingerprint.is_some(), "ProjFS root identity missing");
+        }
         if m.version == 2 {
             ensure!(
                 m.origins.is_empty() && m.legacy_ceiling.is_none(),
@@ -749,15 +853,38 @@ pub async fn start(tree: Arc<Tree>, root: &Path, state: &Path) -> Result<ProjfsM
         let mut id = GUID::default();
         check(unsafe { CoCreateGuid(&mut id) }, "create projection GUID")?;
         let m = Manifest {
-            version: 3,
+            version: 4,
             root: root.clone(),
             instance: guid_key(&id),
             tree_identity: tree.identity().to_owned(),
             legacy_ceiling: Some(0),
             origins: Vec::new(),
+            root_fingerprint: Some(native_fingerprint(&root)?.context("ProjFS root missing")?),
         };
         durable_publish(&path, &serde_json::to_vec(&m)?)?;
         m
+    };
+    let source_control = if tree.source_baseline().is_ok() {
+        let marker = tree.resolve(".jj/native-workspace")?;
+        ensure!(
+            marker.kind == NodeKind::File
+                && marker.remote.is_none()
+                && marker.size > 0
+                && marker.size <= 4096,
+            "invalid core source control marker"
+        );
+        let expected = tree.read(marker.id, 0, 4097).await?;
+        ensure!(
+            expected.len() as u64 == marker.size,
+            "incomplete core source control marker"
+        );
+        Some(source_control::SourceControl::prepare(
+            &root,
+            expected,
+            fresh_projection,
+        )?)
+    } else {
+        None
     };
     let root_name = wide(&root);
     let mut native = 0;
@@ -800,6 +927,8 @@ pub async fn start(tree: Arc<Tree>, root: &Path, state: &Path) -> Result<ProjfsM
         early_cancellations: Mutex::new(VecDeque::new()),
         completed: AtomicU64::new(0),
         canceled: AtomicU64::new(0),
+        source_captures: std::sync::atomic::AtomicUsize::new(0),
+        source_control,
         budget: Arc::new(Semaphore::new(32)),
         runtime,
     });
@@ -815,8 +944,19 @@ pub async fn start(tree: Arc<Tree>, root: &Path, state: &Path) -> Result<ProjfsM
         CancelCommandCallback: Some(cancel),
     };
     let empty = wide("");
+    let mut notification_mask = PRJ_NOTIFY_PRE_RENAME | PRJ_NOTIFY_PRE_SET_HARDLINK;
+    if provider.source_control.is_some() {
+        notification_mask |= PRJ_NOTIFY_PRE_DELETE
+            | PRJ_NOTIFY_FILE_PRE_CONVERT_TO_FULL
+            | PRJ_NOTIFY_FILE_OPENED
+            | PRJ_NOTIFY_FILE_OVERWRITTEN
+            | PRJ_NOTIFY_NEW_FILE_CREATED
+            | PRJ_NOTIFY_FILE_RENAMED
+            | PRJ_NOTIFY_FILE_HANDLE_CLOSED_FILE_MODIFIED
+            | PRJ_NOTIFY_FILE_HANDLE_CLOSED_FILE_DELETED;
+    }
     let mut mapping = PRJ_NOTIFICATION_MAPPING {
-        NotificationBitMask: PRJ_NOTIFY_PRE_RENAME | PRJ_NOTIFY_PRE_SET_HARDLINK,
+        NotificationBitMask: notification_mask,
         NotificationRoot: empty.as_ptr(),
     };
     let options = PRJ_STARTVIRTUALIZING_OPTIONS {
@@ -1091,8 +1231,13 @@ impl Projection for ProjfsMount {
         // Cached paging reads are not reliably cancellable on Windows. Complete
         // verified in-flight ranges before StopVirtualizing; aborting them can
         // expose sparse zero-filled pages even when native completion is failed.
-        self.provider.draining.store(true, Ordering::Release);
-        while !self.provider.pending.lock().unwrap().is_empty() {
+        {
+            let _pending = self.provider.pending.lock().unwrap();
+            self.provider.draining.store(true, Ordering::Release);
+        }
+        while !self.provider.pending.lock().unwrap().is_empty()
+            || self.provider.source_captures.load(Ordering::Acquire) != 0
+        {
             tokio::time::sleep(std::time::Duration::from_millis(1)).await;
         }
         self.stop();
@@ -1554,6 +1699,37 @@ unsafe extern "system" fn notification(
 ) -> HRESULT {
     unsafe {
         callback(d, |data, provider| {
+            if let Some(control) = &provider.source_control {
+                let path = string(data.FilePathName);
+                let destination = string(destination);
+                if control.is_path(&path) || control.is_path(&destination) {
+                    if matches!(
+                        n,
+                        PRJ_NOTIFICATION_PRE_DELETE
+                            | PRJ_NOTIFICATION_PRE_RENAME
+                            | PRJ_NOTIFICATION_PRE_SET_HARDLINK
+                            | PRJ_NOTIFICATION_FILE_PRE_CONVERT_TO_FULL
+                    ) {
+                        return Ok(hr(ERROR_ACCESS_DENIED));
+                    }
+                    if matches!(
+                        n,
+                        PRJ_NOTIFICATION_FILE_OVERWRITTEN
+                            | PRJ_NOTIFICATION_NEW_FILE_CREATED
+                            | PRJ_NOTIFICATION_FILE_RENAMED
+                            | PRJ_NOTIFICATION_FILE_HANDLE_CLOSED_FILE_MODIFIED
+                            | PRJ_NOTIFICATION_FILE_HANDLE_CLOSED_FILE_DELETED
+                    ) {
+                        control.invalidate();
+                        return Ok(hr(ERROR_ACCESS_DENIED));
+                    }
+                    if n == PRJ_NOTIFICATION_FILE_OPENED {
+                        // Do not open paths recursively from an open callback.
+                        // The physical read-only lease enforces access mode.
+                        control.check_open()?;
+                    }
+                }
+            }
             if n == PRJ_NOTIFICATION_PRE_SET_HARDLINK {
                 return Ok(hr(ERROR_NOT_SUPPORTED));
             }

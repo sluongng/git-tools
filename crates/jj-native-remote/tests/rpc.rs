@@ -1333,3 +1333,142 @@ async fn lazy_connection_uses_captured_ca_and_new_trust_never_reuses_old_connect
     );
     server.stop().await;
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn native_workspace_delivery_does_not_reenter_its_shared_cache() {
+    struct Case {
+        name: &'static str,
+        fetch_slots: usize,
+        inflight_bytes: u64,
+    }
+    for case in [
+        Case {
+            name: "single_fetch_slot",
+            fetch_slots: 1,
+            inflight_bytes: 64 * 1024,
+        },
+        Case {
+            name: "single_byte_unit_for_3000_byte_file",
+            fetch_slots: 8,
+            inflight_bytes: 4096,
+        },
+    ] {
+        let (_serverdir, store, fixture, head) = seed();
+        let counts = Counters::new();
+        let server = Server::start(store, counts.clone()).await;
+        let directory = private_dir();
+        let cache = LocalCas::open(
+            directory.path().join("cache"),
+            Arc::new(NoUpstream),
+            local_cas::CacheConfig {
+                max_concurrent_fetches: case.fetch_slots,
+                max_inflight_bytes: case.inflight_bytes,
+                operation_timeout: Duration::from_secs(3),
+                fetch_timeout: Duration::from_secs(3),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let remote_config = config(&server);
+        // Trusted fixture configuration selects the security scope, not a file
+        // request. Do not alias workspace and repository cache artifact keys.
+        let configured_identity = blake3::hash(
+            format!(
+                "{}\0{}\0{}",
+                remote_config.remote.endpoint, remote_config.authorization_profile, TOKEN
+            )
+            .as_bytes(),
+        );
+        let scope = native_workspace::Scope::from_configured_identity(
+            &remote_config.remote.repository_id,
+            configured_identity.as_bytes(),
+        )
+        .unwrap();
+        let (direct, repo) = local(directory.path(), cache.clone(), remote_config, true);
+        assert_eq!(
+            repo.control.admit_reference("main").await.unwrap().head,
+            head
+        );
+        let compiler =
+            native_workspace::Compiler::new(repo.io.clone(), scope.clone(), Default::default())
+                .unwrap();
+        let compiled = compiler.compile_commit(head).await.unwrap();
+        let tree = output_core::Tree::open_with_cache_and_source(
+            directory.path().join("namespace"),
+            scope.backend(),
+            cache.clone(),
+            compiled.source(),
+        )
+        .unwrap();
+        tree.install_source(
+            compiled.manifest(tree.identity()),
+            None,
+            "workspace-base",
+            &Default::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            counts.files.load(Ordering::SeqCst),
+            0,
+            "{} startup hydrates no files",
+            case.name
+        );
+        let selected = fixture
+            .manifest
+            .files
+            .iter()
+            .find(|file| file.size_bytes == 3000)
+            .unwrap();
+        let object = fixture
+            .objects()
+            .iter()
+            .find(|object| {
+                object.descriptor.key.kind == m::Kind::File
+                    && blake3::hash(&object.bytes).to_hex().as_str() == selected.id
+            })
+            .unwrap();
+        assert_eq!(object.bytes.len(), 3000);
+        assert_eq!(
+            direct.descriptor(object.descriptor.key).await.unwrap(),
+            None
+        );
+        let node = tree.resolve(&selected.path).unwrap();
+        let bytes = tokio::time::timeout(Duration::from_secs(2), tree.read(node.id, 0, 3000))
+            .await
+            .unwrap_or_else(|_| {
+                panic!("{} recursively waited on shared cache admission", case.name)
+            })
+            .unwrap();
+        assert_eq!(bytes, object.bytes, "{} cold read", case.name);
+        assert_eq!(
+            counts.files.load(Ordering::SeqCst),
+            1,
+            "{} cold read uses exactly one native file RPC",
+            case.name
+        );
+        assert_eq!(
+            tree.read(node.id, 0, 3000).await.unwrap(),
+            object.bytes,
+            "{} warm read",
+            case.name
+        );
+        assert_eq!(
+            counts.files.load(Ordering::SeqCst),
+            1,
+            "{} warm read makes no file RPC",
+            case.name
+        );
+        assert_eq!(
+            direct.descriptor(object.descriptor.key).await.unwrap(),
+            None,
+            "{} clean cache bytes must not create authoritative residency",
+            case.name
+        );
+        tokio::time::timeout(Duration::from_secs(2), cache.wait_for_idle())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(cache.metrics().reserved_bytes, 0);
+        server.stop().await;
+    }
+}

@@ -288,12 +288,47 @@ impl Artifact {
         Ok(())
     }
 }
+/// Opaque ownership of cache admission, disk reservation, temporary path and
+/// directory lock. A source detaching physical I/O must move a clone into that
+/// job and keep it until its target file handle is closed. Caller cancellation
+/// or a deadline does not release these resources while a job retains a clone.
+#[derive(Clone)]
+pub struct FetchContext {
+    _resources: Arc<FetchResources>,
+}
+impl std::fmt::Debug for FetchContext {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FetchContext").finish_non_exhaustive()
+    }
+}
+struct FetchResources {
+    // Clean temporary paths before releasing reservation/admission/ownership.
+    _temporary: Temporary,
+    _reservation: Arc<Mutex<Reservation>>,
+    _bytes: OwnedSemaphorePermit,
+    _cache: Arc<LocalCas>,
+    // Last: wait_for_idle is an ownership barrier, not just a worker counter.
+    _request: Arc<OwnedSemaphorePermit>,
+}
+
 #[async_trait]
 pub trait BlobSource: Send + Sync {
     /// Stream at most artifact.size bytes; reject an overlong response before
     /// writing it. The cache reserves this declared disk/transfer budget and
     /// independently verifies both complete hash and exact final size.
     async fn fetch(&self, artifact: &Artifact, target: &mut File) -> Result<()>;
+    /// Borrow-only sources can use this default. A source cloning the target or
+    /// detaching physical work MUST override this and retain the context through
+    /// physical completion, even when its fetch future is dropped.
+    async fn fetch_with_context(
+        &self,
+        artifact: &Artifact,
+        target: &mut File,
+        context: FetchContext,
+    ) -> Result<()> {
+        let _context = context;
+        self.fetch(artifact, target).await
+    }
     async fn missing(&self, artifacts: &[Artifact]) -> Result<Vec<Artifact>>;
     /// Best-effort notification after a verified local read. Implementations
     /// must not block or treat this as evidence of upstream presence.
@@ -647,9 +682,9 @@ pub struct LocalCas {
     requests: Arc<Semaphore>,
     lookup_requests: Arc<Semaphore>,
     maintenance_requests: Arc<Semaphore>,
-    bytes: Semaphore,
+    bytes: Arc<Semaphore>,
     byte_units: u32,
-    oversized_bytes: Semaphore,
+    oversized_bytes: Arc<Semaphore>,
     oversized_byte_units: u32,
     flights: Mutex<HashMap<String, Arc<Flight>>>,
     files: Mutex<CacheFiles>,
@@ -827,9 +862,9 @@ impl LocalCas {
             requests: Arc::new(Semaphore::new(config.max_concurrent_fetches)),
             lookup_requests: Arc::new(Semaphore::new(config.max_concurrent_fetches)),
             maintenance_requests: Arc::new(Semaphore::new(1)),
-            bytes: Semaphore::new(byte_units as usize),
+            bytes: Arc::new(Semaphore::new(byte_units as usize)),
             byte_units,
-            oversized_bytes: Semaphore::new(oversized_byte_units as usize),
+            oversized_bytes: Arc::new(Semaphore::new(oversized_byte_units as usize)),
             oversized_byte_units,
             config,
             flights: Mutex::new(HashMap::new()),
@@ -996,6 +1031,11 @@ impl LocalCas {
             files.dirty = false;
         }
         Ok(())
+    }
+    /// Canonical cache directory, for rejecting overlap with projected roots.
+    /// The caller does not gain ownership or permission to mutate cache files.
+    pub fn root_path(&self) -> &Path {
+        &self.dir
     }
     pub fn config(&self) -> &CacheConfig {
         &self.config
@@ -1185,24 +1225,25 @@ impl LocalCas {
         function: i32,
         deadline: tokio::time::Instant,
         request: Arc<OwnedSemaphorePermit>,
+        fetch_context: Option<FetchContext>,
     ) -> Result<(String, u64)> {
         let path = path.to_owned();
         // Tuple fields drop left-to-right, including during unwinding: cache
         // ownership ends before this verifier releases its fetch, foreground
         // lookup, or maintenance lane permit clone.
-        let ownership = (self.clone(), request);
+        let ownership = (fetch_context, self.clone(), request);
         let cancelled = Arc::new(AtomicBool::new(false));
         let _cancel = CancelVerification(cancelled.clone());
         let result = tokio::task::spawn_blocking(move || {
             let result = {
-                let _verification = ElapsedTimer::start(&ownership.0.verification_ns);
+                let _verification = ElapsedTimer::start(&ownership.1.verification_ns);
                 hash_file_until(&path, function, Some(deadline), &cancelled)
             };
             if let Err(error) = &result {
                 let mut diagnostic =
                     FailureDiagnostic::from_error(FailureStage::CacheVerificationRead, error);
                 diagnostic.digest_function = Some(function);
-                ownership.0.failures.record(diagnostic);
+                ownership.1.failures.record(diagnostic);
             }
             drop(ownership);
             result
@@ -1309,7 +1350,13 @@ impl LocalCas {
             let valid = match current.as_ref() {
                 Ok(current) if known.as_ref() == Some(current) => true,
                 Ok(before) => match self
-                    .verify(&path, artifact.digest_function, deadline, request.clone())
+                    .verify(
+                        &path,
+                        artifact.digest_function,
+                        deadline,
+                        request.clone(),
+                        None,
+                    )
                     .await
                 {
                     Ok((hash, size)) => {
@@ -1405,17 +1452,26 @@ impl LocalCas {
             (&self.bytes, self.byte_units)
         };
         let units = artifact.size.div_ceil(4096).clamp(1, units as u64) as u32;
-        let _bytes = budget
-            .acquire_many(units)
+        let byte_permit = budget
+            .clone()
+            .acquire_many_owned(units)
             .await
             .context("cache shutting down")?;
-        let mut reservation = self.reserve(artifact.size)?;
+        let reservation = Arc::new(Mutex::new(self.reserve(artifact.size)?));
         let temp_path = self.dir.join(format!(
             "{}-{}.tmp",
             std::process::id(),
             self.serial.fetch_add(1, Ordering::Relaxed)
         ));
-        let _temp = Temporary(temp_path.clone());
+        let fetch_context = FetchContext {
+            _resources: Arc::new(FetchResources {
+                _temporary: Temporary(temp_path.clone()),
+                _reservation: reservation.clone(),
+                _bytes: byte_permit,
+                _request: request.clone(),
+                _cache: self.clone(),
+            }),
+        };
         let mut target = OpenOptions::new()
             .read(true)
             .write(true)
@@ -1427,7 +1483,7 @@ impl LocalCas {
         {
             let _fetch = ElapsedTimer::start(&self.fetch_ns);
             source
-                .fetch(artifact, &mut target)
+                .fetch_with_context(artifact, &mut target, fetch_context.clone())
                 .await
                 .inspect_err(|error| {
                     self.observe_error(FailureStage::CacheFetch, error, artifact)
@@ -1446,6 +1502,7 @@ impl LocalCas {
                 artifact.digest_function,
                 deadline,
                 request.clone(),
+                Some(fetch_context.clone()),
             )
             .await?;
         self.observe_verification(
@@ -1489,6 +1546,7 @@ impl LocalCas {
                 },
             );
             // Convert reserved bytes to resident bytes in one transaction.
+            let mut reservation = reservation.lock().unwrap();
             state.reserved -= reservation.bytes;
             reservation.bytes = 0;
             state.resident += size;

@@ -21,3 +21,13 @@ relative output symlinks must stay confined. `clean` explicitly removes outputs
 and tombstones; it is not background GC.
 See [BOS setup](../bazel-output-service/README.md) and
 [platform support/tests](../../docs/platforms.md).
+
+Experimental native source capture inventories authoritative NTFS edits and
+excludes `.jj`. It reuses unchanged BLAKE3 locators and privately copies dirty
+contents under kernel change-detection fences; busy or unsupported captures fail
+closed. Persisted source roots require their exact v4 root identity. Live source
+checkout remains unsupported; native Windows acceptance is still required.
+
+Native source identity markers are real, read-leased NTFS control files, not
+sparse placeholders. Missing or changed recognized markers fail startup/capture
+without repair; administration namespace changes invalidate acknowledgment.

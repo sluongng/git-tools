@@ -1,0 +1,636 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Son Luong Ngoc <26684313+sluongng@users.noreply.github.com>
+Date: Fri, 23 Oct 2026 01:27:00 +0000
+Subject: [PATCH] jj: Bound retained operation reads and inventory
+
+A source-object collector must protect views from every retained jj
+operation, not only operations reachable from the current heads. The
+operation store can keep newer detached operations after pruning their
+ancestry. Expose a bounded inventory of persisted operation IDs so
+a caller can include their views without guessing private storage paths.
+
+Count all scanned entries, reject object-shaped non-regular files and
+ambiguous identities, and return no partial inventory on failure. This
+read-only API does not synchronize mutations or authorize deletion;
+callers must hold their own command and collection fences. Bound head
+marker enumeration too, before constructing an unbounded head vector.
+The opt-in readers cap actual file reads and inspect the pinned protobuf
+shape before decoding repeated messages, maps or byte fields. Ordinary
+upstream read behavior remains unchanged.
+
+Also expose a bounded read-only working-copy reload for authoritative root
+inventory. Require both persisted state files, eagerly populate the tree
+state cell and compare checkout bytes around the read. Do not initialize
+missing state or run filesystem capability probes. Share a single decode
+work budget across the complete observation and reject invalid paths and
+merge shapes before assumption-based conversion. Validate retained view
+reference targets before infallible upstream conversion can panic on
+missing oneof values or malformed conflicts. Mutation fencing remains
+the caller's responsibility.
+
+---
+diff --git a/src/simple_op_store.rs b/src/simple_op_store.rs
+--- a/src/simple_op_store.rs
++++ b/src/simple_op_store.rs
+@@ -21,6 +21,7 @@
+ use std::fs;
+ use std::io;
+ use std::io::ErrorKind;
++use std::io::Read as _;
+ use std::io::Write as _;
+ use std::path::Path;
+ use std::path::PathBuf;
+@@ -131,6 +132,351 @@
+     fn operations_dir(&self) -> PathBuf {
+         self.path.join("operations")
+     }
++
++    /// Lists every persisted operation ID without reading its operation or view.
++    ///
++    /// Unlike the current heads' ancestry, this includes detached operations
++    /// retained by the operation store's age policy. The intrinsic root is not
++    /// persisted and is not included. Callers must prevent concurrent mutation
++    /// if they need a complete checkpoint rather than an inventory observation.
++    ///
++    /// Every directory entry consumes the scan budget, including temporary or
++    /// unrelated files. An object-shaped non-regular file or duplicate ID is an
++    /// error; an incomplete inventory must never authorize object collection.
++    pub fn retained_operation_ids(&self, max_entries: usize) -> OpStoreResult<Vec<OperationId>> {
++        let invalid = |message: &'static str| OpStoreError::Other(io::Error::other(message).into());
++        if max_entries == 0 {
++            return Err(invalid(
++                "retained operation inventory requires a positive limit",
++            ));
++        }
++        let directory = self.operations_dir();
++        let entries = fs::read_dir(&directory)
++            .context(&directory)
++            .map_err(|error| OpStoreError::Other(error.into()))?;
++        let mut ids = Vec::new();
++        for (index, entry) in entries.enumerate() {
++            if index >= max_entries {
++                return Err(invalid("retained operation inventory exceeds entry limit"));
++            }
++            let entry = entry
++                .context(&directory)
++                .map_err(|error| OpStoreError::Other(error.into()))?;
++            let name = entry.file_name();
++            let Some(name) = name.to_str() else { continue };
++            if name.len() != OPERATION_ID_LENGTH * 2
++                || !name.bytes().all(|byte| byte.is_ascii_hexdigit())
++            {
++                continue;
++            }
++            let kind = entry
++                .file_type()
++                .context(entry.path())
++                .map_err(|error| OpStoreError::Other(error.into()))?;
++            if !kind.is_file() {
++                return Err(invalid(
++                    "retained operation inventory contains a non-regular object",
++                ));
++            }
++            let id = OperationId::try_from_hex(name)
++                .ok_or_else(|| invalid("invalid retained operation identity"))?;
++            ids.push(id);
++        }
++        ids.sort();
++        if ids.windows(2).any(|pair| pair[0] == pair[1]) {
++            return Err(invalid(
++                "retained operation inventory contains duplicate identities",
++            ));
++        }
++        Ok(ids)
++    }
++    /// Reads a retained view with file-size and predecode allocation-work bounds.
++    pub fn read_view_bounded(
++        &self,
++        id: &ViewId,
++        max_file_bytes: usize,
++        max_decode_bytes: usize,
++    ) -> OpStoreResult<View> {
++        bounded_limits(max_file_bytes, max_decode_bytes)
++            .map_err(|error| to_read_error(error.into(), id))?;
++        if *id == self.root_view_id {
++            return Ok(View::make_root(self.root_data.root_commit_id.clone()));
++        }
++
++        let path = self.views_dir().join(id.hex());
++        let buf = read_payload_bounded(&path, max_file_bytes, max_decode_bytes, BoundedShape::View)
++            .context(&path)
++            .map_err(|err| io_to_read_error(err, id))?;
++
++        let proto = crate::protos::simple_op_store::View::decode(&*buf)
++            .map_err(|err| to_read_error(err.into(), id))?;
++        validate_bounded_view(&proto).map_err(|err| to_read_error(err.into(), id))?;
++        view_from_proto(proto).map_err(|err| to_read_error(err.into(), id))
++    }
++
++    /// Reads a retained operation with file-size and predecode allocation-work bounds.
++    pub fn read_operation_bounded(
++        &self,
++        id: &OperationId,
++        max_file_bytes: usize,
++        max_decode_bytes: usize,
++    ) -> OpStoreResult<Operation> {
++        bounded_limits(max_file_bytes, max_decode_bytes)
++            .map_err(|error| to_read_error(error.into(), id))?;
++        if *id == self.root_operation_id {
++            return Ok(Operation::make_root(self.root_view_id.clone()));
++        }
++
++        let path = self.operations_dir().join(id.hex());
++        let buf = read_payload_bounded(
++            &path,
++            max_file_bytes,
++            max_decode_bytes,
++            BoundedShape::Operation,
++        )
++        .context(&path)
++        .map_err(|err| io_to_read_error(err, id))?;
++
++        let proto = crate::protos::simple_op_store::Operation::decode(&*buf)
++            .map_err(|err| to_read_error(err.into(), id))?;
++        let mut operation =
++            operation_from_proto(proto).map_err(|err| to_read_error(err.into(), id))?;
++        if operation.parents.is_empty() {
++            // Repos created before we had the root operation will have an operation without
++            // parents.
++            operation.parents.push(self.root_operation_id.clone());
++        }
++        Ok(operation)
++    }
++}
++
++// Semantic preflight for the opt-in view reader. Upstream conversion accepts
++// trusted persisted values and has infallible merge constructors/unwraps. Never
++// invoke it on malformed retained input before the caller's semantic hash check.
++#[expect(deprecated)]
++fn validate_bounded_view(proto: &crate::protos::simple_op_store::View) -> io::Result<()> {
++    use crate::protos::simple_op_store::ref_target::Value;
++    let invalid = || io::Error::other("invalid retained view reference shape");
++    let target = |maybe: &Option<crate::protos::simple_op_store::RefTarget>| -> io::Result<()> {
++        let Some(proto) = maybe else { return Ok(()) };
++        match proto.value.as_ref().ok_or_else(invalid)? {
++            Value::Conflict(conflict)
++                if conflict.removes.len().checked_add(1) != Some(conflict.adds.len()) =>
++            {
++                Err(invalid())
++            }
++            // Legacy conflicts deliberately pad absent terms during conversion.
++            _ => Ok(()),
++        }
++    };
++    target(&proto.git_head)?;
++    for entry in &proto.git_heads {
++        target(&entry.target)?;
++    }
++    for entry in &proto.git_refs {
++        target(&entry.target)?;
++    }
++    for entry in &proto.local_tags {
++        target(&entry.target)?;
++    }
++    for bookmark in &proto.bookmarks {
++        target(&bookmark.local_target)?;
++        for remote in &bookmark.remote_bookmarks {
++            target(&remote.target)?;
++        }
++    }
++    for remote in &proto.remote_views {
++        for entry in remote.bookmarks.iter().chain(&remote.tags) {
++            if entry.target_terms.len() % 2 == 0 {
++                return Err(invalid());
++            }
++        }
++    }
++    #[cfg(feature = "git")]
++    if !proto.has_git_refs_migrated_to_remote_tags {
++        let mut has_tags = false;
++        for entry in &proto.git_refs {
++            if let Some(name) = entry.name.strip_prefix("refs/tags/") {
++                if name.is_empty() {
++                    return Err(invalid());
++                }
++                has_tags = true;
++            }
++        }
++        if has_tags
++            && proto.remote_views.iter().any(|remote| {
++                remote.name == crate::git::REMOTE_NAME_FOR_LOCAL_GIT_REPO.as_str()
++                    && !remote.tags.is_empty()
++            })
++        {
++            return Err(invalid());
++        }
++    }
++    Ok(())
++}
++
++// Pinned protobuf-shape preflight for the opt-in bounded readers. Byte fields
++// remain opaque; only known nested messages recurse. The conservative charge
++// covers repeated-message/map slots and byte/string copies before prost and
++// semantic conversion allocate them. Ordinary upstream readers are unchanged.
++#[derive(Clone, Copy)]
++pub(crate) enum BoundedShape {
++    Operation,
++    Metadata,
++    View,
++    Bookmark,
++    RemoteBookmark,
++    RemoteView,
++    RemoteRef,
++    GitRef,
++    RefTarget,
++    Conflict,
++    Flat,
++    Checkout,
++    TreeState,
++    FileStateEntry,
++    FileState,
++    SparsePatterns,
++    WatchmanClock,
++}
++impl BoundedShape {
++    fn child(self, field: u64) -> Option<Self> {
++        use BoundedShape::*;
++        match (self, field) {
++            (TreeState, 2) => Some(FileStateEntry),
++            (TreeState, 3) => Some(SparsePatterns),
++            (TreeState, 4) => Some(WatchmanClock),
++            (FileStateEntry, 2) => Some(FileState),
++            (FileState, 5) => Some(Flat),
++            (Operation, 3) => Some(Metadata),
++            (Operation, 4) | (Metadata, 1 | 2 | 6) => Some(Flat),
++            (View, 5) => Some(Bookmark),
++            (View, 3) => Some(GitRef),
++            (View, 6 | 13) => Some(RemoteBookmark),
++            (View, 8) => Some(Flat),
++            (View, 9) => Some(RefTarget),
++            (View, 11) => Some(RemoteView),
++            (Bookmark, 2) | (RemoteBookmark, 2) | (GitRef, 3) => Some(RefTarget),
++            (Bookmark, 3) => Some(RemoteBookmark),
++            (RemoteView, 2 | 3) => Some(RemoteRef),
++            (RemoteRef, 2) => Some(Flat),
++            (RefTarget, 2) => Some(Flat),
++            (RefTarget, 3) => Some(Conflict),
++            (Conflict, 1 | 2) => Some(Flat),
++            _ => None,
++        }
++    }
++}
++pub(crate) fn bounded_limits(file: usize, decode: usize) -> io::Result<()> {
++    if file == 0 || file > 64 * 1024 * 1024 || decode == 0 || decode > 1024 * 1024 * 1024 {
++        return Err(io::Error::other("invalid retained object read budgets"));
++    }
++    Ok(())
++}
++fn bounded_charge(budget: &mut usize, amount: usize) -> io::Result<()> {
++    *budget = budget
++        .checked_sub(amount)
++        .ok_or_else(|| io::Error::other("retained object predecode budget exceeded"))?;
++    Ok(())
++}
++fn bounded_varint(input: &[u8], cursor: &mut usize) -> io::Result<u64> {
++    let mut value = 0u64;
++    for shift in (0..70).step_by(7) {
++        let byte = *input
++            .get(*cursor)
++            .ok_or_else(|| io::Error::other("truncated retained object"))?;
++        *cursor += 1;
++        if shift == 63 && byte > 1 {
++            return Err(io::Error::other("invalid retained object varint"));
++        }
++        value |= u64::from(byte & 0x7f) << shift;
++        if byte & 0x80 == 0 {
++            return Ok(value);
++        }
++    }
++    Err(io::Error::other("invalid retained object varint"))
++}
++fn bounded_scan(
++    input: &[u8],
++    shape: BoundedShape,
++    depth: usize,
++    budget: &mut usize,
++) -> io::Result<()> {
++    if depth > 8 {
++        return Err(io::Error::other("retained object nesting exceeds limit"));
++    }
++    let mut cursor = 0usize;
++    while cursor < input.len() {
++        bounded_charge(budget, 256)?;
++        let tag = bounded_varint(input, &mut cursor)?;
++        if tag >> 3 == 0 || tag >> 3 > 0x1fff_ffff {
++            return Err(io::Error::other("invalid retained object field"));
++        }
++        let width = match tag & 7 {
++            0 => {
++                bounded_varint(input, &mut cursor)?;
++                0
++            }
++            1 => 8,
++            5 => 4,
++            2 => {
++                let length = usize::try_from(bounded_varint(input, &mut cursor)?)
++                    .map_err(|_| io::Error::other("retained object field exceeds limit"))?;
++                let end = cursor
++                    .checked_add(length)
++                    .ok_or_else(|| io::Error::other("retained object field exceeds limit"))?;
++                let bytes = input
++                    .get(cursor..end)
++                    .ok_or_else(|| io::Error::other("truncated retained object field"))?;
++                if let Some(child) = shape.child(tag >> 3) {
++                    bounded_scan(bytes, child, depth + 1, budget)?;
++                } else {
++                    bounded_charge(
++                        budget,
++                        length.checked_mul(8).ok_or_else(|| {
++                            io::Error::other("retained object allocation overflow")
++                        })?,
++                    )?;
++                }
++                cursor = end;
++                0
++            }
++            _ => return Err(io::Error::other("unsupported retained object wire type")),
++        };
++        cursor = cursor
++            .checked_add(width)
++            .filter(|end| *end <= input.len())
++            .ok_or_else(|| io::Error::other("truncated retained object field"))?;
++    }
++    Ok(())
++}
++fn read_payload_bounded(
++    path: &Path,
++    file_limit: usize,
++    decode_limit: usize,
++    shape: BoundedShape,
++) -> io::Result<Vec<u8>> {
++    let mut budget = decode_limit;
++    read_payload_bounded_with_budget(path, file_limit, &mut budget, shape)
++}
++
++pub(crate) fn read_payload_bounded_with_budget(
++    path: &Path,
++    file_limit: usize,
++    budget: &mut usize,
++    shape: BoundedShape,
++) -> io::Result<Vec<u8>> {
++    let mut bytes = Vec::new();
++    fs::File::open(path)?
++        .take(file_limit as u64 + 1)
++        .read_to_end(&mut bytes)?;
++    if bytes.len() > file_limit {
++        return Err(io::Error::other("retained object file exceeds limit"));
++    }
++    bounded_charge(budget, bytes.capacity())?;
++    bounded_charge(budget, 4096)?;
++    bounded_scan(&bytes, shape, 0, budget)?;
++    Ok(bytes)
+ }
+ 
+ #[async_trait]
+diff --git a/src/simple_op_heads_store.rs b/src/simple_op_heads_store.rs
+--- a/src/simple_op_heads_store.rs
++++ b/src/simple_op_heads_store.rs
+@@ -72,6 +72,56 @@
+     pub fn load(dir: &Path) -> Self {
+         let op_heads_dir = dir.join("heads");
+         Self { dir: op_heads_dir }
++    }
++
++    /// Reads all head markers with a bound on every scanned directory entry.
++    ///
++    /// This read-only inventory does not acquire a mutation lock. Callers must
++    /// hold their own fence when using it to authorize source-object collection.
++    pub fn get_op_heads_bounded(
++        &self,
++        max_entries: usize,
++    ) -> Result<Vec<OperationId>, OpHeadsStoreError> {
++        let invalid =
++            |message: &'static str| OpHeadsStoreError::Read(io::Error::other(message).into());
++        if max_entries == 0 {
++            return Err(invalid(
++                "operation head inventory requires a positive limit",
++            ));
++        }
++        let entries =
++            fs::read_dir(&self.dir).map_err(|error| OpHeadsStoreError::Read(error.into()))?;
++        let mut heads = Vec::new();
++        for (index, entry) in entries.enumerate() {
++            if index >= max_entries {
++                return Err(invalid("operation head inventory exceeds entry limit"));
++            }
++            let entry = entry.map_err(|error| OpHeadsStoreError::Read(error.into()))?;
++            let name = entry.file_name();
++            let name = name
++                .to_str()
++                .ok_or_else(|| invalid("non-UTF8 operation head marker"))?;
++            let Some(bytes) = hex_util::decode_hex(name) else {
++                continue;
++            };
++            if bytes.len() != 64 {
++                return Err(invalid("invalid operation head identity length"));
++            }
++            let kind = entry
++                .file_type()
++                .map_err(|error| OpHeadsStoreError::Read(error.into()))?;
++            if !kind.is_file() {
++                return Err(invalid(
++                    "operation head inventory contains a non-regular marker",
++                ));
++            }
++            heads.push(OperationId::new(bytes));
++        }
++        heads.sort();
++        if heads.is_empty() || heads.windows(2).any(|pair| pair[0] == pair[1]) {
++            return Err(invalid("operation head inventory is empty or ambiguous"));
++        }
++        Ok(heads)
+     }
+ 
+     fn add_op_head(&self, id: &OperationId) -> Result<(), PathError> {
+diff --git a/src/local_working_copy.rs b/src/local_working_copy.rs
+--- a/src/local_working_copy.rs
++++ b/src/local_working_copy.rs
+@@ -2854,6 +2854,178 @@
+         })
+     }
+ 
++    /// Loads mandatory persisted working-copy state with bounded reads and
++    /// predecode work, without first invoking the ordinary unbounded loader.
++    /// Does not initialize missing state, write files, or probe capabilities.
++    pub fn load_readonly(
++        store: Arc<Store>,
++        working_copy_path: PathBuf,
++        state_path: PathBuf,
++        user_settings: &UserSettings,
++        max_file_bytes: usize,
++        max_decode_bytes: usize,
++    ) -> Result<Self, WorkingCopyStateError> {
++        let settings = TreeStateSettings::try_from_user_settings(user_settings).map_err(|err| {
++            WorkingCopyStateError {
++                message: "Failed to read the tree state settings".to_owned(),
++                err: err.into(),
++            }
++        })?;
++        Self::load_readonly_with_settings(
++            store,
++            working_copy_path,
++            state_path,
++            settings,
++            max_file_bytes,
++            max_decode_bytes,
++        )
++    }
++
++    /// Reloads a bounded persisted snapshot. Checkout bytes must agree around
++    /// the tree-state read. Callers requiring an authoritative checkpoint must
++    /// separately fence all workspace mutation.
++    pub fn reload_readonly(
++        &self,
++        max_file_bytes: usize,
++        max_decode_bytes: usize,
++    ) -> Result<Self, WorkingCopyStateError> {
++        Self::load_readonly_with_settings(
++            self.store.clone(),
++            self.working_copy_path.clone(),
++            self.state_path.clone(),
++            self.tree_state_settings.clone(),
++            max_file_bytes,
++            max_decode_bytes,
++        )
++    }
++
++    fn load_readonly_with_settings(
++        store: Arc<Store>,
++        working_copy_path: PathBuf,
++        state_path: PathBuf,
++        tree_state_settings: TreeStateSettings,
++        max_file_bytes: usize,
++        max_decode_bytes: usize,
++    ) -> Result<Self, WorkingCopyStateError> {
++        use crate::simple_op_store::{
++            BoundedShape, bounded_limits, read_payload_bounded_with_budget,
++        };
++        let wrap_err = |err: Box<dyn Error + Send + Sync>| WorkingCopyStateError {
++            message: "Failed to reload persisted working copy state".to_owned(),
++            err,
++        };
++        let invalid = |message: &'static str| wrap_err(io::Error::other(message).into());
++        bounded_limits(max_file_bytes, max_decode_bytes).map_err(|error| wrap_err(error.into()))?;
++        let mut budget = max_decode_bytes;
++        let checkout_path = state_path.join("checkout");
++        let before = read_payload_bounded_with_budget(
++            &checkout_path,
++            max_file_bytes,
++            &mut budget,
++            BoundedShape::Checkout,
++        )
++        .map_err(|error| wrap_err(error.into()))?;
++        let checkout = crate::protos::local_working_copy::Checkout::decode(&*before)
++            .map_err(|error| wrap_err(error.into()))?;
++        if checkout.operation_id.is_empty() {
++            return Err(invalid("persisted checkout has no operation identity"));
++        }
++        let tree_bytes = read_payload_bounded_with_budget(
++            &state_path.join("tree_state"),
++            max_file_bytes,
++            &mut budget,
++            BoundedShape::TreeState,
++        )
++        .map_err(|error| wrap_err(error.into()))?;
++        let mut proto = crate::protos::local_working_copy::TreeState::decode(&*tree_bytes)
++            .map_err(|error| wrap_err(error.into()))?;
++        // Validate every path and merge shape before using upstream conversion
++        // helpers which assume their persisted inputs are valid.
++        let mut paths = HashSet::new();
++        for entry in &proto.file_states {
++            let path = RepoPath::from_internal_string(&entry.path)
++                .map_err(|_| invalid("invalid persisted file-state path"))?;
++            if path.is_root() || entry.state.is_none() || !paths.insert(path) {
++                return Err(invalid("invalid or duplicate persisted file-state entry"));
++            }
++        }
++        if let Some(patterns) = &proto.sparse_patterns {
++            for prefix in &patterns.prefixes {
++                RepoPath::from_internal_string(prefix)
++                    .map_err(|_| invalid("invalid persisted sparse pattern"))?;
++            }
++        }
++        #[expect(deprecated)]
++        let tree_ids = if proto.tree_ids.is_empty() {
++            if proto.legacy_tree_id.is_empty() {
++                return Err(invalid("persisted tree state has no tree identity"));
++            }
++            vec![TreeId::new(mem::take(&mut proto.legacy_tree_id))]
++        } else {
++            if proto.tree_ids.len() % 2 == 0 || proto.tree_ids.iter().any(Vec::is_empty) {
++                return Err(invalid("invalid persisted tree merge"));
++            }
++            mem::take(&mut proto.tree_ids)
++                .into_iter()
++                .map(TreeId::new)
++                .collect()
++        };
++        if !proto.conflict_labels.is_empty()
++            && (proto.conflict_labels.len() % 2 == 0
++                || proto.conflict_labels.len() != tree_ids.len())
++        {
++            return Err(invalid("persisted conflict labels do not match tree merge"));
++        }
++        let after = read_payload_bounded_with_budget(
++            &checkout_path,
++            max_file_bytes,
++            &mut budget,
++            BoundedShape::Checkout,
++        )
++        .map_err(|error| wrap_err(error.into()))?;
++        if before != after {
++            return Err(invalid("persisted checkout changed during read"));
++        }
++        let settings = &tree_state_settings;
++        // Capability policies are inert in this read-only snapshot. In
++        // particular, do not call empty()/load(): both may probe or initialize.
++        // start_mutation() independently reloads normal policy under its lock.
++        let tree_state = TreeState {
++            store: store.clone(),
++            working_copy_path: working_copy_path.clone(),
++            state_path: state_path.clone(),
++            tree: MergedTree::new(
++                store.clone(),
++                Merge::from_vec(tree_ids),
++                ConflictLabels::from_vec(proto.conflict_labels),
++            ),
++            file_states: FileStatesMap::from_proto(proto.file_states, false),
++            sparse_patterns: sparse_patterns_from_proto(proto.sparse_patterns.as_ref()),
++            own_mtime: MillisSinceEpoch(0),
++            symlink_support: false,
++            watchman_clock: proto.watchman_clock,
++            conflict_marker_style: settings.conflict_marker_style,
++            exec_policy: ExecChangePolicy::Ignore,
++            fsmonitor_settings: settings.fsmonitor_settings.clone(),
++            target_eol_strategy: TargetEolStrategy::new(settings.eol_conversion_mode),
++        };
++        Ok(Self {
++            store: store.clone(),
++            working_copy_path: working_copy_path.clone(),
++            state_path: state_path.clone(),
++            checkout_state: CheckoutState {
++                operation_id: OperationId::new(checkout.operation_id),
++                workspace_name: if checkout.workspace_name.is_empty() {
++                    WorkspaceName::DEFAULT.to_owned()
++                } else {
++                    checkout.workspace_name.into()
++                },
++            },
++            tree_state: OnceCell::with_value(tree_state),
++            tree_state_settings: settings.clone(),
++        })
++    }
++
+     pub fn state_path(&self) -> &Path {
+         &self.state_path
+     }

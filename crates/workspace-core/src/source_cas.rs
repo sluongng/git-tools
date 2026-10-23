@@ -3,7 +3,7 @@
 //! authenticates the raw payload shared with BOS. Mutable overlays never enter it.
 use anyhow::{Context, Result, ensure};
 use async_trait::async_trait;
-use local_cas::{Artifact, BlobSource, CachedBlob, LocalCas};
+use local_cas::{Artifact, BlobSource, CachedBlob, FetchContext, LocalCas};
 use sha1::{Digest, Sha1};
 use std::{
     fs::File,
@@ -177,9 +177,13 @@ impl std::fmt::Display for MissingGitBlob {
 }
 impl std::error::Error for MissingGitBlob {}
 
-#[async_trait]
-impl BlobSource for GitBlobSource {
-    async fn fetch(&self, artifact: &Artifact, target: &mut File) -> Result<()> {
+impl GitBlobSource {
+    async fn fetch_impl(
+        &self,
+        artifact: &Artifact,
+        target: &mut File,
+        context: Option<FetchContext>,
+    ) -> Result<()> {
         let repository = self.repository.clone();
         let binary = self.binary.clone();
         let oid = self.oid.clone();
@@ -195,8 +199,19 @@ impl BlobSource for GitBlobSource {
         let _cancel = CancelOnDrop(cancellation.clone());
         let allow_fetch = self.allow_fetch;
         let expected_size = artifact.size;
-        let mut git_target = target.try_clone()?;
+        let git_target = target.try_clone()?;
+        // Capture ONE ordered owner before dispatch, so even dropping queued
+        // work closes its target before releasing cache lifetime resources.
+        struct GitWork {
+            target: File,
+            _context: Option<FetchContext>,
+        }
+        let work = GitWork {
+            target: git_target,
+            _context: context.clone(),
+        };
         let result = tokio::task::spawn_blocking(move || {
+            let mut work = work;
             let mut reader = if allow_fetch {
                 BlobReader::start(&repository, &binary, Some(&cancellation))?
             } else {
@@ -209,7 +224,7 @@ impl BlobSource for GitBlobSource {
                     hash.update(format!("blob {size}\0").as_bytes());
                 }
                 hash.update(bytes);
-                git_target.write_all(bytes)?;
+                work.target.write_all(bytes)?;
                 Ok(())
             })?;
             ensure!(found.is_some(), MissingGitBlob);
@@ -228,7 +243,28 @@ impl BlobSource for GitBlobSource {
         // active. Recover directly through its authorized upstream source.
         target.set_len(0)?;
         target.rewind()?;
-        self.fallback.fetch(artifact, target).await
+        match context {
+            Some(context) => {
+                self.fallback
+                    .fetch_with_context(artifact, target, context)
+                    .await
+            }
+            None => self.fallback.fetch(artifact, target).await,
+        }
+    }
+}
+#[async_trait]
+impl BlobSource for GitBlobSource {
+    async fn fetch(&self, artifact: &Artifact, target: &mut File) -> Result<()> {
+        self.fetch_impl(artifact, target, None).await
+    }
+    async fn fetch_with_context(
+        &self,
+        artifact: &Artifact,
+        target: &mut File,
+        context: FetchContext,
+    ) -> Result<()> {
+        self.fetch_impl(artifact, target, Some(context)).await
     }
     async fn missing(&self, _: &[Artifact]) -> Result<Vec<Artifact>> {
         anyhow::bail!("Git source is not a remote CAS presence oracle")
@@ -382,6 +418,42 @@ mod tests {
                 )
                 .is_err()
         );
+        // Missing local Git objects may fall back to a source which detaches
+        // physical I/O. The cache context must reach that source, not the
+        // borrow-only compatibility method.
+        struct ContextFallback;
+        #[async_trait]
+        impl BlobSource for ContextFallback {
+            async fn fetch(&self, _: &Artifact, _: &mut File) -> Result<()> {
+                anyhow::bail!("cache lifetime context was not forwarded to fallback")
+            }
+            async fn fetch_with_context(
+                &self,
+                _: &Artifact,
+                target: &mut File,
+                context: FetchContext,
+            ) -> Result<()> {
+                let _context = context;
+                target.write_all(b"base")?;
+                Ok(())
+            }
+            async fn missing(&self, _: &[Artifact]) -> Result<Vec<Artifact>> {
+                anyhow::bail!("unexpected fallback presence query")
+            }
+        }
+        let recovered = shared
+            .content(
+                shared.artifact(*blake3::hash(b"base").as_bytes(), 4),
+                Arc::new(GitBlobSource {
+                    repository: repo.repository_path().to_owned(),
+                    binary: "git".into(),
+                    oid: "f".repeat(40),
+                    fallback: Arc::new(ContextFallback),
+                    allow_fetch: false,
+                }),
+            )
+            .unwrap();
+        assert_eq!(std::fs::read(recovered.path()).unwrap(), b"base");
         assert_ne!(
             shared.artifact(*blake3::hash(b"base").as_bytes(), 4),
             Artifact {

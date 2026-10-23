@@ -1,7 +1,11 @@
 # jj-vfs
 
-Jujutsu working-copy library plus the custom `git-jj` executable for an active
-writable Linux `git-vfs` mount. Stock `jj` cannot load this backend.
+Jujutsu working-copy library with Git and native projection adapters. Stock `jj`
+cannot load these backends. Native workspaces use [`tinytree-jj`](../jj-native-cli)
+and external private administration; the adapter never scans a materialized
+checkout or falls back to one.
+
+The custom `git-jj` executable integrates an active writable Linux `git-vfs` mount:
 
 ```sh
 # Start git-vfs with --overlay /state/agent first.
