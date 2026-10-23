@@ -2180,3 +2180,435 @@ fn pack_capacity_continues_without_skipping_eligible_members() {
         assert_eq!(contents.len(), 600);
     }
 }
+
+fn cloud_view(native: CommitId) -> tinytree_cloud::VerifiedObject {
+    cloud_view_with_heads(native, 0)
+}
+fn cloud_view_with_heads(native: CommitId, extra: usize) -> tinytree_cloud::VerifiedObject {
+    use jj_lib::{
+        object_id::ObjectId as _,
+        op_store::{OpStore, RootOperationData, View},
+        simple_op_store::SimpleOpStore,
+    };
+    futures::executor::block_on(async {
+        let directory = tempfile::tempdir().unwrap();
+        let source = SimpleOpStore::init(
+            directory.path(),
+            RootOperationData {
+                root_commit_id: jj_lib::backend::CommitId::from_bytes(&[0; 32]),
+            },
+        )
+        .unwrap();
+        let id = jj_lib::backend::CommitId::from_bytes(&native.0);
+        let mut view = View::make_root(id.clone());
+        for number in 0..extra {
+            let raw = blake3::hash(format!("cloud-summary-head-{number}").as_bytes());
+            view.head_ids
+                .insert(jj_lib::backend::CommitId::from_bytes(raw.as_bytes()));
+        }
+        view.wc_commit_ids.insert("task".into(), id);
+        let id = source.write_view(&view).await.unwrap();
+        tinytree_cloud::export_view(&source, &id, tinytree_cloud::Limits::default())
+            .await
+            .unwrap()
+    })
+}
+fn reverse_cloud_fields(bytes: &[u8]) -> Vec<u8> {
+    fn varint(bytes: &[u8], cursor: &mut usize) -> u64 {
+        let mut value = 0u64;
+        for shift in (0..70).step_by(7) {
+            let byte = bytes[*cursor];
+            *cursor += 1;
+            value |= ((byte & 127) as u64) << shift;
+            if byte & 128 == 0 {
+                return value;
+            }
+        }
+        panic!("fixture varint");
+    }
+    let mut cursor = 0usize;
+    let mut fields = Vec::new();
+    while cursor < bytes.len() {
+        let start = cursor;
+        let tag = varint(bytes, &mut cursor);
+        match tag & 7 {
+            0 => {
+                varint(bytes, &mut cursor);
+            }
+            1 => cursor += 8,
+            2 => {
+                let length = varint(bytes, &mut cursor) as usize;
+                cursor += length;
+            }
+            5 => cursor += 4,
+            _ => panic!("fixture wire type"),
+        };
+        fields.push(&bytes[start..cursor]);
+    }
+    fields.reverse();
+    fields.concat()
+}
+#[test]
+fn cloud_catalog_selects_verified_representation_and_isolates_owner_and_repository() {
+    let (directory, store) = open();
+    store.create_repository("other").unwrap();
+    let owner = CloudOwner {
+        principal: [31; 32],
+    };
+    let other = CloudOwner {
+        principal: [32; 32],
+    };
+    let object = cloud_view(CommitId([9; 32]));
+    let bytes = object.payload().unwrap();
+    let receipt = store
+        .put_cloud_object(
+            "demo",
+            owner,
+            object.id(),
+            object.digest().unwrap(),
+            bytes,
+            0,
+            tinytree_cloud::Limits::default(),
+        )
+        .unwrap();
+    let reordered = reverse_cloud_fields(bytes);
+    assert_ne!(reordered, bytes);
+    let alternate = tinytree_cloud::BlobDigest::of(&reordered);
+    tinytree_cloud::VerifiedObject::verify(
+        object.id(),
+        alternate,
+        &reordered,
+        tinytree_cloud::Limits::default(),
+    )
+    .unwrap();
+    let again = store
+        .put_cloud_object(
+            "demo",
+            owner,
+            object.id(),
+            alternate,
+            &reordered,
+            1,
+            tinytree_cloud::Limits::default(),
+        )
+        .unwrap();
+    assert_eq!(receipt.descriptor, again.descriptor);
+    assert_eq!(receipt.staging_lease, again.staging_lease);
+    assert_eq!(
+        store
+            .lookup_cloud_objects("demo", other, &[object.id()])
+            .unwrap(),
+        vec![None]
+    );
+    assert_eq!(
+        store
+            .lookup_cloud_objects("other", owner, &[object.id()])
+            .unwrap(),
+        vec![None]
+    );
+    assert!(
+        store
+            .read_cloud_object(
+                "demo",
+                other,
+                object.id(),
+                tinytree_cloud::Limits::default()
+            )
+            .is_err()
+    );
+    let mut lease = store
+        .read_cloud_object(
+            "demo",
+            owner,
+            object.id(),
+            tinytree_cloud::Limits::default(),
+        )
+        .unwrap();
+    let mut actual = Vec::new();
+    lease.read_to_end(&mut actual).unwrap();
+    assert_eq!(actual, bytes);
+    drop(lease);
+    assert!(
+        store
+            .client_gc("demo", &client_collection(&store, 2))
+            .is_err()
+    );
+    drop(store);
+    let reopened = Store::open_existing(directory.path(), config()).unwrap();
+    assert_eq!(
+        reopened
+            .lookup_cloud_objects("demo", owner, &[object.id()])
+            .unwrap(),
+        vec![Some(receipt.descriptor)]
+    );
+}
+#[test]
+fn staged_cloud_readers_protect_present_native_descendants_until_actual_drop() {
+    let (_directory, store) = open();
+    let (file, _tree, head) = fixture(&store, "cloud source");
+    let owner = CloudOwner {
+        principal: [33; 32],
+    };
+    let object = cloud_view(CommitId(head.key.id.0));
+    let payload = object.payload().unwrap();
+    store
+        .put_cloud_object(
+            "demo",
+            owner,
+            object.id(),
+            object.digest().unwrap(),
+            payload,
+            5,
+            tinytree_cloud::Limits::default(),
+        )
+        .unwrap();
+    let report = store.gc("demo", 11).unwrap();
+    assert_eq!(report.deleted_cloud_objects, 0);
+    assert_eq!(store.descriptor("demo", file.key).unwrap(), Some(file));
+    let lease = store
+        .read_cloud_object(
+            "demo",
+            owner,
+            object.id(),
+            tinytree_cloud::Limits::default(),
+        )
+        .unwrap();
+    let report = store.gc("demo", 16).unwrap();
+    assert_eq!(report.expired_cloud_leases, 1);
+    assert_eq!(report.deleted_cloud_objects, 0);
+    assert_eq!(store.descriptor("demo", head.key).unwrap(), Some(head));
+    drop(lease);
+    let report = store.gc("demo", 16).unwrap();
+    assert_eq!(report.deleted_cloud_objects, 1);
+    assert_eq!(report.deleted_cloud_bytes, payload.len() as u64);
+    assert_eq!(store.descriptor("demo", file.key).unwrap(), None);
+    assert_eq!(
+        store
+            .lookup_cloud_objects("demo", owner, &[object.id()])
+            .unwrap(),
+        vec![None]
+    );
+}
+#[test]
+fn cloud_feature_upgrade_survives_packing_and_missing_required_keyspace_fails_closed() {
+    let (directory, store) = open();
+    fixture(&store, "cloud pack compatibility");
+    store.pack("demo", PackOptions::default()).unwrap();
+    let owner = CloudOwner {
+        principal: [34; 32],
+    };
+    let object = cloud_view(CommitId([9; 32]));
+    store
+        .put_cloud_object(
+            "demo",
+            owner,
+            object.id(),
+            object.digest().unwrap(),
+            object.payload().unwrap(),
+            0,
+            tinytree_cloud::Limits::default(),
+        )
+        .unwrap();
+    store.pack("demo", PackOptions::default()).unwrap();
+    assert_eq!(
+        store
+            .inner
+            .db
+            .read_tx()
+            .get(&store.inner.spaces.meta, b"format")
+            .unwrap()
+            .unwrap()
+            .as_ref(),
+        b"tinytree-store-3"
+    );
+    drop(store);
+    let store = Store::open_existing(directory.path(), config()).unwrap();
+    assert!(
+        store
+            .read_cloud_object(
+                "demo",
+                owner,
+                object.id(),
+                tinytree_cloud::Limits::default()
+            )
+            .is_ok()
+    );
+    drop(store);
+    {
+        let db = SingleWriterTxDatabase::builder(directory.path().join("metadata"))
+            .open()
+            .unwrap();
+        let space = db
+            .keyspace("cloud-native-roots-v1", KeyspaceCreateOptions::default)
+            .unwrap();
+        db.inner().delete_keyspace(space.inner().clone()).unwrap();
+    }
+    assert!(matches!(
+        Store::open_existing(directory.path(), config()),
+        Err(Error::Corrupt("cloud keyspace missing"))
+    ));
+}
+#[test]
+fn native_and_cloud_objects_share_repository_physical_quota() {
+    let directory = tempfile::tempdir().unwrap();
+    let object = cloud_view(CommitId([9; 32]));
+    let mut cfg = config();
+    cfg.max_repository_bytes =
+        tinytree_model::empty_tree().descriptor.size_bytes + object.digest().unwrap().size_bytes;
+    let store = Store::open(directory.path(), cfg).unwrap();
+    store.create_repository("demo").unwrap();
+    let owner = CloudOwner {
+        principal: [35; 32],
+    };
+    store
+        .put_cloud_object(
+            "demo",
+            owner,
+            object.id(),
+            object.digest().unwrap(),
+            object.payload().unwrap(),
+            0,
+            tinytree_cloud::Limits::default(),
+        )
+        .unwrap();
+    let spare = tinytree_model::describe_file(b"new");
+    assert!(matches!(
+        store.put("demo", spare, b"new", 0),
+        Err(Error::Limit(_))
+    ));
+    assert_eq!(
+        store
+            .lookup_cloud_objects("demo", owner, &[object.id()])
+            .unwrap()[0]
+            .unwrap()
+            .selected,
+        object.digest().unwrap()
+    );
+}
+
+#[test]
+fn concurrent_first_cloud_uploads_share_one_durable_owner_namespace() {
+    let (directory, store) = open();
+    let owner = CloudOwner {
+        principal: [36; 32],
+    };
+    let objects = (1..=8)
+        .map(|id| cloud_view(CommitId([id; 32])))
+        .collect::<Vec<_>>();
+    let barrier = Arc::new(std::sync::Barrier::new(objects.len()));
+    let threads = objects
+        .into_iter()
+        .map(|object| {
+            let store = store.clone();
+            let barrier = barrier.clone();
+            std::thread::spawn(move || {
+                barrier.wait();
+                store
+                    .put_cloud_object(
+                        "demo",
+                        owner,
+                        object.id(),
+                        object.digest().unwrap(),
+                        object.payload().unwrap(),
+                        0,
+                        tinytree_cloud::Limits::default(),
+                    )
+                    .unwrap()
+                    .descriptor
+            })
+        })
+        .collect::<Vec<_>>();
+    let selected = threads
+        .into_iter()
+        .map(|t| t.join().unwrap())
+        .collect::<Vec<_>>();
+    drop(store);
+    let store = Store::open_existing(directory.path(), config()).unwrap();
+    for descriptor in selected {
+        assert_eq!(
+            store
+                .lookup_cloud_objects("demo", owner, &[descriptor.id])
+                .unwrap(),
+            vec![Some(descriptor)]
+        );
+    }
+}
+
+#[test]
+fn cloud_dependency_rows_above_native_metadata_bound_remain_readable_and_reopenable() {
+    let (directory, store) = open();
+    let owner = CloudOwner {
+        principal: [37; 32],
+    };
+    let object = cloud_view_with_heads(CommitId([9; 32]), 1000);
+    let receipt = store
+        .put_cloud_object(
+            "demo",
+            owner,
+            object.id(),
+            object.digest().unwrap(),
+            object.payload().unwrap(),
+            0,
+            tinytree_cloud::Limits::default(),
+        )
+        .unwrap();
+    let mut actual = Vec::new();
+    store
+        .read_cloud_object(
+            "demo",
+            owner,
+            object.id(),
+            tinytree_cloud::Limits::default(),
+        )
+        .unwrap()
+        .read_to_end(&mut actual)
+        .unwrap();
+    assert_eq!(actual, object.payload().unwrap());
+    // The summary contains 1001 explicit native identities and cannot fit the
+    // ordinary native catalog's 16 KiB JSON bound.
+    assert!(object.dependencies().native_commits.len() > 1000);
+    drop(store);
+    let store = Store::open_existing(directory.path(), config()).unwrap();
+    assert_eq!(
+        store
+            .lookup_cloud_objects("demo", owner, &[object.id()])
+            .unwrap(),
+        vec![Some(receipt.descriptor)]
+    );
+    store.gc("demo", 1).unwrap();
+}
+#[test]
+fn oversized_cloud_dependency_row_is_rejected_before_durable_catalog_ack() {
+    let (directory, store) = open();
+    let owner = CloudOwner {
+        principal: [38; 32],
+    };
+    let object = cloud_view_with_heads(CommitId([9; 32]), 12000);
+    let result = store.put_cloud_object(
+        "demo",
+        owner,
+        object.id(),
+        object.digest().unwrap(),
+        object.payload().unwrap(),
+        0,
+        tinytree_cloud::Limits::default(),
+    );
+    assert!(matches!(
+        result,
+        Err(Error::Limit("cloud metadata row bytes"))
+    ));
+    assert_eq!(
+        store
+            .lookup_cloud_objects("demo", owner, &[object.id()])
+            .unwrap(),
+        vec![None]
+    );
+    drop(store);
+    let store = Store::open_existing(directory.path(), config()).unwrap();
+    assert_eq!(
+        store
+            .lookup_cloud_objects("demo", owner, &[object.id()])
+            .unwrap(),
+        vec![None]
+    );
+}

@@ -169,6 +169,11 @@ impl Store {
     pub fn client_gc(&self, repo: &str, request: &ClientGcRequest) -> Result<ClientGcReport> {
         let gate = self.inner.lock()?;
         let mut repository = self.inner.repository(repo)?;
+        if self.inner.has_cloud_state(repo)? {
+            return Err(Error::Invalid(
+                "cloud state requires authoritative server GC",
+            ));
+        }
         if !Weak::ptr_eq(&request.epoch.owner, &Arc::downgrade(&self.inner))
             || request.epoch.repository != repo
             || request.epoch.revision != self.inner.client_revision(repo)?

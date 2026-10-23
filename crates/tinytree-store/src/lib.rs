@@ -23,6 +23,10 @@ use std::sync::{Arc, Mutex, MutexGuard, Weak};
 use tempfile::NamedTempFile;
 use tinytree_model::{CommitId, Descriptor, Kind, Limits, ObjectId, ObjectKey};
 
+mod cloud;
+pub use cloud::{
+    CloudConfig, CloudObjectDescriptor, CloudOwner, CloudReadLease, CloudWriteReceipt,
+};
 mod client_gc;
 mod closure;
 pub use client_gc::{ClientGcEpoch, ClientGcLimits, ClientGcReport, ClientGcRequest};
@@ -87,6 +91,7 @@ impl From<tinytree_model::Error> for Error {
 #[derive(Clone, Debug)]
 pub struct Config {
     pub model_limits: Limits,
+    pub cloud: CloudConfig,
     pub max_file_bytes: u64,
     pub max_repository_bytes: u64,
     pub max_objects_per_repository: u64,
@@ -106,6 +111,7 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             model_limits: Limits::default(),
+            cloud: CloudConfig::default(),
             max_file_bytes: 256 * 1024 * 1024,
             max_repository_bytes: 16 * 1024 * 1024 * 1024,
             max_objects_per_repository: 1_000_000,
@@ -153,6 +159,9 @@ pub struct GcReport {
     pub deleted_objects: u64,
     pub deleted_bytes: u64,
     pub expired_leases: u64,
+    pub deleted_cloud_objects: u64,
+    pub deleted_cloud_bytes: u64,
+    pub expired_cloud_leases: u64,
 }
 
 #[derive(Clone)]
@@ -181,10 +190,13 @@ struct Spaces {
     client_deletions: SingleWriterTxKeyspace,
     locations: SingleWriterTxKeyspace,
     packs: SingleWriterTxKeyspace,
+    cloud: cloud::Spaces,
 }
 #[derive(Default)]
 struct Runtime {
     readers: HashMap<(String, ObjectKey), usize>,
+    cloud_readers: HashMap<(String, [u8; 32], tinytree_cloud::ObjectId), usize>,
+    cloud_reservations: HashMap<(String, [u8; 32]), (u64, u64, u64)>,
     staging_bytes: u64,
     staging_uploads: usize,
     repository_reservations: HashMap<String, (u64, u64)>,
@@ -330,6 +342,30 @@ fn sync_dir(path: &Path) -> Result<()> {
     Ok(())
 }
 
+fn store_feature(value: Option<&[u8]>) -> Result<u8> {
+    match value {
+        Some(b"tinytree-store-1") => Ok(1),
+        Some(b"tinytree-store-2") => Ok(2),
+        Some(b"tinytree-store-3") => Ok(3),
+        _ => Err(Error::Corrupt("store format")),
+    }
+}
+fn advance_feature(
+    tx: &mut fjall::SingleWriterWriteTx<'_>,
+    meta: &SingleWriterTxKeyspace,
+    minimum: u8,
+) -> Result<()> {
+    let current = store_feature(tx.get(meta, b"format")?.as_deref())?;
+    if current < minimum {
+        let value = match minimum {
+            2 => b"tinytree-store-2".as_slice(),
+            3 => b"tinytree-store-3".as_slice(),
+            _ => return Err(Error::Invalid("store feature")),
+        };
+        tx.insert(meta, b"format", value);
+    }
+    Ok(())
+}
 const STORE_MARKER: &str = "tinytree.format";
 const STORE_MARKER_BYTES: &[u8] = b"tinytree-authoritative-store-1\n";
 struct RootPlan {
@@ -491,6 +527,7 @@ impl Store {
         {
             return Err(Error::Invalid("store configuration"));
         }
+        config.cloud.validate()?;
         let planned = preflight_root(root)?;
         if existing_only && planned.fresh {
             return Err(Error::Invalid("existing store required"));
@@ -534,13 +571,24 @@ impl Store {
                 }
             }
         }
-        if !planned.fresh {
+        let feature = if planned.fresh {
+            1
+        } else {
             let meta = db.keyspace("meta", KeyspaceCreateOptions::default)?;
-            if db.read_tx().get(&meta, b"format")?.as_deref()
-                == Some(b"tinytree-store-2".as_slice())
-                && (!db.keyspace_exists("pack-locations-v1") || !db.keyspace_exists("packs-v1"))
-            {
-                return Err(Error::Corrupt("packed store keyspace missing"));
+            store_feature(db.read_tx().get(&meta, b"format")?.as_deref())?
+        };
+        if !planned.fresh
+            && feature >= 2
+            && (!db.keyspace_exists("pack-locations-v1") || !db.keyspace_exists("packs-v1"))
+        {
+            return Err(Error::Corrupt("packed store keyspace missing"));
+        }
+        let cloud_spaces = cloud::Spaces::open(&db, feature >= 3)?;
+        if feature >= 3 {
+            let metadata = fs::symlink_metadata(root.join("cloud"))
+                .map_err(|_| Error::Corrupt("cloud payload namespace missing"))?;
+            if !metadata.is_dir() {
+                return Err(Error::Corrupt("cloud payload namespace type"));
             }
         }
         let spaces = Spaces {
@@ -555,10 +603,15 @@ impl Store {
             client_deletions: db.keyspace("client-deletions", KeyspaceCreateOptions::default)?,
             locations: db.keyspace("pack-locations-v1", KeyspaceCreateOptions::default)?,
             packs: db.keyspace("packs-v1", KeyspaceCreateOptions::default)?,
+            cloud: cloud_spaces,
         };
         let mut tx = db.write_tx().durability(Some(PersistMode::SyncAll));
         match tx.get(&spaces.meta, b"format")? {
-            Some(value) if &*value == b"tinytree-store-1" || &*value == b"tinytree-store-2" => {}
+            Some(value)
+                if matches!(
+                    &*value,
+                    b"tinytree-store-1" | b"tinytree-store-2" | b"tinytree-store-3"
+                ) => {}
             Some(_) => return Err(Error::Corrupt("store format")),
             None if planned.fresh => {
                 tx.insert(&spaces.meta, b"format", b"tinytree-store-1");
@@ -593,6 +646,7 @@ impl Store {
         if !planned.fresh {
             store.inner.validate_retention_on_reopen()?;
             store.inner.validate_packs_on_reopen()?;
+            store.inner.validate_cloud_on_reopen()?;
         }
         Ok(store)
     }
@@ -895,8 +949,15 @@ impl Store {
                     .objects
                     .checked_add(1)
                     .ok_or(Error::Limit("repository object count"))?;
-                if repository.bytes > self.inner.config.max_repository_bytes
-                    || repository.objects > self.inner.config.max_objects_per_repository
+                let cloud = self.inner.cloud_usage(repo)?;
+                if repository
+                    .bytes
+                    .checked_add(cloud.0)
+                    .is_none_or(|n| n > self.inner.config.max_repository_bytes)
+                    || repository
+                        .objects
+                        .checked_add(cloud.1)
+                        .is_none_or(|n| n > self.inner.config.max_objects_per_repository)
                 {
                     return Err(Error::Limit("repository quota"));
                 }
@@ -1149,6 +1210,7 @@ impl Store {
     pub fn gc(&self, repo: &str, now: i64) -> Result<GcReport> {
         let gate = self.inner.lock()?;
         self.inner.repository(repo)?;
+        let cloud = self.inner.cloud_gc_plan(repo, now, &gate)?;
         let prefix = key(repo, b"");
         let view = self.inner.db.read_tx();
         let mut roots = HashSet::from([tinytree_model::empty_tree().descriptor.key]);
@@ -1192,6 +1254,7 @@ impl Store {
                 }
             }
         }
+        stage_roots.extend(cloud.transient.iter().copied());
         retained.extend(self.inner.closure(repo, stage_roots, false, false)?);
         let mut victims = Vec::new();
         for item in view.prefix(&self.inner.spaces.objects, &prefix) {
@@ -1207,6 +1270,9 @@ impl Store {
         let mut repository = self.inner.repository(repo)?;
         let mut report = GcReport {
             expired_leases: expired.len() as u64,
+            deleted_cloud_objects: cloud.objects,
+            deleted_cloud_bytes: cloud.bytes,
+            expired_cloud_leases: cloud.expired,
             ..Default::default()
         };
         for (_, d) in &victims {
@@ -1231,6 +1297,7 @@ impl Store {
             tx.remove(&self.inner.spaces.objects, k.as_ref());
             tx.remove(&self.inner.spaces.client_ages, k.as_ref());
         }
+        cloud.apply(&self.inner, repo, &mut tx)?;
         self.inner.advance_client_revision(&mut tx, repo)?;
         for k in expired {
             tx.remove(&self.inner.spaces.staging, k);
@@ -1246,6 +1313,7 @@ impl Store {
                 Err(e) => return Err(e.into()),
             }
         }
+        cloud.unlink()?;
         self.inner.reclaim_empty_packs(repo)?;
         for kind in [
             Kind::File,
@@ -1330,13 +1398,16 @@ impl Inner {
             return Ok(());
         }
         let record = self.repository(repo)?;
+        let cloud = self.cloud_usage(repo)?;
         if record
             .bytes
-            .checked_add(descriptor.size_bytes)
+            .checked_add(cloud.0)
+            .and_then(|n| n.checked_add(descriptor.size_bytes))
             .is_none_or(|n| n > self.config.max_repository_bytes)
             || record
                 .objects
-                .checked_add(1)
+                .checked_add(cloud.1)
+                .and_then(|n| n.checked_add(1))
                 .is_none_or(|n| n > self.config.max_objects_per_repository)
         {
             return Err(Error::Limit("repository quota"));
@@ -1365,6 +1436,7 @@ impl Inner {
     fn reserve(self: &Arc<Self>, repo: &str, descriptor: Descriptor) -> Result<Reservation> {
         let mut gate = self.lock()?;
         let repository = self.repository(repo)?;
+        let cloud = self.cloud_usage(repo)?;
         if descriptor.format_version != tinytree_model::FORMAT_VERSION {
             return Err(Error::Invalid("object format"));
         }
@@ -1413,11 +1485,13 @@ impl Inner {
             .ok_or(Error::Limit("repository staging objects"))?;
         if repository
             .bytes
-            .checked_add(bytes)
+            .checked_add(cloud.0)
+            .and_then(|n| n.checked_add(bytes))
             .is_none_or(|v| v > self.config.max_repository_bytes)
             || repository
                 .objects
-                .checked_add(objects)
+                .checked_add(cloud.1)
+                .and_then(|n| n.checked_add(objects))
                 .is_none_or(|v| v > self.config.max_objects_per_repository)
         {
             return Err(Error::Limit("repository quota"));

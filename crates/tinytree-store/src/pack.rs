@@ -326,7 +326,7 @@ impl Store {
             .db
             .write_tx()
             .durability(Some(PersistMode::SyncAll));
-        tx.insert(&self.inner.spaces.meta, b"format", b"tinytree-store-2");
+        advance_feature(&mut tx, &self.inner.spaces.meta, 2)?;
         match next_cursor {
             Some(cursor) => tx.insert(&self.inner.spaces.meta, &cursor_key, cursor),
             None => tx.remove(&self.inner.spaces.meta, &cursor_key),
@@ -490,8 +490,7 @@ impl Inner {
         }
         if !counts.is_empty()
             || (has_locations
-                && view.get(&self.spaces.meta, b"format")?.as_deref()
-                    != Some(b"tinytree-store-2".as_slice()))
+                && store_feature(view.get(&self.spaces.meta, b"format")?.as_deref())? < 2)
         {
             return Err(Error::Corrupt("packed catalog or feature marker missing"));
         }
