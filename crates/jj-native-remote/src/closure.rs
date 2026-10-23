@@ -29,6 +29,7 @@ impl Closure {
             "intrinsic root requires no remote admission"
         );
         let mut nodes = HashMap::new();
+        let mut prefetched = HashMap::new();
         let mut pending = vec![(root, false)];
         let mut visiting = HashSet::new();
         let mut done = HashSet::new();
@@ -60,63 +61,98 @@ impl Closure {
                 "native metadata closure contains a cycle"
             );
             ensure!(
-                nodes.len() < inner.config.closure.max_objects,
+                nodes.len().saturating_add(prefetched.len()) < inner.config.closure.max_objects
+                    || prefetched.contains_key(&key),
                 "native metadata closure object budget exceeded"
             );
-            let node = if inner
-                .local
-                .descriptor(key)
-                .await
-                .map_err(crate::backend)?
-                .is_some()
-            {
-                let object = inner
+            let node =
+                if let Some(node) = prefetched.remove(&key) {
+                    node
+                } else if inner
                     .local
-                    .read_metadata(key)
+                    .descriptor(key)
                     .await
-                    .map_err(crate::backend)?;
-                crate::io::check_deadline()?;
-                let descriptor = object.descriptor();
-                let bytes = object.bytes().to_vec();
-                Node {
-                    descriptor,
-                    bytes,
-                    object: object.into_object(),
-                }
-            } else {
-                ensure!(remote, "native local metadata closure is incomplete");
-                let client = inner.connector.get().await?;
-                let mut outcomes = crate::io::network(client.read_objects(vec![key])).await?;
-                match outcomes
-                    .pop()
-                    .context("native metadata response omitted key")?
+                    .map_err(crate::backend)?
+                    .is_some()
                 {
-                    MetadataOutcome::Object(object) => {
-                        let descriptor = object.descriptor();
-                        let bytes = object.canonical_bytes().to_vec();
-                        let decoded = m::decode(&bytes, inner.model_limits())
-                            .context("invalid native canonical metadata")?;
-                        Node {
-                            descriptor,
-                            bytes,
-                            object: decoded,
+                    let object = inner
+                        .local
+                        .read_metadata(key)
+                        .await
+                        .map_err(crate::backend)?;
+                    crate::io::check_deadline()?;
+                    let descriptor = object.descriptor();
+                    let contents = object.bytes().to_vec();
+                    account_bytes(inner, &mut bytes, contents.len())?;
+                    Node {
+                        descriptor,
+                        bytes: contents,
+                        object: object.into_object(),
+                    }
+                } else {
+                    ensure!(remote, "native local metadata closure is incomplete");
+                    // The DFS stack already contains a frontier of known children.
+                    // Fetch missing siblings together, but leave DFS visitation and
+                    // parent-first validation unchanged. Prefetch never follows new
+                    // edges or installs objects into authoritative local storage.
+                    let room = inner
+                        .config
+                        .closure
+                        .max_objects
+                        .checked_sub(nodes.len().saturating_add(prefetched.len()))
+                        .context("native metadata closure object budget exceeded")?;
+                    // A typed 32-byte key uses at most 40 encoded bytes including
+                    // its outer field. Reserve repository string framing as well.
+                    let request_limit =
+                        inner.config.remote.limits.max_request_bytes.saturating_sub(
+                            inner.config.remote.repository_id.len().saturating_add(8),
+                        ) / 40;
+                    let batch_limit = inner
+                        .config
+                        .remote
+                        .limits
+                        .max_batch_items
+                        .min(room)
+                        .min(request_limit);
+                    ensure!(
+                        batch_limit != 0,
+                        "native metadata closure object budget exceeded"
+                    );
+                    let mut keys = vec![key];
+                    let mut selected = HashSet::from([key]);
+                    for &(candidate, exiting) in pending.iter().rev() {
+                        if keys.len() >= batch_limit {
+                            break;
+                        }
+                        if exiting
+                            || candidate.kind == m::Kind::File
+                            || (candidate.kind == m::Kind::Commit && candidate.id.0 == [0; 32])
+                            || nodes.contains_key(&candidate)
+                            || prefetched.contains_key(&candidate)
+                            || visiting.contains(&candidate)
+                            || !selected.insert(candidate)
+                        {
+                            continue;
+                        }
+                        crate::io::check_deadline()?;
+                        if inner
+                            .local
+                            .descriptor(candidate)
+                            .await
+                            .map_err(crate::backend)?
+                            .is_none()
+                        {
+                            keys.push(candidate);
                         }
                     }
-                    MetadataOutcome::Error { .. } => {
-                        bail!("native metadata closure is unavailable")
-                    }
-                }
-            };
+                    prefetch(inner, keys, &mut prefetched, &mut bytes).await?;
+                    prefetched
+                        .remove(&key)
+                        .context("native metadata response omitted key")?
+                };
             ensure!(
                 node.descriptor.key == key,
                 "native closure returned another object"
-            );
-            bytes = bytes
-                .checked_add(node.bytes.len())
-                .context("native closure byte overflow")?;
-            ensure!(
-                bytes <= inner.config.closure.max_metadata_bytes,
-                "native closure metadata byte budget exceeded"
             );
             if let m::Object::Commit(commit) = &node.object {
                 for tree in &commit.root_tree.terms {
@@ -207,6 +243,76 @@ impl Closure {
             .collect()
     }
 }
+fn account_bytes(inner: &Inner, bytes: &mut usize, additional: usize) -> Result<()> {
+    *bytes = bytes
+        .checked_add(additional)
+        .context("native closure byte overflow")?;
+    ensure!(
+        *bytes <= inner.config.closure.max_metadata_bytes,
+        "native closure metadata byte budget exceeded"
+    );
+    Ok(())
+}
+
+async fn prefetch(
+    inner: &Arc<Inner>,
+    keys: Vec<m::ObjectKey>,
+    prefetched: &mut HashMap<m::ObjectKey, Node>,
+    bytes: &mut usize,
+) -> Result<()> {
+    let client = inner.connector.get().await?;
+    let mut batches = vec![keys];
+    while let Some(mut keys) = batches.pop() {
+        crate::io::check_deadline()?;
+        let outcomes = match crate::io::network(client.read_objects(keys.clone())).await {
+            Ok(outcomes) => outcomes,
+            // Metadata sizes are unknown until read. A batch may exceed the
+            // aggregate response/request limit although every individual object
+            // fits. Split only bounded multi-item requests; a failing singleton
+            // remains an admission failure, as it was before batching.
+            Err(error) if error.code() == tonic::Code::ResourceExhausted && keys.len() > 1 => {
+                let tail = keys.split_off(keys.len() / 2);
+                batches.push(tail);
+                batches.push(keys);
+                continue;
+            }
+            Err(error) => return Err(error.into()),
+        };
+        ensure!(
+            outcomes.len() == keys.len(),
+            "native metadata response omitted key"
+        );
+        for (key, outcome) in keys.into_iter().zip(outcomes) {
+            let MetadataOutcome::Object(object) = outcome else {
+                bail!("native metadata closure is unavailable")
+            };
+            let descriptor = object.descriptor();
+            ensure!(
+                descriptor.key == key,
+                "native closure returned another object"
+            );
+            let contents = object.canonical_bytes().to_vec();
+            account_bytes(inner, bytes, contents.len())?;
+            let decoded = m::decode(&contents, inner.model_limits())
+                .context("invalid native canonical metadata")?;
+            ensure!(
+                prefetched
+                    .insert(
+                        key,
+                        Node {
+                            descriptor,
+                            bytes: contents,
+                            object: decoded
+                        }
+                    )
+                    .is_none(),
+                "native metadata frontier contains a duplicate"
+            );
+        }
+    }
+    Ok(())
+}
+
 fn validate_contexts(
     nodes: &HashMap<m::ObjectKey, Node>,
     roots: HashSet<m::TreeId>,

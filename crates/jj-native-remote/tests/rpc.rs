@@ -1,5 +1,5 @@
 use async_trait::async_trait;
-use futures::AsyncReadExt;
+use futures::{AsyncReadExt, StreamExt};
 use jj_native_backend::{DirectObjectIo, NativeObjectIo};
 use jj_native_remote::{Config, PublishRequest, RemoteRepository};
 use local_cas::{Artifact, BlobSource, LocalCas};
@@ -49,6 +49,10 @@ impl BlobSource for NoUpstream {
 struct Counters {
     files: Arc<AtomicUsize>,
     holds: Arc<AtomicUsize>,
+    metadata_rpcs: Arc<AtomicUsize>,
+    metadata_keys: Arc<AtomicUsize>,
+    metadata_bytes: Arc<AtomicUsize>,
+    largest_metadata_batch: Arc<AtomicUsize>,
     paused: Arc<AtomicBool>,
     metadata_started: Arc<tokio::sync::Notify>,
     public_paused: Arc<AtomicBool>,
@@ -59,6 +63,10 @@ impl Counters {
         Self {
             files: Arc::new(AtomicUsize::new(0)),
             holds: Arc::new(AtomicUsize::new(0)),
+            metadata_rpcs: Arc::new(AtomicUsize::new(0)),
+            metadata_keys: Arc::new(AtomicUsize::new(0)),
+            metadata_bytes: Arc::new(AtomicUsize::new(0)),
+            largest_metadata_batch: Arc::new(AtomicUsize::new(0)),
             paused: Arc::new(AtomicBool::new(false)),
             metadata_started: Arc::new(tokio::sync::Notify::new()),
             public_paused: Arc::new(AtomicBool::new(false)),
@@ -90,11 +98,32 @@ impl Repository for Counting {
         &self,
         r: Request<p::BatchReadObjectsRequest>,
     ) -> Result<Response<Self::BatchReadObjectsStream>, Status> {
+        self.counts.metadata_rpcs.fetch_add(1, Ordering::SeqCst);
+        self.counts
+            .metadata_keys
+            .fetch_add(r.get_ref().keys.len(), Ordering::SeqCst);
+        self.counts
+            .largest_metadata_batch
+            .fetch_max(r.get_ref().keys.len(), Ordering::SeqCst);
         self.counts.metadata_started.notify_one();
         while self.counts.paused.load(Ordering::SeqCst) {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
-        self.service.batch_read_objects(r).await
+        let response = self.service.batch_read_objects(r).await?;
+        let counts = self.counts.clone();
+        let stream = response.into_inner().map(move |result| {
+            if let Ok(p::ObjectResult {
+                result: Some(p::object_result::Result::Object(object)),
+                ..
+            }) = &result
+            {
+                counts
+                    .metadata_bytes
+                    .fetch_add(object.canonical_envelope.len(), Ordering::SeqCst);
+            }
+            result
+        });
+        Ok(Response::new(Box::pin(stream)))
     }
     async fn find_missing_objects(
         &self,
@@ -257,6 +286,108 @@ fn seed() -> (
         .unwrap();
     (dir, store, fixture, head)
 }
+/// A wide metadata frontier with repeated shared subtrees and one promised file.
+/// marker_bytes can make individual metadata fit while a batch exceeds its limit.
+fn seed_wide(width: usize, marker_bytes: usize) -> (tempfile::TempDir, Store, m::CommitId, usize) {
+    let (directory, store, fixture, old) = seed();
+    let file = first_file(&fixture).descriptor;
+    let file_value = || m::TreeValue::File {
+        id: m::FileId(file.key.id.0),
+        executable: false,
+        size_bytes: file.size_bytes,
+        copy_id: None,
+    };
+    let shared = m::encode(
+        &m::Object::Tree(m::Tree {
+            entries: vec![m::TreeEntry {
+                name: "source.cc".into(),
+                value: file_value(),
+            }],
+        }),
+        m::Limits::default(),
+    )
+    .unwrap();
+    store
+        .put("example", shared.descriptor, &shared.bytes, 0)
+        .unwrap();
+    let mut entries = Vec::new();
+    for index in 0..width {
+        let target = format!("target-{index:04}-{}", "x".repeat(marker_bytes));
+        let marker = m::encode(&m::Object::Symlink(target.clone()), m::Limits::default()).unwrap();
+        store
+            .put("example", marker.descriptor, &marker.bytes, 0)
+            .unwrap();
+        let mut children: Vec<_> = (0..8)
+            .map(|number| m::TreeEntry {
+                name: format!("file-{number:02}.cc"),
+                value: file_value(),
+            })
+            .collect();
+        children.push(m::TreeEntry {
+            name: "marker".into(),
+            value: m::TreeValue::Symlink {
+                id: m::SymlinkId(marker.descriptor.key.id.0),
+                target_bytes: target.len() as u64,
+            },
+        });
+        children.push(m::TreeEntry {
+            name: "shared".into(),
+            value: m::TreeValue::Tree(m::TreeId(shared.descriptor.key.id.0)),
+        });
+        let leaf = m::encode(
+            &m::Object::Tree(m::Tree { entries: children }),
+            m::Limits::default(),
+        )
+        .unwrap();
+        store
+            .put("example", leaf.descriptor, &leaf.bytes, 0)
+            .unwrap();
+        entries.push(m::TreeEntry {
+            name: format!("dir-{index:04}"),
+            value: m::TreeValue::Tree(m::TreeId(leaf.descriptor.key.id.0)),
+        });
+    }
+    let root = m::encode(&m::Object::Tree(m::Tree { entries }), m::Limits::default()).unwrap();
+    store
+        .put("example", root.descriptor, &root.bytes, 0)
+        .unwrap();
+    let object = fixture
+        .objects()
+        .iter()
+        .find(|object| object.descriptor.key.id.0 == old.0)
+        .unwrap();
+    let m::Object::Commit(mut commit) = m::decode(&object.bytes, m::Limits::default()).unwrap()
+    else {
+        unreachable!()
+    };
+    commit.parents = vec![m::CommitId::ROOT];
+    commit.predecessors.clear();
+    commit.root_tree = m::TreeMerge {
+        terms: vec![m::TreeId(root.descriptor.key.id.0)],
+        labels: vec![String::new()],
+    };
+    commit.description = "wide shared metadata frontier".into();
+    let commit = m::encode(&m::Object::Commit(commit), m::Limits::default()).unwrap();
+    store
+        .put("example", commit.descriptor, &commit.bytes, 0)
+        .unwrap();
+    let head = m::CommitId(commit.descriptor.key.id.0);
+    store
+        .publish(
+            "example",
+            &tinytree_store::PublishRequest {
+                idempotency_key: "wide-fixture-head".into(),
+                reference_name: "main".into(),
+                expected_generation: 1,
+                new_commit: Some(head),
+                staging_leases: vec![],
+            },
+            1,
+        )
+        .unwrap();
+    (directory, store, head, width * 2 + 3)
+}
+
 fn config(server: &Server) -> Config {
     let mut config = Config::default();
     config.remote.endpoint = format!("http://{}", server.address);
@@ -308,6 +439,155 @@ fn first_file(fixture: &tinytree_fixture::Fixture) -> &m::EncodedObject {
         .iter()
         .find(|object| object.descriptor.key.kind == m::Kind::File)
         .unwrap()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn admission_batches_missing_siblings_and_reuses_warm_shared_metadata() {
+    let (_serverdir, store, head, expected_objects) = seed_wide(32, 0);
+    let counts = Counters::new();
+    let server = Server::start(store, counts.clone()).await;
+    let directory = private_dir();
+    let cache = cache(directory.path());
+    let (_direct, repo) = local(directory.path(), cache, config(&server), true);
+    let admitted = repo.control.admit_reference("main").await.unwrap();
+    assert_eq!(admitted.head, head);
+    assert_eq!(admitted.metadata_objects, expected_objects);
+    assert_eq!(
+        counts.metadata_keys.load(Ordering::SeqCst),
+        expected_objects
+    );
+    assert!(counts.largest_metadata_batch.load(Ordering::SeqCst) > 1);
+    let cold_rpcs = counts.metadata_rpcs.load(Ordering::SeqCst);
+    assert!(
+        cold_rpcs < expected_objects,
+        "wide metadata must use fewer RPCs than objects"
+    );
+    repo.control.admit_reference("main").await.unwrap();
+    assert_eq!(
+        counts.metadata_rpcs.load(Ordering::SeqCst),
+        cold_rpcs,
+        "warm admission must use local metadata"
+    );
+    assert_eq!(counts.files.load(Ordering::SeqCst), 0);
+    server.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn admission_splits_aggregate_metadata_bytes_without_rejecting_valid_objects() {
+    let (_serverdir, store, head, expected_objects) = seed_wide(8, 800);
+    let counts = Counters::new();
+    let server = Server::start(store, counts.clone()).await;
+    let directory = private_dir();
+    let cache = cache(directory.path());
+    let mut configuration = config(&server);
+    configuration.remote.limits.max_metadata_bytes = 1024;
+    configuration.remote.limits.max_batch_bytes = 1024;
+    let (_direct, repo) = local(directory.path(), cache, configuration, true);
+    let admitted = repo.control.admit_reference("main").await.unwrap();
+    assert_eq!(admitted.head, head);
+    assert_eq!(admitted.metadata_objects, expected_objects);
+    assert!(counts.largest_metadata_batch.load(Ordering::SeqCst) > 1);
+    assert!(
+        counts.metadata_keys.load(Ordering::SeqCst) > expected_objects,
+        "oversized aggregate retries smaller batches"
+    );
+    assert_eq!(counts.files.load(Ordering::SeqCst), 0);
+    server.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn admission_respects_tight_request_and_closure_budgets() {
+    struct Case {
+        name: &'static str,
+        missing_object_slots: usize,
+        max_metadata_bytes: usize,
+        succeeds: bool,
+    }
+    for case in [
+        Case {
+            name: "exact object limit",
+            missing_object_slots: 0,
+            max_metadata_bytes: 16 * 1024 * 1024,
+            succeeds: true,
+        },
+        Case {
+            name: "prefetched objects count toward limit",
+            missing_object_slots: 1,
+            max_metadata_bytes: 16 * 1024 * 1024,
+            succeeds: false,
+        },
+        Case {
+            name: "prefetched bytes count toward limit",
+            missing_object_slots: 0,
+            max_metadata_bytes: 4096,
+            succeeds: false,
+        },
+    ] {
+        let (_serverdir, store, head, expected_objects) = seed_wide(32, 0);
+        let counts = Counters::new();
+        let server = Server::start(store, counts.clone()).await;
+        let directory = private_dir();
+        let cache = cache(directory.path());
+        let mut configuration = config(&server);
+        configuration.remote.limits.max_request_bytes = 1024;
+        configuration.closure.max_objects = expected_objects - case.missing_object_slots;
+        configuration.closure.max_metadata_bytes = case.max_metadata_bytes;
+        let (direct, repo) = local(directory.path(), cache, configuration, true);
+        let result = repo.control.admit_reference("main").await;
+        assert_eq!(result.is_ok(), case.succeeds, "{}", case.name);
+        assert!(
+            counts.largest_metadata_batch.load(Ordering::SeqCst) <= 25,
+            "{}: typed key framing must fit a 1KiB request",
+            case.name
+        );
+        assert_eq!(counts.files.load(Ordering::SeqCst), 0, "{}", case.name);
+        if !case.succeeds {
+            assert!(
+                direct
+                    .descriptor(m::ObjectKey {
+                        kind: m::Kind::Commit,
+                        id: m::ObjectId(head.0)
+                    })
+                    .await
+                    .unwrap()
+                    .is_none(),
+                "{}: failed collection must not install prefetched metadata",
+                case.name
+            );
+        }
+        server.stop().await;
+    }
+}
+
+/// Matched parent-run baseline/candidate benchmark: real compressed repository
+/// admission only, not native mount or end-to-end Bazel startup acceptance.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "manual cold/warm metadata admission benchmark"]
+async fn metadata_admission_benchmark() {
+    for width in [16, 128] {
+        let (_serverdir, store, _head, expected_objects) = seed_wide(width, 0);
+        let counts = Counters::new();
+        let server = Server::start(store, counts.clone()).await;
+        let directory = private_dir();
+        let cache = cache(directory.path());
+        let (_direct, repo) = local(directory.path(), cache, config(&server), true);
+        let started = std::time::Instant::now();
+        let admitted = repo.control.admit_reference("main").await.unwrap();
+        let cold_ns = started.elapsed().as_nanos();
+        assert_eq!(admitted.metadata_objects, expected_objects);
+        let cold_rpcs = counts.metadata_rpcs.load(Ordering::SeqCst);
+        let cold_keys = counts.metadata_keys.load(Ordering::SeqCst);
+        let cold_bytes = counts.metadata_bytes.load(Ordering::SeqCst);
+        let started = std::time::Instant::now();
+        repo.control.admit_reference("main").await.unwrap();
+        let warm_ns = started.elapsed().as_nanos();
+        assert_eq!(counts.files.load(Ordering::SeqCst), 0);
+        assert_eq!(counts.metadata_rpcs.load(Ordering::SeqCst), cold_rpcs);
+        println!(
+            "{{\"schema\":1,\"benchmark\":\"metadata_admission\",\"width\":{width},\"metadata_objects\":{expected_objects},\"cold_ns\":{cold_ns},\"warm_ns\":{warm_ns},\"cold_metadata_rpcs\":{cold_rpcs},\"cold_requested_keys\":{cold_keys},\"cold_canonical_bytes\":{cold_bytes},\"warm_metadata_rpcs\":0,\"file_rpcs\":0}}"
+        );
+        server.stop().await;
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
