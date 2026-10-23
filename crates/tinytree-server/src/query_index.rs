@@ -20,6 +20,24 @@ use tonic::Status;
 #[derive(Clone, serde::Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct QueryConfig {
+    pub max_queries: usize,
+    pub max_queries_per_principal: usize,
+    pub max_queries_per_repository: usize,
+    pub max_query_replays: usize,
+    pub max_query_replays_per_principal: usize,
+    pub max_query_replays_per_repository: usize,
+    pub max_cursor_memory_bytes: usize,
+    pub query_ttl_seconds: usize,
+    pub max_page_size: usize,
+    pub max_eval_ast_nodes: usize,
+    pub max_eval_ast_depth: usize,
+    pub max_eval_literals: usize,
+    pub max_eval_frontier: usize,
+    pub max_eval_intervals: usize,
+    pub max_eval_latest: usize,
+    pub max_eval_step_work: usize,
+    pub max_eval_steps: usize,
+    pub max_eval_quantum_steps: usize,
     pub max_scopes: usize,
     pub max_scopes_per_principal: usize,
     pub max_scopes_per_repository: usize,
@@ -63,6 +81,24 @@ pub struct QueryConfig {
 impl Default for QueryConfig {
     fn default() -> Self {
         Self {
+            max_queries: 64,
+            max_queries_per_principal: 8,
+            max_queries_per_repository: 32,
+            max_query_replays: 512,
+            max_query_replays_per_principal: 128,
+            max_query_replays_per_repository: 256,
+            max_cursor_memory_bytes: 134217728,
+            query_ttl_seconds: 120,
+            max_page_size: 128,
+            max_eval_ast_nodes: 64,
+            max_eval_ast_depth: 16,
+            max_eval_literals: 1024,
+            max_eval_frontier: 4096,
+            max_eval_intervals: 8192,
+            max_eval_latest: 1024,
+            max_eval_step_work: 128,
+            max_eval_steps: 1_000_000,
+            max_eval_quantum_steps: 128,
             max_scopes: 128,
             max_scopes_per_principal: 16,
             max_scopes_per_repository: 64,
@@ -125,6 +161,7 @@ impl QueryConfig {
             .saturating_add(8 * 1024 * 1024)
     }
     pub(crate) fn validate(&self, request_bytes: usize) -> Result<(), ConfigError> {
+        crate::query_cursor::validate_config(self)?;
         if !(1..=4096).contains(&self.max_scopes)
             || self.max_scopes_per_principal == 0
             || self.max_scopes_per_principal > self.max_scopes
@@ -363,6 +400,7 @@ pub(crate) struct QueryHost {
     pub index: Arc<Index>,
     pub config: QueryConfig,
     pub store: tinytree_store::Store,
+    pub cursors: crate::query_cursor::CursorHost,
     registry: Mutex<Registry>,
     scope_memory: Arc<Semaphore>,
     overlay_memory: Arc<Semaphore>,
@@ -381,6 +419,7 @@ pub(crate) struct Work {
     _inflight: OwnedSemaphorePermit,
     _memory: OwnedSemaphorePermit,
     pub scopes: Mutex<Vec<Arc<Scoped>>>,
+    pub query_owners: Mutex<Vec<Arc<dyn std::any::Any + Send + Sync>>>,
 }
 impl Work {
     pub fn belongs_to(&self, host: &Arc<QueryHost>) -> bool {
@@ -460,7 +499,9 @@ impl QueryHost {
                 })
                 .map_err(|_| ConfigError("cannot start derived query warmer"))?;
         }
+        let cursors = crate::query_cursor::CursorHost::new(&config)?;
         let host = Arc::new(Self {
+            cursors,
             index,
             store,
             request_memory: config.request_memory(service.max_request_bytes),
@@ -534,9 +575,11 @@ impl QueryHost {
             _inflight: permit,
             _memory: memory,
             scopes: Mutex::new(Vec::new()),
+            query_owners: Mutex::new(Vec::new()),
         }))
     }
     fn expire(&self, now: i64) {
+        self.cursors.expire(now);
         let removed = {
             let mut registry = self.registry.lock().unwrap();
             let expired: Vec<_> = registry

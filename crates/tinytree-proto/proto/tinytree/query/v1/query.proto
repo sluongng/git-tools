@@ -211,6 +211,8 @@ message DagRangeExpr {
   GenerationRange generations_from_roots = 3;
 }
 message UnaryExpr { GraphExpr input = 1; }
+// Empty union is empty. Empty intersection is invalid, not an implicit request
+// to enumerate the entire scoped graph.
 message SetExpr { repeated GraphExpr inputs = 1; }
 message DifferenceExpr { GraphExpr left = 1; GraphExpr right = 2; }
 // Select at most count candidates by descending committer milliseconds, with
@@ -220,7 +222,7 @@ message LatestExpr { GraphExpr candidates = 1; uint64 count = 2; }
 
 enum Projection {
   PROJECTION_UNSPECIFIED = 0;
-  IDS = 1;
+  IDS = 1; // Commit and ChangeId only; no selected edges or canonical payload.
   GRAPH = 2;
   CANONICAL = 3; // Graph row plus canonical commit payload, except intrinsic root.
 }
@@ -282,3 +284,7 @@ message EvaluatePage {
 // Limits/expiry cleanup, root pinning under GC, authorization, MACs, canonical
 // verification and replay persistence are implementation obligations, not things
 // this schema or generated bindings enforce.
+// A started query retains its captured graph independently of CloseScope, up to
+// its absolute expiry. Closing a scope prevents new queries; it does not revoke
+// an accepted cursor or its replay identity. Continuations repeat the same AST,
+// projection and page_size; changing any immutable input under query_id errors.

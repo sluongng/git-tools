@@ -746,13 +746,24 @@ impl RepositoryQuery for QueryService {
         &self,
         request: Request<q::EvaluateRequest>,
     ) -> Result<Response<q::EvaluatePage>, Status> {
-        let (identity, _, _) = self.context(&request, false)?;
+        let (identity, deadline, host) = self.context(&request, false)?;
+        let admission = request.extensions().get::<Arc<Work>>().cloned();
         self.bounded(request.get_ref())?;
-        let key = scope_key(request.into_inner().scope)?;
+        let input = request.into_inner();
+        let key = scope_key(input.scope.clone())?;
         identity.authorize(&key.repository_id, false)?;
-        Err(Status::unimplemented(
-            "query evaluation and cursors are not implemented",
-        ))
+        let work = admitted(&host, deadline, admission).await?;
+        let (value, work) = execute(host, work, deadline, move |host, work| {
+            let result = host.cursors.evaluate(host, &identity.id, input)?;
+            work.query_owners.lock().unwrap().push(result.owner);
+            Ok(result.page)
+        })
+        .await?;
+        response(
+            value,
+            work,
+            self.repository.service_config().query.max_response_bytes,
+        )
     }
 }
 enum UploadFrame {
@@ -777,129 +788,158 @@ mod tests {
     use super::*;
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn cancelled_physical_query_retains_scope_roots_and_admission_until_completion() {
-        let temporary = tempfile::tempdir().unwrap();
-        let store =
-            tinytree_store::Store::open(temporary.path().join("objects"), Default::default())
+        for evaluate in [false, true] {
+            let temporary = tempfile::tempdir().unwrap();
+            let store =
+                tinytree_store::Store::open(temporary.path().join("objects"), Default::default())
+                    .unwrap();
+            store.create_repository("example").unwrap();
+            let mut commit = m::synthetic_root();
+            commit.parents = vec![m::CommitId::ROOT];
+            commit.change_id = m::ChangeId([1; 16]);
+            let canonical = m::encode(&m::Object::Commit(commit), Default::default()).unwrap();
+            store
+                .put("example", canonical.descriptor, &canonical.bytes, 0)
                 .unwrap();
-        store.create_repository("example").unwrap();
-        let mut commit = m::synthetic_root();
-        commit.parents = vec![m::CommitId::ROOT];
-        commit.change_id = m::ChangeId([1; 16]);
-        let canonical = m::encode(&m::Object::Commit(commit), Default::default()).unwrap();
-        store
-            .put("example", canonical.descriptor, &canonical.bytes, 0)
-            .unwrap();
-        let index =
-            tinytree_index::Index::open(temporary.path().join("derived"), &Default::default())
+            let index =
+                tinytree_index::Index::open(temporary.path().join("derived"), &Default::default())
+                    .unwrap();
+            index
+                .ingest("example", canonical.descriptor, &canonical.bytes)
                 .unwrap();
-        index
-            .ingest("example", canonical.descriptor, &canonical.bytes)
-            .unwrap();
-        let mut config = crate::ServiceConfig::default();
-        config.query.max_inflight = 1;
-        let repository =
-            RepositoryService::new(store.clone(), config, vec!["example".into()], Vec::new())
-                .unwrap()
-                .with_query_index(index)
-                .unwrap();
-        let host = repository.query_host().unwrap();
-        let owned = host.clone();
-        let scope = tokio::task::spawn_blocking(move || {
-            owned.open(
-                "local-owner",
-                "example",
-                [1; 32],
-                vec![m::CommitId(canonical.descriptor.key.id.0)],
-            )
-        })
-        .await
-        .unwrap()
-        .unwrap();
-        let (entered, started) = std::sync::mpsc::sync_channel(1);
-        let (resume, wait) = std::sync::mpsc::sync_channel(1);
-        *host.pause.lock().unwrap() = Some(crate::query_index::QueryPause {
-            entered,
-            resume: wait,
-        });
-        let service = repository.query_service();
-        let key = scope.key.clone().unwrap();
-        let input = q::QueryFactsRequest {
-            scope: Some(key.clone()),
-            facts: vec![q::GraphFact {
-                fact: Some(q::graph_fact::Fact::HasId(q::HasId {
-                    commit: Some(wire(m::CommitId(canonical.descriptor.key.id.0))),
-                })),
-            }],
-        };
-        let worker = service.clone();
-        let call = tokio::spawn(async move { worker.query_facts(Request::new(input)).await });
-        tokio::task::spawn_blocking(move || {
-            started.recv_timeout(std::time::Duration::from_secs(5))
-        })
-        .await
-        .unwrap()
-        .unwrap();
-        call.abort();
-        let _ = call.await;
-        let owned = host.clone();
-        let closed = key.clone();
-        tokio::task::spawn_blocking(move || owned.close("local-owner", "example", &closed.handle))
+            let mut config = crate::ServiceConfig::default();
+            config.query.max_inflight = 1;
+            let repository =
+                RepositoryService::new(store.clone(), config, vec!["example".into()], Vec::new())
+                    .unwrap()
+                    .with_query_index(index)
+                    .unwrap();
+            let host = repository.query_host().unwrap();
+            let owned = host.clone();
+            let scope = tokio::task::spawn_blocking(move || {
+                owned.open(
+                    "local-owner",
+                    "example",
+                    [1; 32],
+                    vec![m::CommitId(canonical.descriptor.key.id.0)],
+                )
+            })
             .await
             .unwrap()
             .unwrap();
-        let owned = store.clone();
-        tokio::task::spawn_blocking(move || {
-            owned.gc("example", i64::MAX - 1).unwrap();
-            assert!(
-                owned
-                    .descriptor("example", canonical.descriptor.key)
-                    .unwrap()
-                    .is_some()
-            );
-        })
-        .await
-        .unwrap();
-        let mut request = Request::new(q::QueryFactsRequest {
-            scope: Some(key.clone()),
-            facts: Vec::new(),
-        });
-        request.set_timeout(std::time::Duration::from_millis(30));
-        assert_eq!(
-            service.query_facts(request).await.unwrap_err().code(),
-            tonic::Code::DeadlineExceeded,
-            "cancelled waiter must not free accepted physical query admission"
-        );
-        resume.send(()).unwrap();
-        tokio::time::timeout(std::time::Duration::from_secs(5), async {
-            loop {
-                let owned = store.clone();
-                let retained = tokio::task::spawn_blocking(move || {
-                    owned.gc("example", i64::MAX - 1).unwrap();
+            let (entered, started) = std::sync::mpsc::sync_channel(1);
+            let (resume, wait) = std::sync::mpsc::sync_channel(1);
+            *host.pause.lock().unwrap() = Some(crate::query_index::QueryPause {
+                entered,
+                resume: wait,
+            });
+            let service = repository.query_service();
+            let key = scope.key.clone().unwrap();
+            let input = q::QueryFactsRequest {
+                scope: Some(key.clone()),
+                facts: vec![q::GraphFact {
+                    fact: Some(q::graph_fact::Fact::HasId(q::HasId {
+                        commit: Some(wire(m::CommitId(canonical.descriptor.key.id.0))),
+                    })),
+                }],
+            };
+            let worker = service.clone();
+            let call = tokio::spawn(async move {
+                if evaluate {
+                    worker
+                        .evaluate(Request::new(q::EvaluateRequest {
+                            scope: input.scope,
+                            query_id: vec![19; 32],
+                            expression: Some(q::GraphExpr {
+                                version: 1,
+                                expression: Some(q::graph_expr::Expression::Commits(
+                                    q::CommitSet {
+                                        commits: vec![wire(m::CommitId(
+                                            canonical.descriptor.key.id.0,
+                                        ))],
+                                    },
+                                )),
+                            }),
+                            projection: q::Projection::Ids as i32,
+                            page_size: 128,
+                            cursor: Vec::new(),
+                        }))
+                        .await
+                        .map(|_| ())
+                } else {
+                    worker.query_facts(Request::new(input)).await.map(|_| ())
+                }
+            });
+            tokio::task::spawn_blocking(move || {
+                started.recv_timeout(std::time::Duration::from_secs(5))
+            })
+            .await
+            .unwrap()
+            .unwrap();
+            call.abort();
+            let _ = call.await;
+            let owned = host.clone();
+            let closed = key.clone();
+            tokio::task::spawn_blocking(move || {
+                owned.close("local-owner", "example", &closed.handle)
+            })
+            .await
+            .unwrap()
+            .unwrap();
+            let owned = store.clone();
+            tokio::task::spawn_blocking(move || {
+                owned.gc("example", i64::MAX - 1).unwrap();
+                assert!(
                     owned
                         .descriptor("example", canonical.descriptor.key)
                         .unwrap()
                         .is_some()
-                })
-                .await
-                .unwrap();
-                if !retained {
-                    break;
+                );
+            })
+            .await
+            .unwrap();
+            let mut request = Request::new(q::QueryFactsRequest {
+                scope: Some(key.clone()),
+                facts: Vec::new(),
+            });
+            request.set_timeout(std::time::Duration::from_millis(30));
+            assert_eq!(
+                service.query_facts(request).await.unwrap_err().code(),
+                tonic::Code::DeadlineExceeded,
+                "cancelled waiter must not free accepted physical query admission"
+            );
+            resume.send(()).unwrap();
+            tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                loop {
+                    let owned = store.clone();
+                    let retained = tokio::task::spawn_blocking(move || {
+                        owned.gc("example", i64::MAX - 1).unwrap();
+                        owned
+                            .descriptor("example", canonical.descriptor.key)
+                            .unwrap()
+                            .is_some()
+                    })
+                    .await
+                    .unwrap();
+                    if !retained {
+                        break;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
                 }
-                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-            }
-        })
-        .await
-        .unwrap();
-        assert_eq!(
-            service
-                .query_facts(Request::new(q::QueryFactsRequest {
-                    scope: Some(key),
-                    facts: Vec::new()
-                }))
-                .await
-                .unwrap_err()
-                .code(),
-            tonic::Code::FailedPrecondition
-        );
+            })
+            .await
+            .unwrap();
+            assert_eq!(
+                service
+                    .query_facts(Request::new(q::QueryFactsRequest {
+                        scope: Some(key),
+                        facts: Vec::new()
+                    }))
+                    .await
+                    .unwrap_err()
+                    .code(),
+                tonic::Code::FailedPrecondition
+            );
+        }
     }
 }

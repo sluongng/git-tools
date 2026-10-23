@@ -702,3 +702,330 @@ fn unix_seconds() -> Result<i64, Status> {
         .and_then(|value| i64::try_from(value.as_secs()).ok())
         .ok_or_else(|| Status::failed_precondition("native query clock unavailable"))
 }
+
+/// A scoped IDS-only evaluation. The original operation deadline starts in
+/// `begin_query`, including time held by the caller between pages. No inflight
+/// permit is held between calls. Drop releases reserved cumulative-state memory.
+pub struct CheckedIdsQuery {
+    client: NativeClient,
+    scope: CheckedScopeHandle,
+    expression: Arc<q::GraphExpr>,
+    query_id: [u8; 32],
+    page_size: u32,
+    deadline: Instant,
+    cursor: Vec<u8>,
+    sequence: u64,
+    pages: usize,
+    seen: HashSet<CommitId>,
+    exhausted: bool,
+    memory: Arc<QueryMemory>,
+}
+impl std::fmt::Debug for CheckedIdsQuery {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CheckedIdsQuery")
+            .field("pages", &self.pages)
+            .field("rows", &self.seen.len())
+            .field("exhausted", &self.exhausted)
+            .finish_non_exhaustive()
+    }
+}
+impl CheckedIdsQuery {
+    pub fn query_id(&self) -> &[u8; 32] {
+        &self.query_id
+    }
+    pub fn is_exhausted(&self) -> bool {
+        self.exhausted
+    }
+}
+struct QueryMemory {
+    _guards: crate::verified::LifetimeGuards,
+    _bytes: OwnedSemaphorePermit,
+    _state: OwnedSemaphorePermit,
+}
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct IdRow {
+    pub commit: CommitId,
+    pub change: ChangeId,
+}
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CheckedIdsPage {
+    pub sequence: u64,
+    pub rows: Vec<IdRow>,
+    pub exhausted: bool,
+}
+impl CheckedIdsPage {
+    pub fn is_progress(&self) -> bool {
+        self.rows.is_empty() && !self.exhausted
+    }
+}
+impl NativeClient {
+    /// Prepare a versioned structural query without fetching history. The input
+    /// AST is borrowed, checked iteratively, then compactly cloned once. GRAPH
+    /// and CANONICAL projections are deliberately absent from this API.
+    pub async fn begin_query(
+        &self,
+        scope: &CheckedScopeHandle,
+        expression: &q::GraphExpr,
+        page_size: u32,
+    ) -> Result<CheckedIdsQuery, Status> {
+        let deadline = self.deadline();
+        self.checked_scope(scope, false)?;
+        if page_size == 0
+            || page_size as usize > self.inner.config.limits.max_batch_items
+            || page_size > 4096
+        {
+            return Err(Status::invalid_argument("invalid IDS query page size"));
+        }
+        let limits = &self.inner.config.limits;
+        let (nodes, encoded) = validate_expression(expression, limits)?;
+        let bytes = limits
+            .max_graph_objects
+            .checked_mul(128)
+            .and_then(|n| encoded.checked_mul(4).and_then(|e| n.checked_add(e)))
+            .and_then(|n| nodes.checked_mul(256).and_then(|e| n.checked_add(e)))
+            .and_then(|n| n.checked_add(8192))
+            .ok_or_else(|| Status::resource_exhausted("IDS query state exceeds memory budget"))?;
+        if bytes
+            .checked_add(self.unary_memory())
+            .is_none_or(|n| n > limits.max_buffered_bytes)
+        {
+            return Err(Status::resource_exhausted(
+                "IDS query state leaves no page admission budget",
+            ));
+        }
+        let state = reapi::policy::timeout(deadline, async {
+            self.inner
+                .query_state
+                .clone()
+                .acquire_many_owned(bytes as u32)
+                .await
+                .map_err(|_| Status::cancelled("native client closed"))
+        })
+        .await?;
+        let reservation = reapi::policy::timeout(deadline, async {
+            self.inner
+                .bytes
+                .clone()
+                .acquire_many_owned(bytes as u32)
+                .await
+                .map_err(|_| Status::cancelled("native client closed"))
+        })
+        .await?;
+        let memory = Arc::new(QueryMemory {
+            _state: state,
+            _bytes: reservation,
+            _guards: self.guards.clone(),
+        });
+        let mut query_id = [0u8; 32];
+        getrandom::fill(&mut query_id)
+            .map_err(|_| Status::internal("cannot generate evaluation identity"))?;
+        Ok(CheckedIdsQuery {
+            client: self.clone(),
+            scope: scope.clone(),
+            expression: Arc::new(expression.clone()),
+            query_id,
+            page_size,
+            deadline,
+            cursor: Vec::new(),
+            sequence: 0,
+            pages: 0,
+            seen: HashSet::new(),
+            exhausted: false,
+            memory,
+        })
+    }
+    /// Fetch exactly one page/owned work quantum. Empty progress pages are
+    /// visible to callers; transport retries replay identical inputs. On errors
+    /// no cursor, sequence or duplicate-tracking state advances. Ordering and
+    /// completeness are authenticated server guarantees, not provable from IDs.
+    pub async fn evaluate_page(
+        &self,
+        query: &mut CheckedIdsQuery,
+    ) -> Result<CheckedIdsPage, Status> {
+        if !Arc::ptr_eq(&self.inner, &query.client.inner) {
+            return Err(Status::invalid_argument(
+                "IDS query belongs to another client",
+            ));
+        }
+        if query.exhausted {
+            return Err(Status::failed_precondition("IDS query already exhausted"));
+        }
+        // An accepted server query retains its immutable scope after CloseScope;
+        // only its original deadline (and server query expiry) govern continuations.
+        if query.pages == 0 {
+            self.checked_scope(&query.scope, false)?;
+        }
+        if query.pages >= self.inner.config.limits.max_graph_pages {
+            return Err(Status::resource_exhausted(
+                "IDS query page budget exhausted",
+            ));
+        }
+        let budget = self.admit(query.deadline, self.unary_memory()).await?;
+        let request = q::EvaluateRequest {
+            scope: Some(query.scope.key()),
+            query_id: query.query_id.to_vec(),
+            expression: Some((*query.expression).clone()),
+            projection: q::Projection::Ids as i32,
+            page_size: query.page_size,
+            cursor: query.cursor.clone(),
+        };
+        self.bounded(&request)?;
+        let owner = Arc::new((query.expression.clone(), query.memory.clone(), budget));
+        let reply = self
+            .retry(query.deadline, false, |allowance| {
+                let mut grpc = self.inner.grpc.clone();
+                let request = request.clone();
+                let owner = owner.clone();
+                async move {
+                    grpc.evaluate(self.request(request, allowance), owner)
+                        .await
+                        .map(|response| response.into_inner())
+                }
+            })
+            .await?;
+        if reply.scope_digest.as_slice() != query.scope.digest
+            || reply.index_epoch.as_slice() != query.scope.epoch
+            || reply.sequence != query.sequence
+            || reply.rows.len() > query.page_size as usize
+            || reply.cursor.len() > 4096
+        {
+            return Err(integrity());
+        }
+        let exhausted = reply.exhausted.ok_or_else(integrity)?;
+        if exhausted != reply.cursor.is_empty() || (!exhausted && reply.cursor == query.cursor) {
+            return Err(integrity());
+        }
+        let mut page_ids = HashSet::with_capacity(reply.rows.len());
+        let mut rows = Vec::with_capacity(reply.rows.len());
+        for row in reply.rows {
+            if !row.edges.is_empty() || row.canonical.is_some() {
+                return Err(integrity());
+            }
+            let commit = checked_commit(row.commit)?;
+            let change = ChangeId(
+                row.change
+                    .ok_or_else(integrity)?
+                    .value
+                    .try_into()
+                    .map_err(|_| integrity())?,
+            );
+            if query.seen.contains(&commit) || !page_ids.insert(commit) {
+                return Err(integrity());
+            }
+            rows.push(IdRow { commit, change });
+        }
+        if query
+            .seen
+            .len()
+            .checked_add(rows.len())
+            .is_none_or(|n| n > self.inner.config.limits.max_graph_objects)
+        {
+            return Err(Status::resource_exhausted("IDS query row budget exhausted"));
+        }
+        let next_sequence = query.sequence.checked_add(1).ok_or_else(integrity)?;
+        query.seen.extend(page_ids);
+        query.cursor = reply.cursor;
+        query.sequence = next_sequence;
+        query.pages += 1;
+        query.exhausted = exhausted;
+        Ok(CheckedIdsPage {
+            sequence: reply.sequence,
+            rows,
+            exhausted,
+        })
+    }
+}
+
+fn validate_expression(
+    expression: &q::GraphExpr,
+    limits: &crate::Limits,
+) -> Result<(usize, usize), Status> {
+    let invalid = || Status::invalid_argument("invalid versioned graph expression");
+    let exceeded = || Status::resource_exhausted("graph expression exceeds client bounds");
+    let mut pending = vec![(expression, 1usize)];
+    let mut nodes = 0usize;
+    let mut literals = 0usize;
+    while let Some((node, depth)) = pending.pop() {
+        nodes += 1;
+        if depth > 64 || nodes > limits.max_batch_items {
+            return Err(exceeded());
+        }
+        if node.version != 1 {
+            return Err(invalid());
+        }
+        use q::graph_expr::Expression as E;
+        let mut children = Vec::new();
+        match node.expression.as_ref().ok_or_else(invalid)? {
+            E::Commits(set) => {
+                literals = literals
+                    .checked_add(set.commits.len())
+                    .ok_or_else(exceeded)?;
+                if literals > limits.max_batch_items
+                    || set.commits.iter().any(|id| id.value.len() != 32)
+                {
+                    return Err(invalid());
+                }
+            }
+            E::Ancestors(value) => {
+                generation_range(value.generations.as_ref())?;
+                parent_range(value.parents.as_ref())?;
+                children.push(value.heads.as_deref().ok_or_else(invalid)?);
+            }
+            E::Range(value) => {
+                generation_range(value.generations.as_ref())?;
+                parent_range(value.parents.as_ref())?;
+                children.push(value.roots.as_deref().ok_or_else(invalid)?);
+                children.push(value.heads.as_deref().ok_or_else(invalid)?);
+            }
+            E::DagRange(value) => {
+                generation_range(value.generations_from_roots.as_ref())?;
+                children.push(value.roots.as_deref().ok_or_else(invalid)?);
+                children.push(value.heads.as_deref().ok_or_else(invalid)?);
+            }
+            E::Heads(value) | E::Roots(value) => {
+                children.push(value.input.as_deref().ok_or_else(invalid)?)
+            }
+            E::Union(value) | E::Intersection(value) => {
+                if value.inputs.len() > limits.max_batch_items {
+                    return Err(exceeded());
+                }
+                children.extend(value.inputs.iter());
+            }
+            E::Difference(value) => {
+                children.push(value.left.as_deref().ok_or_else(invalid)?);
+                children.push(value.right.as_deref().ok_or_else(invalid)?);
+            }
+            E::Latest(value) => {
+                if value.count > limits.max_graph_objects as u64 {
+                    return Err(exceeded());
+                }
+                children.push(value.candidates.as_deref().ok_or_else(invalid)?);
+            }
+        }
+        if nodes
+            .checked_add(pending.len())
+            .and_then(|n| n.checked_add(children.len()))
+            .is_none_or(|n| n > limits.max_batch_items)
+        {
+            return Err(exceeded());
+        }
+        pending.extend(children.into_iter().map(|child| (child, depth + 1)));
+    }
+    let bytes = expression.encoded_len();
+    if bytes > limits.max_request_bytes {
+        return Err(exceeded());
+    }
+    Ok((nodes, bytes))
+}
+fn generation_range(range: Option<&q::GenerationRange>) -> Result<(), Status> {
+    if range.is_some_and(|range| range.end_exclusive.is_some_and(|end| end < range.start)) {
+        return Err(Status::invalid_argument("invalid generation interval"));
+    }
+    Ok(())
+}
+fn parent_range(range: Option<&q::ParentRange>) -> Result<(), Status> {
+    if range.is_some_and(|range| range.end_exclusive.is_some_and(|end| end < range.start)) {
+        return Err(Status::invalid_argument("invalid parent interval"));
+    }
+    Ok(())
+}

@@ -30,7 +30,10 @@ to the authenticated caller; they are ephemeral query data, not repository uploa
 or backup receipts. Closing a parent preserves live forks without extending
 their absolute expiry. Active-scope quotas
 and bounded replay-history quotas are separate; closed keys remain closed until
-their absolute expiry. Paged evaluation is not implemented yet.
+their absolute expiry. IDs evaluation is incremental and bounded; empty pages with
+continuations signal progress. Cursors expire absolutely, cache only their latest
+page for replay, and retain roots independently of a closed scope. Graph/canonical
+projection and unsupported operators return explicit errors.
 
 Derived state lives in `derived-index-v{schema}/generation-{index_rebuild_generation}`
 under storage. Restarting with the same generation reuses it; increment

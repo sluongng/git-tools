@@ -8,6 +8,8 @@ mod body_deadline;
 pub use body_deadline::DeadlineLayer;
 mod config;
 mod derived_index;
+mod query_cursor;
+mod query_eval;
 mod query_index;
 mod query_ingress;
 mod query_overlay;

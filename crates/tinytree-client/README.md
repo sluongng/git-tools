@@ -14,7 +14,12 @@ Private parent-first draft overlays and forks share an immutable remote checkpoi
 they never upload objects or publish changes. Verify local drafts with
 `NativeClient::verify_metadata`, then use `open_query_scope_with_overlay` or
 `fork_query_scope`. Forks do not extend the parent scope's expiry. These APIs do
-not yet replace jj's local index or implement graph evaluation.
+not yet replace jj's local index. `begin_query` / `evaluate_page` expose bounded
+IDS-only graph pages using version-1 `query_protocol` structural ASTs. A page
+size of 128 matches the default server cap; empty progress pages are explicit.
+One operation
+deadline covers the query and caller pauses between pages; drop the query to
+release reserved state. GRAPH/CANONICAL projections remain unsupported.
 
 Load [the TOML example](examples/client.toml) with `Config::load`, then call
 `NativeClient::connect`. Plaintext is loopback-only; other TCP endpoints require

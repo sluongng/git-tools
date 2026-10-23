@@ -163,6 +163,28 @@ impl Client {
         )
         .await
     }
+    pub async fn evaluate(
+        &mut self,
+        request: Request<q::EvaluateRequest>,
+        owner: PhysicalOwner,
+    ) -> Result<Response<q::EvaluatePage>, Status> {
+        self.inner
+            .ready()
+            .await
+            .map_err(|_| Status::unavailable("native gRPC transport not ready"))?;
+        self.inner
+            .unary(
+                request,
+                http::uri::PathAndQuery::from_static("/tinytree.query.v1.RepositoryQuery/Evaluate"),
+                BoundedCodec::<q::EvaluateRequest, q::EvaluatePage>::new(
+                    Shape::IdsPage,
+                    self.limits.clone(),
+                    self.decode,
+                )
+                .with_owner(owner),
+            )
+            .await
+    }
     pub async fn open_repository(
         &mut self,
         r: Request<p::OpenRepositoryRequest>,
@@ -287,6 +309,8 @@ enum Shape {
     ChangeTarget,
     ShortestPrefix,
     QueryEmpty,
+    IdsPage,
+    IdsRow,
     View,
     Reference,
     Descriptor,
@@ -460,6 +484,11 @@ fn scan(
             }
             _ => return Err(invalid()),
         };
+        // This client surface requests IDS only. Reject graph/canonical payloads
+        // before Prost can allocate them, even if empty/default-valued.
+        if matches!(shape, Shape::IdsRow) && matches!(number, 3 | 4) {
+            return Err(invalid());
+        }
         let rule = rule(shape, number, limits);
         if let Some((expected, child, maximum, allocation)) = rule {
             if wire != expected {
@@ -477,7 +506,7 @@ fn scan(
             if wire == 0
                 && matches!(
                     (shape, number),
-                    (Shape::FactAnswer, 1 | 2) | (Shape::ChangeTarget, 2)
+                    (Shape::FactAnswer, 1 | 2) | (Shape::ChangeTarget, 2) | (Shape::IdsPage, 6)
                 )
             {
                 let mut offset = 0;
@@ -497,12 +526,14 @@ fn scan(
                     charge(budget, data.len().saturating_mul(2))?;
                     let exact = match (shape, number) {
                         (Shape::QueryScope, 2)
+                        | (Shape::IdsPage, 1)
                         | (Shape::ScopeKey, 2)
                         | (Shape::CommitId, 1)
                         | (Shape::QueryFacts, 2) => Some(32),
-                        (Shape::QueryScope, 3) | (Shape::ChangeId, 1) | (Shape::QueryFacts, 3) => {
-                            Some(16)
-                        }
+                        (Shape::QueryScope, 3)
+                        | (Shape::IdsPage, 2)
+                        | (Shape::ChangeId, 1)
+                        | (Shape::QueryFacts, 3) => Some(16),
                         _ => None,
                     };
                     if exact.is_some_and(|n| data.len() != n) {
@@ -522,6 +553,8 @@ fn scan(
         }
     }
     let required = match shape {
+        Shape::IdsPage => (1 << 1) | (1 << 2) | (1 << 6),
+        Shape::IdsRow => (1 << 1) | (1 << 2),
         Shape::QueryScope => (1 << 1) | (1 << 2) | (1 << 3) | (1 << 5),
         Shape::ScopeKey => (1 << 1) | (1 << 2),
         Shape::QueryFacts => (1 << 2) | (1 << 3),
@@ -566,6 +599,17 @@ fn rule(shape: Shape, n: u32, l: &Limits) -> Option<(u8, Option<Shape>, usize, u
     let nested = |child| Some((2, Some(child), 1, 0));
     let repeated = |child, count, allocation| Some((2, Some(child), count, allocation));
     match (shape, n) {
+        (Shape::IdsPage, 1) => text(32),
+        (Shape::IdsPage, 2) => text(16),
+        (Shape::IdsPage, 3 | 6) => scalar(),
+        (Shape::IdsPage, 4) => repeated(
+            Shape::IdsRow,
+            l.max_batch_items,
+            4 * std::mem::size_of::<q::GraphRow>(),
+        ),
+        (Shape::IdsPage, 5) => text(4096),
+        (Shape::IdsRow, 1) => nested(Shape::CommitId),
+        (Shape::IdsRow, 2) => nested(Shape::ChangeId),
         (Shape::QueryScope, 1) => nested(Shape::ScopeKey),
         (Shape::QueryScope, 2)
         | (Shape::ScopeKey, 2)

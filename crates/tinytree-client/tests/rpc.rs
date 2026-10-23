@@ -71,6 +71,7 @@ impl Running {
             mode: QueryMode::Normal,
             counts: queries.clone(),
             first_scope: Arc::new(std::sync::Mutex::new(None)),
+            first_page: Arc::new(std::sync::Mutex::new(None)),
         })
         .accept_compressed(tonic::codec::CompressionEncoding::Zstd)
         .send_compressed(tonic::codec::CompressionEncoding::Zstd);
@@ -1439,6 +1440,19 @@ enum QueryMode {
     WrongCommitWidth,
     WrongShortestKind,
     LongestOverflow,
+    EvaluateRetry,
+    EvaluatePause,
+    EvaluateDelay,
+    EvaluateMissingExhausted,
+    EvaluateWrongDigest,
+    EvaluateWrongEpoch,
+    EvaluateWrongSequence,
+    EvaluateCommitWidth,
+    EvaluateChangeWidth,
+    EvaluateEdges,
+    EvaluateCanonical,
+    EvaluateCursorMismatch,
+    EvaluateDuplicate,
 }
 #[derive(Default)]
 struct QueryCounts {
@@ -1451,6 +1465,9 @@ struct QueryCounts {
     commit_prefixes: AtomicUsize,
     change_prefixes: AtomicUsize,
     shortest_prefixes: AtomicUsize,
+    evaluations: AtomicUsize,
+    evaluate_entered: tokio::sync::Notify,
+    evaluate_release: tokio::sync::Notify,
 }
 #[derive(Clone)]
 struct QueryFaults {
@@ -1458,6 +1475,7 @@ struct QueryFaults {
     mode: QueryMode,
     counts: Arc<QueryCounts>,
     first_scope: Arc<std::sync::Mutex<Option<q::QueryScope>>>,
+    first_page: Arc<std::sync::Mutex<Option<q::EvaluatePage>>>,
 }
 #[tonic::async_trait]
 impl RepositoryQuery for QueryFaults {
@@ -1606,7 +1624,68 @@ impl RepositoryQuery for QueryFaults {
         &self,
         request: Request<q::EvaluateRequest>,
     ) -> Result<Response<q::EvaluatePage>, Status> {
-        self.service.evaluate(request).await
+        let attempt = self.counts.evaluations.fetch_add(1, Ordering::SeqCst);
+        if self.mode == QueryMode::EvaluatePause {
+            self.counts.evaluate_entered.notify_one();
+            self.counts.evaluate_release.notified().await;
+        }
+        if self.mode == QueryMode::EvaluateDelay {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+        let mut response = self.service.evaluate(request).await?;
+        if self.mode == QueryMode::EvaluateRetry {
+            if attempt == 0 {
+                *self.first_page.lock().unwrap() = Some(response.get_ref().clone());
+                return Err(Status::unavailable("Evaluate ACK withheld for replay test"));
+            }
+            if attempt == 1 && self.first_page.lock().unwrap().as_ref() != Some(response.get_ref())
+            {
+                return Err(Status::data_loss("Evaluate retry changed page bytes"));
+            }
+        }
+        let page = response.get_mut();
+        match self.mode {
+            QueryMode::EvaluateMissingExhausted => page.exhausted = None,
+            QueryMode::EvaluateWrongDigest => page.scope_digest[0] ^= 1,
+            QueryMode::EvaluateWrongEpoch => page.index_epoch[0] ^= 1,
+            QueryMode::EvaluateWrongSequence => page.sequence += 1,
+            QueryMode::EvaluateCommitWidth => {
+                if let Some(row) = page.rows.first_mut() {
+                    row.commit.as_mut().unwrap().value.pop();
+                }
+            }
+            QueryMode::EvaluateChangeWidth => {
+                if let Some(row) = page.rows.first_mut() {
+                    row.change.as_mut().unwrap().value.pop();
+                }
+            }
+            QueryMode::EvaluateEdges => {
+                if let Some(row) = page.rows.first_mut() {
+                    row.edges = vec![q::SelectedEdge { edge: None }; 100_000];
+                }
+            }
+            QueryMode::EvaluateCanonical => {
+                if let Some(row) = page.rows.first_mut() {
+                    row.canonical = Some(p::ObjectData::default());
+                }
+            }
+            QueryMode::EvaluateCursorMismatch => {
+                page.exhausted = Some(page.exhausted != Some(true))
+            }
+            QueryMode::EvaluateDuplicate => {
+                let mut first_page = self.first_page.lock().unwrap();
+                if let Some(first) = first_page.as_ref() {
+                    if let (Some(row), Some(previous)) = (page.rows.first_mut(), first.rows.first())
+                    {
+                        *row = previous.clone();
+                    }
+                } else {
+                    *first_page = Some(page.clone());
+                }
+            }
+            _ => {}
+        }
+        Ok(response)
     }
 }
 struct QueryRunning {
@@ -1627,6 +1706,7 @@ impl QueryRunning {
             mode,
             counts: counts.clone(),
             first_scope: Arc::new(std::sync::Mutex::new(None)),
+            first_page: Arc::new(std::sync::Mutex::new(None)),
         };
         let (stop, stopped) = tokio::sync::oneshot::channel();
         let task = tokio::spawn(async move {
@@ -1679,7 +1759,19 @@ struct QueryFixture {
     change: tinytree_model::ChangeId,
 }
 fn setup_query_retained() -> QueryFixture {
-    let (store_dir, store, service) = setup();
+    setup_query_configured(ServiceConfig::default())
+}
+fn setup_query_configured(config: ServiceConfig) -> QueryFixture {
+    let store_dir = private_tempdir();
+    let store = Store::open(store_dir.path(), Default::default()).unwrap();
+    store.create_repository("example").unwrap();
+    let service = RepositoryService::new(
+        store.clone(),
+        config,
+        vec!["example".into()],
+        vec![Principal::new("test", TOKEN, vec!["example".into()], true).unwrap()],
+    )
+    .unwrap();
     let index_dir = private_tempdir();
     let index = tinytree_index::Index::open(index_dir.path(), &Default::default()).unwrap();
     let fixture = fixture();
@@ -2550,6 +2642,525 @@ async fn private_overlay_full_open_versus_incremental_fork_benchmark() {
             base_bytes,
             base_bytes + extension_bytes,
             extension_bytes
+        );
+        running.stop().await;
+    }
+}
+
+fn ids_commits(ids: &[tinytree_model::CommitId]) -> q::GraphExpr {
+    q::GraphExpr {
+        version: 1,
+        expression: Some(q::graph_expr::Expression::Commits(q::CommitSet {
+            commits: ids
+                .iter()
+                .map(|id| q::CommitId {
+                    value: id.0.to_vec(),
+                })
+                .collect(),
+        })),
+    }
+}
+fn ids_ancestors(head: tinytree_model::CommitId) -> q::GraphExpr {
+    q::GraphExpr {
+        version: 1,
+        expression: Some(q::graph_expr::Expression::Ancestors(Box::new(
+            q::AncestorsExpr {
+                heads: Some(Box::new(ids_commits(&[head]))),
+                generations: None,
+                parents: None,
+            },
+        ))),
+    }
+}
+#[tokio::test]
+async fn checked_ids_pages_replay_and_retain_private_scope_until_exact_eof() {
+    use tinytree_model::{ChangeId, CommitId};
+    let fixture = setup_query_retained();
+    let running = QueryRunning::start(fixture.service.clone(), QueryMode::EvaluateRetry).await;
+    let mut config = running.config.clone();
+    config.limits.max_inflight = 1;
+    let client = NativeClient::connect(config).await.unwrap();
+    let mut parent = fixture.root;
+    let mut drafts = Vec::new();
+    let mut expected = vec![CommitId::ROOT, fixture.root];
+    for index in 0..3 {
+        let draft = private_draft(parent, ChangeId([index + 61; 16]), "paged private draft");
+        parent = CommitId(draft.descriptor.key.id.0);
+        expected.push(parent);
+        drafts.push(checked_draft(&client, &draft).await);
+    }
+    let scope = client
+        .open_query_scope_with_overlay(vec![fixture.root], drafts)
+        .await
+        .unwrap();
+    let expression = ids_ancestors(parent);
+    let mut query = client.begin_query(&scope, &expression, 2).await.unwrap();
+    // Idle query state holds byte accounting, never the sole inflight permit.
+    assert_eq!(
+        client
+            .query_facts(&scope, vec![QueryFact::HasId(parent)])
+            .await
+            .unwrap(),
+        vec![FactAnswer::HasId(true)]
+    );
+    let first = client.evaluate_page(&mut query).await.unwrap();
+    assert_eq!(first.sequence, 0);
+    assert_eq!(
+        running.counts.evaluations.load(Ordering::SeqCst),
+        2,
+        "lost ACK replays the same query/cursor identity"
+    );
+    let mut found: Vec<_> = first.rows.iter().map(|row| row.commit).collect();
+    client.close_query_scope(&scope).await.unwrap();
+    let mut sequence = 1;
+    while !query.is_exhausted() {
+        let page = client.evaluate_page(&mut query).await.unwrap();
+        assert_eq!(page.sequence, sequence);
+        sequence += 1;
+        found.extend(page.rows.into_iter().map(|row| row.commit));
+    }
+    expected.reverse();
+    assert_eq!(found, expected);
+    let calls = running.counts.evaluations.load(Ordering::SeqCst);
+    assert_eq!(
+        client.evaluate_page(&mut query).await.unwrap_err().code(),
+        Code::FailedPrecondition
+    );
+    assert_eq!(
+        running.counts.evaluations.load(Ordering::SeqCst),
+        calls,
+        "EOF must not restart the query"
+    );
+    running.stop().await;
+}
+
+#[tokio::test]
+async fn ids_progress_pages_and_original_deadline_are_not_reset() {
+    let mut config = ServiceConfig::default();
+    config.query.max_eval_quantum_steps = 1;
+    config.query.max_eval_step_work = 1;
+    let fixture = setup_query_configured(config);
+    let running = QueryRunning::start(fixture.service.clone(), QueryMode::Normal).await;
+    let client = running.client().await;
+    let scope = client.open_query_scope(vec![fixture.root]).await.unwrap();
+    let expression = q::GraphExpr {
+        version: 1,
+        expression: Some(q::graph_expr::Expression::Latest(Box::new(q::LatestExpr {
+            candidates: Some(Box::new(ids_ancestors(fixture.root))),
+            count: 1,
+        }))),
+    };
+    let mut query = client.begin_query(&scope, &expression, 1).await.unwrap();
+    let mut progress = false;
+    let mut found = Vec::new();
+    while !query.is_exhausted() {
+        let page = client.evaluate_page(&mut query).await.unwrap();
+        progress |= page.is_progress();
+        found.extend(page.rows.into_iter().map(|row| row.commit));
+    }
+    assert!(
+        progress,
+        "one-step engine quanta must expose bounded progress instead of false completion"
+    );
+    assert_eq!(found, vec![fixture.root]);
+    client.close_query_scope(&scope).await.unwrap();
+    running.stop().await;
+    let (_store, _index, service, root, _change) = setup_query();
+    let running = QueryRunning::start(service, QueryMode::EvaluateDelay).await;
+    let mut config = running.config.clone();
+    config.rpc.operation_timeout_ms = 350;
+    let client = NativeClient::connect(config).await.unwrap();
+    let scope = client.open_query_scope(vec![root]).await.unwrap();
+    let mut query = client
+        .begin_query(&scope, &ids_ancestors(root), 1)
+        .await
+        .unwrap();
+    assert!(!client.evaluate_page(&mut query).await.unwrap().exhausted);
+    assert_eq!(
+        client.evaluate_page(&mut query).await.unwrap_err().code(),
+        Code::DeadlineExceeded,
+        "second page uses the first operation's remaining allowance"
+    );
+    client.close_query_scope(&scope).await.unwrap();
+    running.stop().await;
+}
+
+#[tokio::test]
+async fn ids_pages_reject_malformed_replies_and_duplicates_without_advancing() {
+    for mode in [
+        QueryMode::EvaluateMissingExhausted,
+        QueryMode::EvaluateWrongDigest,
+        QueryMode::EvaluateWrongEpoch,
+        QueryMode::EvaluateWrongSequence,
+        QueryMode::EvaluateCommitWidth,
+        QueryMode::EvaluateChangeWidth,
+        QueryMode::EvaluateEdges,
+        QueryMode::EvaluateCanonical,
+        QueryMode::EvaluateCursorMismatch,
+        QueryMode::EvaluateDuplicate,
+    ] {
+        let (_store, _index, service, root, _change) = setup_query();
+        let running = QueryRunning::start(service, mode).await;
+        let client = running.client().await;
+        let scope = client.open_query_scope(vec![root]).await.unwrap();
+        let mut query = client
+            .begin_query(&scope, &ids_ancestors(root), 1)
+            .await
+            .unwrap();
+        if mode == QueryMode::EvaluateDuplicate {
+            assert!(!client.evaluate_page(&mut query).await.unwrap().exhausted);
+        }
+        let error = client.evaluate_page(&mut query).await.unwrap_err();
+        assert!(
+            matches!(error.code(), Code::DataLoss | Code::ResourceExhausted),
+            "{mode:?}: {error}"
+        );
+        assert!(!query.is_exhausted());
+        client.close_query_scope(&scope).await.unwrap();
+        running.stop().await;
+    }
+}
+
+#[tokio::test]
+async fn cancelled_ids_page_releases_owned_state_and_aggregate_idle_queries_leave_page_headroom() {
+    let (_store, _index, service, root, _change) = setup_query();
+    let running = QueryRunning::start(service, QueryMode::EvaluatePause).await;
+    let client = running.client().await;
+    let scope = client.open_query_scope(vec![root]).await.unwrap();
+    let dropped = Arc::new(AtomicUsize::new(0));
+    let guarded = client
+        .clone()
+        .with_lifetime_guard(Arc::new(LifetimeProbe(dropped.clone())));
+    let mut query = guarded
+        .begin_query(&scope, &ids_ancestors(root), 1)
+        .await
+        .unwrap();
+    let task = tokio::spawn(async move { guarded.evaluate_page(&mut query).await });
+    tokio::time::timeout(
+        Duration::from_secs(2),
+        running.counts.evaluate_entered.notified(),
+    )
+    .await
+    .unwrap();
+    task.abort();
+    let _ = task.await;
+    running.counts.evaluate_release.notify_one();
+    assert_released(&dropped).await;
+    client.close_query_scope(&scope).await.unwrap();
+    running.stop().await;
+    let (_store, _index, service, root, _change) = setup_query();
+    let running = QueryRunning::start(service, QueryMode::Normal).await;
+    let mut config = running.config.clone();
+    config.limits.max_graph_objects = 300_000;
+    config.limits.max_graph_bytes = 32 * 1024 * 1024;
+    // Valid ordinary RPC bounds leave 128 MiB page admission plus 48 MiB
+    // persistent state: one ~38.4 MB query fits, while a second must wait.
+    config.limits.max_buffered_bytes = 176 * 1024 * 1024;
+    let client = NativeClient::connect(config).await.unwrap();
+    let scope = client.open_query_scope(vec![root]).await.unwrap();
+    let expression = ids_ancestors(root);
+    let mut first = client.begin_query(&scope, &expression, 1).await.unwrap();
+    let mut pending = Box::pin(client.begin_query(&scope, &expression, 1));
+    assert!(
+        tokio::time::timeout(Duration::from_millis(10), &mut pending)
+            .await
+            .is_err(),
+        "second idle query should wait on the bounded state subpool"
+    );
+    assert!(
+        !client
+            .evaluate_page(&mut first)
+            .await
+            .unwrap()
+            .rows
+            .is_empty(),
+        "pending state admission must leave page memory available"
+    );
+    drop(pending);
+    drop(first);
+    let _reused = client.begin_query(&scope, &expression, 1).await.unwrap();
+    client.close_query_scope(&scope).await.unwrap();
+    running.stop().await;
+}
+
+struct IdsTiming {
+    begin_ns: u128,
+    first_window_ns: u128,
+    after_window_ns: u128,
+    total_ns: u128,
+    first_window_rows: usize,
+    ids: std::collections::BTreeSet<tinytree_model::CommitId>,
+}
+async fn measure_ids_window_and_completion(
+    client: &NativeClient,
+    scope: &tinytree_client::CheckedScopeHandle,
+    head: tinytree_model::CommitId,
+) -> IdsTiming {
+    use tinytree_model::CommitId;
+    let begin = std::time::Instant::now();
+    let mut query = client
+        .begin_query(scope, &ids_ancestors(head), 40)
+        .await
+        .unwrap();
+    let begin_ns = begin.elapsed().as_nanos();
+    let started = std::time::Instant::now();
+    let mut ids = std::collections::BTreeSet::new();
+    while ids.len() < 40 && !query.is_exhausted() {
+        let page = client.evaluate_page(&mut query).await.unwrap();
+        ids.extend(
+            page.rows
+                .into_iter()
+                .map(|row| row.commit)
+                .filter(|id| *id != CommitId::ROOT),
+        );
+    }
+    let first_window_ns = started.elapsed().as_nanos();
+    let first_window_rows = ids.len();
+    let tail = std::time::Instant::now();
+    while !query.is_exhausted() {
+        let page = client.evaluate_page(&mut query).await.unwrap();
+        ids.extend(
+            page.rows
+                .into_iter()
+                .map(|row| row.commit)
+                .filter(|id| *id != CommitId::ROOT),
+        );
+    }
+    let after_window_ns = tail.elapsed().as_nanos();
+    IdsTiming {
+        begin_ns,
+        first_window_ns,
+        after_window_ns,
+        total_ns: started.elapsed().as_nanos(),
+        first_window_rows,
+        ids,
+    }
+}
+fn linear_ids_fixture(
+    depth: usize,
+) -> (
+    QueryFixture,
+    u128,
+    u128,
+    std::collections::BTreeSet<tinytree_model::CommitId>,
+) {
+    use tinytree_model::{ChangeId, CommitId};
+    let (store_directory, store, service) = setup();
+    let index_directory = private_tempdir();
+    let started = std::time::Instant::now();
+    let empty = tinytree_model::empty_tree();
+    store
+        .put("example", empty.descriptor, &empty.bytes, 0)
+        .unwrap();
+    let mut encoded = Vec::with_capacity(depth);
+    let mut root = CommitId::ROOT;
+    let mut change = ChangeId::ROOT;
+    let mut ids = std::collections::BTreeSet::new();
+    for position in 0..depth {
+        let mut value = [0u8; 16];
+        value[..8].copy_from_slice(&((position + 1) as u64).to_be_bytes());
+        value[15] = 11;
+        change = ChangeId(value);
+        let object = private_draft(root, change, &format!("public indexed commit {position}"));
+        root = CommitId(object.descriptor.key.id.0);
+        ids.insert(root);
+        store
+            .put("example", object.descriptor, &object.bytes, 0)
+            .unwrap();
+        encoded.push(object);
+    }
+    let source_ns = started.elapsed().as_nanos();
+    let started = std::time::Instant::now();
+    let index = tinytree_index::Index::open(index_directory.path(), &Default::default()).unwrap();
+    for object in encoded {
+        index
+            .ingest("example", object.descriptor, &object.bytes)
+            .unwrap();
+    }
+    let index_ns = started.elapsed().as_nanos();
+    let service = service.with_query_index(index.clone()).unwrap();
+    (
+        QueryFixture {
+            store_directory,
+            index_directory,
+            store,
+            index,
+            service,
+            root,
+            change,
+        },
+        source_ns,
+        index_ns,
+        ids,
+    )
+}
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "manual IDS first-window/full enumeration benchmark; old public API materializes all pages"]
+async fn checked_ids_first_window_and_completion_benchmark() {
+    use tinytree_model::{ChangeId, CommitId};
+    for (public_count, private_count, compare_old) in [
+        (128usize, 0usize, true),
+        (1024, 0, true),
+        (4096, 0, false),
+        (128, 10, false),
+        (128, 100, false),
+        (128, 1000, false),
+    ] {
+        let (fixture, source_ns, index_ns, mut expected) = linear_ids_fixture(public_count);
+        let running =
+            Running::start_with_socket_policy(fixture.service.clone(), Mode::Normal, true).await;
+        let mut config = running.config();
+        config.limits.max_batch_items = if private_count == 0 { 40 } else { 1024 };
+        let configured_batch_items = config.limits.max_batch_items;
+        let client = NativeClient::connect(config).await.unwrap();
+        let mut head = fixture.root;
+        let mut canonical_drafts = Vec::with_capacity(private_count);
+        for position in 0..private_count {
+            let mut value = [0u8; 16];
+            value[..8].copy_from_slice(&((position + 1) as u64).to_be_bytes());
+            value[15] = 12;
+            let object = private_draft(
+                head,
+                ChangeId(value),
+                &format!("private indexed draft {position}"),
+            );
+            head = CommitId(object.descriptor.key.id.0);
+            expected.insert(head);
+            canonical_drafts.push(object);
+        }
+        let verify_started = std::time::Instant::now();
+        let mut drafts = Vec::with_capacity(private_count);
+        for object in &canonical_drafts {
+            drafts.push(checked_draft(&client, object).await);
+        }
+        let local_overlay_verify_ns = verify_started.elapsed().as_nanos();
+        let open_started = std::time::Instant::now();
+        let scope = client
+            .open_query_scope_with_overlay(vec![fixture.root], drafts)
+            .await
+            .unwrap();
+        let scope_open_ns = open_started.elapsed().as_nanos();
+        let mut old_ns = Vec::new();
+        let mut begin_ns = Vec::new();
+        let mut first_ns = Vec::new();
+        let mut after_ns = Vec::new();
+        let mut total_ns = Vec::new();
+        let mut first_rows = Vec::new();
+        let old_graph_before = running.graph.load(Ordering::SeqCst);
+        let old_bytes_before = running.canonical_bytes.load(Ordering::SeqCst);
+        // Old checked API has no first-page return: its first usable 40 entries
+        // arrive only after complete canonical materialization. Do not label this
+        // a fixed-40 network comparison. Limit old whole-closure work to1024.
+        if compare_old {
+            for _ in 0..3 {
+                let started = std::time::Instant::now();
+                let graph = client
+                    .canonical_commit_summaries(
+                        vec![ObjectKey {
+                            kind: Kind::Commit,
+                            id: ObjectId(head.0),
+                        }],
+                        vec![],
+                    )
+                    .await
+                    .unwrap();
+                assert!(graph.entries.len() >= 40);
+                let _first40 = &graph.entries[..40];
+                old_ns.push(started.elapsed().as_nanos());
+                let actual: std::collections::BTreeSet<_> = graph
+                    .entries
+                    .iter()
+                    .map(|entry| {
+                        CommitId(
+                            key(entry.commit.as_ref().unwrap().key.as_ref().unwrap())
+                                .id
+                                .0,
+                        )
+                    })
+                    .collect();
+                assert_eq!(actual, expected);
+            }
+        }
+        let old_graph_rpcs = running.graph.load(Ordering::SeqCst) - old_graph_before;
+        let old_canonical_bytes = running.canonical_bytes.load(Ordering::SeqCst) - old_bytes_before;
+        let ids_rpc_before = running.queries.evaluations.load(Ordering::SeqCst);
+        for _ in 0..3 {
+            let timing = measure_ids_window_and_completion(&client, &scope, head).await;
+            assert_eq!(
+                timing.ids, expected,
+                "complete IDS result normalized by removing intrinsic root must match the identical canonical/private fixture"
+            );
+            begin_ns.push(timing.begin_ns);
+            first_ns.push(timing.first_window_ns);
+            after_ns.push(timing.after_window_ns);
+            total_ns.push(timing.total_ns);
+            first_rows.push(timing.first_window_rows);
+        }
+        let ids_rpcs = running.queries.evaluations.load(Ordering::SeqCst) - ids_rpc_before;
+        assert_eq!(
+            running.graph.load(Ordering::SeqCst) - old_graph_before,
+            old_graph_rpcs
+        );
+        assert_eq!(
+            running.canonical_bytes.load(Ordering::SeqCst) - old_bytes_before,
+            old_canonical_bytes
+        );
+        assert_eq!(running.metadata.load(Ordering::SeqCst), 0);
+        assert_eq!(running.files.load(Ordering::SeqCst), 0);
+        for object in &canonical_drafts {
+            assert!(
+                fixture
+                    .store
+                    .descriptor("example", object.descriptor.key)
+                    .unwrap()
+                    .is_none()
+            );
+            assert!(
+                fixture
+                    .index
+                    .node("example", CommitId(object.descriptor.key.id.0))
+                    .unwrap()
+                    .is_none()
+            );
+        }
+        let close_started = std::time::Instant::now();
+        client.close_query_scope(&scope).await.unwrap();
+        let close_ns = close_started.elapsed().as_nanos();
+        eprintln!(
+            concat!(
+                "{{\"schema\":1,\"benchmark\":\"checked_ids_first_window_and_completion\",",
+                "\"public_history_commits\":{},\"private_commits\":{},\"client_max_batch_items\":{},\"page_size\":40,\"trials\":3,",
+                "\"old_compared\":{},\"old_boundary\":\"public_api_materializes_entire_graph_before_first40\",",
+                "\"intrinsic_root\":\"new_includes_old_excludes_removed_for_complete_ID_set_comparison\",",
+                "\"public_source_setup_ns\":{},\"ready_index_ns\":{},\"index_ready_before_requests\":true,",
+                "\"local_overlay_verification_ns\":{},\"scope_open_ns\":{},\"scope_close_ns\":{},",
+                "\"old_full_materialization_to_first40_samples_ns\":{:?},",
+                "\"new_local_query_preparation_samples_ns\":{:?},\"new_first_window_call_samples_ns\":{:?},",
+                "\"new_first_window_fetched_nonroot_IDs\":{:?},\"new_completion_after_window_samples_ns\":{:?},\"new_complete_call_samples_ns\":{:?},",
+                "\"call_timings_include_client_decode_and_verification\":true,\"decode_separately_instrumented\":false,",
+                "\"old_graph_rpcs\":{},\"new_IDS_rpcs\":{},\"old_logical_canonical_envelope_bytes\":{},",
+                "\"new_canonical_public_bytes_fetched\":0,\"metadata_rpcs\":0,\"file_rpcs\":0,",
+                "\"byte_measure\":\"logical_envelopes_not_zstd_wire_bytes\",\"new_only_cases_have_no_old_speed_ratio\":true,",
+                "\"authenticated\":true,\"zstd\":true,\"tcp_nodelay\":true}}"
+            ),
+            public_count,
+            private_count,
+            configured_batch_items,
+            compare_old,
+            source_ns,
+            index_ns,
+            local_overlay_verify_ns,
+            scope_open_ns,
+            close_ns,
+            old_ns,
+            begin_ns,
+            first_ns,
+            first_rows,
+            after_ns,
+            total_ns,
+            old_graph_rpcs,
+            ids_rpcs,
+            old_canonical_bytes
         );
         running.stop().await;
     }

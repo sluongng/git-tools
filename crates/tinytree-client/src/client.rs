@@ -37,12 +37,18 @@ struct Inner {
     token: Option<tonic::metadata::MetadataValue<tonic::metadata::Ascii>>,
     inflight: Arc<Semaphore>,
     bytes: Arc<Semaphore>,
+    // Idle query state also consumes `bytes`, but cannot occupy the allowance
+    // needed to fetch its next page. Acquire this sub-pool before `bytes`.
+    query_state: Arc<Semaphore>,
     disk: Arc<Semaphore>,
 }
 struct Budget {
     _inflight: OwnedSemaphorePermit,
     _bytes: OwnedSemaphorePermit,
     _guards: crate::verified::LifetimeGuards,
+}
+fn unary_memory(limits: &crate::Limits) -> usize {
+    limits.max_batch_bytes.max(limits.max_request_bytes) * 4
 }
 impl NativeClient {
     /// Pin external resource owners through temporary creation, readers,
@@ -189,6 +195,12 @@ impl NativeClient {
             inner: Arc::new(Inner {
                 inflight: Arc::new(Semaphore::new(config.limits.max_inflight)),
                 bytes: Arc::new(Semaphore::new(config.limits.max_buffered_bytes)),
+                query_state: Arc::new(Semaphore::new(
+                    config
+                        .limits
+                        .max_buffered_bytes
+                        .saturating_sub(unary_memory(&config.limits)),
+                )),
                 disk: Arc::new(Semaphore::new(config.limits.max_temporary_bytes as usize)),
                 config,
                 grpc,
@@ -240,12 +252,7 @@ impl NativeClient {
         request
     }
     fn unary_memory(&self) -> usize {
-        self.inner
-            .config
-            .limits
-            .max_batch_bytes
-            .max(self.inner.config.limits.max_request_bytes)
-            * 4
+        unary_memory(&self.inner.config.limits)
     }
     fn bounded<T: Message>(&self, value: &T) -> Result<(), Status> {
         if value.encoded_len() > self.inner.config.limits.max_request_bytes {

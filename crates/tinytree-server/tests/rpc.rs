@@ -1955,6 +1955,7 @@ async fn root_query_service_warms_persistently_and_returns_exact_facts_and_prefi
             .evaluate(request(
                 q::EvaluateRequest {
                     scope: Some(key.clone()),
+                    projection: q::Projection::Graph as i32,
                     ..Default::default()
                 },
                 ALPHA
@@ -3199,6 +3200,333 @@ async fn private_query_reservations_follow_shared_physical_scope_lifetimes() {
     })
     .await
     .unwrap();
+    drop(client);
+    server.stop().await;
+}
+
+fn ids_evaluation(scope: &q::QueryScope, query: u8, commits: &[ObjectKey]) -> q::EvaluateRequest {
+    q::EvaluateRequest {
+        scope: scope.key.clone(),
+        query_id: vec![query; 32],
+        expression: Some(q::GraphExpr {
+            version: 1,
+            expression: Some(q::graph_expr::Expression::Commits(q::CommitSet {
+                commits: commits.iter().copied().map(query_id).collect(),
+            })),
+        }),
+        projection: q::Projection::Ids as i32,
+        page_size: 128,
+        cursor: Vec::new(),
+    }
+}
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn ids_query_pages_replay_concurrently_and_retain_roots_after_scope_close() {
+    let (temporary, store) = setup();
+    let canonical = fixture();
+    let ancestor = root(&canonical);
+    let index =
+        tinytree_index::Index::open(temporary.path().join("derived"), &Default::default()).unwrap();
+    let mut parent = None;
+    for object in canonical.objects() {
+        store
+            .put("alpha", object.descriptor, &object.bytes, 0)
+            .unwrap();
+        if object.descriptor.key.kind == Kind::Commit {
+            index
+                .ingest("alpha", object.descriptor, &object.bytes)
+                .unwrap();
+            if object.descriptor.key == ancestor {
+                let Object::Commit(commit) =
+                    tinytree_model::decode(&object.bytes, Limits::default()).unwrap()
+                else {
+                    unreachable!()
+                };
+                parent = Some(commit);
+            }
+        }
+    }
+    let mut commit = parent.unwrap();
+    commit.parents = vec![CommitId(ancestor.id.0)];
+    commit.change_id = tinytree_model::ChangeId([81; 16]);
+    let head = tinytree_model::encode(&Object::Commit(commit), Limits::default()).unwrap();
+    store.put("alpha", head.descriptor, &head.bytes, 0).unwrap();
+    index.ingest("alpha", head.descriptor, &head.bytes).unwrap();
+    let mut config = ServiceConfig::default();
+    config.query.max_eval_quantum_steps = 1;
+    let server = Running::start_query(store.clone(), config, index).await;
+    let mut client = server.query_client().await;
+    let scope = query_ready(&mut client, &[head.descriptor.key], 50).await;
+    let zero = ObjectKey {
+        kind: Kind::Commit,
+        id: ObjectId([0; 32]),
+    };
+    let input = ids_evaluation(&scope, 51, &[ancestor, zero, head.descriptor.key]);
+    let mut other = client.clone();
+    let (first, replayed) = tokio::join!(
+        client.evaluate(request(input.clone(), ALPHA)),
+        other.evaluate(request(input.clone(), ALPHA))
+    );
+    let first = first.unwrap().into_inner();
+    assert_eq!(replayed.unwrap().into_inner(), first);
+    assert_eq!(first.sequence, 0);
+    assert_eq!(first.exhausted, Some(false));
+    assert!(!first.cursor.is_empty());
+    client
+        .close_scope(request(
+            q::CloseScopeRequest {
+                scope: scope.key.clone(),
+            },
+            ALPHA,
+        ))
+        .await
+        .unwrap();
+    store.gc("alpha", i64::MAX - 1).unwrap();
+    assert!(
+        store
+            .descriptor("alpha", head.descriptor.key)
+            .unwrap()
+            .is_some()
+    );
+    let mut altered = input.clone();
+    altered.page_size = 1;
+    assert_eq!(
+        client
+            .evaluate(request(altered, ALPHA))
+            .await
+            .unwrap_err()
+            .code(),
+        Code::AlreadyExists
+    );
+    let mut next = input.clone();
+    next.cursor = first.cursor.clone();
+    let mut forged = next.clone();
+    forged.cursor[0] ^= 1;
+    assert_eq!(
+        client
+            .evaluate(request(forged, ALPHA))
+            .await
+            .unwrap_err()
+            .code(),
+        Code::PermissionDenied
+    );
+    assert_eq!(
+        client
+            .evaluate(request(next.clone(), PEER))
+            .await
+            .unwrap_err()
+            .code(),
+        Code::PermissionDenied
+    );
+    let mut rows = first.rows.clone();
+    let mut sequence = 1;
+    let mut saw_terminal = false;
+    for _ in 0..128 {
+        let page = client
+            .evaluate(request(next.clone(), ALPHA))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(page.sequence, sequence);
+        sequence += 1;
+        assert_eq!(page.scope_digest, scope.content_digest);
+        assert_eq!(page.index_epoch, scope.index_epoch);
+        assert_eq!(
+            client
+                .evaluate(request(next.clone(), ALPHA))
+                .await
+                .unwrap()
+                .into_inner(),
+            page,
+            "latest input replay is byte-equivalent"
+        );
+        assert_eq!(
+            client
+                .evaluate(request(input.clone(), ALPHA))
+                .await
+                .unwrap_err()
+                .code(),
+            Code::FailedPrecondition,
+            "older input never advances to the current page"
+        );
+        assert!(
+            page.rows
+                .iter()
+                .all(|row| row.edges.is_empty() && row.canonical.is_none())
+        );
+        rows.extend(page.rows.clone());
+        if page.exhausted == Some(true) {
+            assert!(page.cursor.is_empty());
+            saw_terminal = true;
+            break;
+        }
+        assert_eq!(page.exhausted, Some(false));
+        assert!(!page.cursor.is_empty());
+        next.cursor = page.cursor;
+    }
+    assert!(saw_terminal);
+    assert_eq!(
+        rows.iter()
+            .map(|row| row.commit.clone().unwrap())
+            .collect::<Vec<_>>(),
+        vec![
+            query_id(head.descriptor.key),
+            query_id(ancestor),
+            query_id(zero)
+        ]
+    );
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let store = store.clone();
+            let removed = tokio::task::spawn_blocking(move || {
+                store.gc("alpha", i64::MAX - 1).unwrap();
+                store
+                    .descriptor("alpha", head.descriptor.key)
+                    .unwrap()
+                    .is_none()
+            })
+            .await
+            .unwrap();
+            if removed {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap();
+    drop(client);
+    drop(other);
+    server.stop().await;
+}
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn idle_ids_queries_expire_and_release_authoritative_roots_without_next_page() {
+    let (temporary, store) = setup();
+    let canonical = fixture();
+    let root = root(&canonical);
+    let index =
+        tinytree_index::Index::open(temporary.path().join("derived"), &Default::default()).unwrap();
+    for object in canonical.objects() {
+        store
+            .put("alpha", object.descriptor, &object.bytes, 0)
+            .unwrap();
+        if object.descriptor.key.kind == Kind::Commit {
+            index
+                .ingest("alpha", object.descriptor, &object.bytes)
+                .unwrap();
+        }
+    }
+    let mut config = ServiceConfig::default();
+    config.query.max_eval_quantum_steps = 1;
+    config.query.query_ttl_seconds = 2;
+    config.query.expiry_interval_ms = 20;
+    config.query.max_queries = 1;
+    config.query.max_queries_per_principal = 1;
+    config.query.max_queries_per_repository = 1;
+    let server = Running::start_query(store.clone(), config, index).await;
+    let mut client = server.query_client().await;
+    let scope = query_ready(&mut client, &[root], 60).await;
+    let input = ids_evaluation(&scope, 61, &[root]);
+    let first = client
+        .evaluate(request(input.clone(), ALPHA))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(first.exhausted, Some(false));
+    let mut second = input.clone();
+    second.query_id = vec![62; 32];
+    assert_eq!(
+        client
+            .evaluate(request(second, ALPHA))
+            .await
+            .unwrap_err()
+            .code(),
+        Code::ResourceExhausted
+    );
+    client
+        .close_scope(request(q::CloseScopeRequest { scope: scope.key }, ALPHA))
+        .await
+        .unwrap();
+    store.gc("alpha", i64::MAX - 1).unwrap();
+    assert!(store.descriptor("alpha", root).unwrap().is_some());
+    tokio::time::sleep(Duration::from_millis(2300)).await;
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let store = store.clone();
+            let removed = tokio::task::spawn_blocking(move || {
+                store.gc("alpha", i64::MAX - 1).unwrap();
+                store.descriptor("alpha", root).unwrap().is_none()
+            })
+            .await
+            .unwrap();
+            if removed {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let mut expired = input;
+    expired.cursor = first.cursor;
+    assert_eq!(
+        client
+            .evaluate(request(expired, ALPHA))
+            .await
+            .unwrap_err()
+            .code(),
+        Code::FailedPrecondition
+    );
+    drop(client);
+    server.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn ids_query_budget_exhaustion_is_an_error_not_an_exhausted_page() {
+    let (temporary, store) = setup();
+    let index =
+        tinytree_index::Index::open(temporary.path().join("derived"), &Default::default()).unwrap();
+    let mut config = ServiceConfig::default();
+    config.query.max_eval_steps = 1;
+    config.query.max_eval_step_work = 1;
+    config.query.max_eval_quantum_steps = 1;
+    let server = Running::start_query(store, config, index).await;
+    let mut client = server.query_client().await;
+    let zero = ObjectKey {
+        kind: Kind::Commit,
+        id: ObjectId([0; 32]),
+    };
+    let scope = query_ready(&mut client, &[zero], 70).await;
+    let mut input = ids_evaluation(&scope, 71, &[zero]);
+    let mut failed = false;
+    for _ in 0..8 {
+        match client.evaluate(request(input.clone(), ALPHA)).await {
+            Ok(response) => {
+                let page = response.into_inner();
+                assert_eq!(
+                    page.exhausted,
+                    Some(false),
+                    "cumulative step exhaustion cannot prove completion"
+                );
+                assert!(!page.cursor.is_empty());
+                input.cursor = page.cursor;
+            }
+            Err(error) => {
+                assert_eq!(error.code(), Code::ResourceExhausted);
+                assert_eq!(
+                    client
+                        .evaluate(request(input.clone(), ALPHA))
+                        .await
+                        .unwrap_err()
+                        .code(),
+                    Code::ResourceExhausted,
+                    "failed quantum is replayable without renewed work budget"
+                );
+                failed = true;
+                break;
+            }
+        }
+    }
+    assert!(failed);
     drop(client);
     server.stop().await;
 }
