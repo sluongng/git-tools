@@ -836,50 +836,82 @@ impl Scope {
         let Some(target) = self.read(state, ancestor, budget)? else {
             return Ok(false);
         };
+        let target_key = (target.commit, target.position, target.generation);
+        drop(target);
+        let target = target_key;
         let Some(start) = self.read(state, descendant, budget)? else {
             return Ok(false);
         };
-        let mut frontier = vec![start];
+        // Only IDs and verified skip metadata are queued. In particular a
+        // merge cannot retain every decoded parent's own parent vector.
+        let mut frontier = vec![(descendant, Some((start.position, start.generation)))];
+        let mut initial = Some(start);
         let mut visited = HashSet::new();
-        while let Some(node) = frontier.pop() {
-            if !visited.insert(node.commit) {
+        while let Some((id, expected)) = frontier.pop() {
+            if !visited.insert(id.0) {
                 continue;
             }
             budget.frontier(visited.len().saturating_add(frontier.len()))?;
-            if node.commit == target.commit {
+            let node = if id == descendant {
+                initial.take().ok_or(Error::Corrupt)?
+            } else {
+                self.read(state, id, budget)?.ok_or(Error::Corrupt)?
+            };
+            if expected.is_some_and(|(position, generation)| {
+                node.position != position || node.generation != generation
+            }) {
+                return Err(Error::Corrupt);
+            }
+            if node.commit == target.0 {
                 return Ok(true);
             }
-            if node.generation <= target.generation || node.position <= target.position {
+            if node.generation <= target.2 || node.position <= target.1 {
                 continue;
             }
             if node.parents.len() == 1 {
-                let Some(next) = node.skips.iter().rev().find(|skip| {
-                    skip.generation >= target.generation && skip.position >= target.position
-                }) else {
-                    // A later insertion on another branch can have a
-                    // higher position than every node on this parent chain.
-                    // No eligible jump then proves this branch cannot reach
-                    // the target; it is not a malformed skip table.
+                let Some(next) = node
+                    .skips
+                    .iter()
+                    .rev()
+                    .find(|skip| skip.generation >= target.2 && skip.position >= target.1)
+                else {
+                    // Interleaved positions can put the entire parent chain
+                    // before an unrelated target. That branch cannot reach it.
                     continue;
                 };
+                if next.position >= node.position {
+                    return Err(Error::Corrupt);
+                }
                 budget.charge(0, 1, 0)?;
-                frontier.push(
-                    self.read(state, m::CommitId(next.commit), budget)?
-                        .ok_or(Error::Corrupt)?,
-                );
+                if !visited.contains(&next.commit) {
+                    budget.frontier(
+                        visited
+                            .len()
+                            .saturating_add(frontier.len())
+                            .saturating_add(1),
+                    )?;
+                    frontier.push((
+                        m::CommitId(next.commit),
+                        Some((next.position, next.generation)),
+                    ));
+                }
             } else {
                 budget.charge(0, node.parents.len() as u64, 0)?;
+                let pending = node
+                    .parents
+                    .iter()
+                    .filter(|parent| !visited.contains(*parent))
+                    .count();
                 budget.frontier(
                     visited
                         .len()
                         .saturating_add(frontier.len())
-                        .saturating_add(node.parents.len()),
+                        .saturating_add(pending),
                 )?;
                 for parent in node.parents {
-                    frontier.push(
-                        self.read(state, m::CommitId(parent), budget)?
-                            .ok_or(Error::Corrupt)?,
-                    );
+                    if !visited.contains(&parent) {
+                        frontier.push((m::CommitId(parent), None));
+                    }
                 }
             }
         }
@@ -950,35 +982,10 @@ impl Scope {
         }
         Ok(result)
     }
-    fn ancestors(
-        &self,
-        state: &State,
-        roots: &[m::CommitId],
-        budget: &mut WorkBudget,
-    ) -> Result<BTreeSet<m::CommitId>> {
-        let mut frontier = roots.to_vec();
-        let mut result = BTreeSet::new();
-        budget.frontier(frontier.len())?;
-        while let Some(id) = frontier.pop() {
-            if result.contains(&id) {
-                continue;
-            }
-            let node = self.read(state, id, budget)?.ok_or(Error::NotReady)?;
-            budget.charge(0, node.parents.len() as u64, 0)?;
-            budget.frontier(
-                result
-                    .len()
-                    .saturating_add(frontier.len())
-                    .saturating_add(node.parents.len())
-                    .saturating_add(1),
-            )?;
-            frontier.extend(node.parents.into_iter().map(m::CommitId));
-            result.insert(id);
-        }
-        Ok(result)
-    }
     /// Maximal intersection of the ancestors of each input set's union.
-    /// Inputs outside this frozen logical graph are rejected.
+    /// Inputs outside this frozen logical graph are rejected. Descending stable
+    /// positions combine every incoming color before a node is visited; emitted
+    /// common nodes dominate their ancestors, which need not become results.
     pub fn common_ancestors(
         &self,
         left: &[m::CommitId],
@@ -999,10 +1006,61 @@ impl Scope {
                 return Err(Error::NotReady);
             }
         }
-        let left = self.ancestors(&state, left, budget)?;
-        let right = self.ancestors(&state, right, budget)?;
-        let common: Vec<_> = left.intersection(&right).copied().collect();
-        self.heads_locked(&state, &common, budget)
+        if left.is_empty() || right.is_empty() {
+            return Ok(Vec::new());
+        }
+        // Linear histories and ancestor-related roots should use the verified
+        // chain accelerators instead of enumerating their public ancestry.
+        if let ([left], [right]) = (left, right) {
+            if self.ancestor(&state, *left, *right, budget)? {
+                return Ok(vec![*left]);
+            }
+            if self.ancestor(&state, *right, *left, budget)? {
+                return Ok(vec![*right]);
+            }
+        }
+        let mut frontier = CommonFrontier::default();
+        for (roots, color) in [(left, LEFT_COLOR), (right, RIGHT_COLOR)] {
+            for id in roots {
+                let node = self.read(&state, *id, budget)?.ok_or(Error::NotReady)?;
+                frontier.push(&node, color, 0, budget)?;
+            }
+        }
+        let mut result = Vec::new();
+        while frontier.undominated != 0 {
+            let (position, (id, mut flags)) = frontier.pop().ok_or(Error::Corrupt)?;
+            if flags & BOTH_COLORS == BOTH_COLORS && flags & DOMINATED == 0 {
+                budget.frontier(
+                    frontier
+                        .pending
+                        .len()
+                        .checked_add(result.len())
+                        .and_then(|n| n.checked_add(1))
+                        .ok_or(Error::BudgetExceeded)?,
+                )?;
+                result.push(id);
+                flags |= DOMINATED;
+            }
+            if flags & DOMINATED != 0 && frontier.undominated == 0 {
+                break;
+            }
+            let node = self.read(&state, id, budget)?.ok_or(Error::Corrupt)?;
+            if node.position != position {
+                return Err(Error::Corrupt);
+            }
+            budget.charge(0, node.parents.len() as u64, 0)?;
+            for parent in node.parents {
+                let parent = self
+                    .read(&state, m::CommitId(parent), budget)?
+                    .ok_or(Error::Corrupt)?;
+                if parent.position >= position {
+                    return Err(Error::Corrupt);
+                }
+                frontier.push(&parent, flags, result.len(), budget)?;
+            }
+        }
+        result.sort();
+        Ok(result)
     }
     pub fn resolve_commit_prefix(
         &self,
@@ -1116,6 +1174,58 @@ impl Scope {
     }
 }
 
+const LEFT_COLOR: u8 = 1;
+const RIGHT_COLOR: u8 = 2;
+const BOTH_COLORS: u8 = LEFT_COLOR | RIGHT_COLOR;
+const DOMINATED: u8 = 4;
+/// Only immutable IDs, topological positions and flags are queued, never full
+/// parent records. A parent is strictly older than its child, so all incoming
+/// flags are combined before pop and a popped node cannot be reinserted.
+#[derive(Default)]
+struct CommonFrontier {
+    pending: BTreeMap<u64, (m::CommitId, u8)>,
+    undominated: usize,
+}
+impl CommonFrontier {
+    fn push(
+        &mut self,
+        node: &StoredNode,
+        flags: u8,
+        output_len: usize,
+        budget: &WorkBudget,
+    ) -> Result<()> {
+        if let Some((id, current)) = self.pending.get_mut(&node.position) {
+            if id.0 != node.commit {
+                return Err(Error::Corrupt);
+            }
+            if *current & DOMINATED == 0 && flags & DOMINATED != 0 {
+                self.undominated -= 1;
+            }
+            *current |= flags;
+        } else {
+            budget.frontier(
+                self.pending
+                    .len()
+                    .checked_add(output_len)
+                    .and_then(|n| n.checked_add(1))
+                    .ok_or(Error::BudgetExceeded)?,
+            )?;
+            self.pending
+                .insert(node.position, (m::CommitId(node.commit), flags));
+            if flags & DOMINATED == 0 {
+                self.undominated += 1;
+            }
+        }
+        Ok(())
+    }
+    fn pop(&mut self) -> Option<(u64, (m::CommitId, u8))> {
+        let item = self.pending.pop_last()?;
+        if item.1.1 & DOMINATED == 0 {
+            self.undominated -= 1;
+        }
+        Some(item)
+    }
+}
 fn validate_prefix(prefix: &str, width: usize) -> Result<()> {
     if prefix.len() > width
         || !prefix

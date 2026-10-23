@@ -395,6 +395,17 @@ fn exhausted_work_is_not_a_negative_and_linear_probes_use_skip_links() {
         budget.nodes_read() < 64,
         "linear history should use logarithmic record probes"
     );
+    let mut common_budget = WorkBudget::new(64, 64, 1024 * 1024, 128);
+    assert_eq!(
+        scope
+            .common_ancestors(&[commits[17]], &[commits[512]], &mut common_budget)
+            .unwrap(),
+        vec![commits[17]]
+    );
+    assert!(
+        common_budget.nodes_read() < 64,
+        "ancestor-related common roots must use chain skips"
+    );
     let mut empty = WorkBudget::new(0, 0, 0, 0);
     assert!(matches!(
         scope.has_id(commits[17], &mut empty),
@@ -544,6 +555,31 @@ fn benchmark_storage_and_scoped_queries() {
             })
             .sum()
     }
+    fn allocated_bytes(path: &Path) -> Option<u64> {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            let mut bytes = std::fs::metadata(path).unwrap().blocks().checked_mul(512)?;
+            for entry in std::fs::read_dir(path).unwrap() {
+                let entry = entry.unwrap();
+                let kind = entry.file_type().unwrap();
+                let allocated = if kind.is_dir() {
+                    allocated_bytes(&entry.path())?
+                } else if kind.is_file() {
+                    entry.metadata().unwrap().blocks().checked_mul(512)?
+                } else {
+                    panic!("unexpected benchmark storage entry")
+                };
+                bytes = bytes.checked_add(allocated)?;
+            }
+            Some(bytes)
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = path;
+            None
+        }
+    }
     fn outcome<T>(result: &Result<T>) -> &'static str {
         match result {
             Ok(_) => "complete",
@@ -601,6 +637,7 @@ fn benchmark_storage_and_scoped_queries() {
             };
             drop(index);
             let closed_file_bytes = file_bytes(&path);
+            let closed_allocated_bytes = allocated_bytes(&path);
             let started = Instant::now();
             let reopened = Index::open(&path, &Limits::default()).unwrap();
             let reopen_ns = started.elapsed().as_nanos();
@@ -627,7 +664,7 @@ fn benchmark_storage_and_scoped_queries() {
             let prefixes = (|| -> Result<()> {
                 let target = commits[size / 3];
                 let text = hex(&target.0);
-                if scope.resolve_commit_prefix(&text[..8], &mut prefix_budget)?
+                if scope.resolve_commit_prefix(&text, &mut prefix_budget)?
                     != PrefixResolution::Single(target)
                 {
                     return Err(Error::Corrupt);
@@ -641,12 +678,14 @@ fn benchmark_storage_and_scoped_queries() {
             drop(scope);
             drop(reopened);
             let final_file_bytes = file_bytes(&path);
+            let final_allocated_bytes = allocated_bytes(&path);
             println!(
                 "{}",
                 serde_json::json!({
                     "benchmark": "tinytree_index_storage_v1", "shape": shape, "commits": size,
                     "canonical_commit_bytes": canonical_bytes, "logical_record_bytes": stats.logical_bytes,
                     "closed_file_bytes": closed_file_bytes, "final_file_bytes": final_file_bytes,
+                    "closed_allocated_bytes": closed_allocated_bytes, "final_allocated_bytes": final_allocated_bytes,
                     "logical_bytes_per_commit": stats.logical_bytes as f64 / size as f64,
                     "logical_to_canonical_ratio": stats.logical_bytes as f64 / canonical_bytes as f64,
                     "ingest_ns": ingest_ns, "reopen_ns": reopen_ns, "scope_ns": scope_ns,
@@ -665,6 +704,16 @@ fn benchmark_storage_and_scoped_queries() {
 #[test]
 fn wide_merge_dag_remains_ready_and_exact_after_reopen() {
     let (directory, index) = fixture();
+    // Earlier position and equal generation force traversal through every
+    // merge parent without reaching this independent branch.
+    let unrelated = add(
+        &index,
+        "repo",
+        &[m::CommitId::ROOT],
+        7,
+        "unrelated earlier branch",
+    )
+    .commit;
     let mut shared = Vec::new();
     for ordinal in 0..32 {
         shared.push(
@@ -699,6 +748,24 @@ fn wide_merge_dag_remains_ready_and_exact_after_reopen() {
                 .unwrap()
         );
     }
+    let both = reopened
+        .scope("repo", &[final_merge.commit, unrelated])
+        .unwrap();
+    let mut bounded = WorkBudget::new(256, 4096, 64 * 1024 * 1024, 128);
+    assert!(
+        !both
+            .is_ancestor(unrelated, final_merge.commit, &mut bounded)
+            .unwrap()
+    );
+    assert!(
+        bounded.nodes_read() < 256,
+        "shared parents must not be repeatedly decoded across merge fan-in"
+    );
+    let mut exhausted = WorkBudget::new(8, 4096, 64 * 1024 * 1024, 128);
+    assert!(matches!(
+        both.is_ancestor(unrelated, final_merge.commit, &mut exhausted),
+        Err(Error::BudgetExceeded)
+    ));
     shared.sort();
     assert_eq!(
         scope
@@ -706,4 +773,99 @@ fn wide_merge_dag_remains_ready_and_exact_after_reopen() {
             .unwrap(),
         shared
     );
+}
+
+#[test]
+fn common_ancestor_sets_match_reference_for_every_crisscross_subset() {
+    let (_directory, index) = fixture();
+    let a = add(&index, "repo", &[m::CommitId::ROOT], 1, "a").commit;
+    let b = add(&index, "repo", &[m::CommitId::ROOT], 2, "b").commit;
+    let c = add(&index, "repo", &[a, b], 3, "c merge").commit;
+    let d = add(&index, "repo", &[b, a], 4, "d crisscross merge").commit;
+    let left_tip = add(&index, "repo", &[c], 5, "left tip").commit;
+    let right_tip = add(&index, "repo", &[d], 6, "right tip").commit;
+    let graph = BTreeMap::from([
+        (m::CommitId::ROOT, Vec::new()),
+        (a, vec![m::CommitId::ROOT]),
+        (b, vec![m::CommitId::ROOT]),
+        (c, vec![a, b]),
+        (d, vec![b, a]),
+        (left_tip, vec![c]),
+        (right_tip, vec![d]),
+    ]);
+    let scope = index.scope("repo", &[left_tip, right_tip]).unwrap();
+    let ids = [a, b, c, d, left_tip, right_tip];
+    let sets: Vec<Vec<_>> = (0..1usize << ids.len())
+        .map(|mask| {
+            ids.iter()
+                .enumerate()
+                .filter_map(|(bit, id)| (mask & (1 << bit) != 0).then_some(*id))
+                .collect()
+        })
+        .collect();
+    for left in &sets {
+        for right in &sets {
+            let common: Vec<_> = graph
+                .keys()
+                .copied()
+                .filter(|candidate| {
+                    left.iter()
+                        .any(|head| reference_ancestor(&graph, *candidate, *head))
+                        && right
+                            .iter()
+                            .any(|head| reference_ancestor(&graph, *candidate, *head))
+                })
+                .collect();
+            let expected: Vec<_> = common
+                .iter()
+                .copied()
+                .filter(|candidate| {
+                    !common.iter().any(|other| {
+                        candidate != other && reference_ancestor(&graph, *candidate, *other)
+                    })
+                })
+                .collect();
+            assert_eq!(
+                scope
+                    .common_ancestors(left, right, &mut WorkBudget::default())
+                    .unwrap(),
+                expected,
+                "left={left:?}, right={right:?}"
+            );
+        }
+    }
+    let mut expected = vec![a, b];
+    expected.sort();
+    assert_eq!(
+        scope
+            .common_ancestors(&[left_tip], &[right_tip], &mut WorkBudget::default())
+            .unwrap(),
+        expected
+    );
+    assert_eq!(
+        scope
+            .common_ancestors(&[c], &[left_tip], &mut WorkBudget::default())
+            .unwrap(),
+        vec![c]
+    );
+    assert_eq!(
+        scope
+            .common_ancestors(
+                &[m::CommitId::ROOT],
+                &[right_tip],
+                &mut WorkBudget::default()
+            )
+            .unwrap(),
+        vec![m::CommitId::ROOT]
+    );
+    let mut aggregate = WorkBudget::new(100_000, 1_000_000, 64 * 1024 * 1024, 3);
+    assert!(matches!(
+        scope.common_ancestors(&[a, b], &[c, d], &mut aggregate),
+        Err(Error::BudgetExceeded)
+    ));
+    let mut read_bound = WorkBudget::new(4, 1_000_000, 64 * 1024 * 1024, 100);
+    assert!(matches!(
+        scope.common_ancestors(&[left_tip], &[right_tip], &mut read_bound),
+        Err(Error::BudgetExceeded)
+    ));
 }
