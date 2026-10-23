@@ -49,6 +49,46 @@ pub struct QueryResources {
 pub struct QueryScope {
     pub handle: [u8; 32],
     pub expires_at_unix_seconds: i64,
+    /// 1 keeps legacy replay history; 2 binds query identities to this handle.
+    pub query_identity_version: u32,
+}
+impl QueryScope {
+    pub fn bound_query_id(&self, nonce: [u8; 16]) -> Result<[u8; 32], Status> {
+        if self.query_identity_version != 2 {
+            return Err(Status::failed_precondition(
+                "native scope does not support bound query identities",
+            ));
+        }
+        let mut hash = blake3::Hasher::new();
+        hash.update(b"native-broker-query-scope-id-v2\0");
+        hash.update(&self.handle);
+        hash.update(&nonce);
+        let mut id = [0; 32];
+        id[..16].copy_from_slice(&nonce);
+        id[16..].copy_from_slice(&hash.finalize().as_bytes()[..16]);
+        Ok(id)
+    }
+    pub fn validate_query_id(&self, id: &[u8; 32]) -> Result<(), Status> {
+        if normalize_query_identity_version(self.query_identity_version)? == 2 {
+            let expected = self.bound_query_id(id[..16].try_into().expect("fixed nonce width"))?;
+            if expected != *id {
+                return Err(Status::invalid_argument(
+                    "native query identity belongs to another scope",
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+/// Zero is the legacy wire default. Explicit version 2 never silently falls back.
+pub fn normalize_query_identity_version(version: u32) -> Result<u32, Status> {
+    match version {
+        0 | 1 => Ok(1),
+        2 => Ok(2),
+        _ => Err(Status::unimplemented(
+            "native query identity version unsupported",
+        )),
+    }
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct QueryHandle {
@@ -60,6 +100,7 @@ pub struct OpenQueryScope {
     pub roots: Vec<CommitId>,
     pub overlay: Vec<Vec<u8>>,
     pub replay_key: [u8; 32],
+    pub query_identity_version: u32,
 }
 #[derive(Clone, Debug)]
 pub struct ForkQueryScope {
@@ -90,6 +131,9 @@ pub struct QueryPage {
 /// Before returning errors, implementations drain noncancellable owned jobs or
 /// transfer their complete owner to those jobs. Never recursively call the same
 /// admitted broker. Close releases logical state and is not proof of EOF.
+/// `begin` prepares a local session; only its first page establishes the upstream
+/// evaluator. Closing its scope before that first page may reject evaluation.
+/// Established unclosed queries retain their page replay until close/expiry.
 #[async_trait]
 pub trait NativeQueryIo: Send + Sync + std::fmt::Debug {
     fn resources(&self) -> QueryResources;

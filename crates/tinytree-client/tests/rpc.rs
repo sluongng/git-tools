@@ -1429,7 +1429,9 @@ enum QueryMode {
     ForkExtendedExpiry,
     ForkParentHandle,
     MalformedScope,
+    LegacyScopeVersion,
     MissingFact,
+    ExtraFact,
     MissingAnswer,
     WrongAnswer,
     WrongDigest,
@@ -1441,6 +1443,8 @@ enum QueryMode {
     WrongShortestKind,
     LongestOverflow,
     EvaluateRetry,
+    EvaluateRetryAfterScopeClose,
+    EvaluatePauseAfter,
     EvaluatePause,
     EvaluateDelay,
     EvaluateMissingExhausted,
@@ -1477,6 +1481,7 @@ struct QueryCounts {
     change_prefixes: AtomicUsize,
     shortest_prefixes: AtomicUsize,
     evaluations: AtomicUsize,
+    lost_final_attempts: AtomicUsize,
     query_closes: AtomicUsize,
     close_query_entered: tokio::sync::Notify,
     close_query_release: tokio::sync::Notify,
@@ -1499,6 +1504,9 @@ impl RepositoryQuery for QueryFaults {
     ) -> Result<Response<q::QueryScope>, Status> {
         let mut reply = self.service.open_scope(request).await?;
         let attempt = self.counts.opens.fetch_add(1, Ordering::SeqCst);
+        if self.mode == QueryMode::LegacyScopeVersion {
+            reply.get_mut().query_identity_version = 0;
+        }
         if matches!(self.mode, QueryMode::RetryOpen | QueryMode::RetryOverlay) {
             if attempt == 0 {
                 *self.first_scope.lock().unwrap() = Some(reply.get_ref().clone());
@@ -1598,6 +1606,7 @@ impl RepositoryQuery for QueryFaults {
             QueryMode::MissingFact => {
                 value.answers.pop();
             }
+            QueryMode::ExtraFact => value.answers.push(value.answers[0].clone()),
             QueryMode::MissingAnswer => value.answers[0].answer = None,
             QueryMode::WrongAnswer => {
                 value.answers[0].answer = Some(q::graph_fact_answer::Answer::IsAncestor(false))
@@ -1669,7 +1678,13 @@ impl RepositoryQuery for QueryFaults {
         if self.mode == QueryMode::EvaluateDelay {
             tokio::time::sleep(Duration::from_millis(200)).await;
         }
+        let close_key = request.get_ref().scope.clone();
+        let close_metadata = request.metadata().clone();
         let mut response = self.service.evaluate(request).await?;
+        if self.mode == QueryMode::EvaluatePauseAfter && attempt == 0 {
+            self.counts.evaluate_entered.notify_one();
+            self.counts.evaluate_release.notified().await;
+        }
         if self.mode == QueryMode::EvaluateRetry {
             if attempt == 0 {
                 *self.first_page.lock().unwrap() = Some(response.get_ref().clone());
@@ -1678,6 +1693,30 @@ impl RepositoryQuery for QueryFaults {
             if attempt == 1 && self.first_page.lock().unwrap().as_ref() != Some(response.get_ref())
             {
                 return Err(Status::data_loss("Evaluate retry changed page bytes"));
+            }
+        }
+        if self.mode == QueryMode::EvaluateRetryAfterScopeClose
+            && response.get_ref().exhausted == Some(true)
+        {
+            let final_attempt = self
+                .counts
+                .lost_final_attempts
+                .fetch_add(1, Ordering::SeqCst);
+            if final_attempt == 0 {
+                *self.first_page.lock().unwrap() = Some(response.get_ref().clone());
+                let mut close = Request::new(q::CloseScopeRequest { scope: close_key });
+                *close.metadata_mut() = close_metadata;
+                self.service.close_scope(close).await?;
+                return Err(Status::unavailable(
+                    "final Evaluate ACK withheld after scope close",
+                ));
+            }
+            if final_attempt == 1
+                && self.first_page.lock().unwrap().as_ref() != Some(response.get_ref())
+            {
+                return Err(Status::data_loss(
+                    "closed-scope final replay changed page bytes",
+                ));
             }
         }
         let page = response.get_mut();
@@ -5090,4 +5129,484 @@ async fn literal_queries_reject_overreturned_rows_without_advancing_ids_or_graph
     }
     client.close_query_scope(&scope).await.unwrap();
     running.stop().await;
+}
+
+#[tokio::test]
+async fn membership_facts_validate_original_expression_before_rpc_even_for_absent_candidates() {
+    use tinytree_model::CommitId;
+    let fixture = setup_query_retained();
+    let running = QueryRunning::start(fixture.service.clone(), QueryMode::Normal).await;
+    let client = running.client().await;
+    let scope = client.open_query_scope(vec![fixture.root]).await.unwrap();
+    let mut wrong_version = ids_commits(&[fixture.root]);
+    wrong_version.version = 2;
+    let missing = q::GraphExpr {
+        version: 1,
+        expression: None,
+    };
+    let huge_id = q::GraphExpr {
+        version: 1,
+        expression: Some(q::graph_expr::Expression::Commits(q::CommitSet {
+            commits: vec![q::CommitId {
+                value: vec![1; running.config.limits.max_request_bytes + 1],
+            }],
+        })),
+    };
+    let reversed = q::GraphExpr {
+        version: 1,
+        expression: Some(q::graph_expr::Expression::Ancestors(Box::new(
+            q::AncestorsExpr {
+                heads: Some(Box::new(ids_commits(&[fixture.root]))),
+                generations: Some(q::GenerationRange {
+                    start: 2,
+                    end_exclusive: Some(1),
+                }),
+                parents: None,
+            },
+        ))),
+    };
+    let too_wide = q::GraphExpr {
+        version: 1,
+        expression: Some(q::graph_expr::Expression::Union(q::SetExpr {
+            inputs: vec![ids_commits(&[]); running.config.limits.max_batch_items],
+        })),
+    };
+    for (name, expression, expected) in [
+        ("unknown version", wrong_version, Code::InvalidArgument),
+        ("missing operator", missing, Code::InvalidArgument),
+        ("oversized malformed ID", huge_id, Code::InvalidArgument),
+        (
+            "reversed generation interval",
+            reversed,
+            Code::InvalidArgument,
+        ),
+        (
+            "aggregate expression nodes",
+            too_wide,
+            Code::ResourceExhausted,
+        ),
+    ] {
+        let error = client
+            .query_facts(
+                &scope,
+                vec![QueryFact::Membership {
+                    expression,
+                    candidate: CommitId([99; 32]),
+                }],
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(error.code(), expected, "{name}");
+    }
+    assert_eq!(
+        running.counts.facts.load(Ordering::SeqCst),
+        0,
+        "invalid original expressions must not be cloned into transport requests"
+    );
+    client.close_query_scope(&scope).await.unwrap();
+    running.stop().await;
+}
+
+#[tokio::test]
+async fn membership_facts_reject_missing_wrong_extra_and_unbound_answers() {
+    for mode in [
+        QueryMode::MissingFact,
+        QueryMode::MissingAnswer,
+        QueryMode::WrongAnswer,
+        QueryMode::ExtraFact,
+        QueryMode::WrongDigest,
+        QueryMode::WrongEpoch,
+        QueryMode::RepeatedEmptyIds,
+    ] {
+        let fixture = setup_query_retained();
+        let running = QueryRunning::start(fixture.service.clone(), mode).await;
+        let client = running.client().await;
+        let scope = client.open_query_scope(vec![fixture.root]).await.unwrap();
+        let error = client
+            .query_facts(
+                &scope,
+                vec![QueryFact::Membership {
+                    expression: ids_ancestors(fixture.root),
+                    candidate: fixture.root,
+                }],
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(error.code(), Code::DataLoss | Code::ResourceExhausted),
+            "{mode:?}: {error}"
+        );
+        client.close_query_scope(&scope).await.unwrap();
+        running.stop().await;
+    }
+}
+
+#[tokio::test]
+async fn repeated_membership_facts_do_not_consume_resumable_query_history() {
+    use tinytree_model::CommitId;
+    let mut config = ServiceConfig::default();
+    config.query.max_queries = 2;
+    config.query.max_queries_per_principal = 2;
+    config.query.max_queries_per_repository = 2;
+    config.query.max_query_replays = 128;
+    config.query.max_query_replays_per_principal = 128;
+    config.query.max_query_replays_per_repository = 128;
+    let fixture = setup_query_configured(config);
+    let running = QueryRunning::start(fixture.service.clone(), QueryMode::Normal).await;
+    let client = running.client().await;
+    let scope = client.open_query_scope(vec![fixture.root]).await.unwrap();
+    for _ in 0..160 {
+        assert_eq!(
+            client
+                .query_facts(
+                    &scope,
+                    vec![
+                        QueryFact::Membership {
+                            expression: ids_ancestors(fixture.root),
+                            candidate: fixture.root
+                        },
+                        QueryFact::Membership {
+                            expression: ids_commits(&[fixture.root]),
+                            candidate: CommitId::ROOT
+                        },
+                        QueryFact::Membership {
+                            expression: ids_ancestors(fixture.root),
+                            candidate: CommitId([99; 32])
+                        },
+                    ]
+                )
+                .await
+                .unwrap(),
+            vec![
+                FactAnswer::Membership(true),
+                FactAnswer::Membership(false),
+                FactAnswer::Membership(false)
+            ]
+        );
+    }
+    assert_eq!(running.counts.facts.load(Ordering::SeqCst), 160);
+    assert_eq!(running.counts.evaluations.load(Ordering::SeqCst), 0);
+    assert_eq!(running.counts.query_closes.load(Ordering::SeqCst), 0);
+    // The real resumable registry remains usable beyond its replay quota.
+    let mut query = client
+        .begin_query(&scope, &ids_commits(&[fixture.root]), 1)
+        .await
+        .unwrap();
+    let page = client.evaluate_page(&mut query).await.unwrap();
+    assert_eq!(page.rows[0].commit, fixture.root);
+    client.close_ids_query(&mut query).await.unwrap();
+    client.close_query_scope(&scope).await.unwrap();
+    running.stop().await;
+}
+
+fn single_query_history_config() -> ServiceConfig {
+    let mut config = ServiceConfig::default();
+    config.query.max_queries = 1;
+    config.query.max_queries_per_principal = 1;
+    config.query.max_queries_per_repository = 1;
+    config.query.max_query_replays = 1;
+    config.query.max_query_replays_per_principal = 1;
+    config.query.max_query_replays_per_repository = 1;
+    config
+}
+
+#[tokio::test]
+async fn v2_query_identity_negotiation_binds_exact_scope_and_preserves_legacy_bytes() {
+    let fixture = setup_query_retained();
+    let running = QueryRunning::start(fixture.service.clone(), QueryMode::Normal).await;
+    let client = running.client().await;
+    let legacy = client.open_query_scope(vec![fixture.root]).await.unwrap();
+    assert_eq!(legacy.query_identity_version(), 1);
+    let literal = ids_commits(&[fixture.root]);
+    let exact = [37; 32];
+    let legacy_query = client
+        .begin_query_with_id(&legacy, &literal, 1, exact)
+        .await
+        .unwrap();
+    assert_eq!(legacy_query.query_id(), &exact);
+    drop(legacy_query);
+    let first = client
+        .open_query_scope_v2(vec![fixture.root])
+        .await
+        .unwrap();
+    let second = client
+        .open_query_scope_v2(vec![fixture.root])
+        .await
+        .unwrap();
+    assert_eq!(first.query_identity_version(), 2);
+    let id = first.bound_query_id([11; 16]).unwrap();
+    assert_eq!(&id[..16], &[11; 16]);
+    assert_ne!(id, second.bound_query_id([11; 16]).unwrap());
+    let mut query = client
+        .begin_query_with_id(&first, &literal, 1, id)
+        .await
+        .unwrap();
+    assert_eq!(query.query_id(), &id);
+    assert_eq!(
+        client
+            .begin_query_with_id(&second, &literal, 1, id)
+            .await
+            .unwrap_err()
+            .code(),
+        Code::InvalidArgument
+    );
+    assert_eq!(
+        client
+            .begin_query_with_id(&first, &literal, 1, exact)
+            .await
+            .unwrap_err()
+            .code(),
+        Code::InvalidArgument
+    );
+    client.evaluate_page(&mut query).await.unwrap();
+    client.close_ids_query(&mut query).await.unwrap();
+    let child = client.fork_query_scope(&first, vec![]).await.unwrap();
+    assert_eq!(child.query_identity_version(), 2);
+    assert_ne!(child.bound_query_id([11; 16]).unwrap(), id);
+    for scope in [&legacy, &first, &second, &child] {
+        client.close_query_scope(scope).await.unwrap();
+    }
+    // Mode is part of the identity namespace. Retiring closed v2 history does
+    // not revoke legacy v1's ability to use arbitrary raw identity bytes.
+    let legacy_reuse = client.open_query_scope(vec![fixture.root]).await.unwrap();
+    let mut reused = client
+        .begin_query_with_id(&legacy_reuse, &literal, 1, id)
+        .await
+        .unwrap();
+    assert_eq!(reused.query_id(), &id);
+    assert_eq!(
+        client.evaluate_page(&mut reused).await.unwrap().rows[0].commit,
+        fixture.root
+    );
+    client.close_ids_query(&mut reused).await.unwrap();
+    client.close_query_scope(&legacy_reuse).await.unwrap();
+    running.stop().await;
+    let running = QueryRunning::start(fixture.service.clone(), QueryMode::LegacyScopeVersion).await;
+    let client = running.client().await;
+    let legacy = client.open_query_scope(vec![fixture.root]).await.unwrap();
+    assert_eq!(legacy.query_identity_version(), 1);
+    assert_eq!(
+        client
+            .open_query_scope_v2(vec![fixture.root])
+            .await
+            .unwrap_err()
+            .code(),
+        Code::DataLoss,
+        "explicit v2 must not accept an unnegotiated response"
+    );
+    client.close_query_scope(&legacy).await.unwrap();
+    running.stop().await;
+}
+
+#[tokio::test]
+async fn closed_v2_scope_retires_only_explicitly_closed_queries_in_both_close_orders() {
+    let fixture = setup_query_configured(single_query_history_config());
+    let running = QueryRunning::start(fixture.service.clone(), QueryMode::Normal).await;
+    let client = running.client().await;
+    for scope_first in [false, true] {
+        for _ in 0..8 {
+            let scope = client
+                .open_query_scope_v2(vec![fixture.root])
+                .await
+                .unwrap();
+            let mut query = client
+                .begin_query(&scope, &ids_commits(&[fixture.root]), 1)
+                .await
+                .unwrap();
+            let id = *query.query_id();
+            client.evaluate_page(&mut query).await.unwrap();
+            if scope_first {
+                client.close_query_scope(&scope).await.unwrap();
+            }
+            client.close_ids_query(&mut query).await.unwrap();
+            if !scope_first {
+                client.close_query_scope(&scope).await.unwrap();
+            }
+            let mut late = client
+                .begin_query_with_id(&scope, &ids_commits(&[fixture.root]), 1, id)
+                .await
+                .unwrap();
+            assert_eq!(
+                client.evaluate_page(&mut late).await.unwrap_err().code(),
+                Code::FailedPrecondition
+            );
+            client.close_ids_query(&mut late).await.unwrap();
+        }
+    }
+    // A raw pre-Evaluate close creates an ordered tombstone; the SDK correctly
+    // avoids sending cleanup for a locally prepared but unattempted query.
+    let channel = tonic::transport::Endpoint::from_shared(running.config.endpoint.clone())
+        .unwrap()
+        .connect()
+        .await
+        .unwrap();
+    let mut raw = q::repository_query_client::RepositoryQueryClient::new(channel)
+        .send_compressed(tonic::codec::CompressionEncoding::Zstd)
+        .accept_compressed(tonic::codec::CompressionEncoding::Zstd);
+    for _ in 0..4 {
+        let scope = client
+            .open_query_scope_v2(vec![fixture.root])
+            .await
+            .unwrap();
+        let id = scope.bound_query_id([55; 16]).unwrap();
+        let close_request = || {
+            let mut request = Request::new(q::CloseQueryRequest {
+                scope: Some(q::ScopeKey {
+                    repository_id: scope.repository_id().into(),
+                    handle: scope.handle().to_vec(),
+                }),
+                query_id: id.to_vec(),
+            });
+            request
+                .metadata_mut()
+                .insert("authorization", format!("Bearer {TOKEN}").parse().unwrap());
+            request
+        };
+        raw.close_query(close_request()).await.unwrap();
+        let mut late = client
+            .begin_query_with_id(&scope, &ids_commits(&[fixture.root]), 1, id)
+            .await
+            .unwrap();
+        assert_eq!(
+            client.evaluate_page(&mut late).await.unwrap_err().code(),
+            Code::FailedPrecondition,
+            "pre-Evaluate tombstone must prevent a late first request"
+        );
+        client.close_query_scope(&scope).await.unwrap();
+        raw.close_query(close_request()).await.unwrap();
+        client.close_ids_query(&mut late).await.unwrap();
+    }
+    running.stop().await;
+    // Legacy closed history intentionally remains fenced until original expiry.
+    let fixture = setup_query_configured(single_query_history_config());
+    let running = QueryRunning::start(fixture.service.clone(), QueryMode::Normal).await;
+    let client = running.client().await;
+    let scope = client.open_query_scope(vec![fixture.root]).await.unwrap();
+    let mut query = client
+        .begin_query(&scope, &ids_commits(&[fixture.root]), 1)
+        .await
+        .unwrap();
+    client.evaluate_page(&mut query).await.unwrap();
+    client.close_ids_query(&mut query).await.unwrap();
+    client.close_query_scope(&scope).await.unwrap();
+    let next = client.open_query_scope(vec![fixture.root]).await.unwrap();
+    let mut query = client
+        .begin_query(&next, &ids_commits(&[fixture.root]), 1)
+        .await
+        .unwrap();
+    assert_eq!(
+        client.evaluate_page(&mut query).await.unwrap_err().code(),
+        Code::ResourceExhausted
+    );
+    client.close_query_scope(&next).await.unwrap();
+    drop(query);
+    running.stop().await;
+}
+
+#[tokio::test]
+async fn closed_v2_scope_keeps_lost_final_replay_until_explicit_query_close() {
+    let fixture = setup_query_configured(single_query_history_config());
+    let running = QueryRunning::start(
+        fixture.service.clone(),
+        QueryMode::EvaluateRetryAfterScopeClose,
+    )
+    .await;
+    let client = running.client().await;
+    let scope = client
+        .open_query_scope_v2(vec![fixture.root])
+        .await
+        .unwrap();
+    let mut query = client
+        .begin_query(&scope, &ids_commits(&[fixture.root]), 1)
+        .await
+        .unwrap();
+    let mut selected = Vec::new();
+    while !query.is_exhausted() {
+        let page = client.evaluate_page(&mut query).await.unwrap();
+        selected.extend(page.rows.into_iter().map(|row| row.commit));
+    }
+    assert_eq!(selected, vec![fixture.root]);
+    assert_eq!(
+        running.counts.lost_final_attempts.load(Ordering::SeqCst),
+        2,
+        "the actual final response must replay exactly once after its ACK is withheld"
+    );
+    let next = client
+        .open_query_scope_v2(vec![fixture.root])
+        .await
+        .unwrap();
+    let mut blocked = client
+        .begin_query(&next, &ids_commits(&[fixture.root]), 1)
+        .await
+        .unwrap();
+    assert_eq!(
+        client.evaluate_page(&mut blocked).await.unwrap_err().code(),
+        Code::ResourceExhausted,
+        "EOF alone must not release lost-page replay history"
+    );
+    client.close_ids_query(&mut query).await.unwrap();
+    let mut selected = Vec::new();
+    while !blocked.is_exhausted() {
+        selected.extend(
+            client
+                .evaluate_page(&mut blocked)
+                .await
+                .unwrap()
+                .rows
+                .into_iter()
+                .map(|row| row.commit),
+        );
+    }
+    assert_eq!(selected, vec![fixture.root]);
+    client.close_ids_query(&mut blocked).await.unwrap();
+    client.close_query_scope(&next).await.unwrap();
+    running.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn v2_scope_close_orders_against_inflight_creation_and_existing_pages() {
+    for (mode, created) in [
+        (QueryMode::EvaluatePause, false),
+        (QueryMode::EvaluatePauseAfter, true),
+    ] {
+        let fixture = setup_query_configured(single_query_history_config());
+        let running = QueryRunning::start(fixture.service.clone(), mode).await;
+        let client = running.client().await;
+        let control = running.client().await;
+        let scope = client
+            .open_query_scope_v2(vec![fixture.root])
+            .await
+            .unwrap();
+        let mut query = client
+            .begin_query(&scope, &ids_ancestors(fixture.root), 1)
+            .await
+            .unwrap();
+        let caller = client.clone();
+        let task = tokio::spawn(async move {
+            let result = caller.evaluate_page(&mut query).await;
+            (result, query)
+        });
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            running.counts.evaluate_entered.notified(),
+        )
+        .await
+        .unwrap();
+        // The paused Evaluate holds its physical byte budget. A separate
+        // control connection exercises the server race without waiting for
+        // another full unary reservation in that deliberately paused pool.
+        control.close_query_scope(&scope).await.unwrap();
+        running.counts.evaluate_release.notify_one();
+        let (result, mut query) = task.await.unwrap();
+        if created {
+            assert!(!result.unwrap().exhausted);
+            while !query.is_exhausted() {
+                client.evaluate_page(&mut query).await.unwrap();
+            }
+        } else {
+            assert_eq!(result.unwrap_err().code(), Code::FailedPrecondition);
+        }
+        client.close_ids_query(&mut query).await.unwrap();
+        running.stop().await;
+    }
 }

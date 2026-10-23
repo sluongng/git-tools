@@ -1,0 +1,37 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Son Luong Ngoc <26684313+sluongng@users.noreply.github.com>
+Date: Fri, 23 Oct 2026 19:56:00 +0000
+Subject: [PATCH] jj: Merge prepared read-only indexes
+
+A custom index can prepare a complete immutable remote checkpoint
+without constructing another ReadonlyRepo. Importing that checkpoint
+before loading selected commits lets the repository use exact index
+membership instead of walking their public ancestry.
+
+Expose a narrow read-only-index merge entry point and delegate the
+existing repository-based helper to it. Compatibility checks remain
+with the index backend. This does not expose mutable index internals,
+admit objects or change repository views and references.
+
+---
+diff --git a/src/repo.rs b/src/repo.rs
+--- a/src/repo.rs
++++ b/src/repo.rs
+@@ -2057,7 +2057,16 @@
+     }
+ 
+     pub fn merge_index(&mut self, other_repo: &ReadonlyRepo) -> IndexResult<()> {
+-        self.index.merge_in(other_repo.readonly_index())
++        self.merge_index_from(other_repo.readonly_index())
++    }
++
++    /// Merges an already prepared read-only index without changing the view.
++    ///
++    /// Index backends can use this to import an immutable remote checkpoint
++    /// before loading its selected commits. The index implementation checks
++    /// compatibility; this method does not admit objects or update references.
++    pub fn merge_index_from(&mut self, other_index: &dyn ReadonlyIndex) -> IndexResult<()> {
++        self.index.merge_in(other_index)
+     }
+ 
+     async fn merge_view(&mut self, base: &View, other: &View) -> Result<(), RepoLoaderError> {

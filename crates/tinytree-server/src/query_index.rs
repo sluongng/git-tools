@@ -386,6 +386,7 @@ struct Record {
     digest: [u8; 32],
     binding: [u8; 32],
     expires: i64,
+    query_identity_version: u32,
     scope: Option<Arc<Scoped>>,
     _memory: Arc<OwnedSemaphorePermit>,
 }
@@ -637,11 +638,37 @@ impl QueryHost {
             .clone()
             .ok_or_else(|| Status::failed_precondition("query scope is closed"))
     }
+    /// The registry keeps the identity mode after logical scope closure.
+    /// Never retain this registry lock while acquiring the cursor registry.
+    pub(crate) fn scope_status(
+        &self,
+        owner: &str,
+        repository: &str,
+        handle: &[u8],
+    ) -> Result<Option<(u32, bool)>, Status> {
+        let id: [u8; 32] = handle
+            .try_into()
+            .map_err(|_| Status::invalid_argument("invalid scope handle"))?;
+        let registry = self.registry.lock().unwrap();
+        let Some(record) = registry.records.get(&id) else {
+            return Ok(None);
+        };
+        if record.owner != owner || record.repository != repository {
+            return Err(Status::permission_denied("query scope access denied"));
+        }
+        if record.expires <= now()? {
+            return Ok(None);
+        }
+        Ok(Some((
+            record.query_identity_version,
+            record.scope.is_none(),
+        )))
+    }
     pub fn close(&self, owner: &str, repository: &str, handle: &[u8]) -> Result<(), Status> {
         let id: [u8; 32] = handle
             .try_into()
             .map_err(|_| Status::invalid_argument("invalid scope handle"))?;
-        let scope = {
+        let (scope, version) = {
             let mut registry = self.registry.lock().unwrap();
             let Some(record) = registry.records.get_mut(&id) else {
                 return Ok(());
@@ -649,8 +676,13 @@ impl QueryHost {
             if record.owner != owner || record.repository != repository {
                 return Err(Status::permission_denied("query scope access denied"));
             }
-            record.scope.take()
+            (record.scope.take(), record.query_identity_version)
         };
+        // Establish closure before retiring records. Evaluate's creation path
+        // locks cursor -> scope; never invert that order while holding scope.
+        if version == 2 {
+            self.cursors.retire_closed(owner, repository, id);
+        }
         drop(scope);
         Ok(())
     }
@@ -757,6 +789,9 @@ impl QueryHost {
         parent: Option<q::ScopeKey>,
     ) -> Result<Arc<Prepared>, Status> {
         let repository = &header.repository_id;
+        if !matches!(header.version, 1 | 2) {
+            return Err(Status::invalid_argument("unsupported query scope version"));
+        }
         self.store
             .references(repository, &[])
             .map_err(|_| Status::not_found("native repository unavailable"))?;
@@ -788,6 +823,11 @@ impl QueryHost {
                 return Err(Status::invalid_argument("fork parent repository differs"));
             }
             let base = self.lookup(owner, repository, &parent.handle)?;
+            if base.wire.query_identity_version != header.version {
+                return Err(Status::invalid_argument(
+                    "fork scope identity version mismatch",
+                ));
+            }
             if base.scope.roots() != roots.as_slice() {
                 return Err(Status::invalid_argument(
                     "fork remote roots differ from parent",
@@ -859,6 +899,7 @@ impl QueryHost {
                 index_epoch: scope.epoch().to_vec(),
                 high_water: scope.high_water(),
                 expires_at_unix_seconds: now + self.config.scope_ttl_seconds as i64,
+                query_identity_version: header.version,
             };
             let graph = OverlayGraph::remote(scope.clone());
             (
@@ -1022,6 +1063,7 @@ impl QueryHost {
             index_epoch: prepared.base.scope.epoch().to_vec(),
             high_water: prepared.base.scope.high_water(),
             expires_at_unix_seconds: expires,
+            query_identity_version: header.version,
         };
         let scope = Arc::new(Scoped {
             scope: prepared.base.scope.clone(),
@@ -1042,6 +1084,7 @@ impl QueryHost {
                 digest,
                 binding: prepared.binding,
                 expires,
+                query_identity_version: header.version,
                 scope: Some(scope.clone()),
                 _memory: memory,
             },

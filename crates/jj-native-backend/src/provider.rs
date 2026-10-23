@@ -201,6 +201,19 @@ pub trait NativeObjectIo: Send + Sync + fmt::Debug {
     }
     async fn write_metadata(&self, object: m::Object) -> BackendResult<m::Descriptor>;
     async fn read_file(&self, id: m::FileId) -> BackendResult<FileRead>;
+    /// Ordinary file delivery whose owner follows all physical hydration,
+    /// verification, spool work and returned readers after waiter cancellation.
+    /// Unlike `read_file_for_cache`, this does not promise non-recursive cache I/O.
+    async fn read_file_with_owner(
+        &self,
+        _id: m::FileId,
+        _owner: Arc<dyn std::any::Any + Send + Sync>,
+    ) -> BackendResult<FileRead> {
+        Err(other(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "native provider does not support owned file reads",
+        )))
+    }
     /// Delivery into an already admitted cache fetch. Implementations MUST NOT
     /// hydrate through that cache (including under another artifact scope).
     /// `owner` must follow physical work and pinned readers past cancellation.
@@ -237,6 +250,8 @@ pub struct DirectObjectIo {
     staging_uploads: Arc<tokio::sync::Semaphore>,
     #[cfg(test)]
     metadata_put_hook: Option<Arc<dyn Fn() + Send + Sync>>,
+    #[cfg(test)]
+    file_read_hook: Option<Arc<dyn Fn() + Send + Sync>>,
 }
 // Field order is part of the admission contract: destroy payloads and their
 // physical storage/staging owners before releasing the external operation owner.
@@ -275,6 +290,11 @@ impl DirectObjectIo {
     pub(crate) fn set_metadata_put_hook(&mut self, hook: Arc<dyn Fn() + Send + Sync>) {
         self.metadata_put_hook = Some(hook);
     }
+    #[cfg(test)]
+    pub(crate) fn set_file_read_hook(&mut self, hook: Arc<dyn Fn() + Send + Sync>) {
+        self.file_read_hook = Some(hook);
+    }
+
     /// Install fetched or authored immutable bytes while retaining the caller's
     /// complete admission/lifetime owner through actual blocking encode/put.
     /// This does not publish operation roots or create retention authority.
@@ -418,6 +438,8 @@ impl DirectObjectIo {
             copy_gate: Arc::new(tokio::sync::Mutex::new(())),
             #[cfg(test)]
             metadata_put_hook: None,
+            #[cfg(test)]
+            file_read_hook: None,
         })
     }
     async fn reserve_staging(
@@ -495,6 +517,13 @@ impl NativeObjectIo for DirectObjectIo {
         }
         FileRead::from_preverified_pinned_source(descriptor, Box::pin(io::Reader::new(lease)))
     }
+    async fn read_file_with_owner(
+        &self,
+        id: m::FileId,
+        owner: Arc<dyn std::any::Any + Send + Sync>,
+    ) -> BackendResult<FileRead> {
+        self.read_file_for_cache(id, owner).await
+    }
     async fn read_file_for_cache(
         &self,
         id: m::FileId,
@@ -514,10 +543,10 @@ impl NativeObjectIo for DirectObjectIo {
         if descriptor.size_bytes > self.config.store.max_file_bytes {
             return Err(invalid("native file exceeds configured limit"));
         }
-        FileRead::from_preverified_pinned_source(
-            descriptor,
-            Box::pin(io::Reader::for_delivery(lease, owner)),
-        )
+        let reader = io::Reader::for_delivery(lease, owner);
+        #[cfg(test)]
+        let reader = reader.with_read_hook(self.file_read_hook.clone());
+        FileRead::from_preverified_pinned_source(descriptor, Box::pin(reader))
     }
     async fn write_file(
         &self,

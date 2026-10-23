@@ -3,7 +3,8 @@ use std::{
     fs::{self, File, OpenOptions},
     io::{self, Read, Write},
     path::{Component, Path, PathBuf},
-    sync::Arc,
+    sync::{Arc, Mutex, OnceLock},
+    time::{Duration, Instant},
 };
 
 use jj_lib::{
@@ -155,6 +156,199 @@ fn load(path: &Path) -> Result<Box<dyn Backend>, BackendLoadError> {
     restore().map_err(BackendLoadError)
 }
 
+// Handles do not retain repository/index cores. A bounded process-exit drain
+// completes accepted cleanup after all command-owned repositories are dropped.
+static CLEANUP: OnceLock<Mutex<Vec<jj_native_index::CleanupHandle>>> = OnceLock::new();
+fn cleanup_capacity() -> Result<(), Failure> {
+    if CLEANUP
+        .get_or_init(Default::default)
+        .lock()
+        .map_err(|_| io::Error::other("native cleanup registry unavailable"))?
+        .len()
+        >= 64
+    {
+        return Err(io::Error::other("native index loader capacity exceeded").into());
+    }
+    Ok(())
+}
+fn retain_cleanup(index: &jj_native_index::NativeIndexStore) -> Result<(), Failure> {
+    let mut handles = CLEANUP
+        .get_or_init(Default::default)
+        .lock()
+        .map_err(|_| io::Error::other("native cleanup registry unavailable"))?;
+    if handles.len() >= 64 {
+        return Err(io::Error::other("native index loader capacity exceeded").into());
+    }
+    handles.push(index.cleanup_handle());
+    Ok(())
+}
+pub(crate) fn drain_cleanup() {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let handles = CLEANUP
+        .get_or_init(Default::default)
+        .lock()
+        .map(|mut h| std::mem::take(&mut *h));
+    let failure = match handles {
+        Ok(handles) => {
+            let mut first = None;
+            for handle in handles {
+                let left = deadline.saturating_duration_since(Instant::now());
+                let result = if left.is_zero() {
+                    Err(jj_native_index::Error::Query(tonic::Code::DeadlineExceeded))
+                } else {
+                    handle.wait(left)
+                };
+                if let Err(error) = result {
+                    let code = match error {
+                        jj_native_index::Error::Query(code) => code,
+                        _ => tonic::Code::Internal,
+                    };
+                    first.get_or_insert(handle.first_failure().unwrap_or(("driver", "wait", code)));
+                }
+            }
+            first
+        }
+        Err(_) => Some(("driver", "registry", tonic::Code::Internal)),
+    };
+    if let Some((operation, origin, code)) = failure {
+        // Codes are a fixed public enum. Never print transport messages, opaque
+        // query handles, provider identities or local connection paths here.
+        eprintln!(
+            "Warning: native query cleanup remains pending ({operation}/{origin}: {code:?}); bounded server expiry will reclaim it."
+        );
+    }
+}
+
+fn query_client(locator: &Locator) -> Result<native_broker::BrokerQueryClient, Failure> {
+    let locator = locator.clone();
+    std::thread::spawn(move || {
+        futures::executor::block_on(native_broker::BrokerQueryClient::connect(
+            locator.socket,
+            locator.store,
+            Default::default(),
+        ))
+    })
+    .join()
+    .map_err(|_| io::Error::other("native query loader failed"))?
+    .map_err(|e| Box::new(e) as Failure)
+}
+fn description(
+    query: &native_broker::BrokerQueryClient,
+) -> Result<native_broker::ProviderDescription, Failure> {
+    let query = query.clone();
+    std::thread::spawn(move || futures::executor::block_on(query.describe_provider()))
+        .join()
+        .map_err(|_| io::Error::other("native provider handshake failed"))?
+        .map_err(|e| Box::new(e) as Failure)
+}
+/// Creation policy is live, not persisted trust. Existing repositories instead
+/// select the factory named by their recorded index/type.
+pub(crate) fn creation_policy(
+    locator: &Locator,
+) -> Result<native_broker::ProviderIndexMode, Failure> {
+    let description = description(&query_client(locator)?)?;
+    if description.index_mode == native_broker::ProviderIndexMode::Federated {
+        #[cfg(windows)]
+        return Err(
+            io::Error::other("federated native index writers are unsupported on Windows").into(),
+        );
+        if !description.query_capable {
+            return Err(io::Error::other(
+                "federated native index requires a query-capable provider",
+            )
+            .into());
+        }
+    }
+    Ok(description.index_mode)
+}
+fn open_index(
+    path: &Path,
+    initial: Option<(&jj_lib::backend::CommitId, &jj_lib::op_store::OperationId)>,
+) -> Result<Box<dyn jj_lib::index::IndexStore>, Failure> {
+    use jj_lib::object_id::ObjectId as _;
+    cleanup_capacity()?;
+    #[cfg(windows)]
+    return Err(
+        io::Error::other("federated native index writers are unsupported on Windows").into(),
+    );
+    #[cfg(not(windows))]
+    {
+        let store_path = path
+            .parent()
+            .ok_or_else(|| io::Error::other("native index has no repository"))?
+            .join("store");
+        let locator = locator(&store_path)?;
+        let query = query_client(&locator)?;
+        let live = description(&query)?;
+        if !live.query_capable {
+            return Err(io::Error::other("native index provider has no query capability").into());
+        }
+        let config = jj_native_index::Config {
+            endpoint: jj_native_index::Endpoint::UnixSocket(locator.socket.clone()),
+            store_alias: locator.store.clone(),
+            provider_fingerprint: live.identity,
+        };
+        let objects = std::thread::spawn(move || {
+            futures::executor::block_on(native_broker::BrokerObjectIo::connect(
+                locator.socket,
+                locator.store,
+                store_path.join(SPOOL),
+                Default::default(),
+            ))
+        })
+        .join()
+        .map_err(|_| io::Error::other("native index object loader failed"))??;
+        let objects: Arc<dyn jj_native_backend::NativeObjectIo> = Arc::new(objects);
+        let index = match initial {
+            Some((root, operation)) => {
+                let root = tinytree_model::CommitId::from_slice(root.as_bytes())?;
+                let operation: &[u8; 64] = operation
+                    .as_bytes()
+                    .try_into()
+                    .map_err(|_| io::Error::other("invalid root operation width"))?;
+                jj_native_index::NativeIndexStore::init_fresh_for_root_operation(
+                    path,
+                    config,
+                    Default::default(),
+                    Arc::new(query),
+                    objects,
+                    vec![root],
+                    operation,
+                )?
+            }
+            None => jj_native_index::NativeIndexStore::open(
+                path,
+                &config,
+                Default::default(),
+                Arc::new(query),
+                objects,
+            )?,
+        };
+        retain_cleanup(&index)?;
+        Ok(Box::new(index))
+    }
+}
+pub(crate) fn init_index(
+    path: &Path,
+    mode: native_broker::ProviderIndexMode,
+    settings: &jj_lib::settings::UserSettings,
+    root: &jj_lib::backend::CommitId,
+    operation: &jj_lib::op_store::OperationId,
+) -> Result<Box<dyn jj_lib::index::IndexStore>, BackendInitError> {
+    match mode {
+        native_broker::ProviderIndexMode::Legacy => {
+            jj_lib::repo::ReadonlyRepo::default_index_store_initializer()(settings, path)
+        }
+        native_broker::ProviderIndexMode::Federated => {
+            open_index(path, Some((root, operation))).map_err(BackendInitError)
+        }
+    }
+}
+
 pub(crate) fn register(factories: &mut StoreFactories) {
     factories.add_backend(NativeBackend::NAME, Box::new(|_, path| load(path)));
+    factories.add_index_store(
+        jj_native_index::NAME,
+        Box::new(|_, path| open_index(path, None).map_err(BackendLoadError)),
+    );
 }

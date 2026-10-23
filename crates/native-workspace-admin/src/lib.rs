@@ -512,6 +512,16 @@ impl WorkspaceLoader for Loader {
     }
 }
 
+/// Native initializer with the actual root operation captured from the op-store
+/// initializer, before jj first asks the index store for that operation.
+pub type RootOperationIndexInitializer<'a> = dyn Fn(
+        &UserSettings,
+        &Path,
+        &OperationId,
+    )
+        -> std::result::Result<Box<dyn jj_lib::index::IndexStore>, jj_lib::backend::BackendInitError>
+    + 'a;
+
 /// Initialize only after the caller has obtained/admitted an initial native
 /// commit and started its matching lazy mount. Failures preserve an explicit
 /// journal and all partial authoritative state; no cleanup/reset is attempted.
@@ -525,6 +535,35 @@ pub async fn initialize(
     connector: Arc<dyn ProjectionConnector>,
     initial_commit: &CommitId,
     workspace_name: WorkspaceNameBuf,
+) -> Result<(Workspace, Arc<ReadonlyRepo>)> {
+    let index_initializer = |settings: &UserSettings, path: &Path, _: &OperationId| {
+        ReadonlyRepo::default_index_store_initializer()(settings, path)
+    };
+    initialize_with_index(
+        registry,
+        binding,
+        settings,
+        backend_initializer,
+        signer,
+        connector,
+        initial_commit,
+        workspace_name,
+        &index_initializer,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn initialize_with_index(
+    registry: &Registry,
+    binding: &Binding,
+    settings: &UserSettings,
+    backend_initializer: &BackendInitializer<'_>,
+    signer: Signer,
+    connector: Arc<dyn ProjectionConnector>,
+    initial_commit: &CommitId,
+    workspace_name: WorkspaceNameBuf,
+    index_initializer: &RootOperationIndexInitializer<'_>,
 ) -> Result<(Workspace, Arc<ReadonlyRepo>)> {
     registry.validate(binding)?;
     validate_marker(binding)?;
@@ -556,15 +595,29 @@ pub async fn initialize(
     };
     admin.replace(JOURNAL, &bounded_encode(&journal)?)?;
     let repo_directory = PrivateDir::create(&binding.repo)?;
+    let root_operation = std::cell::RefCell::new(None::<OperationId>);
+    let op_initializer: &jj_lib::repo::OpStoreInitializer<'_> = &|settings, path, root_data| {
+        let store = ReadonlyRepo::default_op_store_initializer()(settings, path, root_data)?;
+        *root_operation.borrow_mut() = Some(store.root_operation_id().clone());
+        Ok(store)
+    };
+    let captured_index_initializer: &jj_lib::repo::IndexStoreInitializer<'_> = &|settings, path| {
+        let root = root_operation.borrow().clone().ok_or_else(|| {
+            jj_lib::backend::BackendInitError(Box::new(std::io::Error::other(
+                "root operation unavailable before native index initialization",
+            )))
+        })?;
+        index_initializer(settings, path, &root)
+    };
     let repo = ReadonlyRepo::init(
         settings,
         repo_directory.path(),
         backend_initializer,
         signer,
         ReadonlyRepo::default_workspace_store_initializer(),
-        ReadonlyRepo::default_op_store_initializer(),
+        op_initializer,
         ReadonlyRepo::default_op_heads_store_initializer(),
-        ReadonlyRepo::default_index_store_initializer(),
+        captured_index_initializer,
         ReadonlyRepo::default_submodule_store_initializer(),
     )
     .await?;

@@ -32,6 +32,7 @@ uuid = { version = "1", features = ["v4"] }
 libc = "0.2"
 
 [dev-dependencies]
+jj-native-index = { path = "../jj-native-index" }
 tinytree-index = { path = "../tinytree-index" }
 output-core = { path = "../output-core" }
 native-workspace = { path = "../native-workspace" }

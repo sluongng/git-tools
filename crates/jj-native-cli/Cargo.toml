@@ -25,6 +25,7 @@ tempfile = "3"
 uuid = { version = "1", features = ["v4"] }
 jj-cli = { version = "=0.46.0", default-features = false }
 jj-lib = { version = "=0.46.0", default-features = false }
+jj-native-index = { path = "../jj-native-index" }
 jj-native-backend = { path = "../jj-native-backend" }
 native-broker = { path = "../native-broker" }
 tinytree-model = { path = "../tinytree-model" }
@@ -32,11 +33,12 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 toml = "1.1"
 
+tonic = { version = "0.14", features = ["zstd"] }
+
 [dev-dependencies]
 tinytree-index = { path = "../tinytree-index" }
 tinytree-client = { path = "../tinytree-client" }
 http = "1"
-tonic = { version = "0.14", features = ["zstd"] }
 tower = { version = "0.5", features = ["util"] }
 futures = "0.3"
 serde_json = "1"

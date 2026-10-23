@@ -156,6 +156,24 @@ impl Fixture {
             .push(("TINYTREE_MOUNT_TEST_TOKEN".into(), REMOTE_TOKEN.into()));
     }
 
+    fn index_mode(&mut self, mode: &str) {
+        let mut config: toml::Value =
+            toml::from_str(&fs::read_to_string(&self.daemon_config).unwrap()).unwrap();
+        config
+            .as_table_mut()
+            .unwrap()
+            .entry("native")
+            .or_insert_with(|| toml::Value::Table(Default::default()))
+            .as_table_mut()
+            .unwrap()
+            .entry("workspaces")
+            .or_insert_with(|| toml::Value::Table(Default::default()))
+            .as_table_mut()
+            .unwrap()
+            .insert("index_mode".into(), mode.into());
+        fs::write(&self.daemon_config, toml::to_string(&config).unwrap()).unwrap();
+    }
+
     fn start(&mut self) {
         assert!(self.daemon.is_none());
         let log = fs::File::create(self.base().join("daemon.log")).unwrap();
@@ -281,6 +299,14 @@ impl Fixture {
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr)
         );
+        if args.contains(&"log") {
+            assert!(
+                !String::from_utf8_lossy(&output.stdout).contains("<Error"),
+                "successful CLI log rendered a template failure {args:?}: stdout={} stderr={}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
         String::from_utf8(output.stdout).unwrap()
     }
 
@@ -1341,6 +1367,172 @@ fn shipped_remote_cli_clones_lazily_and_publishes_between_isolated_mounts() {
     fixture.stop_daemon();
 }
 
+#[test]
+#[ignore = "requires usable /dev/fuse and fusermount3; run mounted_tests locally"]
+fn federated_index_production_factory_preserves_operations_and_drains_cli_queries() {
+    let upstream = RemoteServer::start();
+    let mut fixture = Fixture::new();
+    fixture.configure_remote(&upstream.endpoint);
+    fixture.index_mode("federated");
+    fixture.start();
+    let base = fixture.base().to_owned();
+    let root = base.join("federated");
+    fixture.clone_remote(&root);
+    let binding = fixture.binding(&root);
+    let index = binding.repo.join("index");
+    assert_eq!(
+        fs::read_to_string(index.join("type")).unwrap(),
+        jj_native_index::NAME
+    );
+    assert_eq!(fixture.revision(&root, "main"), upstream.head);
+    assert!(!fixture.success(&root, &["log", "-n", "40"]).is_empty());
+    // More than the server's active-scope allowance: each real process must
+    // drain logical cleanup, not defer every close until its absolute TTL.
+    for command in 0..40 {
+        let args: &[&str] = if command % 2 == 0 {
+            &["status"]
+        } else {
+            &["log", "-n", "40"]
+        };
+        let output = fixture.run(&root, args);
+        assert!(
+            output.status.success(),
+            "CLI iteration {command} {args:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            !String::from_utf8_lossy(&output.stdout).contains("<Error"),
+            "CLI template iteration {command} {args:?}: stdout={} stderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            !String::from_utf8_lossy(&output.stderr).contains("cleanup remains pending"),
+            "CLI cleanup iteration {command} {args:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    let second = base.join("federated-reader");
+    fixture.clone_remote(&second);
+    let previous = fixture.revision(&root, "@");
+    fixture.success(&root, &["new", "-m", "first private draft"]);
+    let draft = fixture.revision(&root, "@");
+    assert_ne!(draft, previous);
+    fixture.success(&root, &["describe", "-m", "amended private draft"]);
+    let amended = fixture.revision(&root, "@");
+    assert_ne!(amended, draft);
+    fixture.success(&root, &["undo"]);
+    assert_eq!(fixture.revision(&root, "@"), draft);
+    let operation = fixture.success(&root, &["op", "log", "--no-graph", "-n", "1", "-T", "id"]);
+    let operation = operation.trim().to_owned();
+    assert_eq!(operation.len(), 128);
+    fixture.success(&root, &["--at-op", &operation, "log", "-n", "40"]);
+    fixture.success(&root, &["bookmark", "set", "main", "-r", "@"]);
+    fixture.success(
+        &root,
+        &[
+            "tinytree",
+            "push",
+            "--reference",
+            "main",
+            "--bookmark",
+            "main",
+        ],
+    );
+    fixture.success(
+        &second,
+        &[
+            "tinytree",
+            "fetch",
+            "--reference",
+            "main",
+            "--bookmark",
+            "main",
+        ],
+    );
+    assert_eq!(fixture.revision(&second, "main"), draft);
+    // The writer now observes its own formerly private draft as a public root;
+    // the new checkpoint must not resend it as an overlapping private overlay.
+    fixture.success(
+        &root,
+        &[
+            "tinytree",
+            "fetch",
+            "--reference",
+            "main",
+            "--bookmark",
+            "main",
+        ],
+    );
+    assert_eq!(fixture.revision(&root, "main"), draft);
+    fixture.success(&base, &["tinytree", "unmount", second.to_str().unwrap()]);
+    assert_eq!(
+        upstream.file_reads(),
+        0,
+        "clone/log/draft metadata must not fetch source FILE bodies"
+    );
+    fixture.success(&base, &["tinytree", "unmount", root.to_str().unwrap()]);
+    fixture.stop_daemon();
+
+    // Creation policy does not rotate the live security identity or replace an
+    // existing repository's recorded native index with the legacy index.
+    fixture.index_mode("legacy");
+    fixture.start();
+    fixture.success(&base, &["tinytree", "resume", root.to_str().unwrap()]);
+    fixture.success(&root, &["status"]);
+    assert_eq!(fixture.revision(&root, "@"), draft);
+    assert_eq!(
+        fs::read_to_string(index.join("type")).unwrap(),
+        jj_native_index::NAME
+    );
+
+    // Missing operation associations fail closed and are never rebuilt from
+    // fetched ancestry or silently replaced with a default index.
+    let association = index.join("operations").join(&operation);
+    let saved = base.join("saved-operation-association");
+    fs::rename(&association, &saved).unwrap();
+    let output = fixture.run(&root, &["--at-op", &operation, "log", "-n", "40"]);
+    assert!(!output.status.success());
+    assert!(!association.exists());
+    assert_eq!(
+        fs::read_to_string(index.join("type")).unwrap(),
+        jj_native_index::NAME
+    );
+    fs::rename(saved, &association).unwrap();
+    fixture.success(&root, &["status"]);
+    fixture.success(&base, &["tinytree", "unmount", root.to_str().unwrap()]);
+    fixture.stop_daemon();
+
+    let mut config: toml::Value =
+        toml::from_str(&fs::read_to_string(&fixture.daemon_config).unwrap()).unwrap();
+    // A changed provider configuration changes the live fingerprint. Keep the
+    // remote authorization binding intact so the daemon itself can reopen.
+    config["native"]["repositories"]["example"]
+        .as_table_mut()
+        .unwrap()
+        .insert(
+            "max_staging_uploads".into(),
+            toml::Value::Integer(
+                jj_native_backend::Config::default()
+                    .store
+                    .max_staging_uploads as i64
+                    + 1,
+            ),
+        );
+    fs::write(&fixture.daemon_config, toml::to_string(&config).unwrap()).unwrap();
+    fixture.start();
+    let output = fixture.run(&base, &["tinytree", "resume", root.to_str().unwrap()]);
+    assert!(
+        !output.status.success(),
+        "changed live provider identity must not load the old index"
+    );
+    assert_eq!(
+        fs::read_to_string(index.join("type")).unwrap(),
+        jj_native_index::NAME
+    );
+    assert!(index.join("manifest").is_file());
+}
+
 fn write_synced(path: &Path, bytes: &[u8]) {
     let mut file = fs::File::create(path).unwrap();
     file.write_all(bytes).unwrap();
@@ -1628,17 +1820,24 @@ struct StartupTrialFailure<'a> {
     upstream: &'a RemoteServer,
     history: usize,
     trial: usize,
+    index_mode: &'static str,
     phase: &'static str,
     started: Instant,
     before: StartupCounters,
     complete: bool,
 }
 impl<'a> StartupTrialFailure<'a> {
-    fn new(upstream: &'a RemoteServer, history: usize, trial: usize) -> Self {
+    fn new(
+        upstream: &'a RemoteServer,
+        history: usize,
+        trial: usize,
+        index_mode: &'static str,
+    ) -> Self {
         Self {
             upstream,
             history,
             trial,
+            index_mode,
             phase: "fixture_configuration",
             started: Instant::now(),
             before: upstream.startup_counters(),
@@ -1660,7 +1859,7 @@ impl Drop for StartupTrialFailure<'_> {
                 "{}",
                 serde_json::json!({
                     "schema":1,"benchmark":"native_mounted_startup","measurement":false,
-                    "status":"failed_or_timeout","historical_commits":self.history,"trial":self.trial,
+                    "status":"failed_or_timeout","historical_commits":self.history,"trial":self.trial,"index_mode":self.index_mode,
                     "phase":self.phase,"phase_elapsed_ns":self.started.elapsed().as_nanos(),
                     "partial_phase_counters":self.upstream.startup_counters().subtract(self.before),
                     "cli_timeout_seconds":30,"daemon_readiness_timeout_seconds":20,
@@ -1694,6 +1893,17 @@ fn native_mounted_startup_benchmark_ladder() {
         );
         return;
     }
+    let index_mode = match std::env::var("TINYTREE_MOUNTED_STARTUP_INDEX_MODE") {
+        Ok(value) if value == "legacy" => "legacy",
+        Ok(value) if value == "federated" => "federated",
+        Err(std::env::VarError::NotPresent) => "legacy",
+        _ => panic!("TINYTREE_MOUNTED_STARTUP_INDEX_MODE must be legacy or federated"),
+    };
+    let expected_index = match index_mode {
+        "legacy" => jj_lib::default_index::DefaultIndexStore::NAME,
+        "federated" => jj_native_index::NAME,
+        _ => unreachable!(),
+    };
     for history in [8usize, 128, 1024] {
         for trial in 1..=3 {
             // Fresh upstream/index/daemon/cache/mount state in every trial.
@@ -1707,7 +1917,7 @@ fn native_mounted_startup_benchmark_ladder() {
                 Err(panic) => {
                     eprintln!(
                         "{}",
-                        serde_json::json!({"schema":1,"benchmark":"native_mounted_startup","measurement":false,"status":"failed_or_timeout","historical_commits":history,"trial":trial,"phase":"upstream_setup","phase_elapsed_ns":upstream_started.elapsed().as_nanos(),"partial_phase_counters":null,"counters_available":false,"failure_bound_not_success_latency":true})
+                        serde_json::json!({"schema":1,"benchmark":"native_mounted_startup","measurement":false,"status":"failed_or_timeout","historical_commits":history,"trial":trial,"index_mode":index_mode,"phase":"upstream_setup","phase_elapsed_ns":upstream_started.elapsed().as_nanos(),"partial_phase_counters":null,"counters_available":false,"failure_bound_not_success_latency":true})
                     );
                     std::panic::resume_unwind(panic);
                 }
@@ -1716,11 +1926,12 @@ fn native_mounted_startup_benchmark_ladder() {
             // Declare the owner before the failure tracker, so its actual
             // FUSE/daemon cleanup runs AFTER the sanitized failure record.
             let mut fixture_owner = std::cell::OnceCell::new();
-            let mut failure = StartupTrialFailure::new(&upstream, history, trial);
+            let mut failure = StartupTrialFailure::new(&upstream, history, trial, index_mode);
             let fixture_started = Instant::now();
             assert!(fixture_owner.set(Fixture::new()).is_ok());
             let fixture = fixture_owner.get_mut().unwrap();
             fixture.configure_remote(&upstream.endpoint);
+            fixture.index_mode(index_mode);
             let fixture_setup_ns = fixture_started.elapsed().as_nanos();
             let daemon = mounted_startup_phase(&mut failure, "daemon_start", || fixture.start());
             let base = fixture.base().to_owned();
@@ -1732,6 +1943,11 @@ fn native_mounted_startup_benchmark_ladder() {
             failure.begin("first_mount_validation");
             assert_fuse_mounted(&first);
             let first_binding = fixture.binding(&first);
+            assert_eq!(
+                fs::read_to_string(first_binding.repo.join("index/type")).unwrap(),
+                expected_index,
+                "requested benchmark index mode must actually be recorded"
+            );
             let cold_log = mounted_startup_phase(&mut failure, "first_default_log_n40", || {
                 let output = fixture.success(&first, &["log", "-n", "40"]);
                 assert!(
@@ -1751,6 +1967,10 @@ fn native_mounted_startup_benchmark_ladder() {
             failure.begin("second_mount_validation");
             assert_fuse_mounted(&second);
             let second_binding = fixture.binding(&second);
+            assert_eq!(
+                fs::read_to_string(second_binding.repo.join("index/type")).unwrap(),
+                expected_index
+            );
             assert_ne!(first_binding.repo, second_binding.repo);
             assert_ne!(first_binding.working_copy, second_binding.working_copy);
             let total = upstream.startup_counters();
@@ -1766,7 +1986,7 @@ fn native_mounted_startup_benchmark_ladder() {
                 serde_json::json!({
                     "schema":1,"benchmark":"native_mounted_startup","measurement":true,"status":"completed",
                     "historical_commits":history,"reachable_stored_commits":history+1,
-                    "index_ingested_commits":history+2,"trial":trial,"trials":3,
+                    "index_ingested_commits":history+2,"trial":trial,"trials":3,"index_mode":index_mode,
                     "workspace_provider":"actual_linux_fuse","checkout":"lazy_no_full_checkout_substitute",
                     "source_setup_ns":upstream.setup_ns,"index_ready_ns":upstream.index_ready_ns,
                     "index_ready_before_daemon":true,"upstream_total_setup_ns":upstream_total_ns,

@@ -136,7 +136,45 @@ impl Fixture {
 fn native_initialization_keeps_all_jj_administration_external_and_loader_is_native_only() {
     futures::executor::block_on(async {
         let fixture = Fixture::new();
-        let (workspace, repo) = fixture.initialize().await.unwrap();
+        let captured_root = std::cell::RefCell::new(None);
+        let backend_initializer =
+            |_: &UserSettings,
+             path: &Path|
+             -> std::result::Result<Box<dyn Backend>, BackendInitError> {
+                Ok(Box::new(NativeBackend::init(
+                    path,
+                    BackendConfig::default(),
+                )?))
+            };
+        let index_initializer = |settings: &UserSettings, path: &Path, root: &OperationId| {
+            assert!(
+                captured_root.borrow().is_none(),
+                "initializer is called once"
+            );
+            assert!(
+                fixture.binding.repo.join("op_store/type").is_file(),
+                "actual op store exists before the index hook"
+            );
+            *captured_root.borrow_mut() = Some(root.clone());
+            ReadonlyRepo::default_index_store_initializer()(settings, path)
+        };
+        let (workspace, repo) = initialize_with_index(
+            &fixture.registry,
+            &fixture.binding,
+            &fixture.settings,
+            &backend_initializer,
+            Signer::new(None, vec![]),
+            fixture.connector.clone(),
+            &CommitId::new(vec![0; 32]),
+            WorkspaceName::DEFAULT.to_owned(),
+            &index_initializer,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            captured_root.borrow().as_ref(),
+            Some(repo.op_store().root_operation_id())
+        );
         assert_eq!(workspace.workspace_root(), fixture.binding.root);
         assert_eq!(workspace.repo_path(), fixture.binding.repo);
         assert_eq!(workspace.working_copy().name(), jj_vfs::native::NAME);

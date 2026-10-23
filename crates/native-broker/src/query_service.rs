@@ -146,6 +146,14 @@ pub(crate) fn fact_shapes(facts: &[q::GraphFact], cap: usize) -> Result<Vec<u8>,
                 }
                 3
             }
+            q::graph_fact::Fact::Membership(v) => {
+                id(v.candidate.as_ref())?;
+                let expression = v.expression.as_ref().ok_or_else(|| {
+                    Status::invalid_argument("missing native query membership expression")
+                })?;
+                expression_shape(expression, cap)?;
+                5
+            }
             q::graph_fact::Fact::CommonAncestors(v) => {
                 bounded_input(
                     v.left
@@ -306,6 +314,9 @@ impl p::query_io_server::QueryIo for BrokerService {
             .open_scope(
                 OpenQueryScope {
                     roots: commits(i.roots)?,
+                    query_identity_version: crate::normalize_query_identity_version(
+                        i.query_identity_version,
+                    )?,
                     overlay: i.overlay,
                     replay_key: handle(&i.replay_key)?,
                 },
@@ -318,6 +329,7 @@ impl p::query_io_server::QueryIo for BrokerService {
                 value: p::QueryScopeReply {
                     handle: v.value.handle.to_vec(),
                     expires_at_unix_seconds: v.value.expires_at_unix_seconds,
+                    query_identity_version: v.value.query_identity_version,
                 },
                 owner: v.owner,
             },
@@ -347,6 +359,7 @@ impl p::query_io_server::QueryIo for BrokerService {
                 value: p::QueryScopeReply {
                     handle: v.value.handle.to_vec(),
                     expires_at_unix_seconds: v.value.expires_at_unix_seconds,
+                    query_identity_version: v.value.query_identity_version,
                 },
                 owner: v.owner,
             },

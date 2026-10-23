@@ -359,6 +359,7 @@ fn scope(v: p::QueryScopeReply) -> Result<QueryScope, Status> {
     Ok(QueryScope {
         handle: handle(&v.handle)?,
         expires_at_unix_seconds: v.expires_at_unix_seconds,
+        query_identity_version: crate::normalize_query_identity_version(v.query_identity_version)?,
     })
 }
 #[async_trait::async_trait]
@@ -375,11 +376,12 @@ impl NativeQueryIo for BrokerQueryClient {
         i: OpenQueryScope,
         o: QueryOwner,
     ) -> Result<QueryReply<QueryScope>, Status> {
+        let expected = crate::normalize_query_identity_version(i.query_identity_version)?;
         let cap = self.inner.config.max_query_bytes;
         self.preflight(
             crate::query_service::visible_bytes(&i.roots, cap)?
                 .saturating_add(crate::query_service::overlay_bytes(&i.overlay, cap)?)
-                .saturating_add(34),
+                .saturating_add(40),
         )?;
         let r = self
             .execute(o, move |mut c, d, s, cap| {
@@ -389,6 +391,7 @@ impl NativeQueryIo for BrokerQueryClient {
                         p::QueryOpenScopeRequest {
                             store_id: s,
                             roots: ids(i.roots),
+                            query_identity_version: i.query_identity_version,
                             overlay: i.overlay,
                             replay_key: i.replay_key.to_vec(),
                         },
@@ -400,8 +403,14 @@ impl NativeQueryIo for BrokerQueryClient {
                 }
             })
             .await?;
+        let value = scope(r.value)?;
+        if value.query_identity_version != expected {
+            return Err(Status::unimplemented(
+                "native query identity negotiation failed",
+            ));
+        }
         Ok(QueryReply {
-            value: scope(r.value)?,
+            value,
             owner: r.owner,
         })
     }
@@ -474,13 +483,15 @@ impl NativeQueryIo for BrokerQueryClient {
                 q::graph_fact_answer::Answer::IsAncestor(_) => 2,
                 q::graph_fact_answer::Answer::Heads(_) => 3,
                 q::graph_fact_answer::Answer::CommonAncestors(_) => 4,
+                q::graph_fact_answer::Answer::Membership(_) => 5,
             };
             if actual != expected {
                 return Err(integrity());
             }
             match answer.answer.as_ref().ok_or_else(integrity)? {
                 q::graph_fact_answer::Answer::HasId(_)
-                | q::graph_fact_answer::Answer::IsAncestor(_) => {}
+                | q::graph_fact_answer::Answer::IsAncestor(_)
+                | q::graph_fact_answer::Answer::Membership(_) => {}
                 q::graph_fact_answer::Answer::Heads(v)
                 | q::graph_fact_answer::Answer::CommonAncestors(v) => {
                     for id in &v.commits {

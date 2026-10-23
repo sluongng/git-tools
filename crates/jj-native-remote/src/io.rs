@@ -209,18 +209,24 @@ struct OwnedFile {
     _scope: Option<Arc<ControlScope>>,
     _delivery: Option<Arc<dyn std::any::Any + Send + Sync>>,
 }
+struct ReadChunk {
+    result: io::Result<Vec<u8>>,
+    source: OwnedFile,
+}
 pub(crate) struct Reader {
-    source: Option<OwnedFile>,
-    pending: Option<JoinHandle<(OwnedFile, io::Result<Vec<u8>>)>>,
     bytes: Vec<u8>,
+    source: Option<OwnedFile>,
+    pending: Option<JoinHandle<ReadChunk>>,
     offset: usize,
     eof: bool,
+    _owner: Option<Arc<dyn std::any::Any + Send + Sync>>,
 }
 impl Reader {
     pub fn verified(
         reader: tinytree_client::VerifiedReader,
         owner: Arc<dyn std::any::Any + Send + Sync>,
     ) -> Self {
+        let retained_owner = owner.clone();
         Self {
             source: Some(OwnedFile {
                 file: ReadOwner::Verified(reader),
@@ -231,6 +237,7 @@ impl Reader {
             bytes: Vec::new(),
             offset: 0,
             eof: false,
+            _owner: Some(retained_owner),
         }
     }
     pub async fn open(lease: Arc<CachedBlob>) -> anyhow::Result<Self> {
@@ -247,6 +254,7 @@ impl Reader {
         owner: Option<Arc<dyn std::any::Any + Send + Sync>>,
     ) -> anyhow::Result<Self> {
         let scope = scope();
+        let retained_owner = owner.clone();
         let source = blocking(move || {
             let file = std::fs::File::open(lease.path())?;
             Ok(OwnedFile {
@@ -265,6 +273,7 @@ impl Reader {
             bytes: Vec::new(),
             offset: 0,
             eof: false,
+            _owner: retained_owner,
         })
     }
 }
@@ -280,7 +289,7 @@ impl AsyncRead for Reader {
         }
         loop {
             if let Some(task) = this.pending.as_mut() {
-                let (source, result) = ready!(Pin::new(task).poll(cx))
+                let ReadChunk { source, result } = ready!(Pin::new(task).poll(cx))
                     .map_err(|_| io::Error::other("native cached read worker failed"))?;
                 this.pending = None;
                 this.source = Some(source);
@@ -288,6 +297,7 @@ impl AsyncRead for Reader {
                 this.offset = 0;
                 this.eof = this.bytes.is_empty();
                 if this.eof {
+                    this.bytes = Vec::new();
                     this.source = None;
                 }
             }
@@ -311,7 +321,7 @@ impl AsyncRead for Reader {
                     bytes.truncate(n);
                     bytes
                 });
-                (source, result)
+                ReadChunk { result, source }
             }));
         }
     }

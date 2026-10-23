@@ -144,6 +144,26 @@ impl NativeObjectIo for GuardedIo {
     async fn read_file(&self, id: m::FileId) -> BackendResult<FileRead> {
         self.read_file_for_cache(id, Arc::new(())).await
     }
+    async fn read_file_with_owner(&self, id: m::FileId, owner: Owner) -> BackendResult<FileRead> {
+        let max_bytes = self.config.max_file_bytes;
+        self.read("/ReadFile", owner, move |provider, owner| async move {
+            let file = provider.read_file_with_owner(id, owner.clone()).await?;
+            let (descriptor, reader) = file.into_parts();
+            if descriptor.key.id.0 != id.0 || descriptor.size_bytes > max_bytes {
+                return Err(wire::other(tonic::Status::resource_exhausted(
+                    "broker file exceeds limit",
+                )));
+            }
+            FileRead::from_preverified_pinned_source(
+                descriptor,
+                Box::pin(OwnedReader {
+                    reader,
+                    _owner: owner,
+                }),
+            )
+        })
+        .await
+    }
     async fn read_file_for_cache(&self, id: m::FileId, owner: Owner) -> BackendResult<FileRead> {
         let max_bytes = self.config.max_file_bytes;
         self.read("/ReadFile", owner, move |provider, owner| async move {

@@ -311,8 +311,15 @@ impl NativeObjectIo for BrokerObjectIo {
         .await
     }
     async fn read_file(&self, id: tinytree_model::FileId) -> BackendResult<FileRead> {
+        self.read_file_with_owner(id, Arc::new(())).await
+    }
+    async fn read_file_with_owner(
+        &self,
+        id: tinytree_model::FileId,
+        owner: Arc<dyn std::any::Any + Send + Sync>,
+    ) -> BackendResult<FileRead> {
         let inner = self.inner.clone();
-        run(async move {
+        run_owned(owner.clone(), async move {
             let deadline = Instant::now() + inner.config.policy.operation_timeout();
             reapi::policy::timeout(deadline, async {
                 let budget = inner.budget(inner.config.file_memory()).await?;
@@ -332,6 +339,7 @@ impl NativeObjectIo for BrokerObjectIo {
                 let create_directory = inner._spool_directory.clone();
                 let create_disk = disk.clone();
                 let create_budget = budget.clone();
+                let create_owner = owner.clone();
                 let mut spool = tokio::task::spawn_blocking(move || {
                     let _budget = create_budget;
                     crate::transport::private_directory(&create_spool)?;
@@ -341,6 +349,7 @@ impl NativeObjectIo for BrokerObjectIo {
                         file,
                         _disk: create_disk,
                         _reader_memory: None,
+                        _owner: create_owner,
                         #[cfg(windows)]
                         _directory: create_directory,
                     })
@@ -384,17 +393,14 @@ impl NativeObjectIo for BrokerObjectIo {
                             offset += chunk.data.len() as u64;
                             count += 1;
                             hash.update(&chunk.data);
-                            let b = budget.clone();
-                            spool = tokio::task::spawn_blocking(move || {
-                                let _budget = b;
-                                spool
-                                    .file
-                                    .write_all(&chunk.data)
-                                    .map_err(|_| Status::internal("broker spool write failed"))?;
-                                Ok::<_, Status>(spool)
-                            })
-                            .await
-                            .map_err(|_| Status::internal("broker spool worker failed"))??;
+                            let work = SpoolWrite {
+                                data: chunk.data,
+                                spool,
+                                _budget: budget.clone(),
+                            };
+                            spool = tokio::task::spawn_blocking(move || work.execute())
+                                .await
+                                .map_err(|_| Status::internal("broker spool worker failed"))??;
                         }
                         Some(p::read_frame::Frame::Complete(end)) if !complete => {
                             if end.count != count
@@ -680,17 +686,38 @@ struct Spool {
     _directory: Arc<private_fs::PrivateDir>,
     _disk: Arc<OwnedSemaphorePermit>,
     _reader_memory: Option<OwnedSemaphorePermit>,
+    _owner: Arc<dyn std::any::Any + Send + Sync>,
+}
+struct SpoolWrite {
+    data: Vec<u8>,
+    spool: Spool,
+    _budget: Arc<Budget>,
+}
+impl SpoolWrite {
+    fn execute(mut self) -> Result<Spool, Status> {
+        self.spool
+            .file
+            .write_all(&self.data)
+            .map_err(|_| Status::internal("broker spool write failed"))?;
+        Ok(self.spool)
+    }
+}
+struct SpoolChunk {
+    result: std::io::Result<Vec<u8>>,
+    state: Spool,
 }
 struct SpoolReader {
-    state: Option<Spool>,
-    pending: Option<JoinHandle<(Spool, std::io::Result<Vec<u8>>)>>,
     bytes: Vec<u8>,
+    state: Option<Spool>,
+    pending: Option<JoinHandle<SpoolChunk>>,
     position: usize,
     eof: bool,
     buffer_bytes: usize,
+    _owner: Arc<dyn std::any::Any + Send + Sync>,
 }
 impl SpoolReader {
     fn new(state: Spool, buffer_bytes: usize) -> Self {
+        let owner = state._owner.clone();
         Self {
             state: Some(state),
             pending: None,
@@ -698,6 +725,7 @@ impl SpoolReader {
             position: 0,
             eof: false,
             buffer_bytes,
+            _owner: owner,
         }
     }
 }
@@ -714,7 +742,7 @@ impl AsyncRead for SpoolReader {
             if let Some(job) = self.pending.as_mut() {
                 let joined = std::task::ready!(Pin::new(job).poll(cx));
                 self.pending = None;
-                let (state, result) =
+                let SpoolChunk { state, result } =
                     joined.map_err(|_| std::io::Error::other("broker spool reader failed"))?;
                 self.state = Some(state);
                 self.bytes = result?;
@@ -745,7 +773,7 @@ impl AsyncRead for SpoolReader {
                     bytes.truncate(n);
                     bytes
                 });
-                (state, result)
+                SpoolChunk { result, state }
             }));
         }
     }

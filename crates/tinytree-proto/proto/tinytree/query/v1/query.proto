@@ -34,9 +34,20 @@ message QueryScope {
   bytes index_epoch = 3; // Exactly 16 bytes, durable index incarnation.
   uint64 high_water = 4;
   int64 expires_at_unix_seconds = 5; // Absolute expiry, not sliding access TTL.
+  uint32 query_identity_version = 7; // 1 legacy; 2 scope-bound query identities.
 }
 
-// version MUST equal 1. Roots are sorted unique authoritative remote checkpoint
+// Version 1 preserves legacy arbitrary query IDs. Version 2 explicitly requires
+// query_id = nonce16 || BLAKE3("tinytree-query-scope-id-v2\0" ||
+// u64BE(repository UTF-8 byte length) || repository || exact scope handle32 ||
+// nonce16)[0..16]. This public binding is not authentication. Explicitly closed
+// v2 query history can be retired once its scope is closed. Server-established
+// unclosed queries and final-page replay remain valid until original expiry;
+// SDK-only preparation does not establish a server query. Identity mode is part
+// of the namespace: legacy v1 may reuse raw bytes after v2 history is retired.
+// Old v2 requests cannot reopen their closed scope or rebind to another v2 scope.
+// No version downgrade fallback.
+// Roots are sorted unique authoritative remote checkpoint
 // IDs, never private draft heads. The logical graph is their complete ancestry
 // union every admitted private draft, including hidden/divergent siblings.
 // Declared overlay totals count only this stream's additions, not shared ancestry.
@@ -115,12 +126,15 @@ message HasId { CommitId commit = 1; }
 message IsAncestor { CommitId ancestor = 1; CommitId descendant = 2; }
 message Heads { repeated CommitId commits = 1; }
 message CommonAncestors { repeated CommitId left = 1; repeated CommitId right = 2; }
+// Stateless membership never creates a cursor or a query replay record.
+message Membership { GraphExpr expression = 1; CommitId candidate = 2; }
 message GraphFact {
   oneof fact {
     HasId has_id = 1;
     IsAncestor is_ancestor = 2;
     Heads heads = 3;
     CommonAncestors common_ancestors = 4;
+    Membership membership = 5;
   }
 }
 message CommitSet { repeated CommitId commits = 1; }
@@ -130,6 +144,7 @@ message GraphFactAnswer {
     bool is_ancestor = 2;
     CommitSet heads = 3;
     CommitSet common_ancestors = 4;
+    bool membership = 5;
   }
 }
 message QueryFactsRequest { ScopeKey scope = 1; repeated GraphFact facts = 2; }

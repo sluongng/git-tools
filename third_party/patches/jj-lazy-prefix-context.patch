@@ -1,0 +1,225 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Son Luong Ngoc <26684313+sluongng@users.noreply.github.com>
+Date: Fri, 23 Oct 2026 22:37:00 +0000
+Subject: [PATCH] jj: Delegate narrow prefix disambiguation
+
+Short ID formatting currently materializes every commit/change pair in
+its configured disambiguation revset. A remote index can answer the same
+prefix questions without transferring unrendered canonical history.
+
+Let a revset optionally return an owned exact prefix provider. Cache it
+in the existing context, and retain materialization when no provider is
+available. Keep global fallback, current-view membership and change
+visibility checks, and bookmark/tag name precedence on the client.
+
+The default hook returns None. Providers must preserve the complete
+selection or decline delegation; filtered streams and canonical object
+access are not changed. Independent I/O ownership is required because
+existing synchronous prefix calls may block their caller's executor.
+
+---
+diff --git a/src/id_prefix.rs b/src/id_prefix.rs
+--- a/src/id_prefix.rs
++++ b/src/id_prefix.rs
+@@ -48,9 +48,44 @@
+     Evaluation(#[from] RevsetEvaluationError),
+ }
+ 
++/// An independently owned index of exactly the configured disambiguation set.
++///
++/// This is a prefix-query optimization, not permission to widen or approximate
++/// the set. In particular, change-prefix ambiguity compares distinct change IDs,
++/// not the number of divergent commits. Errors must remain errors.
++///
++/// Implementations must own their immutable selection and any I/O context. The
++/// synchronous commit-prefix API blocks on these futures, like the existing
++/// global Index API, so I/O must not depend on the blocked caller's executor.
++#[async_trait::async_trait]
++pub trait PrefixDisambiguationIndex: Send + Sync {
++    async fn resolve_commit_prefix(
++        &self,
++        prefix: &HexPrefix,
++    ) -> IndexResult<PrefixResolution<CommitId>>;
++
++    async fn resolve_change_prefix(
++        &self,
++        prefix: &HexPrefix,
++    ) -> IndexResult<PrefixResolution<ChangeId>>;
++
++    /// None means the target is outside the disambiguation set. Some is the
++    /// exact shortest length within that set; zero is a valid length.
++    async fn shortest_commit_prefix_len(&self, id: &CommitId) -> IndexResult<Option<usize>>;
++
++    /// Membership means any selected commit has this change ID. The returned
++    /// length distinguishes change IDs, not divergent targets of one change.
++    async fn shortest_change_prefix_len(&self, id: &ChangeId) -> IndexResult<Option<usize>>;
++}
++
+ struct DisambiguationData {
+     expression: Arc<UserRevsetExpression>,
+-    indexes: OnceCell<Indexes>,
++    indexes: OnceCell<DisambiguationIndexes>,
++}
++
++enum DisambiguationIndexes {
++    Materialized(Indexes),
++    Delegated(Arc<dyn PrefixDisambiguationIndex>),
+ }
+ 
+ struct Indexes {
+@@ -64,13 +99,20 @@
+         &self,
+         repo: &dyn Repo,
+         extensions: &[Box<dyn SymbolResolverExtension>],
+-    ) -> Result<&Indexes, IdPrefixIndexLoadError> {
++    ) -> Result<&DisambiguationIndexes, IdPrefixIndexLoadError> {
+         self.indexes.get_or_try_init(|| {
+             let symbol_resolver = SymbolResolver::new(repo, extensions);
+             let revset = self
+                 .expression
+                 .resolve_user_expression(repo, &symbol_resolver)?
+                 .evaluate()?;
++
++            if let Some(index) = revset
++                .prefix_disambiguation_index()
++                .map_err(|error| RevsetEvaluationError::Other(Box::new(error)))?
++            {
++                return Ok(DisambiguationIndexes::Delegated(index));
++            }
+ 
+             let commit_change_ids: Vec<_> = revset.commit_change_ids().try_collect().block_on()?;
+             let mut commit_index = IdIndex::with_capacity(commit_change_ids.len());
+@@ -80,11 +122,11 @@
+                 commit_index.insert(commit_id, i);
+                 change_index.insert(change_id, i);
+             }
+-            Ok(Indexes {
++            Ok(DisambiguationIndexes::Materialized(Indexes {
+                 commit_change_ids,
+                 commit_index: commit_index.build(),
+                 change_index: change_index.build(),
+-            })
++            }))
+         })
+     }
+ }
+@@ -148,7 +190,7 @@
+ 
+ /// Loaded index to disambiguate commit/change IDs.
+ pub struct IdPrefixIndex<'a> {
+-    indexes: Option<&'a Indexes>,
++    indexes: Option<&'a DisambiguationIndexes>,
+ }
+ 
+ impl IdPrefixIndex<'_> {
+@@ -164,9 +206,14 @@
+         prefix: &HexPrefix,
+     ) -> IndexResult<PrefixResolution<CommitId>> {
+         if let Some(indexes) = self.indexes {
+-            let resolution = indexes
+-                .commit_index
+-                .resolve_prefix_to_key(&*indexes.commit_change_ids, prefix);
++            let resolution = match indexes {
++                DisambiguationIndexes::Materialized(indexes) => indexes
++                    .commit_index
++                    .resolve_prefix_to_key(&*indexes.commit_change_ids, prefix),
++                DisambiguationIndexes::Delegated(index) => {
++                    index.resolve_commit_prefix(prefix).block_on()?
++                }
++            };
+             match resolution {
+                 PrefixResolution::NoMatch => {
+                     // Fall back to resolving in entire repo
+@@ -208,12 +255,19 @@
+         repo: &dyn Repo,
+         commit_id: &CommitId,
+     ) -> IndexResult<usize> {
+-        if let Some(indexes) = self.indexes
+-            && let Some(lookup) = indexes
+-                .commit_index
+-                .lookup_exact(&*indexes.commit_change_ids, commit_id)
+-        {
+-            return Ok(lookup.shortest_unique_prefix_len());
++        if let Some(indexes) = self.indexes {
++            let length = match indexes {
++                DisambiguationIndexes::Materialized(indexes) => indexes
++                    .commit_index
++                    .lookup_exact(&*indexes.commit_change_ids, commit_id)
++                    .map(|lookup| lookup.shortest_unique_prefix_len()),
++                DisambiguationIndexes::Delegated(index) => {
++                    index.shortest_commit_prefix_len(commit_id).block_on()?
++                }
++            };
++            if let Some(length) = length {
++                return Ok(length);
++            }
+         }
+         repo.index()
+             .shortest_unique_commit_id_prefix_len(commit_id)
+@@ -227,9 +281,14 @@
+         prefix: &HexPrefix,
+     ) -> IndexResult<PrefixResolution<ResolvedChangeTargets>> {
+         if let Some(indexes) = self.indexes {
+-            let resolution = indexes
+-                .change_index
+-                .resolve_prefix_to_key(&*indexes.commit_change_ids, prefix);
++            let resolution = match indexes {
++                DisambiguationIndexes::Materialized(indexes) => indexes
++                    .change_index
++                    .resolve_prefix_to_key(&*indexes.commit_change_ids, prefix),
++                DisambiguationIndexes::Delegated(index) => {
++                    index.resolve_change_prefix(prefix).await?
++                }
++            };
+             match resolution {
+                 PrefixResolution::NoMatch => {
+                     // Fall back to resolving in entire repo
+@@ -272,12 +331,19 @@
+         repo: &dyn Repo,
+         change_id: &ChangeId,
+     ) -> IndexResult<usize> {
+-        if let Some(indexes) = self.indexes
+-            && let Some(lookup) = indexes
+-                .change_index
+-                .lookup_exact(&*indexes.commit_change_ids, change_id)
+-        {
+-            return Ok(lookup.shortest_unique_prefix_len());
++        if let Some(indexes) = self.indexes {
++            let length = match indexes {
++                DisambiguationIndexes::Materialized(indexes) => indexes
++                    .change_index
++                    .lookup_exact(&*indexes.commit_change_ids, change_id)
++                    .map(|lookup| lookup.shortest_unique_prefix_len()),
++                DisambiguationIndexes::Delegated(index) => {
++                    index.shortest_change_prefix_len(change_id).await?
++                }
++            };
++            if let Some(length) = length {
++                return Ok(length);
++            }
+         }
+         repo.shortest_unique_change_id_prefix_len(change_id).await
+     }
+diff --git a/src/revset.rs b/src/revset.rs
+--- a/src/revset.rs
++++ b/src/revset.rs
+@@ -3511,6 +3511,19 @@
+ }
+ 
+ pub trait Revset: fmt::Debug {
++    /// Optional independently owned prefix index for this exact selection.
++    ///
++    /// Constructing it must not enumerate the selected history. Implementations
++    /// must preserve the entire selection, including filters, or return None so
++    /// the existing materialized path remains authoritative. This does not
++    /// change stream projections or grant access to canonical object bodies.
++    fn prefix_disambiguation_index(
++        &self,
++    ) -> crate::index::IndexResult<Option<Arc<dyn crate::id_prefix::PrefixDisambiguationIndex>>>
++    {
++        Ok(None)
++    }
++
+     /// Streams in topological order with children before parents.
+     // TODO: Relax to BoxStream?
+     fn stream<'a>(&self) -> LocalBoxStream<'a, Result<CommitId, RevsetEvaluationError>>

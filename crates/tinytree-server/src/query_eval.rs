@@ -190,6 +190,7 @@ pub(crate) struct Evaluator {
     limits: EvalLimits,
     memory: Memory,
     steps: u64,
+    literals: usize,
     failed: bool,
 }
 impl Evaluator {
@@ -205,6 +206,7 @@ impl Evaluator {
             literals: 0,
         };
         let root = compiler.compile(&expression, 1)?;
+        let literals = compiler.literals;
         Ok(Self {
             graph,
             root,
@@ -215,8 +217,38 @@ impl Evaluator {
             },
             limits,
             steps: 0,
+            literals,
             failed: false,
         })
+    }
+    /// Compile the complete user expression at the ordinary Evaluate limits,
+    /// then intersect it with one bounded internal literal. The wrapper does
+    /// not consume the caller's AST node/depth/literal allowance.
+    pub fn membership(
+        graph: Arc<OverlayGraph>,
+        expression: q::GraphExpr,
+        candidate: m::CommitId,
+        limits: EvalLimits,
+    ) -> Result<Self> {
+        let mut evaluator = Self::new(graph, expression, limits)?;
+        let selected = std::mem::replace(&mut evaluator.root, Operator::Empty);
+        evaluator.root = Operator::Set(SetOperator {
+            left: Box::new(Operator::Commits(Commits {
+                ids: vec![candidate],
+                next: 0,
+                rows: BTreeMap::new(),
+            })),
+            right: Box::new(selected),
+            a: None,
+            b: None,
+            left_done: false,
+            right_done: false,
+            kind: SetKind::Intersection,
+        });
+        Ok(evaluator)
+    }
+    pub fn literal_count(&self) -> usize {
+        self.literals
     }
     pub fn graph(&self) -> &Arc<OverlayGraph> {
         &self.graph

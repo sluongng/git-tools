@@ -35,8 +35,8 @@ BOS is opt-in and strictly lazy. Cache, execution, Remote Asset, BES and BOS sha
 `rbe.sock`; CLI control uses `control.sock`. Optional native repository aliases
 also use `rbe.sock` for shared object I/O and native reference control. Configure
 `native.repositories.ALIAS.remote` in the same TOML, then use
-[`tinytree-jj`](../jj-native-cli) for materialized native clone/fetch/push.
-Native source mounts and client GC/offloading are not yet implemented.
+[`tinytree-jj`](../jj-native-cli) for native clone/fetch/push through daemon-owned
+lazy Linux mounts. Native client GC/offloading is not automatic.
 
 Bazel needs the
 [Unix authority fix](https://github.com/bazelbuild/bazel/commit/242563f1a14378801725e5f6b0ee397ef0d307f2)

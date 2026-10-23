@@ -66,6 +66,8 @@ struct ScopeRecord {
     captured: Option<Arc<CapturedScope>>,
     expires: i64,
     closed: bool,
+    close_acked: bool,
+    query_identity_version: u32,
 }
 struct CapturedScope {
     client: NativeClient,
@@ -80,6 +82,10 @@ enum CheckedQuery {
     Graph(CheckedGraphQuery),
 }
 struct QueryRecord {
+    scope_handle: [u8; 32],
+    query_identity_version: u32,
+    begin_key: [u8; 32],
+    close_acked: bool,
     scope: Option<Arc<CapturedScope>>,
     client: NativeClient,
     checked: Option<CheckedQuery>,
@@ -182,6 +188,58 @@ impl Registry {
             .clone()
             .context("native query scope unavailable")
     }
+    fn query_identity(&self, handle: [u8; 32], id: &[u8; 32]) -> Result<u32> {
+        let scope = self
+            .scopes
+            .get(&handle)
+            .context("native query scope unavailable")?;
+        let value = QueryScope {
+            handle,
+            expires_at_unix_seconds: scope.expires,
+            query_identity_version: scope.query_identity_version,
+        };
+        value.validate_query_id(id)?;
+        Ok(scope.query_identity_version)
+    }
+    fn retire_closed_queries(&mut self, scope_handle: [u8; 32]) -> Result<Retired> {
+        let Some(scope) = self.scopes.get(&scope_handle) else {
+            return Ok(Retired::default());
+        };
+        if scope.query_identity_version != 2 || !scope.close_acked {
+            return Ok(Retired::default());
+        }
+        let ids: Vec<_> = self
+            .queries
+            .iter()
+            .filter(|(_, query)| {
+                query.scope_handle == scope_handle
+                    && query.query_identity_version == 2
+                    && query.closed
+                    && query.close_acked
+            })
+            .map(|(handle, query)| (*handle, query.begin_key))
+            .collect();
+        // Verify all pairings before mutation: a retirement must never remove
+        // another creation intent or weaken its replay fingerprint.
+        for (handle, key) in &ids {
+            ensure!(
+                self.replays
+                    .get(&(3, *key))
+                    .is_some_and(|r| r.handle == *handle),
+                "native query replay pairing changed"
+            );
+        }
+        let mut retired = Retired::default();
+        for (handle, key) in ids {
+            retired
+                .queries
+                .push(self.queries.remove(&handle).expect("checked query"));
+            retired
+                .replays
+                .push(self.replays.remove(&(3, key)).expect("checked replay"));
+        }
+        Ok(retired)
+    }
     fn replay(&self, kind: u8, key: [u8; 32], fingerprint: [u8; 32]) -> Result<Option<[u8; 32]>> {
         let Some(r) = self.replays.get(&(kind, key)) else {
             return Ok(None);
@@ -279,6 +337,16 @@ impl RemoteQueryIo {
             Ok(())
         })
         .await
+    }
+    async fn drop_retired(&self, retired: Retired, owner: QueryOwner) -> Result<()> {
+        if !retired.is_empty() {
+            io::blocking_owned(owner, move || {
+                drop(retired);
+                Ok(())
+            })
+            .await?;
+        }
+        Ok(())
     }
     fn charge(&self, bytes: usize) -> Result<OwnedSemaphorePermit> {
         let bytes = u32::try_from(bytes).map_err(|_| {
@@ -629,7 +697,14 @@ impl NativeQueryIo for RemoteQueryIo {
     ) -> std::result::Result<QueryReply<QueryScope>, tonic::Status> {
         self.run(owner, move |this, operation| async move {
             this.input_bounds(&input.roots, &input.overlay)?;
+            let version =
+                native_broker::normalize_query_identity_version(input.query_identity_version)?;
             let fingerprint = scope_fingerprint(&input.roots, &input.overlay);
+            let fingerprint = if version == 2 {
+                hash(&[b"native-open-scope-identity-v2\0", &fingerprint])
+            } else {
+                fingerprint
+            };
             let time = now()?;
             this.clean_expired().await?;
             let mut registry = this.registry.lock().await;
@@ -639,6 +714,7 @@ impl NativeQueryIo for RemoteQueryIo {
                     value: QueryScope {
                         handle,
                         expires_at_unix_seconds: scope.checked.expires_at_unix_seconds(),
+                        query_identity_version: scope.checked.query_identity_version(),
                     },
                     owner: scope,
                 });
@@ -672,9 +748,19 @@ impl NativeQueryIo for RemoteQueryIo {
                 let client = this.inner.connector.get().await?;
                 let rpc_client = client.clone().with_rpc_lifetime_guard(operation.clone());
                 let (overlay, overlays) = this.overlay(&rpc_client, input.overlay).await?;
-                let checked = rpc_client
-                    .open_query_scope_with_overlay(input.roots, overlay)
-                    .await?;
+                let checked = if version == 2 {
+                    rpc_client
+                        .open_query_scope_with_overlay_v2(input.roots, overlay)
+                        .await?
+                } else {
+                    rpc_client
+                        .open_query_scope_with_overlay(input.roots, overlay)
+                        .await?
+                };
+                ensure!(
+                    checked.query_identity_version() == version,
+                    tonic::Status::unimplemented("native query identity negotiation failed")
+                );
                 Ok(Arc::new(CapturedScope {
                     client,
                     checked,
@@ -697,12 +783,15 @@ impl NativeQueryIo for RemoteQueryIo {
                             captured: Some(scope.clone()),
                             expires,
                             closed: false,
+                            close_acked: false,
+                            query_identity_version: scope.checked.query_identity_version(),
                         },
                     );
                     Ok(QueryReply {
                         value: QueryScope {
                             handle,
                             expires_at_unix_seconds: expires,
+                            query_identity_version: scope.checked.query_identity_version(),
                         },
                         owner: scope,
                     })
@@ -740,6 +829,7 @@ impl NativeQueryIo for RemoteQueryIo {
                     value: QueryScope {
                         handle,
                         expires_at_unix_seconds: scope.checked.expires_at_unix_seconds(),
+                        query_identity_version: scope.checked.query_identity_version(),
                     },
                     owner: scope,
                 });
@@ -810,12 +900,15 @@ impl NativeQueryIo for RemoteQueryIo {
                             captured: Some(scope.clone()),
                             expires,
                             closed: false,
+                            close_acked: false,
+                            query_identity_version: scope.checked.query_identity_version(),
                         },
                     );
                     Ok(QueryReply {
                         value: QueryScope {
                             handle,
                             expires_at_unix_seconds: expires,
+                            query_identity_version: scope.checked.query_identity_version(),
                         },
                         owner: scope,
                     })
@@ -842,6 +935,41 @@ impl NativeQueryIo for RemoteQueryIo {
         facts: Vec<q::GraphFact>,
         owner: QueryOwner,
     ) -> std::result::Result<QueryReply<q::GraphFacts>, tonic::Status> {
+        let limits = &self.inner.config.remote.limits;
+        if facts.len() > limits.max_batch_items {
+            return Err(tonic::Status::resource_exhausted(
+                "native query fact count exceeded",
+            ));
+        }
+        let mut bytes = 0usize;
+        for fact in &facts {
+            if let Some(q::graph_fact::Fact::Membership(value)) = &fact.fact {
+                let expression = value.expression.as_ref().ok_or_else(|| {
+                    tonic::Status::invalid_argument("missing native membership expression")
+                })?;
+                if value
+                    .candidate
+                    .as_ref()
+                    .is_none_or(|candidate| candidate.value.len() != 32)
+                {
+                    return Err(tonic::Status::invalid_argument(
+                        "invalid native membership candidate",
+                    ));
+                }
+                self.expression_bounds(expression).map_err(status)?;
+            }
+            bytes = bytes
+                .checked_add(fact.encoded_len())
+                .and_then(|n| n.checked_add(8))
+                .ok_or_else(|| {
+                    tonic::Status::resource_exhausted("native query facts size overflow")
+                })?;
+            if bytes > limits.max_request_bytes {
+                return Err(tonic::Status::resource_exhausted(
+                    "native query facts bytes exceeded",
+                ));
+            }
+        }
         self.scope_request(scope, owner, move |scope, rpc_client| async move {
             let inputs = facts
                 .into_iter()
@@ -859,6 +987,16 @@ impl NativeQueryIo for RemoteQueryIo {
                         q::graph_fact::Fact::Heads(v) => tinytree_client::QueryFact::Heads(
                             v.commits.into_iter().map(commit).collect::<Result<_>>()?,
                         ),
+                        q::graph_fact::Fact::Membership(v) => {
+                            tinytree_client::QueryFact::Membership {
+                                expression: v
+                                    .expression
+                                    .context("missing membership expression")?,
+                                candidate: commit(
+                                    v.candidate.context("missing membership candidate")?,
+                                )?,
+                            }
+                        }
                         q::graph_fact::Fact::CommonAncestors(v) => {
                             tinytree_client::QueryFact::CommonAncestors {
                                 left: v.left.into_iter().map(commit).collect::<Result<_>>()?,
@@ -884,6 +1022,9 @@ impl NativeQueryIo for RemoteQueryIo {
                             q::graph_fact_answer::Answer::Heads(q::CommitSet {
                                 commits: ids.into_iter().map(wire_commit).collect(),
                             })
+                        }
+                        tinytree_client::FactAnswer::Membership(value) => {
+                            q::graph_fact_answer::Answer::Membership(value)
                         }
                         tinytree_client::FactAnswer::CommonAncestors(ids) => {
                             q::graph_fact_answer::Answer::CommonAncestors(q::CommitSet {
@@ -1029,6 +1170,9 @@ impl NativeQueryIo for RemoteQueryIo {
             ]);
             this.clean_expired().await?;
             let mut registry = this.registry.lock().await;
+            // Binding is checked against the exact local scope before even a
+            // cached creation outcome can be observed or a new one reserved.
+            let version = registry.query_identity(input.scope, &input.replay_key)?;
             if let Some(handle) = registry.replay(3, input.replay_key, fingerprint)? {
                 let query = registry
                     .queries
@@ -1071,7 +1215,40 @@ impl NativeQueryIo for RemoteQueryIo {
                 // never the incoming broker inflight permit. Physical SDK work
                 // keeps them after logical query close or caller cancellation.
                 let query_client = scope.client.clone().with_lifetime_guard(scope.clone());
-                let checked = if input.projection == q::Projection::Ids {
+                let checked = if version == 2 {
+                    let mut nonce = blake3::Hasher::new();
+                    nonce.update(b"tinytree-native-query-upstream-nonce-v2\0");
+                    nonce.update(scope.checked.handle());
+                    nonce.update(&input.replay_key);
+                    let nonce: [u8; 16] = nonce.finalize().as_bytes()[..16]
+                        .try_into()
+                        .expect("fixed nonce width");
+                    let id = scope.checked.bound_query_id(nonce)?;
+                    if input.projection == q::Projection::Ids {
+                        CheckedQuery::Ids(
+                            query_client
+                                .begin_query_with_id(
+                                    &scope.checked,
+                                    &input.expression,
+                                    input.page_size,
+                                    id,
+                                )
+                                .await?,
+                        )
+                    } else {
+                        CheckedQuery::Graph(
+                            query_client
+                                .begin_graph_query_with_id(
+                                    &scope.checked,
+                                    &input.expression,
+                                    input.page_size,
+                                    input.projection == q::Projection::Canonical,
+                                    id,
+                                )
+                                .await?,
+                        )
+                    }
+                } else if input.projection == q::Projection::Ids {
                     CheckedQuery::Ids(
                         query_client
                             .begin_query(&scope.checked, &input.expression, input.page_size)
@@ -1090,6 +1267,10 @@ impl NativeQueryIo for RemoteQueryIo {
                     )
                 };
                 Ok(QueryRecord {
+                    scope_handle: input.scope,
+                    query_identity_version: version,
+                    begin_key: input.replay_key,
+                    close_acked: false,
                     scope: Some(scope.clone()),
                     client: scope.client.clone(),
                     checked: Some(checked),
@@ -1343,7 +1524,10 @@ impl NativeQueryIo for RemoteQueryIo {
             record.pending_ids = None;
             record.replay = None;
             record.scope = None;
-            let rpc_client = record.client.clone().with_rpc_lifetime_guard(operation);
+            let rpc_client = record
+                .client
+                .clone()
+                .with_rpc_lifetime_guard(operation.clone());
             if let Some(query) = record.checked.as_mut() {
                 match query {
                     CheckedQuery::Ids(query) => rpc_client.close_ids_query(query).await?,
@@ -1351,11 +1535,16 @@ impl NativeQueryIo for RemoteQueryIo {
                 }
             }
             record.checked = None;
+            record.close_acked = true;
+            let scope_handle = record.scope_handle;
             // ACK removes all active query/overlay ownership. Keep only a small
             // local tombstone until the original replay window expires.
             let old = std::mem::replace(&mut record._memory, this.charge(0)?);
             drop(old);
             record._memory = this.charge(4096)?;
+            let retired = registry.retire_closed_queries(scope_handle)?;
+            drop(registry);
+            this.drop_retired(retired, operation).await?;
             Ok(())
         })
         .await
@@ -1376,11 +1565,15 @@ impl NativeQueryIo for RemoteQueryIo {
                 scope
                     .client
                     .clone()
-                    .with_rpc_lifetime_guard(operation)
+                    .with_rpc_lifetime_guard(operation.clone())
                     .close_query_scope(&scope.checked)
                     .await?;
             }
             record.captured = None;
+            record.close_acked = true;
+            let retired = registry.retire_closed_queries(handle)?;
+            drop(registry);
+            this.drop_retired(retired, operation).await?;
             Ok(())
         })
         .await

@@ -25,6 +25,11 @@ operation, index and working-copy state live in private external administration.
 Fetch an absent reference explicitly before its first push. Native publication
 is not Git push.
 
+For new remote workspaces, experimental `[native.workspaces] index_mode =
+"federated"` uses immutable native index checkpoints and broker queries rather
+than building a full local history index. The default remains `"legacy"`. Existing
+workspaces keep their recorded index type; missing native state fails closed.
+
 Push uses this workspace's durable observed generation, which jj undo cannot
 roll back. Interrupted pushes retain their original replay intent. Retry that
 push to reconcile it; `fetch --abandon-pending-push` explicitly archives the local

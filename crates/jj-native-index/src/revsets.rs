@@ -21,7 +21,81 @@ fn commits(ids: &[CommitId]) -> Result<q::GraphExpr, Error> {
             .collect::<Result<_, Error>>()?,
     })))
 }
-pub(super) fn compile(input: &ResolvedExpression, limits: &Limits) -> Result<q::GraphExpr, Error> {
+/// The file predicate is deliberately a selected-client stage, never a scan of
+/// the public commit closure. Other metadata predicates remain explicit errors.
+pub(super) fn selected_file_all(input: &ResolvedExpression) -> Option<&ResolvedExpression> {
+    use jj_lib::{
+        fileset::FilesetExpression,
+        revset::{ResolvedPredicateExpression as P, RevsetFilterPredicate as F},
+    };
+    let ResolvedExpression::FilterWithin {
+        candidates,
+        predicate,
+    } = input
+    else {
+        return None;
+    };
+    let P::Intersection(a, b) = predicate else {
+        return None;
+    };
+    let conflict = |v: &P| matches!(v, P::Filter(F::HasConflict));
+    let all = |v: &P| matches!(v, P::Filter(F::File(FilesetExpression::All)));
+    ((conflict(a) && all(b)) || (all(a) && conflict(b))).then_some(candidates.as_ref())
+}
+
+pub(super) fn compile(
+    input: &ResolvedExpression,
+    limits: &Limits,
+    conflict: bool,
+) -> Result<q::GraphExpr, Error> {
+    // A signed set represents S or its complement relative to the candidates.
+    // Boolean lowering moves owned children rather than duplicating candidates.
+    fn predicate(
+        input: &jj_lib::revset::ResolvedPredicateExpression,
+        depth: usize,
+        left: &mut usize,
+        literals: &mut usize,
+        limits: &Limits,
+    ) -> Result<(q::GraphExpr, bool), Error> {
+        use jj_lib::revset::ResolvedPredicateExpression as P;
+        use q::graph_expr::Expression as Q;
+        if depth > limits.max_expression_depth || *left == 0 {
+            return Err(Error::Limit);
+        }
+        *left -= 1;
+        match input {
+            P::Set(value) => Ok((build(value, depth + 1, left, literals, limits)?, false)),
+            P::NotIn(value) => {
+                let (value, negative) = predicate(value, depth + 1, left, literals, limits)?;
+                Ok((value, !negative))
+            }
+            P::Union(a, b) | P::Intersection(a, b) => {
+                let (a, an) = predicate(a, depth + 1, left, literals, limits)?;
+                let (b, bn) = predicate(b, depth + 1, left, literals, limits)?;
+                let union = matches!(input, P::Union(..));
+                let difference = |a, b| {
+                    expr(Q::Difference(Box::new(q::DifferenceExpr {
+                        left: Some(Box::new(a)),
+                        right: Some(Box::new(b)),
+                    })))
+                };
+                Ok(match (union, an, bn) {
+                    (true, false, false) | (false, true, true) => {
+                        (expr(Q::Union(q::SetExpr { inputs: vec![a, b] })), an)
+                    }
+                    (false, false, false) | (true, true, true) => {
+                        (expr(Q::Intersection(q::SetExpr { inputs: vec![a, b] })), an)
+                    }
+                    (true, false, true) => (difference(b, a), true),
+                    (true, true, false) => (difference(a, b), true),
+                    (false, false, true) => (difference(a, b), false),
+                    (false, true, false) => (difference(b, a), false),
+                })
+            }
+            P::Filter(_) => Err(Error::UnsupportedExpression("filter_metadata_boolean")),
+            P::Divergent { .. } => Err(Error::UnsupportedExpression("filter_divergent")),
+        }
+    }
     fn build(
         input: &ResolvedExpression,
         depth: usize,
@@ -104,6 +178,32 @@ pub(super) fn compile(input: &ResolvedExpression, limits: &Limits) -> Result<q::
                 left: Some(Box::new(child(a, left, literals)?)),
                 right: Some(Box::new(child(b, left, literals)?)),
             }))),
+            R::FilterWithin {
+                candidates,
+                predicate:
+                    jj_lib::revset::ResolvedPredicateExpression::Filter(
+                        jj_lib::revset::RevsetFilterPredicate::HasConflict,
+                    ),
+            } => expr(Q::HasConflict(Box::new(q::UnaryExpr {
+                input: Some(Box::new(child(candidates, left, literals)?)),
+            }))),
+            R::FilterWithin {
+                candidates,
+                predicate: filter,
+            } => {
+                let candidates = child(candidates, left, literals)?;
+                let (set, negative) = predicate(filter, depth + 1, left, literals, limits)?;
+                if negative {
+                    expr(Q::Difference(Box::new(q::DifferenceExpr {
+                        left: Some(Box::new(candidates)),
+                        right: Some(Box::new(set)),
+                    })))
+                } else {
+                    expr(Q::Intersection(q::SetExpr {
+                        inputs: vec![candidates, set],
+                    }))
+                }
+            }
             R::Latest { candidates, count } => {
                 if *count > limits.max_query_rows {
                     return Err(Error::Limit);
@@ -113,18 +213,42 @@ pub(super) fn compile(input: &ResolvedExpression, limits: &Limits) -> Result<q::
                     count: *count as u64,
                 })))
             }
-            _ => return Err(Error::Unsupported),
+            unsupported => {
+                return Err(Error::UnsupportedExpression(match unsupported {
+                    R::Reachable { .. } => "reachable",
+                    R::HeadsRange { .. } => "heads_range_filter",
+                    R::Forks { .. } => "forks",
+                    R::ForkPoint(_) => "fork_point",
+                    R::MergePoint { .. } => "merge_point",
+                    R::Bisect(_) => "bisect",
+                    R::HasSize { .. } => "has_size",
+                    R::Coalesce(..) => "coalesce",
+                    _ => "unknown",
+                }));
+            }
         })
     }
-    let mut remaining_nodes = limits.max_expression_nodes;
+    let mut remaining_nodes = limits
+        .max_expression_nodes
+        .checked_sub(usize::from(conflict))
+        .ok_or(Error::Limit)?;
     let mut remaining_literals = limits.max_query_rows;
     let expression = build(
         input,
-        1,
+        1 + usize::from(conflict),
         &mut remaining_nodes,
         &mut remaining_literals,
         limits,
     )?;
+    let expression = if conflict {
+        expr(q::graph_expr::Expression::HasConflict(Box::new(
+            q::UnaryExpr {
+                input: Some(Box::new(expression)),
+            },
+        )))
+    } else {
+        expression
+    };
     if expression.encoded_len() > limits.max_segment_bytes {
         return Err(Error::Limit);
     }
@@ -193,6 +317,7 @@ fn parent_range(r: &std::ops::Range<u32>) -> Result<q::ParentRange, Error> {
 pub(super) struct NativeRevset {
     pub(super) index: NativeReadonlyIndex,
     pub(super) expression: q::GraphExpr,
+    pub(super) file_all: Option<Arc<Store>>,
 }
 struct Cursor {
     index: NativeReadonlyIndex,
@@ -221,7 +346,10 @@ impl Cursor {
                     expression,
                     projection,
                     page_size: index.core.limits.page_size,
-                    replay_key: random(),
+                    replay_key: scope
+                        .value
+                        .bound_query_id(random()[..16].try_into().expect("fixed nonce width"))
+                        .map_err(status)?,
                 },
                 Arc::new((index.core.owner(), scope.clone())),
             )
@@ -387,10 +515,103 @@ fn rows(
     index: NativeReadonlyIndex,
     expression: q::GraphExpr,
     projection: q::Projection,
+    file_all: Option<Arc<Store>>,
 ) -> LocalBoxStream<'static, Result<q::GraphRow, RevsetEvaluationError>> {
-    Box::pin(
-        async_stream::try_stream! {let mut cursor=Cursor::begin(index,expression,projection).await.map_err(rev_err)?;loop{let page=cursor.page().await.map_err(rev_err)?;let exhausted=page.value.exhausted;let mut batch=Rows{rows:page.value.rows.into_iter(),_owner:page.owner};for row in &mut batch.rows{yield row;}if exhausted{cursor.close().await;break}}},
-    )
+    Box::pin(async_stream::try_stream! {
+        let wire_projection = if file_all.is_some() { q::Projection::Canonical } else { projection };
+        let mut cursor=Cursor::begin(index,expression,wire_projection).await.map_err(rev_err)?;
+        let mut diff_entries = selected::Work::default();
+        loop {
+            let page=cursor.page().await.map_err(rev_err)?;
+            let exhausted=page.value.exhausted;
+            let mut batch=Rows{rows:page.value.rows.into_iter(),_owner:page.owner};
+            for row in &mut batch.rows {
+                if let Some(store) = &file_all {
+                    let id = jj_id(checked_model(row.commit.as_ref()).map_err(rev_err)?);
+                    if !selected_file_changed(store, &cursor.index, &cursor.scope, id, batch._owner.clone(), &mut diff_entries).await? { continue; }
+                }
+                yield row;
+            }
+            if exhausted { cursor.close().await; break }
+        }
+    })
+}
+// Separate from the sync boolean bridge: all four sync workers may await
+// selected work concurrently, so sharing their blocking pool would deadlock.
+fn selected_runtime() -> Result<&'static SyncRuntime, Error> {
+    static STATE: std::sync::OnceLock<Result<SyncRuntime, std::io::Error>> =
+        std::sync::OnceLock::new();
+    STATE
+        .get_or_init(|| {
+            Ok(SyncRuntime {
+                runtime: tokio::runtime::Builder::new_multi_thread()
+                    .worker_threads(1)
+                    .max_blocking_threads(4)
+                    .thread_name("native-index-selected")
+                    .enable_all()
+                    .build()?,
+                jobs: Arc::new(tokio::sync::Semaphore::new(4)),
+            })
+        })
+        .as_ref()
+        .map_err(|e| {
+            Error::Io(std::io::Error::new(
+                e.kind(),
+                "native index selected runtime unavailable",
+            ))
+        })
+}
+async fn selected_file_changed(
+    store: &Arc<Store>,
+    index: &NativeReadonlyIndex,
+    scope: &Arc<CachedScope>,
+    id: CommitId,
+    owner: QueryOwner,
+    entries: &mut selected::Work,
+) -> Result<bool, RevsetEvaluationError> {
+    let runtime = selected_runtime().map_err(rev_err)?;
+    let permit = runtime
+        .jobs
+        .clone()
+        .try_acquire_owned()
+        .map_err(|_| rev_err(Error::Limit))?;
+    // Admission precedes snapshots. The physical job, not its waiter/timer,
+    // retains provenance and permits through underlying metadata/tree/file I/O.
+    let store = store.clone();
+    let index = index.clone();
+    let timeout = Duration::from_millis(index.core.limits.sync_query_timeout_ms);
+    let work = *entries;
+    let scope = scope.clone();
+    let owner: QueryOwner = Arc::new((store.clone(), index.clone(), scope.clone(), owner, permit));
+    let (send, recv) = tokio::sync::oneshot::channel();
+    runtime.runtime.spawn_blocking(move || {
+        let result = futures::executor::block_on(selected::changed(
+            &store,
+            &index,
+            scope,
+            id,
+            owner.clone(),
+            work,
+        ));
+        drop(index);
+        drop(store);
+        drop(owner);
+        let _ = send.send(result);
+    });
+    let (send, recv_result) = tokio::sync::oneshot::channel();
+    runtime.runtime.spawn(async move {
+        let result = match tokio::time::timeout(timeout, recv).await {
+            Ok(Ok(result)) => result,
+            Ok(Err(_)) => Err(rev_err(Error::Query(tonic::Code::Unavailable))),
+            Err(_) => Err(rev_err(Error::Query(tonic::Code::DeadlineExceeded))),
+        };
+        let _ = send.send(result);
+    });
+    let (changed, used) = recv_result
+        .await
+        .map_err(|_| rev_err(Error::Query(tonic::Code::Unavailable)))??;
+    *entries = used;
+    Ok(changed)
 }
 impl Revset for NativeRevset {
     fn stream<'a>(&self) -> LocalBoxStream<'a, Result<CommitId, RevsetEvaluationError>>
@@ -402,6 +623,7 @@ impl Revset for NativeRevset {
                 self.index.clone(),
                 self.expression.clone(),
                 q::Projection::Canonical,
+                self.file_all.clone(),
             )
             .map(|v| {
                 let row = v?;
@@ -420,6 +642,7 @@ impl Revset for NativeRevset {
                 self.index.clone(),
                 self.expression.clone(),
                 q::Projection::Canonical,
+                self.file_all.clone(),
             )
             .map(|v| {
                 let row = v?;
@@ -436,11 +659,17 @@ impl Revset for NativeRevset {
     where
         Self: 'a,
     {
+        if self.file_all.is_some() {
+            return Box::pin(futures::stream::once(async {
+                Err(rev_err(Error::UnsupportedExpression("selected_file_graph")))
+            }));
+        }
         Box::pin(
             rows(
                 self.index.clone(),
                 self.expression.clone(),
                 q::Projection::Canonical,
+                self.file_all.clone(),
             )
             .map(|v| {
                 let row = v?;
@@ -465,7 +694,7 @@ impl Revset for NativeRevset {
         )
     }
     fn is_empty(&self) -> Result<bool, RevsetEvaluationError> {
-        sync_empty(&self.index, &self.expression)
+        sync_empty(&self.index, &self.expression, self.file_all.as_ref())
     }
     fn count_estimate(&self) -> Result<(usize, Option<usize>), RevsetEvaluationError> {
         Ok((0, None))
@@ -476,9 +705,11 @@ impl Revset for NativeRevset {
     {
         let index = self.index.clone();
         let expression = self.expression.clone();
+        let file_all = self.file_all.clone();
         Box::new(move |id| {
             let index = index.clone();
             let expression = expression.clone();
+            let file_all = file_all.clone();
             let id = id.clone();
             Box::pin(async move {
                 if !index
@@ -488,15 +719,31 @@ impl Revset for NativeRevset {
                 {
                     return Ok(false);
                 }
-                let selected = commits(&[id]).map_err(rev_err)?;
-                let intersection = expr(q::graph_expr::Expression::Intersection(q::SetExpr {
-                    inputs: vec![expression, selected],
-                }));
-                rows(index, intersection, q::Projection::Ids)
-                    .next()
-                    .await
-                    .transpose()
-                    .map(|v| v.is_some())
+                // A pure immutable membership fact needs no resumable query
+                // identity or replay tombstone for every rendered template row.
+                let fact = q::graph_fact::Fact::Membership(q::Membership {
+                    expression: Some(expression),
+                    candidate: Some(q::CommitId {
+                        value: model_id(&id).map_err(rev_err)?.0.to_vec(),
+                    }),
+                });
+                let present = match index.fact(fact).await.map_err(rev_err)? {
+                    q::graph_fact_answer::Answer::Membership(present) => present,
+                    _ => return Err(rev_err(Error::Corrupt)),
+                };
+                if !present {
+                    return Ok(false);
+                }
+                if let Some(store) = file_all {
+                    // Membership only narrows the server-side graph predicate;
+                    // preserve the exact selected-client file filter as well.
+                    let scope = index.scope().await.map_err(rev_err)?;
+                    let owner: QueryOwner = Arc::new((index.core.owner(), scope.clone()));
+                    let mut work = selected::Work::default();
+                    selected_file_changed(&store, &index, &scope, id, owner, &mut work).await
+                } else {
+                    Ok(true)
+                }
             }) as LocalBoxFuture<'a, _>
         })
     }
@@ -532,6 +779,7 @@ fn sync_runtime() -> Result<&'static SyncRuntime, Error> {
 fn sync_empty(
     index: &NativeReadonlyIndex,
     expression: &q::GraphExpr,
+    file_all: Option<&Arc<Store>>,
 ) -> Result<bool, RevsetEvaluationError> {
     let runtime = sync_runtime().map_err(rev_err)?;
     // Acquire before spawning: neither Tokio's blocking queue nor accepted
@@ -544,13 +792,14 @@ fn sync_empty(
     // Deep snapshots are admitted too, not just the subsequently queued job.
     let index = index.clone();
     let expression = expression.clone();
+    let file_all = file_all.cloned();
     let timeout = Duration::from_millis(index.core.limits.sync_query_timeout_ms);
     let (send, recv) = std::sync::mpsc::sync_channel(1);
     runtime.runtime.spawn_blocking(move || {
         // The LocalBoxStream is created and polled on this owned worker, never
         // nested inside the caller's LocalPool or current-thread runtime.
         let result = futures::executor::block_on(async {
-            rows(index, expression, q::Projection::Ids)
+            rows(index, expression, q::Projection::Ids, file_all)
                 .next()
                 .await
                 .transpose()

@@ -2,7 +2,7 @@
 name = "jj-native-index"
 version = "0.1.0"
 edition = "2024"
-license = "MIT"
+license = "MIT AND Apache-2.0"
 description = "Immutable checkpoint-backed jj index over local broker queries"
 
 [dependencies]

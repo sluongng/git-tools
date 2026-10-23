@@ -655,6 +655,22 @@ async fn pinned_admission_loads_commits_without_historical_trees_and_reopens_laz
         file.bytes
     );
     assert_eq!(counts.files.load(Ordering::SeqCst), 1);
+    // The caller's physical owner survives EOF while the reader is still held.
+    let permit = Arc::new(tokio::sync::Semaphore::new(1));
+    let owner = Arc::new(permit.clone().acquire_owned().await.unwrap());
+    let owned = repo
+        .io
+        .read_file_with_owner(m::FileId(file.descriptor.key.id.0), owner.clone())
+        .await
+        .unwrap();
+    drop(owner);
+    let (_, mut held_reader) = owned.into_parts();
+    let mut observed = Vec::new();
+    held_reader.read_to_end(&mut observed).await.unwrap();
+    assert_eq!(observed, file.bytes);
+    assert!(permit.clone().try_acquire_owned().is_err());
+    drop(held_reader);
+    assert!(permit.clone().try_acquire_owned().is_ok());
     cache.wait_for_idle().await.unwrap();
     repo.wait_for_idle().await;
     drop(repo);
@@ -3178,6 +3194,7 @@ async fn captured_multi_root_queries_admit_deep_metadata_without_intervening_his
         .query
         .open_scope(
             OpenQueryScope {
+                query_identity_version: 1,
                 roots: vec![head, independent_head],
                 overlay: Vec::new(),
                 replay_key: [31; 32],
@@ -3336,6 +3353,7 @@ async fn captured_multi_root_queries_admit_deep_metadata_without_intervening_his
         .query
         .open_scope(
             OpenQueryScope {
+                query_identity_version: 1,
                 roots: vec![head, independent_head],
                 overlay: vec![draft.bytes.clone()],
                 replay_key: [33; 32],
@@ -3509,6 +3527,7 @@ async fn captured_multi_root_queries_admit_deep_metadata_without_intervening_his
         .query
         .open_scope(
             OpenQueryScope {
+                query_identity_version: 1,
                 roots: vec![head, independent_head],
                 overlay: Vec::new(),
                 replay_key: [35; 32],
@@ -3643,6 +3662,7 @@ async fn real_broker_query_then_lazy_object_reads_share_the_captured_remote_adap
     let opened = query
         .open_scope(
             OpenQueryScope {
+                query_identity_version: 1,
                 roots: vec![head],
                 overlay: vec![],
                 replay_key: [41; 32],
@@ -3911,4 +3931,886 @@ async fn metadata_conflict_queries_match_pinned_jj_without_loading_history_or_tr
         }
         server.stop().await;
     }
+}
+
+/// Observation only: every operation still runs through the actual remote
+/// query adapter. In particular, an observed graph ID is not an object grant.
+#[derive(Debug)]
+struct SelectedQueryObserver {
+    inner: Arc<dyn native_broker::NativeQueryIo>,
+    reads: std::sync::Mutex<Vec<m::CommitId>>,
+}
+#[async_trait]
+impl native_broker::NativeQueryIo for SelectedQueryObserver {
+    fn resources(&self) -> native_broker::QueryResources {
+        self.inner.resources()
+    }
+    async fn open_scope(
+        &self,
+        input: native_broker::OpenQueryScope,
+        owner: native_broker::QueryOwner,
+    ) -> Result<native_broker::QueryReply<native_broker::QueryScope>, Status> {
+        self.inner.open_scope(input, owner).await
+    }
+    async fn fork_scope(
+        &self,
+        input: native_broker::ForkQueryScope,
+        owner: native_broker::QueryOwner,
+    ) -> Result<native_broker::QueryReply<native_broker::QueryScope>, Status> {
+        self.inner.fork_scope(input, owner).await
+    }
+    async fn facts(
+        &self,
+        scope: [u8; 32],
+        facts: Vec<tinytree_client::query_protocol::GraphFact>,
+        owner: native_broker::QueryOwner,
+    ) -> Result<native_broker::QueryReply<tinytree_client::query_protocol::GraphFacts>, Status>
+    {
+        self.inner.facts(scope, facts, owner).await
+    }
+    async fn resolve_commit_prefix(
+        &self,
+        scope: [u8; 32],
+        prefix: String,
+        owner: native_broker::QueryOwner,
+    ) -> Result<
+        native_broker::QueryReply<tinytree_client::query_protocol::CommitPrefixResult>,
+        Status,
+    > {
+        self.inner.resolve_commit_prefix(scope, prefix, owner).await
+    }
+    async fn resolve_change_prefix(
+        &self,
+        scope: [u8; 32],
+        prefix: String,
+        heads: Vec<m::CommitId>,
+        owner: native_broker::QueryOwner,
+    ) -> Result<
+        native_broker::QueryReply<tinytree_client::query_protocol::ChangePrefixResult>,
+        Status,
+    > {
+        self.inner
+            .resolve_change_prefix(scope, prefix, heads, owner)
+            .await
+    }
+    async fn shortest_prefix(
+        &self,
+        scope: [u8; 32],
+        target: tinytree_client::query_protocol::shortest_prefix_request::Target,
+        heads: Vec<m::CommitId>,
+        owner: native_broker::QueryOwner,
+    ) -> Result<
+        native_broker::QueryReply<tinytree_client::query_protocol::ShortestPrefixResult>,
+        Status,
+    > {
+        self.inner
+            .shortest_prefix(scope, target, heads, owner)
+            .await
+    }
+    async fn begin(
+        &self,
+        input: native_broker::BeginQuery,
+        owner: native_broker::QueryOwner,
+    ) -> Result<native_broker::QueryReply<native_broker::QueryHandle>, Status> {
+        self.inner.begin(input, owner).await
+    }
+    async fn page(
+        &self,
+        query: [u8; 32],
+        sequence: u64,
+        owner: native_broker::QueryOwner,
+    ) -> Result<native_broker::QueryReply<native_broker::QueryPage>, Status> {
+        self.inner.page(query, sequence, owner).await
+    }
+    async fn read_commit(
+        &self,
+        scope: [u8; 32],
+        commit: m::CommitId,
+        owner: native_broker::QueryOwner,
+    ) -> Result<native_broker::QueryReply<jj_native_backend::VerifiedMetadata>, Status> {
+        let reply = self.inner.read_commit(scope, commit, owner).await?;
+        self.reads.lock().unwrap().push(commit);
+        Ok(reply)
+    }
+    async fn close_query(
+        &self,
+        query: [u8; 32],
+        owner: native_broker::QueryOwner,
+    ) -> Result<(), Status> {
+        self.inner.close_query(query, owner).await
+    }
+    async fn close_scope(
+        &self,
+        scope: [u8; 32],
+        owner: native_broker::QueryOwner,
+    ) -> Result<(), Status> {
+        self.inner.close_scope(scope, owner).await
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn selected_file_conflicts_admit_only_needed_deep_bases_through_real_remote_query_scope() {
+    use futures::TryStreamExt as _;
+    use jj_lib::{
+        backend::{ChangeId, CopyId, Tree, TreeValue},
+        conflict_labels::ConflictLabels,
+        fileset::FilesetExpression,
+        index::Index as _,
+        merge::Merge,
+        merged_tree::MergedTree,
+        object_id::ObjectId as _,
+        repo::Repo as _,
+        repo_path::{RepoPath, RepoPathComponentBuf},
+        revset::{
+            ResolvedExpression as R, ResolvedPredicateExpression as P, RevsetFilterPredicate as F,
+        },
+    };
+    // Materialized reference is an oracle only. The tested index has a separate
+    // empty local object store and actual scoped query/object remote adapters.
+    let mut reference = pinned_graph_reference(&[], false).await;
+    let mut trees = Vec::new();
+    let mut files = Vec::new();
+    for text in [
+        "one\nmiddle\nthree\n",
+        "ONE\nmiddle\nthree\n",
+        "one\nmiddle\nTHREE\n",
+        "ONE\nmiddle\nTHREE\n",
+        "OTHER\nmiddle\nTHREE\n",
+    ] {
+        let id = reference
+            .repo
+            .store()
+            .backend()
+            .write_file(
+                RepoPath::root(),
+                &mut futures::io::Cursor::new(text.as_bytes()),
+            )
+            .await
+            .unwrap();
+        let tree = reference
+            .repo
+            .store()
+            .backend()
+            .write_tree(
+                RepoPath::root(),
+                &Tree::from_sorted_entries(vec![(
+                    RepoPathComponentBuf::new("file").unwrap(),
+                    TreeValue::File {
+                        id: id.clone(),
+                        executable: false,
+                        copy_id: CopyId::placeholder(),
+                    },
+                )]),
+            )
+            .await
+            .unwrap();
+        files.push((id, text.as_bytes().to_vec()));
+        trees.push(tree);
+    }
+    // 1 is older history that must remain cold; 2 is the deep merge base.
+    // Intervening commits 3/4 must stay cold: the selected parents 5/6
+    // therefore do not grant the common base just by exposing its ID.
+    // 7 has an unresolved tree representation but no diff from merged parents;
+    // 8 has the same parents and a real diff; 9 is a clean public head.
+    let shapes: &[(usize, &[usize], bool)] = &[
+        (0, &[0], false),
+        (0, &[1], false),
+        (0, &[2], false),
+        (0, &[2], false),
+        (1, &[3], false),
+        (2, &[4], false),
+        (3, &[5, 6], true),
+        (4, &[5, 6], true),
+        (3, &[7, 8], false),
+    ];
+    let mut transaction = reference.repo.start_transaction();
+    for (position, (tree, parents, conflict)) in shapes.iter().enumerate() {
+        let terms = if *conflict {
+            Merge::from_vec(vec![
+                trees[*tree].clone(),
+                reference.repo.store().empty_tree_id().clone(),
+                reference.repo.store().empty_tree_id().clone(),
+            ])
+        } else {
+            Merge::resolved(trees[*tree].clone())
+        };
+        let selected = MergedTree::new(
+            reference.repo.store().clone(),
+            terms,
+            if *conflict {
+                ConflictLabels::from_vec(vec!["left".into(), "base".into(), "right".into()])
+            } else {
+                ConflictLabels::unlabeled()
+            },
+        );
+        let commit = transaction
+            .repo_mut()
+            .new_commit(
+                parents.iter().map(|n| reference.ids[*n].clone()).collect(),
+                selected,
+            )
+            .set_change_id(ChangeId::from_bytes(&[80 + position as u8; 16]))
+            .set_description(format!("selected merge fixture {}", position + 1))
+            .write()
+            .await
+            .unwrap();
+        reference.ids.push(commit.id().clone());
+    }
+    reference.repo = transaction.commit("selected merge fixture").await.unwrap();
+    let commit_key = |position: usize| m::ObjectKey {
+        kind: m::Kind::Commit,
+        id: m::ObjectId::from_slice(reference.ids[position].as_bytes()).unwrap(),
+    };
+    let remote_directory = private_dir();
+    let remote_store = Store::open(remote_directory.path(), Default::default()).unwrap();
+    remote_store.create_repository("example").unwrap();
+    let index_directory = private_dir();
+    let index = tinytree_index::Index::open(index_directory.path(), &Default::default()).unwrap();
+    for position in 1..reference.ids.len() {
+        let metadata = reference
+            ._io
+            .read_metadata(commit_key(position))
+            .await
+            .unwrap();
+        remote_store
+            .put("example", metadata.descriptor(), metadata.bytes(), 0)
+            .unwrap();
+        index
+            .ingest("example", metadata.descriptor(), metadata.bytes())
+            .unwrap();
+    }
+    for tree in &trees {
+        let value = reference
+            ._io
+            .read_metadata(m::ObjectKey {
+                kind: m::Kind::Tree,
+                id: m::ObjectId::from_slice(tree.as_bytes()).unwrap(),
+            })
+            .await
+            .unwrap();
+        remote_store
+            .put("example", value.descriptor(), value.bytes(), 0)
+            .unwrap();
+    }
+    for (id, bytes) in &files {
+        let descriptor = m::describe_file(bytes);
+        assert_eq!(descriptor.key.id.0.as_slice(), id.as_bytes());
+        remote_store.put("example", descriptor, bytes, 0).unwrap();
+    }
+    let head = m::CommitId(commit_key(9).id.0);
+    remote_store
+        .publish(
+            "example",
+            &tinytree_store::PublishRequest {
+                idempotency_key: "selected-head".into(),
+                reference_name: "main".into(),
+                expected_generation: 0,
+                new_commit: Some(head),
+                staging_leases: vec![],
+            },
+            1,
+        )
+        .unwrap();
+    let counts = Counters::new();
+    let service = RepositoryService::new(
+        remote_store,
+        ServiceConfig::default(),
+        vec!["example".into()],
+        vec![
+            Principal::new("test", TOKEN, vec!["example".into()], true)
+                .unwrap()
+                .with_retention(true),
+        ],
+    )
+    .unwrap()
+    .with_query_index(index)
+    .unwrap();
+    let server = Server::start_service(service, counts.clone(), None).await;
+    let local_directory = private_dir();
+    let (direct, remote) = local(
+        local_directory.path(),
+        cache(local_directory.path()),
+        config(&server),
+        true,
+    );
+    remote.control.admit_reference("main").await.unwrap();
+    assert!(direct.descriptor(commit_key(2)).await.unwrap().is_none());
+    assert!(direct.descriptor(commit_key(1)).await.unwrap().is_none());
+    assert!(
+        remote.io.read_metadata(commit_key(2)).await.is_err(),
+        "an ID alone cannot fetch the deep base"
+    );
+    let initial_metadata = counts.metadata_keys.load(Ordering::SeqCst);
+    let initial_holds = counts.holds.load(Ordering::SeqCst);
+    let observed = Arc::new(SelectedQueryObserver {
+        inner: remote.query.clone(),
+        reads: std::sync::Mutex::new(vec![]),
+    });
+    let native_index = jj_native_index::NativeIndexStore::init(
+        &local_directory.path().join("index"),
+        jj_native_index::Config {
+            endpoint: jj_native_index::Endpoint::UnixSocket(
+                local_directory.path().join("unused-fixture.sock"),
+            ),
+            store_alias: "example".into(),
+            provider_fingerprint: [8; 32],
+        },
+        Default::default(),
+        observed.clone(),
+        remote.io.clone(),
+        vec![head],
+    )
+    .unwrap();
+    let readonly = native_index.seed_index().unwrap();
+    let backend = jj_native_backend::NativeBackend::from_io(remote.io.clone(), Default::default())
+        .await
+        .unwrap();
+    let jj_store = jj_lib::store::Store::new(
+        Box::new(backend),
+        jj_lib::signing::Signer::new(None, vec![]),
+        jj_lib::tree_merge::MergeOptions {
+            hunk_level: jj_lib::files::FileMergeHunkLevel::Line,
+            same_change: jj_lib::merge::SameChange::Accept,
+        },
+    );
+    for (name, candidates, expected_positions) in [
+        (
+            "mixed ancestor history",
+            vec![1, 2, 3, 4, 5, 6, 7, 8, 9],
+            vec![8],
+        ),
+        ("auto-merged empty conflict", vec![7], vec![]),
+    ] {
+        let expression = R::FilterWithin {
+            candidates: Box::new(R::Commits(
+                candidates
+                    .iter()
+                    .map(|n| reference.ids[*n].clone())
+                    .collect(),
+            )),
+            predicate: P::Intersection(
+                Box::new(P::Filter(F::HasConflict)),
+                Box::new(P::Filter(F::File(FilesetExpression::all()))),
+            ),
+        };
+        let expected = reference
+            .repo
+            .index()
+            .evaluate_revset(&expression, reference.repo.store())
+            .unwrap()
+            .stream()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        assert_eq!(
+            expected,
+            expected_positions
+                .iter()
+                .map(|n| reference.ids[*n].clone())
+                .collect::<Vec<_>>(),
+            "{name}"
+        );
+        let actual = readonly
+            .evaluate_revset(&expression, &jj_store)
+            .unwrap()
+            .stream()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        assert_eq!(actual, expected, "{name}");
+    }
+    assert!(
+        observed
+            .reads
+            .lock()
+            .unwrap()
+            .contains(&m::CommitId(commit_key(2).id.0)),
+        "selected deep bases must be canonically admitted under the original scope"
+    );
+    assert!(direct.descriptor(commit_key(2)).await.unwrap().is_some());
+    assert!(
+        direct.descriptor(commit_key(1)).await.unwrap().is_none(),
+        "unneeded older history must stay cold"
+    );
+    for position in [3, 4] {
+        assert!(
+            direct
+                .descriptor(commit_key(position))
+                .await
+                .unwrap()
+                .is_none(),
+            "intervening parent history must stay cold"
+        );
+        assert!(
+            !observed
+                .reads
+                .lock()
+                .unwrap()
+                .contains(&m::CommitId(commit_key(position).id.0))
+        );
+    }
+    assert_eq!(
+        counts.holds.load(Ordering::SeqCst),
+        initial_holds,
+        "selected bases reuse the captured rootset, not per-base holds"
+    );
+    assert!(
+        counts.metadata_requests.lock().unwrap()[initial_metadata..]
+            .iter()
+            .all(|key| key.kind != m::Kind::Commit as i32),
+        "selected canonical admission must not hydrate intervening history through BatchReadObjects"
+    );
+    assert_eq!(counts.graph_rpcs.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn native_v2_retires_only_acknowledged_queries_after_scope_close_and_keeps_active_replays() {
+    use native_broker::{
+        BeginQuery, ForkQueryScope, NativeQueryIo, OpenQueryScope, query_protocol as q,
+    };
+    let (_serverdir, store, _fixture, head, _historical) = seed_history(4);
+    let indexdir = private_dir();
+    let index = tinytree_index::Index::open(indexdir.path(), &Default::default()).unwrap();
+    let service = RepositoryService::new(
+        store,
+        ServiceConfig::default(),
+        vec!["example".into()],
+        vec![
+            Principal::new("test", TOKEN, vec!["example".into()], true)
+                .unwrap()
+                .with_retention(true),
+        ],
+    )
+    .unwrap()
+    .with_query_index(index)
+    .unwrap();
+    let server = Server::start_service(service, Counters::new(), None).await;
+    let directory = private_dir();
+    let mut configuration = config(&server);
+    configuration.query.max_queries = 4;
+    configuration.query.max_replays = 8;
+    let (_direct, repo) = local(
+        directory.path(),
+        cache(directory.path()),
+        configuration,
+        true,
+    );
+    repo.control.admit_reference("main").await.unwrap();
+    let opened = repo
+        .query
+        .open_scope(
+            OpenQueryScope {
+                roots: vec![head],
+                overlay: vec![],
+                replay_key: [91; 32],
+                query_identity_version: 2,
+            },
+            Arc::new(()),
+        )
+        .await
+        .unwrap();
+    assert_eq!(opened.value.query_identity_version, 2);
+    let scope = opened.value.clone();
+    let fork = ForkQueryScope {
+        parent: scope.handle,
+        overlay: vec![],
+        replay_key: [92; 32],
+    };
+    let child = repo
+        .query
+        .fork_scope(fork.clone(), Arc::new(()))
+        .await
+        .unwrap();
+    assert_eq!(child.value.query_identity_version, 2);
+    let expression = q::GraphExpr {
+        version: 1,
+        expression: Some(q::graph_expr::Expression::Commits(q::CommitSet {
+            commits: vec![
+                q::CommitId {
+                    value: head.0.to_vec(),
+                },
+                q::CommitId { value: vec![0; 32] },
+            ],
+        })),
+    };
+    let request = |nonce: u8| BeginQuery {
+        scope: scope.handle,
+        expression: expression.clone(),
+        projection: q::Projection::Ids,
+        page_size: 1,
+        replay_key: scope.bound_query_id([nonce; 16]).unwrap(),
+    };
+    let closed_request = request(1);
+    let closed = repo
+        .query
+        .begin(closed_request.clone(), Arc::new(()))
+        .await
+        .unwrap()
+        .value;
+    let live_request = request(2);
+    let live = repo
+        .query
+        .begin(live_request.clone(), Arc::new(()))
+        .await
+        .unwrap()
+        .value;
+    // Establish both upstream evaluators, then retain the exact delivered page.
+    let _ = repo
+        .query
+        .page(closed.handle, 0, Arc::new(()))
+        .await
+        .unwrap();
+    let delivered = repo.query.page(live.handle, 0, Arc::new(())).await.unwrap();
+    let eof_request = BeginQuery {
+        scope: scope.handle,
+        expression: q::GraphExpr {
+            version: 1,
+            expression: Some(q::graph_expr::Expression::Commits(q::CommitSet {
+                commits: vec![q::CommitId {
+                    value: head.0.to_vec(),
+                }],
+            })),
+        },
+        projection: q::Projection::Ids,
+        page_size: 1,
+        replay_key: scope.bound_query_id([3; 16]).unwrap(),
+    };
+    let eof = repo
+        .query
+        .begin(eof_request.clone(), Arc::new(()))
+        .await
+        .unwrap()
+        .value;
+    let mut sequence = 0;
+    let last = loop {
+        let page = repo
+            .query
+            .page(eof.handle, sequence, Arc::new(()))
+            .await
+            .unwrap();
+        if page.value.exhausted {
+            break page;
+        }
+        sequence += 1;
+    };
+    // Either serialization order is valid: only an acknowledged close is retired.
+    let (query_close, scope_close) = tokio::join!(
+        repo.query.close_query(closed.handle, Arc::new(())),
+        repo.query.close_scope(scope.handle, Arc::new(()))
+    );
+    query_close.unwrap();
+    scope_close.unwrap();
+    assert_eq!(
+        repo.query
+            .begin(closed_request.clone(), Arc::new(()))
+            .await
+            .unwrap_err()
+            .code(),
+        tonic::Code::FailedPrecondition
+    );
+    let repeated = repo
+        .query
+        .begin(live_request.clone(), Arc::new(()))
+        .await
+        .unwrap();
+    assert_eq!(repeated.value.handle, live.handle);
+    let replay = repo.query.page(live.handle, 0, Arc::new(())).await.unwrap();
+    assert_eq!(replay.value.rows, delivered.value.rows);
+    assert_eq!(replay.value.exhausted, delivered.value.exhausted);
+    let replay_eof = repo
+        .query
+        .page(eof.handle, sequence, Arc::new(()))
+        .await
+        .unwrap();
+    assert_eq!(replay_eof.value.rows, last.value.rows);
+    assert!(replay_eof.value.exhausted);
+    // Continue the established live evaluator after public scope closure.
+    let mut next = 1;
+    if !delivered.value.exhausted {
+        loop {
+            let page = repo
+                .query
+                .page(live.handle, next, Arc::new(()))
+                .await
+                .unwrap();
+            if page.value.exhausted {
+                break;
+            }
+            next += 1;
+        }
+    }
+    repo.query
+        .close_query(live.handle, Arc::new(()))
+        .await
+        .unwrap();
+    repo.query
+        .close_query(eof.handle, Arc::new(()))
+        .await
+        .unwrap();
+    repo.query
+        .close_query(live.handle, Arc::new(()))
+        .await
+        .unwrap();
+    assert_eq!(
+        repo.query
+            .begin(live_request, Arc::new(()))
+            .await
+            .unwrap_err()
+            .code(),
+        tonic::Code::FailedPrecondition
+    );
+    let fork_replay = repo.query.fork_scope(fork, Arc::new(())).await.unwrap();
+    assert_eq!(
+        fork_replay.value, child.value,
+        "lost Fork ACK remains replayable after parent close"
+    );
+    let new_scope = repo
+        .query
+        .open_scope(
+            OpenQueryScope {
+                roots: vec![head],
+                overlay: vec![],
+                replay_key: [93; 32],
+                query_identity_version: 2,
+            },
+            Arc::new(()),
+        )
+        .await
+        .unwrap();
+    let rebound = BeginQuery {
+        scope: new_scope.value.handle,
+        ..closed_request
+    };
+    assert_eq!(
+        repo.query
+            .begin(rebound, Arc::new(()))
+            .await
+            .unwrap_err()
+            .code(),
+        tonic::Code::InvalidArgument,
+        "retired identity cannot rebind under a different exact scope"
+    );
+    let mut malformed = BeginQuery {
+        scope: new_scope.value.handle,
+        expression,
+        projection: q::Projection::Ids,
+        page_size: 1,
+        replay_key: new_scope.value.bound_query_id([4; 16]).unwrap(),
+    };
+    malformed.replay_key[31] ^= 1;
+    assert_eq!(
+        repo.query
+            .begin(malformed, Arc::new(()))
+            .await
+            .unwrap_err()
+            .code(),
+        tonic::Code::InvalidArgument
+    );
+    // Keeping closed-query tombstones would exhaust the unchanged eight-entry
+    // local replay budget here. Creation/scope replays remain retained.
+    async fn complete_literal(
+        query: &dyn NativeQueryIo,
+        scope: &native_broker::QueryScope,
+        head: m::CommitId,
+        nonce: u8,
+    ) {
+        let query_handle = query
+            .begin(
+                BeginQuery {
+                    scope: scope.handle,
+                    expression: q::GraphExpr {
+                        version: 1,
+                        expression: Some(q::graph_expr::Expression::Commits(q::CommitSet {
+                            commits: vec![q::CommitId {
+                                value: head.0.to_vec(),
+                            }],
+                        })),
+                    },
+                    projection: q::Projection::Ids,
+                    page_size: 1,
+                    replay_key: scope.bound_query_id([nonce; 16]).unwrap(),
+                },
+                Arc::new(()),
+            )
+            .await
+            .unwrap()
+            .value;
+        let mut sequence = 0;
+        loop {
+            let page = query
+                .page(query_handle.handle, sequence, Arc::new(()))
+                .await
+                .unwrap();
+            if page.value.exhausted {
+                break;
+            }
+            sequence += 1;
+        }
+        query
+            .close_query(query_handle.handle, Arc::new(()))
+            .await
+            .unwrap();
+    }
+    for nonce in [5, 6, 7] {
+        complete_literal(repo.query.as_ref(), &new_scope.value, head, nonce).await;
+    }
+    let unstarted = repo
+        .query
+        .begin(
+            BeginQuery {
+                scope: new_scope.value.handle,
+                expression: q::GraphExpr {
+                    version: 1,
+                    expression: Some(q::graph_expr::Expression::Commits(q::CommitSet {
+                        commits: vec![q::CommitId {
+                            value: head.0.to_vec(),
+                        }],
+                    })),
+                },
+                projection: q::Projection::Ids,
+                page_size: 1,
+                replay_key: new_scope.value.bound_query_id([8; 16]).unwrap(),
+            },
+            Arc::new(()),
+        )
+        .await
+        .unwrap()
+        .value;
+    repo.query
+        .close_scope(new_scope.value.handle, Arc::new(()))
+        .await
+        .unwrap();
+    assert_eq!(
+        repo.query
+            .page(unstarted.handle, 0, Arc::new(()))
+            .await
+            .unwrap_err()
+            .code(),
+        tonic::Code::FailedPrecondition,
+        "a locally prepared but unpaged query has no upstream evaluator to preserve"
+    );
+    repo.query
+        .close_query(unstarted.handle, Arc::new(()))
+        .await
+        .unwrap();
+    for scope_key in [94, 95] {
+        let current = repo
+            .query
+            .open_scope(
+                OpenQueryScope {
+                    roots: vec![head],
+                    overlay: vec![],
+                    replay_key: [scope_key; 32],
+                    query_identity_version: 2,
+                },
+                Arc::new(()),
+            )
+            .await
+            .unwrap();
+        for nonce in [5, 6, 7] {
+            complete_literal(repo.query.as_ref(), &current.value, head, nonce).await;
+        }
+        repo.query
+            .close_scope(current.value.handle, Arc::new(()))
+            .await
+            .unwrap();
+    }
+    repo.query
+        .close_scope(child.value.handle, Arc::new(()))
+        .await
+        .unwrap();
+    repo.query
+        .close_scope(new_scope.value.handle, Arc::new(()))
+        .await
+        .unwrap();
+    // V1 keeps its original tombstone/rebinding rules; no early retirement.
+    let legacy_directory = private_dir();
+    let (_legacy_direct, legacy) = local(
+        legacy_directory.path(),
+        cache(legacy_directory.path()),
+        config(&server),
+        true,
+    );
+    legacy.control.admit_reference("main").await.unwrap();
+    let first = legacy
+        .query
+        .open_scope(
+            OpenQueryScope {
+                roots: vec![head],
+                overlay: vec![],
+                replay_key: [101; 32],
+                query_identity_version: 1,
+            },
+            Arc::new(()),
+        )
+        .await
+        .unwrap();
+    assert_eq!(first.value.query_identity_version, 1);
+    let legacy_request = BeginQuery {
+        scope: first.value.handle,
+        expression: q::GraphExpr {
+            version: 1,
+            expression: Some(q::graph_expr::Expression::Commits(q::CommitSet {
+                commits: vec![q::CommitId {
+                    value: head.0.to_vec(),
+                }],
+            })),
+        },
+        projection: q::Projection::Ids,
+        page_size: 1,
+        replay_key: [102; 32],
+    };
+    let legacy_query = legacy
+        .query
+        .begin(legacy_request.clone(), Arc::new(()))
+        .await
+        .unwrap();
+    let _ = legacy
+        .query
+        .page(legacy_query.value.handle, 0, Arc::new(()))
+        .await
+        .unwrap();
+    legacy
+        .query
+        .close_query(legacy_query.value.handle, Arc::new(()))
+        .await
+        .unwrap();
+    legacy
+        .query
+        .close_scope(first.value.handle, Arc::new(()))
+        .await
+        .unwrap();
+    let second = legacy
+        .query
+        .open_scope(
+            OpenQueryScope {
+                roots: vec![head],
+                overlay: vec![],
+                replay_key: [103; 32],
+                query_identity_version: 1,
+            },
+            Arc::new(()),
+        )
+        .await
+        .unwrap();
+    let rebound = BeginQuery {
+        scope: second.value.handle,
+        ..legacy_request
+    };
+    assert_eq!(
+        legacy
+            .query
+            .begin(rebound, Arc::new(()))
+            .await
+            .unwrap_err()
+            .code(),
+        tonic::Code::AlreadyExists,
+        "legacy creation identity remains bound to its original intent"
+    );
+    legacy
+        .query
+        .close_scope(second.value.handle, Arc::new(()))
+        .await
+        .unwrap();
+    server.stop().await;
 }

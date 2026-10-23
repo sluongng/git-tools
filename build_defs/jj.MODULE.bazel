@@ -9,6 +9,8 @@ crate.annotation(
         "//third_party/patches:jj-retained-operation-inventory.patch",
         "//third_party/patches:jj-cloud-operation-codec.patch",
         "//third_party/patches:jj-index-capabilities.patch",
+        "//third_party/patches:jj-merge-prepared-index.patch",
+        "//third_party/patches:jj-lazy-prefix-context.patch",
     ],
     patch_args = ["-p1"],
 )

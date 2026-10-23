@@ -72,7 +72,7 @@ impl QueryService {
         mut stream: Streaming<T>,
         frame: impl Fn(T) -> UploadFrame,
     ) -> Result<Response<q::QueryScope>, Status> {
-        if header.version != 1 {
+        if !matches!(header.version, 1 | 2) {
             return Err(Status::invalid_argument("unsupported query scope version"));
         }
         let replay: [u8; 32] = header
@@ -495,6 +495,7 @@ impl RepositoryQuery for QueryService {
         if input.facts.len() > host.config.max_facts {
             return Err(Status::resource_exhausted("query fact count exceeded"));
         }
+        let facts_host = host.clone();
         self.scoped(
             identity,
             deadline,
@@ -505,11 +506,32 @@ impl RepositoryQuery for QueryService {
                 let mut answers = Vec::new();
                 let mut inputs = 0usize;
                 let mut outputs = 0usize;
+                let mut remaining_steps = config.max_eval_steps as u64;
                 for fact in input.facts {
                     let answer = match fact
                         .fact
                         .ok_or_else(|| Status::invalid_argument("query fact variant missing"))?
                     {
+                        q::graph_fact::Fact::Membership(value) => {
+                            let candidate = commit(value.candidate.as_ref().ok_or_else(|| {
+                                Status::invalid_argument("membership candidate missing")
+                            })?)?;
+                            let expression = value.expression.ok_or_else(|| {
+                                Status::invalid_argument("membership expression missing")
+                            })?;
+                            q::graph_fact_answer::Answer::Membership(
+                                facts_host.cursors.membership(
+                                    scope,
+                                    expression,
+                                    candidate,
+                                    budget,
+                                    config,
+                                    deadline,
+                                    &mut remaining_steps,
+                                    &mut inputs,
+                                )?,
+                            )
+                        }
                         q::graph_fact::Fact::HasId(value) => {
                             inputs += 1;
                             q::graph_fact_answer::Answer::HasId(
@@ -1099,5 +1121,151 @@ mod tests {
         })
         .await
         .unwrap();
+    }
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn membership_facts_preserve_ast_limits_strict_errors_and_shared_step_budget() {
+        let temporary = tempfile::tempdir().unwrap();
+        let store =
+            tinytree_store::Store::open(temporary.path().join("objects"), Default::default())
+                .unwrap();
+        store.create_repository("example").unwrap();
+        let mut commit = m::synthetic_root();
+        commit.parents = vec![m::CommitId::ROOT];
+        commit.change_id = m::ChangeId([31; 16]);
+        let object = m::encode(&m::Object::Commit(commit), Default::default()).unwrap();
+        store
+            .put("example", object.descriptor, &object.bytes, 0)
+            .unwrap();
+        let index =
+            tinytree_index::Index::open(temporary.path().join("derived"), &Default::default())
+                .unwrap();
+        index
+            .ingest("example", object.descriptor, &object.bytes)
+            .unwrap();
+        let mut config = crate::ServiceConfig::default();
+        config.query.max_eval_ast_nodes = 1;
+        config.query.max_eval_ast_depth = 1;
+        config.query.max_eval_literals = 1;
+        config.query.max_eval_steps = 8;
+        let repository = RepositoryService::new(store, config, vec!["example".into()], Vec::new())
+            .unwrap()
+            .with_query_index(index)
+            .unwrap();
+        let host = repository.query_host().unwrap();
+        let owner = host.clone();
+        let known = m::CommitId(object.descriptor.key.id.0);
+        let scope = tokio::task::spawn_blocking(move || {
+            owner.open("local-owner", "example", [32; 32], vec![known])
+        })
+        .await
+        .unwrap()
+        .unwrap();
+        let key = scope.key.clone();
+        let service = repository.query_service();
+        let expression = q::GraphExpr {
+            version: 1,
+            expression: Some(q::graph_expr::Expression::Commits(q::CommitSet {
+                commits: vec![wire(known)],
+            })),
+        };
+        let fact = |expression: q::GraphExpr, candidate: m::CommitId| q::GraphFact {
+            fact: Some(q::graph_fact::Fact::Membership(q::Membership {
+                expression: Some(expression),
+                candidate: Some(wire(candidate)),
+            })),
+        };
+        // The internal intersection must not reduce the existing user AST/depth
+        // or literal allowance. Repeated calls retain no cursor memory/history.
+        for _ in 0..20 {
+            let answer = service
+                .query_facts(Request::new(q::QueryFactsRequest {
+                    scope: key.clone(),
+                    facts: vec![fact(expression.clone(), known)],
+                }))
+                .await
+                .unwrap()
+                .into_inner();
+            assert_eq!(
+                answer.answers[0].answer,
+                Some(q::graph_fact_answer::Answer::Membership(true))
+            );
+        }
+        let error = service
+            .query_facts(Request::new(q::QueryFactsRequest {
+                scope: key.clone(),
+                facts: vec![
+                    fact(expression.clone(), known),
+                    fact(expression.clone(), known),
+                ],
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(
+            error.code(),
+            tonic::Code::ResourceExhausted,
+            "fact batches share one evaluation step allowance"
+        );
+        let absent = m::CommitId([33; 32]);
+        let mut invalid = expression.clone();
+        invalid.version = 2;
+        assert_eq!(
+            service
+                .query_facts(Request::new(q::QueryFactsRequest {
+                    scope: key.clone(),
+                    facts: vec![fact(invalid, absent)]
+                }))
+                .await
+                .unwrap_err()
+                .code(),
+            tonic::Code::InvalidArgument,
+            "an absent candidate must not bypass full AST validation"
+        );
+        let empty_intersection = q::GraphExpr {
+            version: 1,
+            expression: Some(q::graph_expr::Expression::Intersection(q::SetExpr {
+                inputs: vec![],
+            })),
+        };
+        assert_eq!(
+            service
+                .query_facts(Request::new(q::QueryFactsRequest {
+                    scope: key.clone(),
+                    facts: vec![fact(empty_intersection, absent)]
+                }))
+                .await
+                .unwrap_err()
+                .code(),
+            tonic::Code::InvalidArgument
+        );
+        let answer = service
+            .query_facts(Request::new(q::QueryFactsRequest {
+                scope: key.clone(),
+                facts: vec![fact(expression.clone(), absent)],
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(
+            answer.answers[0].answer,
+            Some(q::graph_fact_answer::Answer::Membership(false))
+        );
+        let unknown_literal = q::GraphExpr {
+            version: 1,
+            expression: Some(q::graph_expr::Expression::Commits(q::CommitSet {
+                commits: vec![wire(absent)],
+            })),
+        };
+        assert_eq!(
+            service
+                .query_facts(Request::new(q::QueryFactsRequest {
+                    scope: key,
+                    facts: vec![fact(unknown_literal, known)]
+                }))
+                .await
+                .unwrap_err()
+                .code(),
+            tonic::Code::InvalidArgument,
+            "out-of-scope literals preserve Evaluate errors"
+        );
     }
 }

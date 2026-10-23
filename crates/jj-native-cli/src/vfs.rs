@@ -111,7 +111,12 @@ pub(crate) async fn initialize(
             |_: &UserSettings, path: &Path| -> Result<Box<dyn Backend>, BackendInitError> {
                 broker::init(path, locator.clone())
             };
-        let initialized = native_workspace_admin::initialize(
+        let mode = broker::creation_policy(&locator).map_err(failure)?;
+        let index_initializer =
+            |settings: &UserSettings, path: &Path, operation: &jj_lib::op_store::OperationId| {
+                broker::init_index(path, mode, settings, initial, operation)
+            };
+        let initialized = native_workspace_admin::initialize_with_index(
             &registry,
             &binding,
             &settings,
@@ -120,6 +125,7 @@ pub(crate) async fn initialize(
             connector,
             initial,
             WorkspaceName::DEFAULT.to_owned(),
+            &index_initializer,
         )
         .await
         .map_err(failure)?;
@@ -397,7 +403,15 @@ pub(crate) async fn resume(
                     broker::init(path, locator.clone())
                 };
             use jj_lib::ref_name::WorkspaceName;
-            native_workspace_admin::initialize(
+            let mode = broker::creation_policy(&locator).map_err(failure)?;
+            let initial = intent.initial_commit();
+            let index_initializer =
+                |settings: &UserSettings,
+                 path: &Path,
+                 operation: &jj_lib::op_store::OperationId| {
+                    broker::init_index(path, mode, settings, &initial, operation)
+                };
+            native_workspace_admin::initialize_with_index(
                 &registry,
                 &binding,
                 &settings,
@@ -406,6 +420,7 @@ pub(crate) async fn resume(
                 connector(&binding).map_err(failure)?,
                 &intent.initial_commit(),
                 WorkspaceName::DEFAULT.to_owned(),
+                &index_initializer,
             )
             .await
             .map_err(failure)?;

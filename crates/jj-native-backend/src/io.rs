@@ -42,14 +42,26 @@ struct OwnedLease {
     lease: ReadLease,
     _delivery: Option<Arc<dyn std::any::Any + Send + Sync>>,
 }
+struct ReadChunk {
+    result: io::Result<Vec<u8>>,
+    lease: OwnedLease,
+}
 pub(crate) struct Reader {
-    lease: Option<OwnedLease>,
-    pending: Option<JoinHandle<(OwnedLease, io::Result<Vec<u8>>)>>,
     bytes: Vec<u8>,
+    lease: Option<OwnedLease>,
+    pending: Option<JoinHandle<ReadChunk>>,
     position: usize,
     eof: bool,
+    #[cfg(test)]
+    read_hook: Option<Arc<dyn Fn() + Send + Sync>>,
+    _owner: Option<Arc<dyn std::any::Any + Send + Sync>>,
 }
 impl Reader {
+    #[cfg(test)]
+    pub(crate) fn with_read_hook(mut self, hook: Option<Arc<dyn Fn() + Send + Sync>>) -> Self {
+        self.read_hook = hook;
+        self
+    }
     pub(crate) fn new(lease: ReadLease) -> Self {
         Self::with_owner(lease, None)
     }
@@ -60,6 +72,7 @@ impl Reader {
         Self::with_owner(lease, Some(owner))
     }
     fn with_owner(lease: ReadLease, owner: Option<Arc<dyn std::any::Any + Send + Sync>>) -> Self {
+        let retained_owner = owner.clone();
         Self {
             lease: Some(OwnedLease {
                 lease,
@@ -69,6 +82,9 @@ impl Reader {
             bytes: vec![],
             position: 0,
             eof: false,
+            #[cfg(test)]
+            read_hook: None,
+            _owner: retained_owner,
         }
     }
 }
@@ -86,7 +102,7 @@ impl AsyncRead for Reader {
             if let Some(task) = this.pending.as_mut() {
                 let joined = ready!(Pin::new(task).poll(cx));
                 this.pending = None;
-                let (lease, result) =
+                let ReadChunk { lease, result } =
                     joined.map_err(|_| io::Error::other("native read job failed"))?;
                 this.lease = Some(lease);
                 let bytes = result?;
@@ -94,6 +110,7 @@ impl AsyncRead for Reader {
                 this.bytes = bytes;
                 this.position = 0;
                 if this.eof {
+                    this.bytes = Vec::new();
                     this.lease = None;
                 }
             }
@@ -110,6 +127,8 @@ impl AsyncRead for Reader {
                 runtime().map_err(|_| io::Error::other("native I/O executor unavailable"))?;
             let mut lease = this.lease.take().expect("live reader has a lease");
             let count = output.len().min(64 * 1024);
+            #[cfg(test)]
+            let hook = this.read_hook.clone();
             this.pending = Some(runtime.spawn_blocking(move || {
                 let mut bytes = vec![0; count];
                 let result = loop {
@@ -123,7 +142,12 @@ impl AsyncRead for Reader {
                         }
                     }
                 };
-                (lease, result)
+                let chunk = ReadChunk { result, lease };
+                #[cfg(test)]
+                if let Some(hook) = hook {
+                    hook();
+                }
+                chunk
             }));
         }
     }

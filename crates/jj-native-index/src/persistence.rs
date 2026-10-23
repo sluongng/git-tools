@@ -2,6 +2,26 @@ use super::*;
 use fs2::FileExt as _;
 use std::{fs::File, io::Write};
 pub(super) type SegmentId = [u8; 32];
+#[derive(Default)]
+struct Layout {
+    segments: usize,
+    bytes: usize,
+    linked_segments: usize,
+    linked_bytes: usize,
+}
+fn encoded_size(parents: usize, roots: usize, drafts: &[Arc<Draft>]) -> Result<usize, Error> {
+    let mut size = 57usize
+        .checked_add(parents.checked_mul(32).ok_or(Error::Limit)?)
+        .and_then(|n| n.checked_add(roots.checked_mul(32)?))
+        .ok_or(Error::Limit)?;
+    for draft in drafts {
+        size = size
+            .checked_add(70)
+            .and_then(|n| n.checked_add(draft.parents.len().checked_mul(32)?))
+            .ok_or(Error::Limit)?;
+    }
+    Ok(size)
+}
 const MAGIC: &[u8; 8] = b"JJNIDX01";
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -53,7 +73,7 @@ fn payload<'a>(kind: u8, key: &[u8], bytes: &'a [u8]) -> Result<&'a [u8], Error>
     }
     Ok(&bytes[13..13 + len])
 }
-fn require_durable_writer() -> Result<(), Error> {
+pub(super) fn require_durable_writer() -> Result<(), Error> {
     if cfg!(unix) {
         Ok(())
     } else {
@@ -332,6 +352,15 @@ impl Storage {
         tips: &[SegmentId],
         limits: &Limits,
     ) -> Result<(Vec<m::CommitId>, Vec<Arc<Draft>>), Error> {
+        let (roots, drafts, _) = self.load_layout(tips, limits)?;
+        Ok((roots, drafts))
+    }
+    fn load_layout(
+        &self,
+        tips: &[SegmentId],
+        limits: &Limits,
+    ) -> Result<(Vec<m::CommitId>, Vec<Arc<Draft>>, Layout), Error> {
+        let mut layout = Layout::default();
         if tips.is_empty() || tips.len() > limits.max_segments {
             return Err(Error::Limit);
         }
@@ -359,6 +388,10 @@ impl Storage {
             }
             let mut r = Reader(body);
             let n = r.count_width(limits.max_segments, 32)?;
+            if n > 0 {
+                layout.linked_segments += 1;
+                layout.linked_bytes += bytes.len();
+            }
             if pending
                 .len()
                 .checked_add(n)
@@ -430,7 +463,135 @@ impl Storage {
         if roots.is_empty() {
             roots.insert(m::CommitId::ROOT);
         }
-        Ok((roots.into_iter().collect(), order_drafts(drafts, limits)?))
+        layout.segments = visited.len();
+        layout.bytes = total;
+        Ok((
+            roots.into_iter().collect(),
+            order_drafts(drafts, limits)?,
+            layout,
+        ))
+    }
+    /// Preserve all parent meaning, including hidden/promoted drafts and original
+    /// ordering. No old segment or operation association is replaced or deleted.
+    pub(super) fn persist_checkpoint(
+        &self,
+        parents: &[SegmentId],
+        added_roots: &[m::CommitId],
+        added: &[Arc<Draft>],
+        limits: &Limits,
+    ) -> Result<Vec<SegmentId>, Error> {
+        require_durable_writer()?;
+        // Read through the destination storage, even for unchanged or merged
+        // checkpoints. A missing/corrupt parent must never be hidden by flattening.
+        let (roots, drafts, layout) = self.load_layout(parents, limits)?;
+        if added_roots.is_empty() && added.is_empty() {
+            return Ok(parents.to_vec());
+        }
+        let delta = encoded_size(parents.len(), added_roots.len(), added)?;
+        let threshold = 64usize
+            .min(limits.max_depth.saturating_sub(1).max(1))
+            .min(limits.max_segments.saturating_sub(1).max(1));
+        let flatten = layout.linked_segments >= threshold
+            || layout.linked_bytes > limits.max_checkpoint_bytes / 4
+            || layout
+                .segments
+                .checked_add(1)
+                .is_none_or(|n| n > limits.max_segments)
+            || layout
+                .linked_segments
+                .checked_add(1)
+                .is_none_or(|n| n > limits.max_depth)
+            || layout
+                .bytes
+                .checked_add(delta)
+                .is_none_or(|n| n > limits.max_checkpoint_bytes)
+            || delta > limits.max_segment_bytes;
+        if !flatten {
+            return Ok(vec![self.segment(parents, added_roots, added, limits)?]);
+        }
+        let mut all_roots: BTreeSet<_> = roots.into_iter().collect();
+        for root in added_roots {
+            all_roots.insert(*root);
+            if all_roots.len() > limits.max_roots {
+                return Err(Error::Limit);
+            }
+        }
+        let mut all_drafts: BTreeMap<_, _> = drafts.into_iter().map(|d| (d.id(), d)).collect();
+        for draft in added {
+            if draft.parents.len() > limits.max_parents {
+                return Err(Error::Limit);
+            }
+            if let Some(old) = all_drafts.get(&draft.id()) {
+                if !old.canonical_eq(draft) {
+                    return Err(Error::Corrupt);
+                }
+                if old.order <= draft.order {
+                    continue;
+                }
+            }
+            all_drafts.insert(draft.id(), draft.clone());
+            if all_drafts.len() > limits.max_drafts {
+                return Err(Error::Limit);
+            }
+        }
+        let roots: Vec<_> = all_roots.into_iter().collect();
+        let drafts = order_drafts(all_drafts, limits)?;
+        // Plan exact encoded sizes before any shard publication. Ranges borrow
+        // complete records; no per-shard copies or split parent vectors.
+        let mut plan = Vec::new();
+        let (mut root, mut draft, mut total) = (0usize, 0usize, 0usize);
+        while root < roots.len() || draft < drafts.len() {
+            if plan.len() >= limits.max_segments {
+                return Err(Error::Limit);
+            }
+            let (r0, d0) = (root, draft);
+            let mut bytes = 57usize;
+            while root < roots.len()
+                && bytes
+                    .checked_add(32)
+                    .is_some_and(|n| n <= limits.max_segment_bytes)
+            {
+                bytes += 32;
+                root += 1;
+            }
+            while draft < drafts.len() {
+                let record = encoded_size(0, 0, &drafts[draft..draft + 1])?
+                    .checked_sub(57)
+                    .ok_or(Error::Limit)?;
+                let next = bytes.checked_add(record).ok_or(Error::Limit)?;
+                if next > limits.max_segment_bytes {
+                    break;
+                }
+                bytes = next;
+                draft += 1;
+            }
+            if root == r0 && draft == d0 {
+                return Err(Error::Limit);
+            }
+            total = total.checked_add(bytes).ok_or(Error::Limit)?;
+            if total > limits.max_checkpoint_bytes {
+                return Err(Error::Limit);
+            }
+            plan.push((r0, root, d0, draft));
+        }
+        if plan.is_empty() {
+            return Err(Error::Corrupt);
+        }
+        // Operation records also have a bounded complete tip list.
+        if plan
+            .len()
+            .checked_mul(32)
+            .and_then(|n| n.checked_add(49))
+            .is_none_or(|n| n > limits.max_segment_bytes)
+        {
+            return Err(Error::Limit);
+        }
+        let mut tips = Vec::with_capacity(plan.len());
+        for (r0, r1, d0, d1) in plan {
+            tips.push(self.segment(&[], &roots[r0..r1], &drafts[d0..d1], limits)?);
+        }
+        self.load(&tips, limits)?;
+        Ok(tips)
     }
 }
 fn put_count(out: &mut Vec<u8>, n: usize) {
@@ -465,6 +626,19 @@ pub(super) fn order_drafts(
     drafts: BTreeMap<m::CommitId, Arc<Draft>>,
     limits: &Limits,
 ) -> Result<Vec<Arc<Draft>>, Error> {
+    if drafts.len() > limits.max_drafts {
+        return Err(Error::Limit);
+    }
+    let edge_bound = drafts.values().try_fold(0usize, |sum, draft| {
+        if draft.parents.len() > limits.max_parents {
+            return Err(Error::Limit);
+        }
+        sum.checked_add(draft.parents.len()).ok_or(Error::Limit)
+    })?;
+    let work_bound = edge_bound
+        .checked_add(drafts.len().checked_mul(2).ok_or(Error::Limit)?)
+        .ok_or(Error::Limit)?;
+    let mut work = 0usize;
     let mut done = BTreeSet::new();
     let mut visiting = BTreeSet::new();
     let mut output = Vec::with_capacity(drafts.len());
@@ -473,6 +647,10 @@ pub(super) fn order_drafts(
     for id in ordered {
         let mut stack = vec![(id, false, 0usize)];
         while let Some((id, exit, depth)) = stack.pop() {
+            work = work.checked_add(1).ok_or(Error::Limit)?;
+            if work > work_bound {
+                return Err(Error::Limit);
+            }
             if done.contains(&id) {
                 continue;
             }
@@ -482,8 +660,11 @@ pub(super) fn order_drafts(
                 output.push(drafts[&id].clone());
                 continue;
             }
-            if depth > limits.max_depth || !visiting.insert(id) {
+            if !visiting.insert(id) {
                 return Err(Error::Corrupt);
+            }
+            if depth > limits.max_drafts {
+                return Err(Error::Limit);
             }
             let draft = &drafts[&id];
             if stack
@@ -502,4 +683,42 @@ pub(super) fn order_drafts(
         }
     }
     Ok(output)
+}
+
+pub(super) fn prepare_fresh_directory(path: &Path) -> Result<(), Error> {
+    require_durable_writer()?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        if !path.is_absolute()
+            || path.as_os_str().len() > 4096
+            || path.components().any(|v| {
+                matches!(
+                    v,
+                    std::path::Component::ParentDir | std::path::Component::CurDir
+                )
+            })
+        {
+            return Err(Error::Invalid);
+        }
+        let parent = private_fs::PrivateDir::open_existing(path.parent().ok_or(Error::Invalid)?)?;
+        match std::fs::symlink_metadata(path) {
+            Ok(metadata) => {
+                if !metadata.is_dir()
+                    || metadata.file_type().is_symlink()
+                    || metadata.uid() != std::fs::metadata(parent.path())?.uid()
+                {
+                    return Err(Error::Invalid);
+                }
+                if std::fs::read_dir(path)?.next().is_some() {
+                    return Err(Error::Corrupt);
+                }
+                std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))?;
+                File::open(path)?.sync_all()?;
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e.into()),
+        }
+    }
+    Ok(())
 }

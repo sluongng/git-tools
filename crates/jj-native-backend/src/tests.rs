@@ -909,3 +909,69 @@ fn cancelled_metadata_install_keeps_the_physical_put_owner_and_admission() {
         Some(expected)
     );
 }
+
+#[test]
+fn owned_file_read_keeps_admission_through_cancelled_physical_chunk_output() {
+    use std::sync::{Arc, Condvar, Mutex};
+    use std::time::{Duration, Instant};
+    let directory = tempfile::tempdir().unwrap();
+    let mut provider = DirectObjectIo::init(directory.path(), Default::default()).unwrap();
+    let bytes = vec![19; 65536];
+    let id =
+        block_on(provider.write_file(&mut Cursor::new(bytes.clone()), bytes.len() as u64)).unwrap();
+    let gate = Arc::new((Mutex::new(false), Condvar::new()));
+    let worker_gate = gate.clone();
+    let (entered, started) = std::sync::mpsc::channel();
+    provider.set_file_read_hook(Arc::new(move || {
+        entered.send(()).unwrap();
+        let (lock, changed) = &*worker_gate;
+        let mut released = lock.lock().unwrap();
+        while !*released {
+            released = changed.wait(released).unwrap();
+        }
+    }));
+    let pool = Arc::new(tokio::sync::Semaphore::new(1));
+    let owner = Arc::new(pool.clone().try_acquire_owned().unwrap());
+    let weak = Arc::downgrade(&owner);
+    let file = block_on(provider.read_file_with_owner(id, owner)).unwrap();
+    let (_, mut reader) = file.into_parts();
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    let task = runtime.spawn(async move {
+        let mut output = vec![0; 4096];
+        reader.read_exact(&mut output).await.unwrap();
+        output
+    });
+    // The hook runs after a real read has populated the owned chunk, before
+    // returning it to the waiter. Dropping the waiter must not free its owner.
+    started.recv_timeout(Duration::from_secs(5)).unwrap();
+    task.abort();
+    let _ = runtime.block_on(task);
+    assert!(weak.upgrade().is_some());
+    assert!(pool.clone().try_acquire_owned().is_err());
+    let (lock, changed) = &*gate;
+    *lock.lock().unwrap() = true;
+    changed.notify_all();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while weak.upgrade().is_some() {
+        assert!(
+            Instant::now() < deadline,
+            "physical file-output owner did not release"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    let next = Arc::new(pool.clone().try_acquire_owned().unwrap());
+    let eof_owner = Arc::downgrade(&next);
+    let file = block_on(provider.read_file_with_owner(id, next)).unwrap();
+    let (_, mut reader) = file.into_parts();
+    let mut output = Vec::new();
+    block_on(reader.read_to_end(&mut output)).unwrap();
+    assert_eq!(output, bytes);
+    assert!(
+        eof_owner.upgrade().is_some(),
+        "an application-held EOF reader retains its owned delivery"
+    );
+    assert!(pool.clone().try_acquire_owned().is_err());
+    drop(reader);
+    assert!(eof_owner.upgrade().is_none());
+    assert!(pool.clone().try_acquire_owned().is_ok());
+}

@@ -23,6 +23,20 @@ use tinytree_proto::v1 as p;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tonic::Status;
 
+fn bound_id(repository: &str, scope_handle: &[u8; 32], query_id: &[u8; 32]) -> Result<(), Status> {
+    let mut hash = blake3::Hasher::new();
+    hash.update(b"tinytree-query-scope-id-v2\0");
+    hash.update(&(repository.len() as u64).to_be_bytes());
+    hash.update(repository.as_bytes());
+    hash.update(scope_handle);
+    hash.update(&query_id[..16]);
+    if query_id[16..] != hash.finalize().as_bytes()[..16] {
+        return Err(Status::invalid_argument(
+            "query identity belongs to another scope",
+        ));
+    }
+    Ok(())
+}
 fn clock() -> Result<i64, Status> {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -165,6 +179,7 @@ struct Record {
     query_id: [u8; 32],
     binding: Option<[u8; 32]>,
     scope_handle: [u8; 32],
+    query_identity_version: u32,
     closed: AtomicBool,
     id: [u8; 32],
     scope_digest: [u8; 32],
@@ -306,6 +321,27 @@ impl CursorHost {
         }
         Ok(())
     }
+    pub(crate) fn retire_closed(&self, owner: &str, repository: &str, scope: [u8; 32]) {
+        let removed = {
+            let mut records = self.records.lock().unwrap();
+            let ids: Vec<_> = records
+                .iter()
+                .filter(|(_, r)| {
+                    r.owner == owner
+                        && r.repository == repository
+                        && r.scope_handle == scope
+                        && r.query_identity_version == 2
+                        && r.closed.load(Ordering::Acquire)
+                })
+                .map(|(id, _)| *id)
+                .collect();
+            ids.into_iter()
+                .filter_map(|id| records.remove(&id))
+                .collect::<Vec<_>>()
+        };
+        // Physical response/page owners keep their own Arc after registry GC.
+        drop(removed);
+    }
     pub fn close(
         &self,
         host: &QueryHost,
@@ -321,6 +357,10 @@ impl CursorHost {
             .as_slice()
             .try_into()
             .map_err(|_| Status::invalid_argument("invalid scope handle"))?;
+        let status = host.scope_status(owner, &key.repository_id, &scope_handle)?;
+        if status.is_some_and(|(version, _)| version == 2) {
+            bound_id(&key.repository_id, &scope_handle, &query_id)?;
+        }
         let now = clock()?;
         self.expire(now);
         let record = {
@@ -333,8 +373,14 @@ impl CursorHost {
                 if record.scope_handle != scope_handle {
                     return Err(Status::permission_denied("query scope binding mismatch"));
                 }
+                if record.query_identity_version == 2 {
+                    bound_id(&key.repository_id, &scope_handle, &query_id)?;
+                }
                 record.clone()
             } else {
+                if status == Some((2, true)) {
+                    return Ok(());
+                }
                 // Closing before the first Evaluate is an ordered cancellation,
                 // not a no-op. Its bounded tombstone prevents a late creation.
                 let scope = match host.lookup(owner, &key.repository_id, &key.handle) {
@@ -345,6 +391,9 @@ impl CursorHost {
                     Err(error) if error.code() == tonic::Code::FailedPrecondition => return Ok(()),
                     Err(error) => return Err(error),
                 };
+                if scope.wire.query_identity_version == 2 {
+                    bound_id(&key.repository_id, &scope_handle, &query_id)?;
+                }
                 self.history_room(&host.config, owner, &key.repository_id, &records)?;
                 let charge = 4096usize
                     .saturating_add(owner.len().saturating_mul(2))
@@ -363,6 +412,7 @@ impl CursorHost {
                     query_id,
                     binding: None,
                     scope_handle,
+                    query_identity_version: scope.wire.query_identity_version,
                     closed: AtomicBool::new(true),
                     id,
                     scope_digest: scope
@@ -410,7 +460,89 @@ impl CursorHost {
         state.scope = None;
         state.active_memory = None;
         record.active.store(false, Ordering::Release);
+        drop(state);
+        if record.query_identity_version == 2
+            && host.scope_status(owner, &key.repository_id, &scope_handle)? == Some((2, true))
+        {
+            self.retire_closed(owner, &key.repository_id, scope_handle);
+        }
         Ok(())
+    }
+    /// Ephemeral fact evaluation shares the cursor allocation pool but owns no
+    /// Record, query ID, replay history or tombstone. Scope/Work ownership comes
+    /// from QueryFacts' accepted blocking job, including after cancellation.
+    pub fn membership(
+        &self,
+        scope: &Scoped,
+        expression: q::GraphExpr,
+        candidate: m::CommitId,
+        budget: &mut WorkBudget,
+        config: &QueryConfig,
+        deadline: tokio::time::Instant,
+        remaining_steps: &mut u64,
+        inputs: &mut usize,
+    ) -> Result<bool, Status> {
+        if *remaining_steps == 0 {
+            return Err(Status::resource_exhausted(
+                "query membership step budget exhausted",
+            ));
+        }
+        let mut policy = limits(config);
+        policy.max_steps = *remaining_steps;
+        let bytes = policy
+            .memory_bytes()
+            .and_then(|n| n.checked_add(4096))
+            .and_then(|n| u32::try_from(n).ok())
+            .ok_or_else(|| Status::resource_exhausted("query membership memory budget exceeded"))?;
+        // Declare this owner before the evaluator so all compiled state is
+        // destroyed before its permit, also on graph errors or timeout.
+        let _memory = self
+            .memory
+            .clone()
+            .try_acquire_many_owned(bytes)
+            .map_err(|_| Status::resource_exhausted("query membership memory exhausted"))?;
+        let mut evaluator =
+            Evaluator::membership(scope.graph().clone(), expression, candidate, policy)
+                .map_err(eval_error)?;
+        *inputs = inputs
+            .saturating_add(evaluator.literal_count())
+            .saturating_add(1);
+        if *inputs > config.max_input_ids {
+            return Err(Status::resource_exhausted(
+                "query aggregate ID count exceeded",
+            ));
+        }
+        // Full AST compilation precedes an exact negative scope answer.
+        if !scope
+            .graph()
+            .has_id(candidate, budget)
+            .map_err(index_error)?
+        {
+            return Ok(false);
+        }
+        let answer = loop {
+            if tokio::time::Instant::now() >= deadline {
+                return Err(Status::deadline_exceeded(
+                    "query membership deadline exceeded",
+                ));
+            }
+            match evaluator.step(budget).map_err(eval_error)? {
+                EvalStep::Progress => {}
+                EvalStep::Done => break false,
+                EvalStep::Row(row) => {
+                    if row.commit() != candidate {
+                        return Err(Status::data_loss(
+                            "query membership result identity mismatch",
+                        ));
+                    }
+                    break true;
+                }
+            }
+        };
+        *remaining_steps = remaining_steps
+            .checked_sub(evaluator.steps())
+            .ok_or_else(|| Status::resource_exhausted("query membership step budget exhausted"))?;
+        Ok(answer)
     }
     pub fn evaluate(
         &self,
@@ -452,6 +584,14 @@ impl CursorHost {
             if let Some(existing) = records.values().find(|r| {
                 r.owner == owner && r.repository == key.repository_id && r.query_id == query_id
             }) {
+                if existing.query_identity_version == 2 {
+                    let handle: [u8; 32] = key
+                        .handle
+                        .as_slice()
+                        .try_into()
+                        .map_err(|_| Status::invalid_argument("invalid scope handle"))?;
+                    bound_id(&key.repository_id, &handle, &query_id)?;
+                }
                 if existing.closed.load(Ordering::Acquire) {
                     return Err(Status::failed_precondition("query is closed"));
                 }
@@ -464,6 +604,14 @@ impl CursorHost {
             } else {
                 self.room(&host.config, owner, &key.repository_id, &records)?;
                 let scope = host.lookup(owner, &key.repository_id, &key.handle)?;
+                if scope.wire.query_identity_version == 2 {
+                    let handle: [u8; 32] = key
+                        .handle
+                        .as_slice()
+                        .try_into()
+                        .map_err(|_| Status::invalid_argument("invalid scope handle"))?;
+                    bound_id(&key.repository_id, &handle, &query_id)?;
+                }
                 let expression = request
                     .expression
                     .take()
@@ -505,6 +653,7 @@ impl CursorHost {
                         .as_slice()
                         .try_into()
                         .map_err(|_| Status::invalid_argument("invalid scope handle"))?,
+                    query_identity_version: scope.wire.query_identity_version,
                     closed: AtomicBool::new(false),
                     id,
                     scope_digest: scope

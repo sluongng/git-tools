@@ -1,8 +1,11 @@
 //! A complete logical jj index backed by immutable checkpoints and broker scopes.
 //! Persisted descriptors do not prove object residency or remote retention.
+mod cleanup;
+pub use cleanup::CleanupHandle;
 mod persistence;
 mod query;
 mod revsets;
+mod selected;
 use async_trait::async_trait;
 use jj_lib::{
     backend::{ChangeId, CommitId},
@@ -157,6 +160,8 @@ pub enum Error {
     Corrupt,
     #[error("unsupported native index format or expression")]
     Unsupported,
+    #[error("unsupported native index expression: {0}")]
+    UnsupportedExpression(&'static str),
     #[error("native index resource limit exceeded")]
     Limit,
     #[error("native index operation association is missing")]
@@ -224,11 +229,14 @@ impl Draft {
 struct CachedScope {
     value: native_broker::QueryScope,
     _owner: QueryOwner,
-    cleanup: std::sync::mpsc::SyncSender<Cleanup>,
+    cleanup: cleanup::Queue,
+    close_once: cleanup::CloseOnce,
+    parent: Option<Arc<CachedScope>>,
     timeout: Duration,
 }
 struct ScopeState {
     cached: Option<Arc<CachedScope>>,
+    root_only: Option<Arc<CachedScope>>,
     replay: [u8; 32],
 }
 struct Checkpoint {
@@ -245,6 +253,7 @@ impl Checkpoint {
             drafts,
             scope: tokio::sync::Mutex::new(ScopeState {
                 cached: None,
+                root_only: None,
                 replay: random(),
             }),
         }
@@ -259,7 +268,7 @@ struct Core {
     query: Arc<dyn NativeQueryIo>,
     objects: Arc<dyn NativeObjectIo>,
     limits: Limits,
-    cleanup: std::sync::mpsc::SyncSender<Cleanup>,
+    cleanup: cleanup::Queue,
 }
 impl std::fmt::Debug for Core {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -271,24 +280,17 @@ impl std::fmt::Debug for NativeIndexStore {
         f.debug_struct("NativeIndexStore").finish_non_exhaustive()
     }
 }
-struct Cleanup {
-    handle: [u8; 32],
-    scope: bool,
-    owner: QueryOwner,
-    deadline: std::time::Instant,
-}
 impl Core {
     fn owner(&self) -> QueryOwner {
         Arc::new((self.storage.clone(), self.objects.clone()))
     }
     fn enqueue(&self, handle: [u8; 32], scope: bool, owner: QueryOwner) {
-        let _ = self.cleanup.try_send(Cleanup {
+        self.cleanup.send(
             handle,
             scope,
             owner,
-            deadline: std::time::Instant::now()
-                + Duration::from_millis(self.limits.cleanup_timeout_ms),
-        });
+            Duration::from_millis(self.limits.cleanup_timeout_ms),
+        );
     }
 }
 impl NativeIndexStore {
@@ -334,47 +336,41 @@ impl NativeIndexStore {
         query: Arc<dyn NativeQueryIo>,
         objects: Arc<dyn NativeObjectIo>,
     ) -> Result<Self, Error> {
-        let (send, recv) = std::sync::mpsc::sync_channel::<Cleanup>(limits.cleanup_capacity);
-        let cleanup_io = query.clone();
-        std::thread::Builder::new()
-            .name("native-index-cleanup".into())
-            .spawn(move || {
-                let Ok(runtime) = tokio::runtime::Builder::new_current_thread()
-                    .enable_all()
-                    .build()
-                else {
-                    return;
-                };
-                while let Ok(item) = recv.recv() {
-                    let timeout = item
-                        .deadline
-                        .saturating_duration_since(std::time::Instant::now());
-                    if timeout.is_zero() {
-                        continue;
-                    }
-                    let io = cleanup_io.clone();
-                    runtime.block_on(async move {
-                        let _ = tokio::time::timeout(timeout, async move {
-                            if item.scope {
-                                io.close_scope(item.handle, item.owner).await
-                            } else {
-                                io.close_query(item.handle, item.owner).await
-                            }
-                        })
-                        .await;
-                    });
-                }
-            })
-            .map_err(Error::Io)?;
+        let cleanup = cleanup::Queue::start(query.clone(), &limits)?;
         Ok(Self {
             core: Arc::new(Core {
                 storage: Arc::new(storage),
                 query,
                 objects,
                 limits,
-                cleanup: send,
+                cleanup,
             }),
         })
+    }
+    pub fn cleanup_handle(&self) -> CleanupHandle {
+        self.core.cleanup.handle()
+    }
+    /// Only for an initialization-journal-owned, proven-fresh empty directory.
+    /// Existing stores, partial stores and foreign contents are never repaired.
+    pub fn init_fresh_for_root_operation(
+        path: &Path,
+        config: Config,
+        limits: Limits,
+        query: Arc<dyn NativeQueryIo>,
+        objects: Arc<dyn NativeObjectIo>,
+        roots: Vec<m::CommitId>,
+        root_operation: &[u8; 64],
+    ) -> Result<Self, Error> {
+        limits.validate()?;
+        config.validate()?;
+        if roots.len() > limits.max_roots {
+            return Err(Error::Limit);
+        }
+        persistence::prepare_fresh_directory(path)?;
+        let store = Self::init(path, config, limits, query, objects, roots)?;
+        let seed = store.seed_index()?;
+        store.associate_operation(root_operation, &seed)?;
+        Ok(store)
     }
     pub fn seed_index(&self) -> Result<NativeReadonlyIndex, Error> {
         self.core.load(vec![self.core.storage.seed()?])
@@ -394,13 +390,13 @@ impl NativeIndexStore {
             .downcast::<NativeMutableIndex>()
             .ok_or(Error::Foreign)?;
         self.core.same(&mutable.inner.core)?;
-        let tip = self.core.storage.segment(
+        let tips = self.core.storage.persist_checkpoint(
             &mutable.parents,
             &[],
             &mutable.pending,
             &self.core.limits,
         )?;
-        self.core.load(vec![tip])
+        self.core.load(tips)
     }
     pub fn associate_operation(
         &self,
@@ -425,6 +421,30 @@ impl std::fmt::Debug for NativeReadonlyIndex {
             .field("roots", &self.checkpoint.roots.len())
             .field("drafts", &self.checkpoint.drafts.len())
             .finish()
+    }
+}
+impl CachedScope {
+    fn request_close(&self) {
+        self.close_once.schedule(
+            &self.cleanup,
+            self.value.handle,
+            self._owner.clone(),
+            self.timeout,
+        );
+        if let Some(parent) = &self.parent {
+            parent.request_close();
+        }
+    }
+}
+impl Drop for Checkpoint {
+    fn drop(&mut self) {
+        let state = self.scope.get_mut();
+        if let Some(scope) = &state.cached {
+            scope.request_close()
+        }
+        if let Some(scope) = &state.root_only {
+            scope.request_close()
+        }
     }
 }
 struct NativeMutableIndex {

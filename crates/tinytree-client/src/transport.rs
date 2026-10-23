@@ -644,7 +644,7 @@ fn scan(
             if wire == 0
                 && matches!(
                     (shape, number),
-                    (Shape::FactAnswer, 1 | 2)
+                    (Shape::FactAnswer, 1 | 2 | 5)
                         | (Shape::ChangeTarget, 2)
                         | (Shape::IdsPage | Shape::GraphPage | Shape::CanonicalPage, 6)
                         | (Shape::CloudChunk, 4)
@@ -727,7 +727,7 @@ fn scan(
         return Err(invalid());
     }
     let oneof_fields = match shape {
-        Shape::FactAnswer => 4,
+        Shape::FactAnswer => 5,
         Shape::SelectedEdge => 3,
         Shape::CommitPrefix | Shape::ChangePrefix => 3,
         _ => 0,
@@ -814,14 +814,14 @@ fn rule(shape: Shape, n: u32, l: &Limits) -> Option<(u8, Option<Shape>, usize, u
         | (Shape::CommitId, 1)
         | (Shape::QueryFacts, 2) => text(32),
         (Shape::QueryScope, 3) | (Shape::ChangeId, 1) | (Shape::QueryFacts, 3) => text(16),
-        (Shape::QueryScope, 4 | 5) | (Shape::ShortestPrefix, 1 | 2) => scalar(),
+        (Shape::QueryScope, 4 | 5 | 7) | (Shape::ShortestPrefix, 1 | 2) => scalar(),
         (Shape::ScopeKey, 1) => text(128),
         (Shape::QueryFacts, 1) => repeated(
             Shape::FactAnswer,
             l.max_batch_items,
             4 * std::mem::size_of::<q::GraphFactAnswer>(),
         ),
-        (Shape::FactAnswer, 1 | 2) | (Shape::ChangeTarget, 2) => scalar(),
+        (Shape::FactAnswer, 1 | 2 | 5) | (Shape::ChangeTarget, 2) => scalar(),
         (Shape::FactAnswer, 3 | 4) => nested(Shape::CommitSet),
         (Shape::CommitSet, 1) => repeated(
             Shape::CommitId,

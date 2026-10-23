@@ -188,6 +188,15 @@ impl NativeObjectIo for RemoteObjectIo {
         .await;
         result.map_err(backend_error)
     }
+    async fn read_file_with_owner(
+        &self,
+        id: m::FileId,
+        owner: Arc<dyn std::any::Any + Send + Sync>,
+    ) -> BackendResult<FileRead> {
+        // The hit-only/raw-delivery implementation also satisfies ordinary owned
+        // reads. It deliberately avoids recursively filling the shared cache.
+        self.read_file_for_cache(id, owner).await
+    }
     async fn read_file_for_cache(
         &self,
         id: m::FileId,
@@ -197,7 +206,13 @@ impl NativeObjectIo for RemoteObjectIo {
             kind: m::Kind::File,
             id: m::ObjectId(id.0),
         };
-        if self.inner.local.descriptor(key).await?.is_some() {
+        if self
+            .inner
+            .local
+            .descriptor_with_owner(key, owner.clone())
+            .await?
+            .is_some()
+        {
             return self.inner.local.read_file_for_cache(id, owner).await;
         }
         let deadline = io::scope().map_or_else(

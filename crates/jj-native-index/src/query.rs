@@ -72,19 +72,186 @@ impl NativeReadonlyIndex {
             parents: commit.parents,
         })
     }
+    fn lease(
+        &self,
+        reply: native_broker::QueryReply<native_broker::QueryScope>,
+        parent: Option<Arc<CachedScope>>,
+    ) -> Result<Arc<CachedScope>, Error> {
+        if reply.value.query_identity_version != 2 {
+            return Err(Error::Unsupported);
+        }
+        if reply.value.expires_at_unix_seconds <= now()? {
+            return Err(Error::Corrupt);
+        }
+        Ok(Arc::new(CachedScope {
+            value: reply.value,
+            _owner: reply.owner,
+            cleanup: self.core.cleanup.clone(),
+            close_once: Default::default(),
+            parent,
+            timeout: Duration::from_millis(self.core.limits.cleanup_timeout_ms),
+        }))
+    }
+    async fn root_scope(
+        &self,
+        roots: Vec<m::CommitId>,
+        replay_key: [u8; 32],
+    ) -> Result<Arc<CachedScope>, Error> {
+        let reply = self
+            .core
+            .query
+            .open_scope(
+                native_broker::OpenQueryScope {
+                    roots,
+                    query_identity_version: 2,
+                    overlay: Vec::new(),
+                    replay_key,
+                },
+                self.core.owner(),
+            )
+            .await
+            .map_err(status)?;
+        self.lease(reply, None)
+    }
+    async fn classify(
+        &self,
+        base: &Arc<CachedScope>,
+        ids: &[m::CommitId],
+    ) -> Result<Vec<bool>, Error> {
+        if ids.len() > self.core.limits.max_drafts.max(self.core.limits.max_roots) {
+            return Err(Error::Limit);
+        }
+        let batch = (self.core.limits.page_size as usize).min(64).max(1);
+        let mut known = Vec::with_capacity(ids.len());
+        for ids in ids.chunks(batch) {
+            let reply = self
+                .core
+                .query
+                .facts(
+                    base.value.handle,
+                    ids.iter()
+                        .map(|id| q::GraphFact {
+                            fact: Some(q::graph_fact::Fact::HasId(q::HasId {
+                                commit: Some(wire(*id)),
+                            })),
+                        })
+                        .collect(),
+                    Arc::new((self.core.owner(), base.clone())),
+                )
+                .await
+                .map_err(status)?;
+            if reply.value.answers.len() != ids.len() {
+                return Err(Error::Corrupt);
+            }
+            for answer in reply.value.answers {
+                match answer.answer {
+                    Some(q::graph_fact_answer::Answer::HasId(value)) => known.push(value),
+                    _ => return Err(Error::Corrupt),
+                }
+            }
+        }
+        Ok(known)
+    }
+    /// Extend this exact checkpoint using roots already admitted by the matching
+    /// broker. The broker root-only scope validates retention and index readiness.
+    /// No operation association, prior root or local draft record is overwritten.
+    pub async fn with_remote_roots(&self, roots: Vec<m::CommitId>) -> Result<Self, Error> {
+        persistence::require_durable_writer()?;
+        if roots.len() > self.core.limits.max_roots {
+            return Err(Error::Limit);
+        }
+        if roots.is_empty() {
+            return Ok(self.clone());
+        }
+        let mut union: BTreeSet<_> = self.checkpoint.roots.iter().copied().collect();
+        union.extend(roots.iter().copied());
+        if union.len() > self.core.limits.max_roots {
+            return Err(Error::Limit);
+        }
+        let union: Vec<_> = union.into_iter().collect();
+        let proof = self.root_scope(union.clone(), random()).await?;
+        if self
+            .classify(&proof, &union)
+            .await?
+            .iter()
+            .any(|known| !*known)
+        {
+            return Err(Error::Corrupt);
+        }
+        let added: Vec<_> = union
+            .iter()
+            .filter(|root| !self.checkpoint.roots.contains(root))
+            .copied()
+            .collect();
+        if added.is_empty() {
+            return Ok(self.clone());
+        }
+        let tips = self.core.storage.persist_checkpoint(
+            &self.checkpoint.tips,
+            &added,
+            &[],
+            &self.core.limits,
+        )?;
+        let next = self.core.load(tips)?;
+        next.checkpoint.scope.lock().await.root_only = Some(proof);
+        Ok(next)
+    }
     pub(super) async fn scope(&self) -> Result<Arc<CachedScope>, Error> {
         let mut state = self.checkpoint.scope.lock().await;
-        if state.cached.as_ref().is_some_and(|scope| {
-            scope.value.expires_at_unix_seconds > now().unwrap_or(i64::MAX) + 1
-        }) {
+        let threshold = now()?.checked_add(1).ok_or(Error::Invalid)?;
+        if state
+            .cached
+            .as_ref()
+            .is_some_and(|scope| scope.value.expires_at_unix_seconds > threshold)
+        {
             return Ok(state.cached.as_ref().unwrap().clone());
         }
         if state.cached.take().is_some() {
-            state.replay = random()
+            state.root_only = None;
+            state.replay = random();
         }
+        if state
+            .root_only
+            .as_ref()
+            .is_some_and(|scope| scope.value.expires_at_unix_seconds <= threshold)
+        {
+            state.root_only = None;
+            state.replay = random();
+        }
+        let base = if let Some(base) = &state.root_only {
+            base.clone()
+        } else {
+            let roots = if self.checkpoint.roots.is_empty() {
+                vec![m::CommitId::ROOT]
+            } else {
+                self.checkpoint.roots.clone()
+            };
+            let mut key = blake3::Hasher::new();
+            key.update(b"jj-native-index-root-only-scope-v1");
+            key.update(&state.replay);
+            let base = self.root_scope(roots, *key.finalize().as_bytes()).await?;
+            state.root_only = Some(base.clone());
+            base
+        };
+        let ids: Vec<_> = self
+            .checkpoint
+            .drafts
+            .iter()
+            .map(|draft| draft.id())
+            .collect();
+        let covered = match self.classify(&base, &ids).await {
+            Ok(known) => known,
+            Err(error) => {
+                if matches!(error, Error::Query(tonic::Code::FailedPrecondition)) {
+                    state.root_only = None;
+                    state.replay = random();
+                }
+                return Err(error);
+            }
+        };
         let mut overlay = Vec::with_capacity(self.checkpoint.drafts.len());
         let mut total = 0usize;
-        for draft in &self.checkpoint.drafts {
+        for (draft, covered) in self.checkpoint.drafts.iter().zip(covered) {
             let metadata = self
                 .core
                 .objects
@@ -96,42 +263,44 @@ impl NativeReadonlyIndex {
             if !verified.canonical_eq(draft) {
                 return Err(Error::Canonical);
             }
-            total = total
-                .checked_add(metadata.bytes().len())
-                .ok_or(Error::Limit)?;
-            if total > self.core.limits.max_checkpoint_bytes {
-                return Err(Error::Limit);
+            if !covered {
+                total = total
+                    .checked_add(metadata.bytes().len())
+                    .ok_or(Error::Limit)?;
+                if total > self.core.limits.max_checkpoint_bytes {
+                    return Err(Error::Limit);
+                }
+                overlay.push(metadata.bytes().to_vec());
             }
-            overlay.push(metadata.bytes().to_vec());
         }
-        let roots = if self.checkpoint.roots.is_empty() {
-            vec![m::CommitId::ROOT]
+        let scope = if overlay.is_empty() {
+            base.clone()
         } else {
-            self.checkpoint.roots.clone()
+            let reply = self
+                .core
+                .query
+                .fork_scope(
+                    native_broker::ForkQueryScope {
+                        parent: base.value.handle,
+                        overlay,
+                        replay_key: state.replay,
+                    },
+                    Arc::new((self.core.owner(), base.clone())),
+                )
+                .await;
+            match reply {
+                Ok(reply) => self.lease(reply, Some(base.clone()))?,
+                Err(error) => {
+                    if error.code() == tonic::Code::FailedPrecondition {
+                        state.root_only = None;
+                        state.replay = random();
+                    }
+                    return Err(status(error));
+                }
+            }
         };
-        let reply = self
-            .core
-            .query
-            .open_scope(
-                native_broker::OpenQueryScope {
-                    roots,
-                    overlay,
-                    replay_key: state.replay,
-                },
-                self.core.owner(),
-            )
-            .await
-            .map_err(status)?;
-        if reply.value.expires_at_unix_seconds <= now()? {
-            return Err(Error::Corrupt);
-        }
-        let scope = Arc::new(CachedScope {
-            value: reply.value,
-            _owner: reply.owner,
-            cleanup: self.core.cleanup.clone(),
-            timeout: Duration::from_millis(self.core.limits.cleanup_timeout_ms),
-        });
         state.cached = Some(scope.clone());
+        state.root_only = None;
         Ok(scope)
     }
     async fn invalidate(&self, handle: [u8; 32]) {
@@ -142,10 +311,14 @@ impl NativeReadonlyIndex {
             .is_some_and(|s| s.value.handle == handle)
         {
             state.cached = None;
+            state.root_only = None;
             state.replay = random();
         }
     }
-    async fn fact(&self, fact: q::graph_fact::Fact) -> Result<q::graph_fact_answer::Answer, Error> {
+    pub(super) async fn fact(
+        &self,
+        fact: q::graph_fact::Fact,
+    ) -> Result<q::graph_fact_answer::Answer, Error> {
         for attempt in 0..2 {
             let scope = self.scope().await?;
             let reply = self
@@ -201,12 +374,7 @@ impl NativeReadonlyIndex {
 }
 impl Drop for CachedScope {
     fn drop(&mut self) {
-        let _ = self.cleanup.try_send(Cleanup {
-            handle: self.value.handle,
-            scope: true,
-            owner: self._owner.clone(),
-            deadline: std::time::Instant::now() + self.timeout,
-        });
+        self.request_close();
     }
 }
 #[async_trait]
@@ -339,12 +507,19 @@ impl Index for NativeReadonlyIndex {
     fn evaluate_revset(
         &self,
         expression: &ResolvedExpression,
-        _: &Arc<Store>,
+        store: &Arc<Store>,
     ) -> Result<Box<dyn Revset>, RevsetEvaluationError> {
-        let expression = revsets::compile(expression, &self.core.limits).map_err(rev_err)?;
+        let selected = revsets::selected_file_all(expression);
+        let expression = revsets::compile(
+            selected.unwrap_or(expression),
+            &self.core.limits,
+            selected.is_some(),
+        )
+        .map_err(rev_err)?;
         Ok(Box::new(revsets::NativeRevset {
             index: self.clone(),
             expression,
+            file_all: selected.map(|_| store.clone()),
         }))
     }
 }

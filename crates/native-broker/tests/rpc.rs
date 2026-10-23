@@ -1627,6 +1627,7 @@ impl native_broker::NativeQueryIo for FakeQuery {
         Ok(self.reply(native_broker::QueryScope {
             handle: [self.marker; 32],
             expires_at_unix_seconds: i64::MAX / 2,
+            query_identity_version: 1,
         }))
     }
     async fn fork_scope(
@@ -1638,6 +1639,7 @@ impl native_broker::NativeQueryIo for FakeQuery {
         Ok(self.reply(native_broker::QueryScope {
             handle: [self.marker; 32],
             expires_at_unix_seconds: i64::MAX / 2,
+            query_identity_version: 1,
         }))
     }
     async fn facts(
@@ -1879,6 +1881,7 @@ async fn query_aliases_preserve_scopes_replay_pages_and_cancellation_without_hol
         .await
         .unwrap();
     let open = || native_broker::OpenQueryScope {
+        query_identity_version: 1,
         roots: vec![native_broker::CommitId([1; 32])],
         overlay: vec![],
         replay_key: [3; 32],
@@ -1904,6 +1907,22 @@ async fn query_aliases_preserve_scopes_replay_pages_and_cancellation_without_hol
         "oversized input must fail before adapter invocation"
     );
 
+    let unsupported = first
+        .open_scope(
+            native_broker::OpenQueryScope {
+                query_identity_version: 2,
+                replay_key: [9; 32],
+                ..open()
+            },
+            Arc::new(()),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(
+        unsupported.code(),
+        tonic::Code::Unimplemented,
+        "explicit v2 request must not silently accept a legacy provider"
+    );
     let fact = || q::GraphFact {
         fact: Some(q::graph_fact::Fact::HasId(q::HasId {
             commit: Some(q::CommitId { value: vec![1; 32] }),
@@ -2238,6 +2257,7 @@ async fn held_query_replies_exhaust_only_retained_pool_and_release_restores_prog
     let scope = client
         .open_scope(
             native_broker::OpenQueryScope {
+                query_identity_version: 1,
                 roots: vec![native_broker::CommitId([1; 32])],
                 overlay: vec![],
                 replay_key: [1; 32],
@@ -2329,6 +2349,7 @@ async fn composed_query_brokers_release_physical_owner_without_pinning_completed
     let scope = local
         .open_scope(
             native_broker::OpenQueryScope {
+                query_identity_version: 1,
                 roots: vec![native_broker::CommitId([1; 32])],
                 overlay: vec![],
                 replay_key: [5; 32],

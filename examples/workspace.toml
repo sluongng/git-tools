@@ -78,6 +78,9 @@ buildbuddy = "https://github.com/buildbuddy-io/buildbuddy.git"
 # Lower per-repository limits or raise this cap for additional remote aliases.
 # max_query_persistent_bytes = 536870912
 # max_temporary_bytes = 1073741824
+# [native.workspaces]
+# index_mode = "legacy" # Experimental "federated" avoids eager jj history indexing.
+# Existing workspaces retain their recorded index type.
 # [native.repositories.example]
 # max_repository_bytes = 17179869184
 # max_file_bytes = 268435456

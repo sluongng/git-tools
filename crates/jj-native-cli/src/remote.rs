@@ -155,11 +155,35 @@ async fn integrate_fetch(
         .tracked_target()
         .clone();
     let incoming = target(observation.head.as_deref())?;
+    // The observation admitted this remote root. Extend the immutable native
+    // checkpoint before reading its commit so jj never hydrates all ancestry
+    // through the legacy index_commits compatibility path.
+    let prepared_index = match (
+        helper
+            .repo()
+            .readonly_index()
+            .downcast_ref::<jj_native_index::NativeReadonlyIndex>(),
+        incoming.as_normal(),
+    ) {
+        (Some(index), Some(id)) => Some(
+            index
+                .with_remote_roots(vec![
+                    tinytree_model::CommitId::from_slice(id.as_bytes()).map_err(failure)?,
+                ])
+                .await
+                .map_err(failure)?,
+        ),
+        _ => None,
+    };
+    let store = helper.repo().store().clone();
+    let mut tx = helper.start_transaction();
+    if let Some(index) = prepared_index.as_ref() {
+        tx.repo_mut().merge_index_from(index)?;
+    }
     let commit = match incoming.as_normal() {
-        Some(id) => Some(helper.repo().store().get_commit_async(id).await?),
+        Some(id) => Some(store.get_commit_async(id).await?),
         None => None,
     };
-    let mut tx = helper.start_transaction();
     if let Some(commit) = &commit {
         tx.repo_mut()
             .index_commits(std::slice::from_ref(commit))
@@ -343,6 +367,8 @@ pub(crate) async fn clone(
     let bookmark_name = names(&reference, &bookmark)?;
     let bookmark = bookmark_name.as_str().to_owned();
     let locator = Locator::new(command.cwd().join(socket), store).map_err(failure)?;
+    #[cfg(not(feature = "protocol-fixture"))]
+    broker::creation_policy(&locator).map_err(failure)?;
     let client = control(&locator).await?;
     let snapshot = client
         .observe_reference(&reference)

@@ -13,8 +13,31 @@ pub struct CheckedScopeHandle {
     high_water: u64,
     expires_at: i64,
     remote_roots: Arc<[CommitId]>,
+    query_identity_version: u32,
 }
 impl CheckedScopeHandle {
+    pub fn query_identity_version(&self) -> u32 {
+        self.query_identity_version
+    }
+    /// Derive an exact v2 identity from caller-provided randomness. The binding
+    /// is public replay provenance, not a remote authorization credential.
+    pub fn bound_query_id(&self, nonce: [u8; 16]) -> Result<[u8; 32], Status> {
+        if self.query_identity_version != 2 {
+            return Err(Status::invalid_argument(
+                "scope does not use bound query identities",
+            ));
+        }
+        let mut hash = blake3::Hasher::new();
+        hash.update(b"tinytree-query-scope-id-v2\0");
+        hash.update(&(self.repository.len() as u64).to_be_bytes());
+        hash.update(self.repository.as_bytes());
+        hash.update(&self.handle);
+        hash.update(&nonce);
+        let mut id = [0; 32];
+        id[..16].copy_from_slice(&nonce);
+        id[16..].copy_from_slice(&hash.finalize().as_bytes()[..16]);
+        Ok(id)
+    }
     /// Authoritative remote checkpoint roots, not private draft heads.
     pub fn remote_roots(&self) -> &[CommitId] {
         &self.remote_roots
@@ -44,7 +67,7 @@ impl CheckedScopeHandle {
         }
     }
 }
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum QueryFact {
     HasId(CommitId),
     IsAncestor {
@@ -56,13 +79,21 @@ pub enum QueryFact {
         left: Vec<CommitId>,
         right: Vec<CommitId>,
     },
+    /// Membership in the original bounded expression, not a fetched history.
+    Membership {
+        expression: q::GraphExpr,
+        candidate: CommitId,
+    },
 }
+// The protobuf graph AST contains only discrete (non-floating-point) values.
+impl Eq for QueryFact {}
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum FactAnswer {
     HasId(bool),
     IsAncestor(bool),
     Heads(Vec<CommitId>),
     CommonAncestors(Vec<CommitId>),
+    Membership(bool),
 }
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum CommitPrefix {
@@ -125,7 +156,30 @@ impl NativeClient {
         if roots.is_empty() {
             return Err(Status::invalid_argument("query scope requires roots"));
         }
-        self.install_query_scope(roots.into(), overlay, None).await
+        self.install_query_scope(roots.into(), overlay, None, 1)
+            .await
+    }
+    /// Explicitly negotiate scope-bound query identities; never downgrade.
+    pub async fn open_query_scope_v2(
+        &self,
+        roots: Vec<CommitId>,
+    ) -> Result<CheckedScopeHandle, Status> {
+        self.open_query_scope_with_overlay_v2(roots, Vec::new())
+            .await
+    }
+    pub async fn open_query_scope_with_overlay_v2(
+        &self,
+        mut roots: Vec<CommitId>,
+        overlay: Vec<VerifiedMetadata>,
+    ) -> Result<CheckedScopeHandle, Status> {
+        self.batch(roots.len())?;
+        roots.sort_unstable();
+        roots.dedup();
+        if roots.is_empty() {
+            return Err(Status::invalid_argument("query scope requires roots"));
+        }
+        self.install_query_scope(roots.into(), overlay, None, 2)
+            .await
     }
     /// Shares the parent's immutable remote checkpoint and private graph, adding
     /// only these parent-first drafts. Forks cannot extend the parent's expiry.
@@ -135,14 +189,20 @@ impl NativeClient {
         overlay: Vec<VerifiedMetadata>,
     ) -> Result<CheckedScopeHandle, Status> {
         self.checked_scope(parent, false)?;
-        self.install_query_scope(parent.remote_roots.clone(), overlay, Some(parent))
-            .await
+        self.install_query_scope(
+            parent.remote_roots.clone(),
+            overlay,
+            Some(parent),
+            parent.query_identity_version,
+        )
+        .await
     }
     async fn install_query_scope(
         &self,
         roots: Arc<[CommitId]>,
         overlay: Vec<VerifiedMetadata>,
         parent: Option<&CheckedScopeHandle>,
+        identity_version: u32,
     ) -> Result<CheckedScopeHandle, Status> {
         let deadline = self.deadline();
         self.batch(overlay.len())?;
@@ -217,7 +277,7 @@ impl NativeClient {
         getrandom::fill(&mut replay_key)
             .map_err(|_| Status::internal("cannot generate query replay identity"))?;
         let header = q::ScopeHeader {
-            version: 1,
+            version: identity_version,
             repository_id: self.inner.config.repository_id.clone(),
             replay_key: replay_key.to_vec(),
             roots: roots.iter().copied().map(wire_commit).collect(),
@@ -279,7 +339,9 @@ impl NativeClient {
                 reapi::policy::timeout(deadline, async { finished.await.map_err(|_| integrity()) })
                     .await?;
                 let key = scope.key.ok_or_else(integrity)?;
-                if key.repository_id != self.inner.config.repository_id
+                if (identity_version == 2 && scope.query_identity_version != 2)
+                    || (identity_version == 1 && !matches!(scope.query_identity_version, 0 | 1))
+                    || key.repository_id != self.inner.config.repository_id
                     || scope.expires_at_unix_seconds <= unix_seconds()?
                     || parent.is_some_and(|parent| {
                         key.handle.as_slice() == parent.handle
@@ -298,6 +360,7 @@ impl NativeClient {
                     high_water: scope.high_water,
                     expires_at: scope.expires_at_unix_seconds,
                     remote_roots: roots,
+                    query_identity_version: identity_version,
                 })
             }
         })
@@ -328,27 +391,77 @@ impl NativeClient {
     ) -> Result<Vec<FactAnswer>, Status> {
         self.checked_scope(scope, false)?;
         self.batch(facts.len())?;
-        let deadline = self.deadline();
-        let budget = self.admit(deadline, self.unary_memory()).await?;
-        let mut wire = Vec::with_capacity(facts.len());
+        let mut request_bytes = 256usize;
         let mut input_ids = 0usize;
+        let mut expression_nodes = 0usize;
         for fact in &facts {
-            let count = match fact {
-                QueryFact::HasId(_) => 1,
-                QueryFact::IsAncestor { .. } => 2,
-                QueryFact::Heads(ids) => ids.len(),
+            let (count, bytes) = match fact {
+                QueryFact::Membership { expression, .. } => {
+                    let (nodes, bytes, literals) =
+                        validate_expression(expression, &self.inner.config.limits)?;
+                    expression_nodes = expression_nodes.checked_add(nodes).ok_or_else(|| {
+                        Status::resource_exhausted("query expression nodes exceed budget")
+                    })?;
+                    self.batch(expression_nodes)?;
+                    (
+                        literals.checked_add(1).ok_or_else(|| {
+                            Status::resource_exhausted("query input IDs exceed budget")
+                        })?,
+                        bytes.checked_add(96).ok_or_else(|| {
+                            Status::resource_exhausted("query request exceeds budget")
+                        })?,
+                    )
+                }
+                QueryFact::HasId(_) => (1, 72),
+                QueryFact::IsAncestor { .. } => (2, 112),
+                QueryFact::Heads(ids) => (
+                    ids.len(),
+                    ids.len()
+                        .checked_mul(40)
+                        .and_then(|n| n.checked_add(32))
+                        .ok_or_else(|| {
+                            Status::resource_exhausted("query request exceeds budget")
+                        })?,
+                ),
                 QueryFact::CommonAncestors { left, right } => {
-                    left.len().checked_add(right.len()).ok_or_else(|| {
+                    let count = left.len().checked_add(right.len()).ok_or_else(|| {
                         Status::resource_exhausted("query input IDs exceed budget")
-                    })?
+                    })?;
+                    (
+                        count,
+                        count
+                            .checked_mul(40)
+                            .and_then(|n| n.checked_add(32))
+                            .ok_or_else(|| {
+                                Status::resource_exhausted("query request exceeds budget")
+                            })?,
+                    )
                 }
             };
             input_ids = input_ids
                 .checked_add(count)
                 .ok_or_else(|| Status::resource_exhausted("query input IDs exceed budget"))?;
             self.batch(input_ids)?;
+            request_bytes = request_bytes
+                .checked_add(bytes)
+                .ok_or_else(|| Status::resource_exhausted("query request exceeds budget"))?;
+            if request_bytes > self.inner.config.limits.max_request_bytes {
+                return Err(Status::resource_exhausted("query request exceeds budget"));
+            }
+        }
+        let deadline = self.deadline();
+        let budget = self.admit(deadline, self.unary_memory()).await?;
+        let mut wire = Vec::with_capacity(facts.len());
+        for fact in &facts {
             use q::graph_fact::Fact;
             let fact = match fact {
+                QueryFact::Membership {
+                    expression,
+                    candidate,
+                } => Fact::Membership(q::Membership {
+                    expression: Some(expression.clone()),
+                    candidate: Some(wire_commit(*candidate)),
+                }),
                 QueryFact::HasId(id) => Fact::HasId(q::HasId {
                     commit: Some(wire_commit(*id)),
                 }),
@@ -403,6 +516,9 @@ impl NativeClient {
                     .map(|(answer, expected)| {
                         use q::graph_fact_answer::Answer;
                         match (expected, answer.answer) {
+                            (QueryFact::Membership { .. }, Some(Answer::Membership(value))) => {
+                                Ok(FactAnswer::Membership(value))
+                            }
                             (QueryFact::HasId(_), Some(Answer::HasId(value))) => {
                                 Ok(FactAnswer::HasId(value))
                             }
@@ -819,12 +935,40 @@ impl NativeClient {
     /// Prepare a versioned structural query without fetching history. The input
     /// AST is borrowed, checked iteratively, then compactly cloned once. GRAPH
     /// and CANONICAL projections are deliberately absent from this API.
+    /// Preparation is local: before any Evaluate is accepted, closing the scope
+    /// may make the first page unavailable. Only server-established queries and
+    /// their unclosed final-page replay survive logical scope closure.
     pub async fn begin_query(
         &self,
         scope: &CheckedScopeHandle,
         expression: &q::GraphExpr,
         page_size: u32,
     ) -> Result<CheckedIdsQuery, Status> {
+        let mut id = [0; 32];
+        getrandom::fill(&mut id)
+            .map_err(|_| Status::internal("cannot generate evaluation identity"))?;
+        if scope.query_identity_version == 2 {
+            id = scope.bound_query_id(id[..16].try_into().unwrap())?;
+        }
+        self.begin_query_with_id(scope, expression, page_size, id)
+            .await
+    }
+    /// Prepare with the exact provided identity. V2 identities must already be
+    /// bound to this scope; this method never transforms caller bytes.
+    pub async fn begin_query_with_id(
+        &self,
+        scope: &CheckedScopeHandle,
+        expression: &q::GraphExpr,
+        page_size: u32,
+        query_id: [u8; 32],
+    ) -> Result<CheckedIdsQuery, Status> {
+        if scope.query_identity_version == 2
+            && scope.bound_query_id(query_id[..16].try_into().unwrap())? != query_id
+        {
+            return Err(Status::invalid_argument(
+                "query identity belongs to another scope",
+            ));
+        }
         let deadline = self.deadline();
         self.checked_scope(scope, false)?;
         if page_size == 0
@@ -834,7 +978,7 @@ impl NativeClient {
             return Err(Status::invalid_argument("invalid IDS query page size"));
         }
         let limits = &self.inner.config.limits;
-        let (nodes, encoded) = validate_expression(expression, limits)?;
+        let (nodes, encoded, _) = validate_expression(expression, limits)?;
         // Membership intersections inherit their literal bound. This lets a
         // selected canonical read or template membership check coexist with its
         // still-live outer query without changing graph traversal reservations.
@@ -876,9 +1020,6 @@ impl NativeClient {
             _bytes: reservation,
             _guards: self.guards.clone(),
         });
-        let mut query_id = [0u8; 32];
-        getrandom::fill(&mut query_id)
-            .map_err(|_| Status::internal("cannot generate evaluation identity"))?;
         Ok(CheckedIdsQuery {
             client: self.without_rpc_guards(),
             scope: scope.clone(),
@@ -1138,6 +1279,22 @@ impl NativeClient {
     ) -> Result<CheckedGraphQuery, Status> {
         Ok(CheckedGraphQuery {
             core: self.begin_query(scope, expression, page_size).await?,
+            canonical,
+            edges: 0,
+        })
+    }
+    pub async fn begin_graph_query_with_id(
+        &self,
+        scope: &CheckedScopeHandle,
+        expression: &q::GraphExpr,
+        page_size: u32,
+        canonical: bool,
+        query_id: [u8; 32],
+    ) -> Result<CheckedGraphQuery, Status> {
+        Ok(CheckedGraphQuery {
+            core: self
+                .begin_query_with_id(scope, expression, page_size, query_id)
+                .await?,
             canonical,
             edges: 0,
         })
@@ -1627,7 +1784,7 @@ fn expression_row_capacity(expression: &q::GraphExpr, maximum: usize) -> usize {
 fn validate_expression(
     expression: &q::GraphExpr,
     limits: &crate::Limits,
-) -> Result<(usize, usize), Status> {
+) -> Result<(usize, usize, usize), Status> {
     let invalid = || Status::invalid_argument("invalid versioned graph expression");
     let exceeded = || Status::resource_exhausted("graph expression exceeds client bounds");
     let mut pending = vec![(expression, 1usize)];
@@ -1703,7 +1860,7 @@ fn validate_expression(
     if bytes > limits.max_request_bytes {
         return Err(exceeded());
     }
-    Ok((nodes, bytes))
+    Ok((nodes, bytes, literals))
 }
 fn generation_range(range: Option<&q::GenerationRange>) -> Result<(), Status> {
     if range.is_some_and(|range| range.end_exclusive.is_some_and(|end| end < range.start)) {

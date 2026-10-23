@@ -67,12 +67,16 @@ service QueryIo {
 message QueryOpenScopeRequest {
   string store_id = 1; repeated bytes roots = 2;
   repeated bytes overlay = 3; bytes replay_key = 4;
+  uint32 query_identity_version = 5; // 0/1 legacy; 2 scope-bound identities.
 }
 message QueryForkScopeRequest {
   string store_id = 1; bytes parent = 2;
   repeated bytes overlay = 3; bytes replay_key = 4;
 }
-message QueryScopeReply { bytes handle = 1; int64 expires_at_unix_seconds = 2; }
+message QueryScopeReply {
+  bytes handle = 1; int64 expires_at_unix_seconds = 2;
+  uint32 query_identity_version = 3;
+}
 message QueryFactsRequest {
   string store_id = 1; bytes scope = 2;
   repeated tinytree.query.v1.GraphFact facts = 3;

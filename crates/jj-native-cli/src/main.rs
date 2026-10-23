@@ -213,6 +213,12 @@ async fn run_native_command(
                     "native initialization requires --broker and --store for a lazy mount",
                 ));
             }
+            #[cfg(not(feature = "protocol-fixture"))]
+            broker::creation_policy(locator.as_ref().expect("validated broker locator")).map_err(
+                |error| {
+                    user_error_with_message("Native provider cannot create this workspace", error)
+                },
+            )?;
             let destination = command.cwd().join(destination);
             vfs::prepare_destination(&destination)
                 .map_err(|error| user_error_with_message("Failed to create workspace", error))?;
@@ -301,10 +307,11 @@ fn main() -> std::process::ExitCode {
             .set_workspace_loader_factory(Box::new(vfs::Loader))
             .add_working_copy_factories(working_copies)
     };
-    runner
+    let status = runner
         .version(env!("CARGO_PKG_VERSION"))
         .add_store_factories(factories)
         .add_subcommand(run_native_command)
-        .run()
-        .into()
+        .run();
+    broker::drain_cleanup();
+    status.into()
 }
