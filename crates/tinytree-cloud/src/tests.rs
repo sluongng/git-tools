@@ -408,3 +408,455 @@ async fn corrupt_stored_identity_and_unroundtrippable_legacy_operation_are_rejec
             .is_err()
     );
 }
+
+fn native_key(kind: tinytree_model::Kind, byte: u8) -> tinytree_model::ObjectKey {
+    tinytree_model::ObjectKey {
+        kind,
+        id: tinytree_model::ObjectId([byte; 32]),
+    }
+}
+fn manifest_roots(
+    objects: &[VerifiedObject],
+    wc: &WorkingCopy,
+    intents: &[IntentRoots],
+) -> Vec<tinytree_model::ObjectKey> {
+    use tinytree_model as m;
+    let mut keys = BTreeSet::new();
+    for object in objects {
+        for id in &object.dependencies().native_commits {
+            if *id != [0; 32] {
+                keys.insert((m::Kind::Commit as u8, *id));
+            }
+        }
+    }
+    for tree in &wc.tree.terms {
+        keys.insert((m::Kind::Tree as u8, tree.0));
+    }
+    for intent in intents {
+        for root in &intent.roots {
+            keys.insert((root.kind as u8, root.id.0));
+        }
+    }
+    keys.into_iter()
+        .map(|(kind, id)| m::ObjectKey {
+            kind: m::Kind::try_from(kind).unwrap(),
+            id: m::ObjectId(id),
+        })
+        .collect()
+}
+async fn manifest_fixture() -> (Manifest, Vec<VerifiedObject>) {
+    use tinytree_model as m;
+    let dir = tempfile::tempdir().unwrap();
+    let store = init(&dir.path().join("manifest-source"));
+    let view_a = store.write_view(&rich_view()).await.unwrap();
+    let id_a = store
+        .write_operation(&operation(
+            view_a.clone(),
+            Some(BTreeMap::from([(commit(12), vec![commit(13), commit(0)])])),
+        ))
+        .await
+        .unwrap();
+    let mut changed = rich_view();
+    changed.head_ids.insert(commit(16));
+    let view_b = store.write_view(&changed).await.unwrap();
+    let mut op_b = operation(view_b.clone(), Some(BTreeMap::new()));
+    op_b.parents = vec![id_a.clone()];
+    let id_b = store.write_operation(&op_b).await.unwrap();
+    let mut op_c = operation(view_b.clone(), None);
+    op_c.parents = vec![id_b.clone(), id_a.clone()];
+    op_c.metadata.description = "merge private task histories".into();
+    let id_c = store.write_operation(&op_c).await.unwrap();
+    let mut objects = vec![
+        export_view(&store, &view_a, Limits::default())
+            .await
+            .unwrap(),
+        export_view(&store, &view_b, Limits::default())
+            .await
+            .unwrap(),
+    ];
+    for id in [&id_a, &id_b, &id_c] {
+        objects.push(
+            export_operation(&store, id, Limits::default())
+                .await
+                .unwrap(),
+        );
+    }
+    let members = objects
+        .iter()
+        .map(|object| Member {
+            id: object.id(),
+            selected: object.digest().unwrap(),
+        })
+        .collect::<Vec<_>>();
+    let wc = WorkingCopy {
+        workspace_name: "task".into(),
+        wc_operation: array(id_a.as_bytes()).unwrap(),
+        snapshot_operation: array(id_c.as_bytes()).unwrap(),
+        snapshot_commit: [9; 32],
+        tree: m::TreeMerge {
+            terms: vec![
+                m::TreeId([21; 32]),
+                m::TreeId([22; 32]),
+                m::TreeId([23; 32]),
+            ],
+            labels: vec!["our side".into(), "base".into(), "their side".into()],
+        },
+    };
+    let intent_roots = vec![
+        IntentRoots {
+            kind: IntentKind::Publication,
+            id: [1; 32],
+            roots: vec![native_key(m::Kind::File, 17), native_key(m::Kind::Tree, 18)],
+        },
+        IntentRoots {
+            kind: IntentKind::Recovery,
+            id: [2; 32],
+            roots: vec![
+                native_key(m::Kind::Symlink, 19),
+                native_key(m::Kind::CopyHistory, 20),
+            ],
+        },
+    ];
+    let native_roots = manifest_roots(&objects, &wc, &intent_roots);
+    let mut manifest = Manifest {
+        workspace: [1; 32],
+        exporter: [2; 16],
+        sequence: 7,
+        operation_heads: vec![array(id_c.as_bytes()).unwrap()],
+        undo_operations: vec![array(id_a.as_bytes()).unwrap()],
+        intent_operations: vec![array(id_b.as_bytes()).unwrap()],
+        working_copy: wc,
+        parents: vec![ManifestId([1; 32]), ManifestId([2; 32])],
+        members,
+        intent_roots,
+        native_roots,
+        coverage: Coverage::FullRequired,
+        detached: vec![],
+    };
+    manifest.members.sort_by_key(|m| m.id);
+    // Verification does not require the caller's decoded-object order to match.
+    objects.reverse();
+    (manifest, objects)
+}
+#[tokio::test]
+async fn manifest_roundtrip_preserves_full_undo_graph_native_roots_and_tree_merge_order() {
+    use tinytree_model as m;
+    let (manifest, objects) = manifest_fixture().await;
+    let limits = ManifestLimits::default();
+    let bytes = encode_manifest(&manifest, limits).unwrap();
+    let id = ManifestId::of(&bytes);
+    assert_ne!(
+        id.0,
+        BlobDigest::of(&bytes).blake3,
+        "manifest and raw blob hash domains remain distinct"
+    );
+    let decoded = decode_manifest(&bytes, id, limits).unwrap();
+    assert_eq!(decoded, manifest);
+    assert_eq!(encode_manifest(&decoded, limits).unwrap(), bytes);
+    let checked = verify_coverage(&decoded, &objects, limits).unwrap();
+    assert_eq!(checked.native_roots(), manifest.native_roots);
+    assert_ne!(
+        checked.working_copy().wc_operation,
+        checked.working_copy().snapshot_operation
+    );
+    for byte in [3, 4, 5, 12, 13, 16] {
+        assert!(
+            checked
+                .native_roots()
+                .contains(&native_key(m::Kind::Commit, byte)),
+            "negative conflict and predecessor terms must survive"
+        );
+    }
+    for key in [
+        native_key(m::Kind::File, 17),
+        native_key(m::Kind::Tree, 22),
+        native_key(m::Kind::Symlink, 19),
+        native_key(m::Kind::CopyHistory, 20),
+    ] {
+        assert!(checked.native_roots().contains(&key));
+    }
+    assert!(
+        !checked
+            .native_roots()
+            .contains(&native_key(m::Kind::Commit, 0))
+    );
+    let mut reordered = manifest.clone();
+    reordered.working_copy.tree.terms.swap(0, 2);
+    reordered.working_copy.tree.labels.swap(0, 2);
+    let other = encode_manifest(&reordered, limits).unwrap();
+    assert_ne!(ManifestId::of(&other), id);
+    assert_eq!(
+        decode_manifest(&other, ManifestId::of(&other), limits)
+            .unwrap()
+            .working_copy
+            .tree,
+        reordered.working_copy.tree
+    );
+    verify_coverage(&reordered, &objects, limits).unwrap();
+    let mut repeated = manifest.clone();
+    repeated.working_copy.tree.terms[2] = repeated.working_copy.tree.terms[0];
+    repeated.native_roots =
+        manifest_roots(&objects, &repeated.working_copy, &repeated.intent_roots);
+    let encoded = encode_manifest(&repeated, limits).unwrap();
+    assert_eq!(
+        decode_manifest(&encoded, ManifestId::of(&encoded), limits)
+            .unwrap()
+            .working_copy
+            .tree,
+        repeated.working_copy.tree
+    );
+    verify_coverage(&repeated, &objects, limits).unwrap();
+}
+#[tokio::test]
+async fn manifest_coverage_rejects_omitted_dependencies_wrong_representations_and_unreachable_members()
+ {
+    let (manifest, objects) = manifest_fixture().await;
+    let limits = ManifestLimits::default();
+    for omitted in [
+        ObjectId::Operation(manifest.working_copy.wc_operation),
+        objects
+            .iter()
+            .find(|o| matches!(o.id(), ObjectId::View(_)))
+            .unwrap()
+            .id(),
+    ] {
+        let mut incomplete = manifest.clone();
+        incomplete.members.retain(|m| m.id != omitted);
+        let borrowed = objects
+            .iter()
+            .filter(|o| o.id() != omitted)
+            .collect::<Vec<_>>();
+        // Reverify exported immutable bytes to form an independently owned list.
+        let remaining = borrowed
+            .into_iter()
+            .map(|o| {
+                VerifiedObject::verify(
+                    o.id(),
+                    o.digest().unwrap(),
+                    o.payload().unwrap(),
+                    Limits::default(),
+                )
+                .unwrap()
+            })
+            .collect::<Vec<_>>();
+        assert!(matches!(
+            verify_coverage(&incomplete, &remaining, limits),
+            Err(Error::Invalid("required cloud object missing"))
+        ));
+    }
+    let mut wrong = manifest.clone();
+    wrong.members[0].selected.blake3[0] ^= 1;
+    assert!(matches!(
+        verify_coverage(&wrong, &objects, limits),
+        Err(Error::Invalid("selected cloud representation mismatch"))
+    ));
+    let mut wrong = manifest.clone();
+    wrong.working_copy.snapshot_commit = [88; 32];
+    assert!(matches!(
+        verify_coverage(&wrong, &objects, limits),
+        Err(Error::Invalid("selected workspace snapshot mismatch"))
+    ));
+    let mut wrong = manifest.clone();
+    wrong.intent_operations = vec![[99; 64]];
+    assert!(verify_coverage(&wrong, &objects, limits).is_err());
+    let dir = tempfile::tempdir().unwrap();
+    let store = init(&dir.path().join("unreachable"));
+    let mut unused = rich_view();
+    unused.head_ids.insert(commit(99));
+    let id = store.write_view(&unused).await.unwrap();
+    let extra = export_view(&store, &id, Limits::default()).await.unwrap();
+    let mut extra_objects = objects;
+    extra_objects.push(extra);
+    let mut wrong = manifest;
+    wrong.members.push(Member {
+        id: extra_objects.last().unwrap().id(),
+        selected: extra_objects.last().unwrap().digest().unwrap(),
+    });
+    wrong.members.sort_by_key(|m| m.id);
+    assert!(matches!(
+        verify_coverage(&wrong, &extra_objects, limits),
+        Err(Error::Invalid("unreachable cloud member"))
+    ));
+}
+#[tokio::test]
+async fn manifest_native_root_union_is_exact_for_conflicts_predecessors_tree_and_intent_roots() {
+    use tinytree_model as m;
+    let (manifest, objects) = manifest_fixture().await;
+    let limits = ManifestLimits::default();
+    for (name, key) in [
+        ("negative conflict", native_key(m::Kind::Commit, 3)),
+        ("rewrite predecessor", native_key(m::Kind::Commit, 13)),
+        ("working-copy remove term", native_key(m::Kind::Tree, 22)),
+        ("publication file", native_key(m::Kind::File, 17)),
+        ("recovery copy", native_key(m::Kind::CopyHistory, 20)),
+    ] {
+        let mut wrong = manifest.clone();
+        wrong.native_roots.retain(|r| *r != key);
+        assert!(
+            matches!(
+                verify_coverage(&wrong, &objects, limits),
+                Err(Error::Invalid("native root union mismatch"))
+            ),
+            "{name}"
+        );
+    }
+    let mut wrong = manifest;
+    wrong
+        .native_roots
+        .push(native_key(m::Kind::CopyHistory, 99));
+    assert!(matches!(
+        verify_coverage(&wrong, &objects, limits),
+        Err(Error::Invalid("native root union mismatch"))
+    ));
+}
+#[tokio::test]
+async fn manifest_decoder_rejects_malformed_noncanonical_and_over_budget_inputs() {
+    let (manifest, objects) = manifest_fixture().await;
+    let limits = ManifestLimits::default();
+    let bytes = encode_manifest(&manifest, limits).unwrap();
+    assert!(decode_manifest(&bytes, ManifestId([0; 32]), limits).is_err());
+    for end in 0..bytes.len() {
+        let cut = &bytes[..end];
+        assert!(
+            decode_manifest(cut, ManifestId::of(cut), limits).is_err(),
+            "truncated length {end}"
+        );
+    }
+    let mut trailing = bytes.clone();
+    trailing.push(0);
+    assert!(matches!(
+        decode_manifest(&trailing, ManifestId::of(&trailing), limits),
+        Err(Error::Invalid("trailing cloud manifest data"))
+    ));
+    let mut unknown = bytes.clone();
+    unknown[8..10].copy_from_slice(&2u16.to_le_bytes());
+    assert!(matches!(
+        decode_manifest(&unknown, ManifestId::of(&unknown), limits),
+        Err(Error::Unsupported(_))
+    ));
+    let mut giant = bytes.clone();
+    let heads_count = 73 + CODEC.len();
+    giant[heads_count..heads_count + 4].copy_from_slice(&u32::MAX.to_le_bytes());
+    assert!(matches!(
+        decode_manifest(&giant, ManifestId::of(&giant), limits),
+        Err(Error::Limit(_))
+    ));
+    let mut invalid_utf8 = bytes.clone();
+    let name = invalid_utf8.windows(4).position(|v| v == b"task").unwrap();
+    invalid_utf8[name] = 255;
+    assert!(decode_manifest(&invalid_utf8, ManifestId::of(&invalid_utf8), limits).is_err());
+    assert!(matches!(
+        decode_manifest(
+            &bytes,
+            ManifestId::of(&bytes),
+            ManifestLimits {
+                max_decode_bytes: 1,
+                ..limits
+            }
+        ),
+        Err(Error::Limit(_))
+    ));
+    assert!(matches!(
+        verify_coverage(
+            &manifest,
+            &objects,
+            ManifestLimits {
+                max_total_payload_bytes: 0,
+                ..limits
+            }
+        ),
+        Err(Error::Limit(_))
+    ));
+    assert!(matches!(
+        verify_coverage(
+            &manifest,
+            &objects,
+            ManifestLimits {
+                max_members: 1,
+                ..limits
+            }
+        ),
+        Err(Error::Limit(_))
+    ));
+    assert!(matches!(
+        verify_coverage(
+            &manifest,
+            &objects,
+            ManifestLimits {
+                max_edges: 1,
+                ..limits
+            }
+        ),
+        Err(Error::Limit(_))
+    ));
+    let mut unsorted = manifest.clone();
+    unsorted.members.reverse();
+    assert!(encode_manifest(&unsorted, limits).is_err());
+    let mut duplicate = manifest.clone();
+    duplicate.operation_heads.push(duplicate.operation_heads[0]);
+    assert!(encode_manifest(&duplicate, limits).is_err());
+    let mut unsorted = manifest.clone();
+    unsorted.native_roots.reverse();
+    assert!(encode_manifest(&unsorted, limits).is_err());
+    let mut invalid = manifest.clone();
+    invalid.working_copy.tree.terms.pop();
+    assert!(encode_manifest(&invalid, limits).is_err());
+    let mut invalid = manifest.clone();
+    invalid.working_copy.workspace_name = "/not/a/portable/name".into();
+    let error = encode_manifest(&invalid, limits).unwrap_err().to_string();
+    assert!(!error.contains("/not/a"));
+    let mut detached = manifest;
+    detached.detached.push(DetachedComponent {
+        roots: vec![[7; 64]],
+        missing_parent_edges: vec![MissingParentEdge {
+            from_operation: [7; 64],
+            to_parent: [8; 64],
+        }],
+    });
+    assert!(matches!(
+        encode_manifest(&detached, limits),
+        Err(Error::Unsupported("detached cloud components"))
+    ));
+    let mut detached_wire = bytes;
+    let end = detached_wire.len();
+    detached_wire[end - 4..].copy_from_slice(&1u32.to_le_bytes());
+    assert!(matches!(
+        decode_manifest(&detached_wire, ManifestId::of(&detached_wire), limits),
+        Err(Error::Unsupported("detached cloud components"))
+    ));
+}
+#[test]
+fn intrinsic_cloud_checkpoint_has_no_stored_op_view_payload_but_retains_the_real_empty_tree() {
+    use tinytree_model as m;
+    let wc = WorkingCopy {
+        workspace_name: "task".into(),
+        wc_operation: [0; 64],
+        snapshot_operation: [0; 64],
+        snapshot_commit: [0; 32],
+        tree: m::synthetic_root().root_tree,
+    };
+    let native_roots = manifest_roots(&[], &wc, &[]);
+    let manifest = Manifest {
+        workspace: [1; 32],
+        exporter: [2; 16],
+        sequence: 0,
+        operation_heads: vec![[0; 64]],
+        undo_operations: vec![],
+        intent_operations: vec![],
+        working_copy: wc,
+        parents: vec![],
+        members: vec![],
+        intent_roots: vec![],
+        native_roots,
+        coverage: Coverage::FullRequired,
+        detached: vec![],
+    };
+    let limits = ManifestLimits::default();
+    let bytes = encode_manifest(&manifest, limits).unwrap();
+    let decoded = decode_manifest(&bytes, ManifestId::of(&bytes), limits).unwrap();
+    let checked = verify_coverage(&decoded, &[], limits).unwrap();
+    assert_eq!(checked.native_roots(), &[m::empty_tree().descriptor.key]);
+    let mut invalid = manifest;
+    invalid.working_copy.snapshot_commit = [1; 32];
+    assert!(verify_coverage(&invalid, &[], limits).is_err());
+}

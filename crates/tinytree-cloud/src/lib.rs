@@ -4,6 +4,9 @@
 //! Callers own authorization, checkpoint fencing, root retention and atomic
 //! installation of the restored workspace. Importing these objects alone does
 //! not publish a workspace or authorize deleting a sole local copy.
+mod manifest;
+pub use manifest::*;
+
 use jj_lib::{
     backend::CommitId,
     object_id::ObjectId as _,
@@ -55,6 +58,10 @@ pub struct Dependencies {
 pub enum Error {
     #[error("invalid native operation-cloud object: {0}")]
     Invalid(&'static str),
+    #[error("native operation-cloud resource limit: {0}")]
+    Limit(&'static str),
+    #[error("unsupported native operation-cloud feature: {0}")]
+    Unsupported(&'static str),
     #[error("operation-cloud codec: {0}")]
     Codec(#[from] io::Error),
     #[error("operation-store access failed")]

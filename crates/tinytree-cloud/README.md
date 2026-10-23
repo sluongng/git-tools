@@ -17,3 +17,13 @@ This is not an automatic backup service. Callers must fence captures, authorize
 access, retain complete operation/view/native dependencies and atomically install
 restored workspace/head state. Import alone does not validate dependency residency
 or authorize offloading sole local copies. Payload metadata is private; do not log it.
+
+Version-one recovery manifests use a deterministic, bounded binary codec and a
+separate domain-separated identity. Coverage verifies all declared required
+OP/VIEW ancestry, selected raw representations, workspace snapshot mapping and
+the exact typed native-root union. Tree merge terms/labels retain their order.
+Nonempty detached-history components are explicitly unsupported.
+
+Manifest coverage is not proof of a fenced client capture or retained native
+bytes. Storage callers must pin objects, verify native closure and compare the
+snapshot commit's actual tree before publishing a durable cloud version.

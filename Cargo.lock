@@ -5595,6 +5595,7 @@ dependencies = [
  "jj-lib",
  "tempfile",
  "thiserror 2.0.21",
+ "tinytree-model",
  "tokio",
 ]
 
