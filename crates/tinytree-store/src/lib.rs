@@ -25,7 +25,9 @@ use tinytree_model::{CommitId, Descriptor, Kind, Limits, ObjectId, ObjectKey};
 
 mod cloud;
 pub use cloud::{
-    CloudConfig, CloudObjectDescriptor, CloudOwner, CloudReadLease, CloudWriteReceipt,
+    CloudConfig, CloudObjectDescriptor, CloudOwner, CloudPublication, CloudPublicationLimits,
+    CloudReadLease, CloudVersion, CloudVersionReadGuard, CloudWorkspace, CloudWriteReceipt,
+    PublishCloudRequest,
 };
 mod client_gc;
 mod closure;
@@ -51,6 +53,7 @@ pub enum Error {
     MissingObject(ObjectKey),
     StaleReference(Reference),
     IdempotencyConflict,
+    StaleCloudWorkspace(cloud::CloudWorkspace),
     Limit(&'static str),
     Poisoned,
 }
@@ -65,6 +68,7 @@ impl fmt::Display for Error {
             Self::UnknownRepository => f.write_str("unknown native repository"),
             Self::MissingObject(_) => f.write_str("native object is unavailable"),
             Self::StaleReference(_) => f.write_str("native reference generation changed"),
+            Self::StaleCloudWorkspace(_) => f.write_str("cloud workspace generation changed"),
             Self::IdempotencyConflict => f.write_str("idempotency key has a different request"),
             Self::Limit(why) => write!(f, "native store limit: {why}"),
             Self::Poisoned => f.write_str("native store publication gate is poisoned"),
@@ -197,6 +201,7 @@ struct Runtime {
     readers: HashMap<(String, ObjectKey), usize>,
     cloud_readers: HashMap<(String, [u8; 32], tinytree_cloud::ObjectId), usize>,
     cloud_reservations: HashMap<(String, [u8; 32]), (u64, u64, u64)>,
+    cloud_version_readers: HashMap<(String, [u8; 32], [u8; 32], u64), usize>,
     staging_bytes: u64,
     staging_uploads: usize,
     repository_reservations: HashMap<String, (u64, u64)>,
@@ -1172,6 +1177,15 @@ impl Store {
                 return Err(Error::Invalid("expired staging lease"));
             }
         }
+        if let Some(target) = commit {
+            // A new durable root must leave authoritative cloud GC runnable.
+            // Releases remain available even after operator limits are lowered.
+            self.inner.check_cloud_gc_union(
+                repo,
+                &[],
+                Some((&request.reference_name, target.key)),
+            )?;
+        }
         let retention_update = retention
             .map(|(owner, limits)| {
                 self.inner
@@ -1229,6 +1243,7 @@ impl Store {
                 }
             }
         }
+        roots.extend(cloud.strict.iter().copied());
         let mut retained = self.inner.closure(repo, roots, true, false)?;
         let mut expired = Vec::new();
         let mut stage_roots = HashSet::new();

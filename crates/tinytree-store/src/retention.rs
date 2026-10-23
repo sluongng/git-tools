@@ -305,12 +305,25 @@ impl Inner {
             };
             principal_roots.push(target);
             client_roots.push(target);
-            for (roots, maximum) in [
-                (client_roots, limits.max_unique_bytes_per_client),
-                (principal_roots, limits.max_unique_bytes_per_principal),
+            // Both publication paths account one principal's deduplicated native
+            // closure plus retained cloud payloads. Migration overlap is not
+            // charged twice, and separate source namespaces cannot bypass quota.
+            let (cloud_roots, cloud_bytes) =
+                self.cloud_principal_promises(repo, owner.principal, limits.max_quota_scan_roots)?;
+            principal_roots.extend(cloud_roots);
+            for (roots, maximum, initial) in [
+                (client_roots, limits.max_unique_bytes_per_client, 0),
+                (
+                    principal_roots,
+                    limits.max_unique_bytes_per_principal,
+                    cloud_bytes,
+                ),
             ] {
                 let closure = self.closure(repo, roots, true, false)?;
-                let mut size = 0u64;
+                let mut size = initial;
+                if size > maximum {
+                    return Err(Error::Limit("retention closure byte quota"));
+                }
                 for object in closure {
                     let descriptor = self
                         .descriptor(repo, object)?

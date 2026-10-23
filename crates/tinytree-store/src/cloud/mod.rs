@@ -20,6 +20,8 @@ pub struct CloudWriteReceipt {
 #[derive(Clone, Debug)]
 pub struct CloudConfig {
     pub max_object_bytes: usize,
+    pub manifest_limits: tinytree_cloud::ManifestLimits,
+    pub max_version_decode_bytes: usize,
     pub max_decode_bytes: usize,
     pub max_fields: usize,
     pub max_field_bytes: usize,
@@ -37,6 +39,8 @@ impl Default for CloudConfig {
     fn default() -> Self {
         Self {
             max_object_bytes: 4 * 1024 * 1024,
+            manifest_limits: tinytree_cloud::ManifestLimits::default(),
+            max_version_decode_bytes: 512 * 1024 * 1024,
             max_decode_bytes: 64 * 1024 * 1024,
             max_fields: 100_000,
             max_field_bytes: 1024 * 1024,
@@ -54,12 +58,16 @@ impl Default for CloudConfig {
 }
 impl CloudConfig {
     pub(super) fn validate(&self) -> Result<()> {
+        self.manifest_limits
+            .validate()
+            .map_err(|_| Error::Invalid("cloud manifest limits"))?;
         if !(1024..=64 * 1024 * 1024).contains(&self.max_object_bytes)
             || self.max_decode_bytes < self.max_object_bytes
             || self.max_decode_bytes > 1024 * 1024 * 1024
             || !(1..=1_000_000).contains(&self.max_fields)
             || self.max_field_bytes == 0
             || self.max_field_bytes > self.max_object_bytes
+            || !(65536..=1024 * 1024 * 1024).contains(&self.max_version_decode_bytes)
             || self.max_validation_payload_bytes == 0
             || !(1..=1_000_000).contains(&self.max_objects_per_owner)
             || self.max_blob_bytes_per_owner == 0
@@ -78,6 +86,12 @@ impl CloudConfig {
 // Cloud dependency summaries are larger than ordinary native catalog rows.
 // Keep read and precommit bounds identical; a durable ACK must remain readable.
 const CLOUD_JSON_ROW_BYTES: usize = 1024 * 1024;
+const CLOUD_BINARY_ROW_BYTES: usize = 64 * 1024 * 1024 + 4096;
+mod versions;
+pub use versions::{
+    CloudPublication, CloudPublicationLimits, CloudVersion, CloudVersionReadGuard, CloudWorkspace,
+    PublishCloudRequest,
+};
 fn decode<T: serde::de::DeserializeOwned>(bytes: &[u8]) -> Result<T> {
     if bytes.len() > CLOUD_JSON_ROW_BYTES {
         return Err(Error::Corrupt("cloud metadata row size"));
@@ -238,6 +252,12 @@ struct Accounting {
     objects: u64,
     blob_bytes: u64,
     selected_bytes: u64,
+    #[serde(default)]
+    version_payload_bytes: u64,
+    #[serde(default)]
+    version_metadata_bytes: u64,
+    #[serde(default)]
+    version_records: u64,
     metadata_bytes: u64,
     records: u64,
     namespaces: u64,
@@ -633,6 +653,9 @@ struct Delta {
     objects: i128,
     blob_bytes: i128,
     selected_bytes: i128,
+    version_payload_bytes: i128,
+    version_metadata_bytes: i128,
+    version_records: i128,
     stages: i128,
     workspaces: i128,
     versions: i128,
@@ -678,7 +701,15 @@ impl Inner {
             }
             match value {
                 Some(value) => {
-                    if value.len() > CLOUD_JSON_ROW_BYTES {
+                    let binary = std::ptr::eq(space, &self.spaces.cloud.manifests)
+                        || std::ptr::eq(space, &self.spaces.cloud.roots);
+                    if value.len()
+                        > if binary {
+                            CLOUD_BINARY_ROW_BYTES
+                        } else {
+                            CLOUD_JSON_ROW_BYTES
+                        }
+                    {
                         return Err(Error::Limit("cloud metadata row bytes"));
                     }
                     metadata += (key.len() + value.len()) as i128;
@@ -694,6 +725,15 @@ impl Inner {
             adjust(&mut account.metadata_bytes, metadata)?;
             adjust(&mut account.records, records)?;
             adjust(&mut account.selected_bytes, delta.selected_bytes)?;
+            adjust(
+                &mut account.version_payload_bytes,
+                delta.version_payload_bytes,
+            )?;
+            adjust(
+                &mut account.version_metadata_bytes,
+                delta.version_metadata_bytes,
+            )?;
+            adjust(&mut account.version_records, delta.version_records)?;
             if fresh_namespace {
                 adjust(&mut account.namespaces, 1)?;
             }
@@ -720,15 +760,20 @@ impl Inner {
             return Err(Error::Limit("cloud owner quota"));
         }
         if growth
-            && (global.selected_bytes > self.config.cloud.max_validation_payload_bytes
+            && (global
+                .selected_bytes
+                .checked_add(global.version_payload_bytes)
+                .is_none_or(|bytes| bytes > self.config.cloud.max_validation_payload_bytes)
                 || global
                     .records
-                    .checked_add(global.namespaces.saturating_mul(2))
+                    .checked_add(global.version_records)
+                    .and_then(|n| n.checked_add(global.namespaces.saturating_mul(2)))
                     .and_then(|n| n.checked_add(1))
                     .is_none_or(|n| n > self.config.max_retention_validation_records as u64)
                 || global
                     .metadata_bytes
-                    .checked_add(global.namespaces.saturating_mul(4096))
+                    .checked_add(global.version_metadata_bytes)
+                    .and_then(|n| n.checked_add(global.namespaces.saturating_mul(4096)))
                     .and_then(|n| n.checked_add(4096))
                     .is_none_or(|n| n > self.config.max_retention_validation_bytes))
         {
@@ -980,6 +1025,15 @@ fn add_account(target: &mut Accounting, source: &Accounting) -> Result<()> {
     adjust(&mut target.objects, source.objects as i128)?;
     adjust(&mut target.blob_bytes, source.blob_bytes as i128)?;
     adjust(&mut target.selected_bytes, source.selected_bytes as i128)?;
+    adjust(
+        &mut target.version_payload_bytes,
+        source.version_payload_bytes as i128,
+    )?;
+    adjust(
+        &mut target.version_metadata_bytes,
+        source.version_metadata_bytes as i128,
+    )?;
+    adjust(&mut target.version_records, source.version_records as i128)?;
     adjust(&mut target.metadata_bytes, source.metadata_bytes as i128)?;
     adjust(&mut target.records, source.records as i128)?;
     adjust(&mut target.namespaces, source.namespaces as i128)?;
@@ -1144,19 +1198,7 @@ impl Inner {
             metadata_account(a, &key, &value)?;
             adjust(&mut a.stages, 1)?;
         }
-        // Until version publication is installed, populated version tables are
-        // corruption, not a partial promise that collection may ignore.
-        for space in [
-            &self.spaces.cloud.manifests,
-            &self.spaces.cloud.workspaces,
-            &self.spaces.cloud.versions,
-            &self.spaces.cloud.roots,
-            &self.spaces.cloud.receipts,
-        ] {
-            if view.iter(space).next().is_some() {
-                return Err(Error::Corrupt("unsupported cloud version catalog"));
-            }
-        }
+        self.validate_cloud_versions_on_reopen(&mut expected, &mut scan)?;
         let mut actual = HashMap::<Vec<u8>, Accounting>::new();
         let mut namespaces = Vec::new();
         for item in view.iter(&self.spaces.cloud.accounting) {
@@ -1234,6 +1276,7 @@ struct OwnerGc {
     delta: Delta,
 }
 pub(super) struct CloudGcPlan {
+    pub strict: HashSet<ObjectKey>,
     pub transient: HashSet<ObjectKey>,
     groups: HashMap<CloudOwner, OwnerGc>,
     paths: Vec<PathBuf>,
@@ -1303,13 +1346,7 @@ impl Inner {
             bytes: 0,
             payload: 0,
         };
-        if view
-            .prefix(&self.spaces.cloud.versions, &prefix)
-            .next()
-            .is_some()
-        {
-            return Err(Error::Corrupt("unsupported cloud version catalog"));
-        }
+        let published = self.retained_cloud_plan(Some(repo), None, true, &mut scan)?;
         let mut objects = HashMap::<(CloudOwner, CloudId), (Vec<u8>, ObjectRecord)>::new();
         for item in view.prefix(&self.spaces.cloud.objects, &prefix) {
             let (key, value) = item.into_inner()?;
@@ -1326,6 +1363,7 @@ impl Inner {
             objects.insert((owner, selected.id), (key.to_vec(), record));
         }
         let mut plan = CloudGcPlan {
+            strict: published.native,
             transient: HashSet::new(),
             groups: HashMap::new(),
             paths: Vec::new(),
@@ -1334,7 +1372,7 @@ impl Inner {
             expired: 0,
         };
         let mut pending = Vec::new();
-        let mut marked = HashSet::new();
+        let mut marked = published.cloud;
         for item in view.prefix(&self.spaces.cloud.staging, &prefix) {
             let (key, value) = item.into_inner()?;
             scan.visit(self, &key, &value)?;

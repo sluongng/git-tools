@@ -1115,6 +1115,7 @@ fn store_status(error: tinytree_store::Error) -> Status {
         E::Invalid(_) | E::Model(_) => Status::invalid_argument("invalid native object or request"),
         E::Corrupt(_) => Status::data_loss("native store integrity check failed"),
         E::StaleReference(_) => Status::aborted("native reference generation changed"),
+        E::StaleCloudWorkspace(_) => Status::aborted("cloud workspace generation changed"),
         E::IdempotencyConflict => {
             Status::already_exists("native idempotency key has another request")
         }

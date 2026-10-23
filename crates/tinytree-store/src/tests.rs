@@ -2612,3 +2612,820 @@ fn oversized_cloud_dependency_row_is_rejected_before_durable_catalog_ack() {
         vec![None]
     );
 }
+
+fn cloud_capture(
+    store: &Store,
+    owner: CloudOwner,
+    head: Descriptor,
+    root: Descriptor,
+) -> (tinytree_cloud::Manifest, Vec<CloudWriteReceipt>) {
+    cloud_capture_with_refs(store, owner, head, root, 0)
+}
+fn cloud_capture_with_refs(
+    store: &Store,
+    owner: CloudOwner,
+    head: Descriptor,
+    root: Descriptor,
+    bookmarks: usize,
+) -> (tinytree_cloud::Manifest, Vec<CloudWriteReceipt>) {
+    use jj_lib::{
+        backend::{MillisSinceEpoch, Timestamp as JjTimestamp},
+        object_id::ObjectId as _,
+        op_store::{
+            OpStore, Operation, OperationMetadata, RootOperationData, TimestampRange, View,
+        },
+        simple_op_store::SimpleOpStore,
+    };
+    futures::executor::block_on(async {
+        let directory = tempfile::tempdir().unwrap();
+        let source = SimpleOpStore::init(
+            directory.path(),
+            RootOperationData {
+                root_commit_id: jj_lib::backend::CommitId::from_bytes(&[0; 32]),
+            },
+        )
+        .unwrap();
+        let commit = jj_lib::backend::CommitId::from_bytes(&head.key.id.0);
+        let mut view = View::make_root(commit.clone());
+        view.wc_commit_ids.insert("task".into(), commit.clone());
+        for index in 0..bookmarks {
+            view.local_bookmarks.insert(
+                format!("task-{index}").into(),
+                jj_lib::op_store::RefTarget::normal(commit.clone()),
+            );
+        }
+        let view_id = source.write_view(&view).await.unwrap();
+        let timestamp = JjTimestamp {
+            timestamp: MillisSinceEpoch(0),
+            tz_offset: 0,
+        };
+        let op = Operation {
+            view_id: view_id.clone(),
+            parents: vec![jj_lib::op_store::OperationId::from_bytes(&[0; 64])],
+            metadata: OperationMetadata {
+                time: TimestampRange {
+                    start: timestamp.clone(),
+                    end: timestamp,
+                },
+                description: "capture task".into(),
+                hostname: "agent".into(),
+                username: "agent".into(),
+                is_snapshot: true,
+                workspace_name: Some("task".into()),
+                attributes: Default::default(),
+            },
+            commit_predecessors: None,
+        };
+        let operation_id = source.write_operation(&op).await.unwrap();
+        let objects = vec![
+            tinytree_cloud::export_view(&source, &view_id, tinytree_cloud::Limits::default())
+                .await
+                .unwrap(),
+            tinytree_cloud::export_operation(
+                &source,
+                &operation_id,
+                tinytree_cloud::Limits::default(),
+            )
+            .await
+            .unwrap(),
+        ];
+        let mut members = Vec::new();
+        let mut receipts = Vec::new();
+        for object in objects {
+            let receipt = store
+                .put_cloud_object(
+                    "demo",
+                    owner,
+                    object.id(),
+                    object.digest().unwrap(),
+                    object.payload().unwrap(),
+                    0,
+                    tinytree_cloud::Limits::default(),
+                )
+                .unwrap();
+            members.push(tinytree_cloud::Member {
+                id: object.id(),
+                selected: receipt.descriptor.selected,
+            });
+            receipts.push(receipt);
+        }
+        members.sort_by_key(|member| member.id);
+        let operation = operation_id.as_bytes().try_into().unwrap();
+        let mut native_roots = vec![head.key, root.key];
+        native_roots.sort_by_key(|key| (key.kind as u8, key.id.0));
+        (
+            tinytree_cloud::Manifest {
+                workspace: [41; 32],
+                exporter: [42; 16],
+                sequence: 1,
+                operation_heads: vec![operation],
+                undo_operations: vec![],
+                intent_operations: vec![],
+                working_copy: tinytree_cloud::WorkingCopy {
+                    workspace_name: "task".into(),
+                    wc_operation: operation,
+                    snapshot_operation: operation,
+                    snapshot_commit: head.key.id.0,
+                    tree: TreeMerge {
+                        terms: vec![TreeId(root.key.id.0)],
+                        labels: vec![String::new()],
+                    },
+                },
+                parents: vec![],
+                members,
+                intent_roots: vec![],
+                native_roots,
+                coverage: tinytree_cloud::Coverage::FullRequired,
+                detached: vec![],
+            },
+            receipts,
+        )
+    })
+}
+fn cloud_request(
+    manifest: &tinytree_cloud::Manifest,
+    generation: u64,
+    token: &str,
+    leases: &[CloudWriteReceipt],
+) -> PublishCloudRequest {
+    let bytes =
+        tinytree_cloud::encode_manifest(manifest, tinytree_cloud::ManifestLimits::default())
+            .unwrap();
+    PublishCloudRequest {
+        workspace: manifest.workspace,
+        expected_generation: generation,
+        idempotency_key: token.into(),
+        manifest: tinytree_cloud::ManifestId::of(&bytes),
+        manifest_bytes: bytes,
+        staging_leases: leases
+            .iter()
+            .map(|receipt| receipt.staging_lease.clone())
+            .collect(),
+    }
+}
+#[test]
+fn cloud_publication_is_atomic_replayable_retains_history_and_survives_gc_and_reopen() {
+    let (directory, store) = open();
+    let owner = CloudOwner {
+        principal: [40; 32],
+    };
+    let (file, root, head) = fixture(&store, "cloud task");
+    let (manifest, leases) = cloud_capture(&store, owner, head, root);
+    let first = cloud_request(&manifest, 0, "capture-first", &leases);
+    let limits = CloudPublicationLimits::default();
+    let published = store
+        .publish_cloud_version("demo", owner, &first, 1, &limits)
+        .unwrap();
+    assert_eq!(published.workspace.generation, 1);
+    assert_eq!(
+        store
+            .publish_cloud_version("demo", owner, &first, 100, &limits)
+            .unwrap(),
+        published
+    );
+    assert_eq!(
+        store
+            .get_cloud_workspace(
+                "demo",
+                CloudOwner {
+                    principal: [99; 32]
+                },
+                manifest.workspace
+            )
+            .unwrap()
+            .generation,
+        0
+    );
+    let (_, next_root, next_head) = fixture(&store, "next cloud task");
+    let (mut next, next_leases) = cloud_capture(&store, owner, next_head, next_root);
+    next.sequence = 2;
+    next.parents = vec![first.manifest];
+    let second = cloud_request(&next, 1, "capture-second", &next_leases);
+    store
+        .publish_cloud_version("demo", owner, &second, 2, &limits)
+        .unwrap();
+    assert_eq!(
+        store
+            .publish_cloud_version("demo", owner, &first, 100, &limits)
+            .unwrap(),
+        published
+    );
+    let mut conflicting = first.clone();
+    conflicting.manifest_bytes.push(0);
+    assert!(matches!(
+        store.publish_cloud_version("demo", owner, &conflicting, 3, &limits),
+        Err(Error::IdempotencyConflict)
+    ));
+    let mut stale = second.clone();
+    stale.idempotency_key = "stale-capture".into();
+    assert!(matches!(
+        store.publish_cloud_version("demo", owner, &stale, 3, &limits),
+        Err(Error::StaleCloudWorkspace(_))
+    ));
+    let guard = store
+        .read_cloud_version("demo", owner, manifest.workspace, 1, limits.manifest)
+        .unwrap();
+    assert_eq!(guard.manifest_bytes(), first.manifest_bytes);
+    store.gc("demo", 100).unwrap();
+    assert!(store.descriptor("demo", file.key).unwrap().is_some());
+    assert!(matches!(
+        store.client_gc("demo", &client_collection(&store, 100)),
+        Err(Error::Invalid(_))
+    ));
+    drop(guard);
+    drop(store);
+    let store = Store::open_existing(directory.path(), config()).unwrap();
+    assert_eq!(
+        store
+            .get_cloud_workspace("demo", owner, manifest.workspace)
+            .unwrap()
+            .generation,
+        2
+    );
+    assert_eq!(
+        store
+            .read_cloud_version("demo", owner, manifest.workspace, 1, limits.manifest)
+            .unwrap()
+            .manifest_bytes(),
+        first.manifest_bytes
+    );
+    assert_eq!(
+        store
+            .cloud_publication("demo", owner, "capture-first")
+            .unwrap(),
+        Some(published)
+    );
+    assert!(store.descriptor("demo", file.key).unwrap().is_some());
+}
+
+#[test]
+fn invalid_cloud_checkpoint_and_incomplete_coverage_leave_no_publication() {
+    let (directory, store) = open();
+    let owner = CloudOwner {
+        principal: [43; 32],
+    };
+    let (_, root, head) = fixture(&store, "validate checkpoint");
+    let (manifest, leases) = cloud_capture(&store, owner, head, root);
+    let mut invalid = manifest.clone();
+    let empty = tinytree_model::empty_tree().descriptor.key;
+    invalid.working_copy.tree.terms = vec![TreeId(empty.id.0)];
+    invalid.native_roots = vec![head.key, empty];
+    invalid
+        .native_roots
+        .sort_by_key(|key| (key.kind as u8, key.id.0));
+    let request = cloud_request(&invalid, 0, "wrong-checkpoint", &leases);
+    assert!(matches!(
+        store.publish_cloud_version(
+            "demo",
+            owner,
+            &request,
+            1,
+            &CloudPublicationLimits::default()
+        ),
+        Err(Error::Invalid(
+            "cloud working-copy checkpoint tree mismatch"
+        ))
+    ));
+    let mut incomplete = manifest.clone();
+    incomplete.members.pop();
+    let request = cloud_request(&incomplete, 0, "incomplete-capture", &[]);
+    assert!(matches!(
+        store.publish_cloud_version(
+            "demo",
+            owner,
+            &request,
+            1,
+            &CloudPublicationLimits::default()
+        ),
+        Err(Error::Invalid(_))
+    ));
+    assert_eq!(
+        store
+            .get_cloud_workspace("demo", owner, manifest.workspace)
+            .unwrap()
+            .generation,
+        0
+    );
+    assert_eq!(
+        store
+            .cloud_publication("demo", owner, "wrong-checkpoint")
+            .unwrap(),
+        None
+    );
+    // Failed validation must not consume staging or reserve a receipt slot.
+    let valid = cloud_request(&manifest, 0, "wrong-checkpoint", &leases);
+    store
+        .publish_cloud_version("demo", owner, &valid, 1, &CloudPublicationLimits::default())
+        .unwrap();
+    drop(store);
+    Store::open_existing(directory.path(), config()).unwrap();
+}
+
+#[test]
+fn cloud_and_legacy_holds_share_one_deduplicated_principal_promise_quota() {
+    let (_directory, store) = open();
+    let owner = CloudOwner {
+        principal: [44; 32],
+    };
+    let (file, root, head) = fixture(&store, "shared promised history");
+    let (manifest, leases) = cloud_capture(&store, owner, head, root);
+    let cloud_bytes = manifest
+        .members
+        .iter()
+        .map(|member| member.selected.size_bytes)
+        .sum::<u64>();
+    let exact_bytes = cloud_bytes + file.size_bytes + root.size_bytes + head.size_bytes;
+    let retention = RetentionLimits {
+        max_unique_bytes_per_principal: exact_bytes,
+        ..RetentionLimits::default()
+    };
+    let hold = hold_owner(44, 1);
+    store
+        .publish_retention(
+            "demo",
+            hold,
+            &hold_request(hold, head, "legacy-first", 0, true),
+            &retention,
+            0,
+        )
+        .unwrap();
+    let mut limits = CloudPublicationLimits {
+        retention: retention.clone(),
+        ..CloudPublicationLimits::default()
+    };
+    let request = cloud_request(&manifest, 0, "cloud-promise", &leases);
+    limits.retention.max_unique_bytes_per_principal = exact_bytes - 1;
+    assert!(matches!(
+        store.publish_cloud_version("demo", owner, &request, 1, &limits),
+        Err(Error::Limit("principal promised closure byte quota"))
+    ));
+    limits.retention.max_unique_bytes_per_principal = exact_bytes;
+    store
+        .publish_cloud_version("demo", owner, &request, 1, &limits)
+        .unwrap();
+    // A second client holding the same canonical history adds no promise bytes.
+    let peer = hold_owner(44, 2);
+    store
+        .publish_retention(
+            "demo",
+            peer,
+            &hold_request(peer, head, "same-history", 0, true),
+            &retention,
+            2,
+        )
+        .unwrap();
+    let other = put_object(
+        &store,
+        Object::Commit(commit(TreeId(root.key.id.0), "additional promise")),
+        2,
+    );
+    assert!(matches!(
+        store.publish_retention(
+            "demo",
+            peer,
+            &hold_request(peer, other, "additional-history", 0, true),
+            &retention,
+            2
+        ),
+        Err(Error::Limit(_))
+    ));
+}
+
+#[test]
+fn prospective_cloud_validation_budget_rejects_before_ack_and_reopens_cleanly() {
+    let (directory, store) = open();
+    let owner = CloudOwner {
+        principal: [45; 32],
+    };
+    let (_, root, head) = fixture(&store, "bounded validation");
+    let (manifest, leases) = cloud_capture(&store, owner, head, root);
+    let raw = manifest
+        .members
+        .iter()
+        .map(|member| member.selected.size_bytes)
+        .sum::<u64>();
+    drop(store);
+    let mut cfg = config();
+    // Unique catalog fits, but retaining one version would require validating
+    // both the catalog and its selected DAG on every fail-closed reopen.
+    cfg.cloud.max_validation_payload_bytes = raw * 2 - 1;
+    let store = Store::open_existing(directory.path(), cfg.clone()).unwrap();
+    let request = cloud_request(&manifest, 0, "budgeted-capture", &leases);
+    assert!(matches!(
+        store.publish_cloud_version(
+            "demo",
+            owner,
+            &request,
+            1,
+            &CloudPublicationLimits::default()
+        ),
+        Err(Error::Limit("cloud validation catalog budget"))
+    ));
+    assert_eq!(
+        store
+            .get_cloud_workspace("demo", owner, manifest.workspace)
+            .unwrap()
+            .generation,
+        0
+    );
+    assert_eq!(
+        store
+            .cloud_publication("demo", owner, "budgeted-capture")
+            .unwrap(),
+        None
+    );
+    drop(store);
+    Store::open_existing(directory.path(), cfg).unwrap();
+}
+
+#[test]
+fn concurrent_cloud_captures_use_generation_cas_without_partial_receipts() {
+    let (directory, store) = open();
+    let owner = CloudOwner {
+        principal: [46; 32],
+    };
+    let (_, root, head) = fixture(&store, "concurrent capture");
+    let (manifest, _) = cloud_capture(&store, owner, head, root);
+    let barrier = Arc::new(std::sync::Barrier::new(2));
+    let jobs = (0..2)
+        .map(|index| {
+            let store = store.clone();
+            let barrier = barrier.clone();
+            let mut manifest = manifest.clone();
+            manifest.sequence += index;
+            let request = cloud_request(&manifest, 0, &format!("concurrent-{index}"), &[]);
+            std::thread::spawn(move || {
+                barrier.wait();
+                store.publish_cloud_version(
+                    "demo",
+                    owner,
+                    &request,
+                    1,
+                    &CloudPublicationLimits::default(),
+                )
+            })
+        })
+        .collect::<Vec<_>>();
+    let results = jobs
+        .into_iter()
+        .map(|job| job.join().unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
+    assert_eq!(
+        results
+            .iter()
+            .filter(|result| matches!(result, Err(Error::StaleCloudWorkspace(_))))
+            .count(),
+        1
+    );
+    assert_eq!(
+        store
+            .get_cloud_workspace("demo", owner, manifest.workspace)
+            .unwrap()
+            .generation,
+        1
+    );
+    assert_eq!(
+        (0..2)
+            .filter(|index| store
+                .cloud_publication("demo", owner, &format!("concurrent-{index}"))
+                .unwrap()
+                .is_some())
+            .count(),
+        1
+    );
+    drop(store);
+    Store::open_existing(directory.path(), config()).unwrap();
+}
+
+#[test]
+fn decoded_cloud_version_budget_bounds_retained_objects_before_publication() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut cfg = config();
+    cfg.cloud.max_version_decode_bytes = 65536;
+    let store = Store::open(directory.path(), cfg.clone()).unwrap();
+    store.create_repository("demo").unwrap();
+    let owner = CloudOwner {
+        principal: [47; 32],
+    };
+    let (_, root, head) = fixture(&store, "bounded decoded objects");
+    let (manifest, leases) = cloud_capture_with_refs(&store, owner, head, root, 1000);
+    let request = cloud_request(&manifest, 0, "decoded-budget", &leases);
+    assert!(matches!(
+        store.publish_cloud_version(
+            "demo",
+            owner,
+            &request,
+            1,
+            &CloudPublicationLimits::default()
+        ),
+        Err(Error::Limit("cloud version decoded object budget"))
+    ));
+    assert_eq!(
+        store
+            .get_cloud_workspace("demo", owner, manifest.workspace)
+            .unwrap()
+            .generation,
+        0
+    );
+    assert_eq!(
+        store
+            .cloud_publication("demo", owner, "decoded-budget")
+            .unwrap(),
+        None
+    );
+    drop(store);
+    Store::open_existing(directory.path(), cfg).unwrap();
+}
+
+#[test]
+fn cloud_publication_verifies_native_file_bytes_before_promising_retention() {
+    let (directory, store) = open();
+    let owner = CloudOwner {
+        principal: [48; 32],
+    };
+    let (file, root, head) = fixture(&store, "verify cloud native closure");
+    let (manifest, leases) = cloud_capture(&store, owner, head, root);
+    let path = store.inner.path("demo", file.key);
+    let original = fs::read(&path).unwrap();
+    fs::write(&path, vec![0; original.len()]).unwrap();
+    let request = cloud_request(&manifest, 0, "verify-native-files", &leases);
+    assert!(
+        store
+            .publish_cloud_version(
+                "demo",
+                owner,
+                &request,
+                1,
+                &CloudPublicationLimits::default()
+            )
+            .is_err()
+    );
+    assert_eq!(
+        store
+            .get_cloud_workspace("demo", owner, manifest.workspace)
+            .unwrap()
+            .generation,
+        0
+    );
+    assert_eq!(
+        store
+            .cloud_publication("demo", owner, "verify-native-files")
+            .unwrap(),
+        None
+    );
+    fs::write(path, original).unwrap();
+    store
+        .publish_cloud_version(
+            "demo",
+            owner,
+            &request,
+            1,
+            &CloudPublicationLimits::default(),
+        )
+        .unwrap();
+    drop(store);
+    Store::open_existing(directory.path(), config()).unwrap();
+}
+
+#[test]
+fn cloud_reopen_rejects_missing_retained_version_root_record() {
+    let (directory, store) = open();
+    let owner = CloudOwner {
+        principal: [49; 32],
+    };
+    let (_, root, head) = fixture(&store, "exact retained root index");
+    let (manifest, leases) = cloud_capture(&store, owner, head, root);
+    let request = cloud_request(&manifest, 0, "root-index", &leases);
+    store
+        .publish_cloud_version(
+            "demo",
+            owner,
+            &request,
+            1,
+            &CloudPublicationLimits::default(),
+        )
+        .unwrap();
+    drop(store);
+    {
+        let db = SingleWriterTxDatabase::builder(directory.path().join("metadata"))
+            .open()
+            .unwrap();
+        let space = db
+            .keyspace("cloud-native-roots-v1", KeyspaceCreateOptions::default)
+            .unwrap();
+        let keys = db
+            .read_tx()
+            .iter(&space)
+            .map(|entry| entry.into_inner().unwrap().0)
+            .collect::<Vec<_>>();
+        assert_eq!(keys.len(), 1);
+        let mut tx = db.write_tx().durability(Some(PersistMode::SyncAll));
+        tx.remove(&space, keys[0].clone());
+        tx.commit().unwrap();
+    }
+    assert!(matches!(
+        Store::open_existing(directory.path(), config()),
+        Err(Error::Corrupt("cloud version roots missing"))
+    ));
+}
+
+#[test]
+fn prospective_cloud_repeated_metadata_work_is_bounded_before_ack() {
+    let (directory, store) = open();
+    let owner = CloudOwner {
+        principal: [50; 32],
+    };
+    let (_, root, head) = fixture(&store, "bounded metadata validation");
+    let (manifest, leases) = cloud_capture(&store, owner, head, root);
+    drop(store);
+    let mut cfg = config();
+    cfg.max_retention_validation_records = 15;
+    let store = Store::open_existing(directory.path(), cfg.clone()).unwrap();
+    let request = cloud_request(&manifest, 0, "metadata-budget", &leases);
+    assert!(matches!(
+        store.publish_cloud_version(
+            "demo",
+            owner,
+            &request,
+            1,
+            &CloudPublicationLimits::default()
+        ),
+        Err(Error::Limit("cloud validation catalog budget"))
+    ));
+    assert_eq!(
+        store
+            .get_cloud_workspace("demo", owner, manifest.workspace)
+            .unwrap()
+            .generation,
+        0
+    );
+    assert_eq!(
+        store
+            .cloud_publication("demo", owner, "metadata-budget")
+            .unwrap(),
+        None
+    );
+    drop(store);
+    Store::open_existing(directory.path(), cfg).unwrap();
+}
+
+#[test]
+fn cloud_gc_root_budget_is_shared_across_owners_and_all_publication_routes() {
+    for cloud_first in [false, true] {
+        let directory = tempfile::tempdir().unwrap();
+        let mut cfg = config();
+        cfg.max_closure_objects = 4;
+        let store = Store::open(directory.path(), cfg.clone()).unwrap();
+        store.create_repository("demo").unwrap();
+        let (_, root, legacy_head) = fixture(&store, "legacy owner history");
+        let (_, _, cloud_head) = fixture(&store, "different cloud owner history");
+        let legacy_owner = hold_owner(51, 1);
+        let cloud_owner = CloudOwner {
+            principal: [52; 32],
+        };
+        let (manifest, leases) = cloud_capture(&store, cloud_owner, cloud_head, root);
+        let cloud = cloud_request(&manifest, 0, "bounded-cloud-union", &leases);
+        let hold = hold_request(legacy_owner, legacy_head, "bounded-legacy-union", 0, true);
+        if cloud_first {
+            store
+                .publish_cloud_version(
+                    "demo",
+                    cloud_owner,
+                    &cloud,
+                    1,
+                    &CloudPublicationLimits::default(),
+                )
+                .unwrap();
+            assert!(matches!(
+                store.publish_retention(
+                    "demo",
+                    legacy_owner,
+                    &hold,
+                    &RetentionLimits::default(),
+                    2
+                ),
+                Err(Error::Limit("object closure"))
+            ));
+            assert!(matches!(
+                store.publish(
+                    "demo",
+                    &request("bounded-public-union", 0, Some(legacy_head)),
+                    2
+                ),
+                Err(Error::Limit("object closure"))
+            ));
+            assert_eq!(
+                store.publication("demo", "bounded-legacy-union").unwrap(),
+                None
+            );
+            assert_eq!(
+                store.publication("demo", "bounded-public-union").unwrap(),
+                None
+            );
+            assert_eq!(
+                store
+                    .get_cloud_workspace("demo", cloud_owner, manifest.workspace)
+                    .unwrap()
+                    .generation,
+                1
+            );
+        } else {
+            store
+                .publish_retention("demo", legacy_owner, &hold, &RetentionLimits::default(), 1)
+                .unwrap();
+            assert!(matches!(
+                store.publish_cloud_version(
+                    "demo",
+                    cloud_owner,
+                    &cloud,
+                    2,
+                    &CloudPublicationLimits::default()
+                ),
+                Err(Error::Limit("object closure"))
+            ));
+            assert_eq!(
+                store
+                    .cloud_publication("demo", cloud_owner, "bounded-cloud-union")
+                    .unwrap(),
+                None
+            );
+            assert_eq!(
+                store
+                    .get_cloud_workspace("demo", cloud_owner, manifest.workspace)
+                    .unwrap()
+                    .generation,
+                0
+            );
+            // Removing the old root is allowed and immediately makes room for
+            // the same rejected cloud request; its staging was not consumed.
+            store
+                .publish_retention(
+                    "demo",
+                    legacy_owner,
+                    &hold_request(legacy_owner, legacy_head, "release-old-union", 1, false),
+                    &RetentionLimits::default(),
+                    3,
+                )
+                .unwrap();
+            store
+                .publish_cloud_version(
+                    "demo",
+                    cloud_owner,
+                    &cloud,
+                    3,
+                    &CloudPublicationLimits::default(),
+                )
+                .unwrap();
+        }
+        store.gc("demo", 100).unwrap();
+        drop(store);
+        Store::open_existing(directory.path(), cfg).unwrap();
+    }
+}
+
+#[test]
+fn native_reference_replacement_checks_poststate_not_old_plus_new_cloud_union() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut cfg = config();
+    cfg.max_closure_objects = 5;
+    let store = Store::open(directory.path(), cfg.clone()).unwrap();
+    store.create_repository("demo").unwrap();
+    let (_, root, cloud_head) = fixture(&store, "cloud history");
+    let (_, _, first) = fixture(&store, "first public history");
+    let (_, _, replacement) = fixture(&store, "replacement public history");
+    let owner = CloudOwner {
+        principal: [53; 32],
+    };
+    let (manifest, leases) = cloud_capture(&store, owner, cloud_head, root);
+    store
+        .publish_cloud_version(
+            "demo",
+            owner,
+            &cloud_request(&manifest, 0, "cloud-anchor", &leases),
+            1,
+            &CloudPublicationLimits::default(),
+        )
+        .unwrap();
+    store
+        .publish("demo", &request("first-public", 0, Some(first)), 1)
+        .unwrap();
+    store
+        .publish("demo", &request("replace-public", 1, Some(replacement)), 2)
+        .unwrap();
+    store.gc("demo", 100).unwrap();
+    assert_eq!(store.descriptor("demo", first.key).unwrap(), None);
+    assert_eq!(
+        store.descriptor("demo", replacement.key).unwrap(),
+        Some(replacement)
+    );
+    drop(store);
+    cfg.max_closure_objects = 4;
+    let store = Store::open_existing(directory.path(), cfg).unwrap();
+    // Lowering an operator work limit must not prevent a growth-free release.
+    store
+        .publish("demo", &request("release-public", 2, None), 101)
+        .unwrap();
+    store.gc("demo", 101).unwrap();
+    assert_eq!(store.descriptor("demo", replacement.key).unwrap(), None);
+}
