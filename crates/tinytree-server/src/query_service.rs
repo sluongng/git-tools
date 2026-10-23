@@ -742,6 +742,29 @@ impl RepositoryQuery for QueryService {
         )
         .await
     }
+    async fn close_query(
+        &self,
+        request: Request<q::CloseQueryRequest>,
+    ) -> Result<Response<q::CloseQueryResponse>, Status> {
+        let (identity, deadline, host) = self.context(&request, false)?;
+        let admission = request.extensions().get::<Arc<Work>>().cloned();
+        self.bounded(request.get_ref())?;
+        let input = request.into_inner();
+        let key = scope_key(input.scope)?;
+        identity.authorize(&key.repository_id, false)?;
+        let work = admitted(&host, deadline, admission).await?;
+        let (value, work) = execute(host, work, deadline, move |host, _| {
+            host.cursors
+                .close(host, &identity.id, &key, &input.query_id)?;
+            Ok(q::CloseQueryResponse {})
+        })
+        .await?;
+        response(
+            value,
+            work,
+            self.repository.service_config().query.max_response_bytes,
+        )
+    }
     async fn evaluate(
         &self,
         request: Request<q::EvaluateRequest>,
@@ -883,6 +906,21 @@ mod tests {
             .unwrap();
             call.abort();
             let _ = call.await;
+            let close_call = if projection.is_some() {
+                let service = service.clone();
+                let close_key = key.clone();
+                Some(tokio::spawn(async move {
+                    service
+                        .close_query(Request::new(q::CloseQueryRequest {
+                            scope: Some(close_key),
+                            query_id: vec![19; 32],
+                        }))
+                        .await
+                }))
+            } else {
+                None
+            };
+
             let owned = host.clone();
             let closed = key.clone();
             tokio::task::spawn_blocking(move || {
@@ -914,6 +952,10 @@ mod tests {
                 "cancelled waiter must not free accepted physical query admission"
             );
             resume.send(()).unwrap();
+            if let Some(close) = close_call {
+                close.await.unwrap().unwrap();
+            }
+
             tokio::time::timeout(std::time::Duration::from_secs(5), async {
                 loop {
                     let owned = store.clone();
@@ -946,5 +988,116 @@ mod tests {
                 tonic::Code::FailedPrecondition
             );
         }
+    }
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn closed_query_preserves_the_previously_returned_response_owner_until_drop() {
+        let temporary = tempfile::tempdir().unwrap();
+        let store =
+            tinytree_store::Store::open(temporary.path().join("objects"), Default::default())
+                .unwrap();
+        store.create_repository("example").unwrap();
+        let mut commit = m::synthetic_root();
+        commit.parents = vec![m::CommitId::ROOT];
+        commit.change_id = m::ChangeId([22; 16]);
+        let object = m::encode(&m::Object::Commit(commit), Default::default()).unwrap();
+        store
+            .put("example", object.descriptor, &object.bytes, 0)
+            .unwrap();
+        let index =
+            tinytree_index::Index::open(temporary.path().join("derived"), &Default::default())
+                .unwrap();
+        index
+            .ingest("example", object.descriptor, &object.bytes)
+            .unwrap();
+        let mut config = crate::ServiceConfig::default();
+        config.query.max_eval_quantum_steps = 1;
+        let repository =
+            RepositoryService::new(store.clone(), config, vec!["example".into()], Vec::new())
+                .unwrap()
+                .with_query_index(index)
+                .unwrap();
+        let host = repository.query_host().unwrap();
+        let opened = host.clone();
+        let scope = tokio::task::spawn_blocking(move || {
+            opened.open(
+                "local-owner",
+                "example",
+                [21; 32],
+                vec![m::CommitId(object.descriptor.key.id.0)],
+            )
+        })
+        .await
+        .unwrap()
+        .unwrap();
+        let service = repository.query_service();
+        let input = q::EvaluateRequest {
+            scope: scope.key.clone(),
+            query_id: vec![23; 32],
+            expression: Some(q::GraphExpr {
+                version: 1,
+                expression: Some(q::graph_expr::Expression::Commits(q::CommitSet {
+                    commits: vec![wire(m::CommitId(object.descriptor.key.id.0))],
+                })),
+            }),
+            projection: q::Projection::Canonical as i32,
+            page_size: 128,
+            cursor: Vec::new(),
+        };
+        // This is a direct-handler response-budget lifetime regression, not a
+        // claim that the unit fixture exercised HTTP/2 socket backpressure.
+        let response = service.evaluate(Request::new(input.clone())).await.unwrap();
+        assert_eq!(response.get_ref().exhausted, Some(false));
+        service
+            .close_query(Request::new(q::CloseQueryRequest {
+                scope: scope.key.clone(),
+                query_id: input.query_id.clone(),
+            }))
+            .await
+            .unwrap();
+        service
+            .close_scope(Request::new(q::CloseScopeRequest {
+                scope: scope.key.clone(),
+            }))
+            .await
+            .unwrap();
+        let held = store.clone();
+        tokio::task::spawn_blocking(move || {
+            held.gc("example", i64::MAX - 1).unwrap();
+            assert!(
+                held.descriptor("example", object.descriptor.key)
+                    .unwrap()
+                    .is_some()
+            );
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            service
+                .evaluate(Request::new(input))
+                .await
+                .unwrap_err()
+                .code(),
+            tonic::Code::FailedPrecondition
+        );
+        drop(response);
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                let held = store.clone();
+                let gone = tokio::task::spawn_blocking(move || {
+                    held.gc("example", i64::MAX - 1).unwrap();
+                    held.descriptor("example", object.descriptor.key)
+                        .unwrap()
+                        .is_none()
+                })
+                .await
+                .unwrap();
+                if gone {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap();
     }
 }

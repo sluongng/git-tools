@@ -41,14 +41,18 @@ struct Inner {
     // needed to fetch its next page. Acquire this sub-pool before `bytes`.
     query_state: Arc<Semaphore>,
     disk: Arc<Semaphore>,
+    query_cleanup: tokio::sync::mpsc::Sender<query::QueryCleanup>,
 }
 struct Budget {
+    _guards: crate::verified::LifetimeGuards,
     _inflight: OwnedSemaphorePermit,
     _bytes: OwnedSemaphorePermit,
-    _guards: crate::verified::LifetimeGuards,
 }
 fn unary_memory(limits: &crate::Limits) -> usize {
     limits.max_batch_bytes.max(limits.max_request_bytes) * 4
+}
+fn query_headroom(limits: &crate::Limits) -> usize {
+    unary_memory(limits).max(query::CLEANUP_MEMORY)
 }
 impl NativeClient {
     /// Pin external resource owners through temporary creation, readers,
@@ -190,7 +194,9 @@ impl NativeClient {
                 .send_compressed(CompressionEncoding::Zstd)
                 .accept_compressed(CompressionEncoding::Zstd);
         }
-        Ok(Self {
+        let (query_cleanup, cleanup_receiver) =
+            tokio::sync::mpsc::channel(config.limits.query_cleanup_capacity);
+        let client = Self {
             guards: Default::default(),
             inner: Arc::new(Inner {
                 inflight: Arc::new(Semaphore::new(config.limits.max_inflight)),
@@ -199,14 +205,18 @@ impl NativeClient {
                     config
                         .limits
                         .max_buffered_bytes
-                        .saturating_sub(unary_memory(&config.limits)),
+                        .saturating_sub(query_headroom(&config.limits)),
                 )),
                 disk: Arc::new(Semaphore::new(config.limits.max_temporary_bytes as usize)),
                 config,
                 grpc,
                 token,
+                query_cleanup,
             }),
-        })
+        };
+        let worker = query::CleanupWorker::new(&client);
+        tokio::spawn(worker.run(cleanup_receiver));
+        Ok(client)
     }
     fn deadline(&self) -> Instant {
         Instant::now() + self.inner.config.rpc.operation_timeout()

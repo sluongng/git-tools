@@ -105,6 +105,7 @@ mod tests {
                 ("ResolveChangePrefix", false, false),
                 ("ShortestPrefix", false, false),
                 ("Evaluate", false, false),
+                ("CloseQuery", false, false),
             ]
         );
 

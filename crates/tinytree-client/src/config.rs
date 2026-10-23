@@ -8,6 +8,8 @@ use std::{
 #[serde(default, deny_unknown_fields)]
 pub struct Limits {
     pub max_inflight: usize,
+    /// Bounded best-effort query cleanup queue per connection.
+    pub query_cleanup_capacity: usize,
     pub max_frame_bytes: usize,
     pub max_request_bytes: usize,
     pub max_metadata_bytes: usize,
@@ -45,6 +47,7 @@ impl Default for Limits {
     fn default() -> Self {
         Self {
             max_inflight: 4,
+            query_cleanup_capacity: 64,
             max_frame_bytes: 65536,
             max_request_bytes: 256 * 1024,
             max_metadata_bytes: 16 * 1024 * 1024,
@@ -74,6 +77,8 @@ pub struct Config {
     pub token_env: Option<String>,
     pub tls: Option<Tls>,
     pub compression: bool,
+    /// Fresh cleanup deadline, including time waiting in the Drop queue.
+    pub query_cleanup_timeout_ms: u64,
     pub limits: Limits,
     pub rpc: reapi::policy::Policy,
 }
@@ -85,6 +90,7 @@ impl Default for Config {
             token_env: None,
             tls: None,
             compression: true,
+            query_cleanup_timeout_ms: 5000,
             limits: Limits::default(),
             rpc: Default::default(),
         }
@@ -131,7 +137,9 @@ impl Config {
             return Err(ConfigError("invalid native endpoint or TLS name"));
         }
         let l = &self.limits;
-        if !(1..=1024).contains(&l.max_inflight)
+        if !(1..=60_000).contains(&self.query_cleanup_timeout_ms)
+            || !(1..=4096).contains(&l.query_cleanup_capacity)
+            || !(1..=1024).contains(&l.max_inflight)
             || !(1024..=1024 * 1024).contains(&l.max_frame_bytes)
             || !(1024..=64 * 1024 * 1024).contains(&l.max_request_bytes)
             || !(1024..=64 * 1024 * 1024).contains(&l.max_metadata_bytes)

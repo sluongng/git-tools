@@ -163,7 +163,9 @@ struct Record {
     owner: String,
     repository: String,
     query_id: [u8; 32],
-    binding: [u8; 32],
+    binding: Option<[u8; 32]>,
+    scope_handle: [u8; 32],
+    closed: AtomicBool,
     id: [u8; 32],
     scope_digest: [u8; 32],
     epoch: [u8; 16],
@@ -251,7 +253,11 @@ impl CursorHost {
         bytes.extend_from_slice(&record.expires.to_be_bytes());
         bytes.extend_from_slice(&record.scope_digest);
         bytes.extend_from_slice(&record.epoch);
-        let mac = self.mac(&record.owner, &record.binding, &bytes);
+        let mac = self.mac(
+            &record.owner,
+            record.binding.as_ref().expect("open query binding"),
+            &bytes,
+        );
         bytes.extend_from_slice(mac.as_bytes());
         bytes
     }
@@ -279,6 +285,15 @@ impl CursorHost {
         {
             return Err(Status::resource_exhausted("active query quota exceeded"));
         }
+        self.history_room(c, owner, repo, records)
+    }
+    fn history_room(
+        &self,
+        c: &QueryConfig,
+        owner: &str,
+        repo: &str,
+        records: &HashMap<[u8; 32], Arc<Record>>,
+    ) -> Result<(), Status> {
         if records.len() >= c.max_query_replays
             || records.values().filter(|r| r.owner == owner).count()
                 >= c.max_query_replays_per_principal
@@ -289,6 +304,112 @@ impl CursorHost {
                 "query replay history quota exceeded",
             ));
         }
+        Ok(())
+    }
+    pub fn close(
+        &self,
+        host: &QueryHost,
+        owner: &str,
+        key: &q::ScopeKey,
+        query_id: &[u8],
+    ) -> Result<(), Status> {
+        let query_id: [u8; 32] = query_id
+            .try_into()
+            .map_err(|_| Status::invalid_argument("query ID must be 32 bytes"))?;
+        let scope_handle: [u8; 32] = key
+            .handle
+            .as_slice()
+            .try_into()
+            .map_err(|_| Status::invalid_argument("invalid scope handle"))?;
+        let now = clock()?;
+        self.expire(now);
+        let record = {
+            let mut records = self.records.lock().unwrap();
+            if let Some(record) = records.values().find(|record| {
+                record.owner == owner
+                    && record.repository == key.repository_id
+                    && record.query_id == query_id
+            }) {
+                if record.scope_handle != scope_handle {
+                    return Err(Status::permission_denied("query scope binding mismatch"));
+                }
+                record.clone()
+            } else {
+                // Closing before the first Evaluate is an ordered cancellation,
+                // not a no-op. Its bounded tombstone prevents a late creation.
+                let scope = match host.lookup(owner, &key.repository_id, &key.handle) {
+                    Ok(scope) => scope,
+                    // A closed/expired/missing scope cannot authorize any late
+                    // creation. Cleanup is already complete; foreign ownership
+                    // remains a permission error, not an existence oracle.
+                    Err(error) if error.code() == tonic::Code::FailedPrecondition => return Ok(()),
+                    Err(error) => return Err(error),
+                };
+                self.history_room(&host.config, owner, &key.repository_id, &records)?;
+                let charge = 4096usize
+                    .saturating_add(owner.len().saturating_mul(2))
+                    .saturating_add(key.repository_id.len().saturating_mul(2));
+                let permit = self
+                    .memory
+                    .clone()
+                    .try_acquire_many_owned(u32::try_from(charge).map_err(|_| {
+                        Status::resource_exhausted("closed query metadata exceeds budget")
+                    })?)
+                    .map_err(|_| Status::resource_exhausted("query history memory exhausted"))?;
+                let id = random();
+                let record = Arc::new(Record {
+                    owner: owner.into(),
+                    repository: key.repository_id.clone(),
+                    query_id,
+                    binding: None,
+                    scope_handle,
+                    closed: AtomicBool::new(true),
+                    id,
+                    scope_digest: scope
+                        .wire
+                        .content_digest
+                        .as_slice()
+                        .try_into()
+                        .map_err(|_| Status::internal("invalid scope digest"))?,
+                    epoch: scope
+                        .wire
+                        .index_epoch
+                        .as_slice()
+                        .try_into()
+                        .map_err(|_| Status::internal("invalid scope epoch"))?,
+                    expires: (now + host.config.query_ttl_seconds as i64)
+                        .min(scope.wire.expires_at_unix_seconds),
+                    active: AtomicBool::new(false),
+                    state: Some(Mutex::new(State {
+                        pending: None,
+                        evaluator: None,
+                        pending_row: None,
+                        scope: None,
+                        budget: host.config.budget(),
+                        next: 0,
+                        last: None,
+                        replay_memory: None,
+                        active_memory: None,
+                    })),
+                    memory: Some(Arc::new(permit)),
+                    cleanup: self.cleanup.clone(),
+                });
+                records.insert(id, record.clone());
+                record
+            }
+        };
+        let mut state = record.state.as_ref().unwrap().lock().unwrap();
+        record.closed.store(true, Ordering::Release);
+        // This method only runs in an owned blocking job. Physical previously
+        // returned pages independently retain their scope and active reservation.
+        state.evaluator = None;
+        state.pending = None;
+        state.pending_row = None;
+        state.last = None;
+        state.replay_memory = None;
+        state.scope = None;
+        state.active_memory = None;
+        record.active.store(false, Ordering::Release);
         Ok(())
     }
     pub fn evaluate(
@@ -331,7 +452,10 @@ impl CursorHost {
             if let Some(existing) = records.values().find(|r| {
                 r.owner == owner && r.repository == key.repository_id && r.query_id == query_id
             }) {
-                if existing.binding != binding {
+                if existing.closed.load(Ordering::Acquire) {
+                    return Err(Status::failed_precondition("query is closed"));
+                }
+                if existing.binding != Some(binding) {
                     return Err(Status::already_exists(
                         "query ID reused with different inputs",
                     ));
@@ -375,7 +499,13 @@ impl CursorHost {
                     owner: owner.into(),
                     repository: key.repository_id.clone(),
                     query_id,
-                    binding,
+                    binding: Some(binding),
+                    scope_handle: key
+                        .handle
+                        .as_slice()
+                        .try_into()
+                        .map_err(|_| Status::invalid_argument("invalid scope handle"))?,
+                    closed: AtomicBool::new(false),
                     id,
                     scope_digest: scope
                         .wire
@@ -430,9 +560,12 @@ impl CursorHost {
                 .get(&id)
                 .cloned()
                 .ok_or_else(|| Status::failed_precondition("query cursor unavailable"))?;
+            if record.closed.load(Ordering::Acquire) {
+                return Err(Status::failed_precondition("query is closed"));
+            }
             if record.owner != owner
                 || record.repository != key.repository_id
-                || record.binding != binding
+                || record.binding != Some(binding)
                 || record.scope_digest.as_slice() != &cursor[48..80]
                 || record.epoch.as_slice() != &cursor[80..96]
                 || record.expires != expires
@@ -448,6 +581,10 @@ impl CursorHost {
             return Err(Status::failed_precondition("query cursor expired"));
         }
         let mut state = record.state.as_ref().unwrap().lock().unwrap();
+        if record.closed.load(Ordering::Acquire) {
+            return Err(Status::failed_precondition("query is closed"));
+        }
+
         if record.expires <= clock()? {
             return Err(Status::failed_precondition("query cursor expired"));
         }

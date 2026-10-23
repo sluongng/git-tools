@@ -1459,6 +1459,10 @@ enum QueryMode {
     GraphEdgeWidth,
     GraphUnknownDirect,
     GraphDuplicateEdges,
+    CloseQueryRetry,
+    CloseQueryPause,
+    CloseQueryUnavailable,
+    CloseQueryInitialReject,
 }
 #[derive(Default)]
 struct QueryCounts {
@@ -1472,6 +1476,9 @@ struct QueryCounts {
     change_prefixes: AtomicUsize,
     shortest_prefixes: AtomicUsize,
     evaluations: AtomicUsize,
+    query_closes: AtomicUsize,
+    close_query_entered: tokio::sync::Notify,
+    close_query_release: tokio::sync::Notify,
     evaluate_entered: tokio::sync::Notify,
     evaluate_release: tokio::sync::Notify,
 }
@@ -1555,6 +1562,29 @@ impl RepositoryQuery for QueryFaults {
     ) -> Result<Response<q::CloseScopeResponse>, Status> {
         self.counts.closes.fetch_add(1, Ordering::SeqCst);
         self.service.close_scope(request).await
+    }
+    async fn close_query(
+        &self,
+        request: Request<q::CloseQueryRequest>,
+    ) -> Result<Response<q::CloseQueryResponse>, Status> {
+        let attempt = self.counts.query_closes.fetch_add(1, Ordering::SeqCst);
+        if self.mode == QueryMode::CloseQueryPause {
+            self.counts.close_query_entered.notify_one();
+            self.counts.close_query_release.notified().await;
+        }
+        if self.mode == QueryMode::CloseQueryInitialReject && attempt < 3 {
+            return Err(Status::permission_denied(
+                "initial close intentionally rejected",
+            ));
+        }
+        if self.mode == QueryMode::CloseQueryUnavailable {
+            return Err(Status::unavailable("query close intentionally unavailable"));
+        }
+        let response = self.service.close_query(request).await?;
+        if self.mode == QueryMode::CloseQueryRetry && attempt == 0 {
+            return Err(Status::unavailable("query close ACK withheld"));
+        }
+        Ok(response)
     }
     async fn query_facts(
         &self,
@@ -3621,8 +3651,8 @@ async fn empty_graph_progress_pages_consume_retained_headroom() {
 }
 
 /// Component/payload comparison, not native jj startup or compressed wire size.
-/// Every query is drained: dropping a partial client query currently does not
-/// cancel its server cursor, which can remain active until its expiry.
+/// Every query is drained. Drop cleanup is bounded best effort, not an ACK;
+/// a partial cursor can remain active until expiry if that cleanup cannot run.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "manual completed default-log IDS/GRAPH/CANONICAL component benchmark"]
 async fn checked_query_projection_payload_benchmark() {
@@ -3835,7 +3865,7 @@ async fn checked_query_projection_payload_benchmark() {
                         "\"ordered_edges\":{},\"logical_canonical_envelope_bytes\":{},\"repo_graph_rpcs\":0,\"repo_metadata_rpcs\":0,\"file_rpcs\":0,",
                         "\"proven_eof\":true,\"call_times_include_decode_and_verification\":true,",
                         "\"byte_measure\":\"logical_canonical_envelopes_not_zstd_wire_bytes\",",
-                        "\"lifecycle\":\"drained_to_EOF_partial_query_drop_does_not_cancel_server_cursor\",\"native_jj_startup_measured\":false}}"
+                        "\"lifecycle\":\"drained_to_EOF_Drop_cleanup_best_effort_expiry_fallback\",\"native_jj_startup_measured\":false}}"
                     ),
                     public_count,
                     projection.as_str_name(),
@@ -3875,3 +3905,566 @@ async fn checked_query_projection_payload_benchmark() {
         running.stop().await;
     }
 }
+
+async fn wait_query_close_count(counts: &QueryCounts, expected: usize) {
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while counts.query_closes.load(Ordering::SeqCst) < expected {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn explicit_query_close_is_idempotent_not_eof_and_releases_partial_query_admission() {
+    let fixture = setup_query_retained();
+    let running = QueryRunning::start(fixture.service.clone(), QueryMode::CloseQueryRetry).await;
+    let mut config = running.config.clone();
+    config.limits.max_inflight = 1;
+    let client = NativeClient::connect(config).await.unwrap();
+    let scope = client.open_query_scope(vec![fixture.root]).await.unwrap();
+    let expression = ids_ancestors(fixture.root);
+    let mut ids = client.begin_query(&scope, &expression, 1).await.unwrap();
+    let first = client.evaluate_page(&mut ids).await.unwrap();
+    assert!(!first.exhausted);
+    client.close_ids_query(&mut ids).await.unwrap();
+    assert!(ids.is_closed());
+    assert!(!ids.is_exhausted());
+    assert_eq!(
+        running.counts.query_closes.load(Ordering::SeqCst),
+        2,
+        "lost ACK retries same close identity"
+    );
+    client.close_ids_query(&mut ids).await.unwrap();
+    assert_eq!(running.counts.query_closes.load(Ordering::SeqCst), 2);
+    assert_eq!(
+        client.evaluate_page(&mut ids).await.unwrap_err().code(),
+        Code::FailedPrecondition
+    );
+    for canonical in [false, true] {
+        for _ in 0..12 {
+            let mut query = client
+                .begin_graph_query(&scope, &expression, 1, canonical)
+                .await
+                .unwrap();
+            let page = client.evaluate_graph_page(&mut query).await.unwrap();
+            assert!(!page.exhausted);
+            client.close_graph_query(&mut query).await.unwrap();
+            assert!(query.is_closed());
+            assert!(!query.is_exhausted());
+            assert_eq!(
+                client
+                    .evaluate_graph_page(&mut query)
+                    .await
+                    .unwrap_err()
+                    .code(),
+                Code::FailedPrecondition
+            );
+            // Held response quota must not retain the sole inflight permit.
+            assert_eq!(page.rows()[0].commit, fixture.root);
+            drop(page);
+        }
+    }
+    let before = running.counts.query_closes.load(Ordering::SeqCst);
+    let mut never = client.begin_query(&scope, &expression, 1).await.unwrap();
+    client.close_ids_query(&mut never).await.unwrap();
+    assert!(never.is_closed());
+    assert!(!never.is_exhausted());
+    drop(never);
+    let idle = client
+        .begin_graph_query(&scope, &expression, 1, false)
+        .await
+        .unwrap();
+    drop(idle);
+    assert_eq!(
+        running.counts.query_closes.load(Ordering::SeqCst),
+        before,
+        "unattempted queries need no cleanup RPC"
+    );
+    client.close_query_scope(&scope).await.unwrap();
+    running.stop().await;
+}
+
+#[tokio::test]
+async fn drop_query_cleanup_is_bounded_and_drains_after_last_client_drop() {
+    let fixture = setup_query_retained();
+    let running = QueryRunning::start(fixture.service.clone(), QueryMode::CloseQueryPause).await;
+    let mut config = running.config.clone();
+    config.limits.query_cleanup_capacity = 1;
+    config.query_cleanup_timeout_ms = 2000;
+    let client = NativeClient::connect(config).await.unwrap();
+    let scope = client.open_query_scope(vec![fixture.root]).await.unwrap();
+    let first_dropped = Arc::new(AtomicUsize::new(0));
+    let queued_dropped = Arc::new(AtomicUsize::new(0));
+    let overflow_dropped = Arc::new(AtomicUsize::new(0));
+    for (probe, wait_for_active) in [
+        (&first_dropped, true),
+        (&queued_dropped, false),
+        (&overflow_dropped, false),
+    ] {
+        let guarded = client
+            .clone()
+            .with_lifetime_guard(Arc::new(LifetimeProbe(probe.clone())));
+        let mut query = guarded
+            .begin_query(&scope, &ids_ancestors(fixture.root), 1)
+            .await
+            .unwrap();
+        let page = guarded.evaluate_page(&mut query).await.unwrap();
+        drop(page);
+        drop(query);
+        drop(guarded);
+        if wait_for_active {
+            tokio::time::timeout(
+                Duration::from_secs(2),
+                running.counts.close_query_entered.notified(),
+            )
+            .await
+            .unwrap();
+        }
+    }
+    assert_eq!(first_dropped.load(Ordering::SeqCst), 0);
+    assert_eq!(queued_dropped.load(Ordering::SeqCst), 0);
+    assert_released(&overflow_dropped).await;
+    // The worker owns transport/semaphores, not Inner, and drains queued work
+    // after the final connection handle disappears.
+    drop(scope);
+    drop(client);
+    running.counts.close_query_release.notify_one();
+    tokio::time::timeout(
+        Duration::from_secs(2),
+        running.counts.close_query_entered.notified(),
+    )
+    .await
+    .unwrap();
+    running.counts.close_query_release.notify_one();
+    assert_released(&first_dropped).await;
+    assert_released(&queued_dropped).await;
+    running.stop().await;
+}
+
+#[tokio::test]
+async fn cancelled_evaluate_and_failed_explicit_close_keep_bounded_cleanup_owners() {
+    let fixture = setup_query_retained();
+    let running = QueryRunning::start(fixture.service.clone(), QueryMode::EvaluatePause).await;
+    let client = running.client().await;
+    let scope = client.open_query_scope(vec![fixture.root]).await.unwrap();
+    let dropped = Arc::new(AtomicUsize::new(0));
+    let guarded = client
+        .clone()
+        .with_lifetime_guard(Arc::new(LifetimeProbe(dropped.clone())));
+    let mut query = guarded
+        .begin_graph_query(&scope, &ids_ancestors(fixture.root), 1, true)
+        .await
+        .unwrap();
+    let task = tokio::spawn(async move { guarded.evaluate_graph_page(&mut query).await });
+    tokio::time::timeout(
+        Duration::from_secs(2),
+        running.counts.evaluate_entered.notified(),
+    )
+    .await
+    .unwrap();
+    task.abort();
+    let _ = task.await;
+    wait_query_close_count(&running.counts, 1).await;
+    running.counts.evaluate_release.notify_one();
+    assert_released(&dropped).await;
+    client.close_query_scope(&scope).await.unwrap();
+    running.stop().await;
+
+    let fixture = setup_query_retained();
+    let running =
+        QueryRunning::start(fixture.service.clone(), QueryMode::CloseQueryUnavailable).await;
+    let mut config = running.config.clone();
+    config.query_cleanup_timeout_ms = 40;
+    let client = NativeClient::connect(config).await.unwrap();
+    let scope = client.open_query_scope(vec![fixture.root]).await.unwrap();
+    let dropped = Arc::new(AtomicUsize::new(0));
+    let guarded = client
+        .clone()
+        .with_lifetime_guard(Arc::new(LifetimeProbe(dropped.clone())));
+    let mut query = guarded
+        .begin_query(&scope, &ids_ancestors(fixture.root), 1)
+        .await
+        .unwrap();
+    guarded.evaluate_page(&mut query).await.unwrap();
+    let error = client.close_ids_query(&mut query).await.unwrap_err();
+    assert!(matches!(
+        error.code(),
+        Code::DeadlineExceeded | Code::Unavailable
+    ));
+    assert!(query.is_closed());
+    assert!(!query.is_exhausted());
+    let before = running.counts.query_closes.load(Ordering::SeqCst);
+    drop(query);
+    drop(guarded);
+    wait_query_close_count(&running.counts, before + 1).await;
+    assert_released(&dropped).await;
+    client.close_query_scope(&scope).await.unwrap();
+    running.stop().await;
+}
+
+#[tokio::test]
+async fn query_cleanup_runtime_exit_releases_owners_without_unbounded_retry_tasks() {
+    let fixture = setup_query_retained();
+    let running = QueryRunning::start(fixture.service.clone(), QueryMode::CloseQueryPause).await;
+    let config = running.config.clone();
+    let root = fixture.root;
+    let counts = running.counts.clone();
+    let dropped = Arc::new(AtomicUsize::new(0));
+    let probe = dropped.clone();
+    tokio::task::spawn_blocking(move || {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async move {
+            let client = NativeClient::connect(config)
+                .await
+                .unwrap()
+                .with_lifetime_guard(Arc::new(LifetimeProbe(probe)));
+            let scope = client.open_query_scope(vec![root]).await.unwrap();
+            let mut query = client
+                .begin_query(&scope, &ids_ancestors(root), 1)
+                .await
+                .unwrap();
+            client.evaluate_page(&mut query).await.unwrap();
+            drop(query);
+            drop(client);
+            wait_query_close_count(&counts, 1).await;
+        });
+        // Aborting this runtime drops the one worker and its queued/active
+        // owners; no background thread or per-Drop runtime is created.
+        drop(runtime);
+    })
+    .await
+    .unwrap();
+    assert_released(&dropped).await;
+    running.counts.close_query_release.notify_one();
+    running.stop().await;
+}
+
+#[tokio::test]
+async fn drop_cleanup_cannot_steal_reserved_page_headroom_and_deadlock_sole_inflight_slot() {
+    let fixture = setup_query_retained();
+    let running =
+        QueryRunning::start(fixture.service.clone(), QueryMode::CloseQueryUnavailable).await;
+    let mut config = running.config.clone();
+    config.limits.max_inflight = 1;
+    config.limits.max_frame_bytes = 4096;
+    config.limits.max_batch_bytes = 32768;
+    config.limits.max_metadata_bytes = 1024;
+    config.limits.max_request_bytes = 1024;
+    config.limits.max_graph_bytes = 1024;
+    config.limits.max_buffered_bytes = 262144;
+    config.limits.max_batch_items = 16;
+    config.limits.max_graph_objects = 950;
+    config.query_cleanup_timeout_ms = 40;
+    let client = NativeClient::connect(config).await.unwrap();
+    let scope = client.open_query_scope(vec![fixture.root]).await.unwrap();
+    let expression = ids_ancestors(fixture.root);
+    let mut uncertain = client.begin_query(&scope, &expression, 1).await.unwrap();
+    client.evaluate_page(&mut uncertain).await.unwrap();
+    assert!(client.close_ids_query(&mut uncertain).await.is_err());
+    assert!(uncertain.is_closed());
+    // The closed handle has released its local query reservation but still owes
+    // uncertain cleanup. A new query leaves less than a queued item's 1024B in
+    // persistent headroom; Drop must use expiry, not steal the unary allowance.
+    let mut fresh = client.begin_query(&scope, &expression, 1).await.unwrap();
+    let close_calls = running.counts.query_closes.load(Ordering::SeqCst);
+    drop(uncertain);
+    let page = client.evaluate_page(&mut fresh).await.unwrap();
+    assert_eq!(page.rows[0].commit, fixture.root);
+    assert_eq!(
+        running.counts.query_closes.load(Ordering::SeqCst),
+        close_calls
+    );
+    let _ = client.close_ids_query(&mut fresh).await;
+    drop(fresh);
+    client.close_query_scope(&scope).await.unwrap();
+    running.stop().await;
+}
+
+#[tokio::test]
+async fn acknowledged_query_close_releases_begin_guards_even_with_closed_handle_retained() {
+    let fixture = setup_query_retained();
+    let running = QueryRunning::start(fixture.service.clone(), QueryMode::Normal).await;
+    let client = running.client().await;
+    let scope = client.open_query_scope(vec![fixture.root]).await.unwrap();
+    for attempted in [false, true] {
+        let dropped = Arc::new(AtomicUsize::new(0));
+        let guarded = client
+            .clone()
+            .with_lifetime_guard(Arc::new(LifetimeProbe(dropped.clone())));
+        let mut query = guarded
+            .begin_query(&scope, &ids_ancestors(fixture.root), 1)
+            .await
+            .unwrap();
+        if attempted {
+            guarded.evaluate_page(&mut query).await.unwrap();
+        }
+        drop(guarded);
+        client.close_ids_query(&mut query).await.unwrap();
+        assert!(query.is_closed());
+        assert!(!query.is_exhausted());
+        assert_released(&dropped).await;
+        // Keeping this closed handle must retain neither owners nor state quota.
+        assert!(query.is_closed());
+    }
+    client.close_query_scope(&scope).await.unwrap();
+    running.stop().await;
+}
+
+#[tokio::test]
+async fn smallest_page_config_reserves_larger_cleanup_headroom_without_inflight_stall() {
+    let fixture = setup_query_retained();
+    let running =
+        QueryRunning::start(fixture.service.clone(), QueryMode::CloseQueryInitialReject).await;
+    let mut config = running.config.clone();
+    config.limits.max_inflight = 1;
+    config.limits.max_frame_bytes = 1024;
+    config.limits.max_batch_bytes = 1024;
+    config.limits.max_metadata_bytes = 1024;
+    config.limits.max_request_bytes = 1024;
+    config.limits.max_graph_bytes = 1024;
+    config.limits.max_buffered_bytes = 16384;
+    config.limits.max_batch_items = 4;
+    config.limits.max_graph_objects = 1;
+    config.query_cleanup_timeout_ms = 2000;
+    config.rpc.operation_timeout_ms = 350;
+    let client = NativeClient::connect(config).await.unwrap();
+    let scope = client.open_query_scope(vec![fixture.root]).await.unwrap();
+    let expression = ids_ancestors(fixture.root);
+    let mut uncertain = Vec::new();
+    for _ in 0..3 {
+        let mut query = client.begin_query(&scope, &expression, 1).await.unwrap();
+        client.evaluate_page(&mut query).await.unwrap();
+        assert_eq!(
+            client.close_ids_query(&mut query).await.unwrap_err().code(),
+            Code::PermissionDenied
+        );
+        uncertain.push(query);
+    }
+    let mut active = client.begin_query(&scope, &expression, 1).await.unwrap();
+    // The old unary-only 4KiB reserve admits three queued items, then its
+    // cleanup worker holds the sole inflight slot waiting for 6KiB. Reserving
+    // max(page,cleanup) admits only one item and leaves its entire allowance.
+    drop(uncertain);
+    tokio::task::yield_now().await;
+    let page = client.evaluate_page(&mut active).await.unwrap();
+    assert_eq!(page.rows[0].commit, fixture.root);
+    assert_eq!(running.counts.query_closes.load(Ordering::SeqCst), 4);
+    client.close_ids_query(&mut active).await.unwrap();
+    client.close_query_scope(&scope).await.unwrap();
+    running.stop().await;
+}
+
+// BEGIN TINYTREE_PARTIAL_QUERY_DROP_BENCH_V1
+// Matched before/after workload. This measures checked SDK partial-query
+// lifecycle behavior, not native CLI startup. Keep this block compatible with
+// the pre-cleanup API: no explicit query-close RPCs or new lifecycle fields.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "manual matched partial-query Drop cleanup and bounded GC convergence benchmark"]
+async fn partial_graph_query_drop_cleanup_benchmark() {
+    const HISTORY: usize = 128;
+    const REQUESTED: usize = 24;
+    const GRACE_MS: u64 = 1000;
+    const POLL_MS: u64 = 10;
+    for canonical in [false, true] {
+        let (fixture, source_ns, index_ns, _) = linear_ids_fixture(HISTORY);
+        let connect_started = std::time::Instant::now();
+        let running =
+            Running::start_with_socket_policy(fixture.service.clone(), Mode::Normal, true).await;
+        let client = running.client().await;
+        let connect_ns = connect_started.elapsed().as_nanos();
+        let scope_started = std::time::Instant::now();
+        let scope = client.open_query_scope(vec![fixture.root]).await.unwrap();
+        let scope_open_ns = scope_started.elapsed().as_nanos();
+        let expression = ids_ancestors(fixture.root);
+        let rpc_before = running.queries.evaluations.load(Ordering::SeqCst);
+        let workload_started = std::time::Instant::now();
+        let mut attempted = 0usize;
+        let mut completed = 0usize;
+        let mut retries = 0usize;
+        let mut samples_ns = Vec::new();
+        let mut first_page_rows = Vec::new();
+        let mut outcome = "completed";
+        let mut error_code = "none";
+        for _ in 0..REQUESTED {
+            attempted += 1;
+            let started = std::time::Instant::now();
+            let deadline = tokio::time::Instant::now() + Duration::from_millis(GRACE_MS);
+            let mut query = match tokio::time::timeout_at(
+                deadline,
+                client.begin_graph_query(&scope, &expression, 1, canonical),
+            )
+            .await
+            {
+                Ok(Ok(query)) => query,
+                Ok(Err(error)) => {
+                    outcome = "begin_error";
+                    error_code = match error.code() {
+                        Code::ResourceExhausted => "ResourceExhausted",
+                        Code::DeadlineExceeded => "DeadlineExceeded",
+                        _ => "OtherStatus",
+                    };
+                    break;
+                }
+                Err(_) => {
+                    outcome = "begin_grace_expired";
+                    error_code = "AppGraceExpired";
+                    break;
+                }
+            };
+            let mut iteration_completed = false;
+            loop {
+                match tokio::time::timeout_at(deadline, client.evaluate_graph_page(&mut query))
+                    .await
+                {
+                    Ok(Ok(page)) => {
+                        // Exactly one page, including a legitimate progress page;
+                        // never drain the history to manufacture cleanup success.
+                        assert!(!page.exhausted, "history128/page1 must remain partial");
+                        first_page_rows.push(page.rows().len());
+                        drop(page);
+                        iteration_completed = true;
+                        break;
+                    }
+                    Ok(Err(error)) if error.code() == Code::ResourceExhausted => {
+                        error_code = "ResourceExhausted";
+                        // Retry the SAME checked query identity/cursor. A fresh
+                        // query ID on each retry would distort the quota test.
+                        if tokio::time::Instant::now() + Duration::from_millis(POLL_MS) >= deadline
+                        {
+                            outcome = "resource_exhausted_after_grace";
+                            break;
+                        }
+                        retries += 1;
+                        tokio::time::sleep(Duration::from_millis(POLL_MS)).await;
+                    }
+                    Ok(Err(error)) => {
+                        outcome = "evaluate_error";
+                        error_code = match error.code() {
+                            Code::DeadlineExceeded => "DeadlineExceeded",
+                            Code::FailedPrecondition => "FailedPrecondition",
+                            Code::DataLoss => "DataLoss",
+                            _ => "OtherStatus",
+                        };
+                        break;
+                    }
+                    Err(_) => {
+                        outcome = "evaluate_grace_expired";
+                        if error_code != "ResourceExhausted" {
+                            error_code = "AppGraceExpired";
+                        }
+                        break;
+                    }
+                }
+            }
+            drop(query);
+            if !iteration_completed {
+                break;
+            }
+            completed += 1;
+            samples_ns.push(started.elapsed().as_nanos());
+            error_code = "none";
+        }
+        let workload_ns = workload_started.elapsed().as_nanos();
+        let close_started = std::time::Instant::now();
+        let scope_closed = matches!(
+            tokio::time::timeout(
+                Duration::from_millis(GRACE_MS),
+                client.close_query_scope(&scope),
+            )
+            .await,
+            Ok(Ok(()))
+        );
+        let scope_close_ns = close_started.elapsed().as_nanos();
+        drop(scope);
+        let root = tinytree_model::ObjectKey {
+            kind: tinytree_model::Kind::Commit,
+            id: tinytree_model::ObjectId(fixture.root.0),
+        };
+        let gc_started = std::time::Instant::now();
+        let gc_deadline = tokio::time::Instant::now() + Duration::from_millis(GRACE_MS);
+        let mut gc_passes = 0usize;
+        let mut gc_failed = false;
+        let mut root_live = true;
+        let mut deleted_objects = 0u64;
+        loop {
+            let store = fixture.store.clone();
+            // GC is synchronous physical work: retain/await its owned worker,
+            // even if one pass crosses the bounded polling-grace deadline.
+            let result = tokio::task::spawn_blocking(move || {
+                let report = store.gc("example", i64::MAX - 1)?;
+                let live = store.descriptor("example", root)?.is_some();
+                Ok::<_, tinytree_store::Error>((report, live))
+            })
+            .await
+            .unwrap();
+            gc_passes += 1;
+            match result {
+                Ok((report, live)) => {
+                    deleted_objects += report.deleted_objects;
+                    root_live = live;
+                }
+                Err(_) => {
+                    gc_failed = true;
+                    break;
+                }
+            }
+            if !root_live || tokio::time::Instant::now() >= gc_deadline {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(POLL_MS)).await;
+        }
+        let gc_ns = gc_started.elapsed().as_nanos();
+        let projection = if canonical { "CANONICAL" } else { "GRAPH" };
+        assert_eq!(running.files.load(Ordering::SeqCst), 0);
+        eprintln!(
+            concat!(
+                "{{\"schema\":1,\"benchmark\":\"partial_graph_query_drop_cleanup\",",
+                "\"projection\":\"{}\",\"history_commits\":{},\"page_size\":1,\"query_ttl_seconds_unchanged\":120,",
+                "\"iterations_requested\":{},\"iterations_attempted\":{},\"iterations_completed\":{},",
+                "\"outcome\":\"{}\",\"last_error_code\":\"{}\",\"resource_retries_same_query\":{},",
+                "\"iteration_grace_ms\":{},\"retry_poll_ms\":{},\"evaluation_rpcs\":{},",
+                "\"source_setup_ns\":{},\"ready_index_ns\":{},\"connect_ns\":{},\"scope_open_ns\":{},",
+                "\"completed_iteration_samples_ns\":{:?},\"first_page_rows\":{:?},\"workload_ns\":{},",
+                "\"scope_closed\":{},\"scope_close_ns\":{},\"gc_poll_grace_ms\":{},\"gc_ns\":{},",
+                "\"gc_passes\":{},\"gc_failed\":{},\"gc_deleted_objects\":{},\"gc_root_live_after_grace\":{},",
+                "\"orphan_root_inference_valid\":{},\"gc_grace_is_poll_budget_not_physical_job_cancellation\":true,",
+                "\"file_rpcs\":0,\"authenticated\":true,\"zstd\":true,\"tcp_nodelay\":true,",
+                "\"claim\":\"partial_checked_query_lifecycle_not_native_cli_startup\",\"failed_vs_success_timing_ratio_valid\":false}}"
+            ),
+            projection,
+            HISTORY,
+            REQUESTED,
+            attempted,
+            completed,
+            outcome,
+            error_code,
+            retries,
+            GRACE_MS,
+            POLL_MS,
+            running.queries.evaluations.load(Ordering::SeqCst) - rpc_before,
+            source_ns,
+            index_ns,
+            connect_ns,
+            scope_open_ns,
+            samples_ns,
+            first_page_rows,
+            workload_ns,
+            scope_closed,
+            scope_close_ns,
+            GRACE_MS,
+            gc_ns,
+            gc_passes,
+            gc_failed,
+            deleted_objects,
+            root_live,
+            scope_closed && !gc_failed
+        );
+        running.stop().await;
+    }
+}
+// END TINYTREE_PARTIAL_QUERY_DROP_BENCH_V1

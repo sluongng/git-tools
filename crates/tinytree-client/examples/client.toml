@@ -2,9 +2,11 @@ endpoint = "http://127.0.0.1:8093"
 repository_id = "example"
 token_env = "TINYTREE_AGENT_TOKEN"
 compression = true
+query_cleanup_timeout_ms = 5000
 
 [limits]
 max_inflight = 4
+query_cleanup_capacity = 64
 max_buffered_bytes = 268435456
 max_temporary_bytes = 1073741824
 

@@ -37,7 +37,10 @@ are separate; closed keys remain closed until
 their absolute expiry. IDs, selected-graph and canonical evaluation are incremental
 and bounded; empty pages with continuations signal progress. Cursors expire
 absolutely, cache only their latest
-page for replay, and retain roots independently of a closed scope. Canonical rows
+page for replay, and retain roots independently of a closed scope. `CloseQuery`
+releases a partial query without draining it; close is distinct from proven
+exhaustion and prevents replay until its absolute tombstone expiry. Closing before
+the first evaluation also prevents a late request from creating that query. Canonical rows
 include verified commit envelopes, while graph edges describe the selected set.
 Response-byte limits can shorten pages; unsupported operators return explicit errors.
 Active graph/canonical work and retained replay bytes share a configurable cursor

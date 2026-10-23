@@ -19,6 +19,7 @@ service RepositoryQuery {
   rpc ResolveChangePrefix(ResolveChangePrefixRequest) returns (ChangePrefixResult);
   rpc ShortestPrefix(ShortestPrefixRequest) returns (ShortestPrefixResult);
   rpc Evaluate(EvaluateRequest) returns (EvaluatePage);
+  rpc CloseQuery(CloseQueryRequest) returns (CloseQueryResponse);
 }
 
 message CommitId { bytes value = 1; } // Exactly 32 bytes; zero is intrinsic root.
@@ -96,6 +97,19 @@ message ForkScopeFrame {
 }
 message CloseScopeRequest { ScopeKey scope = 1; }
 message CloseScopeResponse {}
+
+// Release one query without draining its remaining results. Cancellation is not
+// proof of exhaustion and never releases durable repository retention holds.
+// Bind the identity to the authenticated caller, repository and exact scope.
+// An idempotent close also records bounded cancellation before the first
+// Evaluate arrives, preventing late requests from recreating a cancelled query.
+// Closed identities remain closed until their absolute expiry. Accepted physical
+// jobs and response bodies retain their resource owners until actual teardown.
+message CloseQueryRequest {
+  ScopeKey scope = 1;
+  bytes query_id = 2; // Exactly 32 bytes, identical to Evaluate.query_id.
+}
+message CloseQueryResponse {}
 
 message HasId { CommitId commit = 1; }
 message IsAncestor { CommitId ancestor = 1; CommitId descendant = 2; }

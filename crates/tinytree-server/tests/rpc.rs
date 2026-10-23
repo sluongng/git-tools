@@ -4123,3 +4123,280 @@ async fn default_graph_quota_allows_two_live_queries_and_many_tiny_completed_his
     drop(peer);
     server.stop().await;
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn close_query_releases_partial_graphs_and_precreation_close_prevents_resurrection() {
+    let (temporary, store) = setup();
+    let canonical = fixture();
+    let root = root(&canonical);
+    let index =
+        tinytree_index::Index::open(temporary.path().join("derived"), &Default::default()).unwrap();
+    for object in canonical.objects() {
+        store
+            .put("alpha", object.descriptor, &object.bytes, 0)
+            .unwrap();
+        if object.descriptor.key.kind == Kind::Commit {
+            index
+                .ingest("alpha", object.descriptor, &object.bytes)
+                .unwrap();
+        }
+    }
+    let mut config = ServiceConfig::default();
+    config.query.max_eval_quantum_steps = 1;
+    let server = Running::start_query(store.clone(), config, index).await;
+    let mut client = server.query_client().await;
+    let scope = query_ready(&mut client, &[root], 150).await;
+    // More partial queries than the default pool can retain simultaneously.
+    // Closing one page, rather than draining history, must permit the next agent.
+    let mut final_input = None;
+    for (id, projection) in (151..159u8).zip(
+        [q::Projection::Graph, q::Projection::Canonical]
+            .into_iter()
+            .cycle(),
+    ) {
+        let mut input = ids_evaluation(&scope, id, &[root]);
+        input.projection = projection as i32;
+        let page = client
+            .evaluate(request(input.clone(), ALPHA))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(page.exhausted, Some(false));
+        input.cursor = page.cursor;
+        let close = q::CloseQueryRequest {
+            scope: scope.key.clone(),
+            query_id: input.query_id.clone(),
+        };
+        client
+            .close_query(request(close.clone(), ALPHA))
+            .await
+            .unwrap();
+        client.close_query(request(close, ALPHA)).await.unwrap();
+        assert_eq!(
+            client
+                .evaluate(request(input.clone(), ALPHA))
+                .await
+                .unwrap_err()
+                .code(),
+            Code::FailedPrecondition
+        );
+        input.cursor.clear();
+        input.page_size = 1;
+        assert_eq!(
+            client
+                .evaluate(request(input.clone(), ALPHA))
+                .await
+                .unwrap_err()
+                .code(),
+            Code::FailedPrecondition,
+            "closed state is checked before changed-input replay binding"
+        );
+        final_input = Some(input);
+    }
+    let before = ids_evaluation(&scope, 160, &[root]);
+    let close = q::CloseQueryRequest {
+        scope: scope.key.clone(),
+        query_id: before.query_id.clone(),
+    };
+    client
+        .close_query(request(close.clone(), ALPHA))
+        .await
+        .unwrap();
+    client.close_query(request(close, ALPHA)).await.unwrap();
+    assert_eq!(
+        client
+            .evaluate(request(before, ALPHA))
+            .await
+            .unwrap_err()
+            .code(),
+        Code::FailedPrecondition,
+        "close arriving before Evaluate must install an ordered tombstone"
+    );
+    let other_scope = query_ready(&mut client, &[root], 161).await;
+    let known = final_input.unwrap();
+    assert_eq!(
+        client
+            .close_query(request(
+                q::CloseQueryRequest {
+                    scope: other_scope.key.clone(),
+                    query_id: known.query_id.clone()
+                },
+                ALPHA
+            ))
+            .await
+            .unwrap_err()
+            .code(),
+        Code::PermissionDenied
+    );
+    assert_eq!(
+        client
+            .close_query(request(
+                q::CloseQueryRequest {
+                    scope: scope.key.clone(),
+                    query_id: known.query_id.clone()
+                },
+                PEER
+            ))
+            .await
+            .unwrap_err()
+            .code(),
+        Code::PermissionDenied
+    );
+    assert_eq!(
+        client
+            .close_query(request(
+                q::CloseQueryRequest {
+                    scope: scope.key.clone(),
+                    query_id: known.query_id.clone()
+                },
+                BETA
+            ))
+            .await
+            .unwrap_err()
+            .code(),
+        Code::PermissionDenied
+    );
+    client
+        .close_scope(request(
+            q::CloseScopeRequest {
+                scope: scope.key.clone(),
+            },
+            ALPHA,
+        ))
+        .await
+        .unwrap();
+    client
+        .close_scope(request(
+            q::CloseScopeRequest {
+                scope: other_scope.key,
+            },
+            ALPHA,
+        ))
+        .await
+        .unwrap();
+    client
+        .close_query(request(
+            q::CloseQueryRequest {
+                scope: scope.key,
+                query_id: known.query_id,
+            },
+            ALPHA,
+        ))
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let store = store.clone();
+            let removed = tokio::task::spawn_blocking(move || {
+                store.gc("alpha", i64::MAX - 1).unwrap();
+                store.descriptor("alpha", root).unwrap().is_none()
+            })
+            .await
+            .unwrap();
+            if removed {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap();
+    drop(client);
+    server.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn precreation_query_close_counts_history_not_active_quota_and_expires_absolutely() {
+    let (temporary, store) = setup();
+    let index =
+        tinytree_index::Index::open(temporary.path().join("derived"), &Default::default()).unwrap();
+    let mut config = ServiceConfig::default();
+    config.query.max_eval_quantum_steps = 1;
+    config.query.max_queries = 1;
+    config.query.max_queries_per_principal = 1;
+    config.query.max_queries_per_repository = 1;
+    config.query.max_query_replays = 2;
+    config.query.max_query_replays_per_principal = 2;
+    config.query.max_query_replays_per_repository = 2;
+    config.query.query_ttl_seconds = 2;
+    config.query.expiry_interval_ms = 20;
+    let server = Running::start_query(store, config, index).await;
+    let mut client = server.query_client().await;
+    let zero = ObjectKey {
+        kind: Kind::Commit,
+        id: ObjectId([0; 32]),
+    };
+    let scope = query_ready(&mut client, &[zero], 170).await;
+    let mut active = ids_evaluation(&scope, 171, &[zero]);
+    active.projection = q::Projection::Graph as i32;
+    let page = client
+        .evaluate(request(active.clone(), ALPHA))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(page.exhausted, Some(false));
+    let early = q::CloseQueryRequest {
+        scope: scope.key.clone(),
+        query_id: vec![172; 32],
+    };
+    client
+        .close_query(request(early.clone(), ALPHA))
+        .await
+        .unwrap();
+    assert_eq!(
+        client
+            .close_query(request(
+                q::CloseQueryRequest {
+                    scope: scope.key.clone(),
+                    query_id: vec![173; 32]
+                },
+                ALPHA
+            ))
+            .await
+            .unwrap_err()
+            .code(),
+        Code::ResourceExhausted,
+        "closed precreation records retain bounded replay history"
+    );
+    client
+        .close_query(request(
+            q::CloseQueryRequest {
+                scope: scope.key.clone(),
+                query_id: active.query_id.clone(),
+            },
+            ALPHA,
+        ))
+        .await
+        .unwrap();
+    client.close_query(request(early, ALPHA)).await.unwrap();
+    assert_eq!(
+        client
+            .evaluate(request(active, ALPHA))
+            .await
+            .unwrap_err()
+            .code(),
+        Code::FailedPrecondition
+    );
+    tokio::time::sleep(Duration::from_millis(2300)).await;
+    // A fresh identifier works after absolute tombstone expiry without any
+    // sliding lease extension from repeated CloseQuery calls.
+    let fresh = ids_evaluation(&scope, 173, &[zero]);
+    client.evaluate(request(fresh, ALPHA)).await.unwrap();
+    let mut malformed = q::CloseQueryRequest {
+        scope: scope.key.clone(),
+        query_id: vec![1; 31],
+    };
+    assert_eq!(
+        client
+            .close_query(request(malformed.clone(), ALPHA))
+            .await
+            .unwrap_err()
+            .code(),
+        Code::InvalidArgument
+    );
+    malformed.query_id = vec![174; 32];
+    malformed.scope.as_mut().unwrap().handle = vec![0; 32];
+    client.close_query(request(malformed, ALPHA)).await.unwrap();
+    drop(client);
+    server.stop().await;
+}

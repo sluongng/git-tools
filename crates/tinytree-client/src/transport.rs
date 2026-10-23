@@ -4,6 +4,7 @@ use bytes::Buf;
 use prost::Message;
 use std::{any::Any, marker::PhantomData, sync::Arc};
 type PhysicalOwner = Arc<dyn Any + Send + Sync>;
+pub(crate) const QUERY_CLOSE_CAP: usize = 1024;
 use tinytree_proto::{query_v1 as q, v1 as p};
 use tonic::{
     Request, Response, Status, Streaming,
@@ -118,6 +119,36 @@ impl Client {
             Shape::QueryEmpty,
         )
         .await
+    }
+    pub async fn close_query(
+        &mut self,
+        request: Request<q::CloseQueryRequest>,
+        owner: PhysicalOwner,
+    ) -> Result<Response<q::CloseQueryResponse>, Status> {
+        // The transport/decompress cap must match cleanup admission, not the
+        // much larger ordinary metadata-page response cap.
+        let mut grpc = self
+            .clone()
+            .max_decoding_message_size(QUERY_CLOSE_CAP)
+            .max_encoding_message_size(QUERY_CLOSE_CAP);
+        grpc.inner
+            .ready()
+            .await
+            .map_err(|_| Status::unavailable("native gRPC transport not ready"))?;
+        grpc.inner
+            .unary(
+                request,
+                http::uri::PathAndQuery::from_static(
+                    "/tinytree.query.v1.RepositoryQuery/CloseQuery",
+                ),
+                BoundedCodec::<q::CloseQueryRequest, q::CloseQueryResponse>::new(
+                    Shape::QueryEmpty,
+                    self.limits.clone(),
+                    QUERY_CLOSE_CAP,
+                )
+                .with_owner(owner),
+            )
+            .await
     }
     pub async fn query_facts(
         &mut self,

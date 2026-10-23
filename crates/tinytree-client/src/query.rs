@@ -718,7 +718,12 @@ pub struct CheckedIdsQuery {
     pages: usize,
     seen: HashSet<CommitId>,
     exhausted: bool,
-    memory: Arc<QueryMemory>,
+    begin_guards: crate::verified::LifetimeGuards,
+    cleanup_guards: crate::verified::LifetimeGuards,
+    close_guards: crate::verified::LifetimeGuards,
+    cleanup_armed: bool,
+    closed: bool,
+    memory: Option<Arc<QueryMemory>>,
 }
 impl std::fmt::Debug for CheckedIdsQuery {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -735,6 +740,57 @@ impl CheckedIdsQuery {
     }
     pub fn is_exhausted(&self) -> bool {
         self.exhausted
+    }
+    /// Closed means cancelled/released locally, not proven EOF.
+    pub fn is_closed(&self) -> bool {
+        self.closed
+    }
+    fn release_cleanup_guards(&mut self) {
+        self.begin_guards = Default::default();
+        self.cleanup_guards = Default::default();
+        self.close_guards = Default::default();
+        self.client.guards = Default::default();
+    }
+    fn release_closed_state(&mut self) {
+        self.seen = HashSet::new();
+        self.cursor = Vec::new();
+        self.expression = Arc::new(q::GraphExpr::default());
+        self.memory.take();
+    }
+}
+impl Drop for CheckedIdsQuery {
+    fn drop(&mut self) {
+        if self.cleanup_armed {
+            self.release_closed_state();
+            // Cleanup admission is nonblocking and precedes request allocation.
+            // A full queue or byte pool falls back to server-side expiry.
+            let Ok(queued_state) = self
+                .client
+                .inner
+                .query_state
+                .clone()
+                .try_acquire_many_owned(1024)
+            else {
+                return;
+            };
+            let Ok(queued_bytes) = self.client.inner.bytes.clone().try_acquire_many_owned(1024)
+            else {
+                return;
+            };
+            let _ = self.client.inner.query_cleanup.try_send(QueryCleanup {
+                scope: self.scope.key(),
+                query_id: self.query_id,
+                deadline: Instant::now()
+                    + Duration::from_millis(self.client.inner.config.query_cleanup_timeout_ms),
+                guards: CleanupGuards {
+                    _begin: self.begin_guards.clone(),
+                    _attempt: self.cleanup_guards.clone(),
+                    _current: self.close_guards.clone(),
+                },
+                queued_state: Some(queued_state),
+                queued_bytes: Some(queued_bytes),
+            });
+        }
     }
 }
 struct QueryMemory {
@@ -786,7 +842,7 @@ impl NativeClient {
             .and_then(|n| n.checked_add(8192))
             .ok_or_else(|| Status::resource_exhausted("IDS query state exceeds memory budget"))?;
         if bytes
-            .checked_add(self.unary_memory())
+            .checked_add(query_headroom(limits))
             .is_none_or(|n| n > limits.max_buffered_bytes)
         {
             return Err(Status::resource_exhausted(
@@ -831,7 +887,12 @@ impl NativeClient {
             pages: 0,
             seen: HashSet::new(),
             exhausted: false,
-            memory,
+            begin_guards: self.guards.clone(),
+            cleanup_guards: self.guards.clone(),
+            close_guards: self.guards.clone(),
+            cleanup_armed: false,
+            closed: false,
+            memory: Some(memory),
         })
     }
     /// Fetch exactly one page/owned work quantum. Empty progress pages are
@@ -846,6 +907,9 @@ impl NativeClient {
             return Err(Status::invalid_argument(
                 "IDS query belongs to another client",
             ));
+        }
+        if query.closed {
+            return Err(Status::failed_precondition("IDS query is closed"));
         }
         if query.exhausted {
             return Err(Status::failed_precondition("IDS query already exhausted"));
@@ -870,9 +934,15 @@ impl NativeClient {
             cursor: query.cursor.clone(),
         };
         self.bounded(&request)?;
-        let owner = Arc::new((query.expression.clone(), query.memory.clone(), budget));
+        let owner = Arc::new((
+            query.expression.clone(),
+            query.memory.as_ref().ok_or_else(integrity)?.clone(),
+            budget,
+        ));
         let reply = self
             .retry(query.deadline, false, |allowance| {
+                query.cleanup_armed = true;
+                query.cleanup_guards = self.guards.clone();
                 let mut grpc = self.inner.grpc.clone();
                 let request = request.clone();
                 let owner = owner.clone();
@@ -956,6 +1026,9 @@ impl CheckedGraphQuery {
     }
     pub fn is_exhausted(&self) -> bool {
         self.core.is_exhausted()
+    }
+    pub fn is_closed(&self) -> bool {
+        self.core.is_closed()
     }
 }
 /// Ordered selected-set edges; repeated targets are intentional and preserved.
@@ -1069,6 +1142,9 @@ impl NativeClient {
                 "graph query belongs to another client",
             ));
         }
+        if core.closed {
+            return Err(Status::failed_precondition("graph query is closed"));
+        }
         if core.exhausted {
             return Err(Status::failed_precondition("graph query already exhausted"));
         }
@@ -1082,6 +1158,8 @@ impl NativeClient {
         const PAGE_OWNER_BYTES: usize = 512;
         let guard_count = core
             .memory
+            .as_ref()
+            .ok_or_else(integrity)?
             ._guards
             .len()
             .checked_add(self.guards.len())
@@ -1127,9 +1205,15 @@ impl NativeClient {
             cursor: core.cursor.clone(),
         };
         self.bounded(&request)?;
-        let owner = Arc::new((core.expression.clone(), core.memory.clone(), budget.clone()));
+        let owner = Arc::new((
+            core.expression.clone(),
+            core.memory.as_ref().ok_or_else(integrity)?.clone(),
+            budget.clone(),
+        ));
         let reply = self
             .retry(core.deadline, false, |allowance| {
+                core.cleanup_armed = true;
+                core.cleanup_guards = self.guards.clone();
                 let mut grpc = self.inner.grpc.clone();
                 let request = request.clone();
                 let owner = owner.clone();
@@ -1302,7 +1386,14 @@ impl NativeClient {
         // wait while holding page admission: a held earlier page may itself be
         // the owner of those bytes. Failure leaves the replay cursor unchanged.
         let mut result_guards = Vec::with_capacity(guard_count);
-        result_guards.extend(core.memory._guards.iter().cloned());
+        result_guards.extend(
+            core.memory
+                .as_ref()
+                .ok_or_else(integrity)?
+                ._guards
+                .iter()
+                .cloned(),
+        );
         result_guards.extend(self.guards.iter().cloned());
         retained = retained
             .checked_add(
@@ -1351,6 +1442,140 @@ impl NativeClient {
             rows,
             exhausted,
         })
+    }
+}
+
+pub(super) const CLEANUP_MEMORY: usize = 4 * crate::transport::QUERY_CLOSE_CAP + 2048;
+
+// Queue items retain resource owners, never the AST, QueryMemory or inflight
+// slot. Deadline includes queue residence. A single worker owns only transport
+// and semaphore clones, so dropping the last Inner closes/drains the channel.
+struct CleanupGuards {
+    _begin: crate::verified::LifetimeGuards,
+    _attempt: crate::verified::LifetimeGuards,
+    _current: crate::verified::LifetimeGuards,
+}
+struct CleanupOwner {
+    _guards: CleanupGuards,
+    _queued_state: Option<OwnedSemaphorePermit>,
+    _queued_bytes: Option<OwnedSemaphorePermit>,
+}
+pub(super) struct QueryCleanup {
+    scope: q::ScopeKey,
+    query_id: [u8; 32],
+    deadline: Instant,
+    guards: CleanupGuards,
+    queued_state: Option<OwnedSemaphorePermit>,
+    queued_bytes: Option<OwnedSemaphorePermit>,
+}
+pub(super) struct CleanupWorker {
+    grpc: RepositoryClient,
+    token: Option<tonic::metadata::MetadataValue<tonic::metadata::Ascii>>,
+    policy: reapi::policy::Policy,
+    inflight: Arc<Semaphore>,
+    bytes: Arc<Semaphore>,
+}
+impl CleanupWorker {
+    pub(super) fn new(client: &NativeClient) -> Self {
+        Self {
+            grpc: client.inner.grpc.clone(),
+            token: client.inner.token.clone(),
+            policy: client.inner.config.rpc.clone(),
+            inflight: client.inner.inflight.clone(),
+            bytes: client.inner.bytes.clone(),
+        }
+    }
+    pub(super) async fn run(self, mut receiver: tokio::sync::mpsc::Receiver<QueryCleanup>) {
+        while let Some(item) = receiver.recv().await {
+            let _ = self.close(item).await;
+        }
+    }
+    async fn close(&self, item: QueryCleanup) -> Result<(), Status> {
+        let deadline = item.deadline;
+        // Close-specific raw/decompressed cap + encoded/decoded overhead and
+        // fixed owner/request scaffolding. Never ordinary page-sized admission.
+        let guards: crate::verified::LifetimeGuards = Arc::new(vec![Arc::new(CleanupOwner {
+            _guards: item.guards,
+            _queued_state: item.queued_state,
+            _queued_bytes: item.queued_bytes,
+        })]);
+        let inflight = reapi::policy::timeout(deadline, async {
+            self.inflight
+                .clone()
+                .acquire_owned()
+                .await
+                .map_err(|_| Status::cancelled("native client closed"))
+        })
+        .await?;
+        let bytes = reapi::policy::timeout(deadline, async {
+            self.bytes
+                .clone()
+                .acquire_many_owned(CLEANUP_MEMORY as u32)
+                .await
+                .map_err(|_| Status::cancelled("native client closed"))
+        })
+        .await?;
+        let owner = Arc::new(Budget {
+            _inflight: inflight,
+            _bytes: bytes,
+            _guards: guards,
+        });
+        let request = q::CloseQueryRequest {
+            scope: Some(item.scope),
+            query_id: item.query_id.to_vec(),
+        };
+        self.policy
+            .retry(deadline, self.policy.rpc_timeout(), |allowance| {
+                let mut grpc = self.grpc.clone();
+                let mut request = Request::new(request.clone());
+                request.set_timeout(allowance);
+                if let Some(token) = &self.token {
+                    request
+                        .metadata_mut()
+                        .insert("authorization", token.clone());
+                }
+                let owner = owner.clone();
+                async move { grpc.close_query(request, owner).await.map(|_| ()) }
+            })
+            .await
+    }
+}
+impl NativeClient {
+    /// Close/release a query without claiming EOF. Cleanup has its own bounded
+    /// deadline, never extends query execution, and can be retried after an
+    /// uncertain ACK. Drop is bounded best effort; expiry is the fallback.
+    pub async fn close_ids_query(&self, query: &mut CheckedIdsQuery) -> Result<(), Status> {
+        if !Arc::ptr_eq(&self.inner, &query.client.inner) {
+            return Err(Status::invalid_argument("query belongs to another client"));
+        }
+        query.closed = true;
+        query.release_closed_state();
+        if !query.cleanup_armed {
+            query.release_cleanup_guards();
+            return Ok(());
+        }
+        let item = QueryCleanup {
+            scope: query.scope.key(),
+            query_id: query.query_id,
+            deadline: Instant::now()
+                + Duration::from_millis(self.inner.config.query_cleanup_timeout_ms),
+            guards: CleanupGuards {
+                _begin: query.begin_guards.clone(),
+                _attempt: query.cleanup_guards.clone(),
+                _current: self.guards.clone(),
+            },
+            queued_state: None,
+            queued_bytes: None,
+        };
+        // Preserve current owners for an uncertain close's Drop retry too.
+        query.close_guards = self.guards.clone();
+        CleanupWorker::new(self).close(item).await?;
+        query.cleanup_armed = false;
+        query.release_cleanup_guards();
+        Ok(())
+    }
+    pub async fn close_graph_query(&self, query: &mut CheckedGraphQuery) -> Result<(), Status> {
+        self.close_ids_query(&mut query.core).await
     }
 }
 

@@ -17,13 +17,17 @@ they never upload objects or publish changes. Verify local drafts with
 not yet replace jj's local index. `begin_query` / `evaluate_page` expose bounded
 IDS-only graph pages using version-1 `query_protocol` structural ASTs. A page
 size of 128 matches the default server cap; empty progress pages are explicit.
-One deadline covers the query and caller pauses between pages. Dropping a query
-releases local state; unfinished server cursors remain until their absolute TTL.
+One deadline covers the query and caller pauses between pages.
 `begin_graph_query` / `evaluate_graph_page` add ordered
 selected-set edges and optional verified canonical commits. Root has no canonical
 payload. Indirect/missing edges and completeness still trust the authenticated
 server; they are not canonical parent summaries. Pages retain byte reservations
-until dropped, without retaining an inflight RPC slot.
+until dropped, without retaining an inflight RPC slot. Close partial queries with
+`close_ids_query` / `close_graph_query`; `is_closed()` is cancellation, not proof
+of EOF. Drop queues bounded best-effort cleanup (64 slots by default), including
+completed-query replay state. `query_cleanup_timeout_ms` defaults to 5000 and
+`limits.query_cleanup_capacity` is configurable. Queue saturation, shutdown or
+network failures fall back to server expiry. Closing a scope is not query cancellation.
 
 Load [the TOML example](examples/client.toml) with `Config::load`, then call
 `NativeClient::connect`. Plaintext is loopback-only; other TCP endpoints require
