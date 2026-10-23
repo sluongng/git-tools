@@ -7,6 +7,7 @@ use jj_lib::{
     },
 };
 use std::{collections::BTreeMap, path::Path};
+use tinytree_model as m;
 
 fn commit(byte: u8) -> CommitId {
     CommitId::from_bytes(&[byte; 32])
@@ -948,4 +949,605 @@ fn intrinsic_cloud_checkpoint_has_no_stored_op_view_payload_but_retains_the_real
     let mut invalid = manifest;
     invalid.working_copy.snapshot_commit = [1; 32];
     assert!(verify_coverage(&invalid, &[], limits).is_err());
+}
+
+fn portable_index_fixture() -> PortableIndexSnapshot {
+    let mut drafts = Vec::new();
+    for description in ["hidden divergent draft", "promoted draft remains local"] {
+        let mut commit = m::synthetic_root();
+        commit.parents = vec![m::CommitId::ROOT];
+        commit.change_id = m::ChangeId([9; 16]);
+        commit.description = description.into();
+        let encoded = m::encode(&m::Object::Commit(commit.clone()), Default::default()).unwrap();
+        drafts.push(IndexDraft {
+            descriptor: encoded.descriptor,
+            change: commit.change_id,
+            parents: commit.parents,
+            order: 7,
+        });
+    }
+    drafts.sort_by_key(IndexDraft::commit);
+    PortableIndexSnapshot {
+        roots: vec![m::CommitId::ROOT, drafts[1].commit()],
+        drafts,
+    }
+}
+#[test]
+fn portable_index_roundtrip_preserves_exact_hidden_promoted_membership_and_shared_ordinals() {
+    let original = portable_index_fixture();
+    let bytes = encode_index_snapshot(&original, IndexSnapshotLimits::default()).unwrap();
+    let id = IndexSnapshotId::of(&bytes);
+    let verified = decode_index_snapshot(&bytes, id, IndexSnapshotLimits::default()).unwrap();
+    assert_eq!(verified.snapshot(), &original);
+    assert_eq!(verified.descriptor().selected, BlobDigest::of(&bytes));
+    assert_ne!(
+        id.0,
+        BlobDigest::of(&bytes).blake3,
+        "snapshot semantic domain differs from raw transfer digest"
+    );
+    assert_eq!(
+        encode_index_snapshot(verified.snapshot(), IndexSnapshotLimits::default()).unwrap(),
+        bytes
+    );
+    let mut reordered = original.clone();
+    reordered.drafts[0].order = 8;
+    assert_ne!(
+        IndexSnapshotId::of(
+            &encode_index_snapshot(&reordered, IndexSnapshotLimits::default()).unwrap()
+        ),
+        id
+    );
+    let mut removed = original;
+    removed.drafts.remove(0);
+    assert_ne!(
+        IndexSnapshotId::of(
+            &encode_index_snapshot(&removed, IndexSnapshotLimits::default()).unwrap()
+        ),
+        id
+    );
+}
+#[test]
+fn portable_index_rejects_tampering_noncanonical_graphs_and_declared_allocation_bounds() {
+    let original = portable_index_fixture();
+    let bytes = encode_index_snapshot(&original, IndexSnapshotLimits::default()).unwrap();
+    let id = IndexSnapshotId::of(&bytes);
+    let mut damaged = bytes.clone();
+    *damaged.last_mut().unwrap() ^= 1;
+    assert!(decode_index_snapshot(&damaged, id, IndexSnapshotLimits::default()).is_err());
+    let mut count = bytes.clone();
+    count[14..18].copy_from_slice(&u32::MAX.to_le_bytes());
+    assert!(
+        decode_index_snapshot(
+            &count,
+            IndexSnapshotId::of(&count),
+            IndexSnapshotLimits::default()
+        )
+        .is_err()
+    );
+    let mut version = bytes.clone();
+    version[8..10].copy_from_slice(&2u16.to_le_bytes());
+    assert!(matches!(
+        decode_index_snapshot(
+            &version,
+            IndexSnapshotId::of(&version),
+            IndexSnapshotLimits::default()
+        ),
+        Err(Error::Unsupported(_))
+    ));
+    assert!(
+        decode_index_snapshot(
+            &bytes,
+            id,
+            IndexSnapshotLimits {
+                max_decode_bytes: 1,
+                ..Default::default()
+            }
+        )
+        .is_err()
+    );
+    assert!(
+        encode_index_snapshot(
+            &original,
+            IndexSnapshotLimits {
+                max_encoded_bytes: bytes.len() - 1,
+                ..Default::default()
+            }
+        )
+        .is_err()
+    );
+    let mut zero = original.clone();
+    zero.drafts[0].order = 0;
+    let mut duplicate = original.clone();
+    duplicate.drafts.push(duplicate.drafts[0].clone());
+    let mut cycle = original.clone();
+    cycle.drafts[0].parents = vec![cycle.drafts[0].commit()];
+    let mut unsorted = original.clone();
+    unsorted.roots.reverse();
+    let mut kind = original.clone();
+    kind.drafts[0].descriptor.key.kind = m::Kind::Tree;
+    let mut empty = original.clone();
+    empty.roots.clear();
+    for (name, value) in [
+        ("zero ordinal", zero),
+        ("duplicate draft", duplicate),
+        ("local cycle", cycle),
+        ("unsorted roots", unsorted),
+        ("noncommit descriptor", kind),
+        ("implicit intrinsic anchor", empty),
+    ] {
+        assert!(
+            encode_index_snapshot(&value, IndexSnapshotLimits::default()).is_err(),
+            "{name}"
+        );
+    }
+}
+fn index_artifact_fixture(
+    models: &[&PortableIndexSnapshot],
+) -> (Vec<IndexRootDescriptor>, Vec<VerifiedIndexArtifact>) {
+    let limits = IndexArtifactLimits::default();
+    let mut all = BTreeMap::new();
+    let mut roots = Vec::new();
+    for model in models {
+        let encoded = build_index_artifacts(model, limits).unwrap();
+        roots.push(encoded.root);
+        for artifact in encoded.artifacts {
+            if let Some(old) = all.insert(artifact.descriptor.id, artifact.bytes.clone()) {
+                assert_eq!(old, artifact.bytes);
+            }
+        }
+    }
+    roots.sort_by_key(|d| d.id);
+    roots.dedup();
+    let artifacts = all
+        .into_iter()
+        .map(|(id, bytes)| {
+            decode_index_artifact(
+                &bytes,
+                IndexArtifactDescriptor {
+                    id,
+                    selected: BlobDigest::of(&bytes),
+                },
+                limits,
+            )
+            .unwrap()
+        })
+        .collect();
+    (roots, artifacts)
+}
+#[tokio::test]
+async fn manifest_v2_binds_every_actual_operation_to_exact_index_and_retains_hidden_records() {
+    let (recovery, objects) = manifest_fixture().await;
+    let empty = PortableIndexSnapshot {
+        roots: vec![m::CommitId::ROOT],
+        drafts: vec![],
+    };
+    let full = portable_index_fixture();
+    let limits = ManifestV2Limits::default();
+    let empty_root = build_index_artifacts(&empty, limits.artifacts)
+        .unwrap()
+        .root;
+    let full_root = build_index_artifacts(&full, limits.artifacts).unwrap().root;
+    let (index_roots, artifacts) = index_artifact_fixture(&[&empty, &full]);
+    let graph = verify_index_artifact_graph(&index_roots, &artifacts, limits.artifacts).unwrap();
+    let mut bindings = vec![OperationIndex {
+        operation: [0; 64],
+        root: empty_root.id,
+    }];
+    bindings.extend(
+        recovery
+            .members
+            .iter()
+            .filter_map(|member| match member.id {
+                ObjectId::Operation(id) => Some(OperationIndex {
+                    operation: id,
+                    root: full_root.id,
+                }),
+                _ => None,
+            }),
+    );
+    bindings.sort_by_key(|b| b.operation);
+    let mut value = ManifestV2 {
+        recovery,
+        operation_indexes: bindings,
+        index_roots: index_roots.clone(),
+    };
+    value.recovery.native_roots.extend(
+        full.roots
+            .iter()
+            .filter(|id| **id != m::CommitId::ROOT)
+            .map(|id| m::ObjectKey {
+                kind: m::Kind::Commit,
+                id: m::ObjectId(id.0),
+            }),
+    );
+    value
+        .recovery
+        .native_roots
+        .extend(full.drafts.iter().map(|d| d.descriptor.key));
+    value
+        .recovery
+        .native_roots
+        .sort_by_key(|r| (r.kind as u8, r.id.0));
+    value.recovery.native_roots.dedup();
+    let bytes = encode_manifest_v2(&value, limits).unwrap();
+    let digest = ManifestId::of(&bytes);
+    assert!(matches!(
+        decode_manifest(&bytes, digest, limits.recovery),
+        Err(Error::Unsupported(_))
+    ));
+    let decoded = decode_manifest_v2(&bytes, digest, limits).unwrap();
+    assert_eq!(decoded, value);
+    assert_eq!(
+        verify_coverage_v2(&decoded, &objects, &graph, limits)
+            .unwrap()
+            .native_roots(),
+        value.recovery.native_roots
+    );
+    let old = encode_manifest(&value.recovery, limits.recovery).unwrap();
+    assert!(matches!(
+        decode_manifest_v2(&old, ManifestId::of(&old), limits),
+        Err(Error::Unsupported(_))
+    ));
+    assert!(verify_coverage(&value.recovery, &objects, limits.recovery).is_err());
+    let mut changed_full = full.clone();
+    changed_full.drafts[0].order = 11;
+    let changed_root = build_index_artifacts(&changed_full, limits.artifacts)
+        .unwrap()
+        .root;
+    let (changed_roots, changed_artifacts) = index_artifact_fixture(&[&empty, &changed_full]);
+    let changed_graph =
+        verify_index_artifact_graph(&changed_roots, &changed_artifacts, limits.artifacts).unwrap();
+    let mut changed = value.clone();
+    for binding in &mut changed.operation_indexes {
+        if binding.root == full_root.id {
+            binding.root = changed_root.id;
+        }
+    }
+    changed.index_roots = changed_roots.clone();
+    assert_eq!(changed.recovery, value.recovery);
+    assert_ne!(
+        ManifestId::of(&encode_manifest_v2(&changed, limits).unwrap()),
+        digest
+    );
+    verify_coverage_v2(&changed, &objects, &changed_graph, limits).unwrap();
+    let mut missing = value.clone();
+    missing.operation_indexes.remove(0);
+    assert!(encode_manifest_v2(&missing, limits).is_err());
+    let mut omitted = value.clone();
+    omitted
+        .recovery
+        .native_roots
+        .retain(|root| *root != full.drafts[0].descriptor.key);
+    assert!(verify_coverage_v2(&omitted, &objects, &graph, limits).is_err());
+    let mut selected = value.clone();
+    selected.index_roots[0].selected.blake3[0] ^= 1;
+    assert!(verify_coverage_v2(&selected, &objects, &graph, limits).is_err());
+    let mut tighter = limits;
+    tighter.artifacts.snapshot.max_drafts = 1;
+    assert!(
+        verify_coverage_v2(&value, &objects, &graph, tighter).is_err(),
+        "already verified graph must obey tighter current draft policy"
+    );
+    let mut tighter = limits;
+    tighter.artifacts.snapshot.max_roots = 1;
+    assert!(verify_coverage_v2(&value, &objects, &graph, tighter).is_err());
+    let mut tighter = limits;
+    tighter.artifacts.snapshot.max_edges = 1;
+    assert!(verify_coverage_v2(&value, &objects, &graph, tighter).is_err());
+    let mut tighter = limits;
+    tighter.artifacts.snapshot.max_metadata_bytes = 1;
+    assert!(verify_coverage_v2(&value, &objects, &graph, tighter).is_err());
+    assert!(
+        decode_manifest_v2(
+            &bytes,
+            digest,
+            ManifestV2Limits {
+                max_operation_indexes: 1,
+                ..limits
+            }
+        )
+        .is_err()
+    );
+    assert!(decode_manifest_v2(&bytes, ManifestId([0; 32]), limits).is_err());
+}
+
+fn artifact_history_model(count: usize) -> PortableIndexSnapshot {
+    let mut model = PortableIndexSnapshot {
+        roots: vec![m::CommitId::ROOT],
+        drafts: vec![],
+    };
+    let mut parent = m::CommitId::ROOT;
+    for number in 1..=count {
+        let mut commit = m::synthetic_root();
+        commit.parents = vec![parent];
+        commit.change_id = m::ChangeId([9; 16]);
+        commit.description = format!("portable artifact draft {number}");
+        let encoded = m::encode(&m::Object::Commit(commit.clone()), Default::default()).unwrap();
+        parent = m::CommitId(encoded.descriptor.key.id.0);
+        model.drafts.push(IndexDraft {
+            descriptor: encoded.descriptor,
+            change: commit.change_id,
+            parents: commit.parents,
+            order: number as u64,
+        });
+    }
+    model.drafts.sort_by_key(IndexDraft::commit);
+    model
+}
+#[test]
+fn radix_artifacts_roundtrip_and_reject_noncanonical_or_incomplete_dependency_graphs() {
+    let model = artifact_history_model(70);
+    let limits = IndexArtifactLimits::default();
+    let encoded = build_index_artifacts(&model, limits).unwrap();
+    let decoded = encoded
+        .artifacts
+        .iter()
+        .map(|a| decode_index_artifact(&a.bytes, a.descriptor, limits).unwrap())
+        .collect::<Vec<_>>();
+    let roots = [encoded.root];
+    let graph = verify_index_artifact_graph(&roots, &decoded, limits).unwrap();
+    assert_eq!(graph.snapshot(encoded.root.id).unwrap(), model);
+    let replay = build_index_artifacts(&model, limits).unwrap();
+    assert_eq!(encoded.root, replay.root);
+    assert!(
+        encoded
+            .artifacts
+            .iter()
+            .zip(&replay.artifacts)
+            .all(|(a, b)| a.descriptor == b.descriptor && a.bytes == b.bytes)
+    );
+    assert!(verify_index_artifact_graph(&roots, &decoded[1..], limits).is_err());
+    let mut duplicate = encoded
+        .artifacts
+        .iter()
+        .map(|a| decode_index_artifact(&a.bytes, a.descriptor, limits).unwrap())
+        .collect::<Vec<_>>();
+    duplicate.push(
+        decode_index_artifact(
+            &encoded.artifacts[0].bytes,
+            encoded.artifacts[0].descriptor,
+            limits,
+        )
+        .unwrap(),
+    );
+    assert!(verify_index_artifact_graph(&roots, &duplicate, limits).is_err());
+    let other = portable_index_fixture();
+    let (all_roots, all) = index_artifact_fixture(&[&model, &other]);
+    assert!(
+        verify_index_artifact_graph(&roots, &all, limits).is_err(),
+        "unrelated artifacts are not silently retained as members"
+    );
+    verify_index_artifact_graph(&all_roots, &all, limits).unwrap();
+    let root = decoded
+        .iter()
+        .find_map(|a| match a.artifact() {
+            IndexArtifact::Root(r) => Some(r.clone()),
+            _ => None,
+        })
+        .unwrap();
+    let branch_id = root.drafts.unwrap();
+    let branch = decoded
+        .iter()
+        .find(|a| a.descriptor().id == IndexArtifactId::Node(branch_id))
+        .unwrap();
+    let IndexArtifact::Node(mut wrong_summary) = branch.artifact().clone() else {
+        panic!()
+    };
+    wrong_summary.records += 1;
+    let replacement = encode_index_artifact(&IndexArtifact::Node(wrong_summary), limits).unwrap();
+    let IndexArtifactId::Node(replacement_id) = replacement.descriptor.id else {
+        panic!()
+    };
+    let mut wrong_root = root.clone();
+    wrong_root.drafts = Some(replacement_id);
+    let replacement_root = encode_index_artifact(&IndexArtifact::Root(wrong_root), limits).unwrap();
+    let IndexArtifactId::Root(replacement_root_id) = replacement_root.descriptor.id else {
+        panic!()
+    };
+    let replacement_roots = [IndexRootDescriptor {
+        id: replacement_root_id,
+        selected: replacement_root.descriptor.selected,
+    }];
+    let mut replaced = encoded
+        .artifacts
+        .iter()
+        .filter(|a| {
+            a.descriptor.id != IndexArtifactId::Root(encoded.root.id)
+                && a.descriptor.id != IndexArtifactId::Node(branch_id)
+        })
+        .map(|a| decode_index_artifact(&a.bytes, a.descriptor, limits).unwrap())
+        .collect::<Vec<_>>();
+    replaced
+        .push(decode_index_artifact(&replacement.bytes, replacement.descriptor, limits).unwrap());
+    replaced.push(
+        decode_index_artifact(&replacement_root.bytes, replacement_root.descriptor, limits)
+            .unwrap(),
+    );
+    assert!(
+        verify_index_artifact_graph(&replacement_roots, &replaced, limits).is_err(),
+        "branch counts must equal actual dependency sums"
+    );
+    let IndexArtifact::Node(mut misplaced) = decoded
+        .iter()
+        .find(|a| a.descriptor().id == IndexArtifactId::Node(root.anchors))
+        .unwrap()
+        .artifact()
+        .clone()
+    else {
+        panic!()
+    };
+    misplaced.depth = 1;
+    let misplaced = encode_index_artifact(&IndexArtifact::Node(misplaced), limits).unwrap();
+    let IndexArtifactId::Node(misplaced_id) = misplaced.descriptor.id else {
+        panic!()
+    };
+    let mut wrong_root = root;
+    wrong_root.anchors = misplaced_id;
+    let wrong_root = encode_index_artifact(&IndexArtifact::Root(wrong_root), limits).unwrap();
+    let IndexArtifactId::Root(wrong_id) = wrong_root.descriptor.id else {
+        panic!()
+    };
+    let wrong_roots = [IndexRootDescriptor {
+        id: wrong_id,
+        selected: wrong_root.descriptor.selected,
+    }];
+    let mut replaced = encoded
+        .artifacts
+        .iter()
+        .filter(|a| {
+            a.descriptor.id != IndexArtifactId::Root(encoded.root.id)
+                && a.descriptor.id != IndexArtifactId::Node(root_anchors(&decoded))
+        })
+        .map(|a| decode_index_artifact(&a.bytes, a.descriptor, limits).unwrap())
+        .collect::<Vec<_>>();
+    replaced.push(decode_index_artifact(&misplaced.bytes, misplaced.descriptor, limits).unwrap());
+    replaced.push(decode_index_artifact(&wrong_root.bytes, wrong_root.descriptor, limits).unwrap());
+    assert!(
+        verify_index_artifact_graph(&wrong_roots, &replaced, limits).is_err(),
+        "a valid node cannot be placed at a different radix depth"
+    );
+    let source = &encoded
+        .artifacts
+        .iter()
+        .find(|a| matches!(a.descriptor.id, IndexArtifactId::Node(_)))
+        .unwrap();
+    let mut huge = source.bytes.clone();
+    huge[44..48].copy_from_slice(&u32::MAX.to_le_bytes());
+    assert!(
+        decode_index_artifact(
+            &huge,
+            IndexArtifactDescriptor {
+                id: IndexArtifactId::of_node(&huge),
+                selected: BlobDigest::of(&huge)
+            },
+            limits
+        )
+        .is_err()
+    );
+    assert!(
+        decode_index_artifact(
+            &source.bytes,
+            source.descriptor,
+            IndexArtifactLimits {
+                max_decode_bytes: 1,
+                ..limits
+            }
+        )
+        .is_err()
+    );
+}
+fn root_anchors(artifacts: &[VerifiedIndexArtifact]) -> IndexNodeId {
+    artifacts
+        .iter()
+        .find_map(|a| match a.artifact() {
+            IndexArtifact::Root(root) => Some(root.anchors),
+            _ => None,
+        })
+        .unwrap()
+}
+#[test]
+fn radix_single_large_record_is_indivisible_and_obeys_common_wire_cap() {
+    let mut commit = m::synthetic_root();
+    commit.parents = vec![m::CommitId::ROOT; 9000];
+    commit.description = "one bounded large parent vector".into();
+    let encoded = m::encode(&m::Object::Commit(commit.clone()), Default::default()).unwrap();
+    let model = PortableIndexSnapshot {
+        roots: vec![m::CommitId::ROOT],
+        drafts: vec![IndexDraft {
+            descriptor: encoded.descriptor,
+            change: commit.change_id,
+            parents: commit.parents,
+            order: 1,
+        }],
+    };
+    let mut limits = IndexArtifactLimits::default();
+    limits.snapshot.max_parents = 9000;
+    let built = build_index_artifacts(&model, limits).unwrap();
+    assert!(built.artifacts.iter().any(|a| a.bytes.len() > 256 * 1024));
+    assert!(
+        built
+            .artifacts
+            .iter()
+            .all(|a| a.bytes.len() <= 4 * 1024 * 1024)
+    );
+    let artifacts = built
+        .artifacts
+        .iter()
+        .map(|a| decode_index_artifact(&a.bytes, a.descriptor, limits).unwrap())
+        .collect::<Vec<_>>();
+    let roots = [built.root];
+    assert_eq!(
+        verify_index_artifact_graph(&roots, &artifacts, limits)
+            .unwrap()
+            .snapshot(built.root.id)
+            .unwrap(),
+        model
+    );
+    limits.max_artifact_bytes = 256 * 1024;
+    assert!(build_index_artifacts(&model, limits).is_err());
+}
+#[test]
+fn radix_history_reuses_artifacts_across_one_thousand_draft_operations() {
+    let full = artifact_history_model(1000);
+    let limits = IndexArtifactLimits::default();
+    let mut chronological = full.drafts.clone();
+    chronological.sort_by_key(|d| d.order);
+    let mut current = PortableIndexSnapshot {
+        roots: full.roots.clone(),
+        drafts: vec![],
+    };
+    let mut unique = BTreeMap::<IndexArtifactId, (IndexArtifactDescriptor, Vec<u8>)>::new();
+    let mut roots = Vec::new();
+    let mut full_bytes = 0u64;
+    let mut all_bytes = 0u64;
+    for draft in chronological {
+        current.drafts.push(draft);
+        current.drafts.sort_by_key(IndexDraft::commit);
+        full_bytes += encode_index_snapshot(&current, limits.snapshot)
+            .unwrap()
+            .len() as u64;
+        let built = build_index_artifacts(&current, limits).unwrap();
+        roots.push(built.root);
+        for artifact in built.artifacts {
+            all_bytes += artifact.bytes.len() as u64;
+            if let Some((descriptor, bytes)) = unique.get(&artifact.descriptor.id) {
+                assert_eq!(*descriptor, artifact.descriptor);
+                assert_eq!(*bytes, artifact.bytes);
+            } else {
+                unique.insert(
+                    artifact.descriptor.id,
+                    (artifact.descriptor, artifact.bytes),
+                );
+            }
+        }
+    }
+    let unique_bytes = unique
+        .values()
+        .map(|(_, bytes)| bytes.len() as u64)
+        .sum::<u64>();
+    assert!(
+        unique_bytes < full_bytes / 2,
+        "logical artifact reuse must reduce storage/transfer, not merely rename full snapshots"
+    );
+    roots.sort_by_key(|r| r.id);
+    let artifacts = unique
+        .values()
+        .map(|(d, b)| decode_index_artifact(b, *d, limits).unwrap())
+        .collect::<Vec<_>>();
+    let graph = verify_index_artifact_graph(&roots, &artifacts, limits).unwrap();
+    let final_root = build_index_artifacts(&full, limits).unwrap().root;
+    assert_eq!(graph.snapshot(final_root.id).unwrap(), full);
+    let replay = build_index_artifacts(&full, limits).unwrap();
+    assert!(
+        replay
+            .artifacts
+            .iter()
+            .all(|a| unique.contains_key(&a.descriptor.id))
+    );
+    eprintln!(
+        "{{\"schema\":1,\"benchmark\":\"portable_index_artifact_history_bytes\",\"draft_operations\":1000,\"full_snapshot_logical_bytes\":{full_bytes},\"all_artifact_logical_bytes_before_dedup\":{all_bytes},\"unique_artifact_logical_bytes\":{unique_bytes},\"unique_artifacts\":{},\"snapshot_roots\":{},\"max_artifact_bytes\":{},\"cpu_incremental_claim\":false,\"wire_compressed_bytes\":false}}",
+        unique.len(),
+        roots.len(),
+        unique.values().map(|(_, b)| b.len()).max().unwrap()
+    );
 }

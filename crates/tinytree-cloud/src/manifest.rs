@@ -306,8 +306,11 @@ impl Writer {
     }
 }
 fn write(manifest: &Manifest, w: &mut Writer) -> Result<()> {
+    write_version(manifest, w, VERSION)
+}
+fn write_version(manifest: &Manifest, w: &mut Writer, version: u16) -> Result<()> {
     w.raw(MAGIC)?;
-    w.u16(VERSION)?;
+    w.u16(version)?;
     w.u16(m::FORMAT_VERSION)?;
     w.string(CODEC)?;
     w.raw(&manifest.workspace)?;
@@ -467,6 +470,18 @@ pub fn decode_manifest(
     expected: ManifestId,
     limits: ManifestLimits,
 ) -> Result<Manifest> {
+    let (manifest, reader) = read_manifest(bytes, expected, limits, VERSION)?;
+    if reader.position != bytes.len() {
+        return Err(invalid("trailing cloud manifest data"));
+    }
+    Ok(manifest)
+}
+fn read_manifest(
+    bytes: &[u8],
+    expected: ManifestId,
+    limits: ManifestLimits,
+    version: u16,
+) -> Result<(Manifest, Reader<'_>)> {
     limits.validate()?;
     if bytes.len() > limits.max_manifest_bytes {
         return Err(limit());
@@ -485,7 +500,7 @@ pub fn decode_manifest(
     if r.raw(MAGIC.len())? != MAGIC {
         return Err(invalid("manifest magic"));
     }
-    if r.u16()? != VERSION || r.u16()? != m::FORMAT_VERSION {
+    if r.u16()? != version || r.u16()? != m::FORMAT_VERSION {
         return Err(Error::Unsupported("manifest or native format version"));
     }
     let codec_len = r.u32()?;
@@ -562,9 +577,6 @@ pub fn decode_manifest(
     if r.u32()? != 0 {
         return Err(Error::Unsupported("detached cloud components"));
     }
-    if r.position != bytes.len() {
-        return Err(invalid("trailing cloud manifest data"));
-    }
     let manifest = Manifest {
         workspace,
         exporter,
@@ -581,7 +593,7 @@ pub fn decode_manifest(
         detached: vec![],
     };
     shape(&manifest, limits)?;
-    Ok(manifest)
+    Ok((manifest, r))
 }
 /// Borrowed proof: selected object bytes and the manifest cannot be replaced
 /// while its exact root set is used. Store callers still pin storage and verify
@@ -619,6 +631,14 @@ pub fn verify_coverage<'a>(
     objects: &'a [VerifiedObject],
     limits: ManifestLimits,
 ) -> Result<ValidatedManifest<'a>> {
+    verify_coverage_extra(manifest, objects, &[], limits)
+}
+fn verify_coverage_extra<'a>(
+    manifest: &'a Manifest,
+    objects: &'a [VerifiedObject],
+    extra_roots: &[m::ObjectKey],
+    limits: ManifestLimits,
+) -> Result<ValidatedManifest<'a>> {
     shape(manifest, limits)?;
     if objects.len() != manifest.members.len() {
         return Err(invalid("cloud member coverage count"));
@@ -630,6 +650,12 @@ pub fn verify_coverage<'a>(
     // Covers fixed validation scaffolding and the model's small intrinsic-root
     // construction before any table, frame or root-set allocation is allowed.
     memory.charge(4096)?;
+    memory.charge(
+        extra_roots
+            .len()
+            .checked_mul(std::mem::size_of::<m::ObjectKey>())
+            .ok_or_else(limit)?,
+    )?;
     memory.charge(objects.len().checked_mul(256).ok_or_else(limit)?)?;
     let mut table = BTreeMap::new();
     let mut payload = 0u64;
@@ -782,6 +808,9 @@ pub fn verify_coverage<'a>(
             add(*root)?;
         }
     }
+    for root in extra_roots {
+        add(*root)?;
+    }
     if !manifest
         .native_roots
         .iter()
@@ -793,5 +822,265 @@ pub fn verify_coverage<'a>(
     Ok(ValidatedManifest {
         manifest,
         _objects: objects,
+    })
+}
+
+/// Version two binds every retained operation (including intrinsic operation0)
+/// to its exact portable logical index. It does not grant remote root authority.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct OperationIndex {
+    pub operation: [u8; 64],
+    pub root: crate::IndexRootId,
+}
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ManifestV2 {
+    /// Native roots are the complete OP/VIEW, WC, intent AND index-snapshot union.
+    pub recovery: Manifest,
+    pub operation_indexes: Vec<OperationIndex>,
+    pub index_roots: Vec<crate::IndexRootDescriptor>,
+}
+#[derive(Clone, Copy, Debug)]
+pub struct ManifestV2Limits {
+    pub recovery: ManifestLimits,
+    pub artifacts: crate::IndexArtifactLimits,
+    pub max_index_roots: usize,
+    pub max_operation_indexes: usize,
+}
+impl Default for ManifestV2Limits {
+    fn default() -> Self {
+        Self {
+            recovery: Default::default(),
+            artifacts: Default::default(),
+            max_index_roots: 4096,
+            max_operation_indexes: 65537,
+        }
+    }
+}
+impl ManifestV2Limits {
+    pub fn validate(self) -> Result<()> {
+        self.recovery.validate()?;
+        self.artifacts.validate()?;
+        if !(1..=1_000_000).contains(&self.max_index_roots)
+            || !(1..=1_000_001).contains(&self.max_operation_indexes)
+        {
+            return Err(invalid("manifest index limits"));
+        }
+        Ok(())
+    }
+}
+fn shape_v2(value: &ManifestV2, limits: ManifestV2Limits) -> Result<()> {
+    limits.validate()?;
+    shape(&value.recovery, limits.recovery)?;
+    if value.operation_indexes.len() > limits.max_operation_indexes
+        || value.index_roots.len() > limits.max_index_roots
+    {
+        return Err(limit());
+    }
+    if !value
+        .operation_indexes
+        .windows(2)
+        .all(|p| p[0].operation < p[1].operation)
+        || !value.index_roots.windows(2).all(|p| p[0].id < p[1].id)
+    {
+        return Err(invalid("manifest index ordering"));
+    }
+    let mut memory = Memory {
+        used: 0,
+        maximum: limits.recovery.max_decode_bytes,
+    };
+    memory.charge(4096)?;
+    // Cover decoded recovery data and simultaneous validation maps before any
+    // map allocation. Sixteen wire bytes per decoded byte conservatively
+    // bounds empty strings/vectors and fixed records in this canonical codec.
+    let mut wire = Writer {
+        bytes: None,
+        used: 0,
+        maximum: limits.recovery.max_manifest_bytes,
+    };
+    write_v2(value, &mut wire)?;
+    memory.charge(wire.used.checked_mul(16).ok_or_else(limit)?)?;
+    memory.charge(
+        value
+            .recovery
+            .members
+            .len()
+            .checked_mul(512)
+            .ok_or_else(limit)?,
+    )?;
+    memory.charge(
+        value
+            .operation_indexes
+            .len()
+            .checked_mul(512)
+            .ok_or_else(limit)?,
+    )?;
+    memory.charge(value.index_roots.len().checked_mul(512).ok_or_else(limit)?)?;
+    let required: BTreeSet<_> = value
+        .recovery
+        .members
+        .iter()
+        .filter_map(|m| match m.id {
+            ObjectId::Operation(id) => Some(id),
+            _ => None,
+        })
+        .chain([[0; 64]])
+        .collect();
+    if !value
+        .operation_indexes
+        .iter()
+        .map(|a| a.operation)
+        .eq(required)
+    {
+        return Err(invalid("manifest operation index coverage"));
+    }
+    let wanted: BTreeSet<_> = value.operation_indexes.iter().map(|a| a.root).collect();
+    if !value.index_roots.iter().map(|d| d.id).eq(wanted) {
+        return Err(invalid("manifest snapshot coverage"));
+    }
+    if value
+        .index_roots
+        .iter()
+        .any(|d| !matches!(d.selected.size_bytes, 56 | 88))
+    {
+        return Err(invalid("index root descriptor size"));
+    }
+    Ok(())
+}
+fn write_v2(value: &ManifestV2, w: &mut Writer) -> Result<()> {
+    write_version(&value.recovery, w, 2)?;
+    w.u32(value.operation_indexes.len())?;
+    for binding in &value.operation_indexes {
+        w.raw(&binding.operation)?;
+        w.raw(&binding.root.0)?;
+    }
+    w.u32(value.index_roots.len())?;
+    for snapshot in &value.index_roots {
+        w.raw(&snapshot.id.0)?;
+        w.raw(&snapshot.selected.blake3)?;
+        w.u64(snapshot.selected.size_bytes)?;
+    }
+    Ok(())
+}
+pub fn encode_manifest_v2(value: &ManifestV2, limits: ManifestV2Limits) -> Result<Vec<u8>> {
+    shape_v2(value, limits)?;
+    let mut size = Writer {
+        bytes: None,
+        used: 0,
+        maximum: limits.recovery.max_manifest_bytes,
+    };
+    write_v2(value, &mut size)?;
+    let mut writer = Writer {
+        bytes: Some(Vec::with_capacity(size.used)),
+        used: 0,
+        maximum: limits.recovery.max_manifest_bytes,
+    };
+    write_v2(value, &mut writer)?;
+    Ok(writer.bytes.expect("writer owns bytes"))
+}
+pub fn decode_manifest_v2(
+    bytes: &[u8],
+    expected: ManifestId,
+    limits: ManifestV2Limits,
+) -> Result<ManifestV2> {
+    limits.validate()?;
+    let (recovery, mut reader) = read_manifest(bytes, expected, limits.recovery, 2)?;
+    let n = reader.count::<OperationIndex>(limits.max_operation_indexes, 96)?;
+    let mut operation_indexes = Vec::with_capacity(n);
+    for _ in 0..n {
+        operation_indexes.push(OperationIndex {
+            operation: reader.array()?,
+            root: crate::IndexRootId(reader.array()?),
+        });
+    }
+    let n = reader.count::<crate::IndexRootDescriptor>(limits.max_index_roots, 72)?;
+    let mut index_roots = Vec::with_capacity(n);
+    for _ in 0..n {
+        index_roots.push(crate::IndexRootDescriptor {
+            id: crate::IndexRootId(reader.array()?),
+            selected: BlobDigest {
+                blake3: reader.array()?,
+                size_bytes: reader.u64()?,
+            },
+        });
+    }
+    if reader.position != bytes.len() {
+        return Err(invalid("trailing cloud manifest data"));
+    }
+    let value = ManifestV2 {
+        recovery,
+        operation_indexes,
+        index_roots,
+    };
+    shape_v2(&value, limits)?;
+    Ok(value)
+}
+pub struct ValidatedManifestV2<'a, 'g> {
+    recovery: ValidatedManifest<'a>,
+    _graph: &'a crate::VerifiedIndexGraph<'g>,
+}
+impl ValidatedManifestV2<'_, '_> {
+    pub fn native_roots(&self) -> &[m::ObjectKey] {
+        self.recovery.native_roots()
+    }
+    pub fn working_copy(&self) -> &WorkingCopy {
+        self.recovery.working_copy()
+    }
+}
+/// Exact artifact-root associations and retention union. The graph is rechecked
+/// against this call's policy, even if it was decoded under wider limits.
+/// Canonical draft bytes, per-snapshot external-parent membership and remote
+/// authorization remain Store/import/provider responsibilities.
+pub fn verify_coverage_v2<'a, 'g>(
+    value: &'a ManifestV2,
+    objects: &'a [VerifiedObject],
+    graph: &'a crate::VerifiedIndexGraph<'g>,
+    limits: ManifestV2Limits,
+) -> Result<ValidatedManifestV2<'a, 'g>> {
+    shape_v2(value, limits)?;
+    if graph.roots() != value.index_roots {
+        return Err(invalid("manifest index root coverage"));
+    }
+    graph.validate_for_limits(limits.artifacts)?;
+    let mut memory = Memory {
+        used: 0,
+        maximum: limits.recovery.max_decode_bytes,
+    };
+    memory.charge(4096)?;
+    let mut roots = BTreeSet::new();
+    for descriptor in &value.index_roots {
+        let snapshot = graph.snapshot(descriptor.id)?;
+        for root in snapshot
+            .roots
+            .iter()
+            .map(|id| m::ObjectKey {
+                kind: m::Kind::Commit,
+                id: m::ObjectId(id.0),
+            })
+            .chain(snapshot.drafts.iter().map(|d| d.descriptor.key))
+        {
+            if root.id.0 == [0; 32] {
+                continue;
+            }
+            let key = root_key(&root);
+            if !roots.contains(&key) {
+                if roots.len() >= limits.recovery.max_native_roots {
+                    return Err(limit());
+                }
+                memory.charge(256)?;
+                roots.insert(key);
+            }
+        }
+    }
+    let roots: Vec<_> = roots
+        .into_iter()
+        .map(|(_, id)| m::ObjectKey {
+            kind: m::Kind::Commit,
+            id: m::ObjectId(id),
+        })
+        .collect();
+    let recovery = verify_coverage_extra(&value.recovery, objects, &roots, limits.recovery)?;
+    Ok(ValidatedManifestV2 {
+        recovery,
+        _graph: graph,
     })
 }

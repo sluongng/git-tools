@@ -4,6 +4,10 @@
 //! Callers own authorization, checkpoint fencing, root retention and atomic
 //! installation of the restored workspace. Importing these objects alone does
 //! not publish a workspace or authorize deleting a sole local copy.
+mod index_artifact;
+pub use index_artifact::*;
+mod index_snapshot;
+pub use index_snapshot::*;
 mod manifest;
 pub use manifest::*;
 

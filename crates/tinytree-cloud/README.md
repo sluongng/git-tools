@@ -27,3 +27,12 @@ Nonempty detached-history components are explicitly unsupported.
 Manifest coverage is not proof of a fenced client capture or retained native
 bytes. Storage callers must pin objects, verify native closure and compare the
 snapshot commit's actual tree before publishing a durable cloud version.
+
+Portable index artifacts preserve exact anchors, hidden/promoted draft records
+and numeric order, without paths or local segment layout. Canonical radix nodes
+reuse unchanged records across operation roots; each artifact is at most 4 MiB.
+Manifest-v2 library APIs bind operations to typed artifact roots. The initial
+builder still scans the bounded model; byte reuse is not an incremental CPU claim.
+These structural models are not canonical-draft/authorization proofs or deployed
+upload/restore support. Importers must verify those separately. The full-snapshot
+codec remains a component oracle, not the per-operation durable artifact format.
