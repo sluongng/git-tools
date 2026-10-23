@@ -27,6 +27,7 @@ pub struct Provider {
     metadata: Mutex<HashMap<m::ObjectKey, (m::Descriptor, Vec<u8>)>>,
     files: Mutex<HashMap<m::FileId, (m::Descriptor, Vec<u8>)>>,
     pub file_reads: AtomicUsize,
+    pub metadata_reads: AtomicUsize,
 }
 impl Provider {
     pub fn object(&self, object: m::Object) -> m::Descriptor {
@@ -60,6 +61,7 @@ impl NativeObjectIo for Provider {
         })
     }
     async fn read_metadata(&self, key: m::ObjectKey) -> BackendResult<VerifiedMetadata> {
+        self.metadata_reads.fetch_add(1, Ordering::SeqCst);
         let (d, b) = self
             .metadata
             .lock()
@@ -68,6 +70,13 @@ impl NativeObjectIo for Provider {
             .cloned()
             .ok_or_else(error)?;
         VerifiedMetadata::verify(d, b, m::Limits::default())
+    }
+    async fn read_metadata_with_owner(
+        &self,
+        key: m::ObjectKey,
+        _owner: Arc<dyn std::any::Any + Send + Sync>,
+    ) -> BackendResult<VerifiedMetadata> {
+        self.read_metadata(key).await
     }
     async fn write_metadata(&self, _: m::Object) -> BackendResult<m::Descriptor> {
         Err(error())

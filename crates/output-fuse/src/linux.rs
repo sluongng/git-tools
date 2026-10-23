@@ -25,6 +25,12 @@ const TTL: Duration = Duration::ZERO;
 const PAYLOAD_SLOTS: usize = 64;
 
 fn errno(error: anyhow::Error) -> i32 {
+    if error.is::<output_core::SourceLoadBusy>()
+        || error.is::<output_core::SourceNotLoaded>()
+        || error.is::<output_core::CacheTimeoutError>()
+    {
+        return libc::EAGAIN;
+    }
     if error
         .downcast_ref::<output_core::CacheLimitError>()
         .is_some()
@@ -279,6 +285,35 @@ impl Adapter {
         Ok(ticket)
     }
 }
+fn reply_directory(tree: &Tree, ino: u64, offset: i64, mut reply: ReplyDirectory) {
+    let result = (|| -> Result<()> {
+        let directory = tree.get(ino)?;
+        if offset == 0 && reply.add(ino, 1, FileType::Directory, ".") {
+            return Ok(());
+        }
+        if offset <= 1 && reply.add(directory.parent, 2, FileType::Directory, "..") {
+            return Ok(());
+        }
+        let mut after = (offset as u64).saturating_sub(2);
+        loop {
+            let nodes = tree.list(ino, after, 256)?;
+            if nodes.is_empty() {
+                break;
+            }
+            for node in nodes {
+                if reply.add(node.id, (node.id + 2) as i64, kind(&node), &node.name) {
+                    return Ok(());
+                }
+                after = node.id;
+            }
+        }
+        Ok(())
+    })();
+    match result {
+        Ok(()) => reply.ok(),
+        Err(e) => reply.error(errno(e)),
+    }
+}
 impl Filesystem for Adapter {
     fn init(&mut self, _: &Request<'_>, config: &mut KernelConfig) -> Result<(), i32> {
         self.atomic_truncate = config.add_capabilities(consts::FUSE_ATOMIC_O_TRUNC).is_ok();
@@ -287,7 +322,37 @@ impl Filesystem for Adapter {
         Ok(())
     }
     fn lookup(&mut self, _: &Request<'_>, parent: u64, name_: &OsStr, reply: ReplyEntry) {
-        let result = name(name_).and_then(|n| self.tree.lookup_referenced(parent, &n));
+        let owned_name = match name(name_) {
+            Ok(name) => name,
+            Err(error) => return reply.error(errno(error)),
+        };
+        let result = self.tree.lookup_referenced(parent, &owned_name);
+        if result
+            .as_ref()
+            .is_err_and(|e| e.is::<output_core::SourceNotLoaded>())
+        {
+            let ticket = match self.enter() {
+                Ok(ticket) => ticket,
+                Err(error) => return reply.error(error),
+            };
+            let tree = self.tree.clone();
+            let references = self.references.clone();
+            self.dispatch(async move {
+                let _ticket = ticket;
+                let result = async {
+                    tree.ensure_directory_loaded(parent).await?;
+                    let node = tree.lookup_referenced(parent, &owned_name)?;
+                    references.entry(&node, true)?;
+                    Ok::<_, anyhow::Error>(node)
+                }
+                .await;
+                match result {
+                    Ok(node) => reply.entry(&TTL, &attrs(&node), node.generation),
+                    Err(error) => reply.error(errno(error)),
+                }
+            });
+            return;
+        }
         match result {
             Ok(n) => match self.references.entry(&n, true) {
                 Ok(()) => reply.entry(&TTL, &attrs(&n), n.generation),
@@ -334,47 +399,45 @@ impl Filesystem for Adapter {
     fn readlink(&mut self, _: &Request<'_>, ino: u64, reply: ReplyData) {
         match self.tree.readlink(ino) {
             Ok(target) => reply.data(target.as_bytes()),
+            Err(e) if e.is::<output_core::SourceNotLoaded>() => {
+                let ticket = match self.enter() {
+                    Ok(ticket) => ticket,
+                    Err(error) => return reply.error(error),
+                };
+                let tree = self.tree.clone();
+                self.dispatch(async move {
+                    let _ticket = ticket;
+                    match tree.readlink_source(ino).await {
+                        Ok(target) => reply.data(target.as_bytes()),
+                        Err(error) => reply.error(errno(error)),
+                    }
+                });
+            }
             Err(e) => reply.error(errno(e)),
         }
     }
-    fn readdir(
-        &mut self,
-        _: &Request<'_>,
-        ino: u64,
-        _: u64,
-        offset: i64,
-        mut reply: ReplyDirectory,
-    ) {
+    fn readdir(&mut self, _: &Request<'_>, ino: u64, _: u64, offset: i64, reply: ReplyDirectory) {
         if offset < 0 {
             reply.error(libc::EINVAL);
             return;
         }
-        let result = (|| -> Result<()> {
-            let directory = self.tree.get(ino)?;
-            if offset == 0 && reply.add(ino, 1, FileType::Directory, ".") {
-                return Ok(());
-            }
-            if offset <= 1 && reply.add(directory.parent, 2, FileType::Directory, "..") {
-                return Ok(());
-            }
-            let mut after = (offset as u64).saturating_sub(2);
-            loop {
-                let nodes = self.tree.list(ino, after, 256)?;
-                if nodes.is_empty() {
-                    break;
-                }
-                for node in nodes {
-                    if reply.add(node.id, (node.id + 2) as i64, kind(&node), &node.name) {
-                        return Ok(());
+        match self.tree.list(ino, 0, 0) {
+            Ok(_) => reply_directory(&self.tree, ino, offset, reply),
+            Err(error) if error.is::<output_core::SourceNotLoaded>() => {
+                let ticket = match self.enter() {
+                    Ok(ticket) => ticket,
+                    Err(error) => return reply.error(error),
+                };
+                let tree = self.tree.clone();
+                self.dispatch(async move {
+                    let _ticket = ticket;
+                    match tree.ensure_directory_loaded(ino).await {
+                        Ok(()) => reply_directory(&tree, ino, offset, reply),
+                        Err(error) => reply.error(errno(error)),
                     }
-                    after = node.id;
-                }
+                });
             }
-            Ok(())
-        })();
-        match result {
-            Ok(()) => reply.ok(),
-            Err(e) => reply.error(errno(e)),
+            Err(error) => reply.error(errno(error)),
         }
     }
     fn open(&mut self, _: &Request<'_>, ino: u64, flags: i32, reply: ReplyOpen) {
@@ -1251,6 +1314,46 @@ impl Projection for FuseMount {
                     tree.freeze_source(output_core::SourceFrontendFence::TreeOnly, &limits)?;
                 for entry in current.entries() {
                     invalidate(&notifier, &entry.node)?;
+                }
+                invalidate(&notifier, &tree.get(tree.root_id())?)?;
+                Ok(receipt)
+            })
+        })
+        .await
+    }
+    async fn publish_lazy_source(
+        &self,
+        root: output_core::LazySourceRoot,
+        expected: output_core::SourceVersion,
+        request_id: String,
+        limits: output_core::SourceLimits,
+    ) -> Result<output_core::SourceReceipt> {
+        self.complete(move |tree, notifier| {
+            Box::pin(async move {
+                // Capture only the explicit lazy delta. Unopened directories
+                // remain immutable base links rather than inferred deletions.
+                let deadline = tokio::time::Instant::now()
+                    + Duration::from_millis(root.load_limits.timeout_ms);
+                let snapshot = tree
+                    .freeze_lazy_source_wait(
+                        output_core::SourceFrontendFence::TreeOnly,
+                        &limits,
+                        deadline,
+                    )
+                    .await?;
+                let old = tree.known_source_nodes(&limits)?;
+                // Retain the same source fence through replacement: dropping it
+                // and reacquiring lets a kernel metadata job race publication.
+                // The explicit original version also preserves exact replay.
+                let receipt =
+                    snapshot.install_with_expected(root, expected, &request_id, &limits)?;
+                // complete() retains the generation/control guard through every
+                // notification, even if its initiating RPC was cancelled.
+                for node in old {
+                    invalidate(&notifier, &node)?;
+                }
+                for node in tree.known_source_nodes(&limits)? {
+                    invalidate(&notifier, &node)?;
                 }
                 invalidate(&notifier, &tree.get(tree.root_id())?)?;
                 Ok(receipt)

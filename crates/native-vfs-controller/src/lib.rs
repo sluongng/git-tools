@@ -17,7 +17,8 @@ use jj_vfs::native::{
 use native_vfs::NativeMount;
 use native_workspace::Compiler;
 use output_core::{
-    SourceLimits, SourceOperation, SourceReceipt, SourceSnapshot, SourceVersion, Tree,
+    SourceDeltaSnapshot, SourceLimits, SourceOperation, SourceReceipt, SourceSnapshot,
+    SourceVersion, Tree,
 };
 use private_fs::PrivateDir;
 use serde::{Deserialize, Serialize};
@@ -35,6 +36,7 @@ use std::{
 use tinytree_model as m;
 use tokio::sync::{Mutex as AsyncMutex, OwnedMutexGuard};
 
+mod lazy_snapshot;
 mod policy;
 mod scope;
 mod snapshot;
@@ -113,6 +115,50 @@ impl Config {
     }
 }
 
+/// Complete inventories and lazy deltas are deliberately distinct capture types.
+enum Capture {
+    Complete(SourceSnapshot),
+    Lazy(SourceDeltaSnapshot),
+}
+impl Capture {
+    fn base_root(&self) -> [u8; 32] {
+        match self {
+            Self::Complete(s) => s.base_root(),
+            Self::Lazy(s) => s.baseline_tree(),
+        }
+    }
+    fn version(&self) -> &SourceVersion {
+        match self {
+            Self::Complete(s) => s.version(),
+            Self::Lazy(s) => s.version(),
+        }
+    }
+    fn complete(self) -> Result<SourceSnapshot> {
+        match self {
+            Self::Complete(snapshot) => Ok(snapshot),
+            Self::Lazy(_) => bail!("lazy source capture is not a complete inventory"),
+        }
+    }
+}
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum LazyMutationUnsupported {
+    DirectoryRename,
+    ResetWithDifferentContents,
+}
+impl std::fmt::Display for LazyMutationUnsupported {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::DirectoryRename => {
+                "native lazy directory rename requires recursive copy-lineage rewriting"
+            }
+            Self::ResetWithDifferentContents => {
+                "native lazy reset requires a content-equivalent baseline"
+            }
+        })
+    }
+}
+impl std::error::Error for LazyMutationUnsupported {}
+
 enum Host {
     Mounted(Arc<NativeMount>),
     #[cfg(any(test, feature = "protocol-test-support"))]
@@ -190,7 +236,41 @@ impl Host {
         &self,
         limits: &SourceLimits,
         deadline: tokio::time::Instant,
-    ) -> Result<SourceSnapshot> {
+    ) -> Result<Capture> {
+        if self.tree().lazy_source_pin().is_some() {
+            return match self {
+                Self::Mounted(mount) => {
+                    #[cfg(target_os = "linux")]
+                    {
+                        mount
+                            .tree()
+                            .freeze_lazy_source_wait(
+                                output_core::SourceFrontendFence::TreeOnly,
+                                limits,
+                                deadline,
+                            )
+                            .await
+                            .map(Capture::Lazy)
+                    }
+                    #[cfg(not(target_os = "linux"))]
+                    {
+                        let _ = (mount, limits, deadline);
+                        bail!(
+                            "native provider source capture fence is not implemented on this platform"
+                        )
+                    }
+                }
+                #[cfg(any(test, feature = "protocol-test-support"))]
+                Self::Protocol { tree, .. } => tree
+                    .freeze_lazy_source_wait(
+                        output_core::SourceFrontendFence::TreeOnly,
+                        limits,
+                        deadline,
+                    )
+                    .await
+                    .map(Capture::Lazy),
+            };
+        }
         match self {
             Self::Mounted(mount) => {
                 // NFS needs a real client flush/quiescence fence. ProjFS needs
@@ -212,17 +292,14 @@ impl Host {
                             deadline,
                         )
                         .await
+                        .map(Capture::Complete)
                 }
             }
             #[cfg(any(test, feature = "protocol-test-support"))]
-            Self::Protocol { tree, .. } => {
-                tree.freeze_source_wait(
-                    output_core::SourceFrontendFence::TreeOnly,
-                    limits,
-                    deadline,
-                )
+            Self::Protocol { tree, .. } => tree
+                .freeze_source_wait(output_core::SourceFrontendFence::TreeOnly, limits, deadline)
                 .await
-            }
+                .map(Capture::Complete),
         }
     }
     async fn publish(
@@ -236,22 +313,35 @@ impl Host {
         let merge = resolved_merge(tree)?;
         match self {
             Self::Mounted(mount) => {
-                let compiled = mount.compiler().compile_merge(&merge).await?;
                 if let Some(scope) = scope {
                     scope.check()?;
                 }
-                mount
-                    .projection()
-                    .publish_source(
-                        compiled.manifest(mount.tree().identity()),
-                        expected,
-                        id.into(),
-                        limits.clone(),
-                    )
-                    .await
+                mount.checkout_resolved(&merge, expected, id.into()).await
             }
             #[cfg(any(test, feature = "protocol-test-support"))]
             Self::Protocol { tree, compiler, .. } => {
+                if tree.lazy_source_pin().is_some() {
+                    // Request identity must remain stable after core applied a
+                    // receipt but controller completion/invalidation was lost.
+                    let generation = expected
+                        .generation
+                        .checked_add(1)
+                        .context("source generation exhausted")?;
+                    let lazy = compiler.lazy_tree_for_source(
+                        merge.terms[0],
+                        generation,
+                        limits.clone(),
+                    )?;
+                    if let Some(scope) = scope {
+                        scope.check()?;
+                    }
+                    return tree.install_lazy_source(
+                        lazy.source_root(tree.identity()),
+                        Some(expected),
+                        id,
+                        limits,
+                    );
+                }
                 let compiled = compiler.compile_merge(&merge).await?;
                 if let Some(scope) = scope {
                     scope.check()?;
@@ -1091,17 +1181,23 @@ impl Mutation {
             scope.check().map_err(ambiguous)?;
             return Ok((receipt, SnapshotStats::default()));
         }
-        let snapshot = Arc::new(
-            self.controller
-                .inner
-                .host
-                .capture(
-                    &self.controller.inner.config.source_limits,
-                    scope.deadline(),
-                )
-                .await
-                .map_err(rejected)?,
-        );
+        let capture = self
+            .controller
+            .inner
+            .host
+            .capture(
+                &self.controller.inner.config.source_limits,
+                scope.deadline(),
+            )
+            .await
+            .map_err(rejected)?;
+        let snapshot = match capture {
+            Capture::Lazy(snapshot) => {
+                return lazy_snapshot::snapshot(self, id, policy, fingerprint, scope, snapshot)
+                    .await;
+            }
+            Capture::Complete(snapshot) => Arc::new(snapshot),
+        };
         scope.check().map_err(rejected)?;
         let base = self
             .controller
@@ -1190,6 +1286,16 @@ impl NativeProjectionMutation for Mutation {
             scope.check().map_err(ambiguous)?;
             return Ok((receipt, CheckoutStats::default()));
         }
+        if self
+            .controller
+            .inner
+            .host
+            .tree()
+            .lazy_source_pin()
+            .is_some()
+        {
+            return lazy_snapshot::checkout(self, id, tree, scope).await;
+        }
         let target = self
             .controller
             .inner
@@ -1208,6 +1314,8 @@ impl NativeProjectionMutation for Mutation {
                     scope.deadline(),
                 )
                 .await
+                .map_err(rejected)?
+                .complete()
                 .map_err(rejected)?,
         );
         scope.check().map_err(rejected)?;
@@ -1272,6 +1380,16 @@ impl NativeProjectionMutation for Mutation {
             scope.check().map_err(ambiguous)?;
             return Ok(receipt);
         }
+        if self
+            .controller
+            .inner
+            .host
+            .tree()
+            .lazy_source_pin()
+            .is_some()
+        {
+            return lazy_snapshot::reset(self, id, tree, recover, scope).await;
+        }
         self.controller
             .inner
             .host
@@ -1289,6 +1407,8 @@ impl NativeProjectionMutation for Mutation {
                 scope.deadline(),
             )
             .await
+            .map_err(rejected)?
+            .complete()
             .map_err(rejected)?;
         let expected = snapshot.version().clone();
         scope.check().map_err(rejected)?;

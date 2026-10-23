@@ -3,7 +3,7 @@
 use super::*;
 use std::collections::BTreeMap;
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct SourceLimits {
     pub max_entries: usize,
     pub max_metadata_bytes: usize,
@@ -25,7 +25,7 @@ impl Default for SourceLimits {
     }
 }
 impl SourceLimits {
-    fn validate(&self) -> Result<()> {
+    pub(super) fn validate(&self) -> Result<()> {
         ensure!(
             self.max_entries > 0
                 && self.max_metadata_bytes > 0
@@ -78,21 +78,23 @@ pub struct SourceReceipt {
 }
 #[derive(Clone, Serialize, Deserialize)]
 pub(super) struct Receipt {
-    intent: [u8; 32],
-    result: SourceReceipt,
+    pub(super) intent: [u8; 32],
+    pub(super) result: SourceReceipt,
 }
 #[derive(Clone, Serialize, Deserialize)]
 pub(super) struct SourceMeta {
     pub(super) root: [u8; 32],
     pub(super) generation: u64,
     pub(super) revision: u64,
-    receipts: BTreeMap<String, Receipt>,
+    pub(super) receipts: BTreeMap<String, Receipt>,
+    #[serde(default)]
+    pub(super) lazy: Option<lazy_source::LazyMeta>,
 }
 #[derive(Default)]
 pub(super) struct Gate {
     pub(super) frozen: bool,
     active: usize,
-    changed: Arc<tokio::sync::Notify>,
+    pub(super) changed: Arc<tokio::sync::Notify>,
 }
 /// Only these transient gate conditions may be retried when acquiring a source
 /// snapshot. Namespace, inventory and limit errors are not contention.
@@ -133,7 +135,7 @@ impl Drop for Job {
         }
     }
 }
-struct Freeze {
+pub(super) struct Freeze {
     gate: Arc<Mutex<Gate>>,
 }
 impl Drop for Freeze {
@@ -300,7 +302,7 @@ impl Tree {
             gate: self.source_gate.clone(),
         })
     }
-    fn source_freeze(&self) -> Result<Freeze> {
+    pub(super) fn source_freeze(&self) -> Result<Freeze> {
         let mut gate = self.source_gate.lock().unwrap();
         if gate.frozen {
             return Err(SourceFreezeBusy::Frozen.into());
@@ -324,6 +326,13 @@ impl Tree {
         ensure!(
             !ns.failed && ns.state.pending.map.is_empty(),
             "source namespace has pending publication"
+        );
+        ensure!(
+            ns.state
+                .source
+                .as_ref()
+                .is_none_or(|source| source.lazy.is_none()),
+            "lazy source requires a delta snapshot"
         );
         let (entries, version) = self.source_inventory(&ns.state, limits)?;
         let entries_by_id = entries
@@ -613,6 +622,7 @@ impl Tree {
                 generation,
                 revision,
                 receipts: BTreeMap::new(),
+                lazy: None,
             });
             let (_, version) = self.source_inventory(state, limits)?;
             let result = SourceReceipt {
@@ -634,12 +644,16 @@ impl Tree {
             Ok(result)
         })
     }
-    fn source_inventory(
+    pub(super) fn source_inventory(
         &self,
         state: &State,
         limits: &SourceLimits,
     ) -> Result<(Vec<SourceSnapshotEntry>, SourceVersion)> {
         let source = state.source.as_ref().context("not a source namespace")?;
+        ensure!(
+            source.lazy.is_none(),
+            "lazy source requires a delta snapshot"
+        );
         let mut entries = Vec::new();
         let mut stack = vec![(1, String::new())];
         let mut metadata = 0usize;
@@ -756,7 +770,7 @@ impl Tree {
     }
 }
 
-fn control_name(name: &str) -> bool {
+pub(super) fn control_name(name: &str) -> bool {
     name.split(':')
         .next()
         .unwrap_or(name)
@@ -876,7 +890,7 @@ impl Tree {
     }
 }
 
-fn validate_request_id(request_id: &str) -> Result<()> {
+pub(super) fn validate_request_id(request_id: &str) -> Result<()> {
     ensure!(
         !request_id.is_empty()
             && request_id.len() <= 128

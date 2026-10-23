@@ -73,6 +73,14 @@ impl NativeObjectIo for Provider {
             .ok_or_else(error)?;
         VerifiedMetadata::verify(d, b, m::Limits::default())
     }
+    async fn read_metadata_with_owner(
+        &self,
+        key: m::ObjectKey,
+        _owner: Arc<dyn Any + Send + Sync>,
+    ) -> BackendResult<VerifiedMetadata> {
+        // This fixture has no detached physical metadata jobs.
+        self.read_metadata(key).await
+    }
     async fn write_metadata(&self, _: m::Object) -> BackendResult<m::Descriptor> {
         Err(error())
     }
@@ -157,7 +165,12 @@ fn fixture() -> Fixture {
     let executable = provider.file(b"#!/bin/sh\necho native\n");
     let unused = provider.file(b"not accessed during startup");
     let link = provider.object(m::Object::Symlink("bin/tool".into()));
-    let copy = m::CopyId([8; 32]);
+    let copy = provider.object(m::Object::CopyHistory(m::CopyHistory {
+        current_path: "bin/tool".into(),
+        parents: vec![],
+        salt: vec![8],
+    }));
+    let copy = m::CopyId(copy.key.id.0);
     let child = provider.object(m::Object::Tree(m::Tree {
         entries: vec![file_entry("tool", executable, true, Some(copy))],
     }));
@@ -624,4 +637,187 @@ async fn cache_timeout_during_physical_copy_retains_temp_reservation_and_ownersh
             .filter_map(|e| e.ok())
             .any(|e| e.path().extension().is_some_and(|v| v == "tmp"))
     );
+}
+
+#[tokio::test]
+async fn lazy_directory_provider_loads_only_requested_metadata_and_keeps_file_bodies_lazy() {
+    use output_core::lazy_source::SourceDirectoryEntryKind;
+    let f = fixture();
+    let compiler = Arc::new(Compiler::new(f.provider.clone(), scope(), Limits::default()).unwrap());
+    let lazy = compiler.lazy_tree(f.root, 1).unwrap();
+    assert_eq!(f.provider.metadata_reads.load(Ordering::SeqCst), 0);
+    let source = lazy.source_root("directory-fixture");
+    let root = source
+        .provider
+        .read_directory(
+            source.pin.clone(),
+            source.root_tree,
+            String::new(),
+            source.load_limits.clone(),
+            Arc::new(()),
+        )
+        .await
+        .unwrap();
+    assert_eq!(root.tree_id, f.root.0);
+    assert_eq!(f.provider.metadata_reads.load(Ordering::SeqCst), 1);
+    let child = root.entries.iter().find(|e| e.name == "bin").unwrap();
+    let SourceDirectoryEntryKind::Directory { tree_id } = child.kind else {
+        panic!("bin must retain an unloaded canonical directory link")
+    };
+    let directory = source
+        .provider
+        .read_directory(
+            source.pin.clone(),
+            tree_id,
+            "bin".into(),
+            source.load_limits.clone(),
+            Arc::new(()),
+        )
+        .await
+        .unwrap();
+    assert_eq!(directory.entries.len(), 1);
+    assert_eq!(
+        f.provider.metadata_reads.load(Ordering::SeqCst),
+        3,
+        "only the selected directory and its copy provenance are read"
+    );
+    let tool = &directory.entries[0];
+    assert_eq!(tool.mode, 0o755);
+    let SourceDirectoryEntryKind::File { artifact, copy_id } = &tool.kind else {
+        panic!("tool must retain verified immutable file provenance")
+    };
+    assert_eq!(*copy_id, Some(f.copy.0));
+    assert_eq!(artifact.hash, hex(&f.executable.key.id.0));
+    let link = root.entries.iter().find(|e| e.name == "link").unwrap();
+    let SourceDirectoryEntryKind::Symlink {
+        object_id,
+        target_size,
+    } = link.kind
+    else {
+        panic!("symlink target must remain lazy")
+    };
+    assert_eq!(
+        source
+            .provider
+            .read_symlink(source.pin.clone(), object_id, target_size, Arc::new(()))
+            .await
+            .unwrap(),
+        "bin/tool"
+    );
+    assert_eq!(f.provider.file_reads.load(Ordering::SeqCst), 0);
+    let mut other_pin = source.pin.clone();
+    other_pin.generation += 1;
+    let reads = f.provider.metadata_reads.load(Ordering::SeqCst);
+    assert!(
+        source
+            .provider
+            .read_directory(
+                other_pin,
+                source.root_tree,
+                String::new(),
+                source.load_limits.clone(),
+                Arc::new(())
+            )
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        f.provider.metadata_reads.load(Ordering::SeqCst),
+        reads,
+        "another source generation is rejected before object I/O"
+    );
+}
+
+#[tokio::test]
+async fn lazy_copy_provenance_uses_canonical_base_path_not_a_moved_overlay_path() {
+    use output_core::lazy_source::SourceDirectoryEntryKind;
+    let f = fixture();
+    let compiler = Arc::new(Compiler::new(f.provider.clone(), scope(), Limits::default()).unwrap());
+    let lazy = compiler.lazy_tree(f.root, 1).unwrap();
+    let source = lazy.source_root("copy-context-fixture");
+    let root = source
+        .provider
+        .read_directory(
+            source.pin.clone(),
+            source.root_tree,
+            String::new(),
+            source.load_limits.clone(),
+            Arc::new(()),
+        )
+        .await
+        .unwrap();
+    let child = root.entries.iter().find(|e| e.name == "bin").unwrap();
+    let SourceDirectoryEntryKind::Directory { tree_id } = child.kind else {
+        panic!()
+    };
+    assert!(
+        source
+            .provider
+            .read_directory(
+                source.pin.clone(),
+                tree_id,
+                "other".into(),
+                source.load_limits.clone(),
+                Arc::new(())
+            )
+            .await
+            .is_err()
+    );
+    let temporary = tempfile::tempdir().unwrap();
+    let cache = LocalCas::open(temporary.path(), lazy.source(), CacheConfig::default()).unwrap();
+    assert!(
+        cache.content(scope().artifact(f.executable)).await.is_err(),
+        "a failed directory must not authorize its file locators"
+    );
+    assert_eq!(f.provider.file_reads.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn lazy_directories_reject_projection_constraints_before_authorizing_files() {
+    for (behavior, names, byte_limit) in [
+        ("case aliases", vec!["A.cc", "a.cc"], 4 * 1024 * 1024),
+        (
+            "reserved administration entry",
+            vec![".jj"],
+            4 * 1024 * 1024,
+        ),
+        ("decoded directory budget", vec!["source.cc"], 1024),
+    ] {
+        let provider = Arc::new(Provider::default());
+        let file = provider.file(b"not authorized by a rejected directory");
+        let root = provider.object(m::Object::Tree(m::Tree {
+            entries: names
+                .into_iter()
+                .map(|name| file_entry(name, file, false, None))
+                .collect(),
+        }));
+        let compiler =
+            Arc::new(Compiler::new(provider.clone(), scope(), Limits::default()).unwrap());
+        let lazy = compiler.lazy_tree(m::TreeId(root.key.id.0), 1).unwrap();
+        let source = lazy.source_root("rejected-directory");
+        let mut limits = source.load_limits;
+        limits.max_directory_bytes = byte_limit;
+        assert!(
+            source
+                .provider
+                .read_directory(
+                    source.pin,
+                    source.root_tree,
+                    String::new(),
+                    limits,
+                    Arc::new(()),
+                )
+                .await
+                .is_err(),
+            "{behavior}"
+        );
+        let temporary = tempfile::tempdir().unwrap();
+        let cache =
+            LocalCas::open(temporary.path(), lazy.source(), CacheConfig::default()).unwrap();
+        assert!(
+            cache.content(scope().artifact(file)).await.is_err(),
+            "{behavior}"
+        );
+        assert_eq!(provider.file_reads.load(Ordering::SeqCst), 0, "{behavior}");
+    }
 }

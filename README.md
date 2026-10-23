@@ -95,7 +95,7 @@ entry points. Most also expose Rust libraries; `jj-native-cli` is executable-onl
 | [`jj-native-backend`](crates/jj-native-backend) | Native jj Backend and verified object-I/O providers; retains authoritative local objects. |
 | [`jj-native-remote`](crates/jj-native-remote) | Lazy native file provider, durable admission/publication and private broker control. |
 | [`native-broker`](crates/native-broker) | Private object I/O and reference control shared by independent native jj processes. |
-| [`native-workspace`](crates/native-workspace), [`native-vfs`](crates/native-vfs) | Metadata-only native source projection and platform mount ownership. |
+| [`native-workspace`](crates/native-workspace), [`native-vfs`](crates/native-vfs) | Directory-at-a-time native source projection and platform mount ownership. |
 | [`native-workspace-admin`](crates/native-workspace-admin) | Private external jj administration and restart-safe provisioning. |
 | [`native-vfs-controller`](crates/native-vfs-controller), [`native-vfs-rpc`](crates/native-vfs-rpc) | Dirty-only snapshots, checked root changes and private projection control. |
 | [`native-retention`](crates/native-retention) | Durable workspace root claims and collection fences; not yet automatic client GC. |
@@ -105,7 +105,7 @@ entry points. Most also expose Rust libraries; `jj-native-cli` is executable-onl
 | [`reapi`](crates/reapi) | Remote Execution API protocols and client policy. |
 | [`cache-proxy`](crates/cache-proxy) | Cache, execution and remote-downloader forwarding. |
 | [`bes-proxy`](crates/bes-proxy) | Durable, concurrent build-event forwarding. |
-| [`output-core`](crates/output-core) | Lazy output namespace and metadata. |
+| [`output-core`](crates/output-core) | Durable output/source namespaces and lazy directory metadata. |
 | [`output-fuse`](crates/output-fuse), [`output-nfs`](crates/output-nfs), [`output-projfs`](crates/output-projfs) | Linux, macOS and Windows output-mount adapters. |
 
 For native repository test seeds, [tinytree-fixture](crates/tinytree-fixture)

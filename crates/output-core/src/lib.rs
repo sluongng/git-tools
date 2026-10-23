@@ -1,11 +1,18 @@
 //! Generation-aware output metadata and a verified, bounded disk cache.
 //! Namespace records are authoritative; clean CAS bytes are expendable. Retired
 //! records remain addressable until explicit lifetime-aware reclamation. IDs are never reused.
+pub mod lazy_source;
 pub mod source;
 use anyhow::{Context, Result, ensure};
 use async_trait::async_trait;
 use fjall::{
     KeyspaceCreateOptions, PersistMode, Readable, SingleWriterTxDatabase, SingleWriterTxKeyspace,
+};
+pub use lazy_source::{
+    LazySourceRoot, SourceBaseOrigin, SourceBaselineUpdate, SourceDeltaEntry, SourceDeltaSnapshot,
+    SourceDirectoryCursor, SourceDirectoryEntry, SourceDirectoryEntryKind, SourceDirectoryLink,
+    SourceDirectoryPage, SourceDirectoryProvider, SourceLoadBusy, SourceLoadLimits,
+    SourceNamespaceChange, SourceNotLoaded, SourcePin, VerifiedSourceDirectory,
 };
 pub use local_cas::{
     Artifact, BlobSource, CacheConfig, CacheLimitError, CacheMetrics, CacheTimeoutError,
@@ -134,6 +141,18 @@ pub trait Projection: Send + Sync {
     ) -> Result<SourceReceipt> {
         anyhow::bail!("native source publication is unsupported by this provider")
     }
+    /// Checked lazy-root publication requires the same native invalidation
+    /// fence as a complete source root. Unsupported providers must not expose
+    /// an unfenced raw namespace replacement or force full materialization.
+    async fn publish_lazy_source(
+        &self,
+        _root: LazySourceRoot,
+        _expected: SourceVersion,
+        _request_id: String,
+        _limits: SourceLimits,
+    ) -> Result<SourceReceipt> {
+        anyhow::bail!("native lazy source publication is unsupported by this provider")
+    }
     /// The caller must quiesce native filesystem users and RPC admission.
     /// This is an explicit maintenance boundary, not build finalization.
     async fn maintain_quiescent(&self, _transaction_budget: usize) -> Result<MaintenanceOutcome> {
@@ -157,6 +176,12 @@ struct Record {
     node: Node,
     target: Option<String>,
     verifier: Option<[u8; 8]>,
+    #[serde(default)]
+    source_origin: Option<SourceBaseOrigin>,
+    #[serde(default)]
+    source_directory: Option<lazy_source::DirectoryBase>,
+    #[serde(default)]
+    source_clean_ctime: Option<u64>,
 }
 #[derive(Clone, Serialize, Deserialize)]
 struct Pending {
@@ -201,6 +226,7 @@ impl<T: Clone> Table<T> {
 }
 #[derive(Clone)]
 struct State {
+    version: u32,
     source: Option<source::SourceMeta>,
     identity: String,
     backend: String,
@@ -262,6 +288,8 @@ pub struct Tree {
     source: Arc<dyn BlobSource>,
     cache: Arc<LocalCas>,
     mutation_locks: Mutex<HashMap<u64, Weak<AsyncMutex<()>>>>,
+    self_ref: Weak<Tree>,
+    lazy_runtime: Mutex<Option<Arc<lazy_source::Runtime>>>,
 }
 /// A frontend-owned reference to one immutable entry ID. Reclamation cannot
 /// remove its metadata or local payload until the last lease has been dropped.
@@ -348,6 +376,7 @@ fn resolve_state(s: &State, path: &str) -> Result<Option<u64>> {
     let mut id = 1;
     for part in parts(path)? {
         directory(s, id)?;
+        lazy_source::require_loaded(s, id)?;
         let Some(next) = child(s, id, part) else {
             return Ok(None);
         };
@@ -387,6 +416,9 @@ fn allocate(
             node: node.clone(),
             target: None,
             verifier: None,
+            source_origin: None,
+            source_directory: None,
+            source_clean_ctime: None,
         },
     );
     Ok(node)
@@ -505,10 +537,11 @@ impl Tree {
                 "existing namespace identity missing"
             );
             ensure!(
-                matches!(header.version, 2 | 3) && header.backend == backend,
+                matches!(header.version, 2 | 3 | 4) && header.backend == backend,
                 "output state backend/version mismatch"
             );
             let mut state = State {
+                version: header.version,
                 source: header.source,
                 identity: if header.identity.is_empty() {
                     uuid::Uuid::new_v4().to_string()
@@ -572,9 +605,13 @@ impl Tree {
                     },
                     target: None,
                     verifier: None,
+                    source_origin: None,
+                    source_directory: None,
+                    source_clean_ctime: None,
                 },
             );
             State {
+                version: 3,
                 source: None,
                 identity: uuid::Uuid::new_v4().to_string(),
                 backend: backend.clone(),
@@ -627,6 +664,10 @@ impl Tree {
                     .max(id.checked_add(1).context("inode highwater exhausted")?);
             }
         }
+        // Verify persisted counters against the original records before
+        // repairing trusted authoritative payload metadata after a crash.
+        lazy_source::validate_reopen(&state)?;
+        let persisted_state = state.clone();
         // A data fsync may precede its metadata transaction at a crash. Local
         // bytes are authoritative; reconcile length before serving any client.
         let local_ids: Vec<_> = state
@@ -650,7 +691,8 @@ impl Tree {
                 node.ctime = node.mtime;
             }
         }
-        let tree = Arc::new(Self {
+        lazy_source::account_records(&persisted_state, &mut state)?;
+        let tree = Arc::new_cyclic(|weak| Self {
             source_gate: Arc::new(Mutex::new(source::Gate::default())),
             identity: state.identity.clone(),
             namespace: Mutex::new(Namespace {
@@ -668,6 +710,8 @@ impl Tree {
             source,
             cache,
             mutation_locks: Mutex::new(HashMap::new()),
+            self_ref: weak.clone(),
+            lazy_runtime: Mutex::new(None),
         });
         tree.change(|_| Ok(()))?;
         tree.drain_retired_payloads(usize::MAX)?;
@@ -689,9 +733,28 @@ impl Tree {
             !ns.failed,
             "output namespace commit failed; reopen for recovery"
         );
+        Self::change_locked_mode(ns, false, f)
+    }
+    fn change_locked_mode<T>(
+        ns: &mut Namespace,
+        population: bool,
+        f: impl FnOnce(&mut State) -> Result<T>,
+    ) -> Result<T> {
+        ensure!(
+            !ns.failed,
+            "output namespace commit failed; reopen for recovery"
+        );
         let mut next = ns.state.clone();
         let result = f(&mut next)?;
-        if !next.nodes.dirty.is_empty() {
+        if !population {
+            lazy_source::track_changes(&ns.state, &mut next)?;
+        }
+        lazy_source::account_records(&ns.state, &mut next)?;
+        if !population
+            && !next.nodes.dirty.is_empty()
+            && (next.source.as_ref().is_none_or(|s| s.lazy.is_none())
+                || lazy_source::has_user_changes(&ns.state, &next)?)
+        {
             if let (Some(old), Some(new)) = (&ns.state.source, &mut next.source) {
                 if new.revision == old.revision {
                     new.revision = new
@@ -733,7 +796,7 @@ impl Tree {
             serde_json::to_vec(&Header {
                 source: next.source.clone(),
                 identity: next.identity.clone(),
-                version: 3,
+                version: next.version.max(3),
                 backend: next.backend.clone(),
                 next_id: next.next_id,
                 retain_placeholders: next.retain_placeholders,
@@ -867,7 +930,12 @@ impl Tree {
     pub fn lookup_referenced(&self, parent: u64, name: &str) -> Result<Node> {
         component(name)?;
         let mut ns = self.namespace.lock().unwrap();
+        ensure!(
+            !ns.failed,
+            "output namespace commit failed; reopen for recovery"
+        );
         directory(&ns.state, parent)?;
+        lazy_source::require_loaded(&ns.state, parent)?;
         let id = child(&ns.state, parent, name).ok_or(CoreError::NotFound)?;
         let node = record(&ns.state, id)?.node.clone();
         Self::retain_lookup_locked(&mut ns, id)?;
@@ -1080,18 +1148,32 @@ impl Tree {
     pub fn lookup(&self, parent: u64, name: &str) -> Result<Node> {
         component(name)?;
         let ns = self.namespace.lock().unwrap();
+        ensure!(
+            !ns.failed,
+            "output namespace commit failed; reopen for recovery"
+        );
         directory(&ns.state, parent)?;
+        lazy_source::require_loaded(&ns.state, parent)?;
         let id = child(&ns.state, parent, name).ok_or(CoreError::NotFound)?;
         Ok(record(&ns.state, id)?.node.clone())
     }
     pub fn resolve(&self, path: &str) -> Result<Node> {
         let ns = self.namespace.lock().unwrap();
+        ensure!(
+            !ns.failed,
+            "output namespace commit failed; reopen for recovery"
+        );
         let id = resolve_state(&ns.state, path)?.ok_or(CoreError::NotFound)?;
         Ok(record(&ns.state, id)?.node.clone())
     }
     pub fn list(&self, parent: u64, after: u64, limit: usize) -> Result<Vec<Node>> {
         let ns = self.namespace.lock().unwrap();
+        ensure!(
+            !ns.failed,
+            "output namespace commit failed; reopen for recovery"
+        );
         directory(&ns.state, parent)?;
+        lazy_source::require_loaded(&ns.state, parent)?;
         Ok(ns
             .state
             .children
@@ -1106,8 +1188,15 @@ impl Tree {
 
     pub fn readlink(&self, id: u64) -> Result<String> {
         let ns = self.namespace.lock().unwrap();
+        ensure!(
+            !ns.failed,
+            "output namespace commit failed; reopen for recovery"
+        );
         let r = record(&ns.state, id)?;
         ensure!(r.node.kind == NodeKind::Symlink, "not a symlink");
+        if r.target.is_none() && r.source_origin.is_some() {
+            return Err(SourceNotLoaded.into());
+        }
         r.target.clone().context("missing symlink target")
     }
     /// Maximum immutable artifact size admitted by the configured cache lanes.
@@ -1129,6 +1218,8 @@ impl Tree {
             .await
     }
     pub async fn ensure_dir(&self, path: &str) -> Result<Node> {
+        let _job = self.source_job()?;
+        self.ensure_source_path_ancestors(path).await?;
         let names = parts(path)?;
         self.source_writable_path(path)?;
         {
@@ -1141,6 +1232,8 @@ impl Tree {
         self.change(|s| {
             let mut id = 1;
             for name in names {
+                require(record(s, id)?.node.linked, CoreError::Stale)?;
+                lazy_source::require_loaded(s, id)?;
                 id = if let Some(id) = child(s, id, name) {
                     directory(s, id)?;
                     id
@@ -1164,8 +1257,15 @@ impl Tree {
     ) -> Result<Node> {
         component(name)?;
         self.source_writable_child(parent, name)?;
-        self.change(|s| {
+        let gate = self.source_gate.lock().unwrap();
+        ensure!(!gate.frozen, "source namespace is frozen");
+        let mut ns = self.namespace.lock().unwrap();
+        let mut created_payload = None;
+        let result = Self::change_locked(&mut ns, |s| {
+            let previous = s.clone();
             directory(s, parent)?;
+            require(record(s, parent)?.node.linked, CoreError::Stale)?;
+            lazy_source::require_loaded(s, parent)?;
             if let Some(id) = child(s, parent, name) {
                 let r = record(s, id)?;
                 if verifier.is_some() && r.verifier == verifier && r.node.kind == NodeKind::File {
@@ -1179,6 +1279,7 @@ impl Tree {
                     .write(true)
                     .create_new(true)
                     .open(self.local_path(n.id))?;
+                created_payload = Some(self.local_path(n.id));
                 f.sync_all()?;
                 sync_directory(&self.state_dir.join("local"))?;
             }
@@ -1188,10 +1289,25 @@ impl Tree {
             r.verifier = verifier;
             let n = r.node.clone();
             touch(s, parent);
+            source::validate_control_change(&previous, s)?;
             Ok(n)
-        })
+        });
+        // Validation failures roll back the allocator as well as metadata. Do
+        // not strand a reusable inode ID behind its uncommitted local payload.
+        // Keep the namespace/allocator lock through cleanup so no other writer
+        // can reuse this inode before its rollback payload has been removed.
+        // A failed database commit is uncertain: preserve bytes for reopen.
+        if result.is_err() && !ns.failed {
+            if let Some(path) = created_payload {
+                fs::remove_file(path).context("remove uncommitted source payload")?;
+                sync_directory(&self.state_dir.join("local"))?;
+            }
+        }
+        result
     }
     pub async fn create(&self, parent: u64, name: &str, mode: u32) -> Result<Node> {
+        let _job = self.source_job()?;
+        self.ensure_directory_loaded(parent).await?;
         self.create_record(parent, name, NodeKind::File, mode, None, None)
     }
     pub async fn create_exclusive(
@@ -1201,12 +1317,18 @@ impl Tree {
         mode: u32,
         verifier: [u8; 8],
     ) -> Result<Node> {
+        let _job = self.source_job()?;
+        self.ensure_directory_loaded(parent).await?;
         self.create_record(parent, name, NodeKind::File, mode, None, Some(verifier))
     }
     pub async fn mkdir(&self, parent: u64, name: &str, mode: u32) -> Result<Node> {
+        let _job = self.source_job()?;
+        self.ensure_directory_loaded(parent).await?;
         self.create_record(parent, name, NodeKind::Directory, mode, None, None)
     }
     pub async fn symlink(&self, parent: u64, name: &str, target: &str) -> Result<Node> {
+        let _job = self.source_job()?;
+        self.ensure_directory_loaded(parent).await?;
         ensure!(!target.contains('\0'), "invalid symlink target");
         self.create_record(parent, name, NodeKind::Symlink, 0o777, Some(target), None)
     }
@@ -1223,6 +1345,7 @@ impl Tree {
                 }
             }
             if node.kind == NodeKind::Directory {
+                lazy_source::require_loaded(s, id)?;
                 require(
                     s.children.range((id, 0)..=(id, u64::MAX)).next().is_none(),
                     CoreError::NotEmpty,
@@ -1234,12 +1357,26 @@ impl Tree {
         })
     }
     pub async fn unlink(&self, parent: u64, name: &str) -> Result<()> {
+        let _job = self.source_job()?;
+        self.ensure_directory_loaded(parent).await?;
+        let candidate = self.lookup(parent, name)?;
+        if candidate.kind == NodeKind::Directory {
+            self.ensure_directory_loaded(candidate.id).await?;
+        }
         self.unlink_kind(parent, name, None)
     }
     pub async fn unlink_file(&self, parent: u64, name: &str) -> Result<()> {
+        let _job = self.source_job()?;
+        self.ensure_directory_loaded(parent).await?;
         self.unlink_kind(parent, name, Some(NodeKind::File))
     }
     pub async fn unlink_directory(&self, parent: u64, name: &str) -> Result<()> {
+        let _job = self.source_job()?;
+        self.ensure_directory_loaded(parent).await?;
+        let candidate = self.lookup(parent, name)?;
+        if candidate.kind == NodeKind::Directory {
+            self.ensure_directory_loaded(candidate.id).await?;
+        }
         self.unlink_kind(parent, name, Some(NodeKind::Directory))
     }
     pub async fn rename(
@@ -1249,6 +1386,14 @@ impl Tree {
         new_parent: u64,
         new_name: &str,
     ) -> Result<()> {
+        let _job = self.source_job()?;
+        self.ensure_directory_loaded(parent).await?;
+        self.ensure_directory_loaded(new_parent).await?;
+        if let Ok(replaced) = self.lookup(new_parent, new_name) {
+            if replaced.kind == NodeKind::Directory {
+                self.ensure_directory_loaded(replaced.id).await?;
+            }
+        }
         component(name)?;
         component(new_name)?;
         let expected = self.lookup(parent, name)?.id;
@@ -1256,6 +1401,9 @@ impl Tree {
         let _guard = lock.lock().await;
         self.change(|s| {
             directory(s, new_parent)?;
+            require(record(s, new_parent)?.node.linked, CoreError::Stale)?;
+            lazy_source::require_loaded(s, parent)?;
+            lazy_source::require_loaded(s, new_parent)?;
             let id = child(s, parent, name).ok_or(CoreError::NotFound)?;
             require(id == expected, CoreError::Stale)?;
             if parent == new_parent && name == new_name {
@@ -1281,6 +1429,7 @@ impl Tree {
                     },
                 )?;
                 if oldnode.kind == NodeKind::Directory {
+                    lazy_source::require_loaded(s, old)?;
                     require(
                         s.children
                             .range((old, 0)..=(old, u64::MAX))
@@ -1301,6 +1450,7 @@ impl Tree {
         })
     }
     pub async fn prepare_stage(&self, path: &str, artifact: Artifact) -> Result<PreparedStage> {
+        let _job = self.source_job()?;
         self.source_writable_path(path)?;
         self.validate_artifact(&artifact)?;
         let names = parts(path)?;
@@ -1308,8 +1458,11 @@ impl Tree {
         let name = *names.last().unwrap();
         let prefix = names[..names.len() - 1].join("/");
         let parent = self.ensure_dir(&prefix).await?;
+        self.ensure_directory_loaded(parent.id).await?;
         self.change(|s| {
             directory(s, parent.id)?;
+            require(record(s, parent.id)?.node.linked, CoreError::Stale)?;
+            lazy_source::require_loaded(s, parent.id)?;
             let previous = child(s, parent.id, name).map(|id| record(s, id).unwrap().node.clone());
             if let Some(n) = &previous {
                 ensure!(n.kind != NodeKind::Directory, "cannot stage over directory");
@@ -1392,6 +1545,7 @@ impl Tree {
     /// Atomic namespace-only publication. Channels needing a pre-publication
     /// native update must instead use prepare_stage/commit_stage.
     pub async fn stage(&self, path: &str, artifact: Artifact) -> Result<Node> {
+        let _job = self.source_job()?;
         self.source_writable_path(path)?;
         self.validate_artifact(&artifact)?;
         let names = parts(path)?;
@@ -1399,6 +1553,7 @@ impl Tree {
         let name = *names.last().unwrap();
         let prefix = names[..names.len() - 1].join("/");
         let parent = self.ensure_dir(&prefix).await?;
+        self.ensure_directory_loaded(parent.id).await?;
         self.change(|s| {
             directory(s, parent.id)?;
             require(record(s, parent.id)?.node.linked, CoreError::Stale)?;
@@ -1519,6 +1674,34 @@ impl Tree {
         }
         Ok(())
     }
+    fn prepare_payload_change(&self, id: u64) -> Result<u64> {
+        let gate = self.source_gate.lock().unwrap();
+        ensure!(!gate.frozen, "source namespace is frozen");
+        let mut ns = self.namespace.lock().unwrap();
+        ensure!(
+            !ns.failed,
+            "output namespace commit failed; reopen for recovery"
+        );
+        let current = record(&ns.state, id)?;
+        if ns
+            .state
+            .source
+            .as_ref()
+            .is_none_or(|source| source.lazy.is_none())
+            || current.source_clean_ctime.is_none()
+        {
+            return Ok(current.node.ctime);
+        }
+        Self::change_locked(&mut ns, |state| {
+            state
+                .nodes
+                .get_mut(&id)
+                .context("inode disappeared")?
+                .source_clean_ctime = None;
+            touch(state, id);
+            Ok(record(state, id)?.node.ctime)
+        })
+    }
     pub async fn write(&self, id: u64, offset: u64, bytes: &[u8]) -> Result<usize> {
         let deadline = tokio::time::Instant::now() + self.cache.config().operation_timeout;
         self.bounded_operation(deadline, self.write_inner(id, offset, bytes, deadline))
@@ -1538,7 +1721,12 @@ impl Tree {
         if bytes.is_empty() {
             return Ok(0);
         }
+        self.prepare_payload_change(id)?;
         self.make_local(id, deadline).await?;
+        let mut physical = PayloadMutation {
+            tree: self,
+            armed: self.lazy_source_pin().is_some(),
+        };
         let mut file = OpenOptions::new().write(true).open(self.local_path(id))?;
         file.seek(SeekFrom::Start(offset))?;
         file.write_all(bytes)?;
@@ -1550,6 +1738,7 @@ impl Tree {
             touch(s, id);
             Ok(())
         })?;
+        physical.armed = false;
         Ok(bytes.len())
     }
     pub async fn setattr(&self, id: u64, attrs: SetAttr) -> Result<Node> {
@@ -1582,9 +1771,20 @@ impl Tree {
         if let Some(t) = expected_ctime {
             require(node.ctime == t, CoreError::NotSync)?;
         }
+        let mut expected_ctime = expected_ctime;
+        let protect_payload = self.lazy_source_pin().is_some();
+        let mut physical = PayloadMutation {
+            tree: self,
+            armed: false,
+        };
         if let Some(size) = attrs.size {
             ensure!(node.kind == NodeKind::File, "cannot resize non-file");
+            let prepared = self.prepare_payload_change(id)?;
+            if expected_ctime.is_some() {
+                expected_ctime = Some(prepared);
+            }
             if size == 0 && node.remote.is_some() {
+                physical.armed = protect_payload;
                 let f = File::create(self.local_path(id))?;
                 f.sync_all()?;
                 sync_directory(&self.state_dir.join("local"))?;
@@ -1597,11 +1797,12 @@ impl Tree {
             } else {
                 self.make_local(id, deadline).await?;
             }
+            physical.armed = protect_payload;
             let f = OpenOptions::new().write(true).open(self.local_path(id))?;
             f.set_len(size)?;
             f.sync_all()?;
         }
-        self.change(|s| {
+        let result = self.change(|s| {
             let n = &mut s.nodes.get_mut(&id).context("inode disappeared")?.node;
             if let Some(t) = expected_ctime {
                 require(n.ctime == t, CoreError::NotSync)?;
@@ -1620,9 +1821,14 @@ impl Tree {
                 n.mtime = t;
             }
             Ok(n.clone())
-        })
+        });
+        if result.is_ok() {
+            physical.armed = false;
+        }
+        result
     }
     pub fn known_remotes(&self, prefix: &str) -> Result<Vec<Artifact>> {
+        self.require_complete_source_namespace()?;
         let ns = self.namespace.lock().unwrap();
         let Some(root) = resolve_state(&ns.state, prefix)? else {
             return Ok(vec![]);
@@ -1636,6 +1842,7 @@ impl Tree {
             .collect())
     }
     pub async fn prepare_refresh(&self, prefix: &str) -> Result<RefreshPlan> {
+        self.require_complete_source_namespace()?;
         let candidates = {
             let ns = self.namespace.lock().unwrap();
             let mut candidates = Vec::new();
@@ -1709,6 +1916,7 @@ impl Tree {
         self.apply_refresh(plan).await
     }
     pub async fn clean(&self, prefix: &str) -> Result<()> {
+        self.require_complete_source_namespace()?;
         parts(prefix)?;
         self.change(|s| {
             // Clean also cancels unpublished records, even if no linked entry
@@ -1761,12 +1969,12 @@ impl Tree {
         digest_function: i32,
         deadline: tokio::time::Instant,
     ) -> Result<Option<TreeStat>> {
-        let node = {
-            let ns = self.namespace.lock().unwrap();
-            let Some(id) = resolve_state(&ns.state, path)? else {
+        let node = match self.resolve_source(path).await {
+            Ok(node) => node,
+            Err(error) if error.downcast_ref::<CoreError>() == Some(&CoreError::NotFound) => {
                 return Ok(None);
-            };
-            record(&ns.state, id)?.node.clone()
+            }
+            Err(error) => return Err(error),
         };
         if node.kind == NodeKind::File && node.remote.is_some() {
             let ns = self.namespace.lock().unwrap();
@@ -1941,6 +2149,20 @@ fn hash_file_until(
         },
         size,
     ))
+}
+/// Once authoritative bytes may have changed, metadata rejection cannot leave
+/// the namespace readable with stale clean checkpoints. Dirty intent is already
+/// durable; reopen reconciles authoritative sizes before serving it again.
+struct PayloadMutation<'a> {
+    tree: &'a Tree,
+    armed: bool,
+}
+impl Drop for PayloadMutation<'_> {
+    fn drop(&mut self) {
+        if self.armed {
+            self.tree.namespace.lock().unwrap().failed = true;
+        }
+    }
 }
 struct CancelWork(Arc<AtomicBool>);
 impl Drop for CancelWork {

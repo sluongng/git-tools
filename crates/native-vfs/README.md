@@ -2,8 +2,8 @@
 
 Owns a native source workspace and projects it through Linux FUSE, macOS NFS or
 Windows ProjFS. These use the existing platform providers; protocol tests are not
-native macOS/Windows acceptance. Directory and symlink metadata are installed before mounting;
-regular files hydrate on demand through the daemon's shared local CAS.
+native macOS/Windows acceptance. New workspaces load directory and symlink metadata
+lazily; regular files hydrate on demand through the daemon's shared local CAS.
 
 Use private state outside the mount and an opaque workspace ID. Restart preserves
 dirty files and uses the durable current base, not a bootstrap reset. Persistent

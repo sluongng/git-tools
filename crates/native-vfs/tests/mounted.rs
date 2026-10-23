@@ -14,6 +14,7 @@ async fn native_mount_is_metadata_only_lazy_writable_and_restartable() {
         .await
         .unwrap();
     assert_eq!(provider.file_reads.load(Ordering::SeqCst), 0);
+    assert_eq!(provider.metadata_reads.load(Ordering::SeqCst), 0);
     assert_eq!(
         fs::metadata(config.root.join("tool"))
             .unwrap()
@@ -32,11 +33,42 @@ async fn native_mount_is_metadata_only_lazy_writable_and_restartable() {
         b"native source\n"
     );
     assert_eq!(provider.file_reads.load(Ordering::SeqCst), 1);
+    let snapshot = mount
+        .tree()
+        .freeze_lazy_source_wait(
+            output_core::SourceFrontendFence::TreeOnly,
+            &config.source_limits,
+            tokio::time::Instant::now() + std::time::Duration::from_secs(5),
+        )
+        .await
+        .unwrap();
+    let expected = snapshot.version().clone();
+    drop(snapshot);
+    let receipt = mount
+        .checkout_resolved(
+            &config.root_merge,
+            expected.clone(),
+            "native-checked-replay".into(),
+        )
+        .await
+        .unwrap();
+    let replay = mount
+        .checkout_resolved(&config.root_merge, expected, "native-checked-replay".into())
+        .await
+        .unwrap();
+    assert_eq!(
+        receipt, replay,
+        "exact retry must retain the original generation"
+    );
+    assert_eq!(
+        mount.tree().source_baseline().unwrap().1,
+        receipt.version.generation
+    );
     fs::write(config.root.join("tool"), b"dirty native file\n").unwrap();
     fs::write(config.root.join("new"), b"new native file\n").unwrap();
     assert!(fs::write(config.root.join(".jj/native-workspace"), b"tampered").is_err());
     assert!(fs::rename(config.root.join(".jj"), config.root.join("moved")).is_err());
-    let snapshot = mount.capture_quiescent().unwrap();
+    let snapshot = mount.capture_lazy_quiescent().unwrap();
     assert!(snapshot.entries().iter().any(|e| e.path == "new"));
     drop(snapshot);
     mount.shutdown().await.unwrap();

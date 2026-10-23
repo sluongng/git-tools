@@ -12,12 +12,23 @@ async fn prepare_is_metadata_only_and_restart_preserves_dirty_files_and_control_
         .unwrap();
     let tree = workspace.tree();
     assert_eq!(provider.file_reads.load(Ordering::SeqCst), 0);
-    assert_eq!(tree.resolve("tool").unwrap().mode & 0o777, 0o755);
+    assert_eq!(provider.metadata_reads.load(Ordering::SeqCst), 0);
+    assert!(
+        tree.resolve("tool")
+            .unwrap_err()
+            .is::<output_core::SourceNotLoaded>()
+    );
     assert_eq!(
-        tree.readlink(tree.resolve("link").unwrap().id).unwrap(),
+        tree.resolve_source("tool").await.unwrap().mode & 0o777,
+        0o755
+    );
+    assert_eq!(
+        tree.readlink_source(tree.resolve_source("link").await.unwrap().id)
+            .await
+            .unwrap(),
         "tool"
     );
-    let control = tree.resolve(".jj/native-workspace").unwrap();
+    let control = tree.resolve_source(".jj/native-workspace").await.unwrap();
     assert_eq!(
         tree.read(control.id, 0, 100).await.unwrap(),
         "03".repeat(32).as_bytes()
@@ -30,10 +41,10 @@ async fn prepare_is_metadata_only_and_restart_preserves_dirty_files_and_control_
     );
     let local = tree.create(tree.root_id(), "new", 0o644).await.unwrap();
     tree.write(local.id, 0, b"new local bytes").await.unwrap();
-    let tool = tree.resolve("tool").unwrap();
+    let tool = tree.resolve_source("tool").await.unwrap();
     tree.write(tool.id, 0, b"DIRTY").await.unwrap();
     assert_eq!(provider.file_reads.load(Ordering::SeqCst), 1);
-    let snapshot = workspace.capture_tree_only().unwrap();
+    let snapshot = workspace.capture_lazy_tree_only().unwrap();
     assert!(
         snapshot
             .entries()
@@ -48,20 +59,33 @@ async fn prepare_is_metadata_only_and_restart_preserves_dirty_files_and_control_
         .await
         .unwrap();
     let tree = workspace.tree();
+    assert_eq!(provider.metadata_reads.load(Ordering::SeqCst), 2);
     assert_eq!(
-        tree.read(tree.resolve("new").unwrap().id, 0, 100)
+        tree.read(tree.resolve_source("unused").await.unwrap().id, 0, 100)
+            .await
+            .unwrap(),
+        b"untouched source\n"
+    );
+    assert_eq!(
+        tree.read(tree.resolve_source("new").await.unwrap().id, 0, 100)
             .await
             .unwrap(),
         b"new local bytes"
     );
     assert!(
-        tree.read(tree.resolve("tool").unwrap().id, 0, 100)
+        tree.read(tree.resolve_source("tool").await.unwrap().id, 0, 100)
             .await
             .unwrap()
             .starts_with(b"DIRTY")
     );
-    assert_eq!(tree.resolve(".jj/native-workspace").unwrap().id, control.id);
-    assert_eq!(provider.file_reads.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        tree.resolve_source(".jj/native-workspace")
+            .await
+            .unwrap()
+            .id,
+        control.id
+    );
+    assert_eq!(provider.file_reads.load(Ordering::SeqCst), 2);
     assert!(
         prepare(config, provider, cache).await.is_err(),
         "a second owner must not open this namespace"
@@ -99,7 +123,7 @@ async fn pending_exact_bootstrap_replay_does_not_reset_dirty_state() {
     let workspace = prepare(config, provider.clone(), cache).await.unwrap();
     let tree = workspace.tree();
     assert_eq!(
-        tree.read(tree.resolve("survivor").unwrap().id, 0, 100)
+        tree.read(tree.resolve_source("survivor").await.unwrap().id, 0, 100)
             .await
             .unwrap(),
         b"must survive receipt replay"
@@ -177,36 +201,35 @@ async fn restart_authorizes_durable_current_base_without_replacing_it_with_boots
             },
         }],
     }));
-    let compiled = workspace
+    let lazy = workspace
         .compiler()
-        .compile_tree(tinytree_model::TreeId(root.key.id.0))
-        .await
+        .lazy_tree(tinytree_model::TreeId(root.key.id.0), 2)
         .unwrap();
     let tree = workspace.tree();
-    let snapshot = workspace.capture_tree_only().unwrap();
+    let snapshot = workspace.capture_lazy_tree_only().unwrap();
     snapshot
         .install(
-            compiled.manifest(tree.identity()),
+            lazy.source_root(tree.identity()),
             "checked-switch",
             &config.source_limits,
         )
         .unwrap();
     let local = tree.create(tree.root_id(), "dirty", 0o644).await.unwrap();
     tree.write(local.id, 0, b"dirty on new base").await.unwrap();
-    drop(compiled);
+    drop(lazy);
     drop(tree);
     drop(workspace);
     let workspace = prepare(config, provider.clone(), cache).await.unwrap();
     let tree = workspace.tree();
-    assert!(tree.resolve("tool").is_err());
+    assert!(tree.resolve_source("tool").await.is_err());
     assert_eq!(
-        tree.read(tree.resolve("next").unwrap().id, 0, 100)
+        tree.read(tree.resolve_source("next").await.unwrap().id, 0, 100)
             .await
             .unwrap(),
         b"new durable base source"
     );
     assert_eq!(
-        tree.read(tree.resolve("dirty").unwrap().id, 0, 100)
+        tree.read(tree.resolve_source("dirty").await.unwrap().id, 0, 100)
             .await
             .unwrap(),
         b"dirty on new base"

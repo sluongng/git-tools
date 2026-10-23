@@ -1555,3 +1555,723 @@ async fn source_freeze_rejects_inflight_cow_and_nonempty_initial_namespace() {
     );
     assert!(other.resolve("existing").is_ok());
 }
+
+#[derive(Default)]
+struct Directories {
+    panic: AtomicBool,
+    directories: Mutex<HashMap<[u8; 32], Vec<SourceDirectoryEntry>>>,
+    calls: Mutex<Vec<([u8; 32], String)>>,
+    delay: AtomicBool,
+    fail: AtomicBool,
+    entered: tokio::sync::Notify,
+    release: tokio::sync::Notify,
+    held_owner: Mutex<Option<Arc<dyn std::any::Any + Send + Sync>>>,
+    retain_owner: AtomicBool,
+}
+#[async_trait]
+impl SourceDirectoryProvider for Directories {
+    async fn read_directory(
+        &self,
+        _: SourcePin,
+        tree_id: [u8; 32],
+        base_path: String,
+        _: SourceLoadLimits,
+        owner: Arc<dyn std::any::Any + Send + Sync>,
+    ) -> Result<VerifiedSourceDirectory> {
+        self.calls.lock().unwrap().push((tree_id, base_path));
+        assert!(
+            !self.panic.swap(false, Ordering::SeqCst),
+            "injected provider panic"
+        );
+        if self.retain_owner.swap(false, Ordering::SeqCst) {
+            *self.held_owner.lock().unwrap() = Some(owner);
+        }
+        if self.delay.swap(false, Ordering::SeqCst) {
+            self.entered.notify_one();
+            self.release.notified().await;
+        }
+        ensure!(!self.fail.load(Ordering::SeqCst), "directory unavailable");
+        let entries = self
+            .directories
+            .lock()
+            .unwrap()
+            .get(&tree_id)
+            .context("missing directory")?
+            .clone();
+        Ok(VerifiedSourceDirectory { tree_id, entries })
+    }
+    async fn read_symlink(
+        &self,
+        _: SourcePin,
+        _: [u8; 32],
+        _: u64,
+        _: Arc<dyn std::any::Any + Send + Sync>,
+    ) -> Result<String> {
+        Ok("target".into())
+    }
+}
+fn directory_entry(name: &str, tree_id: [u8; 32]) -> SourceDirectoryEntry {
+    SourceDirectoryEntry {
+        name: name.into(),
+        mode: 0o755,
+        kind: SourceDirectoryEntryKind::Directory { tree_id },
+    }
+}
+fn file_entry(name: &str, artifact: Artifact, copy_id: Option<[u8; 32]>) -> SourceDirectoryEntry {
+    SourceDirectoryEntry {
+        name: name.into(),
+        mode: 0o644,
+        kind: SourceDirectoryEntryKind::File { artifact, copy_id },
+    }
+}
+fn lazy_fixture(tree: &Tree, source: &Source, directories: &Arc<Directories>) -> LazySourceRoot {
+    directories.directories.lock().unwrap().insert(
+        [1; 32],
+        vec![
+            directory_entry("a", [2; 32]),
+            file_entry("root.txt", source.artifact(b"root"), None),
+            directory_entry("unvisited", [3; 32]),
+        ],
+    );
+    directories.directories.lock().unwrap().insert(
+        [2; 32],
+        vec![file_entry(
+            "tracked.txt",
+            source.artifact(b"before"),
+            Some([9; 32]),
+        )],
+    );
+    directories.directories.lock().unwrap().insert(
+        [3; 32],
+        vec![file_entry(
+            "untouched.txt",
+            source.artifact(b"untouched"),
+            None,
+        )],
+    );
+    LazySourceRoot {
+        identity: tree.identity().into(),
+        root_tree: [1; 32],
+        pin: SourcePin {
+            root: [1; 32],
+            generation: 1,
+        },
+        provider: directories.clone(),
+        load_limits: SourceLoadLimits::default(),
+    }
+}
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn lazy_directories_are_not_absent_and_population_is_not_an_edit() {
+    let (_dir, source, tree) = setup(CacheConfig::default());
+    let directories = Arc::new(Directories::default());
+    tree.install_lazy_source(
+        lazy_fixture(&tree, &source, &directories),
+        None,
+        "install",
+        &SourceLimits::default(),
+    )
+    .unwrap();
+    assert!(
+        tree.lookup(1, "a")
+            .unwrap_err()
+            .downcast_ref::<SourceNotLoaded>()
+            .is_some()
+    );
+    assert!(
+        tree.list(1, 0, 10)
+            .unwrap_err()
+            .downcast_ref::<SourceNotLoaded>()
+            .is_some()
+    );
+    assert!(
+        tree.freeze_source(SourceFrontendFence::TreeOnly, &SourceLimits::default())
+            .is_err(),
+        "a full inventory must never silently become partial"
+    );
+    let before = tree
+        .freeze_lazy_source(SourceFrontendFence::TreeOnly, &SourceLimits::default())
+        .unwrap();
+    let version = before.version().clone();
+    drop(before);
+    let a = tree.lookup_source(1, "a").await.unwrap();
+    assert_eq!(directories.calls.lock().unwrap().len(), 1);
+    let file = tree.lookup_source(a.id, "tracked.txt").await.unwrap();
+    let after = tree
+        .freeze_lazy_source(SourceFrontendFence::TreeOnly, &SourceLimits::default())
+        .unwrap();
+    assert_eq!(after.version(), &version);
+    assert!(after.changes().is_empty() && after.entries().is_empty());
+    assert!(
+        after
+            .directories()
+            .iter()
+            .any(|d| d.path == "unvisited" && !d.loaded)
+    );
+    drop(after);
+    assert_eq!(source.calls.load(Ordering::SeqCst), 0);
+    assert_eq!(tree.read(file.id, 0, 99).await.unwrap(), b"before");
+    assert_eq!(source.calls.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        *directories.calls.lock().unwrap(),
+        vec![([1; 32], String::new()), ([2; 32], "a".into())]
+    );
+    tree.rename(1, "unvisited", 1, "moved").await.unwrap();
+    let moved = tree.lookup_source(1, "moved").await.unwrap();
+    let snapshot = tree
+        .freeze_lazy_source(SourceFrontendFence::TreeOnly, &SourceLimits::default())
+        .unwrap();
+    assert!(
+        snapshot
+            .directories()
+            .iter()
+            .any(|d| d.path == "moved" && d.tree_id == [3; 32] && !d.loaded)
+    );
+    assert!(snapshot.changes().iter().any(|change| matches!(change,
+        SourceNamespaceChange::Move { from, to, origin: Some(origin) }
+        if from == "unvisited" && to == "moved" && origin.path == "unvisited")));
+    let moved_version = snapshot.version().clone();
+    drop(snapshot);
+    tree.lookup_source(moved.id, "untouched.txt").await.unwrap();
+    assert_eq!(
+        directories.calls.lock().unwrap().last().unwrap(),
+        &([3; 32], "unvisited".into())
+    );
+    let loaded = tree
+        .freeze_lazy_source(SourceFrontendFence::TreeOnly, &SourceLimits::default())
+        .unwrap();
+    assert_eq!(
+        loaded.version(),
+        &moved_version,
+        "population under a moved directory is still not an edit"
+    );
+}
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn lazy_directory_fetch_singleflight_and_physical_owner_outlive_cancelled_waiters() {
+    let (_dir, source, tree) = setup(CacheConfig::default());
+    let directories = Arc::new(Directories::default());
+    tree.install_lazy_source(
+        lazy_fixture(&tree, &source, &directories),
+        None,
+        "install",
+        &SourceLimits::default(),
+    )
+    .unwrap();
+    directories.delay.store(true, Ordering::SeqCst);
+    directories.retain_owner.store(true, Ordering::SeqCst);
+    let first = {
+        let tree = tree.clone();
+        tokio::spawn(async move { tree.ensure_directory_loaded(1).await })
+    };
+    directories.entered.notified().await;
+    first.abort();
+    let _ = first.await;
+    let second = {
+        let tree = tree.clone();
+        tokio::spawn(async move { tree.ensure_directory_loaded(1).await })
+    };
+    directories.release.notify_one();
+    second.await.unwrap().unwrap();
+    assert_eq!(directories.calls.lock().unwrap().len(), 1);
+    assert!(
+        tree.freeze_lazy_source(SourceFrontendFence::TreeOnly, &SourceLimits::default())
+            .unwrap_err()
+            .downcast_ref::<SourceFreezeBusy>()
+            .is_some(),
+        "physical metadata workers retain the source fence"
+    );
+    directories.held_owner.lock().unwrap().take();
+    tree.freeze_lazy_source_wait(
+        SourceFrontendFence::TreeOnly,
+        &SourceLimits::default(),
+        tokio::time::Instant::now() + Duration::from_secs(2),
+    )
+    .await
+    .unwrap();
+}
+#[tokio::test]
+async fn lazy_directory_failure_bounds_and_real_emptiness_never_publish_a_subset() {
+    // Canonical prefixes are repeated in every child's provenance. The wire
+    // object is small, but its expanded resident Records exceed this budget.
+    {
+        let (_dir, source, bounded) = setup(CacheConfig::default());
+        let directories = Arc::new(Directories::default());
+        let mut root = lazy_fixture(&bounded, &source, &directories);
+        root.load_limits.max_directory_bytes = 64 * 1024;
+        let component = "p".repeat(200);
+        for index in 1..=10u8 {
+            directories.directories.lock().unwrap().insert(
+                [index; 32],
+                vec![directory_entry(&component, [index + 1; 32])],
+            );
+        }
+        directories.directories.lock().unwrap().insert(
+            [11; 32],
+            (0..16)
+                .map(|index| file_entry(&format!("f{index:03}"), source.artifact(b"file"), None))
+                .collect(),
+        );
+        let limits = SourceLimits {
+            max_metadata_bytes: 128 * 1024,
+            ..SourceLimits::default()
+        };
+        bounded
+            .install_lazy_source(root, None, "prefix-bound", &limits)
+            .unwrap();
+        let mut parent = 1;
+        for _ in 0..10 {
+            parent = bounded.lookup_source(parent, &component).await.unwrap().id;
+        }
+        let before = bounded.known_source_nodes(&limits).unwrap().len();
+        assert!(bounded.ensure_directory_loaded(parent).await.is_err());
+        assert_eq!(
+            bounded.known_source_nodes(&limits).unwrap().len(),
+            before,
+            "expanded-prefix failure must not publish or allocate a child subset"
+        );
+        assert!(
+            bounded
+                .lookup(parent, "f000")
+                .unwrap_err()
+                .downcast_ref::<SourceNotLoaded>()
+                .is_some()
+        );
+        assert_eq!(source.calls.load(Ordering::SeqCst), 0);
+    }
+    {
+        let (_dir, source, bounded) = setup(CacheConfig::default());
+        let directories = Arc::new(Directories::default());
+        let root = lazy_fixture(&bounded, &source, &directories);
+        let limits = SourceLimits {
+            max_entries: 3,
+            ..SourceLimits::default()
+        };
+        bounded
+            .install_lazy_source(root, None, "resident-bound", &limits)
+            .unwrap();
+        bounded.ensure_directory_loaded(1).await.unwrap();
+        assert!(bounded.create(1, "new.txt", 0o644).await.is_err());
+        bounded.unlink_file(1, "root.txt").await.unwrap();
+        bounded.reclaim_retired(10).unwrap();
+        bounded.create(1, "new.txt", 0o644).await.unwrap();
+    }
+    // A canonical object above the configured direct-entry limit must leave
+    // the entire directory unknown, never publish a permitted prefix.
+    {
+        let (_dir, source, bounded) = setup(CacheConfig::default());
+        let directories = Arc::new(Directories::default());
+        let mut root = lazy_fixture(&bounded, &source, &directories);
+        root.load_limits.max_directory_entries = 2;
+        bounded
+            .install_lazy_source(root, None, "bounded", &SourceLimits::default())
+            .unwrap();
+        assert!(bounded.ensure_directory_loaded(1).await.is_err());
+        assert!(
+            bounded
+                .lookup(1, "a")
+                .unwrap_err()
+                .downcast_ref::<SourceNotLoaded>()
+                .is_some()
+        );
+        assert_eq!(source.calls.load(Ordering::SeqCst), 0);
+    }
+    let (_dir, source, tree) = setup(CacheConfig::default());
+    let directories = Arc::new(Directories::default());
+    tree.install_lazy_source(
+        lazy_fixture(&tree, &source, &directories),
+        None,
+        "install",
+        &SourceLimits::default(),
+    )
+    .unwrap();
+    directories.panic.store(true, Ordering::SeqCst);
+    assert!(
+        tokio::time::timeout(Duration::from_secs(2), tree.ensure_directory_loaded(1))
+            .await
+            .unwrap()
+            .is_err()
+    );
+    directories.fail.store(true, Ordering::SeqCst);
+    assert!(tree.ensure_directory_loaded(1).await.is_err());
+    assert!(
+        tree.list(1, 0, 10)
+            .unwrap_err()
+            .downcast_ref::<SourceNotLoaded>()
+            .is_some()
+    );
+    directories.fail.store(false, Ordering::SeqCst);
+    directories
+        .directories
+        .lock()
+        .unwrap()
+        .get_mut(&[1; 32])
+        .unwrap()
+        .push(directory_entry("a", [2; 32]));
+    assert!(tree.ensure_directory_loaded(1).await.is_err());
+    assert!(
+        tree.lookup(1, "a")
+            .unwrap_err()
+            .downcast_ref::<SourceNotLoaded>()
+            .is_some()
+    );
+    directories
+        .directories
+        .lock()
+        .unwrap()
+        .get_mut(&[1; 32])
+        .unwrap()
+        .pop();
+    let unvisited = tree.lookup_source(1, "unvisited").await.unwrap();
+    assert_eq!(
+        *tree
+            .unlink_directory(1, "unvisited")
+            .await
+            .unwrap_err()
+            .downcast_ref::<CoreError>()
+            .unwrap(),
+        CoreError::NotEmpty
+    );
+    assert!(
+        tree.create(unvisited.id, "untouched.txt", 0o644)
+            .await
+            .unwrap_err()
+            .downcast_ref::<CoreError>()
+            == Some(&CoreError::AlreadyExists)
+    );
+    assert_eq!(source.calls.load(Ordering::SeqCst), 0);
+}
+#[tokio::test]
+async fn lazy_delta_reopen_and_acknowledgement_keep_unvisited_siblings_and_local_authority() {
+    let (dir, source, tree) = setup(CacheConfig::default());
+    let directories = Arc::new(Directories::default());
+    tree.install_lazy_source(
+        lazy_fixture(&tree, &source, &directories),
+        None,
+        "install",
+        &SourceLimits::default(),
+    )
+    .unwrap();
+    let a = tree.lookup_source(1, "a").await.unwrap();
+    let file = tree.lookup_source(a.id, "tracked.txt").await.unwrap();
+    tree.setattr(
+        file.id,
+        SetAttr {
+            size: Some(0),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    tree.write(file.id, 0, b"edited").await.unwrap();
+    tree.rename(a.id, "tracked.txt", a.id, "renamed.txt")
+        .await
+        .unwrap();
+    let new = tree.create(a.id, "new.txt", 0o644).await.unwrap();
+    tree.write(new.id, 0, b"new").await.unwrap();
+    tree.unlink_file(1, "root.txt").await.unwrap();
+    tree.reclaim_retired(100).unwrap();
+    let before = tree
+        .freeze_lazy_source(SourceFrontendFence::TreeOnly, &SourceLimits::default())
+        .unwrap();
+    assert!(before.changes().iter().any(|c|matches!(c,SourceNamespaceChange::Move{from,to,..} if from=="a/tracked.txt"&&to=="a/renamed.txt")));
+    assert!(
+        before
+            .changes()
+            .iter()
+            .any(|c| matches!(c,SourceNamespaceChange::Remove{path,..} if path=="root.txt"))
+    );
+    assert!(
+        before
+            .directories()
+            .iter()
+            .any(|d| d.path == "unvisited" && !d.loaded)
+    );
+    assert_eq!(before.read_local(file.id, 0, 99).unwrap(), b"edited");
+    let expected = before.version().clone();
+    let same_root = LazySourceRoot {
+        identity: tree.identity().into(),
+        root_tree: [1; 32],
+        pin: SourcePin {
+            root: [1; 32],
+            generation: 2,
+        },
+        provider: directories.clone(),
+        load_limits: SourceLoadLimits::default(),
+    };
+    assert!(
+        before
+            .acknowledge_root(
+                same_root,
+                Vec::new(),
+                expected.clone(),
+                "missing-ancestry",
+                &SourceLimits::default()
+            )
+            .is_err()
+    );
+    assert!(tree.source_receipt("missing-ancestry").unwrap().is_none());
+    drop(tree);
+    let tree = Tree::open(dir.path(), "test", source.clone(), CacheConfig::default()).unwrap();
+    tree.attach_lazy_source(
+        directories.clone(),
+        SourcePin {
+            root: [1; 32],
+            generation: 1,
+        },
+    )
+    .unwrap();
+    assert!(
+        tree.lookup_source(1, "root.txt")
+            .await
+            .unwrap_err()
+            .downcast_ref::<CoreError>()
+            == Some(&CoreError::NotFound)
+    );
+    let snapshot = tree
+        .freeze_lazy_source(SourceFrontendFence::TreeOnly, &SourceLimits::default())
+        .unwrap();
+    assert_eq!(snapshot.version(), &expected);
+    let new_entries = vec![
+        file_entry("new.txt", source.artifact(b"new"), None),
+        file_entry("renamed.txt", source.artifact(b"edited"), Some([10; 32])),
+    ];
+    let root_entries = vec![
+        directory_entry("a", [12; 32]),
+        directory_entry("unvisited", [3; 32]),
+    ];
+    directories
+        .directories
+        .lock()
+        .unwrap()
+        .insert([11; 32], root_entries.clone());
+    directories
+        .directories
+        .lock()
+        .unwrap()
+        .insert([12; 32], new_entries.clone());
+    let next = LazySourceRoot {
+        identity: tree.identity().into(),
+        root_tree: [11; 32],
+        pin: SourcePin {
+            root: [11; 32],
+            generation: 2,
+        },
+        provider: directories.clone(),
+        load_limits: SourceLoadLimits::default(),
+    };
+    let receipt = snapshot
+        .acknowledge_root(
+            next,
+            vec![
+                SourceBaselineUpdate {
+                    symlink_targets: Default::default(),
+                    path: String::new(),
+                    directory: VerifiedSourceDirectory {
+                        tree_id: [11; 32],
+                        entries: root_entries,
+                    },
+                },
+                SourceBaselineUpdate {
+                    symlink_targets: Default::default(),
+                    path: "a".into(),
+                    directory: VerifiedSourceDirectory {
+                        tree_id: [12; 32],
+                        entries: new_entries,
+                    },
+                },
+            ],
+            expected,
+            "ack",
+            &SourceLimits::default(),
+        )
+        .unwrap();
+    assert_eq!(receipt.version.generation, 2);
+    assert!(
+        tree.get(file.id).unwrap().remote.is_none(),
+        "ACK never offloads local authoritative bytes"
+    );
+    let after = tree
+        .freeze_lazy_source(SourceFrontendFence::TreeOnly, &SourceLimits::default())
+        .unwrap();
+    assert!(after.entries().is_empty() && after.changes().is_empty());
+    assert!(
+        after
+            .directories()
+            .iter()
+            .any(|d| d.path == "unvisited" && d.tree_id == [3; 32] && !d.loaded)
+    );
+    drop(after);
+    assert_eq!(tree.read(file.id, 0, 99).await.unwrap(), b"edited");
+    assert!(
+        !directories
+            .calls
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|(id, _)| *id == [3; 32])
+    );
+}
+#[tokio::test]
+async fn lazy_directory_cursor_rejects_mutations_and_root_replacement() {
+    let (_dir, source, tree) = setup(CacheConfig::default());
+    let directories = Arc::new(Directories::default());
+    tree.install_lazy_source(
+        lazy_fixture(&tree, &source, &directories),
+        None,
+        "install",
+        &SourceLimits::default(),
+    )
+    .unwrap();
+    let page = tree.list_source_page(1, None, 1).await.unwrap();
+    let cursor = page.next.unwrap();
+    tree.create(1, "local", 0o644).await.unwrap();
+    assert_eq!(
+        *tree
+            .list_source_page(1, Some(cursor), 1)
+            .await
+            .unwrap_err()
+            .downcast_ref::<CoreError>()
+            .unwrap(),
+        CoreError::Stale
+    );
+    let snapshot = tree
+        .freeze_lazy_source(SourceFrontendFence::TreeOnly, &SourceLimits::default())
+        .unwrap();
+    let next = LazySourceRoot {
+        identity: tree.identity().into(),
+        root_tree: [1; 32],
+        pin: SourcePin {
+            root: [1; 32],
+            generation: 2,
+        },
+        provider: directories,
+        load_limits: SourceLoadLimits::default(),
+    };
+    snapshot
+        .install(next, "replace", &SourceLimits::default())
+        .unwrap();
+    assert!(
+        tree.lookup(1, "a")
+            .unwrap_err()
+            .downcast_ref::<SourceNotLoaded>()
+            .is_some()
+    );
+}
+
+#[tokio::test]
+async fn lazy_symlink_acknowledgement_rejects_same_size_different_target() {
+    let (_dir, source, tree) = setup(CacheConfig::default());
+    let directories = Arc::new(Directories::default());
+    let initial = lazy_fixture(&tree, &source, &directories);
+    directories
+        .directories
+        .lock()
+        .unwrap()
+        .insert([1; 32], Vec::new());
+    tree.install_lazy_source(initial, None, "install", &SourceLimits::default())
+        .unwrap();
+    let link = tree.symlink(1, "link", "left").await.unwrap();
+    let snapshot = tree
+        .freeze_lazy_source(SourceFrontendFence::TreeOnly, &SourceLimits::default())
+        .unwrap();
+    let expected = snapshot.version().clone();
+    let root = LazySourceRoot {
+        identity: tree.identity().into(),
+        root_tree: [11; 32],
+        pin: SourcePin {
+            root: [11; 32],
+            generation: 2,
+        },
+        provider: directories,
+        load_limits: SourceLoadLimits::default(),
+    };
+    let update = SourceBaselineUpdate {
+        path: String::new(),
+        directory: VerifiedSourceDirectory {
+            tree_id: [11; 32],
+            entries: vec![SourceDirectoryEntry {
+                name: "link".into(),
+                mode: 0o777,
+                kind: SourceDirectoryEntryKind::Symlink {
+                    object_id: [66; 32],
+                    target_size: 4,
+                },
+            }],
+        },
+        symlink_targets: std::collections::BTreeMap::from([("link".into(), "else".into())]),
+    };
+    assert!(
+        snapshot
+            .acknowledge_root(
+                root,
+                vec![update],
+                expected.clone(),
+                "wrong-target",
+                &SourceLimits::default()
+            )
+            .is_err()
+    );
+    assert_eq!(tree.readlink(link.id).unwrap(), "left");
+    assert!(tree.source_receipt("wrong-target").unwrap().is_none());
+    let unchanged = tree
+        .freeze_lazy_source(SourceFrontendFence::TreeOnly, &SourceLimits::default())
+        .unwrap();
+    assert_eq!(unchanged.version(), &expected);
+    assert_eq!(
+        unchanged
+            .entries()
+            .iter()
+            .find(|entry| entry.node.id == link.id)
+            .unwrap()
+            .target
+            .as_deref(),
+        Some("left")
+    );
+}
+
+#[tokio::test]
+async fn lazy_authoritative_payload_recovery_keeps_same_size_and_growing_edits_dirty() {
+    for (behavior, bytes) in [
+        ("same-size edit", b"abcdefghi".as_slice()),
+        ("size repair", b"abcdefghij".as_slice()),
+    ] {
+        let (dir, source, tree) = setup(CacheConfig::default());
+        let directories = Arc::new(Directories::default());
+        let root = lazy_fixture(&tree, &source, &directories);
+        directories.directories.lock().unwrap().insert(
+            [1; 32],
+            vec![file_entry("tracked", source.artifact(b"123456789"), None)],
+        );
+        tree.install_lazy_source(root, None, "install", &SourceLimits::default())
+            .unwrap();
+        let file = tree.lookup_source(1, "tracked").await.unwrap();
+        // This public write copies up clean bytes but cannot complete its seek
+        // or write at the unrepresentable file offset. It must have persisted
+        // dirty intent before attempting physical mutation, not only after a
+        // successful metadata commit. Replace bytes to model the crash window.
+        assert!(tree.write(file.id, u64::MAX, b"x").await.is_err());
+        assert!(tree.lookup(1, "tracked").is_err());
+        assert!(tree.list(1, 0, 10).is_err());
+        assert!(tree.resolve_source("tracked").await.is_err());
+        assert!(
+            tree.freeze_lazy_source(SourceFrontendFence::TreeOnly, &SourceLimits::default())
+                .is_err()
+        );
+        fs::write(dir.path().join("local").join(file.id.to_string()), bytes).unwrap();
+        drop(tree);
+        let reopened = Tree::open(dir.path(), "test", source, CacheConfig::default()).unwrap();
+        let snapshot = reopened
+            .freeze_lazy_source(SourceFrontendFence::TreeOnly, &SourceLimits::default())
+            .unwrap();
+        let entry = snapshot
+            .entries()
+            .iter()
+            .find(|entry| entry.node.id == file.id)
+            .unwrap_or_else(|| panic!("{behavior} must remain dirty after restart"));
+        assert_eq!(entry.node.size, bytes.len() as u64, "{behavior}");
+        assert_eq!(
+            snapshot.read_local(file.id, 0, 99).unwrap(),
+            bytes,
+            "{behavior}"
+        );
+    }
+}

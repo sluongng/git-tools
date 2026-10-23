@@ -51,6 +51,12 @@ fn hr(c: u32) -> HRESULT {
     }
 }
 fn hydration_error(error: &anyhow::Error) -> HRESULT {
+    if error.is::<output_core::SourceLoadBusy>()
+        || error.is::<output_core::SourceNotLoaded>()
+        || error.is::<output_core::CacheTimeoutError>()
+    {
+        return hr(ERROR_FILE_SYSTEM_VIRTUALIZATION_UNAVAILABLE);
+    }
     if error
         .downcast_ref::<output_core::CacheLimitError>()
         .is_some()
@@ -323,6 +329,7 @@ struct Publication {
     rename_epoch: u64,
 }
 struct Enumeration {
+    _generation: output_core::GenerationLease,
     nodes: Vec<Node>,
     next: usize,
     expression: Option<Vec<u16>>,
@@ -349,6 +356,7 @@ struct Provider {
     completed: AtomicU64,
     canceled: AtomicU64,
     source_captures: std::sync::atomic::AtomicUsize,
+    metadata_jobs: std::sync::atomic::AtomicUsize,
     source_control: Option<source_control::SourceControl>,
     budget: Arc<Semaphore>,
     runtime: tokio::runtime::Handle,
@@ -442,7 +450,7 @@ impl Provider {
         }
         Ok(())
     }
-    fn lookup(&self, path: &str) -> Result<Node> {
+    fn lookup(self: &Arc<Self>, path: &str) -> Result<Node> {
         let mut n = self.tree.get(1)?;
         for part in path.split(['\\', '/']).filter(|s| !s.is_empty()) {
             crate::validate_component(part)?;
@@ -453,25 +461,74 @@ impl Provider {
                 .find(
                     |n| unsafe { PrjFileNameCompare(wide(&n.name).as_ptr(), wanted.as_ptr()) } == 0,
                 )
-                .context("output not found")?;
+                .ok_or(output_core::CoreError::NotFound)?;
         }
         Ok(n)
     }
-    fn children(&self, parent: u64) -> Result<Vec<Node>> {
-        let mut all = Vec::new();
-        let mut after = 0;
-        loop {
-            let nodes = self.tree.list(parent, after, 1024)?;
-            if nodes.is_empty() {
-                break;
+    fn children(self: &Arc<Self>, parent: u64) -> Result<Vec<Node>> {
+        let mut all = match self.tree.list(parent, 0, usize::MAX) {
+            Ok(nodes) => nodes,
+            Err(error) if error.is::<output_core::SourceNotLoaded>() => {
+                self.load_directory(parent)?;
+                self.tree.list(parent, 0, usize::MAX)?
             }
-            after = nodes.last().unwrap().id;
-            all.extend(nodes);
-        }
+            Err(error) => return Err(error),
+        };
         all.sort_by(|a, b| {
             unsafe { PrjFileNameCompare(wide(&a.name).as_ptr(), wide(&b.name).as_ptr()) }.cmp(&0)
         });
         Ok(all)
+    }
+    // Native callbacks own no runtime. Copy only owned state into a bounded
+    // runtime job, and wait without holding namespace/provider locks. The job
+    // retains its admission and generation even if the callback times out.
+    fn load_directory(self: &Arc<Self>, parent: u64) -> Result<()> {
+        let permit = self
+            .budget
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| output_core::SourceLoadBusy)?;
+        {
+            let _pending = self.pending.lock().unwrap();
+            ensure!(
+                !self.stopping.load(Ordering::Acquire) && !self.draining.load(Ordering::Acquire),
+                "projection stopped"
+            );
+            self.metadata_jobs.fetch_add(1, Ordering::AcqRel);
+        }
+        struct Job(Arc<Provider>);
+        impl Drop for Job {
+            fn drop(&mut self) {
+                self.0.metadata_jobs.fetch_sub(1, Ordering::AcqRel);
+            }
+        }
+        let job = Job(self.clone());
+        let generation = self.tree.pin_generation();
+        let (send, receive) = std::sync::mpsc::sync_channel(1);
+        self.runtime.spawn(async move {
+            let _permit = permit;
+            let _generation = generation;
+            let result = job.0.tree.ensure_directory_loaded(parent).await;
+            let _ = send.send(result);
+            drop(job);
+        });
+        let wait = || {
+            receive
+                .recv_timeout(std::time::Duration::from_secs(30))
+                .map_err(|_| {
+                    anyhow::Error::from(output_core::SourceLoadBusy)
+                        .context("source directory unavailable or timed out")
+                })?
+        };
+        let result = if tokio::runtime::Handle::try_current().is_ok_and(|runtime| {
+            runtime.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread
+        }) {
+            tokio::task::block_in_place(wait)
+        } else {
+            wait()
+        };
+        ensure!(!self.stopping.load(Ordering::Acquire), "projection stopped");
+        result
     }
     fn native_state(&self, path: &str) -> Result<Option<PRJ_FILE_STATE>> {
         let mut state = 0;
@@ -501,7 +558,7 @@ impl Provider {
     fn flush(&self) -> Result<()> {
         self.context_call(|c| unsafe { PrjClearNegativePathCache(c, ptr::null_mut()) })
     }
-    fn validate_path(&self, path: &str) -> Result<()> {
+    fn validate_path(self: &Arc<Self>, path: &str) -> Result<()> {
         ensure!(
             !path.starts_with(['\\', '/']) && !path.contains('\\'),
             "expected relative slash-separated path"
@@ -745,6 +802,7 @@ impl Drop for ProjfsMount {
             let drain = || {
                 while !self.provider.pending.lock().unwrap().is_empty()
                     || self.provider.source_captures.load(Ordering::Acquire) != 0
+                    || self.provider.metadata_jobs.load(Ordering::Acquire) != 0
                 {
                     std::thread::sleep(std::time::Duration::from_millis(1));
                 }
@@ -928,6 +986,7 @@ pub async fn start(tree: Arc<Tree>, root: &Path, state: &Path) -> Result<ProjfsM
         completed: AtomicU64::new(0),
         canceled: AtomicU64::new(0),
         source_captures: std::sync::atomic::AtomicUsize::new(0),
+        metadata_jobs: std::sync::atomic::AtomicUsize::new(0),
         source_control,
         budget: Arc::new(Semaphore::new(32)),
         runtime,
@@ -1237,6 +1296,7 @@ impl Projection for ProjfsMount {
         }
         while !self.provider.pending.lock().unwrap().is_empty()
             || self.provider.source_captures.load(Ordering::Acquire) != 0
+            || self.provider.metadata_jobs.load(Ordering::Acquire) != 0
         {
             tokio::time::sleep(std::time::Duration::from_millis(1)).await;
         }
@@ -1357,13 +1417,23 @@ unsafe extern "system" fn start_enumeration(
             ensure!(!id.is_null(), "missing enumeration ID");
             // A locally created directory or a retired placeholder directory
             // still has native children; merge those with an empty remote set.
+            let generation = p.tree.pin_generation();
             let nodes = match p.lookup(&string(d.FilePathName)) {
                 Ok(n) => p.children(n.id)?,
-                Err(_) => Vec::new(),
+                Err(error)
+                    if matches!(
+                        error.downcast_ref::<output_core::CoreError>(),
+                        Some(output_core::CoreError::NotFound)
+                    ) =>
+                {
+                    Vec::new()
+                }
+                Err(error) => return Err(error),
             };
             p.enumerations.lock().unwrap().insert(
                 guid_key(&*id),
                 Enumeration {
+                    _generation: generation,
                     nodes,
                     next: 0,
                     expression: None,
@@ -1436,12 +1506,17 @@ unsafe extern "system" fn enumerate(
 }
 unsafe extern "system" fn query(d: *const PRJ_CALLBACK_DATA) -> HRESULT {
     unsafe {
-        callback(d, |d, p| {
-            Ok(if p.lookup(&string(d.FilePathName)).is_ok() {
-                S_OK
-            } else {
-                hr(ERROR_FILE_NOT_FOUND)
-            })
+        callback(d, |d, p| match p.lookup(&string(d.FilePathName)) {
+            Ok(_) => Ok(S_OK),
+            Err(error)
+                if matches!(
+                    error.downcast_ref::<output_core::CoreError>(),
+                    Some(output_core::CoreError::NotFound)
+                ) =>
+            {
+                Ok(hr(ERROR_FILE_NOT_FOUND))
+            }
+            Err(error) => Err(error),
         })
     }
 }
@@ -1451,7 +1526,15 @@ unsafe extern "system" fn placeholder(d: *const PRJ_CALLBACK_DATA) -> HRESULT {
             let path = string(d.FilePathName);
             let n = match p.lookup(&path) {
                 Ok(n) => n,
-                Err(_) => return Ok(hr(ERROR_FILE_NOT_FOUND)),
+                Err(error)
+                    if matches!(
+                        error.downcast_ref::<output_core::CoreError>(),
+                        Some(output_core::CoreError::NotFound)
+                    ) =>
+                {
+                    return Ok(hr(ERROR_FILE_NOT_FOUND));
+                }
+                Err(error) => return Err(error),
             };
             ensure!(n.kind != NodeKind::Symlink, "remote symlinks unsupported");
             let info = p.placeholder_info(&n)?;
@@ -1738,11 +1821,22 @@ unsafe extern "system" fn notification(
                 // A directory with projected descendants requires namespace
                 // rebasing; reject that case rather than lose virtual children.
                 for path in [string(data.FilePathName), string(destination)] {
-                    if !path.is_empty()
-                        && let Ok(node) = provider.lookup(&path)
-                        && node.kind == NodeKind::Directory
-                        && !provider.children(node.id)?.is_empty()
-                    {
+                    if path.is_empty() {
+                        continue;
+                    }
+                    let node = match provider.lookup(&path) {
+                        Ok(node) => node,
+                        Err(error)
+                            if matches!(
+                                error.downcast_ref::<output_core::CoreError>(),
+                                Some(output_core::CoreError::NotFound)
+                            ) =>
+                        {
+                            continue;
+                        }
+                        Err(error) => return Err(error),
+                    };
+                    if node.kind == NodeKind::Directory && !provider.children(node.id)?.is_empty() {
                         return Ok(hr(ERROR_NOT_SUPPORTED));
                     }
                 }

@@ -44,6 +44,12 @@ fn status(error: anyhow::Error) -> nfsstat3 {
     status_ref(&error)
 }
 fn status_ref(error: &anyhow::Error) -> nfsstat3 {
+    if error.is::<output_core::SourceLoadBusy>()
+        || error.is::<output_core::SourceNotLoaded>()
+        || error.is::<output_core::CacheTimeoutError>()
+    {
+        return nfsstat3::NFS3ERR_JUKEBOX;
+    }
     if error
         .downcast_ref::<output_core::CacheLimitError>()
         .is_some()
@@ -291,7 +297,8 @@ impl NFSFileSystem for OutputNfs {
         }
         Ok(self
             .tree
-            .lookup(parent, name(filename)?)
+            .lookup_source(parent, name(filename)?)
+            .await
             .map_err(status)?
             .id)
     }
@@ -429,7 +436,8 @@ impl NFSFileSystem for OutputNfs {
     ) -> std::result::Result<ReadDirResult, nfsstat3> {
         let nodes = self
             .tree
-            .list(p, after, max.min(4096).saturating_add(1))
+            .list_source(p, after, max.min(4096).saturating_add(1))
+            .await
             .map_err(status)?;
         let end = nodes.len() <= max.min(4096);
         Ok(ReadDirResult {
@@ -464,7 +472,13 @@ impl NFSFileSystem for OutputNfs {
         Ok((node.id, attrs(node)))
     }
     async fn readlink(&self, id: u64) -> std::result::Result<nfspath3, nfsstat3> {
-        Ok(self.tree.readlink(id).map_err(status)?.as_bytes().into())
+        Ok(self
+            .tree
+            .readlink_source(id)
+            .await
+            .map_err(status)?
+            .as_bytes()
+            .into())
     }
 }
 

@@ -5,7 +5,9 @@ use fs2::FileExt;
 use jj_native_backend::NativeObjectIo;
 use local_cas::LocalCas;
 use native_workspace::{Compiler, Limits, Scope};
-use output_core::{Projection, SourceFrontendFence, SourceLimits, SourceSnapshot, Tree};
+use output_core::{
+    Projection, SourceDeltaSnapshot, SourceFrontendFence, SourceLimits, SourceSnapshot, Tree,
+};
 use private_fs::PrivateDir;
 use serde::{Deserialize, Serialize};
 use std::{
@@ -89,9 +91,28 @@ impl PreparedWorkspace {
         self.tree
             .freeze_source(SourceFrontendFence::TreeOnly, &self.config.source_limits)
     }
+    /// Explicit lazy delta capture; unopened base subtrees are not deletions.
+    pub fn capture_lazy_tree_only(&self) -> Result<SourceDeltaSnapshot> {
+        self.tree
+            .freeze_lazy_source(SourceFrontendFence::TreeOnly, &self.config.source_limits)
+    }
 }
 
-/// Compile/register all current source metadata before publishing a namespace.
+fn resolved_tree(merge: &m::TreeMerge) -> Result<m::TreeId> {
+    if merge.terms.len() != 1 {
+        return Err(native_workspace::UnresolvedMerge {
+            merge: merge.clone(),
+        }
+        .into());
+    }
+    ensure!(
+        merge.labels == [String::new()],
+        "invalid resolved native tree merge labels"
+    );
+    Ok(merge.terms[0])
+}
+
+/// Bind a lazy immutable source baseline without enumerating its directories.
 /// This does not mount or fetch regular file payloads and is RBE-testable.
 /// Existing ready state is never reset or reinstalled from the bootstrap seed.
 pub async fn prepare(
@@ -139,28 +160,57 @@ pub async fn prepare(
         );
     }
     if header.ready {
-        let current = {
-            let snapshot =
-                tree.freeze_source(SourceFrontendFence::TreeOnly, &config.source_limits)?;
-            m::TreeId(snapshot.base_root())
-        };
-        // A later successful checkout may differ from the immutable bootstrap.
-        // Authorize the complete CURRENT base before any frontend is exposed.
-        compiler.compile_tree(current).await?;
-    } else {
+        if let Some(pin) = tree.lazy_source_pin() {
+            // The inode root is always a local namespace handle. The persisted
+            // source baseline is the canonical immutable tree identity instead.
+            let (baseline, _) = tree.source_baseline()?;
+            ensure!(pin.root == baseline, "native lazy baseline pin mismatch");
+            let lazy = compiler.lazy_tree_for_source(
+                m::TreeId(baseline),
+                pin.generation,
+                config.source_limits.clone(),
+            )?;
+            let source = lazy.source_root(tree.identity());
+            compiler.restore_lazy_artifacts(&tree.lazy_source_artifacts()?)?;
+            tree.attach_lazy_source(source.provider, pin)?;
+        } else {
+            // Existing complete namespaces retain their explicit full metadata
+            // authorization path; do not reinterpret them as partial lazy state.
+            let current = {
+                let snapshot =
+                    tree.freeze_source(SourceFrontendFence::TreeOnly, &config.source_limits)?;
+                m::TreeId(snapshot.base_root())
+            };
+            compiler.compile_tree(current).await?;
+        }
+    } else if tree.lazy_source_pin().is_none() && tree.source_baseline().is_ok() {
+        // Resume the exact bootstrap receipt of a pre-lazy installation that
+        // stopped before its ready header was made durable.
         let compiled = compiler.compile_merge(&config.root_merge).await?;
-        let install_tree = tree.clone();
         let manifest = compiled.manifest(tree.identity());
+        let install_tree = tree.clone();
+        let limits = config.source_limits.clone();
+        let install_owner = owner.clone();
+        tokio::task::spawn_blocking(move || {
+            let _owner = install_owner;
+            install_tree.install_source(manifest, None, "native-bootstrap-v1", &limits)
+        })
+        .await??;
+    } else {
+        let root = resolved_tree(&config.root_merge)?;
+        let lazy = compiler.lazy_tree_for_source(root, 1, config.source_limits.clone())?;
+        let install_tree = tree.clone();
+        let source = lazy.source_root(tree.identity());
         let limits = config.source_limits.clone();
         let install_owner = owner.clone();
         tokio::task::spawn_blocking(move || -> Result<()> {
             let _owner = install_owner;
-            // Exact receipt replay only: source-core refuses unknown/nonempty
-            // namespaces and never overwrites dirty state using expected=None.
-            install_tree.install_source(manifest, None, "native-bootstrap-v1", &limits)?;
+            // Exact receipt replay only; never replace a recognized dirty view.
+            install_tree.install_lazy_source(source, None, "native-bootstrap-v1", &limits)?;
             Ok(())
         })
         .await??;
+        compiler.restore_lazy_artifacts(&tree.lazy_source_artifacts()?)?;
     }
     let marker = hex(&config.workspace_identity).into_bytes();
     let control_tree = tree.clone();
@@ -230,6 +280,20 @@ impl NativeMount {
             self.prepared.capture_tree_only()
         }
     }
+    /// A lazy namespace must be captured as a delta, never as an incomplete
+    /// complete manifest. Native users must be quiesced and flushed first.
+    pub fn capture_lazy_quiescent(&self) -> Result<SourceDeltaSnapshot> {
+        #[cfg(windows)]
+        {
+            anyhow::bail!(
+                "native Windows lazy source capture requires an authoritative dirty journal"
+            )
+        }
+        #[cfg(not(windows))]
+        {
+            self.prepared.capture_lazy_tree_only()
+        }
+    }
     /// Provider-fenced checked root publication. Providers without a native
     /// publication/invalidation fence return Unsupported; there is no raw Tree
     /// fallback. Compilation alone never changes the mounted namespace.
@@ -239,6 +303,28 @@ impl NativeMount {
         expected: output_core::SourceVersion,
         request_id: String,
     ) -> Result<output_core::SourceReceipt> {
+        if self.prepared.tree.lazy_source_pin().is_some() {
+            // Replays use the original expected version even if the root was
+            // installed before the controller could persist its completion.
+            let generation = expected
+                .generation
+                .checked_add(1)
+                .context("lazy source generation exhausted")?;
+            let lazy = self.prepared.compiler.lazy_tree_for_source(
+                resolved_tree(merge)?,
+                generation,
+                self.prepared.config.source_limits.clone(),
+            )?;
+            return self
+                .projection
+                .publish_lazy_source(
+                    lazy.source_root(self.prepared.tree.identity()),
+                    expected,
+                    request_id,
+                    self.prepared.config.source_limits.clone(),
+                )
+                .await;
+        }
         let compiled = self.prepared.compiler.compile_merge(merge).await?;
         self.projection
             .publish_source(

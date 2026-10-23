@@ -18,6 +18,7 @@ struct CountingIo {
     direct: Arc<DirectObjectIo>,
     reads: AtomicUsize,
     uploads: AtomicUsize,
+    metadata_reads: Mutex<Vec<m::ObjectKey>>,
 }
 #[async_trait]
 impl NativeObjectIo for CountingIo {
@@ -26,6 +27,14 @@ impl NativeObjectIo for CountingIo {
     }
     async fn read_metadata(&self, key: m::ObjectKey) -> BackendResult<VerifiedMetadata> {
         self.direct.read_metadata(key).await
+    }
+    async fn read_metadata_with_owner(
+        &self,
+        key: m::ObjectKey,
+        owner: Arc<dyn std::any::Any + Send + Sync>,
+    ) -> BackendResult<VerifiedMetadata> {
+        self.metadata_reads.lock().unwrap().push(key);
+        self.direct.read_metadata_with_owner(key, owner).await
     }
     async fn write_metadata(&self, object: m::Object) -> BackendResult<m::Descriptor> {
         self.direct.write_metadata(object).await
@@ -70,6 +79,12 @@ struct Fixture {
 }
 impl Fixture {
     async fn new(ignore: bool) -> Self {
+        Self::with_mode(ignore, false).await
+    }
+    async fn lazy(ignore: bool) -> Self {
+        Self::with_mode(ignore, true).await
+    }
+    async fn with_mode(ignore: bool, lazy: bool) -> Self {
         let directory = tempfile::tempdir().unwrap();
         let root = directory.path().join("mount");
         fs::create_dir(&root).unwrap();
@@ -85,6 +100,7 @@ impl Fixture {
             direct,
             reads: AtomicUsize::new(0),
             uploads: AtomicUsize::new(0),
+            metadata_reads: Mutex::new(Vec::new()),
         });
         let mut entries = Vec::new();
         for (name, bytes, executable) in [
@@ -121,6 +137,42 @@ impl Fixture {
                 },
             });
         }
+        if lazy {
+            let copy = provider
+                .write_metadata(m::Object::CopyHistory(m::CopyHistory {
+                    current_path: "tracked".into(),
+                    parents: Vec::new(),
+                    salt: Vec::new(),
+                }))
+                .await
+                .unwrap();
+            if let m::TreeValue::File { copy_id, .. } = &mut entries
+                .iter_mut()
+                .find(|entry| entry.name == "tracked")
+                .unwrap()
+                .value
+            {
+                *copy_id = Some(m::CopyId(copy.key.id.0));
+            }
+            let subtree = provider
+                .write_metadata(m::Object::Tree(m::Tree {
+                    entries: vec![m::TreeEntry {
+                        name: "deep".into(),
+                        value: entries
+                            .iter()
+                            .find(|entry| entry.name == "untouched")
+                            .unwrap()
+                            .value
+                            .clone(),
+                    }],
+                }))
+                .await
+                .unwrap();
+            entries.push(m::TreeEntry {
+                name: "unvisited".into(),
+                value: m::TreeValue::Tree(m::TreeId(subtree.key.id.0)),
+            });
+        }
         entries.sort_by(|a, b| a.name.cmp(&b.name));
         let base = m::TreeId(
             provider
@@ -149,14 +201,27 @@ impl Fixture {
             compiler.source(),
         )
         .unwrap();
-        let compiled = compiler.compile_tree(base).await.unwrap();
-        tree.install_source(
-            compiled.manifest(tree.identity()),
-            None,
-            "bootstrap",
-            &SourceLimits::default(),
-        )
-        .unwrap();
+        if lazy {
+            let source = compiler
+                .lazy_tree_for_source(base, 1, SourceLimits::default())
+                .unwrap();
+            tree.install_lazy_source(
+                source.source_root(tree.identity()),
+                None,
+                "bootstrap",
+                &SourceLimits::default(),
+            )
+            .unwrap();
+        } else {
+            let compiled = compiler.compile_tree(base).await.unwrap();
+            tree.install_source(
+                compiled.manifest(tree.identity()),
+                None,
+                "bootstrap",
+                &SourceLimits::default(),
+            )
+            .unwrap();
+        }
         provider.reads.store(0, Ordering::SeqCst);
         provider.uploads.store(0, Ordering::SeqCst);
         Self {
@@ -200,6 +265,7 @@ impl Fixture {
     fn reset_counts(&self) {
         self.provider.reads.store(0, Ordering::SeqCst);
         self.provider.uploads.store(0, Ordering::SeqCst);
+        self.provider.metadata_reads.lock().unwrap().clear();
     }
 }
 fn options() -> SnapshotOptions<'static> {
@@ -420,6 +486,82 @@ async fn persisted_source_ack_recovers_controller_wal_gap_and_missing_receipts_s
         fixture.tree.resolve("tracked").unwrap().kind,
         NodeKind::File,
         "reset/ack never replaces the namespace"
+    );
+    drop(controller);
+
+    // The lazy checkout's core receipt can land before the controller records
+    // native publication completion. Recovery must replay the ORIGINAL expected
+    // generation, not derive a new request from the already-advanced pin.
+    let fixture = Fixture::lazy(false).await;
+    fixture
+        .provider
+        .write_metadata(m::Object::Tree(m::Tree::default()))
+        .await
+        .unwrap();
+    let controller = fixture.open(None).await;
+    let before = controller.inspect().unwrap();
+    let capture = fixture
+        .tree
+        .freeze_lazy_source(SourceFrontendFence::TreeOnly, &SourceLimits::default())
+        .unwrap();
+    let expected = capture.version().clone();
+    drop(capture);
+    controller
+        .prepare(
+            "lazy-checkout-gap",
+            &before,
+            Action::CheckOut {
+                tree: target.clone(),
+            },
+            expected.clone(),
+        )
+        .unwrap();
+    let source = controller
+        .inner
+        .host
+        .publish(
+            &target,
+            expected.clone(),
+            "lazy-checkout-gap",
+            &SourceLimits::default(),
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(source.version.generation, expected.generation + 1);
+    let local = fixture.local("after-publication", b"preserved").await;
+    drop(controller);
+    let controller = fixture.open(None).await;
+    let receipt = match controller.receipt("lazy-checkout-gap").await.unwrap() {
+        ProjectionOutcome::Applied(receipt) => receipt,
+        _ => panic!("durable lazy checkout proof must recover"),
+    };
+    assert_eq!(receipt.before, before);
+    assert_eq!(receipt.after.tree, target);
+    assert_eq!(receipt.after.generation, source.version.generation);
+    assert_eq!(
+        fixture.tree.source_receipt("lazy-checkout-gap").unwrap(),
+        Some(source)
+    );
+    assert_eq!(
+        fixture
+            .tree
+            .resolve_source("after-publication")
+            .await
+            .unwrap()
+            .id,
+        local
+    );
+    assert_eq!(
+        fixture.tree.read(local, 0, 100).await.unwrap(),
+        b"preserved"
+    );
+    drop(controller);
+    let controller = fixture.open(None).await;
+    assert_eq!(
+        controller.inspect().unwrap(),
+        receipt.after,
+        "repeated reopen must not advance the checkout generation"
     );
 }
 
@@ -726,3 +868,363 @@ async fn empty_directory_prefix_does_not_hide_selected_descendant() {
 }
 
 mod scope_tests;
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn lazy_snapshot_preserves_unvisited_subtrees_and_replays_without_inventory_expansion() {
+    let fixture = Fixture::lazy(false).await;
+    let before_files = files(fixture.provider.as_ref(), fixture.base).await;
+    let m::TreeValue::Tree(hidden) = before_files["unvisited"] else {
+        panic!()
+    };
+    let controller = fixture.open(None).await;
+    fixture.reset_counts();
+    let mut mutation = controller
+        .begin(&controller.inspect().unwrap())
+        .await
+        .unwrap();
+    let (clean, _) = mutation.snapshot("lazy-clean", &options()).await.unwrap();
+    assert_eq!(clean.after.tree.terms, vec![fixture.base.0]);
+    assert!(
+        fixture.provider.metadata_reads.lock().unwrap().is_empty(),
+        "clean snapshot must not enumerate a directory"
+    );
+    mutation
+        .finish(&clean.after, &operation(), Some(&clean))
+        .await
+        .unwrap();
+    drop(mutation);
+    let tracked = fixture.tree.resolve_source("tracked").await.unwrap();
+    fixture.tree.write(tracked.id, 0, b"edit").await.unwrap();
+    fixture.reset_counts();
+    let mut mutation = controller
+        .begin(&controller.inspect().unwrap())
+        .await
+        .unwrap();
+    let (receipt, _) = mutation.snapshot("lazy-edit", &options()).await.unwrap();
+    assert_eq!(fixture.provider.uploads.load(Ordering::SeqCst), 1);
+    assert!(
+        !fixture
+            .provider
+            .metadata_reads
+            .lock()
+            .unwrap()
+            .contains(&m::ObjectKey {
+                kind: m::Kind::Tree,
+                id: m::ObjectId(hidden.0)
+            })
+    );
+    let actual = files(
+        fixture.provider.as_ref(),
+        m::TreeId(receipt.after.tree.terms[0]),
+    )
+    .await;
+    assert_eq!(actual["unvisited"], m::TreeValue::Tree(hidden));
+    assert_eq!(
+        fixture.tree.resolve_source("tracked").await.unwrap().id,
+        tracked.id
+    );
+    assert!(fixture.tree.get(tracked.id).unwrap().remote.is_none());
+    fixture.reset_counts();
+    let (replayed, _) = mutation.snapshot("lazy-edit", &options()).await.unwrap();
+    assert_eq!(replayed, receipt);
+    assert_eq!(fixture.provider.uploads.load(Ordering::SeqCst), 0);
+    assert!(fixture.provider.metadata_reads.lock().unwrap().is_empty());
+    mutation
+        .finish(&receipt.after, &operation(), Some(&receipt))
+        .await
+        .unwrap();
+    drop(mutation);
+    fixture.reset_counts();
+    let mut mutation = controller
+        .begin(&controller.inspect().unwrap())
+        .await
+        .unwrap();
+    mutation.snapshot("lazy-same", &options()).await.unwrap();
+    assert_eq!(fixture.provider.uploads.load(Ordering::SeqCst), 0);
+    assert!(fixture.provider.metadata_reads.lock().unwrap().is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn lazy_policy_keeps_ignored_local_entries_and_verified_symlink_targets() {
+    let fixture = Fixture::lazy(true).await;
+    let controller = fixture.open(None).await;
+    let ignored = fixture.local("ignored", b"not uploaded").await;
+    let new = fixture.local("new", b"ok").await;
+    fixture
+        .tree
+        .symlink(fixture.tree.root_id(), "link", "new")
+        .await
+        .unwrap();
+    fixture.reset_counts();
+    let mut mutation = controller
+        .begin(&controller.inspect().unwrap())
+        .await
+        .unwrap();
+    let (receipt, _) = mutation.snapshot("lazy-policy", &options()).await.unwrap();
+    assert_eq!(fixture.provider.uploads.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        fixture.provider.reads.load(Ordering::SeqCst),
+        1,
+        "only ignore-policy bytes are read"
+    );
+    let actual = files(
+        fixture.provider.as_ref(),
+        m::TreeId(receipt.after.tree.terms[0]),
+    )
+    .await;
+    assert!(actual.contains_key("new") && actual.contains_key("link"));
+    assert!(!actual.contains_key("ignored"));
+    assert_eq!(
+        fixture.tree.resolve_source("ignored").await.unwrap().id,
+        ignored
+    );
+    assert_eq!(fixture.tree.resolve_source("new").await.unwrap().id, new);
+    assert_eq!(
+        fixture.tree.read(ignored, 0, 100).await.unwrap(),
+        b"not uploaded"
+    );
+    let capture = fixture
+        .tree
+        .freeze_lazy_source(SourceFrontendFence::TreeOnly, &SourceLimits::default())
+        .unwrap();
+    assert_eq!(
+        capture
+            .entries()
+            .iter()
+            .filter(|entry| entry.path == "ignored")
+            .count(),
+        1,
+        "excluded content remains a dirty overlay"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn lazy_file_rename_rewrites_copy_lineage_and_directory_rename_rejects_before_intent() {
+    let fixture = Fixture::lazy(false).await;
+    let controller = fixture.open(None).await;
+    fixture
+        .tree
+        .rename(
+            fixture.tree.root_id(),
+            "tracked",
+            fixture.tree.root_id(),
+            "renamed",
+        )
+        .await
+        .unwrap();
+    let mut mutation = controller
+        .begin(&controller.inspect().unwrap())
+        .await
+        .unwrap();
+    let (receipt, _) = mutation.snapshot("lazy-rename", &options()).await.unwrap();
+    let actual = files(
+        fixture.provider.as_ref(),
+        m::TreeId(receipt.after.tree.terms[0]),
+    )
+    .await;
+    assert!(!actual.contains_key("tracked"));
+    let m::TreeValue::File {
+        copy_id: Some(copy_id),
+        ..
+    } = actual["renamed"]
+    else {
+        panic!()
+    };
+    let copy = fixture
+        .provider
+        .read_metadata(m::ObjectKey {
+            kind: m::Kind::CopyHistory,
+            id: m::ObjectId(copy_id.0),
+        })
+        .await
+        .unwrap()
+        .into_object();
+    let m::Object::CopyHistory(copy) = copy else {
+        panic!()
+    };
+    assert_eq!(copy.current_path, "renamed");
+    assert_eq!(copy.parents.len(), 1);
+    mutation
+        .finish(&receipt.after, &operation(), Some(&receipt))
+        .await
+        .unwrap();
+    drop(mutation);
+    fixture
+        .tree
+        .rename(
+            fixture.tree.root_id(),
+            "unvisited",
+            fixture.tree.root_id(),
+            "moved-directory",
+        )
+        .await
+        .unwrap();
+    let before = controller.inspect().unwrap();
+    let mut mutation = controller.begin(&before).await.unwrap();
+    let error = mutation
+        .snapshot("unsupported-directory", &options())
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(&error,ProjectionFailure::Rejected(error) if error.downcast_ref::<LazyMutationUnsupported>()==Some(&LazyMutationUnsupported::DirectoryRename))
+    );
+    assert_eq!(controller.inspect().unwrap(), before);
+    assert!(matches!(
+        controller.receipt("unsupported-directory").await.unwrap(),
+        ProjectionOutcome::Unknown
+    ));
+    assert!(fixture.tree.resolve_source("moved-directory").await.is_ok());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn lazy_checkout_counts_changed_leaves_and_reset_rejects_unsafe_rebaseline_without_intent() {
+    let fixture = Fixture::lazy(false).await;
+    let controller = fixture.open(None).await;
+    let base_files = files(fixture.provider.as_ref(), fixture.base).await;
+    let mut entries: Vec<_> = base_files
+        .into_iter()
+        .map(|(name, value)| m::TreeEntry { name, value })
+        .collect();
+    let file = fixture
+        .provider
+        .write_file(&mut Cursor::new(b"next"), 4)
+        .await
+        .unwrap();
+    if let m::TreeValue::File { id, .. } = &mut entries
+        .iter_mut()
+        .find(|entry| entry.name == "untouched")
+        .unwrap()
+        .value
+    {
+        *id = file;
+    }
+    let target = fixture
+        .provider
+        .write_metadata(m::Object::Tree(m::Tree { entries }))
+        .await
+        .unwrap();
+    let native = NativeTree {
+        terms: vec![target.key.id.0],
+        labels: Vec::new(),
+    };
+    let before = controller.inspect().unwrap();
+    let mut mutation = controller.begin(&before).await.unwrap();
+    let error = mutation
+        .reset("unsafe-reset", &native, false)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(&error,ProjectionFailure::Rejected(error) if error.downcast_ref::<LazyMutationUnsupported>()==Some(&LazyMutationUnsupported::ResetWithDifferentContents))
+    );
+    assert_eq!(controller.inspect().unwrap(), before);
+    assert!(matches!(
+        controller.receipt("unsafe-reset").await.unwrap(),
+        ProjectionOutcome::Unknown
+    ));
+    let (receipt, stats) = mutation.check_out("lazy-checkout", &native).await.unwrap();
+    assert_eq!(stats.updated_files, 1);
+    assert_eq!(stats.added_files, 0);
+    assert_eq!(stats.removed_files, 0);
+    assert_eq!(receipt.after.tree, native);
+    assert_eq!(fixture.provider.reads.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn lazy_recreated_tracked_file_keeps_policy_and_original_copy_lineage() {
+    let fixture = Fixture::lazy(true).await;
+    let controller = fixture.open(None).await;
+    let original = files(fixture.provider.as_ref(), fixture.base).await["tracked"].clone();
+    fixture
+        .tree
+        .unlink_file(fixture.tree.root_id(), "tracked")
+        .await
+        .unwrap();
+    let recreated = fixture.local("tracked", b"replacement").await;
+    let mut policy = options();
+    policy.max_new_file_size = 0;
+    let mut mutation = controller
+        .begin(&controller.inspect().unwrap())
+        .await
+        .unwrap();
+    let (receipt, stats) = mutation
+        .snapshot("tracked-recreate", &policy)
+        .await
+        .unwrap();
+    assert!(
+        stats.untracked_paths.is_empty(),
+        "recreated tracked paths are not new-file policy candidates"
+    );
+    let actual = files(
+        fixture.provider.as_ref(),
+        m::TreeId(receipt.after.tree.terms[0]),
+    )
+    .await;
+    let m::TreeValue::File {
+        copy_id: previous, ..
+    } = original
+    else {
+        panic!()
+    };
+    let m::TreeValue::File {
+        copy_id: current, ..
+    } = actual["tracked"]
+    else {
+        panic!()
+    };
+    assert_eq!(current, previous);
+    assert_eq!(
+        fixture.tree.resolve_source("tracked").await.unwrap().id,
+        recreated
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn lazy_excluded_nested_local_directory_can_be_tracked_on_a_later_snapshot() {
+    let fixture = Fixture::lazy(false).await;
+    let controller = fixture.open(None).await;
+    let directory = fixture
+        .tree
+        .mkdir(fixture.tree.root_id(), "work", 0o755)
+        .await
+        .unwrap();
+    let node = fixture
+        .tree
+        .create(directory.id, "note", 0o644)
+        .await
+        .unwrap();
+    fixture.tree.write(node.id, 0, b"local note").await.unwrap();
+    let mut policy = options();
+    policy.max_new_file_size = 0;
+    let mut mutation = controller
+        .begin(&controller.inspect().unwrap())
+        .await
+        .unwrap();
+    let (first, _) = mutation.snapshot("exclude-nested", &policy).await.unwrap();
+    assert_eq!(first.after.tree.terms, vec![fixture.base.0]);
+    assert_eq!(fixture.provider.uploads.load(Ordering::SeqCst), 0);
+    mutation
+        .finish(&first.after, &operation(), Some(&first))
+        .await
+        .unwrap();
+    drop(mutation);
+    let mut mutation = controller
+        .begin(&controller.inspect().unwrap())
+        .await
+        .unwrap();
+    let (second, _) = mutation.snapshot("track-nested", &options()).await.unwrap();
+    let root = files(
+        fixture.provider.as_ref(),
+        m::TreeId(second.after.tree.terms[0]),
+    )
+    .await;
+    let m::TreeValue::Tree(work) = root["work"] else {
+        panic!()
+    };
+    let leaves = files(fixture.provider.as_ref(), work).await;
+    assert!(leaves.contains_key("note"));
+    assert_eq!(fixture.provider.uploads.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        fixture.tree.resolve_source("work/note").await.unwrap().id,
+        node.id
+    );
+}

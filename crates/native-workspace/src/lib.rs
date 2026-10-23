@@ -23,6 +23,9 @@ use std::{
 use tinytree_model as m;
 use tokio::sync::Semaphore;
 
+mod lazy;
+pub use lazy::LazyWorkspace;
+
 /// Construct only from trusted host repository configuration and its EFFECTIVE
 /// authorization/security identity, never a client-selected alias or endpoint.
 #[derive(Clone)]
@@ -77,7 +80,11 @@ impl Scope {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Limits {
+    /// Per complete compilation, or cumulative across one active lazy adapter.
+    /// Reattaching a lazy baseline starts fresh accounting; this is not a
+    /// durable repository quota. The namespace and provider bound stored state.
     pub max_metadata_objects: usize,
+    /// Same operation/active-adapter scope as `max_metadata_objects`.
     pub max_metadata_bytes: u64,
     pub max_metadata_object_bytes: usize,
     pub max_entries: usize,

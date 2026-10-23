@@ -838,3 +838,102 @@ async fn native_source_dirty_page_flush_preparation_is_not_a_capture_proof() {
     result.unwrap();
     stopped.unwrap();
 }
+
+// Exercise metadata through the public NFS API: an unvisited remote directory
+// is neither empty nor absent, and unavailable metadata is retriable.
+struct DirectorySource {
+    busy: bool,
+    timeout: bool,
+    calls: AtomicUsize,
+}
+#[async_trait]
+impl output_core::SourceDirectoryProvider for DirectorySource {
+    async fn read_directory(
+        &self,
+        _: output_core::SourcePin,
+        tree_id: [u8; 32],
+        _: String,
+        _: output_core::SourceLoadLimits,
+        _: Arc<dyn std::any::Any + Send + Sync>,
+    ) -> anyhow::Result<output_core::VerifiedSourceDirectory> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        if self.busy {
+            return Err(output_core::SourceLoadBusy.into());
+        }
+        if self.timeout {
+            return Err(output_core::CacheTimeoutError.into());
+        }
+        tokio::task::yield_now().await;
+        Ok(output_core::VerifiedSourceDirectory {
+            tree_id,
+            entries: vec![output_core::SourceDirectoryEntry {
+                name: "link".into(),
+                mode: 0o777,
+                kind: output_core::SourceDirectoryEntryKind::Symlink {
+                    object_id: [2; 32],
+                    target_size: 6,
+                },
+            }],
+        })
+    }
+    async fn read_symlink(
+        &self,
+        _: output_core::SourcePin,
+        _: [u8; 32],
+        _: u64,
+        _: Arc<dyn std::any::Any + Send + Sync>,
+    ) -> anyhow::Result<String> {
+        Ok("target".into())
+    }
+}
+#[tokio::test]
+async fn lazy_source_metadata_is_loaded_and_busy_is_not_absence() {
+    for (behavior, busy, timeout) in [
+        ("ready", false, false),
+        ("busy", true, false),
+        ("metadata deadline", false, true),
+    ] {
+        let (_dir, tree, source) = fixture();
+        let directories = Arc::new(DirectorySource {
+            busy,
+            timeout,
+            calls: AtomicUsize::new(0),
+        });
+        tree.install_lazy_source(
+            output_core::LazySourceRoot {
+                identity: tree.identity().into(),
+                root_tree: [1; 32],
+                pin: output_core::SourcePin {
+                    root: [1; 32],
+                    generation: 1,
+                },
+                provider: directories.clone(),
+                load_limits: output_core::SourceLoadLimits::default(),
+            },
+            None,
+            "install",
+            &output_core::SourceLimits::default(),
+        )
+        .unwrap();
+        let fs = OutputNfs::new(tree);
+        let listing = fs.readdir(1, 0, 10).await;
+        if busy || timeout {
+            assert!(
+                matches!(listing, Err(nfsstat3::NFS3ERR_JUKEBOX)),
+                "{behavior}"
+            );
+            assert!(matches!(
+                fs.lookup(1, &b"link"[..].into()).await,
+                Err(nfsstat3::NFS3ERR_JUKEBOX)
+            ));
+        } else {
+            let listing = listing.unwrap();
+            assert!(listing.end);
+            assert_eq!(listing.entries.len(), 1);
+            let link = fs.lookup(1, &b"link"[..].into()).await.unwrap();
+            assert_eq!(fs.readlink(link).await.unwrap().0, b"target");
+            assert_eq!(directories.calls.load(Ordering::SeqCst), 1);
+        }
+        assert_eq!(source.fetches.load(Ordering::SeqCst), 0);
+    }
+}
