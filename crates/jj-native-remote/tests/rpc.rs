@@ -225,7 +225,12 @@ impl Server {
                         .max_encoding_message_size(20 * 1024 * 1024),
                 )
                 .serve_with_incoming_shutdown(
-                    tokio_stream::wrappers::TcpListenerStream::new(listener),
+                    tokio_stream::wrappers::TcpListenerStream::new(listener).map(|accepted| {
+                        accepted.and_then(|stream| {
+                            stream.set_nodelay(true)?;
+                            Ok(stream)
+                        })
+                    }),
                     async {
                         let _ = stopped.await;
                     },

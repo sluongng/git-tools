@@ -22,6 +22,7 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 use tokio::sync::watch;
+use tokio_stream::StreamExt;
 use tonic::transport::{Identity, Server, ServerTlsConfig};
 
 /// Serve an already-bound TCP listener. Shutdown drains requests/streams rather
@@ -50,7 +51,13 @@ pub async fn serve_tcp(
         .concurrency_limit_per_connection(service.maximum_inflight())
         .add_service(service.grpc_service())
         .serve_with_incoming_shutdown(
-            tokio_stream::wrappers::TcpListenerStream::new(listener),
+            tokio_stream::wrappers::TcpListenerStream::new(listener).map(|accepted| {
+                accepted.and_then(|stream| {
+                    // Tonic does not configure socket options for custom incoming streams.
+                    stream.set_nodelay(true)?;
+                    Ok(stream)
+                })
+            }),
             shutdown,
         )
         .await
