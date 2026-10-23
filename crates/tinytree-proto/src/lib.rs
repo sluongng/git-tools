@@ -171,5 +171,43 @@ mod tests {
             decoded.frame,
             Some(query_v1::open_scope_frame::Frame::ScopeEnd(_))
         ));
+
+        // Explicit empty traversal intervals and Latest(0) must not become
+        // unbounded intervals/counts while crossing the wire.
+        use query_v1::graph_expr::Expression;
+        let range = query_v1::GraphExpr {
+            version: 1,
+            expression: Some(Expression::Range(Box::new(query_v1::RangeExpr {
+                parents: Some(query_v1::ParentRange {
+                    start: 0,
+                    end_exclusive: Some(0),
+                }),
+                ..Default::default()
+            }))),
+        };
+        let latest = query_v1::GraphExpr {
+            version: 1,
+            expression: Some(Expression::Latest(Box::new(query_v1::LatestExpr {
+                candidates: Some(Box::new(range)),
+                count: 0,
+            }))),
+        };
+        assert_eq!(
+            query_v1::GraphExpr::decode(latest.encode_to_vec().as_slice()).unwrap(),
+            latest
+        );
+        let dag_range = query_v1::DagRangeExpr {
+            generations_from_roots: Some(query_v1::GenerationRange {
+                start: 0,
+                end_exclusive: Some(0),
+            }),
+            ..Default::default()
+        };
+        let decoded = query_v1::DagRangeExpr::decode(dag_range.encode_to_vec().as_slice()).unwrap();
+        assert_eq!(decoded, dag_range);
+        assert_ne!(
+            decoded.generations_from_roots,
+            query_v1::DagRangeExpr::default().generations_from_roots
+        );
     }
 }

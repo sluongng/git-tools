@@ -182,6 +182,7 @@ message GraphExpr {
     SetExpr union = 8;
     SetExpr intersection = 9;
     DifferenceExpr difference = 10;
+    LatestExpr latest = 11;
   }
 }
 // Half-open intervals. Absent end_exclusive means unbounded; present zero is
@@ -192,12 +193,25 @@ message GenerationRange { uint64 start = 1; optional uint64 end_exclusive = 2; }
 message ParentRange { uint32 start = 1; optional uint32 end_exclusive = 2; }
 message AncestorsExpr { GraphExpr heads = 1; GenerationRange generations = 2; ParentRange parents = 3; }
 // ancestors(heads) minus ancestors(roots), with generations measured from heads.
-message RangeExpr { GraphExpr roots = 1; GraphExpr heads = 2; GenerationRange generations = 3; }
+message RangeExpr {
+  GraphExpr roots = 1;
+  GraphExpr heads = 2;
+  GenerationRange generations = 3;
+  ParentRange parents = 4; // Filters traversal from heads, never from roots.
+}
 // descendants(roots) intersect ancestors(heads), including matching endpoints.
-message DagRangeExpr { GraphExpr roots = 1; GraphExpr heads = 2; }
+message DagRangeExpr {
+  GraphExpr roots = 1;
+  GraphExpr heads = 2;
+  GenerationRange generations_from_roots = 3;
+}
 message UnaryExpr { GraphExpr input = 1; }
 message SetExpr { repeated GraphExpr inputs = 1; }
 message DifferenceExpr { GraphExpr left = 1; GraphExpr right = 2; }
+// Select at most count candidates by descending committer milliseconds, with
+// frozen index position as the tie-breaker. Emit the selection topologically,
+// NOT in timestamp order. Count zero is an empty set, not an absent limit.
+message LatestExpr { GraphExpr candidates = 1; uint64 count = 2; }
 
 enum Projection {
   PROJECTION_UNSPECIFIED = 0;
