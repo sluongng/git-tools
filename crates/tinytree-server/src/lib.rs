@@ -7,6 +7,7 @@ mod auth;
 mod body_deadline;
 pub use body_deadline::DeadlineLayer;
 mod config;
+mod derived_index;
 mod query_index;
 mod query_ingress;
 mod query_service;
@@ -174,10 +175,10 @@ pub async fn serve(
     })
     .await
     .context("native startup worker failed")??;
-    let index_path = config.storage.join("derived-index");
-    let index_limits = config.service.query.index_limits();
+    let index_storage = config.storage.clone();
+    let query_config = config.service.query.clone();
     let index =
-        tokio::task::spawn_blocking(move || tinytree_index::Index::open(index_path, &index_limits))
+        tokio::task::spawn_blocking(move || derived_index::open(&index_storage, &query_config))
             .await;
     let mut service = RepositoryService::new(
         store.clone(),
@@ -365,6 +366,9 @@ mod tests {
             private_key: "key.pem".into(),
         });
         assert!(config.validate().is_ok());
+        config.service.query.index_rebuild_generation = 1_000_000_001;
+        assert!(config.validate().is_err());
+        config.service.query.index_rebuild_generation = 0;
         config.service.max_frame_bytes = usize::MAX;
         assert!(config.validate().is_err());
     }

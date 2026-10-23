@@ -23,6 +23,8 @@ scope_ttl_seconds = 300
 max_scopes_per_principal = 16
 max_pending_warms = 32
 max_warm_jobs = 1
+# Increment and restart for an explicit fresh index; old data is retained.
+index_rebuild_generation = 0
 
 # Non-loopback TCP additionally requires TLS identities supplied separately.
 # [tls]

@@ -87,6 +87,49 @@ impl Running {
             .accept_compressed(CompressionEncoding::Zstd)
             .max_decoding_message_size(20 * 1024 * 1024)
     }
+    async fn start_production(mut config: tinytree_server::Config) -> Self {
+        let reservation = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = reservation.local_addr().unwrap();
+        drop(reservation);
+        config.listen = address.to_string();
+        let repository = config.repositories[0].clone();
+        let (stop, stopped) = oneshot::channel();
+        let task = tokio::spawn(tinytree_server::serve(config, async {
+            let _ = stopped.await;
+        }));
+        let running = Self {
+            address,
+            stop: Some(stop),
+            task: Some(task),
+        };
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                assert!(
+                    !running.task.as_ref().unwrap().is_finished(),
+                    "production startup failed"
+                );
+                if let Ok(channel) = Endpoint::from_shared(format!("http://{address}"))
+                    .unwrap()
+                    .connect()
+                    .await
+                {
+                    let mut client = RepositoryClient::new(channel);
+                    client
+                        .open_repository(p::OpenRepositoryRequest {
+                            repository_id: repository.clone(),
+                            reference_names: Vec::new(),
+                        })
+                        .await
+                        .unwrap();
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap();
+        running
+    }
     async fn query_client(&self) -> q::repository_query_client::RepositoryQueryClient<Channel> {
         let channel = Endpoint::from_shared(format!("http://{}", self.address))
             .unwrap()
@@ -2236,81 +2279,369 @@ async fn query_warm_missing_parent_failure_is_explicit_and_retries_after_canonic
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn unavailable_derived_index_does_not_prevent_production_object_service_startup() {
-    let temporary = tempfile::tempdir().unwrap();
-    let storage = temporary.path().join("objects");
-    let store = Store::open(&storage, Default::default()).unwrap();
-    store.create_repository("example").unwrap();
-    drop(store);
-    let derived = storage.join("derived-index");
-    std::fs::write(&derived, b"preserve unavailable derived state").unwrap();
-    let reservation = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    let address = reservation.local_addr().unwrap();
-    drop(reservation);
-    let mut config = tinytree_server::Config::default();
-    config.storage = storage;
-    config.listen = address.to_string();
-    config.repositories = vec!["example".into()];
-    config.gc_interval_seconds = 0;
-    let (stop, stopped) = oneshot::channel();
-    let server = tokio::spawn(tinytree_server::serve(config, async {
-        let _ = stopped.await;
-    }));
-    let channel = tokio::time::timeout(Duration::from_secs(10), async {
-        loop {
-            match Endpoint::from_shared(format!("http://{address}"))
-                .unwrap()
-                .connect()
-                .await
-            {
-                Ok(channel) => break channel,
-                Err(_) => {
-                    assert!(
-                        !server.is_finished(),
-                        "derived failure must not terminate object startup"
-                    );
-                    tokio::time::sleep(Duration::from_millis(10)).await;
-                }
+    #[derive(Clone, Copy)]
+    enum Failure {
+        GenerationFile,
+        UnrecognizedGeneration,
+        NestedUnrecognizedDatabase,
+        InvalidDatabaseVersion,
+        #[cfg(unix)]
+        SymlinkDatabaseVersion,
+        #[cfg(unix)]
+        SymlinkVersion,
+    }
+    let cases = [
+        Failure::GenerationFile,
+        Failure::UnrecognizedGeneration,
+        Failure::NestedUnrecognizedDatabase,
+        Failure::InvalidDatabaseVersion,
+        #[cfg(unix)]
+        Failure::SymlinkDatabaseVersion,
+        #[cfg(unix)]
+        Failure::SymlinkVersion,
+    ];
+    for failure in cases {
+        let temporary = tempfile::tempdir().unwrap();
+        let storage = temporary.path().join("objects");
+        let store = Store::open(&storage, Default::default()).unwrap();
+        store.create_repository("alpha").unwrap();
+        drop(store);
+        let version_path =
+            storage.join(format!("derived-index-v{}", tinytree_index::STORAGE_SCHEMA));
+        let sentinel = match failure {
+            Failure::GenerationFile => {
+                let version = private_fs::PrivateDir::create(&version_path).unwrap();
+                let path = version.path().join("generation-0");
+                std::fs::write(&path, b"preserve unavailable derived state").unwrap();
+                path
             }
+            Failure::UnrecognizedGeneration => {
+                let version = private_fs::PrivateDir::create(&version_path).unwrap();
+                let generation =
+                    private_fs::PrivateDir::create(version.path().join("generation-0")).unwrap();
+                let path = generation.path().join("unrecognized.marker");
+                std::fs::write(&path, b"preserve unavailable derived state").unwrap();
+                path
+            }
+            #[cfg(unix)]
+            Failure::SymlinkVersion => {
+                let target =
+                    private_fs::PrivateDir::create(temporary.path().join("external-index"))
+                        .unwrap();
+                let path = target.path().join("unrecognized.marker");
+                std::fs::write(&path, b"preserve unavailable derived state").unwrap();
+                std::os::unix::fs::symlink(target.path(), &version_path).unwrap();
+                path
+            }
+            _ => {
+                let version = private_fs::PrivateDir::create(&version_path).unwrap();
+                let generation =
+                    private_fs::PrivateDir::create(version.path().join("generation-0")).unwrap();
+                drop(generation.open_lock("index.lock").unwrap());
+                let database =
+                    private_fs::PrivateDir::create(generation.path().join("index.fjall")).unwrap();
+                let path = database.path().join("unrecognized.marker");
+                std::fs::write(&path, b"preserve unavailable derived state").unwrap();
+                match failure {
+                    Failure::InvalidDatabaseVersion => {
+                        std::fs::write(database.path().join("version"), b"NOPE").unwrap()
+                    }
+                    #[cfg(unix)]
+                    Failure::SymlinkDatabaseVersion => {
+                        let target = temporary.path().join("external-version");
+                        std::fs::write(&target, b"FJL\x03").unwrap();
+                        std::os::unix::fs::symlink(target, database.path().join("version"))
+                            .unwrap();
+                    }
+                    _ => {}
+                }
+                path
+            }
+        };
+        let preserved = match failure {
+            Failure::GenerationFile => None,
+            #[cfg(unix)]
+            Failure::SymlinkVersion => Some(sentinel.parent().unwrap().to_owned()),
+            _ => Some(version_path.join("generation-0")),
+        }
+        .map(|path| {
+            let before = generation_contents(&path);
+            (path, before)
+        });
+        let mut config = tinytree_server::Config::default();
+        config.storage = storage;
+        config.repositories = vec!["alpha".into()];
+        config.gc_interval_seconds = 0;
+        let server = Running::start_production(config).await;
+        let mut objects = server.client().await;
+        objects
+            .open_repository(p::OpenRepositoryRequest {
+                repository_id: "alpha".into(),
+                reference_names: Vec::new(),
+            })
+            .await
+            .unwrap();
+        let mut query = server.query_client().await;
+        assert_eq!(
+            query
+                .open_scope(request(
+                    tokio_stream::iter(query_frames(
+                        &[ObjectKey {
+                            kind: Kind::Commit,
+                            id: ObjectId([0; 32])
+                        }],
+                        1
+                    )),
+                    ALPHA
+                ))
+                .await
+                .unwrap_err()
+                .code(),
+            Code::Unavailable
+        );
+        drop(query);
+        drop(objects);
+        server.stop().await;
+        assert_eq!(
+            std::fs::read(&sentinel).unwrap(),
+            b"preserve unavailable derived state"
+        );
+        if let Some((path, before)) = preserved {
+            assert_eq!(
+                generation_contents(&path),
+                before,
+                "rejected derived storage must remain untouched, including missing version and engine files"
+            );
+        }
+        #[cfg(unix)]
+        if matches!(failure, Failure::SymlinkDatabaseVersion) {
+            assert_eq!(
+                std::fs::read(temporary.path().join("external-version")).unwrap(),
+                b"FJL\x03",
+                "rejected marker links must not modify their target"
+            );
+        }
+        match failure {
+            Failure::UnrecognizedGeneration => assert!(
+                !sentinel.parent().unwrap().join("index.lock").exists(),
+                "unrecognized state must not initialize an index beside unrelated data"
+            ),
+            #[cfg(unix)]
+            Failure::SymlinkVersion => assert!(
+                !sentinel.parent().unwrap().join("generation-0").exists(),
+                "activation must not follow a version-directory symlink"
+            ),
+            _ => {}
+        }
+    }
+}
+
+async fn released_production_storage(storage: &std::path::Path, generation: &std::path::Path) {
+    let storage = storage.to_owned();
+    let generation = generation.to_owned();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let storage = storage.clone();
+            let generation = generation.clone();
+            let released = tokio::task::spawn_blocking(move || {
+                let Ok(store) = Store::open_existing(storage, Default::default()) else {
+                    return false;
+                };
+                let Ok(lock) = std::fs::OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .open(generation.join("index.lock"))
+                else {
+                    return false;
+                };
+                let released = lock.try_lock().is_ok();
+                drop(lock);
+                drop(store);
+                released
+            })
+            .await
+            .unwrap();
+            if released {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
         }
     })
     .await
     .unwrap();
-    let mut objects = RepositoryClient::new(channel.clone());
-    objects
-        .open_repository(p::OpenRepositoryRequest {
-            repository_id: "example".into(),
-            reference_names: Vec::new(),
-        })
-        .await
-        .unwrap();
-    let mut query = q::repository_query_client::RepositoryQueryClient::new(channel);
-    let mut frames = query_frames(
-        &[ObjectKey {
-            kind: Kind::Commit,
-            id: ObjectId([0; 32]),
-        }],
-        1,
-    );
-    let Some(q::open_scope_frame::Frame::Header(header)) = &mut frames[0].frame else {
-        panic!()
-    };
-    header.repository_id = "example".into();
+}
+#[derive(Debug, PartialEq, Eq)]
+enum GenerationEntry {
+    Directory,
+    File(Vec<u8>),
+    Symlink(std::path::PathBuf),
+}
+fn generation_contents(
+    directory: &std::path::Path,
+) -> std::collections::BTreeMap<std::path::PathBuf, GenerationEntry> {
+    fn visit(
+        root: &std::path::Path,
+        path: &std::path::Path,
+        result: &mut std::collections::BTreeMap<std::path::PathBuf, GenerationEntry>,
+    ) {
+        for entry in std::fs::read_dir(path).unwrap() {
+            let entry = entry.unwrap();
+            let path = entry.path();
+            let relative = path.strip_prefix(root).unwrap().to_owned();
+            let kind = entry.file_type().unwrap();
+            if kind.is_dir() {
+                result.insert(relative, GenerationEntry::Directory);
+                visit(root, &path, result);
+            } else if kind.is_symlink() {
+                result.insert(
+                    relative,
+                    GenerationEntry::Symlink(std::fs::read_link(path).unwrap()),
+                );
+            } else {
+                assert!(kind.is_file());
+                result.insert(
+                    relative,
+                    GenerationEntry::File(std::fs::read(path).unwrap()),
+                );
+            }
+        }
+    }
+    let mut result = std::collections::BTreeMap::new();
+    visit(directory, directory, &mut result);
+    result
+}
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn production_index_generation_activation_reuses_ready_state_and_preserves_older_data() {
+    let (temporary, store) = setup();
+    let fixture = fixture();
+    for object in fixture.objects() {
+        store
+            .put("alpha", object.descriptor, &object.bytes, 0)
+            .unwrap();
+    }
+    let head = root(&fixture);
+    drop(store);
+    let legacy = private_fs::PrivateDir::create(temporary.path().join("derived-index")).unwrap();
+    std::fs::write(
+        legacy.path().join("legacy.marker"),
+        b"legacy generation remains operator-owned",
+    )
+    .unwrap();
+    let legacy_contents = generation_contents(legacy.path());
+    let previous_schema = private_fs::PrivateDir::create(temporary.path().join(format!(
+        "derived-index-v{}",
+        tinytree_index::STORAGE_SCHEMA - 1
+    )))
+    .unwrap();
+    std::fs::write(
+        previous_schema.path().join("previous-schema.marker"),
+        b"previous schema remains operator-owned",
+    )
+    .unwrap();
+    let previous_contents = generation_contents(previous_schema.path());
+    let mut config = tinytree_server::Config::default();
+    config.storage = temporary.path().to_owned();
+    config.repositories = vec!["alpha".into(), "beta".into()];
+    config.gc_interval_seconds = 0;
+    let version = temporary
+        .path()
+        .join(format!("derived-index-v{}", tinytree_index::STORAGE_SCHEMA));
+    let generation0 = version.join("generation-0");
+    let server = Running::start_production(config.clone()).await;
+    let mut client = server.query_client().await;
     assert_eq!(
-        query
-            .open_scope(tokio_stream::iter(frames))
+        client
+            .open_scope(request(tokio_stream::iter(query_frames(&[head], 1)), ALPHA))
             .await
             .unwrap_err()
             .code(),
         Code::Unavailable
     );
-    stop.send(()).unwrap();
-    tokio::time::timeout(Duration::from_secs(5), server)
+    let initial = query_ready(&mut client, &[head], 1).await;
+    drop(client);
+    server.stop().await;
+    released_production_storage(temporary.path(), &generation0).await;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        // Enforce Fjall's normal umask-022 directory mode even when the test
+        // runner has a stricter umask. The private generation still encloses it.
+        std::fs::set_permissions(
+            generation0.join("index.fjall"),
+            std::fs::Permissions::from_mode(0o755),
+        )
+        .unwrap();
+    }
+    let server = Running::start_production(config.clone()).await;
+    let mut client = server.query_client().await;
+    assert_eq!(
+        client
+            .query_facts(request(
+                q::QueryFactsRequest {
+                    scope: initial.key.clone(),
+                    facts: Vec::new()
+                },
+                ALPHA
+            ))
+            .await
+            .unwrap_err()
+            .code(),
+        Code::FailedPrecondition
+    );
+    let reused = client
+        .open_scope(request(tokio_stream::iter(query_frames(&[head], 2)), ALPHA))
         .await
         .unwrap()
-        .unwrap()
-        .unwrap();
+        .into_inner();
+    assert_eq!(reused.index_epoch, initial.index_epoch);
+    assert_eq!(reused.high_water, initial.high_water);
+    assert_ne!(reused.key, initial.key);
+    drop(client);
+    server.stop().await;
+    released_production_storage(temporary.path(), &generation0).await;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(
+            std::fs::metadata(generation0.join("index.fjall"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o755,
+            "valid engine permissions must be preserved on restart"
+        );
+    }
+    let old_contents = generation_contents(&generation0);
+    config.service.query.index_rebuild_generation = 1;
+    let server = Running::start_production(config).await;
+    let mut client = server.query_client().await;
     assert_eq!(
-        std::fs::read(derived).unwrap(),
-        b"preserve unavailable derived state"
+        client
+            .open_scope(request(tokio_stream::iter(query_frames(&[head], 3)), ALPHA))
+            .await
+            .unwrap_err()
+            .code(),
+        Code::Unavailable
+    );
+    let rebuilt = query_ready(&mut client, &[head], 3).await;
+    assert_ne!(rebuilt.index_epoch, initial.index_epoch);
+    drop(client);
+    server.stop().await;
+    released_production_storage(temporary.path(), &version.join("generation-1")).await;
+    assert_eq!(
+        generation_contents(&generation0),
+        old_contents,
+        "selecting another generation must not rewrite the previous index"
+    );
+    assert_eq!(
+        generation_contents(legacy.path()),
+        legacy_contents,
+        "schema activation must not migrate or delete legacy state"
+    );
+    assert_eq!(
+        generation_contents(previous_schema.path()),
+        previous_contents,
+        "schema activation must not open or rewrite a previous format"
     );
 }

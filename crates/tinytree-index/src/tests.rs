@@ -419,7 +419,7 @@ fn exhausted_work_is_not_a_negative_and_linear_probes_use_skip_links() {
 }
 
 #[test]
-fn oversized_escaped_repository_record_rejects_without_persisting_bad_state() {
+fn compact_records_bound_actual_nodes_and_round_trip_escaped_repository_names() {
     let directory = tempfile::tempdir().unwrap();
     let limits = Limits {
         max_record_bytes: 1024,
@@ -428,25 +428,46 @@ fn oversized_escaped_repository_record_rejects_without_persisting_bad_state() {
     let path = directory.path().join("graph");
     let index = Index::open(&path, &limits).unwrap();
     let repository = "\"\\".repeat(256);
-    assert_eq!(repository.len(), 512);
-    let commit = canonical(&[m::CommitId::ROOT], 1, "small commit");
+    let first = add(
+        &index,
+        &repository,
+        &[m::CommitId::ROOT],
+        1,
+        "escaped repository",
+    );
+    assert_eq!(first.position, 1);
+    let mut parents = Vec::new();
+    for ordinal in 0..32 {
+        parents.push(
+            add(
+                &index,
+                "repo",
+                &[m::CommitId::ROOT],
+                2,
+                &format!("parent {ordinal}"),
+            )
+            .commit,
+        );
+    }
+    let oversized = canonical(&parents, 3, "oversized derived parent record");
+    let before = index.stats().unwrap();
     assert!(matches!(
-        index.ingest(&repository, commit.descriptor, &commit.bytes),
+        index.ingest("repo", oversized.descriptor, &oversized.bytes),
         Err(Error::Invalid(_))
     ));
+    assert_eq!(index.stats().unwrap(), before);
     assert!(
         index
-            .node(&repository, m::CommitId(commit.descriptor.key.id.0))
+            .node("repo", m::CommitId(oversized.descriptor.key.id.0))
             .unwrap()
             .is_none()
     );
-    let ready = index
-        .ingest("repo", commit.descriptor, &commit.bytes)
-        .unwrap();
-    assert_eq!(ready.position, 1);
     drop(index);
     let reopened = Index::open(&path, &limits).unwrap();
-    assert_eq!(reopened.node("repo", ready.commit).unwrap(), Some(ready));
+    assert_eq!(
+        reopened.node(&repository, first.commit).unwrap(),
+        Some(first)
+    );
 }
 #[test]
 fn empty_prefix_and_unknown_id_shortest_lengths_match_jj_semantics() {
@@ -868,4 +889,344 @@ fn common_ancestor_sets_match_reference_for_every_crisscross_subset() {
         scope.common_ancestors(&[left_tip], &[right_tip], &mut read_bound),
         Err(Error::BudgetExceeded)
     ));
+}
+
+// Fault fixtures edit persistent bytes, while all detection assertions use the
+// public reopen/query API. Re-signing isolates structural validation from the
+// checksum guard rather than accidentally testing only a mismatched digest.
+fn resign_derived_record(key: &[u8], bytes: &mut Vec<u8>) {
+    bytes.truncate(bytes.len() - 32);
+    let mut hash = blake3::Hasher::new();
+    hash.update(b"tinytree-derived-index-record-v2\0");
+    hash.update(&(key.len() as u32).to_le_bytes());
+    hash.update(key);
+    hash.update(bytes);
+    bytes.extend(hash.finalize().as_bytes());
+}
+#[test]
+fn compact_envelope_rejects_truncation_counts_reserved_and_key_transplants() {
+    for behavior in [
+        "truncated",
+        "trailing",
+        "parent_count_overflow",
+        "skip_count_overflow",
+        "reserved",
+        "key_transplant",
+    ] {
+        let (directory, index) = fixture();
+        let a = add(&index, "repo", &[m::CommitId::ROOT], 1, "a");
+        let b = add(&index, "repo", &[m::CommitId::ROOT], 2, "b");
+        drop(index);
+        {
+            let db = SingleWriterTxDatabase::builder(directory.path().join("graph/index.fjall"))
+                .open()
+                .unwrap();
+            let table = db
+                .keyspace("graph", KeyspaceCreateOptions::default)
+                .unwrap();
+            let source = key(b'n', &repo_hash("repo").unwrap(), &a.commit.0);
+            let destination = if behavior == "key_transplant" {
+                key(b'n', &repo_hash("repo").unwrap(), &b.commit.0)
+            } else {
+                source.clone()
+            };
+            let mut bytes = table.get(&source).unwrap().unwrap().to_vec();
+            match behavior {
+                "truncated" => {
+                    bytes.pop();
+                }
+                "trailing" => bytes.push(0),
+                "parent_count_overflow" => {
+                    bytes[60..64].copy_from_slice(&u32::MAX.to_le_bytes());
+                    resign_derived_record(&source, &mut bytes);
+                }
+                "skip_count_overflow" => {
+                    bytes[64] = 65;
+                    resign_derived_record(&source, &mut bytes);
+                }
+                "reserved" => {
+                    bytes[5] = 1;
+                    resign_derived_record(&source, &mut bytes);
+                }
+                "key_transplant" => {}
+                _ => unreachable!(),
+            }
+            let mut tx = db.write_tx().durability(Some(PersistMode::SyncAll));
+            tx.insert(&table, destination, bytes);
+            tx.commit().unwrap();
+        }
+        assert!(
+            matches!(
+                Index::open(directory.path().join("graph"), &Limits::default()),
+                Err(Error::Corrupt)
+            ),
+            "{behavior}"
+        );
+    }
+}
+#[test]
+fn legacy_schema_is_explicitly_unsupported_and_never_rewritten() {
+    #[derive(serde::Serialize)]
+    struct Legacy {
+        schema: u32,
+        epoch: [u8; 16],
+        repositories: u64,
+        nodes: u64,
+        bytes: u64,
+    }
+    let (directory, index) = fixture();
+    drop(index);
+    let value = Legacy {
+        schema: 1,
+        epoch: [7; 16],
+        repositories: 0,
+        nodes: 0,
+        bytes: 0,
+    };
+    let digest = *blake3::hash(&serde_json::to_vec(&value).unwrap()).as_bytes();
+    let bytes = serde_json::to_vec(&serde_json::json!({"value":value,"checksum":digest})).unwrap();
+    {
+        let db = SingleWriterTxDatabase::builder(directory.path().join("graph/index.fjall"))
+            .open()
+            .unwrap();
+        let table = db
+            .keyspace("graph", KeyspaceCreateOptions::default)
+            .unwrap();
+        let mut tx = db.write_tx().durability(Some(PersistMode::SyncAll));
+        tx.insert(&table, b"header", &bytes);
+        tx.commit().unwrap();
+    }
+    assert!(matches!(
+        Index::open(directory.path().join("graph"), &Limits::default()),
+        Err(Error::UnsupportedSchema)
+    ));
+    let db = SingleWriterTxDatabase::builder(directory.path().join("graph/index.fjall"))
+        .open()
+        .unwrap();
+    let table = db
+        .keyspace("graph", KeyspaceCreateOptions::default)
+        .unwrap();
+    assert_eq!(
+        table.get(b"header").unwrap().unwrap().as_ref(),
+        bytes.as_slice()
+    );
+}
+#[test]
+fn negative_committer_time_and_scope_bound_parent_tokens_survive_reopen() {
+    let (directory, index) = fixture();
+    let base = add(&index, "repo", &[m::CommitId::ROOT], 1, "base");
+    let left = add(&index, "repo", &[base.commit], 2, "left");
+    let right = add(&index, "repo", &[base.commit], 3, "right");
+    let object = canonical(&[right.commit, left.commit], 4, "ordered merge");
+    let m::Object::Commit(mut commit) = m::decode(&object.bytes, m::Limits::default()).unwrap()
+    else {
+        unreachable!()
+    };
+    commit.committer.timestamp.millis_since_epoch = -123456789;
+    let object = m::encode(&m::Object::Commit(commit), m::Limits::default()).unwrap();
+    let merge = index
+        .ingest("repo", object.descriptor, &object.bytes)
+        .unwrap();
+    assert_eq!(merge.committer_millis, -123456789);
+    assert_eq!(
+        index
+            .ingest("repo", object.descriptor, &object.bytes)
+            .unwrap(),
+        merge
+    );
+    drop(index);
+    let reopened = Index::open(directory.path().join("graph"), &Limits::default()).unwrap();
+    assert_eq!(
+        reopened.node("repo", merge.commit).unwrap(),
+        Some(merge.clone())
+    );
+    let scope = Arc::new(reopened.scope("repo", &[merge.commit]).unwrap());
+    let token = scope
+        .lookup_node(merge.commit, &mut WorkBudget::default())
+        .unwrap()
+        .unwrap();
+    assert_eq!(token.committer_millis(), -123456789);
+    assert_eq!(
+        scope
+            .parent_nodes(&token, &mut WorkBudget::default())
+            .unwrap()
+            .iter()
+            .map(|node| node.commit())
+            .collect::<Vec<_>>(),
+        vec![right.commit, left.commit]
+    );
+    let root = scope
+        .lookup_node(m::CommitId::ROOT, &mut WorkBudget::default())
+        .unwrap()
+        .unwrap();
+    assert!(
+        scope
+            .parent_nodes(&root, &mut WorkBudget::default())
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        scope
+            .lookup_node(m::CommitId([99; 32]), &mut WorkBudget::default())
+            .unwrap()
+            .is_none()
+    );
+    let reconstructed = Arc::new(reopened.scope("repo", &[merge.commit]).unwrap());
+    assert!(matches!(
+        reconstructed.parent_nodes(&token, &mut WorkBudget::default()),
+        Err(Error::Invalid(_))
+    ));
+    let narrower = Arc::new(reopened.scope("repo", &[left.commit]).unwrap());
+    assert!(matches!(
+        narrower.parent_nodes(&token, &mut WorkBudget::default()),
+        Err(Error::Invalid(_))
+    ));
+    let future = add(&reopened, "repo", &[merge.commit], 5, "future");
+    assert!(
+        scope
+            .lookup_node(future.commit, &mut WorkBudget::default())
+            .unwrap()
+            .is_none()
+    );
+    assert!(matches!(
+        scope.lookup_node(merge.commit, &mut WorkBudget::new(0, 0, 0, 0)),
+        Err(Error::BudgetExceeded)
+    ));
+    assert!(matches!(
+        scope.parent_nodes(&token, &mut WorkBudget::new(100, 100, 1024 * 1024, 1)),
+        Err(Error::BudgetExceeded)
+    ));
+}
+
+#[test]
+fn key_binding_and_duplicate_timestamp_checks_reject_conflicting_derived_rows() {
+    let (_directory, index) = fixture();
+    let object = canonical(&[m::CommitId::ROOT], 1, "a");
+    let a = index
+        .ingest("repo", object.descriptor, &object.bytes)
+        .unwrap();
+    let b = add(&index, "repo", &[m::CommitId::ROOT], 2, "b");
+    {
+        let state = index.state.lock().unwrap();
+        let source = key(b'n', &repo_hash("repo").unwrap(), &a.commit.0);
+        let destination = key(b'n', &repo_hash("repo").unwrap(), &b.commit.0);
+        let bytes = state.table.get(&source).unwrap().unwrap();
+        let mut tx = state.db.write_tx().durability(Some(PersistMode::SyncAll));
+        tx.insert(&state.table, destination, bytes);
+        tx.commit().unwrap();
+    }
+    // Direct public lookup must reject the transplanted value without relying
+    // on a later whole-index/secondary-index consistency scan.
+    assert!(matches!(index.node("repo", b.commit), Err(Error::Corrupt)));
+    {
+        let state = index.state.lock().unwrap();
+        let storage_key = key(b'n', &repo_hash("repo").unwrap(), &a.commit.0);
+        let mut bytes = state.table.get(&storage_key).unwrap().unwrap().to_vec();
+        bytes[52..60].copy_from_slice(&(-42i64).to_le_bytes());
+        resign_derived_record(&storage_key, &mut bytes);
+        let mut tx = state.db.write_tx().durability(Some(PersistMode::SyncAll));
+        tx.insert(&state.table, storage_key, bytes);
+        tx.commit().unwrap();
+    }
+    assert!(matches!(
+        index.ingest("repo", object.descriptor, &object.bytes),
+        Err(Error::Corrupt)
+    ));
+}
+
+#[test]
+fn existing_foreign_or_headerless_databases_are_not_initialized() {
+    struct Case {
+        name: &'static str,
+        keyspace: Option<&'static str>,
+        insert_row: bool,
+        expect_graph: bool,
+    }
+    for case in [
+        Case {
+            name: "foreign keyspace",
+            keyspace: Some("foreign"),
+            insert_row: true,
+            expect_graph: false,
+        },
+        Case {
+            name: "empty graph",
+            keyspace: Some("graph"),
+            insert_row: false,
+            expect_graph: true,
+        },
+        Case {
+            name: "graph with rows without header",
+            keyspace: Some("graph"),
+            insert_row: true,
+            expect_graph: true,
+        },
+        Case {
+            name: "directory without marker",
+            keyspace: None,
+            insert_row: true,
+            expect_graph: false,
+        },
+    ] {
+        let directory = tempfile::tempdir().unwrap();
+        let root = PrivateDir::create(directory.path().join("graph")).unwrap();
+        let data = root.path().join("index.fjall");
+        if let Some(name) = case.keyspace {
+            let db = SingleWriterTxDatabase::builder(&data).open().unwrap();
+            let table = db.keyspace(name, KeyspaceCreateOptions::default).unwrap();
+            if case.insert_row {
+                let mut tx = db.write_tx().durability(Some(PersistMode::SyncAll));
+                tx.insert(&table, b"unrelated", b"preserved");
+                tx.commit().unwrap();
+            }
+        } else {
+            std::fs::create_dir(&data).unwrap();
+            if case.insert_row {
+                std::fs::write(data.join("unrelated"), b"preserved").unwrap();
+            }
+        }
+        assert!(
+            matches!(
+                Index::open(root.path(), &Limits::default()),
+                Err(Error::Corrupt)
+            ),
+            "{}",
+            case.name
+        );
+        if let Some(name) = case.keyspace {
+            let db = SingleWriterTxDatabase::builder(&data).open().unwrap();
+            assert_eq!(
+                db.keyspace_exists("graph"),
+                case.expect_graph,
+                "{}",
+                case.name
+            );
+            let table = db.keyspace(name, KeyspaceCreateOptions::default).unwrap();
+            assert!(table.get(b"header").unwrap().is_none(), "{}", case.name);
+            if case.insert_row {
+                assert_eq!(
+                    table.get(b"unrelated").unwrap().unwrap().as_ref(),
+                    b"preserved",
+                    "{}",
+                    case.name
+                );
+            } else {
+                assert!(
+                    db.read_tx().prefix(&table, b"").next().is_none(),
+                    "{}",
+                    case.name
+                );
+            }
+        } else {
+            assert!(!data.join("version").exists(), "{}", case.name);
+            if case.insert_row {
+                assert_eq!(
+                    std::fs::read(data.join("unrelated")).unwrap(),
+                    b"preserved",
+                    "{}",
+                    case.name
+                );
+            }
+        }
+    }
 }

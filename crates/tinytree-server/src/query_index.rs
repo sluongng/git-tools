@@ -46,6 +46,7 @@ pub struct QueryConfig {
     pub max_index_nodes: usize,
     pub max_index_record_bytes: usize,
     pub max_index_bytes: u64,
+    pub index_rebuild_generation: u64,
 }
 impl Default for QueryConfig {
     fn default() -> Self {
@@ -81,6 +82,7 @@ impl Default for QueryConfig {
             max_index_nodes: 1_000_000,
             max_index_record_bytes: 1024 * 1024,
             max_index_bytes: 1024 * 1024 * 1024,
+            index_rebuild_generation: 0,
         }
     }
 }
@@ -148,6 +150,7 @@ impl QueryConfig {
             || !(1024..=16 * 1024 * 1024).contains(&self.max_index_record_bytes)
             || self.max_index_bytes == 0
             || self.max_index_bytes > 64 * 1024 * 1024 * 1024
+            || self.index_rebuild_generation > 1_000_000_000
         {
             return Err(ConfigError("invalid derived query limits"));
         }
@@ -194,7 +197,13 @@ pub(crate) fn index_error(error: tinytree_index::Error) -> Status {
         }
         Error::BudgetExceeded => Status::resource_exhausted("exact graph work budget exhausted"),
         Error::Invalid(_) => Status::invalid_argument("invalid derived query input"),
+        Error::UnsupportedSchema => {
+            Status::failed_precondition("derived index schema requires a new generation")
+        }
         Error::Corrupt => Status::data_loss("derived graph index requires explicit rebuild"),
+        Error::Model(m::Error::Limit) => {
+            Status::resource_exhausted("derived index model limit exceeded")
+        }
         Error::Model(_) => Status::data_loss("invalid canonical graph metadata"),
         _ => Status::unavailable("derived graph storage unavailable"),
     }

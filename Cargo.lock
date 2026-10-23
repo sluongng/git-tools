@@ -5628,6 +5628,7 @@ dependencies = [
  "http",
  "http-body",
  "libc",
+ "private-fs",
  "prost",
  "reapi",
  "serde",

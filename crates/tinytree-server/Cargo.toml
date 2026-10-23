@@ -16,6 +16,7 @@ grpc-transport = { path = "../grpc-transport" }
 tower = { version = "0.5", features = ["util"] }
 futures-core = "0.3"
 prost = "0.14"
+private-fs = { path = "../private-fs" }
 reapi = { path = "../reapi" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

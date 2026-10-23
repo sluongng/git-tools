@@ -26,3 +26,10 @@ The separate query service supports retained root scopes, exact graph facts and
 prefix resolution. Its rebuildable index warms asynchronously; unavailable
 coverage is an error, not an empty result. Scope TTLs and work limits are TOML
 configurable. Draft overlays and paged evaluation are not implemented yet.
+
+Derived state lives in `derived-index-v{schema}/generation-{index_rebuild_generation}`
+under storage. Restarting with the same generation reuses it; increment
+`service.query.index_rebuild_generation` and restart to rebuild asynchronously with
+a fresh epoch. Older generations and legacy `derived-index` data remain untouched;
+remove them only through explicit offline maintenance. There is no automatic eviction
+or in-place format conversion. An unavailable index does not disable object serving.

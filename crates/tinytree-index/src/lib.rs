@@ -5,14 +5,20 @@ use fjall::{
 };
 use fs2::FileExt;
 use private_fs::PrivateDir;
-use serde::{Deserialize, Serialize, de::DeserializeOwned};
+mod codec;
+mod scoped;
+use codec::{RecordCodec, decode, encode};
+pub use scoped::ScopedNode;
 use std::{
     collections::{BTreeMap, BTreeSet, HashSet},
     fs::File,
+    io::Read,
     path::Path,
     sync::{Arc, Mutex},
 };
 use tinytree_model as m;
+
+pub const STORAGE_SCHEMA: u32 = 2;
 
 pub type Result<T> = std::result::Result<T, Error>;
 #[derive(Debug, thiserror::Error)]
@@ -21,6 +27,8 @@ pub enum Error {
     Invalid(&'static str),
     #[error("derived index is corrupt; explicit rebuild required")]
     Corrupt,
+    #[error("derived index schema is unsupported; rebuild into a new directory")]
+    UnsupportedSchema,
     #[error("canonical parent or scoped root is not indexed yet")]
     NotReady,
     #[error("exact query work budget exhausted")]
@@ -111,6 +119,8 @@ impl WorkBudget {
             bytes: 0,
         }
     }
+    /// Charged metadata probes, including position-row lookups for compact
+    /// skip links as well as node rows (and intrinsic root probes).
     pub fn nodes_read(&self) -> u64 {
         self.nodes
     }
@@ -161,6 +171,7 @@ pub struct CommitNode {
     pub parents: Vec<m::CommitId>,
     pub position: u64,
     pub generation: u64,
+    pub committer_millis: i64,
     pub descriptor: m::Descriptor,
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -175,27 +186,22 @@ pub struct ChangeTargets {
     pub commits: Vec<m::CommitId>,
 }
 
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone)]
 struct Header {
     schema: u32,
+    native_format: u16,
     epoch: [u8; 16],
     repositories: u64,
     nodes: u64,
     bytes: u64,
 }
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone)]
 struct Repository {
     name: String,
     high_water: u64,
     generation: u64,
 }
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-struct Skip {
-    commit: [u8; 32],
-    position: u64,
-    generation: u64,
-}
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 struct StoredNode {
     commit: [u8; 32],
     change: [u8; 16],
@@ -203,7 +209,8 @@ struct StoredNode {
     position: u64,
     generation: u64,
     size: u64,
-    skips: Vec<Skip>,
+    committer_millis: i64,
+    skips: Vec<u64>,
 }
 impl StoredNode {
     fn public(&self) -> CommitNode {
@@ -213,6 +220,7 @@ impl StoredNode {
             parents: self.parents.iter().copied().map(m::CommitId).collect(),
             position: self.position,
             generation: self.generation,
+            committer_millis: self.committer_millis,
             descriptor: m::Descriptor {
                 key: m::ObjectKey {
                     kind: m::Kind::Commit,
@@ -223,31 +231,6 @@ impl StoredNode {
             },
         }
     }
-}
-#[derive(Serialize, Deserialize)]
-struct Envelope<T> {
-    value: T,
-    checksum: [u8; 32],
-}
-fn encode<T: Serialize>(value: &T) -> Result<Vec<u8>> {
-    let bytes = serde_json::to_vec(value).map_err(|_| Error::Corrupt)?;
-    serde_json::to_vec(&Envelope {
-        value,
-        checksum: *blake3::hash(&bytes).as_bytes(),
-    })
-    .map_err(|_| Error::Corrupt)
-}
-fn decode<T: Serialize + DeserializeOwned>(bytes: &[u8], limit: usize) -> Result<T> {
-    if bytes.len() > limit {
-        return Err(Error::Corrupt);
-    }
-    let envelope: Envelope<T> = serde_json::from_slice(bytes).map_err(|_| Error::Corrupt)?;
-    if *blake3::hash(&serde_json::to_vec(&envelope.value).map_err(|_| Error::Corrupt)?).as_bytes()
-        != envelope.checksum
-    {
-        return Err(Error::Corrupt);
-    }
-    Ok(envelope.value)
 }
 fn repo_hash(repo: &str) -> Result<[u8; 32]> {
     if repo.is_empty() || repo.len() > 512 || repo.chars().any(char::is_control) {
@@ -275,6 +258,7 @@ fn synthetic() -> StoredNode {
         position: 0,
         generation: 0,
         size: 0,
+        committer_millis: 0,
         skips: Vec::new(),
     }
 }
@@ -302,18 +286,61 @@ pub struct Scope {
 }
 
 impl State {
-    fn get<T: Serialize + DeserializeOwned>(&self, key: &[u8], limit: usize) -> Result<Option<T>> {
+    fn get<T: RecordCodec>(&self, key: &[u8], limits: &Limits) -> Result<Option<T>> {
         if self.failed {
             return Err(Error::Unavailable);
         }
         self.table
             .get(key)
             .map_err(storage)?
-            .map(|bytes| decode(&bytes, limit))
+            .map(|bytes| decode(key, &bytes, limits))
             .transpose()
     }
-    fn repository(&self, repo: &str, hash: &[u8; 32], limit: usize) -> Result<Option<Repository>> {
-        let result: Option<Repository> = self.get(&key(b'r', hash, b""), limit)?;
+    fn position_id(
+        &self,
+        repo: &[u8; 32],
+        position: u64,
+        limits: &Limits,
+        budget: &mut WorkBudget,
+    ) -> Result<Option<m::CommitId>> {
+        budget.charge(1, 0, 0)?;
+        if self.failed {
+            return Err(Error::Unavailable);
+        }
+        if position == 0 {
+            return Ok(Some(m::CommitId::ROOT));
+        }
+        let storage_key = key(b'p', repo, &position.to_be_bytes());
+        let Some(bytes) = self.table.get(&storage_key).map_err(storage)? else {
+            return Ok(None);
+        };
+        budget.charge(0, 0, bytes.len() as u64)?;
+        let id: [u8; 32] = decode(&storage_key, &bytes, limits)?;
+        Ok(Some(m::CommitId(id)))
+    }
+    fn node_at_position(
+        &self,
+        repo: &[u8; 32],
+        position: u64,
+        limits: &Limits,
+        budget: &mut WorkBudget,
+    ) -> Result<Option<StoredNode>> {
+        let Some(id) = self.position_id(repo, position, limits, budget)? else {
+            return Ok(None);
+        };
+        let node = self.node(repo, id, limits, budget)?.ok_or(Error::Corrupt)?;
+        if node.position != position {
+            return Err(Error::Corrupt);
+        }
+        Ok(Some(node))
+    }
+    fn repository(
+        &self,
+        repo: &str,
+        hash: &[u8; 32],
+        limits: &Limits,
+    ) -> Result<Option<Repository>> {
+        let result: Option<Repository> = self.get(&key(b'r', hash, b""), limits)?;
         if result.as_ref().is_some_and(|value| value.name != repo) {
             return Err(Error::Corrupt);
         }
@@ -323,7 +350,7 @@ impl State {
         &self,
         repo: &[u8; 32],
         id: m::CommitId,
-        limit: usize,
+        limits: &Limits,
         budget: &mut WorkBudget,
     ) -> Result<Option<StoredNode>> {
         budget.charge(1, 0, 0)?;
@@ -337,7 +364,7 @@ impl State {
             return Ok(None);
         };
         budget.charge(0, 0, bytes.len() as u64)?;
-        let node: StoredNode = decode(&bytes, limit)?;
+        let node: StoredNode = decode(&key(b'n', repo, &id.0), &bytes, limits)?;
         if node.commit != id.0
             || node.position == 0
             || node.generation == 0
@@ -354,26 +381,61 @@ impl Index {
         let directory = PrivateDir::create(path)?;
         let lock = directory.open_lock("index.lock")?;
         lock.try_lock_exclusive()?;
-        let db = SingleWriterTxDatabase::builder(directory.path().join("index.fjall"))
+        // Only an absent data directory may acquire a new logical schema.
+        // Fjall otherwise initializes a missing marker itself; doing that to
+        // partial/foreign derived state would silently adopt it.
+        let data_path = directory.path().join("index.fjall");
+        let fresh = match std::fs::symlink_metadata(&data_path) {
+            Ok(metadata) => {
+                if !metadata.is_dir() || metadata.file_type().is_symlink() {
+                    return Err(Error::Corrupt);
+                }
+                let marker_path = data_path.join("version");
+                let marker = std::fs::symlink_metadata(&marker_path).map_err(|_| Error::Corrupt)?;
+                if !marker.is_file() || marker.len() != 4 {
+                    return Err(Error::Corrupt);
+                }
+                let file = File::open(marker_path).map_err(|_| Error::Corrupt)?;
+                let opened = file.metadata().map_err(|_| Error::Corrupt)?;
+                if !opened.is_file() || opened.len() != 4 {
+                    return Err(Error::Corrupt);
+                }
+                let mut bytes = Vec::with_capacity(5);
+                file.take(5)
+                    .read_to_end(&mut bytes)
+                    .map_err(|_| Error::Corrupt)?;
+                if bytes != b"FJL\x03" {
+                    return Err(Error::Corrupt);
+                }
+                false
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => true,
+            Err(error) => return Err(error.into()),
+        };
+        let db = SingleWriterTxDatabase::builder(data_path)
             .open()
             .map_err(storage)?;
+        if !fresh && !db.keyspace_exists("graph") {
+            return Err(Error::Corrupt);
+        }
         let table = db
             .keyspace("graph", KeyspaceCreateOptions::default)
             .map_err(storage)?;
         let header = if let Some(bytes) = table.get(b"header").map_err(storage)? {
-            decode(&bytes, limits.max_record_bytes)?
+            decode(b"header", &bytes, limits)?
         } else {
-            if db.read_tx().prefix(&table, b"").next().is_some() {
+            if !fresh || db.read_tx().prefix(&table, b"").next().is_some() {
                 return Err(Error::Corrupt);
             }
             let header = Header {
-                schema: 1,
+                schema: STORAGE_SCHEMA,
+                native_format: m::FORMAT_VERSION,
                 epoch: *uuid::Uuid::new_v4().as_bytes(),
                 repositories: 0,
                 nodes: 0,
                 bytes: 0,
             };
-            let bytes = encode(&header)?;
+            let bytes = encode(b"header", &header)?;
             if bytes.len() > limits.max_record_bytes {
                 return Err(Error::Invalid("derived header size"));
             }
@@ -382,8 +444,10 @@ impl Index {
             tx.commit().map_err(storage)?;
             header
         };
-        if header.schema != 1
-            || header.epoch == [0; 16]
+        if header.schema != STORAGE_SCHEMA || header.native_format != m::FORMAT_VERSION {
+            return Err(Error::UnsupportedSchema);
+        }
+        if header.epoch == [0; 16]
             || header.nodes > limits.max_nodes as u64
             || header.repositories > limits.max_repositories as u64
             || header.bytes > limits.max_index_bytes
@@ -454,19 +518,20 @@ impl Index {
         let old = state.node(
             &repo,
             m::CommitId(descriptor.key.id.0),
-            self.limits.max_record_bytes,
+            &self.limits,
             &mut budget,
         )?;
         if let Some(old) = old {
             if old.change != commit.change_id.0
                 || old.parents != commit.parents.iter().map(|id| id.0).collect::<Vec<_>>()
                 || old.size != descriptor.size_bytes
+                || old.committer_millis != commit.committer.timestamp.millis_since_epoch
             {
                 return Err(Error::Corrupt);
             }
             return Ok(old.public());
         }
-        let existing = state.repository(repository, &repo, self.limits.max_record_bytes)?;
+        let existing = state.repository(repository, &repo, &self.limits)?;
         let mut metadata = existing.clone().unwrap_or(Repository {
             name: repository.into(),
             high_water: 0,
@@ -479,7 +544,7 @@ impl Index {
         let mut sole_parent = None;
         for id in &commit.parents {
             let parent = state
-                .node(&repo, *id, self.limits.max_record_bytes, &mut budget)?
+                .node(&repo, *id, &self.limits, &mut budget)?
                 .ok_or(Error::NotReady)?;
             if parent.position > metadata.high_water {
                 return Err(Error::Corrupt);
@@ -505,9 +570,10 @@ impl Index {
             position,
             generation,
             size: descriptor.size_bytes,
+            committer_millis: commit.committer.timestamp.millis_since_epoch,
             skips,
         };
-        let node_bytes = encode(&node)?;
+        let node_bytes = encode(&key(b'n', &repo, &node.commit), &node)?;
         if node_bytes.len() > self.limits.max_record_bytes {
             return Err(Error::Invalid("derived node size"));
         }
@@ -519,9 +585,9 @@ impl Index {
             .repositories
             .checked_add(u64::from(existing.is_none()))
             .ok_or(Error::Corrupt)?;
-        let position_bytes = encode(&node.commit)?;
-        let change_bytes = encode(&position)?;
-        let metadata_bytes = encode(&metadata)?;
+        let position_bytes = encode(&key(b'p', &repo, &position.to_be_bytes()), &node.commit)?;
+        let change_bytes = encode(&change_key(&repo, &node.change, &node.commit), &position)?;
+        let metadata_bytes = encode(&key(b'r', &repo, b""), &metadata)?;
         let added = node_bytes.len()
             + 65
             + position_bytes.len()
@@ -532,7 +598,7 @@ impl Index {
             + 33;
         let removed = existing
             .as_ref()
-            .map(|before| encode(before).map(|bytes| bytes.len() + 33))
+            .map(|before| encode(&key(b'r', &repo, b""), before).map(|bytes| bytes.len() + 33))
             .transpose()?
             .unwrap_or(0);
         header.bytes = header
@@ -546,7 +612,7 @@ impl Index {
         {
             return Err(Error::Invalid("persistent graph budget"));
         }
-        let header_bytes = encode(&header)?;
+        let header_bytes = encode(b"header", &header)?;
         if [
             &node_bytes,
             &position_bytes,
@@ -583,7 +649,7 @@ impl Index {
     pub fn node(&self, repository: &str, id: m::CommitId) -> Result<Option<CommitNode>> {
         let repo = repo_hash(repository)?;
         let state = self.state.lock().unwrap();
-        state.repository(repository, &repo, self.limits.max_record_bytes)?;
+        state.repository(repository, &repo, &self.limits)?;
         let mut budget = WorkBudget::new(
             u64::MAX,
             u64::MAX,
@@ -591,7 +657,7 @@ impl Index {
             self.limits.max_nodes,
         );
         Ok(state
-            .node(&repo, id, self.limits.max_record_bytes, &mut budget)?
+            .node(&repo, id, &self.limits, &mut budget)?
             .map(|node| node.public()))
     }
     pub fn scope(self: &Arc<Self>, repository: &str, roots: &[m::CommitId]) -> Result<Scope> {
@@ -601,7 +667,7 @@ impl Index {
         }
         let state = self.state.lock().unwrap();
         let metadata = state
-            .repository(repository, &repo, self.limits.max_record_bytes)?
+            .repository(repository, &repo, &self.limits)?
             .unwrap_or(Repository {
                 name: repository.into(),
                 high_water: 0,
@@ -618,7 +684,7 @@ impl Index {
         );
         for root in &sorted {
             state
-                .node(&repo, *root, self.limits.max_record_bytes, &mut budget)?
+                .node(&repo, *root, &self.limits, &mut budget)?
                 .ok_or(Error::NotReady)?;
         }
         Ok(Scope {
@@ -639,31 +705,28 @@ fn build_skips(
     parent: Option<&StoredNode>,
     limits: &Limits,
     budget: &mut WorkBudget,
-) -> Result<Vec<Skip>> {
+) -> Result<Vec<u64>> {
     let Some(parent) = parent else {
         return Ok(Vec::new());
     };
-    let mut skips = vec![Skip {
-        commit: parent.commit,
-        position: parent.position,
-        generation: parent.generation,
-    }];
+    let mut skips = vec![parent.position];
     for level in 1..64 {
-        let middle = state
-            .node(
-                repo,
-                m::CommitId(skips[level - 1].commit),
-                limits.max_record_bytes,
-                budget,
-            )?
-            .ok_or(Error::Corrupt)?;
+        let loaded;
+        let middle = if level == 1 {
+            parent
+        } else {
+            loaded = state
+                .node_at_position(repo, skips[level - 1], limits, budget)?
+                .ok_or(Error::Corrupt)?;
+            &loaded
+        };
         let Some(target) = middle.skips.get(level - 1) else {
             break;
         };
-        if target.position >= skips[level - 1].position {
+        if *target >= skips[level - 1] {
             return Err(Error::Corrupt);
         }
-        skips.push(target.clone());
+        skips.push(*target);
     }
     Ok(skips)
 }
@@ -698,7 +761,7 @@ fn validate_storage(state: &State, limits: &Limits) -> Result<()> {
         let repo: [u8; 32] = key_bytes[1..33].try_into().map_err(|_| Error::Corrupt)?;
         match key_bytes[0] {
             b'r' if key_bytes.len() == 33 => {
-                let metadata: Repository = decode(&value, limits.max_record_bytes)?;
+                let metadata: Repository = decode(&key_bytes, &value, limits)?;
                 if repo_hash(&metadata.name)? != repo
                     || metadata.high_water == 0
                     || metadata.generation != metadata.high_water
@@ -712,15 +775,15 @@ fn validate_storage(state: &State, limits: &Limits) -> Result<()> {
                 }
             }
             b'n' if key_bytes.len() == 65 => {
-                let _: StoredNode = decode(&value, limits.max_record_bytes)?;
+                let _: StoredNode = decode(&key_bytes, &value, limits)?;
                 counts[0] += 1;
             }
             b'p' if key_bytes.len() == 41 => {
-                let _: [u8; 32] = decode(&value, limits.max_record_bytes)?;
+                let _: [u8; 32] = decode(&key_bytes, &value, limits)?;
                 counts[1] += 1;
             }
             b'c' if key_bytes.len() == 81 => {
-                let _: u64 = decode(&value, limits.max_record_bytes)?;
+                let _: u64 = decode(&key_bytes, &value, limits)?;
                 counts[2] += 1;
             }
             _ => return Err(Error::Corrupt),
@@ -740,13 +803,10 @@ fn validate_storage(state: &State, limits: &Limits) -> Result<()> {
             .ok_or(Error::Corrupt)?;
         for position in 1..=metadata.high_water {
             let id: [u8; 32] = state
-                .get(
-                    &key(b'p', &repo, &position.to_be_bytes()),
-                    limits.max_record_bytes,
-                )?
+                .get(&key(b'p', &repo, &position.to_be_bytes()), limits)?
                 .ok_or(Error::Corrupt)?;
             let node = state
-                .node(&repo, m::CommitId(id), limits.max_record_bytes, &mut budget)?
+                .node(&repo, m::CommitId(id), limits, &mut budget)?
                 .ok_or(Error::Corrupt)?;
             if node.position != position
                 || node.parents.len() > limits.max_parents
@@ -755,10 +815,7 @@ fn validate_storage(state: &State, limits: &Limits) -> Result<()> {
                 return Err(Error::Corrupt);
             }
             let indexed: u64 = state
-                .get(
-                    &change_key(&repo, &node.change, &node.commit),
-                    limits.max_record_bytes,
-                )?
+                .get(&change_key(&repo, &node.change, &node.commit), limits)?
                 .ok_or(Error::Corrupt)?;
             if indexed != position {
                 return Err(Error::Corrupt);
@@ -767,12 +824,7 @@ fn validate_storage(state: &State, limits: &Limits) -> Result<()> {
             let mut sole_parent = None;
             for parent in &node.parents {
                 let parent = state
-                    .node(
-                        &repo,
-                        m::CommitId(*parent),
-                        limits.max_record_bytes,
-                        &mut budget,
-                    )?
+                    .node(&repo, m::CommitId(*parent), limits, &mut budget)?
                     .ok_or(Error::Corrupt)?;
                 if parent.position >= position {
                     return Err(Error::Corrupt);
@@ -795,6 +847,11 @@ fn validate_storage(state: &State, limits: &Limits) -> Result<()> {
         return Err(Error::Corrupt);
     }
     Ok(())
+}
+
+enum AncestorLocator {
+    Id(m::CommitId, Option<u64>),
+    Position(u64),
 }
 
 impl Scope {
@@ -823,7 +880,7 @@ impl Scope {
             return Err(Error::Unavailable);
         }
         Ok(state
-            .node(&self.repo, id, self.index.limits.max_record_bytes, budget)?
+            .node(&self.repo, id, &self.index.limits, budget)?
             .filter(|node| node.position <= self.high_water))
     }
     fn ancestor(
@@ -838,16 +895,27 @@ impl Scope {
         };
         let target_key = (target.commit, target.position, target.generation);
         drop(target);
-        let target = target_key;
         let Some(start) = self.read(state, descendant, budget)? else {
             return Ok(false);
         };
-        // Only IDs and verified skip metadata are queued. In particular a
-        // merge cannot retain every decoded parent's own parent vector.
-        let mut frontier = vec![(descendant, Some((start.position, start.generation)))];
+        let mut frontier = vec![AncestorLocator::Id(descendant, Some(start.position))];
         let mut initial = Some(start);
         let mut visited = HashSet::new();
-        while let Some((id, expected)) = frontier.pop() {
+        while let Some(locator) = frontier.pop() {
+            let (id, expected) = match locator {
+                AncestorLocator::Id(id, expected) => (id, expected),
+                AncestorLocator::Position(position) => {
+                    if position > self.high_water {
+                        return Err(Error::Corrupt);
+                    }
+                    (
+                        state
+                            .position_id(&self.repo, position, &self.index.limits, budget)?
+                            .ok_or(Error::Corrupt)?,
+                        Some(position),
+                    )
+                }
+            };
             if !visited.insert(id.0) {
                 continue;
             }
@@ -857,43 +925,42 @@ impl Scope {
             } else {
                 self.read(state, id, budget)?.ok_or(Error::Corrupt)?
             };
-            if expected.is_some_and(|(position, generation)| {
-                node.position != position || node.generation != generation
-            }) {
+            if expected.is_some_and(|position| node.position != position) {
                 return Err(Error::Corrupt);
             }
-            if node.commit == target.0 {
+            if node.commit == target_key.0 {
                 return Ok(true);
             }
-            if node.generation <= target.2 || node.position <= target.1 {
+            if node.generation <= target_key.2 || node.position <= target_key.1 {
                 continue;
             }
             if node.parents.len() == 1 {
-                let Some(next) = node
+                let Some((level, next)) = node
                     .skips
                     .iter()
+                    .enumerate()
                     .rev()
-                    .find(|skip| skip.generation >= target.2 && skip.position >= target.1)
+                    .find(|(_, position)| **position >= target_key.1)
                 else {
-                    // Interleaved positions can put the entire parent chain
-                    // before an unrelated target. That branch cannot reach it.
                     continue;
                 };
-                if next.position >= node.position {
+                if *next >= node.position {
                     return Err(Error::Corrupt);
                 }
                 budget.charge(0, 1, 0)?;
-                if !visited.contains(&next.commit) {
-                    budget.frontier(
-                        visited
-                            .len()
-                            .saturating_add(frontier.len())
-                            .saturating_add(1),
-                    )?;
-                    frontier.push((
-                        m::CommitId(next.commit),
-                        Some((next.position, next.generation)),
-                    ));
+                budget.frontier(
+                    visited
+                        .len()
+                        .saturating_add(frontier.len())
+                        .saturating_add(1),
+                )?;
+                if level == 0 {
+                    let id = m::CommitId(node.parents[0]);
+                    if !visited.contains(&id.0) {
+                        frontier.push(AncestorLocator::Id(id, Some(*next)));
+                    }
+                } else {
+                    frontier.push(AncestorLocator::Position(*next));
                 }
             } else {
                 budget.charge(0, node.parents.len() as u64, 0)?;
@@ -910,7 +977,7 @@ impl Scope {
                 )?;
                 for parent in node.parents {
                     if !visited.contains(&parent) {
-                        frontier.push((m::CommitId(parent), None));
+                        frontier.push(AncestorLocator::Id(m::CommitId(parent), None));
                     }
                 }
             }
@@ -1120,6 +1187,9 @@ impl Scope {
             if key.len() != 81 {
                 return Err(Error::Corrupt);
             }
+            // The change row participates in this read even though scope
+            // membership is subsequently verified through the primary graph.
+            let _: u64 = decode(&key, &value, &self.index.limits)?;
             let candidate = m::ChangeId(key[33..49].try_into().map_err(|_| Error::Corrupt)?);
             let id = m::CommitId(key[49..].try_into().map_err(|_| Error::Corrupt)?);
             if !hex(&candidate.0).starts_with(prefix) {
