@@ -32,6 +32,8 @@ Kernel/provider acceptance needs the actual platform. On Linux, install
 bazel test --config=rbe \
   //crates/workspace-fuse:mounted_tests \
   //crates/jj-vfs:mounted_tests \
+  //crates/jj-native-cli:mounted_tests \
+  //crates/native-vfs:mounted_tests \
   //crates/output-fuse:mounted_tests --test_output=all
 ```
 

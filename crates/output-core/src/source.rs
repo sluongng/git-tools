@@ -92,13 +92,45 @@ pub(super) struct SourceMeta {
 pub(super) struct Gate {
     pub(super) frozen: bool,
     active: usize,
+    changed: Arc<tokio::sync::Notify>,
 }
+/// Only these transient gate conditions may be retried when acquiring a source
+/// snapshot. Namespace, inventory and limit errors are not contention.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SourceFreezeBusy {
+    ActiveOperations,
+    Frozen,
+}
+impl std::fmt::Display for SourceFreezeBusy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::ActiveOperations => "source namespace has active operations",
+            Self::Frozen => "source namespace is frozen",
+        })
+    }
+}
+impl std::error::Error for SourceFreezeBusy {}
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SourceFreezeTimeout;
+impl std::fmt::Display for SourceFreezeTimeout {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("source snapshot acquisition deadline expired")
+    }
+}
+impl std::error::Error for SourceFreezeTimeout {}
 pub(super) struct Job {
     gate: Arc<Mutex<Gate>>,
 }
 impl Drop for Job {
     fn drop(&mut self) {
-        self.gate.lock().unwrap().active -= 1;
+        let changed = {
+            let mut gate = self.gate.lock().unwrap();
+            gate.active -= 1;
+            (gate.active == 0).then(|| gate.changed.clone())
+        };
+        if let Some(changed) = changed {
+            changed.notify_waiters();
+        }
     }
 }
 struct Freeze {
@@ -106,7 +138,12 @@ struct Freeze {
 }
 impl Drop for Freeze {
     fn drop(&mut self) {
-        self.gate.lock().unwrap().frozen = false;
+        let changed = {
+            let mut gate = self.gate.lock().unwrap();
+            gate.frozen = false;
+            gate.changed.clone()
+        };
+        changed.notify_waiters();
     }
 }
 /// Trusted frontend attestation, not an OS fence. `TreeOnly` is valid only when
@@ -265,10 +302,12 @@ impl Tree {
     }
     fn source_freeze(&self) -> Result<Freeze> {
         let mut gate = self.source_gate.lock().unwrap();
-        ensure!(
-            !gate.frozen && gate.active == 0,
-            "source namespace has active operations"
-        );
+        if gate.frozen {
+            return Err(SourceFreezeBusy::Frozen.into());
+        }
+        if gate.active != 0 {
+            return Err(SourceFreezeBusy::ActiveOperations.into());
+        }
         gate.frozen = true;
         Ok(Freeze {
             gate: self.source_gate.clone(),
@@ -300,6 +339,37 @@ impl Tree {
             version,
             limits: limits.clone(),
         })
+    }
+    /// Wait for Tree-owned physical jobs or an existing snapshot to release
+    /// their guards, without cancelling either. No fence is held while waiting.
+    /// The frontend attestation has the same requirements as `freeze_source`.
+    /// Only typed gate contention is retried; all other failures are immediate.
+    pub async fn freeze_source_wait(
+        self: &Arc<Self>,
+        fence: SourceFrontendFence,
+        limits: &SourceLimits,
+        deadline: tokio::time::Instant,
+    ) -> Result<SourceSnapshot> {
+        limits.validate()?;
+        let changed = self.source_gate.lock().unwrap().changed.clone();
+        loop {
+            if tokio::time::Instant::now() >= deadline {
+                return Err(SourceFreezeTimeout.into());
+            }
+            // Register before inspecting the gate so a concurrent final job
+            // drop cannot be lost between the failed acquisition and waiting.
+            let notified = changed.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            match self.freeze_source(fence, limits) {
+                Ok(snapshot) => return Ok(snapshot),
+                Err(error) if error.downcast_ref::<SourceFreezeBusy>().is_some() => {}
+                Err(error) => return Err(error),
+            }
+            tokio::time::timeout_at(deadline, notified)
+                .await
+                .map_err(|_| SourceFreezeTimeout)?;
+        }
     }
     /// Metadata-only atomic publication. The first publication requires an
     /// otherwise empty namespace. Subsequent publication requires an exact

@@ -999,6 +999,31 @@ pub async fn start_with_retirement_budget(
     root: &Path,
     retirement_budget: usize,
 ) -> Result<Arc<FuseMount>> {
+    start_named(tree, root, retirement_budget, "git-tools-outputs".into()).await
+}
+/// Native source mounts have a workspace-specific kernel source name, so
+/// disconnected recovery cannot mistake an output mount for a source mount.
+pub async fn start_native_source(
+    tree: Arc<Tree>,
+    root: &Path,
+    workspace_identity: [u8; 32],
+) -> Result<Arc<FuseMount>> {
+    ensure!(
+        workspace_identity != [0; 32],
+        "native source identity must be nonzero"
+    );
+    let id: String = workspace_identity
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    start_named(tree, root, 64, format!("git-tools-native-{id}")).await
+}
+async fn start_named(
+    tree: Arc<Tree>,
+    root: &Path,
+    retirement_budget: usize,
+    source_name: String,
+) -> Result<Arc<FuseMount>> {
     let root = root.to_owned();
     let runtime = Handle::current();
     tokio::task::spawn_blocking(move || {
@@ -1038,7 +1063,7 @@ pub async fn start_with_retirement_budget(
             adapter.clone(),
             &root,
             &[
-                MountOption::FSName("git-tools-outputs".into()),
+                MountOption::FSName(source_name),
                 MountOption::DefaultPermissions,
                 MountOption::NoAtime,
                 MountOption::NoSuid,

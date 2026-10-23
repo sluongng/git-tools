@@ -38,6 +38,10 @@ pub enum Request {
     NativeMounted {
         workspace_id: String,
     },
+    /// Detach only a privately recorded, proven disconnected native mount.
+    NativeRecover {
+        workspace_id: String,
+    },
 
     Mounted {
         session: PathBuf,

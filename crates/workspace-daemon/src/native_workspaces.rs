@@ -47,6 +47,8 @@ struct Record {
     bootstrap_commit: [u8; 32],
     scope: String,
     state: Lifecycle,
+    #[serde(default)]
+    native_mount: Option<crate::recovery::NativeMountProof>,
 }
 struct Entry {
     record: Record,
@@ -219,6 +221,7 @@ impl Manager {
             bootstrap_commit: commit,
             scope: repository.scope.backend().into(),
             state: Lifecycle::Pending,
+            native_mount: None,
         };
         if let Some(entry) = self.entries.get(&workspace_id) {
             ensure!(
@@ -368,6 +371,27 @@ impl Manager {
         };
         // Retain the live mount BEFORE any following fallible operation.
         self.entries.get_mut(&workspace_id).unwrap().mount = Some(mount.clone());
+        #[cfg(target_os = "linux")]
+        {
+            let namespace_identity = mount.tree().identity().to_owned();
+            let proof = match crate::recovery::NativeMountProof::capture(
+                &record.root,
+                &native_source_name(record.workspace_id),
+                &namespace_identity,
+            ) {
+                Ok(proof) => proof,
+                Err(error) => {
+                    self.failed(&workspace_id)?;
+                    return Err(error
+                        .context("native kernel identity capture failed; live provider retained"));
+                }
+            };
+            let entry = self.entries.get_mut(&workspace_id).unwrap();
+            entry.record.native_mount = Some(proof);
+            // Acknowledgement is forbidden until the exact kernel evidence is
+            // durable. A crash before this write requires manual inspection.
+            persist(entry)?;
+        }
         let binding = self.binding(&record)?;
         let provision = match registry.lookup(&binding.root) {
             Ok(existing) => {
@@ -462,6 +486,21 @@ impl Manager {
                 .to_owned(),
         })
     }
+    pub fn recover(&mut self, id: &str) -> Result<serde_json::Value> {
+        let _ = unhex(id)?;
+        let entry = self
+            .entries
+            .get_mut(id)
+            .context("native workspace is not registered")?;
+        ensure!(
+            entry.mount.is_none()
+                && entry.controller.is_none()
+                && !entry.registered
+                && entry.provider_failure.is_none(),
+            "native workspace has a live owned provider; use tinytree unmount, never recovery"
+        );
+        recover_entry(&self.config, entry)
+    }
     pub async fn stop(&mut self, id: &str) -> Result<()> {
         let _ = unhex(id)?;
         let entry = self
@@ -523,6 +562,11 @@ impl Manager {
                 return Err(error.context("native provider remains owned after unsuccessful stop"));
             }
         }
+        #[cfg(target_os = "linux")]
+        ensure!(
+            crate::recovery::identity(&entry.record.root)?.is_none(),
+            "native kernel mount remains without a live handle; use workspace recover --native-workspace ID"
+        );
         entry.controller = None;
         entry.mount = None;
         entry.record.state = Lifecycle::Stopped;
@@ -554,6 +598,86 @@ impl Manager {
             .drain()
             .await
             .map_err(|_| anyhow::anyhow!("native projection RPCs did not drain"))
+    }
+}
+fn native_source_name(id: [u8; 32]) -> String {
+    format!("git-tools-native-{}", hex(&id))
+}
+/// The caller must own the daemon's exclusive lock. Do not open providers or
+/// canonicalize the disconnected projected root merely to select a record.
+pub(crate) fn recover_offline(config: &Config, id: &str) -> Result<serde_json::Value> {
+    let expected = unhex(id)?;
+    let directory = PrivateDir::open_existing(config.state_dir.join("native-workspaces"))?;
+    let child = PrivateDir::open_existing(directory.path().join(id))?;
+    let record: Record = serde_json::from_slice(&child.read("workspace.json", MAX_RECORD)?)?;
+    ensure!(
+        record.workspace_id == expected,
+        "native recovery record identity mismatch"
+    );
+    let mut entry = Entry {
+        record,
+        directory: child,
+        mount: None,
+        controller: None,
+        registered: false,
+        provider_failure: None,
+    };
+    recover_entry(config, &mut entry)
+}
+fn recover_entry(config: &Config, entry: &mut Entry) -> Result<serde_json::Value> {
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (config, entry);
+        anyhow::bail!("native disconnected-mount recovery currently requires Linux")
+    }
+    #[cfg(target_os = "linux")]
+    {
+        validate_record(&entry.record)?;
+        ensure!(
+            config.native.repositories.contains_key(&entry.record.store),
+            "native recovery repository alias is not configured"
+        );
+        ensure!(
+            !overlaps(&entry.record.root, &config.state_dir),
+            "native recovery mount and daemon state overlap"
+        );
+        let mounted = crate::recovery::identity(&entry.record.root)?;
+        let owner = if mounted.is_some() {
+            let proof = entry
+                .record
+                .native_mount
+                .as_ref()
+                .context("no persisted native kernel identity; inspect and unmount manually")?;
+            Some(native_vfs::lock_recovery(
+                &entry.directory.path().join("mount"),
+                &entry.record.root,
+                entry.record.workspace_id,
+                &entry.record.scope,
+                &proof.namespace_identity,
+            )?)
+        } else {
+            None
+        };
+        let detached = if let Some(proof) = entry
+            .record
+            .native_mount
+            .as_ref()
+            .filter(|_| owner.is_some())
+        {
+            proof.detach(
+                &entry.record.root,
+                &native_source_name(entry.record.workspace_id),
+            )?
+        } else {
+            false
+        };
+        entry.record.state = Lifecycle::Stopped;
+        persist(entry)?;
+        drop(owner);
+        Ok(
+            serde_json::json!({"workspace_id": hex(&entry.record.workspace_id),
+            "detached": detached, "state": "stopped", "next": "tinytree resume DEST"}),
+        )
     }
 }
 fn persist(entry: &Entry) -> Result<()> {

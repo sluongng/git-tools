@@ -40,7 +40,11 @@ enum Operation {
     Serve,
     /// Safely detach verified disconnected mounts after a daemon crash.
     Recover {
+        #[arg(conflicts_with = "native_workspace")]
         session: Option<PathBuf>,
+        /// Select a native workspace without looking up its disconnected root.
+        #[arg(long, conflicts_with = "session")]
+        native_workspace: Option<String>,
     },
     #[command(hide = true)]
     MountProbe {
@@ -151,7 +155,21 @@ async fn run(cli: Cli) -> Result<serde_json::Value> {
         );
     }
     let config = Config::load(&cli.config)?;
-    if let Operation::Recover { session } = &cli.command {
+    if let Operation::Recover {
+        session,
+        native_workspace,
+    } = &cli.command
+    {
+        if let Some(workspace_id) = native_workspace {
+            let controller = client(&config);
+            if std::os::unix::net::UnixStream::connect(config.socket()).is_ok() {
+                controller.validate_identity()?;
+                return controller.call(Request::NativeRecover {
+                    workspace_id: workspace_id.clone(),
+                });
+            }
+            return workspace_daemon::daemon::recover_native_offline(config, workspace_id);
+        }
         let session = session
             .as_ref()
             .map(|path| path.canonicalize().context("recovery session must exist"))

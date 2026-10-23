@@ -3106,6 +3106,7 @@ dependencies = [
  "clap",
  "fs2",
  "futures",
+ "http",
  "jj-cli",
  "jj-lib",
  "jj-native-backend",
@@ -3126,6 +3127,8 @@ dependencies = [
  "tokio",
  "tokio-stream",
  "toml",
+ "tonic",
+ "tower",
  "uuid",
  "workspace-daemon",
 ]

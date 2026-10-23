@@ -284,8 +284,12 @@ pub async fn mount_prepared(prepared: PreparedWorkspace) -> Result<NativeMount> 
     #[cfg(any(target_os = "linux", target_os = "macos", windows))]
     {
         #[cfg(target_os = "linux")]
-        let projection: Arc<dyn Projection> =
-            output_fuse::start(prepared.tree(), prepared.root()).await?;
+        let projection: Arc<dyn Projection> = output_fuse::start_native_source(
+            prepared.tree(),
+            prepared.root(),
+            prepared.workspace_identity(),
+        )
+        .await?;
         #[cfg(target_os = "macos")]
         let projection: Arc<dyn Projection> =
             Arc::new(output_nfs::NfsMount::start(prepared.tree(), prepared.root()).await?);
@@ -309,6 +313,137 @@ pub async fn mount_prepared(prepared: PreparedWorkspace) -> Result<NativeMount> 
         })
     }
 }
+/// Pins recognized private state while the daemon detaches an independently
+/// proven disconnected kernel mount. This guard never opens the projected root
+/// or opens/repairs the namespace database.
+#[derive(Debug)]
+pub struct RecoveryGuard {
+    _directory: PrivateDir,
+    _namespace: File,
+    _database: File,
+    _version: File,
+    _lock: File,
+}
+pub fn lock_recovery(
+    state: &Path,
+    root: &Path,
+    workspace_identity: [u8; 32],
+    backend: &str,
+    expected_namespace: &str,
+) -> Result<RecoveryGuard> {
+    #[cfg(target_os = "linux")]
+    {
+        lock_recovery_linux(state, root, workspace_identity, backend, expected_namespace)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (state, root, workspace_identity, backend, expected_namespace);
+        anyhow::bail!("native disconnected-mount recovery currently requires Linux")
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn lock_recovery_linux(
+    state: &Path,
+    root: &Path,
+    workspace_identity: [u8; 32],
+    backend: &str,
+    expected_namespace: &str,
+) -> Result<RecoveryGuard> {
+    use std::{io::Read, os::unix::fs::MetadataExt};
+    ensure!(
+        workspace_identity != [0; 32],
+        "invalid native recovery identity"
+    );
+    for path in [state, root] {
+        ensure!(
+            path.is_absolute()
+                && path.as_os_str().len() <= 4096
+                && !path
+                    .components()
+                    .any(|part| matches!(part, Component::CurDir | Component::ParentDir)),
+            "native recovery paths must be absolute and normalized"
+        );
+    }
+    ensure!(
+        !overlaps(state, root),
+        "native recovery state and mount overlap"
+    );
+    ensure!(
+        !expected_namespace.is_empty() && expected_namespace.len() <= 128,
+        "native recovery namespace identity is invalid"
+    );
+    let directory = PrivateDir::open_existing(state)?;
+    ensure!(
+        fs::symlink_metadata(directory.path().join("owner.lock"))?.is_file(),
+        "native recovery owner lock is missing"
+    );
+    let lock = directory.open_lock("owner.lock")?;
+    lock.try_lock_exclusive()
+        .context("native workspace state remains owned")?;
+    let header: Header = serde_json::from_slice(&directory.read("native-vfs.json", 32 * 1024)?)?;
+    ensure!(
+        header.format == 1
+            && header.ready
+            && header.workspace_identity == workspace_identity
+            && header.mount_root == root
+            && header.backend == backend
+            && header.namespace_identity.as_deref() == Some(expected_namespace),
+        "native recovery header does not match the persisted mount proof"
+    );
+    // Fjall creates ordinary 0755 children. The retained 0700 state directory
+    // is the access boundary; do not chmod or reject recognized readonly DB
+    // children merely because their leaf modes inherit less-private defaults.
+    let owner = fs::metadata(directory.path())?.uid();
+    let namespace_path = directory.path().join("namespace");
+    let namespace = open_recovery_child(&namespace_path, owner, true)?;
+    let database_path = namespace_path.join("namespace.fjall");
+    let database = open_recovery_child(&database_path, owner, true)?;
+    let mut version = open_recovery_child(&database_path.join("version"), owner, false)?;
+    let mut bytes = Vec::with_capacity(5);
+    (&mut version).take(5).read_to_end(&mut bytes)?;
+    ensure!(
+        bytes == b"FJL\x03",
+        "unrecognized native recovery namespace database"
+    );
+    Ok(RecoveryGuard {
+        _directory: directory,
+        _namespace: namespace,
+        _database: database,
+        _version: version,
+        _lock: lock,
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn open_recovery_child(path: &Path, owner: u32, directory: bool) -> Result<File> {
+    use std::os::unix::fs::MetadataExt;
+    let valid = |metadata: &fs::Metadata| {
+        metadata.uid() == owner
+            && metadata.mode() & 0o022 == 0
+            && if directory {
+                metadata.is_dir()
+            } else {
+                metadata.is_file()
+            }
+    };
+    let before = fs::symlink_metadata(path)?;
+    ensure!(valid(&before), "untrusted native recovery child");
+    let file = File::open(path)?;
+    let opened = file.metadata()?;
+    let after = fs::symlink_metadata(path)?;
+    ensure!(
+        valid(&opened)
+            && valid(&after)
+            && before.dev() == opened.dev()
+            && before.ino() == opened.ino()
+            && opened.dev() == after.dev()
+            && opened.ino() == after.ino(),
+        "native recovery child changed while opening"
+    );
+    Ok(file)
+}
+
 fn validate(config: &Config) -> Result<()> {
     for path in [&config.root, &config.state] {
         ensure!(

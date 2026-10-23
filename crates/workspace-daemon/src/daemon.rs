@@ -7,6 +7,7 @@ use fs2::FileExt;
 use local_cas::{CacheConfig, LocalCas};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
+use std::os::unix::fs::OpenOptionsExt;
 use std::{
     collections::BTreeMap,
     fs::{File, OpenOptions},
@@ -362,6 +363,60 @@ fn persist_bos(config: &Config, identity: crate::recovery::Identity) -> Result<(
     File::open(&config.state_dir)?.sync_all()?;
     Ok(())
 }
+#[cfg(target_os = "linux")]
+fn existing_daemon_owner_lock(directory: &private_fs::PrivateDir) -> Result<File> {
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+    let path = directory.path().join("daemon.lock");
+    let owner = std::fs::metadata(directory.path())?.uid();
+    let valid = |metadata: &std::fs::Metadata| {
+        metadata.is_file()
+            && metadata.uid() == owner
+            && metadata.mode() & 0o022 == 0
+            && metadata.nlink() == 1
+    };
+    let before = std::fs::symlink_metadata(&path)?;
+    ensure!(valid(&before), "untrusted existing daemon owner lock");
+    // Legacy daemons created a 0644 lock under their 0700 state directory.
+    // Linux flock works on this readonly descriptor; never chmod or replace it.
+    let file = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK)
+        .open(&path)?;
+    let opened = file.metadata()?;
+    let after = std::fs::symlink_metadata(path)?;
+    ensure!(
+        valid(&opened)
+            && valid(&after)
+            && before.dev() == opened.dev()
+            && before.ino() == opened.ino()
+            && opened.dev() == after.dev()
+            && opened.ino() == after.ino(),
+        "daemon owner lock changed while opening"
+    );
+    Ok(file)
+}
+
+/// Native recovery uses a private opaque ID and never selects through a dead
+/// FUSE pathname. Offline execution must hold the same daemon owner lock as
+/// normal startup, and cannot initialize missing state or contact providers.
+pub fn recover_native_offline(mut config: Config, workspace_id: &str) -> Result<serde_json::Value> {
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (config, workspace_id);
+        anyhow::bail!("native disconnected-mount recovery currently requires Linux")
+    }
+    #[cfg(target_os = "linux")]
+    {
+        config.validate()?;
+        let directory = private_fs::PrivateDir::open_existing(&config.state_dir)?;
+        config.state_dir = directory.path().canonicalize()?;
+        let lock = existing_daemon_owner_lock(&directory)?;
+        lock.try_lock_exclusive().context(
+            "daemon is still alive or starting; use its private recovery command, never offline recovery")?;
+        crate::native_workspaces::recover_offline(&config, workspace_id)
+    }
+}
+
 /// Offline repair never races a running daemon: its exclusive lock is mandatory.
 pub fn recover_offline(mut config: Config, session: Option<&Path>) -> Result<serde_json::Value> {
     config.validate()?;
@@ -372,6 +427,7 @@ pub fn recover_offline(mut config: Config, session: Option<&Path>) -> Result<ser
         .write(true)
         .create(true)
         .truncate(false)
+        .mode(0o600)
         .open(config.state_dir.join("daemon.lock"))?;
     lock.try_lock_exclusive().context(
         "daemon is still alive or starting; stop it normally, do not recover live mounts",
@@ -618,6 +674,7 @@ pub async fn serve(mut config: Config) -> Result<()> {
         .write(true)
         .create(true)
         .truncate(false)
+        .mode(0o600)
         .open(config.state_dir.join("daemon.lock"))?;
     lock.try_lock_exclusive()
         .context("another workspace daemon owns this state directory")?;
@@ -983,6 +1040,21 @@ pub async fn serve(mut config: Config) -> Result<()> {
                         None => Err(anyhow::anyhow!("native repositories are not configured")),
                     }
                 }
+                Ok(Request::NativeRecover { workspace_id }) => {
+                    let mut state = state_slot.take().expect("owned daemon state");
+                    let (returned, result) = tokio::task::spawn_blocking(move || {
+                        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                            match state.native_workspaces.as_mut() {
+                                Some(manager) => manager.recover(&workspace_id),
+                                None => Err(anyhow::anyhow!("native repositories are not configured")),
+                            }
+                        })).unwrap_or_else(|_| Err(anyhow::anyhow!(
+                            "native recovery worker panicked; owned providers retained")));
+                        (state, result)
+                    }).await.context("native recovery worker panicked")?;
+                    state_slot = Some(returned);
+                    result
+                }
                 Ok(Request::NativeMounted { workspace_id }) => {
                     match state_slot.as_ref().unwrap().native_workspaces.as_ref() {
                         Some(manager) => manager.mounted(&workspace_id).map(|value| json!(value)),
@@ -1161,6 +1233,11 @@ async fn cleanup_native_workspaces(state: &mut State, listener: &UnixListener, t
                 .stop(&workspace_id)
                 .await
                 .map(|()| json!(true)),
+            Ok(Request::NativeRecover { workspace_id }) => state
+                .native_workspaces
+                .as_mut()
+                .unwrap()
+                .recover(&workspace_id),
             Ok(Request::NativeMounted { workspace_id }) => state
                 .native_workspaces
                 .as_ref()
@@ -1221,6 +1298,39 @@ mod tests {
         async fn missing(&self, _: &[local_cas::Artifact]) -> Result<Vec<local_cas::Artifact>> {
             anyhow::bail!("native startup fixture must not query remote objects")
         }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn native_recovery_reuses_legacy_readonly_daemon_lock_without_repair() -> Result<()> {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+        let temporary = tempfile::tempdir()?;
+        let directory = private_fs::PrivateDir::create(temporary.path().join("state"))?;
+        let path = directory.path().join("daemon.lock");
+        std::fs::write(&path, b"legacy lock")?;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644))?;
+        let first = existing_daemon_owner_lock(&directory)?;
+        first.try_lock_exclusive()?;
+        let second = existing_daemon_owner_lock(&directory)?;
+        assert!(second.try_lock_exclusive().is_err());
+        assert_eq!(
+            std::fs::metadata(&path)?.permissions().mode() & 0o777,
+            0o644
+        );
+        assert_eq!(std::fs::read(&path)?, b"legacy lock");
+        drop(first);
+        second.try_lock_exclusive()?;
+        drop(second);
+        std::fs::rename(&path, directory.path().join("saved.lock"))?;
+        symlink("saved.lock", &path)?;
+        assert!(existing_daemon_owner_lock(&directory).is_err());
+        std::fs::remove_file(&path)?;
+        std::fs::hard_link(directory.path().join("saved.lock"), &path)?;
+        assert!(existing_daemon_owner_lock(&directory).is_err());
+        std::fs::remove_file(&path)?;
+        assert!(existing_daemon_owner_lock(&directory).is_err());
+        assert!(!path.exists());
+        Ok(())
     }
 
     #[test]

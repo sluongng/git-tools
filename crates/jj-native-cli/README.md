@@ -36,6 +36,11 @@ to stop and resume the original workspace without resetting edits. Interrupted
 mutations use `tinytree recover DEST`; an applied mutation may require its actual
 retained operation ID as proof.
 
+After a Linux daemon crash, select the workspace ID from `workspace status`, run
+`workspace recover --native-workspace ID`, then `tinytree resume DEST`. Recovery
+only detaches a proven disconnected mount with its matching persisted identity;
+missing evidence requires manual inspection, not a reset.
+
 Linux FUSE is the current integrated provider. Native macOS/Windows mutation
 integration and acceptance remain incomplete; unsupported operations fail
 without creating a checkout. Client GC/offloading is not automatic. Protocol

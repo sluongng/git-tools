@@ -3,12 +3,18 @@
 #![cfg(target_os = "linux")]
 
 use std::{
+    collections::BTreeMap,
     fs,
     io::{BufRead, BufReader, Read, Write},
     net::TcpListener,
     os::unix::{net::UnixStream, process::CommandExt},
     path::{Path, PathBuf},
     process::{Child, Command, Output, Stdio},
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    },
+    task::{Context, Poll},
     time::{Duration, Instant},
 };
 use workspace_daemon::control::{Request, Response};
@@ -26,6 +32,7 @@ struct Fixture {
     socket: PathBuf,
     broker: PathBuf,
     command_number: usize,
+    child_env: Vec<(String, String)>,
 }
 
 impl Fixture {
@@ -91,6 +98,7 @@ impl Fixture {
             broker: state.join("rbe.sock"),
             directory: Some(directory),
             command_number: 0,
+            child_env: vec![],
         }
     }
 
@@ -106,7 +114,38 @@ impl Fixture {
             .env("TINYTREE_REGISTRY", &self.registry)
             .env("JJ_CONFIG", &self.jj_config)
             .env("TERM", "dumb")
+            .envs(self.child_env.iter().map(|(name, value)| (name, value)))
             .stdin(Stdio::null());
+        unsafe extern "C" {
+            fn umask(mask: u32) -> u32;
+        }
+        // Exercise ordinary shell defaults in the CLI, daemon, and recovery
+        // helper rather than inheriting a restrictive test-runner umask.
+        // SAFETY: umask is async-signal-safe and affects only the forked child.
+        unsafe {
+            command.pre_exec(|| {
+                umask(0o022);
+                Ok(())
+            });
+        }
+    }
+
+    fn configure_remote(&mut self, endpoint: &str) {
+        let mut config: toml::Value =
+            toml::from_str(&fs::read_to_string(&self.daemon_config).unwrap()).unwrap();
+        let mut remote = jj_native_remote::Config::default();
+        remote.remote.endpoint = endpoint.to_owned();
+        remote.remote.repository_id = "example".into();
+        remote.remote.token_env = Some("TINYTREE_MOUNT_TEST_TOKEN".into());
+        remote.authorization_profile = "native-mount-fixture".into();
+        config["native"]["repositories"]["example"]
+            .as_table_mut()
+            .unwrap()
+            .insert("remote".into(), toml::Value::try_from(remote).unwrap());
+        fs::write(&self.daemon_config, toml::to_string(&config).unwrap()).unwrap();
+        workspace_daemon::config::Config::load(&self.daemon_config).unwrap();
+        self.child_env
+            .push(("TINYTREE_MOUNT_TEST_TOKEN".into(), REMOTE_TOKEN.into()));
     }
 
     fn start(&mut self) {
@@ -159,30 +198,50 @@ impl Fixture {
     }
 
     fn run(&mut self, cwd: &Path, args: &[&str]) -> Output {
+        let binary = self.cli.clone();
+        let args: Vec<_> = ["--no-pager", "--color=never"]
+            .into_iter()
+            .chain(args.iter().copied())
+            .collect();
+        self.run_binary(cwd, &binary, &args, false)
+    }
+
+    fn workspace(&mut self, args: &[&str]) -> Output {
+        let binary = self.daemon_binary.clone();
+        let config = self.daemon_config.to_str().unwrap().to_owned();
+        let args: Vec<_> = ["--config", config.as_str()]
+            .into_iter()
+            .chain(args.iter().copied())
+            .collect();
+        let base = self.base().to_owned();
+        self.run_binary(&base, &binary, &args, true)
+    }
+
+    fn run_binary(
+        &mut self,
+        cwd: &Path,
+        binary: &Path,
+        args: &[&str],
+        native_path: bool,
+    ) -> Output {
         self.command_number += 1;
         let stdout_path = self.base().join(format!("{}.out", self.command_number));
         let stderr_path = self.base().join(format!("{}.err", self.command_number));
-        let mut command = Command::new(&self.cli);
+        let mut command = Command::new(binary);
         self.environment(&mut command);
         command
-            .args(["--no-pager", "--color=never"])
             .args(args)
             .current_dir(cwd)
-            .env("PATH", &self.empty_path)
+            .env(
+                "PATH",
+                if native_path {
+                    Path::new("/usr/bin:/bin")
+                } else {
+                    &self.empty_path
+                },
+            )
             .stdout(fs::File::create(&stdout_path).unwrap())
             .stderr(fs::File::create(&stderr_path).unwrap());
-        unsafe extern "C" {
-            fn umask(mask: u32) -> u32;
-        }
-        // Exercise ordinary shell defaults: private workspace creation must
-        // not depend on the test runner supplying a restrictive umask.
-        // SAFETY: umask is async-signal-safe and affects only the forked child.
-        unsafe {
-            command.pre_exec(|| {
-                umask(0o022);
-                Ok(())
-            });
-        }
         let mut child = command.spawn().unwrap();
         let deadline = Instant::now() + Duration::from_secs(30);
         let status = loop {
@@ -230,6 +289,28 @@ impl Fixture {
                 broker.to_str().unwrap(),
                 "--store",
                 "example",
+            ],
+        );
+        assert_fuse_mounted(root);
+    }
+
+    fn clone_remote(&mut self, root: &Path) {
+        let base = self.base().to_owned();
+        let broker = self.broker.clone();
+        self.success(
+            &base,
+            &[
+                "tinytree",
+                "clone",
+                root.to_str().unwrap(),
+                "--broker",
+                broker.to_str().unwrap(),
+                "--store",
+                "example",
+                "--reference",
+                "main",
+                "--bookmark",
+                "main",
             ],
         );
         assert_fuse_mounted(root);
@@ -287,11 +368,40 @@ impl Fixture {
             std::thread::sleep(Duration::from_millis(20));
         }
     }
+
+    fn kill_daemon(&mut self) {
+        let mut child = self.daemon.take().unwrap();
+        child.kill().unwrap();
+        let status = child.wait().unwrap();
+        assert!(
+            !status.success(),
+            "the fixture owner must actually be killed"
+        );
+    }
+
+    fn retain_scratch_if_mounted(&mut self) {
+        let mounts = fs::read_to_string("/proc/self/mountinfo");
+        let safe = mounts.is_ok_and(|mounts| {
+            !mounts.lines().any(|line| {
+                line.split_whitespace()
+                    .nth(4)
+                    .is_some_and(|path| Path::new(path).starts_with(self.base()))
+            })
+        });
+        if !safe {
+            let directory = self.directory.take().unwrap().keep();
+            eprintln!(
+                "native fixture mount remains; scratch retained at {}",
+                directory.display()
+            );
+        }
+    }
 }
 
 impl Drop for Fixture {
     fn drop(&mut self) {
         if self.daemon.is_none() {
+            self.retain_scratch_if_mounted();
             return;
         }
         // Never delete a live projection or kill its owner. On failure retain
@@ -328,7 +438,10 @@ impl Drop for Fixture {
         let deadline = Instant::now() + Duration::from_secs(15);
         loop {
             match child.try_wait() {
-                Ok(Some(_)) => return,
+                Ok(Some(_)) => {
+                    self.retain_scratch_if_mounted();
+                    return;
+                }
                 Ok(None) if Instant::now() < deadline => {
                     std::thread::sleep(Duration::from_millis(20));
                 }
@@ -343,17 +456,21 @@ impl Drop for Fixture {
 }
 
 fn assert_fuse_mounted(root: &Path) {
-    let mounts = fs::read_to_string("/proc/self/mountinfo").unwrap();
     assert!(
-        mounts.lines().any(|line| {
-            let Some((mount, filesystem)) = line.split_once(" - ") else {
-                return false;
-            };
-            mount.split_whitespace().nth(4) == root.to_str() && filesystem.starts_with("fuse")
-        }),
+        fuse_mounted(root),
         "expected an actual FUSE mount at {}",
         root.display()
     );
+}
+
+fn fuse_mounted(root: &Path) -> bool {
+    let mounts = fs::read_to_string("/proc/self/mountinfo").unwrap();
+    mounts.lines().any(|line| {
+        let Some((mount, filesystem)) = line.split_once(" - ") else {
+            return false;
+        };
+        mount.split_whitespace().nth(4) == root.to_str() && filesystem.starts_with("fuse")
+    })
 }
 
 #[test]
@@ -446,5 +563,583 @@ fn shipped_cli_uses_lazy_mounts_and_external_per_workspace_state() {
         "dirty across restart\n"
     );
     fixture.success(&base_dir, &["tinytree", "unmount", root.to_str().unwrap()]);
+    fixture.stop_daemon();
+}
+
+const REMOTE_TOKEN: &str = "public-mounted-native-token-not-a-secret";
+
+/// Count real upstream method admission without replacing the repository
+/// implementation, its compression, or its production deadline layer.
+#[derive(Clone)]
+struct CountFileReads<S> {
+    inner: S,
+    reads: Arc<AtomicUsize>,
+}
+impl<S, B> tower::Service<http::Request<B>> for CountFileReads<S>
+where
+    S: tower::Service<http::Request<B>>,
+{
+    type Response = S::Response;
+    type Error = S::Error;
+    type Future = S::Future;
+
+    fn poll_ready(&mut self, context: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        self.inner.poll_ready(context)
+    }
+
+    fn call(&mut self, request: http::Request<B>) -> Self::Future {
+        if request.uri().path() == "/tinytree.v1.Repository/ReadFile" {
+            self.reads.fetch_add(1, Ordering::SeqCst);
+        }
+        self.inner.call(request)
+    }
+}
+
+struct RemoteServer {
+    _directory: tempfile::TempDir,
+    runtime: Option<tokio::runtime::Runtime>,
+    task: Option<tokio::task::JoinHandle<()>>,
+    stop: Option<tokio::sync::oneshot::Sender<()>>,
+    store: tinytree_store::Store,
+    endpoint: String,
+    head: String,
+    source_file: tinytree_model::ObjectKey,
+    source_bytes: Vec<u8>,
+    reads: Arc<AtomicUsize>,
+}
+
+impl RemoteServer {
+    fn start() -> Self {
+        let directory = tempfile::tempdir().unwrap();
+        let store = tinytree_store::Store::open(directory.path().join("store"), Default::default())
+            .unwrap();
+        store.create_repository("example").unwrap();
+        let seed = tinytree_fixture::build_fixture(tinytree_fixture::FixtureConfig {
+            unused_files: 2,
+            bytes_per_file: 64,
+        })
+        .unwrap();
+        for object in seed.objects() {
+            store
+                .put("example", object.descriptor, &object.bytes, 0)
+                .unwrap();
+        }
+        let head: [u8; 32] = *blake3::Hash::from_hex(&seed.manifest.root_commit)
+            .unwrap()
+            .as_bytes();
+        store
+            .publish(
+                "example",
+                &tinytree_store::PublishRequest {
+                    idempotency_key: "mounted-seed".into(),
+                    reference_name: "main".into(),
+                    expected_generation: 0,
+                    new_commit: Some(tinytree_model::CommitId(head)),
+                    staging_leases: vec![],
+                },
+                0,
+            )
+            .unwrap();
+        let source = seed
+            .manifest
+            .files
+            .iter()
+            .find(|file| file.path == "hello.cc")
+            .unwrap();
+        let source_file = tinytree_model::ObjectKey {
+            kind: tinytree_model::Kind::File,
+            id: tinytree_model::ObjectId(*blake3::Hash::from_hex(&source.id).unwrap().as_bytes()),
+        };
+        let source_bytes = seed
+            .objects()
+            .iter()
+            .find(|object| object.descriptor.key == source_file)
+            .unwrap()
+            .bytes
+            .clone();
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(4)
+            .enable_all()
+            .build()
+            .unwrap();
+        let service = tinytree_server::RepositoryService::new(
+            store.clone(),
+            Default::default(),
+            vec!["example".into()],
+            vec![
+                tinytree_server::Principal::new(
+                    "mounted-writer",
+                    REMOTE_TOKEN,
+                    vec!["example".into()],
+                    true,
+                )
+                .unwrap()
+                .with_retention(true),
+            ],
+        )
+        .unwrap();
+        let reads = Arc::new(AtomicUsize::new(0));
+        let counter = reads.clone();
+        let (stop, stopped) = tokio::sync::oneshot::channel();
+        let (endpoint, task) = runtime.block_on(async move {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let endpoint = format!("http://{}", listener.local_addr().unwrap());
+            let task = tokio::spawn(async move {
+                tonic::transport::Server::builder()
+                    .layer(service.deadline_layer())
+                    .layer(tower::layer::layer_fn(move |inner| CountFileReads {
+                        inner,
+                        reads: counter.clone(),
+                    }))
+                    .concurrency_limit_per_connection(service.maximum_inflight())
+                    .add_service(service.grpc_service())
+                    .serve_with_incoming_shutdown(
+                        tokio_stream::wrappers::TcpListenerStream::new(listener),
+                        async {
+                            let _ = stopped.await;
+                        },
+                    )
+                    .await
+                    .unwrap();
+            });
+            (endpoint, task)
+        });
+        Self {
+            _directory: directory,
+            runtime: Some(runtime),
+            task: Some(task),
+            stop: Some(stop),
+            store,
+            endpoint,
+            head: seed.manifest.root_commit,
+            source_file,
+            source_bytes,
+            reads,
+        }
+    }
+
+    fn file_reads(&self) -> usize {
+        self.reads.load(Ordering::SeqCst)
+    }
+
+    fn public(&self) -> tinytree_store::Reference {
+        self.store
+            .references("example", &["main".into()])
+            .unwrap()
+            .remove(0)
+    }
+}
+
+impl Drop for RemoteServer {
+    fn drop(&mut self) {
+        if let Some(stop) = self.stop.take() {
+            let _ = stop.send(());
+        }
+        if let Some(task) = self.task.take() {
+            let runtime = self.runtime.as_ref().unwrap();
+            runtime.block_on(async move {
+                let abort = task.abort_handle();
+                if tokio::time::timeout(Duration::from_secs(5), task)
+                    .await
+                    .is_err()
+                {
+                    abort.abort();
+                }
+            });
+        }
+        self.runtime
+            .take()
+            .unwrap()
+            .shutdown_timeout(Duration::from_secs(5));
+    }
+}
+
+fn remote_observation(binding: &native_workspace_admin::Binding) -> (Vec<u8>, toml::Value) {
+    let bytes = fs::read(binding.working_copy.join("native-remote.toml")).unwrap();
+    let value = toml::from_str(std::str::from_utf8(&bytes).unwrap()).unwrap();
+    (bytes, value)
+}
+
+#[test]
+#[ignore = "requires usable /dev/fuse and fusermount3; run mounted_tests locally"]
+fn shipped_remote_cli_clones_lazily_and_publishes_between_isolated_mounts() {
+    // Declaration order makes the daemon/mount owner clean up before upstream.
+    // Its runtime keeps serving while this test waits for real CLI subprocesses.
+    let upstream = RemoteServer::start();
+    let mut fixture = Fixture::new();
+    fixture.configure_remote(&upstream.endpoint);
+    fixture.start();
+    let base = fixture.base().to_owned();
+    let first = base.join("writer");
+    let second = base.join("reader");
+    fixture.clone_remote(&first);
+    fixture.clone_remote(&second);
+    let first_binding = fixture.binding(&first);
+    let second_binding = fixture.binding(&second);
+    assert_ne!(first_binding.repo, second_binding.repo);
+    assert_ne!(first_binding.working_copy, second_binding.working_copy);
+    assert_eq!(fixture.revision(&first, "main"), upstream.head);
+    assert_eq!(fixture.revision(&second, "main"), upstream.head);
+    assert_eq!(
+        fs::metadata(first.join("hello.cc")).unwrap().len(),
+        upstream.source_bytes.len() as u64
+    );
+    assert_eq!(
+        fs::metadata(second.join("assets/unused-00000000.bin"))
+            .unwrap()
+            .len(),
+        64
+    );
+    assert_eq!(
+        upstream.file_reads(),
+        0,
+        "clone/stat must load metadata, not FILE payloads"
+    );
+    assert_eq!(
+        fs::read(first.join("hello.cc")).unwrap(),
+        upstream.source_bytes
+    );
+    assert_eq!(
+        upstream.file_reads(),
+        1,
+        "one cold source read must issue one real ReadFile RPC"
+    );
+    assert_eq!(
+        fs::read(first.join("hello.cc")).unwrap(),
+        upstream.source_bytes
+    );
+    assert_eq!(
+        fs::read(second.join("hello.cc")).unwrap(),
+        upstream.source_bytes
+    );
+    assert_eq!(
+        upstream.file_reads(),
+        1,
+        "warm reads share the daemon CAS across mounts"
+    );
+
+    let (second_observation, second_state) = remote_observation(&second_binding);
+    assert_eq!(
+        second_state["observations"][0]["generation"].as_integer(),
+        Some(1)
+    );
+    fs::write(
+        first.join("agent.txt"),
+        "published from lazy source mount\n",
+    )
+    .unwrap();
+    fixture.success(&first, &["status"]);
+    fixture.success(&first, &["describe", "-m", "native mounted publication"]);
+    fixture.success(&first, &["bookmark", "set", "main", "-r", "@"]);
+    let published = fixture.revision(&first, "@");
+    fixture.success(
+        &first,
+        &[
+            "tinytree",
+            "push",
+            "--reference",
+            "main",
+            "--bookmark",
+            "main",
+        ],
+    );
+    let public = upstream.public();
+    assert_eq!(public.generation, 2);
+    assert_eq!(
+        blake3::Hash::from(public.commit.unwrap().key.id.0)
+            .to_hex()
+            .as_str(),
+        published
+    );
+    assert_eq!(
+        remote_observation(&second_binding).0,
+        second_observation,
+        "another workspace's publication must not advance this workspace's observation"
+    );
+    assert!(!second.join("agent.txt").exists());
+    fixture.success(
+        &second,
+        &[
+            "tinytree",
+            "fetch",
+            "--reference",
+            "main",
+            "--bookmark",
+            "main",
+        ],
+    );
+    assert_eq!(fixture.revision(&second, "main"), published);
+    assert_eq!(
+        upstream.file_reads(),
+        1,
+        "metadata fetch must not hydrate unrelated source files"
+    );
+    let (observed, state) = remote_observation(&second_binding);
+    assert_eq!(state["observations"][0]["generation"].as_integer(), Some(2));
+    fixture.success(&second, &["edit", "main"]);
+    assert_eq!(
+        fs::read(second.join("agent.txt")).unwrap(),
+        b"published from lazy source mount\n"
+    );
+    fixture.success(&second, &["undo"]);
+    assert_eq!(
+        remote_observation(&second_binding).0,
+        observed,
+        "jj undo must not rewind the external remote observation"
+    );
+    fixture.success(&second, &["edit", &published]);
+
+    fixture.success(&base, &["tinytree", "unmount", first.to_str().unwrap()]);
+    fixture.success(&base, &["tinytree", "unmount", second.to_str().unwrap()]);
+    fixture.stop_daemon();
+    // Cache fills are disposable CAS data, not authoritative repository FILEs.
+    let local = tinytree_store::Store::open_existing(
+        base.join("daemon/native/example/native-objects"),
+        jj_native_backend::Config::default().store,
+    )
+    .unwrap();
+    assert!(
+        local
+            .descriptor("local", upstream.source_file)
+            .unwrap()
+            .is_none(),
+        "reading a remote source file must not install authoritative residency"
+    );
+    drop(local);
+    fixture.start();
+    fixture.success(&base, &["tinytree", "resume", second.to_str().unwrap()]);
+    assert_fuse_mounted(&second);
+    assert_eq!(fixture.binding(&second), second_binding);
+    assert_eq!(remote_observation(&second_binding).0, observed);
+    assert_eq!(fixture.revision(&second, "main"), published);
+    let reads = upstream.file_reads();
+    assert_eq!(
+        fs::read(second.join("hello.cc")).unwrap(),
+        upstream.source_bytes
+    );
+    assert_eq!(
+        upstream.file_reads(),
+        reads,
+        "warm CAS survives daemon restart"
+    );
+    assert_eq!(
+        fs::read(second.join("agent.txt")).unwrap(),
+        b"published from lazy source mount\n"
+    );
+    fixture.success(&base, &["tinytree", "unmount", second.to_str().unwrap()]);
+    fixture.stop_daemon();
+}
+
+fn write_synced(path: &Path, bytes: &[u8]) {
+    let mut file = fs::File::create(path).unwrap();
+    file.write_all(bytes).unwrap();
+    file.sync_all().unwrap();
+}
+
+fn files_in(path: &Path) -> BTreeMap<PathBuf, Vec<u8>> {
+    fs::read_dir(path)
+        .unwrap()
+        .map(|entry| {
+            let path = entry.unwrap().path();
+            assert!(path.is_file());
+            (path.clone(), fs::read(path).unwrap())
+        })
+        .collect()
+}
+
+fn recovery_report(output: Output) -> serde_json::Value {
+    assert!(
+        output.status.success(),
+        "native recovery failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let result: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(result["ok"], true);
+    result["report"].clone()
+}
+
+#[test]
+#[ignore = "requires usable /dev/fuse and fusermount3; run mounted_tests locally"]
+fn killed_daemon_mounts_require_exact_private_recovery_before_resume() {
+    let mut fixture = Fixture::new();
+    fixture.start();
+    let base = fixture.base().to_owned();
+    let first = base.join("first");
+    let second = base.join("second");
+    fixture.initialize(&first);
+    fixture.initialize(&second);
+    let bindings = [fixture.binding(&first), fixture.binding(&second)];
+    let mut revisions = Vec::new();
+    for (index, root) in [&first, &second].into_iter().enumerate() {
+        let bootstrap = fixture.revision(root, "@");
+        write_synced(
+            &root.join("canonical.txt"),
+            format!("canonical {index}\n").as_bytes(),
+        );
+        fixture.success(root, &["describe", "-m", "canonical before crash"]);
+        let revision = fixture.revision(root, "@");
+        assert_ne!(revision, bootstrap);
+        assert_ne!(revision, "0".repeat(64));
+        revisions.push(revision);
+        // Close and fsync the handle, but deliberately issue no jj snapshot.
+        write_synced(
+            &root.join("dirty.txt"),
+            format!("unsnapshotted {index}\n").as_bytes(),
+        );
+    }
+    let first_id = bindings[0].id();
+    let second_id = bindings[1].id();
+    let first_record = base
+        .join("daemon/native-workspaces")
+        .join(&first_id)
+        .join("workspace.json");
+    let original_record = fs::read(&first_record).unwrap();
+    let original: serde_json::Value = serde_json::from_slice(&original_record).unwrap();
+    assert!(original["native_mount"]["kernel"].is_object());
+    assert!(original["native_mount"]["context"].is_object());
+    assert!(original["native_mount"]["namespace_identity"].is_string());
+    let mut admin = files_in(&fixture.registry.join("client-intents"));
+    for binding in &bindings {
+        for path in [
+            binding.admin.join("initialization.json"),
+            binding.working_copy.join("native-vfs.json"),
+        ] {
+            admin.insert(path.clone(), fs::read(path).unwrap());
+        }
+        admin.extend(files_in(&binding.repo.join("op_heads/heads")));
+    }
+    let live = fixture.workspace(&["recover", "--native-workspace", &first_id]);
+    assert!(
+        !live.status.success(),
+        "a live owned provider must not be recovered"
+    );
+    assert_fuse_mounted(&first);
+    assert_fuse_mounted(&second);
+    fixture.kill_daemon();
+    for root in [&first, &second] {
+        assert_fuse_mounted(root);
+        assert_eq!(
+            fs::metadata(root.join("dirty.txt"))
+                .unwrap_err()
+                .raw_os_error(),
+            Some(107),
+            "the kernel must report ENOTCONN after its exact owner is killed"
+        );
+    }
+
+    let mut missing = original.clone();
+    missing.as_object_mut().unwrap().remove("native_mount");
+    write_synced(&first_record, &serde_json::to_vec(&missing).unwrap());
+    let refused = fixture.workspace(&["recover", "--native-workspace", &first_id]);
+    assert!(
+        !refused.status.success(),
+        "a missing proof must not authorize detach"
+    );
+    assert_fuse_mounted(&first);
+    assert_fuse_mounted(&second);
+    let mut wrong = original;
+    let id = wrong["native_mount"]["kernel"]["id"].as_u64().unwrap();
+    wrong["native_mount"]["kernel"]["id"] = serde_json::Value::from(id.checked_add(1).unwrap());
+    write_synced(&first_record, &serde_json::to_vec(&wrong).unwrap());
+    let refused = fixture.workspace(&["recover", "--native-workspace", &first_id]);
+    assert!(
+        !refused.status.success(),
+        "a mismatched proof must not authorize detach"
+    );
+    assert_fuse_mounted(&first);
+    assert_fuse_mounted(&second);
+    write_synced(&first_record, &original_record);
+
+    let recovered =
+        recovery_report(fixture.workspace(&["recover", "--native-workspace", &first_id]));
+    assert_eq!(recovered["workspace_id"], first_id);
+    assert_eq!(recovered["detached"], true);
+    assert!(!fuse_mounted(&first));
+    assert_fuse_mounted(&second);
+    assert_eq!(
+        fs::metadata(second.join("dirty.txt"))
+            .unwrap_err()
+            .raw_os_error(),
+        Some(107),
+        "recovering one identity must leave the other disconnected mount untouched"
+    );
+    let repeated =
+        recovery_report(fixture.workspace(&["recover", "--native-workspace", &first_id]));
+    assert_eq!(repeated["detached"], false);
+
+    // Keep the second disconnected mount while starting its replacement owner.
+    // Ordinary unmount must not misclassify an unowned kernel mount as stopped.
+    fixture.start();
+    assert!(!fuse_mounted(&first));
+    assert_fuse_mounted(&second);
+    assert!(
+        fixture
+            .control(Request::NativeUnmount {
+                workspace_id: second_id.clone(),
+            })
+            .is_err(),
+        "an unowned disconnected mount requires explicit recovery, not unmount"
+    );
+    assert_fuse_mounted(&second);
+    let status = fixture.control(Request::Status).unwrap();
+    let record = status["native"]["workspaces"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|record| record["workspace_id"] == second_id)
+        .unwrap();
+    assert_eq!(record["state"], "recovery_required");
+
+    // This invocation now routes through the running daemon. Its failed startup
+    // restoration must have retained the exact proof needed for recovery.
+    let recovered =
+        recovery_report(fixture.workspace(&["recover", "--native-workspace", &second_id]));
+    assert_eq!(recovered["workspace_id"], second_id);
+    assert_eq!(recovered["detached"], true);
+    assert!(!fuse_mounted(&second));
+    for (path, bytes) in &admin {
+        assert_eq!(&fs::read(path).unwrap(), bytes);
+    }
+
+    // Explicit recovery leaves both stopped until the user's resume command.
+    assert!(!fuse_mounted(&first));
+    assert!(!fuse_mounted(&second));
+    for (index, root) in [&first, &second].into_iter().enumerate() {
+        fixture.success(&base, &["tinytree", "resume", root.to_str().unwrap()]);
+        assert_fuse_mounted(root);
+        assert_eq!(fixture.binding(root), bindings[index]);
+        assert_eq!(
+            fixture
+                .success(
+                    root,
+                    &[
+                        "--ignore-working-copy",
+                        "log",
+                        "--no-graph",
+                        "-r",
+                        "@",
+                        "-T",
+                        "commit_id"
+                    ]
+                )
+                .trim(),
+            revisions[index]
+        );
+        assert_eq!(
+            fs::read(root.join("canonical.txt")).unwrap(),
+            format!("canonical {index}\n").as_bytes()
+        );
+        assert_eq!(
+            fs::read(root.join("dirty.txt")).unwrap(),
+            format!("unsnapshotted {index}\n").as_bytes()
+        );
+    }
+    for (path, bytes) in &admin {
+        assert_eq!(&fs::read(path).unwrap(), bytes);
+    }
+    for root in [&first, &second] {
+        fixture.success(&base, &["tinytree", "unmount", root.to_str().unwrap()]);
+    }
     fixture.stop_daemon();
 }

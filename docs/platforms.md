@@ -1,7 +1,7 @@
 # Platform support
 
-All frontends are experimental, fixed-base projections. Unified `workspace`
-source-session lifecycle is Linux-only; macOS and Windows use standalone adapters.
+All frontends are experimental. Git source projections are fixed-base. Unified
+`workspace` source-session lifecycle is Linux-only; macOS and Windows use standalone adapters.
 Client filesystem support does not provision compatible remote execution workers.
 
 | Surface | Setup | Important limits |
@@ -10,6 +10,7 @@ Client filesystem support does not provision compatible remote execution workers
 | [macOS source NFS](../crates/workspace-nfs/README.md) | Built-in NFS client, loopback export | No digest xattrs, hardlinks or distributed locking |
 | [Windows source ProjFS](../crates/workspace-projfs/README.md) | NTFS, Windows 10 2004+, Client-ProjFS | Rejects ambiguous names, directory renames, unsupported symlinks |
 | [Jujutsu](../crates/jj-vfs/README.md) | Linux writable mount + custom `git-jj` | No submodules, sparse checkout, `workspace add`, conflict snapshots |
+| [Native Jujutsu](../crates/jj-native-cli/README.md) | Linux FUSE + `tinytree-jj` + daemon | Lazy mounts only; macOS/Windows mutation integration is incomplete, with no checkout fallback |
 | [Bazel outputs](../crates/bazel-output-service/README.md) | Linux FUSE / macOS NFS / Windows ProjFS | Whole-blob verified reads; no TreeArtifactLocator staging |
 
 macOS mounts without sudo as the mountpoint owner using
@@ -82,7 +83,7 @@ bazel test --platforms=@llvm//platforms:windows_x86_64_msvc `
 Native acceptance intentionally inherits PATH for installed Git/Python and the
 Windows system tools; ordinary portable tests still use declared fixtures.
 Git must be on PATH and Python must be native Python 3. Append
-`--test_arg=--list` before acceptance: expect one source case and three output
+`--test_arg=--list` before acceptance: expect one source case and six output
 cases, not zero. The source target explicitly enables the `native` feature.
 These manual, Windows-constrained targets run ignored provider tests only and
 are excluded from wildcard test runs. A successful build/list without running

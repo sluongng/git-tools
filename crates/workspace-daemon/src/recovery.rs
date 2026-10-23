@@ -15,6 +15,100 @@ pub struct Identity {
     source: String,
     owner: u32,
 }
+/// Native mount numbers are meaningful only within their original boot and
+/// mount namespace. Keep this proof separate from legacy Git/BOS records.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct NativeMountProof {
+    pub kernel: Identity,
+    context: MountContext,
+    pub namespace_identity: String,
+}
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct MountContext {
+    boot_id: String,
+    namespace_device: u64,
+    namespace_inode: u64,
+}
+#[cfg(target_os = "linux")]
+fn boot_id(input: &str) -> Result<String> {
+    let value = input.strip_suffix('\n').unwrap_or(input);
+    ensure!(
+        value.len() == 36
+            && value.bytes().enumerate().all(|(index, byte)| {
+                if [8, 13, 18, 23].contains(&index) {
+                    byte == b'-'
+                } else {
+                    byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)
+                }
+            }),
+        "invalid Linux boot identity"
+    );
+    Ok(value.to_owned())
+}
+impl MountContext {
+    fn current() -> Result<Self> {
+        #[cfg(target_os = "linux")]
+        {
+            use std::io::Read;
+            use std::os::unix::fs::MetadataExt;
+            let mut bytes = String::new();
+            std::fs::File::open("/proc/sys/kernel/random/boot_id")?
+                .take(65)
+                .read_to_string(&mut bytes)?;
+            let namespace = std::fs::metadata("/proc/self/ns/mnt")?;
+            ensure!(
+                namespace.ino() != 0,
+                "invalid Linux mount namespace identity"
+            );
+            Ok(Self {
+                boot_id: boot_id(&bytes)?,
+                namespace_device: namespace.dev(),
+                namespace_inode: namespace.ino(),
+            })
+        }
+        #[cfg(not(target_os = "linux"))]
+        anyhow::bail!("native disconnected-mount recovery currently requires Linux")
+    }
+}
+impl NativeMountProof {
+    pub fn capture(path: &Path, source: &str, namespace_identity: &str) -> Result<Self> {
+        let context = MountContext::current()?;
+        let kernel = identity(path)?.context("native kernel mount identity missing")?;
+        ensure!(
+            kernel.source == source
+                && matches!(kernel.filesystem.as_str(), "fuse" | "fuse.git-tools-native"),
+            "native mount is not the expected source filesystem"
+        );
+        #[cfg(unix)]
+        ensure!(
+            kernel.owner == unsafe { libc::geteuid() },
+            "native mount belongs to another user"
+        );
+        ensure!(
+            !namespace_identity.is_empty() && namespace_identity.len() <= 128,
+            "native namespace identity is invalid"
+        );
+        ensure!(
+            context == MountContext::current()?,
+            "mount context changed during capture"
+        );
+        Ok(Self {
+            kernel,
+            context,
+            namespace_identity: namespace_identity.to_owned(),
+        })
+    }
+    pub fn detach(&self, path: &Path, source: &str) -> Result<bool> {
+        ensure!(
+            self.context == MountContext::current()?,
+            "native mount boot or mount namespace changed; refuse unverified recovery"
+        );
+        detach(path, Some(&self.kernel), source)
+    }
+}
+
 #[cfg(target_os = "linux")]
 fn unescape(value: &str) -> Result<PathBuf> {
     use std::os::unix::ffi::OsStringExt;
@@ -122,7 +216,7 @@ pub fn detach(path: &Path, expected: Option<&Identity>, source: &str) -> Result<
     ensure!(
         matches!(
             current.filesystem.as_str(),
-            "fuse" | "fuse.git-vfs" | "fuse.git-tools-outputs"
+            "fuse" | "fuse.git-vfs" | "fuse.git-tools-outputs" | "fuse.git-tools-native"
         ) && current.source == source,
         "mount is not the expected project FUSE filesystem"
     );
@@ -194,5 +288,26 @@ mod tests {
         assert_eq!(found.owner, 1000);
         assert!(parse(&line.repeat(2), Path::new("/tmp/a b")).is_err());
         assert!(parse(line, Path::new("/tmp/other")).unwrap().is_none());
+    }
+    #[test]
+    fn native_recovery_rejects_changed_boot_or_namespace_before_any_detach() {
+        let directory = tempfile::tempdir().unwrap();
+        let target = directory.path().join("not-mounted");
+        let line = "55 1 0:40 / /tmp/example rw - fuse git-tools-native-example rw,user_id=1000,group_id=1000\n";
+        let kernel = parse(line, Path::new("/tmp/example")).unwrap().unwrap();
+        let context = MountContext::current().unwrap();
+        let mut proof = NativeMountProof {
+            kernel,
+            context: context.clone(),
+            namespace_identity: "namespace".into(),
+        };
+        proof.context.namespace_inode = proof.context.namespace_inode.wrapping_add(1);
+        assert!(proof.detach(&target, "git-tools-native-example").is_err());
+        proof.context = context;
+        proof.context.boot_id = "00000000-0000-0000-0000-000000000000".into();
+        assert!(proof.detach(&target, "git-tools-native-example").is_err());
+        assert!(!target.exists());
+        assert!(boot_id(&"a".repeat(65)).is_err());
+        assert!(boot_id("00000000-0000-0000-0000-000000000000\n").is_ok());
     }
 }

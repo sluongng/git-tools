@@ -983,6 +983,160 @@ async fn server_generation_and_persisted_placeholder_fences_are_not_request_coun
     assert_eq!(tree.read(node.id, 0, 99).await.unwrap(), b"old handle");
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn source_snapshot_wait_drains_a_gated_write_and_retains_stable_dirty_bytes() {
+    let (_dir, source, tree) = setup(CacheConfig::default());
+    let limits = SourceLimits::default();
+    tree.install_source(
+        SourceManifest {
+            identity: tree.identity().into(),
+            root: [1; 32],
+            entries: vec![SourceEntry {
+                path: "file".into(),
+                mode: 0o644,
+                content: SourceContent::File(source.artifact(b"base")),
+            }],
+        },
+        None,
+        "initial",
+        &limits,
+    )
+    .unwrap();
+    let id = tree.resolve("file").unwrap().id;
+    source.delay.store(true, Ordering::SeqCst);
+    let writer_tree = tree.clone();
+    let writer = tokio::spawn(async move { writer_tree.write(id, 0, b"edit").await });
+    source.entered.notified().await;
+    let error = tree
+        .freeze_source(SourceFrontendFence::TreeOnly, &limits)
+        .err()
+        .unwrap();
+    assert_eq!(
+        error.downcast_ref::<SourceFreezeBusy>(),
+        Some(&SourceFreezeBusy::ActiveOperations)
+    );
+    let capture = tree.freeze_source_wait(
+        SourceFrontendFence::TreeOnly,
+        &limits,
+        tokio::time::Instant::now() + Duration::from_secs(5),
+    );
+    tokio::pin!(capture);
+    std::future::poll_fn(|cx| {
+        assert!(std::future::Future::poll(capture.as_mut(), cx).is_pending());
+        std::task::Poll::Ready(())
+    })
+    .await;
+    source.release.notify_one();
+    assert_eq!(writer.await.unwrap().unwrap(), 4);
+    let snapshot = capture.await.unwrap();
+    assert_eq!(snapshot.read_local(id, 0, 4).unwrap(), b"edit");
+    assert!(tree.write(id, 0, b"race").await.is_err());
+    assert_eq!(snapshot.read_local(id, 0, 4).unwrap(), b"edit");
+    // An existing snapshot is a distinct typed contention condition. Its Drop
+    // must wake a registered waiter just as a physical job's Drop does.
+    let error = tree
+        .freeze_source(SourceFrontendFence::TreeOnly, &limits)
+        .err()
+        .unwrap();
+    assert_eq!(
+        error.downcast_ref::<SourceFreezeBusy>(),
+        Some(&SourceFreezeBusy::Frozen)
+    );
+    let capture = tree.freeze_source_wait(
+        SourceFrontendFence::TreeOnly,
+        &limits,
+        tokio::time::Instant::now() + Duration::from_secs(5),
+    );
+    tokio::pin!(capture);
+    std::future::poll_fn(|cx| {
+        assert!(std::future::Future::poll(capture.as_mut(), cx).is_pending());
+        std::task::Poll::Ready(())
+    })
+    .await;
+    drop(snapshot);
+    let next = capture.await.unwrap();
+    assert_eq!(next.read_local(id, 0, 4).unwrap(), b"edit");
+    drop(next);
+    assert_eq!(tree.write(id, 0, b"next").await.unwrap(), 4);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn source_snapshot_wait_expiry_does_not_cancel_physical_work_or_leak_a_fence() {
+    let (_dir, source, tree) = setup(CacheConfig::default());
+    let limits = SourceLimits::default();
+    tree.install_source(
+        SourceManifest {
+            identity: tree.identity().into(),
+            root: [1; 32],
+            entries: vec![SourceEntry {
+                path: "file".into(),
+                mode: 0o644,
+                content: SourceContent::File(source.artifact(b"base")),
+            }],
+        },
+        None,
+        "initial",
+        &limits,
+    )
+    .unwrap();
+    let id = tree.resolve("file").unwrap().id;
+    source.delay.store(true, Ordering::SeqCst);
+    let writer_tree = tree.clone();
+    let writer = tokio::spawn(async move { writer_tree.write(id, 0, b"edit").await });
+    source.entered.notified().await;
+    let error = tree
+        .freeze_source_wait(
+            SourceFrontendFence::TreeOnly,
+            &limits,
+            tokio::time::Instant::now() + Duration::from_millis(20),
+        )
+        .await
+        .err()
+        .unwrap();
+    assert!(error.downcast_ref::<SourceFreezeTimeout>().is_some());
+    assert!(
+        !writer.is_finished(),
+        "snapshot expiry must not cancel admitted work"
+    );
+    let error = tree
+        .freeze_source(SourceFrontendFence::TreeOnly, &limits)
+        .err()
+        .unwrap();
+    assert_eq!(
+        error.downcast_ref::<SourceFreezeBusy>(),
+        Some(&SourceFreezeBusy::ActiveOperations)
+    );
+    // Invalid limits must not be mistaken for contention, even with active IO.
+    let invalid = SourceLimits {
+        max_entries: 0,
+        ..limits.clone()
+    };
+    let error = tree
+        .freeze_source_wait(
+            SourceFrontendFence::TreeOnly,
+            &invalid,
+            tokio::time::Instant::now() + Duration::from_secs(5),
+        )
+        .await
+        .err()
+        .unwrap();
+    assert!(error.downcast_ref::<SourceFreezeTimeout>().is_none());
+    assert!(error.downcast_ref::<SourceFreezeBusy>().is_none());
+    source.release.notify_one();
+    assert_eq!(writer.await.unwrap().unwrap(), 4);
+    let snapshot = tree
+        .freeze_source_wait(
+            SourceFrontendFence::TreeOnly,
+            &limits,
+            tokio::time::Instant::now() + Duration::from_secs(5),
+        )
+        .await
+        .unwrap();
+    assert_eq!(snapshot.read_local(id, 0, 4).unwrap(), b"edit");
+    drop(snapshot);
+    assert_eq!(tree.write(id, 0, b"next").await.unwrap(), 4);
+}
+
 #[tokio::test]
 async fn source_manifest_is_atomic_lazy_durable_and_preserves_dirty_generations() {
     use crate::source::*;

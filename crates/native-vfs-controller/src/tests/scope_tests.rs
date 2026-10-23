@@ -104,6 +104,49 @@ async fn expired_admission_does_not_prepare_or_publish_and_keeps_the_original_de
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn snapshot_capture_contention_uses_the_original_action_deadline_before_prepare() {
+    let fixture = Fixture::new(false).await;
+    let controller = fixture.open(None).await;
+    fixture.local("new", b"dirty bytes").await;
+    let before = controller.inspect().unwrap();
+    let mut mutation = controller.begin_session(&before).await.unwrap();
+    let frozen = fixture
+        .tree
+        .freeze_source(SourceFrontendFence::TreeOnly, &SourceLimits::default())
+        .unwrap();
+    let deadline = tokio::time::Instant::now() + Duration::from_millis(20);
+    mutation.set_action_scope(ActionScope::new(deadline, Arc::new(AtomicBool::new(false))));
+    let options = options();
+    let capture = mutation.snapshot("waiting-capture", &options);
+    tokio::pin!(capture);
+    std::future::poll_fn(|cx| {
+        assert!(std::future::Future::poll(capture.as_mut(), cx).is_pending());
+        std::task::Poll::Ready(())
+    })
+    .await;
+    match capture.await {
+        Err(ProjectionFailure::Rejected(error)) => {
+            assert!(
+                error
+                    .downcast_ref::<output_core::SourceFreezeTimeout>()
+                    .is_some()
+            );
+        }
+        _ => panic!("capture contention must expire before preparing a request"),
+    }
+    assert!(controller.inner.ledger.lock().unwrap().requests.is_empty());
+    assert_eq!(fixture.provider.uploads.load(Ordering::SeqCst), 0);
+    assert_eq!(frozen.base_root(), fixture.base.0);
+    drop(frozen);
+    // Expiry did not acquire/leak a second fence or publish an intent.
+    let next = fixture
+        .tree
+        .freeze_source(SourceFrontendFence::TreeOnly, &SourceLimits::default())
+        .unwrap();
+    assert!(next.entries().iter().any(|entry| entry.path == "new"));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn eof_revocation_drains_the_admitted_upload_before_stopping_later_logical_writes() {
     let fixture = Fixture::new(false).await;
     fixture.local("new", b"owned physical payload").await;

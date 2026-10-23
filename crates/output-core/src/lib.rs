@@ -14,8 +14,9 @@ pub use local_cas::{
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 pub use source::{
-    SourceContent, SourceEntry, SourceFrontendFence, SourceLimits, SourceManifest, SourceOperation,
-    SourceReceipt, SourceSnapshot, SourceSnapshotEntry, SourceVersion,
+    SourceContent, SourceEntry, SourceFreezeBusy, SourceFreezeTimeout, SourceFrontendFence,
+    SourceLimits, SourceManifest, SourceOperation, SourceReceipt, SourceSnapshot,
+    SourceSnapshotEntry, SourceVersion,
 };
 use std::{
     collections::{HashMap, HashSet},

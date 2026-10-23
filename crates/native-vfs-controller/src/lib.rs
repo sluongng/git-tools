@@ -186,27 +186,42 @@ impl Host {
         );
         Ok(())
     }
-    fn capture(&self, limits: &SourceLimits) -> Result<SourceSnapshot> {
+    async fn capture(
+        &self,
+        limits: &SourceLimits,
+        deadline: tokio::time::Instant,
+    ) -> Result<SourceSnapshot> {
         match self {
             Self::Mounted(mount) => {
                 // NFS needs a real client flush/quiescence fence. ProjFS needs
                 // authoritative NTFS dirty capture, not a scan of Tree alone.
                 #[cfg(not(target_os = "linux"))]
                 {
-                    let _ = (mount, limits);
+                    let _ = (mount, limits, deadline);
                     bail!(
                         "native provider source capture fence is not implemented on this platform"
                     );
                 }
                 #[cfg(target_os = "linux")]
                 {
-                    let _ = limits;
-                    mount.capture_quiescent()
+                    mount
+                        .tree()
+                        .freeze_source_wait(
+                            output_core::SourceFrontendFence::TreeOnly,
+                            limits,
+                            deadline,
+                        )
+                        .await
                 }
             }
             #[cfg(any(test, feature = "protocol-test-support"))]
             Self::Protocol { tree, .. } => {
-                tree.freeze_source(output_core::SourceFrontendFence::TreeOnly, limits)
+                tree.freeze_source_wait(
+                    output_core::SourceFrontendFence::TreeOnly,
+                    limits,
+                    deadline,
+                )
+                .await
             }
         }
     }
@@ -541,7 +556,11 @@ impl Controller {
             tokio::time::timeout_at(deadline, self.inner.host.wait_source_idle())
                 .await
                 .context("native publication recovery drain timed out")??;
-            let frozen = self.inner.host.capture(&self.inner.config.source_limits)?;
+            let frozen = self
+                .inner
+                .host
+                .capture(&self.inner.config.source_limits, deadline)
+                .await?;
             ensure!(
                 tokio::time::Instant::now() < deadline,
                 "native publication recovery deadline expired"
@@ -1076,7 +1095,11 @@ impl Mutation {
             self.controller
                 .inner
                 .host
-                .capture(&self.controller.inner.config.source_limits)
+                .capture(
+                    &self.controller.inner.config.source_limits,
+                    scope.deadline(),
+                )
+                .await
                 .map_err(rejected)?,
         );
         scope.check().map_err(rejected)?;
@@ -1180,7 +1203,11 @@ impl NativeProjectionMutation for Mutation {
             self.controller
                 .inner
                 .host
-                .capture(&self.controller.inner.config.source_limits)
+                .capture(
+                    &self.controller.inner.config.source_limits,
+                    scope.deadline(),
+                )
+                .await
                 .map_err(rejected)?,
         );
         scope.check().map_err(rejected)?;
@@ -1257,7 +1284,11 @@ impl NativeProjectionMutation for Mutation {
             .controller
             .inner
             .host
-            .capture(&self.controller.inner.config.source_limits)
+            .capture(
+                &self.controller.inner.config.source_limits,
+                scope.deadline(),
+            )
+            .await
             .map_err(rejected)?;
         let expected = snapshot.version().clone();
         scope.check().map_err(rejected)?;

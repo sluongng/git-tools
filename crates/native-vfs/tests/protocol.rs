@@ -255,3 +255,108 @@ async fn persistent_nonempty_root_without_native_binding_is_not_adopted() {
         header
     );
 }
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn recovery_guard_pins_existing_state_without_looking_up_or_repairing_the_mount() {
+    use std::os::unix::fs::{PermissionsExt, symlink};
+    let dir = tempfile::tempdir().unwrap();
+    let (config, provider) = common::fixture(dir.path());
+    let cache = common::cache(dir.path());
+    let workspace = prepare(config.clone(), provider, cache).await.unwrap();
+    let identity = workspace.tree().identity().to_owned();
+    let header = fs::read(config.state.join("native-vfs.json")).unwrap();
+    assert!(
+        native_vfs::lock_recovery(
+            &config.state,
+            &config.root,
+            config.workspace_identity,
+            config.scope.backend(),
+            &identity,
+        )
+        .is_err(),
+        "a live provider still owns its private state"
+    );
+    drop(workspace);
+    let database = config.state.join("namespace/namespace.fjall");
+    fs::set_permissions(&database, fs::Permissions::from_mode(0o755)).unwrap();
+    assert_eq!(
+        fs::metadata(&config.state).unwrap().permissions().mode() & 0o777,
+        0o700
+    );
+    fs::remove_dir(&config.root).unwrap();
+    assert!(
+        native_vfs::lock_recovery(
+            &config.state,
+            &config.root,
+            config.workspace_identity,
+            config.scope.backend(),
+            "different-namespace",
+        )
+        .is_err()
+    );
+    let guard = native_vfs::lock_recovery(
+        &config.state,
+        &config.root,
+        config.workspace_identity,
+        config.scope.backend(),
+        &identity,
+    )
+    .unwrap();
+    assert!(
+        !config.root.exists(),
+        "recovery must not inspect or create the projection root"
+    );
+    assert!(
+        native_vfs::lock_recovery(
+            &config.state,
+            &config.root,
+            config.workspace_identity,
+            config.scope.backend(),
+            &identity,
+        )
+        .is_err(),
+        "the guard retains exclusive source ownership"
+    );
+    assert_eq!(
+        fs::read(config.state.join("native-vfs.json")).unwrap(),
+        header
+    );
+    drop(guard);
+    assert_eq!(
+        fs::metadata(&database).unwrap().permissions().mode() & 0o777,
+        0o755,
+        "readonly recovery must not repair inherited child permissions"
+    );
+    let original = database.with_file_name("saved-database");
+    fs::rename(&database, &original).unwrap();
+    symlink(&original, &database).unwrap();
+    assert!(
+        native_vfs::lock_recovery(
+            &config.state,
+            &config.root,
+            config.workspace_identity,
+            config.scope.backend(),
+            &identity,
+        )
+        .is_err(),
+        "a symlink is not a recognized namespace child"
+    );
+    fs::remove_file(&database).unwrap();
+    fs::rename(original, &database).unwrap();
+    fs::remove_file(config.state.join("owner.lock")).unwrap();
+    assert!(
+        native_vfs::lock_recovery(
+            &config.state,
+            &config.root,
+            config.workspace_identity,
+            config.scope.backend(),
+            &identity,
+        )
+        .is_err()
+    );
+    assert!(
+        !config.state.join("owner.lock").exists(),
+        "missing ownership evidence is not repaired"
+    );
+}
