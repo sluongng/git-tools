@@ -154,7 +154,7 @@ pub(super) fn compile(input: &ResolvedExpression, limits: &Limits) -> Result<q::
                 todo.push((v.roots.as_deref().ok_or(Error::Corrupt)?, depth + 1));
                 todo.push((v.heads.as_deref().ok_or(Error::Corrupt)?, depth + 1))
             }
-            Q::Heads(v) | Q::Roots(v) => {
+            Q::Heads(v) | Q::Roots(v) | Q::HasConflict(v) => {
                 todo.push((v.input.as_deref().ok_or(Error::Corrupt)?, depth + 1))
             }
             Q::Union(v) | Q::Intersection(v) => {

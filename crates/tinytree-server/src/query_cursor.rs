@@ -917,6 +917,7 @@ fn graph_row(
             .parent_nodes(&selected.node, budget)
             .map_err(index_error)?;
         if commit.change_id != selected.node.change_id()
+            || (commit.root_tree.terms.len() > 1) != selected.node.has_conflict()
             || commit.committer.timestamp.millis_since_epoch != selected.node.committer_millis()
             || !commit
                 .parents

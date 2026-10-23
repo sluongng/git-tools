@@ -13,6 +13,7 @@ pub struct ScopedNode {
     position: u64,
     generation: u64,
     committer_millis: i64,
+    has_conflict: bool,
     size: u64,
 }
 impl ScopedNode {
@@ -24,6 +25,7 @@ impl ScopedNode {
             position: node.position,
             generation: node.generation,
             committer_millis: node.committer_millis,
+            has_conflict: node.has_conflict,
             size: node.size,
         }
     }
@@ -41,6 +43,9 @@ impl ScopedNode {
     }
     pub fn committer_millis(&self) -> i64 {
         self.committer_millis
+    }
+    pub fn has_conflict(&self) -> bool {
+        self.has_conflict
     }
     /// The intrinsic root has no canonical payload despite its synthetic
     /// zero-sized descriptor. Callers requesting payloads must handle it first.
@@ -101,6 +106,7 @@ impl Scope {
             || node.generation != token.generation
             || node.change != token.change.0
             || node.committer_millis != token.committer_millis
+            || node.has_conflict != token.has_conflict
             || node.size != token.size
         {
             return Err(Error::Corrupt);

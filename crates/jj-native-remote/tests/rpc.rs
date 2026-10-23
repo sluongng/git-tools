@@ -50,6 +50,7 @@ struct Counters {
     files: Arc<AtomicUsize>,
     holds: Arc<AtomicUsize>,
     metadata_rpcs: Arc<AtomicUsize>,
+    graph_rpcs: Arc<AtomicUsize>,
     metadata_keys: Arc<AtomicUsize>,
     metadata_requests: Arc<std::sync::Mutex<Vec<p::ObjectKey>>>,
     metadata_bytes: Arc<AtomicUsize>,
@@ -65,6 +66,7 @@ impl Counters {
             files: Arc::new(AtomicUsize::new(0)),
             holds: Arc::new(AtomicUsize::new(0)),
             metadata_rpcs: Arc::new(AtomicUsize::new(0)),
+            graph_rpcs: Arc::new(AtomicUsize::new(0)),
             metadata_keys: Arc::new(AtomicUsize::new(0)),
             metadata_requests: Arc::new(std::sync::Mutex::new(Vec::new())),
             metadata_bytes: Arc::new(AtomicUsize::new(0)),
@@ -93,6 +95,7 @@ impl Repository for Counting {
         &self,
         r: Request<p::GetCommitGraphRequest>,
     ) -> Result<Response<p::CommitGraphPage>, Status> {
+        self.counts.graph_rpcs.fetch_add(1, Ordering::SeqCst);
         self.service.get_commit_graph(r).await
     }
     type BatchReadObjectsStream = <RepositoryService as Repository>::BatchReadObjectsStream;
@@ -2256,6 +2259,13 @@ struct PinnedGraphReference {
     _directory: tempfile::TempDir,
 }
 async fn pinned_graph_reference(parents: &[&[usize]], divergent: bool) -> PinnedGraphReference {
+    pinned_graph_reference_with_conflicts(parents, divergent, &[]).await
+}
+async fn pinned_graph_reference_with_conflicts(
+    parents: &[&[usize]],
+    divergent: bool,
+    conflicts: &[usize],
+) -> PinnedGraphReference {
     use jj_lib::{
         backend::{Backend, BackendInitError, ChangeId},
         config::{ConfigLayer, ConfigSource, StackedConfig},
@@ -2308,11 +2318,30 @@ async fn pinned_graph_reference(parents: &[&[usize]], divergent: bool) -> Pinned
             position + 1
         };
         change[..8].copy_from_slice(&(logical_change as u64).to_be_bytes());
+        // Deliberately unavailable tree terms make this a metadata-only
+        // has_conflict oracle: neither jj nor the query may load tree bodies.
+        let selected_tree = if conflicts.contains(&(position + 1)) {
+            jj_lib::merged_tree::MergedTree::new(
+                repo.store().clone(),
+                jj_lib::merge::Merge::from_vec(vec![
+                    jj_lib::backend::TreeId::from_bytes(&[21; 32]),
+                    jj_lib::backend::TreeId::from_bytes(&[22; 32]),
+                    jj_lib::backend::TreeId::from_bytes(&[23; 32]),
+                ]),
+                jj_lib::conflict_labels::ConflictLabels::from_vec(vec![
+                    "left".into(),
+                    "base".into(),
+                    "right".into(),
+                ]),
+            )
+        } else {
+            tree.clone()
+        };
         let commit = transaction
             .repo_mut()
             .new_commit(
                 parents.iter().map(|&parent| ids[parent].clone()).collect(),
-                tree.clone(),
+                selected_tree,
             )
             .set_change_id(ChangeId::from_bytes(&change))
             .set_description(format!("pinned graph reference commit {}", position + 1))
@@ -3674,4 +3703,212 @@ async fn real_broker_query_then_lazy_object_reads_share_the_captured_remote_adap
         .unwrap();
     repo.wait_for_idle().await;
     server.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn metadata_conflict_queries_match_pinned_jj_without_loading_history_or_tree_file_bodies() {
+    use jj_lib::{
+        object_id::ObjectId as _,
+        revset::{
+            ResolvedExpression as Jj, ResolvedPredicateExpression as Predicate,
+            RevsetFilterPredicate,
+        },
+    };
+    use tinytree_client::{NativeClient, query_protocol as q};
+    struct Case {
+        name: &'static str,
+        parents: &'static [&'static [usize]],
+        conflicts: &'static [usize],
+        public: usize,
+        candidates: &'static [usize],
+    }
+    let linear: &'static [&'static [usize]] = &[&[0], &[1], &[2], &[3]];
+    let cases = [
+        Case {
+            name: "clean history",
+            parents: linear,
+            conflicts: &[],
+            public: 4,
+            candidates: &[4, 3, 2, 1, 0],
+        },
+        Case {
+            name: "single parent conflict",
+            parents: linear,
+            conflicts: &[2],
+            public: 4,
+            candidates: &[4, 3, 2, 1, 0],
+        },
+        Case {
+            name: "resolved multiparent merge",
+            parents: &[&[0], &[1], &[1], &[2, 3]],
+            conflicts: &[2],
+            public: 4,
+            candidates: &[4, 3, 2, 1, 0],
+        },
+        Case {
+            name: "private conflicted draft",
+            parents: linear,
+            conflicts: &[3],
+            public: 2,
+            candidates: &[4, 3, 2, 1, 0],
+        },
+        Case {
+            name: "private clean draft with public conflict",
+            parents: linear,
+            conflicts: &[2],
+            public: 2,
+            candidates: &[4, 3, 2, 1, 0],
+        },
+        Case {
+            name: "empty selected set",
+            parents: linear,
+            conflicts: &[2],
+            public: 4,
+            candidates: &[],
+        },
+        Case {
+            name: "intrinsic root is clean",
+            parents: linear,
+            conflicts: &[2],
+            public: 4,
+            candidates: &[0],
+        },
+        Case {
+            name: "ordered separated conflicts",
+            parents: linear,
+            conflicts: &[1, 3],
+            public: 4,
+            candidates: &[4, 3, 2, 1, 0],
+        },
+    ];
+    for case in cases {
+        let reference =
+            pinned_graph_reference_with_conflicts(case.parents, false, case.conflicts).await;
+        let wire = q::GraphExpr {
+            version: 1,
+            expression: Some(q::graph_expr::Expression::HasConflict(Box::new(
+                q::UnaryExpr {
+                    input: Some(Box::new(q::GraphExpr {
+                        version: 1,
+                        expression: Some(q::graph_expr::Expression::Commits(q::CommitSet {
+                            commits: case
+                                .candidates
+                                .iter()
+                                .map(|&i| q::CommitId {
+                                    value: reference.ids[i].as_bytes().to_vec(),
+                                })
+                                .collect(),
+                        })),
+                    })),
+                },
+            ))),
+        };
+        let expected = pinned_expression_expected(
+            &reference,
+            &Jj::FilterWithin {
+                candidates: Box::new(Jj::Commits(
+                    case.candidates
+                        .iter()
+                        .map(|&i| reference.ids[i].clone())
+                        .collect(),
+                )),
+                predicate: Predicate::Filter(RevsetFilterPredicate::HasConflict),
+            },
+        );
+        let directory = private_dir();
+        let store = Store::open(directory.path(), Default::default()).unwrap();
+        store.create_repository("example").unwrap();
+        let index_directory = private_dir();
+        let index =
+            tinytree_index::Index::open(index_directory.path(), &Default::default()).unwrap();
+        for (descriptor, bytes) in &reference.canonical[..case.public] {
+            store.put("example", *descriptor, bytes, 0).unwrap();
+            index.ingest("example", *descriptor, bytes).unwrap();
+        }
+        let mut service_config = ServiceConfig::default();
+        service_config.query.max_eval_quantum_steps = 1;
+        service_config.query.max_eval_step_work = 1;
+        service_config.query.max_graph_query_step_work = 1;
+        let service = RepositoryService::new(
+            store.clone(),
+            service_config,
+            vec!["example".into()],
+            vec![Principal::new("test", TOKEN, vec!["example".into()], true).unwrap()],
+        )
+        .unwrap()
+        .with_query_index(index.clone())
+        .unwrap();
+        let counts = Counters::new();
+        let server = Server::start_service(service, counts.clone(), None).await;
+        let mut cfg = config(&server).remote;
+        cfg.limits.max_graph_pages = 10_000;
+        let client = NativeClient::connect(cfg).await.unwrap();
+        let mut overlay = Vec::new();
+        for (descriptor, bytes) in &reference.canonical[case.public..] {
+            overlay.push(
+                client
+                    .verify_metadata(*descriptor, bytes.clone())
+                    .await
+                    .unwrap(),
+            );
+        }
+        let root = m::CommitId::from_slice(reference.ids[case.public].as_bytes()).unwrap();
+        let scope = client
+            .open_query_scope_with_overlay(vec![root], overlay)
+            .await
+            .unwrap();
+        let mut query = client.begin_query(&scope, &wire, 1).await.unwrap();
+        let mut actual = Vec::new();
+        while !query.is_exhausted() {
+            let page = client.evaluate_page(&mut query).await.unwrap();
+            actual.extend(page.rows.into_iter().map(|r| r.commit));
+        }
+        assert_eq!(
+            actual,
+            expected.iter().map(|(id, _)| *id).collect::<Vec<_>>(),
+            "{}",
+            case.name
+        );
+        client.close_ids_query(&mut query).await.unwrap();
+        let mut query = client
+            .begin_graph_query(&scope, &wire, 1, true)
+            .await
+            .unwrap();
+        let mut actual = Vec::new();
+        while !query.is_exhausted() {
+            let page = client.evaluate_graph_page(&mut query).await.unwrap();
+            for row in page.rows() {
+                assert!(row.canonical.as_ref().is_some_and(
+                    |m| matches!(m.object(),m::Object::Commit(c) if c.root_tree.terms.len()>1)
+                ));
+                actual.push((row.commit, row.edges().to_vec()));
+            }
+        }
+        assert_eq!(actual, expected, "{}", case.name);
+        client.close_graph_query(&mut query).await.unwrap();
+        client.close_query_scope(&scope).await.unwrap();
+        assert_eq!(counts.files.load(Ordering::SeqCst), 0, "{}", case.name);
+        assert_eq!(
+            counts.metadata_rpcs.load(Ordering::SeqCst),
+            0,
+            "{}",
+            case.name
+        );
+        assert_eq!(counts.graph_rpcs.load(Ordering::SeqCst), 0, "{}", case.name);
+        for (descriptor, _) in &reference.canonical[case.public..] {
+            assert!(
+                store
+                    .descriptor("example", descriptor.key)
+                    .unwrap()
+                    .is_none()
+            );
+            assert!(
+                index
+                    .node("example", m::CommitId(descriptor.key.id.0))
+                    .unwrap()
+                    .is_none()
+            );
+        }
+        server.stop().await;
+    }
 }

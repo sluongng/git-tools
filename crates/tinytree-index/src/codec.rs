@@ -165,7 +165,9 @@ impl RecordCodec for StoredNode {
         bytes.extend(self.committer_millis.to_le_bytes());
         bytes.extend(count.to_le_bytes());
         bytes.push(self.skips.len() as u8);
-        bytes.extend([0; 3]);
+        // Explicit feature presence prevents an old reserved-zero row from
+        // being mistaken for a verified clean commit, even in a mixed catalog.
+        bytes.extend([u8::from(self.has_conflict), 1, 0]);
         for parent in &self.parents {
             bytes.extend(parent)
         }
@@ -175,7 +177,7 @@ impl RecordCodec for StoredNode {
         Ok(bytes)
     }
     fn from_payload(key: &[u8], bytes: &[u8], limits: &Limits) -> Result<Self> {
-        if bytes.len() < 56 || bytes[53..56] != [0; 3] {
+        if bytes.len() < 56 || bytes[53] > 1 || bytes[54..56] != [1, 0] {
             return Err(Error::Corrupt);
         }
         let parents = u32::from_le_bytes(take(bytes, 48)?) as usize;
@@ -213,6 +215,7 @@ impl RecordCodec for StoredNode {
             generation: u64_at(bytes, 24)?,
             size: u64_at(bytes, 32)?,
             committer_millis: i64::from_le_bytes(take(bytes, 40)?),
+            has_conflict: bytes[53] == 1,
             skips: positions,
         })
     }

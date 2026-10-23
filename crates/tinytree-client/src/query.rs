@@ -1631,7 +1631,7 @@ fn validate_expression(
                 children.push(value.roots.as_deref().ok_or_else(invalid)?);
                 children.push(value.heads.as_deref().ok_or_else(invalid)?);
             }
-            E::Heads(value) | E::Roots(value) => {
+            E::Heads(value) | E::Roots(value) | E::HasConflict(value) => {
                 children.push(value.input.as_deref().ok_or_else(invalid)?)
             }
             E::Union(value) | E::Intersection(value) => {

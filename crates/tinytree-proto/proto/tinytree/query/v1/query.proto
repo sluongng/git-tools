@@ -202,6 +202,9 @@ message GraphExpr {
     SetExpr intersection = 9;
     DifferenceExpr difference = 10;
     LatestExpr latest = 11;
+    // Canonical root-tree merge has multiple terms. This is metadata-only,
+    // not a file-content conflict scan and not the commit parent count.
+    UnaryExpr has_conflict = 12;
   }
 }
 // Half-open intervals. Absent end_exclusive means unbounded; present zero is

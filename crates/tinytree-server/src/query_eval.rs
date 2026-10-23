@@ -615,6 +615,36 @@ impl Heads {
         }
     }
 }
+// The flag is part of a scope-bound, canonically derived node summary. It
+// needs no canonical payload or tree/file reads during predicate evaluation.
+struct HasConflict {
+    input: Box<Operator>,
+    look: Option<GraphNode>,
+    done: bool,
+}
+impl HasConflict {
+    fn poll(&mut self, ctx: &mut Context<'_>) -> Result<EvalStep> {
+        loop {
+            if !fill(&mut self.input, &mut self.look, &mut self.done, ctx)? {
+                return Ok(EvalStep::Progress);
+            }
+            if self.done && self.look.is_none() {
+                return Ok(EvalStep::Done);
+            }
+            if !ctx.tick()? {
+                return Ok(EvalStep::Progress);
+            }
+            let node = self.look.take().ok_or(GraphError::Corrupt)?;
+            ctx.memory.release(Counts {
+                slots: 1,
+                intervals: 0,
+            });
+            if node.has_conflict() {
+                return Ok(EvalStep::Row(node));
+            }
+        }
+    }
+}
 struct Roots {
     input: Box<Operator>,
     look: Option<GraphNode>,
@@ -1054,6 +1084,7 @@ enum Operator {
     Commits(Commits),
     Ancestors(Ancestors),
     Heads(Heads),
+    HasConflict(HasConflict),
     Roots(Roots),
     DagRange(DagRange),
     Set(SetOperator),
@@ -1105,6 +1136,10 @@ impl Operator {
                         .map_or(0, |expansion| expansion.batch_slots),
                 intervals: 0,
             }),
+            Self::HasConflict(state) => state.input.counts().add(Counts {
+                slots: usize::from(state.look.is_some()),
+                intervals: 0,
+            }),
             Self::Roots(state) => state.input.counts().add(Counts {
                 slots: state.candidates.len() + usize::from(state.look.is_some()),
                 intervals: 0,
@@ -1146,6 +1181,7 @@ impl Operator {
             Self::Commits(state) => state.poll(ctx),
             Self::Ancestors(state) => state.poll(ctx),
             Self::Heads(state) => state.poll(ctx),
+            Self::HasConflict(state) => state.poll(ctx),
             Self::Roots(state) => state.poll(ctx),
             Self::DagRange(state) => state.poll(ctx),
             Self::Set(state) => state.poll(ctx),
@@ -1361,6 +1397,14 @@ impl Compiler<'_> {
                     expansion: None,
                 }))
             }
+            X::HasConflict(value) => {
+                let input = self.compile(child(&value.input)?, depth + 1)?;
+                Ok(Operator::HasConflict(HasConflict {
+                    input: Box::new(input),
+                    look: None,
+                    done: false,
+                }))
+            }
             X::Roots(value) => {
                 let input = self.compile(child(&value.input)?, depth + 1)?;
                 Ok(Operator::Roots(Roots {
@@ -1543,6 +1587,39 @@ mod tests {
             }
         }
         panic!("incremental evaluator did not finish")
+    }
+    #[test]
+    fn conflict_filter_is_incremental_and_empty_clean_history_is_not_false_progress_eof() {
+        let (_directory, graph, ids) = linear();
+        let filter = expression(q::graph_expr::Expression::HasConflict(Box::new(
+            q::UnaryExpr {
+                input: Some(Box::new(ancestors(commits(&[ids[10]]), 0, None, None))),
+            },
+        )));
+        let (rows, progress, _) = collect(
+            graph.clone(),
+            filter,
+            EvalLimits {
+                max_step_work: 1,
+                ..Default::default()
+            },
+        );
+        assert!(rows.is_empty());
+        assert!(progress > 0);
+        let empty = expression(q::graph_expr::Expression::HasConflict(Box::new(
+            q::UnaryExpr {
+                input: Some(Box::new(commits(&[]))),
+            },
+        )));
+        let (rows, _, _) = collect(
+            graph,
+            empty,
+            EvalLimits {
+                max_step_work: 1,
+                ..Default::default()
+            },
+        );
+        assert!(rows.is_empty());
     }
     #[test]
     fn disjoint_generation_windows_match_pinned_jj_linear_fixtures() {

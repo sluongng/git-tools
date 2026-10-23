@@ -213,7 +213,7 @@ pub(crate) fn expression_shape(expression: &q::GraphExpr, cap: usize) -> Result<
                 child!(v.roots.as_deref());
                 child!(v.heads.as_deref());
             }
-            E::Heads(v) | E::Roots(v) => child!(v.input.as_deref()),
+            E::Heads(v) | E::Roots(v) | E::HasConflict(v) => child!(v.input.as_deref()),
             E::Union(v) | E::Intersection(v) => {
                 if v.inputs
                     .len()

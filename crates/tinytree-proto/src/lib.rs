@@ -197,6 +197,16 @@ mod tests {
             query_v1::GraphExpr::decode(latest.encode_to_vec().as_slice()).unwrap(),
             latest
         );
+        let conflict = query_v1::GraphExpr {
+            version: 1,
+            expression: Some(Expression::HasConflict(Box::new(query_v1::UnaryExpr {
+                input: Some(Box::new(latest)),
+            }))),
+        };
+        assert_eq!(
+            query_v1::GraphExpr::decode(conflict.encode_to_vec().as_slice()).unwrap(),
+            conflict
+        );
         let dag_range = query_v1::DagRangeExpr {
             generations_from_roots: Some(query_v1::GenerationRange {
                 start: 0,

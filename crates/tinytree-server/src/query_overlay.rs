@@ -48,6 +48,7 @@ struct DraftNode {
     generation: u64,
     ordinal: u64,
     committer_millis: i64,
+    has_conflict: bool,
     // Every escaped draft token keeps its uniquely allocated chunk charged.
     _owner: Arc<dyn Any + Send + Sync>,
 }
@@ -121,6 +122,12 @@ impl GraphNode {
         match &self.0 {
             Parent::Remote(node) => node.committer_millis(),
             Parent::Draft(node) => node.committer_millis,
+        }
+    }
+    pub fn has_conflict(&self) -> bool {
+        match &self.0 {
+            Parent::Remote(node) => node.has_conflict(),
+            Parent::Draft(node) => node.has_conflict,
         }
     }
     pub fn descriptor(&self) -> m::Descriptor {
@@ -288,6 +295,7 @@ impl OverlayGraph {
                     generation,
                     ordinal,
                     committer_millis: commit.committer.timestamp.millis_since_epoch,
+                    has_conflict: commit.root_tree.terms.len() > 1,
                     _owner: owner.clone(),
                 }),
             );

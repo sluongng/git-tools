@@ -539,7 +539,7 @@ impl RemoteQueryIo {
                         pending.push((c, depth + 1));
                     }
                 }
-                E::Heads(v) | E::Roots(v) => {
+                E::Heads(v) | E::Roots(v) | E::HasConflict(v) => {
                     if let Some(c) = v.input.as_deref() {
                         pending.push((c, depth + 1));
                     }

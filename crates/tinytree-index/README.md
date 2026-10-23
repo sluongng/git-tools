@@ -10,6 +10,7 @@ Budget exhaustion and incomplete coverage are errors, never negative answers.
 Scope-bound node tokens let operators follow verified parent edges without
 repeating root-reachability checks or retaining parent vectors in a frontier.
 
-Storage schema 2 rejects legacy schema 1 explicitly. Rebuild canonical inputs
+Storage schema 3 adds a canonically derived root-tree conflict flag and rejects
+older schemas explicitly. Rebuild canonical inputs
 into a new private directory; existing logical records are never automatically
 converted or discarded.

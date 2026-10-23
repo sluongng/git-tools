@@ -911,6 +911,9 @@ fn compact_envelope_rejects_truncation_counts_reserved_and_key_transplants() {
         "parent_count_overflow",
         "skip_count_overflow",
         "reserved",
+        "missing_conflict_feature",
+        "invalid_conflict_flag",
+        "conflict_checksum",
         "key_transplant",
     ] {
         let (directory, index) = fixture();
@@ -948,6 +951,15 @@ fn compact_envelope_rejects_truncation_counts_reserved_and_key_transplants() {
                     bytes[5] = 1;
                     resign_derived_record(&source, &mut bytes);
                 }
+                "missing_conflict_feature" => {
+                    bytes[65..68].copy_from_slice(&[0, 0, 0]);
+                    resign_derived_record(&source, &mut bytes);
+                }
+                "invalid_conflict_flag" => {
+                    bytes[65] = 2;
+                    resign_derived_record(&source, &mut bytes);
+                }
+                "conflict_checksum" => bytes[65] ^= 1,
                 "key_transplant" => {}
                 _ => unreachable!(),
             }
@@ -1012,7 +1024,7 @@ fn legacy_schema_is_explicitly_unsupported_and_never_rewritten() {
     );
 }
 #[test]
-fn negative_committer_time_and_scope_bound_parent_tokens_survive_reopen() {
+fn conflict_metadata_negative_time_and_scope_bound_parent_tokens_survive_reopen() {
     let (directory, index) = fixture();
     let base = add(&index, "repo", &[m::CommitId::ROOT], 1, "base");
     let left = add(&index, "repo", &[base.commit], 2, "left");
@@ -1023,11 +1035,18 @@ fn negative_committer_time_and_scope_bound_parent_tokens_survive_reopen() {
         unreachable!()
     };
     commit.committer.timestamp.millis_since_epoch = -123456789;
+    commit.root_tree = m::TreeMerge {
+        terms: vec![m::TreeId([1; 32]), m::TreeId([2; 32]), m::TreeId([3; 32])],
+        labels: vec!["left".into(), "base".into(), "right".into()],
+    };
+
     let object = m::encode(&m::Object::Commit(commit), m::Limits::default()).unwrap();
     let merge = index
         .ingest("repo", object.descriptor, &object.bytes)
         .unwrap();
     assert_eq!(merge.committer_millis, -123456789);
+    assert!(merge.has_conflict);
+    assert!(!left.has_conflict && !right.has_conflict);
     assert_eq!(
         index
             .ingest("repo", object.descriptor, &object.bytes)
@@ -1046,6 +1065,7 @@ fn negative_committer_time_and_scope_bound_parent_tokens_survive_reopen() {
         .unwrap()
         .unwrap();
     assert_eq!(token.committer_millis(), -123456789);
+    assert!(token.has_conflict());
     assert_eq!(
         scope
             .parent_nodes(&token, &mut WorkBudget::default())
@@ -1059,6 +1079,7 @@ fn negative_committer_time_and_scope_bound_parent_tokens_survive_reopen() {
         .lookup_node(m::CommitId::ROOT, &mut WorkBudget::default())
         .unwrap()
         .unwrap();
+    assert!(!root.has_conflict());
     assert!(
         scope
             .parent_nodes(&root, &mut WorkBudget::default())
@@ -1229,4 +1250,97 @@ fn existing_foreign_or_headerless_databases_are_not_initialized() {
             }
         }
     }
+}
+
+#[test]
+fn tree_conflict_flag_is_not_inferred_from_number_of_commit_parents() {
+    let (_directory, index) = fixture();
+    let clean = add(&index, "repo", &[m::CommitId::ROOT], 1, "clean");
+    let other = add(&index, "repo", &[m::CommitId::ROOT], 2, "other");
+    let resolved_merge = add(
+        &index,
+        "repo",
+        &[clean.commit, other.commit],
+        3,
+        "resolved merge",
+    );
+    assert!(!resolved_merge.has_conflict);
+    let value = canonical(&[resolved_merge.commit], 4, "single-parent conflict");
+    let m::Object::Commit(mut commit) = m::decode(&value.bytes, Default::default()).unwrap() else {
+        unreachable!()
+    };
+    commit.root_tree = m::TreeMerge {
+        terms: vec![m::TreeId([1; 32]), m::TreeId([2; 32]), m::TreeId([3; 32])],
+        labels: vec!["one".into(), "base".into(), "two".into()],
+    };
+    let value = m::encode(&m::Object::Commit(commit), Default::default()).unwrap();
+    let conflict = index
+        .ingest("repo", value.descriptor, &value.bytes)
+        .unwrap();
+    assert!(conflict.has_conflict);
+    let scope = Arc::new(index.scope("repo", &[conflict.commit]).unwrap());
+    assert!(
+        scope
+            .lookup_node(conflict.commit, &mut WorkBudget::default())
+            .unwrap()
+            .unwrap()
+            .has_conflict()
+    );
+    assert!(
+        !scope
+            .lookup_node(resolved_merge.commit, &mut WorkBudget::default())
+            .unwrap()
+            .unwrap()
+            .has_conflict()
+    );
+    // Even a checksummed derived flag cannot replace canonical truth on upsert.
+    {
+        let state = index.state.lock().unwrap();
+        let storage_key = key(b'n', &repo_hash("repo").unwrap(), &conflict.commit.0);
+        let mut bytes = state.table.get(&storage_key).unwrap().unwrap().to_vec();
+        bytes[65] = 0;
+        resign_derived_record(&storage_key, &mut bytes);
+        let mut tx = state.db.write_tx().durability(Some(PersistMode::SyncAll));
+        tx.insert(&state.table, storage_key, bytes);
+        tx.commit().unwrap();
+    }
+    assert!(matches!(
+        index.ingest("repo", value.descriptor, &value.bytes),
+        Err(Error::Corrupt)
+    ));
+}
+#[test]
+fn schema_two_without_conflict_summary_is_unsupported_and_not_rewritten() {
+    let (directory, index) = fixture();
+    drop(index);
+    let original = {
+        let db = SingleWriterTxDatabase::builder(directory.path().join("graph/index.fjall"))
+            .open()
+            .unwrap();
+        let table = db
+            .keyspace("graph", KeyspaceCreateOptions::default)
+            .unwrap();
+        let bytes = table.get(b"header").unwrap().unwrap();
+        let mut header: Header = decode(b"header", &bytes, &Limits::default()).unwrap();
+        header.schema = 2;
+        let bytes = encode(b"header", &header).unwrap();
+        let mut tx = db.write_tx().durability(Some(PersistMode::SyncAll));
+        tx.insert(&table, b"header", &bytes);
+        tx.commit().unwrap();
+        bytes
+    };
+    assert!(matches!(
+        Index::open(directory.path().join("graph"), &Limits::default()),
+        Err(Error::UnsupportedSchema)
+    ));
+    let db = SingleWriterTxDatabase::builder(directory.path().join("graph/index.fjall"))
+        .open()
+        .unwrap();
+    let table = db
+        .keyspace("graph", KeyspaceCreateOptions::default)
+        .unwrap();
+    assert_eq!(
+        table.get(b"header").unwrap().unwrap().as_ref(),
+        original.as_slice()
+    );
 }

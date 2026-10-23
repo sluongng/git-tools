@@ -18,7 +18,7 @@ use std::{
 };
 use tinytree_model as m;
 
-pub const STORAGE_SCHEMA: u32 = 2;
+pub const STORAGE_SCHEMA: u32 = 3;
 
 pub type Result<T> = std::result::Result<T, Error>;
 #[derive(Debug, thiserror::Error)]
@@ -177,6 +177,8 @@ pub struct CommitNode {
     pub position: u64,
     pub generation: u64,
     pub committer_millis: i64,
+    /// Verified canonical root-tree merge has multiple terms, not parents.
+    pub has_conflict: bool,
     pub descriptor: m::Descriptor,
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -215,6 +217,7 @@ struct StoredNode {
     generation: u64,
     size: u64,
     committer_millis: i64,
+    has_conflict: bool,
     skips: Vec<u64>,
 }
 impl StoredNode {
@@ -226,6 +229,7 @@ impl StoredNode {
             position: self.position,
             generation: self.generation,
             committer_millis: self.committer_millis,
+            has_conflict: self.has_conflict,
             descriptor: m::Descriptor {
                 key: m::ObjectKey {
                     kind: m::Kind::Commit,
@@ -264,6 +268,7 @@ fn synthetic() -> StoredNode {
         generation: 0,
         size: 0,
         committer_millis: 0,
+        has_conflict: false,
         skips: Vec::new(),
     }
 }
@@ -531,6 +536,7 @@ impl Index {
                 || old.parents != commit.parents.iter().map(|id| id.0).collect::<Vec<_>>()
                 || old.size != descriptor.size_bytes
                 || old.committer_millis != commit.committer.timestamp.millis_since_epoch
+                || old.has_conflict != (commit.root_tree.terms.len() > 1)
             {
                 return Err(Error::Corrupt);
             }
@@ -576,6 +582,7 @@ impl Index {
             generation,
             size: descriptor.size_bytes,
             committer_millis: commit.committer.timestamp.millis_since_epoch,
+            has_conflict: commit.root_tree.terms.len() > 1,
             skips,
         };
         let node_bytes = encode(&key(b'n', &repo, &node.commit), &node)?;
