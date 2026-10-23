@@ -1,7 +1,7 @@
 use crate::{Config, proto as p, wire};
 use futures::AsyncReadExt;
 use http::{Request as HttpRequest, Response as HttpResponse};
-use jj_native_backend::{CopyCatalogLimits, NativeObjectIo};
+use jj_native_backend::{CopyCatalogLimits, NativeObjectIo, ObjectIoResources};
 use std::{
     collections::HashMap,
     convert::Infallible,
@@ -28,9 +28,71 @@ struct Inner {
     stores: HashMap<String, Arc<dyn NativeObjectIo>>,
     controls: HashMap<String, Arc<dyn crate::NativeRepositoryControl>>,
     config: Config,
+    metadata_work: ObjectIoResources,
     calls: Arc<Semaphore>,
     memory: Arc<Semaphore>,
     staging: Arc<Semaphore>,
+}
+impl Inner {
+    async fn admit(&self, path: &str, deadline: Instant) -> Result<Arc<Work>, Status> {
+        let is_control = path.starts_with("/native.broker.v1.RepositoryControl/");
+        // The alias is inside the protobuf body, which has not been decoded at
+        // this boundary. Reserve the largest registered provider workset.
+        let is_metadata = ["/Descriptor", "/ReadMetadata", "/CopyCatalog", "/ReadFile"]
+            .iter()
+            .any(|suffix| path.ends_with(suffix));
+        let memory = if is_control {
+            self.config.max_memory_bytes
+        } else if path.ends_with("/CopyCatalog") {
+            self.config
+                .catalog_memory()
+                .max(self.config.metadata_memory())
+                .max(self.config.file_memory())
+        } else {
+            self.config.metadata_memory().max(self.config.file_memory())
+        };
+        let memory = if is_metadata {
+            memory.max(self.metadata_work.memory_bytes as usize)
+        } else {
+            memory
+        };
+        let temporary = if is_control {
+            self.config.max_temporary_bytes
+        } else if is_metadata {
+            self.metadata_work.temporary_bytes
+        } else {
+            0
+        };
+        let calls = self
+            .calls
+            .clone()
+            .acquire_owned()
+            .await
+            .map_err(|_| Status::unavailable("broker draining"))?;
+        let bytes = self
+            .memory
+            .clone()
+            .acquire_many_owned(memory as u32)
+            .await
+            .map_err(|_| Status::unavailable("broker draining"))?;
+        let staging = if temporary > 0 {
+            Some(
+                self.staging
+                    .clone()
+                    .acquire_many_owned(temporary as u32)
+                    .await
+                    .map_err(|_| Status::unavailable("broker staging admission closed"))?,
+            )
+        } else {
+            None
+        };
+        Ok(Arc::new(Work {
+            _calls: calls,
+            _memory: bytes,
+            _staging: staging,
+            deadline,
+        }))
+    }
 }
 impl BrokerService {
     /// Call after stopping incoming requests. Waits for transport-held guards
@@ -54,12 +116,27 @@ impl BrokerService {
         if stores.is_empty() || stores.len() > 1024 {
             return Err(Status::invalid_argument("invalid broker store registry"));
         }
-        for id in stores.keys() {
+        let mut metadata_work = ObjectIoResources::default();
+        for (id, provider) in &stores {
             wire::id(id)?;
+            if let Some(required) = provider.metadata_work_budget() {
+                if required.memory_bytes == 0
+                    || required.memory_bytes > config.max_memory_bytes as u64
+                    || required.temporary_bytes > config.max_temporary_bytes
+                {
+                    return Err(Status::invalid_argument(
+                        "native metadata resource bounds exceed broker pools",
+                    ));
+                }
+                metadata_work.memory_bytes = metadata_work.memory_bytes.max(required.memory_bytes);
+                metadata_work.temporary_bytes =
+                    metadata_work.temporary_bytes.max(required.temporary_bytes);
+            }
         }
         Ok(Self {
             inner: Arc::new(Inner {
                 stores,
+                metadata_work,
                 controls: HashMap::new(),
                 calls: Arc::new(Semaphore::new(config.max_inflight)),
                 memory: Arc::new(Semaphore::new(config.max_memory_bytes)),
@@ -105,6 +182,27 @@ impl BrokerService {
                 "native repository control is not configured for this alias",
             )
         })
+    }
+    /// In-process object I/O facade sharing RPC admission and drain. Reads are
+    /// guarded; writes preserve the provider's existing staging/ACK contract.
+    pub fn source_io(&self, id: &str) -> Result<Arc<dyn NativeObjectIo>, Status> {
+        Ok(Arc::new(crate::local::GuardedIo::new(
+            self.clone(),
+            self.store(id)?,
+            self.inner.config.clone(),
+        )))
+    }
+    pub(crate) fn operation_deadline(&self) -> Instant {
+        Instant::now() + self.inner.config.policy.operation_timeout()
+    }
+    pub(crate) async fn admit_local(
+        &self,
+        method: &str,
+        deadline: Instant,
+    ) -> Result<Arc<Work>, Status> {
+        tokio::time::timeout_at(deadline, self.inner.admit(method, deadline))
+            .await
+            .map_err(|_| Status::deadline_exceeded("broker source admission deadline exceeded"))?
     }
     fn store(&self, id: &str) -> Result<Arc<dyn NativeObjectIo>, Status> {
         wire::id(id)?;
@@ -252,24 +350,7 @@ where
     }
     fn call(&mut self, request: HttpRequest<Body>) -> Self::Future {
         let shared = self.shared.clone();
-        let is_control = request
-            .uri()
-            .path()
-            .starts_with("/native.broker.v1.RepositoryControl/");
-        let memory = if is_control {
-            shared.config.max_memory_bytes
-        } else if request.uri().path().ends_with("/CopyCatalog") {
-            shared
-                .config
-                .catalog_memory()
-                .max(shared.config.metadata_memory())
-                .max(shared.config.file_memory())
-        } else {
-            shared
-                .config
-                .metadata_memory()
-                .max(shared.config.file_memory())
-        };
+        let path = request.uri().path().to_owned();
         let budget = match grpc_budget(request.headers(), shared.config.policy.operation_timeout())
         {
             Ok(value) => value,
@@ -280,36 +361,7 @@ where
         let mut inner = std::mem::replace(&mut self.inner, ready);
         Box::pin(async move {
             let result = tokio::time::timeout_at(deadline, async {
-                let calls = shared
-                    .calls
-                    .clone()
-                    .acquire_owned()
-                    .await
-                    .map_err(|_| Status::unavailable("broker draining"))?;
-                let bytes = shared
-                    .memory
-                    .clone()
-                    .acquire_many_owned(memory as u32)
-                    .await
-                    .map_err(|_| Status::unavailable("broker draining"))?;
-                let staging = if is_control {
-                    Some(
-                        shared
-                            .staging
-                            .clone()
-                            .acquire_many_owned(shared.config.max_temporary_bytes as u32)
-                            .await
-                            .map_err(|_| Status::unavailable("broker staging admission closed"))?,
-                    )
-                } else {
-                    None
-                };
-                let work = Arc::new(Work {
-                    _calls: calls,
-                    _memory: bytes,
-                    _staging: staging,
-                    deadline,
-                });
+                let work = shared.admit(&path, deadline).await?;
                 let mut request = request.map(|body| {
                     Body::new(InboundBody::new(
                         body,
@@ -350,10 +402,15 @@ impl p::object_io_server::ObjectIo for BrokerService {
         &self,
         request: Request<p::ObjectRequest>,
     ) -> Result<Response<p::DescriptorReply>, Status> {
+        let owner = request
+            .extensions()
+            .get::<Arc<Work>>()
+            .cloned()
+            .ok_or_else(|| Status::internal("broker request missing resource scope"))?;
         let input = request.into_inner();
         let provider = self.store(&input.store_id)?;
         let value = provider
-            .descriptor(wire::key(input.kind, &input.id)?)
+            .descriptor_with_owner(wire::key(input.kind, &input.id)?, owner)
             .await
             .map_err(wire::backend)?;
         Ok(Response::new(p::DescriptorReply {
@@ -364,13 +421,21 @@ impl p::object_io_server::ObjectIo for BrokerService {
         &self,
         request: Request<p::ObjectRequest>,
     ) -> Result<Response<p::Metadata>, Status> {
+        let owner = request
+            .extensions()
+            .get::<Arc<Work>>()
+            .cloned()
+            .ok_or_else(|| Status::internal("broker request missing resource scope"))?;
         let input = request.into_inner();
         let provider = self.store(&input.store_id)?;
         let key = wire::key(input.kind, &input.id)?;
         if key.kind == tinytree_model::Kind::File {
             return Err(Status::invalid_argument("file requires broker stream"));
         }
-        let metadata = provider.read_metadata(key).await.map_err(wire::backend)?;
+        let metadata = provider
+            .read_metadata_with_owner(key, owner)
+            .await
+            .map_err(wire::backend)?;
         if metadata.descriptor().key != key
             || metadata.bytes().len() > self.inner.config.max_metadata_bytes
         {
@@ -431,7 +496,7 @@ impl p::object_io_server::ObjectIo for BrokerService {
             return Err(Status::invalid_argument("broker stream requires file"));
         }
         let source = provider
-            .read_file(tinytree_model::FileId(key.id.0))
+            .read_file_for_cache(tinytree_model::FileId(key.id.0), work.clone())
             .await
             .map_err(wire::backend)?;
         let (descriptor, mut source) = source.into_parts();
@@ -606,6 +671,11 @@ impl p::object_io_server::ObjectIo for BrokerService {
         &self,
         request: Request<p::CatalogRequest>,
     ) -> Result<Response<Self::CopyCatalogStream>, Status> {
+        let owner = request
+            .extensions()
+            .get::<Arc<Work>>()
+            .cloned()
+            .ok_or_else(|| Status::internal("broker request missing resource scope"))?;
         let input = request.into_inner();
         let provider = self.store(&input.store_id)?;
         let cfg = &self.inner.config;
@@ -621,11 +691,14 @@ impl p::object_io_server::ObjectIo for BrokerService {
             ));
         }
         let snapshot = provider
-            .copy_catalog_snapshot(CopyCatalogLimits {
-                max_objects: input.max_objects as usize,
-                max_metadata_bytes: input.max_bytes as usize,
-                max_edges: input.max_edges as usize,
-            })
+            .copy_catalog_snapshot_with_owner(
+                CopyCatalogLimits {
+                    max_objects: input.max_objects as usize,
+                    max_metadata_bytes: input.max_bytes as usize,
+                    max_edges: input.max_edges as usize,
+                },
+                owner,
+            )
             .await
             .map_err(wire::backend)?;
         let entries = snapshot.into_entries();
@@ -706,7 +779,7 @@ fn grpc_budget(
     Ok(value.min(maximum))
 }
 
-struct Work {
+pub(crate) struct Work {
     _calls: OwnedSemaphorePermit,
     _memory: OwnedSemaphorePermit,
     _staging: Option<OwnedSemaphorePermit>,

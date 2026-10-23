@@ -81,6 +81,11 @@ pub(crate) struct Root {
     pub generation: Option<u64>,
     pub binding: String,
     pub complete: bool,
+    /// Remote retention is independent of complete local metadata residency.
+    #[serde(default)]
+    pub pinned: bool,
+    #[serde(default)]
+    pub ready: bool,
 }
 #[derive(Clone, Serialize, Deserialize)]
 pub(crate) struct FileClaim {
@@ -94,12 +99,32 @@ pub(crate) struct Receipt {
     pub generation: u64,
     pub binding: String,
 }
+impl Root {
+    pub fn retained(&self) -> bool {
+        (self.pinned || self.complete)
+            && self.generation.is_some_and(|generation| generation > 0)
+            && self.request.is_none()
+    }
+}
+#[derive(Clone, Serialize, Deserialize)]
+pub(crate) struct KnownReference {
+    pub parent: Option<StoredDescriptor>,
+}
+#[derive(Default, Serialize, Deserialize)]
+struct Progress {
+    objects: usize,
+    bytes: u64,
+    edges: usize,
+    known: usize,
+}
 pub(crate) struct Ledger {
     db: fjall::SingleWriterTxDatabase,
     meta: fjall::SingleWriterTxKeyspace,
     roots: fjall::SingleWriterTxKeyspace,
     pending: fjall::SingleWriterTxKeyspace,
     members: fjall::SingleWriterTxKeyspace,
+    references: fjall::SingleWriterTxKeyspace,
+    progress: fjall::SingleWriterTxKeyspace,
     files: fjall::SingleWriterTxKeyspace,
     receipts: fjall::SingleWriterTxKeyspace,
     gate: Mutex<()>,
@@ -110,7 +135,8 @@ pub(crate) struct Ledger {
     pub binding: Binding,
 }
 const MARKER: &str = "admission.format";
-const FORMAT: &[u8] = b"tinytree-native-admission-1\n";
+const LEGACY_FORMAT: &[u8] = b"tinytree-native-admission-1\n";
+const FORMAT: &[u8] = b"tinytree-native-admission-2\n";
 pub(crate) fn preflight(path: &Path) -> Result<bool> {
     match std::fs::symlink_metadata(path) {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(true),
@@ -123,7 +149,16 @@ pub(crate) fn preflight(path: &Path) -> Result<bool> {
             if std::fs::read_dir(path)?.next().is_none() {
                 return Ok(true);
             }
-            require_bytes(&path.join(MARKER), FORMAT)?;
+            require_file(&path.join(MARKER))?;
+            ensure!(
+                std::fs::metadata(path.join(MARKER))?.len() <= FORMAT.len() as u64,
+                "native admission marker exceeds its bound"
+            );
+            let marker = std::fs::read(path.join(MARKER))?;
+            ensure!(
+                marker == FORMAT || marker == LEGACY_FORMAT,
+                "unrecognized native admission ledger format"
+            );
             require_file(&path.join("owner"))?;
             ensure!(
                 std::fs::symlink_metadata(path.join("data"))?.is_dir(),
@@ -199,14 +234,28 @@ impl Ledger {
             }
         }
         let meta = db.keyspace("meta", fjall::KeyspaceCreateOptions::default)?;
+        if !fresh && db.read_tx().get(&meta, b"format")?.as_deref() == Some(FORMAT) {
+            ensure!(
+                db.keyspace_exists("known-references-v2")
+                    && db.keyspace_exists("verified-progress-v2"),
+                "recognized sparse admission keyspace missing"
+            );
+        }
         let roots = db.keyspace("roots", fjall::KeyspaceCreateOptions::default)?;
         let pending = db.keyspace("pending", fjall::KeyspaceCreateOptions::default)?;
         let members = db.keyspace("admissions", fjall::KeyspaceCreateOptions::default)?;
         let files = db.keyspace("derived_files", fjall::KeyspaceCreateOptions::default)?;
         let receipts = db.keyspace("receipts", fjall::KeyspaceCreateOptions::default)?;
+        let references =
+            db.keyspace("known-references-v2", fjall::KeyspaceCreateOptions::default)?;
+        let progress = db.keyspace(
+            "verified-progress-v2",
+            fjall::KeyspaceCreateOptions::default,
+        )?;
         if !fresh {
+            let stored_format = db.read_tx().get(&meta, b"format")?;
             ensure!(
-                db.read_tx().get(&meta, b"format")?.as_deref() == Some(FORMAT),
+                matches!(stored_format.as_deref(), Some(value) if value == FORMAT || value == LEGACY_FORMAT),
                 "native admission ledger format identity missing"
             );
             let counter = db
@@ -285,22 +334,24 @@ impl Ledger {
             "invalid native admission ledger client identity"
         );
         let mut tx = db.write_tx().durability(Some(fjall::PersistMode::SyncAll));
+        // The durable database feature gate precedes the marker replacement.
+        // Old readers reject the database even after a crash between these writes.
+        tx.insert(&meta, b"format", FORMAT);
         if fresh {
-            tx.insert(&meta, b"format", FORMAT);
             tx.insert(&meta, b"bytes", serde_json::to_vec(&0u64)?);
         }
         tx.insert(&meta, b"binding", serde_json::to_vec(&binding)?);
         tx.insert(&meta, b"client", client);
         tx.commit()?;
-        if fresh {
-            directory.replace(MARKER, FORMAT)?;
-        }
+        directory.replace(MARKER, FORMAT)?;
         Ok(Self {
             db,
             meta,
             roots,
             pending,
             members,
+            references,
+            progress,
             files,
             receipts,
             gate: Mutex::new(()),
@@ -344,6 +395,293 @@ impl Ledger {
         );
         Ok(true)
     }
+    pub fn pin(&self, mut root: Root) -> Result<()> {
+        let _gate = self
+            .gate
+            .lock()
+            .map_err(|_| anyhow::anyhow!("native ledger requires recovery"))?;
+        ensure!(
+            root.generation.is_some_and(|generation| generation > 0) && root.request.is_none(),
+            "native pin lacks a current retention proof"
+        );
+        if !self
+            .root(CommitId(unhex(&root.head)?))?
+            .is_some_and(|value| value.retained())
+        {
+            ensure!(
+                self.roots()?
+                    .iter()
+                    .filter(|value| value.retained())
+                    .count()
+                    < self.config.max_admitted_roots,
+                "native admitted root budget exceeded"
+            );
+        }
+        let key = ObjectKey {
+            kind: Kind::Commit,
+            id: ObjectId(unhex(&root.head)?),
+        };
+        if root.pinned && !root.complete && self.reference(&root.head, key)?.is_some() {
+            ensure!(
+                self.get::<Progress>(&self.progress, root.head.as_bytes())?
+                    .is_some(),
+                "native sparse admission progress missing"
+            );
+        }
+        root.pinned = true;
+        let key = ObjectKey {
+            kind: Kind::Commit,
+            id: ObjectId(unhex(&root.head)?),
+        };
+        let mut changes = vec![(
+            &self.roots,
+            root.head.as_bytes().to_vec(),
+            Some(serde_json::to_vec(&root)?),
+        )];
+        if self
+            .get::<KnownReference>(&self.references, member_key(&root.head, key))?
+            .is_none()
+        {
+            let mut progress: Progress = self
+                .get(&self.progress, root.head.as_bytes())?
+                .unwrap_or_default();
+            progress.known = progress
+                .known
+                .checked_add(1)
+                .context("native known-reference count overflow")?;
+            ensure!(
+                progress.known <= self.config.closure.max_edges,
+                "native known-reference budget exceeded"
+            );
+            changes.push((
+                &self.references,
+                member_key(&root.head, key),
+                Some(serde_json::to_vec(&KnownReference { parent: None })?),
+            ));
+            changes.push((
+                &self.progress,
+                root.head.as_bytes().to_vec(),
+                Some(serde_json::to_vec(&progress)?),
+            ));
+        }
+        self.write_locked(changes)
+    }
+    /// A known reference is not residency: its canonical parent is rechecked by the provider.
+    pub fn reference(&self, root: &str, key: ObjectKey) -> Result<Option<KnownReference>> {
+        self.get(&self.references, member_key(root, key))
+    }
+    pub fn metadata_root(&self, key: ObjectKey) -> Result<Option<Root>> {
+        for root in self.roots()? {
+            if root.retained()
+                && (self.reference(&root.head, key)?.is_some()
+                    || (root.complete && self.member(&root.head, key)?))
+            {
+                return Ok(Some(root));
+            }
+        }
+        Ok(None)
+    }
+    pub fn verified_members(&self, root: &str) -> Result<Vec<Descriptor>> {
+        let mut result = Vec::new();
+        for item in self
+            .db
+            .read_tx()
+            .prefix(&self.members, format!("{root}/").as_bytes())
+        {
+            ensure!(
+                result.len() < self.config.closure.max_objects,
+                "native verified metadata count exceeded"
+            );
+            let (key, value) = item.into_inner()?;
+            let descriptor = serde_json::from_slice::<StoredDescriptor>(&value)?.descriptor()?;
+            ensure!(
+                key.as_ref() == member_key(root, descriptor.key).as_slice(),
+                "native verified metadata index is corrupt"
+            );
+            result.push(descriptor);
+        }
+        Ok(result)
+    }
+    pub fn check_verified_batch(
+        &self,
+        head: CommitId,
+        nodes: &[(Descriptor, tinytree_model::Object)],
+    ) -> Result<()> {
+        let root = self
+            .root(head)?
+            .context("native metadata root disappeared")?;
+        ensure!(root.retained(), "native metadata root is not pinned");
+        let progress: Option<Progress> = self.get(&self.progress, root.head.as_bytes())?;
+        ensure!(
+            root.complete || progress.is_some(),
+            "native sparse admission progress missing"
+        );
+        let mut progress = progress.unwrap_or_default();
+        let mut known = std::collections::HashSet::new();
+        for (descriptor, object) in nodes {
+            if self.member(&root.head, descriptor.key)? {
+                continue;
+            }
+            progress.objects = progress
+                .objects
+                .checked_add(1)
+                .context("native metadata count overflow")?;
+            progress.bytes = progress
+                .bytes
+                .checked_add(descriptor.size_bytes)
+                .context("native metadata bytes overflow")?;
+            let refs = object.references();
+            progress.edges = progress
+                .edges
+                .checked_add(refs.len())
+                .context("native metadata edges overflow")?;
+            for key in refs.into_iter().filter(|key| key.kind != Kind::File) {
+                if known.insert(key) && self.reference(&root.head, key)?.is_none() {
+                    progress.known = progress
+                        .known
+                        .checked_add(1)
+                        .context("native known-reference count overflow")?;
+                }
+            }
+        }
+        ensure!(
+            progress.objects <= self.config.closure.max_objects
+                && progress.bytes <= self.config.closure.max_metadata_bytes as u64
+                && progress.edges <= self.config.closure.max_edges
+                && progress.known <= self.config.closure.max_edges,
+            "native verified metadata budget exceeded"
+        );
+        Ok(())
+    }
+    /// Publish verified bytes, their outgoing references and exact FILE claims atomically.
+    pub fn verified(
+        &self,
+        head: CommitId,
+        descriptor: Descriptor,
+        object: &tinytree_model::Object,
+    ) -> Result<()> {
+        let _gate = self
+            .gate
+            .lock()
+            .map_err(|_| anyhow::anyhow!("native ledger requires recovery"))?;
+        let root = self
+            .root(head)?
+            .context("native metadata root disappeared")?;
+        ensure!(root.retained(), "native metadata root is not pinned");
+        if let Some(previous) =
+            self.get::<StoredDescriptor>(&self.members, member_key(&root.head, descriptor.key))?
+        {
+            ensure!(
+                previous.descriptor()? == descriptor,
+                "native verified metadata descriptor changed"
+            );
+            return Ok(());
+        }
+        ensure!(
+            self.reference(&root.head, descriptor.key)?.is_some(),
+            "native metadata has no known reference"
+        );
+        let progress: Option<Progress> = self.get(&self.progress, root.head.as_bytes())?;
+        ensure!(
+            root.complete || progress.is_some(),
+            "native sparse admission progress missing"
+        );
+        let mut progress = progress.unwrap_or_default();
+        progress.objects = progress
+            .objects
+            .checked_add(1)
+            .context("native metadata count overflow")?;
+        progress.bytes = progress
+            .bytes
+            .checked_add(descriptor.size_bytes)
+            .context("native metadata bytes overflow")?;
+        let refs = object.references();
+        progress.edges = progress
+            .edges
+            .checked_add(refs.len())
+            .context("native metadata edges overflow")?;
+        ensure!(
+            progress.objects <= self.config.closure.max_objects
+                && progress.bytes <= self.config.closure.max_metadata_bytes as u64
+                && progress.edges <= self.config.closure.max_edges,
+            "native verified metadata budget exceeded"
+        );
+        let parent = StoredDescriptor::new(descriptor);
+        let mut changes = vec![(
+            &self.members,
+            member_key(&root.head, descriptor.key),
+            Some(serde_json::to_vec(&parent)?),
+        )];
+        let mut outgoing = std::collections::HashSet::new();
+        for key in refs.into_iter().filter(|key| key.kind != Kind::File) {
+            if !outgoing.insert(key) {
+                continue;
+            }
+            if self.reference(&root.head, key)?.is_none() {
+                progress.known = progress
+                    .known
+                    .checked_add(1)
+                    .context("native known-reference count overflow")?;
+                ensure!(
+                    progress.known <= self.config.closure.max_edges,
+                    "native known-reference budget exceeded"
+                );
+                changes.push((
+                    &self.references,
+                    member_key(&root.head, key),
+                    Some(serde_json::to_vec(&KnownReference {
+                        parent: Some(parent.clone()),
+                    })?),
+                ));
+            }
+        }
+        if let tinytree_model::Object::Tree(tree) = object {
+            let mut count = 0usize;
+            for item in self.db.read_tx().iter(&self.files) {
+                item.into_inner()?;
+                count += 1;
+            }
+            let mut files = std::collections::HashMap::new();
+            for entry in &tree.entries {
+                if let tinytree_model::TreeValue::File { id, size_bytes, .. } = entry.value {
+                    if let Some(previous) = files.insert(id, size_bytes) {
+                        ensure!(
+                            previous == size_bytes,
+                            "conflicting admitted native file lengths"
+                        );
+                        continue;
+                    }
+                    if let Some(existing) = self.claim(id.0)? {
+                        ensure!(
+                            existing.size == size_bytes,
+                            "conflicting admitted native file lengths"
+                        );
+                    } else {
+                        count += 1;
+                    }
+                    ensure!(
+                        count <= self.config.max_file_index_entries,
+                        "native derived file index count exceeded"
+                    );
+                    changes.push((
+                        &self.files,
+                        hex(&id.0).into_bytes(),
+                        Some(serde_json::to_vec(&FileClaim {
+                            size: size_bytes,
+                            root: root.head.clone(),
+                            tree: hex(&descriptor.key.id.0),
+                        })?),
+                    ));
+                }
+            }
+        }
+        changes.push((
+            &self.progress,
+            root.head.as_bytes().to_vec(),
+            Some(serde_json::to_vec(&progress)?),
+        ));
+        self.write_locked(changes)
+    }
     pub fn discard_pending(&self, id: &str) -> Result<()> {
         self.write(vec![(&self.pending, id.as_bytes().to_vec(), None)])
     }
@@ -351,7 +689,7 @@ impl Ledger {
         if self.root(CommitId(unhex(&root.head)?))?.is_none() {
             let roots = self.roots()?;
             ensure!(
-                roots.iter().filter(|root| !root.complete).count()
+                roots.iter().filter(|root| !root.retained()).count()
                     < self.config.max_pending_operations,
                 "native pending hold budget exceeded"
             );
@@ -398,14 +736,15 @@ impl Ledger {
         members: &[Descriptor],
         files: &[(ObjectId, u64, ObjectId)],
     ) -> Result<()> {
-        if !root.complete {
+        if !root.retained() {
             ensure!(
-                self.roots()?.iter().filter(|root| root.complete).count()
+                self.roots()?.iter().filter(|root| root.retained()).count()
                     < self.config.max_admitted_roots,
                 "native admitted root budget exceeded"
             );
         }
         root.complete = true;
+        root.pinned = true;
         let mut changes = Vec::new();
         for descriptor in members {
             changes.push((
@@ -527,6 +866,12 @@ impl Ledger {
             .gate
             .lock()
             .map_err(|_| anyhow::anyhow!("native ledger requires recovery"))?;
+        self.write_locked(changes)
+    }
+    fn write_locked(
+        &self,
+        changes: Vec<(&fjall::SingleWriterTxKeyspace, Vec<u8>, Option<Vec<u8>>)>,
+    ) -> Result<()> {
         let mut tx = self
             .db
             .write_tx()

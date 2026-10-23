@@ -25,15 +25,81 @@ fn runtime() -> io::Result<&'static Runtime> {
     .as_ref()
     .map_err(|_| io::Error::other("native remote I/O runtime unavailable"))
 }
+#[derive(Default)]
+pub(crate) struct OwnedWork {
+    active: std::sync::atomic::AtomicUsize,
+    changed: tokio::sync::Notify,
+}
+impl OwnedWork {
+    pub fn enter(self: &Arc<Self>) -> WorkTicket {
+        self.active
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        WorkTicket(self.clone())
+    }
+    pub async fn wait_for_idle(&self) {
+        loop {
+            let changed = self.changed.notified();
+            if self.active.load(std::sync::atomic::Ordering::Acquire) == 0 {
+                return;
+            }
+            changed.await;
+        }
+    }
+}
+pub(crate) struct WorkTicket(Arc<OwnedWork>);
+impl Drop for WorkTicket {
+    fn drop(&mut self) {
+        if self
+            .0
+            .active
+            .fetch_sub(1, std::sync::atomic::Ordering::AcqRel)
+            == 1
+        {
+            self.0.changed.notify_waiters();
+        }
+    }
+}
+/// Owned provider work remains alive when its waiter is cancelled.
+pub(crate) async fn owned<T: Send + 'static>(
+    future: impl Future<Output = anyhow::Result<T>> + Send + 'static,
+) -> anyhow::Result<T> {
+    runtime()?.spawn(future).await?
+}
+pub(crate) async fn blocking_owned<T: Send + 'static>(
+    owner: Arc<dyn std::any::Any + Send + Sync>,
+    job: impl FnOnce() -> anyhow::Result<T> + Send + 'static,
+) -> anyhow::Result<T> {
+    blocking(move || {
+        let _owner = owner;
+        job()
+    })
+    .await
+}
 pub(crate) struct ControlScope {
-    _lease: tokio::sync::OwnedSemaphorePermit,
+    _lease: Option<tokio::sync::OwnedSemaphorePermit>,
+    _parent: Option<Arc<ControlScope>>,
     pub deadline: tokio::time::Instant,
+    _owner: Arc<dyn std::any::Any + Send + Sync>,
 }
 impl ControlScope {
-    pub fn new(lease: tokio::sync::OwnedSemaphorePermit, deadline: tokio::time::Instant) -> Self {
+    pub fn with_owner(parent: Arc<Self>, owner: Arc<dyn std::any::Any + Send + Sync>) -> Arc<Self> {
+        Arc::new(Self {
+            deadline: parent.deadline,
+            _lease: None,
+            _parent: Some(parent),
+            _owner: owner,
+        })
+    }
+    pub fn new(
+        lease: tokio::sync::OwnedSemaphorePermit,
+        deadline: tokio::time::Instant,
+        owner: Arc<dyn std::any::Any + Send + Sync>,
+    ) -> Self {
         Self {
-            _lease: lease,
+            _lease: Some(lease),
+            _parent: None,
             deadline,
+            _owner: owner,
         }
     }
 }

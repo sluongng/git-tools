@@ -4,7 +4,8 @@ use async_trait::async_trait;
 use futures::AsyncRead;
 use jj_lib::backend::BackendResult;
 use jj_native_backend::{
-    CopyCatalogLimits, CopyCatalogSnapshot, FileRead, NativeObjectIo, VerifiedMetadata,
+    CopyCatalogLimits, CopyCatalogSnapshot, FileRead, NativeObjectIo, ObjectIoResources,
+    VerifiedMetadata,
 };
 use local_cas::{Artifact, BlobSource, FetchContext};
 use std::sync::Arc;
@@ -21,8 +22,15 @@ impl std::fmt::Debug for RemoteObjectIo {
 }
 impl RemoteObjectIo {
     async fn promise(&self, id: m::FileId) -> Result<Option<m::Descriptor>> {
+        self.promise_owned(id, Arc::new(())).await
+    }
+    pub(crate) async fn promise_owned(
+        &self,
+        id: m::FileId,
+        owner: Arc<dyn std::any::Any + Send + Sync>,
+    ) -> Result<Option<m::Descriptor>> {
         let ledger = self.inner.ledger.clone();
-        let claim = io::blocking(move || ledger.claim(id.0)).await?;
+        let claim = io::blocking_owned(owner.clone(), move || ledger.claim(id.0)).await?;
         let Some(claim) = claim else { return Ok(None) };
         let ledger = self.inner.ledger.clone();
         let root = m::CommitId(unhex(&claim.root)?);
@@ -30,19 +38,19 @@ impl RemoteObjectIo {
             kind: m::Kind::Tree,
             id: m::ObjectId(unhex(&claim.tree)?),
         };
-        let valid = io::blocking(move || {
-            Ok(ledger.root(root)?.is_some_and(|root| root.complete)
-                && ledger.member(&hex(&root.0), tree)?)
-        })
-        .await?;
+        let retained = io::blocking_owned(owner.clone(), move || ledger.root(root))
+            .await?
+            .context("native file provenance root disappeared")?;
         ensure!(
-            valid,
-            "native derived file index lacks a completed metadata admission"
+            retained.retained(),
+            "native file provenance root is not pinned"
         );
+        self.prove_owned(&retained, tree, owner.clone(), self.inner.deadline())
+            .await?;
         let metadata = self
             .inner
             .local
-            .read_metadata(tree)
+            .read_metadata_with_owner(tree, owner)
             .await
             .map_err(backend)?;
         let m::Object::Tree(tree) = metadata.into_object() else {
@@ -125,20 +133,36 @@ impl RemoteObjectIo {
 }
 #[async_trait]
 impl NativeObjectIo for RemoteObjectIo {
+    fn metadata_work_budget(&self) -> Option<ObjectIoResources> {
+        let budget = self.inner.config.control_work_budget();
+        Some(ObjectIoResources {
+            memory_bytes: budget.memory_bytes,
+            temporary_bytes: budget.temporary_bytes,
+        })
+    }
     async fn descriptor(&self, key: m::ObjectKey) -> BackendResult<Option<m::Descriptor>> {
-        if let Some(descriptor) = self.inner.local.descriptor(key).await? {
-            return Ok(Some(descriptor));
-        }
-        if key.kind == m::Kind::File {
-            self.promise(m::FileId(key.id.0))
-                .await
-                .map_err(backend_error)
-        } else {
-            Ok(None)
-        }
+        self.descriptor_with_owner(key, Arc::new(())).await
+    }
+    async fn descriptor_with_owner(
+        &self,
+        key: m::ObjectKey,
+        owner: Arc<dyn std::any::Any + Send + Sync>,
+    ) -> BackendResult<Option<m::Descriptor>> {
+        self.owned_descriptor(key, owner)
+            .await
+            .map_err(backend_error)
     }
     async fn read_metadata(&self, key: m::ObjectKey) -> BackendResult<VerifiedMetadata> {
-        self.inner.local.read_metadata(key).await
+        self.verified_metadata(key).await.map_err(backend_error)
+    }
+    async fn read_metadata_with_owner(
+        &self,
+        key: m::ObjectKey,
+        owner: Arc<dyn std::any::Any + Send + Sync>,
+    ) -> BackendResult<VerifiedMetadata> {
+        self.verified_metadata_with_owner(key, owner)
+            .await
+            .map_err(backend_error)
     }
     async fn write_metadata(&self, object: m::Object) -> BackendResult<m::Descriptor> {
         self.inner.local.write_metadata(object).await
@@ -181,7 +205,7 @@ impl NativeObjectIo for RemoteObjectIo {
         );
         let operation = async {
             let descriptor = self
-                .promise(id)
+                .promise_owned(id, owner.clone())
                 .await?
                 .context("native file has no admitted canonical provenance")?;
             let artifact = self.artifact(descriptor);
@@ -230,7 +254,17 @@ impl NativeObjectIo for RemoteObjectIo {
         &self,
         limits: CopyCatalogLimits,
     ) -> BackendResult<CopyCatalogSnapshot> {
-        self.inner.local.copy_catalog_snapshot(limits).await
+        self.copy_catalog_snapshot_with_owner(limits, Arc::new(()))
+            .await
+    }
+    async fn copy_catalog_snapshot_with_owner(
+        &self,
+        limits: CopyCatalogLimits,
+        owner: Arc<dyn std::any::Any + Send + Sync>,
+    ) -> BackendResult<CopyCatalogSnapshot> {
+        self.owned_catalog(limits, owner)
+            .await
+            .map_err(backend_error)
     }
 }
 struct RemoteSource {
@@ -538,6 +572,7 @@ mod tests {
         let scope = Arc::new(io::ControlScope::new(
             permit,
             tokio::time::Instant::now() + Duration::from_millis(50),
+            Arc::new(()),
         ));
         let source = RemoteSource {
             inner: repo.io.inner.clone(),

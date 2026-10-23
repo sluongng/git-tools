@@ -619,6 +619,11 @@ fn open_native_host(
         }
     }
 
+    let broker =
+        native_broker::BrokerService::new(stores, config.native.broker_config(&config.reapi))
+            .and_then(|broker| broker.with_controls(controls))
+            .map_err(|_| anyhow::anyhow!("cannot configure native broker"))?;
+
     for (alias, settings) in &config.native.repositories {
         let store_path = root.join(alias).canonicalize()?;
         let mut fingerprint = blake3::Hasher::new();
@@ -644,19 +649,14 @@ fn open_native_host(
         retained.insert(
             alias.clone(),
             crate::native_workspaces::Repository {
-                io: stores
-                    .get(alias)
-                    .expect("configured native provider")
-                    .clone(),
+                io: broker
+                    .source_io(alias)
+                    .map_err(|_| anyhow::anyhow!("cannot configure native source provider"))?,
                 scope,
                 remote: settings.remote.is_some(),
             },
         );
     }
-    let broker =
-        native_broker::BrokerService::new(stores, config.native.broker_config(&config.reapi))
-            .and_then(|broker| broker.with_controls(controls))
-            .map_err(|_| anyhow::anyhow!("cannot configure native broker"))?;
     Ok((Some(broker), retained))
 }
 

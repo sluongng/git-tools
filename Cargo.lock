@@ -3120,6 +3120,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tempfile",
+ "tinytree-client",
  "tinytree-fixture",
  "tinytree-model",
  "tinytree-server",

@@ -6,6 +6,7 @@ mod config;
 mod control;
 mod io;
 mod ledger;
+mod metadata;
 mod provider;
 mod staging;
 use anyhow::{Context, Result, ensure};
@@ -37,6 +38,8 @@ pub(crate) struct Inner {
     pub staging_owner: Arc<staging::Owner>,
     pub config: Config,
     pub control: Arc<tokio::sync::Semaphore>,
+    pub metadata: Arc<tokio::sync::Mutex<()>>,
+    pub metadata_work: Arc<io::OwnedWork>,
     pub spool: Arc<tokio::sync::Semaphore>,
 }
 impl Inner {
@@ -52,6 +55,12 @@ impl Inner {
     }
 }
 impl RemoteRepository {
+    /// Stop producers before awaiting accepted owned metadata/control work.
+    pub async fn wait_for_idle(&self) {
+        self.control.drain_control().await;
+        self.io.inner.metadata_work.wait_for_idle().await;
+    }
+
     /// Paths/configuration are trusted broker inputs, never incoming RPC fields.
     /// No network connection is established while opening an offline workspace.
     pub fn open(
@@ -152,6 +161,8 @@ impl RemoteRepository {
             staging,
             staging_owner,
             control: Arc::new(tokio::sync::Semaphore::new(1)),
+            metadata: Arc::new(tokio::sync::Mutex::new(())),
+            metadata_work: Arc::new(io::OwnedWork::default()),
             spool: Arc::new(tokio::sync::Semaphore::new(
                 config.max_upload_spool_bytes as usize,
             )),

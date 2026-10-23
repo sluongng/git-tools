@@ -141,15 +141,64 @@ impl CopyCatalogSnapshot {
         self.entries
     }
 }
+/// Peak physical work retained by one metadata operation, including dependency
+/// hydration, decoding, and temporary staging across background jobs.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct ObjectIoResources {
+    pub memory_bytes: u64,
+    pub temporary_bytes: u64,
+}
 /// One instance is scoped to one authoritative repository; IDs do not select
 /// another repository. Implementations own durable ACK semantics,
 /// verified/pinned reads, aggregate staging admission and cross-writer catalog
 /// coordination. There is deliberately no upload/offload/retention/network API.
 #[async_trait]
 pub trait NativeObjectIo: Send + Sync + fmt::Debug {
+    /// None promises descriptor/metadata reads fit direct one-object bounds and
+    /// catalog reads fit caller-supplied catalog bounds, without transitive work.
+    /// Providers doing dependency hydration must declare the whole workset here.
+    fn metadata_work_budget(&self) -> Option<ObjectIoResources> {
+        None
+    }
+    /// Like owned metadata reads, retain the owner through physical work after cancellation.
+    async fn descriptor_with_owner(
+        &self,
+        _key: m::ObjectKey,
+        _owner: Arc<dyn std::any::Any + Send + Sync>,
+    ) -> BackendResult<Option<m::Descriptor>> {
+        Err(other(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "native provider does not support owned descriptor reads",
+        )))
+    }
+    /// Like owned metadata reads, retain the owner through physical work after cancellation.
+    async fn copy_catalog_snapshot_with_owner(
+        &self,
+        _limits: CopyCatalogLimits,
+        _owner: Arc<dyn std::any::Any + Send + Sync>,
+    ) -> BackendResult<CopyCatalogSnapshot> {
+        Err(other(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "native provider does not support owned catalog reads",
+        )))
+    }
     /// Metadata claim only: not a read lease, residency proof or durable ACK.
     async fn descriptor(&self, key: m::ObjectKey) -> BackendResult<Option<m::Descriptor>>;
     async fn read_metadata(&self, key: m::ObjectKey) -> BackendResult<VerifiedMetadata>;
+    /// A source-load read whose resource/lifetime owner follows every physical
+    /// read and verification job, including work left after caller cancellation.
+    /// Providers must opt in: retaining the owner only in the awaiting future
+    /// does not satisfy this contract when they detach background work.
+    async fn read_metadata_with_owner(
+        &self,
+        _key: m::ObjectKey,
+        _owner: Arc<dyn std::any::Any + Send + Sync>,
+    ) -> BackendResult<VerifiedMetadata> {
+        Err(other(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "native provider does not support owned metadata reads",
+        )))
+    }
     async fn write_metadata(&self, object: m::Object) -> BackendResult<m::Descriptor>;
     async fn read_file(&self, id: m::FileId) -> BackendResult<FileRead>;
     /// Delivery into an already admitted cache fetch. Implementations MUST NOT
@@ -285,13 +334,32 @@ impl DirectObjectIo {
 #[async_trait]
 impl NativeObjectIo for DirectObjectIo {
     async fn descriptor(&self, key: m::ObjectKey) -> BackendResult<Option<m::Descriptor>> {
+        self.descriptor_with_owner(key, Arc::new(())).await
+    }
+    async fn descriptor_with_owner(
+        &self,
+        key: m::ObjectKey,
+        owner: Arc<dyn std::any::Any + Send + Sync>,
+    ) -> BackendResult<Option<m::Descriptor>> {
         let store = self.store.clone();
-        io::blocking(move || store.descriptor(REPOSITORY, key).map_err(other)).await
+        io::blocking(move || {
+            let _owner = owner;
+            store.descriptor(REPOSITORY, key).map_err(other)
+        })
+        .await
     }
     async fn read_metadata(&self, key: m::ObjectKey) -> BackendResult<VerifiedMetadata> {
+        self.read_metadata_with_owner(key, Arc::new(())).await
+    }
+    async fn read_metadata_with_owner(
+        &self,
+        key: m::ObjectKey,
+        owner: Arc<dyn std::any::Any + Send + Sync>,
+    ) -> BackendResult<VerifiedMetadata> {
         let store = self.store.clone();
         let limits = self.config.store.model_limits;
         io::blocking(move || {
+            let _owner = owner;
             let (descriptor, bytes) = store.read_metadata(REPOSITORY, key).map_err(other)?;
             VerifiedMetadata::verify(descriptor, bytes, limits)
         })
@@ -442,6 +510,14 @@ impl NativeObjectIo for DirectObjectIo {
         &self,
         limits: CopyCatalogLimits,
     ) -> BackendResult<CopyCatalogSnapshot> {
+        self.copy_catalog_snapshot_with_owner(limits, Arc::new(()))
+            .await
+    }
+    async fn copy_catalog_snapshot_with_owner(
+        &self,
+        limits: CopyCatalogLimits,
+        owner: Arc<dyn std::any::Any + Send + Sync>,
+    ) -> BackendResult<CopyCatalogSnapshot> {
         let limits = CopyCatalogLimits {
             max_objects: limits
                 .max_objects
@@ -456,6 +532,7 @@ impl NativeObjectIo for DirectObjectIo {
         let store = self.store.clone();
         let model_limits = self.config.store.model_limits;
         io::blocking(move || {
+            let _owner = owner;
             let _guard = guard;
             let mut entries = Vec::new();
             let mut after = None;

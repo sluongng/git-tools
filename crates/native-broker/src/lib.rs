@@ -4,6 +4,7 @@ mod client;
 mod config;
 mod control;
 mod control_client;
+mod local;
 pub use control::{
     AdmittedCommit, ConfirmedPublication, ControlResources, NativeRepositoryControl,
     PublishRequest, ReferenceSnapshot,

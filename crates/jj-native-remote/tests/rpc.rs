@@ -51,6 +51,7 @@ struct Counters {
     holds: Arc<AtomicUsize>,
     metadata_rpcs: Arc<AtomicUsize>,
     metadata_keys: Arc<AtomicUsize>,
+    metadata_requests: Arc<std::sync::Mutex<Vec<p::ObjectKey>>>,
     metadata_bytes: Arc<AtomicUsize>,
     largest_metadata_batch: Arc<AtomicUsize>,
     paused: Arc<AtomicBool>,
@@ -65,6 +66,7 @@ impl Counters {
             holds: Arc::new(AtomicUsize::new(0)),
             metadata_rpcs: Arc::new(AtomicUsize::new(0)),
             metadata_keys: Arc::new(AtomicUsize::new(0)),
+            metadata_requests: Arc::new(std::sync::Mutex::new(Vec::new())),
             metadata_bytes: Arc::new(AtomicUsize::new(0)),
             largest_metadata_batch: Arc::new(AtomicUsize::new(0)),
             paused: Arc::new(AtomicBool::new(false)),
@@ -99,6 +101,11 @@ impl Repository for Counting {
         r: Request<p::BatchReadObjectsRequest>,
     ) -> Result<Response<Self::BatchReadObjectsStream>, Status> {
         self.counts.metadata_rpcs.fetch_add(1, Ordering::SeqCst);
+        self.counts
+            .metadata_requests
+            .lock()
+            .unwrap()
+            .extend(r.get_ref().keys.clone());
         self.counts
             .metadata_keys
             .fetch_add(r.get_ref().keys.len(), Ordering::SeqCst);
@@ -393,6 +400,86 @@ fn seed_wide(width: usize, marker_bytes: usize) -> (tempfile::TempDir, Store, m:
     (directory, store, head, width * 2 + 3)
 }
 
+fn seed_history(
+    depth: usize,
+) -> (
+    tempfile::TempDir,
+    Store,
+    tinytree_fixture::Fixture,
+    m::CommitId,
+    Vec<m::EncodedObject>,
+) {
+    let (directory, store, fixture, old) = seed();
+    let original = fixture
+        .objects()
+        .iter()
+        .find(|object| object.descriptor.key.id.0 == old.0)
+        .unwrap();
+    let m::Object::Commit(base) = m::decode(&original.bytes, m::Limits::default()).unwrap() else {
+        unreachable!()
+    };
+    let file = first_file(&fixture).descriptor;
+    let mut parent = m::CommitId::ROOT;
+    let mut trees = Vec::new();
+    for index in 0..depth {
+        let tree = m::encode(
+            &m::Object::Tree(m::Tree {
+                entries: vec![m::TreeEntry {
+                    name: format!("historical-{index:04}.txt"),
+                    value: m::TreeValue::File {
+                        id: m::FileId(file.key.id.0),
+                        executable: false,
+                        size_bytes: file.size_bytes,
+                        copy_id: None,
+                    },
+                }],
+            }),
+            m::Limits::default(),
+        )
+        .unwrap();
+        store
+            .put("example", tree.descriptor, &tree.bytes, 0)
+            .unwrap();
+        let mut commit = base.clone();
+        commit.parents = vec![parent];
+        commit.predecessors.clear();
+        commit.root_tree = m::TreeMerge {
+            terms: vec![m::TreeId(tree.descriptor.key.id.0)],
+            labels: vec![String::new()],
+        };
+        commit.description = format!("historical metadata {index}");
+        let commit = m::encode(&m::Object::Commit(commit), m::Limits::default()).unwrap();
+        store
+            .put("example", commit.descriptor, &commit.bytes, 0)
+            .unwrap();
+        parent = m::CommitId(commit.descriptor.key.id.0);
+        trees.push(tree);
+    }
+    let mut current = base;
+    current.parents = vec![parent];
+    current.predecessors.clear();
+    current.description = "current sparse root".into();
+    let current = m::encode(&m::Object::Commit(current), m::Limits::default()).unwrap();
+    store
+        .put("example", current.descriptor, &current.bytes, 0)
+        .unwrap();
+    let head = m::CommitId(current.descriptor.key.id.0);
+    store
+        .publish(
+            "example",
+            &tinytree_store::PublishRequest {
+                idempotency_key: "history-fixture-head".into(),
+                reference_name: "main".into(),
+                expected_generation: 1,
+                new_commit: Some(head),
+                staging_leases: vec![],
+            },
+            1,
+        )
+        .unwrap();
+    (directory, store, fixture, head, trees)
+}
+
 fn config(server: &Server) -> Config {
     let mut config = Config::default();
     config.remote.endpoint = format!("http://{}", server.address);
@@ -446,6 +533,379 @@ fn first_file(fixture: &tinytree_fixture::Fixture) -> &m::EncodedObject {
         .unwrap()
 }
 
+async fn read_current_metadata(repo: &RemoteRepository, head: m::CommitId) {
+    let root = repo
+        .io
+        .read_metadata(m::ObjectKey {
+            kind: m::Kind::Commit,
+            id: m::ObjectId(head.0),
+        })
+        .await
+        .unwrap();
+    let m::Object::Commit(commit) = root.into_object() else {
+        unreachable!()
+    };
+    let mut pending: Vec<_> = commit
+        .root_tree
+        .terms
+        .into_iter()
+        .map(|id| m::ObjectKey {
+            kind: m::Kind::Tree,
+            id: m::ObjectId(id.0),
+        })
+        .collect();
+    let mut seen = std::collections::HashSet::new();
+    while let Some(key) = pending.pop() {
+        if !seen.insert(key) {
+            continue;
+        }
+        let object = repo.io.read_metadata(key).await.unwrap().into_object();
+        pending.extend(
+            object
+                .references()
+                .into_iter()
+                .filter(|key| key.kind != m::Kind::File && key.kind != m::Kind::Commit),
+        );
+    }
+}
+async fn complete_copy_metadata(
+    repo: &RemoteRepository,
+) -> Result<jj_native_backend::CopyCatalogSnapshot, jj_lib::backend::BackendError> {
+    repo.io
+        .copy_catalog_snapshot(jj_native_backend::CopyCatalogLimits {
+            max_objects: 10_000,
+            max_metadata_bytes: 16 * 1024 * 1024,
+            max_edges: 50_000,
+        })
+        .await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn pinned_admission_loads_commits_without_historical_trees_and_reopens_lazily() {
+    let (_serverdir, store, fixture, head, historical) = seed_history(8);
+    let counts = Counters::new();
+    let server = Server::start(store, counts.clone()).await;
+    let directory = private_dir();
+    let cache = cache(directory.path());
+    let configuration = config(&server);
+    let (direct, repo) = local(directory.path(), cache.clone(), configuration.clone(), true);
+    let admitted = repo.control.admit_reference("main").await.unwrap();
+    assert_eq!(admitted.metadata_objects, 1);
+    assert_eq!(counts.metadata_keys.load(Ordering::SeqCst), 1);
+    assert_eq!(repo.control.rebuild_file_index().await.unwrap(), 0);
+    let unknown = m::ObjectKey {
+        kind: m::Kind::Tree,
+        id: m::ObjectId([7; 32]),
+    };
+    assert!(repo.io.read_metadata(unknown).await.is_err());
+    assert_eq!(
+        counts.metadata_keys.load(Ordering::SeqCst),
+        1,
+        "an unrelated ID is not a remote-read grant"
+    );
+    let mut current = head;
+    while current != m::CommitId::ROOT {
+        let object = repo
+            .io
+            .read_metadata(m::ObjectKey {
+                kind: m::Kind::Commit,
+                id: m::ObjectId(current.0),
+            })
+            .await
+            .unwrap()
+            .into_object();
+        let m::Object::Commit(commit) = object else {
+            unreachable!()
+        };
+        current = commit.parents[0];
+    }
+    assert!(
+        counts
+            .metadata_requests
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|key| key.kind == m::Kind::Commit as i32)
+    );
+    for tree in &historical {
+        assert!(
+            direct
+                .descriptor(tree.descriptor.key)
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+    read_current_metadata(&repo, head).await;
+    let file = first_file(&fixture);
+    assert_eq!(
+        bytes(repo.io.as_ref(), m::FileId(file.descriptor.key.id.0)).await,
+        file.bytes
+    );
+    assert_eq!(counts.files.load(Ordering::SeqCst), 1);
+    cache.wait_for_idle().await.unwrap();
+    repo.wait_for_idle().await;
+    drop(repo);
+    drop(direct);
+    let (direct, repo) = local(directory.path(), cache, configuration, false);
+    let oldest = &historical[0];
+    assert!(
+        direct
+            .descriptor(oldest.descriptor.key)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(
+        repo.io
+            .read_metadata(oldest.descriptor.key)
+            .await
+            .unwrap()
+            .bytes(),
+        oldest.bytes
+    );
+    assert_eq!(counts.files.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        repo.control.rebuild_file_index().await.unwrap(),
+        fixture.manifest.files.len()
+    );
+    server.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn corrupt_indexed_metadata_is_not_replaced_by_remote_fallback() {
+    let (_serverdir, store, _fixture, head) = seed();
+    let counts = Counters::new();
+    let server = Server::start(store, counts.clone()).await;
+    let directory = private_dir();
+    let cache = cache(directory.path());
+    let (_direct, repo) = local(directory.path(), cache, config(&server), true);
+    repo.control.admit_reference("main").await.unwrap();
+    let before = counts.metadata_rpcs.load(Ordering::SeqCst);
+    let hash: String = head.0.iter().map(|byte| format!("{byte:02x}")).collect();
+    let path = directory
+        .path()
+        .join("local/native-objects/repos/local/3")
+        .join(hash);
+    std::fs::write(path, b"corrupt indexed bytes").unwrap();
+    assert!(
+        repo.io
+            .read_metadata(m::ObjectKey {
+                kind: m::Kind::Commit,
+                id: m::ObjectId(head.0)
+            })
+            .await
+            .is_err()
+    );
+    assert_eq!(counts.metadata_rpcs.load(Ordering::SeqCst), before);
+    server.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cancelled_owned_metadata_operations_retain_external_guard_until_physical_completion() {
+    #[derive(Clone, Copy, Debug)]
+    enum Operation {
+        Read,
+        Descriptor,
+        Catalog,
+    }
+    for operation in [Operation::Read, Operation::Descriptor, Operation::Catalog] {
+        let (_serverdir, store, _fixture, head) = seed();
+        let counts = Counters::new();
+        let server = Server::start(store, counts.clone()).await;
+        let directory = private_dir();
+        let cache = cache(directory.path());
+        let (direct, repo) = local(directory.path(), cache, config(&server), true);
+        let declared = repo.io.metadata_work_budget().unwrap();
+        let expected = config(&server).control_work_budget();
+        assert_eq!(declared.memory_bytes, expected.memory_bytes);
+        assert_eq!(declared.temporary_bytes, expected.temporary_bytes);
+        repo.control.admit_reference("main").await.unwrap();
+        // Consume the pin's already-observed notification before pausing the next RPC.
+        counts.metadata_started.notified().await;
+        let object = repo
+            .io
+            .read_metadata(m::ObjectKey {
+                kind: m::Kind::Commit,
+                id: m::ObjectId(head.0),
+            })
+            .await
+            .unwrap()
+            .into_object();
+        let m::Object::Commit(commit) = object else {
+            unreachable!()
+        };
+        let key = m::ObjectKey {
+            kind: m::Kind::Tree,
+            id: m::ObjectId(commit.root_tree.terms[0].0),
+        };
+        counts.paused.store(true, Ordering::SeqCst);
+        let owner = Arc::new(());
+        let weak = Arc::downgrade(&owner);
+        let io = repo.io.clone();
+        let task = tokio::spawn(async move {
+            match operation {
+                Operation::Read => io.read_metadata_with_owner(key, owner).await.map(|_| ()),
+                Operation::Descriptor => io.descriptor_with_owner(key, owner).await.map(|_| ()),
+                Operation::Catalog => io
+                    .copy_catalog_snapshot_with_owner(
+                        jj_native_backend::CopyCatalogLimits {
+                            max_objects: 10_000,
+                            max_metadata_bytes: 16 * 1024 * 1024,
+                            max_edges: 50_000,
+                        },
+                        owner,
+                    )
+                    .await
+                    .map(|_| ()),
+            }
+        });
+        tokio::time::timeout(Duration::from_secs(5), counts.metadata_started.notified())
+            .await
+            .unwrap();
+        task.abort();
+        let _ = task.await;
+        assert!(
+            weak.upgrade().is_some(),
+            "caller cancellation must not release accepted metadata ownership"
+        );
+        assert!(direct.descriptor(key).await.unwrap().is_none());
+        counts.paused.store(false, Ordering::SeqCst);
+        repo.wait_for_idle().await;
+        assert!(direct.descriptor(key).await.unwrap().is_some());
+        assert!(
+            weak.upgrade().is_none(),
+            "idle must follow worker and owner destruction"
+        );
+        server.stop().await;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn legacy_complete_ledger_upgrades_without_losing_resident_provenance() {
+    use fjall::Readable;
+    let (_serverdir, store, fixture, head) = seed();
+    let counts = Counters::new();
+    let server = Server::start(store, counts.clone()).await;
+    let directory = private_dir();
+    let cache = cache(directory.path());
+    let configuration = config(&server);
+    let (direct, repo) = local(directory.path(), cache.clone(), configuration.clone(), true);
+    repo.control.admit_reference("main").await.unwrap();
+    complete_copy_metadata(&repo).await.unwrap();
+    repo.wait_for_idle().await;
+    drop(repo);
+    drop(direct);
+    // Reconstruct the actual v1 serialized root/member representation. V2-only
+    // keyspaces are empty; old readers ignored unknown empty keyspaces.
+    {
+        let db = fjall::SingleWriterTxDatabase::builder(directory.path().join("ledger/data"))
+            .open()
+            .unwrap();
+        let meta = db
+            .keyspace("meta", fjall::KeyspaceCreateOptions::default)
+            .unwrap();
+        let roots = db
+            .keyspace("roots", fjall::KeyspaceCreateOptions::default)
+            .unwrap();
+        let known = db
+            .keyspace("known-references-v2", fjall::KeyspaceCreateOptions::default)
+            .unwrap();
+        let progress = db
+            .keyspace(
+                "verified-progress-v2",
+                fjall::KeyspaceCreateOptions::default,
+            )
+            .unwrap();
+        let view = db.read_tx();
+        let mut bytes: u64 =
+            serde_json::from_slice(&view.get(&meta, b"bytes").unwrap().unwrap()).unwrap();
+        let mut tx = db.write_tx().durability(Some(fjall::PersistMode::SyncAll));
+        for item in view.iter(&roots) {
+            let (key, previous) = item.into_inner().unwrap();
+            let mut root: serde_json::Value = serde_json::from_slice(&previous).unwrap();
+            assert_eq!(root["complete"], true);
+            root.as_object_mut().unwrap().remove("pinned");
+            root.as_object_mut().unwrap().remove("ready");
+            let value = serde_json::to_vec(&root).unwrap();
+            bytes = bytes - previous.len() as u64 + value.len() as u64;
+            tx.insert(&roots, key, value);
+        }
+        for space in [&known, &progress] {
+            for item in view.iter(space) {
+                let (key, value) = item.into_inner().unwrap();
+                bytes -= (key.len() + value.len()) as u64;
+                tx.remove(space, key);
+            }
+        }
+        tx.insert(&meta, b"format", b"tinytree-native-admission-1\n");
+        tx.insert(&meta, b"bytes", serde_json::to_vec(&bytes).unwrap());
+        tx.commit().unwrap();
+    }
+    std::fs::write(
+        directory.path().join("ledger/admission.format"),
+        b"tinytree-native-admission-1\n",
+    )
+    .unwrap();
+    let before = counts.metadata_rpcs.load(Ordering::SeqCst);
+    let (_direct, repo) = local(directory.path(), cache, configuration, false);
+    let root = repo
+        .io
+        .read_metadata(m::ObjectKey {
+            kind: m::Kind::Commit,
+            id: m::ObjectId(head.0),
+        })
+        .await
+        .unwrap();
+    assert_eq!(root.descriptor().key.id.0, head.0);
+    let file = first_file(&fixture);
+    assert_eq!(
+        repo.io.descriptor(file.descriptor.key).await.unwrap(),
+        Some(file.descriptor)
+    );
+    assert_eq!(counts.metadata_rpcs.load(Ordering::SeqCst), before);
+    assert_eq!(
+        std::fs::read(directory.path().join("ledger/admission.format")).unwrap(),
+        b"tinytree-native-admission-2\n"
+    );
+    assert_eq!(counts.files.load(Ordering::SeqCst), 0);
+    server.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "manual history-shaped sparse admission benchmark"]
+async fn historical_metadata_admission_benchmark() {
+    for depth in [8, 64, 256] {
+        let (_serverdir, store, _fixture, head, historical) = seed_history(depth);
+        let counts = Counters::new();
+        let server = Server::start(store, counts.clone()).await;
+        let directory = private_dir();
+        let cache = cache(directory.path());
+        let (direct, repo) = local(directory.path(), cache, config(&server), true);
+        let started = std::time::Instant::now();
+        let admitted = repo.control.admit_reference("main").await.unwrap();
+        assert_eq!(admitted.head, head);
+        let cold_ns = started.elapsed().as_nanos();
+        let metadata_rpcs = counts.metadata_rpcs.load(Ordering::SeqCst);
+        let canonical_bytes = counts.metadata_bytes.load(Ordering::SeqCst);
+        for tree in &historical {
+            let _ = direct.descriptor(tree.descriptor.key).await.unwrap();
+        }
+        let tree_rpcs = counts
+            .metadata_requests
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|key| key.kind == m::Kind::Tree as i32)
+            .count();
+        assert_eq!(counts.files.load(Ordering::SeqCst), 0);
+        println!(
+            "{{\"schema\":1,\"benchmark\":\"historical_metadata_admission\",\"history_depth\":{depth},\"cold_ns\":{cold_ns},\"metadata_rpcs\":{metadata_rpcs},\"canonical_bytes\":{canonical_bytes},\"tree_requests\":{tree_rpcs},\"file_rpcs\":0}}"
+        );
+        server.stop().await;
+    }
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn admission_batches_missing_siblings_and_reuses_warm_shared_metadata() {
     let (_serverdir, store, head, expected_objects) = seed_wide(32, 0);
@@ -456,7 +916,9 @@ async fn admission_batches_missing_siblings_and_reuses_warm_shared_metadata() {
     let (_direct, repo) = local(directory.path(), cache, config(&server), true);
     let admitted = repo.control.admit_reference("main").await.unwrap();
     assert_eq!(admitted.head, head);
-    assert_eq!(admitted.metadata_objects, expected_objects);
+    assert_eq!(admitted.metadata_objects, 1);
+    assert_eq!(counts.metadata_keys.load(Ordering::SeqCst), 1);
+    complete_copy_metadata(&repo).await.unwrap();
     assert_eq!(
         counts.metadata_keys.load(Ordering::SeqCst),
         expected_objects
@@ -490,7 +952,8 @@ async fn admission_splits_aggregate_metadata_bytes_without_rejecting_valid_objec
     let (_direct, repo) = local(directory.path(), cache, configuration, true);
     let admitted = repo.control.admit_reference("main").await.unwrap();
     assert_eq!(admitted.head, head);
-    assert_eq!(admitted.metadata_objects, expected_objects);
+    assert_eq!(admitted.metadata_objects, 1);
+    complete_copy_metadata(&repo).await.unwrap();
     assert!(counts.largest_metadata_batch.load(Ordering::SeqCst) > 1);
     assert!(
         counts.metadata_keys.load(Ordering::SeqCst) > expected_objects,
@@ -538,7 +1001,24 @@ async fn admission_respects_tight_request_and_closure_budgets() {
         configuration.closure.max_objects = expected_objects - case.missing_object_slots;
         configuration.closure.max_metadata_bytes = case.max_metadata_bytes;
         let (direct, repo) = local(directory.path(), cache, configuration, true);
-        let result = repo.control.admit_reference("main").await;
+        repo.control.admit_reference("main").await.unwrap();
+        let head_object = repo
+            .io
+            .read_metadata(m::ObjectKey {
+                kind: m::Kind::Commit,
+                id: m::ObjectId(head.0),
+            })
+            .await
+            .unwrap()
+            .into_object();
+        let m::Object::Commit(head_object) = head_object else {
+            unreachable!()
+        };
+        let current_tree = m::ObjectKey {
+            kind: m::Kind::Tree,
+            id: m::ObjectId(head_object.root_tree.terms[0].0),
+        };
+        let result = complete_copy_metadata(&repo).await;
         assert_eq!(result.is_ok(), case.succeeds, "{}", case.name);
         assert!(
             counts.largest_metadata_batch.load(Ordering::SeqCst) <= 25,
@@ -548,14 +1028,7 @@ async fn admission_respects_tight_request_and_closure_budgets() {
         assert_eq!(counts.files.load(Ordering::SeqCst), 0, "{}", case.name);
         if !case.succeeds {
             assert!(
-                direct
-                    .descriptor(m::ObjectKey {
-                        kind: m::Kind::Commit,
-                        id: m::ObjectId(head.0)
-                    })
-                    .await
-                    .unwrap()
-                    .is_none(),
+                direct.descriptor(current_tree).await.unwrap().is_none(),
                 "{}: failed collection must not install prefetched metadata",
                 case.name
             );
@@ -579,7 +1052,7 @@ async fn metadata_admission_benchmark() {
         let started = std::time::Instant::now();
         let admitted = repo.control.admit_reference("main").await.unwrap();
         let cold_ns = started.elapsed().as_nanos();
-        assert_eq!(admitted.metadata_objects, expected_objects);
+        assert!(admitted.metadata_objects <= expected_objects);
         let cold_rpcs = counts.metadata_rpcs.load(Ordering::SeqCst);
         let cold_keys = counts.metadata_keys.load(Ordering::SeqCst);
         let cold_bytes = counts.metadata_bytes.load(Ordering::SeqCst);
@@ -611,6 +1084,8 @@ async fn metadata_only_admission_and_public_ref_gc_keep_lazy_old_reads_available
         "admission must never fetch payloads, including unused source files"
     );
     assert_eq!(counts.holds.load(Ordering::SeqCst), 1);
+    assert_eq!(repo.control.rebuild_file_index().await.unwrap(), 0);
+    read_current_metadata(&repo, head).await;
     assert!(repo.control.rebuild_file_index().await.unwrap() > 20);
     let file = first_file(&fixture);
     let descriptor = repo
@@ -662,7 +1137,8 @@ async fn cached_offline_reads_and_new_writes_survive_reopen_without_credentials(
     let cache = cache(directory.path());
     let original = config(&server);
     let (direct, repo) = local(directory.path(), cache.clone(), original.clone(), true);
-    repo.control.admit_reference("main").await.unwrap();
+    let admitted = repo.control.admit_reference("main").await.unwrap();
+    read_current_metadata(&repo, admitted.head).await;
     let file = first_file(&fixture);
     assert_eq!(
         bytes(repo.io.as_ref(), m::FileId(file.descriptor.key.id.0)).await,
@@ -732,9 +1208,10 @@ async fn cancelled_admission_reconciles_current_durable_hold_after_restart() {
     assert_eq!(counts.holds.load(Ordering::SeqCst), 1);
     task.abort();
     let _ = task.await;
+    counts.paused.store(false, Ordering::SeqCst);
+    repo.wait_for_idle().await;
     drop(repo);
     drop(direct);
-    counts.paused.store(false, Ordering::SeqCst);
     let (_direct, repo) = local(directory.path(), cache, config, false);
     assert_eq!(repo.control.client_id(), client_id);
     assert_eq!(repo.control.reconcile_pending().await.unwrap(), 1);
@@ -992,7 +1469,8 @@ async fn admission_traverses_negative_terms_legacy_edges_copy_parents_and_symlin
         .admit_commit(m::CommitId(head.descriptor.key.id.0))
         .await
         .unwrap();
-    assert!(admitted.metadata_objects >= 7);
+    assert_eq!(admitted.metadata_objects, 1);
+    complete_copy_metadata(&repo).await.unwrap();
     for object in [&parent, &child, &symlink, &negative, &legacy] {
         assert_eq!(
             repo.io
@@ -1147,7 +1625,8 @@ async fn credential_change_requires_own_hold_and_never_reuses_other_credential_c
     let cache = cache(directory.path());
     let original = config(&server);
     let (direct, repo) = local(directory.path(), cache.clone(), original.clone(), true);
-    repo.control.admit_reference("main").await.unwrap();
+    let admitted = repo.control.admit_reference("main").await.unwrap();
+    read_current_metadata(&repo, admitted.head).await;
     let client_id = repo.control.client_id();
     drop(repo);
     drop(direct);
@@ -1382,8 +1861,7 @@ async fn private_broker_control_preserves_absent_tombstones_and_exact_historical
     small.max_memory_bytes = required.memory_bytes as usize - 1;
     assert!(
         BrokerService::new(stores.clone(), small)
-            .unwrap()
-            .with_controls(controls.clone())
+            .and_then(|broker| broker.with_controls(controls.clone()))
             .is_err(),
         "registration must reject a provider larger than the shared memory pool"
     );

@@ -7,7 +7,7 @@ mod io;
 mod provider;
 pub use provider::{
     CopyCatalogLimits, CopyCatalogSnapshot, DirectObjectIo, FileRead, NativeObjectIo,
-    VerifiedMetadata,
+    ObjectIoResources, VerifiedMetadata,
 };
 
 use async_trait::async_trait;

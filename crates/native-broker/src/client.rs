@@ -49,6 +49,46 @@ async fn run<T: Send + 'static>(
         .map_err(|_| wire::other(std::io::Error::other("native broker job failed")))?
         .map_err(wire::other)
 }
+/// Unlike ordinary request waiters, a source load must retain its external
+/// owner until its bounded RPC and synchronous verification actually finish.
+pub(crate) async fn run_owned<T: Send + 'static>(
+    owner: Arc<dyn std::any::Any + Send + Sync>,
+    future: impl Future<Output = Result<T, Status>> + Send + 'static,
+) -> BackendResult<T> {
+    runtime()?
+        .spawn(async move {
+            let _owner = owner;
+            future.await
+        })
+        .await
+        .map_err(|_| wire::other(std::io::Error::other("native broker job failed")))?
+        .map_err(wire::other)
+}
+async fn read_metadata_request(
+    inner: Arc<Inner>,
+    key: tinytree_model::ObjectKey,
+) -> Result<VerifiedMetadata, Status> {
+    let deadline = Instant::now() + inner.config.policy.operation_timeout();
+    reapi::policy::timeout(deadline, async {
+        let _budget = inner.budget(inner.config.metadata_memory()).await?;
+        let value = inner
+            .client(inner.config.max_metadata_bytes + 4096)
+            .read_metadata(inner.request(inner.object(key), deadline)?)
+            .await?
+            .into_inner();
+        let descriptor = wire::descriptor(
+            value
+                .descriptor
+                .ok_or_else(|| Status::data_loss("missing broker descriptor"))?,
+        )?;
+        if descriptor.key != key {
+            return Err(Status::data_loss("broker metadata key mismatch"));
+        }
+        VerifiedMetadata::verify(descriptor, value.canonical, inner.config.model_limits())
+            .map_err(wire::backend)
+    })
+    .await
+}
 struct Budget {
     _calls: OwnedSemaphorePermit,
     _memory: OwnedSemaphorePermit,
@@ -198,34 +238,43 @@ impl NativeObjectIo for BrokerObjectIo {
         })
         .await
     }
+    async fn descriptor_with_owner(
+        &self,
+        key: tinytree_model::ObjectKey,
+        owner: Arc<dyn std::any::Any + Send + Sync>,
+    ) -> BackendResult<Option<tinytree_model::Descriptor>> {
+        let provider = self.clone();
+        run_owned(owner, async move {
+            provider.descriptor(key).await.map_err(wire::backend)
+        })
+        .await
+    }
+    async fn copy_catalog_snapshot_with_owner(
+        &self,
+        limits: CopyCatalogLimits,
+        owner: Arc<dyn std::any::Any + Send + Sync>,
+    ) -> BackendResult<CopyCatalogSnapshot> {
+        let provider = self.clone();
+        run_owned(owner, async move {
+            provider
+                .copy_catalog_snapshot(limits)
+                .await
+                .map_err(wire::backend)
+        })
+        .await
+    }
     async fn read_metadata(
         &self,
         key: tinytree_model::ObjectKey,
     ) -> BackendResult<VerifiedMetadata> {
-        let inner = self.inner.clone();
-        run(async move {
-            let deadline = Instant::now() + inner.config.policy.operation_timeout();
-            reapi::policy::timeout(deadline, async {
-                let _budget = inner.budget(inner.config.metadata_memory()).await?;
-                let value = inner
-                    .client(inner.config.max_metadata_bytes + 4096)
-                    .read_metadata(inner.request(inner.object(key), deadline)?)
-                    .await?
-                    .into_inner();
-                let descriptor = wire::descriptor(
-                    value
-                        .descriptor
-                        .ok_or_else(|| Status::data_loss("missing broker descriptor"))?,
-                )?;
-                if descriptor.key != key {
-                    return Err(Status::data_loss("broker metadata key mismatch"));
-                }
-                VerifiedMetadata::verify(descriptor, value.canonical, inner.config.model_limits())
-                    .map_err(wire::backend)
-            })
-            .await
-        })
-        .await
+        run(read_metadata_request(self.inner.clone(), key)).await
+    }
+    async fn read_metadata_with_owner(
+        &self,
+        key: tinytree_model::ObjectKey,
+        owner: Arc<dyn std::any::Any + Send + Sync>,
+    ) -> BackendResult<VerifiedMetadata> {
+        run_owned(owner, read_metadata_request(self.inner.clone(), key)).await
     }
     async fn write_metadata(
         &self,

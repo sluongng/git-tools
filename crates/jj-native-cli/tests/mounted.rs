@@ -2,8 +2,10 @@
 //! must not count as acceptance of lazy, externally administered workspaces.
 #![cfg(target_os = "linux")]
 
+use futures::StreamExt;
+use p::repository_server::{Repository, RepositoryServer};
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, HashSet},
     fs,
     io::{BufRead, BufReader, Read, Write},
     net::TcpListener,
@@ -11,11 +13,16 @@ use std::{
     path::{Path, PathBuf},
     process::{Child, Command, Output, Stdio},
     sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicUsize, Ordering},
     },
     task::{Context, Poll},
     time::{Duration, Instant},
+};
+use tinytree_client::protocol as p;
+use tinytree_model as m;
+use tonic::{
+    Request as RpcRequest, Response as RpcResponse, Status, Streaming, codec::CompressionEncoding,
 };
 use workspace_daemon::control::{Request, Response};
 
@@ -595,6 +602,110 @@ where
     }
 }
 
+#[derive(Default)]
+struct MetadataReads {
+    keys: Mutex<HashSet<(i32, [u8; 32])>>,
+    calls: AtomicUsize,
+    canonical_bytes: AtomicUsize,
+}
+
+/// Observe decoded metadata without replacing any repository implementation.
+#[derive(Clone)]
+struct CountMetadata {
+    inner: tinytree_server::RepositoryService,
+    reads: Arc<MetadataReads>,
+}
+
+#[tonic::async_trait]
+impl Repository for CountMetadata {
+    async fn open_repository(
+        &self,
+        request: RpcRequest<p::OpenRepositoryRequest>,
+    ) -> Result<RpcResponse<p::RepositoryView>, Status> {
+        self.inner.open_repository(request).await
+    }
+
+    async fn get_commit_graph(
+        &self,
+        request: RpcRequest<p::GetCommitGraphRequest>,
+    ) -> Result<RpcResponse<p::CommitGraphPage>, Status> {
+        self.inner.get_commit_graph(request).await
+    }
+
+    type BatchReadObjectsStream =
+        <tinytree_server::RepositoryService as Repository>::BatchReadObjectsStream;
+
+    async fn batch_read_objects(
+        &self,
+        request: RpcRequest<p::BatchReadObjectsRequest>,
+    ) -> Result<RpcResponse<Self::BatchReadObjectsStream>, Status> {
+        self.reads.calls.fetch_add(1, Ordering::SeqCst);
+        {
+            let mut keys = self.reads.keys.lock().unwrap();
+            for key in &request.get_ref().keys {
+                if let Ok(id) = key.native_id.as_slice().try_into() {
+                    if keys.len() >= 8192 && !keys.contains(&(key.kind, id)) {
+                        return Err(Status::resource_exhausted("fixture metadata counter limit"));
+                    }
+                    keys.insert((key.kind, id));
+                }
+            }
+        }
+        let response = self.inner.batch_read_objects(request).await?;
+        let reads = self.reads.clone();
+        let body = response.into_inner().map(move |result| {
+            if let Ok(p::ObjectResult {
+                result: Some(p::object_result::Result::Object(object)),
+                ..
+            }) = &result
+            {
+                reads
+                    .canonical_bytes
+                    .fetch_add(object.canonical_envelope.len(), Ordering::SeqCst);
+            }
+            result
+        });
+        Ok(RpcResponse::new(Box::pin(body)))
+    }
+
+    async fn find_missing_objects(
+        &self,
+        request: RpcRequest<p::FindMissingObjectsRequest>,
+    ) -> Result<RpcResponse<p::MissingObjects>, Status> {
+        self.inner.find_missing_objects(request).await
+    }
+
+    type ReadFileStream = <tinytree_server::RepositoryService as Repository>::ReadFileStream;
+
+    async fn read_file(
+        &self,
+        request: RpcRequest<p::ReadFileRequest>,
+    ) -> Result<RpcResponse<Self::ReadFileStream>, Status> {
+        self.inner.read_file(request).await
+    }
+
+    async fn write_object(
+        &self,
+        request: RpcRequest<Streaming<p::WriteFrame>>,
+    ) -> Result<RpcResponse<p::WriteReceipt>, Status> {
+        self.inner.write_object(request).await
+    }
+
+    async fn publish_reference(
+        &self,
+        request: RpcRequest<p::PublishReferenceRequest>,
+    ) -> Result<RpcResponse<p::Publication>, Status> {
+        self.inner.publish_reference(request).await
+    }
+
+    async fn get_publication(
+        &self,
+        request: RpcRequest<p::GetPublicationRequest>,
+    ) -> Result<RpcResponse<p::Publication>, Status> {
+        self.inner.get_publication(request).await
+    }
+}
+
 struct RemoteServer {
     _directory: tempfile::TempDir,
     runtime: Option<tokio::runtime::Runtime>,
@@ -603,9 +714,12 @@ struct RemoteServer {
     store: tinytree_store::Store,
     endpoint: String,
     head: String,
+    historical_head: String,
+    historical_trees: Vec<tinytree_model::ObjectKey>,
     source_file: tinytree_model::ObjectKey,
     source_bytes: Vec<u8>,
     reads: Arc<AtomicUsize>,
+    metadata: Arc<MetadataReads>,
 }
 
 impl RemoteServer {
@@ -624,9 +738,74 @@ impl RemoteServer {
                 .put("example", object.descriptor, &object.bytes, 0)
                 .unwrap();
         }
-        let head: [u8; 32] = *blake3::Hash::from_hex(&seed.manifest.root_commit)
+        let root_commit = seed
+            .objects()
+            .iter()
+            .find(|object| object.descriptor.key.kind == m::Kind::Commit)
+            .unwrap();
+        let m::Object::Commit(template) =
+            m::decode(&root_commit.bytes, m::Limits::default()).unwrap()
+        else {
+            unreachable!()
+        };
+        let root = seed
+            .objects()
+            .iter()
+            .find(|object| object.descriptor.key.id.0 == template.root_tree.terms[0].0)
+            .unwrap();
+        let m::Object::Tree(current_tree) = m::decode(&root.bytes, m::Limits::default()).unwrap()
+        else {
+            unreachable!()
+        };
+        let source_value = current_tree
+            .entries
+            .iter()
+            .find(|entry| entry.name == "hello.cc")
             .unwrap()
-            .as_bytes();
+            .value
+            .clone();
+        let mut parent = m::CommitId::ROOT;
+        let mut historical_head = None;
+        let mut historical_trees = Vec::new();
+        for number in 0..8 {
+            let mut tree = current_tree.clone();
+            tree.entries.push(m::TreeEntry {
+                name: format!("history-{number:02}.cc"),
+                value: source_value.clone(),
+            });
+            tree.entries
+                .sort_by(|left, right| left.name.as_bytes().cmp(right.name.as_bytes()));
+            let tree = m::encode(&m::Object::Tree(tree), m::Limits::default()).unwrap();
+            store
+                .put("example", tree.descriptor, &tree.bytes, 0)
+                .unwrap();
+            historical_trees.push(tree.descriptor.key);
+            let mut commit = template.clone();
+            commit.parents = vec![parent];
+            commit.predecessors.clear();
+            commit.root_tree.terms = vec![m::TreeId(tree.descriptor.key.id.0)];
+            commit.change_id = m::ChangeId(
+                blake3::hash(format!("mounted-history-{number}").as_bytes()).as_bytes()[..16]
+                    .try_into()
+                    .unwrap(),
+            );
+            commit.description = format!("native history {number}");
+            let commit = m::encode(&m::Object::Commit(commit), m::Limits::default()).unwrap();
+            store
+                .put("example", commit.descriptor, &commit.bytes, 0)
+                .unwrap();
+            parent = m::CommitId(commit.descriptor.key.id.0);
+            historical_head
+                .get_or_insert_with(|| blake3::Hash::from(parent.0).to_hex().to_string());
+        }
+        let mut current = template;
+        current.parents = vec![parent];
+        let current = m::encode(&m::Object::Commit(current), m::Limits::default()).unwrap();
+        store
+            .put("example", current.descriptor, &current.bytes, 0)
+            .unwrap();
+        let head_id = m::CommitId(current.descriptor.key.id.0);
+        let head = blake3::Hash::from(head_id.0).to_hex().to_string();
         store
             .publish(
                 "example",
@@ -634,7 +813,7 @@ impl RemoteServer {
                     idempotency_key: "mounted-seed".into(),
                     reference_name: "main".into(),
                     expected_generation: 0,
-                    new_commit: Some(tinytree_model::CommitId(head)),
+                    new_commit: Some(head_id),
                     staging_leases: vec![],
                 },
                 0,
@@ -662,9 +841,14 @@ impl RemoteServer {
             .enable_all()
             .build()
             .unwrap();
+        let configuration = tinytree_server::ServiceConfig::default();
+        let request_bytes = configuration
+            .max_request_bytes
+            .max(configuration.max_frame_bytes + 1024);
+        let response_bytes = configuration.max_metadata_bytes + 4096;
         let service = tinytree_server::RepositoryService::new(
             store.clone(),
-            Default::default(),
+            configuration,
             vec!["example".into()],
             vec![
                 tinytree_server::Principal::new(
@@ -680,6 +864,11 @@ impl RemoteServer {
         .unwrap();
         let reads = Arc::new(AtomicUsize::new(0));
         let counter = reads.clone();
+        let metadata = Arc::new(MetadataReads::default());
+        let observed = CountMetadata {
+            inner: service.clone(),
+            reads: metadata.clone(),
+        };
         let (stop, stopped) = tokio::sync::oneshot::channel();
         let (endpoint, task) = runtime.block_on(async move {
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -692,9 +881,20 @@ impl RemoteServer {
                         reads: counter.clone(),
                     }))
                     .concurrency_limit_per_connection(service.maximum_inflight())
-                    .add_service(service.grpc_service())
+                    .add_service(
+                        RepositoryServer::new(observed)
+                            .accept_compressed(CompressionEncoding::Zstd)
+                            .send_compressed(CompressionEncoding::Zstd)
+                            .max_decoding_message_size(request_bytes)
+                            .max_encoding_message_size(response_bytes),
+                    )
                     .serve_with_incoming_shutdown(
-                        tokio_stream::wrappers::TcpListenerStream::new(listener),
+                        tokio_stream::wrappers::TcpListenerStream::new(listener).map(|accepted| {
+                            accepted.and_then(|stream| {
+                                stream.set_nodelay(true)?;
+                                Ok(stream)
+                            })
+                        }),
                         async {
                             let _ = stopped.await;
                         },
@@ -711,15 +911,26 @@ impl RemoteServer {
             stop: Some(stop),
             store,
             endpoint,
-            head: seed.manifest.root_commit,
+            head,
+            historical_head: historical_head.unwrap(),
+            historical_trees,
             source_file,
             source_bytes,
             reads,
+            metadata,
         }
     }
 
     fn file_reads(&self) -> usize {
         self.reads.load(Ordering::SeqCst)
+    }
+
+    fn historical_tree_reads(&self) -> usize {
+        let requested = self.metadata.keys.lock().unwrap();
+        self.historical_trees
+            .iter()
+            .filter(|key| requested.contains(&(key.kind as i32, key.id.0)))
+            .count()
     }
 
     fn public(&self) -> tinytree_store::Reference {
@@ -772,8 +983,10 @@ fn shipped_remote_cli_clones_lazily_and_publishes_between_isolated_mounts() {
     let base = fixture.base().to_owned();
     let first = base.join("writer");
     let second = base.join("reader");
+    let cloning = Instant::now();
     fixture.clone_remote(&first);
     fixture.clone_remote(&second);
+    let clone_pair_ns = cloning.elapsed().as_nanos();
     let first_binding = fixture.binding(&first);
     let second_binding = fixture.binding(&second);
     assert_ne!(first_binding.repo, second_binding.repo);
@@ -794,6 +1007,38 @@ fn shipped_remote_cli_clones_lazily_and_publishes_between_isolated_mounts() {
         upstream.file_reads(),
         0,
         "clone/stat must load metadata, not FILE payloads"
+    );
+    let clone_metadata_bytes = upstream.metadata.canonical_bytes.load(Ordering::SeqCst);
+    eprintln!(
+        "{{\"schema\":1,\"benchmark\":\"native_history_admission\",\"history_commits\":8,\"clone_pair_ns\":{clone_pair_ns},\"metadata_rpcs\":{},\"canonical_metadata_bytes\":{clone_metadata_bytes},\"historical_trees_requested\":{},\"file_rpcs\":{}}}",
+        upstream.metadata.calls.load(Ordering::SeqCst),
+        upstream.historical_tree_reads(),
+        upstream.file_reads(),
+    );
+    assert!(clone_metadata_bytes > 0);
+    assert_eq!(
+        upstream.historical_tree_reads(),
+        0,
+        "clone/index/stat must not fetch unused ancestor trees"
+    );
+    let historical_listing =
+        fixture.success(&first, &["file", "list", "-r", &upstream.historical_head]);
+    assert!(
+        historical_listing
+            .lines()
+            .any(|path| path == "history-00.cc")
+    );
+    assert!(!historical_listing.contains("history-01.cc"));
+    assert_eq!(
+        upstream.historical_tree_reads(),
+        1,
+        "listing one old revision fetches its tree, not every ancestor tree"
+    );
+    assert!(upstream.metadata.canonical_bytes.load(Ordering::SeqCst) > clone_metadata_bytes);
+    assert_eq!(
+        upstream.file_reads(),
+        0,
+        "historical file listing needs metadata, not historical file contents"
     );
     assert_eq!(
         fs::read(first.join("hello.cc")).unwrap(),

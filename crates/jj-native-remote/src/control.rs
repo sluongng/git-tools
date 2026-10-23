@@ -30,7 +30,7 @@ pub struct AdmittedHead {
     pub hold_generation: u64,
     pub metadata_objects: usize,
     pub public_reference: Option<AdmittedReference>,
-    _complete: (),
+    _retained: (),
 }
 #[derive(Clone, Debug)]
 pub struct AdmittedReference {
@@ -141,6 +141,14 @@ impl RemoteRepositoryControl {
         deadline: tokio::time::Instant,
         operation: impl std::future::Future<Output = Result<T>>,
     ) -> Result<T> {
+        self.run_owned(deadline, Arc::new(()), operation).await
+    }
+    pub(crate) async fn run_owned<T>(
+        &self,
+        deadline: tokio::time::Instant,
+        owner: Arc<dyn std::any::Any + Send + Sync>,
+        operation: impl std::future::Future<Output = Result<T>>,
+    ) -> Result<T> {
         // Only admission is cancellable here. Once DirectObjectIo owns a job,
         // await its physical completion; the broker's owned request task keeps
         // this future alive even when the incoming RPC times out/disconnects.
@@ -149,7 +157,7 @@ impl RemoteRepositoryControl {
             .map_err(|_| {
                 tonic::Status::deadline_exceeded("native control admission deadline exceeded")
             })??;
-        let scope = Arc::new(io::ControlScope::new(permit, deadline));
+        let scope = Arc::new(io::ControlScope::new(permit, deadline, owner));
         let result = io::control_scope(scope, operation).await;
         if tokio::time::Instant::now() >= deadline {
             return Err(tonic::Status::deadline_exceeded(
@@ -172,50 +180,34 @@ impl RemoteRepositoryControl {
             "intrinsic root does not need remote admission"
         );
         let client = self.inner.connector.get().await?;
-        let root = self.hold(&client, head).await?;
-        let closure = Closure::collect(&self.inner, head, true).await?;
-        // Parent-first order preserves CopyHistory's authoritative parent checks.
-        for key in &closure.order {
-            io::check_deadline()?;
-            let node = &closure.nodes[key];
-            if self
-                .inner
-                .local
-                .descriptor(*key)
-                .await
-                .map_err(backend)?
-                .is_none()
-            {
-                io::check_deadline()?;
-                let descriptor = self
-                    .inner
-                    .local
-                    .write_metadata(node.object.clone())
-                    .await
-                    .map_err(backend)?;
-                io::check_deadline()?;
-                ensure!(
-                    descriptor == node.descriptor,
-                    "native metadata installation changed canonical identity"
-                );
-            }
-        }
-        let root = self.current_hold(&client, root).await?;
-        let descriptors = closure.descriptors();
-        let count = descriptors.len();
-        let files = closure.files;
+        let mut root = self.hold(&client, head).await?;
+        root.pinned = true;
         let ledger = self.inner.ledger.clone();
-        let installed = root.clone();
-        io::blocking(move || ledger.completed(installed, &descriptors, &files)).await?;
+        let pinned = root.clone();
+        io::blocking(move || ledger.pin(pinned)).await?;
+        let provider = RemoteObjectIo {
+            inner: self.inner.clone(),
+        };
+        let key = m::ObjectKey {
+            kind: m::Kind::Commit,
+            id: m::ObjectId(head.0),
+        };
+        provider.read_metadata(key).await.map_err(backend)?;
+        let mut root = self.current_hold(&client, root).await?;
+        root.ready = true;
+        // Save the confirmed pin independently of complete local closure state.
+        let ledger = self.inner.ledger.clone();
+        let pinned = root.clone();
+        io::blocking(move || ledger.pin(pinned)).await?;
         Ok(AdmittedHead {
             head,
             hold_name: root.hold_name,
             hold_generation: root
                 .generation
                 .context("native hold proof missing generation")?,
-            metadata_objects: count,
+            metadata_objects: 1,
             public_reference: None,
-            _complete: (),
+            _retained: (),
         })
     }
     async fn hold(&self, client: &NativeClient, head: m::CommitId) -> Result<Root> {
@@ -234,6 +226,8 @@ impl RemoteRepositoryControl {
             generation: None,
             binding: self.inner.ledger.binding.scope.clone(),
             complete: false,
+            pinned: false,
+            ready: false,
         });
         // A durable intent and stable client identity precede even the lookup.
         let ledger = self.inner.ledger.clone();
@@ -351,7 +345,7 @@ impl RemoteRepositoryControl {
         let saved = pending.clone();
         io::blocking(move || ledger.save_pending(&saved)).await?;
         let client = self.inner.connector.get().await?;
-        let closure = Closure::collect(&self.inner, request.head, false).await?;
+        let closure = self.hydrate_closure(request.head).await?;
         let mut descriptors = closure.descriptors();
         for (id, size, _) in &closure.files {
             descriptors.push(m::Descriptor {
@@ -611,8 +605,63 @@ impl RemoteRepositoryControl {
         })
         .await
     }
-    /// Rebuild disposable file-size/provenance hints exclusively from already
-    /// admitted canonical local trees. Does not fetch payloads or renew holds.
+    /// Explicit compatibility path for consumers requiring a complete copy catalog.
+    /// This may fetch historical trees; ordinary admission and reads do not.
+    pub(crate) async fn complete_metadata(&self) -> Result<()> {
+        let operation = async {
+            let ledger = self.inner.ledger.clone();
+            let roots = io::blocking(move || ledger.roots()).await?;
+            for root in roots
+                .into_iter()
+                .filter(|root| root.retained() && !root.complete)
+            {
+                let head = m::CommitId(unhex(&root.head)?);
+                let client = self.inner.connector.get().await?;
+                let root = self.hold(&client, head).await?;
+                let closure = self.hydrate_closure(head).await?;
+                let root = self.current_hold(&client, root).await?;
+                let members = closure.descriptors();
+                let files = closure.files;
+                let ledger = self.inner.ledger.clone();
+                io::blocking(move || ledger.completed(root, &members, &files)).await?;
+            }
+            Ok(())
+        };
+        if io::in_control() {
+            operation.await
+        } else {
+            self.run(self.inner.deadline(), operation).await
+        }
+    }
+    async fn hydrate_closure(&self, head: m::CommitId) -> Result<Closure> {
+        let _metadata = self.inner.metadata.clone().lock_owned().await;
+        let closure = Closure::collect(&self.inner, head, true).await?;
+        for key in &closure.order {
+            io::check_deadline()?;
+            let node = &closure.nodes[key];
+            if self
+                .inner
+                .local
+                .descriptor(*key)
+                .await
+                .map_err(backend)?
+                .is_none()
+            {
+                let descriptor = self
+                    .inner
+                    .local
+                    .write_metadata(node.object.clone())
+                    .await
+                    .map_err(backend)?;
+                ensure!(
+                    descriptor == node.descriptor,
+                    "native metadata installation changed identity"
+                );
+            }
+        }
+        Ok(closure)
+    }
+    /// Rebuild hints from already verified resident trees, never hydrate history.
     pub async fn rebuild_file_index(&self) -> Result<usize> {
         let deadline = self.inner.deadline();
         self.run(deadline, async {
@@ -620,29 +669,51 @@ impl RemoteRepositoryControl {
             let roots = io::blocking(move || ledger.roots()).await?;
             let mut claims =
                 std::collections::HashMap::<m::ObjectId, crate::ledger::FileClaim>::new();
-            for root in roots.into_iter().filter(|root| root.complete) {
-                let closure =
-                    Closure::collect(&self.inner, m::CommitId(unhex(&root.head)?), false).await?;
-                for (id, size, tree) in closure.files {
-                    if let Some(existing) = claims.get(&id) {
-                        ensure!(
-                            existing.size == size,
-                            "conflicting native admitted file lengths"
-                        );
-                    } else {
-                        claims.insert(
-                            id,
-                            crate::ledger::FileClaim {
-                                size,
-                                root: root.head.clone(),
-                                tree: hex(&tree.0),
-                            },
-                        );
-                    }
+            for root in roots.into_iter().filter(|root| root.retained()) {
+                let ledger = self.inner.ledger.clone();
+                let head = root.head.clone();
+                let members = io::blocking(move || ledger.verified_members(&head)).await?;
+                for descriptor in members
+                    .into_iter()
+                    .filter(|descriptor| descriptor.key.kind == m::Kind::Tree)
+                {
+                    let verified = self
+                        .inner
+                        .local
+                        .read_metadata(descriptor.key)
+                        .await
+                        .map_err(backend)?;
                     ensure!(
-                        claims.len() <= self.inner.config.max_file_index_entries,
-                        "native derived file index count exceeded"
+                        verified.descriptor() == descriptor,
+                        "native verified tree descriptor changed"
                     );
+                    let m::Object::Tree(tree) = verified.into_object() else {
+                        anyhow::bail!("native file provenance is not a tree")
+                    };
+                    for entry in tree.entries {
+                        if let m::TreeValue::File { id, size_bytes, .. } = entry.value {
+                            let id = m::ObjectId(id.0);
+                            if let Some(existing) = claims.get(&id) {
+                                ensure!(
+                                    existing.size == size_bytes,
+                                    "conflicting admitted native file lengths"
+                                );
+                            } else {
+                                claims.insert(
+                                    id,
+                                    crate::ledger::FileClaim {
+                                        size: size_bytes,
+                                        root: root.head.clone(),
+                                        tree: hex(&descriptor.key.id.0),
+                                    },
+                                );
+                            }
+                            ensure!(
+                                claims.len() <= self.inner.config.max_file_index_entries,
+                                "native derived file index count exceeded"
+                            );
+                        }
+                    }
                 }
             }
             let count = claims.len();
@@ -659,7 +730,8 @@ impl RemoteRepositoryControl {
             let roots = io::blocking(move || ledger.roots()).await?;
             let mut completed = 0;
             for root in roots {
-                if !root.complete
+                if !root.retained()
+                    || !(root.ready || root.complete)
                     || root.request.is_some()
                     || root.binding != self.inner.ledger.binding.scope
                 {

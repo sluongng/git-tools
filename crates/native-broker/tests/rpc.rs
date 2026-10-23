@@ -1,6 +1,6 @@
 #![cfg(unix)]
 use futures::io::Cursor;
-use jj_native_backend::{CopyCatalogLimits, DirectObjectIo, NativeObjectIo};
+use jj_native_backend::{CopyCatalogLimits, DirectObjectIo, NativeObjectIo, ObjectIoResources};
 use native_broker::{BrokerObjectIo, BrokerService, Config};
 use std::{
     collections::HashMap,
@@ -440,13 +440,26 @@ async fn retained_tiny_readers_keep_their_buffer_memory_charged_until_drop() {
     c.max_catalog_bytes = 1024;
     c.max_catalog_objects = 1;
     c.max_memory_bytes = 1024 * 1024;
-    let host = Running::start(&socket, provider, c.clone()).await;
+    let service = BrokerService::new(
+        HashMap::from([("example".into(), provider as Arc<dyn NativeObjectIo>)]),
+        c.clone(),
+    )
+    .unwrap();
+    let local = service.source_io("example").unwrap();
+    let host = Running::start_service(&socket, service).await;
+    let local_reader = local.read_file(file).await.unwrap();
+
     c.max_file_bytes = 1;
     c.max_temporary_bytes = 1024 * 1024;
     c.policy.operation_timeout_ms = 200;
     let client = BrokerObjectIo::connect(&socket, "example", &spool, c)
         .await
         .unwrap();
+    assert!(
+        client.read_file(file).await.is_err(),
+        "local reader must retain shared host memory until drop"
+    );
+    drop(local_reader);
     let mut held = Vec::new();
     let mut exhausted = false;
     for _ in 0..600 {
@@ -488,16 +501,21 @@ async fn retained_tiny_readers_keep_their_buffer_memory_charged_until_drop() {
     host.stop().await;
 }
 #[derive(Debug)]
-struct PausedDescriptor {
+struct PausedObjectRead {
+    resources: Option<ObjectIoResources>,
     inner: Arc<dyn NativeObjectIo>,
     entered: Arc<std::sync::atomic::AtomicUsize>,
     release: Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>,
 }
 #[async_trait::async_trait]
-impl NativeObjectIo for PausedDescriptor {
-    async fn descriptor(
+impl NativeObjectIo for PausedObjectRead {
+    fn metadata_work_budget(&self) -> Option<ObjectIoResources> {
+        self.resources
+    }
+    async fn descriptor_with_owner(
         &self,
         key: tinytree_model::ObjectKey,
+        owner: Arc<dyn std::any::Any + Send + Sync>,
     ) -> jj_lib::backend::BackendResult<Option<tinytree_model::Descriptor>> {
         if self
             .entered
@@ -505,7 +523,9 @@ impl NativeObjectIo for PausedDescriptor {
             == 0
         {
             let release = self.release.clone();
+            let blocking_owner = owner.clone();
             tokio::task::spawn_blocking(move || {
+                let _owner = blocking_owner;
                 let (lock, wake) = &*release;
                 let mut done = lock.lock().unwrap();
                 while !*done {
@@ -515,7 +535,22 @@ impl NativeObjectIo for PausedDescriptor {
             .await
             .unwrap();
         }
-        self.inner.descriptor(key).await
+        self.inner.descriptor_with_owner(key, owner).await
+    }
+    async fn copy_catalog_snapshot_with_owner(
+        &self,
+        limits: CopyCatalogLimits,
+        owner: Arc<dyn std::any::Any + Send + Sync>,
+    ) -> jj_lib::backend::BackendResult<jj_native_backend::CopyCatalogSnapshot> {
+        self.inner
+            .copy_catalog_snapshot_with_owner(limits, owner)
+            .await
+    }
+    async fn descriptor(
+        &self,
+        key: tinytree_model::ObjectKey,
+    ) -> jj_lib::backend::BackendResult<Option<tinytree_model::Descriptor>> {
+        self.descriptor_with_owner(key, Arc::new(())).await
     }
     async fn read_metadata(
         &self,
@@ -523,11 +558,58 @@ impl NativeObjectIo for PausedDescriptor {
     ) -> jj_lib::backend::BackendResult<jj_native_backend::VerifiedMetadata> {
         self.inner.read_metadata(key).await
     }
+    async fn read_metadata_with_owner(
+        &self,
+        key: tinytree_model::ObjectKey,
+        owner: Arc<dyn std::any::Any + Send + Sync>,
+    ) -> jj_lib::backend::BackendResult<jj_native_backend::VerifiedMetadata> {
+        if self
+            .entered
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+            != 0
+        {
+            return self.inner.read_metadata_with_owner(key, owner).await;
+        }
+        let release = self.release.clone();
+        let inner = self.inner.clone();
+        // Deliberately return a bounded error while owned physical work drains.
+        // The real provider must keep the broker's resource scope in that job.
+        let task = tokio::spawn(async move {
+            let owner_for_blocking = owner.clone();
+            tokio::task::spawn_blocking(move || {
+                let _owner = owner_for_blocking;
+                let (lock, wake) = &*release;
+                let mut done = lock.lock().unwrap();
+                while !*done {
+                    done = wake.wait(done).unwrap();
+                }
+            })
+            .await
+            .unwrap();
+            inner.read_metadata_with_owner(key, owner).await
+        });
+        tokio::time::timeout(Duration::from_millis(200), task)
+            .await
+            .map_err(|_| {
+                jj_lib::backend::BackendError::Other(Box::new(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "metadata waiter timed out",
+                )))
+            })?
+            .unwrap()
+    }
     async fn write_metadata(
         &self,
         value: tinytree_model::Object,
     ) -> jj_lib::backend::BackendResult<tinytree_model::Descriptor> {
         self.inner.write_metadata(value).await
+    }
+    async fn read_file_for_cache(
+        &self,
+        id: tinytree_model::FileId,
+        owner: Arc<dyn std::any::Any + Send + Sync>,
+    ) -> jj_lib::backend::BackendResult<jj_native_backend::FileRead> {
+        self.inner.read_file_for_cache(id, owner).await
     }
     async fn read_file(
         &self,
@@ -577,7 +659,8 @@ async fn timed_out_provider_job_keeps_admission_until_its_blocking_work_finishes
         std::sync::Condvar::new(),
     )));
     let entered = Arc::new(AtomicUsize::new(0));
-    let provider = Arc::new(PausedDescriptor {
+    let provider = Arc::new(PausedObjectRead {
+        resources: None,
         inner: Arc::new(DirectObjectIo::init(&backend, backend_config()).unwrap()),
         entered: entered.clone(),
         release: release.0.clone(),
@@ -624,6 +707,137 @@ async fn timed_out_provider_job_keeps_admission_until_its_blocking_work_finishes
     drop(client);
     host.stop().await;
 }
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cancelled_metadata_waiter_keeps_owners_until_local_and_provider_jobs_finish() {
+    // Exercise each global pool independently: either missing reservation would
+    // otherwise let the second alias enter while the first job is still live.
+    for resources in [
+        ObjectIoResources {
+            memory_bytes: 128 * 1024 * 1024,
+            temporary_bytes: 0,
+        },
+        ObjectIoResources {
+            memory_bytes: 1,
+            temporary_bytes: 64 * 1024 * 1024,
+        },
+    ] {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        private(&root);
+        let backend = root.join("store");
+        private(&backend);
+        let spool = root.join("spool");
+        private(&spool);
+        let release = Release(Arc::new((
+            std::sync::Mutex::new(false),
+            std::sync::Condvar::new(),
+        )));
+        let entered = Arc::new(AtomicUsize::new(0));
+        let provider: Arc<dyn NativeObjectIo> = Arc::new(PausedObjectRead {
+            resources: Some(resources),
+            inner: Arc::new(DirectObjectIo::init(&backend, backend_config()).unwrap()),
+            entered: entered.clone(),
+            release: release.0.clone(),
+        });
+        let socket = root.join("broker.sock");
+        let mut server_config = config();
+        server_config.max_inflight = 2;
+        server_config.max_memory_bytes = 128 * 1024 * 1024;
+        server_config.max_temporary_bytes = 64 * 1024 * 1024;
+        server_config.policy.operation_timeout_ms = 1000;
+        let stores = HashMap::from([
+            ("example".into(), provider.clone()),
+            ("peer".into(), provider),
+        ]);
+        let mut insufficient = server_config.clone();
+        if resources.temporary_bytes == 0 {
+            insufficient.max_memory_bytes -= 1;
+        } else {
+            insufficient.max_temporary_bytes -= 1;
+        }
+        assert!(
+            BrokerService::new(stores.clone(), insufficient).is_err(),
+            "provider workset must fit pools before control registration"
+        );
+        let service = BrokerService::new(stores, server_config).unwrap();
+        let host = Running::start_service(&socket, service.clone()).await;
+        let mut client_config = config();
+        client_config.policy.operation_timeout_ms = 1000;
+        let client = BrokerObjectIo::connect(&socket, "example", &spool, client_config)
+            .await
+            .unwrap();
+        let key = tinytree_model::empty_tree().descriptor.key;
+        let owner = Arc::new(());
+        let weak = Arc::downgrade(&owner);
+        let task_client = client.clone();
+        let task =
+            tokio::spawn(async move { task_client.read_metadata_with_owner(key, owner).await });
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while entered.load(Ordering::SeqCst) == 0 {
+                tokio::time::sleep(Duration::from_millis(2)).await;
+            }
+        })
+        .await
+        .unwrap();
+        task.abort();
+        let _ = task.await;
+        assert!(
+            weak.upgrade().is_some(),
+            "cancelled caller lost its local read owner"
+        );
+        // The provider returns its timeout while the blocking job remains live.
+        // Once the bounded client job completes, only the remote Work guard remains.
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while weak.upgrade().is_some() {
+                tokio::time::sleep(Duration::from_millis(2)).await;
+            }
+        })
+        .await
+        .unwrap();
+        let mut probe_config = config();
+        probe_config.policy.operation_timeout_ms = 100;
+        let probe = BrokerObjectIo::connect(&socket, "peer", &spool, probe_config)
+            .await
+            .unwrap();
+        let local_probe = service.source_io("peer").unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), local_probe.read_metadata(key))
+                .await
+                .is_err(),
+            "local mount must share RPC admission"
+        );
+        assert!(probe.read_metadata(key).await.is_err());
+        assert!(probe.descriptor(key).await.is_err());
+        assert!(
+            probe
+                .copy_catalog_snapshot(CopyCatalogLimits {
+                    max_objects: 10,
+                    max_metadata_bytes: 1024,
+                    max_edges: 10,
+                })
+                .await
+                .is_err()
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), service.drain())
+                .await
+                .is_err(),
+            "drain must await detached physical work"
+        );
+        assert_eq!(
+            entered.load(Ordering::SeqCst),
+            1,
+            "provider's detached metadata work lost the server admission owner"
+        );
+        release.release();
+        let result = client.read_metadata(key).await.unwrap();
+        assert_eq!(result.descriptor().key, key);
+        drop((client, probe));
+        host.stop().await;
+    }
+}
+
 #[derive(Clone)]
 struct EarlyAck;
 #[tonic::async_trait]
@@ -739,6 +953,22 @@ struct ObservedWrites {
 }
 #[async_trait::async_trait]
 impl NativeObjectIo for ObservedWrites {
+    async fn descriptor_with_owner(
+        &self,
+        key: tinytree_model::ObjectKey,
+        owner: Arc<dyn std::any::Any + Send + Sync>,
+    ) -> jj_lib::backend::BackendResult<Option<tinytree_model::Descriptor>> {
+        self.inner.descriptor_with_owner(key, owner).await
+    }
+    async fn copy_catalog_snapshot_with_owner(
+        &self,
+        limits: CopyCatalogLimits,
+        owner: Arc<dyn std::any::Any + Send + Sync>,
+    ) -> jj_lib::backend::BackendResult<jj_native_backend::CopyCatalogSnapshot> {
+        self.inner
+            .copy_catalog_snapshot_with_owner(limits, owner)
+            .await
+    }
     async fn descriptor(
         &self,
         key: tinytree_model::ObjectKey,
@@ -751,6 +981,13 @@ impl NativeObjectIo for ObservedWrites {
     ) -> jj_lib::backend::BackendResult<jj_native_backend::VerifiedMetadata> {
         self.inner.read_metadata(key).await
     }
+    async fn read_metadata_with_owner(
+        &self,
+        key: tinytree_model::ObjectKey,
+        owner: Arc<dyn std::any::Any + Send + Sync>,
+    ) -> jj_lib::backend::BackendResult<jj_native_backend::VerifiedMetadata> {
+        self.inner.read_metadata_with_owner(key, owner).await
+    }
     async fn write_metadata(
         &self,
         value: tinytree_model::Object,
@@ -758,6 +995,13 @@ impl NativeObjectIo for ObservedWrites {
         self.metadata
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         self.inner.write_metadata(value).await
+    }
+    async fn read_file_for_cache(
+        &self,
+        id: tinytree_model::FileId,
+        owner: Arc<dyn std::any::Any + Send + Sync>,
+    ) -> jj_lib::backend::BackendResult<jj_native_backend::FileRead> {
+        self.inner.read_file_for_cache(id, owner).await
     }
     async fn read_file(
         &self,
