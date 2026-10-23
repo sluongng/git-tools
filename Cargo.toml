@@ -21,6 +21,7 @@ members = [
     "crates/packblob",
     "crates/tinytree-proto",
     "crates/tinytree-model",
+    "crates/tinytree-cloud",
     "crates/tinytree-fixture",
     "crates/tinytree-store",
     "crates/tinytree-server",

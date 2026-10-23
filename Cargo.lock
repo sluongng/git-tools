@@ -5556,6 +5556,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "tinytree-cloud"
+version = "0.1.0"
+dependencies = [
+ "blake3",
+ "jj-lib",
+ "tempfile",
+ "thiserror 2.0.21",
+ "tokio",
+]
+
+[[package]]
 name = "tinytree-fixture"
 version = "0.1.0"
 dependencies = [

@@ -1,0 +1,448 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Son Luong Ngoc <26684313+sluongng@users.noreply.github.com>
+Date: Fri, 23 Oct 2026 11:20:00 +0000
+Subject: [PATCH] jj: Expose bounded lossless operation cloud codecs
+
+Native workspace backup must preserve operation views and rewrite history.
+Generic operation serialization omits those fields, and protobuf bytes do
+not define the semantic operation or view identity.
+
+Expose the pinned SimpleOpStore codecs with predecode work, field and byte
+limits, backend identity-width validation and semantic hash checks. Keep
+intrinsic roots outside payload decoding and reject parentless legacy
+operations that cannot round-trip through the current writer. Expose a
+file/directory sync boundary so imports can be acknowledged durably.
+Ordinary upstream operation readers and writers remain unchanged.
+
+---
+diff --git a/src/simple_op_store.rs b/src/simple_op_store.rs
+--- a/src/simple_op_store.rs
++++ b/src/simple_op_store.rs
+@@ -247,5 +247,427 @@
+             operation.parents.push(self.root_operation_id.clone());
+         }
+         Ok(operation)
++    }
++}
++
++/// Resource limits for the pinned SimpleOpStore cloud representation.
++#[derive(Clone, Copy, Debug)]
++pub struct CloudOpLimits {
++    pub max_payload_bytes: usize,
++    pub max_decode_bytes: usize,
++    /// Counts all protobuf fields, including nested map/message fields.
++    pub max_fields: usize,
++    pub max_field_bytes: usize,
++    /// Expected commit identity width for the exporting repository's backend.
++    pub commit_id_bytes: usize,
++}
++impl Default for CloudOpLimits {
++    fn default() -> Self {
++        Self {
++            max_payload_bytes: 4 * 1024 * 1024,
++            max_decode_bytes: 64 * 1024 * 1024,
++            max_fields: 100_000,
++            max_field_bytes: 1024 * 1024,
++            commit_id_bytes: 32,
++        }
++    }
++}
++fn cloud_invalid(message: &'static str) -> io::Error {
++    io::Error::new(io::ErrorKind::InvalidData, message)
++}
++impl CloudOpLimits {
++    /// Validate codec configuration before reading or allocating payloads.
++    pub fn validate(self) -> io::Result<()> {
++        bounded_limits(self.max_payload_bytes, self.max_decode_bytes)?;
++        if self.max_fields == 0
++            || self.max_fields > 1_000_000
++            || self.max_field_bytes == 0
++            || self.max_field_bytes > self.max_payload_bytes
++            || self.commit_id_bytes == 0
++            || self.commit_id_bytes > 64
++        {
++            return Err(cloud_invalid("invalid cloud operation limits"));
++        }
++        Ok(())
++    }
++}
++struct CloudCheck {
++    limits: CloudOpLimits,
++    fields: usize,
++    bytes: usize,
++}
++impl CloudCheck {
++    fn new(limits: CloudOpLimits) -> io::Result<Self> {
++        limits.validate()?;
++        Ok(Self {
++            limits,
++            fields: 0,
++            bytes: 4096,
++        })
++    }
++    fn field(&mut self, bytes: usize) -> io::Result<()> {
++        self.fields = self
++            .fields
++            .checked_add(1)
++            .ok_or_else(|| cloud_invalid("cloud field count"))?;
++        self.bytes = self
++            .bytes
++            .checked_add(256)
++            .and_then(|n| bytes.checked_mul(8).and_then(|size| n.checked_add(size)))
++            .ok_or_else(|| cloud_invalid("cloud decode work overflow"))?;
++        if self.fields > self.limits.max_fields
++            || bytes > self.limits.max_field_bytes
++            || self.bytes > self.limits.max_decode_bytes
++        {
++            return Err(cloud_invalid("cloud operation resource limit exceeded"));
++        }
++        Ok(())
++    }
++    fn id(&mut self, bytes: &[u8], expected: usize) -> io::Result<()> {
++        self.field(bytes.len())?;
++        if bytes.len() != expected {
++            return Err(cloud_invalid("cloud object identity width mismatch"));
++        }
++        Ok(())
++    }
++    fn name(&mut self, value: &str) -> io::Result<()> {
++        self.field(value.len())?;
++        if value.is_empty() || value.contains('\0') {
++            return Err(cloud_invalid("invalid cloud reference name"));
++        }
++        Ok(())
++    }
++    fn target(&mut self, target: &RefTarget) -> io::Result<()> {
++        self.field(0)?;
++        for term in target.iter() {
++            self.field(0)?;
++            if let Some(id) = term {
++                self.id(id.as_bytes(), self.limits.commit_id_bytes)?;
++            }
++        }
++        Ok(())
++    }
++}
++fn cloud_timestamp(timestamp: &Timestamp) -> io::Result<()> {
++    if !(-1439..=1439).contains(&timestamp.tz_offset)
++        || chrono::DateTime::<chrono::Utc>::from_timestamp_millis(timestamp.timestamp.0).is_none()
++    {
++        return Err(cloud_invalid(
++            "cloud operation timestamp is not representable",
++        ));
++    }
++    Ok(())
++}
++fn cloud_operation_shape(operation: &Operation, limits: CloudOpLimits) -> io::Result<()> {
++    let mut check = CloudCheck::new(limits)?;
++    check.id(operation.view_id.as_bytes(), VIEW_ID_LENGTH)?;
++    // Non-root parentless legacy operations cannot round-trip through write_operation.
++    if operation.parents.is_empty() {
++        return Err(cloud_invalid("parentless cloud operation is unsupported"));
++    }
++    for parent in &operation.parents {
++        check.id(parent.as_bytes(), OPERATION_ID_LENGTH)?;
++    }
++    let metadata = &operation.metadata;
++    cloud_timestamp(&metadata.time.start)?;
++    cloud_timestamp(&metadata.time.end)?;
++    for value in [
++        &metadata.description,
++        &metadata.hostname,
++        &metadata.username,
++    ] {
++        check.field(value.len())?;
++    }
++    if let Some(name) = &metadata.workspace_name {
++        check.name(name.as_str())?;
++    }
++    for (key, value) in &metadata.attributes {
++        check.field(key.len())?;
++        check.field(value.len())?;
++    }
++    if let Some(predecessors) = &operation.commit_predecessors {
++        for (id, parents) in predecessors {
++            check.id(id.as_bytes(), limits.commit_id_bytes)?;
++            for parent in parents {
++                check.id(parent.as_bytes(), limits.commit_id_bytes)?;
++            }
++        }
++    }
++    Ok(())
++}
++fn cloud_view_shape(view: &View, limits: CloudOpLimits) -> io::Result<()> {
++    let mut check = CloudCheck::new(limits)?;
++    if view.head_ids.is_empty() {
++        return Err(cloud_invalid("cloud view has no heads"));
++    }
++    for id in &view.head_ids {
++        check.id(id.as_bytes(), limits.commit_id_bytes)?;
++    }
++    // jj's View API represents a deleted local bookmark by removing its key.
++    // The pinned persisted codec omits absent local targets on readback.
++    if view.local_bookmarks.values().any(RefTarget::is_absent) {
++        return Err(cloud_invalid(
++            "absent local bookmark is not a canonical view",
++        ));
++    }
++    for (name, target) in view.local_bookmarks.iter().chain(&view.local_tags) {
++        check.name(name.as_str())?;
++        check.target(target)?;
++    }
++    for (name, target) in &view.git_refs {
++        check.name(name.as_str())?;
++        check.target(target)?;
++    }
++    for (name, target) in &view.git_heads {
++        check.name(name.as_str())?;
++        check.target(target)?;
++    }
++    for (name, id) in &view.wc_commit_ids {
++        check.name(name.as_str())?;
++        check.id(id.as_bytes(), limits.commit_id_bytes)?;
++    }
++    for (name, remote) in &view.remote_views {
++        check.name(name.as_str())?;
++        for (name, reference) in remote.bookmarks.iter().chain(&remote.tags) {
++            check.name(name.as_str())?;
++            check.target(&reference.target)?;
++        }
++    }
++    Ok(())
++}
++fn cloud_scan_fields(
++    input: &[u8],
++    shape: BoundedShape,
++    depth: usize,
++    check: &mut CloudCheck,
++) -> io::Result<()> {
++    if depth > 8 {
++        return Err(cloud_invalid("cloud operation nesting limit exceeded"));
++    }
++    let mut cursor = 0;
++    while cursor < input.len() {
++        let tag = bounded_varint(input, &mut cursor)?;
++        match tag & 7 {
++            0 => {
++                check.field(0)?;
++                bounded_varint(input, &mut cursor)?;
++            }
++            1 | 5 => {
++                let width = if tag & 7 == 1 { 8 } else { 4 };
++                check.field(width)?;
++                cursor = cursor
++                    .checked_add(width)
++                    .filter(|n| *n <= input.len())
++                    .ok_or_else(|| cloud_invalid("truncated cloud field"))?;
++            }
++            2 => {
++                let length = usize::try_from(bounded_varint(input, &mut cursor)?)
++                    .map_err(|_| cloud_invalid("cloud field overflow"))?;
++                let end = cursor
++                    .checked_add(length)
++                    .filter(|n| *n <= input.len())
++                    .ok_or_else(|| cloud_invalid("truncated cloud field"))?;
++                check.field(length)?;
++                if let Some(child) = shape.child(tag >> 3) {
++                    cloud_scan_fields(&input[cursor..end], child, depth + 1, check)?;
++                }
++                cursor = end;
++            }
++            _ => return Err(cloud_invalid("unsupported cloud wire type")),
++        }
++    }
++    Ok(())
++}
++fn cloud_payload(bytes: &[u8], shape: BoundedShape, limits: CloudOpLimits) -> io::Result<()> {
++    limits.validate()?;
++    if bytes.len() > limits.max_payload_bytes {
++        return Err(cloud_invalid("cloud payload byte limit exceeded"));
++    }
++    let mut budget = limits.max_decode_bytes;
++    bounded_charge(&mut budget, bytes.len())?;
++    bounded_charge(&mut budget, 4096)?;
++    bounded_scan(bytes, shape, 0, &mut budget)?;
++    cloud_scan_fields(bytes, shape, 0, &mut CloudCheck::new(limits)?)
++}
++/// Encode an operation using the actual pinned protobuf codec, preserving evolution data.
++pub fn encode_cloud_operation(
++    operation: &Operation,
++    limits: CloudOpLimits,
++) -> io::Result<(OperationId, Vec<u8>)> {
++    cloud_operation_shape(operation, limits)?;
++    let bytes = operation_to_proto(operation).encode_to_vec();
++    cloud_payload(&bytes, BoundedShape::Operation, limits)?;
++    Ok((OperationId::new(blake2b_hash(operation).to_vec()), bytes))
++}
++/// Decode a non-intrinsic operation and verify its independently expected semantic identity.
++pub fn decode_cloud_operation(
++    expected: &OperationId,
++    bytes: &[u8],
++    limits: CloudOpLimits,
++) -> io::Result<Operation> {
++    if expected.as_bytes().len() != OPERATION_ID_LENGTH
++        || expected.as_bytes().iter().all(|b| *b == 0)
++    {
++        return Err(cloud_invalid(
++            "intrinsic or invalid operation identity has no cloud payload",
++        ));
++    }
++    cloud_payload(bytes, BoundedShape::Operation, limits)?;
++    let proto = crate::protos::simple_op_store::Operation::decode(bytes)
++        .map_err(|_| cloud_invalid("invalid cloud operation protobuf"))?;
++    if !proto.stores_commit_predecessors && !proto.commit_predecessors.is_empty() {
++        return Err(cloud_invalid(
++            "cloud operation would discard predecessor data",
++        ));
++    }
++    let mut seen = HashSet::new();
++    for entry in &proto.commit_predecessors {
++        if !seen.insert(&entry.commit_id) {
++            return Err(cloud_invalid("duplicate cloud predecessor key"));
++        }
++    }
++    let operation =
++        operation_from_proto(proto).map_err(|_| cloud_invalid("invalid cloud operation state"))?;
++    cloud_operation_shape(&operation, limits)?;
++    if &blake2b_hash(&operation)[..] != expected.as_bytes() {
++        return Err(cloud_invalid("cloud operation semantic identity mismatch"));
++    }
++    Ok(operation)
++}
++/// Encode a view using the actual pinned protobuf codec rather than an application copy.
++pub fn encode_cloud_view(view: &View, limits: CloudOpLimits) -> io::Result<(ViewId, Vec<u8>)> {
++    cloud_view_shape(view, limits)?;
++    let bytes = view_to_proto(view).encode_to_vec();
++    cloud_payload(&bytes, BoundedShape::View, limits)?;
++    Ok((ViewId::new(blake2b_hash(view).to_vec()), bytes))
++}
++/// Decode a non-intrinsic view and verify its independently expected semantic identity.
++pub fn decode_cloud_view(
++    expected: &ViewId,
++    bytes: &[u8],
++    limits: CloudOpLimits,
++) -> io::Result<View> {
++    if expected.as_bytes().len() != VIEW_ID_LENGTH || expected.as_bytes().iter().all(|b| *b == 0) {
++        return Err(cloud_invalid(
++            "intrinsic or invalid view identity has no cloud payload",
++        ));
++    }
++    cloud_payload(bytes, BoundedShape::View, limits)?;
++    let proto = crate::protos::simple_op_store::View::decode(bytes)
++        .map_err(|_| cloud_invalid("invalid cloud view protobuf"))?;
++    validate_bounded_view(&proto)?;
++    let view = view_from_proto(proto).map_err(|_| cloud_invalid("invalid cloud view state"))?;
++    cloud_view_shape(&view, limits)?;
++    if &blake2b_hash(&view)[..] != expected.as_bytes() {
++        return Err(cloud_invalid("cloud view semantic identity mismatch"));
++    }
++    Ok(view)
++}
++fn cloud_file_exists(path: &Path) -> io::Result<bool> {
++    match fs::symlink_metadata(path) {
++        Ok(metadata) if metadata.is_file() => Ok(true),
++        Ok(_) => Err(cloud_invalid("cloud operation slot is not a regular file")),
++        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
++        Err(error) => Err(error),
++    }
++}
++impl SimpleOpStore {
++    /// Validate any existing slot before a caller invokes the ordinary writer.
++    /// The caller must fence concurrent mutations through installation and sync.
++    pub fn cloud_operation_is_present(
++        &self,
++        id: &OperationId,
++        limits: CloudOpLimits,
++    ) -> io::Result<bool> {
++        limits.validate()?;
++        if id.as_bytes().len() != OPERATION_ID_LENGTH || id == &self.root_operation_id {
++            return Err(cloud_invalid("intrinsic or invalid cloud operation slot"));
++        }
++        if !cloud_file_exists(&self.operations_dir().join(id.hex()))? {
++            return Ok(false);
++        }
++        self.read_cloud_operation_payload(id, limits)?;
++        Ok(true)
++    }
++    /// Validate any existing slot before a caller invokes the ordinary writer.
++    /// The caller must fence concurrent mutations through installation and sync.
++    pub fn cloud_view_is_present(&self, id: &ViewId, limits: CloudOpLimits) -> io::Result<bool> {
++        limits.validate()?;
++        if id.as_bytes().len() != VIEW_ID_LENGTH || id == &self.root_view_id {
++            return Err(cloud_invalid("intrinsic or invalid cloud view slot"));
++        }
++        if !cloud_file_exists(&self.views_dir().join(id.hex()))? {
++            return Ok(false);
++        }
++        self.read_cloud_view_payload(id, limits)?;
++        Ok(true)
++    }
++    /// Read the actual pinned operation representation, bounded before decoding.
++    pub fn read_cloud_operation_payload(
++        &self,
++        id: &OperationId,
++        limits: CloudOpLimits,
++    ) -> io::Result<Vec<u8>> {
++        limits.validate()?;
++        if id.as_bytes().len() != OPERATION_ID_LENGTH || id == &self.root_operation_id {
++            return Err(cloud_invalid(
++                "intrinsic or invalid operation identity has no cloud payload",
++            ));
++        }
++        cloud_file_exists(&self.operations_dir().join(id.hex()))?;
++        let bytes = read_payload_bounded(
++            &self.operations_dir().join(id.hex()),
++            limits.max_payload_bytes,
++            limits.max_decode_bytes,
++            BoundedShape::Operation,
++        )?;
++        decode_cloud_operation(id, &bytes, limits)?;
++        Ok(bytes)
++    }
++    /// Read the actual pinned view representation, bounded before decoding.
++    pub fn read_cloud_view_payload(
++        &self,
++        id: &ViewId,
++        limits: CloudOpLimits,
++    ) -> io::Result<Vec<u8>> {
++        limits.validate()?;
++        if id.as_bytes().len() != VIEW_ID_LENGTH || id == &self.root_view_id {
++            return Err(cloud_invalid(
++                "intrinsic or invalid view identity has no cloud payload",
++            ));
++        }
++        cloud_file_exists(&self.views_dir().join(id.hex()))?;
++        let bytes = read_payload_bounded(
++            &self.views_dir().join(id.hex()),
++            limits.max_payload_bytes,
++            limits.max_decode_bytes,
++            BoundedShape::View,
++        )?;
++        decode_cloud_view(id, &bytes, limits)?;
++        Ok(bytes)
++    }
++    /// Sync an imported operation and its containing directories before acknowledging it.
++    pub fn sync_cloud_operation(&self, id: &OperationId) -> io::Result<()> {
++        if id.as_bytes().len() != OPERATION_ID_LENGTH {
++            return Err(cloud_invalid("invalid operation identity"));
++        }
++        if id == &self.root_operation_id {
++            return Ok(());
++        }
++        fs::File::open(self.operations_dir().join(id.hex()))?.sync_all()?;
++        fs::File::open(self.operations_dir())?.sync_all()?;
++        fs::File::open(&self.path)?.sync_all()
++    }
++    /// Sync an imported view and its containing directories before acknowledging it.
++    pub fn sync_cloud_view(&self, id: &ViewId) -> io::Result<()> {
++        if id.as_bytes().len() != VIEW_ID_LENGTH {
++            return Err(cloud_invalid("invalid view identity"));
++        }
++        if id == &self.root_view_id {
++            return Ok(());
++        }
++        fs::File::open(self.views_dir().join(id.hex()))?.sync_all()?;
++        fs::File::open(self.views_dir())?.sync_all()?;
++        fs::File::open(&self.path)?.sync_all()
+     }
+ }
