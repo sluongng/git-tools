@@ -1,0 +1,505 @@
+use super::*;
+use fs2::FileExt as _;
+use std::{fs::File, io::Write};
+pub(super) type SegmentId = [u8; 32];
+const MAGIC: &[u8; 8] = b"JJNIDX01";
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Manifest {
+    version: u32,
+    identity: [u8; 32],
+    config: Config,
+}
+pub(super) struct Storage {
+    location: PathBuf,
+    root: private_fs::PrivateDir,
+    segments: private_fs::PrivateDir,
+    operations: private_fs::PrivateDir,
+    manifest: Manifest,
+}
+fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+fn envelope(kind: u8, key: &[u8], body: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(body.len() + 48);
+    out.extend_from_slice(MAGIC);
+    out.push(kind);
+    out.extend_from_slice(&(body.len() as u32).to_le_bytes());
+    out.extend_from_slice(body);
+    let mut hash = blake3::Hasher::new();
+    hash.update(b"jj-native-index-record-v1");
+    hash.update(key);
+    hash.update(&out);
+    out.extend_from_slice(hash.finalize().as_bytes());
+    out
+}
+fn payload<'a>(kind: u8, key: &[u8], bytes: &'a [u8]) -> Result<&'a [u8], Error> {
+    if bytes.len() < 45 || &bytes[..8] != MAGIC {
+        return Err(Error::Unsupported);
+    }
+    if bytes[8] != kind {
+        return Err(Error::Corrupt);
+    }
+    let len = u32::from_le_bytes(bytes[9..13].try_into().map_err(|_| Error::Corrupt)?) as usize;
+    if len.checked_add(45) != Some(bytes.len()) {
+        return Err(Error::Corrupt);
+    }
+    let mut hash = blake3::Hasher::new();
+    hash.update(b"jj-native-index-record-v1");
+    hash.update(key);
+    hash.update(&bytes[..13 + len]);
+    if hash.finalize().as_bytes() != &bytes[13 + len..] {
+        return Err(Error::Corrupt);
+    }
+    Ok(&bytes[13..13 + len])
+}
+fn require_durable_writer() -> Result<(), Error> {
+    if cfg!(unix) {
+        Ok(())
+    } else {
+        Err(Error::Unsupported)
+    }
+}
+fn install(
+    dir: &private_fs::PrivateDir,
+    name: &str,
+    bytes: &[u8],
+    cap: usize,
+) -> Result<(), Error> {
+    if bytes.len() > cap {
+        return Err(Error::Limit);
+    }
+    match dir.read(name, cap) {
+        Ok(old) => {
+            if old != bytes {
+                return Err(Error::Corrupt);
+            }
+            // Another process may have published this entry but crashed before
+            // its directory sync. Idempotent retries establish that durability.
+            #[cfg(unix)]
+            File::open(dir.path())?.sync_all()?;
+            return Ok(());
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e.into()),
+    }
+    let mut temp = tempfile::NamedTempFile::new_in(dir.path())?;
+    temp.write_all(bytes)?;
+    temp.as_file().sync_all()?;
+    match temp.persist_noclobber(dir.path().join(name)) {
+        Ok(_) => {}
+        Err(e) if e.error.kind() == std::io::ErrorKind::AlreadyExists => {
+            if dir.read(name, cap)? != bytes {
+                return Err(Error::Corrupt);
+            }
+        }
+        Err(e) => return Err(Error::Io(e.error)),
+    }
+    #[cfg(unix)]
+    File::open(dir.path())?.sync_all()?;
+    Ok(())
+}
+fn lock(root: &private_fs::PrivateDir) -> Result<File, Error> {
+    let file = root.open_lock("writer.lock")?;
+    file.lock_exclusive()?;
+    Ok(file)
+}
+impl Storage {
+    pub(super) fn init(
+        path: &Path,
+        config: Config,
+        limits: &Limits,
+        mut roots: Vec<m::CommitId>,
+    ) -> Result<Self, Error> {
+        require_durable_writer()?;
+        if roots.len() > limits.max_roots {
+            return Err(Error::Limit);
+        }
+        roots.sort_unstable();
+        roots.dedup();
+        if roots.is_empty() {
+            roots.push(m::CommitId::ROOT)
+        }
+        let root = private_fs::PrivateDir::create(path)?;
+        // Refuse foreign contents before creating even the coordination lock.
+        // Repeat under the lock because another initializer can race this read.
+        if std::fs::read_dir(root.path())?
+            .any(|e| e.map_or(true, |e| e.file_name() != "writer.lock"))
+        {
+            return Err(Error::Corrupt);
+        }
+        let _lock = lock(&root)?;
+        // Existing unknown/partial stores are never adopted or repaired.
+        if std::fs::read_dir(root.path())?
+            .any(|e| e.map_or(true, |e| e.file_name() != "writer.lock"))
+        {
+            return Err(Error::Corrupt);
+        }
+        let segments = private_fs::PrivateDir::create(root.path().join("segments"))?;
+        let operations = private_fs::PrivateDir::create(root.path().join("operations"))?;
+        let manifest = Manifest {
+            version: 1,
+            identity: random(),
+            config,
+        };
+        let storage = Self {
+            location: root.path().canonicalize()?,
+            root,
+            segments,
+            operations,
+            manifest,
+        };
+        let segment = storage.segment(&[], &roots, &[], limits)?;
+        let seed = envelope(2, b"seed", &segment);
+        install(&storage.root, "seed", &seed, 128)?;
+        let config = toml::to_string(&storage.manifest).map_err(|_| Error::Invalid)?;
+        install(
+            &storage.root,
+            "manifest",
+            &envelope(0, b"manifest", config.as_bytes()),
+            16384,
+        )?;
+        // create() validates permissions but does not sync the new root's
+        // entry in its already-durable parent. All children are synced above.
+        #[cfg(unix)]
+        File::open(storage.root.path().parent().ok_or(Error::Invalid)?)?.sync_all()?;
+        Ok(storage)
+    }
+    pub(super) fn open(path: &Path, expected: &Config, limits: &Limits) -> Result<Self, Error> {
+        let root = private_fs::PrivateDir::open_existing(path)?;
+        let bytes = root.read("manifest", 16384)?;
+        let bytes = payload(0, b"manifest", &bytes)?;
+        let manifest: Manifest =
+            toml::from_str(std::str::from_utf8(bytes).map_err(|_| Error::Corrupt)?)
+                .map_err(|_| Error::Corrupt)?;
+        if manifest.version != 1 {
+            return Err(Error::Unsupported);
+        }
+        if &manifest.config != expected {
+            return Err(Error::Foreign);
+        }
+        manifest.config.validate()?;
+        if manifest.identity == [0; 32] {
+            return Err(Error::Corrupt);
+        }
+        let segments = private_fs::PrivateDir::open_existing(root.path().join("segments"))?;
+        let operations = private_fs::PrivateDir::open_existing(root.path().join("operations"))?;
+        let storage = Self {
+            location: root.path().canonicalize()?,
+            root,
+            segments,
+            operations,
+            manifest,
+        };
+        storage.load(&[storage.seed()?], limits)?;
+        #[cfg(unix)]
+        File::open(storage.root.path())?.sync_all()?;
+        #[cfg(unix)]
+        File::open(storage.root.path().parent().ok_or(Error::Invalid)?)?.sync_all()?;
+        Ok(storage)
+    }
+    pub(super) fn location(&self) -> &Path {
+        &self.location
+    }
+    pub(super) fn identity(&self) -> [u8; 32] {
+        self.manifest.identity
+    }
+    pub(super) fn seed(&self) -> Result<SegmentId, Error> {
+        let bytes = self.root.read("seed", 128)?;
+        payload(2, b"seed", &bytes)?
+            .try_into()
+            .map_err(|_| Error::Corrupt)
+    }
+    pub(super) fn segment(
+        &self,
+        parents: &[SegmentId],
+        roots: &[m::CommitId],
+        drafts: &[Arc<Draft>],
+        limits: &Limits,
+    ) -> Result<SegmentId, Error> {
+        require_durable_writer()?;
+        if parents.len() > limits.max_segments
+            || roots.len() > limits.max_roots
+            || drafts.len() > limits.max_drafts
+        {
+            return Err(Error::Limit);
+        }
+        let mut size = 12usize
+            .checked_add(parents.len().checked_mul(32).ok_or(Error::Limit)?)
+            .and_then(|n| n.checked_add(roots.len().checked_mul(32)?))
+            .ok_or(Error::Limit)?;
+        for draft in drafts {
+            size = size
+                .checked_add(70)
+                .and_then(|n| n.checked_add(draft.parents.len().checked_mul(32)?))
+                .ok_or(Error::Limit)?;
+        }
+        if size
+            .checked_add(45)
+            .is_none_or(|n| n > limits.max_segment_bytes)
+        {
+            return Err(Error::Limit);
+        }
+        let mut out = Vec::with_capacity(size);
+        put_count(&mut out, parents.len());
+        for id in parents {
+            out.extend_from_slice(id)
+        }
+        put_count(&mut out, roots.len());
+        for id in roots {
+            out.extend_from_slice(&id.0)
+        }
+        put_count(&mut out, drafts.len());
+        for draft in drafts {
+            if draft.parents.len() > limits.max_parents {
+                return Err(Error::Limit);
+            }
+            out.extend_from_slice(&draft.id().0);
+            out.extend_from_slice(&draft.change.0);
+            out.extend_from_slice(&draft.descriptor.size_bytes.to_le_bytes());
+            out.extend_from_slice(&draft.descriptor.format_version.to_le_bytes());
+            out.extend_from_slice(&draft.order.to_le_bytes());
+            put_count(&mut out, draft.parents.len());
+            for parent in &draft.parents {
+                out.extend_from_slice(&parent.0)
+            }
+            if out.len().saturating_add(45) > limits.max_segment_bytes {
+                return Err(Error::Limit);
+            }
+        }
+        let id = *blake3::hash(&out).as_bytes();
+        let bytes = envelope(1, &id, &out);
+        install(&self.segments, &hex(&id), &bytes, limits.max_segment_bytes)?;
+        Ok(id)
+    }
+    pub(super) fn operation(
+        &self,
+        id: &[u8; 64],
+        limits: &Limits,
+    ) -> Result<Vec<SegmentId>, Error> {
+        let bytes = match self.operations.read(hex(id), limits.max_segment_bytes) {
+            Ok(v) => v,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                return Err(Error::MissingOperation);
+            }
+            Err(e) => return Err(e.into()),
+        };
+        let mut reader = Reader(payload(3, id, &bytes)?);
+        let n = reader.count_width(limits.max_segments, 32)?;
+        let mut tips = Vec::with_capacity(n);
+        for _ in 0..n {
+            tips.push(reader.array()?)
+        }
+        reader.end()?;
+        if tips.is_empty() {
+            return Err(Error::Corrupt);
+        }
+        Ok(tips)
+    }
+    pub(super) fn associate(
+        &self,
+        id: &[u8; 64],
+        tips: &[SegmentId],
+        limits: &Limits,
+    ) -> Result<(), Error> {
+        require_durable_writer()?;
+        if tips.is_empty() || tips.len() > limits.max_segments {
+            return Err(Error::Limit);
+        }
+        if tips
+            .len()
+            .checked_mul(32)
+            .and_then(|n| n.checked_add(49))
+            .is_none_or(|n| n > limits.max_segment_bytes)
+        {
+            return Err(Error::Limit);
+        }
+        let _lock = lock(&self.root)?;
+        let mut body = Vec::with_capacity(4 + 32 * tips.len());
+        put_count(&mut body, tips.len());
+        for tip in tips {
+            body.extend_from_slice(tip)
+        }
+        install(
+            &self.operations,
+            &hex(id),
+            &envelope(3, id, &body),
+            limits.max_segment_bytes,
+        )
+    }
+    pub(super) fn load(
+        &self,
+        tips: &[SegmentId],
+        limits: &Limits,
+    ) -> Result<(Vec<m::CommitId>, Vec<Arc<Draft>>), Error> {
+        if tips.is_empty() || tips.len() > limits.max_segments {
+            return Err(Error::Limit);
+        }
+        let mut pending: Vec<_> = tips.iter().map(|id| (*id, 0usize)).collect();
+        let mut visited = BTreeSet::new();
+        let mut roots = BTreeSet::new();
+        let mut drafts: BTreeMap<m::CommitId, Arc<Draft>> = BTreeMap::new();
+        let mut total = 0usize;
+        while let Some((id, depth)) = pending.pop() {
+            if visited.contains(&id) {
+                continue;
+            }
+            if depth > limits.max_depth || visited.len() >= limits.max_segments {
+                return Err(Error::Limit);
+            }
+            visited.insert(id);
+            let bytes = self.segments.read(hex(&id), limits.max_segment_bytes)?;
+            total = total.checked_add(bytes.len()).ok_or(Error::Limit)?;
+            if total > limits.max_checkpoint_bytes {
+                return Err(Error::Limit);
+            }
+            let body = payload(1, &id, &bytes)?;
+            if blake3::hash(body).as_bytes() != &id {
+                return Err(Error::Corrupt);
+            }
+            let mut r = Reader(body);
+            let n = r.count_width(limits.max_segments, 32)?;
+            if pending
+                .len()
+                .checked_add(n)
+                .is_none_or(|n| n > limits.max_segments)
+            {
+                return Err(Error::Limit);
+            }
+            for _ in 0..n {
+                pending.push((r.array()?, depth + 1))
+            }
+            let n = r.count_width(limits.max_roots, 32)?;
+            for _ in 0..n {
+                roots.insert(m::CommitId(r.array()?));
+                if roots.len() > limits.max_roots {
+                    return Err(Error::Limit);
+                }
+            }
+            let n = r.count_width(limits.max_drafts, 70)?;
+            for _ in 0..n {
+                let commit = m::CommitId(r.array()?);
+                let change = m::ChangeId(r.array()?);
+                let size = u64::from_le_bytes(r.array()?);
+                let version = u16::from_le_bytes(r.array()?);
+                let order = u64::from_le_bytes(r.array()?);
+                if order == 0 {
+                    return Err(Error::Corrupt);
+                }
+                if commit == m::CommitId::ROOT
+                    || size > limits.max_metadata_bytes as u64
+                    || version != m::FORMAT_VERSION
+                {
+                    return Err(Error::Corrupt);
+                }
+                let n = r.count_width(limits.max_parents, 32)?;
+                if n == 0 || size == 0 {
+                    return Err(Error::Corrupt);
+                }
+                let mut parents = Vec::with_capacity(n);
+                for _ in 0..n {
+                    parents.push(m::CommitId(r.array()?))
+                }
+                let draft = Arc::new(Draft {
+                    order,
+                    descriptor: m::Descriptor {
+                        key: m::ObjectKey {
+                            kind: m::Kind::Commit,
+                            id: m::ObjectId(commit.0),
+                        },
+                        size_bytes: size,
+                        format_version: version,
+                    },
+                    change,
+                    parents,
+                });
+                if let Some(old) = drafts.insert(commit, draft.clone()) {
+                    if !old.canonical_eq(&draft) {
+                        return Err(Error::Corrupt);
+                    }
+                    if old.order < draft.order {
+                        drafts.insert(commit, old);
+                    }
+                }
+                if drafts.len() > limits.max_drafts {
+                    return Err(Error::Limit);
+                }
+            }
+            r.end()?;
+        }
+        if roots.is_empty() {
+            roots.insert(m::CommitId::ROOT);
+        }
+        Ok((roots.into_iter().collect(), order_drafts(drafts, limits)?))
+    }
+}
+fn put_count(out: &mut Vec<u8>, n: usize) {
+    out.extend_from_slice(&(n as u32).to_le_bytes())
+}
+struct Reader<'a>(&'a [u8]);
+impl Reader<'_> {
+    fn array<const N: usize>(&mut self) -> Result<[u8; N], Error> {
+        let (head, tail) = self.0.split_at_checked(N).ok_or(Error::Corrupt)?;
+        self.0 = tail;
+        head.try_into().map_err(|_| Error::Corrupt)
+    }
+    fn count_width(&mut self, cap: usize, width: usize) -> Result<usize, Error> {
+        let n = u32::from_le_bytes(self.array()?) as usize;
+        if n > cap
+            || n.checked_mul(width)
+                .is_none_or(|bytes| bytes > self.0.len())
+        {
+            return Err(Error::Limit);
+        }
+        Ok(n)
+    }
+    fn end(self) -> Result<(), Error> {
+        if self.0.is_empty() {
+            Ok(())
+        } else {
+            Err(Error::Corrupt)
+        }
+    }
+}
+pub(super) fn order_drafts(
+    drafts: BTreeMap<m::CommitId, Arc<Draft>>,
+    limits: &Limits,
+) -> Result<Vec<Arc<Draft>>, Error> {
+    let mut done = BTreeSet::new();
+    let mut visiting = BTreeSet::new();
+    let mut output = Vec::with_capacity(drafts.len());
+    let mut ordered: Vec<_> = drafts.keys().copied().collect();
+    ordered.sort_by_key(|id| (drafts[id].order, *id));
+    for id in ordered {
+        let mut stack = vec![(id, false, 0usize)];
+        while let Some((id, exit, depth)) = stack.pop() {
+            if done.contains(&id) {
+                continue;
+            }
+            if exit {
+                visiting.remove(&id);
+                done.insert(id);
+                output.push(drafts[&id].clone());
+                continue;
+            }
+            if depth > limits.max_depth || !visiting.insert(id) {
+                return Err(Error::Corrupt);
+            }
+            let draft = &drafts[&id];
+            if stack
+                .len()
+                .checked_add(draft.parents.len())
+                .is_none_or(|n| n > limits.max_drafts + limits.max_parents)
+            {
+                return Err(Error::Limit);
+            }
+            stack.push((id, true, depth));
+            for parent in draft.parents.iter().rev() {
+                if drafts.contains_key(parent) && !done.contains(parent) {
+                    stack.push((*parent, false, depth + 1))
+                }
+            }
+        }
+    }
+    Ok(output)
+}

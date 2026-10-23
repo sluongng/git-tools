@@ -3136,6 +3136,31 @@ dependencies = [
 ]
 
 [[package]]
+name = "jj-native-index"
+version = "0.1.0"
+dependencies = [
+ "async-stream",
+ "async-trait",
+ "blake3",
+ "fs2",
+ "futures",
+ "jj-lib",
+ "jj-native-backend",
+ "native-broker",
+ "private-fs",
+ "prost",
+ "serde",
+ "tempfile",
+ "thiserror 2.0.21",
+ "tinytree-model",
+ "tinytree-proto",
+ "tokio",
+ "toml",
+ "tonic",
+ "uuid",
+]
+
+[[package]]
 name = "jj-native-remote"
 version = "0.1.0"
 dependencies = [

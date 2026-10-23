@@ -94,6 +94,7 @@ entry points. Most also expose Rust libraries; `jj-native-cli` is executable-onl
 | [`tinytree-client`](crates/tinytree-client) | Bounded, verifying native RPCs and immutable transfer snapshots. |
 | [`tinytree-store`](crates/tinytree-store) | Authoritative native objects, durable refs and reachability GC; not LRU. |
 | [`jj-native-backend`](crates/jj-native-backend) | Native jj Backend and verified object-I/O providers; retains authoritative local objects. |
+| [`jj-native-index`](crates/jj-native-index) | Immutable checkpoint-backed jj index over broker queries; not yet the default. |
 | [`jj-native-remote`](crates/jj-native-remote) | Lazy native object I/O, checked query admission and durable publication. |
 | [`native-broker`](crates/native-broker) | Private object, reference and query I/O over one local endpoint. |
 | [`native-workspace`](crates/native-workspace), [`native-vfs`](crates/native-vfs) | Directory-at-a-time native source projection and platform mount ownership. |
