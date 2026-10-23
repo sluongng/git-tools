@@ -116,6 +116,98 @@ impl VerifiedObject {
             _ => None,
         }
     }
+    /// Conservative retained-allocation admission charge for this verified object.
+    ///
+    /// Includes the inline object, owned payload/dependency capacities and decoded
+    /// native containers. This is not RSS or a bound on transient decoding work;
+    /// callers must separately bound the worker which constructs the object.
+    /// Opaque native buffers include a wire-backed reserve for retained capacity
+    /// from overwritten protobuf fields. Revisit this estimate when changing the
+    /// pinned decoder or native containers.
+    pub fn retained_size_upper_bound(&self) -> Result<usize> {
+        let mut charge = RetainedCharge(std::mem::size_of::<Self>());
+        if let Some(bytes) = &self.bytes {
+            charge.vector(bytes)?;
+            // Prost can clear a large singular bytes/string field and overwrite
+            // it with a shorter duplicate without shrinking the old allocation.
+            // Distinct surviving opaque buffers consume disjoint byte-field
+            // histories in the wire payload. Twice the whole wire length bounds
+            // their retained growth capacity, independently of the raw copy.
+            // Native conversions move these buffers; any extra clones are of
+            // final logical contents and charged again by opaque()/target().
+            charge.product(bytes.len(), 2)?;
+        }
+        charge.vector(&self.dependencies.operations)?;
+        charge.vector(&self.dependencies.views)?;
+        charge.vector(&self.dependencies.native_commits)?;
+        match &self.state {
+            State::Operation(operation) => {
+                charge.opaque(operation.view_id.as_bytes().len())?;
+                charge.vector(&operation.parents)?;
+                for id in &operation.parents {
+                    charge.opaque(id.as_bytes().len())?;
+                }
+                let metadata = &operation.metadata;
+                charge.string(&metadata.description)?;
+                charge.string(&metadata.hostname)?;
+                charge.string(&metadata.username)?;
+                if let Some(name) = &metadata.workspace_name {
+                    charge.opaque(name.as_str().len())?;
+                }
+                charge.map(&metadata.attributes)?;
+                for (key, value) in &metadata.attributes {
+                    charge.string(key)?;
+                    charge.string(value)?;
+                }
+                if let Some(predecessors) = &operation.commit_predecessors {
+                    charge.map(predecessors)?;
+                    for (id, parents) in predecessors {
+                        charge.opaque(id.as_bytes().len())?;
+                        charge.vector(parents)?;
+                        for parent in parents {
+                            charge.opaque(parent.as_bytes().len())?;
+                        }
+                    }
+                }
+            }
+            State::View(view) => {
+                // SwissTable buckets/control bytes, rounded above its public
+                // capacity. No assumptions about the number of live heads.
+                charge.product(
+                    view.head_ids
+                        .capacity()
+                        .checked_add(1)
+                        .ok_or(RETAINED_OVERFLOW)?,
+                    2 * (std::mem::size_of::<CommitId>() + 16),
+                )?;
+                charge.add(256)?;
+                for id in &view.head_ids {
+                    charge.opaque(id.as_bytes().len())?;
+                }
+                charge.targets(&view.local_bookmarks)?;
+                charge.targets(&view.local_tags)?;
+                charge.targets(&view.git_refs)?;
+                charge.targets(&view.git_heads)?;
+                charge.map(&view.wc_commit_ids)?;
+                for (name, id) in &view.wc_commit_ids {
+                    charge.opaque(name.as_str().len())?;
+                    charge.opaque(id.as_bytes().len())?;
+                }
+                charge.map(&view.remote_views)?;
+                for (name, remote) in &view.remote_views {
+                    charge.opaque(name.as_str().len())?;
+                    for references in [&remote.bookmarks, &remote.tags] {
+                        charge.map(references)?;
+                        for (name, reference) in references {
+                            charge.opaque(name.as_str().len())?;
+                            charge.target(&reference.target)?;
+                        }
+                    }
+                }
+            }
+        }
+        Ok(charge.0)
+    }
     /// Decode an independently selected semantic object and verify its raw transfer digest.
     pub fn verify(id: ObjectId, digest: BlobDigest, bytes: &[u8], limits: Limits) -> Result<Self> {
         native_limits(limits)?;
@@ -216,6 +308,66 @@ impl VerifiedObject {
             }
         };
         Ok(actual)
+    }
+}
+const RETAINED_OVERFLOW: Error = Error::Limit("retained allocation accounting overflow");
+struct RetainedCharge(usize);
+impl RetainedCharge {
+    fn add(&mut self, bytes: usize) -> Result<()> {
+        self.0 = self.0.checked_add(bytes).ok_or(RETAINED_OVERFLOW)?;
+        Ok(())
+    }
+    fn product(&mut self, count: usize, bytes: usize) -> Result<()> {
+        self.add(count.checked_mul(bytes).ok_or(RETAINED_OVERFLOW)?)
+    }
+    fn vector<T>(&mut self, values: &Vec<T>) -> Result<()> {
+        self.product(values.capacity(), std::mem::size_of::<T>())?;
+        self.add(32)
+    }
+    fn string(&mut self, value: &String) -> Result<()> {
+        self.add(value.capacity())?;
+        self.add(32)
+    }
+    fn opaque(&mut self, len: usize) -> Result<()> {
+        // IDs/name capacities are private upstream. Charge logical contents and
+        // minimum growth/allocator overhead here; retained high-water capacity
+        // from overwritten protobuf fields has a separate wire-backed reserve.
+        self.product(len, 2)?;
+        self.add(32)
+    }
+    fn map<K, V>(&mut self, values: &std::collections::BTreeMap<K, V>) -> Result<()> {
+        // Pinned std BTree nodes hold at most 11 entries. Charging every entry
+        // (plus one) as a full 16-slot node also covers sparse internal nodes,
+        // edges, alignment and allocator metadata without inspecting internals.
+        let node = std::mem::size_of::<(K, V)>()
+            .checked_mul(16)
+            .and_then(|bytes| bytes.checked_add(256))
+            .ok_or(RETAINED_OVERFLOW)?;
+        self.product(values.len().checked_add(1).ok_or(RETAINED_OVERFLOW)?, node)
+    }
+    fn target(&mut self, target: &RefTarget) -> Result<()> {
+        // The native Merge uses SmallVec<[Option<CommitId>; 1]>; the decoder
+        // builds its exact ordered terms without subsequently simplifying them.
+        self.product(
+            target.as_slice().len(),
+            2 * std::mem::size_of::<Option<CommitId>>(),
+        )?;
+        self.add(32)?;
+        for id in target.iter().flatten() {
+            self.opaque(id.as_bytes().len())?;
+        }
+        Ok(())
+    }
+    fn targets<K: AsRef<str>>(
+        &mut self,
+        values: &std::collections::BTreeMap<K, RefTarget>,
+    ) -> Result<()> {
+        self.map(values)?;
+        for (name, target) in values {
+            self.opaque(name.as_ref().len())?;
+            self.target(target)?;
+        }
+        Ok(())
     }
 }
 fn native_limits(limits: Limits) -> Result<()> {

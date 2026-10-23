@@ -174,6 +174,70 @@ async fn real_stores_preserve_views_operations_and_all_predecessor_states() {
 }
 
 #[tokio::test]
+async fn retained_admission_charge_covers_rich_decoded_objects_and_intrinsics() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = init(&dir.path().join("source"));
+    let small_id = store.write_view(&rich_view()).await.unwrap();
+    let small = export_view(&store, &small_id, Limits::default())
+        .await
+        .unwrap();
+    let mut expanded_view = rich_view();
+    for index in 0..100 {
+        expanded_view.local_bookmarks.insert(
+            format!("bookmark-{index}-{}", "x".repeat(1024)).into(),
+            RefTarget::from_removes_adds([Some(commit(1))], [Some(commit(2)), Some(commit(3))]),
+        );
+    }
+    let expanded_id = store.write_view(&expanded_view).await.unwrap();
+    let expanded = export_view(&store, &expanded_id, Limits::default())
+        .await
+        .unwrap();
+    let view_charge = expanded.retained_size_upper_bound().unwrap();
+    assert!(view_charge > small.retained_size_upper_bound().unwrap());
+    assert!(
+        view_charge > std::mem::size_of::<VerifiedObject>() + expanded.payload().unwrap().len()
+    );
+    let mut operation = operation(
+        expanded_id,
+        Some(BTreeMap::from([
+            (commit(12), vec![commit(13), commit(14)]),
+            (commit(15), vec![]),
+        ])),
+    );
+    operation.metadata.description = "snapshot ".repeat(8192);
+    operation
+        .metadata
+        .attributes
+        .insert("detail".into(), "x".repeat(4096));
+    let id = store.write_operation(&operation).await.unwrap();
+    let object = export_operation(&store, &id, Limits::default())
+        .await
+        .unwrap();
+    let charge = object.retained_size_upper_bound().unwrap();
+    assert!(
+        charge
+            > std::mem::size_of::<VerifiedObject>()
+                + object.payload().unwrap().len()
+                + operation.metadata.description.len()
+                + operation.metadata.attributes["detail"].len()
+    );
+    let decoded = VerifiedObject::verify(
+        object.id(),
+        object.digest().unwrap(),
+        object.payload().unwrap(),
+        Limits::default(),
+    )
+    .unwrap();
+    assert_eq!(decoded.retained_size_upper_bound().unwrap(), charge);
+    for id in [ObjectId::Operation([0; 64]), ObjectId::View([0; 64])] {
+        let intrinsic = VerifiedObject::intrinsic(id).unwrap();
+        assert!(
+            intrinsic.retained_size_upper_bound().unwrap() >= std::mem::size_of::<VerifiedObject>()
+        );
+    }
+}
+
+#[tokio::test]
 async fn raw_and_semantic_identity_checks_are_independent() {
     let dir = tempfile::tempdir().unwrap();
     let store = init(&dir.path().join("source"));
@@ -190,6 +254,31 @@ async fn raw_and_semantic_identity_checks_are_independent() {
         .unwrap();
     let bytes = exported.payload().unwrap();
     let digest = exported.digest().unwrap();
+    // Legal protobuf alternate encoding: a large singular view_id is replaced
+    // by the canonical final value. Prost retains the first field's capacity
+    // even though the verified semantic identity and final ID width are exact.
+    let overwritten_bytes = 128 * 1024;
+    let mut alternate = vec![0x0a]; // Operation.view_id, length-delimited.
+    let mut length = overwritten_bytes;
+    while length >= 128 {
+        alternate.push((length as u8 & 0x7f) | 0x80);
+        length >>= 7;
+    }
+    alternate.push(length as u8);
+    alternate.resize(alternate.len() + overwritten_bytes, 1);
+    alternate.extend_from_slice(bytes);
+    let alternate_object = VerifiedObject::verify(
+        exported.id(),
+        BlobDigest::of(&alternate),
+        &alternate,
+        Limits::default(),
+    )
+    .unwrap();
+    assert_eq!(alternate_object.operation(), exported.operation());
+    assert!(
+        alternate_object.retained_size_upper_bound().unwrap()
+            >= std::mem::size_of::<VerifiedObject>() + alternate.len() + overwritten_bytes
+    );
     assert_ne!(&digest.blake3[..], &exported.id().bytes()[..]);
     let mut wrong_digest = digest;
     wrong_digest.size_bytes += 1;
