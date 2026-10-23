@@ -3113,6 +3113,36 @@ dependencies = [
 ]
 
 [[package]]
+name = "jj-native-remote"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-stream",
+ "async-trait",
+ "blake3",
+ "fjall",
+ "fs2",
+ "futures",
+ "jj-lib",
+ "jj-native-backend",
+ "libc",
+ "local-cas",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tinytree-client",
+ "tinytree-fixture",
+ "tinytree-model",
+ "tinytree-server",
+ "tinytree-store",
+ "tokio",
+ "tokio-stream",
+ "toml",
+ "tonic",
+ "uuid",
+]
+
+[[package]]
 name = "jj-vfs"
 version = "0.1.0"
 dependencies = [

@@ -1,0 +1,31 @@
+load("@crates//:defs.bzl", "aliases", "all_crate_deps")
+load("@rules_rs//rs:rust_library.bzl", "rust_library")
+load("@rules_rs//rs:rust_test.bzl", "rust_test")
+
+package(default_visibility = ["//visibility:public"])
+
+rust_library(
+    name = "jj-native-remote",
+    srcs = glob(["src/**/*.rs"]),
+    aliases = aliases(),
+    crate_name = "jj_native_remote",
+    crate_root = "src/lib.rs",
+    edition = "2024",
+    version = "0.1.0",
+    deps = all_crate_deps(normal = True),
+)
+
+rust_test(
+    name = "rpc_tests",
+    srcs = ["tests/rpc.rs"],
+    aliases = aliases(),
+    edition = "2024",
+    env = {
+        "TINYTREE_REMOTE_TEST_TOKEN": "native-remote-loopback-test-token",
+        "TINYTREE_REMOTE_OTHER_TOKEN": "native-remote-other-loopback-test-token",
+    },
+    deps = [":jj-native-remote"] + all_crate_deps(
+        normal = True,
+        normal_dev = True,
+    ),
+)

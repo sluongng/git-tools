@@ -91,6 +91,7 @@ entry points. Most also expose Rust libraries; `jj-native-cli` is executable-onl
 | [`tinytree-client`](crates/tinytree-client) | Bounded, verifying native RPCs and immutable transfer snapshots. |
 | [`tinytree-store`](crates/tinytree-store) | Authoritative native objects, durable refs and reachability GC; not LRU. |
 | [`jj-native-backend`](crates/jj-native-backend) | Native jj Backend and verified object-I/O providers; retains authoritative local objects. |
+| [`jj-native-remote`](crates/jj-native-remote) | Lazy native file provider and durable remote admission/publication; not yet wired to CLI commands. |
 | [`native-broker`](crates/native-broker) | Private daemon object I/O shared by independent native jj processes. |
 | [`grpc-transport`](crates/grpc-transport) | Response-body deadlines and resource lifetime guards for gRPC services. |
 | [`git-pack-cache`](crates/git-pack-cache) | Reusable Git fetch/pack responses. |

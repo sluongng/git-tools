@@ -18,6 +18,7 @@ members = [
     "crates/tinytree-server",
     "crates/tinytree-client",
     "crates/jj-native-backend",
+    "crates/jj-native-remote",
     "crates/jj-native-cli",
     "crates/git-proxy",
     "crates/workspace-projfs",

@@ -1,0 +1,206 @@
+//! Broker-hosted lazy native I/O. Canonical local objects remain authoritative;
+//! the admission ledger records roots/proofs, never fabricated file residency.
+mod closure;
+mod config;
+mod control;
+mod io;
+mod ledger;
+mod provider;
+mod staging;
+use anyhow::{Context, Result, ensure};
+pub use config::{ClosureLimits, Config};
+pub use control::{
+    AdmittedHead, AdmittedReference, ConfirmedPublication, PublishRequest, RemoteRepositoryControl,
+};
+use jj_native_backend::DirectObjectIo;
+use local_cas::LocalCas;
+pub use provider::RemoteObjectIo;
+use std::{
+    path::{Path, PathBuf},
+    sync::Arc,
+    time::Duration,
+};
+use tinytree_client::NativeClient;
+
+pub struct RemoteRepository {
+    pub io: Arc<RemoteObjectIo>,
+    pub control: RemoteRepositoryControl,
+}
+pub(crate) struct Inner {
+    pub local: Arc<DirectObjectIo>,
+    pub cache: Arc<LocalCas>,
+    pub ledger: Arc<ledger::Ledger>,
+    pub connector: Arc<Connector>,
+    pub staging: PathBuf,
+    pub staging_owner: Arc<std::fs::File>,
+    pub config: Config,
+    pub control: Arc<tokio::sync::Semaphore>,
+    pub spool: Arc<tokio::sync::Semaphore>,
+}
+impl Inner {
+    fn model_limits(&self) -> tinytree_model::Limits {
+        tinytree_model::Limits {
+            max_object_bytes: self.config.remote.limits.max_metadata_bytes,
+            max_path_bytes: self.config.closure.max_path_bytes,
+            ..Default::default()
+        }
+    }
+    pub fn deadline(&self) -> tokio::time::Instant {
+        tokio::time::Instant::now() + Duration::from_millis(self.config.operation_timeout_ms)
+    }
+}
+impl RemoteRepository {
+    /// Paths/configuration are trusted broker inputs, never incoming RPC fields.
+    /// No network connection is established while opening an offline workspace.
+    pub fn open(
+        local: Arc<DirectObjectIo>,
+        cache: Arc<LocalCas>,
+        ledger_path: &Path,
+        private_staging: &Path,
+        config: Config,
+    ) -> Result<Self> {
+        config.validate()?;
+        let fresh = ledger::preflight(ledger_path)?;
+        let staging_plan = staging::preflight(private_staging, config.max_staging_files)?;
+        if fresh {
+            if let Some(name) = &config.remote.token_env {
+                ensure!(
+                    std::env::var(name).is_ok(),
+                    "cannot initialize native remote ledger without configured credentials"
+                );
+            }
+        }
+        let staging_owner = staging::open(private_staging, staging_plan)?;
+        let staging = private_staging.canonicalize()?;
+        let ledger = Arc::new(ledger::Ledger::open(ledger_path, &config)?);
+        let connector = Arc::new(Connector {
+            config: config.remote.clone(),
+            credential: ledger.binding.credential.clone(),
+            client: tokio::sync::OnceCell::new(),
+            owner: staging_owner.clone(),
+        });
+        let inner = Arc::new(Inner {
+            local,
+            cache,
+            ledger,
+            connector,
+            staging,
+            staging_owner,
+            control: Arc::new(tokio::sync::Semaphore::new(1)),
+            spool: Arc::new(tokio::sync::Semaphore::new(
+                config.max_upload_spool_bytes as usize,
+            )),
+            config,
+        });
+        Ok(Self {
+            io: Arc::new(RemoteObjectIo {
+                inner: inner.clone(),
+            }),
+            control: RemoteRepositoryControl { inner },
+        })
+    }
+}
+pub(crate) struct Connector {
+    config: tinytree_client::Config,
+    credential: String,
+    client: tokio::sync::OnceCell<NativeClient>,
+    owner: Arc<std::fs::File>,
+}
+impl Connector {
+    pub async fn get(&self) -> Result<NativeClient> {
+        let actual = match &self.config.token_env {
+            None => "anonymous".into(),
+            Some(name) => {
+                let value = std::env::var(name).map_err(|_| {
+                    anyhow::anyhow!(
+                        "native credentials unavailable; only offline local/cache access is allowed"
+                    )
+                })?;
+                blake3::hash(value.as_bytes()).to_hex().to_string()
+            }
+        };
+        ensure!(
+            actual == self.credential,
+            "native credentials changed; reopen the broker repository before network access"
+        );
+        Ok(self
+            .client
+            .get_or_try_init(|| async {
+                Ok::<_, tonic::Status>(
+                    NativeClient::connect(self.config.clone())
+                        .await?
+                        .with_lifetime_guard(self.owner.clone()),
+                )
+            })
+            .await?
+            .clone())
+    }
+}
+pub(crate) fn backend(error: jj_lib::backend::BackendError) -> anyhow::Error {
+    anyhow::anyhow!(error.to_string())
+}
+pub(crate) fn backend_error(error: anyhow::Error) -> jj_lib::backend::BackendError {
+    jj_lib::backend::BackendError::Other(error.into())
+}
+pub(crate) fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+pub(crate) fn unhex<const N: usize>(text: &str) -> Result<[u8; N]> {
+    ensure!(text.len() == N * 2, "invalid native durable identity");
+    let mut bytes = [0; N];
+    for (i, pair) in text.as_bytes().chunks_exact(2).enumerate() {
+        let part = std::str::from_utf8(pair)?;
+        bytes[i] = u8::from_str_radix(part, 16).context("invalid native durable identity")?;
+    }
+    Ok(bytes)
+}
+pub(crate) fn private_directory(path: &Path) -> Result<()> {
+    ensure!(
+        path.is_absolute() && path.as_os_str().len() <= 4096,
+        "native private path must be bounded and absolute"
+    );
+    if !path.exists() {
+        let parent = path.parent().context("native private path has no parent")?;
+        check_private(parent)?;
+        let mut builder = std::fs::DirBuilder::new();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::DirBuilderExt;
+            builder.mode(0o700);
+        }
+        builder.create(path)?;
+        std::fs::File::open(parent)?.sync_all()?;
+    }
+    check_private(path)
+}
+fn check_private(path: &Path) -> Result<()> {
+    let path = path.canonicalize()?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let uid = unsafe { libc::geteuid() };
+        let mut ancestor = PathBuf::new();
+        for component in path.components() {
+            ancestor.push(component.as_os_str());
+            let m = std::fs::symlink_metadata(&ancestor)?;
+            let mode = m.permissions().mode();
+            ensure!(
+                m.is_dir()
+                    && !m.file_type().is_symlink()
+                    && (m.uid() == 0 || m.uid() == uid)
+                    && (mode & 0o022 == 0 || (m.uid() == 0 && mode & 0o1000 != 0)),
+                "untrusted native storage ancestor"
+            );
+        }
+        let m = std::fs::symlink_metadata(path)?;
+        ensure!(
+            m.uid() == uid && m.permissions().mode() & 0o077 == 0,
+            "native broker storage must be owner-private"
+        );
+    }
+    #[cfg(not(unix))]
+    {
+        anyhow::bail!("private native storage ACL verification is unavailable on this platform");
+    }
+    Ok(())
+}

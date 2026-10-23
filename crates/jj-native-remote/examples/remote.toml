@@ -1,0 +1,18 @@
+# This profile is selected by trusted broker configuration, not incoming RPCs.
+authorization_profile = "agent-profile"
+operation_timeout_ms = 120000
+max_ledger_bytes = 268435456
+max_upload_spool_bytes = 536870912
+
+[remote]
+endpoint = "http://127.0.0.1:8093"
+repository_id = "example"
+token_env = "TINYTREE_AGENT_TOKEN"
+compression = true
+
+[closure]
+max_objects = 100000
+max_edges = 1000000
+max_metadata_bytes = 67108864
+max_path_contexts = 100000
+max_path_context_bytes = 33554432
