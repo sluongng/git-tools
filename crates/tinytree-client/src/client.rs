@@ -27,6 +27,7 @@ use tonic::{
 #[derive(Clone)]
 pub struct NativeClient {
     inner: Arc<Inner>,
+    guards: crate::verified::LifetimeGuards,
 }
 struct Inner {
     config: Config,
@@ -39,8 +40,20 @@ struct Inner {
 struct Budget {
     _inflight: OwnedSemaphorePermit,
     _bytes: OwnedSemaphorePermit,
+    _guards: crate::verified::LifetimeGuards,
 }
 impl NativeClient {
+    /// Pin external resource owners through temporary creation, readers,
+    /// snapshots and cancelled blocking work produced by this client. Existing
+    /// client clones are unchanged; the guard does not authorize remote access.
+    pub fn with_lifetime_guard<T: std::any::Any + Send + Sync>(self, guard: Arc<T>) -> Self {
+        let mut guards = self.guards.as_ref().clone();
+        guards.push(guard);
+        Self {
+            inner: self.inner,
+            guards: Arc::new(guards),
+        }
+    }
     pub async fn connect(config: Config) -> Result<Self, Status> {
         config
             .validate()
@@ -146,6 +159,7 @@ impl NativeClient {
                 .accept_compressed(CompressionEncoding::Zstd);
         }
         Ok(Self {
+            guards: Default::default(),
             inner: Arc::new(Inner {
                 inflight: Arc::new(Semaphore::new(config.limits.max_inflight)),
                 bytes: Arc::new(Semaphore::new(config.limits.max_buffered_bytes)),
@@ -186,6 +200,7 @@ impl NativeClient {
         Ok(Arc::new(Budget {
             _inflight: inflight,
             _bytes: bytes,
+            _guards: self.guards.clone(),
         }))
     }
     fn request<T>(&self, value: T, allowance: Duration) -> Request<T> {
@@ -697,6 +712,7 @@ impl NativeClient {
             .await?,
         );
         let parent = parent.to_path_buf();
+        let guards = self.guards.clone();
         blocking(deadline, move || {
             let _budget = budget;
             let parent = secure_directory(&parent)?;
@@ -708,6 +724,7 @@ impl NativeClient {
             Ok(Temporary {
                 file: Arc::new(OwnedTemporary::new(file)?),
                 _disk: disk,
+                _guards: guards,
             })
         })
         .await

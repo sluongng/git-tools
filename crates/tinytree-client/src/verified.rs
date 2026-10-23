@@ -1,7 +1,9 @@
 use std::{
+    any::Any,
     path::{Path, PathBuf},
     sync::Arc,
 };
+pub(crate) type LifetimeGuards = Arc<Vec<Arc<dyn Any + Send + Sync>>>;
 use tinytree_model::{Descriptor, Object};
 use tonic::Status;
 
@@ -26,6 +28,15 @@ impl VerifiedMetadata {
 pub(crate) struct Temporary {
     pub file: Arc<OwnedTemporary>,
     pub _disk: Arc<tokio::sync::OwnedSemaphorePermit>,
+    pub _guards: LifetimeGuards,
+}
+impl Temporary {
+    fn with_guard<T: Any + Send + Sync>(mut self, guard: Arc<T>) -> Self {
+        let mut guards = self._guards.as_ref().clone();
+        guards.push(guard);
+        self._guards = Arc::new(guards);
+        self
+    }
 }
 pub(crate) struct OwnedTemporary {
     file: tempfile::NamedTempFile,
@@ -143,6 +154,17 @@ pub(crate) struct Source {
     pub descriptor: Descriptor,
 }
 impl UploadSource {
+    /// Keep external resource ownership with this returned source and every
+    /// derived retry, reader and blocking result. Previously created clones
+    /// are not modified. This grants no verification or retention guarantee.
+    pub fn with_lifetime_guard<T: Any + Send + Sync>(self, guard: Arc<T>) -> Self {
+        Self {
+            inner: Arc::new(Source {
+                temporary: self.inner.temporary.clone().with_guard(guard),
+                descriptor: self.inner.descriptor,
+            }),
+        }
+    }
     pub fn descriptor(&self) -> Descriptor {
         self.inner.descriptor
     }

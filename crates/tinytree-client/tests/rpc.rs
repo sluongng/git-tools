@@ -23,6 +23,22 @@ fn private_tempdir() -> tempfile::TempDir {
     directory
 }
 const TOKEN: &str = "client-loopback-test-token-not-a-secret";
+struct LifetimeProbe(Arc<AtomicUsize>);
+impl Drop for LifetimeProbe {
+    fn drop(&mut self) {
+        self.0.fetch_add(1, Ordering::SeqCst);
+    }
+}
+async fn assert_released(counter: &AtomicUsize) {
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while counter.load(Ordering::SeqCst) == 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(counter.load(Ordering::SeqCst), 1);
+}
 struct Running {
     address: std::net::SocketAddr,
     stop: Option<tokio::sync::oneshot::Sender<()>>,
@@ -520,12 +536,18 @@ async fn owned_upload_snapshot_replays_and_caller_mutation_cannot_change_it() {
     let bytes = vec![49; 10000];
     std::fs::write(&path, &bytes).unwrap();
     let descriptor = tinytree_model::describe_file(&bytes);
+    let released = Arc::new(AtomicUsize::new(0));
     let source = client
         .prepare_upload_file(&path, descriptor, parent.path())
         .await
-        .unwrap();
+        .unwrap()
+        .with_lifetime_guard(Arc::new(LifetimeProbe(released.clone())));
+    let held_source = source.clone();
     std::fs::write(path, b"mutable caller content").unwrap();
     let receipt = client.upload_file(source).await.unwrap();
+    assert_eq!(released.load(Ordering::SeqCst), 0);
+    drop(held_source);
+    assert_released(&released).await;
     assert_eq!(
         key(receipt.descriptor.as_ref().unwrap().key.as_ref().unwrap()),
         descriptor.key
@@ -819,6 +841,60 @@ async fn staging_requires_private_parent_and_replaced_temp_never_opens_or_instal
 }
 
 #[tokio::test]
+async fn cancelled_cross_client_upload_keeps_queued_worker_owners() {
+    let (_dir, _store, service) = setup();
+    let running = Running::start(service, Mode::Normal).await;
+    let producer = running.client().await;
+    let parent = private_tempdir();
+    let path = parent.path().join("input");
+    let bytes = b"cross-client upload";
+    std::fs::write(&path, bytes).unwrap();
+    let source = producer
+        .prepare_upload_file(&path, tinytree_model::describe_file(bytes), parent.path())
+        .await
+        .unwrap();
+    let config = running.config();
+    let (done, finished) = tokio::sync::oneshot::channel();
+    let worker = std::thread::spawn(move || {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .max_blocking_threads(1)
+            .build()
+            .unwrap();
+        runtime.block_on(async move {
+            let released = Arc::new(AtomicUsize::new(0));
+            let consumer = NativeClient::connect(config)
+                .await
+                .unwrap()
+                .with_lifetime_guard(Arc::new(LifetimeProbe(released.clone())));
+            let (started, ready) = tokio::sync::oneshot::channel();
+            let (unblock, blocked) = std::sync::mpsc::channel();
+            let occupied = tokio::task::spawn_blocking(move || {
+                started.send(()).unwrap();
+                blocked.recv().unwrap();
+            });
+            ready.await.unwrap();
+            {
+                let upload = consumer.upload_file(source);
+                tokio::pin!(upload);
+                assert!(futures_util::poll!(&mut upload).is_pending());
+            }
+            drop(consumer);
+            // The receiving client, not the source's producer, owns this guard.
+            // Its cancelled upload has queued physical work behind the barrier.
+            assert_eq!(released.load(Ordering::SeqCst), 0);
+            unblock.send(()).unwrap();
+            occupied.await.unwrap();
+            assert_released(&released).await;
+        });
+        done.send(()).unwrap();
+    });
+    finished.await.unwrap();
+    worker.join().unwrap();
+    running.stop().await;
+}
+
+#[tokio::test]
 async fn readonly_reader_keeps_disk_budget_until_reader_is_dropped() {
     let (_dir, store, service) = setup();
     let bytes = b"native reader bytes";
@@ -829,7 +905,11 @@ async fn readonly_reader_keeps_disk_budget_until_reader_is_dropped() {
     config.limits.max_file_bytes = 4096;
     config.limits.max_temporary_bytes = 4096;
     config.rpc.operation_timeout_ms = 100;
-    let client = NativeClient::connect(config).await.unwrap();
+    let released = Arc::new(AtomicUsize::new(0));
+    let client = NativeClient::connect(config)
+        .await
+        .unwrap()
+        .with_lifetime_guard(Arc::new(LifetimeProbe(released.clone())));
     let parent = private_tempdir();
     let verified = client
         .download_file(descriptor.key.id, parent.path())
@@ -851,7 +931,12 @@ async fn readonly_reader_keeps_disk_budget_until_reader_is_dropped() {
         .download_file(descriptor.key.id, parent.path())
         .await
         .unwrap();
+    let final_reader = verified.open().unwrap();
     drop(verified);
+    drop(client);
+    assert_eq!(released.load(Ordering::SeqCst), 0);
+    drop(final_reader);
+    assert_released(&released).await;
     running.stop().await;
 }
 
