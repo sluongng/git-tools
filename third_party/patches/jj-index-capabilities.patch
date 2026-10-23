@@ -1,0 +1,153 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Son Luong Ngoc <26684313+sluongng@users.noreply.github.com>
+Date: Fri, 23 Oct 2026 17:56:00 +0000
+Subject: [PATCH] jj: Expose opt-in index guarantees
+
+Custom indexes are excluded from rewrite inference and duplicate
+new-commit checks because these checks recognize only the default
+index's concrete type. Let an index explicitly promise the behavior
+needed by each check without requiring the default representation.
+
+Expose separate capabilities for exact commit membership and complete
+range/change-ID comparisons suitable for rewrite inference. Exact
+membership must distinguish commits written to the object store from
+commits already admitted to the index. Neither capability permits
+partial answers on error.
+
+Both capabilities default to false, preserving existing custom-index
+behavior. The default indexes opt in and keep their existing checks. No
+other implementation opts in as part of this patch.
+
+---
+diff --git a/src/index.rs b/src/index.rs
+--- a/src/index.rs
++++ b/src/index.rs
+@@ -99,6 +99,18 @@
+ /// repository by [`CommitId`].
+ #[async_trait]
+ pub trait Index: Send + Sync {
++    /// Whether successful [`Index::has_id`] answers distinguish indexed commits
++    /// from other identities, including commits just written to the object
++    /// store but not yet added to this index.
++    ///
++    /// Opting in enables duplicate-new-commit protection before recording
++    /// predecessor and parent mappings. Errors must remain errors, not be
++    /// converted to membership answers. The conservative default preserves
++    /// compatibility with custom indexes that do not provide this guarantee.
++    fn supports_exact_commit_membership(&self) -> bool {
++        false
++    }
++
+     /// Returns the minimum prefix length to disambiguate `commit_id` from other
+     /// commits in the index. The length returned is the number of hexadecimal
+     /// digits in the minimum prefix.
+@@ -193,6 +205,18 @@
+ #[expect(missing_docs)]
+ #[async_trait]
+ pub trait MutableIndex: Any {
++    /// Whether comparing the complete added and removed ancestor ranges and
++    /// their change IDs is supported for rewrite inference during view merges.
++    ///
++    /// Opting in requires exact, complete revset streams for these ranges. An
++    /// implementation must propagate failures instead of returning partial
++    /// results. It may decline if such traversal is not suitable for its index.
++    /// This capability is separate from exact commit membership, and defaults
++    /// to false to preserve existing custom-index merge behavior.
++    fn supports_rewrite_inference(&self) -> bool {
++        false
++    }
++
+     fn as_index(&self) -> &dyn Index;
+ 
+     fn change_id_index(
+diff --git a/src/default_index/mutable.rs b/src/default_index/mutable.rs
+--- a/src/default_index/mutable.rs
++++ b/src/default_index/mutable.rs
+@@ -559,6 +559,10 @@
+ 
+ #[async_trait]
+ impl Index for DefaultMutableIndex {
++    fn supports_exact_commit_membership(&self) -> bool {
++        true
++    }
++
+     async fn shortest_unique_commit_id_prefix_len(
+         &self,
+         commit_id: &CommitId,
+@@ -622,6 +626,10 @@
+ 
+ #[async_trait]
+ impl MutableIndex for DefaultMutableIndex {
++    fn supports_rewrite_inference(&self) -> bool {
++        true
++    }
++
+     fn as_index(&self) -> &dyn Index {
+         self
+     }
+diff --git a/src/default_index/readonly.rs b/src/default_index/readonly.rs
+--- a/src/default_index/readonly.rs
++++ b/src/default_index/readonly.rs
+@@ -718,6 +718,10 @@
+ 
+ #[async_trait]
+ impl Index for DefaultReadonlyIndex {
++    fn supports_exact_commit_membership(&self) -> bool {
++        true
++    }
++
+     async fn shortest_unique_commit_id_prefix_len(
+         &self,
+         commit_id: &CommitId,
+diff --git a/src/repo.rs b/src/repo.rs
+--- a/src/repo.rs
++++ b/src/repo.rs
+@@ -50,7 +50,6 @@
+ use crate::dag_walk;
+ use crate::dag_walk_async;
+ use crate::default_index::DefaultIndexStore;
+-use crate::default_index::DefaultMutableIndex;
+ use crate::default_submodule_store::DefaultSubmoduleStore;
+ use crate::file_util::IoResultExt as _;
+ use crate::file_util::PathError;
+@@ -1067,10 +1066,6 @@
+         self.index.as_ref()
+     }
+ 
+-    pub(crate) fn is_backed_by_default_index(&self) -> bool {
+-        self.index.downcast_ref::<DefaultMutableIndex>().is_some()
+-    }
+-
+     pub fn has_changes(&self) -> bool {
+         !(self.commit_predecessors.is_empty()
+             && self.parent_mapping.is_empty()
+@@ -2070,13 +2065,9 @@
+         let own_heads = self.view().heads().iter().cloned().collect_vec();
+         let other_heads = other.heads().iter().cloned().collect_vec();
+ 
+-        // HACK: Don't walk long ranges of commits to find rewrites when using other
+-        // custom implementations. The only custom index implementation we're currently
+-        // aware of is Google's. That repo has too high commit rate for it to be
+-        // feasible to walk all added and removed commits.
+-        // TODO: Fix this somehow. Maybe a method on `Index` to find rewritten commits
+-        // given `base_heads`, `own_heads` and `other_heads`?
+-        if self.is_backed_by_default_index() {
++        // Rewrite inference needs complete range/change-ID answers. Custom
++        // indexes opt in only when that traversal is supported and suitable.
++        if self.index.supports_rewrite_inference() {
+             self.record_rewrites(&base_heads, &own_heads).await?;
+             self.record_rewrites(&base_heads, &other_heads).await?;
+             // No need to remove heads removed by `other` because we already
+diff --git a/src/commit_builder.rs b/src/commit_builder.rs
+--- a/src/commit_builder.rs
++++ b/src/commit_builder.rs
+@@ -409,8 +409,7 @@
+             &self.sign_settings,
+         )
+         .await?;
+-        // FIXME: Google's index.has_id() always returns true.
+-        if mut_repo.is_backed_by_default_index()
++        if mut_repo.index().supports_exact_commit_membership()
+             && mut_repo
+                 .index()
+                 .has_id(commit.id())

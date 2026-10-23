@@ -395,6 +395,63 @@ fn real_jj_materialized_workspace_initializes_and_snapshots_with_native_backend(
         .unwrap();
         assert_eq!(repo.store().backend().name(), NativeBackend::NAME);
         assert!(!directory.path().join(".git").exists());
+        assert!(repo.index().supports_exact_commit_membership());
+        let mut transaction = repo.start_transaction();
+        assert!(
+            transaction
+                .repo_mut()
+                .mutable_index()
+                .supports_rewrite_inference()
+        );
+        assert!(
+            transaction
+                .repo_mut()
+                .index()
+                .supports_exact_commit_membership()
+        );
+        let root = repo.store().root_commit();
+        let signature = root.author().clone();
+        let change = ChangeId::from_bytes(&[57; 16]);
+        let builder = transaction
+            .repo_mut()
+            .new_commit(vec![root.id().clone()], root.tree())
+            .set_change_id(change.clone())
+            .set_description("indexed duplicate protection")
+            .set_author(signature.clone())
+            .set_committer(signature.clone())
+            .detach();
+        let stored = builder.write_hidden().await.unwrap();
+        assert!(
+            !transaction
+                .repo_mut()
+                .index()
+                .has_id(stored.id())
+                .await
+                .unwrap(),
+            "writing an object alone must not admit it to the index"
+        );
+        let admitted = builder.write(transaction.repo_mut()).await.unwrap();
+        assert_eq!(stored.id(), admitted.id());
+        assert!(
+            transaction
+                .repo_mut()
+                .index()
+                .has_id(admitted.id())
+                .await
+                .unwrap()
+        );
+        let duplicate = transaction
+            .repo_mut()
+            .new_commit(vec![root.id().clone()], root.tree())
+            .set_change_id(change)
+            .set_description("indexed duplicate protection")
+            .set_author(signature.clone())
+            .set_committer(signature)
+            .write()
+            .await
+            .unwrap_err();
+        assert!(duplicate.to_string().contains("already exists"));
+        drop(transaction);
         std::fs::write(
             directory.path().join("hello"),
             b"native materialized fixture",

@@ -8,6 +8,7 @@ crate.annotation(
     patches = [
         "//third_party/patches:jj-retained-operation-inventory.patch",
         "//third_party/patches:jj-cloud-operation-codec.patch",
+        "//third_party/patches:jj-index-capabilities.patch",
     ],
     patch_args = ["-p1"],
 )
