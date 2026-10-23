@@ -1957,7 +1957,7 @@ async fn root_query_service_warms_persistently_and_returns_exact_facts_and_prefi
                     scope: Some(key.clone()),
                     query_id: vec![99; 32],
                     expression: Some(q::GraphExpr {
-                        version: 1,
+                        version: 2,
                         expression: Some(q::graph_expr::Expression::Roots(
                             q::UnaryExpr {
                                 input: Some(
@@ -1984,8 +1984,48 @@ async fn root_query_service_warms_persistently_and_returns_exact_facts_and_prefi
             .await
             .unwrap_err()
             .code(),
-        Code::Unimplemented
+        Code::InvalidArgument
     );
+    let root_selection = q::GraphExpr {
+        version: 1,
+        expression: Some(q::graph_expr::Expression::Roots(
+            q::UnaryExpr {
+                input: Some(
+                    q::GraphExpr {
+                        version: 1,
+                        expression: Some(q::graph_expr::Expression::Commits(q::CommitSet {
+                            commits: vec![query_id(heads[0]), query_id(base)],
+                        })),
+                    }
+                    .into(),
+                ),
+            }
+            .into(),
+        )),
+    };
+    let page = client
+        .evaluate(request(
+            q::EvaluateRequest {
+                scope: Some(key.clone()),
+                query_id: vec![100; 32],
+                expression: Some(root_selection),
+                projection: q::Projection::Ids as i32,
+                page_size: 128,
+                cursor: Vec::new(),
+            },
+            ALPHA,
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(
+        page.rows
+            .iter()
+            .map(|row| row.commit.clone().unwrap())
+            .collect::<Vec<_>>(),
+        vec![query_id(base)]
+    );
+    assert_eq!(page.exhausted, Some(true));
     drop(client);
     server.stop().await;
     // Pending in-memory jobs are not replayed after restart. Persisted verified

@@ -2357,20 +2357,25 @@ fn pinned_graph_expected(
     reference: &PinnedGraphReference,
     selected: &[usize],
 ) -> Vec<(m::CommitId, Vec<tinytree_client::GraphEdge>)> {
-    use jj_lib::{
-        default_index::DefaultReadonlyIndex, object_id::ObjectId as _, repo::Repo,
-        revset::ResolvedExpression,
-    };
+    pinned_expression_expected(
+        reference,
+        &jj_lib::revset::ResolvedExpression::Commits(
+            selected
+                .iter()
+                .map(|&index| reference.ids[index].clone())
+                .collect(),
+        ),
+    )
+}
+fn pinned_expression_expected(
+    reference: &PinnedGraphReference,
+    expression: &jj_lib::revset::ResolvedExpression,
+) -> Vec<(m::CommitId, Vec<tinytree_client::GraphEdge>)> {
+    use jj_lib::{default_index::DefaultReadonlyIndex, object_id::ObjectId as _, repo::Repo};
     use tinytree_client::GraphEdge;
     let index: &DefaultReadonlyIndex = reference.repo.readonly_index().downcast_ref().unwrap();
-    let expression = ResolvedExpression::Commits(
-        selected
-            .iter()
-            .map(|&index| reference.ids[index].clone())
-            .collect(),
-    );
     index
-        .evaluate_revset_impl(&expression, reference.repo.store())
+        .evaluate_revset_impl(expression, reference.repo.store())
         .unwrap()
         .iter_graph_impl(true)
         .map(|result| {
@@ -2670,6 +2675,388 @@ async fn checked_selected_graph_rpc_matches_actual_pinned_jj_default_index() {
             counts.metadata_rpcs.load(Ordering::SeqCst),
             0,
             "canonical projection must not silently rehydrate full client history"
+        );
+        for (descriptor, _) in &reference.canonical[case.public..] {
+            assert!(
+                store
+                    .descriptor("example", descriptor.key)
+                    .unwrap()
+                    .is_none()
+            );
+            assert!(
+                index
+                    .node("example", m::CommitId(descriptor.key.id.0))
+                    .unwrap()
+                    .is_none()
+            );
+        }
+        server.stop().await;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn roots_and_dag_range_graph_rpc_match_actual_pinned_jj() {
+    use jj_lib::{object_id::ObjectId as _, revset::ResolvedExpression as Jj};
+    use tinytree_client::{NativeClient, query_protocol as q};
+    enum Operator {
+        Roots {
+            candidates: &'static [usize],
+        },
+        DagRange {
+            roots: &'static [usize],
+            heads: &'static [usize],
+            generation: Option<(u64, Option<u64>)>,
+        },
+    }
+    struct Case {
+        name: &'static str,
+        parents: &'static [&'static [usize]],
+        public: usize,
+        operator: Operator,
+    }
+    use Operator::{DagRange, Roots};
+    let linear: &'static [&'static [usize]] = &[&[0], &[1], &[2]];
+    // A,b,c,D,E. A->D has lengths1/3; A->E has lengths2/4.
+    // A min/max envelope would falsely admit E at generation3.
+    let unequal: &'static [&'static [usize]] = &[&[0], &[1], &[2], &[1, 3], &[4]];
+    let cases = [
+        Case {
+            name: "roots through excluded intermediate",
+            parents: linear,
+            public: 3,
+            operator: Roots {
+                candidates: &[1, 3],
+            },
+        },
+        Case {
+            name: "roots through excluded merge",
+            parents: &[&[0], &[1], &[1], &[2, 3], &[4]],
+            public: 5,
+            operator: Roots {
+                candidates: &[1, 5],
+            },
+        },
+        Case {
+            name: "roots disconnected candidates",
+            parents: &[&[0], &[1], &[0], &[3], &[2, 4]],
+            public: 5,
+            operator: Roots {
+                candidates: &[2, 4],
+            },
+        },
+        Case {
+            name: "roots intrinsic root dominates",
+            parents: linear,
+            public: 3,
+            operator: Roots {
+                candidates: &[0, 3],
+            },
+        },
+        Case {
+            name: "roots empty candidates",
+            parents: linear,
+            public: 3,
+            operator: Roots { candidates: &[] },
+        },
+        Case {
+            name: "roots private excluded bridge",
+            parents: &[&[0], &[1], &[2], &[3]],
+            public: 1,
+            operator: Roots {
+                candidates: &[2, 4],
+            },
+        },
+        Case {
+            name: "dag range full inclusive endpoints",
+            parents: linear,
+            public: 3,
+            operator: DagRange {
+                roots: &[1],
+                heads: &[3],
+                generation: None,
+            },
+        },
+        Case {
+            name: "dag range generation zero",
+            parents: linear,
+            public: 3,
+            operator: DagRange {
+                roots: &[1],
+                heads: &[3],
+                generation: Some((0, Some(1))),
+            },
+        },
+        Case {
+            name: "dag range middle generation",
+            parents: linear,
+            public: 3,
+            operator: DagRange {
+                roots: &[1],
+                heads: &[3],
+                generation: Some((1, Some(2))),
+            },
+        },
+        Case {
+            name: "dag range empty generation interval",
+            parents: linear,
+            public: 3,
+            operator: DagRange {
+                roots: &[1],
+                heads: &[3],
+                generation: Some((1, Some(1))),
+            },
+        },
+        Case {
+            name: "dag range explicit empty zero interval",
+            parents: linear,
+            public: 3,
+            operator: DagRange {
+                roots: &[1],
+                heads: &[3],
+                generation: Some((0, Some(0))),
+            },
+        },
+        Case {
+            name: "dag range intrinsic root generation zero",
+            parents: linear,
+            public: 3,
+            operator: DagRange {
+                roots: &[0],
+                heads: &[3],
+                generation: Some((0, Some(1))),
+            },
+        },
+        Case {
+            name: "dag range root only",
+            parents: &[],
+            public: 0,
+            operator: DagRange {
+                roots: &[0],
+                heads: &[0],
+                generation: None,
+            },
+        },
+        Case {
+            name: "dag range disconnected endpoints",
+            parents: &[&[0], &[1], &[0], &[3]],
+            public: 4,
+            operator: DagRange {
+                roots: &[1],
+                heads: &[4],
+                generation: None,
+            },
+        },
+        Case {
+            name: "dag range empty root set",
+            parents: linear,
+            public: 3,
+            operator: DagRange {
+                roots: &[],
+                heads: &[3],
+                generation: None,
+            },
+        },
+        Case {
+            name: "dag range unequal alternate path",
+            parents: unequal,
+            public: 5,
+            operator: DagRange {
+                roots: &[1],
+                heads: &[5],
+                generation: Some((3, Some(4))),
+            },
+        },
+        Case {
+            name: "dag range unequal long path endpoint",
+            parents: unequal,
+            public: 5,
+            operator: DagRange {
+                roots: &[1],
+                heads: &[5],
+                generation: Some((4, Some(5))),
+            },
+        },
+        Case {
+            name: "dag range multiple roots",
+            parents: unequal,
+            public: 5,
+            operator: DagRange {
+                roots: &[1, 2],
+                heads: &[5],
+                generation: Some((0, Some(1))),
+            },
+        },
+        Case {
+            name: "dag range private alternate path",
+            parents: unequal,
+            public: 2,
+            operator: DagRange {
+                roots: &[1],
+                heads: &[5],
+                generation: Some((3, Some(4))),
+            },
+        },
+    ];
+    for case in cases {
+        let reference = pinned_graph_reference(case.parents, false).await;
+        let wire_commits = |selected: &[usize]| q::GraphExpr {
+            version: 1,
+            expression: Some(q::graph_expr::Expression::Commits(q::CommitSet {
+                commits: selected
+                    .iter()
+                    .map(|&index| q::CommitId {
+                        value: reference.ids[index].as_bytes().to_vec(),
+                    })
+                    .collect(),
+            })),
+        };
+        let jj_commits = |selected: &[usize]| {
+            Jj::Commits(
+                selected
+                    .iter()
+                    .map(|&index| reference.ids[index].clone())
+                    .collect(),
+            )
+        };
+        let (wire, expression) = match case.operator {
+            Roots { candidates } => (
+                q::GraphExpr {
+                    version: 1,
+                    expression: Some(q::graph_expr::Expression::Roots(Box::new(q::UnaryExpr {
+                        input: Some(Box::new(wire_commits(candidates))),
+                    }))),
+                },
+                Jj::Roots(Box::new(jj_commits(candidates))),
+            ),
+            DagRange {
+                roots,
+                heads,
+                generation,
+            } => {
+                let interval = generation.map(|(start, end_exclusive)| q::GenerationRange {
+                    start,
+                    end_exclusive,
+                });
+                let (start, end) = generation.unwrap_or((0, None));
+                (
+                    q::GraphExpr {
+                        version: 1,
+                        expression: Some(q::graph_expr::Expression::DagRange(Box::new(
+                            q::DagRangeExpr {
+                                roots: Some(Box::new(wire_commits(roots))),
+                                heads: Some(Box::new(wire_commits(heads))),
+                                generations_from_roots: interval,
+                            },
+                        ))),
+                    },
+                    Jj::DagRange {
+                        roots: Box::new(jj_commits(roots)),
+                        heads: Box::new(jj_commits(heads)),
+                        generation_from_roots: start..end.unwrap_or(u64::MAX),
+                    },
+                )
+            }
+        };
+        let expected = pinned_expression_expected(&reference, &expression);
+        let store_directory = private_dir();
+        let store = Store::open(store_directory.path(), Default::default()).unwrap();
+        store.create_repository("example").unwrap();
+        let empty = m::empty_tree();
+        store
+            .put("example", empty.descriptor, &empty.bytes, 0)
+            .unwrap();
+        let index_directory = private_dir();
+        let index =
+            tinytree_index::Index::open(index_directory.path(), &Default::default()).unwrap();
+        for (descriptor, bytes) in &reference.canonical[..case.public] {
+            store.put("example", *descriptor, bytes, 0).unwrap();
+            index.ingest("example", *descriptor, bytes).unwrap();
+        }
+        let mut service_config = ServiceConfig::default();
+        service_config.query.max_eval_quantum_steps = 1;
+        service_config.query.max_eval_step_work = 1;
+        service_config.query.max_graph_query_step_work = 1;
+        let service = RepositoryService::new(
+            store.clone(),
+            service_config,
+            vec!["example".into()],
+            vec![Principal::new("test", TOKEN, vec!["example".into()], true).unwrap()],
+        )
+        .unwrap()
+        .with_query_index(index.clone())
+        .unwrap();
+        let counts = Counters::new();
+        let server = Server::start_service(service, counts.clone(), None).await;
+        let mut client_config = config(&server).remote;
+        client_config.limits.max_graph_pages = 10_000;
+        let client = NativeClient::connect(client_config).await.unwrap();
+        let roots = if case.public == 0 {
+            vec![m::CommitId::ROOT]
+        } else {
+            reference.ids[1..=case.public]
+                .iter()
+                .map(|id| m::CommitId::from_slice(id.as_bytes()).unwrap())
+                .collect()
+        };
+        let mut overlay = Vec::new();
+        for (descriptor, bytes) in &reference.canonical[case.public..] {
+            overlay.push(
+                client
+                    .verify_metadata(*descriptor, bytes.clone())
+                    .await
+                    .unwrap(),
+            );
+        }
+        let scope = client
+            .open_query_scope_with_overlay(roots, overlay)
+            .await
+            .unwrap();
+        // One canonical selected-graph projection checks both the operator's
+        // exact selected IDs and its ordered direct/indirect/missing edges.
+        let mut query = client
+            .begin_graph_query(&scope, &wire, 1, true)
+            .await
+            .unwrap();
+        let mut actual = Vec::new();
+        let mut sequence = 0;
+        while !query.is_exhausted() {
+            let page = client.evaluate_graph_page(&mut query).await.unwrap();
+            assert_eq!(page.sequence, sequence, "{}", case.name);
+            sequence += 1;
+            for row in page.rows() {
+                actual.push((row.commit, row.edges().to_vec()));
+                if row.commit == m::CommitId::ROOT {
+                    assert!(row.canonical.is_none());
+                    assert_eq!(row.change, m::ChangeId::ROOT);
+                } else {
+                    let (descriptor, bytes) = reference
+                        .canonical
+                        .iter()
+                        .find(|(descriptor, _)| descriptor.key.id.0 == row.commit.0)
+                        .unwrap();
+                    let canonical = row
+                        .canonical
+                        .as_ref()
+                        .expect("canonical non-root row missing");
+                    assert_eq!(canonical.descriptor(), *descriptor);
+                    assert_eq!(canonical.canonical_bytes(), bytes.as_slice());
+                }
+            }
+            drop(page);
+        }
+        assert_eq!(
+            actual, expected,
+            "actual jj Roots/DagRange mismatch: {}",
+            case.name
+        );
+        client.close_graph_query(&mut query).await.unwrap();
+        client.close_query_scope(&scope).await.unwrap();
+        assert_eq!(counts.files.load(Ordering::SeqCst), 0, "{}", case.name);
+        assert_eq!(
+            counts.metadata_rpcs.load(Ordering::SeqCst),
+            0,
+            "{}",
+            case.name
         );
         for (descriptor, _) in &reference.canonical[case.public..] {
             assert!(

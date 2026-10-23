@@ -153,6 +153,22 @@ impl Context<'_> {
         self.remaining -= 1;
         Ok(true)
     }
+    fn is_ancestor(&mut self, ancestor: &GraphNode, descendant: &GraphNode) -> Result<bool> {
+        // Indexed ancestry is one bounded graph primitive, not an uncharged
+        // private traversal outside the aggregate retained/temporary frontier.
+        let available = self
+            .memory
+            .max_slots
+            .checked_sub(self.memory.used.slots)
+            .ok_or_else(limit)?;
+        let original = self.budget.max_frontier;
+        self.budget.max_frontier = original.min(available);
+        let result = self
+            .graph
+            .is_ancestor(ancestor.commit(), descendant.commit(), self.budget);
+        self.budget.max_frontier = original;
+        Ok(result?)
+    }
     fn parents(&mut self, node: &GraphNode) -> Result<Vec<GraphNode>> {
         let available = self
             .memory
@@ -599,6 +615,230 @@ impl Heads {
         }
     }
 }
+struct Roots {
+    input: Box<Operator>,
+    look: Option<GraphNode>,
+    done: bool,
+    scanning: bool,
+    scan: Option<GraphKey>,
+    candidates: BTreeMap<GraphKey, GraphNode>,
+}
+impl Roots {
+    fn poll(&mut self, ctx: &mut Context<'_>) -> Result<EvalStep> {
+        loop {
+            if self.scanning {
+                if !ctx.tick()? {
+                    return Ok(EvalStep::Progress);
+                }
+                if let Some(key) = self.scan {
+                    let candidate = self.candidates.get(&key).ok_or(GraphError::Corrupt)?;
+                    let node = self.look.as_ref().ok_or(GraphError::Corrupt)?;
+                    let remove = ctx.is_ancestor(node, candidate)?;
+                    self.scan = self
+                        .candidates
+                        .range(..key)
+                        .next_back()
+                        .map(|(key, _)| *key);
+                    if remove {
+                        self.candidates.remove(&key);
+                        ctx.memory.release(Counts {
+                            slots: 1,
+                            intervals: 0,
+                        });
+                    }
+                } else {
+                    let node = self.look.take().ok_or(GraphError::Corrupt)?;
+                    if self.candidates.insert(node.key(), node).is_some() {
+                        return Err(GraphError::Corrupt.into());
+                    }
+                    // Transfer the charged lookahead slot into the antichain.
+                    self.scanning = false;
+                }
+                continue;
+            }
+            if !fill(&mut self.input, &mut self.look, &mut self.done, ctx)? {
+                return Ok(EvalStep::Progress);
+            }
+            if self.look.is_some() {
+                self.scan = self.candidates.last_key_value().map(|(key, _)| *key);
+                self.scanning = true;
+                continue;
+            }
+            if self.done {
+                if !ctx.tick()? {
+                    return Ok(EvalStep::Progress);
+                }
+                if let Some((_, node)) = self.candidates.pop_last() {
+                    ctx.memory.release(Counts {
+                        slots: 1,
+                        intervals: 0,
+                    });
+                    return Ok(EvalStep::Row(node));
+                }
+                return Ok(EvalStep::Done);
+            }
+        }
+    }
+}
+struct DagRange {
+    roots_input: Box<Operator>,
+    roots_done: bool,
+    roots: BTreeMap<GraphKey, GraphNode>,
+    heads: Box<Operator>,
+    heads_done: bool,
+    look: Option<GraphNode>,
+    checking: bool,
+    scan: Option<GraphKey>,
+    probe: Option<Box<Operator>>,
+    generations: Window,
+}
+impl DagRange {
+    fn clear_probe(&mut self, memory: &mut Memory) {
+        if let Some(probe) = self.probe.take() {
+            memory.release(probe.counts());
+        }
+    }
+    fn take_candidate(&mut self, memory: &mut Memory) -> Result<GraphNode> {
+        self.checking = false;
+        self.scan = None;
+        let node = self.look.take().ok_or(GraphError::Corrupt)?;
+        memory.release(Counts {
+            slots: 1,
+            intervals: 0,
+        });
+        Ok(node)
+    }
+    fn poll(&mut self, ctx: &mut Context<'_>) -> Result<EvalStep> {
+        loop {
+            if !self.roots_done {
+                match self.roots_input.poll(ctx)? {
+                    EvalStep::Progress => return Ok(EvalStep::Progress),
+                    EvalStep::Done => self.roots_done = true,
+                    EvalStep::Row(node) => {
+                        ctx.cpu()?;
+                        ctx.memory.slots(1)?;
+                        if self.roots.insert(node.key(), node).is_some() {
+                            return Err(GraphError::Corrupt.into());
+                        }
+                    }
+                }
+                continue;
+            }
+            // Do not evaluate heads or traverse their ancestry when no root can
+            // reach them. Compilation still validates both expression shapes.
+            if self.roots.is_empty() {
+                return Ok(EvalStep::Done);
+            }
+            if let Some(probe) = &mut self.probe {
+                let selected = match probe.poll(ctx)? {
+                    EvalStep::Progress => return Ok(EvalStep::Progress),
+                    EvalStep::Done => Some(false),
+                    EvalStep::Row(node) => {
+                        ctx.cpu()?;
+                        if let Some(root) = self.roots.get(&node.key()) {
+                            if root.commit() != node.commit() {
+                                return Err(GraphError::Corrupt.into());
+                            }
+                            Some(true)
+                        } else if node.key() < *self.roots.first_key_value().unwrap().0 {
+                            Some(false)
+                        } else {
+                            None
+                        }
+                    }
+                };
+                if let Some(selected) = selected {
+                    self.clear_probe(ctx.memory);
+                    let node = self.take_candidate(ctx.memory)?;
+                    if selected {
+                        return Ok(EvalStep::Row(node));
+                    }
+                }
+                continue;
+            }
+            if !fill(&mut self.heads, &mut self.look, &mut self.heads_done, ctx)? {
+                return Ok(EvalStep::Progress);
+            }
+            if self.heads_done && self.look.is_none() {
+                return Ok(EvalStep::Done);
+            }
+            if self
+                .look
+                .as_ref()
+                .is_some_and(|node| node.key() < *self.roots.first_key_value().unwrap().0)
+            {
+                return Ok(EvalStep::Done);
+            }
+            if self.generations.start == 0 && self.generations.end == None {
+                if !self.checking {
+                    self.scan = self.roots.first_key_value().map(|(key, _)| *key);
+                    self.checking = true;
+                }
+                if !ctx.tick()? {
+                    return Ok(EvalStep::Progress);
+                }
+                if let Some(key) = self.scan {
+                    let root = self.roots.get(&key).ok_or(GraphError::Corrupt)?;
+                    let candidate = self.look.as_ref().ok_or(GraphError::Corrupt)?;
+                    let selected = ctx.is_ancestor(root, candidate)?;
+                    self.scan = self
+                        .roots
+                        .range((std::ops::Bound::Excluded(key), std::ops::Bound::Unbounded))
+                        .next()
+                        .map(|(key, _)| *key);
+                    if selected {
+                        return Ok(EvalStep::Row(self.take_candidate(ctx.memory)?));
+                    }
+                } else {
+                    self.take_candidate(ctx.memory)?;
+                }
+                continue;
+            }
+            if self.generations.start == 0 && self.generations.end == Some(1) {
+                if !ctx.tick()? {
+                    return Ok(EvalStep::Progress);
+                }
+                let candidate = self.look.as_ref().ok_or(GraphError::Corrupt)?;
+                let selected = self
+                    .roots
+                    .get(&candidate.key())
+                    .map(|node| node.commit() == candidate.commit())
+                    .unwrap_or(false);
+                let node = self.take_candidate(ctx.memory)?;
+                if selected {
+                    return Ok(EvalStep::Row(node));
+                }
+                continue;
+            }
+            // Reverse reachability uses the SAME path-length intervals as the
+            // ancestor walker: a root is accepted if ANY path to this candidate
+            // has a generation in the requested half-open range. Each probe is
+            // resumable and shares the query's cumulative work/memory budget.
+            if !ctx.tick()? {
+                return Ok(EvalStep::Progress);
+            }
+            let node = self.look.as_ref().ok_or(GraphError::Corrupt)?.clone();
+            ctx.memory.slots(1)?;
+            let mut seed = BTreeMap::new();
+            seed.insert(node.key(), node);
+            self.probe = Some(Box::new(Operator::Ancestors(Ancestors {
+                heads: Box::new(Operator::Commits(Commits {
+                    ids: Vec::new(),
+                    next: 0,
+                    rows: seed,
+                })),
+                look: None,
+                done: false,
+                queue: BTreeMap::new(),
+                expansion: None,
+                pending: None,
+                exclusion: None,
+                generations: self.generations,
+                parents: Window::all(),
+            })));
+        }
+    }
+}
 #[derive(Clone, Copy)]
 enum SetKind {
     Union,
@@ -814,6 +1054,8 @@ enum Operator {
     Commits(Commits),
     Ancestors(Ancestors),
     Heads(Heads),
+    Roots(Roots),
+    DagRange(DagRange),
     Set(SetOperator),
     Latest(Latest),
 }
@@ -863,6 +1105,24 @@ impl Operator {
                         .map_or(0, |expansion| expansion.batch_slots),
                 intervals: 0,
             }),
+            Self::Roots(state) => state.input.counts().add(Counts {
+                slots: state.candidates.len() + usize::from(state.look.is_some()),
+                intervals: 0,
+            }),
+            Self::DagRange(state) => state
+                .roots_input
+                .counts()
+                .add(state.heads.counts())
+                .add(Counts {
+                    slots: state.roots.len() + usize::from(state.look.is_some()),
+                    intervals: 0,
+                })
+                .add(
+                    state
+                        .probe
+                        .as_ref()
+                        .map_or(Counts::default(), |probe| probe.counts()),
+                ),
             Self::Set(state) => state.left.counts().add(state.right.counts()).add(Counts {
                 slots: usize::from(state.a.is_some()) + usize::from(state.b.is_some()),
                 intervals: 0,
@@ -886,6 +1146,8 @@ impl Operator {
             Self::Commits(state) => state.poll(ctx),
             Self::Ancestors(state) => state.poll(ctx),
             Self::Heads(state) => state.poll(ctx),
+            Self::Roots(state) => state.poll(ctx),
+            Self::DagRange(state) => state.poll(ctx),
             Self::Set(state) => state.poll(ctx),
             Self::Latest(state) => state.poll(ctx),
         }?;
@@ -1099,8 +1361,47 @@ impl Compiler<'_> {
                     expansion: None,
                 }))
             }
-            X::Roots(_) => Err(EvalError::Unsupported("Roots")),
-            X::DagRange(_) => Err(EvalError::Unsupported("DagRange")),
+            X::Roots(value) => {
+                let input = self.compile(child(&value.input)?, depth + 1)?;
+                Ok(Operator::Roots(Roots {
+                    input: Box::new(input),
+                    look: None,
+                    done: false,
+                    scanning: false,
+                    scan: None,
+                    candidates: BTreeMap::new(),
+                }))
+            }
+            X::DagRange(value) => {
+                let roots = self.compile(child(&value.roots)?, depth + 1)?;
+                let heads = self.compile(child(&value.heads)?, depth + 1)?;
+                let generations = value
+                    .generations_from_roots
+                    .as_ref()
+                    .map(|range| Self::window(range.start, range.end_exclusive))
+                    .transpose()?
+                    .unwrap_or(Window::all());
+                // Generated candidate ancestry plus the one live probe/seed.
+                self.bump()?;
+                self.bump()?;
+                self.bump()?;
+                if generations.empty() {
+                    return Ok(Operator::Empty);
+                }
+                let heads = self.ancestors(heads, Window::all(), Window::all());
+                Ok(Operator::DagRange(DagRange {
+                    roots_input: Box::new(roots),
+                    roots_done: false,
+                    roots: BTreeMap::new(),
+                    heads: Box::new(heads),
+                    heads_done: false,
+                    look: None,
+                    checking: false,
+                    scan: None,
+                    probe: None,
+                    generations,
+                }))
+            }
         }
     }
 }
@@ -1151,6 +1452,32 @@ mod tests {
             q::LatestExpr {
                 candidates: Some(input.into()),
                 count,
+            }
+            .into(),
+        ))
+    }
+    fn roots(input: q::GraphExpr) -> q::GraphExpr {
+        expression(q::graph_expr::Expression::Roots(
+            q::UnaryExpr {
+                input: Some(input.into()),
+            }
+            .into(),
+        ))
+    }
+    fn dag_range(
+        roots: q::GraphExpr,
+        heads: q::GraphExpr,
+        start: u64,
+        end: Option<u64>,
+    ) -> q::GraphExpr {
+        expression(q::graph_expr::Expression::DagRange(
+            q::DagRangeExpr {
+                roots: Some(roots.into()),
+                heads: Some(heads.into()),
+                generations_from_roots: Some(q::GenerationRange {
+                    start,
+                    end_exclusive: end,
+                }),
             }
             .into(),
         ))
@@ -1476,7 +1803,7 @@ mod tests {
         ));
     }
     #[test]
-    fn aggregate_memory_ast_and_unsupported_work_never_become_empty_results() {
+    fn aggregate_memory_ast_and_invalid_work_never_become_empty_results() {
         let (_directory, graph, ids) = linear();
         let union = expression(q::graph_expr::Expression::Union(
             q::SetExpr {
@@ -1512,15 +1839,20 @@ mod tests {
             ),
             Err(EvalError::Invalid(_))
         ));
-        let unsupported = expression(q::graph_expr::Expression::Roots(
-            q::UnaryExpr {
-                input: Some(commits(&[ids[1]]).into()),
+        let invalid = expression(q::graph_expr::Expression::DagRange(
+            q::DagRangeExpr {
+                roots: Some(commits(&[ids[1]]).into()),
+                heads: Some(commits(&[ids[10]]).into()),
+                generations_from_roots: Some(q::GenerationRange {
+                    start: 3,
+                    end_exclusive: Some(2),
+                }),
             }
             .into(),
         ));
         assert!(matches!(
-            Evaluator::new(graph, unsupported, EvalLimits::default()),
-            Err(EvalError::Unsupported(_))
+            Evaluator::new(graph, invalid, EvalLimits::default()),
+            Err(EvalError::Invalid(_))
         ));
     }
 
@@ -2099,4 +2431,373 @@ mod tests {
             }
         }
     }
+    #[test]
+    fn roots_and_dag_range_match_reference_merge_sets_with_single_transition_quanta() {
+        let directory = tempfile::tempdir().unwrap();
+        let index = Index::open(directory.path().join("index"), &Default::default()).unwrap();
+        let add = |parents: &[m::CommitId], ordinal| {
+            let object = canonical(parents, ordinal, 0, 0);
+            index
+                .ingest("repo", object.descriptor, &object.bytes)
+                .unwrap()
+                .commit
+        };
+        let r = m::CommitId::ROOT;
+        let a = add(&[r], 1);
+        let b = add(&[a], 2);
+        let c = add(&[b, r], 3);
+        let x = add(&[r], 4);
+        let e = add(&[b, x], 5);
+        let graph = OverlayGraph::remote(Arc::new(index.scope("repo", &[c, e]).unwrap()));
+        struct Case {
+            name: &'static str,
+            expr: q::GraphExpr,
+            expected: Vec<m::CommitId>,
+        }
+        for case in [
+            Case {
+                name: "roots exclude non-direct descendants",
+                expr: roots(commits(&[c, a])),
+                expected: vec![a],
+            },
+            Case {
+                name: "roots retain disconnected minimal branches",
+                expr: roots(commits(&[c, e, b, x])),
+                expected: vec![x, b],
+            },
+            Case {
+                name: "intrinsic root removes every selected descendant",
+                expr: roots(commits(&[c, e, r])),
+                expected: vec![r],
+            },
+            Case {
+                name: "empty roots selection",
+                expr: roots(commits(&[])),
+                expected: vec![],
+            },
+            Case {
+                name: "full dag range",
+                expr: dag_range(commits(&[a]), commits(&[c, e]), 0, None),
+                expected: vec![e, c, b, a],
+            },
+            Case {
+                name: "generation zero equals reachable roots",
+                expr: dag_range(commits(&[b, x]), commits(&[c]), 0, Some(1)),
+                expected: vec![b],
+            },
+            Case {
+                name: "root shortcuts are generation one",
+                expr: dag_range(commits(&[r]), commits(&[c, e]), 0, Some(2)),
+                expected: vec![x, c, a, r],
+            },
+            Case {
+                name: "generation holes are not min-max filled",
+                expr: dag_range(commits(&[r]), commits(&[c, e]), 2, Some(3)),
+                expected: vec![e, b],
+            },
+            Case {
+                name: "long alternate paths are retained",
+                expr: dag_range(commits(&[r]), commits(&[c, e]), 3, Some(4)),
+                expected: vec![e, c],
+            },
+            Case {
+                name: "multiple roots share inclusive descendants",
+                expr: dag_range(commits(&[b, x]), commits(&[c, e]), 1, Some(2)),
+                expected: vec![e, c],
+            },
+            Case {
+                name: "root unreachable from heads",
+                expr: dag_range(commits(&[x]), commits(&[c]), 0, None),
+                expected: vec![],
+            },
+            Case {
+                name: "empty generation interval",
+                expr: dag_range(commits(&[a]), commits(&[c, e]), 2, Some(2)),
+                expected: vec![],
+            },
+        ] {
+            let (actual, progress, _) = collect(
+                graph.clone(),
+                case.expr,
+                EvalLimits {
+                    max_step_work: 1,
+                    ..Default::default()
+                },
+            );
+            assert_eq!(actual, case.expected, "{}", case.name);
+            if !case.expected.is_empty() {
+                assert!(progress > 0, "{} must remain resumable", case.name);
+            }
+        }
+    }
+    #[test]
+    fn empty_dag_roots_skip_heads_and_new_operators_share_cumulative_limits() {
+        let (_directory, graph, ids) = linear();
+        let unknown = m::CommitId([99; 32]);
+        for expression in [
+            dag_range(commits(&[]), commits(&[unknown]), 0, None),
+            dag_range(commits(&[unknown]), commits(&[unknown]), 2, Some(2)),
+        ] {
+            let mut evaluator = Evaluator::new(
+                graph.clone(),
+                expression,
+                EvalLimits {
+                    max_step_work: 1,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            let mut budget = WorkBudget::new(0, 0, 0, 32);
+            let mut done = false;
+            for _ in 0..100 {
+                match evaluator.step(&mut budget).unwrap() {
+                    EvalStep::Progress => {}
+                    EvalStep::Done => {
+                        done = true;
+                        break;
+                    }
+                    EvalStep::Row(_) => panic!("empty query cannot emit"),
+                }
+            }
+            assert!(done);
+            assert_eq!(budget.nodes_read(), 0);
+        }
+        for expression in [
+            roots(ancestors(commits(&[ids[10]]), 0, None, None)),
+            dag_range(commits(&[ids[0]]), commits(&[ids[10]]), 2, Some(4)),
+        ] {
+            let mut evaluator = Evaluator::new(
+                graph.clone(),
+                expression,
+                EvalLimits {
+                    max_step_work: 1,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            let mut budget = WorkBudget::new(8, 32, 4096, 32);
+            let mut failed = false;
+            for _ in 0..1000 {
+                match evaluator.step(&mut budget) {
+                    Ok(EvalStep::Progress | EvalStep::Row(_)) => {}
+                    Err(EvalError::Graph(GraphError::BudgetExceeded)) => {
+                        failed = true;
+                        break;
+                    }
+                    _ => panic!("query must report its shared work cap"),
+                }
+            }
+            assert!(failed);
+        }
+    }
+    #[test]
+    fn dag_roots_candidate_and_probe_use_one_aggregate_frontier() {
+        let (_directory, graph, ids) = linear();
+        let expression = dag_range(commits(&[ids[0], ids[1]]), commits(&[ids[10]]), 2, Some(3));
+        let mut evaluator = Evaluator::new(
+            graph,
+            expression,
+            EvalLimits {
+                max_frontier: 3,
+                max_step_work: 1,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let mut budget = WorkBudget::default();
+        let mut failed = false;
+        for _ in 0..1000 {
+            match evaluator.step(&mut budget) {
+                Ok(EvalStep::Progress | EvalStep::Row(_)) => {}
+                Err(EvalError::Graph(GraphError::BudgetExceeded)) => {
+                    failed = true;
+                    break;
+                }
+                _ => panic!("rootset, candidate and probe cannot exceed their shared frontier"),
+            }
+        }
+        assert!(failed);
+    }
+    // BEGIN TINYTREE_ROOTS_DAGRANGE_READY_BENCH_V1
+    // Insert inside the existing query_eval.rs #[cfg(test)] mod tests, immediately
+    // before its final closing brace. This uses that module's fixture helpers.
+    #[test]
+    #[ignore = "manual ready-index Roots/DagRange evaluator benchmark"]
+    fn benchmark_roots_and_dag_range_ready_component() {
+        let overall = std::time::Instant::now();
+        for public_count in [128usize, 1024, 4096] {
+            let opened = std::time::Instant::now();
+            let directory = tempfile::tempdir().unwrap();
+            let index = Index::open(directory.path().join("index"), &Default::default()).unwrap();
+            let index_open_ms = opened.elapsed().as_secs_f64() * 1000.0;
+            let seeded = std::time::Instant::now();
+            let mut boundary = m::CommitId::ROOT;
+            let mut canonical_public_bytes = 0usize;
+            for ordinal in 1..=public_count {
+                let object = canonical(&[boundary], ordinal, 0, 0);
+                canonical_public_bytes += object.bytes.len();
+                boundary = index
+                    .ingest("repo", object.descriptor, &object.bytes)
+                    .unwrap()
+                    .commit;
+            }
+            let public_seed_ms = seeded.elapsed().as_secs_f64() * 1000.0;
+            let scoped = std::time::Instant::now();
+            let remote = OverlayGraph::remote(Arc::new(index.scope("repo", &[boundary]).unwrap()));
+            let remote_scope_ms = scoped.elapsed().as_secs_f64() * 1000.0;
+            let drafted = std::time::Instant::now();
+            let mut draft_objects = Vec::new();
+            let mut selected = vec![boundary];
+            let mut head = boundary;
+            let mut canonical_private_bytes = 0usize;
+            for ordinal in 1..=10 {
+                let object = canonical(&[head], public_count + ordinal, 0, 0);
+                head = m::CommitId(object.descriptor.key.id.0);
+                canonical_private_bytes += object.bytes.len();
+                selected.push(head);
+                draft_objects.push((object.descriptor, Arc::<[u8]>::from(object.bytes)));
+            }
+            let linear = OverlayGraph::extend(
+                remote.clone(),
+                draft_objects,
+                &crate::query_overlay::OverlayLimits::default(),
+                &mut WorkBudget::default(),
+                Arc::new(()),
+            )
+            .unwrap();
+            let private_prepare_ms = drafted.elapsed().as_secs_f64() * 1000.0;
+            let mut middle = selected[2..4].to_vec();
+            middle.reverse();
+            let mut full = selected.clone();
+            full.reverse();
+            let mut cases = vec![
+                (
+                    "roots_fixed_ten_drafts_plus_boundary",
+                    linear.clone(),
+                    roots(commits(&selected)),
+                    vec![boundary],
+                ),
+                (
+                    "dag_full_fixed_ten_drafts",
+                    linear.clone(),
+                    dag_range(commits(&[boundary]), commits(&[head]), 0, None),
+                    full,
+                ),
+                (
+                    "dag_generations_two_to_four",
+                    linear,
+                    dag_range(commits(&[boundary]), commits(&[head]), 2, Some(4)),
+                    middle,
+                ),
+            ];
+            // Unequal paths from a to d have lengths1/3; from a to e lengths2/4.
+            // Therefore generation3 must include d but NOT e; generation4 includes e.
+            let merged = std::time::Instant::now();
+            let mut objects = Vec::new();
+            let mut add = |parents: &[m::CommitId], ordinal| {
+                let object = canonical(parents, public_count + ordinal, 0, 0);
+                let id = m::CommitId(object.descriptor.key.id.0);
+                objects.push((object.descriptor, Arc::<[u8]>::from(object.bytes)));
+                id
+            };
+            let a = add(&[boundary], 21);
+            let b = add(&[a], 22);
+            let c = add(&[b], 23);
+            let d = add(&[c, a], 24);
+            let e = add(&[d], 25);
+            let merge_graph = OverlayGraph::extend(
+                remote,
+                objects,
+                &crate::query_overlay::OverlayLimits::default(),
+                &mut WorkBudget::default(),
+                Arc::new(()),
+            )
+            .unwrap();
+            let merge_prepare_ms = merged.elapsed().as_secs_f64() * 1000.0;
+            cases.push((
+                "dag_unequal_merge_generation_three",
+                merge_graph.clone(),
+                dag_range(commits(&[a]), commits(&[e]), 3, Some(4)),
+                vec![d],
+            ));
+            cases.push((
+                "dag_unequal_merge_generation_four",
+                merge_graph,
+                dag_range(commits(&[a]), commits(&[e]), 4, Some(5)),
+                vec![e],
+            ));
+            let stats = index.stats().unwrap();
+            assert_eq!(stats.nodes, public_count as u64);
+            for (name, graph, expression, expected) in cases {
+                assert!(
+                    overall.elapsed() < std::time::Duration::from_secs(180),
+                    "bounded fixture/query loop expired"
+                );
+                let limits = EvalLimits::default();
+                let frontier_limit = limits.max_frontier;
+                let interval_limit = limits.max_intervals;
+                let started = std::time::Instant::now();
+                let mut evaluator = Evaluator::new(graph, expression, limits).unwrap();
+                let compile_ms = started.elapsed().as_secs_f64() * 1000.0;
+                let walking = std::time::Instant::now();
+                let mut budget = WorkBudget::default();
+                let mut observed = Vec::new();
+                let mut progress = 0usize;
+                let mut status = "step_limit".to_owned();
+                let mut complete = false;
+                for _ in 0..100_000 {
+                    assert!(
+                        overall.elapsed() < std::time::Duration::from_secs(180),
+                        "bounded evaluation loop expired"
+                    );
+                    match evaluator.step(&mut budget) {
+                        Ok(EvalStep::Row(node)) => {
+                            assert_eq!(
+                                expected.get(observed.len()),
+                                Some(&node.commit()),
+                                "{name}: ordered output prefix differs"
+                            );
+                            observed.push(node.commit());
+                        }
+                        Ok(EvalStep::Progress) => progress += 1,
+                        Ok(EvalStep::Done) => {
+                            complete = true;
+                            status = "complete".into();
+                            break;
+                        }
+                        Err(EvalError::Graph(GraphError::BudgetExceeded)) => {
+                            status = "resource_exhausted".into();
+                            break;
+                        }
+                        Err(error) => {
+                            status = format!("error:{error}");
+                            break;
+                        }
+                    }
+                }
+                let walk_ms = walking.elapsed().as_secs_f64() * 1000.0;
+                if complete {
+                    assert_eq!(observed, expected, "{name}: complete coverage differs");
+                }
+                println!(
+                    "TINYTREE_ROOTS_DAGRANGE_READY_BENCH_V1 {}",
+                    serde_json::json!({
+                        "case":name,"public_commits":public_count,"linear_private_chain_commits":10,"merge_private_commits":5,
+                        "index_open_ms":index_open_ms,"public_seed_ms":public_seed_ms,"remote_scope_ms":remote_scope_ms,
+                        "private_prepare_ms":private_prepare_ms,"merge_prepare_ms":merge_prepare_ms,
+                        "canonical_public_bytes":canonical_public_bytes,"linear_private_canonical_bytes":canonical_private_bytes,
+                        "index_nodes":stats.nodes,"index_logical_bytes":stats.logical_bytes,
+                        "compile_ms":compile_ms,"walk_ms":walk_ms,"ready_query_ms":compile_ms+walk_ms,
+                        "cpu_steps":evaluator.steps(),"metadata_probes":budget.nodes_read(),"edges_read":budget.edges_read(),"metadata_bytes":budget.bytes_read(),
+                        "progress_steps":progress,"observed_rows":observed.len(),"expected_rows":expected.len(),"complete":complete,"status":status,
+                        "configured_frontier_slots":frontier_limit,"configured_interval_slots":interval_limit,"peak_frontier":"not instrumented",
+                        "scope":"ready production index/private overlay; in-process evaluator, no transport or CLI timing",
+                        "baseline":"operators previously unsupported; no before/after speedup ratio",
+                        "file_rpcs":0
+                    })
+                );
+            }
+        }
+    }
+    // END TINYTREE_ROOTS_DAGRANGE_READY_BENCH_V1
 }
