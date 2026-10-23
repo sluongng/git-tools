@@ -225,6 +225,7 @@ struct CommandState {
 }
 enum Phase {
     Open,
+    Capturing,
     Frozen([u8; 32]),
     Complete(CheckpointReceipt),
     Failed,
@@ -469,6 +470,62 @@ impl Registry {
         let worker = storage::runtime()?.spawn(checkpoint_worker(context, checkpoint));
         worker.await.map_err(|_| Error::Poisoned)?
     }
+    /// Seal a command before capturing its final state. The callback starts only
+    /// after all accepted job leases have drained, while the collector fence is
+    /// still held. It must read the final state directly, not resolve this closed
+    /// command token or enqueue work counted among its own drained jobs.
+    ///
+    /// Once accepted, cancellation of the caller does not cancel capture or its
+    /// durable checkpoint. A failed capture leaves the workspace dirty. This
+    /// captures local root claims only; it is not a remote backup receipt.
+    pub async fn capture_checkpoint<C, F>(
+        &self,
+        token: CommandToken,
+        capture: C,
+    ) -> Result<CheckpointReceipt>
+    where
+        C: FnOnce() -> F + Send + 'static,
+        F: std::future::Future<Output = Result<RootCheckpoint>> + Send + 'static,
+    {
+        self.inner.check()?;
+        let context = self.lookup(token)?;
+        // Obtain the runtime before sealing: failure must not leave an accepted
+        // capture without its physical worker.
+        let runtime = storage::runtime()?;
+        {
+            let mut state = context.state.lock().map_err(|_| Error::Poisoned)?;
+            if !state.owner_alive {
+                return Err(Error::ClosedCommand);
+            }
+            if !matches!(state.phase, Phase::Open) {
+                return Err(Error::CheckpointConflict);
+            }
+            state.phase = Phase::Capturing;
+        }
+        let worker = runtime.spawn(async move {
+            drain_jobs(&context).await?;
+            let result = async {
+                let checkpoint = capture().await?;
+                let commit = context.clone();
+                storage::blocking(move || {
+                    let checkpoint = storage::canonical(checkpoint, &commit.registry.limits)?;
+                    let fingerprint =
+                        storage::fingerprint(&commit.registration, commit.epoch, &checkpoint);
+                    commit.registry.checkpoint(
+                        commit.registration,
+                        commit.epoch,
+                        checkpoint,
+                        fingerprint,
+                    )
+                })
+                .await
+            }
+            .await;
+            finish_checkpoint(&context, &result)?;
+            result
+        });
+        worker.await.map_err(|_| Error::Poisoned)?
+    }
     pub async fn acquire_collector(&self) -> Result<CollectorGuard> {
         self.inner.check()?;
         let write = self.inner.fence.clone().write_owned().await;
@@ -554,13 +611,7 @@ async fn checkpoint_worker(
             changed.await;
         }
     }
-    loop {
-        let changed = context.changed.notified();
-        if context.state.lock().map_err(|_| Error::Poisoned)?.jobs == 0 {
-            break;
-        }
-        changed.await;
-    }
+    drain_jobs(&context).await?;
     let commit = context.clone();
     let result = storage::blocking(move || {
         commit
@@ -568,15 +619,28 @@ async fn checkpoint_worker(
             .checkpoint(commit.registration, commit.epoch, checkpoint, fingerprint)
     })
     .await;
+    finish_checkpoint(&context, &result)?;
+    result
+}
+async fn drain_jobs(context: &CommandContext) -> Result<()> {
+    loop {
+        let changed = context.changed.notified();
+        if context.state.lock().map_err(|_| Error::Poisoned)?.jobs == 0 {
+            return Ok(());
+        }
+        changed.await;
+    }
+}
+fn finish_checkpoint(context: &CommandContext, result: &Result<CheckpointReceipt>) -> Result<()> {
     {
         let mut state = context.state.lock().map_err(|_| Error::Poisoned)?;
-        state.phase = match &result {
+        state.phase = match result {
             Ok(receipt) => Phase::Complete(receipt.clone()),
             Err(_) => Phase::Failed,
         };
     }
     context.changed.notify_waiters();
-    result
+    Ok(())
 }
 #[cfg(test)]
 mod tests;

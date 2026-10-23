@@ -600,3 +600,123 @@ fn reopen_rejects_valid_old_clean_row_under_newer_manifest_without_repair() {
         );
     });
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn capture_reads_after_physical_jobs_and_survives_caller_cancellation() {
+    let (_directory, registry) = registry().await;
+    let registration = registry
+        .register(WorkspaceId([2; 16]), OpStoreId([3; 16]))
+        .await
+        .unwrap();
+    let owner = registry.begin_command(registration).await.unwrap();
+    let token = owner.token();
+    let physical_job = registry.resolve(token).unwrap();
+    let state = Arc::new(std::sync::atomic::AtomicU8::new(4));
+    let final_state = state.clone();
+    let (entered, entered_rx) = tokio::sync::oneshot::channel();
+    let (release, release_rx) = tokio::sync::oneshot::channel();
+    let capture_registry = registry.clone();
+    let callback_registry = registry.clone();
+    let pending = tokio::spawn(async move {
+        capture_registry
+            .capture_checkpoint(token, move || async move {
+                assert!(matches!(
+                    callback_registry.resolve(token),
+                    Err(Error::ClosedCommand)
+                ));
+                let value = final_state.load(Ordering::Acquire);
+                entered.send(value).unwrap();
+                release_rx.await.unwrap();
+                Ok(checkpoint(value))
+            })
+            .await
+    });
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            match registry.resolve(token) {
+                Err(Error::ClosedCommand) => break,
+                Ok(probe) => drop(probe),
+                Err(other) => panic!("unexpected resolve: {other}"),
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(
+        registry
+            .capture_checkpoint(token, || async { Ok(checkpoint(9)) })
+            .await
+            .unwrap_err(),
+        Error::CheckpointConflict
+    );
+    assert!(!pending.is_finished());
+    pending.abort();
+    assert!(pending.await.unwrap_err().is_cancelled());
+    drop(owner);
+    let collection_registry = registry.clone();
+    let collection = tokio::spawn(async move { collection_registry.acquire_collector().await });
+    assert_eq!(
+        registry.workspace(registration).await.unwrap().state,
+        WorkspaceState::Dirty
+    );
+    state.store(7, Ordering::Release);
+    drop(physical_job);
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(2), entered_rx)
+            .await
+            .unwrap()
+            .unwrap(),
+        7,
+        "capture must observe the completed physical mutation"
+    );
+    assert!(!collection.is_finished(), "capture still owns the fence");
+    release.send(()).unwrap();
+    let collector = tokio::time::timeout(Duration::from_secs(2), collection)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert!(collector.roots().contains(&ObjectKey {
+        kind: Kind::Commit,
+        id: tinytree_model::ObjectId([7; 32]),
+    }));
+    drop(collector);
+    assert_eq!(
+        registry.workspace(registration).await.unwrap().state,
+        WorkspaceState::Clean
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn failed_capture_preserves_dirty_state_and_allows_a_new_command() {
+    let (_directory, registry) = registry().await;
+    let registration = registry
+        .register(WorkspaceId([2; 16]), OpStoreId([3; 16]))
+        .await
+        .unwrap();
+    let owner = registry.begin_command(registration).await.unwrap();
+    assert_eq!(
+        registry
+            .capture_checkpoint(owner.token(), || async { Err(Error::Storage) })
+            .await
+            .unwrap_err(),
+        Error::Storage
+    );
+    assert!(matches!(
+        registry.resolve(owner.token()),
+        Err(Error::ClosedCommand)
+    ));
+    drop(owner);
+    assert!(matches!(
+        registry.acquire_collector().await,
+        Err(Error::DirtyWorkspace)
+    ));
+    let owner = registry.begin_command(registration).await.unwrap();
+    registry
+        .capture_checkpoint(owner.token(), || async { Ok(checkpoint(8)) })
+        .await
+        .unwrap();
+    drop(owner);
+    registry.acquire_collector().await.unwrap();
+}
