@@ -3429,3 +3429,477 @@ fn native_reference_replacement_checks_poststate_not_old_plus_new_cloud_union() 
     store.gc("demo", 101).unwrap();
     assert_eq!(store.descriptor("demo", replacement.key).unwrap(), None);
 }
+
+fn cloud_index_artifacts(head: CommitId) -> Vec<tinytree_cloud::EncodedIndexArtifact> {
+    use tinytree_cloud::{
+        IndexArtifact, IndexArtifactId, IndexCollection, IndexNode, IndexNodePayload, IndexRoot,
+    };
+    let leaf = tinytree_cloud::encode_index_artifact(
+        &IndexArtifact::Node(IndexNode {
+            collection: IndexCollection::Anchors,
+            depth: 0,
+            prefix: [0; 32],
+            records: 1,
+            record_bytes: 32,
+            payload: IndexNodePayload::Anchors(vec![head]),
+        }),
+        Default::default(),
+    )
+    .unwrap();
+    let IndexArtifactId::Node(id) = leaf.descriptor.id else {
+        panic!("node fixture");
+    };
+    let root = tinytree_cloud::encode_index_artifact(
+        &IndexArtifact::Root(IndexRoot {
+            anchors: id,
+            drafts: None,
+            anchor_count: 1,
+            draft_count: 0,
+        }),
+        Default::default(),
+    )
+    .unwrap();
+    vec![leaf, root]
+}
+#[test]
+fn typed_index_artifacts_are_owner_scoped_readable_and_reopenable_without_op_ids() {
+    let (directory, store) = open();
+    let owner = CloudOwner {
+        principal: [61; 32],
+    };
+    let other = CloudOwner {
+        principal: [62; 32],
+    };
+    store.create_repository("other").unwrap();
+    let artifacts = cloud_index_artifacts(CommitId([7; 32]));
+    for artifact in &artifacts {
+        let receipt = store
+            .put_cloud_index_artifact(
+                "demo",
+                owner,
+                artifact.descriptor,
+                &artifact.bytes,
+                0,
+                Default::default(),
+            )
+            .unwrap();
+        assert_eq!(receipt.descriptor, artifact.descriptor);
+        assert_eq!(receipt.staging_lease.len(), 64);
+        let retry = store
+            .put_cloud_index_artifact(
+                "demo",
+                owner,
+                artifact.descriptor,
+                &artifact.bytes,
+                1,
+                Default::default(),
+            )
+            .unwrap();
+        assert_eq!(receipt.staging_lease, retry.staging_lease);
+        assert_eq!(
+            store
+                .lookup_cloud_index_artifacts("demo", other, &[artifact.descriptor.id])
+                .unwrap(),
+            vec![None]
+        );
+        assert_eq!(
+            store
+                .lookup_cloud_index_artifacts("other", owner, &[artifact.descriptor.id])
+                .unwrap(),
+            vec![None]
+        );
+        let mut bytes = Vec::new();
+        store
+            .read_cloud_index_artifact("demo", owner, artifact.descriptor.id, Default::default())
+            .unwrap()
+            .read_to_end(&mut bytes)
+            .unwrap();
+        assert_eq!(bytes, artifact.bytes);
+    }
+    assert!(
+        store
+            .client_gc("demo", &client_collection(&store, 2))
+            .is_err()
+    );
+    assert_eq!(
+        store
+            .inner
+            .db
+            .read_tx()
+            .get(&store.inner.spaces.meta, b"format")
+            .unwrap()
+            .unwrap()
+            .as_ref(),
+        b"tinytree-store-4"
+    );
+    drop(store);
+    let store = Store::open_existing(directory.path(), config()).unwrap();
+    for artifact in artifacts {
+        assert_eq!(
+            store
+                .lookup_cloud_index_artifacts("demo", owner, &[artifact.descriptor.id])
+                .unwrap(),
+            vec![Some(artifact.descriptor)]
+        );
+    }
+}
+#[test]
+fn actual_index_root_reader_keeps_present_artifact_and_native_descendants_through_gc() {
+    let (directory, store) = open();
+    let owner = CloudOwner {
+        principal: [63; 32],
+    };
+    let (file, _, head) = fixture(&store, "index read lease");
+    let artifacts = cloud_index_artifacts(CommitId(head.key.id.0));
+    for artifact in &artifacts {
+        store
+            .put_cloud_index_artifact(
+                "demo",
+                owner,
+                artifact.descriptor,
+                &artifact.bytes,
+                0,
+                Default::default(),
+            )
+            .unwrap();
+    }
+    let reader = store
+        .read_cloud_index_artifact(
+            "demo",
+            owner,
+            artifacts[1].descriptor.id,
+            Default::default(),
+        )
+        .unwrap();
+    store.gc("demo", 100).unwrap();
+    assert_eq!(store.descriptor("demo", file.key).unwrap(), Some(file));
+    assert!(
+        store
+            .lookup_cloud_index_artifacts("demo", owner, &[artifacts[0].descriptor.id])
+            .unwrap()[0]
+            .is_some()
+    );
+    drop(reader);
+    let report = store.gc("demo", 101).unwrap();
+    assert_eq!(report.deleted_cloud_objects, 2);
+    assert_eq!(
+        store
+            .lookup_cloud_index_artifacts("demo", owner, &[artifacts[1].descriptor.id])
+            .unwrap(),
+        vec![None]
+    );
+    assert_eq!(store.descriptor("demo", file.key).unwrap(), None);
+    drop(store);
+    Store::open_existing(directory.path(), config()).unwrap();
+}
+#[test]
+fn index_artifact_upload_rejects_bad_typed_identity_and_raw_bytes_before_ack() {
+    let (directory, store) = open();
+    let owner = CloudOwner {
+        principal: [64; 32],
+    };
+    let artifacts = cloud_index_artifacts(CommitId([8; 32]));
+    let artifact = &artifacts[0];
+    let mut bad = artifact.descriptor;
+    bad.id = tinytree_cloud::IndexArtifactId::Root(tinytree_cloud::IndexRootId([9; 32]));
+    assert!(matches!(
+        store.put_cloud_index_artifact("demo", owner, bad, &artifact.bytes, 0, Default::default()),
+        Err(Error::Invalid(_))
+    ));
+    let mut corrupt = artifact.bytes.clone();
+    corrupt[0] ^= 1;
+    assert!(matches!(
+        store.put_cloud_index_artifact(
+            "demo",
+            owner,
+            artifact.descriptor,
+            &corrupt,
+            0,
+            Default::default()
+        ),
+        Err(Error::Invalid(_))
+    ));
+    assert_eq!(
+        store
+            .lookup_cloud_index_artifacts("demo", owner, &[artifact.descriptor.id])
+            .unwrap(),
+        vec![None]
+    );
+    drop(store);
+    Store::open_existing(directory.path(), config()).unwrap();
+}
+#[test]
+fn index_and_op_uploads_share_owner_staging_and_repository_physical_quotas() {
+    let directory = tempfile::tempdir().unwrap();
+    let artifact = cloud_index_artifacts(CommitId([10; 32])).remove(0);
+    let object = cloud_view(CommitId([11; 32]));
+    let mut cfg = config();
+    cfg.max_repository_bytes = tinytree_model::empty_tree().descriptor.size_bytes
+        + artifact.descriptor.selected.size_bytes;
+    let store = Store::open(directory.path(), cfg).unwrap();
+    store.create_repository("demo").unwrap();
+    let owner = CloudOwner {
+        principal: [65; 32],
+    };
+    store
+        .put_cloud_index_artifact(
+            "demo",
+            owner,
+            artifact.descriptor,
+            &artifact.bytes,
+            0,
+            Default::default(),
+        )
+        .unwrap();
+    assert!(matches!(
+        store.put_cloud_object(
+            "demo",
+            owner,
+            object.id(),
+            object.digest().unwrap(),
+            object.payload().unwrap(),
+            0,
+            Default::default()
+        ),
+        Err(Error::Limit(_))
+    ));
+    let extra = tinytree_model::describe_file(b"extra");
+    assert!(matches!(
+        store.put("demo", extra, b"extra", 0),
+        Err(Error::Limit(_))
+    ));
+}
+#[test]
+fn index_feature4_survives_pack_and_missing_required_index_space_fails_closed() {
+    let (directory, store) = open();
+    let owner = CloudOwner {
+        principal: [66; 32],
+    };
+    let (_, _, head) = fixture(&store, "packed index root");
+    let artifact = cloud_index_artifacts(CommitId(head.key.id.0)).remove(0);
+    store
+        .put_cloud_index_artifact(
+            "demo",
+            owner,
+            artifact.descriptor,
+            &artifact.bytes,
+            0,
+            Default::default(),
+        )
+        .unwrap();
+    store.pack("demo", PackOptions::default()).unwrap();
+    assert_eq!(
+        store
+            .inner
+            .db
+            .read_tx()
+            .get(&store.inner.spaces.meta, b"format")
+            .unwrap()
+            .unwrap()
+            .as_ref(),
+        b"tinytree-store-4"
+    );
+    drop(store);
+    let store = Store::open_existing(directory.path(), config()).unwrap();
+    drop(store);
+    {
+        let db = SingleWriterTxDatabase::builder(directory.path().join("metadata"))
+            .open()
+            .unwrap();
+        let meta = db.keyspace("meta", KeyspaceCreateOptions::default).unwrap();
+        let mut tx = db.write_tx().durability(Some(PersistMode::SyncAll));
+        tx.insert(&meta, b"format", b"tinytree-store-3");
+        tx.commit().unwrap();
+    }
+    assert!(matches!(
+        Store::open_existing(directory.path(), config()),
+        Err(Error::Corrupt("cloud index feature marker missing"))
+    ));
+    {
+        let db = SingleWriterTxDatabase::builder(directory.path().join("metadata"))
+            .open()
+            .unwrap();
+        let meta = db.keyspace("meta", KeyspaceCreateOptions::default).unwrap();
+        let mut tx = db.write_tx().durability(Some(PersistMode::SyncAll));
+        tx.insert(&meta, b"format", b"tinytree-store-4");
+        tx.commit().unwrap();
+    }
+    {
+        let db = SingleWriterTxDatabase::builder(directory.path().join("metadata"))
+            .open()
+            .unwrap();
+        let space = db
+            .keyspace("cloud-index-staging-v1", KeyspaceCreateOptions::default)
+            .unwrap();
+        db.inner().delete_keyspace(space.inner().clone()).unwrap();
+    }
+    assert!(matches!(
+        Store::open_existing(directory.path(), config()),
+        Err(Error::Corrupt("cloud index keyspace missing"))
+    ));
+}
+
+fn cloud_payload_bytes(path: &std::path::Path) -> u64 {
+    let root = path.join("cloud");
+    if !root.exists() {
+        return 0;
+    }
+    let mut directories = vec![root];
+    let mut bytes = 0;
+    while let Some(directory) = directories.pop() {
+        for entry in fs::read_dir(directory).unwrap() {
+            let entry = entry.unwrap();
+            let ty = entry.file_type().unwrap();
+            if ty.is_dir() {
+                directories.push(entry.path());
+            } else if ty.is_file() {
+                bytes += entry.metadata().unwrap().len();
+            }
+        }
+    }
+    bytes
+}
+#[test]
+fn rejected_cloud_metadata_quota_installs_no_raw_payload_and_retry_can_succeed() {
+    for index in [false, true] {
+        let directory = tempfile::tempdir().unwrap();
+        let mut cfg = config();
+        cfg.cloud.max_metadata_bytes_per_owner = 1;
+        let store = Store::open(directory.path(), cfg).unwrap();
+        store.create_repository("demo").unwrap();
+        let owner = CloudOwner {
+            principal: [67; 32],
+        };
+        let object = cloud_view(CommitId([12; 32]));
+        let artifact = cloud_index_artifacts(CommitId([13; 32])).remove(0);
+        for _ in 0..3 {
+            let result = if index {
+                store
+                    .put_cloud_index_artifact(
+                        "demo",
+                        owner,
+                        artifact.descriptor,
+                        &artifact.bytes,
+                        0,
+                        Default::default(),
+                    )
+                    .map(|_| ())
+            } else {
+                store
+                    .put_cloud_object(
+                        "demo",
+                        owner,
+                        object.id(),
+                        object.digest().unwrap(),
+                        object.payload().unwrap(),
+                        0,
+                        Default::default(),
+                    )
+                    .map(|_| ())
+            };
+            assert!(matches!(result, Err(Error::Limit("cloud owner quota"))));
+            assert_eq!(
+                cloud_payload_bytes(directory.path()),
+                0,
+                "a rejected metadata promise must not leak raw disk usage"
+            );
+        }
+        drop(store);
+        let store = Store::open_existing(directory.path(), config()).unwrap();
+        let expected = if index {
+            store
+                .put_cloud_index_artifact(
+                    "demo",
+                    owner,
+                    artifact.descriptor,
+                    &artifact.bytes,
+                    1,
+                    Default::default(),
+                )
+                .unwrap();
+            artifact.bytes.len() as u64
+        } else {
+            store
+                .put_cloud_object(
+                    "demo",
+                    owner,
+                    object.id(),
+                    object.digest().unwrap(),
+                    object.payload().unwrap(),
+                    1,
+                    Default::default(),
+                )
+                .unwrap();
+            object.payload().unwrap().len() as u64
+        };
+        assert_eq!(cloud_payload_bytes(directory.path()), expected);
+        drop(store);
+        Store::open_existing(directory.path(), config()).unwrap();
+    }
+}
+#[test]
+fn preexisting_verified_index_raw_payload_is_reused_without_overwrite() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut cfg = config();
+    cfg.cloud.max_metadata_bytes_per_owner = 1;
+    let store = Store::open(directory.path(), cfg).unwrap();
+    store.create_repository("demo").unwrap();
+    let owner = CloudOwner {
+        principal: [68; 32],
+    };
+    let artifact = cloud_index_artifacts(CommitId([14; 32])).remove(0);
+    assert!(
+        store
+            .put_cloud_index_artifact(
+                "demo",
+                owner,
+                artifact.descriptor,
+                &artifact.bytes,
+                0,
+                Default::default()
+            )
+            .is_err()
+    );
+    drop(store);
+    // Model a previous interrupted publication: complete canonical raw bytes
+    // exist without a catalog row. Upload must verify and sync the collision,
+    // never adopt a different representation or overwrite unknown bytes.
+    let namespace = fs::read_dir(directory.path().join("cloud"))
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+    let path = namespace.join(hex(&artifact.descriptor.selected.blake3));
+    fs::write(&path, &artifact.bytes).unwrap();
+    let store = Store::open_existing(directory.path(), config()).unwrap();
+    let receipt = store
+        .put_cloud_index_artifact(
+            "demo",
+            owner,
+            artifact.descriptor,
+            &artifact.bytes,
+            1,
+            Default::default(),
+        )
+        .unwrap();
+    let again = store
+        .put_cloud_index_artifact(
+            "demo",
+            owner,
+            artifact.descriptor,
+            &artifact.bytes,
+            2,
+            Default::default(),
+        )
+        .unwrap();
+    assert_eq!(receipt.descriptor, again.descriptor);
+    assert_eq!(receipt.staging_lease, again.staging_lease);
+    assert_eq!(fs::read(path).unwrap(), artifact.bytes);
+    assert_eq!(
+        cloud_payload_bytes(directory.path()),
+        artifact.bytes.len() as u64
+    );
+    drop(store);
+    Store::open_existing(directory.path(), config()).unwrap();
+}

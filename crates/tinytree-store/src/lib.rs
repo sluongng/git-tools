@@ -25,9 +25,9 @@ use tinytree_model::{CommitId, Descriptor, Kind, Limits, ObjectId, ObjectKey};
 
 mod cloud;
 pub use cloud::{
-    CloudConfig, CloudObjectDescriptor, CloudOwner, CloudPublication, CloudPublicationLimits,
-    CloudReadLease, CloudVersion, CloudVersionReadGuard, CloudWorkspace, CloudWriteReceipt,
-    PublishCloudRequest,
+    CloudConfig, CloudIndexReadLease, CloudIndexWriteReceipt, CloudObjectDescriptor, CloudOwner,
+    CloudPublication, CloudPublicationLimits, CloudReadLease, CloudVersion, CloudVersionReadGuard,
+    CloudWorkspace, CloudWriteReceipt, PublishCloudRequest,
 };
 mod client_gc;
 mod closure;
@@ -200,6 +200,7 @@ struct Spaces {
 struct Runtime {
     readers: HashMap<(String, ObjectKey), usize>,
     cloud_readers: HashMap<(String, [u8; 32], tinytree_cloud::ObjectId), usize>,
+    index_artifact_readers: HashMap<(String, [u8; 32], tinytree_cloud::IndexArtifactId), usize>,
     cloud_reservations: HashMap<(String, [u8; 32]), (u64, u64, u64)>,
     cloud_version_readers: HashMap<(String, [u8; 32], [u8; 32], u64), usize>,
     staging_bytes: u64,
@@ -352,6 +353,7 @@ fn store_feature(value: Option<&[u8]>) -> Result<u8> {
         Some(b"tinytree-store-1") => Ok(1),
         Some(b"tinytree-store-2") => Ok(2),
         Some(b"tinytree-store-3") => Ok(3),
+        Some(b"tinytree-store-4") => Ok(4),
         _ => Err(Error::Corrupt("store format")),
     }
 }
@@ -365,6 +367,7 @@ fn advance_feature(
         let value = match minimum {
             2 => b"tinytree-store-2".as_slice(),
             3 => b"tinytree-store-3".as_slice(),
+            4 => b"tinytree-store-4".as_slice(),
             _ => return Err(Error::Invalid("store feature")),
         };
         tx.insert(meta, b"format", value);
@@ -594,7 +597,7 @@ impl Store {
         {
             return Err(Error::Corrupt("packed store keyspace missing"));
         }
-        let cloud_spaces = cloud::Spaces::open(&db, feature >= 3)?;
+        let cloud_spaces = cloud::Spaces::open(&db, feature)?;
         if feature >= 3 {
             let metadata = fs::symlink_metadata(root.join("cloud"))
                 .map_err(|_| Error::Corrupt("cloud payload namespace missing"))?;
@@ -618,12 +621,9 @@ impl Store {
         };
         let mut tx = db.write_tx().durability(Some(PersistMode::SyncAll));
         match tx.get(&spaces.meta, b"format")? {
-            Some(value)
-                if matches!(
-                    &*value,
-                    b"tinytree-store-1" | b"tinytree-store-2" | b"tinytree-store-3"
-                ) => {}
-            Some(_) => return Err(Error::Corrupt("store format")),
+            Some(value) => {
+                store_feature(Some(value.as_ref()))?;
+            }
             None if planned.fresh => {
                 tx.insert(&spaces.meta, b"format", b"tinytree-store-1");
             }

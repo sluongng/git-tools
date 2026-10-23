@@ -20,6 +20,7 @@ pub struct CloudWriteReceipt {
 #[derive(Clone, Debug)]
 pub struct CloudConfig {
     pub max_object_bytes: usize,
+    pub index_artifacts: tinytree_cloud::IndexArtifactLimits,
     pub manifest_limits: tinytree_cloud::ManifestLimits,
     pub max_version_decode_bytes: usize,
     pub max_decode_bytes: usize,
@@ -39,6 +40,7 @@ impl Default for CloudConfig {
     fn default() -> Self {
         Self {
             max_object_bytes: 4 * 1024 * 1024,
+            index_artifacts: Default::default(),
             manifest_limits: tinytree_cloud::ManifestLimits::default(),
             max_version_decode_bytes: 512 * 1024 * 1024,
             max_decode_bytes: 64 * 1024 * 1024,
@@ -58,6 +60,9 @@ impl Default for CloudConfig {
 }
 impl CloudConfig {
     pub(super) fn validate(&self) -> Result<()> {
+        self.index_artifacts
+            .validate()
+            .map_err(|_| Error::Invalid("cloud index artifact limits"))?;
         self.manifest_limits
             .validate()
             .map_err(|_| Error::Invalid("cloud manifest limits"))?;
@@ -87,6 +92,8 @@ impl CloudConfig {
 // Keep read and precommit bounds identical; a durable ACK must remain readable.
 const CLOUD_JSON_ROW_BYTES: usize = 1024 * 1024;
 const CLOUD_BINARY_ROW_BYTES: usize = 64 * 1024 * 1024 + 4096;
+mod artifacts;
+pub use artifacts::{CloudIndexReadLease, CloudIndexWriteReceipt};
 mod versions;
 pub use versions::{
     CloudPublication, CloudPublicationLimits, CloudVersion, CloudVersionReadGuard, CloudWorkspace,
@@ -98,7 +105,7 @@ fn decode<T: serde::de::DeserializeOwned>(bytes: &[u8]) -> Result<T> {
     }
     serde_json::from_slice(bytes).map_err(|_| Error::Corrupt("cloud metadata encoding"))
 }
-const TABLES: [&str; 9] = [
+const TABLES: [&str; 11] = [
     "cloud-objects-v1",
     "cloud-blobs-v1",
     "cloud-staging-v1",
@@ -108,6 +115,8 @@ const TABLES: [&str; 9] = [
     "cloud-native-roots-v1",
     "cloud-receipts-v1",
     "cloud-accounting-v1",
+    "cloud-index-artifacts-v1",
+    "cloud-index-staging-v1",
 ];
 pub(super) struct Spaces {
     objects: SingleWriterTxKeyspace,
@@ -119,11 +128,16 @@ pub(super) struct Spaces {
     roots: SingleWriterTxKeyspace,
     receipts: SingleWriterTxKeyspace,
     accounting: SingleWriterTxKeyspace,
+    index_artifacts: SingleWriterTxKeyspace,
+    index_staging: SingleWriterTxKeyspace,
 }
 impl Spaces {
-    pub(super) fn open(db: &SingleWriterTxDatabase, required: bool) -> Result<Self> {
-        if required && TABLES.iter().any(|name| !db.keyspace_exists(name)) {
+    pub(super) fn open(db: &SingleWriterTxDatabase, feature: u8) -> Result<Self> {
+        if feature >= 3 && TABLES[..9].iter().any(|name| !db.keyspace_exists(name)) {
             return Err(Error::Corrupt("cloud keyspace missing"));
+        }
+        if feature >= 4 && TABLES[9..].iter().any(|name| !db.keyspace_exists(name)) {
+            return Err(Error::Corrupt("cloud index keyspace missing"));
         }
         Ok(Self {
             objects: db.keyspace(TABLES[0], KeyspaceCreateOptions::default)?,
@@ -135,9 +149,11 @@ impl Spaces {
             roots: db.keyspace(TABLES[6], KeyspaceCreateOptions::default)?,
             receipts: db.keyspace(TABLES[7], KeyspaceCreateOptions::default)?,
             accounting: db.keyspace(TABLES[8], KeyspaceCreateOptions::default)?,
+            index_artifacts: db.keyspace(TABLES[9], KeyspaceCreateOptions::default)?,
+            index_staging: db.keyspace(TABLES[10], KeyspaceCreateOptions::default)?,
         })
     }
-    fn all(&self) -> [&SingleWriterTxKeyspace; 9] {
+    fn all(&self) -> [&SingleWriterTxKeyspace; 11] {
         [
             &self.objects,
             &self.blobs,
@@ -148,6 +164,8 @@ impl Spaces {
             &self.roots,
             &self.receipts,
             &self.accounting,
+            &self.index_artifacts,
+            &self.index_staging,
         ]
     }
 }
@@ -559,11 +577,27 @@ impl Inner {
         id: CloudId,
         digest: BlobDigest,
     ) -> Result<CloudReservation> {
+        self.reserve_cloud_catalog(
+            repo,
+            owner,
+            &self.spaces.cloud.objects,
+            object_key(repo, owner, id),
+            digest,
+        )
+    }
+    fn reserve_cloud_catalog(
+        self: &Arc<Self>,
+        repo: &str,
+        owner: CloudOwner,
+        space: &SingleWriterTxKeyspace,
+        catalog_key: Vec<u8>,
+        digest: BlobDigest,
+    ) -> Result<CloudReservation> {
         let mut gate = self.lock()?;
         let native = self.repository(repo)?;
         let repository = self.cloud_account(&repo_prefix(repo))?;
         let principal = self.cloud_account(&scope(repo, owner))?;
-        let existing = self.cloud_object(repo, owner, id)?;
+        let existing = self.db.read_tx().get(space, catalog_key)?;
         let blob = self.db.read_tx().get(
             &self.spaces.cloud.blobs,
             blob_key(repo, owner, digest.blake3),
@@ -914,37 +948,6 @@ impl Store {
                     expires_at: expires,
                 });
             }
-            let target = self.inner.cloud_path(repo, owner, digest.blake3);
-            match temporary.persist_noclobber(&target) {
-                Ok(file) => drop(file),
-                Err(error) if error.error.kind() == io::ErrorKind::AlreadyExists => {
-                    temporary = error.file;
-                    let metadata = fs::symlink_metadata(&target)?;
-                    if !metadata.is_file() || metadata.len() != digest.size_bytes {
-                        return Err(Error::Corrupt("cloud raw blob type or size"));
-                    }
-                    if raw_candidate.is_none() {
-                        let mut file = File::open(&target)?;
-                        drop(_gate);
-                        let mut actual = Vec::new();
-                        (&mut file)
-                            .take(digest.size_bytes + 1)
-                            .read_to_end(&mut actual)?;
-                        if BlobDigest::of(&actual) != digest {
-                            return Err(Error::Corrupt("cloud raw blob collision"));
-                        }
-                        file.sync_all()?;
-                        raw_candidate = Some(file);
-                        continue;
-                    }
-                }
-                Err(error) => return Err(error.error.into()),
-            }
-            sync_dir(
-                target
-                    .parent()
-                    .ok_or(Error::Corrupt("cloud payload path"))?,
-            )?;
             let view = self.inner.db.read_tx();
             let key = blob_key(repo, owner, digest.blake3);
             let old = view.get(&self.inner.spaces.cloud.blobs, &key)?;
@@ -1008,6 +1011,43 @@ impl Store {
                     stages: 1,
                     ..Default::default()
                 },
+            )?;
+            // Reject catalog/owner/validation quotas before installing a raw
+            // payload. The transaction is still uncommitted: bytes and their
+            // directory must become durable before any successful metadata ACK.
+            let target = self.inner.cloud_path(repo, owner, digest.blake3);
+            match temporary.persist_noclobber(&target) {
+                Ok(file) => drop(file),
+                Err(error) if error.error.kind() == io::ErrorKind::AlreadyExists => {
+                    temporary = error.file;
+                    let metadata = fs::symlink_metadata(&target)?;
+                    if !metadata.is_file() || metadata.len() != digest.size_bytes {
+                        return Err(Error::Corrupt("cloud raw blob type or size"));
+                    }
+                    if raw_candidate.is_none() {
+                        let mut file = File::open(&target)?;
+                        // Release the uncommitted writer transaction before
+                        // verifying an existing raw file outside the GC gate.
+                        drop(tx);
+                        drop(_gate);
+                        let mut actual = Vec::new();
+                        (&mut file)
+                            .take(digest.size_bytes + 1)
+                            .read_to_end(&mut actual)?;
+                        if BlobDigest::of(&actual) != digest {
+                            return Err(Error::Corrupt("cloud raw blob collision"));
+                        }
+                        file.sync_all()?;
+                        raw_candidate = Some(file);
+                        continue;
+                    }
+                }
+                Err(error) => return Err(error.error.into()),
+            }
+            sync_dir(
+                target
+                    .parent()
+                    .ok_or(Error::Corrupt("cloud payload path"))?,
             )?;
             self.inner.commit(tx)?;
             drop(_gate);
@@ -1159,6 +1199,7 @@ impl Inner {
                 .checked_add(1)
                 .ok_or(Error::Corrupt("cloud blob references overflow"))?;
         }
+        self.validate_index_catalog(feature, &mut expected, &mut blob_refs, &mut scan)?;
         for item in view.iter(&self.spaces.cloud.blobs) {
             let (key, value) = item.into_inner()?;
             scan.visit(self, &key, &value)?;
@@ -1474,6 +1515,7 @@ impl Inner {
                 .or_insert((owner, 0));
             references.1 += 1;
         }
+        self.index_gc_into(repo, now, gate, &mut scan, &mut plan, &mut victim_refs)?;
         for (key, (owner, removed)) in victim_refs {
             let bytes = view
                 .get(&self.spaces.cloud.blobs, &key)?
