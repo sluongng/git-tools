@@ -28,6 +28,7 @@ struct Inner {
     stores: HashMap<String, Arc<dyn NativeObjectIo>>,
     controls: HashMap<String, Arc<dyn crate::NativeRepositoryControl>>,
     queries: HashMap<String, Arc<dyn crate::NativeQueryIo>>,
+    descriptions: HashMap<String, crate::ProviderDescription>,
     query_work: ObjectIoResources,
     config: Config,
     metadata_work: ObjectIoResources,
@@ -38,7 +39,8 @@ struct Inner {
 impl Inner {
     async fn admit(&self, path: &str, deadline: Instant) -> Result<Arc<Work>, Status> {
         let is_control = path.starts_with("/native.broker.v1.RepositoryControl/");
-        let is_query = path.starts_with("/native.broker.v1.QueryIo/");
+        let is_query =
+            path.starts_with("/native.broker.v1.QueryIo/") && !path.ends_with("/DescribeProvider");
         if is_query && self.queries.is_empty() {
             return Err(Status::failed_precondition(
                 "native repository query is not configured",
@@ -153,6 +155,7 @@ impl BrokerService {
                 metadata_work,
                 controls: HashMap::new(),
                 queries: HashMap::new(),
+                descriptions: HashMap::new(),
                 query_work: ObjectIoResources::default(),
                 calls: Arc::new(Semaphore::new(config.max_inflight)),
                 memory: Arc::new(Semaphore::new(config.max_memory_bytes)),
@@ -191,11 +194,51 @@ impl BrokerService {
             .controls = controls;
         Ok(self)
     }
+    /// Register independently computed provider identities before sharing the
+    /// service. Query capability must agree with actual configured adapters.
+    pub fn with_provider_descriptions(
+        mut self,
+        descriptions: HashMap<String, crate::ProviderDescription>,
+    ) -> Result<Self, Status> {
+        if descriptions.len() != self.inner.stores.len() {
+            return Err(Status::invalid_argument(
+                "native provider identity registry is incomplete",
+            ));
+        }
+        for (id, value) in &descriptions {
+            wire::id(id)?;
+            if !self.inner.stores.contains_key(id)
+                || value.identity == [0; 32]
+                || value.query_capable != self.inner.queries.contains_key(id)
+            {
+                return Err(Status::invalid_argument(
+                    "invalid native provider identity registration",
+                ));
+            }
+        }
+        Arc::get_mut(&mut self.inner)
+            .ok_or_else(|| {
+                Status::failed_precondition("register provider identity before sharing service")
+            })?
+            .descriptions = descriptions;
+        Ok(self)
+    }
+    pub fn describe_provider(&self, id: &str) -> Result<crate::ProviderDescription, Status> {
+        self.store(id)?;
+        self.inner.descriptions.get(id).copied().ok_or_else(|| {
+            Status::failed_precondition("native provider identity is not configured")
+        })
+    }
     /// Attach immutable-query adapters only to existing configured aliases.
     pub fn with_queries(
         mut self,
         queries: HashMap<String, Arc<dyn crate::NativeQueryIo>>,
     ) -> Result<Self, Status> {
+        if !self.inner.descriptions.is_empty() {
+            return Err(Status::failed_precondition(
+                "query adapters must be registered before provider descriptions",
+            ));
+        }
         let mut query_work = ObjectIoResources::default();
         let mut distinct = std::collections::HashSet::new();
         let mut persistent = 0u64;
@@ -259,8 +302,13 @@ impl BrokerService {
             .send_compressed(CompressionEncoding::Zstd)
             .max_decoding_message_size(cap)
             .max_encoding_message_size(cap);
+        let describe = raw
+            .clone()
+            .max_decoding_message_size(1024)
+            .max_encoding_message_size(1024);
         crate::query_service::QueryRpcService {
             inner: self.wrap(raw),
+            describe: self.wrap(describe),
         }
     }
     /// Same admission and adapter as local RPC, without a recursive RPC call.

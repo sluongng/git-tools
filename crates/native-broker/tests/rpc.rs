@@ -2450,3 +2450,149 @@ async fn local_query_deadline_returns_while_accepted_provider_job_and_drain_rema
     assert!(finished.load(std::sync::atomic::Ordering::SeqCst));
     assert_eq!(dropped.load(std::sync::atomic::Ordering::SeqCst), 1);
 }
+
+#[tokio::test]
+async fn live_provider_description_binds_alias_identity_and_separate_creation_policy() {
+    use native_broker::{BrokerQueryClient, ProviderDescription, ProviderIndexMode};
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path().canonicalize().unwrap();
+    private(&root);
+    private(&root.join("store"));
+    let provider: Arc<dyn NativeObjectIo> =
+        Arc::new(DirectObjectIo::init(&root.join("store"), backend_config()).unwrap());
+    let stores = HashMap::from([
+        ("first".to_owned(), provider.clone()),
+        ("second".to_owned(), provider),
+    ]);
+    let description = ProviderDescription {
+        identity: [17; 32],
+        query_capable: false,
+        index_mode: ProviderIndexMode::Legacy,
+    };
+    assert!(
+        BrokerService::new(stores.clone(), query_config())
+            .unwrap()
+            .with_provider_descriptions(HashMap::from([("first".into(), description)]))
+            .is_err()
+    );
+    let mut wrong = description;
+    wrong.query_capable = true;
+    assert!(
+        BrokerService::new(stores.clone(), query_config())
+            .unwrap()
+            .with_provider_descriptions(HashMap::from([
+                ("first".into(), wrong),
+                ("second".into(), description)
+            ]))
+            .is_err()
+    );
+    let query: Arc<dyn native_broker::NativeQueryIo> = Arc::new(FakeQuery::new(1, 1024));
+    let descriptions = HashMap::from([
+        ("first".into(), description),
+        ("second".into(), description),
+    ]);
+    assert!(
+        BrokerService::new(stores.clone(), query_config())
+            .unwrap()
+            .with_provider_descriptions(descriptions)
+            .unwrap()
+            .with_queries(HashMap::from([("first".into(), query.clone())]))
+            .is_err()
+    );
+    assert!(
+        BrokerService::new(stores.clone(), query_config())
+            .unwrap()
+            .with_queries(HashMap::from([("first".into(), query)]))
+            .unwrap()
+            .with_provider_descriptions(HashMap::from([
+                ("first".into(), wrong),
+                ("second".into(), description)
+            ]))
+            .unwrap()
+            .with_queries(HashMap::new())
+            .is_err()
+    );
+    let mut second = description;
+    second.identity = [18; 32];
+    second.index_mode = ProviderIndexMode::Federated;
+    let service = BrokerService::new(stores, query_config())
+        .unwrap()
+        .with_provider_descriptions(HashMap::from([
+            ("first".into(), description),
+            ("second".into(), second),
+        ]))
+        .unwrap();
+    assert_eq!(service.describe_provider("first").unwrap(), description);
+    let socket = root.join("describe.sock");
+    let host = Running::start_service(&socket, service).await;
+    let first = BrokerQueryClient::connect(&socket, "first", query_config())
+        .await
+        .unwrap();
+    let second_client = BrokerQueryClient::connect(&socket, "second", query_config())
+        .await
+        .unwrap();
+    assert_eq!(
+        first.describe_provider().await.unwrap(),
+        description,
+        "description is available even without a query adapter"
+    );
+    assert_eq!(second_client.describe_provider().await.unwrap(), second);
+    let unknown = BrokerQueryClient::connect(&socket, "unknown", query_config())
+        .await
+        .unwrap();
+    assert_eq!(
+        unknown.describe_provider().await.unwrap_err().code(),
+        tonic::Code::NotFound
+    );
+    // Unknown fields vanish during Prost decoding: the route must enforce the
+    // small handshake cap on the raw/decompressed message, before allocation.
+    #[derive(Clone, prost::Message)]
+    struct OversizedDescription {
+        #[prost(string, tag = "1")]
+        store_id: String,
+        #[prost(bytes = "vec", tag = "99")]
+        unknown: Vec<u8>,
+    }
+    for compressed in [false, true] {
+        let socket = socket.clone();
+        let channel = tonic::transport::Endpoint::from_static("http://[::]:50051")
+            .connect_with_connector(tower::service_fn(move |_: http::Uri| {
+                let path = socket.clone();
+                async move {
+                    Ok::<_, std::io::Error>(hyper_util::rt::TokioIo::new(
+                        tokio::net::UnixStream::connect(path).await?,
+                    ))
+                }
+            }))
+            .await
+            .unwrap();
+        let mut raw = tonic::client::Grpc::new(channel);
+        if compressed {
+            raw = raw.send_compressed(tonic::codec::CompressionEncoding::Zstd);
+        }
+        raw.ready().await.unwrap();
+        let result: Result<
+            tonic::Response<native_broker::proto::ProviderDescription>,
+            tonic::Status,
+        > = raw
+            .unary(
+                tonic::Request::new(OversizedDescription {
+                    store_id: "first".into(),
+                    unknown: vec![0; 2048],
+                }),
+                http::uri::PathAndQuery::from_static("/native.broker.v1.QueryIo/DescribeProvider"),
+                tonic_prost::ProstCodec::default(),
+            )
+            .await;
+        assert_eq!(
+            result.unwrap_err().code(),
+            if compressed {
+                tonic::Code::ResourceExhausted
+            } else {
+                tonic::Code::OutOfRange
+            }
+        );
+    }
+    drop((first, second_client, unknown));
+    host.stop().await;
+}

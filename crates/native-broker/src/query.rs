@@ -6,6 +6,19 @@ use tinytree_model::CommitId;
 use tinytree_proto::query_v1 as q;
 use tonic::Status;
 
+/// Creation policy is not part of provider security identity. Existing stores
+/// always load their recorded index/type rather than applying this preference.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ProviderIndexMode {
+    Legacy,
+    Federated,
+}
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ProviderDescription {
+    pub identity: [u8; 32],
+    pub query_capable: bool,
+    pub index_mode: ProviderIndexMode,
+}
 /// Owner of physical request/job work only. It may contain an inflight slot;
 /// implementations must not move it into persistent registry or reply owners.
 pub type QueryOwner = Arc<dyn Any + Send + Sync>;

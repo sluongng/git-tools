@@ -249,6 +249,8 @@ pub(crate) fn bounded_input(bytes: usize, cap: usize) -> Result<(), Status> {
 pub struct QueryRpcService {
     pub(crate) inner:
         tower::util::BoxCloneSyncService<HttpRequest<Body>, HttpResponse<Body>, Infallible>,
+    pub(crate) describe:
+        tower::util::BoxCloneSyncService<HttpRequest<Body>, HttpResponse<Body>, Infallible>,
 }
 impl NamedService for QueryRpcService {
     const NAME: &'static str = "native.broker.v1.QueryIo";
@@ -258,14 +260,42 @@ impl Service<HttpRequest<Body>> for QueryRpcService {
     type Error = Infallible;
     type Future = Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send>>;
     fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
-        self.inner.poll_ready(cx)
+        std::task::ready!(self.inner.poll_ready(cx))?;
+        self.describe.poll_ready(cx)
     }
     fn call(&mut self, request: HttpRequest<Body>) -> Self::Future {
-        self.inner.call(request)
+        if request.uri().path() == "/native.broker.v1.QueryIo/DescribeProvider" {
+            self.describe.call(request)
+        } else {
+            self.inner.call(request)
+        }
     }
 }
 #[tonic::async_trait]
 impl p::query_io_server::QueryIo for BrokerService {
+    async fn describe_provider(
+        &self,
+        request: Request<p::DescribeProviderRequest>,
+    ) -> Result<Response<p::ProviderDescription>, Status> {
+        let (input, work) = input(request, 1024)?;
+        let description = self.describe_provider(&input.store_id)?;
+        reply(
+            QueryReply {
+                value: p::ProviderDescription {
+                    store_id: input.store_id,
+                    identity: description.identity.to_vec(),
+                    query_capable: Some(description.query_capable),
+                    index_mode: match description.index_mode {
+                        crate::ProviderIndexMode::Legacy => p::ProviderIndexMode::Legacy,
+                        crate::ProviderIndexMode::Federated => p::ProviderIndexMode::Federated,
+                    } as i32,
+                },
+                owner: Arc::new(()),
+            },
+            work,
+            1024,
+        )
+    }
     async fn open_scope(
         &self,
         request: Request<p::QueryOpenScopeRequest>,

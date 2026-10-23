@@ -623,14 +623,8 @@ fn open_native_host(
         }
     }
 
-    let broker =
-        native_broker::BrokerService::new(stores, config.native.broker_config(&config.reapi))
-            .and_then(|broker| broker.with_controls(controls))
-            .and_then(|broker| broker.with_queries(queries))
-            .map_err(|status| {
-                anyhow::anyhow!("cannot configure native broker: {}", status.message())
-            })?;
-
+    let mut descriptions = std::collections::HashMap::new();
+    let mut scopes = BTreeMap::new();
     for (alias, settings) in &config.native.repositories {
         let store_path = root.join(alias).canonicalize()?;
         let mut fingerprint = blake3::Hasher::new();
@@ -649,17 +643,42 @@ fn open_native_host(
             fingerprint.update(&(bytes.len() as u64).to_le_bytes());
             fingerprint.update(&bytes);
         }
-        let scope = native_workspace::Scope::from_configured_identity(
-            alias,
-            fingerprint.finalize().as_bytes(),
-        )?;
+        let identity = *fingerprint.finalize().as_bytes();
+        let scope = native_workspace::Scope::from_configured_identity(alias, &identity)?;
+        scopes.insert(alias.clone(), scope);
+        descriptions.insert(
+            alias.clone(),
+            native_broker::ProviderDescription {
+                identity,
+                query_capable: queries.contains_key(alias),
+                index_mode: match config.native.workspaces.index_mode {
+                    crate::config::NativeIndexMode::Legacy => {
+                        native_broker::ProviderIndexMode::Legacy
+                    }
+                    crate::config::NativeIndexMode::Federated => {
+                        native_broker::ProviderIndexMode::Federated
+                    }
+                },
+            },
+        );
+    }
+    let broker =
+        native_broker::BrokerService::new(stores, config.native.broker_config(&config.reapi))
+            .and_then(|broker| broker.with_controls(controls))
+            .and_then(|broker| broker.with_queries(queries))
+            .and_then(|broker| broker.with_provider_descriptions(descriptions))
+            .map_err(|status| {
+                anyhow::anyhow!("cannot configure native broker: {}", status.message())
+            })?;
+
+    for (alias, settings) in &config.native.repositories {
         retained.insert(
             alias.clone(),
             crate::native_workspaces::Repository {
                 io: broker
                     .source_io(alias)
                     .map_err(|_| anyhow::anyhow!("cannot configure native source provider"))?,
-                scope,
+                scope: scopes.remove(alias).expect("configured provider scope"),
                 remote: settings.remote.is_some(),
             },
         );
@@ -1364,8 +1383,23 @@ mod tests {
             open_native_repositories(&config, &cache, &BTreeMap::new()).is_err(),
             "a second provider must not steal the live owner lock"
         );
+        let identity = broker.describe_provider("example")?;
+        assert_eq!(
+            identity.index_mode,
+            native_broker::ProviderIndexMode::Legacy
+        );
         drop(broker);
+        config.native.workspaces.index_mode = crate::config::NativeIndexMode::Federated;
         let reopened = open_native_repositories(&config, &cache, &BTreeMap::new())?.unwrap();
+        let changed_policy = reopened.describe_provider("example")?;
+        assert_eq!(
+            changed_policy.identity, identity.identity,
+            "index rollout policy is not provider security identity"
+        );
+        assert_eq!(
+            changed_policy.index_mode,
+            native_broker::ProviderIndexMode::Federated
+        );
         drop(reopened);
 
         let (broker, providers) =

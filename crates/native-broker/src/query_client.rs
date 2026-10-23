@@ -203,6 +203,42 @@ impl BrokerQueryClient {
         })
         .await
     }
+    /// Check a live daemon identity; persisted local manifests are never their
+    /// own expected identity. This performs no upstream repository discovery.
+    pub async fn describe_provider(&self) -> Result<crate::ProviderDescription, Status> {
+        let expected = self.inner.store.clone();
+        let reply = self
+            .execute(Arc::new(()), |mut client, deadline, store, _| async move {
+                client = client
+                    .max_decoding_message_size(1024)
+                    .max_encoding_message_size(1024);
+                Ok(client
+                    .describe_provider(request(
+                        p::DescribeProviderRequest { store_id: store },
+                        deadline,
+                        1024,
+                    )?)
+                    .await?
+                    .into_inner())
+            })
+            .await?
+            .value;
+        let identity: [u8; 32] = reply.identity.try_into().map_err(|_| integrity())?;
+        if reply.store_id != expected || identity == [0; 32] {
+            return Err(integrity());
+        }
+        let index_mode =
+            match p::ProviderIndexMode::try_from(reply.index_mode).map_err(|_| integrity())? {
+                p::ProviderIndexMode::Legacy => crate::ProviderIndexMode::Legacy,
+                p::ProviderIndexMode::Federated => crate::ProviderIndexMode::Federated,
+                _ => return Err(integrity()),
+            };
+        Ok(crate::ProviderDescription {
+            identity,
+            index_mode,
+            query_capable: reply.query_capable.ok_or_else(integrity)?,
+        })
+    }
     fn preflight(&self, payload_bytes: usize) -> Result<(), Status> {
         crate::query_service::bounded_input(
             payload_bytes.saturating_add(crate::query_service::field_bytes(self.inner.store.len())),

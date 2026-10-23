@@ -67,9 +67,20 @@ impl Default for Native {
         }
     }
 }
+/// Rollout policy for newly created native indexes, not provider identity.
+#[derive(Clone, Copy, Default, Debug, Eq, PartialEq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NativeIndexMode {
+    #[default]
+    Legacy,
+    Federated,
+}
+
 #[derive(Clone, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct NativeWorkspaces {
+    /// Experimental opt-in; existing index/type always wins on reload.
+    pub index_mode: NativeIndexMode,
     /// None uses the per-user registry shared with the native jj client.
     pub registry_path: Option<PathBuf>,
     pub max_workspaces: usize,
@@ -81,6 +92,7 @@ pub struct NativeWorkspaces {
 impl Default for NativeWorkspaces {
     fn default() -> Self {
         Self {
+            index_mode: NativeIndexMode::Legacy,
             registry_path: None,
             max_workspaces: 128,
             max_entries: 100_000,
@@ -737,6 +749,15 @@ mod tests {
         let old: Config = toml::from_str(EXAMPLE).unwrap();
         assert!(old.native.repositories.is_empty());
         assert_eq!(old.native.workspaces.max_workspaces, 128);
+        assert_eq!(old.native.workspaces.index_mode, NativeIndexMode::Legacy);
+        assert_eq!(
+            toml::from_str::<Config>("[native.workspaces]\nindex_mode='federated'\n")
+                .unwrap()
+                .native
+                .workspaces
+                .index_mode,
+            NativeIndexMode::Federated
+        );
         assert!(old.native.workspaces.registry_path.is_none());
         for value in [0, 4097] {
             let mut invalid = old.clone();

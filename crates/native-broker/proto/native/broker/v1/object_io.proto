@@ -51,6 +51,7 @@ message PublicationReply {
 // Immutable repository queries through the configured local alias. Handles are
 // broker-local and never carry upstream connection settings or cursor tokens.
 service QueryIo {
+  rpc DescribeProvider(DescribeProviderRequest) returns (ProviderDescription);
   rpc OpenScope(QueryOpenScopeRequest) returns (QueryScopeReply);
   rpc ForkScope(QueryForkScopeRequest) returns (QueryScopeReply);
   rpc Facts(QueryFactsRequest) returns (tinytree.query.v1.GraphFacts);
@@ -101,3 +102,14 @@ message QueryPageReply {
 message QueryReadCommitRequest { string store_id = 1; bytes scope = 2; bytes commit = 3; }
 message QueryCloseRequest { string store_id = 1; bytes handle = 2; }
 message QueryCloseReply {}
+
+// Local opaque identity and creation policy only. No upstream connection or
+// authorization settings cross this owner-private transport boundary.
+enum ProviderIndexMode { PROVIDER_INDEX_MODE_UNSPECIFIED = 0; LEGACY = 1; FEDERATED = 2; }
+message DescribeProviderRequest { string store_id = 1; }
+message ProviderDescription {
+  string store_id = 1;
+  bytes identity = 2; // Exactly 32 nonzero opaque daemon-computed bytes.
+  optional bool query_capable = 3;
+  ProviderIndexMode index_mode = 4;
+}
