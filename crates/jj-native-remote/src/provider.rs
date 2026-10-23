@@ -33,18 +33,15 @@ impl RemoteObjectIo {
         let claim = io::blocking_owned(owner.clone(), move || ledger.claim(id.0)).await?;
         let Some(claim) = claim else { return Ok(None) };
         let ledger = self.inner.ledger.clone();
-        let root = m::CommitId(unhex(&claim.root)?);
+        let authority_key = claim.root.clone();
         let tree = m::ObjectKey {
             kind: m::Kind::Tree,
             id: m::ObjectId(unhex(&claim.tree)?),
         };
-        let retained = io::blocking_owned(owner.clone(), move || ledger.root(root))
+        let retained = io::blocking_owned(owner.clone(), move || ledger.authority(&authority_key))
             .await?
             .context("native file provenance root disappeared")?;
-        ensure!(
-            retained.retained(),
-            "native file provenance root is not pinned"
-        );
+        self.inner.ledger.validate_authority(&retained)?;
         self.prove_owned(&retained, tree, owner.clone(), self.inner.deadline())
             .await?;
         let metadata = self
@@ -117,16 +114,20 @@ impl RemoteObjectIo {
             .await?
             .context("native lazy file lacks admission provenance")?;
         let ledger = self.inner.ledger.clone();
-        let root_id = m::CommitId(unhex(&claim.root)?);
-        let root = io::blocking(move || ledger.root(root_id))
+        let authority_key = claim.root;
+        let authority = io::blocking(move || ledger.authority(&authority_key))
             .await?
-            .context("native lazy file admission root missing")?;
-        if root.binding != self.inner.ledger.binding.scope {
-            crate::RemoteRepositoryControl {
-                inner: self.inner.clone(),
+            .context("native lazy file admission authority missing")?;
+        if let Some(root) = authority.root() {
+            if root.binding != self.inner.ledger.binding.scope {
+                crate::RemoteRepositoryControl {
+                    inner: self.inner.clone(),
+                }
+                .refresh_scope_hold(m::CommitId(unhex(&root.head)?))
+                .await?;
             }
-            .refresh_scope_hold(root_id)
-            .await?;
+        } else {
+            self.inner.ledger.validate_authority(&authority)?;
         }
         Ok(())
     }

@@ -235,6 +235,35 @@ pub struct DirectObjectIo {
     copy_gate: Arc<tokio::sync::Mutex<()>>,
     staging_bytes: Arc<tokio::sync::Semaphore>,
     staging_uploads: Arc<tokio::sync::Semaphore>,
+    #[cfg(test)]
+    metadata_put_hook: Option<Arc<dyn Fn() + Send + Sync>>,
+}
+// Field order is part of the admission contract: destroy payloads and their
+// physical storage/staging owners before releasing the external operation owner.
+type MetadataOwner = Arc<dyn std::any::Any + Send + Sync>;
+struct MetadataEncodeInput {
+    object: Option<m::Object>,
+    copy_guard: Option<tokio::sync::OwnedMutexGuard<()>>,
+    owner: Option<MetadataOwner>,
+}
+struct MetadataEncoded {
+    encoded: m::EncodedObject,
+    copy_parents: BTreeSet<m::CopyId>,
+    copy_guard: Option<tokio::sync::OwnedMutexGuard<()>>,
+    owner: MetadataOwner,
+}
+struct MetadataPutJob {
+    encoded: m::EncodedObject,
+    copy_parents: BTreeSet<m::CopyId>,
+    store: Arc<Store>,
+    _reservation: (
+        tokio::sync::OwnedSemaphorePermit,
+        tokio::sync::OwnedSemaphorePermit,
+    ),
+    _copy_guard: Option<tokio::sync::OwnedMutexGuard<()>>,
+    #[cfg(test)]
+    hook: Option<Arc<dyn Fn() + Send + Sync>>,
+    _owner: MetadataOwner,
 }
 impl fmt::Debug for DirectObjectIo {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -242,6 +271,89 @@ impl fmt::Debug for DirectObjectIo {
     }
 }
 impl DirectObjectIo {
+    #[cfg(test)]
+    pub(crate) fn set_metadata_put_hook(&mut self, hook: Arc<dyn Fn() + Send + Sync>) {
+        self.metadata_put_hook = Some(hook);
+    }
+    /// Install fetched or authored immutable bytes while retaining the caller's
+    /// complete admission/lifetime owner through actual blocking encode/put.
+    /// This does not publish operation roots or create retention authority.
+    pub async fn write_metadata_with_owner(
+        &self,
+        object: m::Object,
+        owner: Arc<dyn std::any::Any + Send + Sync>,
+    ) -> BackendResult<m::Descriptor> {
+        let mut input = MetadataEncodeInput {
+            object: Some(object),
+            copy_guard: None,
+            owner: Some(owner),
+        };
+        if matches!(input.object.as_ref(), Some(m::Object::CopyHistory(_))) {
+            input.copy_guard = Some(self.copy_gate.clone().lock_owned().await);
+        }
+        let limits = self.config.store.model_limits;
+        let encoded = io::blocking(move || {
+            // Move the whole aggregate, preventing disjoint closure captures
+            // from selecting a different field destruction order.
+            let mut input = input;
+            let object = input.object.as_ref().expect("owned metadata input");
+            let encoded = m::encode(object, limits).map_err(other)?;
+            let copy_parents = match object {
+                m::Object::CopyHistory(copy) => copy.parents.iter().copied().collect(),
+                _ => BTreeSet::new(),
+            };
+            // Drop decoded input before transferring the owner to the result.
+            // A cancelled join waiter can leave this result owned by Tokio.
+            drop(input.object.take());
+            Ok(MetadataEncoded {
+                encoded,
+                copy_parents,
+                copy_guard: input.copy_guard.take(),
+                owner: input.owner.take().expect("owned metadata admission"),
+            })
+        })
+        .await?;
+        let reservation = self
+            .reserve_staging(encoded.encoded.descriptor.size_bytes)
+            .await?;
+        let job = MetadataPutJob {
+            encoded: encoded.encoded,
+            copy_parents: encoded.copy_parents,
+            store: self.store.clone(),
+            _reservation: reservation,
+            _copy_guard: encoded.copy_guard,
+            #[cfg(test)]
+            hook: self.metadata_put_hook.clone(),
+            _owner: encoded.owner,
+        };
+        io::blocking(move || {
+            let job = job;
+            #[cfg(test)]
+            if let Some(hook) = &job.hook {
+                hook();
+            }
+            for id in &job.copy_parents {
+                let key = m::ObjectKey {
+                    kind: m::Kind::CopyHistory,
+                    id: m::ObjectId(id.0),
+                };
+                let (descriptor, bytes) =
+                    job.store.read_metadata(REPOSITORY, key).map_err(other)?;
+                VerifiedMetadata::verify(descriptor, bytes, limits)?;
+            }
+            job.store
+                .put(
+                    REPOSITORY,
+                    job.encoded.descriptor,
+                    &job.encoded.bytes,
+                    now()?,
+                )
+                .map_err(other)?;
+            Ok(job.encoded.descriptor)
+        })
+        .await
+    }
+
     pub fn init(path: &Path, config: Config) -> BackendResult<Self> {
         Self::open(path, config, true)
     }
@@ -304,6 +416,8 @@ impl DirectObjectIo {
             )),
             config,
             copy_gate: Arc::new(tokio::sync::Mutex::new(())),
+            #[cfg(test)]
+            metadata_put_hook: None,
         })
     }
     async fn reserve_staging(
@@ -366,40 +480,7 @@ impl NativeObjectIo for DirectObjectIo {
         .await
     }
     async fn write_metadata(&self, object: m::Object) -> BackendResult<m::Descriptor> {
-        let copy_guard = if matches!(&object, m::Object::CopyHistory(_)) {
-            Some(self.copy_gate.clone().lock_owned().await)
-        } else {
-            None
-        };
-        let limits = self.config.store.model_limits;
-        let (encoded, copy_parents) = io::blocking(move || {
-            let encoded = m::encode(&object, limits).map_err(other)?;
-            let copy_parents = match object {
-                m::Object::CopyHistory(copy) => copy.parents.into_iter().collect::<BTreeSet<_>>(),
-                _ => BTreeSet::new(),
-            };
-            Ok((encoded, copy_parents))
-        })
-        .await?;
-        let reservation = self.reserve_staging(encoded.descriptor.size_bytes).await?;
-        let store = self.store.clone();
-        io::blocking(move || {
-            let _copy_guard = copy_guard;
-            let _reservation = reservation;
-            for id in copy_parents {
-                let key = m::ObjectKey {
-                    kind: m::Kind::CopyHistory,
-                    id: m::ObjectId(id.0),
-                };
-                let (descriptor, bytes) = store.read_metadata(REPOSITORY, key).map_err(other)?;
-                VerifiedMetadata::verify(descriptor, bytes, limits)?;
-            }
-            store
-                .put(REPOSITORY, encoded.descriptor, &encoded.bytes, now()?)
-                .map_err(other)?;
-            Ok(encoded.descriptor)
-        })
-        .await
+        self.write_metadata_with_owner(object, Arc::new(())).await
     }
     async fn read_file(&self, id: m::FileId) -> BackendResult<FileRead> {
         let store = self.store.clone();

@@ -30,6 +30,7 @@ use tonic::{
 pub struct NativeClient {
     inner: Arc<Inner>,
     guards: crate::verified::LifetimeGuards,
+    rpc_guards: crate::verified::LifetimeGuards,
 }
 struct Inner {
     config: Config,
@@ -64,7 +65,39 @@ impl NativeClient {
         Self {
             inner: self.inner,
             guards: Arc::new(guards),
+            rpc_guards: self.rpc_guards,
         }
+    }
+    /// Pin a physical request/job owner through actual codec and blocking work.
+    /// Unlike `with_lifetime_guard`, this owner is never captured by query state,
+    /// returned pages/metadata/files, or deferred Drop cleanup. Use a transient
+    /// clone per operation; existing clones and access authorization are unchanged.
+    pub fn with_rpc_lifetime_guard<T: std::any::Any + Send + Sync>(self, guard: Arc<T>) -> Self {
+        let mut guards = self.rpc_guards.as_ref().clone();
+        guards.push(guard);
+        Self {
+            inner: self.inner,
+            guards: self.guards,
+            rpc_guards: Arc::new(guards),
+        }
+    }
+    fn without_rpc_guards(&self) -> Self {
+        Self {
+            inner: self.inner.clone(),
+            guards: self.guards.clone(),
+            rpc_guards: Default::default(),
+        }
+    }
+    fn rpc_lifetime_guards(&self) -> crate::verified::LifetimeGuards {
+        if self.rpc_guards.is_empty() {
+            return self.guards.clone();
+        }
+        let mut guards = self.guards.as_ref().clone();
+        guards.extend(self.rpc_guards.iter().cloned());
+        Arc::new(guards)
+    }
+    fn rpc_client(&self, budget: Arc<Budget>) -> RepositoryClient {
+        self.inner.grpc.clone().with_owner(budget)
     }
     pub async fn connect(config: Config) -> Result<Self, Status> {
         Self::connect_with_trust(config, None).await
@@ -198,6 +231,7 @@ impl NativeClient {
             tokio::sync::mpsc::channel(config.limits.query_cleanup_capacity);
         let client = Self {
             guards: Default::default(),
+            rpc_guards: Default::default(),
             inner: Arc::new(Inner {
                 inflight: Arc::new(Semaphore::new(config.limits.max_inflight)),
                 bytes: Arc::new(Semaphore::new(config.limits.max_buffered_bytes)),
@@ -248,7 +282,7 @@ impl NativeClient {
         Ok(Arc::new(Budget {
             _inflight: inflight,
             _bytes: bytes,
-            _guards: self.guards.clone(),
+            _guards: self.rpc_lifetime_guards(),
         }))
     }
     fn request<T>(&self, value: T, allowance: Duration) -> Request<T> {
@@ -304,7 +338,7 @@ impl NativeClient {
     pub async fn open(&self, names: Vec<String>) -> Result<p::RepositoryView, Status> {
         let deadline = self.deadline();
         self.batch(names.len())?;
-        let _budget = self.admit(deadline, self.unary_memory()).await?;
+        let budget = self.admit(deadline, self.unary_memory()).await?;
         if names
             .iter()
             .any(|name| name.is_empty() || name.len() > 4096)
@@ -327,9 +361,7 @@ impl NativeClient {
 
         self.retry(deadline, false, |allowance| {
             let mut grpc = self
-                .inner
-                .grpc
-                .clone()
+                .rpc_client(budget.clone())
                 .max_decoding_message_size(self.inner.config.limits.max_batch_bytes);
             let names = names.clone();
             async move {
@@ -372,7 +404,7 @@ impl NativeClient {
     pub async fn find_missing(&self, mut keys: Vec<ObjectKey>) -> Result<Vec<ObjectKey>, Status> {
         let deadline = self.deadline();
         self.batch(keys.len())?;
-        let _budget = self.admit(deadline, self.unary_memory()).await?;
+        let budget = self.admit(deadline, self.unary_memory()).await?;
         let mut unique = HashSet::new();
         keys.retain(|key| unique.insert(*key));
         self.bounded(&p::FindMissingObjectsRequest {
@@ -382,9 +414,7 @@ impl NativeClient {
 
         self.retry(deadline, false, |allowance| {
             let mut grpc = self
-                .inner
-                .grpc
-                .clone()
+                .rpc_client(budget.clone())
                 .max_decoding_message_size(self.inner.config.limits.max_batch_bytes);
             let keys = keys.clone();
             async move {
@@ -447,7 +477,7 @@ impl NativeClient {
             0usize,
         )));
         self.retry(deadline, true, |allowance| {
-            let mut grpc = self.inner.grpc.clone().max_decoding_message_size(
+            let mut grpc = self.rpc_client(budget.clone()).max_decoding_message_size(
                 self.inner
                     .config
                     .limits
@@ -607,9 +637,7 @@ impl NativeClient {
             let mut page = self
                 .retry(deadline, false, |allowance| {
                     let mut grpc = self
-                        .inner
-                        .grpc
-                        .clone()
+                        .rpc_client(budget.clone())
                         .max_decoding_message_size(self.inner.config.limits.max_graph_bytes);
                     let request = request.clone();
                     async move {
@@ -815,8 +843,7 @@ impl NativeClient {
         );
         let parent = parent.to_path_buf();
         let guards = self.guards.clone();
-        blocking(deadline, move || {
-            let _budget = budget;
+        blocking_owned(deadline, budget, None, move || {
             let parent = Arc::new(secure_directory(&parent)?);
             let file = tempfile::Builder::new()
                 .prefix("tinytree-")
@@ -849,7 +876,7 @@ impl NativeClient {
             )
             .await?;
         self.retry(deadline, true, |allowance| {
-            let mut grpc = self.inner.grpc.clone().max_decoding_message_size(
+            let mut grpc = self.rpc_client(budget.clone()).max_decoding_message_size(
                 self.inner
                     .config
                     .limits
@@ -971,9 +998,8 @@ impl NativeClient {
         let held = temporary.clone();
         let path = path.to_path_buf();
         let frame_bytes = self.inner.config.limits.max_frame_bytes;
-        blocking(deadline, move || {
+        blocking_owned(deadline, budget, Some(temporary.clone()), move || {
             use std::io::{Read, Write};
-            let _budget = budget;
             let mut options = std::fs::OpenOptions::new();
             options.read(true);
             #[cfg(unix)]
@@ -1074,7 +1100,7 @@ impl NativeClient {
             .await?;
         let object = Arc::new(object);
         let descriptor = object.descriptor;
-        self.retry(deadline,true,|allowance| {let mut grpc=self.inner.grpc.clone().max_decoding_message_size(1024).max_encoding_message_size(self.inner.config.limits.max_frame_bytes.saturating_add(1024));let object=object.clone();let budget=budget.clone();async move {
+        self.retry(deadline,true,|allowance| {let mut grpc=self.rpc_client(budget.clone()).max_decoding_message_size(1024).max_encoding_message_size(self.inner.config.limits.max_frame_bytes.saturating_add(1024));let object=object.clone();let budget=budget.clone();async move {
             let frame_bytes=self.inner.config.limits.max_frame_bytes;let repo=self.inner.config.repository_id.clone();
             let (done,finished)=tokio::sync::oneshot::channel();
             let stream=async_stream::stream!{let _budget=budget;yield header(&repo,descriptor);for (i,bytes) in object.bytes.chunks(frame_bytes).enumerate(){yield p::WriteFrame{frame:Some(p::write_frame::Frame::Chunk(p::DataChunk{offset:(i*frame_bytes) as u64,data:bytes.to_vec()}))};}let _=done.send(());};
@@ -1096,7 +1122,7 @@ impl NativeClient {
                 self.inner.config.limits.max_frame_bytes * 4 + 1024,
             )
             .await?;
-        self.retry(deadline,true,|allowance| {let mut grpc=self.inner.grpc.clone().max_decoding_message_size(1024).max_encoding_message_size(self.inner.config.limits.max_frame_bytes.saturating_add(1024));let source=source.clone();let budget=budget.clone();async move {
+        self.retry(deadline,true,|allowance| {let mut grpc=self.rpc_client(budget.clone()).max_decoding_message_size(1024).max_encoding_message_size(self.inner.config.limits.max_frame_bytes.saturating_add(1024));let source=source.clone();let budget=budget.clone();async move {
             let descriptor=source.descriptor();let frame_bytes=self.inner.config.limits.max_frame_bytes;let repo=self.inner.config.repository_id.clone();
             let held=source.clone();let memory=budget.clone();let file=blocking_owned(deadline,budget.clone(),Some(source.inner.temporary.clone()),move||{let _memory=memory;held.inner.temporary.file.reopen().map_err(|_|Status::internal("cannot reopen native upload snapshot"))}).await?;
             let (done,finished)=tokio::sync::oneshot::channel();
@@ -1123,19 +1149,22 @@ impl NativeClient {
     pub async fn publication(&self, idempotency_key: &str) -> Result<p::Publication, Status> {
         validate_idempotency(idempotency_key)?;
         let deadline = self.deadline();
-        let _budget = self.admit(deadline, self.unary_memory()).await?;
-        self.publication_at(idempotency_key, deadline).await
+        let budget = self.admit(deadline, self.unary_memory()).await?;
+        self.publication_at(idempotency_key, deadline, budget).await
     }
-    async fn publication_at(&self, id: &str, deadline: Instant) -> Result<p::Publication, Status> {
+    async fn publication_at(
+        &self,
+        id: &str,
+        deadline: Instant,
+        budget: Arc<Budget>,
+    ) -> Result<p::Publication, Status> {
         self.bounded(&p::GetPublicationRequest {
             repository_id: self.inner.config.repository_id.clone(),
             idempotency_key: id.into(),
         })?;
         self.retry(deadline, false, |allowance| {
             let mut grpc = self
-                .inner
-                .grpc
-                .clone()
+                .rpc_client(budget.clone())
                 .max_decoding_message_size(self.inner.config.limits.max_batch_bytes);
             async move {
                 let publication = grpc
@@ -1177,13 +1206,11 @@ impl NativeClient {
         self.batch(request.staging_leases.len())?;
         self.bounded(&request)?;
         let deadline = self.deadline();
-        let _budget = self.admit(deadline, self.unary_memory()).await?;
+        let budget = self.admit(deadline, self.unary_memory()).await?;
         let result = self
             .retry(deadline, false, |allowance| {
                 let mut grpc = self
-                    .inner
-                    .grpc
-                    .clone()
+                    .rpc_client(budget.clone())
                     .max_decoding_message_size(self.inner.config.limits.max_batch_bytes);
                 let request = request.clone();
                 async move {
@@ -1213,7 +1240,7 @@ impl NativeClient {
                     && Instant::now() < deadline =>
             {
                 match self
-                    .publication_at(&request.idempotency_key, deadline)
+                    .publication_at(&request.idempotency_key, deadline, budget.clone())
                     .await
                 {
                     Ok(receipt) => {
@@ -1221,9 +1248,10 @@ impl NativeClient {
                         // Query receipts omit original lease inputs. Replaying
                         // the exact request checks the complete binding too.
                         self.retry(deadline, false, |allowance| {
-                            let mut grpc = self.inner.grpc.clone().max_decoding_message_size(
-                                self.inner.config.limits.max_batch_bytes,
-                            );
+                            let mut grpc =
+                                self.rpc_client(budget.clone()).max_decoding_message_size(
+                                    self.inner.config.limits.max_batch_bytes,
+                                );
                             let request = request.clone();
                             async move {
                                 let confirmed = grpc
@@ -1360,8 +1388,8 @@ async fn blocking<T: Send + 'static>(
 // whose caller was cancelled before collecting its result.
 struct OwnedWork<T> {
     value: T,
-    _budget: Arc<Budget>,
     _temporary: Option<Temporary>,
+    _budget: Arc<Budget>,
 }
 async fn blocking_owned<T: Send + 'static>(
     deadline: Instant,
@@ -1370,14 +1398,20 @@ async fn blocking_owned<T: Send + 'static>(
     operation: impl FnOnce() -> Result<T, Status> + Send + 'static,
 ) -> Result<T, Status> {
     let work = blocking(deadline, move || {
-        operation().map(|value| OwnedWork {
-            value,
-            _budget: budget,
+        // Establish the ordered owner before invoking the operation, including
+        // errors or unwinding. Unreceived results and temporary cleanup must
+        // finish before the last physical request budget can be released.
+        let mut work = OwnedWork {
+            value: None,
             _temporary: temporary,
-        })
+            _budget: budget,
+        };
+        work.value = Some(operation());
+        Ok(work)
     })
     .await?;
-    Ok(work.value)
+    work.value
+        .ok_or_else(|| Status::internal("native client worker returned no result"))?
 }
 
 fn commit_heap(commit: &tinytree_model::Commit) -> usize {

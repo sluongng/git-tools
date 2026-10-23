@@ -4,6 +4,10 @@ A bounded, zstd-enabled native repository client for brokers and jj integrations
 It verifies canonical metadata and complete file hashes, retries replay-safe
 operations under one deadline, and reconciles uncertain reference publications.
 Presence and publication receipts are not retention leases.
+`with_lifetime_guard` pins persistent result/storage owners. Use a transient
+`with_rpc_lifetime_guard` clone for physical request or worker admission instead;
+that guard follows actual I/O/verification, not query state, returned results or
+later Drop cleanup.
 `canonical_commit_summaries` verifies each entry against canonical metadata, not
 the completeness or reachability of the server-selected set. A history importer
 must traverse/verify the complete canonical closure before admitting history.

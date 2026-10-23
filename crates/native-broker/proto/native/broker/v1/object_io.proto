@@ -1,5 +1,6 @@
 syntax = "proto3";
 package native.broker.v1;
+import "tinytree/query/v1/query.proto";
 
 // Private local daemon protocol. Store IDs select configured handles, not paths.
 // No Git service, remote retention promise or jj operation log is shared here.
@@ -46,3 +47,57 @@ message PublicationReply {
   // Absence is no confirmed receipt, not proof that upstream did not commit.
   optional ConfirmedPublication publication = 1;
 }
+
+// Immutable repository queries through the configured local alias. Handles are
+// broker-local and never carry upstream connection settings or cursor tokens.
+service QueryIo {
+  rpc OpenScope(QueryOpenScopeRequest) returns (QueryScopeReply);
+  rpc ForkScope(QueryForkScopeRequest) returns (QueryScopeReply);
+  rpc Facts(QueryFactsRequest) returns (tinytree.query.v1.GraphFacts);
+  rpc ResolveCommitPrefix(QueryCommitPrefixRequest) returns (tinytree.query.v1.CommitPrefixResult);
+  rpc ResolveChangePrefix(QueryChangePrefixRequest) returns (tinytree.query.v1.ChangePrefixResult);
+  rpc ShortestPrefix(QueryShortestPrefixRequest) returns (tinytree.query.v1.ShortestPrefixResult);
+  rpc Begin(QueryBeginRequest) returns (QueryHandleReply);
+  rpc Page(QueryPageRequest) returns (QueryPageReply);
+  rpc ReadCommit(QueryReadCommitRequest) returns (Metadata);
+  rpc CloseQuery(QueryCloseRequest) returns (QueryCloseReply);
+  rpc CloseScope(QueryCloseRequest) returns (QueryCloseReply);
+}
+message QueryOpenScopeRequest {
+  string store_id = 1; repeated bytes roots = 2;
+  repeated bytes overlay = 3; bytes replay_key = 4;
+}
+message QueryForkScopeRequest {
+  string store_id = 1; bytes parent = 2;
+  repeated bytes overlay = 3; bytes replay_key = 4;
+}
+message QueryScopeReply { bytes handle = 1; int64 expires_at_unix_seconds = 2; }
+message QueryFactsRequest {
+  string store_id = 1; bytes scope = 2;
+  repeated tinytree.query.v1.GraphFact facts = 3;
+}
+message QueryCommitPrefixRequest { string store_id = 1; bytes scope = 2; string hex_prefix = 3; }
+message QueryChangePrefixRequest {
+  string store_id = 1; bytes scope = 2; string hex_prefix = 3;
+  repeated bytes visible_heads = 4;
+}
+message QueryShortestPrefixRequest {
+  string store_id = 1; bytes scope = 2;
+  oneof target { bytes commit = 3; bytes change = 4; }
+  repeated bytes visible_heads = 5;
+}
+message QueryBeginRequest {
+  string store_id = 1; bytes scope = 2;
+  tinytree.query.v1.GraphExpr expression = 3;
+  tinytree.query.v1.Projection projection = 4;
+  uint32 page_size = 5; bytes replay_key = 6;
+}
+message QueryHandleReply { bytes handle = 1; int64 expires_at_unix_seconds = 2; }
+message QueryPageRequest { string store_id = 1; bytes query = 2; uint64 expected_sequence = 3; }
+message QueryPageReply {
+  uint64 sequence = 1; repeated tinytree.query.v1.GraphRow rows = 2;
+  optional bool exhausted = 3; // Required; cancellation is not EOF.
+}
+message QueryReadCommitRequest { string store_id = 1; bytes scope = 2; bytes commit = 3; }
+message QueryCloseRequest { string store_id = 1; bytes handle = 2; }
+message QueryCloseReply {}

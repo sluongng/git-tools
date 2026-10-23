@@ -1553,3 +1553,900 @@ async fn cancelled_control_drains_adapter_work_and_keeps_shared_object_pools_cha
     release.release();
     stopping.await.unwrap();
 }
+
+#[derive(Debug)]
+struct QueryPageProbe(Arc<std::sync::atomic::AtomicUsize>);
+impl Drop for QueryPageProbe {
+    fn drop(&mut self) {
+        self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+#[derive(Debug)]
+struct FakeQuery {
+    marker: u8,
+    persistent: u64,
+    closed: std::sync::atomic::AtomicBool,
+    page: std::sync::Mutex<Option<Arc<QueryPageProbe>>>,
+    dropped: Arc<std::sync::atomic::AtomicUsize>,
+    scope_calls: std::sync::atomic::AtomicUsize,
+    transient_pages: std::sync::atomic::AtomicUsize,
+    page_calls: std::sync::Mutex<Vec<([u8; 32], u64)>>,
+    fact_calls: std::sync::atomic::AtomicUsize,
+    page_pause: Option<Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>>,
+    page_entered: Arc<std::sync::atomic::AtomicBool>,
+    page_finished: Arc<std::sync::atomic::AtomicBool>,
+}
+impl FakeQuery {
+    fn new(marker: u8, persistent: u64) -> Self {
+        Self {
+            marker,
+            persistent,
+            closed: Default::default(),
+            page: Default::default(),
+            dropped: Default::default(),
+            scope_calls: Default::default(),
+            transient_pages: Default::default(),
+            page_calls: Default::default(),
+            fact_calls: Default::default(),
+            page_pause: None,
+            page_entered: Default::default(),
+            page_finished: Default::default(),
+        }
+    }
+    fn reply<T>(&self, value: T) -> native_broker::QueryReply<T> {
+        native_broker::QueryReply {
+            value,
+            owner: Arc::new(()),
+        }
+    }
+    fn scope(&self, scope: [u8; 32]) -> Result<(), tonic::Status> {
+        if scope != [self.marker; 32] {
+            return Err(tonic::Status::permission_denied(
+                "fixture private scope detail",
+            ));
+        }
+        Ok(())
+    }
+}
+#[async_trait::async_trait]
+impl native_broker::NativeQueryIo for FakeQuery {
+    fn resources(&self) -> native_broker::QueryResources {
+        native_broker::QueryResources {
+            memory_bytes: 1024,
+            temporary_bytes: 0,
+            persistent_memory_bytes: self.persistent,
+        }
+    }
+    async fn open_scope(
+        &self,
+        _: native_broker::OpenQueryScope,
+        _: native_broker::QueryOwner,
+    ) -> Result<native_broker::QueryReply<native_broker::QueryScope>, tonic::Status> {
+        self.scope_calls
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Ok(self.reply(native_broker::QueryScope {
+            handle: [self.marker; 32],
+            expires_at_unix_seconds: i64::MAX / 2,
+        }))
+    }
+    async fn fork_scope(
+        &self,
+        i: native_broker::ForkQueryScope,
+        _: native_broker::QueryOwner,
+    ) -> Result<native_broker::QueryReply<native_broker::QueryScope>, tonic::Status> {
+        self.scope(i.parent)?;
+        Ok(self.reply(native_broker::QueryScope {
+            handle: [self.marker; 32],
+            expires_at_unix_seconds: i64::MAX / 2,
+        }))
+    }
+    async fn facts(
+        &self,
+        s: [u8; 32],
+        f: Vec<native_broker::query_protocol::GraphFact>,
+        _: native_broker::QueryOwner,
+    ) -> Result<native_broker::QueryReply<native_broker::query_protocol::GraphFacts>, tonic::Status>
+    {
+        self.fact_calls
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.scope(s)?;
+        Ok(self.reply(native_broker::query_protocol::GraphFacts {
+            answers: f
+                .into_iter()
+                .map(|_| native_broker::query_protocol::GraphFactAnswer {
+                    answer: Some(
+                        native_broker::query_protocol::graph_fact_answer::Answer::HasId(
+                            self.marker == 1,
+                        ),
+                    ),
+                })
+                .collect(),
+            scope_digest: vec![self.marker; 32],
+            index_epoch: vec![self.marker; 16],
+        }))
+    }
+    async fn resolve_commit_prefix(
+        &self,
+        s: [u8; 32],
+        _: String,
+        _: native_broker::QueryOwner,
+    ) -> Result<
+        native_broker::QueryReply<native_broker::query_protocol::CommitPrefixResult>,
+        tonic::Status,
+    > {
+        self.scope(s)?;
+        Ok(
+            self.reply(native_broker::query_protocol::CommitPrefixResult {
+                result: Some(
+                    native_broker::query_protocol::commit_prefix_result::Result::Single(
+                        native_broker::query_protocol::CommitMatch {
+                            commit: Some(native_broker::query_protocol::CommitId {
+                                value: vec![self.marker; 32],
+                            }),
+                        },
+                    ),
+                ),
+            }),
+        )
+    }
+    async fn resolve_change_prefix(
+        &self,
+        _: [u8; 32],
+        _: String,
+        _: Vec<native_broker::CommitId>,
+        _: native_broker::QueryOwner,
+    ) -> Result<
+        native_broker::QueryReply<native_broker::query_protocol::ChangePrefixResult>,
+        tonic::Status,
+    > {
+        Err(tonic::Status::unimplemented(
+            "fixture private change detail",
+        ))
+    }
+    async fn shortest_prefix(
+        &self,
+        _: [u8; 32],
+        _: native_broker::query_protocol::shortest_prefix_request::Target,
+        _: Vec<native_broker::CommitId>,
+        _: native_broker::QueryOwner,
+    ) -> Result<
+        native_broker::QueryReply<native_broker::query_protocol::ShortestPrefixResult>,
+        tonic::Status,
+    > {
+        Err(tonic::Status::unimplemented(
+            "fixture private shortest detail",
+        ))
+    }
+    async fn begin(
+        &self,
+        i: native_broker::BeginQuery,
+        _: native_broker::QueryOwner,
+    ) -> Result<native_broker::QueryReply<native_broker::QueryHandle>, tonic::Status> {
+        self.scope(i.scope)?;
+        Ok(self.reply(native_broker::QueryHandle {
+            handle: [self.marker + 10; 32],
+            expires_at_unix_seconds: i64::MAX / 2,
+        }))
+    }
+    async fn page(
+        &self,
+        q: [u8; 32],
+        s: u64,
+        physical: native_broker::QueryOwner,
+    ) -> Result<native_broker::QueryReply<native_broker::QueryPage>, tonic::Status> {
+        let _physical = physical;
+        self.page_calls.lock().unwrap().push((q, s));
+        if let Some(pause) = &self.page_pause {
+            self.page_entered
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            let pause = pause.clone();
+            tokio::task::spawn_blocking(move || {
+                let (lock, wake) = &*pause;
+                let mut released = lock.lock().unwrap();
+                while !*released {
+                    released = wake.wait(released).unwrap();
+                }
+            })
+            .await
+            .unwrap();
+            self.page_finished
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+        if self
+            .transient_pages
+            .fetch_update(
+                std::sync::atomic::Ordering::SeqCst,
+                std::sync::atomic::Ordering::SeqCst,
+                |n| n.checked_sub(1),
+            )
+            .is_ok()
+        {
+            return Err(tonic::Status::unavailable(
+                "fixture private transient detail",
+            ));
+        }
+        if q != [self.marker + 10; 32] {
+            return Err(tonic::Status::permission_denied(
+                "fixture private query detail",
+            ));
+        }
+        if self.closed.load(std::sync::atomic::Ordering::SeqCst) || s > 1 {
+            return Err(tonic::Status::failed_precondition(
+                "fixture private closed detail",
+            ));
+        }
+        let owner = self
+            .page
+            .lock()
+            .unwrap()
+            .get_or_insert_with(|| Arc::new(QueryPageProbe(self.dropped.clone())))
+            .clone();
+        Ok(native_broker::QueryReply {
+            value: native_broker::QueryPage {
+                sequence: s,
+                rows: if s == 0 {
+                    vec![native_broker::query_protocol::GraphRow {
+                        commit: Some(native_broker::query_protocol::CommitId {
+                            value: vec![self.marker; 32],
+                        }),
+                        change: Some(native_broker::query_protocol::ChangeId {
+                            value: vec![self.marker; 16],
+                        }),
+                        edges: vec![],
+                        canonical: None,
+                    }]
+                } else {
+                    vec![]
+                },
+                exhausted: s == 1,
+            },
+            owner,
+        })
+    }
+    async fn read_commit(
+        &self,
+        _: [u8; 32],
+        _: native_broker::CommitId,
+        _: native_broker::QueryOwner,
+    ) -> Result<native_broker::QueryReply<jj_native_backend::VerifiedMetadata>, tonic::Status> {
+        Err(tonic::Status::unimplemented("fixture private read detail"))
+    }
+    async fn close_query(
+        &self,
+        _: [u8; 32],
+        _: native_broker::QueryOwner,
+    ) -> Result<(), tonic::Status> {
+        self.closed.store(true, std::sync::atomic::Ordering::SeqCst);
+        self.page.lock().unwrap().take();
+        Ok(())
+    }
+    async fn close_scope(
+        &self,
+        _: [u8; 32],
+        _: native_broker::QueryOwner,
+    ) -> Result<(), tonic::Status> {
+        Ok(())
+    }
+}
+fn query_config() -> Config {
+    Config {
+        max_query_bytes: 16 * 1024,
+        max_inflight: 2,
+        ..config()
+    }
+}
+fn query_service(root: &Path, a: Arc<FakeQuery>, b: Arc<FakeQuery>, cfg: Config) -> BrokerService {
+    private(&root.join("query-store"));
+    let provider: Arc<dyn NativeObjectIo> =
+        Arc::new(DirectObjectIo::init(&root.join("query-store"), backend_config()).unwrap());
+    BrokerService::new(
+        HashMap::from([
+            ("first".into(), provider.clone()),
+            ("second".into(), provider.clone()),
+            ("local-only".into(), provider),
+        ]),
+        cfg,
+    )
+    .unwrap()
+    .with_queries(HashMap::from([
+        ("first".into(), a as Arc<dyn native_broker::NativeQueryIo>),
+        ("second".into(), b as Arc<dyn native_broker::NativeQueryIo>),
+    ]))
+    .unwrap()
+}
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn query_aliases_preserve_scopes_replay_pages_and_cancellation_without_holding_client_slots()
+{
+    use native_broker::{NativeQueryIo, query_protocol as q};
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path().canonicalize().unwrap();
+    private(&root);
+    let cfg = Config {
+        max_inflight: 1,
+        ..query_config()
+    };
+    let a = Arc::new(FakeQuery::new(1, 1024));
+    let b = Arc::new(FakeQuery::new(2, 1024));
+    a.transient_pages
+        .store(1, std::sync::atomic::Ordering::SeqCst);
+    let service = query_service(&root, a.clone(), b, cfg.clone());
+    let socket = root.join("query.sock");
+    let host = Running::start_service(&socket, service.clone()).await;
+    let first = native_broker::BrokerQueryClient::connect(&socket, "first", cfg.clone())
+        .await
+        .unwrap();
+    let second = native_broker::BrokerQueryClient::connect(&socket, "second", cfg.clone())
+        .await
+        .unwrap();
+    let open = || native_broker::OpenQueryScope {
+        roots: vec![native_broker::CommitId([1; 32])],
+        overlay: vec![],
+        replay_key: [3; 32],
+    };
+    let sa = first.open_scope(open(), Arc::new(())).await.unwrap();
+    let sb = second.open_scope(open(), Arc::new(())).await.unwrap();
+    assert_ne!(sa.value.handle, sb.value.handle);
+    let oversized = first
+        .open_scope(
+            native_broker::OpenQueryScope {
+                overlay: vec![vec![0; cfg.max_query_bytes]],
+                ..open()
+            },
+            Arc::new(()),
+        )
+        .await
+        .err()
+        .unwrap();
+    assert_eq!(oversized.code(), tonic::Code::ResourceExhausted);
+    assert_eq!(
+        a.scope_calls.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "oversized input must fail before adapter invocation"
+    );
+
+    let fact = || q::GraphFact {
+        fact: Some(q::graph_fact::Fact::HasId(q::HasId {
+            commit: Some(q::CommitId { value: vec![1; 32] }),
+        })),
+    };
+    assert_ne!(
+        first
+            .facts(sa.value.handle, vec![fact()], Arc::new(()))
+            .await
+            .unwrap()
+            .value
+            .answers,
+        second
+            .facts(sb.value.handle, vec![fact()], Arc::new(()))
+            .await
+            .unwrap()
+            .value
+            .answers
+    );
+    let foreign = second
+        .facts(sa.value.handle, vec![fact()], Arc::new(()))
+        .await
+        .err()
+        .unwrap();
+    assert_eq!(foreign.code(), tonic::Code::PermissionDenied);
+    assert!(!foreign.message().contains("fixture private"));
+    let local = service.query_io("first").unwrap();
+    let facts_before = a.fact_calls.load(std::sync::atomic::Ordering::SeqCst);
+    let huge = vec![1u8; cfg.max_query_bytes * 256];
+    let malformed = native_broker::BeginQuery {
+        scope: sa.value.handle,
+        expression: q::GraphExpr {
+            version: 1,
+            expression: Some(q::graph_expr::Expression::Commits(q::CommitSet {
+                commits: vec![q::CommitId { value: huge }],
+            })),
+        },
+        projection: q::Projection::Graph,
+        page_size: 1,
+        replay_key: [8; 32],
+    };
+    assert_eq!(
+        first
+            .begin(malformed, Arc::new(()))
+            .await
+            .err()
+            .unwrap()
+            .code(),
+        tonic::Code::InvalidArgument
+    );
+    let too_many = vec![native_broker::CommitId([1; 32]); cfg.max_query_bytes / 34 + 1];
+    assert_eq!(
+        first
+            .resolve_change_prefix(sa.value.handle, "a".into(), too_many.clone(), Arc::new(()))
+            .await
+            .err()
+            .unwrap()
+            .code(),
+        tonic::Code::ResourceExhausted
+    );
+    assert_eq!(
+        local
+            .resolve_change_prefix(sa.value.handle, "a".into(), too_many.clone(), Arc::new(()))
+            .await
+            .err()
+            .unwrap()
+            .code(),
+        tonic::Code::ResourceExhausted
+    );
+    let target = q::shortest_prefix_request::Target::Commit(q::CommitId { value: vec![1; 32] });
+    assert_eq!(
+        local
+            .shortest_prefix(sa.value.handle, target, too_many, Arc::new(()))
+            .await
+            .err()
+            .unwrap()
+            .code(),
+        tonic::Code::ResourceExhausted
+    );
+    let oversized_fact = q::GraphFact {
+        fact: Some(q::graph_fact::Fact::Heads(q::Heads {
+            commits: vec![q::CommitId { value: vec![1; 32] }; cfg.max_query_bytes / 34 + 1],
+        })),
+    };
+    assert_eq!(
+        first
+            .facts(sa.value.handle, vec![oversized_fact.clone()], Arc::new(()))
+            .await
+            .err()
+            .unwrap()
+            .code(),
+        tonic::Code::ResourceExhausted
+    );
+    assert_eq!(
+        local
+            .facts(sa.value.handle, vec![oversized_fact], Arc::new(()))
+            .await
+            .err()
+            .unwrap()
+            .code(),
+        tonic::Code::ResourceExhausted
+    );
+    assert_eq!(
+        a.fact_calls.load(std::sync::atomic::Ordering::SeqCst),
+        facts_before,
+        "invalid inputs must not enter the adapter"
+    );
+    assert_eq!(
+        first
+            .fork_scope(
+                native_broker::ForkQueryScope {
+                    parent: sa.value.handle,
+                    overlay: vec![
+                        vec![0; cfg.max_query_bytes / 2],
+                        vec![0; cfg.max_query_bytes / 2]
+                    ],
+                    replay_key: [9; 32]
+                },
+                Arc::new(())
+            )
+            .await
+            .err()
+            .unwrap()
+            .code(),
+        tonic::Code::ResourceExhausted
+    );
+    let query = first
+        .begin(
+            native_broker::BeginQuery {
+                scope: sa.value.handle,
+                expression: q::GraphExpr {
+                    version: 1,
+                    expression: Some(q::graph_expr::Expression::Commits(q::CommitSet {
+                        commits: vec![q::CommitId { value: vec![1; 32] }],
+                    })),
+                },
+                projection: q::Projection::Graph,
+                page_size: 1,
+                replay_key: [4; 32],
+            },
+            Arc::new(()),
+        )
+        .await
+        .unwrap();
+    let page = first
+        .page(query.value.handle, 0, Arc::new(()))
+        .await
+        .unwrap();
+    assert!(!page.value.exhausted);
+    assert_eq!(
+        &a.page_calls.lock().unwrap()[..2],
+        &[(query.value.handle, 0), (query.value.handle, 0)],
+        "retry must reuse the exact query identity and page sequence"
+    );
+
+    let replay = first
+        .page(query.value.handle, 0, Arc::new(()))
+        .await
+        .unwrap();
+    assert_eq!(page.value.rows, replay.value.rows);
+    // Both decoded pages remain held while another RPC acquires the sole slot.
+    first
+        .close_query(query.value.handle, Arc::new(()))
+        .await
+        .unwrap();
+    assert_eq!(
+        first
+            .page(query.value.handle, 1, Arc::new(()))
+            .await
+            .err()
+            .unwrap()
+            .code(),
+        tonic::Code::FailedPrecondition
+    );
+    let local = native_broker::BrokerQueryClient::connect(&socket, "local-only", cfg.clone())
+        .await
+        .unwrap();
+    assert_eq!(
+        local
+            .open_scope(open(), Arc::new(()))
+            .await
+            .err()
+            .unwrap()
+            .code(),
+        tonic::Code::FailedPrecondition
+    );
+    let unknown = native_broker::BrokerQueryClient::connect(&socket, "unknown", cfg)
+        .await
+        .unwrap();
+    assert_eq!(
+        unknown
+            .open_scope(open(), Arc::new(()))
+            .await
+            .err()
+            .unwrap()
+            .code(),
+        tonic::Code::NotFound
+    );
+    drop((page, replay, query, sa, sb, first, second, local, unknown));
+    host.stop().await;
+}
+#[test]
+fn query_registration_aggregates_distinct_persistent_pools_not_alias_count() {
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path();
+    private(root);
+    private(&root.join("budget-store"));
+    let provider: Arc<dyn NativeObjectIo> =
+        Arc::new(DirectObjectIo::init(&root.join("budget-store"), backend_config()).unwrap());
+    let make = |cfg| {
+        BrokerService::new(
+            HashMap::from([
+                ("first".into(), provider.clone()),
+                ("second".into(), provider.clone()),
+            ]),
+            cfg,
+        )
+        .unwrap()
+    };
+    let first: Arc<dyn native_broker::NativeQueryIo> =
+        Arc::new(FakeQuery::new(1, 320 * 1024 * 1024));
+    let second: Arc<dyn native_broker::NativeQueryIo> =
+        Arc::new(FakeQuery::new(2, 320 * 1024 * 1024));
+    assert!(
+        make(Config::default())
+            .with_queries(HashMap::from([
+                ("first".into(), first.clone()),
+                ("second".into(), second.clone())
+            ]))
+            .is_err()
+    );
+    assert!(
+        make(Config {
+            max_query_persistent_bytes: 768 * 1024 * 1024,
+            ..Default::default()
+        })
+        .with_queries(HashMap::from([
+            ("first".into(), first.clone()),
+            ("second".into(), second)
+        ]))
+        .is_ok()
+    );
+    assert!(
+        make(Config::default())
+            .with_queries(HashMap::from([
+                ("first".into(), first.clone()),
+                ("second".into(), first)
+            ]))
+            .is_ok()
+    );
+}
+
+struct QueryRequestBody(Option<bytes::Bytes>);
+impl http_body::Body for QueryRequestBody {
+    type Data = bytes::Bytes;
+    type Error = std::convert::Infallible;
+    fn poll_frame(
+        mut self: std::pin::Pin<&mut Self>,
+        _: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Result<http_body::Frame<Self::Data>, Self::Error>>> {
+        std::task::Poll::Ready(self.0.take().map(|b| Ok(http_body::Frame::data(b))))
+    }
+}
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn query_returned_response_keeps_page_owner_after_registry_close_until_body_drop() {
+    use native_broker::NativeQueryIo;
+    use prost::Message;
+    use tower::ServiceExt;
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path().canonicalize().unwrap();
+    private(&root);
+    let first = Arc::new(FakeQuery::new(1, 1024));
+    let second = Arc::new(FakeQuery::new(2, 1024));
+    let service = query_service(&root, first.clone(), second, query_config());
+    let body = native_broker::proto::QueryPageRequest {
+        store_id: "first".into(),
+        query: vec![11; 32],
+        expected_sequence: 0,
+    }
+    .encode_to_vec();
+    let mut framed = vec![0];
+    framed.extend_from_slice(&(body.len() as u32).to_be_bytes());
+    framed.extend_from_slice(&body);
+    let request = http::Request::builder()
+        .uri("/native.broker.v1.QueryIo/Page")
+        .header("content-type", "application/grpc")
+        .body(tonic::body::Body::new(QueryRequestBody(Some(
+            framed.into(),
+        ))))
+        .unwrap();
+    let response = service.query_rpc_service().oneshot(request).await.unwrap();
+    assert_eq!(response.status(), http::StatusCode::OK);
+    assert!(first.page.lock().unwrap().is_some());
+    let local = service.query_io("first").unwrap();
+    local.close_query([11; 32], Arc::new(())).await.unwrap();
+    assert!(first.page.lock().unwrap().is_none());
+    assert_eq!(
+        first.dropped.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "the old physical response must retain its source independently of the cleared registry"
+    );
+    drop(response);
+    assert_eq!(first.dropped.load(std::sync::atomic::Ordering::SeqCst), 1);
+    service.drain().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn held_query_replies_exhaust_only_retained_pool_and_release_restores_progress() {
+    use native_broker::{NativeQueryIo, query_protocol as q};
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path().canonicalize().unwrap();
+    private(&root);
+    let service = query_service(
+        &root,
+        Arc::new(FakeQuery::new(1, 1024)),
+        Arc::new(FakeQuery::new(2, 1024)),
+        query_config(),
+    );
+    let socket = root.join("reply-budget.sock");
+    let host = Running::start_service(&socket, service).await;
+    let tiny = Config {
+        max_inflight: 1,
+        max_metadata_bytes: 1024,
+        max_catalog_bytes: 1024,
+        max_catalog_objects: 1,
+        max_memory_bytes: 16 * 1024 * 128 + 4096 + 64 * 1024,
+        ..query_config()
+    };
+    let client = native_broker::BrokerQueryClient::connect(&socket, "first", tiny)
+        .await
+        .unwrap();
+    let scope = client
+        .open_scope(
+            native_broker::OpenQueryScope {
+                roots: vec![native_broker::CommitId([1; 32])],
+                overlay: vec![],
+                replay_key: [1; 32],
+            },
+            Arc::new(()),
+        )
+        .await
+        .unwrap();
+    let query = client
+        .begin(
+            native_broker::BeginQuery {
+                scope: scope.value.handle,
+                expression: q::GraphExpr {
+                    version: 1,
+                    expression: Some(q::graph_expr::Expression::Commits(q::CommitSet {
+                        commits: vec![q::CommitId { value: vec![1; 32] }],
+                    })),
+                },
+                projection: q::Projection::Graph,
+                page_size: 1,
+                replay_key: [2; 32],
+            },
+            Arc::new(()),
+        )
+        .await
+        .unwrap();
+    let query_id = query.value.handle;
+    drop(query);
+    drop(scope);
+    let mut held = Vec::new();
+    let mut exhausted = false;
+    for _ in 0..32 {
+        match client.page(query_id, 0, Arc::new(())).await {
+            Ok(page) => {
+                assert!(!page.value.exhausted);
+                held.push(page);
+            }
+            Err(status) => {
+                assert_eq!(status.code(), tonic::Code::ResourceExhausted);
+                exhausted = true;
+                break;
+            }
+        }
+    }
+    assert!(
+        exhausted && !held.is_empty(),
+        "held replies must be bounded without consuming decode headroom or claiming EOF"
+    );
+    drop(held);
+    let page = client.page(query_id, 0, Arc::new(())).await.unwrap();
+    assert!(!page.value.exhausted);
+    client.close_query(query_id, Arc::new(())).await.unwrap();
+    drop(page);
+    drop(client);
+    host.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn composed_query_brokers_release_physical_owner_without_pinning_completed_replies() {
+    use native_broker::{NativeQueryIo, query_protocol as q};
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path().canonicalize().unwrap();
+    private(&root);
+    let shared = Arc::new(FakeQuery::new(1, 1024));
+    // Explicit registrations of the same adapter are trusted synonyms.
+    let upstream = query_service(&root, shared.clone(), shared, query_config());
+    let socket = root.join("upstream-query.sock");
+    let host = Running::start_service(&socket, upstream).await;
+    let cfg = Config {
+        max_inflight: 1,
+        ..query_config()
+    };
+    let upstream_client = Arc::new(
+        native_broker::BrokerQueryClient::connect(&socket, "first", cfg.clone())
+            .await
+            .unwrap(),
+    );
+    private(&root.join("outer-store"));
+    let provider: Arc<dyn NativeObjectIo> =
+        Arc::new(DirectObjectIo::init(&root.join("outer-store"), backend_config()).unwrap());
+    let outer = BrokerService::new(HashMap::from([("outer".into(), provider)]), cfg.clone())
+        .unwrap()
+        .with_queries(HashMap::from([(
+            "outer".into(),
+            upstream_client as Arc<dyn NativeQueryIo>,
+        )]))
+        .unwrap();
+    let local = outer.query_io("outer").unwrap();
+    let scope = local
+        .open_scope(
+            native_broker::OpenQueryScope {
+                roots: vec![native_broker::CommitId([1; 32])],
+                overlay: vec![],
+                replay_key: [5; 32],
+            },
+            Arc::new(()),
+        )
+        .await
+        .unwrap();
+    let fact = || q::GraphFact {
+        fact: Some(q::graph_fact::Fact::HasId(q::HasId {
+            commit: Some(q::CommitId { value: vec![1; 32] }),
+        })),
+    };
+    let dropped = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let physical: native_broker::QueryOwner = Arc::new(QueryPageProbe(dropped.clone()));
+    let first = tokio::time::timeout(
+        Duration::from_secs(2),
+        local.facts(scope.value.handle, vec![fact()], physical),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while dropped.load(std::sync::atomic::Ordering::SeqCst) != 1 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    let second = tokio::time::timeout(
+        Duration::from_secs(2),
+        local.facts(scope.value.handle, vec![fact()], Arc::new(())),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(first.value.answers, second.value.answers);
+    let synonym = native_broker::BrokerQueryClient::connect(&socket, "second", cfg)
+        .await
+        .unwrap();
+    assert_eq!(
+        synonym
+            .facts(scope.value.handle, vec![fact()], Arc::new(()))
+            .await
+            .unwrap()
+            .value
+            .answers,
+        first.value.answers
+    );
+    tokio::time::timeout(
+        Duration::from_secs(2),
+        local.close_scope(scope.value.handle, Arc::new(())),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    drop((first, second, scope, synonym, local));
+    outer.drain().await.unwrap();
+    drop(outer);
+    host.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn local_query_deadline_returns_while_accepted_provider_job_and_drain_remain_owned() {
+    use native_broker::NativeQueryIo;
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path().canonicalize().unwrap();
+    private(&root);
+    let gate = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
+    let release = Release(gate.clone());
+    let mut slow = FakeQuery::new(1, 1024);
+    slow.page_pause = Some(gate);
+    let entered = slow.page_entered.clone();
+    let finished = slow.page_finished.clone();
+    let mut cfg = Config {
+        max_inflight: 1,
+        ..query_config()
+    };
+    cfg.policy.operation_timeout_ms = 80;
+    let service = query_service(
+        &root,
+        Arc::new(slow),
+        Arc::new(FakeQuery::new(2, 1024)),
+        cfg,
+    );
+    let local = service.query_io("first").unwrap();
+    let dropped = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let physical: native_broker::QueryOwner = Arc::new(QueryPageProbe(dropped.clone()));
+    let call = tokio::spawn(async move { local.page([11; 32], 0, physical).await });
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while !entered.load(std::sync::atomic::Ordering::SeqCst) {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    let status = tokio::time::timeout(Duration::from_secs(2), call)
+        .await
+        .unwrap()
+        .unwrap()
+        .err()
+        .unwrap();
+    assert_eq!(status.code(), tonic::Code::DeadlineExceeded);
+    assert!(!finished.load(std::sync::atomic::Ordering::SeqCst));
+    assert_eq!(dropped.load(std::sync::atomic::Ordering::SeqCst), 0);
+    let drain = service.clone();
+    let draining = tokio::spawn(async move { drain.drain().await });
+    tokio::task::yield_now().await;
+    assert!(
+        !draining.is_finished(),
+        "deadline must not release the physical provider slot"
+    );
+    release.release();
+    tokio::time::timeout(Duration::from_secs(2), draining)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert!(finished.load(std::sync::atomic::Ordering::SeqCst));
+    assert_eq!(dropped.load(std::sync::atomic::Ordering::SeqCst), 1);
+}

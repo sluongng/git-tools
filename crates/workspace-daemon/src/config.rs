@@ -49,6 +49,8 @@ pub struct Native {
     pub workspaces: NativeWorkspaces,
     pub max_inflight: usize,
     pub max_memory_bytes: usize,
+    pub max_query_bytes: usize,
+    pub max_query_persistent_bytes: u64,
     pub max_temporary_bytes: u64,
 }
 impl Default for Native {
@@ -59,6 +61,8 @@ impl Default for Native {
             workspaces: NativeWorkspaces::default(),
             max_inflight: defaults.max_inflight,
             max_memory_bytes: defaults.max_memory_bytes,
+            max_query_bytes: defaults.max_query_bytes,
+            max_query_persistent_bytes: defaults.max_query_persistent_bytes,
             max_temporary_bytes: defaults.max_temporary_bytes,
         }
     }
@@ -174,6 +178,8 @@ impl Native {
     pub(crate) fn broker_config(&self, policy: &reapi::policy::Policy) -> native_broker::Config {
         native_broker::Config {
             max_inflight: self.max_inflight,
+            max_query_bytes: self.max_query_bytes,
+            max_query_persistent_bytes: self.max_query_persistent_bytes,
             max_memory_bytes: self.max_memory_bytes,
             max_temporary_bytes: self.max_temporary_bytes,
             max_file_bytes: self

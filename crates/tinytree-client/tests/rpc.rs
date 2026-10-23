@@ -4468,3 +4468,163 @@ async fn partial_graph_query_drop_cleanup_benchmark() {
     }
 }
 // END TINYTREE_PARTIAL_QUERY_DROP_BENCH_V1
+
+#[tokio::test]
+async fn rpc_only_guard_follows_cancelled_verification_worker_not_verified_metadata() {
+    let (_dir, _store, service) = setup();
+    let running = Running::start(service, Mode::Normal).await;
+    let mut config = running.config();
+    config.limits.max_inflight = 1;
+    config.rpc.operation_timeout_ms = 1000;
+    let (done, finished) = tokio::sync::oneshot::channel();
+    let worker = std::thread::spawn(move || {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .max_blocking_threads(1)
+            .build()
+            .unwrap();
+        runtime.block_on(async move {
+            let client = NativeClient::connect(config).await.unwrap();
+            let drops = Arc::new(AtomicUsize::new(0));
+            let guarded = client
+                .clone()
+                .with_rpc_lifetime_guard(Arc::new(LifetimeProbe(drops.clone())));
+            let object = tinytree_model::encode(
+                &tinytree_model::Object::Tree(tinytree_model::Tree { entries: vec![] }),
+                Default::default(),
+            )
+            .unwrap();
+            let (entered, ready) = tokio::sync::oneshot::channel();
+            let (unblock, blocked) = std::sync::mpsc::channel();
+            let occupied = tokio::task::spawn_blocking(move || {
+                entered.send(()).unwrap();
+                let _ = blocked.recv();
+            });
+            ready.await.unwrap();
+            {
+                let verify = guarded.verify_metadata(object.descriptor, object.bytes.clone());
+                tokio::pin!(verify);
+                assert!(futures_util::poll!(&mut verify).is_pending());
+            }
+            drop(guarded);
+            // The actual SDK verifier is queued behind the occupied worker.
+            // Cancelling its waiter cannot release its external owner or slot.
+            assert_eq!(drops.load(Ordering::SeqCst), 0);
+            unblock.send(()).unwrap();
+            occupied.await.unwrap();
+            assert_released(&drops).await;
+            let drops = Arc::new(AtomicUsize::new(0));
+            let guarded = client
+                .clone()
+                .with_rpc_lifetime_guard(Arc::new(LifetimeProbe(drops.clone())));
+            let metadata = guarded
+                .verify_metadata(object.descriptor, object.bytes)
+                .await
+                .unwrap();
+            drop(guarded);
+            assert_released(&drops).await;
+            assert_eq!(
+                metadata.descriptor(),
+                object.descriptor,
+                "completed metadata does not retain a physical request guard"
+            );
+            drop(metadata);
+        });
+        done.send(()).unwrap();
+    });
+    finished.await.unwrap();
+    worker.join().unwrap();
+    running.stop().await;
+}
+
+#[tokio::test]
+async fn rpc_only_guards_do_not_enter_query_state_pages_or_uncertain_drop_cleanup() {
+    for canonical in [false, true] {
+        let fixture = setup_query_retained();
+        let running = QueryRunning::start(fixture.service.clone(), QueryMode::Normal).await;
+        let mut config = running.config.clone();
+        config.limits.max_inflight = 1;
+        let client = NativeClient::connect(config).await.unwrap();
+        let drops = Arc::new(AtomicUsize::new(0));
+        let guarded = client
+            .clone()
+            .with_rpc_lifetime_guard(Arc::new(LifetimeProbe(drops.clone())));
+        let scope = guarded.open_query_scope(vec![fixture.root]).await.unwrap();
+        drop(guarded);
+        assert_released(&drops).await;
+        let drops = Arc::new(AtomicUsize::new(0));
+        let guarded = client
+            .clone()
+            .with_rpc_lifetime_guard(Arc::new(LifetimeProbe(drops.clone())));
+        let mut query = guarded
+            .begin_graph_query(&scope, &ids_ancestors(fixture.root), 1, canonical)
+            .await
+            .unwrap();
+        drop(guarded);
+        assert_released(&drops).await;
+        let drops = Arc::new(AtomicUsize::new(0));
+        let guarded = client
+            .clone()
+            .with_rpc_lifetime_guard(Arc::new(LifetimeProbe(drops.clone())));
+        let page = guarded.evaluate_graph_page(&mut query).await.unwrap();
+        drop(guarded);
+        assert_released(&drops).await;
+        assert!(!page.exhausted);
+        let drops = Arc::new(AtomicUsize::new(0));
+        let guarded = client
+            .clone()
+            .with_rpc_lifetime_guard(Arc::new(LifetimeProbe(drops.clone())));
+        let facts = guarded
+            .query_facts(
+                &scope,
+                vec![tinytree_client::QueryFact::HasId(fixture.root)],
+            )
+            .await
+            .unwrap();
+        drop(guarded);
+        assert_released(&drops).await;
+        assert_eq!(facts, vec![tinytree_client::FactAnswer::HasId(true)]);
+        let drops = Arc::new(AtomicUsize::new(0));
+        let guarded = client
+            .clone()
+            .with_rpc_lifetime_guard(Arc::new(LifetimeProbe(drops.clone())));
+        guarded.close_graph_query(&mut query).await.unwrap();
+        drop(guarded);
+        assert_released(&drops).await;
+        assert!(query.is_closed());
+        assert!(!query.is_exhausted());
+        assert_eq!(page.rows()[0].commit, fixture.root);
+        drop((page, query));
+        client.close_query_scope(&scope).await.unwrap();
+        running.stop().await;
+    }
+    let fixture = setup_query_retained();
+    let running =
+        QueryRunning::start(fixture.service.clone(), QueryMode::CloseQueryInitialReject).await;
+    let client = running.client().await;
+    let scope = client.open_query_scope(vec![fixture.root]).await.unwrap();
+    let mut query = client
+        .begin_query(&scope, &ids_ancestors(fixture.root), 1)
+        .await
+        .unwrap();
+    client.evaluate_page(&mut query).await.unwrap();
+    let drops = Arc::new(AtomicUsize::new(0));
+    let guarded = client
+        .clone()
+        .with_rpc_lifetime_guard(Arc::new(LifetimeProbe(drops.clone())));
+    assert_eq!(
+        guarded
+            .close_ids_query(&mut query)
+            .await
+            .unwrap_err()
+            .code(),
+        Code::PermissionDenied
+    );
+    drop(guarded);
+    assert_released(&drops).await;
+    let before = running.counts.query_closes.load(Ordering::SeqCst);
+    drop(query);
+    wait_query_close_count(&running.counts, before + 1).await;
+    client.close_query_scope(&scope).await.unwrap();
+    running.stop().await;
+}

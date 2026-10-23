@@ -21,6 +21,7 @@ prost = "0.14"
 reapi = { path = "../reapi" }
 tempfile = "3"
 tinytree-model = { path = "../tinytree-model" }
+tinytree-proto = { path = "../tinytree-proto" }
 tokio = { version = "1", features = ["full"] }
 tokio-stream = { version = "0.1", features = ["net"] }
 tonic = { version = "0.14", features = ["zstd"] }

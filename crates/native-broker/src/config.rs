@@ -3,6 +3,10 @@ use tonic::Status;
 pub struct Config {
     pub max_frame_bytes: usize,
     pub max_metadata_bytes: usize,
+    /// Encoded request/reply bound for immutable local queries.
+    pub max_query_bytes: usize,
+    /// Aggregate declared persistent query/SDK pools across distinct adapters.
+    pub max_query_persistent_bytes: u64,
     pub max_file_bytes: u64,
     pub max_catalog_bytes: usize,
     pub max_catalog_objects: usize,
@@ -19,6 +23,8 @@ impl Default for Config {
         Self {
             max_frame_bytes: 64 * 1024,
             max_metadata_bytes: 16 * 1024 * 1024,
+            max_query_bytes: 512 * 1024,
+            max_query_persistent_bytes: 512 * 1024 * 1024,
             max_file_bytes: 256 * 1024 * 1024,
             max_catalog_bytes: 64 * 1024 * 1024,
             max_catalog_objects: 100_000,
@@ -37,6 +43,8 @@ impl Config {
             .map_err(|_| Status::invalid_argument("invalid broker policy"))?;
         if !(1024..=1024 * 1024).contains(&self.max_frame_bytes)
             || !(1024..=64 * 1024 * 1024).contains(&self.max_metadata_bytes)
+            || !(1024..=8 * 1024 * 1024).contains(&self.max_query_bytes)
+            || self.max_query_persistent_bytes > 16 * 1024 * 1024 * 1024
             || !(1..=1024 * 1024 * 1024).contains(&self.max_file_bytes)
             || !(1..=256 * 1024 * 1024).contains(&self.max_catalog_bytes)
             || !(1..=100_000).contains(&self.max_catalog_objects)
@@ -56,6 +64,13 @@ impl Config {
             return Err(Status::invalid_argument("invalid broker limits"));
         }
         Ok(())
+    }
+    pub(crate) fn query_memory(&self) -> usize {
+        // Decoded nested protobuf nodes/empty rows can be much larger than
+        // their wire representation. Include native/wire copies and encoding.
+        self.max_query_bytes
+            .saturating_mul(128)
+            .saturating_add(4096)
     }
     pub(crate) fn metadata_memory(&self) -> usize {
         // Native decoding bounds counts before allocating, but a malformed

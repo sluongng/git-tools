@@ -27,6 +27,8 @@ pub struct BrokerService {
 struct Inner {
     stores: HashMap<String, Arc<dyn NativeObjectIo>>,
     controls: HashMap<String, Arc<dyn crate::NativeRepositoryControl>>,
+    queries: HashMap<String, Arc<dyn crate::NativeQueryIo>>,
+    query_work: ObjectIoResources,
     config: Config,
     metadata_work: ObjectIoResources,
     calls: Arc<Semaphore>,
@@ -36,12 +38,22 @@ struct Inner {
 impl Inner {
     async fn admit(&self, path: &str, deadline: Instant) -> Result<Arc<Work>, Status> {
         let is_control = path.starts_with("/native.broker.v1.RepositoryControl/");
+        let is_query = path.starts_with("/native.broker.v1.QueryIo/");
+        if is_query && self.queries.is_empty() {
+            return Err(Status::failed_precondition(
+                "native repository query is not configured",
+            ));
+        }
         // The alias is inside the protobuf body, which has not been decoded at
         // this boundary. Reserve the largest registered provider workset.
         let is_metadata = ["/Descriptor", "/ReadMetadata", "/CopyCatalog", "/ReadFile"]
             .iter()
             .any(|suffix| path.ends_with(suffix));
-        let memory = if is_control {
+        let memory = if is_query {
+            self.config
+                .query_memory()
+                .saturating_add(self.query_work.memory_bytes as usize)
+        } else if is_control {
             self.config.max_memory_bytes
         } else if path.ends_with("/CopyCatalog") {
             self.config
@@ -56,7 +68,9 @@ impl Inner {
         } else {
             memory
         };
-        let temporary = if is_control {
+        let temporary = if is_query {
+            self.query_work.temporary_bytes
+        } else if is_control {
             self.config.max_temporary_bytes
         } else if is_metadata {
             self.metadata_work.temporary_bytes
@@ -138,6 +152,8 @@ impl BrokerService {
                 stores,
                 metadata_work,
                 controls: HashMap::new(),
+                queries: HashMap::new(),
+                query_work: ObjectIoResources::default(),
                 calls: Arc::new(Semaphore::new(config.max_inflight)),
                 memory: Arc::new(Semaphore::new(config.max_memory_bytes)),
                 staging: Arc::new(Semaphore::new(config.max_temporary_bytes as usize)),
@@ -174,6 +190,85 @@ impl BrokerService {
             })?
             .controls = controls;
         Ok(self)
+    }
+    /// Attach immutable-query adapters only to existing configured aliases.
+    pub fn with_queries(
+        mut self,
+        queries: HashMap<String, Arc<dyn crate::NativeQueryIo>>,
+    ) -> Result<Self, Status> {
+        let mut query_work = ObjectIoResources::default();
+        let mut distinct = std::collections::HashSet::new();
+        let mut persistent = 0u64;
+        for (id, query) in &queries {
+            wire::id(id)?;
+            if !self.inner.stores.contains_key(id) {
+                return Err(Status::invalid_argument(
+                    "query alias has no native object provider",
+                ));
+            }
+            let required = query.resources();
+            if distinct.insert(Arc::as_ptr(query) as *const () as usize) {
+                persistent = persistent
+                    .checked_add(required.persistent_memory_bytes)
+                    .ok_or_else(|| {
+                        Status::invalid_argument("native query persistent budget overflow")
+                    })?;
+                if persistent > self.inner.config.max_query_persistent_bytes {
+                    return Err(Status::invalid_argument(
+                        "aggregate native query persistent budgets exceed max_query_persistent_bytes; reduce per-repository query limits or raise the configured aggregate cap",
+                    ));
+                }
+            }
+            if required.memory_bytes == 0
+                || required
+                    .memory_bytes
+                    .checked_add(self.inner.config.query_memory() as u64)
+                    .is_none_or(|bytes| bytes > self.inner.config.max_memory_bytes as u64)
+                || required.temporary_bytes > self.inner.config.max_temporary_bytes
+            {
+                return Err(Status::invalid_argument(
+                    "native query resource bounds exceed broker pools",
+                ));
+            }
+            query_work.memory_bytes = query_work.memory_bytes.max(required.memory_bytes);
+            query_work.temporary_bytes = query_work.temporary_bytes.max(required.temporary_bytes);
+        }
+        let inner = Arc::get_mut(&mut self.inner).ok_or_else(|| {
+            Status::failed_precondition("attach native queries before sharing the service")
+        })?;
+        inner.queries = queries;
+        inner.query_work = query_work;
+        Ok(self)
+    }
+    pub(crate) fn query_provider(&self, id: &str) -> Result<Arc<dyn crate::NativeQueryIo>, Status> {
+        self.store(id)?;
+        self.inner.queries.get(id).cloned().ok_or_else(|| {
+            Status::failed_precondition("native repository query is not configured for this alias")
+        })
+    }
+    pub(crate) fn query_limit(&self) -> usize {
+        self.inner.config.max_query_bytes
+    }
+    pub(crate) fn query_config(&self) -> Config {
+        self.inner.config.clone()
+    }
+    pub fn query_rpc_service(&self) -> crate::query_service::QueryRpcService {
+        let cap = self.inner.config.max_query_bytes;
+        let raw = p::query_io_server::QueryIoServer::new(self.clone())
+            .accept_compressed(CompressionEncoding::Zstd)
+            .send_compressed(CompressionEncoding::Zstd)
+            .max_decoding_message_size(cap)
+            .max_encoding_message_size(cap);
+        crate::query_service::QueryRpcService {
+            inner: self.wrap(raw),
+        }
+    }
+    /// Same admission and adapter as local RPC, without a recursive RPC call.
+    pub fn query_io(&self, id: &str) -> Result<Arc<dyn crate::NativeQueryIo>, Status> {
+        Ok(Arc::new(crate::query_service::GuardedQuery::new(
+            self.clone(),
+            self.query_provider(id)?,
+        )))
     }
     fn control(&self, id: &str) -> Result<Arc<dyn crate::NativeRepositoryControl>, Status> {
         self.store(id)?;
@@ -375,9 +470,14 @@ where
                 // its admission remains charged until actual work completes.
                 tokio::spawn(async move {
                     let mut response = inner.call(request).await.unwrap();
+                    // Keep an adapter's returned page owner independently of
+                    // registry advancement, explicit close and handler teardown.
+                    let returned = response
+                        .extensions_mut()
+                        .remove::<grpc_transport::ResponseBudget>();
                     response
                         .extensions_mut()
-                        .insert(grpc_transport::ResponseBudget::new(work));
+                        .insert(grpc_transport::ResponseBudget::new((returned, work)));
                     response
                 })
                 .await
@@ -783,7 +883,7 @@ pub(crate) struct Work {
     _calls: OwnedSemaphorePermit,
     _memory: OwnedSemaphorePermit,
     _staging: Option<OwnedSemaphorePermit>,
-    deadline: Instant,
+    pub(crate) deadline: Instant,
 }
 struct InboundBody {
     body: Body,

@@ -1,6 +1,6 @@
 # jj-native-remote · library
 
-Broker-hosted `NativeObjectIo` plus the private `NativeRepositoryControl` adapter.
+Broker-hosted `NativeObjectIo`, private repository control and `NativeQueryIo`.
 Compose it with the broker's sole `DirectObjectIo` owner and shared `LocalCas`.
 
 Admission establishes a current private hold and verifies only the selected
@@ -13,7 +13,14 @@ Copy-history parents install before children. The legacy complete copy-catalog
 interface explicitly hydrates bounded metadata closures; it never returns an
 incomplete catalog as complete. Publication also validates and installs its full
 metadata closure. These paths may fetch historical trees; ordinary pinning does
-not. The admission ledger upgrades to format 2; older readers must reject it.
+not. The admission ledger upgrades to format 3; older readers must reject it.
+
+Query scopes reuse explicit durable roots, not ambient references. Selected
+canonical rows can grant lazy reads under the exact retained root union; these
+witnesses are distinct from canonical parent edges. Private overlays never gain
+remote retention grants. Sessions, replay and checked SDK memory are bounded;
+close partial queries explicitly, with SDK cleanup/expiry as the fallback.
+These APIs do not yet replace jj's local index or provide complete client GC.
 
 Reads prefer authoritative local files, then verified scoped CAS bytes. New
 writes are durable locally without a network dependency. Publication uploads

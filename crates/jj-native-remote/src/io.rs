@@ -25,6 +25,11 @@ fn runtime() -> io::Result<&'static Runtime> {
     .as_ref()
     .map_err(|_| io::Error::other("native remote I/O runtime unavailable"))
 }
+/// One weak-owned maintenance loop per configured adapter, never per query.
+pub(crate) fn background(future: impl Future<Output = ()> + Send + 'static) -> anyhow::Result<()> {
+    runtime()?.spawn(future);
+    Ok(())
+}
 #[derive(Default)]
 pub(crate) struct OwnedWork {
     active: std::sync::atomic::AtomicUsize,
@@ -69,11 +74,20 @@ pub(crate) async fn blocking_owned<T: Send + 'static>(
     owner: Arc<dyn std::any::Any + Send + Sync>,
     job: impl FnOnce() -> anyhow::Result<T> + Send + 'static,
 ) -> anyhow::Result<T> {
-    blocking(move || {
-        let _owner = owner;
-        job()
+    // A cancelled waiter leaves the completed value in Tokio's join state.
+    // Keep its payload before its owner through that result/discard boundary.
+    struct Completed<T> {
+        result: anyhow::Result<T>,
+        _owner: Arc<dyn std::any::Any + Send + Sync>,
+    }
+    let completed = blocking(move || {
+        Ok(Completed {
+            result: job(),
+            _owner: owner,
+        })
     })
-    .await
+    .await?;
+    completed.result
 }
 pub(crate) struct ControlScope {
     _lease: Option<tokio::sync::OwnedSemaphorePermit>,

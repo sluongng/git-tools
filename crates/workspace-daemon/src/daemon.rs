@@ -579,6 +579,9 @@ fn open_native_host(
         Arc<dyn native_broker::NativeRepositoryControl>,
     > = std::collections::HashMap::new();
 
+    let mut queries: std::collections::HashMap<String, Arc<dyn native_broker::NativeQueryIo>> =
+        std::collections::HashMap::new();
+
     let mut retained = BTreeMap::new();
     for (alias, settings) in &config.native.repositories {
         let path = root.join(alias);
@@ -612,6 +615,7 @@ fn open_native_host(
             )
             .map_err(|_| anyhow::anyhow!("cannot open configured native remote; state retained"))?;
 
+            queries.insert(alias.clone(), remote.query);
             stores.insert(alias.clone(), remote.io);
             controls.insert(alias.clone(), Arc::new(remote.control));
         } else {
@@ -622,7 +626,10 @@ fn open_native_host(
     let broker =
         native_broker::BrokerService::new(stores, config.native.broker_config(&config.reapi))
             .and_then(|broker| broker.with_controls(controls))
-            .map_err(|_| anyhow::anyhow!("cannot configure native broker"))?;
+            .and_then(|broker| broker.with_queries(queries))
+            .map_err(|status| {
+                anyhow::anyhow!("cannot configure native broker: {}", status.message())
+            })?;
 
     for (alias, settings) in &config.native.repositories {
         let store_path = root.join(alias).canonicalize()?;
@@ -787,7 +794,8 @@ pub async fn serve(mut config: Config) -> Result<()> {
         // deadlines; never embed the raw generated ObjectIo service instead.
         rbe_router = rbe_router
             .add_service(broker.rpc_service())
-            .add_service(broker.control_rpc_service());
+            .add_service(broker.control_rpc_service())
+            .add_service(broker.query_rpc_service());
     }
 
     let mut native_workspaces = if native_repositories.is_empty() {

@@ -244,7 +244,7 @@ impl NativeClient {
             })?;
         }
         self.retry(deadline, true, |allowance| {
-            let mut grpc = self.inner.grpc.clone();
+            let mut grpc = self.rpc_client(budget.clone());
             let (header, fork_header, overlay, budget, roots) = (
                 header.clone(),
                 fork_header.clone(),
@@ -306,13 +306,13 @@ impl NativeClient {
     pub async fn close_query_scope(&self, scope: &CheckedScopeHandle) -> Result<(), Status> {
         self.checked_scope(scope, true)?;
         let deadline = self.deadline();
-        let _budget = self.admit(deadline, self.unary_memory()).await?;
+        let budget = self.admit(deadline, self.unary_memory()).await?;
         let request = q::CloseScopeRequest {
             scope: Some(scope.key()),
         };
         self.bounded(&request)?;
         self.retry(deadline, false, |allowance| {
-            let mut grpc = self.inner.grpc.clone();
+            let mut grpc = self.rpc_client(budget.clone());
             let request = request.clone();
             async move {
                 grpc.close_scope(self.request(request, allowance)).await?;
@@ -329,7 +329,7 @@ impl NativeClient {
         self.checked_scope(scope, false)?;
         self.batch(facts.len())?;
         let deadline = self.deadline();
-        let _budget = self.admit(deadline, self.unary_memory()).await?;
+        let budget = self.admit(deadline, self.unary_memory()).await?;
         let mut wire = Vec::with_capacity(facts.len());
         let mut input_ids = 0usize;
         for fact in &facts {
@@ -382,7 +382,7 @@ impl NativeClient {
         };
         self.bounded(&request)?;
         self.retry(deadline, false, |allowance| {
-            let mut grpc = self.inner.grpc.clone();
+            let mut grpc = self.rpc_client(budget.clone());
             let request = request.clone();
             let expected = &facts;
             async move {
@@ -432,14 +432,14 @@ impl NativeClient {
         self.checked_scope(scope, false)?;
         check_prefix(prefix, 64)?;
         let deadline = self.deadline();
-        let _budget = self.admit(deadline, self.unary_memory()).await?;
+        let budget = self.admit(deadline, self.unary_memory()).await?;
         let request = q::ResolveCommitPrefixRequest {
             scope: Some(scope.key()),
             hex_prefix: prefix.into(),
         };
         self.bounded(&request)?;
         self.retry(deadline, false, |allowance| {
-            let mut grpc = self.inner.grpc.clone();
+            let mut grpc = self.rpc_client(budget.clone());
             let request = request.clone();
             async move {
                 use q::commit_prefix_result::Result as R;
@@ -476,7 +476,7 @@ impl NativeClient {
         visible_heads.sort_unstable();
         visible_heads.dedup();
         let deadline = self.deadline();
-        let _budget = self.admit(deadline, self.unary_memory()).await?;
+        let budget = self.admit(deadline, self.unary_memory()).await?;
         let request = q::ResolveChangePrefixRequest {
             scope: Some(scope.key()),
             hex_prefix: prefix.into(),
@@ -484,7 +484,7 @@ impl NativeClient {
         };
         self.bounded(&request)?;
         self.retry(deadline, false, |allowance| {
-            let mut grpc = self.inner.grpc.clone();
+            let mut grpc = self.rpc_client(budget.clone());
             let request = request.clone();
             async move {
                 use q::change_prefix_result::Result as R;
@@ -556,7 +556,7 @@ impl NativeClient {
             ),
         };
         let deadline = self.deadline();
-        let _budget = self.admit(deadline, self.unary_memory()).await?;
+        let budget = self.admit(deadline, self.unary_memory()).await?;
         let request = q::ShortestPrefixRequest {
             scope: Some(scope.key()),
             target: Some(target),
@@ -564,7 +564,7 @@ impl NativeClient {
         };
         self.bounded(&request)?;
         self.retry(deadline, false, |allowance| {
-            let mut grpc = self.inner.grpc.clone();
+            let mut grpc = self.rpc_client(budget.clone());
             let request = request.clone();
             async move {
                 let reply = grpc
@@ -876,7 +876,7 @@ impl NativeClient {
         getrandom::fill(&mut query_id)
             .map_err(|_| Status::internal("cannot generate evaluation identity"))?;
         Ok(CheckedIdsQuery {
-            client: self.clone(),
+            client: self.without_rpc_guards(),
             scope: scope.clone(),
             expression: Arc::new(expression.clone()),
             query_id,
@@ -1474,6 +1474,7 @@ pub(super) struct CleanupWorker {
     policy: reapi::policy::Policy,
     inflight: Arc<Semaphore>,
     bytes: Arc<Semaphore>,
+    rpc_guards: crate::verified::LifetimeGuards,
 }
 impl CleanupWorker {
     pub(super) fn new(client: &NativeClient) -> Self {
@@ -1483,6 +1484,7 @@ impl CleanupWorker {
             policy: client.inner.config.rpc.clone(),
             inflight: client.inner.inflight.clone(),
             bytes: client.inner.bytes.clone(),
+            rpc_guards: client.rpc_guards.clone(),
         }
     }
     pub(super) async fn run(self, mut receiver: tokio::sync::mpsc::Receiver<QueryCleanup>) {
@@ -1494,11 +1496,15 @@ impl CleanupWorker {
         let deadline = item.deadline;
         // Close-specific raw/decompressed cap + encoded/decoded overhead and
         // fixed owner/request scaffolding. Never ordinary page-sized admission.
-        let guards: crate::verified::LifetimeGuards = Arc::new(vec![Arc::new(CleanupOwner {
+        let mut guards: Vec<Arc<dyn std::any::Any + Send + Sync>> = vec![Arc::new(CleanupOwner {
             _guards: item.guards,
             _queued_state: item.queued_state,
             _queued_bytes: item.queued_bytes,
-        })]);
+        })];
+        // Only this explicit physical close attempt sees request owners. The
+        // queued item/uncertain-query guards remain persistent-only.
+        guards.extend(self.rpc_guards.iter().cloned());
+        let guards = Arc::new(guards);
         let inflight = reapi::policy::timeout(deadline, async {
             self.inflight
                 .clone()

@@ -16,3 +16,12 @@ max_edges = 50000
 max_metadata_bytes = 16777216
 max_path_contexts = 5000
 max_path_context_bytes = 2097152
+
+[query]
+max_scopes = 32
+max_queries = 64
+max_replays = 256
+max_registry_bytes = 67108864
+max_authorities = 256
+max_grants = 50000
+expiry_interval_ms = 1000

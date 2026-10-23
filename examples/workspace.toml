@@ -73,6 +73,10 @@ buildbuddy = "https://github.com/buildbuddy-io/buildbuddy.git"
 # [native]
 # max_inflight = 16
 # max_memory_bytes = 536870912
+# max_query_bytes = 524288
+# Separate aggregate registry/replay/SDK cap, not preallocated memory.
+# Lower per-repository limits or raise this cap for additional remote aliases.
+# max_query_persistent_bytes = 536870912
 # max_temporary_bytes = 1073741824
 # [native.repositories.example]
 # max_repository_bytes = 17179869184

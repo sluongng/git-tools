@@ -875,7 +875,7 @@ async fn legacy_complete_ledger_upgrades_without_losing_resident_provenance() {
     assert_eq!(counts.metadata_rpcs.load(Ordering::SeqCst), before);
     assert_eq!(
         std::fs::read(directory.path().join("ledger/admission.format")).unwrap(),
-        b"tinytree-native-admission-2\n"
+        b"tinytree-native-admission-3\n"
     );
     assert_eq!(counts.files.load(Ordering::SeqCst), 0);
     server.stop().await;
@@ -3074,4 +3074,604 @@ async fn roots_and_dag_range_graph_rpc_match_actual_pinned_jj() {
         }
         server.stop().await;
     }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn captured_multi_root_queries_admit_deep_metadata_without_intervening_history_or_new_holds()
+{
+    use native_broker::{NativeQueryIo, OpenQueryScope};
+    let (_serverdir, store, fixture, head, historical) = seed_history(8);
+    let independent = fixture
+        .objects()
+        .iter()
+        .find(|o| o.descriptor.key.kind == m::Kind::Commit)
+        .unwrap();
+    let independent_head = m::CommitId(independent.descriptor.key.id.0);
+    let mut selected = head;
+    let mut ancestry = Vec::new();
+    loop {
+        ancestry.push(selected);
+        let (_, bytes) = store
+            .read_metadata(
+                "example",
+                m::ObjectKey {
+                    kind: m::Kind::Commit,
+                    id: m::ObjectId(selected.0),
+                },
+            )
+            .unwrap();
+        let m::Object::Commit(commit) = m::decode(&bytes, m::Limits::default()).unwrap() else {
+            unreachable!()
+        };
+        if commit.parents == vec![m::CommitId::ROOT] {
+            break;
+        }
+        selected = commit.parents[0];
+    }
+    let counts = Counters::new();
+    let indexdir = private_dir();
+    let index = tinytree_index::Index::open(indexdir.path(), &Default::default()).unwrap();
+    let service = RepositoryService::new(
+        store.clone(),
+        ServiceConfig::default(),
+        vec!["example".into()],
+        vec![
+            Principal::new("test", TOKEN, vec!["example".into()], true)
+                .unwrap()
+                .with_retention(true),
+        ],
+    )
+    .unwrap()
+    .with_query_index(index)
+    .unwrap();
+    let server = Server::start_service(service, counts.clone(), None).await;
+    let directory = private_dir();
+    let cache = cache(directory.path());
+    let mut configuration = config(&server);
+    configuration.remote.limits.max_inflight = 1;
+    configuration.remote.limits.max_graph_objects = 65_536;
+    configuration.query.max_scopes = 2;
+    configuration.query.max_queries = 1;
+    configuration.query.max_replays = 8;
+    configuration.query.max_registry_bytes = 128 * 1024;
+    let (direct, repo) = local(directory.path(), cache.clone(), configuration.clone(), true);
+    repo.control.admit_reference("main").await.unwrap();
+    repo.control.admit_commit(independent_head).await.unwrap();
+    assert_eq!(counts.holds.load(Ordering::SeqCst), 2);
+    let before = counts.metadata_rpcs.load(Ordering::SeqCst);
+    let key = m::ObjectKey {
+        kind: m::Kind::Commit,
+        id: m::ObjectId(selected.0),
+    };
+    assert!(repo.io.read_metadata(key).await.is_err());
+    assert_eq!(counts.metadata_rpcs.load(Ordering::SeqCst), before);
+    let opened = repo
+        .query
+        .open_scope(
+            OpenQueryScope {
+                roots: vec![head, independent_head],
+                overlay: Vec::new(),
+                replay_key: [31; 32],
+            },
+            Arc::new(()),
+        )
+        .await
+        .unwrap();
+    let scope = opened.value.handle;
+    drop(opened);
+    let facts = vec![
+        native_broker::query_protocol::GraphFact {
+            fact: Some(native_broker::query_protocol::graph_fact::Fact::HasId(
+                native_broker::query_protocol::HasId {
+                    commit: Some(native_broker::query_protocol::CommitId {
+                        value: head.0.to_vec()
+                    })
+                }
+            ))
+        };
+        64
+    ];
+    let first_facts = repo
+        .query
+        .facts(scope, facts.clone(), Arc::new(()))
+        .await
+        .unwrap();
+    let second_facts = repo
+        .query
+        .facts(scope, facts.clone(), Arc::new(()))
+        .await
+        .unwrap();
+    let exhausted = repo
+        .query
+        .facts(scope, facts.clone(), Arc::new(()))
+        .await
+        .err()
+        .unwrap();
+    assert_eq!(
+        exhausted.code(),
+        tonic::Code::ResourceExhausted,
+        "retained facts must consume independent registry bytes, not an inflight slot"
+    );
+    drop(first_facts);
+    let recovered = repo.query.facts(scope, facts, Arc::new(())).await.unwrap();
+    assert_eq!(recovered.value.answers.len(), 64);
+    drop(recovered);
+    drop(second_facts);
+    // A retained reply never retains the sole transport slot. Exact replay is
+    // stable and requesting a later page can progress while an old reply lives.
+    let query = repo
+        .query
+        .begin(
+            native_broker::BeginQuery {
+                scope,
+                expression: native_broker::query_protocol::GraphExpr {
+                    version: 1,
+                    expression: Some(
+                        native_broker::query_protocol::graph_expr::Expression::Commits(
+                            native_broker::query_protocol::CommitSet {
+                                commits: vec![
+                                    native_broker::query_protocol::CommitId {
+                                        value: selected.0.to_vec(),
+                                    },
+                                    native_broker::query_protocol::CommitId {
+                                        value: independent_head.0.to_vec(),
+                                    },
+                                ],
+                            },
+                        ),
+                    ),
+                },
+                projection: native_broker::query_protocol::Projection::Canonical,
+                page_size: 1,
+                replay_key: [32; 32],
+            },
+            Arc::new(()),
+        )
+        .await
+        .unwrap();
+    let handle = query.value.handle;
+    drop(query);
+    let first = repo.query.page(handle, 0, Arc::new(())).await.unwrap();
+    let replay = repo.query.page(handle, 0, Arc::new(())).await.unwrap();
+    assert_eq!(first.value.rows, replay.value.rows);
+    drop(replay);
+    let second = tokio::time::timeout(
+        Duration::from_secs(5),
+        repo.query.page(handle, 1, Arc::new(())),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(second.value.sequence, 1);
+    drop(first);
+    drop(second);
+    repo.query.close_query(handle, Arc::new(())).await.unwrap();
+    let selected_reply = repo
+        .query
+        .read_commit(scope, selected, Arc::new(()))
+        .await
+        .unwrap();
+    assert_eq!(selected_reply.value.descriptor().key, key);
+    drop(selected_reply);
+    let independent_reply = repo
+        .query
+        .read_commit(scope, independent_head, Arc::new(()))
+        .await
+        .unwrap();
+    assert_eq!(independent_reply.value.descriptor(), independent.descriptor);
+    drop(independent_reply);
+    let next_oldest = ancestry[ancestry.len() - 2];
+    let next_reply = repo
+        .query
+        .read_commit(scope, next_oldest, Arc::new(()))
+        .await
+        .unwrap();
+    drop(next_reply);
+    assert_eq!(
+        counts.metadata_rpcs.load(Ordering::SeqCst),
+        before,
+        "selected canonical query must not fall back to ancestor metadata RPCs"
+    );
+    assert_eq!(
+        counts.holds.load(Ordering::SeqCst),
+        2,
+        "queries must reuse only original durable holds"
+    );
+    assert!(
+        direct
+            .descriptor(historical[0].descriptor.key)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    // A private overlay can participate in canonical graph queries but must not
+    // gain remote fetch provenance, residency or authoritative publication.
+    let (_, head_bytes) = store
+        .read_metadata(
+            "example",
+            m::ObjectKey {
+                kind: m::Kind::Commit,
+                id: m::ObjectId(head.0),
+            },
+        )
+        .unwrap();
+    let m::Object::Commit(mut draft) = m::decode(&head_bytes, m::Limits::default()).unwrap() else {
+        unreachable!()
+    };
+    draft.parents = vec![head];
+    draft.predecessors.clear();
+    draft.change_id = m::ChangeId([77; 16]);
+    draft.description = "private query overlay".into();
+    let draft = m::encode(&m::Object::Commit(draft), m::Limits::default()).unwrap();
+    let private_scope = repo
+        .query
+        .open_scope(
+            OpenQueryScope {
+                roots: vec![head, independent_head],
+                overlay: vec![draft.bytes.clone()],
+                replay_key: [33; 32],
+            },
+            Arc::new(()),
+        )
+        .await
+        .unwrap();
+    let private = repo
+        .query
+        .read_commit(
+            private_scope.value.handle,
+            m::CommitId(draft.descriptor.key.id.0),
+            Arc::new(()),
+        )
+        .await
+        .unwrap();
+    assert_eq!(private.value.bytes(), draft.bytes);
+    drop(private);
+    let private_query = repo
+        .query
+        .begin(
+            native_broker::BeginQuery {
+                scope: private_scope.value.handle,
+                expression: native_broker::query_protocol::GraphExpr {
+                    version: 1,
+                    expression: Some(
+                        native_broker::query_protocol::graph_expr::Expression::Commits(
+                            native_broker::query_protocol::CommitSet {
+                                commits: vec![native_broker::query_protocol::CommitId {
+                                    value: draft.descriptor.key.id.0.to_vec(),
+                                }],
+                            },
+                        ),
+                    ),
+                },
+                projection: native_broker::query_protocol::Projection::Canonical,
+                page_size: 1,
+                replay_key: [34; 32],
+            },
+            Arc::new(()),
+        )
+        .await
+        .unwrap();
+    let mut seq = 0;
+    loop {
+        let page = repo
+            .query
+            .page(private_query.value.handle, seq, Arc::new(()))
+            .await
+            .unwrap();
+        let done = page.value.exhausted;
+        drop(page);
+        if done {
+            break;
+        }
+        seq += 1;
+    }
+    repo.query
+        .close_query(private_query.value.handle, Arc::new(()))
+        .await
+        .unwrap();
+    drop(private_query);
+    repo.query
+        .close_scope(private_scope.value.handle, Arc::new(()))
+        .await
+        .unwrap();
+    drop(private_scope);
+    assert!(
+        direct
+            .descriptor(draft.descriptor.key)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(repo.io.read_metadata(draft.descriptor.key).await.is_err());
+    assert!(
+        store
+            .descriptor("example", draft.descriptor.key)
+            .unwrap()
+            .is_none()
+    );
+    repo.query.close_scope(scope, Arc::new(())).await.unwrap();
+    repo.wait_for_idle().await;
+    drop(repo);
+    drop(direct);
+    let (_direct, repo) = local(directory.path(), cache, configuration.clone(), false);
+    // The query cursor is gone, but its exact durable anchor-set witness still
+    // authorizes selected commit -> actual tree -> FILE provenance after restart.
+    let tree = repo
+        .io
+        .read_metadata(historical[0].descriptor.key)
+        .await
+        .unwrap();
+    assert_eq!(tree.descriptor(), historical[0].descriptor);
+    assert!(
+        repo.control.rebuild_file_index().await.unwrap() > 0,
+        "rebuild must preserve FILE claims from valid query-set trees"
+    );
+    let file = first_file(&fixture);
+    assert_eq!(
+        bytes(repo.io.as_ref(), m::FileId(file.descriptor.key.id.0)).await,
+        file.bytes
+    );
+    assert_eq!(counts.files.load(Ordering::SeqCst), 1);
+    assert_eq!(counts.holds.load(Ordering::SeqCst), 2);
+    // Replacing a confirmed hold generation invalidates the old exact union
+    // witness even though the immutable head is unchanged. Refresh must requery,
+    // not silently relabel the old grant under a replacement anchor.
+    let hold_name = format!(
+        "_tinytree/hold/v1/{}/{}",
+        repo.control
+            .client_id()
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect::<String>(),
+        blake3::Hash::from(head.0).to_hex()
+    );
+    let publisher = tinytree_client::NativeClient::connect(configuration.remote.clone())
+        .await
+        .unwrap();
+    let released = publisher
+        .publish(p::PublishReferenceRequest {
+            repository_id: "example".into(),
+            idempotency_key: "release-query-anchor".into(),
+            reference_name: hold_name.clone(),
+            expected_generation: 1,
+            new_commit: None,
+            staging_leases: vec![],
+        })
+        .await
+        .unwrap();
+    let released = released.reference.unwrap();
+    assert_eq!(released.generation, 2);
+    assert!(released.commit.is_none());
+    let reacquired = publisher
+        .publish(p::PublishReferenceRequest {
+            repository_id: "example".into(),
+            idempotency_key: "reacquire-query-anchor".into(),
+            reference_name: hold_name,
+            expected_generation: released.generation,
+            new_commit: Some(p::ObjectKey {
+                kind: m::Kind::Commit as i32,
+                native_id: head.0.to_vec(),
+            }),
+            staging_leases: vec![],
+        })
+        .await
+        .unwrap();
+    assert_eq!(reacquired.reference.unwrap().generation, 3);
+    assert_eq!(
+        counts.holds.load(Ordering::SeqCst),
+        4,
+        "two original holds plus the two intentional retention mutations"
+    );
+    repo.control.admit_reference("main").await.unwrap();
+    repo.control.rebuild_file_index().await.unwrap();
+    let before = counts.metadata_rpcs.load(Ordering::SeqCst);
+    assert!(
+        repo.io
+            .read_metadata(historical[1].descriptor.key)
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        counts.metadata_rpcs.load(Ordering::SeqCst),
+        before,
+        "stale union witness must not authorize a network fetch"
+    );
+    let reopened = repo
+        .query
+        .open_scope(
+            OpenQueryScope {
+                roots: vec![head, independent_head],
+                overlay: Vec::new(),
+                replay_key: [35; 32],
+            },
+            Arc::new(()),
+        )
+        .await
+        .unwrap();
+    let fresh = repo
+        .query
+        .read_commit(reopened.value.handle, next_oldest, Arc::new(()))
+        .await
+        .unwrap();
+    drop(fresh);
+    repo.query
+        .close_scope(reopened.value.handle, Arc::new(()))
+        .await
+        .unwrap();
+    drop(reopened);
+    assert_eq!(
+        repo.io
+            .read_metadata(historical[1].descriptor.key)
+            .await
+            .unwrap()
+            .descriptor(),
+        historical[1].descriptor
+    );
+    let unrelated = m::ObjectKey {
+        kind: m::Kind::Commit,
+        id: m::ObjectId([99; 32]),
+    };
+    let before = counts.metadata_rpcs.load(Ordering::SeqCst);
+    assert!(repo.io.read_metadata(unrelated).await.is_err());
+    assert_eq!(counts.metadata_rpcs.load(Ordering::SeqCst), before);
+    assert_eq!(
+        counts.holds.load(Ordering::SeqCst),
+        4,
+        "refresh and replacement-scope queries must not acquire extra holds"
+    );
+    server.stop().await;
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn real_broker_query_then_lazy_object_reads_share_the_captured_remote_adapter() {
+    use native_broker::{NativeQueryIo, OpenQueryScope};
+    use std::collections::HashMap;
+    let (_serverdir, store, fixture, head, historical) = seed_history(4);
+    let mut selected = head;
+    loop {
+        let (_, bytes) = store
+            .read_metadata(
+                "example",
+                m::ObjectKey {
+                    kind: m::Kind::Commit,
+                    id: m::ObjectId(selected.0),
+                },
+            )
+            .unwrap();
+        let m::Object::Commit(commit) = m::decode(&bytes, m::Limits::default()).unwrap() else {
+            unreachable!()
+        };
+        if commit.parents == vec![m::CommitId::ROOT] {
+            break;
+        }
+        selected = commit.parents[0];
+    }
+    let indexdir = private_dir();
+    let index = tinytree_index::Index::open(indexdir.path(), &Default::default()).unwrap();
+    let service = RepositoryService::new(
+        store,
+        ServiceConfig::default(),
+        vec!["example".into()],
+        vec![
+            Principal::new("test", TOKEN, vec!["example".into()], true)
+                .unwrap()
+                .with_retention(true),
+        ],
+    )
+    .unwrap()
+    .with_query_index(index)
+    .unwrap();
+    let counts = Counters::new();
+    let server = Server::start_service(service, counts.clone(), None).await;
+    let directory = private_dir();
+    let cache = cache(directory.path());
+    let (direct, repo) = local(directory.path(), cache, config(&server), true);
+    repo.control.admit_reference("main").await.unwrap();
+    let before = counts.metadata_rpcs.load(Ordering::SeqCst);
+    let mut broker_config = native_broker::Config::default();
+    broker_config.max_inflight = 1;
+    let broker = native_broker::BrokerService::new(
+        HashMap::from([("example".into(), repo.io.clone() as Arc<dyn NativeObjectIo>)]),
+        broker_config.clone(),
+    )
+    .unwrap()
+    .with_queries(HashMap::from([(
+        "example".into(),
+        repo.query.clone() as Arc<dyn NativeQueryIo>,
+    )]))
+    .unwrap();
+    let socket = directory.path().join("broker.sock");
+    let serving = socket.clone();
+    let (stop, stopped) = tokio::sync::oneshot::channel();
+    let task = tokio::spawn(async move {
+        native_broker::serve_unix(&serving, broker, async {
+            let _ = stopped.await;
+        })
+        .await
+    });
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while !socket.exists() {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let query =
+        native_broker::BrokerQueryClient::connect(&socket, "example", broker_config.clone())
+            .await
+            .unwrap();
+    let spool = directory.path().join("broker-spool");
+    make_private(&spool);
+    let objects = native_broker::BrokerObjectIo::connect(&socket, "example", &spool, broker_config)
+        .await
+        .unwrap();
+    let selected_key = m::ObjectKey {
+        kind: m::Kind::Commit,
+        id: m::ObjectId(selected.0),
+    };
+    assert!(objects.read_metadata(selected_key).await.is_err());
+    let opened = query
+        .open_scope(
+            OpenQueryScope {
+                roots: vec![head],
+                overlay: vec![],
+                replay_key: [41; 32],
+            },
+            Arc::new(()),
+        )
+        .await
+        .unwrap();
+    let scope = opened.value.handle;
+    drop(opened);
+    let selected_reply = query
+        .read_commit(scope, selected, Arc::new(()))
+        .await
+        .unwrap();
+    assert_eq!(selected_reply.value.descriptor().key, selected_key);
+    // Holding this decoded query reply must not pin the sole broker call slot.
+    let ordinary =
+        tokio::time::timeout(Duration::from_secs(5), objects.read_metadata(selected_key))
+            .await
+            .unwrap()
+            .unwrap();
+    assert_eq!(ordinary.bytes(), selected_reply.value.bytes());
+    drop(ordinary);
+    drop(selected_reply);
+    assert_eq!(
+        counts.metadata_rpcs.load(Ordering::SeqCst),
+        before,
+        "broker selected metadata must not hydrate intervening public commits"
+    );
+    assert_eq!(counts.holds.load(Ordering::SeqCst), 1, "no per-result hold");
+    assert!(
+        direct
+            .descriptor(historical[0].descriptor.key)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    let tree = objects
+        .read_metadata(historical[0].descriptor.key)
+        .await
+        .unwrap();
+    assert_eq!(tree.descriptor(), historical[0].descriptor);
+    repo.control.rebuild_file_index().await.unwrap();
+    let file = first_file(&fixture);
+    assert_eq!(
+        bytes(&objects, m::FileId(file.descriptor.key.id.0)).await,
+        file.bytes
+    );
+    assert_eq!(counts.files.load(Ordering::SeqCst), 1);
+    query.close_scope(scope, Arc::new(())).await.unwrap();
+    drop(objects);
+    drop(query);
+    let _ = stop.send(());
+    tokio::time::timeout(Duration::from_secs(5), task)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    repo.wait_for_idle().await;
+    server.stop().await;
 }

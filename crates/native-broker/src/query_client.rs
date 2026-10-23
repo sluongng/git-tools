@@ -1,0 +1,712 @@
+use crate::{
+    Config, NativeQueryIo, QueryOwner, QueryReply, proto as p, query::*, query_protocol as q,
+    query_service::handle, wire,
+};
+use http_body::Body as _;
+use prost::Message;
+use std::{
+    future::Future,
+    path::Path,
+    pin::Pin,
+    sync::{Arc, Mutex},
+    task::{Context, Poll},
+};
+use tinytree_model::CommitId;
+use tokio::{
+    sync::{OwnedSemaphorePermit, Semaphore},
+    time::Instant,
+};
+use tonic::{Request, Status, codec::CompressionEncoding, transport::Channel};
+fn integrity() -> Status {
+    Status::data_loss("invalid native query response")
+}
+fn checked_id(value: Option<&q::CommitId>) -> Result<[u8; 32], Status> {
+    value
+        .ok_or_else(integrity)?
+        .value
+        .as_slice()
+        .try_into()
+        .map_err(|_| integrity())
+}
+fn checked_rows(rows: &[q::GraphRow], limits: tinytree_model::Limits) -> Result<(), Status> {
+    let mut ids = std::collections::HashSet::new();
+    for row in rows {
+        let id = checked_id(row.commit.as_ref())?;
+        let change: &[u8] = &row.change.as_ref().ok_or_else(integrity)?.value;
+        if change.len() != 16 || !ids.insert(id) {
+            return Err(integrity());
+        }
+        for edge in &row.edges {
+            match edge.edge.as_ref().ok_or_else(integrity)? {
+                q::selected_edge::Edge::Direct(v) => {
+                    checked_id(v.target.as_ref())?;
+                }
+                q::selected_edge::Edge::Indirect(v) => {
+                    checked_id(v.target.as_ref())?;
+                }
+                q::selected_edge::Edge::Missing(v) => {
+                    checked_id(v.boundary.as_ref())?;
+                }
+            }
+        }
+        if let Some(data) = &row.canonical {
+            if id == [0; 32] {
+                return Err(integrity());
+            }
+            let d = data.descriptor.as_ref().ok_or_else(integrity)?;
+            let key = d.key.as_ref().ok_or_else(integrity)?;
+            if key.kind != tinytree_model::Kind::Commit as i32
+                || key.native_id.as_slice() != id
+                || d.content_blake3.as_slice() != id
+                || d.object_format_version != tinytree_model::FORMAT_VERSION as u32
+            {
+                return Err(integrity());
+            }
+            let descriptor = tinytree_model::Descriptor {
+                key: tinytree_model::ObjectKey {
+                    kind: tinytree_model::Kind::Commit,
+                    id: tinytree_model::ObjectId(id),
+                },
+                size_bytes: d.size_bytes,
+                format_version: tinytree_model::FORMAT_VERSION,
+            };
+            tinytree_model::verify(&descriptor, &data.canonical_envelope, limits)
+                .map_err(|_| integrity())?;
+            match tinytree_model::decode(&data.canonical_envelope, limits)
+                .map_err(|_| integrity())?
+            {
+                tinytree_model::Object::Commit(commit)
+                    if commit.change_id.0.as_slice() == change => {}
+                _ => return Err(integrity()),
+            }
+        }
+    }
+    Ok(())
+}
+// The request future can be cancelled before Hyper has finished consuming its
+// encoded body. Both directions retain this physical budget through teardown.
+struct QueryRpcBudget {
+    _external: QueryOwner,
+    _call: OwnedSemaphorePermit,
+    bytes: Mutex<OwnedSemaphorePermit>,
+}
+struct OwnedQueryBody {
+    body: Pin<Box<tonic::body::Body>>,
+    _owner: Arc<QueryRpcBudget>,
+}
+impl http_body::Body for OwnedQueryBody {
+    type Data = bytes::Bytes;
+    type Error = tonic::Status;
+    fn poll_frame(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<http_body::Frame<Self::Data>, Self::Error>>> {
+        self.body.as_mut().poll_frame(cx)
+    }
+    fn is_end_stream(&self) -> bool {
+        self.body.is_end_stream()
+    }
+    fn size_hint(&self) -> http_body::SizeHint {
+        self.body.size_hint()
+    }
+}
+#[derive(Clone)]
+struct OwnedQueryChannel {
+    channel: Channel,
+    owner: Arc<QueryRpcBudget>,
+}
+impl tower::Service<http::Request<tonic::body::Body>> for OwnedQueryChannel {
+    type Response = http::Response<tonic::body::Body>;
+    type Error = tonic::transport::Error;
+    type Future = Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send>>;
+    fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        tower::Service::poll_ready(&mut self.channel, cx)
+    }
+    fn call(&mut self, request: http::Request<tonic::body::Body>) -> Self::Future {
+        let owner = self.owner.clone();
+        let request = request.map(|body| {
+            tonic::body::Body::new(OwnedQueryBody {
+                body: Box::pin(body),
+                _owner: owner.clone(),
+            })
+        });
+        let response = tower::Service::call(&mut self.channel, request);
+        Box::pin(async move {
+            Ok(response.await?.map(|body| {
+                tonic::body::Body::new(OwnedQueryBody {
+                    body: Box::pin(body),
+                    _owner: owner,
+                })
+            }))
+        })
+    }
+}
+#[derive(Clone)]
+pub struct BrokerQueryClient {
+    inner: Arc<Inner>,
+}
+struct Inner {
+    channel: Channel,
+    store: String,
+    config: Config,
+    calls: Arc<Semaphore>,
+    bytes: Arc<Semaphore>,
+    persistent: Arc<Semaphore>,
+}
+impl std::fmt::Debug for BrokerQueryClient {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BrokerQueryClient").finish_non_exhaustive()
+    }
+}
+impl BrokerQueryClient {
+    pub async fn connect(
+        socket: impl AsRef<Path>,
+        store: impl Into<String>,
+        config: Config,
+    ) -> Result<Self, Status> {
+        Self::connect_local(
+            crate::LocalEndpoint::UnixSocket(socket.as_ref().to_owned()),
+            store,
+            config,
+        )
+        .await
+    }
+    /// All channel I/O runs on the independent broker runtime, including when
+    /// a synchronous jj adapter blocks its caller's current-thread runtime.
+    pub async fn connect_local(
+        endpoint: crate::LocalEndpoint,
+        store: impl Into<String>,
+        config: Config,
+    ) -> Result<Self, Status> {
+        let store = store.into();
+        crate::client::run_control(async move {
+            config.validate()?;
+            wire::id(&store)?;
+            if config.query_memory().saturating_add(16 * 1024) > config.max_memory_bytes {
+                return Err(Status::invalid_argument(
+                    "query client memory is below decode reservation",
+                ));
+            }
+            let channel = crate::transport::connect_local_channel(endpoint, &config).await?;
+            Ok(Self {
+                inner: Arc::new(Inner {
+                    channel,
+                    store,
+                    calls: Arc::new(Semaphore::new(config.max_inflight)),
+                    bytes: Arc::new(Semaphore::new(config.max_memory_bytes)),
+                    persistent: Arc::new(Semaphore::new(
+                        config.max_memory_bytes - config.query_memory(),
+                    )),
+                    config,
+                }),
+            })
+        })
+        .await
+    }
+    fn preflight(&self, payload_bytes: usize) -> Result<(), Status> {
+        crate::query_service::bounded_input(
+            payload_bytes.saturating_add(crate::query_service::field_bytes(self.inner.store.len())),
+            self.inner.config.max_query_bytes,
+        )
+    }
+    async fn execute<T, F, Fut>(
+        &self,
+        owner: QueryOwner,
+        mut operation: F,
+    ) -> Result<QueryReply<T>, Status>
+    where
+        T: Message + Send + 'static,
+        F: FnMut(
+                p::query_io_client::QueryIoClient<OwnedQueryChannel>,
+                Instant,
+                String,
+                usize,
+            ) -> Fut
+            + Send
+            + 'static,
+        Fut: Future<Output = Result<T, Status>> + Send + 'static,
+    {
+        let inner = self.inner.clone();
+        crate::client::run_control(async move {
+            let deadline = Instant::now() + inner.config.policy.operation_timeout();
+            reapi::policy::timeout(deadline, async move {
+                let call = inner
+                    .calls
+                    .clone()
+                    .acquire_owned()
+                    .await
+                    .map_err(|_| Status::unavailable("query client closed"))?;
+                let bytes = inner
+                    .bytes
+                    .clone()
+                    .acquire_many_owned(inner.config.query_memory() as u32)
+                    .await
+                    .map_err(|_| Status::unavailable("query client closed"))?;
+                let budget = Arc::new(QueryRpcBudget {
+                    _external: owner.clone(),
+                    _call: call,
+                    bytes: Mutex::new(bytes),
+                });
+                let client = p::query_io_client::QueryIoClient::new(OwnedQueryChannel {
+                    channel: inner.channel.clone(),
+                    owner: budget.clone(),
+                })
+                .send_compressed(CompressionEncoding::Zstd)
+                .accept_compressed(CompressionEncoding::Zstd)
+                .max_decoding_message_size(inner.config.max_query_bytes)
+                .max_encoding_message_size(inner.config.max_query_bytes);
+                let value = inner
+                    .config
+                    .policy
+                    .retry(deadline, inner.config.policy.rpc_timeout(), |allowance| {
+                        operation(
+                            client.clone(),
+                            Instant::now() + allowance,
+                            inner.store.clone(),
+                            inner.config.max_query_bytes,
+                        )
+                    })
+                    .await?;
+                let len = value.encoded_len();
+                if len > inner.config.max_query_bytes {
+                    return Err(Status::resource_exhausted(
+                        "query client reply exceeds limit",
+                    ));
+                }
+                let retained = len.saturating_mul(128).saturating_add(4096);
+                // Persistent replies cannot consume the headroom needed for
+                // another full decode. Fail instead of waiting on held pages.
+                let state = inner
+                    .persistent
+                    .clone()
+                    .try_acquire_many_owned(retained as u32)
+                    .map_err(|_| {
+                        Status::resource_exhausted("native query retained reply budget exhausted")
+                    })?;
+                let retained = budget
+                    .bytes
+                    .lock()
+                    .map_err(|_| Status::internal("query client memory requires recovery"))?
+                    .split(retained)
+                    .ok_or_else(|| Status::internal("query client reply reservation missing"))?;
+                Ok(QueryReply {
+                    value,
+                    owner: Arc::new((state, retained)),
+                })
+            })
+            .await
+        })
+        .await
+        .map_err(crate::query::status)
+    }
+}
+fn request<T: Message>(value: T, deadline: Instant, cap: usize) -> Result<Request<T>, Status> {
+    if value.encoded_len() > cap {
+        return Err(Status::resource_exhausted(
+            "native query request exceeds limit",
+        ));
+    }
+    let left = deadline
+        .checked_duration_since(Instant::now())
+        .ok_or_else(|| Status::deadline_exceeded("native query deadline exceeded"))?;
+    let mut request = Request::new(value);
+    request.set_timeout(left);
+    Ok(request)
+}
+fn ids(v: Vec<CommitId>) -> Vec<Vec<u8>> {
+    v.into_iter().map(|id| id.0.to_vec()).collect()
+}
+fn scope(v: p::QueryScopeReply) -> Result<QueryScope, Status> {
+    if v.expires_at_unix_seconds <= 0 {
+        return Err(integrity());
+    }
+    Ok(QueryScope {
+        handle: handle(&v.handle)?,
+        expires_at_unix_seconds: v.expires_at_unix_seconds,
+    })
+}
+#[async_trait::async_trait]
+impl NativeQueryIo for BrokerQueryClient {
+    fn resources(&self) -> QueryResources {
+        QueryResources {
+            memory_bytes: self.inner.config.query_memory() as u64,
+            temporary_bytes: 0,
+            persistent_memory_bytes: self.inner.config.max_memory_bytes as u64,
+        }
+    }
+    async fn open_scope(
+        &self,
+        i: OpenQueryScope,
+        o: QueryOwner,
+    ) -> Result<QueryReply<QueryScope>, Status> {
+        let cap = self.inner.config.max_query_bytes;
+        self.preflight(
+            crate::query_service::visible_bytes(&i.roots, cap)?
+                .saturating_add(crate::query_service::overlay_bytes(&i.overlay, cap)?)
+                .saturating_add(34),
+        )?;
+        let r = self
+            .execute(o, move |mut c, d, s, cap| {
+                let i = i.clone();
+                async move {
+                    Ok(c.open_scope(request(
+                        p::QueryOpenScopeRequest {
+                            store_id: s,
+                            roots: ids(i.roots),
+                            overlay: i.overlay,
+                            replay_key: i.replay_key.to_vec(),
+                        },
+                        d,
+                        cap,
+                    )?)
+                    .await?
+                    .into_inner())
+                }
+            })
+            .await?;
+        Ok(QueryReply {
+            value: scope(r.value)?,
+            owner: r.owner,
+        })
+    }
+    async fn fork_scope(
+        &self,
+        i: ForkQueryScope,
+        o: QueryOwner,
+    ) -> Result<QueryReply<QueryScope>, Status> {
+        let cap = self.inner.config.max_query_bytes;
+        self.preflight(crate::query_service::overlay_bytes(&i.overlay, cap)?.saturating_add(68))?;
+        let r = self
+            .execute(o, move |mut c, d, s, cap| {
+                let i = i.clone();
+                async move {
+                    Ok(c.fork_scope(request(
+                        p::QueryForkScopeRequest {
+                            store_id: s,
+                            parent: i.parent.to_vec(),
+                            overlay: i.overlay,
+                            replay_key: i.replay_key.to_vec(),
+                        },
+                        d,
+                        cap,
+                    )?)
+                    .await?
+                    .into_inner())
+                }
+            })
+            .await?;
+        Ok(QueryReply {
+            value: scope(r.value)?,
+            owner: r.owner,
+        })
+    }
+    async fn facts(
+        &self,
+        s: [u8; 32],
+        f: Vec<q::GraphFact>,
+        o: QueryOwner,
+    ) -> Result<QueryReply<q::GraphFacts>, Status> {
+        let expected = crate::query_service::fact_shapes(&f, self.inner.config.max_query_bytes)?;
+        let n = f.len();
+        self.preflight(f.iter().fold(34usize, |n, f| {
+            n.saturating_add(crate::query_service::field_bytes(f.encoded_len()))
+        }))?;
+        let r = self
+            .execute(o, move |mut c, d, store_id, cap| {
+                let f = f.clone();
+                async move {
+                    Ok(c.facts(request(
+                        p::QueryFactsRequest {
+                            store_id,
+                            scope: s.to_vec(),
+                            facts: f,
+                        },
+                        d,
+                        cap,
+                    )?)
+                    .await?
+                    .into_inner())
+                }
+            })
+            .await?;
+        if r.value.scope_digest.len() != 32 || r.value.index_epoch.len() != 16 {
+            return Err(integrity());
+        }
+        for (answer, expected) in r.value.answers.iter().zip(expected) {
+            let actual = match answer.answer.as_ref().ok_or_else(integrity)? {
+                q::graph_fact_answer::Answer::HasId(_) => 1,
+                q::graph_fact_answer::Answer::IsAncestor(_) => 2,
+                q::graph_fact_answer::Answer::Heads(_) => 3,
+                q::graph_fact_answer::Answer::CommonAncestors(_) => 4,
+            };
+            if actual != expected {
+                return Err(integrity());
+            }
+            match answer.answer.as_ref().ok_or_else(integrity)? {
+                q::graph_fact_answer::Answer::HasId(_)
+                | q::graph_fact_answer::Answer::IsAncestor(_) => {}
+                q::graph_fact_answer::Answer::Heads(v)
+                | q::graph_fact_answer::Answer::CommonAncestors(v) => {
+                    for id in &v.commits {
+                        checked_id(Some(id))?;
+                    }
+                }
+            }
+        }
+        if r.value.answers.len() != n {
+            return Err(Status::data_loss("native query fact count mismatch"));
+        }
+        Ok(r)
+    }
+    async fn resolve_commit_prefix(
+        &self,
+        s: [u8; 32],
+        f: String,
+        o: QueryOwner,
+    ) -> Result<QueryReply<q::CommitPrefixResult>, Status> {
+        crate::query_service::prefix(&f, 64)?;
+        self.preflight(34usize.saturating_add(crate::query_service::field_bytes(f.len())))?;
+        let r = self
+            .execute(o, move |mut c, d, store_id, cap| {
+                let f = f.clone();
+                async move {
+                    Ok(c.resolve_commit_prefix(request(
+                        p::QueryCommitPrefixRequest {
+                            store_id,
+                            scope: s.to_vec(),
+                            hex_prefix: f,
+                        },
+                        d,
+                        cap,
+                    )?)
+                    .await?
+                    .into_inner())
+                }
+            })
+            .await?;
+        if r.value.result.is_none() {
+            return Err(Status::data_loss("missing native commit prefix result"));
+        }
+        Ok(r)
+    }
+    async fn resolve_change_prefix(
+        &self,
+        s: [u8; 32],
+        f: String,
+        h: Vec<CommitId>,
+        o: QueryOwner,
+    ) -> Result<QueryReply<q::ChangePrefixResult>, Status> {
+        crate::query_service::prefix(&f, 32)?;
+        self.preflight(
+            crate::query_service::visible_bytes(&h, self.inner.config.max_query_bytes)?
+                .saturating_add(34)
+                .saturating_add(crate::query_service::field_bytes(f.len())),
+        )?;
+        let r = self
+            .execute(o, move |mut c, d, store_id, cap| {
+                let f = f.clone();
+                let h = h.clone();
+                async move {
+                    Ok(c.resolve_change_prefix(request(
+                        p::QueryChangePrefixRequest {
+                            store_id,
+                            scope: s.to_vec(),
+                            hex_prefix: f,
+                            visible_heads: ids(h),
+                        },
+                        d,
+                        cap,
+                    )?)
+                    .await?
+                    .into_inner())
+                }
+            })
+            .await?;
+        if r.value.result.is_none() {
+            return Err(Status::data_loss("missing native change prefix result"));
+        }
+        Ok(r)
+    }
+    async fn shortest_prefix(
+        &self,
+        s: [u8; 32],
+        t: q::shortest_prefix_request::Target,
+        h: Vec<CommitId>,
+        o: QueryOwner,
+    ) -> Result<QueryReply<q::ShortestPrefixResult>, Status> {
+        self.preflight(
+            crate::query_service::visible_bytes(&h, self.inner.config.max_query_bytes)?
+                .saturating_add(34)
+                .saturating_add(crate::query_service::target_bytes(&t)?),
+        )?;
+        let target = match t {
+            q::shortest_prefix_request::Target::Commit(v) => {
+                p::query_shortest_prefix_request::Target::Commit(v.value)
+            }
+            q::shortest_prefix_request::Target::Change(v) => {
+                p::query_shortest_prefix_request::Target::Change(v.value)
+            }
+        };
+        self.execute(o, move |mut c, d, store_id, cap| {
+            let target = target.clone();
+            let h = h.clone();
+            async move {
+                Ok(c.shortest_prefix(request(
+                    p::QueryShortestPrefixRequest {
+                        store_id,
+                        scope: s.to_vec(),
+                        target: Some(target),
+                        visible_heads: ids(h),
+                    },
+                    d,
+                    cap,
+                )?)
+                .await?
+                .into_inner())
+            }
+        })
+        .await
+    }
+    async fn begin(&self, i: BeginQuery, o: QueryOwner) -> Result<QueryReply<QueryHandle>, Status> {
+        crate::query_service::expression_shape(&i.expression, self.inner.config.max_query_bytes)?;
+        self.preflight(
+            crate::query_service::field_bytes(i.expression.encoded_len()).saturating_add(76),
+        )?;
+        let r = self
+            .execute(o, move |mut c, d, store_id, cap| {
+                let i = i.clone();
+                async move {
+                    Ok(c.begin(request(
+                        p::QueryBeginRequest {
+                            store_id,
+                            scope: i.scope.to_vec(),
+                            expression: Some(i.expression),
+                            projection: i.projection as i32,
+                            page_size: i.page_size,
+                            replay_key: i.replay_key.to_vec(),
+                        },
+                        d,
+                        cap,
+                    )?)
+                    .await?
+                    .into_inner())
+                }
+            })
+            .await?;
+        Ok(QueryReply {
+            value: QueryHandle {
+                handle: handle(&r.value.handle)?,
+                expires_at_unix_seconds: r.value.expires_at_unix_seconds,
+            },
+            owner: r.owner,
+        })
+    }
+    async fn page(
+        &self,
+        q: [u8; 32],
+        s: u64,
+        o: QueryOwner,
+    ) -> Result<QueryReply<QueryPage>, Status> {
+        let r = self
+            .execute(o, move |mut c, d, store_id, cap| async move {
+                Ok(c.page(request(
+                    p::QueryPageRequest {
+                        store_id,
+                        query: q.to_vec(),
+                        expected_sequence: s,
+                    },
+                    d,
+                    cap,
+                )?)
+                .await?
+                .into_inner())
+            })
+            .await?;
+        checked_rows(&r.value.rows, self.inner.config.model_limits())?;
+        if r.value.sequence != s {
+            return Err(Status::data_loss("native query page sequence mismatch"));
+        }
+        let exhausted = r
+            .value
+            .exhausted
+            .ok_or_else(|| Status::data_loss("missing native query exhaustion"))?;
+        Ok(QueryReply {
+            value: QueryPage {
+                sequence: s,
+                rows: r.value.rows,
+                exhausted,
+            },
+            owner: r.owner,
+        })
+    }
+    async fn read_commit(
+        &self,
+        s: [u8; 32],
+        id: CommitId,
+        o: QueryOwner,
+    ) -> Result<QueryReply<jj_native_backend::VerifiedMetadata>, Status> {
+        let limits = self.inner.config.model_limits();
+        let r = self
+            .execute(o, move |mut c, d, store_id, cap| async move {
+                Ok(c.read_commit(request(
+                    p::QueryReadCommitRequest {
+                        store_id,
+                        scope: s.to_vec(),
+                        commit: id.0.to_vec(),
+                    },
+                    d,
+                    cap,
+                )?)
+                .await?
+                .into_inner())
+            })
+            .await?;
+        let descriptor = wire::descriptor(
+            r.value
+                .descriptor
+                .ok_or_else(|| Status::data_loss("missing native query commit descriptor"))?,
+        )?;
+        if descriptor.key.kind != tinytree_model::Kind::Commit || descriptor.key.id.0 != id.0 {
+            return Err(Status::data_loss("native query commit identity mismatch"));
+        }
+        let value =
+            jj_native_backend::VerifiedMetadata::verify(descriptor, r.value.canonical, limits)
+                .map_err(|_| Status::data_loss("invalid native query canonical commit"))?;
+        Ok(QueryReply {
+            value,
+            owner: r.owner,
+        })
+    }
+    async fn close_query(&self, h: [u8; 32], o: QueryOwner) -> Result<(), Status> {
+        self.execute(o, move |mut c, d, store_id, cap| async move {
+            Ok(c.close_query(request(
+                p::QueryCloseRequest {
+                    store_id,
+                    handle: h.to_vec(),
+                },
+                d,
+                cap,
+            )?)
+            .await?
+            .into_inner())
+        })
+        .await
+        .map(|_| ())
+    }
+    async fn close_scope(&self, h: [u8; 32], o: QueryOwner) -> Result<(), Status> {
+        self.execute(o, move |mut c, d, store_id, cap| async move {
+            Ok(c.close_scope(request(
+                p::QueryCloseRequest {
+                    store_id,
+                    handle: h.to_vec(),
+                },
+                d,
+                cap,
+            )?)
+            .await?
+            .into_inner())
+        })
+        .await
+        .map(|_| ())
+    }
+}

@@ -1,0 +1,1531 @@
+//! Captured broker queries. Server membership is authenticated, not a hash proof.
+use crate::{Inner, backend, io, ledger::QueryAuthority};
+use anyhow::{Context, Result, ensure};
+use async_trait::async_trait;
+use jj_native_backend::NativeObjectIo;
+use native_broker::{
+    BeginQuery, ForkQueryScope, NativeQueryIo, OpenQueryScope, QueryHandle, QueryOwner, QueryPage,
+    QueryReply, QueryResources, QueryScope, query_protocol as q,
+};
+use prost::Message;
+use std::{
+    collections::{BTreeMap, HashMap},
+    future::Future,
+    sync::Arc,
+    time::{SystemTime, UNIX_EPOCH},
+};
+use tinytree_client::{
+    CheckedGraphPage, CheckedGraphQuery, CheckedIdsQuery, CheckedScopeHandle, NativeClient,
+};
+use tinytree_model as m;
+use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore};
+
+#[derive(Clone)]
+pub struct RemoteQueryIo {
+    inner: Arc<Inner>,
+    registry: Arc<Mutex<Registry>>,
+    memory: Arc<Semaphore>,
+    operations: Arc<Semaphore>,
+}
+impl std::fmt::Debug for RemoteQueryIo {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RemoteQueryIo").finish_non_exhaustive()
+    }
+}
+#[derive(Default)]
+struct Registry {
+    scopes: HashMap<[u8; 32], ScopeRecord>,
+    queries: HashMap<[u8; 32], QueryRecord>,
+    replays: HashMap<(u8, [u8; 32]), Replay>,
+    _memory: Option<OwnedSemaphorePermit>,
+}
+#[derive(Default)]
+struct Retired {
+    queries: Vec<QueryRecord>,
+    scopes: Vec<ScopeRecord>,
+    replays: Vec<Replay>,
+}
+impl Retired {
+    fn is_empty(&self) -> bool {
+        self.queries.is_empty() && self.scopes.is_empty() && self.replays.is_empty()
+    }
+}
+struct RetirementOwner {
+    _inner: Arc<Inner>,
+    _ticket: io::WorkTicket,
+}
+
+struct Replay {
+    fingerprint: [u8; 32],
+    handle: [u8; 32],
+    error: Option<tonic::Code>,
+    expires: i64,
+    _memory: OwnedSemaphorePermit,
+}
+struct ScopeRecord {
+    captured: Option<Arc<CapturedScope>>,
+    expires: i64,
+    closed: bool,
+}
+struct CapturedScope {
+    client: NativeClient,
+    checked: CheckedScopeHandle,
+    authority: QueryAuthority,
+    overlays: BTreeMap<m::CommitId, Arc<Vec<u8>>>,
+    _parent: Option<Arc<CapturedScope>>,
+    _memory: OwnedSemaphorePermit,
+}
+enum CheckedQuery {
+    Ids(CheckedIdsQuery),
+    Graph(CheckedGraphQuery),
+}
+struct QueryRecord {
+    scope: Option<Arc<CapturedScope>>,
+    client: NativeClient,
+    checked: Option<CheckedQuery>,
+    pending: Option<Arc<CheckedGraphPage>>,
+    pending_ids: Option<tinytree_client::CheckedIdsPage>,
+    replay: Option<Arc<PageState>>,
+    next: u64,
+    expires: i64,
+    closed: bool,
+    _memory: OwnedSemaphorePermit,
+}
+struct PageState {
+    value: QueryPage,
+    _checked: Option<Arc<CheckedGraphPage>>,
+    _scope: Arc<CapturedScope>,
+    _memory: OwnedSemaphorePermit,
+}
+struct PhysicalOperation {
+    _provider: Arc<Inner>,
+    _owner: QueryOwner,
+    _lease: OwnedSemaphorePermit,
+    _ticket: io::WorkTicket,
+}
+fn now() -> Result<i64> {
+    Ok(i64::try_from(
+        SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs(),
+    )?)
+}
+fn status(error: anyhow::Error) -> tonic::Status {
+    let code = error
+        .downcast_ref::<tonic::Status>()
+        .map_or(tonic::Code::FailedPrecondition, tonic::Status::code);
+    tonic::Status::new(code, "native repository query operation failed")
+}
+fn random() -> [u8; 32] {
+    let mut id = [0; 32];
+    id[..16].copy_from_slice(uuid::Uuid::new_v4().as_bytes());
+    id[16..].copy_from_slice(uuid::Uuid::new_v4().as_bytes());
+    id
+}
+fn wire_commit(id: m::CommitId) -> q::CommitId {
+    q::CommitId {
+        value: id.0.to_vec(),
+    }
+}
+fn commit(id: q::CommitId) -> Result<m::CommitId> {
+    Ok(m::CommitId(id.value.try_into().map_err(|_| {
+        tonic::Status::invalid_argument("invalid native query commit ID")
+    })?))
+}
+fn hash(parts: &[&[u8]]) -> [u8; 32] {
+    let mut h = blake3::Hasher::new();
+    h.update(b"native-broker-query-intent-v1\0");
+    for p in parts {
+        h.update(&(p.len() as u64).to_be_bytes());
+        h.update(p);
+    }
+    *h.finalize().as_bytes()
+}
+impl Registry {
+    fn expire(&mut self, time: i64) -> Retired {
+        let mut retired = Retired::default();
+        let expired = self
+            .queries
+            .iter()
+            .filter_map(|(id, q)| (q.expires <= time).then_some(*id))
+            .collect::<Vec<_>>();
+        for id in expired {
+            retired.queries.push(self.queries.remove(&id).unwrap());
+        }
+        let expired = self
+            .scopes
+            .iter()
+            .filter_map(|(id, q)| (q.expires <= time).then_some(*id))
+            .collect::<Vec<_>>();
+        for id in expired {
+            retired.scopes.push(self.scopes.remove(&id).unwrap());
+        }
+        let expired = self
+            .replays
+            .iter()
+            .filter_map(|(id, q)| (q.expires <= time).then_some(*id))
+            .collect::<Vec<_>>();
+        for id in expired {
+            retired.replays.push(self.replays.remove(&id).unwrap());
+        }
+        retired
+    }
+    fn scope(&self, id: [u8; 32]) -> Result<Arc<CapturedScope>> {
+        let record = self
+            .scopes
+            .get(&id)
+            .context("native query scope unavailable")?;
+        ensure!(
+            !record.closed && record.expires > now()?,
+            "native query scope closed or expired"
+        );
+        record
+            .captured
+            .clone()
+            .context("native query scope unavailable")
+    }
+    fn replay(&self, kind: u8, key: [u8; 32], fingerprint: [u8; 32]) -> Result<Option<[u8; 32]>> {
+        let Some(r) = self.replays.get(&(kind, key)) else {
+            return Ok(None);
+        };
+        ensure!(
+            r.fingerprint == fingerprint,
+            tonic::Status::already_exists("query replay key has another intent")
+        );
+        if let Some(code) = r.error {
+            return Err(tonic::Status::new(
+                code,
+                "native query creation outcome unavailable; preserve the original intent",
+            )
+            .into());
+        }
+        Ok(Some(r.handle))
+    }
+}
+impl RemoteQueryIo {
+    pub(crate) fn new(inner: Arc<Inner>) -> Result<Self> {
+        let memory = Arc::new(Semaphore::new(inner.config.query.max_registry_bytes));
+        let base = memory
+            .clone()
+            .try_acquire_many_owned(u32::try_from(inner.config.query.registry_overhead())?)?;
+        let registry = Arc::new(Mutex::new(Registry {
+            _memory: Some(base),
+            ..Default::default()
+        }));
+        let operations = Arc::new(Semaphore::new(1));
+        let weak_registry = Arc::downgrade(&registry);
+        let weak_operations = Arc::downgrade(&operations);
+        let weak_inner = Arc::downgrade(&inner);
+        let interval = std::time::Duration::from_millis(inner.config.query.expiry_interval_ms);
+        io::background(async move {
+            loop {
+                tokio::time::sleep(interval).await;
+                let Some(operations) = weak_operations.upgrade() else {
+                    return;
+                };
+                let Ok(lease) = operations.try_acquire_owned() else {
+                    continue;
+                };
+                let Some(registry) = weak_registry.upgrade() else {
+                    return;
+                };
+                let retired = {
+                    let mut registry = registry.lock().await;
+                    match now() {
+                        Ok(time) => registry.expire(time),
+                        Err(_) => continue,
+                    }
+                };
+                drop(registry);
+                if retired.is_empty() {
+                    drop(lease);
+                    continue;
+                }
+                let Some(inner) = weak_inner.upgrade() else {
+                    return;
+                };
+                let owner = Arc::new(RetirementOwner {
+                    _ticket: inner.metadata_work.enter(),
+                    _inner: inner,
+                });
+                // Removed states keep their own quotas until blocking teardown.
+                let _ = io::blocking_owned(owner, move || {
+                    drop(retired);
+                    drop(lease);
+                    Ok(())
+                })
+                .await;
+            }
+        })?;
+        Ok(Self {
+            inner,
+            registry,
+            memory,
+            operations,
+        })
+    }
+    async fn clean_expired(&self) -> Result<()> {
+        let retired = {
+            let mut registry = self.registry.lock().await;
+            registry.expire(now()?)
+        };
+        if retired.is_empty() {
+            return Ok(());
+        }
+        let owner = Arc::new(RetirementOwner {
+            _ticket: self.inner.metadata_work.enter(),
+            _inner: self.inner.clone(),
+        });
+        io::blocking_owned(owner, move || {
+            drop(retired);
+            Ok(())
+        })
+        .await
+    }
+    fn charge(&self, bytes: usize) -> Result<OwnedSemaphorePermit> {
+        let bytes = u32::try_from(bytes).map_err(|_| {
+            tonic::Status::resource_exhausted("native query registry bytes exceeded")
+        })?;
+        self.memory
+            .clone()
+            .try_acquire_many_owned(bytes)
+            .map_err(|_| {
+                tonic::Status::resource_exhausted("native query registry bytes exhausted").into()
+            })
+    }
+    async fn run<T: Send + 'static, F: Future<Output = Result<T>> + Send + 'static>(
+        &self,
+        owner: QueryOwner,
+        make: impl FnOnce(Self, Arc<PhysicalOperation>) -> F + Send + 'static,
+    ) -> std::result::Result<T, tonic::Status> {
+        let deadline = self.inner.deadline();
+        let lease = tokio::time::timeout_at(deadline, self.operations.clone().acquire_owned())
+            .await
+            .map_err(|_| {
+                tonic::Status::deadline_exceeded("native query admission deadline exceeded")
+            })?
+            .map_err(|_| tonic::Status::unavailable("native query adapter draining"))?;
+        let operation = Arc::new(PhysicalOperation {
+            _provider: self.inner.clone(),
+            _owner: owner,
+            _lease: lease,
+            _ticket: self.inner.metadata_work.enter(),
+        });
+        let this = self.clone();
+        io::owned(async move {
+            let result = tokio::time::timeout_at(deadline, make(this, operation.clone()))
+                .await
+                .map_err(|_| {
+                    tonic::Status::deadline_exceeded("native query operation deadline exceeded")
+                })?;
+            drop(operation);
+            result
+        })
+        .await
+        .map_err(status)
+    }
+    async fn online(&self, scope: &CapturedScope) -> Result<()> {
+        let _ = self.inner.connector.get().await?;
+        self.inner
+            .ledger
+            .validate_authority(&crate::ledger::Authority::Query(scope.authority.clone()))
+    }
+    async fn overlay(
+        &self,
+        client: &NativeClient,
+        raw: Vec<Vec<u8>>,
+    ) -> Result<(
+        Vec<tinytree_client::VerifiedMetadata>,
+        BTreeMap<m::CommitId, Arc<Vec<u8>>>,
+    )> {
+        ensure!(
+            raw.len() <= self.inner.config.closure.max_objects,
+            "native query overlay object limit exceeded"
+        );
+        let mut total = 0usize;
+        let mut verified = Vec::new();
+        let mut index = BTreeMap::new();
+        for bytes in raw {
+            total = total
+                .checked_add(bytes.len())
+                .context("native query overlay byte overflow")?;
+            ensure!(
+                total <= self.inner.config.closure.max_metadata_bytes,
+                "native query overlay bytes exceeded"
+            );
+            let object = m::decode(&bytes, self.inner.model_limits())?;
+            let m::Object::Commit(_) = object else {
+                anyhow::bail!("native query overlay requires commits")
+            };
+            let encoded = m::encode(&object, self.inner.model_limits())?;
+            ensure!(
+                encoded.bytes == bytes,
+                "native query overlay is not canonical"
+            );
+            let id = m::CommitId(encoded.descriptor.key.id.0);
+            ensure!(!index.contains_key(&id), "duplicate native query overlay");
+            let item = client
+                .verify_metadata(encoded.descriptor, bytes.clone())
+                .await?;
+            index.insert(id, Arc::new(bytes));
+            verified.push(item);
+        }
+        Ok((verified, index))
+    }
+    fn replay_reservation(
+        &self,
+        registry: &mut Registry,
+        kind: u8,
+        key: [u8; 32],
+        fingerprint: [u8; 32],
+        expires: i64,
+    ) -> Result<[u8; 32]> {
+        ensure!(
+            registry.replays.len() < self.inner.config.query.max_replays,
+            "native query replay count exceeded"
+        );
+        let charge = self.charge(4096)?;
+        let handle = random();
+        registry.replays.insert(
+            (kind, key),
+            Replay {
+                fingerprint,
+                handle,
+                error: Some(tonic::Code::Unavailable),
+                expires,
+                _memory: charge,
+            },
+        );
+        Ok(handle)
+    }
+    async fn install(
+        &self,
+        scope: &Arc<CapturedScope>,
+        page: &CheckedGraphPage,
+        owner: QueryOwner,
+    ) -> Result<()> {
+        let mut nodes = Vec::new();
+        for row in page.rows() {
+            if row.commit == m::CommitId::ROOT || scope.overlays.contains_key(&row.commit) {
+                continue;
+            }
+            if let Some(canonical) = &row.canonical {
+                let descriptor = canonical.descriptor();
+                let object = canonical.object().clone();
+                ensure!(
+                    descriptor.key.kind == m::Kind::Commit && descriptor.key.id.0 == row.commit.0,
+                    "native canonical row identity mismatch"
+                );
+                let m::Object::Commit(commit) = &object else {
+                    anyhow::bail!("native canonical row is not a commit")
+                };
+                ensure!(
+                    commit.change_id == row.change,
+                    "native canonical row ChangeId mismatch"
+                );
+                nodes.push((descriptor, object));
+            }
+        }
+        if nodes.is_empty() {
+            return Ok(());
+        }
+        let _metadata = self.inner.metadata.clone().lock_owned().await;
+        let ledger = self.inner.ledger.clone();
+        let authority = scope.authority.clone();
+        let plan = nodes.clone();
+        let digest = *scope.checked.content_digest();
+        let epoch = *scope.checked.index_epoch();
+        io::blocking_owned(owner.clone(), move || {
+            ledger.check_query_page(&authority, &plan, digest, epoch)
+        })
+        .await?;
+        // This private fetched-data path installs canonical objects, not authored
+        // operation/index roots. Only the following explicit witness grants fetches.
+        for (expected, object) in &nodes {
+            let actual = self
+                .inner
+                .local
+                .write_metadata_with_owner(object.clone(), owner.clone())
+                .await
+                .map_err(backend)?;
+            ensure!(
+                actual == *expected,
+                "native fetched metadata installation changed identity"
+            );
+        }
+        let ledger = self.inner.ledger.clone();
+        let authority = scope.authority.clone();
+        io::blocking_owned(owner, move || {
+            ledger.admit_query_page(&authority, &nodes, digest, epoch)
+        })
+        .await
+    }
+}
+fn scope_fingerprint(roots: &[m::CommitId], overlay: &[Vec<u8>]) -> [u8; 32] {
+    let mut h = blake3::Hasher::new();
+    h.update(b"native-broker-query-scope-v1\0");
+    h.update(&(roots.len() as u64).to_be_bytes());
+    for root in roots {
+        h.update(&root.0);
+    }
+    h.update(&(overlay.len() as u64).to_be_bytes());
+    for bytes in overlay {
+        h.update(&(bytes.len() as u64).to_be_bytes());
+        h.update(bytes);
+    }
+    *h.finalize().as_bytes()
+}
+
+impl RemoteQueryIo {
+    fn input_bounds(&self, roots: &[m::CommitId], overlay: &[Vec<u8>]) -> Result<()> {
+        ensure!(
+            roots.len() <= self.inner.config.max_admitted_roots
+                && overlay.len() <= self.inner.config.closure.max_objects,
+            "native query input count exceeded"
+        );
+        let total = overlay.iter().try_fold(0usize, |sum, b| {
+            sum.checked_add(b.len())
+                .context("native query overlay bytes overflow")
+        })?;
+        ensure!(
+            total <= self.inner.config.closure.max_metadata_bytes,
+            "native query overlay byte limit exceeded"
+        );
+        Ok(())
+    }
+    fn expression_bounds(&self, expression: &q::GraphExpr) -> Result<()> {
+        let mut pending = vec![(expression, 1usize)];
+        let mut count = 0usize;
+        let mut literals = 0usize;
+        while let Some((node, depth)) = pending.pop() {
+            count += 1;
+            ensure!(
+                depth <= 64
+                    && count <= self.inner.config.remote.limits.max_batch_items
+                    && node.version == 1,
+                "native query AST limit exceeded"
+            );
+            use q::graph_expr::Expression as E;
+            match node
+                .expression
+                .as_ref()
+                .context("native query AST expression missing")?
+            {
+                E::Commits(c) => {
+                    literals = literals
+                        .checked_add(c.commits.len())
+                        .context("native query literal overflow")?;
+                    ensure!(
+                        literals <= self.inner.config.remote.limits.max_batch_items,
+                        "native query literals exceeded"
+                    );
+                }
+                E::Ancestors(v) => {
+                    if let Some(c) = v.heads.as_deref() {
+                        pending.push((c, depth + 1));
+                    }
+                }
+                E::Range(v) => {
+                    if let Some(c) = v.roots.as_deref() {
+                        pending.push((c, depth + 1));
+                    }
+                    if let Some(c) = v.heads.as_deref() {
+                        pending.push((c, depth + 1));
+                    }
+                }
+                E::DagRange(v) => {
+                    if let Some(c) = v.roots.as_deref() {
+                        pending.push((c, depth + 1));
+                    }
+                    if let Some(c) = v.heads.as_deref() {
+                        pending.push((c, depth + 1));
+                    }
+                }
+                E::Heads(v) | E::Roots(v) => {
+                    if let Some(c) = v.input.as_deref() {
+                        pending.push((c, depth + 1));
+                    }
+                }
+                E::Union(v) | E::Intersection(v) => {
+                    ensure!(
+                        v.inputs.len() <= self.inner.config.remote.limits.max_batch_items,
+                        "native query set count exceeded"
+                    );
+                    for c in &v.inputs {
+                        pending.push((c, depth + 1));
+                    }
+                }
+                E::Difference(v) => {
+                    if let Some(c) = v.left.as_deref() {
+                        pending.push((c, depth + 1));
+                    }
+                    if let Some(c) = v.right.as_deref() {
+                        pending.push((c, depth + 1));
+                    }
+                }
+                E::Latest(v) => {
+                    if let Some(c) = v.candidates.as_deref() {
+                        pending.push((c, depth + 1));
+                    }
+                }
+            }
+            ensure!(
+                pending.len() <= self.inner.config.remote.limits.max_batch_items,
+                "native query AST frontier exceeded"
+            );
+        }
+        Ok(())
+    }
+    async fn captured(&self, handle: [u8; 32]) -> Result<Arc<CapturedScope>> {
+        self.clean_expired().await?;
+        self.registry.lock().await.scope(handle)
+    }
+    async fn scope_request<T, F, Fut>(
+        &self,
+        scope: [u8; 32],
+        owner: QueryOwner,
+        call: F,
+    ) -> std::result::Result<QueryReply<T>, tonic::Status>
+    where
+        T: Message + Send + 'static,
+        F: FnOnce(Arc<CapturedScope>, NativeClient) -> Fut + Send + 'static,
+        Fut: Future<Output = Result<T>> + Send + 'static,
+    {
+        self.run(owner, move |this, operation| async move {
+            let scope = this.captured(scope).await?;
+            this.online(&scope).await?;
+            let rpc_client = scope.client.clone().with_rpc_lifetime_guard(operation);
+            let value = call(scope.clone(), rpc_client).await?;
+            // Tiny nested protobuf values can allocate much more than their
+            // encoded length. Returned facts/prefix payloads need independent
+            // ownership after the physical request admission is released.
+            let bytes = value
+                .encoded_len()
+                .checked_mul(128)
+                .and_then(|bytes| bytes.checked_add(4096))
+                .context("native query reply allocation bound overflow")?;
+            let retained = this.charge(bytes)?;
+            Ok(QueryReply {
+                value,
+                owner: Arc::new((scope, retained)),
+            })
+        })
+        .await
+    }
+}
+#[async_trait]
+impl NativeQueryIo for RemoteQueryIo {
+    fn resources(&self) -> QueryResources {
+        let budget = self.inner.config.control_work_budget();
+        QueryResources {
+            memory_bytes: budget.memory_bytes,
+            temporary_bytes: budget.temporary_bytes,
+            persistent_memory_bytes: (self.inner.config.query.max_registry_bytes as u64)
+                .saturating_add(self.inner.config.remote.limits.max_buffered_bytes as u64),
+        }
+    }
+    async fn open_scope(
+        &self,
+        input: OpenQueryScope,
+        owner: QueryOwner,
+    ) -> std::result::Result<QueryReply<QueryScope>, tonic::Status> {
+        self.run(owner, move |this, operation| async move {
+            this.input_bounds(&input.roots, &input.overlay)?;
+            let fingerprint = scope_fingerprint(&input.roots, &input.overlay);
+            let time = now()?;
+            this.clean_expired().await?;
+            let mut registry = this.registry.lock().await;
+            if let Some(handle) = registry.replay(1, input.replay_key, fingerprint)? {
+                let scope = registry.scope(handle)?;
+                return Ok(QueryReply {
+                    value: QueryScope {
+                        handle,
+                        expires_at_unix_seconds: scope.checked.expires_at_unix_seconds(),
+                    },
+                    owner: scope,
+                });
+            }
+            ensure!(
+                registry.scopes.values().filter(|s| !s.closed).count()
+                    < this.inner.config.query.max_scopes,
+                "native query scope count exceeded"
+            );
+            let expires = time
+                .saturating_add(86400)
+                .saturating_add((this.inner.config.operation_timeout_ms / 1000 + 1) as i64);
+            let handle =
+                this.replay_reservation(&mut registry, 1, input.replay_key, fingerprint, expires)?;
+            let result: Result<Arc<CapturedScope>> = async {
+                let raw_bytes = input.overlay.iter().try_fold(0usize, |sum, b| {
+                    sum.checked_add(b.len())
+                        .context("query overlay byte overflow")
+                })?;
+                let charge = this.charge(
+                    8192usize
+                        .saturating_add(raw_bytes.saturating_mul(8))
+                        .saturating_add(input.overlay.len().saturating_mul(512))
+                        .saturating_add(input.roots.len().saturating_mul(1024)),
+                )?;
+                let ledger = this.inner.ledger.clone();
+                let roots = input.roots.clone();
+                let authority =
+                    io::blocking_owned(operation.clone(), move || ledger.query_authority(&roots))
+                        .await?;
+                let client = this.inner.connector.get().await?;
+                let rpc_client = client.clone().with_rpc_lifetime_guard(operation.clone());
+                let (overlay, overlays) = this.overlay(&rpc_client, input.overlay).await?;
+                let checked = rpc_client
+                    .open_query_scope_with_overlay(input.roots, overlay)
+                    .await?;
+                Ok(Arc::new(CapturedScope {
+                    client,
+                    checked,
+                    authority,
+                    overlays,
+                    _parent: None,
+                    _memory: charge,
+                }))
+            }
+            .await;
+            match result {
+                Ok(scope) => {
+                    let expires = scope.checked.expires_at_unix_seconds();
+                    let replay = registry.replays.get_mut(&(1, input.replay_key)).unwrap();
+                    replay.error = None;
+                    replay.expires = expires;
+                    registry.scopes.insert(
+                        handle,
+                        ScopeRecord {
+                            captured: Some(scope.clone()),
+                            expires,
+                            closed: false,
+                        },
+                    );
+                    Ok(QueryReply {
+                        value: QueryScope {
+                            handle,
+                            expires_at_unix_seconds: expires,
+                        },
+                        owner: scope,
+                    })
+                }
+                Err(error) => {
+                    registry
+                        .replays
+                        .get_mut(&(1, input.replay_key))
+                        .unwrap()
+                        .error = Some(
+                        error
+                            .downcast_ref::<tonic::Status>()
+                            .map_or(tonic::Code::FailedPrecondition, tonic::Status::code),
+                    );
+                    Err(error)
+                }
+            }
+        })
+        .await
+    }
+    async fn fork_scope(
+        &self,
+        input: ForkQueryScope,
+        owner: QueryOwner,
+    ) -> std::result::Result<QueryReply<QueryScope>, tonic::Status> {
+        self.run(owner, move |this, operation| async move {
+            this.input_bounds(&[], &input.overlay)?;
+            let overlay_hash = scope_fingerprint(&[], &input.overlay);
+            let fingerprint = hash(&[&input.parent, &overlay_hash]);
+            this.clean_expired().await?;
+            let mut registry = this.registry.lock().await;
+            if let Some(handle) = registry.replay(2, input.replay_key, fingerprint)? {
+                let scope = registry.scope(handle)?;
+                return Ok(QueryReply {
+                    value: QueryScope {
+                        handle,
+                        expires_at_unix_seconds: scope.checked.expires_at_unix_seconds(),
+                    },
+                    owner: scope,
+                });
+            }
+            let parent = registry.scope(input.parent)?;
+            this.online(&parent).await?;
+            ensure!(
+                registry.scopes.values().filter(|s| !s.closed).count()
+                    < this.inner.config.query.max_scopes,
+                "native query scope count exceeded"
+            );
+            let handle = this.replay_reservation(
+                &mut registry,
+                2,
+                input.replay_key,
+                fingerprint,
+                parent.checked.expires_at_unix_seconds(),
+            )?;
+            let result: Result<Arc<CapturedScope>> = async {
+                let bytes = input.overlay.iter().try_fold(0usize, |n, b| {
+                    n.checked_add(b.len())
+                        .context("query overlay bytes overflow")
+                })?;
+                let charge = this.charge(
+                    8192usize
+                        .saturating_add(bytes.saturating_mul(8))
+                        .saturating_add(
+                            (parent.overlays.len() + input.overlay.len()).saturating_mul(512),
+                        ),
+                )?;
+                let rpc_client = parent.client.clone().with_rpc_lifetime_guard(operation);
+                let (overlay, added) = this.overlay(&rpc_client, input.overlay).await?;
+                let checked = rpc_client
+                    .fork_query_scope(&parent.checked, overlay)
+                    .await?;
+                let mut overlays = parent.overlays.clone();
+                for (id, bytes) in added {
+                    if let Some(old) = overlays.insert(id, bytes.clone()) {
+                        ensure!(
+                            *old == *bytes,
+                            "native private query overlay changed identity"
+                        );
+                    }
+                }
+                ensure!(
+                    overlays.len() <= this.inner.config.closure.max_objects,
+                    "native private query overlay object limit exceeded"
+                );
+                Ok(Arc::new(CapturedScope {
+                    client: parent.client.clone(),
+                    checked,
+                    authority: parent.authority.clone(),
+                    overlays,
+                    _parent: Some(parent),
+                    _memory: charge,
+                }))
+            }
+            .await;
+            match result {
+                Ok(scope) => {
+                    let expires = scope.checked.expires_at_unix_seconds();
+                    let r = registry.replays.get_mut(&(2, input.replay_key)).unwrap();
+                    r.error = None;
+                    r.expires = expires;
+                    registry.scopes.insert(
+                        handle,
+                        ScopeRecord {
+                            captured: Some(scope.clone()),
+                            expires,
+                            closed: false,
+                        },
+                    );
+                    Ok(QueryReply {
+                        value: QueryScope {
+                            handle,
+                            expires_at_unix_seconds: expires,
+                        },
+                        owner: scope,
+                    })
+                }
+                Err(error) => {
+                    registry
+                        .replays
+                        .get_mut(&(2, input.replay_key))
+                        .unwrap()
+                        .error = Some(
+                        error
+                            .downcast_ref::<tonic::Status>()
+                            .map_or(tonic::Code::FailedPrecondition, tonic::Status::code),
+                    );
+                    Err(error)
+                }
+            }
+        })
+        .await
+    }
+    async fn facts(
+        &self,
+        scope: [u8; 32],
+        facts: Vec<q::GraphFact>,
+        owner: QueryOwner,
+    ) -> std::result::Result<QueryReply<q::GraphFacts>, tonic::Status> {
+        self.scope_request(scope, owner, move |scope, rpc_client| async move {
+            let inputs = facts
+                .into_iter()
+                .map(|fact| {
+                    Ok(match fact.fact.context("missing graph fact")? {
+                        q::graph_fact::Fact::HasId(v) => tinytree_client::QueryFact::HasId(commit(
+                            v.commit.context("missing fact commit")?,
+                        )?),
+                        q::graph_fact::Fact::IsAncestor(v) => {
+                            tinytree_client::QueryFact::IsAncestor {
+                                ancestor: commit(v.ancestor.context("missing ancestor")?)?,
+                                descendant: commit(v.descendant.context("missing descendant")?)?,
+                            }
+                        }
+                        q::graph_fact::Fact::Heads(v) => tinytree_client::QueryFact::Heads(
+                            v.commits.into_iter().map(commit).collect::<Result<_>>()?,
+                        ),
+                        q::graph_fact::Fact::CommonAncestors(v) => {
+                            tinytree_client::QueryFact::CommonAncestors {
+                                left: v.left.into_iter().map(commit).collect::<Result<_>>()?,
+                                right: v.right.into_iter().map(commit).collect::<Result<_>>()?,
+                            }
+                        }
+                    })
+                })
+                .collect::<Result<Vec<_>>>()?;
+            let answers = rpc_client
+                .query_facts(&scope.checked, inputs)
+                .await?
+                .into_iter()
+                .map(|answer| q::GraphFactAnswer {
+                    answer: Some(match answer {
+                        tinytree_client::FactAnswer::HasId(v) => {
+                            q::graph_fact_answer::Answer::HasId(v)
+                        }
+                        tinytree_client::FactAnswer::IsAncestor(v) => {
+                            q::graph_fact_answer::Answer::IsAncestor(v)
+                        }
+                        tinytree_client::FactAnswer::Heads(ids) => {
+                            q::graph_fact_answer::Answer::Heads(q::CommitSet {
+                                commits: ids.into_iter().map(wire_commit).collect(),
+                            })
+                        }
+                        tinytree_client::FactAnswer::CommonAncestors(ids) => {
+                            q::graph_fact_answer::Answer::CommonAncestors(q::CommitSet {
+                                commits: ids.into_iter().map(wire_commit).collect(),
+                            })
+                        }
+                    }),
+                })
+                .collect();
+            Ok(q::GraphFacts {
+                answers,
+                scope_digest: scope.checked.content_digest().to_vec(),
+                index_epoch: scope.checked.index_epoch().to_vec(),
+            })
+        })
+        .await
+    }
+    async fn resolve_commit_prefix(
+        &self,
+        scope: [u8; 32],
+        prefix: String,
+        owner: QueryOwner,
+    ) -> std::result::Result<QueryReply<q::CommitPrefixResult>, tonic::Status> {
+        self.scope_request(scope, owner, move |scope, rpc_client| async move {
+            let result = match rpc_client
+                .resolve_commit_prefix(&scope.checked, &prefix)
+                .await?
+            {
+                tinytree_client::CommitPrefix::NoMatch => {
+                    q::commit_prefix_result::Result::NoMatch(q::NoMatch {})
+                }
+                tinytree_client::CommitPrefix::Ambiguous => {
+                    q::commit_prefix_result::Result::Ambiguous(q::AmbiguousCommits {})
+                }
+                tinytree_client::CommitPrefix::Single(id) => {
+                    q::commit_prefix_result::Result::Single(q::CommitMatch {
+                        commit: Some(wire_commit(id)),
+                    })
+                }
+            };
+            Ok(q::CommitPrefixResult {
+                result: Some(result),
+            })
+        })
+        .await
+    }
+    async fn resolve_change_prefix(
+        &self,
+        scope: [u8; 32],
+        prefix: String,
+        heads: Vec<m::CommitId>,
+        owner: QueryOwner,
+    ) -> std::result::Result<QueryReply<q::ChangePrefixResult>, tonic::Status> {
+        self.scope_request(scope, owner, move |scope, rpc_client| async move {
+            let result = match rpc_client
+                .resolve_change_prefix(&scope.checked, &prefix, heads)
+                .await?
+            {
+                tinytree_client::ChangePrefix::NoMatch => {
+                    q::change_prefix_result::Result::NoMatch(q::NoMatch {})
+                }
+                tinytree_client::ChangePrefix::Ambiguous => {
+                    q::change_prefix_result::Result::Ambiguous(q::AmbiguousChanges {})
+                }
+                tinytree_client::ChangePrefix::Single(m) => {
+                    q::change_prefix_result::Result::Single(q::ChangeMatch {
+                        change: Some(q::ChangeId {
+                            value: m.change.0.to_vec(),
+                        }),
+                        targets: m
+                            .targets
+                            .into_iter()
+                            .map(|t| q::ChangeTarget {
+                                commit: Some(wire_commit(t.commit)),
+                                visible: Some(t.visible),
+                            })
+                            .collect(),
+                    })
+                }
+            };
+            Ok(q::ChangePrefixResult {
+                result: Some(result),
+            })
+        })
+        .await
+    }
+    async fn shortest_prefix(
+        &self,
+        scope: [u8; 32],
+        target: q::shortest_prefix_request::Target,
+        heads: Vec<m::CommitId>,
+        owner: QueryOwner,
+    ) -> std::result::Result<QueryReply<q::ShortestPrefixResult>, tonic::Status> {
+        self.scope_request(scope, owner, move |scope, rpc_client| async move {
+            let (target, kind) = match target {
+                q::shortest_prefix_request::Target::Commit(id) => (
+                    tinytree_client::PrefixTarget::Commit(commit(id)?),
+                    q::PrefixKind::CommitPrefix,
+                ),
+                q::shortest_prefix_request::Target::Change(id) => (
+                    tinytree_client::PrefixTarget::Change(m::ChangeId(
+                        id.value.try_into().map_err(|_| {
+                            tonic::Status::invalid_argument("invalid native ChangeId")
+                        })?,
+                    )),
+                    q::PrefixKind::ChangePrefix,
+                ),
+            };
+            let hex_length = rpc_client
+                .shortest_prefix(&scope.checked, target, heads)
+                .await?;
+            Ok(q::ShortestPrefixResult {
+                kind: kind as i32,
+                hex_length,
+            })
+        })
+        .await
+    }
+    async fn begin(
+        &self,
+        input: BeginQuery,
+        owner: QueryOwner,
+    ) -> std::result::Result<QueryReply<QueryHandle>, tonic::Status> {
+        self.run(owner, move |this, _operation| async move {
+            ensure!(
+                matches!(
+                    input.projection,
+                    q::Projection::Ids | q::Projection::Graph | q::Projection::Canonical
+                ),
+                tonic::Status::invalid_argument("invalid native query projection")
+            );
+            this.expression_bounds(&input.expression)?;
+            let expression = input.expression.encode_to_vec();
+            ensure!(
+                expression.len() <= this.inner.config.remote.limits.max_request_bytes,
+                "native query AST byte limit exceeded"
+            );
+            let fingerprint = hash(&[
+                &input.scope,
+                &expression,
+                &(input.projection as i32).to_be_bytes(),
+                &input.page_size.to_be_bytes(),
+            ]);
+            this.clean_expired().await?;
+            let mut registry = this.registry.lock().await;
+            if let Some(handle) = registry.replay(3, input.replay_key, fingerprint)? {
+                let query = registry
+                    .queries
+                    .get(&handle)
+                    .context("native query unavailable")?;
+                ensure!(!query.closed, "native query closed");
+                return Ok(QueryReply {
+                    value: QueryHandle {
+                        handle,
+                        expires_at_unix_seconds: query.expires,
+                    },
+                    owner: query
+                        .scope
+                        .clone()
+                        .context("native query scope unavailable")?,
+                });
+            }
+            let scope = registry.scope(input.scope)?;
+            this.online(&scope).await?;
+            ensure!(
+                registry.queries.values().filter(|q| !q.closed).count()
+                    < this.inner.config.query.max_queries,
+                "native query count exceeded"
+            );
+            let expires = scope
+                .checked
+                .expires_at_unix_seconds()
+                .min(now()?.saturating_add(
+                    (this.inner.config.remote.rpc.operation_timeout_ms / 1000 + 1) as i64,
+                ));
+            let handle =
+                this.replay_reservation(&mut registry, 3, input.replay_key, fingerprint, expires)?;
+            let result: Result<QueryRecord> = async {
+                let charge = this.charge(
+                    8192usize
+                        .saturating_add(expression.len().saturating_mul(8))
+                        .saturating_add(input.page_size as usize * 1024),
+                )?;
+                // Scope guards contain only independent persistent quotas/roots,
+                // never the incoming broker inflight permit. Physical SDK work
+                // keeps them after logical query close or caller cancellation.
+                let query_client = scope.client.clone().with_lifetime_guard(scope.clone());
+                let checked = if input.projection == q::Projection::Ids {
+                    CheckedQuery::Ids(
+                        query_client
+                            .begin_query(&scope.checked, &input.expression, input.page_size)
+                            .await?,
+                    )
+                } else {
+                    CheckedQuery::Graph(
+                        query_client
+                            .begin_graph_query(
+                                &scope.checked,
+                                &input.expression,
+                                input.page_size,
+                                input.projection == q::Projection::Canonical,
+                            )
+                            .await?,
+                    )
+                };
+                Ok(QueryRecord {
+                    scope: Some(scope.clone()),
+                    client: scope.client.clone(),
+                    checked: Some(checked),
+                    pending: None,
+                    pending_ids: None,
+                    replay: None,
+                    next: 0,
+                    expires,
+                    closed: false,
+                    _memory: charge,
+                })
+            }
+            .await;
+            match result {
+                Ok(query) => {
+                    registry
+                        .replays
+                        .get_mut(&(3, input.replay_key))
+                        .unwrap()
+                        .error = None;
+                    registry.queries.insert(handle, query);
+                    Ok(QueryReply {
+                        value: QueryHandle {
+                            handle,
+                            expires_at_unix_seconds: expires,
+                        },
+                        owner: scope,
+                    })
+                }
+                Err(error) => {
+                    registry
+                        .replays
+                        .get_mut(&(3, input.replay_key))
+                        .unwrap()
+                        .error = Some(
+                        error
+                            .downcast_ref::<tonic::Status>()
+                            .map_or(tonic::Code::FailedPrecondition, tonic::Status::code),
+                    );
+                    Err(error)
+                }
+            }
+        })
+        .await
+    }
+    async fn page(
+        &self,
+        handle: [u8; 32],
+        expected_sequence: u64,
+        owner: QueryOwner,
+    ) -> std::result::Result<QueryReply<QueryPage>, tonic::Status> {
+        self.run(owner, move |this, operation| async move {
+            this.clean_expired().await?;
+            let mut registry = this.registry.lock().await;
+            let record = registry
+                .queries
+                .get_mut(&handle)
+                .context("native query unavailable")?;
+            ensure!(!record.closed, "native query closed");
+            if let Some(replay) = &record.replay {
+                if replay.value.sequence == expected_sequence {
+                    return Ok(QueryReply {
+                        value: replay.value.clone(),
+                        owner: replay.clone(),
+                    });
+                }
+            }
+            ensure!(
+                record.next == expected_sequence,
+                "native query sequence unavailable"
+            );
+            ensure!(
+                !record.replay.as_ref().is_some_and(|p| p.value.exhausted),
+                "native query already exhausted"
+            );
+            let scope = record
+                .scope
+                .clone()
+                .context("native query scope unavailable")?;
+            this.online(&scope).await?;
+            let rpc_client = scope
+                .client
+                .clone()
+                .with_rpc_lifetime_guard(operation.clone());
+            let (value, checked) = match record
+                .checked
+                .as_mut()
+                .context("native query state unavailable")?
+            {
+                CheckedQuery::Ids(query) => {
+                    let page = if let Some(page) = &record.pending_ids {
+                        page.clone()
+                    } else {
+                        let page = rpc_client.evaluate_page(query).await?;
+                        record.pending_ids = Some(page.clone());
+                        page
+                    };
+                    let value = QueryPage {
+                        sequence: page.sequence,
+                        exhausted: page.exhausted,
+                        rows: page
+                            .rows
+                            .into_iter()
+                            .map(|row| q::GraphRow {
+                                commit: Some(wire_commit(row.commit)),
+                                change: Some(q::ChangeId {
+                                    value: row.change.0.to_vec(),
+                                }),
+                                edges: Vec::new(),
+                                canonical: None,
+                            })
+                            .collect(),
+                    };
+                    (value, None)
+                }
+                CheckedQuery::Graph(query) => {
+                    // SDK state advances only once. Retain its checked page until
+                    // installation + ledger commit succeed; retry never skips it.
+                    let page = if let Some(page) = &record.pending {
+                        page.clone()
+                    } else {
+                        let page = Arc::new(rpc_client.evaluate_graph_page(query).await?);
+                        record.pending = Some(page.clone());
+                        page
+                    };
+                    this.install(&scope, &page, operation).await?;
+                    let rows = page.rows().iter().map(wire_row).collect();
+                    (
+                        QueryPage {
+                            sequence: page.sequence,
+                            exhausted: page.exhausted,
+                            rows,
+                        },
+                        Some(page),
+                    )
+                }
+            };
+            let charge = this.charge(page_memory(&value)?)?;
+            let page = Arc::new(PageState {
+                value,
+                _checked: checked,
+                _scope: scope.clone(),
+                _memory: charge,
+            });
+            record.next = record
+                .next
+                .checked_add(1)
+                .context("native query sequence exhausted")?;
+            record.pending = None;
+            record.pending_ids = None;
+            record.replay = Some(page.clone());
+            Ok(QueryReply {
+                value: page.value.clone(),
+                owner: page,
+            })
+        })
+        .await
+    }
+    async fn read_commit(
+        &self,
+        scope: [u8; 32],
+        id: m::CommitId,
+        owner: QueryOwner,
+    ) -> std::result::Result<QueryReply<jj_native_backend::VerifiedMetadata>, tonic::Status> {
+        self.run(owner, move |this, operation| async move {
+            let scope = this.captured(scope).await?;
+            this.online(&scope).await?;
+            ensure!(
+                id != m::CommitId::ROOT,
+                tonic::Status::invalid_argument("intrinsic root has no canonical payload")
+            );
+            if let Some(bytes) = scope.overlays.get(&id) {
+                let object = m::decode(bytes, this.inner.model_limits())?;
+                let encoded = m::encode(&object, this.inner.model_limits())?;
+                let charge = this.charge(bytes.len().saturating_mul(8).saturating_add(4096))?;
+                let value = jj_native_backend::VerifiedMetadata::verify(
+                    encoded.descriptor,
+                    bytes.as_ref().clone(),
+                    this.inner.model_limits(),
+                )
+                .map_err(backend)?;
+                return Ok(QueryReply {
+                    value,
+                    owner: Arc::new((scope, charge)),
+                });
+            }
+            let expression = q::GraphExpr {
+                version: 1,
+                expression: Some(q::graph_expr::Expression::Commits(q::CommitSet {
+                    commits: vec![wire_commit(id)],
+                })),
+            };
+            let query_client = scope.client.clone().with_lifetime_guard(scope.clone());
+            let rpc_client = query_client
+                .clone()
+                .with_rpc_lifetime_guard(operation.clone());
+            let mut query = query_client
+                .begin_graph_query(&scope.checked, &expression, 1, true)
+                .await?;
+            let mut found = None;
+            while !query.is_exhausted() {
+                let page = rpc_client.evaluate_graph_page(&mut query).await?;
+                this.install(&scope, &page, operation.clone()).await?;
+                for row in page.rows() {
+                    ensure!(
+                        row.commit == id && found.is_none(),
+                        "native literal query returned another commit"
+                    );
+                    let canonical = row
+                        .canonical
+                        .as_ref()
+                        .context("native literal query omitted canonical payload")?;
+                    let charge = this.charge(
+                        canonical
+                            .canonical_bytes()
+                            .len()
+                            .saturating_mul(8)
+                            .saturating_add(4096),
+                    )?;
+                    let verified = jj_native_backend::VerifiedMetadata::verify(
+                        canonical.descriptor(),
+                        canonical.canonical_bytes().to_vec(),
+                        this.inner.model_limits(),
+                    )
+                    .map_err(backend)?;
+                    found = Some((verified, charge));
+                }
+            }
+            rpc_client.close_graph_query(&mut query).await?;
+            let (value, charge) = found.context("native commit is outside the captured scope")?;
+            Ok(QueryReply {
+                value,
+                owner: Arc::new((scope, charge)),
+            })
+        })
+        .await
+    }
+    async fn close_query(
+        &self,
+        handle: [u8; 32],
+        owner: QueryOwner,
+    ) -> std::result::Result<(), tonic::Status> {
+        self.run(owner, move |this, operation| async move {
+            this.clean_expired().await?;
+            let mut registry = this.registry.lock().await;
+            let Some(record) = registry.queries.get_mut(&handle) else {
+                return Ok(());
+            };
+            record.closed = true;
+            record.pending = None;
+            record.pending_ids = None;
+            record.replay = None;
+            record.scope = None;
+            let rpc_client = record.client.clone().with_rpc_lifetime_guard(operation);
+            if let Some(query) = record.checked.as_mut() {
+                match query {
+                    CheckedQuery::Ids(query) => rpc_client.close_ids_query(query).await?,
+                    CheckedQuery::Graph(query) => rpc_client.close_graph_query(query).await?,
+                }
+            }
+            record.checked = None;
+            // ACK removes all active query/overlay ownership. Keep only a small
+            // local tombstone until the original replay window expires.
+            let old = std::mem::replace(&mut record._memory, this.charge(0)?);
+            drop(old);
+            record._memory = this.charge(4096)?;
+            Ok(())
+        })
+        .await
+    }
+    async fn close_scope(
+        &self,
+        handle: [u8; 32],
+        owner: QueryOwner,
+    ) -> std::result::Result<(), tonic::Status> {
+        self.run(owner, move |this, operation| async move {
+            this.clean_expired().await?;
+            let mut registry = this.registry.lock().await;
+            let Some(record) = registry.scopes.get_mut(&handle) else {
+                return Ok(());
+            };
+            record.closed = true;
+            if let Some(scope) = &record.captured {
+                scope
+                    .client
+                    .clone()
+                    .with_rpc_lifetime_guard(operation)
+                    .close_query_scope(&scope.checked)
+                    .await?;
+            }
+            record.captured = None;
+            Ok(())
+        })
+        .await
+    }
+}
+fn wire_row(row: &tinytree_client::GraphRow) -> q::GraphRow {
+    use tinytree_client::GraphEdge;
+    let edges = row
+        .edges()
+        .iter()
+        .map(|edge| q::SelectedEdge {
+            edge: Some(match edge {
+                GraphEdge::Direct(id) => q::selected_edge::Edge::Direct(q::DirectEdge {
+                    target: Some(wire_commit(*id)),
+                }),
+                GraphEdge::Indirect(id) => q::selected_edge::Edge::Indirect(q::IndirectEdge {
+                    target: Some(wire_commit(*id)),
+                }),
+                GraphEdge::Missing(id) => q::selected_edge::Edge::Missing(q::MissingEdge {
+                    boundary: Some(wire_commit(*id)),
+                }),
+            }),
+        })
+        .collect();
+    let canonical = row.canonical.as_ref().map(|metadata| {
+        let d = metadata.descriptor();
+        tinytree_client::protocol::ObjectData {
+            descriptor: Some(tinytree_client::protocol::ObjectDescriptor {
+                key: Some(tinytree_client::protocol::ObjectKey {
+                    kind: d.key.kind as i32,
+                    native_id: d.key.id.0.to_vec(),
+                }),
+                content_blake3: d.key.id.0.to_vec(),
+                size_bytes: d.size_bytes,
+                object_format_version: d.format_version as u32,
+            }),
+            canonical_envelope: metadata.canonical_bytes().to_vec(),
+        }
+    });
+    q::GraphRow {
+        commit: Some(wire_commit(row.commit)),
+        change: Some(q::ChangeId {
+            value: row.change.0.to_vec(),
+        }),
+        edges,
+        canonical,
+    }
+}
+fn page_memory(page: &QueryPage) -> Result<usize> {
+    let mut size = 4096usize;
+    for row in &page.rows {
+        size = size
+            .checked_add(row.encoded_len().saturating_mul(8))
+            .and_then(|n| n.checked_add(row.edges.capacity().saturating_mul(256)))
+            .and_then(|n| n.checked_add(512))
+            .context("native query page bytes overflow")?;
+    }
+    Ok(size)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    struct UnusedSource;
+    #[async_trait]
+    impl local_cas::BlobSource for UnusedSource {
+        async fn fetch(&self, _: &local_cas::Artifact, _: &mut std::fs::File) -> Result<()> {
+            anyhow::bail!("unexpected query cleanup fetch")
+        }
+        async fn missing(
+            &self,
+            artifacts: &[local_cas::Artifact],
+        ) -> Result<Vec<local_cas::Artifact>> {
+            Ok(artifacts.to_vec())
+        }
+    }
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn idle_registry_expiry_reclaims_quota_without_a_request_and_does_not_pin_provider() {
+        let directory = tempfile::tempdir().unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700))
+                .unwrap();
+        }
+        let local_path = directory.path().join("local");
+        std::fs::create_dir(&local_path).unwrap();
+        let direct = Arc::new(
+            jj_native_backend::DirectObjectIo::init(&local_path, Default::default()).unwrap(),
+        );
+        let cache = local_cas::LocalCas::open(
+            directory.path().join("cache"),
+            Arc::new(UnusedSource),
+            Default::default(),
+        )
+        .unwrap();
+        let mut config = crate::Config::default();
+        config.query.expiry_interval_ms = 10;
+        let repo = crate::RemoteRepository::open(
+            direct,
+            cache,
+            &directory.path().join("ledger"),
+            &directory.path().join("staging"),
+            config,
+        )
+        .unwrap();
+        let weak_inner = Arc::downgrade(&repo.query.inner);
+        let weak_registry = Arc::downgrade(&repo.query.registry);
+        let baseline = repo.query.memory.available_permits();
+        let retained = repo.query.charge(16384).unwrap();
+        repo.query.registry.lock().await.replays.insert(
+            (1, [9; 32]),
+            Replay {
+                fingerprint: [8; 32],
+                handle: [7; 32],
+                error: Some(tonic::Code::Unavailable),
+                expires: now().unwrap() - 1,
+                _memory: retained,
+            },
+        );
+        assert_eq!(repo.query.memory.available_permits(), baseline - 16384);
+        // No incoming method invokes clean_expired: only the weak background
+        // loop can return this accepted persistent reservation.
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                if repo.query.memory.available_permits() == baseline {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        repo.wait_for_idle().await;
+        assert!(repo.query.registry.lock().await.replays.is_empty());
+        drop(repo);
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                if weak_inner.upgrade().is_none() && weak_registry.upgrade().is_none() {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+    }
+}

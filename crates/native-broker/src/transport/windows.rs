@@ -133,7 +133,8 @@ pub(super) async fn serve(
 ) -> Result<(), Status> {
     let router = tonic::transport::Server::builder()
         .add_service(service.rpc_service())
-        .add_service(service.control_rpc_service());
+        .add_service(service.control_rpc_service())
+        .add_service(service.query_rpc_service());
     let result = serve_router(name, router, shutdown).await;
     service.drain().await?;
     result

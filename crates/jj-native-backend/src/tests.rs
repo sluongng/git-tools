@@ -852,3 +852,60 @@ fn provider_attachment_requires_verified_bytes_not_a_descriptor_promise() {
     descriptor.key.kind = m::Kind::Tree;
     assert!(VerifiedMetadata::verify(descriptor, trailing, m::Limits::default()).is_err());
 }
+
+#[test]
+fn cancelled_metadata_install_keeps_the_physical_put_owner_and_admission() {
+    use std::sync::{Arc, Condvar, Mutex};
+    use std::time::{Duration, Instant};
+    let directory = tempfile::tempdir().unwrap();
+    let mut provider = DirectObjectIo::init(directory.path(), Default::default()).unwrap();
+    let gate = Arc::new((Mutex::new(false), Condvar::new()));
+    let worker_gate = gate.clone();
+    let (entered, started) = std::sync::mpsc::channel();
+    provider.set_metadata_put_hook(Arc::new(move || {
+        entered.send(()).unwrap();
+        let (lock, changed) = &*worker_gate;
+        let mut released = lock.lock().unwrap();
+        while !*released {
+            released = changed.wait(released).unwrap();
+        }
+    }));
+    let provider = Arc::new(provider);
+    let pool = Arc::new(tokio::sync::Semaphore::new(1));
+    let owner = Arc::new(pool.clone().try_acquire_owned().unwrap());
+    let weak = Arc::downgrade(&owner);
+    let mut commit = m::synthetic_root();
+    commit.parents = vec![m::CommitId::ROOT];
+    let object = m::Object::Commit(commit);
+    let expected = m::encode(&object, m::Limits::default()).unwrap().descriptor;
+    let worker = provider.clone();
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    let task = runtime.spawn(async move { worker.write_metadata_with_owner(object, owner).await });
+    started.recv_timeout(Duration::from_secs(5)).unwrap();
+    task.abort();
+    let _ = runtime.block_on(task);
+    assert!(
+        weak.upgrade().is_some(),
+        "accepted Store.put must retain its caller after cancellation"
+    );
+    assert!(
+        pool.clone().try_acquire_owned().is_err(),
+        "another alias must not acquire physical work admission early"
+    );
+    let (lock, changed) = &*gate;
+    *lock.lock().unwrap() = true;
+    changed.notify_all();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while weak.upgrade().is_some() {
+        assert!(
+            Instant::now() < deadline,
+            "physical put owner did not release"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert!(pool.clone().try_acquire_owned().is_ok());
+    assert_eq!(
+        block_on(provider.descriptor(expected.key)).unwrap(),
+        Some(expected)
+    );
+}

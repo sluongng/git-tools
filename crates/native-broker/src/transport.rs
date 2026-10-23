@@ -189,7 +189,8 @@ pub async fn serve_unix(
 ) -> Result<(), Status> {
     let router = tonic::transport::Server::builder()
         .add_service(service.rpc_service())
-        .add_service(service.control_rpc_service());
+        .add_service(service.control_rpc_service())
+        .add_service(service.query_rpc_service());
     serve_unix_router(path, router, shutdown, service.drain()).await
 }
 #[cfg(unix)]

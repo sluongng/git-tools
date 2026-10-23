@@ -1,7 +1,9 @@
 //! Durable admission/retention bookkeeping, never authoritative object storage.
 use crate::{Config, hex, unhex};
+mod query;
 use anyhow::{Context, Result, ensure};
 use fjall::Readable;
+pub(crate) use query::{Authority, QueryAuthority};
 use serde::{Deserialize, Serialize};
 use std::{
     fs::{File, OpenOptions},
@@ -127,6 +129,8 @@ pub(crate) struct Ledger {
     progress: fjall::SingleWriterTxKeyspace,
     files: fjall::SingleWriterTxKeyspace,
     receipts: fjall::SingleWriterTxKeyspace,
+    query_authorities: fjall::SingleWriterTxKeyspace,
+    query_grants: fjall::SingleWriterTxKeyspace,
     gate: Mutex<()>,
     config: Config,
     _owner: File,
@@ -136,7 +140,8 @@ pub(crate) struct Ledger {
 }
 const MARKER: &str = "admission.format";
 const LEGACY_FORMAT: &[u8] = b"tinytree-native-admission-1\n";
-const FORMAT: &[u8] = b"tinytree-native-admission-2\n";
+const SPARSE_FORMAT: &[u8] = b"tinytree-native-admission-2\n";
+const FORMAT: &[u8] = b"tinytree-native-admission-3\n";
 pub(crate) fn preflight(path: &Path) -> Result<bool> {
     match std::fs::symlink_metadata(path) {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(true),
@@ -156,7 +161,7 @@ pub(crate) fn preflight(path: &Path) -> Result<bool> {
             );
             let marker = std::fs::read(path.join(MARKER))?;
             ensure!(
-                marker == FORMAT || marker == LEGACY_FORMAT,
+                marker == FORMAT || marker == SPARSE_FORMAT || marker == LEGACY_FORMAT,
                 "unrecognized native admission ledger format"
             );
             require_file(&path.join("owner"))?;
@@ -234,13 +239,26 @@ impl Ledger {
             }
         }
         let meta = db.keyspace("meta", fjall::KeyspaceCreateOptions::default)?;
-        if !fresh && db.read_tx().get(&meta, b"format")?.as_deref() == Some(FORMAT) {
+        if !fresh
+            && matches!(db.read_tx().get(&meta, b"format")?.as_deref(), Some(value) if value == FORMAT || value == SPARSE_FORMAT)
+        {
             ensure!(
                 db.keyspace_exists("known-references-v2")
                     && db.keyspace_exists("verified-progress-v2"),
                 "recognized sparse admission keyspace missing"
             );
         }
+        if !fresh && db.read_tx().get(&meta, b"format")?.as_deref() == Some(FORMAT) {
+            ensure!(
+                db.keyspace_exists("query-authorities-v3") && db.keyspace_exists("query-grants-v3"),
+                "recognized query admission keyspace missing"
+            );
+        }
+        let query_authorities = db.keyspace(
+            "query-authorities-v3",
+            fjall::KeyspaceCreateOptions::default,
+        )?;
+        let query_grants = db.keyspace("query-grants-v3", fjall::KeyspaceCreateOptions::default)?;
         let roots = db.keyspace("roots", fjall::KeyspaceCreateOptions::default)?;
         let pending = db.keyspace("pending", fjall::KeyspaceCreateOptions::default)?;
         let members = db.keyspace("admissions", fjall::KeyspaceCreateOptions::default)?;
@@ -255,7 +273,7 @@ impl Ledger {
         if !fresh {
             let stored_format = db.read_tx().get(&meta, b"format")?;
             ensure!(
-                matches!(stored_format.as_deref(), Some(value) if value == FORMAT || value == LEGACY_FORMAT),
+                matches!(stored_format.as_deref(), Some(value) if value == FORMAT || value == SPARSE_FORMAT || value == LEGACY_FORMAT),
                 "native admission ledger format identity missing"
             );
             let counter = db
@@ -354,6 +372,8 @@ impl Ledger {
             progress,
             files,
             receipts,
+            query_authorities,
+            query_grants,
             gate: Mutex::new(()),
             config: config.clone(),
             _owner: owner,

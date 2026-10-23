@@ -16,6 +16,7 @@ pub(crate) struct Client {
     inner: tonic::client::Grpc<Channel>,
     limits: Limits,
     decode: usize,
+    owner: Option<PhysicalOwner>,
 }
 impl Client {
     pub fn new(channel: Channel, limits: Limits) -> Self {
@@ -24,7 +25,12 @@ impl Client {
             inner: tonic::client::Grpc::new(channel),
             limits,
             decode,
+            owner: None,
         }
+    }
+    pub fn with_owner(mut self, owner: PhysicalOwner) -> Self {
+        self.owner = Some(owner);
+        self
     }
     pub fn max_decoding_message_size(mut self, n: usize) -> Self {
         self.decode = n;
@@ -57,7 +63,8 @@ impl Client {
             .unary(
                 request,
                 http::uri::PathAndQuery::from_static(path),
-                BoundedCodec::<T, U>::new(shape, self.limits.clone(), self.decode),
+                BoundedCodec::<T, U>::new(shape, self.limits.clone(), self.decode)
+                    .with_optional_owner(self.owner.clone()),
             )
             .await
     }
@@ -285,7 +292,8 @@ impl Client {
                     Shape::MetadataResult,
                     self.limits.clone(),
                     self.decode,
-                ),
+                )
+                .with_optional_owner(self.owner.clone()),
             )
             .await
     }
@@ -305,7 +313,8 @@ impl Client {
                     Shape::FileFrame,
                     self.limits.clone(),
                     self.decode,
-                ),
+                )
+                .with_optional_owner(self.owner.clone()),
             )
             .await
     }
@@ -325,7 +334,8 @@ impl Client {
                     Shape::Receipt,
                     self.limits.clone(),
                     self.decode,
-                ),
+                )
+                .with_optional_owner(self.owner.clone()),
             )
             .await
     }
@@ -385,6 +395,10 @@ impl<T, U> BoundedCodec<T, U> {
             _type: PhantomData,
             owner: None,
         }
+    }
+    fn with_optional_owner(mut self, owner: Option<PhysicalOwner>) -> Self {
+        self.owner = owner;
+        self
     }
     fn with_owner(mut self, owner: PhysicalOwner) -> Self {
         self.owner = Some(owner);
@@ -820,7 +834,9 @@ mod tests {
     async fn physical_encoded_body_owns_admission_after_fused_source_eof() {
         let drops = Arc::new(AtomicUsize::new(0));
         let source_dropped = Arc::new(AtomicBool::new(false));
-        let owner: PhysicalOwner = Arc::new(OwnerProbe(drops.clone()));
+        let slots = Arc::new(tokio::sync::Semaphore::new(1));
+        let slot = slots.clone().acquire_owned().await.unwrap();
+        let owner: PhysicalOwner = Arc::new((OwnerProbe(drops.clone()), slot));
         let source = Source {
             frame: Some(q::OpenScopeFrame {
                 frame: Some(q::open_scope_frame::Frame::ScopeEnd(q::ScopeEnd::default())),
@@ -855,7 +871,12 @@ mod tests {
         // while the physical body still owns its encoder and admitted buffers.
         assert!(source_dropped.load(Ordering::SeqCst));
         assert_eq!(drops.load(Ordering::SeqCst), 0);
+        assert!(
+            slots.clone().try_acquire_owned().is_err(),
+            "physical body must keep the sole admitted slot after source EOF"
+        );
         drop(body);
         assert_eq!(drops.load(Ordering::SeqCst), 1);
+        assert!(slots.try_acquire_owned().is_ok());
     }
 }

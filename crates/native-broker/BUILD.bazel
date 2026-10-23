@@ -15,8 +15,15 @@ cargo_build_script(
     name = "build_script",
     srcs = ["build.rs"],
     aliases = aliases(),
-    build_script_env = {"PROTOC": "$(execpath //build_defs:protoc)"},
-    data = [":proto_files"],
+    build_script_env = {
+        "PROTOC": "$(execpath //build_defs:protoc)",
+        "TINYTREE_QUERY_PROTO": "$(execpath //crates/tinytree-proto:proto/tinytree/query/v1/query.proto)",
+    },
+    data = [
+        ":proto_files",
+        "//crates/tinytree-proto:proto/tinytree/query/v1/query.proto",
+        "//crates/tinytree-proto:proto/tinytree/v1/repository.proto",
+    ],
     edition = "2024",
     pkg_name = "native-broker",
     tools = ["//build_defs:protoc"],

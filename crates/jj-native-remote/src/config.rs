@@ -23,6 +23,40 @@ impl Default for ClosureLimits {
         }
     }
 }
+/// Bounds for daemon-owned query sessions and durable membership witnesses.
+#[derive(Clone, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct QueryLimits {
+    pub max_scopes: usize,
+    pub max_queries: usize,
+    pub max_replays: usize,
+    pub max_registry_bytes: usize,
+    pub max_authorities: usize,
+    pub max_grants: usize,
+    pub expiry_interval_ms: u64,
+}
+impl Default for QueryLimits {
+    fn default() -> Self {
+        Self {
+            max_scopes: 32,
+            max_queries: 64,
+            max_replays: 256,
+            max_registry_bytes: 64 * 1024 * 1024,
+            max_authorities: 256,
+            max_grants: 50_000,
+            expiry_interval_ms: 1000,
+        }
+    }
+}
+impl QueryLimits {
+    pub(crate) fn registry_overhead(&self) -> usize {
+        self.max_scopes
+            .saturating_mul(128)
+            .saturating_add(self.max_queries.saturating_mul(1024))
+            .saturating_add(self.max_replays.saturating_mul(512))
+            .saturating_mul(4)
+    }
+}
 #[derive(Clone, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Config {
@@ -31,6 +65,7 @@ pub struct Config {
     /// Trusted broker-selected effective authorization profile, not an RPC field.
     pub authorization_profile: String,
     pub closure: ClosureLimits,
+    pub query: QueryLimits,
     pub operation_timeout_ms: u64,
     pub max_ledger_bytes: usize,
     pub max_pending_operations: usize,
@@ -45,6 +80,7 @@ impl Default for Config {
             remote: remote_default(),
             authorization_profile: "default".into(),
             closure: Default::default(),
+            query: Default::default(),
             operation_timeout_ms: 120_000,
             max_ledger_bytes: 32 * 1024 * 1024,
             max_pending_operations: 128,
@@ -60,6 +96,8 @@ fn remote_default() -> tinytree_client::Config {
     config.limits.max_metadata_bytes = 4 * 1024 * 1024;
     config.limits.max_batch_bytes = 4 * 1024 * 1024;
     config.limits.max_graph_bytes = 8 * 1024 * 1024;
+    // Leave retained-page headroom within the provider's smaller SDK pool.
+    config.limits.max_graph_objects = 65_536;
     config.limits.max_buffered_bytes = 32 * 1024 * 1024;
     config.limits.max_file_bytes = 64 * 1024 * 1024;
     config.limits.max_temporary_bytes = 128 * 1024 * 1024;
@@ -161,6 +199,14 @@ impl Config {
         let c = &self.closure;
         if self.authorization_profile.is_empty()
             || self.authorization_profile.len() > 128
+            || !(1..=4096).contains(&self.query.max_scopes)
+            || !(1..=4096).contains(&self.query.max_queries)
+            || !(1..=16384).contains(&self.query.max_replays)
+            || !(65536..=1024 * 1024 * 1024).contains(&self.query.max_registry_bytes)
+            || !(1..=100_000).contains(&self.query.max_authorities)
+            || !(1..=10_000_000).contains(&self.query.max_grants)
+            || !(10..=60_000).contains(&self.query.expiry_interval_ms)
+            || self.query.registry_overhead() > self.query.max_registry_bytes
             || !(1..=86_400_000).contains(&self.operation_timeout_ms)
             || !(1..=1_000_000).contains(&c.max_objects)
             || !(1..=10_000_000).contains(&c.max_edges)

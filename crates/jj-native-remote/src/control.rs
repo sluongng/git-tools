@@ -665,13 +665,14 @@ impl RemoteRepositoryControl {
     pub async fn rebuild_file_index(&self) -> Result<usize> {
         let deadline = self.inner.deadline();
         self.run(deadline, async {
+            let _metadata = self.inner.metadata.clone().lock_owned().await;
             let ledger = self.inner.ledger.clone();
-            let roots = io::blocking(move || ledger.roots()).await?;
+            let authorities = io::blocking(move || ledger.retained_authorities()).await?;
             let mut claims =
                 std::collections::HashMap::<m::ObjectId, crate::ledger::FileClaim>::new();
-            for root in roots.into_iter().filter(|root| root.retained()) {
+            for authority in authorities {
                 let ledger = self.inner.ledger.clone();
-                let head = root.head.clone();
+                let head = authority.key();
                 let members = io::blocking(move || ledger.verified_members(&head)).await?;
                 for descriptor in members
                     .into_iter()
@@ -703,7 +704,7 @@ impl RemoteRepositoryControl {
                                     id,
                                     crate::ledger::FileClaim {
                                         size: size_bytes,
-                                        root: root.head.clone(),
+                                        root: authority.key(),
                                         tree: hex(&descriptor.key.id.0),
                                     },
                                 );

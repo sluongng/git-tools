@@ -1,5 +1,5 @@
 //! Sparse canonical metadata rooted in durable remote retention proofs.
-use crate::{RemoteObjectIo, backend, hex, io, ledger::Root, unhex};
+use crate::{RemoteObjectIo, backend, io, ledger::Authority, unhex};
 use anyhow::{Context, Result, ensure};
 use jj_native_backend::{CopyCatalogLimits, CopyCatalogSnapshot, NativeObjectIo, VerifiedMetadata};
 use std::{
@@ -54,8 +54,9 @@ impl RemoteObjectIo {
                     provider.promise_owned(m::FileId(key.id.0), owner).await
                 } else {
                     let ledger = provider.inner.ledger.clone();
-                    let root = io::blocking_owned(owner.clone(), move || ledger.metadata_root(key))
-                        .await?;
+                    let root =
+                        io::blocking_owned(owner.clone(), move || ledger.metadata_authority(key))
+                            .await?;
                     if root.is_some() {
                         provider
                             .verified_metadata_with_owner(key, owner)
@@ -118,16 +119,13 @@ impl RemoteObjectIo {
     /// Known IDs alone are not grants. Recheck every canonical edge back to its pin.
     pub(crate) async fn prove_owned(
         &self,
-        root: &Root,
+        authority: &Authority,
         mut key: m::ObjectKey,
         owner: Arc<dyn Any + Send + Sync>,
         deadline: tokio::time::Instant,
     ) -> Result<()> {
-        ensure!(root.retained(), "native metadata root is not pinned");
-        let root_key = m::ObjectKey {
-            kind: m::Kind::Commit,
-            id: m::ObjectId(unhex(&root.head)?),
-        };
+        self.inner.ledger.validate_authority(authority)?;
+        let authority_key = authority.key();
         let mut seen = HashSet::new();
         loop {
             check(deadline)?;
@@ -136,32 +134,46 @@ impl RemoteObjectIo {
                 "native metadata provenance is cyclic or exceeds its budget"
             );
             let ledger = self.inner.ledger.clone();
-            let head = root.head.clone();
-            let reference =
-                io::blocking_owned(owner.clone(), move || ledger.reference(&head, key)).await?;
-            if key == root_key {
-                ensure!(
-                    reference.is_some_and(|reference| reference.parent.is_none())
-                        || (root.complete && self.inner.ledger.member(&root.head, key)?),
-                    "native root metadata lacks pin provenance"
-                );
+            let captured = authority.clone();
+            if io::blocking_owned(owner.clone(), move || ledger.query_terminal(&captured, key))
+                .await?
+            {
                 return Ok(());
             }
-            if root.complete && reference.is_none() {
-                let ledger = self.inner.ledger.clone();
-                let head = root.head.clone();
-                ensure!(
-                    io::blocking_owned(owner.clone(), move || ledger.member(&head, key)).await?,
-                    "native legacy metadata lacks complete admission provenance"
-                );
-                return Ok(());
+            let ledger = self.inner.ledger.clone();
+            let head = authority_key.clone();
+            let reference =
+                io::blocking_owned(owner.clone(), move || ledger.reference(&head, key)).await?;
+            if let Some(root) = authority.root() {
+                let root_key = m::ObjectKey {
+                    kind: m::Kind::Commit,
+                    id: m::ObjectId(unhex(&root.head)?),
+                };
+                if key == root_key {
+                    ensure!(
+                        reference.is_some_and(|reference| reference.parent.is_none())
+                            || (root.complete && self.inner.ledger.member(&root.head, key)?),
+                        "native root metadata lacks pin provenance"
+                    );
+                    return Ok(());
+                }
+                if root.complete && reference.is_none() {
+                    let ledger = self.inner.ledger.clone();
+                    let head = root.head.clone();
+                    ensure!(
+                        io::blocking_owned(owner.clone(), move || ledger.member(&head, key))
+                            .await?,
+                        "native legacy metadata lacks complete admission provenance"
+                    );
+                    return Ok(());
+                }
             }
             let parent = reference
                 .and_then(|reference| reference.parent)
                 .context("native metadata lacks canonical parent provenance")?
                 .descriptor()?;
             let ledger = self.inner.ledger.clone();
-            let head = root.head.clone();
+            let head = authority_key.clone();
             ensure!(
                 io::blocking_owned(owner.clone(), move || ledger.member(&head, parent.key)).await?,
                 "native metadata parent is not verified"
@@ -216,8 +228,9 @@ impl RemoteObjectIo {
                         .await
                         .map_err(backend)?;
                     let ledger = provider.inner.ledger.clone();
-                    let root = io::blocking_owned(owner.clone(), move || ledger.metadata_root(key))
-                        .await?;
+                    let root =
+                        io::blocking_owned(owner.clone(), move || ledger.metadata_authority(key))
+                            .await?;
                     let Some(mut root) = root else {
                         ensure!(
                             local.is_some(),
@@ -231,16 +244,27 @@ impl RemoteObjectIo {
                             .map_err(backend);
                     };
                     // Refresh before the metadata lock: control can itself need metadata.
-                    if local.is_none() && root.binding != provider.inner.ledger.binding.scope {
+                    if local.is_none()
+                        && root
+                            .root()
+                            .is_some_and(|root| root.binding != provider.inner.ledger.binding.scope)
+                    {
+                        let root_head = root
+                            .root()
+                            .context("native retained root missing")?
+                            .head
+                            .clone();
                         crate::RemoteRepositoryControl {
                             inner: provider.inner.clone(),
                         }
-                        .refresh_scope_hold(m::CommitId(unhex(&root.head)?))
+                        .refresh_scope_hold(m::CommitId(unhex(&root_head)?))
                         .await?;
                         let ledger = provider.inner.ledger.clone();
-                        root = io::blocking_owned(owner.clone(), move || ledger.metadata_root(key))
-                            .await?
-                            .context("native metadata root disappeared")?;
+                        root = io::blocking_owned(owner.clone(), move || {
+                            ledger.metadata_authority(key)
+                        })
+                        .await?
+                        .context("native metadata root disappeared")?;
                     }
                     let _gate = tokio::time::timeout_at(
                         deadline,
@@ -262,7 +286,7 @@ impl RemoteObjectIo {
     }
     async fn load_metadata(
         &self,
-        root: Root,
+        root: Authority,
         key: m::ObjectKey,
         deadline: tokio::time::Instant,
         owner: Arc<dyn Any + Send + Sync>,
@@ -343,7 +367,7 @@ impl RemoteObjectIo {
             };
             if let m::Object::Symlink(target) = &node.object {
                 let ledger = self.inner.ledger.clone();
-                let head = root.head.clone();
+                let head = root.key();
                 let reference =
                     io::blocking_owned(owner.clone(), move || ledger.reference(&head, current))
                         .await?;
@@ -395,14 +419,14 @@ impl RemoteObjectIo {
             }
             nodes.insert(current, node);
         }
-        let head = m::CommitId(unhex(&root.head)?);
+        let head = root.clone();
         let plan: Vec<_> = nodes
             .values()
             .map(|node| (node.descriptor, node.object.clone()))
             .collect();
         let ledger = self.inner.ledger.clone();
         io::blocking_owned(owner.clone(), move || {
-            ledger.check_verified_batch(head, &plan)
+            ledger.check_verified_authority_batch(&head, &plan)
         })
         .await?;
         for current in &order {
@@ -419,7 +443,7 @@ impl RemoteObjectIo {
                 let descriptor = self
                     .inner
                     .local
-                    .write_metadata(node.object.clone())
+                    .write_metadata_with_owner(node.object.clone(), owner.clone())
                     .await
                     .map_err(backend)?;
                 ensure!(
@@ -440,8 +464,9 @@ impl RemoteObjectIo {
             let object = node.object.clone();
             let descriptor = node.descriptor;
             let ledger = self.inner.ledger.clone();
+            let head = root.clone();
             io::blocking_owned(owner.clone(), move || {
-                ledger.verified(head, descriptor, &object)
+                ledger.verified_authority(&head, descriptor, &object)
             })
             .await?;
             if let m::Object::CopyHistory(copy) = &node.object {

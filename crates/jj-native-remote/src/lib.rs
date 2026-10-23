@@ -8,9 +8,10 @@ mod io;
 mod ledger;
 mod metadata;
 mod provider;
+mod query;
 mod staging;
 use anyhow::{Context, Result, ensure};
-pub use config::{ClosureLimits, Config};
+pub use config::{ClosureLimits, Config, QueryLimits};
 pub use control::{
     AdmittedHead, AdmittedReference, ConfirmedPublication, ObservedReference, PublishRequest,
     RemoteRepositoryControl,
@@ -18,6 +19,7 @@ pub use control::{
 use jj_native_backend::DirectObjectIo;
 use local_cas::LocalCas;
 pub use provider::RemoteObjectIo;
+pub use query::RemoteQueryIo;
 use std::{
     path::{Path, PathBuf},
     sync::Arc,
@@ -28,6 +30,7 @@ use tinytree_client::NativeClient;
 pub struct RemoteRepository {
     pub io: Arc<RemoteObjectIo>,
     pub control: RemoteRepositoryControl,
+    pub query: Arc<RemoteQueryIo>,
 }
 pub(crate) struct Inner {
     pub local: Arc<DirectObjectIo>,
@@ -172,6 +175,7 @@ impl RemoteRepository {
             io: Arc::new(RemoteObjectIo {
                 inner: inner.clone(),
             }),
+            query: Arc::new(RemoteQueryIo::new(inner.clone())?),
             control: RemoteRepositoryControl { inner },
         })
     }

@@ -5,12 +5,19 @@ mod config;
 mod control;
 mod control_client;
 mod local;
+mod query;
+mod query_client;
+mod query_service;
 pub use control::{
     AdmittedCommit, ConfirmedPublication, ControlResources, NativeRepositoryControl,
     PublishRequest, ReferenceSnapshot,
 };
 pub use control_client::BrokerControlClient;
+pub use query::*;
+pub use query_client::BrokerQueryClient;
+pub use query_service::QueryRpcService;
 pub use tinytree_model::CommitId;
+pub use tinytree_proto::query_v1 as query_protocol;
 pub use tonic::{Code as ControlCode, Status as ControlStatus};
 mod service;
 mod transport;

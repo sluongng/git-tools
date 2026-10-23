@@ -75,7 +75,7 @@ entry points. Most also expose Rust libraries; `jj-native-cli` is executable-onl
 | [`workspace-nfs`](crates/workspace-nfs) | `git-nfs` | macOS source mounts over loopback NFS. |
 | [`workspace-projfs`](crates/workspace-projfs) | `git-projfs` | Windows source mounts using ProjFS. |
 | [`jj-vfs`](crates/jj-vfs) | `git-jj` | Jujutsu working-copy integration with the source VFS. |
-| [`tinytree-server`](crates/tinytree-server) | `tinytree` | Separate jj-native object/ref server over compressed gRPC. |
+| [`tinytree-server`](crates/tinytree-server) | `tinytree` | Separate jj-native object, reference and graph-query server over compressed gRPC. |
 | [`jj-native-cli`](crates/jj-native-cli) | `tinytree-jj` | Native jj commands through daemon-owned lazy workspaces; broker-backed clone/fetch/push. |
 | [`bazel-output-service`](crates/bazel-output-service) | `git-output-service` | Lazy Bazel output service backed by remote CAS. |
 
@@ -94,8 +94,8 @@ entry points. Most also expose Rust libraries; `jj-native-cli` is executable-onl
 | [`tinytree-client`](crates/tinytree-client) | Bounded, verifying native RPCs and immutable transfer snapshots. |
 | [`tinytree-store`](crates/tinytree-store) | Authoritative native objects, durable refs and reachability GC; not LRU. |
 | [`jj-native-backend`](crates/jj-native-backend) | Native jj Backend and verified object-I/O providers; retains authoritative local objects. |
-| [`jj-native-remote`](crates/jj-native-remote) | Lazy native file provider, durable admission/publication and private broker control. |
-| [`native-broker`](crates/native-broker) | Private object I/O and reference control shared by independent native jj processes. |
+| [`jj-native-remote`](crates/jj-native-remote) | Lazy native object I/O, checked query admission and durable publication. |
+| [`native-broker`](crates/native-broker) | Private object, reference and query I/O over one local endpoint. |
 | [`native-workspace`](crates/native-workspace), [`native-vfs`](crates/native-vfs) | Directory-at-a-time native source projection and platform mount ownership. |
 | [`native-workspace-admin`](crates/native-workspace-admin) | Private external jj administration and restart-safe provisioning. |
 | [`native-vfs-controller`](crates/native-vfs-controller), [`native-vfs-rpc`](crates/native-vfs-rpc) | Dirty-only snapshots, checked root changes and private projection control. |

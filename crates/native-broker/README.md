@@ -38,3 +38,18 @@ Git unavailable, shared-store concurrency, host restart and cancellation tests.
 native suite covering independent clients, protected-pipe connection, existing
 instance refusal, and insecure-server rejection. Cross-compilation alone is not
 native transport acceptance.
+
+Optional `NativeQueryIo` adapters and `BrokerQueryClient` provide bounded graph
+queries through the same local endpoint. Handles are broker-local; upstream
+credentials and cursors stay in the configured adapter. Distinct repository or
+trust scopes require distinct adapters; aliases explicitly sharing one adapter
+are trusted synonyms for its handles. Partial-query close is
+explicit cancellation, not proof of exhaustion. Returned pages retain byte/root
+owners independently of transport slots.
+
+`max_query_bytes` defaults to 512 KiB. The separate
+`max_query_persistent_bytes` defaults to 512 MiB and bounds the sum of declared
+registry/replay/SDK pools across distinct adapters, not aliases sharing one
+adapter. These are worst-case limits, not preallocated memory. Registration
+fails explicitly when the aggregate cap is too small; lower per-repository
+limits or configure a larger aggregate cap.
