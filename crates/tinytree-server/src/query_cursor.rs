@@ -1,9 +1,11 @@
-//! Process-local, bounded IDs query cursors. HTTP admission is never retained by
+//! Process-local, bounded query cursors. HTTP admission is never retained by
 //! idle cursors; accepted physical jobs and response bodies retain their owners.
 use crate::{
     config::ConfigError,
     query_eval::{EvalError, EvalLimits, EvalStep, Evaluator},
+    query_graph::{EdgeKind, GraphEvaluator, GraphLimits, GraphStep, SelectedRow},
     query_index::{QueryConfig, QueryHost, Scoped, index_error},
+    query_overlay::GraphNode,
 };
 use prost::Message;
 use std::{
@@ -15,7 +17,9 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 use tinytree_index::WorkBudget;
+use tinytree_model as m;
 use tinytree_proto::query_v1 as q;
+use tinytree_proto::v1 as p;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tonic::Status;
 
@@ -26,8 +30,42 @@ fn clock() -> Result<i64, Status> {
         .and_then(|v| i64::try_from(v.as_secs()).ok())
         .ok_or_else(|| Status::internal("query clock unavailable"))
 }
-fn active_memory(config: &QueryConfig) -> usize {
-    limits(config).memory_bytes().unwrap_or(usize::MAX)
+fn page_window(c: &QueryConfig) -> usize {
+    c.max_response_bytes
+        .saturating_mul(5)
+        .saturating_add(
+            c.max_page_size
+                .saturating_mul(std::mem::size_of::<q::GraphRow>())
+                .saturating_mul(2),
+        )
+        .saturating_add(4096)
+}
+fn active_memory(c: &QueryConfig, projection: i32) -> usize {
+    let graph = if projection == q::Projection::Ids as i32 {
+        0
+    } else {
+        graph_limits(c).memory_bytes().unwrap_or(usize::MAX)
+    };
+    limits(c)
+        .memory_bytes()
+        .unwrap_or(usize::MAX)
+        .saturating_add(graph)
+        .saturating_add(page_window(c).saturating_mul(3))
+        .saturating_add(if projection == q::Projection::Canonical as i32 {
+            c.max_commit_bytes.saturating_mul(8)
+        } else {
+            0
+        })
+}
+fn graph_limits(c: &QueryConfig) -> GraphLimits {
+    GraphLimits {
+        max_nodes: c.max_graph_query_nodes,
+        max_edges: c.max_graph_query_edges,
+        max_keys: c.max_graph_query_keys,
+        max_frames: c.max_graph_query_frames,
+        max_step_work: c.max_graph_query_step_work,
+        max_steps: c.max_graph_query_steps as u64,
+    }
 }
 fn history_memory(config: &QueryConfig) -> usize {
     config
@@ -59,7 +97,14 @@ pub(crate) fn validate_config(c: &QueryConfig) -> Result<(), ConfigError> {
         || !(1..=100_000_000).contains(&c.max_eval_steps)
         || !(1..=4096).contains(&c.max_eval_quantum_steps)
         || c.max_cursor_memory_bytes > 1024 * 1024 * 1024
-        || active_memory(c).saturating_add(history_memory(c)) > c.max_cursor_memory_bytes
+        || !(1..=100_000).contains(&c.max_graph_query_nodes)
+        || !(1..=1_000_000).contains(&c.max_graph_query_edges)
+        || !(1..=1_000_000).contains(&c.max_graph_query_keys)
+        || !(1..=100_000).contains(&c.max_graph_query_frames)
+        || !(1..=4096).contains(&c.max_graph_query_step_work)
+        || !(1..=100_000_000).contains(&c.max_graph_query_steps)
+        || active_memory(c, q::Projection::Canonical as i32).saturating_add(history_memory(c))
+            > c.max_cursor_memory_bytes
     {
         return Err(ConfigError("invalid query cursor limits"));
     }
@@ -84,14 +129,31 @@ fn eval_error(error: EvalError) -> Status {
         EvalError::Unsupported(_) => Status::unimplemented("query operator is not implemented"),
     }
 }
+struct ActiveReservation {
+    permit: Mutex<OwnedSemaphorePermit>,
+}
+impl ActiveReservation {
+    fn retain(&self, bytes: usize) -> Result<OwnedSemaphorePermit, Status> {
+        self.permit.lock().unwrap().split(bytes).ok_or_else(|| {
+            Status::internal("cursor retained memory accounting exceeded reservation")
+        })
+    }
+}
+enum RunningEvaluator {
+    Ids(Evaluator),
+    Graph(GraphEvaluator),
+}
 struct State {
     pending: Option<q::GraphExpr>,
-    evaluator: Option<Evaluator>,
+    evaluator: Option<RunningEvaluator>,
+    pending_row: Option<q::GraphRow>,
     scope: Option<Arc<Scoped>>,
-    active_memory: Option<Arc<OwnedSemaphorePermit>>,
     budget: WorkBudget,
     next: u64,
     last: Option<(u64, Result<q::EvaluatePage, Status>)>,
+    // Destroy evaluator, pending/raw rows and replay bytes before permits.
+    replay_memory: Option<OwnedSemaphorePermit>,
+    active_memory: Option<Arc<ActiveReservation>>,
 }
 struct Garbage {
     state: Mutex<State>,
@@ -127,7 +189,7 @@ impl Drop for Record {
 struct PageOwner {
     _record: Arc<Record>,
     _scope: Option<Arc<Scoped>>,
-    _active_memory: Option<Arc<OwnedSemaphorePermit>>,
+    _active_memory: Option<Arc<ActiveReservation>>,
 }
 pub(crate) struct CursorPage {
     pub page: q::EvaluatePage,
@@ -239,16 +301,16 @@ impl CursorHost {
             .scope
             .as_ref()
             .ok_or_else(|| Status::invalid_argument("query scope missing"))?;
-        if request.projection != q::Projection::Ids as i32 {
-            return Err(
-                if request.projection == q::Projection::Graph as i32
-                    || request.projection == q::Projection::Canonical as i32
-                {
-                    Status::unimplemented("query projection is not implemented")
-                } else {
-                    Status::invalid_argument("query projection missing or invalid")
-                },
-            );
+        if ![
+            q::Projection::Ids as i32,
+            q::Projection::Graph as i32,
+            q::Projection::Canonical as i32,
+        ]
+        .contains(&request.projection)
+        {
+            return Err(Status::invalid_argument(
+                "query projection missing or invalid",
+            ));
         }
         if request.page_size == 0 || request.page_size as usize > host.config.max_page_size {
             return Err(Status::resource_exhausted("query page size exceeds budget"));
@@ -260,6 +322,7 @@ impl CursorHost {
             .map_err(|_| Status::invalid_argument("query ID must be 32 bytes"))?;
         let key = key.clone();
         let cursor = std::mem::take(&mut request.cursor);
+        let request_bytes = request.encoded_len();
         let binding = *blake3::hash(&request.encode_to_vec()).as_bytes();
         let now = clock()?;
         let (record, sequence) = if cursor.is_empty() {
@@ -284,16 +347,26 @@ impl CursorHost {
                 let history = self
                     .memory
                     .clone()
-                    .try_acquire_many_owned(u32::try_from(history_memory(&host.config)).map_err(
-                        |_| Status::resource_exhausted("query history memory exceeds budget"),
-                    )?)
+                    .try_acquire_many_owned(
+                        u32::try_from(
+                            request_bytes
+                                .saturating_mul(2)
+                                .saturating_add(owner.len().saturating_mul(2))
+                                .saturating_add(4096),
+                        )
+                        .map_err(|_| {
+                            Status::resource_exhausted("query history memory exceeds budget")
+                        })?,
+                    )
                     .map_err(|_| Status::resource_exhausted("query history memory exhausted"))?;
                 let active = self
                     .memory
                     .clone()
-                    .try_acquire_many_owned(u32::try_from(active_memory(&host.config)).map_err(
-                        |_| Status::resource_exhausted("query cursor memory exceeds budget"),
-                    )?)
+                    .try_acquire_many_owned(
+                        u32::try_from(active_memory(&host.config, request.projection)).map_err(
+                            |_| Status::resource_exhausted("query cursor memory exceeds budget"),
+                        )?,
+                    )
                     .map_err(|_| Status::resource_exhausted("query cursor memory exhausted"))?;
                 let expires = (now + host.config.query_ttl_seconds as i64)
                     .min(scope.wire.expires_at_unix_seconds);
@@ -321,8 +394,12 @@ impl CursorHost {
                     state: Some(Mutex::new(State {
                         pending: Some(expression),
                         evaluator: None,
+                        pending_row: None,
+                        replay_memory: None,
                         scope: Some(scope),
-                        active_memory: Some(Arc::new(active)),
+                        active_memory: Some(Arc::new(ActiveReservation {
+                            permit: Mutex::new(active),
+                        })),
                         budget: host.config.budget(),
                         next: 0,
                         last: None,
@@ -400,70 +477,105 @@ impl CursorHost {
         host.pause_query()?;
         let result = (|| {
             if let Some(expression) = state.pending.take() {
-                state.evaluator = Some(
-                    Evaluator::new(
-                        scope.as_ref().unwrap().graph().clone(),
-                        expression,
-                        limits(&host.config),
+                let graph = scope.as_ref().unwrap().graph().clone();
+                let ids = Evaluator::new(graph.clone(), expression, limits(&host.config))
+                    .map_err(eval_error)?;
+                state.evaluator = Some(if request.projection == q::Projection::Ids as i32 {
+                    RunningEvaluator::Ids(ids)
+                } else {
+                    RunningEvaluator::Graph(
+                        GraphEvaluator::new(graph, ids, graph_limits(&host.config))
+                            .map_err(eval_error)?,
                     )
-                    .map_err(eval_error)?,
-                );
+                });
             }
-            let mut rows = Vec::new();
-            let mut exhausted = false;
+            let next_sequence = sequence
+                .checked_add(1)
+                .ok_or_else(|| Status::resource_exhausted("query sequence exhausted"))?;
+            let mut page = q::EvaluatePage {
+                scope_digest: record.scope_digest.to_vec(),
+                index_epoch: record.epoch.to_vec(),
+                sequence,
+                rows: Vec::with_capacity(request.page_size as usize),
+                cursor: self.token(&record, next_sequence),
+                exhausted: Some(false),
+            };
+            let mut encoded = page.encoded_len();
             for _ in 0..host.config.max_eval_quantum_steps {
                 if record.expires <= clock()? {
                     return Err(Status::failed_precondition(
                         "query cursor expired during evaluation",
                     ));
                 }
-
-                let State {
-                    evaluator, budget, ..
-                } = &mut *state;
-                match evaluator
-                    .as_mut()
-                    .unwrap()
-                    .step(budget)
-                    .map_err(eval_error)?
-                {
-                    EvalStep::Row(node) => {
-                        rows.push(q::GraphRow {
-                            commit: Some(q::CommitId {
-                                value: node.commit().0.to_vec(),
-                            }),
-                            change: Some(q::ChangeId {
-                                value: node.change_id().0.to_vec(),
-                            }),
-                            edges: Vec::new(),
-                            canonical: None,
-                        });
-                        if rows.len() >= request.page_size as usize {
-                            break;
+                let row = if let Some(row) = state.pending_row.take() {
+                    Some(row)
+                } else {
+                    let State {
+                        evaluator, budget, ..
+                    } = &mut *state;
+                    match evaluator.as_mut().unwrap() {
+                        RunningEvaluator::Ids(evaluator) => {
+                            match evaluator.step(budget).map_err(eval_error)? {
+                                EvalStep::Row(node) => Some(ids_row(&node)),
+                                EvalStep::Progress => None,
+                                EvalStep::Done => {
+                                    page.exhausted = Some(true);
+                                    page.cursor.clear();
+                                    break;
+                                }
+                            }
+                        }
+                        RunningEvaluator::Graph(evaluator) => {
+                            match evaluator.step(budget).map_err(eval_error)? {
+                                GraphStep::Row(row) => Some(graph_row(
+                                    host,
+                                    &record.repository,
+                                    scope.as_ref().unwrap(),
+                                    row,
+                                    request.projection == q::Projection::Canonical as i32,
+                                    budget,
+                                    encoded_header(&record, self, next_sequence),
+                                )?),
+                                GraphStep::Progress => None,
+                                GraphStep::Done => {
+                                    page.exhausted = Some(true);
+                                    page.cursor.clear();
+                                    break;
+                                }
+                            }
                         }
                     }
-                    EvalStep::Progress => {}
-                    EvalStep::Done => {
-                        exhausted = true;
-                        break;
+                };
+                let Some(row) = row else { continue };
+                let addition = field_bytes(row.encoded_len());
+                if encoded.saturating_add(addition) > host.config.max_response_bytes {
+                    if page.rows.is_empty() {
+                        return Err(Status::resource_exhausted(
+                            "one query row exceeds response budget",
+                        ));
                     }
+                    if row_memory(&row) > page_window(&host.config) {
+                        return Err(Status::resource_exhausted(
+                            "pending row allocation exceeds window",
+                        ));
+                    }
+                    state.pending_row = Some(row);
+                    break;
+                }
+                encoded += addition;
+                page.rows.push(row);
+                if page_memory(&page) > page_window(&host.config) {
+                    return Err(Status::resource_exhausted(
+                        "query page allocation exceeds window",
+                    ));
+                }
+                if page.rows.len() >= request.page_size as usize {
+                    break;
                 }
             }
             let next = sequence
                 .checked_add(1)
                 .ok_or_else(|| Status::resource_exhausted("query sequence exhausted"))?;
-            let page = q::EvaluatePage {
-                scope_digest: record.scope_digest.to_vec(),
-                index_epoch: record.epoch.to_vec(),
-                sequence,
-                rows,
-                cursor: if exhausted {
-                    Vec::new()
-                } else {
-                    self.token(&record, next)
-                },
-                exhausted: Some(exhausted),
-            };
             if page.encoded_len() > host.config.max_response_bytes {
                 return Err(Status::resource_exhausted(
                     "query page exceeds response budget",
@@ -475,10 +587,20 @@ impl CursorHost {
         let terminal = result
             .as_ref()
             .map_or(true, |page| page.exhausted == Some(true));
-        state.last = Some((sequence, result.clone()));
+        let retained = result.clone();
+        if terminal {
+            let bytes = retained.as_ref().map_or(0, page_memory);
+            state.replay_memory = if bytes > 0 {
+                Some(memory.as_ref().unwrap().retain(bytes)?)
+            } else {
+                None
+            };
+        }
+        state.last = Some((sequence, retained));
         if terminal {
             state.evaluator = None;
             state.pending = None;
+            state.pending_row = None;
             state.scope = None;
             state.active_memory = None;
             record.active.store(false, Ordering::Release);
@@ -494,6 +616,253 @@ impl CursorHost {
             }),
         })
     }
+}
+fn field_bytes(bytes: usize) -> usize {
+    1usize
+        .saturating_add(prost::length_delimiter_len(bytes))
+        .saturating_add(bytes)
+}
+fn ids_row(node: &GraphNode) -> q::GraphRow {
+    q::GraphRow {
+        commit: Some(q::CommitId {
+            value: node.commit().0.to_vec(),
+        }),
+        change: Some(q::ChangeId {
+            value: node.change_id().0.to_vec(),
+        }),
+        edges: Vec::new(),
+        canonical: None,
+    }
+}
+fn encoded_header(record: &Record, host: &CursorHost, sequence: u64) -> usize {
+    q::EvaluatePage {
+        scope_digest: record.scope_digest.to_vec(),
+        index_epoch: record.epoch.to_vec(),
+        sequence,
+        rows: Vec::new(),
+        cursor: host.token(record, sequence),
+        exhausted: Some(false),
+    }
+    .encoded_len()
+}
+fn wire_descriptor(descriptor: m::Descriptor) -> p::ObjectDescriptor {
+    p::ObjectDescriptor {
+        key: Some(p::ObjectKey {
+            kind: descriptor.key.kind as i32,
+            native_id: descriptor.key.id.0.to_vec(),
+        }),
+        content_blake3: descriptor.key.id.0.to_vec(),
+        size_bytes: descriptor.size_bytes,
+        object_format_version: descriptor.format_version as u32,
+    }
+}
+fn graph_row(
+    host: &QueryHost,
+    repository: &str,
+    scope: &Scoped,
+    selected: SelectedRow,
+    canonical: bool,
+    budget: &mut WorkBudget,
+    header: usize,
+) -> Result<q::GraphRow, Status> {
+    let mut row = ids_row(&selected.node);
+    // Native IDs are fixed-width; every selected-edge variant has the same
+    // encoded/allocation shape. Preflight before allocating a large edge Vec.
+    let edge_shape = q::SelectedEdge {
+        edge: Some(q::selected_edge::Edge::Direct(q::DirectEdge {
+            target: Some(q::CommitId { value: vec![0; 32] }),
+        })),
+    };
+    let mut encoded = row
+        .encoded_len()
+        .saturating_add(field_bytes(edge_shape.encoded_len()).saturating_mul(selected.edges.len()));
+    let expected = selected.node.descriptor();
+    let has_payload = canonical && selected.node.commit() != m::CommitId::ROOT;
+    if has_payload {
+        let size = usize::try_from(expected.size_bytes)
+            .map_err(|_| Status::resource_exhausted("canonical row size overflow"))?;
+        if size > host.config.max_commit_bytes {
+            return Err(Status::resource_exhausted(
+                "canonical row exceeds commit byte budget",
+            ));
+        }
+        let descriptor_bytes = p::ObjectData {
+            descriptor: Some(wire_descriptor(expected)),
+            canonical_envelope: Vec::new(),
+        }
+        .encoded_len();
+        encoded = encoded.saturating_add(field_bytes(
+            descriptor_bytes.saturating_add(field_bytes(size)),
+        ));
+    }
+    if header.saturating_add(field_bytes(encoded)) > host.config.max_response_bytes {
+        return Err(Status::resource_exhausted(
+            "one query row exceeds response budget",
+        ));
+    }
+    let mut edges = Vec::with_capacity(selected.edges.len());
+    for edge in &selected.edges {
+        let target = Some(q::CommitId {
+            value: edge.target.commit().0.to_vec(),
+        });
+        edges.push(q::SelectedEdge {
+            edge: Some(match edge.kind {
+                EdgeKind::Direct => q::selected_edge::Edge::Direct(q::DirectEdge { target }),
+                EdgeKind::Indirect => q::selected_edge::Edge::Indirect(q::IndirectEdge { target }),
+                EdgeKind::Missing => {
+                    q::selected_edge::Edge::Missing(q::MissingEdge { boundary: target })
+                }
+            }),
+        });
+    }
+    row.edges = edges.into_boxed_slice().into_vec();
+    if has_payload {
+        let data = if let Some(bytes) = scope
+            .graph()
+            .draft_bytes(&selected.node, budget)
+            .map_err(index_error)?
+        {
+            bytes.to_vec()
+        } else {
+            let descriptor = host
+                .store
+                .descriptor(repository, expected.key)
+                .map_err(|_| Status::unavailable("canonical query object unavailable"))?
+                .ok_or_else(|| Status::data_loss("retained canonical query object missing"))?;
+            if descriptor != expected {
+                return Err(Status::data_loss(
+                    "canonical query descriptor does not match scoped graph",
+                ));
+            }
+            budget
+                .charge(0, 0, expected.size_bytes)
+                .map_err(index_error)?;
+            let (descriptor, data) = host
+                .store
+                .read_metadata(repository, expected.key)
+                .map_err(|_| Status::data_loss("canonical query object read failed"))?;
+            if descriptor != expected {
+                return Err(Status::data_loss(
+                    "canonical query descriptor changed during read",
+                ));
+            }
+            data
+        };
+        if expected.key.kind != m::Kind::Commit
+            || expected.key.id.0 != selected.node.commit().0
+            || expected.format_version != m::FORMAT_VERSION
+            || data.len() as u64 != expected.size_bytes
+            || blake3::hash(&data).as_bytes() != &expected.key.id.0
+        {
+            return Err(Status::data_loss(
+                "canonical query object identity mismatch",
+            ));
+        }
+        let object = m::decode(
+            &data,
+            m::Limits {
+                max_object_bytes: host.config.max_commit_bytes,
+                max_items: host.config.max_commit_parents,
+                ..Default::default()
+            },
+        )
+        .map_err(|error| match error {
+            m::Error::Limit => {
+                Status::resource_exhausted("canonical query shape exceeds configured limits")
+            }
+            _ => Status::data_loss("invalid canonical query object"),
+        })?;
+        let m::Object::Commit(commit) = object else {
+            return Err(Status::data_loss("canonical query object type mismatch"));
+        };
+        let parents = scope
+            .graph()
+            .parent_nodes(&selected.node, budget)
+            .map_err(index_error)?;
+        if commit.change_id != selected.node.change_id()
+            || commit.committer.timestamp.millis_since_epoch != selected.node.committer_millis()
+            || !commit
+                .parents
+                .iter()
+                .copied()
+                .eq(parents.iter().map(GraphNode::commit))
+        {
+            return Err(Status::data_loss(
+                "canonical query metadata does not match scoped graph",
+            ));
+        }
+        row.canonical = Some(p::ObjectData {
+            descriptor: Some(wire_descriptor(expected)),
+            canonical_envelope: data.into_boxed_slice().into_vec(),
+        });
+    }
+    if row_memory(&row) > page_window(&host.config) {
+        return Err(Status::resource_exhausted(
+            "query row allocation exceeds window",
+        ));
+    }
+    Ok(row)
+}
+fn allocation(capacity: usize, size: usize) -> usize {
+    if capacity == 0 {
+        0
+    } else {
+        capacity.saturating_mul(size).saturating_add(32)
+    }
+}
+fn row_heap(row: &q::GraphRow) -> usize {
+    let mut bytes = row
+        .commit
+        .as_ref()
+        .map_or(0, |id| allocation(id.value.capacity(), 1))
+        .saturating_add(
+            row.change
+                .as_ref()
+                .map_or(0, |id| allocation(id.value.capacity(), 1)),
+        )
+        .saturating_add(allocation(
+            row.edges.capacity(),
+            std::mem::size_of::<q::SelectedEdge>(),
+        ));
+    for edge in &row.edges {
+        let target = match &edge.edge {
+            Some(q::selected_edge::Edge::Direct(v)) => v.target.as_ref(),
+            Some(q::selected_edge::Edge::Indirect(v)) => v.target.as_ref(),
+            Some(q::selected_edge::Edge::Missing(v)) => v.boundary.as_ref(),
+            None => None,
+        };
+        bytes = bytes.saturating_add(target.map_or(0, |id| allocation(id.value.capacity(), 1)));
+    }
+    if let Some(object) = &row.canonical {
+        bytes = bytes.saturating_add(allocation(object.canonical_envelope.capacity(), 1));
+        if let Some(descriptor) = &object.descriptor {
+            bytes = bytes.saturating_add(allocation(descriptor.content_blake3.capacity(), 1));
+            if let Some(key) = &descriptor.key {
+                bytes = bytes.saturating_add(allocation(key.native_id.capacity(), 1));
+            }
+        }
+    }
+    bytes
+}
+fn row_memory(row: &q::GraphRow) -> usize {
+    std::mem::size_of::<q::GraphRow>()
+        .saturating_add(row_heap(row))
+        .saturating_mul(2)
+        .saturating_add(1024)
+}
+fn page_memory(page: &q::EvaluatePage) -> usize {
+    let mut bytes = std::mem::size_of::<q::EvaluatePage>()
+        .saturating_add(allocation(page.scope_digest.capacity(), 1))
+        .saturating_add(allocation(page.index_epoch.capacity(), 1))
+        .saturating_add(allocation(page.cursor.capacity(), 1))
+        .saturating_add(allocation(
+            page.rows.capacity(),
+            std::mem::size_of::<q::GraphRow>(),
+        ));
+    for row in &page.rows {
+        bytes = bytes.saturating_add(row_heap(row));
+    }
+    bytes.saturating_mul(2).saturating_add(1024)
 }
 fn random() -> [u8; 32] {
     let mut value = [0; 32];

@@ -213,6 +213,14 @@ impl Server {
             ],
         )
         .unwrap();
+        Self::start_service(service, counts, tls).await
+    }
+    async fn start_service(
+        service: RepositoryService,
+        counts: Counters,
+        tls: Option<tonic::transport::Identity>,
+    ) -> Self {
+        let query = service.query_grpc_service();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let (stop, stopped) = tokio::sync::oneshot::channel();
@@ -231,6 +239,7 @@ impl Server {
                         .max_decoding_message_size(20 * 1024 * 1024)
                         .max_encoding_message_size(20 * 1024 * 1024),
                 )
+                .add_service(query)
                 .serve_with_incoming_shutdown(
                     tokio_stream::wrappers::TcpListenerStream::new(listener).map(|accepted| {
                         accepted.and_then(|stream| {
@@ -2232,6 +2241,450 @@ async fn native_workspace_delivery_does_not_reenter_its_shared_cache() {
             .unwrap()
             .unwrap();
         assert_eq!(cache.metrics().reserved_bytes, 0);
+        server.stop().await;
+    }
+}
+
+// Reference-only fixture: this materialized empty workspace exists solely to
+// invoke the actual pinned jj DefaultIndex graph iterator, not as acceptance of
+// a native lazy-mount user workflow. It has no ambient identity configuration.
+struct PinnedGraphReference {
+    repo: Arc<jj_lib::repo::ReadonlyRepo>,
+    ids: Vec<jj_lib::backend::CommitId>,
+    canonical: Vec<(m::Descriptor, Vec<u8>)>,
+    _io: Arc<DirectObjectIo>,
+    _directory: tempfile::TempDir,
+}
+async fn pinned_graph_reference(parents: &[&[usize]], divergent: bool) -> PinnedGraphReference {
+    use jj_lib::{
+        backend::{Backend, BackendInitError, ChangeId},
+        config::{ConfigLayer, ConfigSource, StackedConfig},
+        object_id::ObjectId as _,
+        repo::Repo,
+        settings::UserSettings,
+        signing::Signer,
+        workspace::Workspace,
+    };
+    let directory = private_dir();
+    let mut layers = StackedConfig::with_defaults();
+    layers.add_layer(ConfigLayer::parse(ConfigSource::User,
+        "[user]\nname='Graph Reference'\nemail='graph@example.invalid'\n[operation]\nhostname='fixture'\nusername='fixture'\n").unwrap());
+    let settings = UserSettings::from_config_and_home_dir(layers, None).unwrap();
+    let slot = Arc::new(std::sync::Mutex::new(None::<Arc<DirectObjectIo>>));
+    let initializer = {
+        let slot = slot.clone();
+        move |_: &UserSettings, path: &Path| -> Result<Box<dyn Backend>, BackendInitError> {
+            let io = Arc::new(
+                DirectObjectIo::init(path, Default::default())
+                    .map_err(|error| BackendInitError(Box::new(error)))?,
+            );
+            let backend = futures::executor::block_on(jj_native_backend::NativeBackend::from_io(
+                io.clone(),
+                Default::default(),
+            ))
+            .map_err(|error| BackendInitError(Box::new(error)))?;
+            *slot.lock().unwrap() = Some(io);
+            Ok(Box::new(backend))
+        }
+    };
+    let (_workspace, repo) = Workspace::init_with_backend(
+        &settings,
+        directory.path(),
+        &initializer,
+        Signer::new(None, vec![]),
+    )
+    .await
+    .unwrap();
+    let io = slot.lock().unwrap().clone().unwrap();
+    let tree = repo.store().root_commit().tree();
+    let mut ids = vec![repo.store().root_commit_id().clone()];
+    assert_eq!(ids[0].as_bytes(), &[0; 32]);
+    let mut transaction = repo.start_transaction();
+    for (position, parents) in parents.iter().enumerate() {
+        let mut change = [0u8; 16];
+        let logical_change = if divergent && matches!(position, 1 | 2) {
+            2
+        } else {
+            position + 1
+        };
+        change[..8].copy_from_slice(&(logical_change as u64).to_be_bytes());
+        let commit = transaction
+            .repo_mut()
+            .new_commit(
+                parents.iter().map(|&parent| ids[parent].clone()).collect(),
+                tree.clone(),
+            )
+            .set_change_id(ChangeId::from_bytes(&change))
+            .set_description(format!("pinned graph reference commit {}", position + 1))
+            .write()
+            .await
+            .unwrap();
+        ids.push(commit.id().clone());
+    }
+    let repo = transaction.commit("graph reference fixture").await.unwrap();
+    let mut canonical = Vec::with_capacity(parents.len());
+    for (position, id) in ids.iter().enumerate().skip(1) {
+        let verified = io
+            .read_metadata(m::ObjectKey {
+                kind: m::Kind::Commit,
+                id: m::ObjectId::from_slice(id.as_bytes()).unwrap(),
+            })
+            .await
+            .unwrap();
+        let m::Object::Commit(commit) = m::decode(verified.bytes(), Default::default()).unwrap()
+        else {
+            panic!("reference backend returned a non-commit");
+        };
+        assert_eq!(
+            commit.parents,
+            parents[position - 1]
+                .iter()
+                .map(|&parent| m::CommitId::from_slice(ids[parent].as_bytes()).unwrap())
+                .collect::<Vec<_>>(),
+            "fixture writer must preserve canonical parent ordering/redundancy"
+        );
+        canonical.push((verified.descriptor(), verified.bytes().to_vec()));
+    }
+    PinnedGraphReference {
+        repo,
+        ids,
+        canonical,
+        _io: io,
+        _directory: directory,
+    }
+}
+fn pinned_graph_expected(
+    reference: &PinnedGraphReference,
+    selected: &[usize],
+) -> Vec<(m::CommitId, Vec<tinytree_client::GraphEdge>)> {
+    use jj_lib::{
+        default_index::DefaultReadonlyIndex, object_id::ObjectId as _, repo::Repo,
+        revset::ResolvedExpression,
+    };
+    use tinytree_client::GraphEdge;
+    let index: &DefaultReadonlyIndex = reference.repo.readonly_index().downcast_ref().unwrap();
+    let expression = ResolvedExpression::Commits(
+        selected
+            .iter()
+            .map(|&index| reference.ids[index].clone())
+            .collect(),
+    );
+    index
+        .evaluate_revset_impl(&expression, reference.repo.store())
+        .unwrap()
+        .iter_graph_impl(true)
+        .map(|result| {
+            let (id, edges) = result.unwrap();
+            let id = m::CommitId::from_slice(id.as_bytes()).unwrap();
+            let edges = edges
+                .into_iter()
+                .map(|edge| {
+                    let target = m::CommitId::from_slice(edge.target.as_bytes()).unwrap();
+                    if edge.is_missing() {
+                        GraphEdge::Missing(target)
+                    } else if edge.is_indirect() {
+                        GraphEdge::Indirect(target)
+                    } else {
+                        GraphEdge::Direct(target)
+                    }
+                })
+                .collect();
+            (id, edges)
+        })
+        .collect()
+}
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn checked_selected_graph_rpc_matches_actual_pinned_jj_default_index() {
+    use jj_lib::object_id::ObjectId as _;
+    use tinytree_client::{NativeClient, query_protocol as q};
+    struct Case {
+        name: &'static str,
+        parents: &'static [&'static [usize]],
+        selected: &'static [usize],
+        public: usize,
+        divergent: bool,
+    }
+    let cases = [
+        Case {
+            name: "linearized diamond",
+            parents: &[&[0], &[1], &[1], &[2, 3]],
+            selected: &[1, 4],
+            public: 4,
+            divergent: false,
+        },
+        Case {
+            name: "virtual octopus",
+            parents: &[&[0], &[0], &[0], &[1, 2], &[2, 3], &[4, 5]],
+            selected: &[1, 2, 3, 6],
+            public: 6,
+            divergent: false,
+        },
+        Case {
+            name: "multiple missing boundaries",
+            parents: &[&[0], &[0], &[0], &[1, 2], &[2, 3], &[4, 5]],
+            selected: &[2, 6],
+            public: 6,
+            divergent: false,
+        },
+        Case {
+            name: "ancestor reduction",
+            parents: &[&[0], &[0], &[1], &[2, 3], &[3], &[4, 5]],
+            selected: &[3, 4, 6],
+            public: 6,
+            divergent: false,
+        },
+        Case {
+            name: "deep lookahead escape",
+            parents: &[
+                &[0],
+                &[1],
+                &[1],
+                &[2],
+                &[4],
+                &[4, 3],
+                &[2],
+                &[6],
+                &[5, 8],
+                &[7, 9],
+            ],
+            selected: &[1, 4, 7, 8, 10],
+            public: 10,
+            divergent: false,
+        },
+        Case {
+            name: "all direct redundancy",
+            parents: &[&[0], &[1], &[2, 1]],
+            selected: &[1, 2, 3],
+            public: 3,
+            divergent: false,
+        },
+        Case {
+            name: "mixed direct and indirect duplicates",
+            parents: &[&[0], &[1], &[2], &[2, 1, 3]],
+            selected: &[1, 2, 4],
+            public: 4,
+            divergent: false,
+        },
+        Case {
+            name: "remote private boundary",
+            parents: &[&[0], &[1], &[2], &[3]],
+            selected: &[1, 4],
+            public: 2,
+            divergent: false,
+        },
+        Case {
+            name: "private hidden divergent sibling",
+            parents: &[&[0], &[1], &[1], &[2]],
+            selected: &[1, 2, 3, 4],
+            public: 1,
+            divergent: true,
+        },
+        Case {
+            name: "intrinsic root",
+            parents: &[],
+            selected: &[0],
+            public: 0,
+            divergent: false,
+        },
+    ];
+    for case in cases {
+        let reference = pinned_graph_reference(case.parents, case.divergent).await;
+        let expected = pinned_graph_expected(&reference, case.selected);
+        let store_directory = private_dir();
+        let store = Store::open(store_directory.path(), Default::default()).unwrap();
+        store.create_repository("example").unwrap();
+        let empty = m::empty_tree();
+        store
+            .put("example", empty.descriptor, &empty.bytes, 0)
+            .unwrap();
+        let index_directory = private_dir();
+        let index =
+            tinytree_index::Index::open(index_directory.path(), &Default::default()).unwrap();
+        // Reference writes, public derived positions and private ordinals all
+        // preserve the SAME parent-first order, including independent siblings.
+        for (descriptor, bytes) in &reference.canonical[..case.public] {
+            store.put("example", *descriptor, bytes, 0).unwrap();
+            index.ingest("example", *descriptor, bytes).unwrap();
+        }
+        let mut service_config = ServiceConfig::default();
+        service_config.query.max_eval_quantum_steps = 1;
+        service_config.query.max_eval_step_work = 1;
+        service_config.query.max_graph_query_step_work = 1;
+        let service = RepositoryService::new(
+            store.clone(),
+            service_config,
+            vec!["example".into()],
+            vec![Principal::new("test", TOKEN, vec!["example".into()], true).unwrap()],
+        )
+        .unwrap()
+        .with_query_index(index.clone())
+        .unwrap();
+        let counts = Counters::new();
+        let server = Server::start_service(service, counts.clone(), None).await;
+        let mut client_config = config(&server).remote;
+        client_config.limits.max_graph_pages = 10_000;
+        let client = NativeClient::connect(client_config).await.unwrap();
+        let roots = if case.public == 0 {
+            vec![m::CommitId::ROOT]
+        } else {
+            reference.ids[1..=case.public]
+                .iter()
+                .map(|id| m::CommitId::from_slice(id.as_bytes()).unwrap())
+                .collect()
+        };
+        let mut overlay = Vec::new();
+        for (descriptor, bytes) in &reference.canonical[case.public..] {
+            overlay.push(
+                client
+                    .verify_metadata(*descriptor, bytes.clone())
+                    .await
+                    .unwrap(),
+            );
+        }
+        let scope = client
+            .open_query_scope_with_overlay(roots, overlay)
+            .await
+            .unwrap();
+        let expression = q::GraphExpr {
+            version: 1,
+            expression: Some(q::graph_expr::Expression::Commits(q::CommitSet {
+                commits: case
+                    .selected
+                    .iter()
+                    .map(|&index| q::CommitId {
+                        value: reference.ids[index].as_bytes().to_vec(),
+                    })
+                    .collect(),
+            })),
+        };
+        if case.divergent {
+            let m::Object::Commit(shared) =
+                m::decode(&reference.canonical[1].1, Default::default()).unwrap()
+            else {
+                unreachable!()
+            };
+            let prefix: String = shared
+                .change_id
+                .0
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect();
+            let visible_head = m::CommitId::from_slice(reference.ids[4].as_bytes()).unwrap();
+            let tinytree_client::ChangePrefix::Single(resolution) = client
+                .resolve_change_prefix(&scope, &prefix, vec![visible_head])
+                .await
+                .unwrap()
+            else {
+                panic!("divergent private ChangeId must remain one change with multiple targets");
+            };
+            let visibility: std::collections::BTreeMap<_, _> = resolution
+                .targets
+                .into_iter()
+                .map(|target| (target.commit, target.visible))
+                .collect();
+            assert_eq!(
+                visibility,
+                std::collections::BTreeMap::from([
+                    (
+                        m::CommitId::from_slice(reference.ids[2].as_bytes()).unwrap(),
+                        true
+                    ),
+                    (
+                        m::CommitId::from_slice(reference.ids[3].as_bytes()).unwrap(),
+                        false
+                    ),
+                ])
+            );
+        }
+        let mut closed = false;
+        for canonical in [false, true] {
+            let mut query = client
+                .begin_graph_query(&scope, &expression, 1, canonical)
+                .await
+                .unwrap();
+            let mut actual = Vec::new();
+            let mut sequence = 0;
+            let mut progress = false;
+            while !query.is_exhausted() {
+                let page = client.evaluate_graph_page(&mut query).await.unwrap();
+                assert_eq!(page.sequence, sequence, "{}", case.name);
+                sequence += 1;
+                progress |= page.is_progress();
+                for row in page.rows() {
+                    actual.push((row.commit, row.edges().to_vec()));
+                    if row.commit == m::CommitId::ROOT {
+                        assert_eq!(row.change, m::ChangeId::ROOT);
+                        assert!(row.canonical.is_none());
+                    } else {
+                        let (descriptor, bytes) = reference
+                            .canonical
+                            .iter()
+                            .find(|(descriptor, _)| descriptor.key.id.0 == row.commit.0)
+                            .unwrap();
+                        let m::Object::Commit(commit) =
+                            m::decode(bytes, Default::default()).unwrap()
+                        else {
+                            unreachable!()
+                        };
+                        assert_eq!(row.change, commit.change_id);
+                        if canonical {
+                            let checked = row.canonical.as_ref().expect(
+                                "canonical non-root projection must include verified bytes",
+                            );
+                            assert_eq!(checked.descriptor(), *descriptor);
+                            assert_eq!(checked.canonical_bytes(), bytes.as_slice());
+                        } else {
+                            assert!(row.canonical.is_none());
+                        }
+                    }
+                }
+                // A captured private graph remains valid after its handle is
+                // closed. Replay/GC/quota matrices live in server RPC coverage.
+                if canonical && case.public < case.parents.len() && !closed {
+                    client.close_query_scope(&scope).await.unwrap();
+                    closed = true;
+                }
+                // Do not retain page budget ownership while requesting another.
+                drop(page);
+            }
+            assert!(
+                progress,
+                "tiny graph quanta should yield bounded progress: {}",
+                case.name
+            );
+            assert_eq!(
+                actual, expected,
+                "actual jj0.46 ordered graph mismatch: {}, canonical={canonical}",
+                case.name
+            );
+        }
+        if !closed {
+            client.close_query_scope(&scope).await.unwrap();
+        }
+        assert_eq!(
+            counts.files.load(Ordering::SeqCst),
+            0,
+            "graph projections must not fetch file blobs"
+        );
+        assert_eq!(
+            counts.metadata_rpcs.load(Ordering::SeqCst),
+            0,
+            "canonical projection must not silently rehydrate full client history"
+        );
+        for (descriptor, _) in &reference.canonical[case.public..] {
+            assert!(
+                store
+                    .descriptor("example", descriptor.key)
+                    .unwrap()
+                    .is_none()
+            );
+            assert!(
+                index
+                    .node("example", m::CommitId(descriptor.key.id.0))
+                    .unwrap()
+                    .is_none()
+            );
+        }
         server.stop().await;
     }
 }

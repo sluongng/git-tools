@@ -936,6 +936,424 @@ impl NativeClient {
     }
 }
 
+/// A checked selected-graph query. Its original deadline includes caller pauses.
+pub struct CheckedGraphQuery {
+    core: CheckedIdsQuery,
+    canonical: bool,
+    edges: usize,
+}
+impl std::fmt::Debug for CheckedGraphQuery {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CheckedGraphQuery")
+            .field("core", &self.core)
+            .field("canonical", &self.canonical)
+            .finish_non_exhaustive()
+    }
+}
+impl CheckedGraphQuery {
+    pub fn query_id(&self) -> &[u8; 32] {
+        self.core.query_id()
+    }
+    pub fn is_exhausted(&self) -> bool {
+        self.core.is_exhausted()
+    }
+}
+/// Ordered selected-set edges; repeated targets are intentional and preserved.
+/// Indirect and missing edges are not canonical parent summaries.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum GraphEdge {
+    Direct(CommitId),
+    Indirect(CommitId),
+    Missing(CommitId),
+}
+pub struct GraphRow {
+    pub commit: CommitId,
+    pub change: ChangeId,
+    edges: Vec<GraphEdge>,
+    pub canonical: Option<VerifiedMetadata>,
+    // Field order keeps quota and guards alive through payload destruction.
+    _memory: Option<Arc<GraphPageMemory>>,
+}
+impl GraphRow {
+    pub fn edges(&self) -> &[GraphEdge] {
+        &self.edges
+    }
+}
+impl std::fmt::Debug for GraphRow {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("GraphRow")
+            .field("commit", &self.commit)
+            .field("change", &self.change)
+            .field("edges", &self.edges)
+            .field("canonical", &self.canonical.is_some())
+            .finish()
+    }
+}
+struct GraphPageMemory {
+    _guards: crate::verified::LifetimeGuards,
+    _state: OwnedSemaphorePermit,
+    _bytes: OwnedSemaphorePermit,
+}
+pub struct CheckedGraphPage {
+    pub sequence: u64,
+    rows: Vec<GraphRow>,
+    pub exhausted: bool,
+    _memory: Arc<GraphPageMemory>,
+}
+/// Owned rows keep the original allocation charged until its iterator buffer
+/// is destroyed, including after the last row has been yielded.
+pub struct CheckedGraphRows {
+    rows: std::vec::IntoIter<GraphRow>,
+    _memory: Arc<GraphPageMemory>,
+}
+impl Iterator for CheckedGraphRows {
+    type Item = GraphRow;
+    fn next(&mut self) -> Option<Self::Item> {
+        self.rows.next()
+    }
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        self.rows.size_hint()
+    }
+}
+impl ExactSizeIterator for CheckedGraphRows {}
+impl std::iter::FusedIterator for CheckedGraphRows {}
+impl std::fmt::Debug for CheckedGraphPage {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CheckedGraphPage")
+            .field("sequence", &self.sequence)
+            .field("rows", &self.rows)
+            .field("exhausted", &self.exhausted)
+            .finish()
+    }
+}
+impl CheckedGraphPage {
+    pub fn rows(&self) -> &[GraphRow] {
+        &self.rows
+    }
+    pub fn into_rows(self) -> CheckedGraphRows {
+        CheckedGraphRows {
+            rows: self.rows.into_iter(),
+            _memory: self._memory,
+        }
+    }
+    pub fn is_progress(&self) -> bool {
+        self.rows.is_empty() && !self.exhausted
+    }
+}
+impl NativeClient {
+    /// Begin GRAPH, or CANONICAL when requested, under the same bounded replay
+    /// and deadline rules as IDS. No history is fetched during preparation.
+    pub async fn begin_graph_query(
+        &self,
+        scope: &CheckedScopeHandle,
+        expression: &q::GraphExpr,
+        page_size: u32,
+        canonical: bool,
+    ) -> Result<CheckedGraphQuery, Status> {
+        Ok(CheckedGraphQuery {
+            core: self.begin_query(scope, expression, page_size).await?,
+            canonical,
+            edges: 0,
+        })
+    }
+    /// Verify one complete selected-graph page before advancing any query state.
+    /// Canonical hashes authenticate rows, not server completeness or indirect
+    /// ancestry. This never downloads FILE objects or hydrates full history.
+    pub async fn evaluate_graph_page(
+        &self,
+        query: &mut CheckedGraphQuery,
+    ) -> Result<CheckedGraphPage, Status> {
+        let core = &mut query.core;
+        if !Arc::ptr_eq(&self.inner, &core.client.inner) {
+            return Err(Status::invalid_argument(
+                "graph query belongs to another client",
+            ));
+        }
+        if core.exhausted {
+            return Err(Status::failed_precondition("graph query already exhausted"));
+        }
+        if core.pages == 0 {
+            self.checked_scope(&core.scope, false)?;
+        }
+        let limits = &self.inner.config.limits;
+        // Bound owner-vector duplication before allocating any page guards.
+        // This fixed allowance covers page/iterator/Arc control scaffolding,
+        // including empty progress pages that otherwise contain no row bytes.
+        const PAGE_OWNER_BYTES: usize = 512;
+        let guard_count = core
+            .memory
+            ._guards
+            .len()
+            .checked_add(self.guards.len())
+            .ok_or_else(|| Status::resource_exhausted("graph page guard budget exhausted"))?;
+        if guard_count
+            .checked_mul(std::mem::size_of::<Arc<dyn std::any::Any + Send + Sync>>())
+            .and_then(|n| n.checked_add(PAGE_OWNER_BYTES))
+            .is_none_or(|n| n > limits.max_batch_bytes)
+        {
+            return Err(Status::resource_exhausted(
+                "graph page guard budget exhausted",
+            ));
+        }
+        if core.pages >= limits.max_graph_pages {
+            return Err(Status::resource_exhausted(
+                "graph query page budget exhausted",
+            ));
+        }
+        let mut budget = self.admit(core.deadline, self.unary_memory()).await?;
+        // Detach retained-page bytes, not its inflight slot. Physical transport
+        // and canonical workers retain this reservation through Budget guards;
+        // completed pages retain it independently until dropped.
+        let admitted = Arc::get_mut(&mut budget).ok_or_else(integrity)?;
+        let window = Arc::new(std::sync::Mutex::new(
+            admitted
+                ._bytes
+                .split(limits.max_batch_bytes)
+                .ok_or_else(integrity)?,
+        ));
+        let mut guards = admitted._guards.as_ref().clone();
+        guards.push(window.clone());
+        admitted._guards = Arc::new(guards);
+        let request = q::EvaluateRequest {
+            scope: Some(core.scope.key()),
+            query_id: core.query_id.to_vec(),
+            expression: Some((*core.expression).clone()),
+            projection: if query.canonical {
+                q::Projection::Canonical
+            } else {
+                q::Projection::Graph
+            } as i32,
+            page_size: core.page_size,
+            cursor: core.cursor.clone(),
+        };
+        self.bounded(&request)?;
+        let owner = Arc::new((core.expression.clone(), core.memory.clone(), budget.clone()));
+        let reply = self
+            .retry(core.deadline, false, |allowance| {
+                let mut grpc = self.inner.grpc.clone();
+                let request = request.clone();
+                let owner = owner.clone();
+                async move {
+                    grpc.evaluate(self.request(request, allowance), owner)
+                        .await
+                        .map(|r| r.into_inner())
+                }
+            })
+            .await?;
+        if reply.scope_digest.as_slice() != core.scope.digest
+            || reply.index_epoch.as_slice() != core.scope.epoch
+            || reply.sequence != core.sequence
+            || reply.rows.len() > core.page_size as usize
+            || reply.cursor.len() > 4096
+        {
+            return Err(integrity());
+        }
+        let exhausted = reply.exhausted.ok_or_else(integrity)?;
+        if exhausted != reply.cursor.is_empty() || (!exhausted && reply.cursor == core.cursor) {
+            return Err(integrity());
+        }
+        let mut page_ids = HashSet::with_capacity(reply.rows.len());
+        let mut rows = Vec::with_capacity(reply.rows.len());
+        let mut edge_count = query.edges;
+        let mut retained = reply
+            .rows
+            .len()
+            .checked_mul(std::mem::size_of::<GraphRow>())
+            .and_then(|n| n.checked_add(PAGE_OWNER_BYTES))
+            .ok_or_else(integrity)?;
+        for row in reply.rows {
+            let commit = checked_commit(row.commit)?;
+            let change = ChangeId(
+                row.change
+                    .ok_or_else(integrity)?
+                    .value
+                    .try_into()
+                    .map_err(|_| integrity())?,
+            );
+            if core.seen.contains(&commit) || !page_ids.insert(commit) {
+                return Err(integrity());
+            }
+            edge_count = edge_count
+                .checked_add(row.edges.len())
+                .ok_or_else(integrity)?;
+            if edge_count > limits.max_query_edges {
+                return Err(Status::resource_exhausted(
+                    "graph query edge budget exhausted",
+                ));
+            }
+            retained = retained
+                .checked_add(
+                    row.edges
+                        .len()
+                        .saturating_mul(std::mem::size_of::<GraphEdge>()),
+                )
+                .ok_or_else(integrity)?;
+            let mut edges = Vec::with_capacity(row.edges.len());
+            for edge in row.edges {
+                use q::selected_edge::Edge;
+                edges.push(match edge.edge.ok_or_else(integrity)? {
+                    Edge::Direct(e) => GraphEdge::Direct(checked_commit(e.target)?),
+                    Edge::Indirect(e) => GraphEdge::Indirect(checked_commit(e.target)?),
+                    Edge::Missing(e) => GraphEdge::Missing(checked_commit(e.boundary)?),
+                });
+            }
+            let canonical = match row.canonical {
+                None if !query.canonical || commit == CommitId::ROOT => None,
+                Some(data) if query.canonical && commit != CommitId::ROOT => {
+                    let descriptor =
+                        parse_descriptor(data.descriptor.as_ref().ok_or_else(integrity)?)?;
+                    if descriptor.key.kind != Kind::Commit
+                        || descriptor.key.id.0 != commit.0
+                        || descriptor.size_bytes != data.canonical_envelope.len() as u64
+                        || data.canonical_envelope.len() > limits.max_metadata_bytes
+                    {
+                        return Err(integrity());
+                    }
+                    let available = limits
+                        .max_batch_bytes
+                        .checked_sub(retained)
+                        .and_then(|n| {
+                            n.checked_sub(data.canonical_envelope.len().saturating_mul(3))
+                        })
+                        .and_then(|n| n.checked_sub(std::mem::size_of::<tinytree_model::Commit>()))
+                        .ok_or_else(|| {
+                            Status::resource_exhausted(
+                                "graph canonical allocation budget exhausted",
+                            )
+                        })?;
+                    let items = (available / 128).min(tinytree_model::Limits::default().max_items);
+                    if items == 0 {
+                        return Err(Status::resource_exhausted(
+                            "graph canonical allocation budget exhausted",
+                        ));
+                    }
+                    // Reuse the page's admission: public verify_metadata would
+                    // deadlock with max_inflight=1 and renew the operation deadline.
+                    let metadata = verify_metadata(
+                        descriptor,
+                        data.canonical_envelope,
+                        limits.max_metadata_bytes,
+                        Some(items),
+                        core.deadline,
+                        budget.clone(),
+                    )
+                    .await?;
+                    let Object::Commit(decoded) = &metadata.object else {
+                        return Err(integrity());
+                    };
+                    let parent_memory = decoded
+                        .parents
+                        .len()
+                        .checked_mul(64)
+                        .ok_or_else(integrity)?;
+                    if retained
+                        .checked_add(metadata.bytes.capacity())
+                        .and_then(|n| n.checked_add(commit_heap(decoded)))
+                        .and_then(|n| n.checked_add(parent_memory))
+                        .is_none_or(|n| n > limits.max_batch_bytes)
+                    {
+                        return Err(Status::resource_exhausted(
+                            "graph canonical parent allocation budget exhausted",
+                        ));
+                    }
+                    let parents: HashSet<_> = decoded.parents.iter().copied().collect();
+                    if decoded.change_id != change
+                        || edges.iter().any(
+                            |edge| matches!(edge, GraphEdge::Direct(id) if !parents.contains(id)),
+                        )
+                    {
+                        return Err(integrity());
+                    }
+                    retained = retained
+                        .checked_add(metadata.bytes.capacity())
+                        .and_then(|n| n.checked_add(commit_heap(decoded)))
+                        .ok_or_else(integrity)?;
+                    Some(metadata)
+                }
+                _ => return Err(integrity()),
+            };
+            if retained > limits.max_batch_bytes {
+                return Err(Status::resource_exhausted(
+                    "graph page allocation budget exhausted",
+                ));
+            }
+            if commit == CommitId::ROOT && (change != ChangeId::ROOT || !edges.is_empty()) {
+                return Err(integrity());
+            }
+            rows.push(GraphRow {
+                _memory: None,
+                commit,
+                change,
+                edges,
+                canonical,
+            });
+        }
+        if core
+            .seen
+            .len()
+            .checked_add(rows.len())
+            .is_none_or(|n| n > limits.max_graph_objects)
+        {
+            return Err(Status::resource_exhausted(
+                "graph query row budget exhausted",
+            ));
+        }
+        // Application-held pages share the idle-query headroom pool. Never
+        // wait while holding page admission: a held earlier page may itself be
+        // the owner of those bytes. Failure leaves the replay cursor unchanged.
+        let mut result_guards = Vec::with_capacity(guard_count);
+        result_guards.extend(core.memory._guards.iter().cloned());
+        result_guards.extend(self.guards.iter().cloned());
+        retained = retained
+            .checked_add(
+                result_guards
+                    .capacity()
+                    .checked_mul(std::mem::size_of::<Arc<dyn std::any::Any + Send + Sync>>())
+                    .ok_or_else(integrity)?,
+            )
+            .filter(|n| *n <= limits.max_batch_bytes)
+            .ok_or_else(|| {
+                Status::resource_exhausted("graph page owner allocation budget exhausted")
+            })?;
+        let state = self
+            .inner
+            .query_state
+            .clone()
+            .try_acquire_many_owned(retained as u32)
+            .map_err(|_| {
+                Status::resource_exhausted("retained graph pages exhaust query headroom")
+            })?;
+        let memory = Arc::new(GraphPageMemory {
+            _bytes: window
+                .lock()
+                .map_err(|_| integrity())?
+                .split(retained)
+                .ok_or_else(integrity)?,
+            _state: state,
+            _guards: Arc::new(result_guards),
+        });
+        for row in &mut rows {
+            row._memory = Some(memory.clone());
+            if let Some(metadata) = &mut row.canonical {
+                metadata._query_owner = Some(memory.clone());
+            }
+        }
+        let sequence = core.sequence.checked_add(1).ok_or_else(integrity)?;
+        core.seen.extend(page_ids);
+        core.cursor = reply.cursor;
+        core.sequence = sequence;
+        core.pages += 1;
+        core.exhausted = exhausted;
+        query.edges = edge_count;
+        Ok(CheckedGraphPage {
+            _memory: memory,
+            sequence: reply.sequence,
+            rows,
+            exhausted,
+        })
+    }
+}
+
 fn validate_expression(
     expression: &q::GraphExpr,
     limits: &crate::Limits,

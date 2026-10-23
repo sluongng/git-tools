@@ -10,6 +10,7 @@ mod config;
 mod derived_index;
 mod query_cursor;
 mod query_eval;
+mod query_graph;
 mod query_index;
 mod query_ingress;
 mod query_overlay;

@@ -24,19 +24,24 @@ reject new promises, not existing ones. A historical receipt is not current proo
 
 The separate query service supports retained root scopes, exact graph facts and
 prefix resolution. Its rebuildable index warms asynchronously; unavailable
-coverage is an error, not an empty result. Warming caches raw canonical payloads up to `max_warm_bytes`, evicting old
-payloads so long histories can progress without full residency.
+coverage is an error, not an empty result. Warming caches raw canonical payloads
+up to `max_warm_bytes`, evicting old payloads so long histories can progress
+without full residency.
 `max_warm_read_bytes` separately bounds actual discovery and cache-miss rereads.
-Scope TTLs and work limits are TOML
-configurable. Private parent-first draft overlays and immutable forks are scoped
+Scope TTLs and work limits are TOML configurable. Private parent-first draft
+overlays and immutable forks are scoped
 to the authenticated caller; they are ephemeral query data, not repository uploads
 or backup receipts. Closing a parent preserves live forks without extending
-their absolute expiry. Active-scope quotas
-and bounded replay-history quotas are separate; closed keys remain closed until
-their absolute expiry. IDs evaluation is incremental and bounded; empty pages with
-continuations signal progress. Cursors expire absolutely, cache only their latest
-page for replay, and retain roots independently of a closed scope. Graph/canonical
-projection and unsupported operators return explicit errors.
+their absolute expiry. Active-scope quotas and bounded replay-history quotas
+are separate; closed keys remain closed until
+their absolute expiry. IDs, selected-graph and canonical evaluation are incremental
+and bounded; empty pages with continuations signal progress. Cursors expire
+absolutely, cache only their latest
+page for replay, and retain roots independently of a closed scope. Canonical rows
+include verified commit envelopes, while graph edges describe the selected set.
+Response-byte limits can shorten pages; unsupported operators return explicit errors.
+Active graph/canonical work and retained replay bytes share a configurable cursor
+memory pool; completed queries retain their actual cached page size.
 
 Derived state lives in `derived-index-v{schema}/generation-{index_rebuild_generation}`
 under storage. Restarting with the same generation reuses it; increment

@@ -1446,6 +1446,7 @@ async fn verify_metadata(
             return Err(integrity());
         }
         Ok(VerifiedMetadata {
+            _query_owner: None,
             descriptor,
             bytes,
             object,

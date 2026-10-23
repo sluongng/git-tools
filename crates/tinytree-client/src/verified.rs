@@ -12,6 +12,8 @@ pub struct VerifiedMetadata {
     pub(crate) descriptor: Descriptor,
     pub(crate) bytes: Vec<u8>,
     pub(crate) object: Object,
+    // Destroy payloads before releasing their retained-page quota and guards.
+    pub(crate) _query_owner: Option<Arc<dyn Any + Send + Sync>>,
 }
 impl VerifiedMetadata {
     pub fn descriptor(&self) -> Descriptor {

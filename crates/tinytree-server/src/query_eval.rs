@@ -497,6 +497,108 @@ impl Ancestors {
         }
     }
 }
+struct HeadExpansion {
+    parents: Vec<GraphNode>,
+    batch_slots: usize,
+    key: GraphKey,
+}
+struct Heads {
+    input: Box<Operator>,
+    look: Option<GraphNode>,
+    done: bool,
+    excluded: BTreeMap<GraphKey, GraphNode>,
+    expansion: Option<HeadExpansion>,
+}
+impl Heads {
+    fn push_excluded(&mut self, node: GraphNode, memory: &mut Memory) -> Result<()> {
+        if let Some(existing) = self.excluded.get(&node.key()) {
+            if existing.commit() != node.commit() {
+                return Err(GraphError::Corrupt.into());
+            }
+        } else {
+            memory.slots(1)?;
+            self.excluded.insert(node.key(), node);
+        }
+        Ok(())
+    }
+    fn expand(&mut self, node: &GraphNode, ctx: &mut Context<'_>) -> Result<()> {
+        let parents = ctx.parents(node)?;
+        let batch_slots = parents.capacity();
+        self.expansion = Some(HeadExpansion {
+            parents,
+            batch_slots,
+            key: node.key(),
+        });
+        Ok(())
+    }
+    fn poll(&mut self, ctx: &mut Context<'_>) -> Result<EvalStep> {
+        loop {
+            if let Some(expansion) = &mut self.expansion {
+                if !ctx.tick()? {
+                    return Ok(EvalStep::Progress);
+                }
+                if let Some(parent) = expansion.parents.pop() {
+                    if parent.key() >= expansion.key {
+                        return Err(GraphError::Corrupt.into());
+                    }
+                    self.push_excluded(parent, ctx.memory)?;
+                    continue;
+                }
+                let expansion = self.expansion.take().unwrap();
+                ctx.memory.release(Counts {
+                    slots: expansion.batch_slots,
+                    intervals: 0,
+                });
+                continue;
+            }
+            if !fill(&mut self.input, &mut self.look, &mut self.done, ctx)? {
+                return Ok(EvalStep::Progress);
+            }
+            // Accepted heads only exclude ancestors of later candidates. No
+            // candidate remains, so never drain an unrelated public tail.
+            if self.done && self.look.is_none() {
+                return Ok(EvalStep::Done);
+            }
+            if !ctx.tick()? {
+                return Ok(EvalStep::Progress);
+            }
+            let candidate = self.look.as_ref().ok_or(GraphError::Corrupt)?;
+            match self
+                .excluded
+                .last_key_value()
+                .map(|(key, _)| key.cmp(&candidate.key()))
+            {
+                Some(std::cmp::Ordering::Greater) => {
+                    let (_, node) = self.excluded.pop_last().unwrap();
+                    self.expand(&node, ctx)?;
+                    ctx.memory.release(Counts {
+                        slots: 1,
+                        intervals: 0,
+                    });
+                }
+                Some(std::cmp::Ordering::Equal) => {
+                    if self.excluded.last_key_value().unwrap().1.commit() != candidate.commit() {
+                        return Err(GraphError::Corrupt.into());
+                    }
+                    self.look.take();
+                    ctx.memory.release(Counts {
+                        slots: 1,
+                        intervals: 0,
+                    });
+                }
+                _ => {
+                    let node = self.look.take().unwrap();
+                    self.expand(&node, ctx)?;
+                    ctx.memory.release(Counts {
+                        slots: 1,
+                        intervals: 0,
+                    });
+                    return Ok(EvalStep::Row(node));
+                }
+            }
+        }
+    }
+}
 #[derive(Clone, Copy)]
 enum SetKind {
     Union,
@@ -711,6 +813,7 @@ enum Operator {
     Empty,
     Commits(Commits),
     Ancestors(Ancestors),
+    Heads(Heads),
     Set(SetOperator),
     Latest(Latest),
 }
@@ -751,6 +854,15 @@ impl Operator {
                 }
                 count
             }
+            Self::Heads(state) => state.input.counts().add(Counts {
+                slots: usize::from(state.look.is_some())
+                    + state.excluded.len()
+                    + state
+                        .expansion
+                        .as_ref()
+                        .map_or(0, |expansion| expansion.batch_slots),
+                intervals: 0,
+            }),
             Self::Set(state) => state.left.counts().add(state.right.counts()).add(Counts {
                 slots: usize::from(state.a.is_some()) + usize::from(state.b.is_some()),
                 intervals: 0,
@@ -773,6 +885,7 @@ impl Operator {
             }
             Self::Commits(state) => state.poll(ctx),
             Self::Ancestors(state) => state.poll(ctx),
+            Self::Heads(state) => state.poll(ctx),
             Self::Set(state) => state.poll(ctx),
             Self::Latest(state) => state.poll(ctx),
         }?;
@@ -976,7 +1089,16 @@ impl Compiler<'_> {
                     }))
                 }
             }
-            X::Heads(_) => Err(EvalError::Unsupported("Heads")),
+            X::Heads(value) => {
+                let input = self.compile(child(&value.input)?, depth + 1)?;
+                Ok(Operator::Heads(Heads {
+                    input: Box::new(input),
+                    look: None,
+                    done: false,
+                    excluded: BTreeMap::new(),
+                    expansion: None,
+                }))
+            }
             X::Roots(_) => Err(EvalError::Unsupported("Roots")),
             X::DagRange(_) => Err(EvalError::Unsupported("DagRange")),
         }
@@ -1390,7 +1512,7 @@ mod tests {
             ),
             Err(EvalError::Invalid(_))
         ));
-        let unsupported = expression(q::graph_expr::Expression::Heads(
+        let unsupported = expression(q::graph_expr::Expression::Roots(
             q::UnaryExpr {
                 input: Some(commits(&[ids[1]]).into()),
             }
@@ -1577,6 +1699,228 @@ mod tests {
                 .0,
                 case.expected
             );
+        }
+    }
+
+    #[test]
+    fn streaming_heads_matches_reference_for_all_merge_dag_subsets() {
+        let directory = tempfile::tempdir().unwrap();
+        let index = Index::open(
+            directory.path().join("index"),
+            &tinytree_index::Limits::default(),
+        )
+        .unwrap();
+        let add = |parents: &[m::CommitId], ordinal| {
+            let value = canonical(parents, ordinal, 0, 0);
+            index
+                .ingest("repo", value.descriptor, &value.bytes)
+                .unwrap()
+                .commit
+        };
+        let root = m::CommitId::ROOT;
+        let a = add(&[root], 1);
+        let b = add(&[root], 2);
+        let c = add(&[a, b], 3);
+        let d = add(&[a], 4);
+        let e = add(&[d, b], 5);
+        let model = BTreeMap::from([
+            (root, vec![]),
+            (a, vec![root]),
+            (b, vec![root]),
+            (c, vec![a, b]),
+            (d, vec![a]),
+            (e, vec![d, b]),
+        ]);
+        let reaches = |ancestor: m::CommitId, head: m::CommitId| {
+            let mut pending = vec![head];
+            let mut seen = BTreeSet::new();
+            let mut found = false;
+            while let Some(id) = pending.pop() {
+                if id == ancestor {
+                    found = true;
+                    break;
+                }
+                if seen.insert(id) {
+                    pending.extend(model.get(&id).unwrap().iter().copied());
+                }
+            }
+            found
+        };
+        let graph = OverlayGraph::remote(Arc::new(index.scope("repo", &[c, e]).unwrap()));
+        let ids = [root, a, b, c, d, e];
+        for mask in 0usize..1 << ids.len() {
+            let candidates: Vec<_> = ids
+                .iter()
+                .enumerate()
+                .filter_map(|(bit, id)| (mask & (1 << bit) != 0).then_some(*id))
+                .collect();
+            let expected: Vec<_> = ids
+                .iter()
+                .rev()
+                .copied()
+                .filter(|candidate| {
+                    candidates.contains(candidate)
+                        && !candidates
+                            .iter()
+                            .any(|other| candidate != other && reaches(*candidate, *other))
+                })
+                .collect();
+            let expr = expression(q::graph_expr::Expression::Heads(
+                q::UnaryExpr {
+                    input: Some(commits(&candidates).into()),
+                }
+                .into(),
+            ));
+            assert_eq!(
+                collect(
+                    graph.clone(),
+                    expr,
+                    EvalLimits {
+                        max_step_work: 1,
+                        ..EvalLimits::default()
+                    }
+                )
+                .0,
+                expected
+            );
+        }
+    }
+    #[test]
+    fn streaming_heads_handles_inherited_private_candidates_duplicates_and_root() {
+        let (_directory, remote, ids) = linear();
+        let boundary = ids[10];
+        let a = canonical(&[boundary], 11, 0, 0);
+        let aid = m::CommitId(a.descriptor.key.id.0);
+        let hidden = canonical(&[boundary], 12, 0, 0);
+        let hid = m::CommitId(hidden.descriptor.key.id.0);
+        let first = OverlayGraph::extend(
+            remote,
+            vec![
+                (a.descriptor, Arc::<[u8]>::from(a.bytes)),
+                (hidden.descriptor, Arc::<[u8]>::from(hidden.bytes)),
+            ],
+            &crate::query_overlay::OverlayLimits::default(),
+            &mut WorkBudget::default(),
+            Arc::new(()),
+        )
+        .unwrap();
+        let b = canonical(&[aid], 13, 0, 0);
+        let bid = m::CommitId(b.descriptor.key.id.0);
+        let graph = OverlayGraph::extend(
+            first,
+            vec![(b.descriptor, Arc::<[u8]>::from(b.bytes))],
+            &crate::query_overlay::OverlayLimits::default(),
+            &mut WorkBudget::default(),
+            Arc::new(()),
+        )
+        .unwrap();
+        struct Case {
+            input: Vec<m::CommitId>,
+            expected: Vec<m::CommitId>,
+        }
+        for case in [
+            Case {
+                input: vec![m::CommitId::ROOT, boundary, aid, bid, hid, aid],
+                expected: vec![bid, hid],
+            },
+            Case {
+                input: vec![m::CommitId::ROOT, m::CommitId::ROOT],
+                expected: vec![m::CommitId::ROOT],
+            },
+            Case {
+                input: vec![],
+                expected: vec![],
+            },
+        ] {
+            let expr = expression(q::graph_expr::Expression::Heads(
+                q::UnaryExpr {
+                    input: Some(commits(&case.input).into()),
+                }
+                .into(),
+            ));
+            assert_eq!(
+                collect(
+                    graph.clone(),
+                    expr,
+                    EvalLimits {
+                        max_step_work: 1,
+                        ..EvalLimits::default()
+                    }
+                )
+                .0,
+                case.expected
+            );
+        }
+    }
+    #[test]
+    fn streaming_heads_never_drains_public_tail_after_candidate_eof() {
+        let mut expected_probes = None;
+        for public_count in [64usize, 4096] {
+            let directory = tempfile::tempdir().unwrap();
+            let index = Index::open(
+                directory.path().join("index"),
+                &tinytree_index::Limits::default(),
+            )
+            .unwrap();
+            let mut boundary = m::CommitId::ROOT;
+            for ordinal in 1..=public_count {
+                let value = canonical(&[boundary], ordinal, 0, 0);
+                boundary = index
+                    .ingest("repo", value.descriptor, &value.bytes)
+                    .unwrap()
+                    .commit;
+            }
+            let remote = OverlayGraph::remote(Arc::new(index.scope("repo", &[boundary]).unwrap()));
+            let mut drafts = Vec::new();
+            let mut tip = boundary;
+            for ordinal in 1..=10 {
+                let value = canonical(&[tip], public_count + ordinal, 0, 0);
+                tip = m::CommitId(value.descriptor.key.id.0);
+                drafts.push((value.descriptor, Arc::<[u8]>::from(value.bytes)));
+            }
+            let graph = OverlayGraph::extend(
+                remote,
+                drafts,
+                &crate::query_overlay::OverlayLimits::default(),
+                &mut WorkBudget::default(),
+                Arc::new(()),
+            )
+            .unwrap();
+            let expr = expression(q::graph_expr::Expression::Heads(
+                q::UnaryExpr {
+                    input: Some(commits(&[boundary, tip]).into()),
+                }
+                .into(),
+            ));
+            let mut evaluator = Evaluator::new(
+                graph,
+                expr,
+                EvalLimits {
+                    max_step_work: 1,
+                    ..EvalLimits::default()
+                },
+            )
+            .unwrap();
+            let mut budget = WorkBudget::new(128, 4096, 4 * 1024 * 1024, 4096);
+            let mut rows = Vec::new();
+            let mut done = false;
+            for _ in 0..10_000 {
+                match evaluator.step(&mut budget).unwrap() {
+                    EvalStep::Row(node) => rows.push(node.commit()),
+                    EvalStep::Progress => {}
+                    EvalStep::Done => {
+                        done = true;
+                        break;
+                    }
+                }
+            }
+            assert!(done);
+            assert_eq!(rows, vec![tip]);
+            assert!(budget.nodes_read() < 128);
+            if let Some(previous) = expected_probes {
+                assert_eq!(previous, budget.nodes_read());
+            }
+            expected_probes = Some(budget.nodes_read());
         }
     }
     /// Manual in-process default-log workload. Setup is separate from query

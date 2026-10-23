@@ -168,6 +168,12 @@ impl Client {
         request: Request<q::EvaluateRequest>,
         owner: PhysicalOwner,
     ) -> Result<Response<q::EvaluatePage>, Status> {
+        let shape = match q::Projection::try_from(request.get_ref().projection) {
+            Ok(q::Projection::Ids) => Shape::IdsPage,
+            Ok(q::Projection::Graph) => Shape::GraphPage,
+            Ok(q::Projection::Canonical) => Shape::CanonicalPage,
+            _ => return Err(Status::invalid_argument("invalid query projection")),
+        };
         self.inner
             .ready()
             .await
@@ -177,7 +183,7 @@ impl Client {
                 request,
                 http::uri::PathAndQuery::from_static("/tinytree.query.v1.RepositoryQuery/Evaluate"),
                 BoundedCodec::<q::EvaluateRequest, q::EvaluatePage>::new(
-                    Shape::IdsPage,
+                    shape,
                     self.limits.clone(),
                     self.decode,
                 )
@@ -311,6 +317,12 @@ enum Shape {
     QueryEmpty,
     IdsPage,
     IdsRow,
+    GraphPage,
+    CanonicalPage,
+    GraphRow,
+    CanonicalRow,
+    SelectedEdge,
+    EdgeTarget,
     View,
     Reference,
     Descriptor,
@@ -398,7 +410,8 @@ impl<U: Message + Default> Decoder for WireDecoder<U> {
             self.cap.saturating_mul(2)
         };
         charge(&mut budget, std::mem::size_of::<U>())?;
-        scan(&bytes, self.shape, &self.limits, &mut budget, 0)?;
+        let mut edges = 0usize;
+        scan(&bytes, self.shape, &self.limits, &mut budget, &mut edges, 0)?;
         U::decode(bytes).map(Some).map_err(|_| invalid())
     }
 }
@@ -432,6 +445,7 @@ fn scan(
     shape: Shape,
     limits: &Limits,
     budget: &mut usize,
+    edges: &mut usize,
     depth: usize,
 ) -> Result<(), Status> {
     if depth > 8 {
@@ -489,6 +503,20 @@ fn scan(
         if matches!(shape, Shape::IdsRow) && matches!(number, 3 | 4) {
             return Err(invalid());
         }
+        if matches!(shape, Shape::GraphRow) && number == 4 {
+            return Err(invalid());
+        }
+        if matches!(shape, Shape::SelectedEdge) {
+            if !(1..=3).contains(&number) {
+                return Err(invalid());
+            }
+        }
+        if matches!(shape, Shape::GraphRow | Shape::CanonicalRow) && number == 3 {
+            *edges = edges.checked_add(1).ok_or_else(exhausted)?;
+            if *edges > limits.max_query_edges {
+                return Err(exhausted());
+            }
+        }
         let rule = rule(shape, number, limits);
         if let Some((expected, child, maximum, allocation)) = rule {
             if wire != expected {
@@ -506,7 +534,9 @@ fn scan(
             if wire == 0
                 && matches!(
                     (shape, number),
-                    (Shape::FactAnswer, 1 | 2) | (Shape::ChangeTarget, 2) | (Shape::IdsPage, 6)
+                    (Shape::FactAnswer, 1 | 2)
+                        | (Shape::ChangeTarget, 2)
+                        | (Shape::IdsPage | Shape::GraphPage | Shape::CanonicalPage, 6)
                 )
             {
                 let mut offset = 0;
@@ -517,7 +547,7 @@ fn scan(
             if wire == 2 {
                 if let Some(child) = child {
                     charge(budget, allocation)?;
-                    scan(data, child, limits, budget, depth + 1)?;
+                    scan(data, child, limits, budget, edges, depth + 1)?;
                 } else {
                     let length_limit = allocation;
                     if data.len() > length_limit {
@@ -526,12 +556,12 @@ fn scan(
                     charge(budget, data.len().saturating_mul(2))?;
                     let exact = match (shape, number) {
                         (Shape::QueryScope, 2)
-                        | (Shape::IdsPage, 1)
+                        | (Shape::IdsPage | Shape::GraphPage | Shape::CanonicalPage, 1)
                         | (Shape::ScopeKey, 2)
                         | (Shape::CommitId, 1)
                         | (Shape::QueryFacts, 2) => Some(32),
                         (Shape::QueryScope, 3)
-                        | (Shape::IdsPage, 2)
+                        | (Shape::IdsPage | Shape::GraphPage | Shape::CanonicalPage, 2)
                         | (Shape::ChangeId, 1)
                         | (Shape::QueryFacts, 3) => Some(16),
                         _ => None,
@@ -553,12 +583,16 @@ fn scan(
         }
     }
     let required = match shape {
-        Shape::IdsPage => (1 << 1) | (1 << 2) | (1 << 6),
-        Shape::IdsRow => (1 << 1) | (1 << 2),
+        Shape::IdsPage | Shape::GraphPage | Shape::CanonicalPage => (1 << 1) | (1 << 2) | (1 << 6),
+        Shape::IdsRow | Shape::GraphRow | Shape::CanonicalRow => (1 << 1) | (1 << 2),
         Shape::QueryScope => (1 << 1) | (1 << 2) | (1 << 3) | (1 << 5),
         Shape::ScopeKey => (1 << 1) | (1 << 2),
         Shape::QueryFacts => (1 << 2) | (1 << 3),
-        Shape::CommitId | Shape::ChangeId | Shape::CommitMatch | Shape::ChangeMatch => 1 << 1,
+        Shape::CommitId
+        | Shape::ChangeId
+        | Shape::CommitMatch
+        | Shape::ChangeMatch
+        | Shape::EdgeTarget => 1 << 1,
         Shape::ChangeTarget => (1 << 1) | (1 << 2),
         Shape::ShortestPrefix => 1 << 1,
         Shape::Reference => 1 << 1,
@@ -576,6 +610,7 @@ fn scan(
     }
     let oneof_fields = match shape {
         Shape::FactAnswer => 4,
+        Shape::SelectedEdge => 3,
         Shape::CommitPrefix | Shape::ChangePrefix => 3,
         _ => 0,
     };
@@ -599,15 +634,35 @@ fn rule(shape: Shape, n: u32, l: &Limits) -> Option<(u8, Option<Shape>, usize, u
     let nested = |child| Some((2, Some(child), 1, 0));
     let repeated = |child, count, allocation| Some((2, Some(child), count, allocation));
     match (shape, n) {
-        (Shape::IdsPage, 1) => text(32),
-        (Shape::IdsPage, 2) => text(16),
-        (Shape::IdsPage, 3 | 6) => scalar(),
+        (Shape::GraphPage, 4) => repeated(
+            Shape::GraphRow,
+            l.max_batch_items,
+            4 * std::mem::size_of::<q::GraphRow>(),
+        ),
+        (Shape::CanonicalPage, 4) => repeated(
+            Shape::CanonicalRow,
+            l.max_batch_items,
+            4 * std::mem::size_of::<q::GraphRow>(),
+        ),
+        (Shape::GraphRow | Shape::CanonicalRow, 1) => nested(Shape::CommitId),
+        (Shape::GraphRow | Shape::CanonicalRow, 2) => nested(Shape::ChangeId),
+        (Shape::GraphRow | Shape::CanonicalRow, 3) => repeated(
+            Shape::SelectedEdge,
+            l.max_query_edges,
+            4 * std::mem::size_of::<q::SelectedEdge>(),
+        ),
+        (Shape::CanonicalRow, 4) => nested(Shape::ObjectData),
+        (Shape::SelectedEdge, 1..=3) => nested(Shape::EdgeTarget),
+        (Shape::EdgeTarget, 1) => nested(Shape::CommitId),
+        (Shape::IdsPage | Shape::GraphPage | Shape::CanonicalPage, 1) => text(32),
+        (Shape::IdsPage | Shape::GraphPage | Shape::CanonicalPage, 2) => text(16),
+        (Shape::IdsPage | Shape::GraphPage | Shape::CanonicalPage, 3 | 6) => scalar(),
         (Shape::IdsPage, 4) => repeated(
             Shape::IdsRow,
             l.max_batch_items,
             4 * std::mem::size_of::<q::GraphRow>(),
         ),
-        (Shape::IdsPage, 5) => text(4096),
+        (Shape::IdsPage | Shape::GraphPage | Shape::CanonicalPage, 5) => text(4096),
         (Shape::IdsRow, 1) => nested(Shape::CommitId),
         (Shape::IdsRow, 2) => nested(Shape::ChangeId),
         (Shape::QueryScope, 1) => nested(Shape::ScopeKey),

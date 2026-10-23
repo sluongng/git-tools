@@ -788,7 +788,12 @@ mod tests {
     use super::*;
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn cancelled_physical_query_retains_scope_roots_and_admission_until_completion() {
-        for evaluate in [false, true] {
+        for projection in [
+            None,
+            Some(q::Projection::Ids),
+            Some(q::Projection::Graph),
+            Some(q::Projection::Canonical),
+        ] {
             let temporary = tempfile::tempdir().unwrap();
             let store =
                 tinytree_store::Store::open(temporary.path().join("objects"), Default::default())
@@ -845,7 +850,7 @@ mod tests {
             };
             let worker = service.clone();
             let call = tokio::spawn(async move {
-                if evaluate {
+                if let Some(projection) = projection {
                     worker
                         .evaluate(Request::new(q::EvaluateRequest {
                             scope: input.scope,
@@ -860,7 +865,7 @@ mod tests {
                                     },
                                 )),
                             }),
-                            projection: q::Projection::Ids as i32,
+                            projection: projection as i32,
                             page_size: 128,
                             cursor: Vec::new(),
                         }))

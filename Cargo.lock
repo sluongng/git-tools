@@ -3158,6 +3158,7 @@ dependencies = [
  "tempfile",
  "tinytree-client",
  "tinytree-fixture",
+ "tinytree-index",
  "tinytree-model",
  "tinytree-server",
  "tinytree-store",

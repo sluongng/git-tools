@@ -1955,8 +1955,29 @@ async fn root_query_service_warms_persistently_and_returns_exact_facts_and_prefi
             .evaluate(request(
                 q::EvaluateRequest {
                     scope: Some(key.clone()),
-                    projection: q::Projection::Graph as i32,
-                    ..Default::default()
+                    query_id: vec![99; 32],
+                    expression: Some(q::GraphExpr {
+                        version: 1,
+                        expression: Some(q::graph_expr::Expression::Roots(
+                            q::UnaryExpr {
+                                input: Some(
+                                    q::GraphExpr {
+                                        version: 1,
+                                        expression: Some(q::graph_expr::Expression::Commits(
+                                            q::CommitSet {
+                                                commits: vec![query_id(heads[0])]
+                                            }
+                                        ))
+                                    }
+                                    .into()
+                                )
+                            }
+                            .into()
+                        ))
+                    }),
+                    projection: q::Projection::Ids as i32,
+                    page_size: 1,
+                    cursor: Vec::new(),
                 },
                 ALPHA
             ))
@@ -3399,85 +3420,93 @@ async fn ids_query_pages_replay_concurrently_and_retain_roots_after_scope_close(
     server.stop().await;
 }
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn idle_ids_queries_expire_and_release_authoritative_roots_without_next_page() {
-    let (temporary, store) = setup();
-    let canonical = fixture();
-    let root = root(&canonical);
-    let index =
-        tinytree_index::Index::open(temporary.path().join("derived"), &Default::default()).unwrap();
-    for object in canonical.objects() {
-        store
-            .put("alpha", object.descriptor, &object.bytes, 0)
-            .unwrap();
-        if object.descriptor.key.kind == Kind::Commit {
-            index
-                .ingest("alpha", object.descriptor, &object.bytes)
+async fn idle_queries_expire_and_release_authoritative_roots_without_next_page() {
+    for projection in [
+        q::Projection::Ids,
+        q::Projection::Graph,
+        q::Projection::Canonical,
+    ] {
+        let (temporary, store) = setup();
+        let canonical = fixture();
+        let root = root(&canonical);
+        let index =
+            tinytree_index::Index::open(temporary.path().join("derived"), &Default::default())
                 .unwrap();
+        for object in canonical.objects() {
+            store
+                .put("alpha", object.descriptor, &object.bytes, 0)
+                .unwrap();
+            if object.descriptor.key.kind == Kind::Commit {
+                index
+                    .ingest("alpha", object.descriptor, &object.bytes)
+                    .unwrap();
+            }
         }
-    }
-    let mut config = ServiceConfig::default();
-    config.query.max_eval_quantum_steps = 1;
-    config.query.query_ttl_seconds = 2;
-    config.query.expiry_interval_ms = 20;
-    config.query.max_queries = 1;
-    config.query.max_queries_per_principal = 1;
-    config.query.max_queries_per_repository = 1;
-    let server = Running::start_query(store.clone(), config, index).await;
-    let mut client = server.query_client().await;
-    let scope = query_ready(&mut client, &[root], 60).await;
-    let input = ids_evaluation(&scope, 61, &[root]);
-    let first = client
-        .evaluate(request(input.clone(), ALPHA))
-        .await
-        .unwrap()
-        .into_inner();
-    assert_eq!(first.exhausted, Some(false));
-    let mut second = input.clone();
-    second.query_id = vec![62; 32];
-    assert_eq!(
-        client
-            .evaluate(request(second, ALPHA))
+        let mut config = ServiceConfig::default();
+        config.query.max_eval_quantum_steps = 1;
+        config.query.query_ttl_seconds = 2;
+        config.query.expiry_interval_ms = 20;
+        config.query.max_queries = 1;
+        config.query.max_queries_per_principal = 1;
+        config.query.max_queries_per_repository = 1;
+        let server = Running::start_query(store.clone(), config, index).await;
+        let mut client = server.query_client().await;
+        let scope = query_ready(&mut client, &[root], 60).await;
+        let mut input = ids_evaluation(&scope, 61, &[root]);
+        input.projection = projection as i32;
+        let first = client
+            .evaluate(request(input.clone(), ALPHA))
             .await
-            .unwrap_err()
-            .code(),
-        Code::ResourceExhausted
-    );
-    client
-        .close_scope(request(q::CloseScopeRequest { scope: scope.key }, ALPHA))
+            .unwrap()
+            .into_inner();
+        assert_eq!(first.exhausted, Some(false));
+        let mut second = input.clone();
+        second.query_id = vec![62; 32];
+        assert_eq!(
+            client
+                .evaluate(request(second, ALPHA))
+                .await
+                .unwrap_err()
+                .code(),
+            Code::ResourceExhausted
+        );
+        client
+            .close_scope(request(q::CloseScopeRequest { scope: scope.key }, ALPHA))
+            .await
+            .unwrap();
+        store.gc("alpha", i64::MAX - 1).unwrap();
+        assert!(store.descriptor("alpha", root).unwrap().is_some());
+        tokio::time::sleep(Duration::from_millis(2300)).await;
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let store = store.clone();
+                let removed = tokio::task::spawn_blocking(move || {
+                    store.gc("alpha", i64::MAX - 1).unwrap();
+                    store.descriptor("alpha", root).unwrap().is_none()
+                })
+                .await
+                .unwrap();
+                if removed {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
         .await
         .unwrap();
-    store.gc("alpha", i64::MAX - 1).unwrap();
-    assert!(store.descriptor("alpha", root).unwrap().is_some());
-    tokio::time::sleep(Duration::from_millis(2300)).await;
-    tokio::time::timeout(Duration::from_secs(5), async {
-        loop {
-            let store = store.clone();
-            let removed = tokio::task::spawn_blocking(move || {
-                store.gc("alpha", i64::MAX - 1).unwrap();
-                store.descriptor("alpha", root).unwrap().is_none()
-            })
-            .await
-            .unwrap();
-            if removed {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(5)).await;
-        }
-    })
-    .await
-    .unwrap();
-    let mut expired = input;
-    expired.cursor = first.cursor;
-    assert_eq!(
-        client
-            .evaluate(request(expired, ALPHA))
-            .await
-            .unwrap_err()
-            .code(),
-        Code::FailedPrecondition
-    );
-    drop(client);
-    server.stop().await;
+        let mut expired = input;
+        expired.cursor = first.cursor;
+        assert_eq!(
+            client
+                .evaluate(request(expired, ALPHA))
+                .await
+                .unwrap_err()
+                .code(),
+            Code::FailedPrecondition
+        );
+        drop(client);
+        server.stop().await;
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -3789,3 +3818,308 @@ async fn benchmark_cold_warming_read_policy() {
     }).await.expect("bounded cold warming benchmark expired");
 }
 // END TINYTREE_COLD_WARM_READ_POLICY_BENCH_V1
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn selected_graph_and_canonical_pages_preserve_edges_payloads_and_byte_carryover() {
+    let (temporary, store) = setup();
+    let canonical = fixture();
+    let ancestor = root(&canonical);
+    let index =
+        tinytree_index::Index::open(temporary.path().join("derived"), &Default::default()).unwrap();
+    let mut commit = None;
+    for object in canonical.objects() {
+        store
+            .put("alpha", object.descriptor, &object.bytes, 0)
+            .unwrap();
+        if object.descriptor.key.kind == Kind::Commit {
+            index
+                .ingest("alpha", object.descriptor, &object.bytes)
+                .unwrap();
+            if object.descriptor.key == ancestor {
+                let Object::Commit(value) =
+                    tinytree_model::decode(&object.bytes, Limits::default()).unwrap()
+                else {
+                    unreachable!()
+                };
+                commit = Some(value);
+            }
+        }
+    }
+    // Give both selected nonroot rows large canonical payloads so the byte cap,
+    // not the requested row count, splits them across pages.
+    let mut commit = commit.unwrap();
+    commit.parents = vec![CommitId(ancestor.id.0)];
+    commit.change_id = tinytree_model::ChangeId([111; 16]);
+    commit.description = "remote selected row ".repeat(50);
+    let selected_remote =
+        tinytree_model::encode(&Object::Commit(commit.clone()), Limits::default()).unwrap();
+    store
+        .put(
+            "alpha",
+            selected_remote.descriptor,
+            &selected_remote.bytes,
+            0,
+        )
+        .unwrap();
+    index
+        .ingest("alpha", selected_remote.descriptor, &selected_remote.bytes)
+        .unwrap();
+    commit.parents = vec![CommitId(selected_remote.descriptor.key.id.0)];
+    commit.change_id = tinytree_model::ChangeId([112; 16]);
+    commit.description = "omitted remote parent".into();
+    let omitted =
+        tinytree_model::encode(&Object::Commit(commit.clone()), Limits::default()).unwrap();
+    store
+        .put("alpha", omitted.descriptor, &omitted.bytes, 0)
+        .unwrap();
+    index
+        .ingest("alpha", omitted.descriptor, &omitted.bytes)
+        .unwrap();
+    commit.parents = vec![CommitId(omitted.descriptor.key.id.0)];
+    commit.change_id = tinytree_model::ChangeId([113; 16]);
+    commit.description = "private selected row ".repeat(50);
+    let draft = tinytree_model::encode(&Object::Commit(commit), Limits::default()).unwrap();
+    let mut config = ServiceConfig::default();
+    config.query.max_response_bytes = selected_remote.bytes.len().max(draft.bytes.len()) + 512;
+    let max_response = config.query.max_response_bytes;
+    let server = Running::start_query(store.clone(), config, index).await;
+    let mut client = server.query_client().await;
+    let scope = client
+        .open_scope(request(
+            tokio_stream::iter(private_query_frames(
+                &[omitted.descriptor.key],
+                100,
+                &[&draft],
+            )),
+            ALPHA,
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+    let zero = ObjectKey {
+        kind: Kind::Commit,
+        id: ObjectId([0; 32]),
+    };
+    let selected = [draft.descriptor.key, selected_remote.descriptor.key, zero];
+    let mut graph = ids_evaluation(&scope, 101, &selected);
+    graph.projection = q::Projection::Graph as i32;
+    let mut graph_rows = Vec::new();
+    for _ in 0..128 {
+        let page = client
+            .evaluate(request(graph.clone(), ALPHA))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(page.rows.iter().all(|row| row.canonical.is_none()));
+        graph_rows.extend(page.rows);
+        if page.exhausted == Some(true) {
+            break;
+        }
+        graph.cursor = page.cursor;
+    }
+    assert_eq!(graph_rows.len(), 3);
+    assert_eq!(
+        graph_rows[0].edges,
+        vec![q::SelectedEdge {
+            edge: Some(q::selected_edge::Edge::Indirect(q::IndirectEdge {
+                target: Some(query_id(selected_remote.descriptor.key))
+            }))
+        }]
+    );
+    assert_eq!(
+        graph_rows[1].edges,
+        vec![q::SelectedEdge {
+            edge: Some(q::selected_edge::Edge::Indirect(q::IndirectEdge {
+                target: Some(query_id(zero))
+            }))
+        }],
+        "omitted ancestry rejoins the explicitly selected intrinsic root"
+    );
+    assert!(graph_rows[2].edges.is_empty());
+    let mut input = ids_evaluation(&scope, 102, &selected);
+    input.projection = q::Projection::Canonical as i32;
+    let mut rows = Vec::new();
+    let mut nonempty_pages = 0;
+    let mut closed = false;
+    let mut terminal = false;
+    for _ in 0..128 {
+        let page = client
+            .evaluate(request(input.clone(), ALPHA))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(
+            client
+                .evaluate(request(input.clone(), ALPHA))
+                .await
+                .unwrap()
+                .into_inner(),
+            page,
+            "lost acknowledgement retry preserves selected edges and canonical bytes"
+        );
+        assert!(prost::Message::encoded_len(&page) <= max_response);
+        assert!(
+            page.rows
+                .iter()
+                .filter(|row| row.canonical.is_some())
+                .count()
+                <= 1,
+            "byte carryover limits each page despite page_size128"
+        );
+        if !page.rows.is_empty() {
+            nonempty_pages += 1;
+        }
+        rows.extend(page.rows.clone());
+        if !closed {
+            client
+                .close_scope(request(
+                    q::CloseScopeRequest {
+                        scope: scope.key.clone(),
+                    },
+                    ALPHA,
+                ))
+                .await
+                .unwrap();
+            closed = true;
+            store.gc("alpha", i64::MAX - 1).unwrap();
+            assert!(
+                store
+                    .descriptor("alpha", omitted.descriptor.key)
+                    .unwrap()
+                    .is_some()
+            );
+        }
+        if page.exhausted == Some(true) {
+            terminal = true;
+            assert!(page.cursor.is_empty());
+            break;
+        }
+        input.cursor = page.cursor;
+    }
+    assert!(terminal);
+    assert!(nonempty_pages >= 2);
+    assert_eq!(rows.len(), 3);
+    for (row, graph) in rows.iter().zip(&graph_rows) {
+        assert_eq!(row.commit, graph.commit);
+        assert_eq!(row.change, graph.change);
+        assert_eq!(row.edges, graph.edges);
+    }
+    for (row, expected) in rows[..2].iter().zip([&draft, &selected_remote]) {
+        let payload = row.canonical.as_ref().unwrap();
+        assert_eq!(payload.descriptor, Some(descriptor(expected.descriptor)));
+        assert_eq!(payload.canonical_envelope, expected.bytes);
+        tinytree_model::verify(
+            &expected.descriptor,
+            &payload.canonical_envelope,
+            Limits::default(),
+        )
+        .unwrap();
+    }
+    assert!(rows[2].canonical.is_none());
+    assert!(
+        store
+            .descriptor("alpha", draft.descriptor.key)
+            .unwrap()
+            .is_none(),
+        "canonical projection never publishes a private draft"
+    );
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let store = store.clone();
+            let key = omitted.descriptor.key;
+            let removed = tokio::task::spawn_blocking(move || {
+                store.gc("alpha", i64::MAX - 1).unwrap();
+                store.descriptor("alpha", key).unwrap().is_none()
+            })
+            .await
+            .unwrap();
+            if removed {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap();
+    drop(client);
+    server.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn default_graph_quota_allows_two_live_queries_and_many_tiny_completed_histories() {
+    let (temporary, store) = setup();
+    let index =
+        tinytree_index::Index::open(temporary.path().join("derived"), &Default::default()).unwrap();
+    let mut config = ServiceConfig::default();
+    config.query.max_eval_quantum_steps = 1;
+    let server = Running::start_query(store, config, index).await;
+    let mut client = server.query_client().await;
+    let zero = ObjectKey {
+        kind: Kind::Commit,
+        id: ObjectId([0; 32]),
+    };
+    let scope = query_ready(&mut client, &[zero], 110).await;
+    let mut first = ids_evaluation(&scope, 111, &[zero]);
+    first.projection = q::Projection::Canonical as i32;
+    let mut second = ids_evaluation(&scope, 112, &[zero]);
+    second.projection = q::Projection::Canonical as i32;
+    let mut peer = client.clone();
+    let (a, b) = tokio::join!(
+        client.evaluate(request(first.clone(), ALPHA)),
+        peer.evaluate(request(second.clone(), ALPHA))
+    );
+    let a = a.unwrap().into_inner();
+    let b = b.unwrap().into_inner();
+    assert_eq!(a.exhausted, Some(false));
+    assert_eq!(b.exhausted, Some(false));
+    first.cursor = a.cursor;
+    second.cursor = b.cursor;
+    for mut query in [first, second] {
+        let mut done = false;
+        for _ in 0..128 {
+            let page = client
+                .evaluate(request(query.clone(), ALPHA))
+                .await
+                .unwrap()
+                .into_inner();
+            if page.exhausted == Some(true) {
+                done = true;
+                break;
+            }
+            query.cursor = page.cursor;
+        }
+        assert!(done);
+    }
+    for id in 120..144u8 {
+        let mut query = ids_evaluation(&scope, id, &[zero]);
+        query.projection = q::Projection::Graph as i32;
+        let mut done = false;
+        for _ in 0..128 {
+            let page = client
+                .evaluate(request(query.clone(), ALPHA))
+                .await
+                .unwrap()
+                .into_inner();
+            if page.exhausted == Some(true) {
+                assert_eq!(
+                    client
+                        .evaluate(request(query.clone(), ALPHA))
+                        .await
+                        .unwrap()
+                        .into_inner(),
+                    page
+                );
+                done = true;
+                break;
+            }
+            query.cursor = page.cursor;
+        }
+        assert!(
+            done,
+            "tiny completed query history must not reserve a maximum-sized response forever"
+        );
+    }
+    drop(client);
+    drop(peer);
+    server.stop().await;
+}

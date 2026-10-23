@@ -6,8 +6,9 @@ mod transport;
 mod verified;
 pub use client::NativeClient;
 pub use client::query::{
-    ChangeMatch, ChangePrefix, ChangeTarget, CheckedIdsPage, CheckedIdsQuery, CheckedScopeHandle,
-    CommitPrefix, FactAnswer, IdRow, PrefixTarget, QueryFact,
+    ChangeMatch, ChangePrefix, ChangeTarget, CheckedGraphPage, CheckedGraphQuery, CheckedGraphRows,
+    CheckedIdsPage, CheckedIdsQuery, CheckedScopeHandle, CommitPrefix, FactAnswer, GraphEdge,
+    GraphRow, IdRow, PrefixTarget, QueryFact,
 };
 pub use config::{Config, ConfigError, Limits, Tls};
 pub use tinytree_proto::query_v1 as query_protocol;

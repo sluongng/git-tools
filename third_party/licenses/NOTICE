@@ -1,0 +1,6 @@
+The selected-graph evaluator in crates/tinytree-server/src/query_graph.rs
+adapts jj-lib 0.46.0, src/default_index/revset_graph_iterator.rs.
+
+Copyright 2021 The Jujutsu Authors.
+Licensed under Apache-2.0; see jj-revset-graph-APACHE-2.0.txt.
+The adapted file retains its copyright and license notice.

@@ -13,6 +13,8 @@ pub struct Limits {
     pub max_metadata_bytes: usize,
     pub max_batch_items: usize,
     pub max_batch_bytes: usize,
+    /// Aggregate selected edges per graph query (also checked before page decoding).
+    pub max_query_edges: usize,
     pub max_graph_pages: usize,
     pub max_graph_objects: usize,
     pub max_graph_bytes: usize,
@@ -48,6 +50,7 @@ impl Default for Limits {
             max_metadata_bytes: 16 * 1024 * 1024,
             max_batch_items: 256,
             max_batch_bytes: 32 * 1024 * 1024,
+            max_query_edges: 65_536,
             max_graph_pages: 1024,
             max_graph_objects: 100_000,
             max_graph_bytes: 64 * 1024 * 1024,
@@ -133,6 +136,7 @@ impl Config {
             || !(1024..=64 * 1024 * 1024).contains(&l.max_request_bytes)
             || !(1024..=64 * 1024 * 1024).contains(&l.max_metadata_bytes)
             || !(1..=4096).contains(&l.max_batch_items)
+            || !(1..=1_000_000).contains(&l.max_query_edges)
             || !(1..=100_000).contains(&l.max_graph_pages)
             || !(1..=1_000_000).contains(&l.max_graph_objects)
             || l.max_batch_bytes < l.max_metadata_bytes

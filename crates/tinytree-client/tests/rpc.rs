@@ -1453,6 +1453,12 @@ enum QueryMode {
     EvaluateCanonical,
     EvaluateCursorMismatch,
     EvaluateDuplicate,
+    GraphMissingCanonical,
+    GraphBadCanonical,
+    GraphCanonicalChange,
+    GraphEdgeWidth,
+    GraphUnknownDirect,
+    GraphDuplicateEdges,
 }
 #[derive(Default)]
 struct QueryCounts {
@@ -1671,6 +1677,48 @@ impl RepositoryQuery for QueryFaults {
             }
             QueryMode::EvaluateCursorMismatch => {
                 page.exhausted = Some(page.exhausted != Some(true))
+            }
+            QueryMode::GraphMissingCanonical => {
+                if let Some(row) = page.rows.first_mut() {
+                    row.canonical = None;
+                }
+            }
+            QueryMode::GraphBadCanonical => {
+                if let Some(data) = page.rows.first_mut().and_then(|r| r.canonical.as_mut()) {
+                    if let Some(byte) = data.canonical_envelope.last_mut() {
+                        *byte ^= 1;
+                    }
+                }
+            }
+            QueryMode::GraphCanonicalChange => {
+                if let Some(change) = page.rows.first_mut().and_then(|r| r.change.as_mut()) {
+                    change.value[0] ^= 1;
+                }
+            }
+            QueryMode::GraphEdgeWidth | QueryMode::GraphUnknownDirect => {
+                if let Some(row) = page.rows.first_mut() {
+                    row.edges = vec![q::SelectedEdge {
+                        edge: Some(q::selected_edge::Edge::Direct(q::DirectEdge {
+                            target: Some(q::CommitId {
+                                value: vec![
+                                    255;
+                                    if self.mode == QueryMode::GraphEdgeWidth {
+                                        31
+                                    } else {
+                                        32
+                                    }
+                                ],
+                            }),
+                        })),
+                    }];
+                }
+            }
+            QueryMode::GraphDuplicateEdges => {
+                if let Some(row) = page.rows.first_mut() {
+                    if let Some(edge) = row.edges.first().cloned() {
+                        row.edges.push(edge);
+                    }
+                }
             }
             QueryMode::EvaluateDuplicate => {
                 let mut first_page = self.first_page.lock().unwrap();
@@ -3162,6 +3210,668 @@ async fn checked_ids_first_window_and_completion_benchmark() {
             ids_rpcs,
             old_canonical_bytes
         );
+        running.stop().await;
+    }
+}
+
+#[tokio::test]
+async fn checked_graph_and_canonical_pages_replay_close_scope_and_keep_single_inflight_live() {
+    use tinytree_client::GraphEdge;
+    use tinytree_model::{ChangeId, CommitId, Object};
+    for canonical in [false, true] {
+        let fixture = setup_query_retained();
+        let running = QueryRunning::start(fixture.service.clone(), QueryMode::EvaluateRetry).await;
+        let mut config = running.config.clone();
+        config.limits.max_inflight = 1;
+        let client = NativeClient::connect(config).await.unwrap();
+        let draft = private_draft(fixture.root, ChangeId([83; 16]), "selected private draft");
+        let head = CommitId(draft.descriptor.key.id.0);
+        let scope = client
+            .open_query_scope_with_overlay(
+                vec![fixture.root],
+                vec![checked_draft(&client, &draft).await],
+            )
+            .await
+            .unwrap();
+        let mut query = client
+            .begin_graph_query(&scope, &ids_ancestors(head), 1, canonical)
+            .await
+            .unwrap();
+        let first = client.evaluate_graph_page(&mut query).await.unwrap();
+        assert_eq!(first.sequence, 0);
+        assert_eq!(first.rows().len(), 1);
+        assert_eq!(first.rows()[0].commit, head);
+        assert_eq!(
+            first.rows()[0].edges(),
+            vec![GraphEdge::Direct(fixture.root)]
+        );
+        assert_eq!(first.rows()[0].canonical.is_some(), canonical);
+        assert_eq!(running.counts.evaluations.load(Ordering::SeqCst), 2);
+        client.close_query_scope(&scope).await.unwrap();
+        let mut ids = vec![head];
+        // Keep the first page alive across the second call: retained page bytes
+        // must not retain the client's only inflight permit.
+        while !query.is_exhausted() {
+            let page = client.evaluate_graph_page(&mut query).await.unwrap();
+            for row in page.rows() {
+                assert_eq!(
+                    row.canonical.is_some(),
+                    canonical && row.commit != CommitId::ROOT
+                );
+                if let Some(metadata) = &row.canonical {
+                    assert_eq!(metadata.descriptor().key.id.0, row.commit.0);
+                    let Object::Commit(commit) = metadata.object() else {
+                        panic!("canonical row must be a commit")
+                    };
+                    assert_eq!(commit.change_id, row.change);
+                }
+                ids.push(row.commit);
+            }
+        }
+        assert_eq!(ids, vec![head, fixture.root, CommitId::ROOT]);
+        assert_eq!(first.rows()[0].commit, head);
+        assert_eq!(
+            client
+                .evaluate_graph_page(&mut query)
+                .await
+                .unwrap_err()
+                .code(),
+            Code::FailedPrecondition
+        );
+        // The endpoint in this fixture implements only RepositoryQuery: any
+        // graph/metadata/FILE hydration would fail rather than hide extra I/O.
+        drop(first);
+        running.stop().await;
+    }
+}
+
+#[tokio::test]
+async fn graph_pages_reject_bad_edges_canonical_and_aggregate_collections_atomically() {
+    struct Case {
+        name: &'static str,
+        mode: QueryMode,
+        canonical: bool,
+        code: Code,
+    }
+    for case in [
+        Case {
+            name: "missing canonical commit",
+            mode: QueryMode::GraphMissingCanonical,
+            canonical: true,
+            code: Code::DataLoss,
+        },
+        Case {
+            name: "canonical content hash",
+            mode: QueryMode::GraphBadCanonical,
+            canonical: true,
+            code: Code::DataLoss,
+        },
+        Case {
+            name: "canonical change identity",
+            mode: QueryMode::GraphCanonicalChange,
+            canonical: true,
+            code: Code::DataLoss,
+        },
+        Case {
+            name: "edge target width",
+            mode: QueryMode::GraphEdgeWidth,
+            canonical: false,
+            code: Code::DataLoss,
+        },
+        Case {
+            name: "direct edge not parent",
+            mode: QueryMode::GraphUnknownDirect,
+            canonical: true,
+            code: Code::DataLoss,
+        },
+        Case {
+            name: "missing edge oneof",
+            mode: QueryMode::EvaluateEdges,
+            canonical: false,
+            code: Code::DataLoss,
+        },
+        Case {
+            name: "graph forbids canonical",
+            mode: QueryMode::EvaluateCanonical,
+            canonical: false,
+            code: Code::DataLoss,
+        },
+    ] {
+        let (_store, _index, service, root, _change) = setup_query();
+        let running = QueryRunning::start(service, case.mode).await;
+        let client = running.client().await;
+        let scope = client.open_query_scope(vec![root]).await.unwrap();
+        let mut query = client
+            .begin_graph_query(&scope, &ids_ancestors(root), 1, case.canonical)
+            .await
+            .unwrap();
+        let id = *query.query_id();
+        let first = client.evaluate_graph_page(&mut query).await.unwrap_err();
+        assert_eq!(first.code(), case.code, "{}: {first}", case.name);
+        let retry = client.evaluate_graph_page(&mut query).await.unwrap_err();
+        assert_eq!(retry.code(), case.code, "{}: {retry}", case.name);
+        assert_eq!(*query.query_id(), id);
+        assert!(!query.is_exhausted());
+        client.close_query_scope(&scope).await.unwrap();
+        running.stop().await;
+    }
+    let (_store, _index, service, root, _change) = setup_query();
+    let running = QueryRunning::start(service, QueryMode::GraphDuplicateEdges).await;
+    let mut config = running.config.clone();
+    config.limits.max_query_edges = 1;
+    let client = NativeClient::connect(config).await.unwrap();
+    let scope = client.open_query_scope(vec![root]).await.unwrap();
+    let mut query = client
+        .begin_graph_query(&scope, &ids_ancestors(root), 1, false)
+        .await
+        .unwrap();
+    assert_eq!(
+        client
+            .evaluate_graph_page(&mut query)
+            .await
+            .unwrap_err()
+            .code(),
+        Code::ResourceExhausted
+    );
+    client.close_query_scope(&scope).await.unwrap();
+    running.stop().await;
+}
+
+#[tokio::test]
+async fn graph_pages_preserve_duplicate_edge_order_and_cancel_owned_admission() {
+    let (_store, _index, service, root, _change) = setup_query();
+    let running = QueryRunning::start(service, QueryMode::GraphDuplicateEdges).await;
+    let client = running.client().await;
+    let scope = client.open_query_scope(vec![root]).await.unwrap();
+    let mut query = client
+        .begin_graph_query(&scope, &ids_ancestors(root), 1, true)
+        .await
+        .unwrap();
+    let page = client.evaluate_graph_page(&mut query).await.unwrap();
+    assert_eq!(page.rows()[0].edges().len(), 2);
+    assert_eq!(page.rows()[0].edges()[0], page.rows()[0].edges()[1]);
+    drop(page);
+    client.close_query_scope(&scope).await.unwrap();
+    running.stop().await;
+
+    let (_store, _index, service, root, _change) = setup_query();
+    let running = QueryRunning::start(service, QueryMode::EvaluatePause).await;
+    let client = running.client().await;
+    let scope = client.open_query_scope(vec![root]).await.unwrap();
+    let dropped = Arc::new(AtomicUsize::new(0));
+    let guarded = client
+        .clone()
+        .with_lifetime_guard(Arc::new(LifetimeProbe(dropped.clone())));
+    let mut query = guarded
+        .begin_graph_query(&scope, &ids_ancestors(root), 1, true)
+        .await
+        .unwrap();
+    let task = tokio::spawn(async move { guarded.evaluate_graph_page(&mut query).await });
+    tokio::time::timeout(
+        Duration::from_secs(2),
+        running.counts.evaluate_entered.notified(),
+    )
+    .await
+    .unwrap();
+    task.abort();
+    let _ = task.await;
+    running.counts.evaluate_release.notify_one();
+    assert_released(&dropped).await;
+    client.close_query_scope(&scope).await.unwrap();
+    running.stop().await;
+}
+
+#[tokio::test]
+async fn retained_graph_pages_fail_headroom_without_waiting_or_advancing() {
+    use tinytree_model::{ChangeId, CommitId};
+    let fixture = setup_query_retained();
+    let running = QueryRunning::start(fixture.service.clone(), QueryMode::Normal).await;
+    let mut config = running.config.clone();
+    config.limits.max_inflight = 1;
+    config.limits.max_frame_bytes = 4096;
+    config.limits.max_batch_bytes = 32768;
+    config.limits.max_metadata_bytes = 16384;
+    config.limits.max_request_bytes = 1024;
+    config.limits.max_graph_bytes = 16384;
+    config.limits.max_buffered_bytes = 262144;
+    config.limits.max_batch_items = 16;
+    config.limits.max_graph_objects = 800;
+    let client = NativeClient::connect(config).await.unwrap();
+    // Large valid canonical descriptions make two application-held pages exceed
+    // persistent headroom while each page and wire request still fit admission.
+    let description = "x".repeat(8192);
+    let first = private_draft(fixture.root, ChangeId([87; 16]), &description);
+    let first_id = CommitId(first.descriptor.key.id.0);
+    let second = private_draft(first_id, ChangeId([88; 16]), &description);
+    let second_id = CommitId(second.descriptor.key.id.0);
+    let overlay = vec![
+        checked_draft(&client, &first).await,
+        checked_draft(&client, &second).await,
+    ];
+    let scope = client
+        .open_query_scope_with_overlay(vec![fixture.root], overlay)
+        .await
+        .unwrap();
+    let mut query = client
+        .begin_graph_query(&scope, &ids_commits(&[first_id, second_id]), 1, true)
+        .await
+        .unwrap();
+    let page = client.evaluate_graph_page(&mut query).await.unwrap();
+    assert_eq!(page.rows()[0].commit, second_id);
+    let failed = client.evaluate_graph_page(&mut query).await.unwrap_err();
+    assert_eq!(failed.code(), Code::ResourceExhausted);
+    assert!(!query.is_exhausted());
+    // Retaining an extracted canonical object retains the page reservation too.
+    let mut rows = page.into_rows();
+    let mut row = rows.next().unwrap();
+    let canonical = row.canonical.take().unwrap();
+    drop(row);
+    drop(rows);
+    assert_eq!(
+        client
+            .evaluate_graph_page(&mut query)
+            .await
+            .unwrap_err()
+            .code(),
+        Code::ResourceExhausted
+    );
+    drop(canonical);
+    let retry = client.evaluate_graph_page(&mut query).await.unwrap();
+    assert_eq!(retry.sequence, 1);
+    assert_eq!(retry.rows()[0].commit, first_id);
+    drop(retry);
+    client.close_query_scope(&scope).await.unwrap();
+    running.stop().await;
+}
+
+#[tokio::test]
+async fn graph_progress_pages_and_original_deadline_are_not_renewed() {
+    let mut config = ServiceConfig::default();
+    config.query.max_eval_quantum_steps = 1;
+    config.query.max_eval_step_work = 1;
+    let fixture = setup_query_configured(config);
+    let running = QueryRunning::start(fixture.service.clone(), QueryMode::Normal).await;
+    let client = running.client().await;
+    let scope = client.open_query_scope(vec![fixture.root]).await.unwrap();
+    let mut query = client
+        .begin_graph_query(&scope, &ids_ancestors(fixture.root), 1, true)
+        .await
+        .unwrap();
+    let mut progress = false;
+    let mut found = Vec::new();
+    while !query.is_exhausted() {
+        let page = client.evaluate_graph_page(&mut query).await.unwrap();
+        progress |= page.is_progress();
+        found.extend(page.rows().iter().map(|r| r.commit));
+    }
+    assert!(progress);
+    assert_eq!(found, vec![fixture.root, tinytree_model::CommitId::ROOT]);
+    client.close_query_scope(&scope).await.unwrap();
+    running.stop().await;
+
+    let (_store, _index, service, root, _change) = setup_query();
+    let running = QueryRunning::start(service, QueryMode::EvaluateDelay).await;
+    let mut config = running.config.clone();
+    config.rpc.operation_timeout_ms = 350;
+    let client = NativeClient::connect(config).await.unwrap();
+    let scope = client.open_query_scope(vec![root]).await.unwrap();
+    let mut query = client
+        .begin_graph_query(&scope, &ids_ancestors(root), 1, true)
+        .await
+        .unwrap();
+    assert!(
+        !client
+            .evaluate_graph_page(&mut query)
+            .await
+            .unwrap()
+            .exhausted
+    );
+    assert_eq!(
+        client
+            .evaluate_graph_page(&mut query)
+            .await
+            .unwrap_err()
+            .code(),
+        Code::DeadlineExceeded
+    );
+    client.close_query_scope(&scope).await.unwrap();
+    running.stop().await;
+}
+
+#[tokio::test]
+async fn graph_rows_and_extracted_canonical_keep_begin_client_guards_through_teardown() {
+    for canonical in [false, true] {
+        let (_store, _index, service, root, _change) = setup_query();
+        let running = QueryRunning::start(service, QueryMode::Normal).await;
+        let client = running.client().await;
+        let scope = client.open_query_scope(vec![root]).await.unwrap();
+        let dropped = Arc::new(AtomicUsize::new(0));
+        let guarded = client
+            .clone()
+            .with_lifetime_guard(Arc::new(LifetimeProbe(dropped.clone())));
+        let mut query = guarded
+            .begin_graph_query(&scope, &ids_ancestors(root), 1, canonical)
+            .await
+            .unwrap();
+        drop(guarded);
+        // Evaluation through a same-inner, unguarded clone must preserve owners
+        // captured at begin_query, without retaining its state/inflight budget.
+        let page = client.evaluate_graph_page(&mut query).await.unwrap();
+        drop(query);
+        assert_eq!(dropped.load(Ordering::SeqCst), 0);
+        let mut rows = page.into_rows();
+        let mut row = rows.next().unwrap();
+        assert!(rows.next().is_none());
+        assert!(!row.edges().is_empty());
+        let metadata = row.canonical.take();
+        drop(row);
+        // The exhausted iterator still owns the original SDK Vec allocation.
+        assert_eq!(dropped.load(Ordering::SeqCst), 0);
+        drop(rows);
+        if canonical {
+            assert!(metadata.is_some());
+            assert_eq!(dropped.load(Ordering::SeqCst), 0);
+            drop(metadata);
+        }
+        assert_released(&dropped).await;
+        client.close_query_scope(&scope).await.unwrap();
+        running.stop().await;
+    }
+}
+
+#[tokio::test]
+async fn empty_graph_progress_pages_consume_retained_headroom() {
+    let mut service_config = ServiceConfig::default();
+    service_config.query.max_eval_quantum_steps = 1;
+    service_config.query.max_eval_step_work = 1;
+    let fixture = setup_query_configured(service_config);
+    let running = QueryRunning::start(fixture.service.clone(), QueryMode::Normal).await;
+    let mut config = running.config.clone();
+    config.limits.max_frame_bytes = 4096;
+    config.limits.max_batch_bytes = 32768;
+    config.limits.max_metadata_bytes = 1024;
+    config.limits.max_request_bytes = 1024;
+    config.limits.max_graph_bytes = 1024;
+    config.limits.max_buffered_bytes = 262144;
+    config.limits.max_batch_items = 16;
+    config.limits.max_graph_objects = 950;
+    let client = NativeClient::connect(config).await.unwrap();
+    let scope = client.open_query_scope(vec![fixture.root]).await.unwrap();
+    let mut query = client
+        .begin_graph_query(&scope, &ids_ancestors(fixture.root), 1, false)
+        .await
+        .unwrap();
+    let first = client.evaluate_graph_page(&mut query).await.unwrap();
+    assert!(first.is_progress());
+    assert_eq!(
+        client
+            .evaluate_graph_page(&mut query)
+            .await
+            .unwrap_err()
+            .code(),
+        Code::ResourceExhausted
+    );
+    assert!(!query.is_exhausted());
+    drop(first);
+    let retry = client.evaluate_graph_page(&mut query).await.unwrap();
+    assert_eq!(retry.sequence, 1);
+    drop(retry);
+    client.close_query_scope(&scope).await.unwrap();
+    running.stop().await;
+}
+
+/// Component/payload comparison, not native jj startup or compressed wire size.
+/// Every query is drained: dropping a partial client query currently does not
+/// cancel its server cursor, which can remain active until its expiry.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "manual completed default-log IDS/GRAPH/CANONICAL component benchmark"]
+async fn checked_query_projection_payload_benchmark() {
+    use tinytree_client::GraphEdge;
+    use tinytree_model::{ChangeId, CommitId};
+    for public_count in [128, 1024, 4096] {
+        let (fixture, source_ns, index_ns, _) = linear_ids_fixture(public_count);
+        let public_parent = fixture
+            .index
+            .node("example", fixture.root)
+            .unwrap()
+            .unwrap()
+            .parents[0];
+        let connected = std::time::Instant::now();
+        let running =
+            Running::start_with_socket_policy(fixture.service.clone(), Mode::Normal, true).await;
+        let client = running.client().await;
+        let connection_ns = connected.elapsed().as_nanos();
+        let draft_started = std::time::Instant::now();
+        let mut head = fixture.root;
+        let mut draft_ids = Vec::with_capacity(10);
+        let mut canonical_drafts = Vec::with_capacity(10);
+        for position in 0..10 {
+            let draft = private_draft(
+                head,
+                ChangeId([position + 101; 16]),
+                "private default-log draft",
+            );
+            head = CommitId(draft.descriptor.key.id.0);
+            draft_ids.push(head);
+            canonical_drafts.push(draft);
+        }
+        let private_source_ns = draft_started.elapsed().as_nanos();
+        let overlay_bytes: usize = canonical_drafts
+            .iter()
+            .map(|object| object.bytes.len())
+            .sum();
+        let started = std::time::Instant::now();
+        let mut overlay = Vec::with_capacity(10);
+        for object in &canonical_drafts {
+            overlay.push(checked_draft(&client, object).await);
+        }
+        let verify_ns = started.elapsed().as_nanos();
+        let started = std::time::Instant::now();
+        let scope = client
+            .open_query_scope_with_overlay(vec![fixture.root], overlay)
+            .await
+            .unwrap();
+        let scope_open_ns = started.elapsed().as_nanos();
+        let range = q::GraphExpr {
+            version: 1,
+            expression: Some(q::graph_expr::Expression::Range(Box::new(q::RangeExpr {
+                roots: Some(Box::new(ids_commits(&[fixture.root]))),
+                heads: Some(Box::new(ids_commits(&[head, fixture.root]))),
+                generations: None,
+                parents: None,
+            }))),
+        };
+        let expression = q::GraphExpr {
+            version: 1,
+            expression: Some(q::graph_expr::Expression::Union(q::SetExpr {
+                inputs: vec![
+                    ids_commits(&[head]),
+                    q::GraphExpr {
+                        version: 1,
+                        expression: Some(q::graph_expr::Expression::Ancestors(Box::new(
+                            q::AncestorsExpr {
+                                heads: Some(Box::new(range)),
+                                generations: Some(q::GenerationRange {
+                                    start: 0,
+                                    end_exclusive: Some(2),
+                                }),
+                                parents: None,
+                            },
+                        ))),
+                    },
+                    ids_commits(&[fixture.root]),
+                ],
+            })),
+        };
+        let mut expected: Vec<_> = draft_ids.iter().rev().copied().collect();
+        expected.push(fixture.root);
+        assert_eq!(expected.len(), 11);
+        eprintln!(
+            concat!(
+                "{{\"schema\":1,\"benchmark\":\"checked_query_projection_payload\",\"record\":\"setup\",",
+                "\"public_history_commits\":{},\"private_commits\":10,\"selected_rows\":11,\"page_size\":40,\"trials_per_projection\":3,",
+                "\"public_source_setup_ns\":{},\"ready_index_ns\":{},\"connection_setup_ns\":{},",
+                "\"private_source_setup_ns\":{},\"overlay_verify_ns\":{},\"scope_open_ns\":{},\"overlay_logical_envelope_bytes\":{},",
+                "\"index_ready_before_requests\":true,\"trial_order\":\"IDS_then_GRAPH_then_CANONICAL\",",
+                "\"transport\":\"authenticated_zstd_loopback_tcp_nodelay\",\"native_jj_startup_measured\":false}}"
+            ),
+            public_count,
+            source_ns,
+            index_ns,
+            connection_ns,
+            private_source_ns,
+            verify_ns,
+            scope_open_ns,
+            overlay_bytes
+        );
+        for projection in [
+            q::Projection::Ids,
+            q::Projection::Graph,
+            q::Projection::Canonical,
+        ] {
+            for trial in 0..3 {
+                let rpc_before = running.queries.evaluations.load(Ordering::SeqCst);
+                let prepared = std::time::Instant::now();
+                let mut ids = Vec::with_capacity(11);
+                let mut page_count = 0usize;
+                let mut progress_pages = 0usize;
+                let mut edge_count = 0usize;
+                let mut canonical_bytes = 0usize;
+                let mut first_page_ns = None;
+                let mut first_data_ns = None;
+                let mut first_page_rows = 0usize;
+                let begin_ns;
+                let completed_ns;
+                if projection == q::Projection::Ids {
+                    let mut query = client.begin_query(&scope, &expression, 40).await.unwrap();
+                    begin_ns = prepared.elapsed().as_nanos();
+                    let started = std::time::Instant::now();
+                    while !query.is_exhausted() {
+                        let page = client.evaluate_page(&mut query).await.unwrap();
+                        page_count += 1;
+                        if first_page_ns.is_none() {
+                            first_page_ns = Some(started.elapsed().as_nanos());
+                            first_page_rows = page.rows.len();
+                        }
+                        if page.is_progress() {
+                            progress_pages += 1;
+                        }
+                        if !page.rows.is_empty() && first_data_ns.is_none() {
+                            first_data_ns = Some(started.elapsed().as_nanos());
+                        }
+                        ids.extend(page.rows.into_iter().map(|row| row.commit));
+                    }
+                    assert!(query.is_exhausted());
+                    completed_ns = started.elapsed().as_nanos();
+                } else {
+                    let canonical = projection == q::Projection::Canonical;
+                    let mut query = client
+                        .begin_graph_query(&scope, &expression, 40, canonical)
+                        .await
+                        .unwrap();
+                    begin_ns = prepared.elapsed().as_nanos();
+                    let started = std::time::Instant::now();
+                    while !query.is_exhausted() {
+                        let page = client.evaluate_graph_page(&mut query).await.unwrap();
+                        page_count += 1;
+                        if first_page_ns.is_none() {
+                            first_page_ns = Some(started.elapsed().as_nanos());
+                            first_page_rows = page.rows().len();
+                        }
+                        if page.is_progress() {
+                            progress_pages += 1;
+                        }
+                        if !page.rows().is_empty() && first_data_ns.is_none() {
+                            first_data_ns = Some(started.elapsed().as_nanos());
+                        }
+                        for row in page.rows() {
+                            assert_eq!(
+                                row.canonical.is_some(),
+                                canonical && row.commit != CommitId::ROOT
+                            );
+                            edge_count += row.edges().len();
+                            canonical_bytes += row
+                                .canonical
+                                .as_ref()
+                                .map_or(0, |metadata| metadata.canonical_bytes().len());
+                            if row.commit == fixture.root {
+                                assert_eq!(
+                                    row.edges(),
+                                    &[GraphEdge::Missing(public_parent)],
+                                    "public boundary must not hydrate the omitted public tail"
+                                );
+                            }
+                            ids.push(row.commit);
+                        }
+                        // Release each response before asking for the next quantum.
+                        drop(page);
+                    }
+                    assert!(query.is_exhausted());
+                    completed_ns = started.elapsed().as_nanos();
+                }
+                assert_eq!(
+                    ids, expected,
+                    "identical ordered result and proven EOF for every projection"
+                );
+                assert_eq!(ids.len(), 11);
+                if projection == q::Projection::Ids {
+                    assert_eq!(edge_count, 0);
+                }
+                if projection != q::Projection::Canonical {
+                    assert_eq!(canonical_bytes, 0);
+                }
+                let rpcs = running.queries.evaluations.load(Ordering::SeqCst) - rpc_before;
+                assert_eq!(rpcs, page_count);
+                assert_eq!(running.graph.load(Ordering::SeqCst), 0);
+                assert_eq!(running.metadata.load(Ordering::SeqCst), 0);
+                assert_eq!(running.files.load(Ordering::SeqCst), 0);
+                assert_eq!(running.canonical_bytes.load(Ordering::SeqCst), 0);
+                eprintln!(
+                    concat!(
+                        "{{\"schema\":1,\"benchmark\":\"checked_query_projection_payload\",\"record\":\"query\",",
+                        "\"public_history_commits\":{},\"private_commits\":10,\"projection\":\"{}\",\"trial\":{},\"page_size\":40,",
+                        "\"begin_ns\":{},\"first_page_ns\":{},\"first_data_ns\":{},\"done_ns\":{},\"begin_to_done_ns\":{},",
+                        "\"evaluate_rpcs\":{},\"pages\":{},\"progress_pages\":{},\"first_page_rows\":{},\"rows\":{},",
+                        "\"ordered_edges\":{},\"logical_canonical_envelope_bytes\":{},\"repo_graph_rpcs\":0,\"repo_metadata_rpcs\":0,\"file_rpcs\":0,",
+                        "\"proven_eof\":true,\"call_times_include_decode_and_verification\":true,",
+                        "\"byte_measure\":\"logical_canonical_envelopes_not_zstd_wire_bytes\",",
+                        "\"lifecycle\":\"drained_to_EOF_partial_query_drop_does_not_cancel_server_cursor\",\"native_jj_startup_measured\":false}}"
+                    ),
+                    public_count,
+                    projection.as_str_name(),
+                    trial,
+                    begin_ns,
+                    first_page_ns.unwrap(),
+                    first_data_ns.unwrap(),
+                    completed_ns,
+                    begin_ns + completed_ns,
+                    rpcs,
+                    page_count,
+                    progress_pages,
+                    first_page_rows,
+                    ids.len(),
+                    edge_count,
+                    canonical_bytes
+                );
+            }
+        }
+        for draft in &canonical_drafts {
+            assert!(
+                fixture
+                    .store
+                    .descriptor("example", draft.descriptor.key)
+                    .unwrap()
+                    .is_none()
+            );
+            assert!(
+                fixture
+                    .index
+                    .node("example", CommitId(draft.descriptor.key.id.0))
+                    .unwrap()
+                    .is_none()
+            );
+        }
+        client.close_query_scope(&scope).await.unwrap();
         running.stop().await;
     }
 }

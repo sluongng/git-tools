@@ -31,6 +31,7 @@ uuid = { version = "1", features = ["v4"] }
 libc = "0.2"
 
 [dev-dependencies]
+tinytree-index = { path = "../tinytree-index" }
 output-core = { path = "../output-core" }
 native-workspace = { path = "../native-workspace" }
 async-stream = "0.3"
