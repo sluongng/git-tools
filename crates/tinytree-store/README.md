@@ -13,6 +13,21 @@ write failures require reopening before further operations.
 final symlinks are rejected without mutation. Traversal and staging are bounded;
 payload quotas exclude database/receipt overhead and interrupted-file orphans.
 
+`Store::pack` explicitly packs small loose objects during quiescent maintenance;
+it is not automatic background work or a server command. Canonical IDs and RPC
+payloads stay unchanged. Repeat bounded calls until `PackReport.scan_complete`;
+the persisted scan cursor advances even across pages with no eligible objects.
+[Indexed packs](../packblob) use independent compression
+or one same-pack dictionary anchor, with bounded reads and memory admission.
+The first pack upgrades the store format to version 2; older binaries must not
+reopen it. Large objects remain loose. GC reclaims a pack only after its final
+logical member dies, retaining dictionary bytes needed by surviving members.
+Partially dead packs are not repacked, and crash-orphan cleanup is not automatic.
+
+For a checked synthetic storage/read comparison, run
+`bazel test --config=rbe //crates/tinytree-store:pack_benchmarks --test_output=all`.
+This component benchmark does not measure Bazel startup or wire savings.
+
 `publish_retention` keeps owner/client-scoped roots until explicit release, with
 atomic namespace, receipt and unique-closure byte quotas. Released names keep
 generation tombstones; existing holds are never evicted to admit another client.

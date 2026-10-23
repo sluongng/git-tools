@@ -5,6 +5,33 @@ load("@rules_rs//rs:rust_test.bzl", "rust_test")
 
 package(default_visibility = ["//visibility:public"])
 
+exports_files(["examples/pack_benchmark.rs"])
+
+rust_binary(
+    name = "pack_benchmark",
+    srcs = ["examples/pack_benchmark.rs"],
+    aliases = aliases(),
+    edition = "2024",
+    tags = ["manual"],
+    deps = [":tinytree-store"] + all_crate_deps(
+        normal = True,
+        normal_dev = True,
+    ),
+)
+
+rust_test(
+    name = "pack_benchmarks",
+    srcs = ["examples/pack_benchmark.rs"],
+    aliases = aliases(),
+    args = ["--nocapture"],
+    edition = "2024",
+    tags = ["manual"],
+    deps = [":tinytree-store"] + all_crate_deps(
+        normal = True,
+        normal_dev = True,
+    ),
+)
+
 rust_library(
     name = "tinytree-store",
     srcs = glob(["src/**/*.rs"]),

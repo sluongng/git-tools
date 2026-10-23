@@ -86,6 +86,7 @@ entry points. Most also expose Rust libraries; `jj-native-cli` is executable-onl
 | [`workspace-core`](crates/workspace-core) | Git-backed source tree, lazy reads and prefetch scheduling. |
 | [`workspace-overlay`](crates/workspace-overlay) | Persistent edits, writable namespace and change journal. |
 | [`local-cas`](crates/local-cas) | Verified local blob storage with bounded LRU eviction. |
+| [`packblob`](crates/packblob) | Indexed immutable blob packs with bounded dictionary compression and selective verified reads. |
 | [`tinytree-model`](crates/tinytree-model) | Canonical jj-native objects, typed IDs and bounded verification. |
 | [`tinytree-proto`](crates/tinytree-proto) | Native repository gRPC bindings; not a server implementation. |
 | [`tinytree-client`](crates/tinytree-client) | Bounded, verifying native RPCs and immutable transfer snapshots. |

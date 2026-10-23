@@ -392,6 +392,7 @@ impl Store {
                 .checked_sub(1)
                 .ok_or(Error::Corrupt("repository object count"))?;
             let k = object_key(repo, d.key);
+            self.inner.remove_location(&mut tx, repo, d.key)?;
             tx.remove(&self.inner.spaces.objects, &k);
             tx.remove(&self.inner.spaces.client_ages, &k);
             tx.insert(
@@ -445,6 +446,7 @@ impl Store {
             tx.remove(&self.inner.spaces.client_deletions, k);
         }
         self.inner.commit(tx)?;
+        self.inner.reclaim_empty_packs(repo)?;
         Ok(report)
     }
 }

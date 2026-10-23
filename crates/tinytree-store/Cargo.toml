@@ -6,6 +6,7 @@ license = "MIT"
 description = "Durable native repository objects and compare-and-set references"
 
 [dependencies]
+packblob = { path = "../packblob" }
 tinytree-model = { path = "../tinytree-model" }
 blake3 = "1"
 fjall = "=3.1.12"
@@ -15,6 +16,7 @@ serde_json = "1"
 tempfile = "3"
 
 [dev-dependencies]
+zstd = "0.13"
 
 [target.'cfg(unix)'.dev-dependencies]
 libc = "0.2"

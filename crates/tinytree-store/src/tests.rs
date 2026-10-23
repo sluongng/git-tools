@@ -1805,3 +1805,369 @@ fn client_gc_repeated_edits_prune_expired_staging_with_a_small_scan_budget() {
     assert_eq!(report.expired_leases, 0);
     assert_eq!(report.deleted_objects, 0);
 }
+
+#[test]
+fn packed_repository_reopens_without_changing_publication_or_object_identity() {
+    let (directory, store) = open();
+    let (file, tree, head) = fixture(&store, "packed head");
+    let large_bytes = vec![19; 65 * 1024];
+    let large = tinytree_model::describe_file(&large_bytes);
+    store.put("demo", large, &large_bytes, 0).unwrap();
+    let lease = store.read("demo", file.key).unwrap();
+    assert!(matches!(
+        store.pack("demo", PackOptions::default()),
+        Err(Error::Limit("pack maintenance requires quiescence"))
+    ));
+    drop(lease);
+    let report = store.pack("demo", PackOptions::default()).unwrap();
+    assert_eq!(report.packed_objects, 3);
+    assert_eq!(report.removed_loose_files, 3);
+    assert_eq!(
+        report.logical_bytes,
+        file.size_bytes + tree.size_bytes + head.size_bytes
+    );
+    assert_eq!(
+        store
+            .pack("demo", PackOptions::default())
+            .unwrap()
+            .packed_objects,
+        0
+    );
+    assert!(store.inner.path("demo", large.key).exists());
+    assert!(!store.inner.path("demo", file.key).exists());
+    store.put("demo", file, b"native source\n", 2).unwrap();
+    assert!(
+        !store.inner.path("demo", file.key).exists(),
+        "duplicate upload must reuse packed backing"
+    );
+    let publication = store
+        .publish("demo", &request("packed-publication", 0, Some(head)), 3)
+        .unwrap();
+    drop(store);
+    let mut limits = config();
+    limits.max_packed_read_memory_bytes = pack::PACK_READ_CHARGE;
+    let store = Store::open_existing(directory.path(), limits).unwrap();
+    assert_eq!(store.descriptor("demo", head.key).unwrap(), Some(head));
+    assert_eq!(
+        store.publication("demo", "packed-publication").unwrap(),
+        Some(publication)
+    );
+    let mut first = store.read("demo", file.key).unwrap();
+    assert!(matches!(
+        store.read("demo", tree.key),
+        Err(Error::Limit("packed read memory"))
+    ));
+    let mut contents = Vec::new();
+    first.read_to_end(&mut contents).unwrap();
+    assert_eq!(contents, b"native source\n");
+    drop(first);
+    assert!(store.read("demo", tree.key).is_ok());
+    let mut actual = Vec::new();
+    store
+        .read("demo", large.key)
+        .unwrap()
+        .read_to_end(&mut actual)
+        .unwrap();
+    assert_eq!(actual, large_bytes);
+}
+
+fn related_packed_files(store: &Store) -> (Descriptor, Vec<u8>, Descriptor, PackReport) {
+    let mut seed = 0x13579bdfu32;
+    let bytes: Vec<u8> = (0..4096)
+        .map(|_| {
+            seed ^= seed << 13;
+            seed ^= seed >> 17;
+            seed ^= seed << 5;
+            seed as u8
+        })
+        .collect();
+    let mut anchor = bytes.clone();
+    anchor.push(3);
+    let target = tinytree_model::describe_file(&bytes);
+    let base = tinytree_model::describe_file(&anchor);
+    store.put("demo", target, &bytes, 0).unwrap();
+    store.put("demo", base, &anchor, 0).unwrap();
+    let report = store.pack("demo", PackOptions::default()).unwrap();
+    assert_eq!(report.packed_objects, 2);
+    assert_eq!(
+        report.delta_entries, 1,
+        "related revisions should exercise an actual dictionary dependency"
+    );
+    (target, bytes, base, report)
+}
+
+#[test]
+fn packed_gc_preserves_a_live_delta_after_its_logical_anchor_is_deleted() {
+    let (_directory, store) = open();
+    let (target, bytes, base, report) = related_packed_files(&store);
+    let pack_path = store
+        .inner
+        .root
+        .join("repos/demo/packs")
+        .join(format!("{}.pack", hex(&report.pack_id.unwrap())));
+    let mut lease = store.read("demo", target.key).unwrap();
+    let collected = store.gc("demo", 100).unwrap();
+    assert_eq!(collected.deleted_objects, 1);
+    assert_eq!(store.descriptor("demo", base.key).unwrap(), None);
+    assert!(
+        pack_path.exists(),
+        "physical anchor remains while another member needs it"
+    );
+    let mut contents = Vec::new();
+    lease.read_to_end(&mut contents).unwrap();
+    assert_eq!(contents, bytes);
+    drop(lease);
+    let mut reread = Vec::new();
+    store
+        .read("demo", target.key)
+        .unwrap()
+        .read_to_end(&mut reread)
+        .unwrap();
+    assert_eq!(reread, bytes);
+    assert_eq!(store.gc("demo", 100).unwrap().deleted_objects, 1);
+    assert!(!pack_path.exists());
+    assert!(matches!(
+        store.read("demo", target.key),
+        Err(Error::MissingObject(_))
+    ));
+}
+
+#[test]
+fn packed_client_gc_reclaims_only_after_the_last_retained_member() {
+    let (_directory, store) = open();
+    let (target, bytes, base, report) = related_packed_files(&store);
+    let pack_path = store
+        .inner
+        .root
+        .join("repos/demo/packs")
+        .join(format!("{}.pack", hex(&report.pack_id.unwrap())));
+    let mut request = client_collection(&store, 100);
+    request.complete_roots = vec![target.key];
+    assert_eq!(
+        store.client_gc("demo", &request).unwrap().deleted_objects,
+        1
+    );
+    assert_eq!(store.descriptor("demo", base.key).unwrap(), None);
+    let mut contents = Vec::new();
+    store
+        .read("demo", target.key)
+        .unwrap()
+        .read_to_end(&mut contents)
+        .unwrap();
+    assert_eq!(contents, bytes);
+    assert!(pack_path.exists());
+    let request = client_collection(&store, 100);
+    assert_eq!(
+        store.client_gc("demo", &request).unwrap().deleted_objects,
+        1
+    );
+    assert!(!pack_path.exists());
+}
+
+#[test]
+fn corrupt_packs_and_inconsistent_feature_metadata_fail_closed() {
+    let (directory, store) = open();
+    let (target, _, _, report) = related_packed_files(&store);
+    let path = store
+        .inner
+        .root
+        .join("repos/demo/packs")
+        .join(format!("{}.pack", hex(&report.pack_id.unwrap())));
+    let original = fs::read(&path).unwrap();
+    let mut corrupt = original.clone();
+    corrupt[8] ^= 1;
+    fs::write(&path, &corrupt).unwrap();
+    assert!(store.read("demo", target.key).is_err());
+    fs::write(&path, &original[..original.len() - 1]).unwrap();
+    assert!(store.descriptor("demo", target.key).is_err());
+    fs::write(&path, &original).unwrap();
+    assert_eq!(
+        store
+            .inner
+            .db
+            .read_tx()
+            .get(&store.inner.spaces.meta, b"format")
+            .unwrap()
+            .as_deref(),
+        Some(b"tinytree-store-2".as_slice())
+    );
+    let mut tx = store
+        .inner
+        .db
+        .write_tx()
+        .durability(Some(PersistMode::SyncAll));
+    tx.insert(&store.inner.spaces.meta, b"format", b"tinytree-store-1");
+    store.inner.commit(tx).unwrap();
+    drop(store);
+    assert!(
+        Store::open_existing(directory.path(), config()).is_err(),
+        "packed locations cannot masquerade as an old loose-only store"
+    );
+}
+
+#[test]
+fn identical_cross_kind_packs_preserve_all_logical_members_across_gc_and_reopen() {
+    let (directory, store) = open();
+    let encoded: Vec<_> = ["first-target", "other-target"]
+        .into_iter()
+        .map(|target| {
+            tinytree_model::encode(&Object::Symlink(target.into()), Limits::default()).unwrap()
+        })
+        .collect();
+    let files: Vec<_> = encoded
+        .iter()
+        .map(|object| {
+            let descriptor = tinytree_model::describe_file(&object.bytes);
+            store.put("demo", descriptor, &object.bytes, 0).unwrap();
+            descriptor
+        })
+        .collect();
+    let first = store.pack("demo", PackOptions::default()).unwrap();
+    assert_eq!(first.packed_objects, 2);
+    for object in &encoded {
+        store
+            .put("demo", object.descriptor, &object.bytes, 0)
+            .unwrap();
+    }
+    let second = store.pack("demo", PackOptions::default()).unwrap();
+    assert_eq!(second.packed_objects, 2);
+    assert_eq!(
+        first.pack_id, second.pack_id,
+        "identical physical bytes deduplicate"
+    );
+    let pack_path = store
+        .inner
+        .root
+        .join("repos/demo/packs")
+        .join(format!("{}.pack", hex(&first.pack_id.unwrap())));
+    let mut request = client_collection(&store, 100);
+    request.complete_roots = encoded.iter().map(|object| object.descriptor.key).collect();
+    assert_eq!(
+        store.client_gc("demo", &request).unwrap().deleted_objects,
+        2
+    );
+    for file in files {
+        assert_eq!(store.descriptor("demo", file.key).unwrap(), None);
+    }
+    assert!(pack_path.exists());
+    drop(store);
+    let store = Store::open(directory.path(), config()).unwrap();
+    for object in &encoded {
+        let mut bytes = Vec::new();
+        store
+            .read("demo", object.descriptor.key)
+            .unwrap()
+            .read_to_end(&mut bytes)
+            .unwrap();
+        assert_eq!(bytes, object.bytes);
+    }
+    assert_eq!(
+        store
+            .client_gc("demo", &client_collection(&store, 100))
+            .unwrap()
+            .deleted_objects,
+        2
+    );
+    assert!(!pack_path.exists());
+}
+
+#[test]
+fn bounded_pack_scan_advances_across_empty_pages_and_survives_reopen() {
+    let (directory, mut store) = open();
+    let large_bytes = vec![b'x'; 65 * 1024];
+    let large = tinytree_model::describe_file(&large_bytes);
+    store.put("demo", large, &large_bytes, 0).unwrap();
+    let objects: Vec<_> = ["target-a", "target-b"]
+        .into_iter()
+        .map(|target| put_object(&store, Object::Symlink(target.into()), 0))
+        .collect();
+    let options = PackOptions {
+        max_scan_objects: 1,
+        ..PackOptions::default()
+    };
+    let first = store.pack("demo", options.clone()).unwrap();
+    assert_eq!(first.scanned_objects, 1);
+    assert_eq!(
+        first.packed_objects, 0,
+        "oversized file is an empty eligibility page"
+    );
+    assert!(!first.scan_complete);
+    drop(store);
+    store = Store::open(directory.path(), config()).unwrap();
+    let mut packed = 0;
+    let mut complete = false;
+    for _ in 0..8 {
+        let report = store.pack("demo", options.clone()).unwrap();
+        assert!(report.scanned_objects <= 1);
+        packed += report.packed_objects;
+        if report.scan_complete {
+            complete = true;
+            break;
+        }
+    }
+    assert!(complete, "bounded maintenance eventually completes a sweep");
+    assert_eq!(packed, 2, "singleton eligible pages cannot starve");
+    for object in objects {
+        let mut bytes = Vec::new();
+        store
+            .read("demo", object.key)
+            .unwrap()
+            .read_to_end(&mut bytes)
+            .unwrap();
+        assert!(!bytes.is_empty());
+    }
+    let mut complete = false;
+    for _ in 0..8 {
+        let report = store.pack("demo", options.clone()).unwrap();
+        assert_eq!(report.packed_objects, 0);
+        if report.scan_complete {
+            complete = true;
+            break;
+        }
+    }
+    assert!(complete, "already-packed pages also advance to the end");
+}
+
+#[test]
+fn pack_capacity_continues_without_skipping_eligible_members() {
+    let (_directory, store) = open();
+    let objects: Vec<_> = [b'a', b'b', b'c']
+        .into_iter()
+        .map(|byte| {
+            let bytes = vec![byte; 600];
+            let descriptor = tinytree_model::describe_file(&bytes);
+            store.put("demo", descriptor, &bytes, 0).unwrap();
+            descriptor
+        })
+        .collect();
+    let options = PackOptions {
+        max_pack_bytes: 1024,
+        ..PackOptions::default()
+    };
+    let mut packed = 0;
+    let mut complete = false;
+    for _ in 0..8 {
+        let report = store.pack("demo", options.clone()).unwrap();
+        assert!(
+            report.packed_objects <= 1,
+            "raw budget fits only one member"
+        );
+        packed += report.packed_objects;
+        if report.scan_complete {
+            complete = true;
+            break;
+        }
+    }
+    assert!(complete);
+    assert_eq!(packed, objects.len() as u64);
+    for object in objects {
+        assert!(!store.inner.path("demo", object.key).exists());
+        let mut contents = Vec::new();
+        store
+            .read("demo", object.key)
+            .unwrap()
+            .read_to_end(&mut contents)
+            .unwrap();
+        assert_eq!(contents.len(), 600);
+    }
+}

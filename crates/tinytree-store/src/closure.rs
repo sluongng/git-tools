@@ -111,7 +111,7 @@ impl Inner {
             // length, while reads/publication verify bytes outside the gate.
             if key.kind == Kind::File {
                 if verify_file_bytes {
-                    let mut file = File::open(self.path(repo, key))?;
+                    let mut file = self.open_backing(repo, descriptor)?;
                     verify_stream(&mut file, descriptor, self.config.model_limits)?;
                 }
                 continue;
@@ -212,7 +212,7 @@ impl Inner {
         if descriptor.key.kind == Kind::File {
             return Err(Error::Invalid("file is not metadata"));
         }
-        let mut file = File::open(self.path(repo, descriptor.key))?;
+        let mut file = self.open_backing(repo, descriptor)?;
         verify_stream(&mut file, descriptor, self.config.model_limits)?;
         file.seek(SeekFrom::Start(0))?;
         let mut bytes = Vec::new();

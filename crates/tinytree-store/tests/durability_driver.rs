@@ -112,6 +112,20 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             checkpoint("DURABLE_ACK")?;
             wait_for_kill()
         }
+        "after-pack" => {
+            let report = store.pack(common::REPOSITORY, tinytree_store::PackOptions::default())?;
+            let expected_members = initial.metadata.len() as u64 + 1;
+            if report.pack_id.is_none()
+                || report.packed_objects != expected_members
+                || report.removed_loose_files != expected_members
+            {
+                return Err("acknowledged pack must replace every fixture payload".into());
+            }
+            // The pack and catalog publication have returned successfully, but
+            // this owning process stays alive until the parent terminates it.
+            checkpoint("PACK_DURABLE_ACK")?;
+            wait_for_kill()
+        }
         "mid-upload" => {
             let descriptor = tinytree_model::describe_file(common::UNACKNOWLEDGED_BYTES);
             store.put_stream(

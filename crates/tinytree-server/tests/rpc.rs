@@ -333,9 +333,97 @@ async fn compressed_native_upload_publication_fetch_and_restart() {
     drop(stream);
     drop(client);
     server.stop().await;
-    let reopened = Store::open(temporary.path(), Default::default()).unwrap();
+    // Maintenance runs while the service is stopped. Reopen once more after
+    // packing so ordinary RPCs exercise durable packed locations, not a live
+    // writer's in-memory state. Logical descriptors and wire messages stay equal.
+    let reopened = Store::open_existing(temporary.path(), Default::default()).unwrap();
+    let packed = reopened
+        .pack("alpha", tinytree_store::PackOptions::default())
+        .unwrap();
+    let intrinsic_tree = tinytree_model::empty_tree().descriptor.key;
+    let expected_members = fixture
+        .objects()
+        .iter()
+        .filter(|object| object.descriptor.key != intrinsic_tree)
+        .count() as u64;
+    assert_eq!(packed.packed_objects, expected_members);
+    assert_eq!(packed.removed_loose_files, expected_members);
+    assert!(packed.pack_id.is_some());
+    drop(reopened);
+    let reopened = Store::open_existing(temporary.path(), Default::default()).unwrap();
     let server = Running::start(reopened, ServiceConfig::default()).await;
     let mut client = server.client().await;
+    let tree = fixture
+        .objects()
+        .iter()
+        .find(|object| {
+            object.descriptor.key.kind == Kind::Tree && object.descriptor.key != intrinsic_tree
+        })
+        .unwrap();
+    let commit = fixture
+        .objects()
+        .iter()
+        .find(|object| object.descriptor.key == root(&fixture))
+        .unwrap();
+    let metadata = [commit, tree];
+    let mut packed_metadata = client
+        .batch_read_objects(request(
+            p::BatchReadObjectsRequest {
+                repository_id: "alpha".into(),
+                keys: metadata
+                    .iter()
+                    .map(|object| wire_key(object.descriptor.key))
+                    .collect(),
+            },
+            READER,
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+    let mut seen = [false; 2];
+    while let Some(result) = packed_metadata.message().await.unwrap() {
+        let index = result.request_index as usize;
+        assert!(index < metadata.len() && !seen[index]);
+        seen[index] = true;
+        let Some(p::object_result::Result::Object(object)) = result.result else {
+            panic!("packed metadata must remain available through ordinary RPCs")
+        };
+        assert_eq!(result.key, Some(wire_key(metadata[index].descriptor.key)));
+        assert_eq!(
+            object.descriptor,
+            Some(descriptor(metadata[index].descriptor))
+        );
+        assert_eq!(object.canonical_envelope, metadata[index].bytes);
+    }
+    assert!(seen.iter().all(|seen| *seen));
+    drop(packed_metadata);
+    let mut packed_file = client
+        .read_file(request(
+            p::ReadFileRequest {
+                repository_id: "alpha".into(),
+                native_file_id: file.descriptor.key.id.0.to_vec(),
+            },
+            READER,
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+    let Some(p::file_frame::Frame::Header(header)) =
+        packed_file.message().await.unwrap().unwrap().frame
+    else {
+        panic!("packed file must start with its unchanged descriptor")
+    };
+    assert_eq!(header, descriptor(file.descriptor));
+    let mut packed_bytes = Vec::new();
+    while let Some(frame) = packed_file.message().await.unwrap() {
+        let Some(p::file_frame::Frame::Chunk(chunk)) = frame.frame else {
+            panic!("packed file repeated its header")
+        };
+        assert_eq!(chunk.offset, packed_bytes.len() as u64);
+        packed_bytes.extend(chunk.data);
+    }
+    assert_eq!(packed_bytes, file.bytes);
+    drop(packed_file);
     let receipt = client
         .get_publication(request(
             p::GetPublicationRequest {

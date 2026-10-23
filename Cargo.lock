@@ -3931,6 +3931,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "packblob"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "blake3",
+ "tempfile",
+ "zstd 0.13.3",
+]
+
+[[package]]
 name = "page_size"
 version = "0.6.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5614,10 +5624,12 @@ dependencies = [
  "fjall",
  "fs2",
  "libc",
+ "packblob",
  "serde",
  "serde_json",
  "tempfile",
  "tinytree-model",
+ "zstd 0.13.3",
 ]
 
 [[package]]

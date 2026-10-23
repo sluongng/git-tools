@@ -169,14 +169,35 @@ fn verify_initial(store: &Store) {
 
 #[test]
 fn acknowledged_native_publication_survives_abrupt_process_termination() {
-    let directory = tempfile::tempdir().unwrap();
-    let root = directory.path().join("store");
-    let mut driver = Driver::start(&root, "after-ack");
-    driver.checkpoint("BASELINE_DURABLE");
-    driver.checkpoint("DURABLE_ACK");
-    driver.kill_and_reap();
-    let store = Store::open_existing(&root, Config::default()).unwrap();
-    verify_initial(&store);
+    // Cover both acknowledged logical publication and the same repository
+    // after its loose payloads have been replaced by a durable physical pack.
+    struct Case {
+        name: &'static str,
+        mode: &'static str,
+        acknowledgement: &'static str,
+    }
+    for case in [
+        Case {
+            name: "loose published objects",
+            mode: "after-ack",
+            acknowledgement: "DURABLE_ACK",
+        },
+        Case {
+            name: "packed published objects",
+            mode: "after-pack",
+            acknowledgement: "PACK_DURABLE_ACK",
+        },
+    ] {
+        eprintln!("checking acknowledged crash recovery: {}", case.name);
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("store");
+        let mut driver = Driver::start(&root, case.mode);
+        driver.checkpoint("BASELINE_DURABLE");
+        driver.checkpoint(case.acknowledgement);
+        driver.kill_and_reap();
+        let store = Store::open_existing(&root, Config::default()).unwrap();
+        verify_initial(&store);
+    }
 }
 
 #[test]

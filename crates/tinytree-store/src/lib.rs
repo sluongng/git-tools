@@ -18,7 +18,7 @@ use std::fmt;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, Weak};
 use tempfile::NamedTempFile;
 use tinytree_model::{CommitId, Descriptor, Kind, Limits, ObjectId, ObjectKey};
@@ -26,7 +26,9 @@ use tinytree_model::{CommitId, Descriptor, Kind, Limits, ObjectId, ObjectKey};
 mod client_gc;
 mod closure;
 pub use client_gc::{ClientGcEpoch, ClientGcLimits, ClientGcReport, ClientGcRequest};
+mod pack;
 mod retention;
+pub use pack::{PackOptions, PackReport};
 
 pub use retention::{
     RetentionLimits, RetentionOwner, parse_retention_reference, retention_reference,
@@ -97,6 +99,8 @@ pub struct Config {
     pub staging_ttl_seconds: i64,
     pub max_retention_validation_records: usize,
     pub max_retention_validation_bytes: u64,
+    /// Independent upper bound for simultaneous packed-object reconstruction.
+    pub max_packed_read_memory_bytes: u64,
 }
 impl Default for Config {
     fn default() -> Self {
@@ -114,6 +118,7 @@ impl Default for Config {
             staging_ttl_seconds: 3600,
             max_retention_validation_records: 2_000_000,
             max_retention_validation_bytes: 1024 * 1024 * 1024,
+            max_packed_read_memory_bytes: 16 * 1024 * 1024,
         }
     }
 }
@@ -161,6 +166,7 @@ struct Inner {
     spaces: Spaces,
     gate: Mutex<Runtime>,
     uncertain_commit: AtomicBool,
+    packed_read_bytes: Arc<AtomicU64>,
     _owner: File,
 }
 struct Spaces {
@@ -173,6 +179,8 @@ struct Spaces {
     client_ages: SingleWriterTxKeyspace,
     client_revisions: SingleWriterTxKeyspace,
     client_deletions: SingleWriterTxKeyspace,
+    locations: SingleWriterTxKeyspace,
+    packs: SingleWriterTxKeyspace,
 }
 #[derive(Default)]
 struct Runtime {
@@ -477,6 +485,7 @@ impl Store {
             || config.max_staging_uploads == 0
             || !(1..=10_000_000).contains(&config.max_retention_validation_records)
             || config.max_retention_validation_bytes == 0
+            || config.max_packed_read_memory_bytes < pack::PACK_READ_CHARGE
             || config.max_repository_bytes < tinytree_model::empty_tree().descriptor.size_bytes
             || config.max_objects_per_repository == 0
         {
@@ -525,6 +534,15 @@ impl Store {
                 }
             }
         }
+        if !planned.fresh {
+            let meta = db.keyspace("meta", KeyspaceCreateOptions::default)?;
+            if db.read_tx().get(&meta, b"format")?.as_deref()
+                == Some(b"tinytree-store-2".as_slice())
+                && (!db.keyspace_exists("pack-locations-v1") || !db.keyspace_exists("packs-v1"))
+            {
+                return Err(Error::Corrupt("packed store keyspace missing"));
+            }
+        }
         let spaces = Spaces {
             meta: db.keyspace("meta", KeyspaceCreateOptions::default)?,
             repos: db.keyspace("repos", KeyspaceCreateOptions::default)?,
@@ -535,10 +553,12 @@ impl Store {
             client_ages: db.keyspace("client-ages", KeyspaceCreateOptions::default)?,
             client_revisions: db.keyspace("client-revisions", KeyspaceCreateOptions::default)?,
             client_deletions: db.keyspace("client-deletions", KeyspaceCreateOptions::default)?,
+            locations: db.keyspace("pack-locations-v1", KeyspaceCreateOptions::default)?,
+            packs: db.keyspace("packs-v1", KeyspaceCreateOptions::default)?,
         };
         let mut tx = db.write_tx().durability(Some(PersistMode::SyncAll));
         match tx.get(&spaces.meta, b"format")? {
-            Some(value) if &*value == b"tinytree-store-1" => {}
+            Some(value) if &*value == b"tinytree-store-1" || &*value == b"tinytree-store-2" => {}
             Some(_) => return Err(Error::Corrupt("store format")),
             None if planned.fresh => {
                 tx.insert(&spaces.meta, b"format", b"tinytree-store-1");
@@ -566,11 +586,13 @@ impl Store {
                 spaces,
                 gate: Mutex::new(Runtime::default()),
                 uncertain_commit: AtomicBool::new(false),
+                packed_read_bytes: Arc::new(AtomicU64::new(0)),
                 _owner: owner,
             }),
         };
         if !planned.fresh {
             store.inner.validate_retention_on_reopen()?;
+            store.inner.validate_packs_on_reopen()?;
         }
         Ok(store)
     }
@@ -591,6 +613,7 @@ impl Store {
             return Ok(());
         }
         let directory = self.inner.root.join("repos").join(repo);
+        self.inner.reclaim_empty_packs(repo)?;
         for kind in [
             Kind::File,
             Kind::Tree,
@@ -717,7 +740,7 @@ impl Store {
             .inner
             .descriptor(repo, object)?
             .ok_or(Error::MissingObject(object))?;
-        let file = File::open(self.inner.path(repo, object))?;
+        let file = self.inner.open_backing(repo, descriptor)?;
         *gate.readers.entry((repo.to_owned(), object)).or_default() += 1;
         drop(gate);
         let mut lease = ReadLease {
@@ -902,6 +925,22 @@ impl Store {
         let mut gate = self.inner.lock()?;
         self.inner.repository(repo)?;
         let path = self.inner.path(repo, descriptor.key);
+        if self.inner.is_packed(repo, descriptor.key)? {
+            let file = self.inner.open_backing(repo, descriptor)?;
+            *gate
+                .readers
+                .entry((repo.to_owned(), descriptor.key))
+                .or_default() += 1;
+            drop(gate);
+            let mut lease = ReadLease {
+                file,
+                descriptor,
+                repo: repo.to_owned(),
+                inner: self.inner.clone(),
+            };
+            verify_stream(&mut lease.file, descriptor, self.inner.config.model_limits)?;
+            return Ok(Some(lease));
+        }
         let metadata = match fs::symlink_metadata(&path) {
             Ok(m) => m,
             Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
@@ -910,7 +949,7 @@ impl Store {
         if !metadata.is_file() || metadata.len() != descriptor.size_bytes {
             return Err(Error::Corrupt("existing object payload"));
         }
-        let file = File::open(path)?;
+        let file = pack::Backing::Loose(File::open(path)?);
         *gate
             .readers
             .entry((repo.to_owned(), descriptor.key))
@@ -1167,7 +1206,8 @@ impl Store {
             .db
             .write_tx()
             .durability(Some(PersistMode::SyncAll));
-        for (k, _) in &victims {
+        for (k, d) in &victims {
+            self.inner.remove_location(&mut tx, repo, d.key)?;
             tx.remove(&self.inner.spaces.objects, k.as_ref());
             tx.remove(&self.inner.spaces.client_ages, k.as_ref());
         }
@@ -1186,6 +1226,7 @@ impl Store {
                 Err(e) => return Err(e.into()),
             }
         }
+        self.inner.reclaim_empty_packs(repo)?;
         for kind in [
             Kind::File,
             Kind::Tree,
@@ -1251,14 +1292,8 @@ impl Inner {
         if d.key != object {
             return Err(Error::Corrupt("object descriptor key"));
         }
-        match fs::symlink_metadata(self.path(repo, object)) {
-            Ok(m) if m.is_file() && m.len() == d.size_bytes => Ok(Some(d)),
-            Ok(_) => Err(Error::Corrupt("object payload type or size")),
-            Err(e) if e.kind() == io::ErrorKind::NotFound => {
-                Err(Error::Corrupt("indexed payload missing"))
-            }
-            Err(e) => Err(e.into()),
-        }
+        self.check_backing(repo, d)?;
+        Ok(Some(d))
     }
     fn require_descriptor(&self, repo: &str, expected: Descriptor) -> Result<()> {
         if self.descriptor(repo, expected.key)? != Some(expected) {
@@ -1380,7 +1415,11 @@ impl Inner {
     }
 }
 
-fn verify_stream(file: &mut File, descriptor: Descriptor, limits: Limits) -> Result<()> {
+fn verify_stream(
+    file: &mut (impl Read + Seek),
+    descriptor: Descriptor,
+    limits: Limits,
+) -> Result<()> {
     file.seek(SeekFrom::Start(0))?;
     let mut hash = blake3::Hasher::new();
     let mut size = 0u64;
@@ -1471,7 +1510,7 @@ fn fingerprint(request: &PublishRequest) -> [u8; 32] {
 }
 
 pub struct ReadLease {
-    file: File,
+    file: pack::Backing,
     descriptor: Descriptor,
     repo: String,
     inner: Arc<Inner>,
