@@ -4,6 +4,7 @@
 
 use futures::StreamExt;
 use p::repository_server::{Repository, RepositoryServer};
+use q::repository_query_server::{RepositoryQuery, RepositoryQueryServer};
 use std::{
     collections::{BTreeMap, HashSet},
     fs,
@@ -19,7 +20,7 @@ use std::{
     task::{Context, Poll},
     time::{Duration, Instant},
 };
-use tinytree_client::protocol as p;
+use tinytree_client::{protocol as p, query_protocol as q};
 use tinytree_model as m;
 use tonic::{
     Request as RpcRequest, Response as RpcResponse, Status, Streaming, codec::CompressionEncoding,
@@ -365,10 +366,12 @@ impl Fixture {
     fn stop_daemon(&mut self) {
         self.control(Request::Shutdown).unwrap();
         let deadline = Instant::now() + Duration::from_secs(15);
-        let mut child = self.daemon.take().unwrap();
         loop {
-            if let Some(status) = child.try_wait().unwrap() {
+            // Keep the owned child in the fixture on errors/timeouts so Drop
+            // cannot mistake a still-running writer for a completed shutdown.
+            if let Some(status) = self.daemon.as_mut().unwrap().try_wait().unwrap() {
                 assert!(status.success());
+                self.daemon.take();
                 return;
             }
             assert!(Instant::now() < deadline, "daemon shutdown timed out");
@@ -581,6 +584,7 @@ const REMOTE_TOKEN: &str = "public-mounted-native-token-not-a-secret";
 struct CountFileReads<S> {
     inner: S,
     reads: Arc<AtomicUsize>,
+    metadata: Arc<MetadataReads>,
 }
 impl<S, B> tower::Service<http::Request<B>> for CountFileReads<S>
 where
@@ -598,6 +602,13 @@ where
         if request.uri().path() == "/tinytree.v1.Repository/ReadFile" {
             self.reads.fetch_add(1, Ordering::SeqCst);
         }
+        if request
+            .uri()
+            .path()
+            .starts_with("/tinytree.query.v1.RepositoryQuery/")
+        {
+            self.metadata.query_calls.fetch_add(1, Ordering::SeqCst);
+        }
         self.inner.call(request)
     }
 }
@@ -607,6 +618,13 @@ struct MetadataReads {
     keys: Mutex<HashSet<(i32, [u8; 32])>>,
     calls: AtomicUsize,
     canonical_bytes: AtomicUsize,
+    commit_bytes: AtomicUsize,
+    tree_bytes: AtomicUsize,
+    other_bytes: AtomicUsize,
+    graph_calls: AtomicUsize,
+    graph_commit_bytes: AtomicUsize,
+    query_calls: AtomicUsize,
+    query_commit_bytes: AtomicUsize,
 }
 
 /// Observe decoded metadata without replacing any repository implementation.
@@ -629,7 +647,18 @@ impl Repository for CountMetadata {
         &self,
         request: RpcRequest<p::GetCommitGraphRequest>,
     ) -> Result<RpcResponse<p::CommitGraphPage>, Status> {
-        self.inner.get_commit_graph(request).await
+        self.reads.graph_calls.fetch_add(1, Ordering::SeqCst);
+        let response = self.inner.get_commit_graph(request).await?;
+        self.reads.graph_commit_bytes.fetch_add(
+            response
+                .get_ref()
+                .entries
+                .iter()
+                .map(|entry| entry.canonical_envelope.len())
+                .sum::<usize>(),
+            Ordering::SeqCst,
+        );
+        Ok(response)
     }
 
     type BatchReadObjectsStream =
@@ -662,6 +691,28 @@ impl Repository for CountMetadata {
                 reads
                     .canonical_bytes
                     .fetch_add(object.canonical_envelope.len(), Ordering::SeqCst);
+                match object
+                    .descriptor
+                    .as_ref()
+                    .and_then(|descriptor| descriptor.key.as_ref())
+                    .map(|key| key.kind)
+                {
+                    Some(kind) if kind == p::ObjectKind::Commit as i32 => {
+                        reads
+                            .commit_bytes
+                            .fetch_add(object.canonical_envelope.len(), Ordering::SeqCst);
+                    }
+                    Some(kind) if kind == p::ObjectKind::Tree as i32 => {
+                        reads
+                            .tree_bytes
+                            .fetch_add(object.canonical_envelope.len(), Ordering::SeqCst);
+                    }
+                    _ => {
+                        reads
+                            .other_bytes
+                            .fetch_add(object.canonical_envelope.len(), Ordering::SeqCst);
+                    }
+                }
             }
             result
         });
@@ -706,6 +757,82 @@ impl Repository for CountMetadata {
     }
 }
 
+/// Observe query payloads after the actual authenticated query implementation;
+/// preserve its response extensions, admission and transport policy.
+#[derive(Clone)]
+struct CountQueryMetadata {
+    inner: tinytree_server::QueryService,
+    reads: Arc<MetadataReads>,
+}
+#[tonic::async_trait]
+impl RepositoryQuery for CountQueryMetadata {
+    async fn open_scope(
+        &self,
+        r: RpcRequest<Streaming<q::OpenScopeFrame>>,
+    ) -> Result<RpcResponse<q::QueryScope>, Status> {
+        self.inner.open_scope(r).await
+    }
+    async fn fork_scope(
+        &self,
+        r: RpcRequest<Streaming<q::ForkScopeFrame>>,
+    ) -> Result<RpcResponse<q::QueryScope>, Status> {
+        self.inner.fork_scope(r).await
+    }
+    async fn close_scope(
+        &self,
+        r: RpcRequest<q::CloseScopeRequest>,
+    ) -> Result<RpcResponse<q::CloseScopeResponse>, Status> {
+        self.inner.close_scope(r).await
+    }
+    async fn query_facts(
+        &self,
+        r: RpcRequest<q::QueryFactsRequest>,
+    ) -> Result<RpcResponse<q::GraphFacts>, Status> {
+        self.inner.query_facts(r).await
+    }
+    async fn resolve_commit_prefix(
+        &self,
+        r: RpcRequest<q::ResolveCommitPrefixRequest>,
+    ) -> Result<RpcResponse<q::CommitPrefixResult>, Status> {
+        self.inner.resolve_commit_prefix(r).await
+    }
+    async fn resolve_change_prefix(
+        &self,
+        r: RpcRequest<q::ResolveChangePrefixRequest>,
+    ) -> Result<RpcResponse<q::ChangePrefixResult>, Status> {
+        self.inner.resolve_change_prefix(r).await
+    }
+    async fn shortest_prefix(
+        &self,
+        r: RpcRequest<q::ShortestPrefixRequest>,
+    ) -> Result<RpcResponse<q::ShortestPrefixResult>, Status> {
+        self.inner.shortest_prefix(r).await
+    }
+    async fn close_query(
+        &self,
+        r: RpcRequest<q::CloseQueryRequest>,
+    ) -> Result<RpcResponse<q::CloseQueryResponse>, Status> {
+        self.inner.close_query(r).await
+    }
+    async fn evaluate(
+        &self,
+        r: RpcRequest<q::EvaluateRequest>,
+    ) -> Result<RpcResponse<q::EvaluatePage>, Status> {
+        let response = self.inner.evaluate(r).await?;
+        let bytes = response
+            .get_ref()
+            .rows
+            .iter()
+            .filter_map(|row| row.canonical.as_ref())
+            .map(|object| object.canonical_envelope.len())
+            .sum::<usize>();
+        self.reads
+            .query_commit_bytes
+            .fetch_add(bytes, Ordering::SeqCst);
+        Ok(response)
+    }
+}
+
 struct RemoteServer {
     _directory: tempfile::TempDir,
     runtime: Option<tokio::runtime::Runtime>,
@@ -720,10 +847,17 @@ struct RemoteServer {
     source_bytes: Vec<u8>,
     reads: Arc<AtomicUsize>,
     metadata: Arc<MetadataReads>,
+    setup_ns: u128,
+    index_ready_ns: u128,
 }
 
 impl RemoteServer {
     fn start() -> Self {
+        Self::start_with_history(8)
+    }
+    fn start_with_history(history: usize) -> Self {
+        assert!((1..=1024).contains(&history));
+        let setup_started = Instant::now();
         let directory = tempfile::tempdir().unwrap();
         let store = tinytree_store::Store::open(directory.path().join("store"), Default::default())
             .unwrap();
@@ -764,10 +898,11 @@ impl RemoteServer {
             .unwrap()
             .value
             .clone();
+        let mut index_commits = vec![(root_commit.descriptor, root_commit.bytes.clone())];
         let mut parent = m::CommitId::ROOT;
         let mut historical_head = None;
         let mut historical_trees = Vec::new();
-        for number in 0..8 {
+        for number in 0..history {
             let mut tree = current_tree.clone();
             tree.entries.push(m::TreeEntry {
                 name: format!("history-{number:02}.cc"),
@@ -794,6 +929,7 @@ impl RemoteServer {
             store
                 .put("example", commit.descriptor, &commit.bytes, 0)
                 .unwrap();
+            index_commits.push((commit.descriptor, commit.bytes.clone()));
             parent = m::CommitId(commit.descriptor.key.id.0);
             historical_head
                 .get_or_insert_with(|| blake3::Hash::from(parent.0).to_hex().to_string());
@@ -804,6 +940,7 @@ impl RemoteServer {
         store
             .put("example", current.descriptor, &current.bytes, 0)
             .unwrap();
+        index_commits.push((current.descriptor, current.bytes.clone()));
         let head_id = m::CommitId(current.descriptor.key.id.0);
         let head = blake3::Hash::from(head_id.0).to_hex().to_string();
         store
@@ -836,6 +973,15 @@ impl RemoteServer {
             .unwrap()
             .bytes
             .clone();
+        let setup_ns = setup_started.elapsed().as_nanos();
+        let indexing_started = Instant::now();
+        let index =
+            tinytree_index::Index::open(directory.path().join("index"), &Default::default())
+                .unwrap();
+        for (descriptor, bytes) in index_commits {
+            index.ingest("example", descriptor, &bytes).unwrap();
+        }
+        let index_ready_ns = indexing_started.elapsed().as_nanos();
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(4)
             .enable_all()
@@ -846,22 +992,27 @@ impl RemoteServer {
             .max_request_bytes
             .max(configuration.max_frame_bytes + 1024);
         let response_bytes = configuration.max_metadata_bytes + 4096;
-        let service = tinytree_server::RepositoryService::new(
-            store.clone(),
-            configuration,
-            vec!["example".into()],
-            vec![
-                tinytree_server::Principal::new(
-                    "mounted-writer",
-                    REMOTE_TOKEN,
-                    vec!["example".into()],
-                    true,
-                )
-                .unwrap()
-                .with_retention(true),
-            ],
-        )
-        .unwrap();
+        let query_response_bytes = configuration.query.max_response_bytes;
+        let service = runtime.block_on(async {
+            tinytree_server::RepositoryService::new(
+                store.clone(),
+                configuration,
+                vec!["example".into()],
+                vec![
+                    tinytree_server::Principal::new(
+                        "mounted-writer",
+                        REMOTE_TOKEN,
+                        vec!["example".into()],
+                        true,
+                    )
+                    .unwrap()
+                    .with_retention(true),
+                ],
+            )
+            .unwrap()
+            .with_query_index(index)
+            .unwrap()
+        });
         let reads = Arc::new(AtomicUsize::new(0));
         let counter = reads.clone();
         let metadata = Arc::new(MetadataReads::default());
@@ -869,6 +1020,11 @@ impl RemoteServer {
             inner: service.clone(),
             reads: metadata.clone(),
         };
+        let query = CountQueryMetadata {
+            inner: service.query_service(),
+            reads: metadata.clone(),
+        };
+        let query_counter = metadata.clone();
         let (stop, stopped) = tokio::sync::oneshot::channel();
         let (endpoint, task) = runtime.block_on(async move {
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -879,6 +1035,7 @@ impl RemoteServer {
                     .layer(tower::layer::layer_fn(move |inner| CountFileReads {
                         inner,
                         reads: counter.clone(),
+                        metadata: query_counter.clone(),
                     }))
                     .concurrency_limit_per_connection(service.maximum_inflight())
                     .add_service(
@@ -887,6 +1044,13 @@ impl RemoteServer {
                             .send_compressed(CompressionEncoding::Zstd)
                             .max_decoding_message_size(request_bytes)
                             .max_encoding_message_size(response_bytes),
+                    )
+                    .add_service(
+                        RepositoryQueryServer::new(query)
+                            .accept_compressed(CompressionEncoding::Zstd)
+                            .send_compressed(CompressionEncoding::Zstd)
+                            .max_decoding_message_size(request_bytes)
+                            .max_encoding_message_size(query_response_bytes),
                     )
                     .serve_with_incoming_shutdown(
                         tokio_stream::wrappers::TcpListenerStream::new(listener).map(|accepted| {
@@ -918,6 +1082,8 @@ impl RemoteServer {
             source_bytes,
             reads,
             metadata,
+            setup_ns,
+            index_ready_ns,
         }
     }
 
@@ -1387,4 +1553,236 @@ fn killed_daemon_mounts_require_exact_private_recovery_before_resume() {
         fixture.success(&base, &["tinytree", "unmount", root.to_str().unwrap()]);
     }
     fixture.stop_daemon();
+}
+
+#[derive(Clone, Copy, Default, serde::Serialize)]
+struct StartupCounters {
+    metadata_batch_rpcs: usize,
+    legacy_graph_rpcs: usize,
+    query_rpcs: usize,
+    canonical_metadata_bytes: usize,
+    canonical_commit_bytes: usize,
+    canonical_tree_bytes: usize,
+    canonical_other_metadata_bytes: usize,
+    distinct_batch_commit_keys_requested: usize,
+    distinct_batch_tree_keys_requested: usize,
+    historical_trees_requested: usize,
+    file_rpcs: usize,
+}
+impl StartupCounters {
+    fn subtract(self, before: Self) -> Self {
+        Self {
+            metadata_batch_rpcs: self.metadata_batch_rpcs - before.metadata_batch_rpcs,
+            legacy_graph_rpcs: self.legacy_graph_rpcs - before.legacy_graph_rpcs,
+            query_rpcs: self.query_rpcs - before.query_rpcs,
+            canonical_metadata_bytes: self.canonical_metadata_bytes
+                - before.canonical_metadata_bytes,
+            canonical_commit_bytes: self.canonical_commit_bytes - before.canonical_commit_bytes,
+            canonical_tree_bytes: self.canonical_tree_bytes - before.canonical_tree_bytes,
+            canonical_other_metadata_bytes: self.canonical_other_metadata_bytes
+                - before.canonical_other_metadata_bytes,
+            distinct_batch_commit_keys_requested: self.distinct_batch_commit_keys_requested
+                - before.distinct_batch_commit_keys_requested,
+            distinct_batch_tree_keys_requested: self.distinct_batch_tree_keys_requested
+                - before.distinct_batch_tree_keys_requested,
+            historical_trees_requested: self.historical_trees_requested
+                - before.historical_trees_requested,
+            file_rpcs: self.file_rpcs - before.file_rpcs,
+        }
+    }
+}
+impl RemoteServer {
+    fn startup_counters(&self) -> StartupCounters {
+        let (commits, trees) = {
+            let keys = self.metadata.keys.lock().unwrap();
+            (
+                keys.iter()
+                    .filter(|(kind, _)| *kind == p::ObjectKind::Commit as i32)
+                    .count(),
+                keys.iter()
+                    .filter(|(kind, _)| *kind == p::ObjectKind::Tree as i32)
+                    .count(),
+            )
+        };
+        let commit_bytes = self.metadata.commit_bytes.load(Ordering::SeqCst)
+            + self.metadata.graph_commit_bytes.load(Ordering::SeqCst)
+            + self.metadata.query_commit_bytes.load(Ordering::SeqCst);
+        let tree_bytes = self.metadata.tree_bytes.load(Ordering::SeqCst);
+        let other_bytes = self.metadata.other_bytes.load(Ordering::SeqCst);
+        StartupCounters {
+            metadata_batch_rpcs: self.metadata.calls.load(Ordering::SeqCst),
+            legacy_graph_rpcs: self.metadata.graph_calls.load(Ordering::SeqCst),
+            query_rpcs: self.metadata.query_calls.load(Ordering::SeqCst),
+            canonical_metadata_bytes: commit_bytes + tree_bytes + other_bytes,
+            canonical_commit_bytes: commit_bytes,
+            canonical_tree_bytes: tree_bytes,
+            canonical_other_metadata_bytes: other_bytes,
+            distinct_batch_commit_keys_requested: commits,
+            distinct_batch_tree_keys_requested: trees,
+            historical_trees_requested: self.historical_tree_reads(),
+            file_rpcs: self.file_reads(),
+        }
+    }
+}
+struct StartupTrialFailure<'a> {
+    upstream: &'a RemoteServer,
+    history: usize,
+    trial: usize,
+    phase: &'static str,
+    started: Instant,
+    before: StartupCounters,
+    complete: bool,
+}
+impl<'a> StartupTrialFailure<'a> {
+    fn new(upstream: &'a RemoteServer, history: usize, trial: usize) -> Self {
+        Self {
+            upstream,
+            history,
+            trial,
+            phase: "fixture_configuration",
+            started: Instant::now(),
+            before: upstream.startup_counters(),
+            complete: false,
+        }
+    }
+    fn begin(&mut self, phase: &'static str) {
+        self.phase = phase;
+        self.before = self.upstream.startup_counters();
+        self.started = Instant::now();
+    }
+}
+impl Drop for StartupTrialFailure<'_> {
+    fn drop(&mut self) {
+        if !self.complete && std::thread::panicking() {
+            // No panic text, child stderr, arguments, paths or endpoints enter
+            // this record. The original panic and fixture recovery still run.
+            eprintln!(
+                "{}",
+                serde_json::json!({
+                    "schema":1,"benchmark":"native_mounted_startup","measurement":false,
+                    "status":"failed_or_timeout","historical_commits":self.history,"trial":self.trial,
+                    "phase":self.phase,"phase_elapsed_ns":self.started.elapsed().as_nanos(),
+                    "partial_phase_counters":self.upstream.startup_counters().subtract(self.before),
+                    "cli_timeout_seconds":30,"daemon_readiness_timeout_seconds":20,
+                    "failure_bound_not_success_latency":true
+                })
+            );
+        }
+    }
+}
+fn mounted_startup_phase(
+    tracker: &mut StartupTrialFailure<'_>,
+    phase: &'static str,
+    action: impl FnOnce(),
+) -> serde_json::Value {
+    tracker.begin(phase);
+    action();
+    let elapsed_ns = tracker.started.elapsed().as_nanos();
+    let counters = tracker.upstream.startup_counters().subtract(tracker.before);
+    serde_json::json!({"elapsed_ns":elapsed_ns,"counters":counters,"file_payload_free":counters.file_rpcs==0})
+}
+
+#[test]
+#[ignore = "manual actual FUSE startup benchmark; requires TINYTREE_MOUNTED_STARTUP_BENCH=1"]
+fn native_mounted_startup_benchmark_ladder() {
+    // mounted_tests runs all ignored native cases. An explicit gate prevents an
+    // ordinary acceptance run from unknowingly executing nine expensive trials.
+    if std::env::var("TINYTREE_MOUNTED_STARTUP_BENCH").as_deref() != Ok("1") {
+        eprintln!(
+            "{}",
+            serde_json::json!({"schema":1,"benchmark":"native_mounted_startup","measurement":false,"status":"skipped","reason":"requires explicit TINYTREE_MOUNTED_STARTUP_BENCH=1 and usable Linux FUSE"})
+        );
+        return;
+    }
+    for history in [8usize, 128, 1024] {
+        for trial in 1..=3 {
+            // Fresh upstream/index/daemon/cache/mount state in every trial.
+            // Declare the kernel/daemon fixture after upstream so it tears down
+            // all real mounted workspaces before the serving runtime exits.
+            let upstream_started = Instant::now();
+            let upstream = match std::panic::catch_unwind(|| {
+                RemoteServer::start_with_history(history)
+            }) {
+                Ok(upstream) => upstream,
+                Err(panic) => {
+                    eprintln!(
+                        "{}",
+                        serde_json::json!({"schema":1,"benchmark":"native_mounted_startup","measurement":false,"status":"failed_or_timeout","historical_commits":history,"trial":trial,"phase":"upstream_setup","phase_elapsed_ns":upstream_started.elapsed().as_nanos(),"partial_phase_counters":null,"counters_available":false,"failure_bound_not_success_latency":true})
+                    );
+                    std::panic::resume_unwind(panic);
+                }
+            };
+            let upstream_total_ns = upstream_started.elapsed().as_nanos();
+            // Declare the owner before the failure tracker, so its actual
+            // FUSE/daemon cleanup runs AFTER the sanitized failure record.
+            let mut fixture_owner = std::cell::OnceCell::new();
+            let mut failure = StartupTrialFailure::new(&upstream, history, trial);
+            let fixture_started = Instant::now();
+            assert!(fixture_owner.set(Fixture::new()).is_ok());
+            let fixture = fixture_owner.get_mut().unwrap();
+            fixture.configure_remote(&upstream.endpoint);
+            let fixture_setup_ns = fixture_started.elapsed().as_nanos();
+            let daemon = mounted_startup_phase(&mut failure, "daemon_start", || fixture.start());
+            let base = fixture.base().to_owned();
+            let first = base.join("agent-one");
+            let second = base.join("agent-two");
+            let cold_clone = mounted_startup_phase(&mut failure, "first_cold_clone", || {
+                fixture.clone_remote(&first)
+            });
+            failure.begin("first_mount_validation");
+            assert_fuse_mounted(&first);
+            let first_binding = fixture.binding(&first);
+            let cold_log = mounted_startup_phase(&mut failure, "first_default_log_n40", || {
+                let output = fixture.success(&first, &["log", "-n", "40"]);
+                assert!(
+                    !output.trim().is_empty(),
+                    "default log must render a real native workspace"
+                );
+            });
+            let warm_log = mounted_startup_phase(&mut failure, "repeated_warm_log_n40", || {
+                let output = fixture.success(&first, &["log", "-n", "40"]);
+                assert!(!output.trim().is_empty());
+            });
+            let shared_daemon_second_clone = mounted_startup_phase(
+                &mut failure,
+                "second_agent_clone_shared_daemon_cache",
+                || fixture.clone_remote(&second),
+            );
+            failure.begin("second_mount_validation");
+            assert_fuse_mounted(&second);
+            let second_binding = fixture.binding(&second);
+            assert_ne!(first_binding.repo, second_binding.repo);
+            assert_ne!(first_binding.working_copy, second_binding.working_copy);
+            let total = upstream.startup_counters();
+            failure.begin("cleanup_second_unmount");
+            fixture.success(&base, &["tinytree", "unmount", second.to_str().unwrap()]);
+            failure.begin("cleanup_first_unmount");
+            fixture.success(&base, &["tinytree", "unmount", first.to_str().unwrap()]);
+            failure.begin("cleanup_daemon_shutdown");
+            fixture.stop_daemon();
+            failure.complete = true;
+            eprintln!(
+                "{}",
+                serde_json::json!({
+                    "schema":1,"benchmark":"native_mounted_startup","measurement":true,"status":"completed",
+                    "historical_commits":history,"reachable_stored_commits":history+1,
+                    "index_ingested_commits":history+2,"trial":trial,"trials":3,
+                    "workspace_provider":"actual_linux_fuse","checkout":"lazy_no_full_checkout_substitute",
+                    "source_setup_ns":upstream.setup_ns,"index_ready_ns":upstream.index_ready_ns,
+                    "index_ready_before_daemon":true,"upstream_total_setup_ns":upstream_total_ns,
+                    "fixture_configuration_ns":fixture_setup_ns,
+                    "daemon_start":daemon,"first_cold_clone":cold_clone,
+                    "first_default_log_n40":cold_log,"repeated_warm_log_n40":warm_log,
+                    "second_agent_clone_shared_daemon_cache":shared_daemon_second_clone,
+                    "total_command_boundary_counters":total,"file_payload_free":total.file_rpcs==0,
+                    "byte_measure":"uncompressed_canonical_envelopes_not_network_wire_bytes",
+                    "counters_are_command_boundary_snapshots":true,
+                    "background_work_may_cross_phase_boundaries":true,
+                    "cli_exit_poll_ms":10,"daemon_readiness_poll_ms":20,
+                    "authenticated":true,"zstd":true,"tcp_nodelay":true,
+                    "default_log_template_unchanged":true,"native_index_store_default_not_assumed":true
+                })
+            );
+        }
+    }
 }
