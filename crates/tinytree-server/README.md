@@ -24,7 +24,10 @@ reject new promises, not existing ones. A historical receipt is not current proo
 
 The separate query service supports retained root scopes, exact graph facts and
 prefix resolution. Its rebuildable index warms asynchronously; unavailable
-coverage is an error, not an empty result. Scope TTLs and work limits are TOML
+coverage is an error, not an empty result. Warming caches raw canonical payloads up to `max_warm_bytes`, evicting old
+payloads so long histories can progress without full residency.
+`max_warm_read_bytes` separately bounds actual discovery and cache-miss rereads.
+Scope TTLs and work limits are TOML
 configurable. Private parent-first draft overlays and immutable forks are scoped
 to the authenticated caller; they are ephemeral query data, not repository uploads
 or backup receipts. Closing a parent preserves live forks without extending

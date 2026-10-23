@@ -33,6 +33,9 @@ max_cursor_memory_bytes = 134217728
 max_page_size = 128
 max_pending_warms = 32
 max_warm_jobs = 1
+# Retained raw payload cache versus total discovery and cache-miss read work.
+max_warm_bytes = 16777216
+max_warm_read_bytes = 268435456
 # Increment and restart for an explicit fresh index; old data is retained.
 index_rebuild_generation = 0
 

@@ -7,7 +7,7 @@ use crate::{
 };
 use prost::Message;
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{HashMap, HashSet, VecDeque},
     sync::{Arc, Mutex},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
@@ -65,6 +65,7 @@ pub struct QueryConfig {
     pub max_warm_nodes: usize,
     pub max_warm_edges: usize,
     pub max_warm_bytes: usize,
+    pub max_warm_read_bytes: usize,
     pub max_warm_frontier: usize,
     pub max_commit_bytes: usize,
     pub max_commit_parents: usize,
@@ -126,6 +127,7 @@ impl Default for QueryConfig {
             max_warm_nodes: 100_000,
             max_warm_edges: 200_000,
             max_warm_bytes: 16 * 1024 * 1024,
+            max_warm_read_bytes: 256 * 1024 * 1024,
             max_warm_frontier: 100_000,
             max_commit_bytes: 256 * 1024,
             max_commit_parents: 4096,
@@ -155,7 +157,8 @@ impl QueryConfig {
     fn warm_memory(&self) -> usize {
         self.max_warm_bytes
             .saturating_mul(4)
-            .saturating_add(self.max_warm_nodes.saturating_mul(128))
+            // Active/done sets, payload-map buckets, and bounded FIFO IDs.
+            .saturating_add(self.max_warm_nodes.saturating_mul(384))
             .saturating_add(self.max_warm_edges.saturating_mul(64))
             .saturating_add(self.max_commit_bytes.saturating_mul(8))
             .saturating_add(8 * 1024 * 1024)
@@ -202,6 +205,8 @@ impl QueryConfig {
             || self.max_warm_edges > 10_000_000
             || self.max_warm_bytes == 0
             || self.max_warm_bytes > 256 * 1024 * 1024
+            || self.max_warm_read_bytes == 0
+            || self.max_warm_read_bytes > 1024 * 1024 * 1024
             || self.max_warm_frontier == 0
             || self.max_warm_frontier > 1_000_000
             || !(1024..=16 * 1024 * 1024).contains(&self.max_commit_bytes)
@@ -1075,6 +1080,62 @@ impl QueryHost {
         Ok(())
     }
 }
+// Raw payloads only; canonical decode state never survives a discovery step.
+// Each unique visited node contributes at most one FIFO identity, including
+// stale entries removed from the map on exit. The node cap bounds both maps.
+struct WarmPayloadCache {
+    entries: HashMap<m::CommitId, (m::Descriptor, Vec<u8>)>,
+    fifo: VecDeque<m::CommitId>,
+    allocated: usize,
+    limit: usize,
+}
+impl WarmPayloadCache {
+    fn new(limit: usize) -> Self {
+        Self {
+            entries: HashMap::new(),
+            fifo: VecDeque::new(),
+            allocated: 0,
+            limit,
+        }
+    }
+    fn room(&mut self, incoming: usize) -> Result<(), Status> {
+        if incoming > self.limit {
+            return Err(Status::resource_exhausted(
+                "derived warm retained payload limit exceeded",
+            ));
+        }
+        while self.allocated > self.limit - incoming {
+            let id = self
+                .fifo
+                .pop_front()
+                .ok_or_else(|| Status::data_loss("derived warm cache accounting mismatch"))?;
+            let _ = self.take(id);
+        }
+        Ok(())
+    }
+    fn take(&mut self, id: m::CommitId) -> Option<(m::Descriptor, Vec<u8>)> {
+        let value = self.entries.remove(&id)?;
+        self.allocated -= value.1.capacity();
+        Some(value)
+    }
+    fn insert(
+        &mut self,
+        id: m::CommitId,
+        descriptor: m::Descriptor,
+        data: Vec<u8>,
+    ) -> Result<(), Status> {
+        // Store may return excess capacity despite a fitting logical length.
+        // Keep that single read transient, rather than violating residency.
+        if data.capacity() > self.limit {
+            return Ok(());
+        }
+        self.room(data.capacity())?;
+        self.allocated += data.capacity();
+        self.entries.insert(id, (descriptor, data));
+        self.fifo.push_back(id);
+        Ok(())
+    }
+}
 impl WarmRuntime {
     fn build(&self, job: &WarmJob) -> Result<(), Status> {
         let deadline =
@@ -1082,8 +1143,8 @@ impl WarmRuntime {
         let mut stack = vec![(job.root, false)];
         let mut active = HashSet::new();
         let mut done = HashSet::new();
-        let mut nodes: HashMap<m::CommitId, (m::Descriptor, Vec<u8>)> = HashMap::new();
-        let mut bytes = 0usize;
+        let mut read_bytes = 0usize;
+        let mut payloads = WarmPayloadCache::new(self.config.max_warm_bytes);
         let mut edges = 0usize;
         while let Some((id, exit)) = stack.pop() {
             if std::time::Instant::now() >= deadline {
@@ -1093,9 +1154,12 @@ impl WarmRuntime {
                 continue;
             }
             if exit {
-                let (descriptor, data) = nodes
-                    .remove(&id)
-                    .ok_or_else(|| Status::data_loss("derived warm node missing"))?;
+                // Reuse a retained discovery payload; evicted ancestors are
+                // reread only after their parents have become index-ready.
+                let (descriptor, data) = match payloads.take(id) {
+                    Some(value) => value,
+                    None => self.read_commit(job, id, &mut read_bytes, &mut payloads)?,
+                };
                 self.index
                     .ingest(&job.repository, descriptor, &data)
                     .map_err(|error| match error {
@@ -1136,32 +1200,7 @@ impl WarmRuntime {
                     "derived warm node budget exceeded",
                 ));
             }
-            let key = m::ObjectKey {
-                kind: m::Kind::Commit,
-                id: m::ObjectId(id.0),
-            };
-            let descriptor = self
-                .store
-                .descriptor(&job.repository, key)
-                .map_err(|_| Status::unavailable("canonical graph unavailable"))?
-                .ok_or_else(|| Status::not_found("canonical graph incomplete"))?;
-            if descriptor.size_bytes > self.config.max_commit_bytes as u64 {
-                return Err(Status::resource_exhausted(
-                    "derived commit byte limit exceeded",
-                ));
-            }
-            let (descriptor, data) = self
-                .store
-                .read_metadata(&job.repository, key)
-                .map_err(|_| Status::data_loss("canonical graph read failed"))?;
-            bytes = bytes
-                .checked_add(data.len())
-                .ok_or_else(|| Status::resource_exhausted("derived warm byte overflow"))?;
-            if bytes > self.config.max_warm_bytes {
-                return Err(Status::resource_exhausted(
-                    "derived warm byte budget exceeded",
-                ));
-            }
+            let (descriptor, data) = self.read_commit(job, id, &mut read_bytes, &mut payloads)?;
             let object = m::decode(
                 &data,
                 m::Limits {
@@ -1190,12 +1229,61 @@ impl WarmRuntime {
                     "derived warm frontier budget exceeded",
                 ));
             }
+            // A bounded FIFO cache avoids rereads for fitting histories, but
+            // never makes a long ancestor path depend on full residency.
+            payloads.insert(id, descriptor, data)?;
             stack.push((id, true));
             for parent in commit.parents.into_iter().rev() {
                 stack.push((parent, false));
             }
-            nodes.insert(id, (descriptor, data));
         }
         Ok(())
+    }
+    fn read_commit(
+        &self,
+        job: &WarmJob,
+        id: m::CommitId,
+        read_bytes: &mut usize,
+        payloads: &mut WarmPayloadCache,
+    ) -> Result<(m::Descriptor, Vec<u8>), Status> {
+        let key = m::ObjectKey {
+            kind: m::Kind::Commit,
+            id: m::ObjectId(id.0),
+        };
+        let expected = self
+            .store
+            .descriptor(&job.repository, key)
+            .map_err(|_| Status::unavailable("canonical graph unavailable"))?
+            .ok_or_else(|| Status::not_found("canonical graph incomplete"))?;
+        let size = usize::try_from(expected.size_bytes)
+            .map_err(|_| Status::resource_exhausted("derived commit byte size overflow"))?;
+        if size > self.config.max_commit_bytes || size > self.config.max_warm_bytes {
+            return Err(Status::resource_exhausted(
+                "derived warm retained payload limit exceeded",
+            ));
+        }
+        let total = read_bytes
+            .checked_add(size)
+            .ok_or_else(|| Status::resource_exhausted("derived warm read byte overflow"))?;
+        if total > self.config.max_warm_read_bytes {
+            return Err(Status::resource_exhausted(
+                "derived warm total read budget exceeded",
+            ));
+        }
+        // Evict before the physical read; only the incoming object's excess
+        // Vec capacity may use the separately reserved transient scratch.
+        payloads.room(size)?;
+        // Account actual discovery and cache-miss reads before allocation.
+        *read_bytes = total;
+        let (descriptor, data) = self
+            .store
+            .read_metadata(&job.repository, key)
+            .map_err(|_| Status::data_loss("canonical graph read failed"))?;
+        if descriptor != expected || data.len() != size {
+            return Err(Status::data_loss(
+                "canonical graph descriptor changed during read",
+            ));
+        }
+        Ok((descriptor, data))
     }
 }

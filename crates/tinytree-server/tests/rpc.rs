@@ -3530,3 +3530,262 @@ async fn ids_query_budget_exhaustion_is_an_error_not_an_exhausted_page() {
     drop(client);
     server.stop().await;
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cold_query_warming_streams_chain_payloads_within_one_object_residency() {
+    let (temporary, store) = setup();
+    let index =
+        tinytree_index::Index::open(temporary.path().join("derived"), &Default::default()).unwrap();
+    let mut commit = tinytree_model::synthetic_root();
+    let mut parent = CommitId::ROOT;
+    let mut keys = Vec::new();
+    let mut canonical_bytes = 0usize;
+    for generation in 0..16u8 {
+        commit.parents = vec![parent];
+        commit.change_id = tinytree_model::ChangeId([generation + 1; 16]);
+        commit.description = format!("cold chain generation {generation}");
+        let object =
+            tinytree_model::encode(&Object::Commit(commit.clone()), Limits::default()).unwrap();
+        assert!(
+            object.bytes.len() <= 512,
+            "each canonical commit fits the retained payload budget"
+        );
+        canonical_bytes += object.bytes.len();
+        store
+            .put("alpha", object.descriptor, &object.bytes, 0)
+            .unwrap();
+        keys.push(object.descriptor.key);
+        parent = CommitId(object.descriptor.key.id.0);
+    }
+    assert!(
+        canonical_bytes > 512,
+        "the complete chain cannot fit the old retained-payload traversal"
+    );
+    let mut config = ServiceConfig::default();
+    config.query.max_warm_bytes = 512;
+    let server = Running::start_query(store, config, index.clone()).await;
+    let mut client = server.query_client().await;
+    let scope = query_ready(&mut client, &[*keys.last().unwrap()], 80).await;
+    for key in &keys {
+        assert!(
+            index.node("alpha", CommitId(key.id.0)).unwrap().is_some(),
+            "parent-first warming must publish every chain commit"
+        );
+    }
+    let facts = client
+        .query_facts(request(
+            q::QueryFactsRequest {
+                scope: scope.key,
+                facts: keys
+                    .into_iter()
+                    .map(|key| q::GraphFact {
+                        fact: Some(q::graph_fact::Fact::HasId(q::HasId {
+                            commit: Some(query_id(key)),
+                        })),
+                    })
+                    .collect(),
+            },
+            ALPHA,
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(facts.answers.len(), 16);
+    assert!(
+        facts
+            .answers
+            .iter()
+            .all(|answer| answer.answer == Some(q::graph_fact_answer::Answer::HasId(true)))
+    );
+    drop(client);
+    server.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cold_query_warming_charges_only_actual_cache_miss_reads() {
+    for (name, retained_bytes, read_multiplier, ready) in [
+        (
+            "fitting cache reads each commit once",
+            16 * 1024 * 1024,
+            1,
+            true,
+        ),
+        (
+            "evicted payloads require additional read budget",
+            512,
+            1,
+            false,
+        ),
+        ("evicted payloads progress with reread budget", 512, 2, true),
+    ] {
+        let (temporary, store) = setup();
+        let index =
+            tinytree_index::Index::open(temporary.path().join("derived"), &Default::default())
+                .unwrap();
+        let mut commit = tinytree_model::synthetic_root();
+        let mut parent = CommitId::ROOT;
+        let mut total = 0usize;
+        let mut keys = Vec::new();
+        for generation in 0..16u8 {
+            commit.parents = vec![parent];
+            commit.change_id = tinytree_model::ChangeId([generation + 101; 16]);
+            commit.description = format!("cache read budget chain {generation}");
+            let object =
+                tinytree_model::encode(&Object::Commit(commit.clone()), Limits::default()).unwrap();
+            assert!(object.bytes.len() <= 512);
+            total += object.bytes.len();
+            store
+                .put("alpha", object.descriptor, &object.bytes, 0)
+                .unwrap();
+            keys.push(object.descriptor.key);
+            parent = CommitId(object.descriptor.key.id.0);
+        }
+        assert!(total > 512);
+        let mut config = ServiceConfig::default();
+        config.query.max_warm_bytes = retained_bytes;
+        config.query.max_warm_read_bytes = total * read_multiplier;
+        let server = Running::start_query(store, config, index.clone()).await;
+        let mut client = server.query_client().await;
+        let frames = query_frames(&[*keys.last().unwrap()], 81);
+        assert_eq!(
+            client
+                .open_scope(request(tokio_stream::iter(frames.clone()), ALPHA))
+                .await
+                .unwrap_err()
+                .code(),
+            Code::Unavailable
+        );
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                match client
+                    .open_scope(request(tokio_stream::iter(frames.clone()), ALPHA))
+                    .await
+                {
+                    Err(error) if error.code() == Code::Unavailable => {
+                        tokio::time::sleep(Duration::from_millis(5)).await
+                    }
+                    Err(error) => {
+                        assert!(!ready, "{name}: {error}");
+                        assert_eq!(error.code(), Code::ResourceExhausted, "{name}");
+                        break;
+                    }
+                    Ok(_) => {
+                        assert!(
+                            ready,
+                            "{name}: read-work exhaustion must not advertise complete coverage"
+                        );
+                        break;
+                    }
+                }
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            index.node("alpha", parent).unwrap().is_some(),
+            ready,
+            "{name}"
+        );
+        if ready {
+            assert_eq!(index.stats().unwrap().nodes, keys.len() as u64, "{name}");
+        }
+        drop(client);
+        server.stop().await;
+    }
+}
+
+// BEGIN TINYTREE_COLD_WARM_READ_POLICY_BENCH_V1
+// Copy this entire block unchanged for a same-fixture source-revision comparison.
+// Warm canonical storage, fresh derived index, production TCP/zstd query RPCs.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "manual cold-index read-policy benchmark; bounded to 1100 seconds"]
+async fn benchmark_cold_warming_read_policy() {
+    tokio::time::timeout(Duration::from_secs(1100), async {
+        for count in [1000usize, 16_000] {
+            let temporary = tempfile::tempdir().unwrap();
+            let opened = std::time::Instant::now();
+            let store = Store::open(temporary.path().join("canonical"), Default::default()).unwrap();
+            store.create_repository("alpha").unwrap();
+            store.create_repository("beta").unwrap();
+            let source_open_ms = opened.elapsed().as_secs_f64() * 1000.0;
+            let seeded = std::time::Instant::now();
+            let mut parent = CommitId::ROOT;
+            let mut keys = Vec::with_capacity(count);
+            let mut canonical_payload_bytes = 0u64;
+            let mut commit = tinytree_model::synthetic_root();
+            for generation in 0..count {
+                commit.parents = vec![parent];
+                let mut change = [0u8; 16];
+                change[..8].copy_from_slice(&(generation as u64 + 1).to_be_bytes());
+                commit.change_id = tinytree_model::ChangeId(change);
+                commit.description = format!("cold warm policy chain {generation}");
+                let object = tinytree_model::encode(&Object::Commit(commit.clone()), Limits::default()).unwrap();
+                assert!(object.bytes.len() <= ServiceConfig::default().query.max_commit_bytes);
+                canonical_payload_bytes += object.bytes.len() as u64;
+                store.put("alpha", object.descriptor, &object.bytes, 0).unwrap();
+                parent = CommitId(object.descriptor.key.id.0);
+                keys.push(object.descriptor.key);
+            }
+            let seed_ms = seeded.elapsed().as_secs_f64() * 1000.0;
+            assert!(canonical_payload_bytes < ServiceConfig::default().query.max_warm_bytes as u64,
+                "both source revisions must admit the same complete graph under their default limits");
+            for trial in 0..3 {
+                let opened = std::time::Instant::now();
+                let index = tinytree_index::Index::open(temporary.path().join(format!("derived-{trial}")), &Default::default()).unwrap();
+                assert_eq!(index.stats().unwrap().nodes, 0);
+                let index_open_ms = opened.elapsed().as_secs_f64() * 1000.0;
+                let started = std::time::Instant::now();
+                let server = Running::start_query(store.clone(), ServiceConfig::default(), index.clone()).await;
+                let server_start_ms = started.elapsed().as_secs_f64() * 1000.0;
+                let connected = std::time::Instant::now();
+                let mut client = server.query_client().await;
+                let connect_ms = connected.elapsed().as_secs_f64() * 1000.0;
+                let requested = std::time::Instant::now();
+                let mut open_rpcs = 0u64;
+                let scope = tokio::time::timeout(Duration::from_secs(300), async {
+                    loop {
+                        open_rpcs += 1;
+                        match client.open_scope(request(tokio_stream::iter(query_frames(&[*keys.last().unwrap()], 90)), ALPHA)).await {
+                            Ok(response) => break response.into_inner(),
+                            Err(error) if error.code() == Code::Unavailable => tokio::time::sleep(Duration::from_millis(10)).await,
+                            Err(error) => panic!("equivalent cold warming workload failed: {error}"),
+                        }
+                    }
+                }).await.unwrap();
+                let warm_ready_ms = requested.elapsed().as_secs_f64() * 1000.0;
+                let verified = std::time::Instant::now();
+                let mut fact_rpcs = 0u64;
+                for batch in keys.chunks(ServiceConfig::default().query.max_facts) {
+                    fact_rpcs += 1;
+                    let facts = client.query_facts(request(q::QueryFactsRequest {
+                        scope: scope.key.clone(),
+                        facts: batch.iter().copied().map(|key| q::GraphFact {
+                            fact: Some(q::graph_fact::Fact::HasId(q::HasId { commit: Some(query_id(key)) })),
+                        }).collect(),
+                    }, ALPHA)).await.unwrap().into_inner();
+                    assert_eq!(facts.answers.len(), batch.len());
+                    assert!(facts.answers.iter().all(|answer| answer.answer == Some(q::graph_fact_answer::Answer::HasId(true))));
+                }
+                let verify_ms = verified.elapsed().as_secs_f64() * 1000.0;
+                let stats = index.stats().unwrap();
+                assert_eq!(stats.nodes, count as u64);
+                println!("TINYTREE_COLD_WARM_READ_POLICY_BENCH_V1 {}", serde_json::json!({
+                    "commits":count,"trial":trial,"canonical_payload_bytes":canonical_payload_bytes,
+                    "source_store_open_ms":source_open_ms,"source_seed_ms":seed_ms,
+                    "index_open_ms":index_open_ms,"server_start_ms":server_start_ms,"connect_ms":connect_ms,
+                    "warm_ready_ms":warm_ready_ms,"verification_ms":verify_ms,
+                    "open_scope_rpcs":open_rpcs,"fact_rpcs":fact_rpcs,"poll_resolution_ms":10,
+                    "index_nodes":stats.nodes,"index_logical_bytes":stats.logical_bytes,
+                    "storage_state":"warm canonical storage; fresh empty derived index each trial",
+                    "read_policy_comparison":"one-read baseline versus bounded payload caching with cache-miss rereads; physical reads not measured",
+                    "physical_read_bytes":"not measured","client_file_rpcs":0,
+                    "transport":"production TCP with zstd query request/response compression"
+                }));
+                drop(client);
+                server.stop().await;
+                drop(index);
+            }
+        }
+    }).await.expect("bounded cold warming benchmark expired");
+}
+// END TINYTREE_COLD_WARM_READ_POLICY_BENCH_V1
