@@ -197,6 +197,8 @@ fn leases_protect_streams_and_owner_until_drop_while_expired_unrooted_objects_co
     let older = store.put("demo", d, b"retained", 0).unwrap();
     assert_eq!(older.expires_at, original.expires_at);
     let mut lease = store.read("demo", d.key).unwrap();
+    let root = store.pin_root("demo", d.key).unwrap();
+    assert_eq!(root.descriptor(), d);
     assert_eq!(store.gc("demo", 200).unwrap().deleted_objects, 0);
     drop(store);
     assert!(Store::open(directory.path(), config()).is_err());
@@ -204,6 +206,11 @@ fn leases_protect_streams_and_owner_until_drop_while_expired_unrooted_objects_co
     lease.read_to_end(&mut bytes).unwrap();
     assert_eq!(bytes, b"retained");
     drop(lease);
+    assert!(
+        Store::open(directory.path(), config()).is_err(),
+        "a lightweight root retains the store after the payload reader is gone"
+    );
+    drop(root);
     let store = Store::open(directory.path(), config()).unwrap();
     let gc = store.gc("demo", 200).unwrap();
     assert_eq!(gc.deleted_objects, 1);
@@ -1852,6 +1859,8 @@ fn packed_repository_reopens_without_changing_publication_or_object_identity() {
         store.publication("demo", "packed-publication").unwrap(),
         Some(publication)
     );
+    let _file_root = store.pin_root("demo", file.key).unwrap();
+    let _tree_root = store.pin_root("demo", tree.key).unwrap();
     let mut first = store.read("demo", file.key).unwrap();
     assert!(matches!(
         store.read("demo", tree.key),

@@ -112,6 +112,9 @@ message GetCommitGraphRequest {
 message CommitGraphEntry {
   ObjectDescriptor commit = 1;
   repeated ObjectKey parents = 2;
+  // Exact canonical commit bytes. Empty permits older-server compatibility;
+  // clients must fetch and verify the canonical object before trusting summaries.
+  bytes canonical_envelope = 3;
 }
 
 message CommitGraphPage {

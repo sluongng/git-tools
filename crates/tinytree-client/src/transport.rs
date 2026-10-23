@@ -426,6 +426,7 @@ fn rule(shape: Shape, n: u32, l: &Limits) -> Option<(u8, Option<Shape>, usize, u
             l.max_graph_objects,
             4 * std::mem::size_of::<p::ObjectKey>(),
         ),
+        (Shape::Entry, 3) => text(l.max_metadata_bytes),
         (Shape::Missing, 1) => repeated(
             Shape::Key,
             l.max_batch_items,

@@ -43,18 +43,35 @@ struct Running {
     address: std::net::SocketAddr,
     stop: Option<tokio::sync::oneshot::Sender<()>>,
     task: tokio::task::JoinHandle<()>,
+    metadata: Arc<AtomicUsize>,
+    graph: Arc<AtomicUsize>,
+    canonical_bytes: Arc<AtomicUsize>,
+    files: Arc<AtomicUsize>,
 }
 impl Running {
     async fn start(service: RepositoryService, mode: Mode) -> Self {
+        Self::start_with_socket_policy(service, mode, false).await
+    }
+    async fn start_with_socket_policy(
+        service: RepositoryService,
+        mode: Mode,
+        nodelay: bool,
+    ) -> Self {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let (stop, stopped) = tokio::sync::oneshot::channel();
+        let metadata = Arc::new(AtomicUsize::new(0));
+        let graph = Arc::new(AtomicUsize::new(0));
+        let canonical_bytes = Arc::new(AtomicUsize::new(0));
+        let files = Arc::new(AtomicUsize::new(0));
         let faults = Faults {
             service,
             mode,
-            reads: Arc::new(AtomicUsize::new(0)),
+            reads: files.clone(),
             writes: Arc::new(AtomicUsize::new(0)),
-            metadata: Arc::new(AtomicUsize::new(0)),
+            metadata: metadata.clone(),
+            graph: graph.clone(),
+            canonical_bytes: canonical_bytes.clone(),
             publications: Arc::new(AtomicUsize::new(0)),
         };
         let task = tokio::spawn(async move {
@@ -67,7 +84,14 @@ impl Running {
                         .max_encoding_message_size(20 * 1024 * 1024),
                 )
                 .serve_with_incoming_shutdown(
-                    tokio_stream::wrappers::TcpListenerStream::new(listener),
+                    tokio_stream::wrappers::TcpListenerStream::new(listener).map(move |result| {
+                        result.and_then(|stream| {
+                            if nodelay {
+                                stream.set_nodelay(true)?;
+                            }
+                            Ok(stream)
+                        })
+                    }),
                     async {
                         let _ = stopped.await;
                     },
@@ -79,6 +103,10 @@ impl Running {
             address,
             stop: Some(stop),
             task,
+            metadata,
+            graph,
+            canonical_bytes,
+            files,
         }
     }
     fn config(&self) -> Config {
@@ -123,6 +151,11 @@ enum Mode {
     DelayFile,
     PartialMetadata,
     WrongGraph,
+    LegacyGraph,
+    MissingGraphObject,
+    CorruptGraphEnvelope,
+    OversizedGraphEnvelope,
+    GraphCanonicalShape,
     LostPublication,
     RetryUpload,
     DelayedPublication,
@@ -140,6 +173,8 @@ struct Faults {
     reads: Arc<AtomicUsize>,
     writes: Arc<AtomicUsize>,
     metadata: Arc<AtomicUsize>,
+    graph: Arc<AtomicUsize>,
+    canonical_bytes: Arc<AtomicUsize>,
     publications: Arc<AtomicUsize>,
 }
 type Stream<T> = std::pin::Pin<Box<dyn futures_util::Stream<Item = Result<T, Status>> + Send>>;
@@ -167,6 +202,7 @@ impl Repository for Faults {
         &self,
         r: Request<p::GetCommitGraphRequest>,
     ) -> Result<Response<p::CommitGraphPage>, Status> {
+        self.graph.fetch_add(1, Ordering::SeqCst);
         let mut response = self.service.get_commit_graph(r).await?;
         if self.mode == Mode::EmptyGraphEntries {
             response.get_mut().entries = vec![p::CommitGraphEntry::default(); 257];
@@ -176,6 +212,51 @@ impl Repository for Faults {
                 entry.parents.clear();
             }
         }
+        if matches!(self.mode, Mode::LegacyGraph | Mode::MissingGraphObject) {
+            for entry in &mut response.get_mut().entries {
+                entry.canonical_envelope.clear();
+            }
+        }
+        if self.mode == Mode::CorruptGraphEnvelope {
+            response.get_mut().entries[0].canonical_envelope[0] ^= 1;
+        }
+        if self.mode == Mode::OversizedGraphEnvelope {
+            response.get_mut().entries[0].canonical_envelope = vec![0; 128 * 1024];
+        }
+        if self.mode == Mode::GraphCanonicalShape {
+            let entry = &mut response.get_mut().entries[0];
+            let tinytree_model::Object::Commit(mut commit) =
+                tinytree_model::decode(&entry.canonical_envelope, Default::default()).unwrap()
+            else {
+                unreachable!()
+            };
+            commit.root_tree.terms = vec![commit.root_tree.terms[0]; 4001];
+            commit.root_tree.labels = vec![String::new(); 4001];
+            let canonical =
+                tinytree_model::encode(&tinytree_model::Object::Commit(commit), Default::default())
+                    .unwrap();
+            tinytree_model::verify(&canonical.descriptor, &canonical.bytes, Default::default())
+                .unwrap();
+            entry.commit = Some(p::ObjectDescriptor {
+                key: Some(p::ObjectKey {
+                    kind: Kind::Commit as i32,
+                    native_id: canonical.descriptor.key.id.0.to_vec(),
+                }),
+                content_blake3: canonical.descriptor.key.id.0.to_vec(),
+                size_bytes: canonical.descriptor.size_bytes,
+                object_format_version: canonical.descriptor.format_version as u32,
+            });
+            entry.canonical_envelope = canonical.bytes;
+        }
+        self.canonical_bytes.fetch_add(
+            response
+                .get_ref()
+                .entries
+                .iter()
+                .map(|entry| entry.canonical_envelope.len())
+                .sum::<usize>(),
+            Ordering::SeqCst,
+        );
         Ok(response)
     }
     type BatchReadObjectsStream = Stream<p::ObjectResult>;
@@ -209,6 +290,29 @@ impl Repository for Faults {
                 }
             }
         }
+        if self.mode == Mode::MissingGraphObject {
+            for item in &mut items {
+                if let Ok(item) = item {
+                    item.result = Some(p::object_result::Result::Error(p::ItemError {
+                        code: p::item_error::Code::NotFound as i32,
+                        message: String::new(),
+                    }));
+                }
+            }
+        }
+        self.canonical_bytes.fetch_add(
+            items
+                .iter()
+                .filter_map(|item| item.as_ref().ok())
+                .filter_map(|item| match &item.result {
+                    Some(p::object_result::Result::Object(data)) => {
+                        Some(data.canonical_envelope.len())
+                    }
+                    _ => None,
+                })
+                .sum::<usize>(),
+            Ordering::SeqCst,
+        );
         items.reverse();
         Ok(Response::new(Box::pin(tokio_stream::iter(items))))
     }
@@ -500,30 +604,136 @@ async fn partial_metadata_retries_only_unfinished_keys_and_keeps_item_errors_exp
 }
 
 #[tokio::test]
-async fn canonical_graph_crosscheck_rejects_forged_parent_summary() {
-    let (_dir, store, service) = setup();
-    let fixture = fixture();
-    let mut commit = None;
-    for object in fixture.objects() {
-        store
-            .put("example", object.descriptor, &object.bytes, 0)
-            .unwrap();
-        if object.descriptor.key.kind == Kind::Commit {
-            commit = Some(object.descriptor.key);
-        }
+async fn canonical_graph_verification_preserves_legacy_compatibility_without_trusting_payloads() {
+    struct Case {
+        name: &'static str,
+        mode: Mode,
+        error: Option<Code>,
+        metadata_rpcs: usize,
+        graph_limit: Option<usize>,
+        metadata_limit: usize,
+        error_message: Option<&'static str>,
     }
-    let running = Running::start(service, Mode::WrongGraph).await;
-    let client = running.client().await;
-    assert_eq!(
-        client
+    for case in [
+        Case {
+            name: "canonical payload avoids metadata RPC",
+            mode: Mode::Normal,
+            error: None,
+            metadata_rpcs: 0,
+            graph_limit: None,
+            metadata_limit: 1024,
+            error_message: None,
+        },
+        Case {
+            name: "old server fetches canonical object",
+            mode: Mode::LegacyGraph,
+            error: None,
+            metadata_rpcs: 1,
+            graph_limit: None,
+            metadata_limit: 1024,
+            error_message: None,
+        },
+        Case {
+            name: "missing old-server canonical object fails",
+            mode: Mode::MissingGraphObject,
+            error: Some(Code::NotFound),
+            metadata_rpcs: 1,
+            graph_limit: None,
+            metadata_limit: 1024,
+            error_message: None,
+        },
+        Case {
+            name: "forged parent summary fails",
+            mode: Mode::WrongGraph,
+            error: Some(Code::DataLoss),
+            metadata_rpcs: 0,
+            graph_limit: None,
+            metadata_limit: 1024,
+            error_message: None,
+        },
+        Case {
+            name: "tampered payload never falls back",
+            mode: Mode::CorruptGraphEnvelope,
+            error: Some(Code::DataLoss),
+            metadata_rpcs: 0,
+            graph_limit: None,
+            metadata_limit: 1024,
+            error_message: None,
+        },
+        Case {
+            name: "payload bounded before allocation",
+            mode: Mode::OversizedGraphEnvelope,
+            error: Some(Code::ResourceExhausted),
+            metadata_rpcs: 0,
+            graph_limit: Some(1024 * 1024),
+            metadata_limit: 1024,
+            error_message: None,
+        },
+        Case {
+            name: "retained graph allocation bounded",
+            mode: Mode::Normal,
+            error: Some(Code::ResourceExhausted),
+            metadata_rpcs: 0,
+            graph_limit: Some(1024),
+            metadata_limit: 1024,
+            error_message: None,
+        },
+        Case {
+            name: "canonical empty-label vectors bounded before decode",
+            mode: Mode::GraphCanonicalShape,
+            error: Some(Code::ResourceExhausted),
+            metadata_rpcs: 0,
+            graph_limit: Some(1024 * 1024),
+            metadata_limit: 256 * 1024,
+            error_message: Some("canonical shape exceeds allocation budget"),
+        },
+    ] {
+        let (_dir, store, service) = setup();
+        let fixture = fixture();
+        let mut commit = None;
+        for object in fixture.objects() {
+            store
+                .put("example", object.descriptor, &object.bytes, 0)
+                .unwrap();
+            if object.descriptor.key.kind == Kind::Commit {
+                commit = Some(object.descriptor.key);
+            }
+        }
+        let running = Running::start(service, case.mode).await;
+        let mut config = running.config();
+        if let Some(limit) = case.graph_limit {
+            config.limits.max_metadata_bytes = case.metadata_limit;
+            config.limits.max_graph_bytes = limit;
+        }
+        let client = NativeClient::connect(config).await.unwrap();
+        let result = client
             .canonical_commit_summaries(vec![commit.unwrap()], vec![])
-            .await
-            .err()
-            .unwrap()
-            .code(),
-        Code::DataLoss
-    );
-    running.stop().await;
+            .await;
+        match case.error {
+            Some(code) => {
+                let error = result.err().expect(case.name);
+                assert_eq!(error.code(), code, "{}", case.name);
+                if let Some(message) = case.error_message {
+                    assert!(error.message().contains(message), "{}: {error}", case.name);
+                }
+            }
+            None => {
+                let graph = result.unwrap();
+                assert_eq!(graph.entries.len(), 1, "{}", case.name);
+                assert_eq!(
+                    graph.entries[0].canonical_envelope.is_empty(),
+                    case.mode == Mode::LegacyGraph
+                );
+            }
+        }
+        assert_eq!(
+            running.metadata.load(Ordering::SeqCst),
+            case.metadata_rpcs,
+            "{}",
+            case.name
+        );
+        running.stop().await;
+    }
 }
 
 #[tokio::test]
@@ -1119,5 +1329,73 @@ async fn compressed_repeated_collection_shapes_are_bounded_before_prost_allocati
         };
         assert_eq!(status.code(), case.expected);
         running.stop().await;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "manual same-server graph wire A/B benchmark; no full-first-page cost claim"]
+async fn canonical_graph_payload_benchmark() {
+    for depth in [16usize, 128, 512] {
+        for mode in [Mode::LegacyGraph, Mode::Normal] {
+            let (_directory, store, service) = setup();
+            let mut commit = tinytree_model::synthetic_root();
+            let mut head = tinytree_model::CommitId::ROOT;
+            for index in 0..depth {
+                commit.parents = vec![head];
+                commit.description = format!("history commit {index}");
+                commit.change_id = tinytree_model::ChangeId([index as u8; 16]);
+                let encoded = tinytree_model::encode(
+                    &tinytree_model::Object::Commit(commit.clone()),
+                    Default::default(),
+                )
+                .unwrap();
+                store
+                    .put("example", encoded.descriptor, &encoded.bytes, 0)
+                    .unwrap();
+                head = tinytree_model::CommitId(encoded.descriptor.key.id.0);
+            }
+            // Production's accepted TCP sockets use TCP_NODELAY. Apply the same
+            // policy to both arms; this compares additive wire payloads on the
+            // SAME current server, not old/new server source or bounded work.
+            let running = Running::start_with_socket_policy(service, mode, true).await;
+            let client = running.client().await;
+            let mut samples = Vec::new();
+            for _ in 0..3 {
+                let started = std::time::Instant::now();
+                let graph = client
+                    .canonical_commit_summaries(
+                        vec![ObjectKey {
+                            kind: Kind::Commit,
+                            id: ObjectId(head.0),
+                        }],
+                        Vec::new(),
+                    )
+                    .await
+                    .unwrap();
+                samples.push(started.elapsed().as_nanos());
+                assert_eq!(graph.entries.len(), depth);
+            }
+            let mut ordered = samples.clone();
+            ordered.sort_unstable();
+            assert_eq!(running.files.load(Ordering::SeqCst), 0);
+            assert_eq!(
+                running.metadata.load(Ordering::SeqCst),
+                if mode == Mode::Normal { 0 } else { depth * 3 }
+            );
+            let arm = if mode == Mode::Normal {
+                "canonical_payload"
+            } else {
+                "legacy_missing_payload"
+            };
+            eprintln!(
+                "{{\"schema\":1,\"benchmark\":\"canonical_graph_wire_ab\",\"arm\":\"{arm}\",\"history_commits\":{depth},\"trials\":3,\"samples_ns\":{samples:?},\"median_ns\":{},\"graph_rpcs\":{},\"metadata_rpcs\":{},\"canonical_bytes\":{},\"file_rpcs\":{},\"tcp_nodelay\":true}}",
+                ordered[1],
+                running.graph.load(Ordering::SeqCst),
+                running.metadata.load(Ordering::SeqCst),
+                running.canonical_bytes.load(Ordering::SeqCst),
+                running.files.load(Ordering::SeqCst)
+            );
+            running.stop().await;
+        }
     }
 }

@@ -43,7 +43,8 @@ pub trait NativeRepositoryControl: Send + Sync + std::fmt::Debug {
     /// Implementations must not recursively call this broker from an operation.
     fn resources(&self) -> ControlResources;
     /// Return name, generation and optional head from ONE initial observation.
-    /// A present head is returned only after full canonical admission/retention.
+    /// A present head is returned only after retained-root admission. This does
+    /// not imply that its full metadata closure has been fetched locally.
     async fn observe_reference(&self, name: &str) -> Result<ReferenceSnapshot, Status>;
     async fn admit_commit(&self, head: CommitId) -> Result<AdmittedCommit, Status>;
     /// Use exactly the caller's expected generation and original replay key.

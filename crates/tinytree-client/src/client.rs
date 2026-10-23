@@ -498,6 +498,7 @@ impl NativeClient {
                                     descriptor,
                                     data.canonical_envelope,
                                     self.inner.config.limits.max_metadata_bytes,
+                                    None,
                                     deadline,
                                     budget.clone(),
                                 )
@@ -584,7 +585,7 @@ impl NativeClient {
                 continuation: continuation.clone(),
             };
             self.bounded(&request)?;
-            let page = self
+            let mut page = self
                 .retry(deadline, false, |allowance| {
                     let mut grpc = self
                         .inner
@@ -615,21 +616,23 @@ impl NativeClient {
             }
             let mut keys = Vec::new();
             for entry in &page.entries {
-                let allocation = std::mem::size_of::<p::CommitGraphEntry>()
-                    .saturating_mul(4)
-                    .saturating_add(
-                        entry.parents.len().saturating_mul(
-                            std::mem::size_of::<p::ObjectKey>()
+                let allocation = entry.canonical_envelope.capacity().saturating_add(
+                    std::mem::size_of::<p::CommitGraphEntry>()
+                        .saturating_mul(4)
+                        .saturating_add(
+                            entry.parents.len().saturating_mul(
+                                std::mem::size_of::<p::ObjectKey>()
+                                    .saturating_mul(4)
+                                    .saturating_add(64),
+                            ),
+                        )
+                        .saturating_add(128)
+                        .saturating_add(
+                            std::mem::size_of::<ObjectKey>()
                                 .saturating_mul(4)
-                                .saturating_add(64),
+                                .saturating_add(16),
                         ),
-                    )
-                    .saturating_add(128)
-                    .saturating_add(
-                        std::mem::size_of::<ObjectKey>()
-                            .saturating_mul(4)
-                            .saturating_add(16),
-                    );
+                );
                 retained_heap = retained_heap
                     .checked_add(allocation)
                     .ok_or_else(integrity)?;
@@ -654,29 +657,85 @@ impl NativeClient {
                 }
                 keys.push(descriptor.key);
             }
-            // Summaries become verified only after canonical commit comparison.
-            for (entry, key) in page.entries.iter().zip(keys) {
-                let mut canonical = self.metadata(vec![key], deadline, budget.clone()).await?;
-                let outcome = canonical.pop().ok_or_else(integrity)?;
-                let metadata = match outcome {
-                    MetadataOutcome::Object(object) => object,
-                    MetadataOutcome::Error { code } => {
-                        return Err(item_status(code));
+            // An absent payload is the additive old-server compatibility path.
+            // A nonempty invalid payload is never replaced by a metadata RPC.
+            for (entry, key) in page.entries.iter_mut().zip(keys) {
+                let expected = parse_descriptor(entry.commit.as_ref().unwrap())?;
+                let direct = !entry.canonical_envelope.is_empty();
+                let metadata = if !direct {
+                    let mut canonical = self.metadata(vec![key], deadline, budget.clone()).await?;
+                    match canonical.pop().ok_or_else(integrity)? {
+                        MetadataOutcome::Object(object) => object,
+                        MetadataOutcome::Error { code } => return Err(item_status(code)),
                     }
+                } else {
+                    if entry.canonical_envelope.len() > self.inner.config.limits.max_metadata_bytes
+                        || expected.size_bytes != entry.canonical_envelope.len() as u64
+                    {
+                        return Err(integrity());
+                    }
+                    // Input bytes already count toward retained_heap. Additional
+                    // decoded strings plus encoder capacity use at most 3x bytes;
+                    // four independent commit vectors use at most 128 bytes/item.
+                    // Bound each vector BEFORE decode, including empty labels.
+                    let fixed = std::mem::size_of::<tinytree_model::Commit>();
+                    let available = self
+                        .inner
+                        .config
+                        .limits
+                        .max_graph_bytes
+                        .checked_sub(retained_heap)
+                        .and_then(|n| {
+                            n.checked_sub(entry.canonical_envelope.len().saturating_mul(3))
+                        })
+                        .and_then(|n| n.checked_sub(fixed))
+                        .ok_or_else(|| {
+                            Status::resource_exhausted(
+                                "native graph verification exceeds allocation budget",
+                            )
+                        })?;
+                    let items = (available / 128).min(tinytree_model::Limits::default().max_items);
+                    if items == 0 {
+                        return Err(Status::resource_exhausted(
+                            "native graph verification exceeds allocation budget",
+                        ));
+                    }
+                    verify_metadata(
+                        expected,
+                        std::mem::take(&mut entry.canonical_envelope),
+                        self.inner.config.limits.max_metadata_bytes,
+                        Some(items),
+                        deadline,
+                        budget.clone(),
+                    )
+                    .await?
                 };
-                let commit = match metadata.object {
+                let commit = match &metadata.object {
                     Object::Commit(commit) => commit,
                     _ => return Err(integrity()),
                 };
-                if parse_descriptor(entry.commit.as_ref().unwrap())? != metadata.descriptor
+                if retained_heap.saturating_add(commit_heap(commit))
+                    > self.inner.config.limits.max_graph_bytes
+                {
+                    return Err(Status::resource_exhausted(
+                        "native graph canonical object exceeds allocation budget",
+                    ));
+                }
+                if expected != metadata.descriptor
                     || entry.parents.len() != commit.parents.len()
                     || !entry
                         .parents
                         .iter()
-                        .zip(commit.parents)
+                        .zip(&commit.parents)
                         .all(|(wire, id)| parse_key(wire).is_ok_and(|key| key.id.0 == id.0))
                 {
                     return Err(integrity());
+                }
+                // Preserve canonical payloads supplied by the server. Legacy
+                // summaries remain payload-free rather than retaining extra RPC
+                // allocations not charged in their original response budget.
+                if direct {
+                    entry.canonical_envelope = metadata.bytes;
                 }
             }
             continuation = page.continuation;
@@ -975,6 +1034,7 @@ impl NativeClient {
             descriptor,
             bytes,
             self.inner.config.limits.max_metadata_bytes,
+            None,
             deadline,
             budget,
         )
@@ -1301,10 +1361,55 @@ async fn blocking_owned<T: Send + 'static>(
     Ok(work.value)
 }
 
+fn commit_heap(commit: &tinytree_model::Commit) -> usize {
+    let mut bytes = std::mem::size_of::<tinytree_model::Commit>()
+        .saturating_add(
+            commit
+                .parents
+                .capacity()
+                .saturating_mul(std::mem::size_of::<tinytree_model::CommitId>()),
+        )
+        .saturating_add(
+            commit
+                .predecessors
+                .capacity()
+                .saturating_mul(std::mem::size_of::<tinytree_model::CommitId>()),
+        )
+        .saturating_add(
+            commit
+                .root_tree
+                .terms
+                .capacity()
+                .saturating_mul(std::mem::size_of::<tinytree_model::TreeId>()),
+        )
+        .saturating_add(
+            commit
+                .root_tree
+                .labels
+                .capacity()
+                .saturating_mul(std::mem::size_of::<String>()),
+        )
+        .saturating_add(commit.description.capacity())
+        .saturating_add(commit.author.name.capacity())
+        .saturating_add(commit.author.email.capacity())
+        .saturating_add(commit.committer.name.capacity())
+        .saturating_add(commit.committer.email.capacity());
+    for label in &commit.root_tree.labels {
+        bytes = bytes.saturating_add(label.capacity());
+    }
+    if let Some(signature) = &commit.secure_signature {
+        bytes = bytes
+            .saturating_add(signature.data.capacity())
+            .saturating_add(signature.signature.capacity());
+    }
+    bytes
+}
+
 async fn verify_metadata(
     descriptor: Descriptor,
     bytes: Vec<u8>,
     limit: usize,
+    graph_items: Option<usize>,
     deadline: Instant,
     budget: Arc<Budget>,
 ) -> Result<VerifiedMetadata, Status> {
@@ -1315,11 +1420,19 @@ async fn verify_metadata(
         }
         let limits = tinytree_model::Limits {
             max_object_bytes: limit,
+            max_items: graph_items.unwrap_or(tinytree_model::Limits::default().max_items),
             ..Default::default()
         };
-        tinytree_model::verify(&descriptor, &bytes, limits).map_err(|_| integrity())?;
-        let object = tinytree_model::decode(&bytes, limits).map_err(|_| integrity())?;
-        let canonical = tinytree_model::encode(&object, limits).map_err(|_| integrity())?;
+        let invalid = |error| {
+            if graph_items.is_some() && matches!(error, tinytree_model::Error::Limit) {
+                Status::resource_exhausted("native graph canonical shape exceeds allocation budget")
+            } else {
+                integrity()
+            }
+        };
+        tinytree_model::verify(&descriptor, &bytes, limits).map_err(invalid)?;
+        let object = tinytree_model::decode(&bytes, limits).map_err(invalid)?;
+        let canonical = tinytree_model::encode(&object, limits).map_err(invalid)?;
         if canonical.bytes != bytes || canonical.descriptor != descriptor {
             return Err(integrity());
         }

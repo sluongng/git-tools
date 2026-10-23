@@ -40,6 +40,13 @@ struct Inner {
     repositories: HashMap<String, Arc<Semaphore>>,
     bytes: Arc<Semaphore>,
     continuation_key: [u8; 32],
+    #[cfg(test)]
+    graph_read_pause: std::sync::Mutex<Option<GraphReadPause>>,
+}
+#[cfg(test)]
+struct GraphReadPause {
+    entered: std::sync::mpsc::SyncSender<()>,
+    resume: std::sync::mpsc::Receiver<()>,
 }
 struct Admission {
     _global: OwnedSemaphorePermit,
@@ -86,6 +93,8 @@ impl RepositoryService {
                 config,
                 auth,
                 continuation_key,
+                #[cfg(test)]
+                graph_read_pause: std::sync::Mutex::new(None),
             }),
         })
     }
@@ -407,9 +416,26 @@ impl Repository for RepositoryService {
         let repo = input.repository_id;
         let response_admission = admission.clone();
         let response_memory = memory.clone();
+        #[cfg(test)]
+        let pause = self.inner.graph_read_pause.lock().unwrap().take();
         let entries = blocking(deadline, move || {
             let (_admission, _memory) = (admission, memory);
             store.references(&repo, &[]).map_err(store_status)?;
+            // Reader roots are acquired under the store's GC gate and protect
+            // their present closure until this graph traversal physically ends.
+            // They are per-call leases, never persistent reference mutations.
+            let _roots = graph_root_leases(&store, &repo, &heads, &common, &cfg)?;
+            #[cfg(test)]
+            if let Some(pause) = pause {
+                pause
+                    .entered
+                    .send(())
+                    .map_err(|_| Status::internal("graph test observer stopped"))?;
+                pause
+                    .resume
+                    .recv_timeout(Duration::from_secs(5))
+                    .map_err(|_| Status::deadline_exceeded("graph test interleaving expired"))?;
+            }
             graph_difference(&store, &repo, heads, common, &cfg)
         })
         .await?;
@@ -1108,6 +1134,43 @@ fn unhex(text: &str) -> Option<Vec<u8>> {
         .collect()
 }
 
+fn graph_root_leases(
+    store: &tinytree_store::Store,
+    repo: &str,
+    heads: &[ObjectKey],
+    common: &[ObjectKey],
+    config: &ServiceConfig,
+) -> Result<Vec<tinytree_store::RootReadGuard>, Status> {
+    let mut seen = HashSet::new();
+    let mut leases = Vec::new();
+    for key in heads.iter().chain(common).copied() {
+        if intrinsic(key) || !seen.insert(key) {
+            continue;
+        }
+        let handles = seen.len().saturating_mul(
+            4 * std::mem::size_of::<tinytree_store::RootReadGuard>()
+                + 4 * std::mem::size_of::<ObjectKey>()
+                + 128,
+        );
+        if handles > config.max_graph_bytes {
+            return Err(Status::resource_exhausted(
+                "native graph root handles exceed allocation budget",
+            ));
+        }
+        let descriptor = store
+            .descriptor(repo, key)
+            .map_err(read_status)?
+            .ok_or_else(|| Status::not_found("native graph object unavailable"))?;
+        if descriptor.size_bytes > config.max_metadata_bytes.min(config.max_graph_bytes) as u64 {
+            return Err(Status::resource_exhausted(
+                "native graph metadata exceeds budget",
+            ));
+        }
+        leases.push(store.pin_root(repo, key).map_err(read_status)?);
+    }
+    Ok(leases)
+}
+
 fn graph_difference(
     store: &tinytree_store::Store,
     repo: &str,
@@ -1158,7 +1221,7 @@ fn graph_difference(
             }
             let (descriptor, data) = store.read_metadata(repo, key).map_err(read_status)?;
             *bytes = bytes
-                .checked_add(data.len())
+                .checked_add(data.capacity())
                 .ok_or_else(|| Status::resource_exhausted("native graph exceeds byte budget"))?;
             if *bytes > config.max_graph_bytes {
                 return Err(Status::resource_exhausted(
@@ -1185,12 +1248,28 @@ fn graph_difference(
                     id: ObjectId(id.0),
                 })
                 .collect();
+            let entry_heap = std::mem::size_of::<p::CommitGraphEntry>()
+                .saturating_add(128)
+                .saturating_add(
+                    parents
+                        .len()
+                        .saturating_mul(4 * std::mem::size_of::<p::ObjectKey>() + 64),
+                );
+            *bytes = bytes.checked_add(entry_heap).ok_or_else(|| {
+                Status::resource_exhausted("native graph exceeds allocation budget")
+            })?;
+            if *bytes > config.max_graph_bytes {
+                return Err(Status::resource_exhausted(
+                    "native graph exceeds allocation budget",
+                ));
+            }
             stack.extend(parents.iter().copied());
             result.insert(
                 key.id.0,
                 p::CommitGraphEntry {
                     commit: Some(descriptor_wire(descriptor)),
                     parents: parents.into_iter().map(key_wire).collect(),
+                    canonical_envelope: data,
                 },
             );
         }
@@ -1209,4 +1288,125 @@ fn graph_difference(
         Some(&excluded),
     )?;
     Ok(included.into_values().collect())
+}
+
+#[cfg(test)]
+mod graph_tests {
+    use super::*;
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn graph_handler_roots_survive_gc_only_until_physical_traversal_finishes() {
+        let temporary = tempfile::tempdir().unwrap();
+        let store = tinytree_store::Store::open(temporary.path(), Default::default()).unwrap();
+        store.create_repository("example").unwrap();
+        let mut commit = tinytree_model::synthetic_root();
+        commit.parents = vec![CommitId::ROOT];
+        commit.change_id = tinytree_model::ChangeId([1; 16]);
+        commit.description = "parent".into();
+        let parent =
+            tinytree_model::encode(&Object::Commit(commit.clone()), Default::default()).unwrap();
+        store
+            .put("example", parent.descriptor, &parent.bytes, 0)
+            .unwrap();
+        commit.parents = vec![CommitId(parent.descriptor.key.id.0)];
+        commit.description = "head".into();
+        let head =
+            tinytree_model::encode(&Object::Commit(commit.clone()), Default::default()).unwrap();
+        store
+            .put("example", head.descriptor, &head.bytes, 0)
+            .unwrap();
+        commit.parents = vec![CommitId::ROOT];
+        commit.description = "independent common".into();
+        let common = tinytree_model::encode(&Object::Commit(commit), Default::default()).unwrap();
+        store
+            .put("example", common.descriptor, &common.bytes, 0)
+            .unwrap();
+        let publication = tinytree_store::PublishRequest {
+            idempotency_key: "seed-reference".into(),
+            reference_name: "main".into(),
+            expected_generation: 0,
+            new_commit: Some(CommitId(head.descriptor.key.id.0)),
+            staging_leases: Vec::new(),
+        };
+        store.publish("example", &publication, 1).unwrap();
+        let service = RepositoryService::new(
+            store.clone(),
+            ServiceConfig::default(),
+            vec!["example".into()],
+            Vec::new(),
+        )
+        .unwrap();
+        let (entered, started) = std::sync::mpsc::sync_channel(1);
+        let (resume, wait) = std::sync::mpsc::sync_channel(1);
+        *service.inner.graph_read_pause.lock().unwrap() = Some(GraphReadPause {
+            entered,
+            resume: wait,
+        });
+        let task = tokio::spawn(async move {
+            service
+                .get_commit_graph(Request::new(p::GetCommitGraphRequest {
+                    repository_id: "example".into(),
+                    heads: vec![
+                        key_wire(head.descriptor.key),
+                        key_wire(head.descriptor.key),
+                        key_wire(ObjectKey {
+                            kind: Kind::Commit,
+                            id: ObjectId(CommitId::ROOT.0),
+                        }),
+                    ],
+                    common: vec![
+                        key_wire(common.descriptor.key),
+                        key_wire(common.descriptor.key),
+                    ],
+                    page_size: 64,
+                    continuation: String::new(),
+                }))
+                .await
+        });
+        tokio::task::spawn_blocking(move || started.recv_timeout(Duration::from_secs(5)))
+            .await
+            .unwrap()
+            .unwrap();
+        let mut remove = publication;
+        remove.idempotency_key = "remove-reference".into();
+        remove.expected_generation = 1;
+        remove.new_commit = None;
+        store.publish("example", &remove, 2).unwrap();
+        store.gc("example", i64::MAX - 1).unwrap();
+        for key in [
+            head.descriptor.key,
+            parent.descriptor.key,
+            common.descriptor.key,
+        ] {
+            assert!(
+                store.descriptor("example", key).unwrap().is_some(),
+                "per-call root lease must retain its ancestry"
+            );
+        }
+        resume.send(()).unwrap();
+        let response = task.await.unwrap().unwrap().into_inner();
+        assert_eq!(response.entries.len(), 2);
+        assert!(response.entries.iter().all(|entry| {
+            entry
+                .commit
+                .as_ref()
+                .unwrap()
+                .key
+                .as_ref()
+                .unwrap()
+                .native_id
+                != common.descriptor.key.id.0
+        }));
+        drop(response);
+        store.gc("example", i64::MAX - 1).unwrap();
+        for key in [
+            head.descriptor.key,
+            parent.descriptor.key,
+            common.descriptor.key,
+        ] {
+            assert!(
+                store.descriptor("example", key).unwrap().is_none(),
+                "graph call must not create permanent roots"
+            );
+        }
+    }
 }

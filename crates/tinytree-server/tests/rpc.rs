@@ -569,6 +569,20 @@ async fn graph_root_pagination_and_partial_metadata_are_explicit() {
         .unwrap()
         .into_inner();
     assert_eq!(first.entries.len(), 1);
+    let entry = &first.entries[0];
+    let descriptor = entry.commit.as_ref().unwrap();
+    let commit = tinytree_model::decode(&entry.canonical_envelope, Limits::default()).unwrap();
+    let encoded = tinytree_model::encode(&commit, Limits::default()).unwrap();
+    assert_eq!(encoded.bytes, entry.canonical_envelope);
+    assert_eq!(encoded.descriptor.size_bytes, descriptor.size_bytes);
+    assert_eq!(
+        encoded.descriptor.key.id.0.as_slice(),
+        descriptor.key.as_ref().unwrap().native_id
+    );
+    let Object::Commit(commit) = commit else {
+        panic!()
+    };
+    assert_eq!(commit.parents.len(), entry.parents.len());
     assert!(!first.continuation.is_empty());
     let mut next = graph.clone();
     next.continuation = first.continuation.clone();
@@ -1163,6 +1177,14 @@ async fn stalled_unary_graph_response_retains_admission_until_body_deadline() {
         .put("alpha", encoded.descriptor, &encoded.bytes, 0)
         .unwrap();
     let mut config = ServiceConfig::default();
+    // This boundary fixture deliberately duplicates 100k parent summaries.
+    // Budget their conservative retained shape plus canonical Vec capacity;
+    // keep the response flow-controlled, rather than fail admission up front.
+    config.max_graph_bytes = encoded.bytes.len().saturating_mul(2)
+        + 100_000 * (4 * std::mem::size_of::<p::ObjectKey>() + 64)
+        + std::mem::size_of::<p::CommitGraphEntry>()
+        + 128;
+    config.max_buffered_bytes = config.max_graph_bytes.max(config.max_metadata_bytes) * 4;
     config.max_inflight = 1;
     config.max_inflight_per_repository = 1;
     config.rpc.rpc_timeout_ms = 1000;
@@ -1502,6 +1524,69 @@ async fn private_retention_is_owner_scoped_durable_and_independent_of_public_wri
         .unwrap();
     reopened.gc("alpha", i64::MAX - 1).unwrap();
     assert!(reopened.descriptor("alpha", head).unwrap().is_none());
+    drop(client);
+    server.stop().await;
+}
+
+#[tokio::test]
+async fn graph_multiple_packed_roots_do_not_reserve_a_packed_reader_per_root() {
+    let (_temporary, store) = setup();
+    let fixture = fixture();
+    for object in fixture.objects() {
+        store
+            .put("alpha", object.descriptor, &object.bytes, 0)
+            .unwrap();
+    }
+    let base = fixture
+        .objects()
+        .iter()
+        .find(|object| object.descriptor.key == root(&fixture))
+        .unwrap();
+    let Object::Commit(mut commit) =
+        tinytree_model::decode(&base.bytes, Limits::default()).unwrap()
+    else {
+        panic!()
+    };
+    commit.parents = vec![CommitId::ROOT];
+    let mut heads = Vec::new();
+    for index in 0..9 {
+        commit.description = format!("independent graph head {index}");
+        let encoded =
+            tinytree_model::encode(&Object::Commit(commit.clone()), Limits::default()).unwrap();
+        store
+            .put("alpha", encoded.descriptor, &encoded.bytes, 0)
+            .unwrap();
+        heads.push(wire_key(encoded.descriptor.key));
+    }
+    let server = Running::start(store.clone(), ServiceConfig::default()).await;
+    let mut client = server.client().await;
+    let query = p::GetCommitGraphRequest {
+        repository_id: "alpha".into(),
+        heads,
+        common: Vec::new(),
+        page_size: 64,
+        continuation: String::new(),
+    };
+    let before = client
+        .get_commit_graph(request(query.clone(), ALPHA))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(before.entries.len(), 9);
+    assert!(before.continuation.is_empty());
+    let packed = store
+        .pack("alpha", tinytree_store::PackOptions::default())
+        .unwrap();
+    assert!(packed.packed_objects >= 9);
+    let after = client
+        .get_commit_graph(request(query, ALPHA))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(
+        after, before,
+        "lightweight root pins must leave packed-reader capacity for traversal"
+    );
     drop(client);
     server.stop().await;
 }

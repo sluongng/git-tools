@@ -732,6 +732,26 @@ impl Store {
         Ok(result)
     }
 
+    /// Protect a stored object and its present reachable graph from GC without
+    /// opening or reconstructing its payload. This is a metadata claim, not
+    /// byte verification or proof that every dependency is resident. Callers
+    /// still verify the objects they read. The guard is process-local only.
+    pub fn pin_root(&self, repo: &str, object: ObjectKey) -> Result<RootReadGuard> {
+        let mut gate = self.inner.lock()?;
+        self.inner.repository(repo)?;
+        let descriptor = self
+            .inner
+            .descriptor(repo, object)?
+            .ok_or(Error::MissingObject(object))?;
+        let readers = gate.readers.entry((repo.to_owned(), object)).or_default();
+        *readers = readers.checked_add(1).ok_or(Error::Limit("reader roots"))?;
+        Ok(RootReadGuard {
+            descriptor,
+            repo: repo.to_owned(),
+            inner: Arc::clone(&self.inner),
+        })
+    }
+
     pub fn read(&self, repo: &str, object: ObjectKey) -> Result<ReadLease> {
         // Acquire the lease under the same gate as GC before opening the file.
         let mut gate = self.inner.lock()?;
@@ -1509,6 +1529,24 @@ fn fingerprint(request: &PublishRequest) -> [u8; 32] {
     *h.finalize().as_bytes()
 }
 
+/// A lightweight process-local GC root. Unlike `ReadLease`, it owns no payload
+/// reader or packed reconstruction buffer and does not verify object bytes.
+pub struct RootReadGuard {
+    descriptor: Descriptor,
+    repo: String,
+    inner: Arc<Inner>,
+}
+impl RootReadGuard {
+    pub fn descriptor(&self) -> Descriptor {
+        self.descriptor
+    }
+}
+impl Drop for RootReadGuard {
+    fn drop(&mut self) {
+        release_read_root(&self.inner, &self.repo, self.descriptor.key);
+    }
+}
+
 pub struct ReadLease {
     file: pack::Backing,
     descriptor: Descriptor,
@@ -1527,13 +1565,16 @@ impl Read for ReadLease {
 }
 impl Drop for ReadLease {
     fn drop(&mut self) {
-        if let Ok(mut gate) = self.inner.gate.lock() {
-            let k = (self.repo.clone(), self.descriptor.key);
-            if let Some(n) = gate.readers.get_mut(&k) {
-                *n -= 1;
-                if *n == 0 {
-                    gate.readers.remove(&k);
-                }
+        release_read_root(&self.inner, &self.repo, self.descriptor.key);
+    }
+}
+fn release_read_root(inner: &Inner, repo: &str, key: ObjectKey) {
+    if let Ok(mut gate) = inner.gate.lock() {
+        let k = (repo.to_owned(), key);
+        if let Some(n) = gate.readers.get_mut(&k) {
+            *n -= 1;
+            if *n == 0 {
+                gate.readers.remove(&k);
             }
         }
     }
