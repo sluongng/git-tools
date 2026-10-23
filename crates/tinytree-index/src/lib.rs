@@ -8,7 +8,9 @@ use private_fs::PrivateDir;
 mod codec;
 mod scoped;
 use codec::{RecordCodec, decode, encode};
-pub use scoped::ScopedNode;
+pub use scoped::{
+    ChangePrefixCursor, CommitPrefixCursor, LexicalPage, MAX_PREFIX_CANDIDATE_SCAN, ScopedNode,
+};
 use std::{
     collections::{BTreeMap, BTreeSet, HashSet},
     fs::File,

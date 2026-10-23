@@ -1344,3 +1344,277 @@ fn schema_two_without_conflict_summary_is_unsupported_and_not_rewritten() {
         original.as_slice()
     );
 }
+
+#[test]
+fn lexical_candidate_pages_seek_after_scanned_rows_and_keep_frozen_scope_membership() {
+    let (_directory, index) = fixture();
+    let frozen = Arc::new(index.scope("repo", &[m::CommitId::ROOT]).unwrap());
+    let mut nodes = Vec::new();
+    for (change, label) in [
+        (0x10, "future first"),
+        (0x11, "future divergent left"),
+        (0x11, "future divergent right"),
+        (0x1f, "future high nibble"),
+        (0x2a, "future outside prefix"),
+    ] {
+        nodes.push(add(&index, "repo", &[m::CommitId::ROOT], change, label));
+    }
+    let mut cursor = None;
+    let mut keys = Vec::new();
+    let mut returned = Vec::new();
+    let mut empty_progress = 0;
+    let mut budget = WorkBudget::default();
+    for _ in 0..nodes.len() + 3 {
+        let before = budget.nodes_read();
+        let page = frozen
+            .commit_prefix_candidates("", cursor.as_ref(), 1, &mut budget)
+            .unwrap();
+        assert!(page.scanned <= 1);
+        returned.extend(page.nodes.iter().map(ScopedNode::commit));
+        if page.complete {
+            assert!(page.cursor.is_none());
+            break;
+        }
+        if page.nodes.is_empty() {
+            empty_progress += 1;
+            assert_eq!(
+                budget.nodes_read() - before,
+                1,
+                "future rows need one physical seek/read, not replay of earlier keys"
+            );
+        }
+        let next = page.cursor.unwrap();
+        keys.push(next.last_scanned());
+        cursor = Some(next);
+    }
+    assert_eq!(returned, vec![m::CommitId::ROOT]);
+    assert_eq!(empty_progress, nodes.len());
+    assert!(keys.windows(2).all(|p| p[0] < p[1]));
+    assert_eq!(keys.len(), nodes.len() + 1);
+    let complete = Arc::new(
+        index
+            .scope("repo", &nodes.iter().map(|n| n.commit).collect::<Vec<_>>())
+            .unwrap(),
+    );
+    let mut expected = nodes
+        .iter()
+        .map(|n| n.commit)
+        .chain([m::CommitId::ROOT])
+        .collect::<Vec<_>>();
+    expected.sort();
+    let mut cursor = None;
+    let mut all = Vec::new();
+    let mut budget = WorkBudget::default();
+    for _ in 0..expected.len() + 2 {
+        let page = complete
+            .commit_prefix_candidates("", cursor.as_ref(), 2, &mut budget)
+            .unwrap();
+        // A host can now apply membership/selection facts: no state mutex is
+        // retained by the page or its fixed metadata tokens.
+        for node in &page.nodes {
+            assert!(complete.has_id(node.commit(), &mut budget).unwrap());
+        }
+        all.extend(page.nodes.iter().map(ScopedNode::commit));
+        if page.complete {
+            assert!(page.cursor.is_none());
+            break;
+        }
+        cursor = page.cursor;
+    }
+    assert_eq!(all, expected);
+    for prefix in [
+        &hex(&nodes[0].commit.0)[..1],
+        &hex(&nodes[0].commit.0)[..2],
+        &hex(&nodes[0].commit.0),
+    ] {
+        let page = complete
+            .commit_prefix_candidates(
+                prefix,
+                None,
+                MAX_PREFIX_CANDIDATE_SCAN,
+                &mut WorkBudget::default(),
+            )
+            .unwrap();
+        let matching = expected
+            .iter()
+            .copied()
+            .filter(|id| hex(&id.0).starts_with(prefix))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            page.nodes
+                .iter()
+                .map(ScopedNode::commit)
+                .collect::<Vec<_>>(),
+            matching
+        );
+        assert_eq!(
+            page.scanned,
+            matching.len(),
+            "odd nibble range must not scan the other half byte"
+        );
+        assert!(page.complete);
+    }
+}
+
+#[test]
+fn lexical_change_candidates_preserve_divergent_pairs_odd_ranges_and_empty_progress() {
+    let (_directory, index) = fixture();
+    let left = add(&index, "repo", &[m::CommitId::ROOT], 0x11, "visible left");
+    let right = add(&index, "repo", &[m::CommitId::ROOT], 0x11, "hidden right");
+    let high = add(
+        &index,
+        "repo",
+        &[m::CommitId::ROOT],
+        0x1f,
+        "upper odd prefix",
+    );
+    let outside = add(
+        &index,
+        "repo",
+        &[m::CommitId::ROOT],
+        0x2a,
+        "outside odd prefix",
+    );
+    let narrow = Arc::new(index.scope("repo", &[left.commit]).unwrap());
+    let mut cursor = None;
+    let mut scanned = Vec::new();
+    let mut tokens = Vec::new();
+    let mut empty = 0;
+    let mut budget = WorkBudget::default();
+    for _ in 0..4 {
+        let page = narrow
+            .change_prefix_candidates("11", cursor.as_ref(), 1, &mut budget)
+            .unwrap();
+        tokens.extend(page.nodes.iter().map(|n| (n.change_id(), n.commit())));
+        if page.complete {
+            break;
+        }
+        if page.nodes.is_empty() {
+            empty += 1;
+        }
+        let next = page.cursor.unwrap();
+        scanned.push(next.last_scanned());
+        cursor = Some(next);
+    }
+    assert_eq!(tokens, vec![(left.change_id, left.commit)]);
+    assert_eq!(empty, 1);
+    assert!(scanned.windows(2).all(|p| p[0] < p[1]));
+    let mut expected = vec![
+        (left.change_id, left.commit),
+        (right.change_id, right.commit),
+    ];
+    expected.sort();
+    assert_eq!(scanned, expected);
+    let full = Arc::new(
+        index
+            .scope(
+                "repo",
+                &[left.commit, right.commit, high.commit, outside.commit],
+            )
+            .unwrap(),
+    );
+    let page = full
+        .change_prefix_candidates(
+            "1",
+            None,
+            MAX_PREFIX_CANDIDATE_SCAN,
+            &mut WorkBudget::default(),
+        )
+        .unwrap();
+    let mut expected = vec![
+        (left.change_id, left.commit),
+        (right.change_id, right.commit),
+        (high.change_id, high.commit),
+    ];
+    expected.sort();
+    assert_eq!(
+        page.nodes
+            .iter()
+            .map(|n| (n.change_id(), n.commit()))
+            .collect::<Vec<_>>(),
+        expected
+    );
+    assert_eq!(page.scanned, 3);
+    assert!(page.complete);
+    let root = full
+        .change_prefix_candidates("0", None, 1, &mut WorkBudget::default())
+        .unwrap();
+    assert_eq!(root.nodes[0].commit(), m::CommitId::ROOT);
+    assert_eq!(
+        root.cursor.unwrap().last_scanned(),
+        (m::ChangeId::ROOT, m::CommitId::ROOT)
+    );
+    assert_eq!(
+        full.resolve_change_prefix("11", &mut WorkBudget::default())
+            .unwrap(),
+        PrefixResolution::Single(ChangeTargets {
+            change_id: left.change_id,
+            commits: {
+                let mut c = vec![left.commit, right.commit];
+                c.sort();
+                c
+            }
+        })
+    );
+}
+
+#[test]
+fn lexical_cursor_policy_and_resource_errors_never_become_absent_prefix_results() {
+    let (_directory, index) = fixture();
+    let node = add(&index, "repo", &[m::CommitId::ROOT], 0x11, "candidate");
+    let scope = Arc::new(index.scope("repo", &[node.commit]).unwrap());
+    let first = scope
+        .commit_prefix_candidates("", None, 1, &mut WorkBudget::default())
+        .unwrap();
+    let cursor = first.cursor.unwrap();
+    let same_roots = Arc::new(index.scope("repo", &[node.commit]).unwrap());
+    assert!(matches!(
+        same_roots.commit_prefix_candidates("", Some(&cursor), 1, &mut WorkBudget::default()),
+        Err(Error::Invalid(_))
+    ));
+    assert!(matches!(
+        scope.commit_prefix_candidates("1", Some(&cursor), 1, &mut WorkBudget::default()),
+        Err(Error::Invalid(_))
+    ));
+    for prefix in ["A", "xyz", &"0".repeat(65)] {
+        assert!(matches!(
+            scope.commit_prefix_candidates(prefix, None, 1, &mut WorkBudget::default()),
+            Err(Error::Invalid(_))
+        ));
+    }
+    for limit in [0, MAX_PREFIX_CANDIDATE_SCAN + 1] {
+        assert!(matches!(
+            scope.change_prefix_candidates("", None, limit, &mut WorkBudget::default()),
+            Err(Error::Invalid(_))
+        ));
+    }
+    let mut no_nodes = WorkBudget::new(0, 100, 10000, 100);
+    assert!(matches!(
+        scope.commit_prefix_candidates("", None, 1, &mut no_nodes),
+        Err(Error::BudgetExceeded)
+    ));
+    assert_eq!(no_nodes.nodes_read(), 0);
+    let mut no_bytes = WorkBudget::new(100, 100, 0, 100);
+    assert!(matches!(
+        scope.commit_prefix_candidates(&hex(&node.commit.0), None, 1, &mut no_bytes),
+        Err(Error::BudgetExceeded)
+    ));
+    assert_eq!(no_bytes.bytes_read(), 0);
+    let mut no_frontier = WorkBudget::new(100, 100, 10000, 2);
+    assert!(matches!(
+        scope.commit_prefix_candidates("", None, 1, &mut no_frontier),
+        Err(Error::BudgetExceeded)
+    ));
+    assert_eq!(no_frontier.nodes_read(), 0);
+    let epoch = index.epoch();
+    index.state.lock().unwrap().header.epoch[0] ^= 1;
+    assert!(matches!(
+        scope.commit_prefix_candidates("", Some(&cursor), 1, &mut WorkBudget::default()),
+        Err(Error::Unavailable)
+    ));
+    index.state.lock().unwrap().header.epoch = epoch;
+    let retry = scope
+        .commit_prefix_candidates("", Some(&cursor), 1, &mut WorkBudget::default())
+        .unwrap();
+    assert_eq!(retry.nodes[0].commit(), node.commit);
+}
