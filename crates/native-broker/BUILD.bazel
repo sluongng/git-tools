@@ -1,0 +1,62 @@
+load("@crates//:defs.bzl", "aliases", "all_crate_deps")
+load("@rules_rs//rs:cargo_build_script.bzl", "cargo_build_script")
+load("@rules_rs//rs:rust_binary.bzl", "rust_binary")
+load("@rules_rs//rs:rust_library.bzl", "rust_library")
+load("@rules_rs//rs:rust_test.bzl", "rust_test")
+
+package(default_visibility = ["//visibility:public"])
+
+filegroup(
+    name = "proto_files",
+    srcs = glob(["proto/**/*.proto"]),
+)
+
+cargo_build_script(
+    name = "build_script",
+    srcs = ["build.rs"],
+    aliases = aliases(),
+    build_script_env = {"PROTOC": "$(execpath //build_defs:protoc)"},
+    data = [":proto_files"],
+    edition = "2024",
+    pkg_name = "native-broker",
+    tools = ["//build_defs:protoc"],
+    version = "0.1.0",
+    deps = ["@crates//:tonic-prost-build"],
+)
+
+rust_library(
+    name = "native-broker",
+    srcs = glob(["src/**/*.rs"]),
+    aliases = aliases(),
+    crate_name = "native_broker",
+    crate_root = "src/lib.rs",
+    edition = "2024",
+    version = "0.1.0",
+    deps = [":build_script"] + all_crate_deps(normal = True),
+)
+
+rust_binary(
+    name = "client_driver",
+    testonly = True,
+    srcs = ["tests/client_driver.rs"],
+    aliases = aliases(),
+    edition = "2024",
+    visibility = ["//visibility:private"],
+    deps = [":native-broker"] + all_crate_deps(
+        normal = True,
+        normal_dev = True,
+    ),
+)
+
+rust_test(
+    name = "rpc_tests",
+    srcs = ["tests/rpc.rs"],
+    aliases = aliases(),
+    data = [":client_driver"],
+    edition = "2024",
+    rustc_env = {"BROKER_CLIENT_DRIVER": "$(rootpath :client_driver)"},
+    deps = [":native-broker"] + all_crate_deps(
+        normal = True,
+        normal_dev = True,
+    ),
+)

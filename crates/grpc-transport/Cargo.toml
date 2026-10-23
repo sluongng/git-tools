@@ -1,0 +1,13 @@
+[package]
+name = "grpc-transport"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+description = "Bounded gRPC response body lifetimes and resource guards"
+
+[dependencies]
+bytes = "1"
+http = "1"
+http-body = "1"
+tokio = { version = "1", features = ["full"] }
+tower = { version = "0.5", features = ["util"] }

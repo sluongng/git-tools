@@ -16,6 +16,7 @@ pub struct Config {
     pub git_proxy: GitProxy,
     pub session: Session,
     pub source: Source,
+    pub native: Native,
     pub reapi: reapi::policy::Policy,
 }
 
@@ -40,6 +41,108 @@ pub struct Source {
     /// None uses the content scheduler's default; Some(0) disables disk spooling.
     pub large_blob_spool_bytes: Option<u64>,
 }
+/// Optional authoritative native repositories served on the existing rbe.sock.
+#[derive(Clone, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct Native {
+    pub repositories: std::collections::BTreeMap<String, NativeRepository>,
+    pub max_inflight: usize,
+    pub max_memory_bytes: usize,
+    pub max_temporary_bytes: u64,
+}
+impl Default for Native {
+    fn default() -> Self {
+        let defaults = native_broker::Config::default();
+        Self {
+            repositories: Default::default(),
+            max_inflight: defaults.max_inflight,
+            max_memory_bytes: defaults.max_memory_bytes,
+            max_temporary_bytes: defaults.max_temporary_bytes,
+        }
+    }
+}
+#[derive(Clone, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct NativeRepository {
+    pub max_repository_bytes: u64,
+    pub max_file_bytes: u64,
+    pub max_objects_per_repository: u64,
+    pub max_staging_bytes: u64,
+    pub max_staging_uploads: usize,
+}
+impl Default for NativeRepository {
+    fn default() -> Self {
+        let defaults = jj_native_backend::Config::default().store;
+        Self {
+            max_repository_bytes: defaults.max_repository_bytes,
+            max_file_bytes: defaults.max_file_bytes,
+            max_objects_per_repository: defaults.max_objects_per_repository,
+            max_staging_bytes: defaults.max_staging_bytes,
+            max_staging_uploads: defaults.max_staging_uploads,
+        }
+    }
+}
+impl NativeRepository {
+    pub(crate) fn materialize(&self) -> jj_native_backend::Config {
+        let mut config = jj_native_backend::Config::default();
+        config.store.max_repository_bytes = self.max_repository_bytes;
+        config.store.max_file_bytes = self.max_file_bytes;
+        config.store.max_objects_per_repository = self.max_objects_per_repository;
+        config.store.max_staging_bytes = self.max_staging_bytes;
+        config.store.max_staging_uploads = self.max_staging_uploads;
+        config
+    }
+    fn validate(&self) -> Result<()> {
+        ensure!(
+            (1..=1024 * 1024 * 1024).contains(&self.max_file_bytes)
+                && self.max_repository_bytes >= 1024
+                && self.max_repository_bytes >= self.max_file_bytes
+                && self.max_repository_bytes <= i64::MAX as u64
+                && (1..=10_000_000).contains(&self.max_objects_per_repository)
+                && self.max_staging_bytes <= u32::MAX as u64
+                && self.max_staging_bytes >= self.max_file_bytes * 2
+                && (1..=1024).contains(&self.max_staging_uploads),
+            "invalid native repository limits"
+        );
+        Ok(())
+    }
+}
+impl Native {
+    pub(crate) fn broker_config(&self, policy: &reapi::policy::Policy) -> native_broker::Config {
+        native_broker::Config {
+            max_inflight: self.max_inflight,
+            max_memory_bytes: self.max_memory_bytes,
+            max_temporary_bytes: self.max_temporary_bytes,
+            max_file_bytes: self
+                .repositories
+                .values()
+                .map(|repo| repo.max_file_bytes)
+                .max()
+                .unwrap_or(native_broker::Config::default().max_file_bytes),
+            policy: policy.clone(),
+            ..native_broker::Config::default()
+        }
+    }
+    fn validate(&self, policy: &reapi::policy::Policy) -> Result<()> {
+        ensure!(
+            self.repositories.len() <= 1024,
+            "too many native repository aliases"
+        );
+        for (alias, repo) in &self.repositories {
+            ensure!(alias.len() <= 64, "native repository alias is too long");
+            tinytree_store::validate_repository_id(alias)
+                .context("invalid native repository alias")?;
+            repo.validate()?;
+        }
+        if !self.repositories.is_empty() {
+            self.broker_config(policy)
+                .validate()
+                .map_err(|_| anyhow::anyhow!("invalid native broker limits"))?;
+        }
+        Ok(())
+    }
+}
+
 #[derive(Clone, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Cache {
@@ -149,6 +252,7 @@ impl Default for Config {
             git_proxy: GitProxy::default(),
             session: Session::default(),
             source: Source::default(),
+            native: Native::default(),
             reapi: Default::default(),
         }
     }
@@ -266,6 +370,7 @@ impl Config {
             "action cache limits outside supported range"
         );
         self.reapi.validate()?;
+        self.native.validate(&self.reapi)?;
         ensure!(
             self.cache.upstream_retention_seconds <= 30 * 86400
                 && self.cache.retention_refresh_seconds <= 30 * 86400
@@ -404,6 +509,11 @@ retry_max_attempts = 4
 # Default: 512 MiB per mount with decoded-content caching enabled.
 # large_blob_spool_bytes = 536870912
 
+# Optional native jj object I/O shares rbe.sock; stores live under state_dir/native.
+# [native.repositories.example]
+# max_repository_bytes = 17179869184
+# max_file_bytes = 268435456
+
 [bos]
 # Opt in to strictly lazy outputs; metadata publication is not yet batched.
 enabled = false
@@ -528,6 +638,56 @@ mod tests {
             16_384
         );
     }
+    #[test]
+    fn native_aliases_are_optional_portable_and_have_independent_budgets() {
+        let old: Config = toml::from_str(EXAMPLE).unwrap();
+        assert!(old.native.repositories.is_empty());
+        let input = format!(
+            "{EXAMPLE}\n[native.repositories.example]\nmax_repository_bytes = 1073741824\n"
+        );
+        let mut configured: Config = toml::from_str(&input).unwrap();
+        configured.validate().unwrap();
+        assert_eq!(configured.native.max_inflight, 16);
+        assert_eq!(configured.native.max_memory_bytes, 512 * 1024 * 1024);
+        assert_eq!(configured.native.max_temporary_bytes, 1024 * 1024 * 1024);
+        assert_eq!(
+            configured.native.repositories["example"].max_file_bytes,
+            256 * 1024 * 1024
+        );
+        configured.cache.max_inflight_bytes = 64 * 1024 * 1024;
+        configured.cache.max_blob_bytes = 64 * 1024 * 1024;
+        configured.validate().unwrap();
+        for alias in [
+            "../escape",
+            "path/name",
+            "Uppercase",
+            "con",
+            "lpt1",
+            "",
+            &"x".repeat(65),
+        ] {
+            let mut bad = old.clone();
+            bad.native
+                .repositories
+                .insert(alias.into(), Default::default());
+            assert!(bad.validate().is_err(), "{alias}");
+        }
+        let mut bad = configured.clone();
+        bad.native.max_inflight = 0;
+        assert!(bad.validate().is_err());
+        bad = configured.clone();
+        bad.native
+            .repositories
+            .get_mut("example")
+            .unwrap()
+            .max_staging_bytes = 1;
+        assert!(bad.validate().is_err());
+        let unknown = format!(
+            "{EXAMPLE}\n[native.repositories.example]\ncaller_path='/tmp/not-selected-by-clients'\n"
+        );
+        assert!(toml::from_str::<Config>(&unknown).is_err());
+    }
+
     #[test]
     fn refuses_public_listener_and_unknown_fields() {
         let mut config: Config = toml::from_str(EXAMPLE).unwrap();

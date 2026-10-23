@@ -6,7 +6,8 @@ package(default_visibility = ["//visibility:public"])
 
 rust_binary(
     name = "tinytree-jj",
-    srcs = ["src/main.rs"],
+    srcs = glob(["src/**/*.rs"]),
+    crate_root = "src/main.rs",
     aliases = aliases(),
     crate_name = "tinytree_jj",
     edition = "2024",

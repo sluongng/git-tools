@@ -9,6 +9,8 @@ members = [
     "crates/workspace-fuse",
     "crates/git-pack-cache",
     "crates/reapi",
+    "crates/grpc-transport",
+    "crates/native-broker",
     "crates/tinytree-proto",
     "crates/tinytree-model",
     "crates/tinytree-fixture",

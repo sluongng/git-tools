@@ -2347,6 +2347,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "grpc-transport"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "http",
+ "http-body",
+ "tokio",
+ "tower",
+]
+
+[[package]]
 name = "h2"
 version = "0.4.20"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3090,10 +3101,15 @@ name = "jj-native-cli"
 version = "0.1.0"
 dependencies = [
  "clap",
+ "futures",
  "jj-cli",
  "jj-lib",
  "jj-native-backend",
+ "native-broker",
+ "serde",
  "tempfile",
+ "tokio",
+ "toml",
 ]
 
 [[package]]
@@ -3452,6 +3468,34 @@ name = "multiversion_no_op"
 version = "1.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "743fb55ba31b18fb1ecef6bdc9aa2743314978ac084044301a7eee33fb99a20d"
+
+[[package]]
+name = "native-broker"
+version = "0.1.0"
+dependencies = [
+ "async-stream",
+ "async-trait",
+ "blake3",
+ "bytes",
+ "futures",
+ "grpc-transport",
+ "http",
+ "http-body",
+ "hyper-util",
+ "jj-lib",
+ "jj-native-backend",
+ "libc",
+ "prost",
+ "reapi",
+ "tempfile",
+ "tinytree-model",
+ "tokio",
+ "tokio-stream",
+ "tonic",
+ "tonic-prost",
+ "tonic-prost-build",
+ "tower",
+]
 
 [[package]]
 name = "nfsserve"
@@ -5328,6 +5372,7 @@ dependencies = [
  "blake3",
  "bytes",
  "futures-core",
+ "grpc-transport",
  "http",
  "http-body",
  "libc",
@@ -6315,12 +6360,16 @@ dependencies = [
  "fs2",
  "git-proxy",
  "hyper-util",
+ "jj-native-backend",
  "libc",
  "local-cas",
+ "native-broker",
  "reapi",
  "serde",
  "serde_json",
  "tempfile",
+ "tinytree-model",
+ "tinytree-store",
  "tokio",
  "tokio-stream",
  "toml",

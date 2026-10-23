@@ -76,7 +76,7 @@ entry points. Most also expose Rust libraries; `jj-native-cli` is executable-onl
 | [`workspace-projfs`](crates/workspace-projfs) | `git-projfs` | Windows source mounts using ProjFS. |
 | [`jj-vfs`](crates/jj-vfs) | `git-jj` | Jujutsu working-copy integration with the source VFS. |
 | [`tinytree-server`](crates/tinytree-server) | `tinytree` | Separate jj-native object/ref server over compressed gRPC. |
-| [`jj-native-cli`](crates/jj-native-cli) | `tinytree-jj` | Local native jj prototype; no remote or mounted workflow yet. |
+| [`jj-native-cli`](crates/jj-native-cli) | `tinytree-jj` | Native jj prototype with direct or shared-broker storage; no remote or mounted workflow yet. |
 | [`bazel-output-service`](crates/bazel-output-service) | `git-output-service` | Lazy Bazel output service backed by remote CAS. |
 
 ### Library-only crates
@@ -90,7 +90,9 @@ entry points. Most also expose Rust libraries; `jj-native-cli` is executable-onl
 | [`tinytree-proto`](crates/tinytree-proto) | Native repository gRPC bindings; not a server implementation. |
 | [`tinytree-client`](crates/tinytree-client) | Bounded, verifying native RPCs and immutable transfer snapshots. |
 | [`tinytree-store`](crates/tinytree-store) | Authoritative native objects, durable refs and reachability GC; not LRU. |
-| [`jj-native-backend`](crates/jj-native-backend) | Local native jj Backend; retains all objects pending client retention integration. |
+| [`jj-native-backend`](crates/jj-native-backend) | Native jj Backend and verified object-I/O providers; retains authoritative local objects. |
+| [`native-broker`](crates/native-broker) | Private daemon object I/O shared by independent native jj processes. |
+| [`grpc-transport`](crates/grpc-transport) | Response-body deadlines and resource lifetime guards for gRPC services. |
 | [`git-pack-cache`](crates/git-pack-cache) | Reusable Git fetch/pack responses. |
 | [`reapi`](crates/reapi) | Remote Execution API protocols and client policy. |
 | [`cache-proxy`](crates/cache-proxy) | Cache, execution and remote-downloader forwarding. |

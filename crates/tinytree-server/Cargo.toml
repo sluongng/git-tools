@@ -12,6 +12,7 @@ blake3 = "1"
 bytes = "1"
 http = "1"
 http-body = "1"
+grpc-transport = { path = "../grpc-transport" }
 tower = { version = "0.5", features = ["util"] }
 futures-core = "0.3"
 prost = "0.14"

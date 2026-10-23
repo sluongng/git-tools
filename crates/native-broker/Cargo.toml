@@ -1,0 +1,34 @@
+[package]
+name = "native-broker"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+description = "Private daemon-owned native repository object I/O"
+
+[dependencies]
+async-trait = "0.1"
+async-stream = "0.3"
+blake3 = "1"
+bytes = "1"
+futures = "0.3"
+grpc-transport = { path = "../grpc-transport" }
+http = "1"
+http-body = "1"
+hyper-util = { version = "0.1", features = ["tokio"] }
+jj-native-backend = { path = "../jj-native-backend" }
+jj-lib = { version = "=0.46.0", default-features = false }
+prost = "0.14"
+reapi = { path = "../reapi" }
+tempfile = "3"
+tinytree-model = { path = "../tinytree-model" }
+tokio = { version = "1", features = ["full"] }
+tokio-stream = { version = "0.1", features = ["net"] }
+tonic = { version = "0.14", features = ["zstd"] }
+tonic-prost = "0.14"
+tower = { version = "0.5", features = ["util"] }
+
+[build-dependencies]
+tonic-prost-build = "0.14"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"

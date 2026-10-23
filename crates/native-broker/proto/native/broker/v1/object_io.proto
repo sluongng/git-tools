@@ -1,0 +1,25 @@
+syntax = "proto3";
+package native.broker.v1;
+
+// Private local daemon protocol. Store IDs select configured handles, not paths.
+// No Git service, remote retention promise or jj operation log is shared here.
+service ObjectIo {
+  rpc Descriptor(ObjectRequest) returns (DescriptorReply);
+  rpc ReadMetadata(ObjectRequest) returns (Metadata);
+  rpc WriteMetadata(MetadataWrite) returns (ObjectDescriptor);
+  rpc ReadFile(ObjectRequest) returns (stream ReadFrame);
+  rpc WriteFile(stream WriteFrame) returns (ObjectDescriptor);
+  rpc CopyCatalog(CatalogRequest) returns (stream CatalogFrame);
+}
+message ObjectRequest { string store_id = 1; uint32 kind = 2; bytes id = 3; }
+message ObjectDescriptor { uint32 kind = 1; bytes id = 2; uint64 size_bytes = 3; uint32 format_version = 4; }
+message DescriptorReply { optional ObjectDescriptor descriptor = 1; }
+message Metadata { ObjectDescriptor descriptor = 1; bytes canonical = 2; }
+message MetadataWrite { string store_id = 1; bytes canonical = 2; }
+message Chunk { uint64 offset = 1; bytes data = 2; }
+message Complete { uint64 count = 1; uint64 size_bytes = 2; bytes digest = 3; }
+message ReadFrame { oneof frame { ObjectDescriptor descriptor = 1; Chunk chunk = 2; Complete complete = 3; } }
+message WriteHeader { string store_id = 1; uint64 max_bytes = 2; }
+message WriteFrame { oneof frame { WriteHeader header = 1; Chunk chunk = 2; bool complete = 3; } }
+message CatalogRequest { string store_id = 1; uint64 max_objects = 2; uint64 max_bytes = 3; uint64 max_edges = 4; }
+message CatalogFrame { oneof frame { Metadata entry = 1; Complete complete = 2; } }

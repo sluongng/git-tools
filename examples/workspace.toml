@@ -68,6 +68,16 @@ sync_to_cas = false
 bazel = "https://github.com/bazelbuild/bazel.git"
 buildbuddy = "https://github.com/buildbuddy-io/buildbuddy.git"
 
+# Optional native jj object I/O shares rbe.sock; no remote repository is implied.
+# One authoritative store per alias lives under state_dir/native, not the CAS LRU.
+# [native]
+# max_inflight = 16
+# max_memory_bytes = 536870912
+# max_temporary_bytes = 1073741824
+# [native.repositories.example]
+# max_repository_bytes = 17179869184
+# max_file_bytes = 268435456
+
 [bos]
 # Opt in to strictly lazy outputs; metadata publication is not yet batched.
 enabled = false

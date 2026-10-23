@@ -73,7 +73,7 @@ impl Challenge {
         let p = &config.reapi;
         // Use length-delimited serialization, including all effective service
         // settings and resolved credentials, excluding session-only settings.
-        let material = serde_json::to_vec(&serde_json::json!({
+        let mut material = serde_json::json!({
             "version": VERSION,
             "state_dir": config.state_dir.canonicalize()?,
             "runtime": config.runtime,
@@ -104,7 +104,13 @@ impl Challenge {
                     "max_backoff_ms": p.retry.max_backoff_ms,
                 },
             },
-        }))?;
+        });
+        // Preserve the pre-native identity for disabled configurations; only
+        // settings captured by an enabled service affect daemon reuse.
+        if !config.native.repositories.is_empty() {
+            material["native"] = serde_json::to_value(&config.native)?;
+        }
+        let material = serde_json::to_vec(&material)?;
         // A fresh per-process key avoids a stable credential-derived identifier.
         // Only a match result is returned; the expected digest is never exposed.
         Ok(blake3::keyed_hash(&self.nonce, &material)
@@ -227,6 +233,66 @@ mod tests {
         let response = serde_json::to_string(challenge)?;
         assert!(!response.contains("credential"));
         assert!(!response.contains(&identity.digest));
+        Ok(())
+    }
+
+    #[test]
+    fn native_identity_binds_only_enabled_aliases_and_effective_limits() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let mut config = Config::default();
+        config.state_dir = root.path().to_owned();
+        let credentials = Credentials {
+            cache: None,
+            bes: None,
+        };
+        let disabled = Identity::new(&config, &credentials)?;
+        config.native.max_inflight += 1;
+        config.native.max_memory_bytes += 1;
+        disabled.validate(
+            VERSION,
+            &disabled.challenge().digest(&config, &credentials)?,
+        )?;
+        config
+            .native
+            .repositories
+            .insert("example".into(), Default::default());
+        assert!(
+            disabled
+                .validate(
+                    VERSION,
+                    &disabled.challenge().digest(&config, &credentials)?
+                )
+                .is_err()
+        );
+        let enabled = Identity::new(&config, &credentials)?;
+        for change in [
+            (|config: &mut Config| config.native.max_inflight += 1) as fn(&mut Config),
+            |config| {
+                config
+                    .native
+                    .repositories
+                    .get_mut("example")
+                    .unwrap()
+                    .max_repository_bytes += 1
+            },
+            |config| {
+                config
+                    .native
+                    .repositories
+                    .insert("other".into(), Default::default());
+            },
+        ] {
+            let mut changed = config.clone();
+            change(&mut changed);
+            assert!(
+                enabled
+                    .validate(
+                        VERSION,
+                        &enabled.challenge().digest(&changed, &credentials)?
+                    )
+                    .is_err()
+            );
+        }
         Ok(())
     }
 

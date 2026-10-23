@@ -20,6 +20,9 @@ cache-proxy = { path = "../cache-proxy" }
 bes-proxy = { path = "../bes-proxy" }
 blake3 = "1"
 local-cas = { path = "../local-cas" }
+native-broker = { path = "../native-broker" }
+jj-native-backend = { path = "../jj-native-backend" }
+tinytree-store = { path = "../tinytree-store" }
 reapi = { path = "../reapi" }
 clap = { version = "4.5", features = ["derive"] }
 fs2 = "0.4"
@@ -37,6 +40,7 @@ workspace-fuse = { path = "../workspace-fuse" }
 workspace-core = { path = "../workspace-core" }
 
 [dev-dependencies]
+tinytree-model = { path = "../tinytree-model" }
 tempfile = "3"
 hyper-util = { version = "0.1", features = ["tokio"] }
 tower = { version = "0.5", features = ["util"] }

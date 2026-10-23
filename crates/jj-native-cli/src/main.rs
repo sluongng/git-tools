@@ -1,4 +1,5 @@
 //! Local native-store entry point. Remote commands and mounts are separate work.
+mod broker;
 use std::path::{Path, PathBuf};
 
 use jj_cli::cli_util::{CliRunner, CommandHelper};
@@ -26,6 +27,12 @@ enum TinytreeCommand {
     Init {
         #[arg(default_value = ".", value_hint = clap::ValueHint::DirPath)]
         destination: PathBuf,
+        /// Use a private host broker instead of opening storage in this process.
+        #[arg(long, requires = "store")]
+        broker: Option<PathBuf>,
+        /// Opaque repository ID configured by the broker owner.
+        #[arg(long, requires = "broker")]
+        store: Option<String>,
     },
 }
 
@@ -36,7 +43,12 @@ async fn run_native_command(
 ) -> Result<(), CommandError> {
     match args {
         NativeCommand::Tinytree {
-            command: TinytreeCommand::Init { destination },
+            command:
+                TinytreeCommand::Init {
+                    destination,
+                    broker: socket,
+                    store,
+                },
         } => {
             if command.global_args().no_integrate_operation
                 || command.global_args().ignore_working_copy
@@ -46,6 +58,19 @@ async fn run_native_command(
                     "native initialization does not support operation or working-copy overrides",
                 ));
             }
+            let locator = match (socket, store) {
+                (Some(socket), Some(store)) => Some(
+                    broker::Locator::new(command.cwd().join(socket), store).map_err(|error| {
+                        user_error_with_message("Invalid native broker configuration", error)
+                    })?,
+                ),
+                (None, None) => None,
+                _ => {
+                    return Err(cli_error(
+                        "native broker and store must be supplied together",
+                    ));
+                }
+            };
             let destination = command.cwd().join(destination);
             std::fs::create_dir_all(&destination)
                 .map_err(|error| user_error_with_message("Failed to create workspace", error))?;
@@ -55,7 +80,10 @@ async fn run_native_command(
             let (settings, _) = command.settings_for_new_workspace(ui, &destination)?;
             let initializer =
                 |_: &UserSettings, path: &Path| -> Result<Box<dyn Backend>, BackendInitError> {
-                    Ok(Box::new(NativeBackend::init(path, Config::default())?))
+                    match &locator {
+                        Some(locator) => broker::init(path, locator.clone()),
+                        None => Ok(Box::new(NativeBackend::init(path, Config::default())?)),
+                    }
                 };
             // Default local working-copy, operation, index and workspace stores
             // remain owned by this workspace; only immutable object I/O changes.
@@ -73,7 +101,7 @@ async fn run_native_command(
 
 fn main() -> std::process::ExitCode {
     let mut factories = StoreFactories::empty();
-    jj_native_backend::register(&mut factories, Config::default());
+    broker::register(&mut factories);
     CliRunner::init()
         .version(env!("CARGO_PKG_VERSION"))
         .add_store_factories(factories)

@@ -87,6 +87,64 @@ fn config(dir: PathBuf, port: u16, upstream: u16) -> Config {
 async fn call(socket: PathBuf, request: ControlRequest) -> Result<serde_json::Value> {
     tokio::task::spawn_blocking(move || Client { socket }.call(request)).await?
 }
+async fn native_client(
+    config: &Config,
+) -> Result<native_broker::proto::object_io_client::ObjectIoClient<tonic::transport::Channel>> {
+    let path = config.state_dir.join("rbe.sock");
+    let channel = tonic::transport::Endpoint::from_static("http://localhost")
+        .connect_timeout(Duration::from_secs(2))
+        .timeout(Duration::from_secs(2))
+        .connect_with_connector(tower::service_fn(move |_| {
+            let path = path.clone();
+            async move {
+                tokio::net::UnixStream::connect(path)
+                    .await
+                    .map(hyper_util::rt::TokioIo::new)
+            }
+        }))
+        .await?;
+    Ok(
+        native_broker::proto::object_io_client::ObjectIoClient::new(channel)
+            .send_compressed(tonic::codec::CompressionEncoding::Zstd)
+            .accept_compressed(tonic::codec::CompressionEncoding::Zstd),
+    )
+}
+async fn native_read(
+    client: &mut native_broker::proto::object_io_client::ObjectIoClient<tonic::transport::Channel>,
+    descriptor: &native_broker::proto::ObjectDescriptor,
+) -> Result<Vec<u8>> {
+    use native_broker::proto::{self as p, read_frame::Frame};
+    let mut stream = client
+        .read_file(p::ObjectRequest {
+            store_id: "example".into(),
+            kind: descriptor.kind,
+            id: descriptor.id.clone(),
+        })
+        .await?
+        .into_inner();
+    let mut bytes = Vec::new();
+    let mut complete = false;
+    while let Some(frame) = stream.message().await? {
+        match frame.frame.unwrap() {
+            Frame::Descriptor(actual) => assert_eq!(actual, *descriptor),
+            Frame::Chunk(chunk) => {
+                assert!(!complete);
+                assert_eq!(chunk.offset, bytes.len() as u64);
+                bytes.extend_from_slice(&chunk.data);
+            }
+            Frame::Complete(footer) => {
+                assert!(!complete);
+                assert_eq!(footer.size_bytes, bytes.len() as u64);
+                assert_eq!(footer.digest, descriptor.id);
+                complete = true;
+            }
+        }
+    }
+    assert!(complete);
+    assert_eq!(blake3::hash(&bytes).as_bytes().as_slice(), descriptor.id);
+    Ok(bytes)
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn private_control_retains_registry_and_excludes_second_owner() -> Result<()> {
     let dir = tempfile::tempdir()?;
@@ -378,7 +436,15 @@ async fn offline_upstream_does_not_prevent_durable_bes_admission_startup() -> Re
     let unavailable = std::net::TcpListener::bind("127.0.0.1:0")?;
     let upstream_port = unavailable.local_addr()?.port();
     drop(unavailable);
-    let config = config(dir.path().join("host"), 8378, upstream_port);
+    let mut config = config(dir.path().join("host"), 8378, upstream_port);
+    config
+        .native
+        .repositories
+        .insert("example".into(), Default::default());
+    config
+        .native
+        .repositories
+        .insert("other".into(), Default::default());
     let socket = config.socket();
     let task = tokio::spawn(workspace_daemon::daemon::serve(config.clone()));
     let status = tokio::time::timeout(Duration::from_secs(5), async {
@@ -391,6 +457,109 @@ async fn offline_upstream_does_not_prevent_durable_bes_admission_startup() -> Re
     })
     .await?;
     assert_eq!(status["bes_endpoint"], config.bes_endpoint());
+    assert_eq!(status["native"]["endpoint"], config.rbe_endpoint());
+    assert_eq!(
+        status["native"]["repositories"],
+        serde_json::json!(["example", "other"])
+    );
+    use native_broker::proto as p;
+    let mut first = native_client(&config).await?;
+    let empty = tinytree_model::empty_tree().descriptor;
+    let found = first
+        .descriptor(p::ObjectRequest {
+            store_id: "example".into(),
+            kind: empty.key.kind as u32,
+            id: empty.key.id.0.to_vec(),
+        })
+        .await?
+        .into_inner()
+        .descriptor
+        .unwrap();
+    assert_eq!(found.size_bytes, empty.size_bytes);
+    let content = b"native bytes shared by independent clients\n";
+    let descriptor = first
+        .write_file(tokio_stream::iter([
+            p::WriteFrame {
+                frame: Some(p::write_frame::Frame::Header(p::WriteHeader {
+                    store_id: "example".into(),
+                    max_bytes: content.len() as u64,
+                })),
+            },
+            p::WriteFrame {
+                frame: Some(p::write_frame::Frame::Chunk(p::Chunk {
+                    offset: 0,
+                    data: content.to_vec(),
+                })),
+            },
+            p::WriteFrame {
+                frame: Some(p::write_frame::Frame::Complete(true)),
+            },
+        ]))
+        .await?
+        .into_inner();
+    assert_eq!(descriptor.id, blake3::hash(content).as_bytes());
+    let mut second = native_client(&config).await?;
+    assert_eq!(native_read(&mut second, &descriptor).await?, content);
+    assert!(
+        second
+            .descriptor(p::ObjectRequest {
+                store_id: "other".into(),
+                kind: descriptor.kind,
+                id: descriptor.id.clone()
+            })
+            .await?
+            .into_inner()
+            .descriptor
+            .is_none(),
+        "configured aliases must not fall back to the first store"
+    );
+    assert_eq!(
+        second
+            .descriptor(p::ObjectRequest {
+                store_id: "missing".into(),
+                kind: descriptor.kind,
+                id: descriptor.id.clone()
+            })
+            .await
+            .unwrap_err()
+            .code(),
+        tonic::Code::NotFound
+    );
+    let path = config.state_dir.join("native/example");
+    assert!(
+        tokio::task::spawn_blocking(move || jj_native_backend::DirectObjectIo::load(
+            &path,
+            jj_native_backend::Config::default()
+        ))
+        .await?
+        .is_err(),
+        "daemon retains the sole native store owner"
+    );
+    assert!(
+        workspace_daemon::daemon::serve(config.clone())
+            .await
+            .is_err(),
+        "a second daemon cannot open another copy of configured native stores"
+    );
+    call(socket.clone(), ControlRequest::Shutdown).await?;
+    tokio::time::timeout(Duration::from_secs(5), task).await???;
+    assert!(!config.state_dir.join("native/example/.jj").exists());
+    let task = tokio::spawn(workspace_daemon::daemon::serve(config.clone()));
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if call(socket.clone(), ControlRequest::Status).await.is_ok() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await?;
+    let mut reopened = native_client(&config).await?;
+    assert_eq!(
+        native_read(&mut reopened, &descriptor).await?,
+        content,
+        "authoritative objects survive daemon restart with upstream unavailable"
+    );
     call(socket, ControlRequest::Shutdown).await?;
     tokio::time::timeout(Duration::from_secs(5), task).await???;
     Ok(())

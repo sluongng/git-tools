@@ -181,3 +181,118 @@ fn native_init_rejects_unsupported_overrides_and_existing_workspace() {
     );
     client.assert_native();
 }
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn independent_jj_processes_share_broker_objects_not_workspace_state() {
+    use jj_native_backend::{DirectObjectIo, NativeObjectIo};
+    use std::{collections::HashMap, os::unix::fs::PermissionsExt, sync::Arc};
+    let host = tempfile::tempdir().unwrap();
+    fs::set_permissions(host.path(), fs::Permissions::from_mode(0o700)).unwrap();
+    let host_path = host.path().canonicalize().unwrap();
+    let repository = host_path.join("repository");
+    fs::create_dir(&repository).unwrap();
+    fs::set_permissions(&repository, fs::Permissions::from_mode(0o700)).unwrap();
+    let provider: Arc<dyn NativeObjectIo> =
+        Arc::new(DirectObjectIo::init(&repository, jj_native_backend::Config::default()).unwrap());
+    let service = native_broker::BrokerService::new(
+        HashMap::from([("example".into(), provider)]),
+        native_broker::Config::default(),
+    )
+    .unwrap();
+    let socket = host_path.join("broker.sock");
+    let serve_path = socket.clone();
+    let (stop, stopped) = tokio::sync::oneshot::channel();
+    // Keep the owned server task even if a child assertion fails.
+    struct ServerGuard {
+        stop: Option<tokio::sync::oneshot::Sender<()>>,
+        task: Option<tokio::task::JoinHandle<()>>,
+    }
+    impl Drop for ServerGuard {
+        fn drop(&mut self) {
+            if let Some(stop) = self.stop.take() {
+                let _ = stop.send(());
+            }
+            if let Some(task) = self.task.take() {
+                task.abort();
+            }
+        }
+    }
+    let task = tokio::spawn(async move {
+        native_broker::serve_unix(&serve_path, service, async {
+            let _ = stopped.await;
+        })
+        .await
+        .unwrap();
+    });
+    let mut server = ServerGuard {
+        stop: Some(stop),
+        task: Some(task),
+    };
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            assert!(
+                !server.task.as_ref().unwrap().is_finished(),
+                "broker exited before ready"
+            );
+            if fs::metadata(&socket).is_ok_and(|m| m.permissions().mode() & 0o777 == 0o600) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let first = Client::new();
+    let second = Client::new();
+    let socket_argument = socket.to_str().unwrap();
+    for client in [&first, &second] {
+        client.success(&[
+            "tinytree",
+            "init",
+            "--broker",
+            socket_argument,
+            "--store",
+            "example",
+        ]);
+        client.assert_native();
+        assert!(
+            client
+                .root
+                .join(".jj/repo/store/native-broker.toml")
+                .is_file()
+        );
+        assert!(!client.root.join(".jj/repo/store/native-objects").exists());
+    }
+    fs::write(first.root.join("shared.txt"), "first workspace\n").unwrap();
+    fs::write(second.root.join("shared.txt"), "second workspace\n").unwrap();
+    std::thread::scope(|scope| {
+        let a = scope.spawn(|| first.success(&["describe", "-m", "first private operation"]));
+        let b = scope.spawn(|| second.success(&["describe", "-m", "second private operation"]));
+        a.join().unwrap();
+        b.join().unwrap();
+    });
+    assert_ne!(first.revision("@"), second.revision("@"));
+    assert_eq!(
+        first.success(&["file", "show", "shared.txt"]),
+        "first workspace\n"
+    );
+    assert_eq!(
+        second.success(&["file", "show", "shared.txt"]),
+        "second workspace\n"
+    );
+    // Every command loads the durable locator in a new process; no process opens
+    // the authoritative store and no Git program is available on the empty PATH.
+    first.success(&["new", "-m", "first private child"]);
+    second.success(&["status"]);
+    first.success(&["undo"]);
+    assert_eq!(
+        second.success(&["file", "show", "shared.txt"]),
+        "second workspace\n"
+    );
+    let _ = server.stop.take().unwrap().send(());
+    tokio::time::timeout(Duration::from_secs(5), server.task.take().unwrap())
+        .await
+        .unwrap()
+        .unwrap();
+}

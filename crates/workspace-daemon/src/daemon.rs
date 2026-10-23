@@ -42,6 +42,7 @@ struct State {
     cache: Arc<LocalCas>,
     proxy: cache_proxy::CacheProxy,
     bes: Option<bes_proxy::BesProxy>,
+    native: Option<native_broker::BrokerService>,
     registry: Registry,
     mounts: BTreeMap<PathBuf, Mount>,
     #[cfg(target_os = "linux")]
@@ -112,7 +113,7 @@ impl State {
     fn status(&self) -> serde_json::Value {
         let metrics = self.cache.metrics();
         let proxy = self.proxy.metrics();
-        json!({"pid":std::process::id(),"runtime":{"open_files":self.startup_limits,"control_accept_resource_exhaustions":self.control_accept.resource_exhaustions()},"rbe_endpoint":self.config.rbe_endpoint(),"cache_endpoint":self.config.cache_endpoint(),"bytestream_uri_prefix":self.config.bytestream_uri_prefix(),"instance_name":self.config.cache.instance_name,"bes_endpoint":self.bes.as_ref().map(|_|self.config.bes_endpoint()),"bes":self.bes.as_ref().map(|bes|bes.metrics()),"bos_endpoint":if self.config.bos.enabled {Some(self.config.rbe_endpoint())}else{None},"output_path_prefix":self.config.state_dir.join("outputs"),"mounts":self.registry.mounts.iter().map(|(path,record)|json!({"session":path,"state":record.state})).collect::<Vec<_>>(),"proxy":{"download_failures":proxy.download_failures,"serving_read_failures":proxy.serving_read_failures,"accept_resource_exhaustions":proxy.accept_resource_exhaustions,"action_cache_hits":proxy.action_cache_hits,"action_cache_upstream":proxy.action_cache_upstream,"blob_reads":proxy.blob_reads,"read_slots_in_use":proxy.read_slots_in_use,"read_slots_queued":proxy.read_slots_queued,"asset_cache_hits":proxy.asset_cache_hits,"asset_upstream_requests":proxy.asset_upstream_requests,"execution_requests":proxy.execution_requests,"execution_waits":proxy.execution_waits,"retention":{"action_refreshes":proxy.retention.action_refreshes,"output_refreshes":proxy.retention.output_refreshes,"blob_refreshes":proxy.retention.blob_refreshes,"blob_repairs":proxy.retention.blob_repairs,"blob_repair_failures":proxy.retention.blob_repair_failures,"failures":proxy.retention.failures,"missing_blobs":proxy.retention.missing_blobs,"dropped":proxy.retention.dropped}},"cache":metrics})
+        json!({"pid":std::process::id(),"runtime":{"open_files":self.startup_limits,"control_accept_resource_exhaustions":self.control_accept.resource_exhaustions()},"rbe_endpoint":self.config.rbe_endpoint(),"cache_endpoint":self.config.cache_endpoint(),"bytestream_uri_prefix":self.config.bytestream_uri_prefix(),"instance_name":self.config.cache.instance_name,"bes_endpoint":self.bes.as_ref().map(|_|self.config.bes_endpoint()),"bes":self.bes.as_ref().map(|bes|bes.metrics()),"native":{"endpoint":self.native.as_ref().map(|_|self.config.rbe_endpoint()),"repositories":self.config.native.repositories.keys().collect::<Vec<_>>()},"bos_endpoint":if self.config.bos.enabled {Some(self.config.rbe_endpoint())}else{None},"output_path_prefix":self.config.state_dir.join("outputs"),"mounts":self.registry.mounts.iter().map(|(path,record)|json!({"session":path,"state":record.state})).collect::<Vec<_>>(),"proxy":{"download_failures":proxy.download_failures,"serving_read_failures":proxy.serving_read_failures,"accept_resource_exhaustions":proxy.accept_resource_exhaustions,"action_cache_hits":proxy.action_cache_hits,"action_cache_upstream":proxy.action_cache_upstream,"blob_reads":proxy.blob_reads,"read_slots_in_use":proxy.read_slots_in_use,"read_slots_queued":proxy.read_slots_queued,"asset_cache_hits":proxy.asset_cache_hits,"asset_upstream_requests":proxy.asset_upstream_requests,"execution_requests":proxy.execution_requests,"execution_waits":proxy.execution_waits,"retention":{"action_refreshes":proxy.retention.action_refreshes,"output_refreshes":proxy.retention.output_refreshes,"blob_refreshes":proxy.retention.blob_refreshes,"blob_repairs":proxy.retention.blob_repairs,"blob_repair_failures":proxy.retention.blob_repair_failures,"failures":proxy.retention.failures,"missing_blobs":proxy.retention.missing_blobs,"dropped":proxy.retention.dropped}},"cache":metrics})
     }
     fn mounted(&self, path: &Path) -> bool {
         #[cfg(target_os = "linux")]
@@ -484,6 +485,40 @@ fn git_cas_endpoint(upstream: &str) -> Result<String> {
     Ok(endpoint)
 }
 
+/// Open each configured native store exactly once under daemon ownership.
+/// A partial/unrecognized existing directory is never guessed or reinitialized.
+fn open_native_repositories(config: &Config) -> Result<Option<native_broker::BrokerService>> {
+    if config.native.repositories.is_empty() {
+        return Ok(None);
+    }
+    let root = config.state_dir.join("native");
+    private_dir(&root)?;
+    // Persist directory names as well as the files subsequently acknowledged
+    // by the authoritative store. Existing ancestors are not chmodded/changed.
+    for ancestor in root.ancestors() {
+        File::open(ancestor)?.sync_all()?;
+    }
+    let mut stores: std::collections::HashMap<String, Arc<dyn jj_native_backend::NativeObjectIo>> =
+        std::collections::HashMap::new();
+    for (alias, settings) in &config.native.repositories {
+        let path = root.join(alias);
+        private_dir(&path)?;
+        File::open(&path)?.sync_all()?;
+        File::open(&root)?.sync_all()?;
+        let fresh = std::fs::read_dir(&path)?.next().is_none();
+        let provider = if fresh {
+            jj_native_backend::DirectObjectIo::init(&path, settings.materialize())
+        } else {
+            jj_native_backend::DirectObjectIo::load(&path, settings.materialize())
+        }
+        .map_err(|_| anyhow::anyhow!("cannot open configured native repository; state retained"))?;
+        stores.insert(alias.clone(), Arc::new(provider));
+    }
+    native_broker::BrokerService::new(stores, config.native.broker_config(&config.reapi))
+        .map(Some)
+        .map_err(|_| anyhow::anyhow!("cannot configure native broker"))
+}
+
 pub async fn serve(mut config: Config) -> Result<()> {
     config.validate()?;
     let git_cas_endpoint = config
@@ -590,6 +625,15 @@ pub async fn serve(mut config: Config) -> Result<()> {
     )?;
     let proxy = cache_proxy::CacheProxy::new(upstream, cache.clone());
     let mut rbe_router = proxy.clone().unix_router();
+    let native_config = config.clone();
+    let native = tokio::task::spawn_blocking(move || open_native_repositories(&native_config))
+        .await
+        .context("native repository startup worker failed")??;
+    if let Some(broker) = &native {
+        // This wrapper carries pre-decode admission and independent body
+        // deadlines; never embed the raw generated ObjectIo service instead.
+        rbe_router = rbe_router.add_service(broker.rpc_service());
+    }
     let bes = if config.bes.enabled {
         let settings = &config.bes;
         let bes_key = credentials.bes.clone();
@@ -755,6 +799,7 @@ pub async fn serve(mut config: Config) -> Result<()> {
         cache,
         proxy: proxy.clone(),
         bes,
+        native,
         registry,
         mounts: BTreeMap::new(),
         #[cfg(target_os = "linux")]
@@ -881,13 +926,26 @@ pub async fn serve(mut config: Config) -> Result<()> {
     if let Some(bes) = &state.bes {
         bes.shutdown().await;
     }
-    if !proxy_completed
-        && tokio::time::timeout(Duration::from_secs(10), &mut proxy_task)
+    if !proxy_completed {
+        if state.native.is_some() {
+            // Native I/O owns authoritative data. Stop accepting first, then
+            // drain HTTP bodies and provider jobs without a forced grace cap.
+            (&mut proxy_task)
+                .await
+                .context("unified transport task failed")??;
+        } else if tokio::time::timeout(Duration::from_secs(10), &mut proxy_task)
             .await
             .is_err()
-    {
-        proxy_task.abort();
-        let _ = proxy_task.await;
+        {
+            proxy_task.abort();
+            let _ = proxy_task.await;
+        }
+    }
+    if let Some(native) = &state.native {
+        native
+            .drain()
+            .await
+            .context("native broker did not drain")?;
     }
     if let Some(shutdown) = git_cas_shutdown {
         shutdown.shutdown().await;
@@ -907,6 +965,61 @@ pub async fn serve(mut config: Config) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn native_store_initialization_reuses_one_owner_and_refuses_partial_or_unrelated_state()
+    -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let mut config = Config::default();
+        config.state_dir = directory.path().join("state");
+        private_dir(&config.state_dir)?;
+        assert!(open_native_repositories(&config)?.is_none());
+        assert!(!config.state_dir.join("native").exists());
+        config
+            .native
+            .repositories
+            .insert("example".into(), Default::default());
+        let broker = open_native_repositories(&config)?.unwrap();
+        assert!(
+            open_native_repositories(&config).is_err(),
+            "a second provider must not steal the live owner lock"
+        );
+        drop(broker);
+        let reopened = open_native_repositories(&config)?.unwrap();
+        drop(reopened);
+
+        for partial in [false, true] {
+            let root = directory
+                .path()
+                .join(if partial { "partial" } else { "unrelated" });
+            config.state_dir = root.clone();
+            let path = root.join("native/example");
+            private_dir(&path)?;
+            if partial {
+                std::fs::create_dir(path.join("native-objects"))?;
+                std::fs::create_dir(path.join("native-file-staging"))?;
+            } else {
+                std::fs::write(path.join("sentinel"), b"unrelated bytes")?;
+            }
+            assert!(open_native_repositories(&config).is_err());
+            if partial {
+                assert!(
+                    std::fs::read_dir(path.join("native-objects"))?
+                        .next()
+                        .is_none()
+                );
+                assert!(
+                    std::fs::read_dir(path.join("native-file-staging"))?
+                        .next()
+                        .is_none()
+                );
+            } else {
+                assert_eq!(std::fs::read(path.join("sentinel"))?, b"unrelated bytes");
+                assert_eq!(std::fs::read_dir(path)?.count(), 1);
+            }
+        }
+        Ok(())
+    }
 
     #[test]
     fn git_cas_endpoint_translates_only_supported_scheme_aliases() {
