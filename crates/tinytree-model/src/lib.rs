@@ -5,6 +5,16 @@ use std::fmt;
 pub const FORMAT_VERSION: u16 = 1;
 const MAGIC: &[u8; 8] = b"TTREE\0\0\0";
 
+/// Hash recovery-manifest bytes in their version-one identity domain.
+///
+/// This does not validate the manifest schema or prove content retention.
+pub fn cloud_manifest_id(bytes: &[u8]) -> [u8; 32] {
+    let mut hash = blake3::Hasher::new();
+    hash.update(b"tinytree-cloud-manifest-v1\0");
+    hash.update(bytes);
+    *hash.finalize().as_bytes()
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Error {
     Invalid(&'static str),

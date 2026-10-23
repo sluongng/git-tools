@@ -12,6 +12,7 @@ rust_library(
         exclude = ["src/main.rs"],
     ),
     aliases = aliases(),
+    compile_data = ["examples/cloud.toml"],
     crate_name = "tinytree_server",
     crate_root = "src/lib.rs",
     edition = "2024",
@@ -42,6 +43,7 @@ rust_test(
 
 rust_test(
     name = "rpc_tests",
+    compile_data = ["examples/cloud.toml"],
     srcs = ["tests/rpc.rs"],
     aliases = aliases(),
     edition = "2024",

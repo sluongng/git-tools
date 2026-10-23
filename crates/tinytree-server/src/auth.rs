@@ -8,6 +8,7 @@ pub struct Principal {
     pub repositories: Vec<String>,
     pub write: bool,
     pub retain: bool,
+    pub cloud: bool,
     token_hash: [u8; 32],
 }
 impl Principal {
@@ -35,8 +36,14 @@ impl Principal {
             repositories,
             write,
             retain: false,
+            cloud: false,
             token_hash: *blake3::hash(token.as_bytes()).as_bytes(),
         })
+    }
+    /// Private workspace history is an independent opt-in capability.
+    pub fn with_cloud(mut self, enabled: bool) -> Self {
+        self.cloud = enabled;
+        self
     }
     /// Retention grants no upload or public-reference write permission.
     pub fn with_retention(mut self, enabled: bool) -> Self {
@@ -82,6 +89,7 @@ impl Authorization {
                 repositories: self.repositories.clone(),
                 write: true,
                 retain: true,
+                cloud: true,
             });
         }
         let header = metadata
@@ -102,6 +110,7 @@ impl Authorization {
             repositories: p.repositories.iter().cloned().collect(),
             write: p.write,
             retain: p.retain,
+            cloud: p.cloud,
         })
     }
 }
@@ -110,8 +119,29 @@ pub(crate) struct Identity {
     repositories: HashSet<String>,
     write: bool,
     retain: bool,
+    cloud: bool,
 }
 impl Identity {
+    pub fn cloud_capability(&self) -> Result<(), Status> {
+        if !self.cloud {
+            return Err(Status::permission_denied("private workspace access denied"));
+        }
+        Ok(())
+    }
+    pub fn cloud_write_capability(&self) -> Result<(), Status> {
+        self.cloud_capability()?;
+        if !self.write {
+            return Err(Status::permission_denied(
+                "private workspace write access denied",
+            ));
+        }
+        Ok(())
+    }
+    pub fn authorize_cloud(&self, repo: &str, write: bool) -> Result<(), Status> {
+        self.cloud_capability()?;
+        self.authorize(repo, write)
+    }
+
     pub fn authorize_retention(&self, repo: &str) -> Result<(), Status> {
         self.authorize(repo, false)?;
         if !self.retain {

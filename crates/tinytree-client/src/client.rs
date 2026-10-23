@@ -1,3 +1,5 @@
+#[path = "cloud.rs"]
+pub(crate) mod cloud;
 #[path = "query.rs"]
 pub(crate) mod query;
 use crate::transport::Client as RepositoryClient;

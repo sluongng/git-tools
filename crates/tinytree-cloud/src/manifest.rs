@@ -12,10 +12,7 @@ pub struct ManifestId(pub [u8; 32]);
 impl ManifestId {
     /// Hash exact canonical bytes in a domain distinct from raw cloud payloads.
     pub fn of(bytes: &[u8]) -> Self {
-        let mut hash = blake3::Hasher::new();
-        hash.update(b"tinytree-cloud-manifest-v1\0");
-        hash.update(bytes);
-        Self(*hash.finalize().as_bytes())
+        Self(m::cloud_manifest_id(bytes))
     }
 }
 #[derive(Clone, Debug, PartialEq, Eq)]

@@ -22,6 +22,13 @@ principals can hold their own `_tinytree/hold/v1/<client>/<commit>` references
 without public-write permission. Holds persist until explicit release; quotas
 reject new promises, not existing ones. A historical receipt is not current proof.
 
+Private workspace history is opt-in: start from [the cloud profile](examples/cloud.toml),
+set `service.cloud.enabled = true` and grant each principal `cloud = true`.
+Reads and uploads are owner-scoped; uploads/publication also require `write = true`.
+All published versions are retained. Quotas reject new promises rather than
+expiring history. The profile explicitly bounds Store validation work and its
+separate RPC memory pool; it does not silently shrink existing native limits.
+
 The separate query service supports retained root scopes, exact graph facts and
 prefix resolution. Its rebuildable index warms asynchronously; unavailable
 coverage is an error, not an empty result. Warming caches raw canonical payloads

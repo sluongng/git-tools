@@ -30,6 +30,7 @@ pub struct ServiceConfig {
     pub rpc: reapi::policy::Policy,
     pub retention: tinytree_store::RetentionLimits,
     pub query: crate::QueryConfig,
+    pub cloud: crate::CloudConfig,
 }
 impl Default for ServiceConfig {
     fn default() -> Self {
@@ -46,12 +47,14 @@ impl Default for ServiceConfig {
             rpc: Default::default(),
             retention: Default::default(),
             query: Default::default(),
+            cloud: Default::default(),
         }
     }
 }
 impl ServiceConfig {
     pub fn validate(&self) -> Result<(), ConfigError> {
         self.query.validate(self.max_request_bytes)?;
+        self.cloud.validate()?;
         self.retention
             .validate()
             .map_err(|_| ConfigError("invalid native retention limits"))?;
@@ -89,7 +92,31 @@ impl ServiceConfig {
 
 #[derive(Clone, Deserialize)]
 #[serde(default, deny_unknown_fields)]
+pub struct CloudStoreConfig {
+    pub max_object_bytes: usize,
+    pub max_decode_bytes: usize,
+    pub max_version_decode_bytes: usize,
+    pub max_manifest_bytes: usize,
+    pub max_manifest_decode_bytes: usize,
+    pub max_manifest_members: usize,
+}
+impl Default for CloudStoreConfig {
+    fn default() -> Self {
+        let c = tinytree_store::CloudConfig::default();
+        Self {
+            max_object_bytes: c.max_object_bytes,
+            max_decode_bytes: c.max_decode_bytes,
+            max_version_decode_bytes: c.max_version_decode_bytes,
+            max_manifest_bytes: c.manifest_limits.max_manifest_bytes,
+            max_manifest_decode_bytes: c.manifest_limits.max_decode_bytes,
+            max_manifest_members: c.manifest_limits.max_members,
+        }
+    }
+}
+#[derive(Clone, Deserialize)]
+#[serde(default, deny_unknown_fields)]
 pub struct StoreConfig {
+    pub cloud: CloudStoreConfig,
     pub max_file_bytes: u64,
     pub max_repository_bytes: u64,
     pub max_objects_per_repository: u64,
@@ -107,6 +134,7 @@ impl Default for StoreConfig {
     fn default() -> Self {
         let c = tinytree_store::Config::default();
         Self {
+            cloud: Default::default(),
             max_file_bytes: c.max_file_bytes,
             max_repository_bytes: c.max_repository_bytes,
             max_objects_per_repository: c.max_objects_per_repository,
@@ -126,6 +154,16 @@ impl StoreConfig {
     pub fn materialize(&self, metadata_bytes: usize) -> tinytree_store::Config {
         let mut config = tinytree_store::Config::default();
         config.model_limits.max_object_bytes = metadata_bytes;
+        config.cloud.max_object_bytes = self.cloud.max_object_bytes;
+        config.cloud.max_field_bytes = config
+            .cloud
+            .max_field_bytes
+            .min(self.cloud.max_object_bytes);
+        config.cloud.max_decode_bytes = self.cloud.max_decode_bytes;
+        config.cloud.max_version_decode_bytes = self.cloud.max_version_decode_bytes;
+        config.cloud.manifest_limits.max_manifest_bytes = self.cloud.max_manifest_bytes;
+        config.cloud.manifest_limits.max_decode_bytes = self.cloud.max_manifest_decode_bytes;
+        config.cloud.manifest_limits.max_members = self.cloud.max_manifest_members;
         config.max_file_bytes = self.max_file_bytes;
         config.max_repository_bytes = self.max_repository_bytes;
         config.max_objects_per_repository = self.max_objects_per_repository;
@@ -141,7 +179,15 @@ impl StoreConfig {
         config
     }
     pub fn validate(&self) -> Result<(), ConfigError> {
-        if self.max_file_bytes == 0
+        if !(1024..=64 * 1024 * 1024).contains(&self.cloud.max_object_bytes)
+            || self.cloud.max_decode_bytes < self.cloud.max_object_bytes
+            || self.cloud.max_decode_bytes > 1024 * 1024 * 1024
+            || !(65536..=1024 * 1024 * 1024).contains(&self.cloud.max_version_decode_bytes)
+            || !(1024..=64 * 1024 * 1024).contains(&self.cloud.max_manifest_bytes)
+            || self.cloud.max_manifest_decode_bytes < self.cloud.max_manifest_bytes
+            || self.cloud.max_manifest_decode_bytes > 1024 * 1024 * 1024
+            || !(1..=65536).contains(&self.cloud.max_manifest_members)
+            || self.max_file_bytes == 0
             || self.max_repository_bytes == 0
             || self.max_objects_per_repository == 0
             || !(1..=1_000_000).contains(&self.max_closure_objects)
@@ -170,6 +216,8 @@ pub struct PrincipalConfig {
     pub write: bool,
     #[serde(default)]
     pub retain: bool,
+    #[serde(default)]
+    pub cloud: bool,
 }
 #[derive(Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -225,6 +273,11 @@ impl Config {
     pub fn validate(&self) -> Result<(), ConfigError> {
         self.service.validate()?;
         self.store.validate()?;
+        if self.service.cloud.enabled {
+            self.service
+                .cloud
+                .validate_store_profile(&self.store.materialize(self.service.max_metadata_bytes))?;
+        }
         if self.repositories.is_empty()
             || self.repositories.len() > 1024
             || self.gc_interval_seconds > 86400

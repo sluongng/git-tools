@@ -20,6 +20,7 @@ private-fs = { path = "../private-fs" }
 reapi = { path = "../reapi" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+tinytree-cloud = { path = "../tinytree-cloud" }
 tinytree-model = { path = "../tinytree-model" }
 tinytree-index = { path = "../tinytree-index" }
 tinytree-proto = { path = "../tinytree-proto" }
@@ -31,6 +32,7 @@ tonic = { version = "0.14", features = ["zstd", "tls-ring"] }
 uuid = { version = "1", features = ["v4"] }
 
 [dev-dependencies]
+jj-lib = { version = "=0.46.0", default-features = false }
 tonic-prost = "0.14"
 tempfile = "3"
 tinytree-fixture = { path = "../tinytree-fixture" }

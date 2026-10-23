@@ -6,7 +6,11 @@
 mod auth;
 mod body_deadline;
 pub use body_deadline::DeadlineLayer;
+mod cloud;
+mod cloud_ingress;
 mod config;
+pub use cloud::CloudConfig;
+pub use cloud_ingress::CloudGrpcService;
 mod derived_index;
 mod query_cursor;
 mod query_eval;
@@ -22,7 +26,9 @@ pub use query_ingress::QueryGrpcService;
 pub use query_service::QueryService;
 
 pub use auth::Principal;
-pub use config::{Config, ConfigError, PrincipalConfig, ServiceConfig, StoreConfig, TlsConfig};
+pub use config::{
+    CloudStoreConfig, Config, ConfigError, PrincipalConfig, ServiceConfig, StoreConfig, TlsConfig,
+};
 pub use service::RepositoryService;
 
 use anyhow::{Context, Result, ensure};
@@ -57,11 +63,13 @@ pub async fn serve_tcp(
             .tls_config(ServerTlsConfig::new().identity(identity))
             .map_err(|_| anyhow::anyhow!("cannot configure native TLS"))?;
     }
-    server
+    let drain = service.clone();
+    let result = server
         .layer(service.deadline_layer())
         .concurrency_limit_per_connection(service.maximum_inflight())
         .add_service(service.grpc_service())
         .add_service(service.query_grpc_service())
+        .add_service(service.cloud_grpc_service())
         .serve_with_incoming_shutdown(
             tokio_stream::wrappers::TcpListenerStream::new(listener).map(|accepted| {
                 accepted.and_then(|stream| {
@@ -73,7 +81,9 @@ pub async fn serve_tcp(
             shutdown,
         )
         .await
-        .context("native gRPC listener failed")
+        .context("native gRPC listener failed");
+    drain.drain_cloud().await;
+    result
 }
 
 #[cfg(unix)]
@@ -91,17 +101,21 @@ async fn run_unix(
     service: RepositoryService,
     shutdown: impl Future<Output = ()> + Send + 'static,
 ) -> Result<()> {
-    Server::builder()
+    let drain = service.clone();
+    let result = Server::builder()
         .layer(service.deadline_layer())
         .concurrency_limit_per_connection(service.maximum_inflight())
         .add_service(service.grpc_service())
         .add_service(service.query_grpc_service())
+        .add_service(service.cloud_grpc_service())
         .serve_with_incoming_shutdown(
             tokio_stream::wrappers::UnixListenerStream::new(listener),
             shutdown,
         )
         .await
-        .context("native Unix gRPC listener failed")
+        .context("native Unix gRPC listener failed");
+    drain.drain_cloud().await;
+    result
 }
 
 /// Initialize configured native repositories and run a standalone server.
@@ -121,7 +135,7 @@ pub async fn serve(
                 let token = std::env::var(&p.token_env)
                     .map_err(|_| ConfigError("cannot resolve native principal token"))?;
                 Principal::new(p.id.clone(), &token, p.repositories.clone(), p.write)
-                    .map(|principal| principal.with_retention(p.retain))
+                    .map(|principal| principal.with_retention(p.retain).with_cloud(p.cloud))
             })
             .collect::<std::result::Result<Vec<_>, _>>()?;
         auth::Authorization::new(principals.clone(), &setup.repositories)?;
@@ -363,6 +377,7 @@ mod tests {
             repositories: vec!["default".into()],
             write: true,
             retain: false,
+            cloud: false,
         });
         assert!(config.validate().is_err());
         config.tls = Some(TlsConfig {
@@ -375,6 +390,36 @@ mod tests {
         config.service.query.index_rebuild_generation = 0;
         config.service.max_frame_bytes = usize::MAX;
         assert!(config.validate().is_err());
+    }
+    #[test]
+    fn cloud_profile_preflight_accepts_nonaligned_pool_but_rejects_insufficient_work_budget() {
+        let mut config: Config = toml::from_str(include_str!("../examples/cloud.toml")).unwrap();
+        // An odd wire bound makes the worst method's byte charge non-aligned.
+        // Find the public configuration admission boundary without depending on
+        // the implementation's reservation arithmetic or private state.
+        config.service.cloud.max_manifest_bytes += 1;
+        let (mut low, mut high) = (1024 * 1024, config.service.cloud.max_buffered_bytes);
+        while low < high {
+            let midpoint = low + (high - low) / 2;
+            config.service.cloud.max_buffered_bytes = midpoint;
+            if config.validate().is_ok() {
+                high = midpoint;
+            } else {
+                low = midpoint + 1;
+            }
+        }
+        assert_eq!(low % 1024, 0, "the entire rounded-up reservation must fit");
+        config.service.cloud.max_buffered_bytes = low - 1;
+        assert!(config.validate().is_err());
+        config.service.cloud.max_buffered_bytes = low + 1;
+        assert!(config.validate().is_ok());
+        config.service.cloud.max_buffered_bytes = 1024 * 1024;
+        assert!(config.validate().is_err());
+        config.service.cloud.enabled = false;
+        assert!(
+            config.validate().is_ok(),
+            "disabled cloud does not shrink native Store policy"
+        );
     }
     #[test]
     fn config_parse_errors_never_echo_file_contents() {

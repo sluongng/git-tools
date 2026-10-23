@@ -77,6 +77,8 @@ pub struct Config {
     pub token_env: Option<String>,
     pub tls: Option<Tls>,
     pub compression: bool,
+    #[serde(skip_serializing_if = "crate::CloudLimits::is_default")]
+    pub cloud: crate::CloudLimits,
     /// Fresh cleanup deadline, including time waiting in the Drop queue.
     pub query_cleanup_timeout_ms: u64,
     pub limits: Limits,
@@ -90,6 +92,7 @@ impl Default for Config {
             token_env: None,
             tls: None,
             compression: true,
+            cloud: Default::default(),
             query_cleanup_timeout_ms: 5000,
             limits: Limits::default(),
             rpc: Default::default(),
@@ -124,6 +127,7 @@ impl Config {
         Ok(value)
     }
     pub fn validate(&self) -> Result<(), ConfigError> {
+        self.cloud.validate().map_err(ConfigError)?;
         self.rpc
             .validate()
             .map_err(|_| ConfigError("invalid native client RPC policy"))?;

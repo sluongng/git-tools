@@ -14,10 +14,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             &[
                 "proto/tinytree/v1/repository.proto",
                 "proto/tinytree/query/v1/query.proto",
+                "proto/tinytree/cloud/v1/cloud.proto",
             ],
             &["proto"],
         )?;
     println!("cargo:rerun-if-changed=proto/tinytree/v1/repository.proto");
     println!("cargo:rerun-if-changed=proto/tinytree/query/v1/query.proto");
+    println!("cargo:rerun-if-changed=proto/tinytree/cloud/v1/cloud.proto");
     Ok(())
 }

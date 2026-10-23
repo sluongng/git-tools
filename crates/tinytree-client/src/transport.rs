@@ -68,6 +68,60 @@ impl Client {
             )
             .await
     }
+    pub(crate) async fn cloud_unary<
+        T: Message + Send + 'static,
+        U: Message + Default + Send + 'static,
+    >(
+        &mut self,
+        request: Request<T>,
+        path: &'static str,
+        shape: Shape,
+        limits: &crate::CloudLimits,
+        cap: usize,
+    ) -> Result<Response<U>, Status> {
+        self.limits.max_batch_items = limits.max_lookup_items;
+        self.limits.max_metadata_bytes = limits.max_manifest_bytes;
+        self.limits.max_frame_bytes = limits.max_chunk_bytes;
+        self.decode = cap;
+        self.inner = self
+            .inner
+            .clone()
+            .max_decoding_message_size(cap)
+            .max_encoding_message_size(
+                limits.max_manifest_bytes.max(limits.max_object_bytes) + 128 * 1024,
+            );
+        self.unary(request, path, shape).await
+    }
+    pub(crate) async fn cloud_read(
+        &mut self,
+        request: Request<tinytree_proto::cloud_v1::ReadObjectRequest>,
+        limits: &crate::CloudLimits,
+    ) -> Result<Response<Streaming<tinytree_proto::cloud_v1::ObjectChunk>>, Status> {
+        let cap = limits.max_chunk_bytes + 1024;
+        self.inner = self
+            .inner
+            .clone()
+            .max_decoding_message_size(cap)
+            .max_encoding_message_size(4096);
+        self.limits.max_frame_bytes = limits.max_chunk_bytes;
+        self.inner
+            .ready()
+            .await
+            .map_err(|_| Status::unavailable("native gRPC transport not ready"))?;
+        self.inner
+            .server_streaming(
+                request,
+                http::uri::PathAndQuery::from_static(
+                    "/tinytree.cloud.v1.WorkspaceCloud/ReadObject",
+                ),
+                BoundedCodec::<
+                    tinytree_proto::cloud_v1::ReadObjectRequest,
+                    tinytree_proto::cloud_v1::ObjectChunk,
+                >::new(Shape::CloudChunk, self.limits.clone(), cap)
+                .with_optional_owner(self.owner.clone()),
+            )
+            .await
+    }
     pub async fn open_scope(
         &mut self,
         request: impl tonic::IntoStreamingRequest<Message = q::OpenScopeFrame>,
@@ -341,7 +395,7 @@ impl Client {
     }
 }
 #[derive(Clone, Copy)]
-enum Shape {
+pub(crate) enum Shape {
     QueryScope,
     ScopeKey,
     QueryFacts,
@@ -356,6 +410,17 @@ enum Shape {
     ChangeTarget,
     ShortestPrefix,
     QueryEmpty,
+    CloudId,
+    CloudDigest,
+    CloudDescriptor,
+    CloudReceipt,
+    CloudSelections,
+    CloudSelection,
+    CloudChunk,
+    CloudWorkspace,
+    CloudPublication,
+    CloudPublicationResult,
+    CloudVersion,
     IdsPage,
     IdsRow,
     GraphPage,
@@ -582,6 +647,7 @@ fn scan(
                     (Shape::FactAnswer, 1 | 2)
                         | (Shape::ChangeTarget, 2)
                         | (Shape::IdsPage | Shape::GraphPage | Shape::CanonicalPage, 6)
+                        | (Shape::CloudChunk, 4)
                 )
             {
                 let mut offset = 0;
@@ -628,6 +694,13 @@ fn scan(
         }
     }
     let required = match shape {
+        Shape::CloudId => (1 << 1) | (1 << 2),
+        Shape::CloudDigest => 1 << 1,
+        Shape::CloudDescriptor | Shape::CloudReceipt | Shape::CloudPublication => {
+            (1 << 1) | (1 << 2)
+        }
+        Shape::CloudChunk | Shape::CloudWorkspace => 1 << 1,
+        Shape::CloudVersion => (1 << 1) | (1 << 3),
         Shape::IdsPage | Shape::GraphPage | Shape::CanonicalPage => (1 << 1) | (1 << 2) | (1 << 6),
         Shape::IdsRow | Shape::GraphRow | Shape::CanonicalRow => (1 << 1) | (1 << 2),
         Shape::QueryScope => (1 << 1) | (1 << 2) | (1 << 3) | (1 << 5),
@@ -679,6 +752,31 @@ fn rule(shape: Shape, n: u32, l: &Limits) -> Option<(u8, Option<Shape>, usize, u
     let nested = |child| Some((2, Some(child), 1, 0));
     let repeated = |child, count, allocation| Some((2, Some(child), count, allocation));
     match (shape, n) {
+        (Shape::CloudId, 1)
+        | (Shape::CloudDigest, 2)
+        | (Shape::CloudReceipt, 3)
+        | (Shape::CloudChunk, 2 | 4)
+        | (Shape::CloudWorkspace, 2)
+        | (Shape::CloudVersion, 2) => scalar(),
+        (Shape::CloudId, 2) => text(64),
+        (Shape::CloudDigest, 1) => text(32),
+        (Shape::CloudDescriptor, 1) => nested(Shape::CloudId),
+        (Shape::CloudDescriptor, 2) => nested(Shape::CloudDigest),
+        (Shape::CloudReceipt | Shape::CloudSelection | Shape::CloudChunk, 1) => {
+            nested(Shape::CloudDescriptor)
+        }
+        (Shape::CloudReceipt, 2) => text(64),
+        (Shape::CloudSelections, 1) => repeated(
+            Shape::CloudSelection,
+            l.max_batch_items,
+            4 * std::mem::size_of::<tinytree_proto::cloud_v1::ObjectSelection>(),
+        ),
+        (Shape::CloudChunk, 3) => text(l.max_frame_bytes),
+        (Shape::CloudWorkspace, 1 | 3) | (Shape::CloudVersion, 1 | 3 | 4) => text(32),
+        (Shape::CloudPublication, 1) => text(256),
+        (Shape::CloudPublication, 2) => nested(Shape::CloudWorkspace),
+        (Shape::CloudPublicationResult, 1) => nested(Shape::CloudPublication),
+        (Shape::CloudVersion, 5) => text(l.max_metadata_bytes),
         (Shape::GraphPage, 4) => repeated(
             Shape::GraphRow,
             l.max_batch_items,

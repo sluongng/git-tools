@@ -43,14 +43,18 @@ impl Running {
         index: Option<std::sync::Arc<tinytree_index::Index>>,
     ) -> Self {
         let principals = vec![
-            Principal::new("alpha", ALPHA, vec!["alpha".into()], true).unwrap(),
+            Principal::new("alpha", ALPHA, vec!["alpha".into()], true)
+                .unwrap()
+                .with_cloud(config.cloud.enabled),
             Principal::new("beta", BETA, vec!["beta".into()], true).unwrap(),
             Principal::new("reader", READER, vec!["alpha".into()], false)
                 .unwrap()
-                .with_retention(true),
+                .with_retention(true)
+                .with_cloud(config.cloud.enabled),
             Principal::new("peer", peer_token, vec!["alpha".into()], true)
                 .unwrap()
-                .with_retention(true),
+                .with_retention(true)
+                .with_cloud(config.cloud.enabled),
         ];
         let service = RepositoryService::new(
             store,
@@ -1141,6 +1145,7 @@ async fn failed_startup_never_creates_storage_or_runs_gc() {
         repositories: vec!["default".into()],
         write: true,
         retain: false,
+        cloud: false,
     }];
     assert!(serve(config.clone(), std::future::pending()).await.is_err());
     assert!(!config.storage.exists());
@@ -1149,6 +1154,13 @@ async fn failed_startup_never_creates_storage_or_runs_gc() {
     assert!(serve(config.clone(), std::future::pending()).await.is_err());
     assert!(!config.storage.exists());
     config.repositories = vec!["default".into()];
+    config.service.cloud.enabled = true;
+    assert!(serve(config.clone(), std::future::pending()).await.is_err());
+    assert!(
+        !config.storage.exists(),
+        "invalid cloud resource profile must fail before persistent state"
+    );
+    config.service.cloud.enabled = false;
     let pem = temporary.path().join("invalid.pem");
     std::fs::write(&pem, "not a PEM identity").unwrap();
     config.tls = Some(TlsConfig {
@@ -4437,6 +4449,530 @@ async fn precreation_query_close_counts_history_not_active_quota_and_expires_abs
     malformed.query_id = vec![174; 32];
     malformed.scope.as_mut().unwrap().handle = vec![0; 32];
     client.close_query(request(malformed, ALPHA)).await.unwrap();
+    drop(client);
+    server.stop().await;
+}
+
+async fn cloud_fixture(
+    fixture: &Fixture,
+) -> (
+    tinytree_cloud::Manifest,
+    Vec<tinytree_cloud::VerifiedObject>,
+) {
+    use jj_lib::{
+        backend::{MillisSinceEpoch, Timestamp},
+        object_id::ObjectId as _,
+        op_store::{
+            OpStore, Operation, OperationMetadata, RootOperationData, TimestampRange, View,
+        },
+        simple_op_store::SimpleOpStore,
+    };
+    let directory = tempfile::tempdir().unwrap();
+    let source = SimpleOpStore::init(
+        directory.path(),
+        RootOperationData {
+            root_commit_id: jj_lib::backend::CommitId::from_bytes(&[0; 32]),
+        },
+    )
+    .unwrap();
+    let head = root(fixture);
+    let commit = jj_lib::backend::CommitId::from_bytes(&head.id.0);
+    let mut view = View::make_root(commit.clone());
+    view.wc_commit_ids.insert("task".into(), commit);
+    let view_id = source.write_view(&view).await.unwrap();
+    let time = Timestamp {
+        timestamp: MillisSinceEpoch(0),
+        tz_offset: 0,
+    };
+    let operation = Operation {
+        view_id: view_id.clone(),
+        parents: vec![jj_lib::op_store::OperationId::from_bytes(&[0; 64])],
+        metadata: OperationMetadata {
+            time: TimestampRange {
+                start: time.clone(),
+                end: time,
+            },
+            description: "snapshot task\n".repeat(6000),
+            hostname: "agent".into(),
+            username: "agent".into(),
+            is_snapshot: true,
+            workspace_name: Some("task".into()),
+            attributes: Default::default(),
+        },
+        commit_predecessors: None,
+    };
+    let op_id = source.write_operation(&operation).await.unwrap();
+    let objects = vec![
+        tinytree_cloud::export_view(&source, &view_id, Default::default())
+            .await
+            .unwrap(),
+        tinytree_cloud::export_operation(&source, &op_id, Default::default())
+            .await
+            .unwrap(),
+    ];
+    let native = fixture
+        .objects()
+        .iter()
+        .find(|object| object.descriptor.key == head)
+        .unwrap();
+    let Object::Commit(commit) = tinytree_model::decode(&native.bytes, Limits::default()).unwrap()
+    else {
+        panic!("fixture commit");
+    };
+    let mut roots = vec![head];
+    roots.extend(commit.root_tree.terms.iter().map(|tree| ObjectKey {
+        kind: Kind::Tree,
+        id: ObjectId(tree.0),
+    }));
+    roots.sort_by_key(|key| (key.kind as u8, key.id.0));
+    roots.dedup();
+    let mut members = objects
+        .iter()
+        .map(|object| tinytree_cloud::Member {
+            id: object.id(),
+            selected: object.digest().unwrap(),
+        })
+        .collect::<Vec<_>>();
+    members.sort_by_key(|member| member.id);
+    let op = op_id.as_bytes().try_into().unwrap();
+    (
+        tinytree_cloud::Manifest {
+            workspace: [71; 32],
+            exporter: [72; 16],
+            sequence: 1,
+            operation_heads: vec![op],
+            undo_operations: vec![],
+            intent_operations: vec![],
+            working_copy: tinytree_cloud::WorkingCopy {
+                workspace_name: "task".into(),
+                wc_operation: op,
+                snapshot_operation: op,
+                snapshot_commit: head.id.0,
+                tree: commit.root_tree,
+            },
+            parents: vec![],
+            members,
+            intent_roots: vec![],
+            native_roots: roots,
+            coverage: tinytree_cloud::Coverage::FullRequired,
+            detached: vec![],
+        },
+        objects,
+    )
+}
+fn cloud_object_descriptor(
+    object: &tinytree_cloud::VerifiedObject,
+) -> tinytree_proto::cloud_v1::ObjectDescriptor {
+    use tinytree_proto::cloud_v1 as c;
+    let (kind, id) = match object.id() {
+        tinytree_cloud::ObjectId::Operation(id) => (1, id),
+        tinytree_cloud::ObjectId::View(id) => (2, id),
+    };
+    let digest = object.digest().unwrap();
+    c::ObjectDescriptor {
+        id: Some(c::ObjectId {
+            kind,
+            semantic_id: id.to_vec(),
+        }),
+        selected: Some(c::RawDigest {
+            blake3: digest.blake3.to_vec(),
+            size_bytes: digest.size_bytes,
+        }),
+    }
+}
+#[tokio::test]
+async fn cloud_rpc_private_compressed_history_replay_gc_and_restart() {
+    use tinytree_proto::cloud_v1::{self as c, workspace_cloud_client::WorkspaceCloudClient};
+    let directory = tempfile::tempdir().unwrap();
+    let profile: tinytree_server::Config =
+        toml::from_str(include_str!("../examples/cloud.toml")).unwrap();
+    let store_config = profile
+        .store
+        .materialize(profile.service.max_metadata_bytes);
+    let store = Store::open(directory.path(), store_config.clone()).unwrap();
+    store.create_repository("alpha").unwrap();
+    store.create_repository("beta").unwrap();
+    let data = fixture();
+    for object in data.objects() {
+        store
+            .put("alpha", object.descriptor, &object.bytes, 0)
+            .unwrap();
+    }
+    let (mut manifest, objects) = cloud_fixture(&data).await;
+    let server = Running::start(store.clone(), profile.service.clone()).await;
+    let channel = Endpoint::from_shared(format!("http://{}", server.address))
+        .unwrap()
+        .connect()
+        .await
+        .unwrap();
+    let mut client = WorkspaceCloudClient::new(channel)
+        .send_compressed(CompressionEncoding::Zstd)
+        .accept_compressed(CompressionEncoding::Zstd)
+        .max_decoding_message_size(1024 * 1024);
+    let mut leases = Vec::new();
+    for object in &objects {
+        let input = c::PutObjectRequest {
+            repository_id: "alpha".into(),
+            descriptor: Some(cloud_object_descriptor(object)),
+            payload: object.payload().unwrap().to_vec(),
+        };
+        assert_eq!(
+            client
+                .put_object(request(input.clone(), READER))
+                .await
+                .unwrap_err()
+                .code(),
+            Code::PermissionDenied
+        );
+        let response = client.put_object(request(input, ALPHA)).await.unwrap();
+        assert_eq!(response.metadata().get("grpc-encoding").unwrap(), "zstd");
+        let receipt = response.into_inner();
+        assert_eq!(receipt.descriptor, Some(cloud_object_descriptor(object)));
+        leases.push(receipt.staging_lease);
+    }
+    let ids = objects
+        .iter()
+        .map(|object| cloud_object_descriptor(object).id.unwrap())
+        .collect::<Vec<_>>();
+    let lookup = c::LookupObjectsRequest {
+        repository_id: "alpha".into(),
+        ids: ids.clone(),
+    };
+    let peer = client
+        .lookup_objects(request(lookup.clone(), PEER))
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(
+        peer.selections
+            .iter()
+            .all(|selection| selection.descriptor.is_none())
+    );
+    assert_eq!(
+        client
+            .lookup_objects(request(lookup.clone(), BETA))
+            .await
+            .unwrap_err()
+            .code(),
+        Code::PermissionDenied
+    );
+    let denied = c::LookupObjectsRequest {
+        repository_id: "beta".into(),
+        ids: ids.clone(),
+    };
+    assert_eq!(
+        client
+            .lookup_objects(request(denied, ALPHA))
+            .await
+            .unwrap_err()
+            .code(),
+        Code::PermissionDenied
+    );
+    let selected = client
+        .lookup_objects(request(lookup, ALPHA))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(selected.selections.len(), 2);
+    for object in &objects {
+        let d = cloud_object_descriptor(object);
+        let response = client
+            .read_object(request(
+                c::ReadObjectRequest {
+                    repository_id: "alpha".into(),
+                    id: d.id.clone(),
+                },
+                ALPHA,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.metadata().get("grpc-encoding").unwrap(), "zstd");
+        let mut stream = response.into_inner();
+        let mut bytes = Vec::new();
+        let mut eof = false;
+        while let Some(chunk) = stream.message().await.unwrap() {
+            assert_eq!(chunk.offset, bytes.len() as u64);
+            assert_eq!(chunk.descriptor, Some(d.clone()));
+            bytes.extend(chunk.data);
+            eof = chunk.eof;
+        }
+        assert!(eof);
+        assert_eq!(bytes, object.payload().unwrap());
+    }
+    let bytes = tinytree_cloud::encode_manifest(&manifest, Default::default()).unwrap();
+    let first = c::PublishVersionRequest {
+        repository_id: "alpha".into(),
+        workspace_id: manifest.workspace.to_vec(),
+        expected_generation: 0,
+        idempotency_key: "first-cloud-capture".into(),
+        manifest_id: tinytree_cloud::ManifestId::of(&bytes).0.to_vec(),
+        manifest: bytes.clone(),
+        staging_leases: leases,
+    };
+    let published = client
+        .publish_version(request(first.clone(), ALPHA))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(published.workspace.as_ref().unwrap().generation, 1);
+    assert_eq!(
+        client
+            .publish_version(request(first.clone(), ALPHA))
+            .await
+            .unwrap()
+            .into_inner(),
+        published
+    );
+    manifest.sequence = 2;
+    manifest.parents = vec![tinytree_cloud::ManifestId::of(&bytes)];
+    let next = tinytree_cloud::encode_manifest(&manifest, Default::default()).unwrap();
+    let second = c::PublishVersionRequest {
+        expected_generation: 1,
+        idempotency_key: "second-cloud-capture".into(),
+        manifest_id: tinytree_cloud::ManifestId::of(&next).0.to_vec(),
+        manifest: next,
+        staging_leases: vec![],
+        ..first.clone()
+    };
+    client
+        .publish_version(request(second.clone(), ALPHA))
+        .await
+        .unwrap();
+    let mut stale = second.clone();
+    stale.idempotency_key = "stale-cloud-capture".into();
+    assert_eq!(
+        client
+            .publish_version(request(stale, ALPHA))
+            .await
+            .unwrap_err()
+            .code(),
+        Code::Aborted
+    );
+    let mut changed = first.clone();
+    changed.manifest.push(0);
+    assert_eq!(
+        client
+            .publish_version(request(changed, ALPHA))
+            .await
+            .unwrap_err()
+            .code(),
+        Code::AlreadyExists
+    );
+    let held = store.clone();
+    tokio::task::spawn_blocking(move || held.gc("alpha", i64::MAX).unwrap())
+        .await
+        .unwrap();
+    let version = c::GetVersionRequest {
+        repository_id: "alpha".into(),
+        workspace_id: manifest.workspace.to_vec(),
+        generation: 1,
+    };
+    assert_eq!(
+        client
+            .get_version(request(version.clone(), ALPHA))
+            .await
+            .unwrap()
+            .into_inner()
+            .manifest,
+        bytes
+    );
+    assert!(
+        client
+            .get_version(request(version.clone(), PEER))
+            .await
+            .is_err()
+    );
+    drop(client);
+    server.stop().await;
+    drop(store);
+    let store = Store::open_existing(directory.path(), store_config).unwrap();
+    let server = Running::start(store, profile.service).await;
+    let channel = Endpoint::from_shared(format!("http://{}", server.address))
+        .unwrap()
+        .connect()
+        .await
+        .unwrap();
+    let mut client = WorkspaceCloudClient::new(channel)
+        .send_compressed(CompressionEncoding::Zstd)
+        .accept_compressed(CompressionEncoding::Zstd);
+    assert_eq!(
+        client
+            .get_version(request(version, ALPHA))
+            .await
+            .unwrap()
+            .into_inner()
+            .manifest,
+        bytes
+    );
+    assert_eq!(
+        client
+            .get_publication(request(
+                c::GetPublicationRequest {
+                    repository_id: "alpha".into(),
+                    idempotency_key: first.idempotency_key.clone()
+                },
+                ALPHA
+            ))
+            .await
+            .unwrap()
+            .into_inner()
+            .publication,
+        Some(published)
+    );
+    assert_eq!(
+        client
+            .publish_version(request(first, ALPHA))
+            .await
+            .unwrap()
+            .into_inner()
+            .workspace
+            .unwrap()
+            .generation,
+        1
+    );
+    drop(client);
+    server.stop().await;
+}
+
+#[tokio::test]
+async fn cloud_rpc_decompressed_and_semantic_request_bounds_reject_before_store_publication() {
+    use tinytree_proto::cloud_v1::{self as c, workspace_cloud_client::WorkspaceCloudClient};
+    let directory = tempfile::tempdir().unwrap();
+    let mut profile: tinytree_server::Config =
+        toml::from_str(include_str!("../examples/cloud.toml")).unwrap();
+    profile.service.cloud.max_object_bytes = 1024;
+    profile.service.cloud.max_manifest_bytes = 1024;
+    profile.service.cloud.max_staging_leases = 1;
+    let store = Store::open(
+        directory.path(),
+        profile
+            .store
+            .materialize(profile.service.max_metadata_bytes),
+    )
+    .unwrap();
+    store.create_repository("alpha").unwrap();
+    store.create_repository("beta").unwrap();
+    let server = Running::start(store, profile.service).await;
+    let channel = Endpoint::from_shared(format!("http://{}", server.address))
+        .unwrap()
+        .connect()
+        .await
+        .unwrap();
+    let mut client = WorkspaceCloudClient::new(channel)
+        .send_compressed(CompressionEncoding::Zstd)
+        .accept_compressed(CompressionEncoding::Zstd);
+    // Highly compressible wire fits the raw-frame bound but must not bypass the
+    // independent decompressed message cap before Prost constructs the payload.
+    let error = client
+        .put_object(request(
+            c::PutObjectRequest {
+                repository_id: "alpha".into(),
+                descriptor: None,
+                payload: vec![0; 32 * 1024],
+            },
+            ALPHA,
+        ))
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        error.code(),
+        Code::ResourceExhausted | Code::OutOfRange
+    ));
+    let error = client
+        .lookup_objects(request(
+            c::LookupObjectsRequest {
+                repository_id: "alpha".into(),
+                ids: vec![
+                    c::ObjectId {
+                        kind: 1,
+                        semantic_id: vec![1; 64]
+                    };
+                    257
+                ],
+            },
+            ALPHA,
+        ))
+        .await
+        .unwrap_err();
+    assert_eq!(error.code(), Code::ResourceExhausted);
+    let error = client
+        .publish_version(request(
+            c::PublishVersionRequest {
+                repository_id: "alpha".into(),
+                workspace_id: vec![1; 32],
+                expected_generation: 0,
+                idempotency_key: "oversized-manifest".into(),
+                manifest_id: vec![2; 32],
+                manifest: vec![0; 1025],
+                staging_leases: vec![],
+            },
+            ALPHA,
+        ))
+        .await
+        .unwrap_err();
+    assert_eq!(error.code(), Code::ResourceExhausted);
+    assert_eq!(
+        client
+            .get_workspace(request(
+                c::GetWorkspaceRequest {
+                    repository_id: "alpha".into(),
+                    workspace_id: vec![1; 32]
+                },
+                ALPHA
+            ))
+            .await
+            .unwrap()
+            .into_inner()
+            .generation,
+        0
+    );
+    assert!(
+        client
+            .get_publication(request(
+                c::GetPublicationRequest {
+                    repository_id: "alpha".into(),
+                    idempotency_key: "oversized-manifest".into()
+                },
+                ALPHA
+            ))
+            .await
+            .unwrap()
+            .into_inner()
+            .publication
+            .is_none()
+    );
+    drop(client);
+    server.stop().await;
+}
+
+#[tokio::test]
+async fn standalone_cloud_profile_registers_private_workspace_service() {
+    use tinytree_proto::cloud_v1::{self as c, workspace_cloud_client::WorkspaceCloudClient};
+    let directory = tempfile::tempdir().unwrap();
+    let mut profile: tinytree_server::Config =
+        toml::from_str(include_str!("../examples/cloud.toml")).unwrap();
+    profile.storage = directory.path().join("standalone-cloud");
+    profile.principals.clear(); // Explicit loopback local-owner mode.
+    profile.gc_interval_seconds = 0;
+    let server = Running::start_production(profile).await;
+    let channel = Endpoint::from_shared(format!("http://{}", server.address))
+        .unwrap()
+        .connect()
+        .await
+        .unwrap();
+    let mut client = WorkspaceCloudClient::new(channel)
+        .send_compressed(CompressionEncoding::Zstd)
+        .accept_compressed(CompressionEncoding::Zstd);
+    let workspace = client
+        .get_workspace(c::GetWorkspaceRequest {
+            repository_id: "example".into(),
+            workspace_id: vec![5; 32],
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(workspace.generation, 0);
+    assert!(workspace.manifest_id.is_none());
     drop(client);
     server.stop().await;
 }

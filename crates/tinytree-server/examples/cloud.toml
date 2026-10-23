@@ -1,0 +1,38 @@
+# Explicit bounded profile for private workspace history. Supply the token in
+# the named environment variable; do not put credentials in this file.
+storage = "/var/tmp/tinytree-cloud"
+listen = "127.0.0.1:8093"
+repositories = ["example"]
+
+[[principals]]
+id = "agent"
+token_env = "TINYTREE_AGENT_TOKEN"
+repositories = ["example"]
+write = true
+cloud = true
+
+[service.cloud]
+enabled = true
+max_manifest_bytes = 524288
+max_staging_leases = 256
+max_inflight = 2
+max_inflight_per_repository = 1
+max_buffered_bytes = 1073741824
+
+# Cloud validation scans are bounded and retain all published versions.
+# New promises are rejected when this profile fills; history is not evicted.
+[store]
+max_retention_validation_records = 1024
+max_retention_validation_bytes = 2097152
+max_closure_objects = 4096
+max_closure_edges = 16384
+max_path_contexts = 4096
+max_path_context_bytes = 4194304
+
+[store.cloud]
+max_object_bytes = 4194304
+max_decode_bytes = 16777216
+max_version_decode_bytes = 134217728
+max_manifest_bytes = 524288
+max_manifest_decode_bytes = 16777216
+max_manifest_members = 1024

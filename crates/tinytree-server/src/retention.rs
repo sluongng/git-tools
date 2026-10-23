@@ -70,7 +70,7 @@ pub(crate) fn wire_name(name: &str, identity: &Identity) -> Result<String, Statu
     Ok(name.to_owned())
 }
 
-fn owner_hash(identity: &Identity) -> [u8; 32] {
+pub(crate) fn owner_hash(identity: &Identity) -> [u8; 32] {
     let mut hash = blake3::Hasher::new();
     hash.update(b"tinytree-retention-owner-v1\0");
     hash.update(&(identity.id.len() as u64).to_be_bytes());

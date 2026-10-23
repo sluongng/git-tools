@@ -32,6 +32,7 @@ pub type RpcStream<T> = Pin<Box<dyn Stream<Item = Result<T, Status>> + Send + 's
 pub struct RepositoryService {
     inner: Arc<Inner>,
     query: Option<Arc<crate::query_index::QueryHost>>,
+    cloud: Option<Arc<crate::cloud::CloudHost>>,
 }
 struct Inner {
     store: tinytree_store::Store,
@@ -73,6 +74,15 @@ impl RepositoryService {
             return Err(ConfigError("invalid native repository identifiers"));
         }
         let auth = Authorization::new(principals, &repositories)?;
+        let cloud = if config.cloud.enabled {
+            Some(crate::cloud::CloudHost::new(
+                store.clone(),
+                config.cloud.clone(),
+                &repositories,
+            )?)
+        } else {
+            None
+        };
         let repository_limits = repositories
             .into_iter()
             .map(|repo| {
@@ -87,6 +97,7 @@ impl RepositoryService {
         continuation_key[16..].copy_from_slice(uuid::Uuid::new_v4().as_bytes());
         Ok(Self {
             query: None,
+            cloud,
             inner: Arc::new(Inner {
                 store,
                 global: Arc::new(Semaphore::new(config.max_inflight)),
@@ -115,6 +126,17 @@ impl RepositoryService {
             &self.inner.config,
         )?);
         Ok(self)
+    }
+    pub fn cloud_grpc_service(&self) -> crate::CloudGrpcService {
+        crate::CloudGrpcService::new(self.clone())
+    }
+    pub(crate) fn cloud_host(&self) -> Option<Arc<crate::cloud::CloudHost>> {
+        self.cloud.clone()
+    }
+    pub async fn drain_cloud(&self) {
+        if let Some(host) = &self.cloud {
+            host.drain().await;
+        }
     }
     pub fn query_service(&self) -> crate::QueryService {
         crate::QueryService::new(self.clone())
@@ -1029,7 +1051,7 @@ impl Read for UploadReader {
         }
     }
 }
-fn now() -> Result<i64, Status> {
+pub(crate) fn now() -> Result<i64, Status> {
     let value = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_err(|_| Status::internal("native server clock unavailable"))?
@@ -1106,7 +1128,7 @@ fn publication_wire(
         reference: Some(reference(value.reference, identity)?),
     })
 }
-fn store_status(error: tinytree_store::Error) -> Status {
+pub(crate) fn store_status(error: tinytree_store::Error) -> Status {
     use tinytree_store::Error as E;
     match error {
         E::UnknownRepository | E::MissingObject(_) => {

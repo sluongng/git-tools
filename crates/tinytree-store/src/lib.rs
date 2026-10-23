@@ -506,6 +506,12 @@ fn create_durable_directories(path: &Path) -> Result<()> {
 }
 
 impl Store {
+    /// Immutable effective policy for transport resource admission. This contains
+    /// no storage paths, credentials, or mutable Store access.
+    pub fn resource_config(&self) -> Config {
+        self.inner.config.clone()
+    }
+
     pub fn open(root: impl AsRef<Path>, config: Config) -> Result<Self> {
         Self::open_inner(root.as_ref(), config, false)
     }

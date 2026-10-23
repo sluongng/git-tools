@@ -716,6 +716,7 @@ pub struct CheckedIdsQuery {
     cursor: Vec<u8>,
     sequence: u64,
     pages: usize,
+    row_capacity: usize,
     seen: HashSet<CommitId>,
     exhausted: bool,
     begin_guards: crate::verified::LifetimeGuards,
@@ -834,8 +835,11 @@ impl NativeClient {
         }
         let limits = &self.inner.config.limits;
         let (nodes, encoded) = validate_expression(expression, limits)?;
-        let bytes = limits
-            .max_graph_objects
+        // Membership intersections inherit their literal bound. This lets a
+        // selected canonical read or template membership check coexist with its
+        // still-live outer query without changing graph traversal reservations.
+        let row_capacity = expression_row_capacity(expression, limits.max_graph_objects);
+        let bytes = row_capacity
             .checked_mul(128)
             .and_then(|n| encoded.checked_mul(4).and_then(|e| n.checked_add(e)))
             .and_then(|n| nodes.checked_mul(256).and_then(|e| n.checked_add(e)))
@@ -885,6 +889,7 @@ impl NativeClient {
             cursor: Vec::new(),
             sequence: 0,
             pages: 0,
+            row_capacity,
             seen: HashSet::new(),
             exhausted: false,
             begin_guards: self.guards.clone(),
@@ -965,6 +970,14 @@ impl NativeClient {
         if exhausted != reply.cursor.is_empty() || (!exhausted && reply.cursor == query.cursor) {
             return Err(integrity());
         }
+        if query
+            .seen
+            .len()
+            .checked_add(reply.rows.len())
+            .is_none_or(|n| n > query.row_capacity)
+        {
+            return Err(Status::resource_exhausted("IDS query row budget exhausted"));
+        }
         let mut page_ids = HashSet::with_capacity(reply.rows.len());
         let mut rows = Vec::with_capacity(reply.rows.len());
         for row in reply.rows {
@@ -988,7 +1001,7 @@ impl NativeClient {
             .seen
             .len()
             .checked_add(rows.len())
-            .is_none_or(|n| n > self.inner.config.limits.max_graph_objects)
+            .is_none_or(|n| n > query.row_capacity)
         {
             return Err(Status::resource_exhausted("IDS query row budget exhausted"));
         }
@@ -1236,6 +1249,16 @@ impl NativeClient {
         if exhausted != reply.cursor.is_empty() || (!exhausted && reply.cursor == core.cursor) {
             return Err(integrity());
         }
+        if core
+            .seen
+            .len()
+            .checked_add(reply.rows.len())
+            .is_none_or(|n| n > core.row_capacity)
+        {
+            return Err(Status::resource_exhausted(
+                "graph query row budget exhausted",
+            ));
+        }
         let mut page_ids = HashSet::with_capacity(reply.rows.len());
         let mut rows = Vec::with_capacity(reply.rows.len());
         let mut edge_count = query.edges;
@@ -1376,7 +1399,7 @@ impl NativeClient {
             .seen
             .len()
             .checked_add(rows.len())
-            .is_none_or(|n| n > limits.max_graph_objects)
+            .is_none_or(|n| n > core.row_capacity)
         {
             return Err(Status::resource_exhausted(
                 "graph query row budget exhausted",
@@ -1582,6 +1605,22 @@ impl NativeClient {
     }
     pub async fn close_graph_query(&self, query: &mut CheckedGraphQuery) -> Result<(), Status> {
         self.close_ids_query(&mut query.core).await
+    }
+}
+
+/// Called only after full expression validation bounds depth to 64 and the
+/// aggregate node count. This borrowed walk allocates nothing and never rewrites
+/// evaluation, so even zero-capacity results preserve strict literal errors.
+fn expression_row_capacity(expression: &q::GraphExpr, maximum: usize) -> usize {
+    match expression.expression.as_ref() {
+        Some(q::graph_expr::Expression::Commits(set)) => set.commits.len().min(maximum),
+        Some(q::graph_expr::Expression::Intersection(set)) => set
+            .inputs
+            .iter()
+            .map(|child| expression_row_capacity(child, maximum))
+            .min()
+            .unwrap_or(maximum),
+        _ => maximum,
     }
 }
 

@@ -1453,6 +1453,7 @@ enum QueryMode {
     EvaluateCanonical,
     EvaluateCursorMismatch,
     EvaluateDuplicate,
+    LiteralOverReturn,
     GraphMissingCanonical,
     GraphBadCanonical,
     GraphCanonicalChange,
@@ -1748,6 +1749,11 @@ impl RepositoryQuery for QueryFaults {
                     if let Some(edge) = row.edges.first().cloned() {
                         row.edges.push(edge);
                     }
+                }
+            }
+            QueryMode::LiteralOverReturn => {
+                if let Some(row) = page.rows.first().cloned() {
+                    page.rows.push(row);
                 }
             }
             QueryMode::EvaluateDuplicate => {
@@ -3482,8 +3488,16 @@ async fn retained_graph_pages_fail_headroom_without_waiting_or_advancing() {
         .open_query_scope_with_overlay(vec![fixture.root], overlay)
         .await
         .unwrap();
+    // Keep this retained-page test on the general-expression state budget.
+    // Exact literal queries intentionally reserve only their literal capacity.
+    let expression = q::GraphExpr {
+        version: 1,
+        expression: Some(q::graph_expr::Expression::Union(q::SetExpr {
+            inputs: vec![ids_commits(&[first_id, second_id])],
+        })),
+    };
     let mut query = client
-        .begin_graph_query(&scope, &ids_commits(&[first_id, second_id]), 1, true)
+        .begin_graph_query(&scope, &expression, 1, true)
         .await
         .unwrap();
     let page = client.evaluate_graph_page(&mut query).await.unwrap();
@@ -4625,6 +4639,455 @@ async fn rpc_only_guards_do_not_enter_query_state_pages_or_uncertain_drop_cleanu
     let before = running.counts.query_closes.load(Ordering::SeqCst);
     drop(query);
     wait_query_close_count(&running.counts, before + 1).await;
+    client.close_query_scope(&scope).await.unwrap();
+    running.stop().await;
+}
+
+#[derive(Clone)]
+struct CloudFaults {
+    mode: Arc<AtomicUsize>,
+    calls: Arc<AtomicUsize>,
+    publication: Arc<std::sync::Mutex<Option<tinytree_client::cloud_protocol::Publication>>>,
+}
+#[tonic::async_trait]
+impl tinytree_client::cloud_protocol::workspace_cloud_server::WorkspaceCloud for CloudFaults {
+    async fn put_object(
+        &self,
+        request: Request<tinytree_client::cloud_protocol::PutObjectRequest>,
+    ) -> Result<Response<tinytree_client::cloud_protocol::WriteReceipt>, Status> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        let request = request.into_inner();
+        let mut descriptor = request.descriptor.unwrap();
+        let proposed = tinytree_client::CloudRawDigest::of(&request.payload);
+        assert_eq!(
+            descriptor.selected.as_ref().unwrap().blake3,
+            proposed.blake3
+        );
+        assert_eq!(
+            descriptor.selected.as_ref().unwrap().size_bytes,
+            proposed.size_bytes
+        );
+        if self.mode.load(Ordering::SeqCst) == 7 {
+            let selected = tinytree_client::CloudRawDigest::of(b"cloud raw bytes");
+            descriptor.selected = Some(tinytree_client::cloud_protocol::RawDigest {
+                blake3: selected.blake3.to_vec(),
+                size_bytes: selected.size_bytes,
+            });
+        }
+        if self.mode.load(Ordering::SeqCst) == 8 {
+            descriptor.id.as_mut().unwrap().semantic_id = vec![9; 64];
+        }
+        Ok(Response::new(
+            tinytree_client::cloud_protocol::WriteReceipt {
+                descriptor: Some(descriptor),
+                staging_lease: "a".repeat(64),
+                expires_at_unix_seconds: 2_000_000_000,
+            },
+        ))
+    }
+    async fn lookup_objects(
+        &self,
+        request: Request<tinytree_client::cloud_protocol::LookupObjectsRequest>,
+    ) -> Result<Response<tinytree_client::cloud_protocol::LookupObjectsResponse>, Status> {
+        use tinytree_client::cloud_protocol as c;
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        let selections = request
+            .into_inner()
+            .ids
+            .into_iter()
+            .map(|mut id| {
+                if self.mode.load(Ordering::SeqCst) == 4 {
+                    id.semantic_id = vec![9; 64]
+                }
+                c::ObjectSelection {
+                    descriptor: Some(c::ObjectDescriptor {
+                        id: Some(id),
+                        selected: Some(c::RawDigest {
+                            blake3: blake3::hash(b"cloud raw bytes").as_bytes().to_vec(),
+                            size_bytes: 15,
+                        }),
+                    }),
+                }
+            })
+            .collect();
+        Ok(Response::new(c::LookupObjectsResponse { selections }))
+    }
+    type ReadObjectStream = std::pin::Pin<
+        Box<
+            dyn futures_util::Stream<
+                    Item = Result<tinytree_client::cloud_protocol::ObjectChunk, Status>,
+                > + Send,
+        >,
+    >;
+    async fn read_object(
+        &self,
+        request: Request<tinytree_client::cloud_protocol::ReadObjectRequest>,
+    ) -> Result<Response<Self::ReadObjectStream>, Status> {
+        use tinytree_client::cloud_protocol as c;
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        let mut bytes = b"cloud raw bytes".to_vec();
+        let mode = self.mode.load(Ordering::SeqCst);
+        let digest = if mode == 2 {
+            vec![0; 32]
+        } else {
+            blake3::hash(&bytes).as_bytes().to_vec()
+        };
+        if mode == 6 {
+            bytes[0] ^= 1;
+        }
+        let descriptor = Some(c::ObjectDescriptor {
+            id: request.into_inner().id,
+            selected: Some(c::RawDigest {
+                blake3: digest,
+                size_bytes: bytes.len() as u64,
+            }),
+        });
+        let frame = c::ObjectChunk {
+            descriptor,
+            offset: 0,
+            data: bytes,
+            eof: mode != 1,
+        };
+        let mut frames = vec![Ok(frame.clone())];
+        if mode == 3 {
+            frames.push(Ok(frame))
+        }
+        Ok(Response::new(Box::pin(futures_util::stream::iter(frames))))
+    }
+    async fn publish_version(
+        &self,
+        request: Request<tinytree_client::cloud_protocol::PublishVersionRequest>,
+    ) -> Result<Response<tinytree_client::cloud_protocol::Publication>, Status> {
+        use tinytree_client::cloud_protocol as c;
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        let request = request.into_inner();
+        let value = c::Publication {
+            idempotency_key: request.idempotency_key,
+            workspace: Some(c::Workspace {
+                workspace_id: request.workspace_id,
+                generation: request.expected_generation + 1,
+                manifest_id: Some(request.manifest_id),
+            }),
+        };
+        *self.publication.lock().unwrap() = Some(value.clone());
+        if self.mode.load(Ordering::SeqCst) == 5 {
+            return Err(Status::unavailable("publication reply lost"));
+        }
+        Ok(Response::new(value))
+    }
+    async fn get_workspace(
+        &self,
+        request: Request<tinytree_client::cloud_protocol::GetWorkspaceRequest>,
+    ) -> Result<Response<tinytree_client::cloud_protocol::Workspace>, Status> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        Ok(Response::new(tinytree_client::cloud_protocol::Workspace {
+            workspace_id: request.into_inner().workspace_id,
+            generation: 0,
+            manifest_id: None,
+        }))
+    }
+    async fn get_version(
+        &self,
+        request: Request<tinytree_client::cloud_protocol::GetVersionRequest>,
+    ) -> Result<Response<tinytree_client::cloud_protocol::Version>, Status> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        let request = request.into_inner();
+        let manifest = b"raw manifest transport fixture".to_vec();
+        Ok(Response::new(tinytree_client::cloud_protocol::Version {
+            workspace_id: request.workspace_id,
+            generation: request.generation,
+            manifest_id: tinytree_client::CloudManifestId::of(&manifest).0.to_vec(),
+            previous_manifest_id: if request.generation == 1 {
+                None
+            } else {
+                Some(vec![3; 32])
+            },
+            manifest,
+        }))
+    }
+    async fn get_publication(
+        &self,
+        _: Request<tinytree_client::cloud_protocol::GetPublicationRequest>,
+    ) -> Result<Response<tinytree_client::cloud_protocol::GetPublicationResponse>, Status> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        Ok(Response::new(
+            tinytree_client::cloud_protocol::GetPublicationResponse {
+                publication: self.publication.lock().unwrap().clone(),
+            },
+        ))
+    }
+}
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn workspace_cloud_checks_stream_selection_reconciles_intent_and_releases_call_owners() {
+    use tinytree_client::cloud_protocol::workspace_cloud_server::WorkspaceCloudServer;
+    use tinytree_client::{CloudDescriptor, CloudObjectId, CloudPublishIntent, CloudRawDigest};
+    let faults = CloudFaults {
+        mode: Arc::new(AtomicUsize::new(0)),
+        calls: Arc::new(AtomicUsize::new(0)),
+        publication: Arc::new(std::sync::Mutex::new(None)),
+    };
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let incoming = async_stream::stream! {loop{match listener.accept().await{Ok((stream,_))=>yield Ok::<_,std::io::Error>(stream),Err(error)=>{yield Err(error);break}}}};
+    let service = WorkspaceCloudServer::new(faults.clone())
+        .accept_compressed(tonic::codec::CompressionEncoding::Zstd)
+        .send_compressed(tonic::codec::CompressionEncoding::Zstd);
+    let server = tokio::spawn(async move {
+        tonic::transport::Server::builder()
+            .add_service(service)
+            .serve_with_incoming(incoming)
+            .await
+            .unwrap()
+    });
+    let mut config = Config::default();
+    config.endpoint = format!("http://{address}");
+    config.limits.max_inflight = 1;
+    config.rpc.retry.max_attempts = 1;
+    let serialized = toml::to_string(&config).unwrap();
+    assert!(
+        !serialized.contains("[cloud]"),
+        "default cloud limits preserve existing serialized provider identity"
+    );
+    let client = NativeClient::connect(config.clone()).await.unwrap();
+    let id = CloudObjectId::Operation([8; 64]);
+    let descriptor = CloudDescriptor {
+        id,
+        selected: CloudRawDigest::of(b"cloud raw bytes"),
+    };
+    assert_eq!(
+        client
+            .cloud_put_object(id, b"cloud raw bytes")
+            .await
+            .unwrap()
+            .descriptor,
+        descriptor
+    );
+    assert_eq!(
+        client.cloud_lookup_objects(&[id]).await.unwrap(),
+        vec![Some(descriptor)]
+    );
+    // A verified server keeps the first selected raw representation for an
+    // existing semantic ID, even when a later upload proposes another encoding.
+    faults.mode.store(7, Ordering::SeqCst);
+    let alternate = b"later proposed representation";
+    let selected = client.cloud_put_object(id, alternate).await.unwrap();
+    assert_eq!(
+        selected.descriptor,
+        CloudDescriptor {
+            id,
+            selected: CloudRawDigest::of(b"cloud raw bytes")
+        }
+    );
+    assert_ne!(selected.descriptor.selected, CloudRawDigest::of(alternate));
+    faults.mode.store(8, Ordering::SeqCst);
+    assert_eq!(
+        client
+            .cloud_put_object(id, b"cloud raw bytes")
+            .await
+            .unwrap_err()
+            .code(),
+        Code::DataLoss
+    );
+    faults.mode.store(0, Ordering::SeqCst);
+
+    let physical = Arc::new(AtomicUsize::new(0));
+    let persistent = Arc::new(AtomicUsize::new(0));
+    let guarded = client
+        .clone()
+        .with_lifetime_guard(Arc::new(LifetimeProbe(persistent.clone())))
+        .with_rpc_lifetime_guard(Arc::new(LifetimeProbe(physical.clone())));
+    let object = guarded.cloud_read_object(descriptor).await.unwrap();
+    assert_eq!(object.payload(), b"cloud raw bytes");
+    drop(guarded);
+    assert_released(&physical).await;
+    assert_eq!(persistent.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        client.cloud_workspace([1; 32]).await.unwrap().generation,
+        0,
+        "holding raw result must not retain the only call slot"
+    );
+    drop(object);
+    assert_released(&persistent).await;
+    for mode in [1, 2, 3, 6] {
+        faults.mode.store(mode, Ordering::SeqCst);
+        assert_eq!(
+            client
+                .cloud_read_object(descriptor)
+                .await
+                .unwrap_err()
+                .code(),
+            Code::DataLoss
+        );
+    }
+    faults.mode.store(4, Ordering::SeqCst);
+    assert_eq!(
+        client.cloud_lookup_objects(&[id]).await.unwrap_err().code(),
+        Code::DataLoss
+    );
+    faults.mode.store(5, Ordering::SeqCst);
+    let intent = CloudPublishIntent {
+        workspace_id: [4; 32],
+        expected_generation: 7,
+        idempotency_key: "original-publication-intent".into(),
+        manifest: b"raw manifest transport fixture".to_vec(),
+        staging_leases: vec!["a".repeat(64)],
+    };
+    let publication = client.cloud_publish_version(&intent).await.unwrap();
+    assert_eq!(publication.workspace.generation, 8);
+    assert_eq!(publication.idempotency_key, intent.idempotency_key);
+    let version = client.cloud_version([4; 32], 8).await.unwrap();
+    assert_eq!(version.manifest(), intent.manifest);
+    let before = faults.calls.load(Ordering::SeqCst);
+    assert_eq!(
+        client
+            .cloud_put_object(id, &vec![0; config.cloud.max_object_bytes + 1])
+            .await
+            .unwrap_err()
+            .code(),
+        Code::ResourceExhausted
+    );
+    assert_eq!(
+        client
+            .cloud_lookup_objects(&vec![id; config.cloud.max_lookup_items + 1])
+            .await
+            .unwrap_err()
+            .code(),
+        Code::ResourceExhausted
+    );
+    assert_eq!(
+        faults.calls.load(Ordering::SeqCst),
+        before,
+        "oversized inputs fail before any RPC"
+    );
+    let mut tiny = config.clone();
+    tiny.limits.max_frame_bytes = 1024;
+    tiny.limits.max_batch_bytes = 1024;
+    tiny.limits.max_metadata_bytes = 1024;
+    tiny.limits.max_request_bytes = 1024;
+    tiny.limits.max_graph_bytes = 1024;
+    tiny.limits.max_buffered_bytes = 16384;
+    tiny.limits.max_batch_items = 4;
+    tiny.limits.max_graph_objects = 1;
+    tiny.validate().unwrap();
+    let tiny = NativeClient::connect(tiny).await.unwrap();
+    assert_eq!(
+        tiny.cloud_read_object(descriptor).await.unwrap_err().code(),
+        Code::ResourceExhausted
+    );
+    assert_eq!(
+        faults.calls.load(Ordering::SeqCst),
+        before,
+        "a small existing native config stays valid but rejects cloud work before RPC"
+    );
+    server.abort();
+    let _ = server.await;
+}
+
+fn scoped_singleton_expressions(
+    root: tinytree_model::CommitId,
+) -> Vec<(&'static str, q::GraphExpr)> {
+    let intersection = |inputs| q::GraphExpr {
+        version: 1,
+        expression: Some(q::graph_expr::Expression::Intersection(q::SetExpr {
+            inputs,
+        })),
+    };
+    vec![
+        ("literal", ids_commits(&[root])),
+        (
+            "general before literal",
+            intersection(vec![ids_ancestors(root), ids_commits(&[root])]),
+        ),
+        (
+            "literal before general",
+            intersection(vec![ids_commits(&[root]), ids_ancestors(root)]),
+        ),
+        (
+            "nested intersection",
+            intersection(vec![
+                ids_ancestors(root),
+                intersection(vec![ids_commits(&[root]), ids_ancestors(root)]),
+            ]),
+        ),
+    ]
+}
+
+#[tokio::test]
+async fn held_wide_graph_query_leaves_capacity_for_a_scoped_literal_without_larger_pool() {
+    let fixture = setup_query_retained();
+    let running = QueryRunning::start(fixture.service.clone(), QueryMode::Normal).await;
+    let mut config = running.config.clone();
+    config.limits.max_inflight = 1;
+    config.limits.max_metadata_bytes = 4 * 1024 * 1024;
+    config.limits.max_batch_bytes = 4 * 1024 * 1024;
+    config.limits.max_graph_bytes = 8 * 1024 * 1024;
+    config.limits.max_graph_objects = 65536;
+    config.limits.max_buffered_bytes = 32 * 1024 * 1024;
+    let client = NativeClient::connect(config).await.unwrap();
+    let scope = client.open_query_scope(vec![fixture.root]).await.unwrap();
+    let mut wide = client
+        .begin_graph_query(&scope, &ids_ancestors(fixture.root), 1, true)
+        .await
+        .unwrap();
+    let held = client.evaluate_graph_page(&mut wide).await.unwrap();
+    assert!(!held.rows().is_empty());
+    for (name, expression) in scoped_singleton_expressions(fixture.root) {
+        let mut literal = client
+            .begin_graph_query(&scope, &expression, 1, true)
+            .await
+            .unwrap();
+        let page = client.evaluate_graph_page(&mut literal).await.unwrap();
+        assert_eq!(
+            page.rows().iter().map(|r| r.commit).collect::<Vec<_>>(),
+            vec![fixture.root],
+            "{name}"
+        );
+        assert!(page.rows()[0].canonical.is_some(), "{name}");
+        client.close_graph_query(&mut literal).await.unwrap();
+    }
+    client.close_graph_query(&mut wide).await.unwrap();
+    drop(held);
+    client.close_query_scope(&scope).await.unwrap();
+    running.stop().await;
+}
+
+#[tokio::test]
+async fn literal_queries_reject_overreturned_rows_without_advancing_ids_or_graph_state() {
+    let fixture = setup_query_retained();
+    let running = QueryRunning::start(fixture.service.clone(), QueryMode::LiteralOverReturn).await;
+    let client = running.client().await;
+    let scope = client.open_query_scope(vec![fixture.root]).await.unwrap();
+    // Page size deliberately permits two rows; the tighter structural bound,
+    // not the page cap or duplicate check, must reject before advancing state.
+    for (name, expression) in scoped_singleton_expressions(fixture.root) {
+        let mut ids = client.begin_query(&scope, &expression, 2).await.unwrap();
+        for _ in 0..2 {
+            assert_eq!(
+                client.evaluate_page(&mut ids).await.unwrap_err().code(),
+                Code::ResourceExhausted,
+                "{name}"
+            );
+            assert!(!ids.is_exhausted(), "{name}");
+        }
+        client.close_ids_query(&mut ids).await.unwrap();
+        let mut graph = client
+            .begin_graph_query(&scope, &expression, 2, true)
+            .await
+            .unwrap();
+        for _ in 0..2 {
+            assert_eq!(
+                client
+                    .evaluate_graph_page(&mut graph)
+                    .await
+                    .unwrap_err()
+                    .code(),
+                Code::ResourceExhausted,
+                "{name}"
+            );
+            assert!(!graph.is_exhausted(), "{name}");
+        }
+        client.close_graph_query(&mut graph).await.unwrap();
+    }
     client.close_query_scope(&scope).await.unwrap();
     running.stop().await;
 }

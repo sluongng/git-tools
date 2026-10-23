@@ -1,0 +1,96 @@
+syntax = "proto3";
+package tinytree.cloud.v1;
+
+// Private workspace history. Ownership comes exclusively from authentication.
+// OP/VIEW semantic IDs and selected raw encodings are separate hash domains.
+service WorkspaceCloud {
+  rpc PutObject(PutObjectRequest) returns (WriteReceipt);
+  rpc LookupObjects(LookupObjectsRequest) returns (LookupObjectsResponse);
+  rpc ReadObject(ReadObjectRequest) returns (stream ObjectChunk);
+  rpc PublishVersion(PublishVersionRequest) returns (Publication);
+  rpc GetWorkspace(GetWorkspaceRequest) returns (Workspace);
+  rpc GetVersion(GetVersionRequest) returns (Version);
+  rpc GetPublication(GetPublicationRequest) returns (GetPublicationResponse);
+}
+enum ObjectKind {
+  OBJECT_KIND_UNSPECIFIED = 0;
+  OPERATION = 1;
+  VIEW = 2;
+}
+message ObjectId {
+  ObjectKind kind = 1;
+  bytes semantic_id = 2; // Exactly 64 bytes; not a native commit ID.
+}
+message RawDigest {
+  bytes blake3 = 1; // Exactly 32 bytes, over selected raw OP/VIEW protobuf.
+  uint64 size_bytes = 2;
+}
+message ObjectDescriptor {
+  ObjectId id = 1;
+  RawDigest selected = 2;
+}
+message PutObjectRequest {
+  string repository_id = 1;
+  ObjectDescriptor descriptor = 2;
+  bytes payload = 3;
+}
+message WriteReceipt {
+  ObjectDescriptor descriptor = 1;
+  string staging_lease = 2;
+  int64 expires_at_unix_seconds = 3;
+}
+message LookupObjectsRequest {
+  string repository_id = 1;
+  repeated ObjectId ids = 2;
+}
+message ObjectSelection { optional ObjectDescriptor descriptor = 1; }
+message LookupObjectsResponse { repeated ObjectSelection selections = 1; }
+message ReadObjectRequest {
+  string repository_id = 1;
+  ObjectId id = 2;
+}
+message ObjectChunk {
+  ObjectDescriptor descriptor = 1;
+  uint64 offset = 2;
+  bytes data = 3;
+  bool eof = 4;
+}
+message Workspace {
+  bytes workspace_id = 1; // Exactly 32 bytes, scoped to authenticated owner/repo.
+  uint64 generation = 2;
+  optional bytes manifest_id = 3; // Exactly 32 bytes when present.
+}
+message Publication {
+  string idempotency_key = 1;
+  Workspace workspace = 2;
+}
+message PublishVersionRequest {
+  string repository_id = 1;
+  bytes workspace_id = 2;
+  uint64 expected_generation = 3;
+  string idempotency_key = 4;
+  bytes manifest_id = 5; // Domain-separated manifest ID, not raw BLAKE3.
+  bytes manifest = 6; // Canonical tinytree-cloud manifest encoding.
+  repeated string staging_leases = 7;
+}
+message GetWorkspaceRequest {
+  string repository_id = 1;
+  bytes workspace_id = 2;
+}
+message GetVersionRequest {
+  string repository_id = 1;
+  bytes workspace_id = 2;
+  uint64 generation = 3;
+}
+message Version {
+  bytes workspace_id = 1;
+  uint64 generation = 2;
+  bytes manifest_id = 3;
+  optional bytes previous_manifest_id = 4;
+  bytes manifest = 5;
+}
+message GetPublicationRequest {
+  string repository_id = 1;
+  string idempotency_key = 2;
+}
+message GetPublicationResponse { optional Publication publication = 1; }

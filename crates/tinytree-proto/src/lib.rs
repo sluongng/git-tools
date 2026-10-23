@@ -7,6 +7,11 @@
 
 // Preserve protobuf package nesting for generated cross-package type paths.
 pub mod tinytree {
+    pub mod cloud {
+        pub mod v1 {
+            tonic::include_proto!("tinytree.cloud.v1");
+        }
+    }
     pub mod v1 {
         tonic::include_proto!("tinytree.v1");
     }
@@ -16,7 +21,7 @@ pub mod tinytree {
         }
     }
 }
-pub use tinytree::{query::v1 as query_v1, v1};
+pub use tinytree::{cloud::v1 as cloud_v1, query::v1 as query_v1, v1};
 
 /// Descriptor set for the native-only protocol, including streaming cardinality.
 pub const FILE_DESCRIPTOR_SET: &[u8] = tonic::include_file_descriptor_set!("tinytree_descriptor");
@@ -30,7 +35,7 @@ mod tests {
     #[test]
     fn native_repository_contract_preserves_rpc_streaming_and_public_bindings() {
         let descriptors = prost_types::FileDescriptorSet::decode(FILE_DESCRIPTOR_SET).unwrap();
-        assert_eq!(descriptors.file.len(), 2);
+        assert_eq!(descriptors.file.len(), 3);
         let file = descriptors
             .file
             .iter()
