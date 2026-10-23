@@ -15,6 +15,9 @@ struct FixtureIo {
     scopes: Mutex<BTreeMap<[u8; 32], Vec<m::Commit>>>,
     queries: Mutex<BTreeMap<[u8; 32], (Vec<q::GraphRow>, usize, u64)>>,
     opens: AtomicUsize,
+    facts_count: AtomicUsize,
+    prefix_count: AtomicUsize,
+    fail_fact: AtomicBool,
     begins: AtomicUsize,
     next: AtomicUsize,
     closes: AtomicUsize,
@@ -237,6 +240,10 @@ impl NativeQueryIo for FixtureIo {
         facts: Vec<q::GraphFact>,
         o: QueryOwner,
     ) -> Result<QueryReply<q::GraphFacts>, tonic::Status> {
+        self.facts_count.fetch_add(1, Ordering::SeqCst);
+        if self.fail_fact.swap(false, Ordering::SeqCst) {
+            return Err(tonic::Status::unavailable("fixture transient fact error"));
+        }
         let scopes = self.scopes.lock().unwrap();
         let nodes = scopes
             .get(&s)
@@ -346,6 +353,7 @@ impl NativeQueryIo for FixtureIo {
         heads: Vec<m::CommitId>,
         owner: QueryOwner,
     ) -> Result<QueryReply<q::ChangePrefixResult>, tonic::Status> {
+        self.prefix_count.fetch_add(1, Ordering::SeqCst);
         let nodes = self.scopes.lock().unwrap().get(&scope).unwrap().clone();
         let visible = selected(
             &q::GraphExpr {
@@ -860,6 +868,21 @@ fn public_mutable_traits_keep_local_drafts_hidden_siblings_and_lazy_streams_acro
             );
             drop(all);
             mutable.add_commit(&commit).await.unwrap();
+            let view = mutable
+                .change_id_index(&mut std::iter::once(root.id()))
+                .unwrap();
+            let PrefixResolution::SingleMatch(changes) = view
+                .resolve_prefix(&HexPrefix::try_from_hex("09".repeat(16)).unwrap())
+                .await
+                .unwrap()
+            else {
+                panic!("draft change missing")
+            };
+            assert_eq!(
+                changes.targets.len(),
+                n as usize,
+                "pending checkpoints with identical persisted tips must not share stale answers"
+            );
             commits.push(commit);
         }
         let readonly = mutable.as_index();
@@ -893,6 +916,24 @@ fn public_mutable_traits_keep_local_drafts_hidden_siblings_and_lazy_streams_acro
         let before_queries = io.begins.load(Ordering::SeqCst);
         assert!(contains(commits[0].id()).await.unwrap());
         assert!(contains(root.id()).await.unwrap());
+        let before_facts = io.facts_count.load(Ordering::SeqCst);
+        assert!(contains(commits[0].id()).await.unwrap());
+        assert!(contains(root.id()).await.unwrap());
+        assert_eq!(
+            io.facts_count.load(Ordering::SeqCst),
+            before_facts,
+            "immutable membership answers are reused without opening cursors"
+        );
+        let other = readonly
+            .evaluate_revset(
+                &ResolvedExpression::Commits(vec![root.id().clone()]),
+                &jj_store,
+            )
+            .unwrap();
+        assert!(
+            !other.containing_fn()(commits[0].id()).await.unwrap(),
+            "membership cache binds the whole expression"
+        );
         assert_eq!(
             io.begins.load(Ordering::SeqCst),
             before_queries,
@@ -1321,6 +1362,34 @@ fn admitted_root_advance_promotes_overlay_without_losing_hidden_drafts_or_old_op
             changes
                 .targets
                 .contains(&(hidden.clone(), ResolvedChangeState::Hidden))
+        );
+        let prefix = HexPrefix::try_from_hex("09".repeat(16)).unwrap();
+        let before_prefixes = io.prefix_count.load(Ordering::SeqCst);
+        let again = change_index.resolve_prefix(&prefix).await.unwrap();
+        assert!(matches!(again, PrefixResolution::SingleMatch(_)));
+        assert_eq!(io.prefix_count.load(Ordering::SeqCst), before_prefixes);
+        let hidden_view = extended
+            .change_id_index(&mut std::iter::once(hidden))
+            .unwrap();
+        let PrefixResolution::SingleMatch(hidden_changes) =
+            hidden_view.resolve_prefix(&prefix).await.unwrap()
+        else {
+            panic!("change missing")
+        };
+        assert!(
+            hidden_changes
+                .targets
+                .contains(&(published.clone(), ResolvedChangeState::Hidden))
+        );
+        assert!(
+            hidden_changes
+                .targets
+                .contains(&(hidden.clone(), ResolvedChangeState::Visible))
+        );
+        assert_eq!(
+            io.prefix_count.load(Ordering::SeqCst),
+            before_prefixes + 1,
+            "visible heads are part of the cache key"
         );
         let expression = ResolvedExpression::Ancestors {
             heads: Box::new(ResolvedExpression::Commits(vec![
@@ -2300,4 +2369,80 @@ fn lifecycle_bench_operation(n: usize) -> [u8; 64] {
     let mut id = [0; 64];
     id[..8].copy_from_slice(&(n as u64).to_le_bytes());
     id
+}
+
+#[test]
+fn immutable_fact_memo_is_optional_bounded_and_never_remembers_errors() {
+    block_on(async {
+        let (directory, _objects_directory, _store, io, objects, config) = fixture();
+        struct Case {
+            name: &'static str,
+            bytes: usize,
+            entries: usize,
+            repeat_calls: usize,
+        }
+        for case in [
+            Case {
+                name: "disabled bytes",
+                bytes: 0,
+                entries: 8,
+                repeat_calls: 2,
+            },
+            Case {
+                name: "disabled entries",
+                bytes: 8192,
+                entries: 0,
+                repeat_calls: 2,
+            },
+            Case {
+                name: "single live entry",
+                bytes: 8192,
+                entries: 1,
+                repeat_calls: 1,
+            },
+            Case {
+                name: "too small to retain",
+                bytes: 128,
+                entries: 8,
+                repeat_calls: 2,
+            },
+        ] {
+            let limits = Limits {
+                fact_cache_bytes: case.bytes,
+                fact_cache_entries: case.entries,
+                ..Limits::default()
+            };
+            let store = NativeIndexStore::open(
+                &directory.path().join("index"),
+                &config,
+                limits,
+                io.clone(),
+                objects.clone(),
+            )
+            .unwrap();
+            let index = store.seed_index().unwrap();
+            let a = CommitId::from_bytes(&[71; 32]);
+            let b = CommitId::from_bytes(&[72; 32]);
+            io.fail_fact.store(true, Ordering::SeqCst);
+            assert!(index.has_id(&a).await.is_err(), "{}", case.name);
+            let before = io.facts_count.load(Ordering::SeqCst);
+            assert!(!index.has_id(&a).await.unwrap());
+            assert!(!index.has_id(&a).await.unwrap());
+            assert_eq!(
+                io.facts_count.load(Ordering::SeqCst) - before,
+                case.repeat_calls,
+                "{}",
+                case.name
+            );
+            assert!(!index.has_id(&b).await.unwrap());
+            let before = io.facts_count.load(Ordering::SeqCst);
+            assert!(!index.has_id(&a).await.unwrap());
+            assert_eq!(
+                io.facts_count.load(Ordering::SeqCst),
+                before + 1,
+                "{}: eviction preserves exact negatives",
+                case.name
+            );
+        }
+    });
 }

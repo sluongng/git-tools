@@ -2,6 +2,7 @@
 //! Persisted descriptors do not prove object residency or remote retention.
 mod cleanup;
 pub use cleanup::CleanupHandle;
+mod memo;
 mod persistence;
 mod query;
 mod revsets;
@@ -68,6 +69,9 @@ impl Config {
 }
 #[derive(Clone, Debug)]
 pub struct Limits {
+    /// Shared immutable-answer cache. Either zero disables memoization.
+    pub fact_cache_bytes: usize,
+    pub fact_cache_entries: usize,
     pub max_segments: usize,
     pub max_roots: usize,
     pub max_drafts: usize,
@@ -90,6 +94,8 @@ pub struct Limits {
 impl Default for Limits {
     fn default() -> Self {
         Self {
+            fact_cache_bytes: 1024 * 1024,
+            fact_cache_entries: 1024,
             max_segments: 4096,
             max_roots: 4096,
             max_drafts: 4096,
@@ -112,7 +118,9 @@ impl Default for Limits {
 }
 impl Limits {
     fn validate(&self) -> Result<(), Error> {
-        if self.max_segments == 0
+        if self.fact_cache_bytes > 64 * 1024 * 1024
+            || self.fact_cache_entries > 65_536
+            || self.max_segments == 0
             || self.max_segments > 65_536
             || self.max_roots == 0
             || self.max_roots > 4096
@@ -240,6 +248,7 @@ struct ScopeState {
     replay: [u8; 32],
 }
 struct Checkpoint {
+    memo_id: [u8; 32],
     tips: Vec<SegmentId>,
     roots: Vec<m::CommitId>,
     drafts: Vec<Arc<Draft>>,
@@ -248,6 +257,7 @@ struct Checkpoint {
 impl Checkpoint {
     fn new(tips: Vec<SegmentId>, roots: Vec<m::CommitId>, drafts: Vec<Arc<Draft>>) -> Self {
         Self {
+            memo_id: memo::checkpoint(&roots, &drafts),
             tips,
             roots,
             drafts,
@@ -264,6 +274,7 @@ pub struct NativeIndexStore {
     core: Arc<Core>,
 }
 struct Core {
+    memo: memo::Memo,
     storage: Arc<Storage>,
     query: Arc<dyn NativeQueryIo>,
     objects: Arc<dyn NativeObjectIo>,
@@ -339,6 +350,7 @@ impl NativeIndexStore {
         let cleanup = cleanup::Queue::start(query.clone(), &limits)?;
         Ok(Self {
             core: Arc::new(Core {
+                memo: memo::Memo::new(limits.fact_cache_bytes, limits.fact_cache_entries),
                 storage: Arc::new(storage),
                 query,
                 objects,

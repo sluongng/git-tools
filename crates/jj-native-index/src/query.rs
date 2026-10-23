@@ -319,6 +319,12 @@ impl NativeReadonlyIndex {
         &self,
         fact: q::graph_fact::Fact,
     ) -> Result<q::graph_fact_answer::Answer, Error> {
+        let key = memo::fact_key(self.checkpoint.memo_id, &fact, &self.core.limits)?;
+        if let Some(entry) = key.and_then(|key| self.core.memo.get(&key)) {
+            if let memo::Value::Fact(answer) = &entry.value {
+                return Ok(answer.clone()); // Only fixed-size boolean answers are stored.
+            }
+        }
         for attempt in 0..2 {
             let scope = self.scope().await?;
             let reply = self
@@ -337,7 +343,16 @@ impl NativeReadonlyIndex {
                     if reply.value.answers.len() != 1 {
                         return Err(Error::Corrupt);
                     }
-                    return reply.value.answers.remove(0).answer.ok_or(Error::Corrupt);
+                    let answer = reply.value.answers.remove(0).answer.ok_or(Error::Corrupt)?;
+                    if let Some(key) = key {
+                        if !memo::matches(&fact, &answer) {
+                            return Err(Error::Corrupt);
+                        }
+                        self.core
+                            .memo
+                            .insert(key, 0, || memo::Value::Fact(answer.clone()));
+                    }
+                    return Ok(answer);
                 }
                 Err(e) if attempt == 0 && e.code() == tonic::Code::FailedPrecondition => {
                     self.invalidate(scope.value.handle).await
@@ -529,6 +544,16 @@ impl ChangeIdIndex for ChangeIndex {
         &self,
         prefix: &HexPrefix,
     ) -> IndexResult<PrefixResolution<ResolvedChangeTargets>> {
+        let prefix = prefix.hex();
+        if prefix.len() > 32 || self.heads.len() > self.index.core.limits.max_roots {
+            return Err(err(Error::Limit));
+        }
+        let key = memo::change_key(self.index.checkpoint.memo_id, &self.heads, &prefix);
+        if let Some(entry) = self.index.core.memo.get(&key) {
+            if let memo::Value::Change(value) = &entry.value {
+                return parse_change(value, self.index.core.limits.max_query_rows).map_err(err);
+            }
+        }
         let scope = self.index.scope().await.map_err(err)?;
         let reply = self
             .index
@@ -536,41 +561,25 @@ impl ChangeIdIndex for ChangeIndex {
             .query
             .resolve_change_prefix(
                 scope.value.handle,
-                prefix.hex(),
+                prefix,
                 self.heads.clone(),
                 Arc::new((self.index.core.owner(), scope)),
             )
             .await
             .map_err(|e| err(status(e)))?;
-        use q::change_prefix_result::Result as R;
-        match reply.value.result.ok_or_else(|| err(Error::Corrupt))? {
-            R::NoMatch(_) => Ok(PrefixResolution::NoMatch),
-            R::Ambiguous(_) => Ok(PrefixResolution::AmbiguousMatch),
-            R::Single(single) => {
-                if single.change.as_ref().is_none_or(|c| c.value.len() != 16)
-                    || single.targets.len() > self.index.core.limits.max_query_rows
-                {
-                    return Err(err(Error::Corrupt));
-                }
-                let mut targets = Vec::with_capacity(single.targets.len());
-                let mut seen = BTreeSet::new();
-                for target in single.targets {
-                    let id = checked(target.commit).map_err(err)?;
-                    if !seen.insert(id.clone()) {
-                        return Err(err(Error::Corrupt));
-                    }
-                    let state = match target.visible {
-                        Some(true) => ResolvedChangeState::Visible,
-                        Some(false) => ResolvedChangeState::Hidden,
-                        None => return Err(err(Error::Corrupt)),
-                    };
-                    targets.push((id, state));
-                }
-                Ok(PrefixResolution::SingleMatch(ResolvedChangeTargets {
-                    targets,
-                }))
-            }
+        let result =
+            parse_change(&reply.value, self.index.core.limits.max_query_rows).map_err(err)?;
+        let targets = match &reply.value.result {
+            Some(q::change_prefix_result::Result::Single(v)) => v.targets.len(),
+            _ => 0,
+        };
+        if let Some(bytes) = targets.checked_mul(160) {
+            self.index
+                .core
+                .memo
+                .insert(key, bytes, || memo::Value::Change(reply.value.clone()));
         }
+        Ok(result)
     }
     async fn shortest_unique_prefix_len(&self, id: &ChangeId) -> IndexResult<usize> {
         let value: [u8; 16] = id.as_bytes().try_into().map_err(|_| err(Error::Invalid))?;
@@ -585,5 +594,48 @@ impl ChangeIdIndex for ChangeIndex {
             )
             .await
             .map_err(err)
+    }
+}
+
+fn parse_change(
+    value: &q::ChangePrefixResult,
+    max_rows: usize,
+) -> Result<PrefixResolution<ResolvedChangeTargets>, Error> {
+    use q::change_prefix_result::Result as R;
+    match value.result.as_ref().ok_or(Error::Corrupt)? {
+        R::NoMatch(_) => Ok(PrefixResolution::NoMatch),
+        R::Ambiguous(_) => Ok(PrefixResolution::AmbiguousMatch),
+        R::Single(single) => {
+            if single.change.as_ref().is_none_or(|c| c.value.len() != 16)
+                || single.targets.len() > max_rows
+            {
+                return Err(Error::Corrupt);
+            }
+            let mut targets = Vec::with_capacity(single.targets.len());
+            let mut seen = BTreeSet::new();
+            for target in &single.targets {
+                let bytes: [u8; 32] = target
+                    .commit
+                    .as_ref()
+                    .ok_or(Error::Corrupt)?
+                    .value
+                    .as_slice()
+                    .try_into()
+                    .map_err(|_| Error::Corrupt)?;
+                let id = CommitId::from_bytes(&bytes);
+                if !seen.insert(id.clone()) {
+                    return Err(Error::Corrupt);
+                }
+                let state = match target.visible {
+                    Some(true) => ResolvedChangeState::Visible,
+                    Some(false) => ResolvedChangeState::Hidden,
+                    None => return Err(Error::Corrupt),
+                };
+                targets.push((id, state));
+            }
+            Ok(PrefixResolution::SingleMatch(ResolvedChangeTargets {
+                targets,
+            }))
+        }
     }
 }
