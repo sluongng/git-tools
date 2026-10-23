@@ -16,13 +16,36 @@ rust_library(
 )
 
 rust_test(
+    name = "unit_tests",
+    aliases = aliases(),
+    crate = ":jj-native-remote",
+    edition = "2024",
+    deps = all_crate_deps(
+        normal = True,
+        normal_dev = True,
+    ),
+)
+
+rust_test(
     name = "rpc_tests",
     srcs = ["tests/rpc.rs"],
     aliases = aliases(),
+    data = [
+        "//crates/tinytree-server:tests/fixtures/ca.pem",
+        "//crates/tinytree-server:tests/fixtures/server.pem",
+        "//crates/tinytree-server:tests/fixtures/server-key.pem",
+        "//crates/tinytree-server:tests/fixtures/wrong-ca.pem",
+    ],
     edition = "2024",
     env = {
         "TINYTREE_REMOTE_TEST_TOKEN": "native-remote-loopback-test-token",
         "TINYTREE_REMOTE_OTHER_TOKEN": "native-remote-other-loopback-test-token",
+    },
+    rustc_env = {
+        "TLS_CA_CERT": "$(rootpath //crates/tinytree-server:tests/fixtures/ca.pem)",
+        "TLS_SERVER_CERT": "$(rootpath //crates/tinytree-server:tests/fixtures/server.pem)",
+        "TLS_SERVER_KEY": "$(rootpath //crates/tinytree-server:tests/fixtures/server-key.pem)",
+        "TLS_WRONG_CA_CERT": "$(rootpath //crates/tinytree-server:tests/fixtures/wrong-ca.pem)",
     },
     deps = [":jj-native-remote"] + all_crate_deps(
         normal = True,

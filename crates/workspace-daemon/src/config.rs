@@ -64,6 +64,8 @@ impl Default for Native {
 #[derive(Clone, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct NativeRepository {
+    /// Optional remote provider; paths and authorization are trusted host inputs.
+    pub remote: Option<jj_native_remote::Config>,
     pub max_repository_bytes: u64,
     pub max_file_bytes: u64,
     pub max_objects_per_repository: u64,
@@ -74,6 +76,7 @@ impl Default for NativeRepository {
     fn default() -> Self {
         let defaults = jj_native_backend::Config::default().store;
         Self {
+            remote: None,
             max_repository_bytes: defaults.max_repository_bytes,
             max_file_bytes: defaults.max_file_bytes,
             max_objects_per_repository: defaults.max_objects_per_repository,
@@ -93,6 +96,20 @@ impl NativeRepository {
         config
     }
     fn validate(&self) -> Result<()> {
+        if let Some(remote) = &self.remote {
+            remote
+                .validate()
+                .map_err(|_| anyhow::anyhow!("invalid native remote configuration"))?;
+            ensure!(
+                remote.remote.limits.max_metadata_bytes
+                    <= self.materialize().store.model_limits.max_object_bytes,
+                "native remote metadata budget must fit authoritative store limits"
+            );
+            ensure!(
+                remote.remote.limits.max_file_bytes <= self.max_file_bytes,
+                "native remote file budget must fit authoritative store limits"
+            );
+        }
         ensure!(
             (1..=1024 * 1024 * 1024).contains(&self.max_file_bytes)
                 && self.max_repository_bytes >= 1024
@@ -133,6 +150,14 @@ impl Native {
             tinytree_store::validate_repository_id(alias)
                 .context("invalid native repository alias")?;
             repo.validate()?;
+            if let Some(remote) = &repo.remote {
+                let required = remote.control_work_budget();
+                ensure!(
+                    required.memory_bytes <= self.max_memory_bytes as u64
+                        && required.temporary_bytes <= self.max_temporary_bytes,
+                    "native remote control work must fit broker memory and staging limits"
+                );
+            }
         }
         if !self.repositories.is_empty() {
             self.broker_config(policy)
@@ -371,6 +396,15 @@ impl Config {
         );
         self.reapi.validate()?;
         self.native.validate(&self.reapi)?;
+        for repository in self.native.repositories.values() {
+            if let Some(remote) = &repository.remote {
+                ensure!(
+                    remote.remote.limits.max_file_bytes <= self.cache.max_bytes
+                        && remote.remote.limits.max_file_bytes <= self.cache.max_inflight_bytes,
+                    "native remote files must fit shared cache and in-flight limits"
+                );
+            }
+        }
         ensure!(
             self.cache.upstream_retention_seconds <= 30 * 86400
                 && self.cache.retention_refresh_seconds <= 30 * 86400
@@ -513,6 +547,13 @@ retry_max_attempts = 4
 # [native.repositories.example]
 # max_repository_bytes = 17179869184
 # max_file_bytes = 268435456
+# [native.repositories.example.remote]
+# authorization_profile = "agent-profile"
+# [native.repositories.example.remote.remote]
+# endpoint = "http://127.0.0.1:8093"
+# repository_id = "example"
+# token_env = "TINYTREE_AGENT_TOKEN"
+# compression = true
 
 [bos]
 # Opt in to strictly lazy outputs; metadata publication is not yet batched.
@@ -657,6 +698,33 @@ mod tests {
         configured.cache.max_inflight_bytes = 64 * 1024 * 1024;
         configured.cache.max_blob_bytes = 64 * 1024 * 1024;
         configured.validate().unwrap();
+        let remote_configuration = format!(
+            "{EXAMPLE}\n[native.repositories.example.remote.remote]\nendpoint='http://127.0.0.1:8093'\nrepository_id='example'\n"
+        );
+        let remote: Config = toml::from_str(&remote_configuration).unwrap();
+        remote.validate().unwrap();
+        let mut oversized = remote.clone();
+        oversized
+            .native
+            .repositories
+            .get_mut("example")
+            .unwrap()
+            .remote
+            .as_mut()
+            .unwrap()
+            .remote
+            .limits
+            .max_metadata_bytes = 32 * 1024 * 1024;
+        assert!(
+            oversized.validate().is_err(),
+            "remote metadata must fit local storage"
+        );
+        let mut no_headroom = remote.clone();
+        no_headroom.native.max_memory_bytes = 64 * 1024 * 1024;
+        assert!(
+            no_headroom.validate().is_err(),
+            "remote control memory must fit the broker pool"
+        );
         for alias in [
             "../escape",
             "path/name",

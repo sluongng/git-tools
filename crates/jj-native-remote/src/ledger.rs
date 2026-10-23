@@ -14,6 +14,8 @@ pub(crate) struct Binding {
     pub base: String,
     pub credential: String,
     pub scope: String,
+    #[serde(default)]
+    pub trust: String,
 }
 #[derive(Clone, Serialize, Deserialize)]
 pub(crate) struct StoredDescriptor {
@@ -159,7 +161,7 @@ fn require_bytes(path: &Path, expected: &[u8]) -> Result<()> {
     Ok(())
 }
 impl Ledger {
-    pub fn open(path: &Path, config: &Config) -> Result<Self> {
+    pub fn open(path: &Path, config: &Config, trust: &str) -> Result<Self> {
         let fresh = preflight(path)?;
         if fresh {
             if let Some(name) = &config.remote.token_env {
@@ -254,13 +256,15 @@ impl Ledger {
         };
         let binding = match credential {
             Some(credential) => {
-                let scope = blake3::hash(serde_json::to_vec(&(&base, &credential))?.as_slice())
-                    .to_hex()
-                    .to_string();
+                let scope =
+                    blake3::hash(serde_json::to_vec(&(&base, &credential, trust))?.as_slice())
+                        .to_hex()
+                        .to_string();
                 Binding {
                     base,
                     credential,
                     scope,
+                    trust: trust.into(),
                 }
             }
             None => existing
@@ -320,6 +324,9 @@ impl Ledger {
             &self.roots,
             self.config.max_admitted_roots + self.config.max_pending_operations,
         )
+    }
+    pub fn pending_request(&self, id: &str) -> Result<Option<Request>> {
+        self.get(&self.pending, id.as_bytes())
     }
     pub fn pending(&self) -> Result<Vec<Request>> {
         self.list(&self.pending, self.config.max_pending_operations)

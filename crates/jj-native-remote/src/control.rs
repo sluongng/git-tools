@@ -38,6 +38,12 @@ pub struct AdmittedReference {
     pub generation: u64,
 }
 #[derive(Clone, Debug)]
+pub struct ObservedReference {
+    pub name: String,
+    pub generation: u64,
+    pub head: Option<AdmittedHead>,
+}
+#[derive(Clone, Debug)]
 pub struct PublishRequest {
     pub head: m::CommitId,
     pub reference_name: String,
@@ -70,6 +76,14 @@ impl RemoteRepositoryControl {
         }
     }
     pub async fn admit_reference(&self, name: &str) -> Result<AdmittedHead> {
+        self.observe_reference(name)
+            .await?
+            .head
+            .ok_or_else(|| tonic::Status::not_found("native reference is absent").into())
+    }
+    /// Observe absence/tombstone or admit the selected immutable head. Both
+    /// values preserve the original public snapshot, never a later generation.
+    pub async fn observe_reference(&self, name: &str) -> Result<ObservedReference> {
         ensure!(
             !name.is_empty() && name.len() <= 4096 && !name.contains('\0'),
             "invalid native admission reference name"
@@ -77,16 +91,26 @@ impl RemoteRepositoryControl {
         let deadline = self.inner.deadline();
         self.run(deadline, async {
             let client = self.inner.connector.get().await?;
-            let view = client.open(vec![name.to_owned()]).await?;
+            let view = io::network(client.open(vec![name.to_owned()])).await?;
             let reference = view
                 .references
                 .first()
                 .context("native reference was omitted")?;
-            let commit = reference
-                .commit
+            let selected = AdmittedReference {
+                name: reference.name.clone(),
+                generation: reference.generation,
+            };
+            let Some(descriptor) = &reference.commit else {
+                return Ok(ObservedReference {
+                    name: selected.name,
+                    generation: selected.generation,
+                    head: None,
+                });
+            };
+            let commit = descriptor
+                .key
                 .as_ref()
-                .and_then(|d| d.key.as_ref())
-                .context("native reference is absent")?;
+                .context("native reference target was omitted")?;
             ensure!(
                 commit.kind == m::Kind::Commit as i32,
                 "native reference is not a commit"
@@ -98,13 +122,13 @@ impl RemoteRepositoryControl {
                     .try_into()
                     .map_err(|_| anyhow::anyhow!("invalid native commit identity"))?,
             );
-            let selected = AdmittedReference {
-                name: reference.name.clone(),
-                generation: reference.generation,
-            };
             let mut admitted = self.admit(head).await?;
-            admitted.public_reference = Some(selected);
-            Ok(admitted)
+            admitted.public_reference = Some(selected.clone());
+            Ok(ObservedReference {
+                name: selected.name,
+                generation: selected.generation,
+                head: Some(admitted),
+            })
         })
         .await
     }
@@ -112,22 +136,35 @@ impl RemoteRepositoryControl {
         let deadline = self.inner.deadline();
         self.run(deadline, self.admit(head)).await
     }
-    async fn run<T>(
+    pub(crate) async fn run<T>(
         &self,
         deadline: tokio::time::Instant,
         operation: impl std::future::Future<Output = Result<T>>,
     ) -> Result<T> {
-        tokio::time::timeout_at(deadline, async {
-            let permit = Arc::new(self.inner.control.clone().acquire_owned().await?);
-            let result = io::control_scope(permit, operation).await;
-            ensure!(
-                tokio::time::Instant::now() < deadline,
-                "native remote operation deadline exceeded"
-            );
-            result
-        })
-        .await
-        .map_err(|_| anyhow::anyhow!("native remote operation deadline exceeded"))?
+        // Only admission is cancellable here. Once DirectObjectIo owns a job,
+        // await its physical completion; the broker's owned request task keeps
+        // this future alive even when the incoming RPC times out/disconnects.
+        let permit = tokio::time::timeout_at(deadline, self.inner.control.clone().acquire_owned())
+            .await
+            .map_err(|_| {
+                tonic::Status::deadline_exceeded("native control admission deadline exceeded")
+            })??;
+        let scope = Arc::new(io::ControlScope::new(permit, deadline));
+        let result = io::control_scope(scope, operation).await;
+        if tokio::time::Instant::now() >= deadline {
+            return Err(tonic::Status::deadline_exceeded(
+                "native remote operation deadline exceeded",
+            )
+            .into());
+        }
+        result
+    }
+    /// The trait adapter keeps the shared broker pool charged through every
+    /// physical client/cache/copy worker, including timed-out owned jobs.
+    pub(crate) async fn drain_control(&self) {
+        if let Ok(permit) = self.inner.control.clone().acquire_owned().await {
+            drop(permit);
+        }
     }
     async fn admit(&self, head: m::CommitId) -> Result<AdmittedHead> {
         ensure!(
@@ -139,6 +176,7 @@ impl RemoteRepositoryControl {
         let closure = Closure::collect(&self.inner, head, true).await?;
         // Parent-first order preserves CopyHistory's authoritative parent checks.
         for key in &closure.order {
+            io::check_deadline()?;
             let node = &closure.nodes[key];
             if self
                 .inner
@@ -148,12 +186,14 @@ impl RemoteRepositoryControl {
                 .map_err(backend)?
                 .is_none()
             {
+                io::check_deadline()?;
                 let descriptor = self
                     .inner
                     .local
                     .write_metadata(node.object.clone())
                     .await
                     .map_err(backend)?;
+                io::check_deadline()?;
                 ensure!(
                     descriptor == node.descriptor,
                     "native metadata installation changed canonical identity"
@@ -199,7 +239,7 @@ impl RemoteRepositoryControl {
         let ledger = self.inner.ledger.clone();
         let saved = root.clone();
         io::blocking(move || ledger.save_root(&saved)).await?;
-        let view = client.open(vec![root.hold_name.clone()]).await?;
+        let view = io::network(client.open(vec![root.hold_name.clone()])).await?;
         let reference = view
             .references
             .first()
@@ -241,15 +281,13 @@ impl RemoteRepositoryControl {
             .request
             .as_ref()
             .context("native pending hold request missing")?;
-        client
-            .publish(request.wire(&self.inner.config.remote.repository_id)?)
-            .await?;
+        io::network(client.publish(request.wire(&self.inner.config.remote.repository_id)?)).await?;
         root.receipt = root.request.clone();
         root.receipt_binding = Some(self.inner.ledger.binding.scope.clone());
         self.current_hold(client, root).await
     }
     async fn current_hold(&self, client: &NativeClient, mut root: Root) -> Result<Root> {
-        let view = client.open(vec![root.hold_name.clone()]).await?;
+        let view = io::network(client.open(vec![root.hold_name.clone()])).await?;
         let reference = view
             .references
             .first()
@@ -327,9 +365,10 @@ impl RemoteRepositoryControl {
         }
         let mut missing = std::collections::HashSet::new();
         for batch in descriptors.chunks(self.inner.config.remote.limits.max_batch_items) {
-            for key in client
-                .find_missing(batch.iter().map(|descriptor| descriptor.key).collect())
-                .await?
+            for key in io::network(
+                client.find_missing(batch.iter().map(|descriptor| descriptor.key).collect()),
+            )
+            .await?
             {
                 missing.insert(key);
             }
@@ -338,10 +377,10 @@ impl RemoteRepositoryControl {
         for key in &closure.order {
             if missing.contains(key) {
                 let node = &closure.nodes[key];
-                let object = client
-                    .verify_metadata(node.descriptor, node.bytes.clone())
-                    .await?;
-                client.upload_metadata(object).await?;
+                let object =
+                    io::network(client.verify_metadata(node.descriptor, node.bytes.clone()))
+                        .await?;
+                io::network(client.upload_metadata(object)).await?;
             }
         }
         let provider = RemoteObjectIo {
@@ -364,7 +403,7 @@ impl RemoteRepositoryControl {
             let source = self
                 .upload_snapshot(read, descriptor, deadline, &client)
                 .await?;
-            client.upload_file(source).await?;
+            io::network(client.upload_file(source)).await?;
         }
         let root = self.hold(&client, request.head).await?;
         let root = self.current_hold(&client, root).await?;
@@ -374,9 +413,10 @@ impl RemoteRepositoryControl {
         let members = closure.descriptors();
         let files = closure.files;
         io::blocking(move || ledger.completed(root, &members, &files)).await?;
-        let publication = match client
-            .publish(pending.wire(&self.inner.config.remote.repository_id)?)
-            .await
+        let publication = match io::network(
+            client.publish(pending.wire(&self.inner.config.remote.repository_id)?),
+        )
+        .await
         {
             Ok(publication) => publication,
             Err(error) => {
@@ -416,16 +456,19 @@ impl RemoteRepositoryControl {
             "native upload file exceeds client bound"
         );
         let quota = Arc::new(
-            self.inner
-                .spool
-                .clone()
-                .acquire_many_owned(u32::try_from(
+            tokio::time::timeout_at(
+                deadline,
+                self.inner.spool.clone().acquire_many_owned(u32::try_from(
                     descriptor
                         .size_bytes
                         .checked_mul(2)
                         .context("native double-spool size overflow")?,
-                )?)
-                .await?,
+                )?),
+            )
+            .await
+            .map_err(|_| {
+                tonic::Status::deadline_exceeded("native upload spool admission deadline exceeded")
+            })??,
         );
         let parent = self.inner.staging.clone();
         let held = quota.clone();
@@ -495,12 +538,78 @@ impl RemoteRepositoryControl {
         // Attach before admission/copy begins: cancellation can leave a client
         // blocking snapshot worker alive before an UploadSource is returned.
         let scoped_client = client.clone().with_lifetime_guard(quota.clone());
-        let source = scoped_client
-            .prepare_upload_file(&path, descriptor, &self.inner.staging)
-            .await?;
+        let source =
+            io::network(scoped_client.prepare_upload_file(&path, descriptor, &self.inner.staging))
+                .await?;
         drop(spool);
         drop(quota);
         Ok(source)
+    }
+    /// Reconcile exactly one durable intent. A missing record is no confirmed
+    /// outcome, never proof that an upstream operation did not commit.
+    pub async fn publication(&self, id: &str) -> Result<Option<ConfirmedPublication>> {
+        ensure!(
+            !id.is_empty()
+                && id.len() <= 128
+                && id
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_'),
+            "invalid native publication key"
+        );
+        let deadline = self.inner.deadline();
+        self.run(deadline, async {
+            let ledger = self.inner.ledger.clone();
+            let key = id.to_owned();
+            let receipt = io::blocking(move || ledger.receipt(&key)).await?;
+            if let Some(receipt) = receipt {
+                ensure!(
+                    receipt.request.id == id
+                        && receipt.request.generation.checked_add(1) == Some(receipt.generation),
+                    "native durable publication receipt is corrupt"
+                );
+                let head = m::CommitId(unhex(
+                    receipt
+                        .request
+                        .commit
+                        .as_deref()
+                        .context("native publication receipt target missing")?,
+                )?);
+                return Ok(Some(ConfirmedPublication {
+                    idempotency_key: receipt.request.id,
+                    reference_name: receipt.request.name,
+                    generation: receipt.generation,
+                    head,
+                }));
+            }
+            let ledger = self.inner.ledger.clone();
+            let key = id.to_owned();
+            let pending = io::blocking(move || ledger.pending_request(&key)).await?;
+            let Some(request) = pending else {
+                return Ok(None);
+            };
+            ensure!(
+                request.id == id,
+                "native durable publication intent is corrupt"
+            );
+            let head = m::CommitId(unhex(
+                request
+                    .commit
+                    .as_deref()
+                    .context("native pending publication target missing")?,
+            )?);
+            self.publish_inner(
+                PublishRequest {
+                    head,
+                    reference_name: request.name,
+                    expected_generation: request.generation,
+                    idempotency_key: request.id,
+                },
+                deadline,
+            )
+            .await
+            .map(Some)
+        })
+        .await
     }
     /// Rebuild disposable file-size/provenance hints exclusively from already
     /// admitted canonical local trees. Does not fetch payloads or renew holds.

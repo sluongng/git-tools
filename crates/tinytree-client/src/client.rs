@@ -55,6 +55,24 @@ impl NativeClient {
         }
     }
     pub async fn connect(config: Config) -> Result<Self, Status> {
+        Self::connect_with_trust(config, None).await
+    }
+    /// Connect using captured explicit trust roots instead of rereading a path.
+    /// Requires TLS configuration and a nonempty, bounded PEM snapshot. The
+    /// configured server name and all ordinary transport checks still apply.
+    pub async fn connect_with_ca_certificate(
+        config: Config,
+        ca: Arc<[u8]>,
+    ) -> Result<Self, Status> {
+        if config.tls.is_none() || ca.is_empty() || ca.len() > 1024 * 1024 {
+            return Err(Status::invalid_argument("invalid native trust snapshot"));
+        }
+        Self::connect_with_trust(config, Some(ca)).await
+    }
+    async fn connect_with_trust(
+        config: Config,
+        ca_snapshot: Option<Arc<[u8]>>,
+    ) -> Result<Self, Status> {
         config
             .validate()
             .map_err(|_| Status::invalid_argument("invalid native client configuration"))?;
@@ -111,24 +129,30 @@ impl NativeClient {
                 .connect_timeout(config.rpc.connect_timeout());
             if let Some(tls) = &config.tls {
                 let path = tls.ca_certificate.clone();
-                let ca = blocking(deadline, move || {
-                    use std::io::Read;
-                    let mut bytes = Vec::new();
-                    std::fs::File::open(path)
-                        .map_err(|_| Status::failed_precondition("cannot read native trust roots"))?
-                        .take(1024 * 1024 + 1)
-                        .read_to_end(&mut bytes)
-                        .map_err(|_| {
-                            Status::failed_precondition("cannot read native trust roots")
-                        })?;
-                    if bytes.len() > 1024 * 1024 {
-                        return Err(Status::resource_exhausted(
-                            "native trust roots exceed limit",
-                        ));
-                    }
-                    Ok(bytes)
-                })
-                .await?;
+                let ca = if let Some(ca) = ca_snapshot {
+                    ca.as_ref().to_vec()
+                } else {
+                    blocking(deadline, move || {
+                        use std::io::Read;
+                        let mut bytes = Vec::new();
+                        std::fs::File::open(path)
+                            .map_err(|_| {
+                                Status::failed_precondition("cannot read native trust roots")
+                            })?
+                            .take(1024 * 1024 + 1)
+                            .read_to_end(&mut bytes)
+                            .map_err(|_| {
+                                Status::failed_precondition("cannot read native trust roots")
+                            })?;
+                        if bytes.is_empty() || bytes.len() > 1024 * 1024 {
+                            return Err(Status::resource_exhausted(
+                                "native trust roots exceed limit",
+                            ));
+                        }
+                        Ok(bytes)
+                    })
+                    .await?
+                };
                 let mut settings = ClientTlsConfig::new().ca_certificate(Certificate::from_pem(ca));
                 if let Some(domain) = &tls.domain_name {
                     settings = settings.domain_name(domain);

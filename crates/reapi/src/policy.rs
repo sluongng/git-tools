@@ -5,11 +5,11 @@
 use std::{fmt, future::Future, io::Read, path::Path, time::Duration};
 
 use prost::Message;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use tokio::time::Instant;
 use tonic::{Code, Status};
 
-#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(default, deny_unknown_fields)]
 pub struct Policy {
     pub connect_timeout_ms: u64,
@@ -23,7 +23,7 @@ pub struct Policy {
     pub retry: RetryPolicy,
 }
 
-#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(default, deny_unknown_fields)]
 pub struct RetryPolicy {
     /// Total attempts, including the original call.

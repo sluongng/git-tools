@@ -151,6 +151,13 @@ struct Server {
 }
 impl Server {
     async fn start(store: Store, counts: Counters) -> Self {
+        Self::start_with_tls(store, counts, None).await
+    }
+    async fn start_with_tls(
+        store: Store,
+        counts: Counters,
+        tls: Option<tonic::transport::Identity>,
+    ) -> Self {
         let service = RepositoryService::new(
             store,
             ServiceConfig::default(),
@@ -174,7 +181,13 @@ impl Server {
         let address = listener.local_addr().unwrap();
         let (stop, stopped) = tokio::sync::oneshot::channel();
         let task = tokio::spawn(async move {
-            tonic::transport::Server::builder()
+            let mut server = tonic::transport::Server::builder();
+            if let Some(identity) = tls {
+                server = server
+                    .tls_config(tonic::transport::ServerTlsConfig::new().identity(identity))
+                    .unwrap();
+            }
+            server
                 .add_service(
                     RepositoryServer::new(Counting { service, counts })
                         .accept_compressed(CompressionEncoding::Zstd)
@@ -758,7 +771,22 @@ async fn lost_publication_ack_is_reconciled_after_restart_without_advancing_gene
     drop(direct);
     counts.public_paused.store(false, Ordering::SeqCst);
     let (_direct, repo) = local(directory.path(), cache, config, false);
-    assert_eq!(repo.control.reconcile_pending().await.unwrap(), 1);
+    let confirmed = repo
+        .control
+        .publication("restart-publication")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(confirmed.head, head);
+    assert_eq!(confirmed.reference_name, "main");
+    assert_eq!(confirmed.generation, 2);
+    assert!(
+        repo.control
+            .publication("unknown-publication-key")
+            .await
+            .unwrap()
+            .is_none()
+    );
     assert_eq!(
         store.references("example", &["main".into()]).unwrap()[0].generation,
         2,
@@ -1015,4 +1043,293 @@ fn upload_spool_configuration_accounts_for_both_simultaneous_snapshots() {
     );
     config.max_upload_spool_bytes = 8192;
     assert!(config.validate().is_ok());
+}
+
+#[test]
+fn conservative_control_resources_fit_default_pool_and_toml_inherits_tight_limits() {
+    let config = Config::default();
+    let required = config.control_work_budget();
+    let broker = native_broker::Config::default();
+    assert!(
+        required.memory_bytes <= broker.max_memory_bytes as u64,
+        "declared control memory {} exceeds {}",
+        required.memory_bytes,
+        broker.max_memory_bytes
+    );
+    assert!(required.temporary_bytes <= broker.max_temporary_bytes);
+    assert_eq!(
+        required.temporary_bytes,
+        2 * config.remote.limits.max_file_bytes
+    );
+    let dir = private_dir();
+    let path = dir.path().join("remote.toml");
+    std::fs::write(&path,"authorization_profile = 'example'\n[remote]\nendpoint = 'http://127.0.0.1:8093'\nrepository_id = 'example'\n").unwrap();
+    let loaded = Config::load(&path).unwrap();
+    assert_eq!(
+        loaded.remote.limits.max_buffered_bytes,
+        config.remote.limits.max_buffered_bytes
+    );
+    assert!(loaded.control_work_budget().memory_bytes <= broker.max_memory_bytes as u64);
+    std::fs::write(&path, "[remote.limits]\nunknown_limit = 1\n").unwrap();
+    assert!(Config::load(&path).is_err());
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn private_broker_control_preserves_absent_tombstones_and_exact_historical_publication() {
+    use native_broker::{BrokerControlClient, BrokerService, NativeRepositoryControl};
+    let (_serverdir, store, _fixture, head) = seed();
+    let counts = Counters::new();
+    let server = Server::start(store.clone(), counts.clone()).await;
+    let directory = private_dir();
+    let cache = cache(directory.path());
+    let (_direct, repo) = local(directory.path(), cache, config(&server), true);
+    let stores = std::collections::HashMap::from([(
+        "workspace".to_owned(),
+        repo.io.clone() as Arc<dyn NativeObjectIo>,
+    )]);
+    let controls = std::collections::HashMap::from([(
+        "workspace".to_owned(),
+        Arc::new(repo.control.clone()) as Arc<dyn NativeRepositoryControl>,
+    )]);
+    let required = repo.control.resources();
+    let mut small = native_broker::Config::default();
+    small.max_memory_bytes = required.memory_bytes as usize - 1;
+    assert!(
+        BrokerService::new(stores.clone(), small)
+            .unwrap()
+            .with_controls(controls.clone())
+            .is_err(),
+        "registration must reject a provider larger than the shared memory pool"
+    );
+    let service = BrokerService::new(stores, native_broker::Config::default())
+        .unwrap()
+        .with_controls(controls)
+        .unwrap();
+    let socket = directory.path().canonicalize().unwrap().join("broker.sock");
+    let path = socket.clone();
+    let (stop, stopped) = tokio::sync::oneshot::channel();
+    let task = tokio::spawn(async move {
+        native_broker::serve_unix(&path, service, async {
+            let _ = stopped.await;
+        })
+        .await
+    });
+    let client = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if task.is_finished() {
+                panic!("broker exited before readiness");
+            }
+            if let Ok(client) =
+                BrokerControlClient::connect(&socket, "workspace", native_broker::Config::default())
+                    .await
+            {
+                break client;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let absent = client.observe_reference("new-reference").await.unwrap();
+    assert_eq!(absent.generation, 0);
+    assert!(absent.head.is_none());
+    assert_eq!(counts.holds.load(Ordering::SeqCst), 0);
+    let selected = client.observe_reference("main").await.unwrap();
+    assert_eq!(selected.generation, 1);
+    assert_eq!(selected.head.unwrap().head, head);
+    assert_eq!(counts.files.load(Ordering::SeqCst), 0);
+    store
+        .publish(
+            "example",
+            &tinytree_store::PublishRequest {
+                idempotency_key: "create-tombstone".into(),
+                reference_name: "removed-reference".into(),
+                expected_generation: 0,
+                new_commit: Some(head),
+                staging_leases: vec![],
+            },
+            2,
+        )
+        .unwrap();
+    store
+        .publish(
+            "example",
+            &tinytree_store::PublishRequest {
+                idempotency_key: "delete-tombstone".into(),
+                reference_name: "removed-reference".into(),
+                expected_generation: 1,
+                new_commit: None,
+                staging_leases: vec![],
+            },
+            3,
+        )
+        .unwrap();
+    let absent = client.observe_reference("removed-reference").await.unwrap();
+    assert_eq!(absent.generation, 2);
+    assert!(absent.head.is_none());
+    let request = native_broker::PublishRequest {
+        name: "main".into(),
+        head,
+        expected_generation: 1,
+        idempotency_key: "broker-exact-publication".into(),
+    };
+    let receipt = client.publish(request.clone()).await.unwrap();
+    assert_eq!(receipt.generation, 2);
+    store
+        .publish(
+            "example",
+            &tinytree_store::PublishRequest {
+                idempotency_key: "move-after-publish".into(),
+                reference_name: "main".into(),
+                expected_generation: 2,
+                new_commit: None,
+                staging_leases: vec![],
+            },
+            4,
+        )
+        .unwrap();
+    assert_eq!(
+        client
+            .publication(&request.idempotency_key)
+            .await
+            .unwrap()
+            .unwrap(),
+        receipt,
+        "lookup must return original intent receipt, never the latest host reference generation"
+    );
+    assert!(
+        client
+            .publication("unknown-intent")
+            .await
+            .unwrap()
+            .is_none()
+    );
+    drop(client);
+    stop.send(()).unwrap();
+    task.await.unwrap().unwrap();
+    server.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn lazy_connection_uses_captured_ca_and_new_trust_never_reuses_old_connector() {
+    let (_serverdir, store, _fixture, _head) = seed();
+    let counts = Counters::new();
+    let identity = tonic::transport::Identity::from_pem(
+        std::fs::read(env!("TLS_SERVER_CERT")).unwrap(),
+        std::fs::read(env!("TLS_SERVER_KEY")).unwrap(),
+    );
+    let server = Server::start_with_tls(store, counts.clone(), Some(identity)).await;
+    let directory = private_dir();
+    let cache = cache(directory.path());
+    let ca = std::fs::read(env!("TLS_CA_CERT")).unwrap();
+    let ca_path = directory.path().join("ca.pem");
+    std::fs::write(&ca_path, &ca).unwrap();
+    let mut original = config(&server);
+    original.remote.endpoint = format!("https://{}", server.address);
+    original.remote.tls = Some(tinytree_client::Tls {
+        ca_certificate: ca_path.clone(),
+        domain_name: Some("localhost".into()),
+    });
+    let (direct, repo) = local(directory.path(), cache.clone(), original.clone(), true);
+    // Nothing connected at open. Replacing the configured path must not replace
+    // the already captured trust snapshot used by the first lazy connection.
+    std::fs::write(&ca_path, std::fs::read(env!("TLS_WRONG_CA_CERT")).unwrap()).unwrap();
+    repo.control.admit_reference("main").await.unwrap();
+    assert_eq!(counts.holds.load(Ordering::SeqCst), 1);
+    drop(repo);
+    drop(direct);
+    let (direct, repo) = local(directory.path(), cache.clone(), original.clone(), false);
+    assert!(
+        repo.control.admit_reference("main").await.is_err(),
+        "reopen with a changed CA must not reuse the old trusted connector/proof"
+    );
+    drop(repo);
+    drop(direct);
+    let direct = Arc::new(
+        DirectObjectIo::load(&directory.path().join("local"), Default::default()).unwrap(),
+    );
+    assert!(
+        RemoteRepository::open_with_ca_certificate(
+            direct.clone(),
+            cache.clone(),
+            &directory.path().join("must-not-create-ledger"),
+            &directory.path().join("must-not-create-stage"),
+            original.clone(),
+            None
+        )
+        .is_err()
+    );
+    assert!(!directory.path().join("must-not-create-ledger").exists());
+    assert!(!directory.path().join("must-not-create-stage").exists());
+    let repo = RemoteRepository::open_with_ca_certificate(
+        direct.clone(),
+        cache.clone(),
+        &directory.path().join("ledger"),
+        &directory.path().join("staging"),
+        original.clone(),
+        Some(Arc::from(ca.clone())),
+    )
+    .unwrap();
+    repo.control.admit_reference("main").await.unwrap();
+    assert_eq!(
+        counts.holds.load(Ordering::SeqCst),
+        1,
+        "restored captured trust reconciles the existing current own hold"
+    );
+    drop(repo);
+    // These two actual TLS configurations collided under raw CA || domain.
+    // PEM readers permit trailing non-PEM text, so trust must be framed, not
+    // concatenated. No network connection is necessary for namespace testing.
+    let mut first = original.clone();
+    first.remote.tls.as_mut().unwrap().domain_name = Some("foo".into());
+    let repo = RemoteRepository::open_with_ca_certificate(
+        direct.clone(),
+        cache.clone(),
+        &directory.path().join("ledger"),
+        &directory.path().join("staging"),
+        first,
+        Some(Arc::from(ca.clone())),
+    )
+    .unwrap();
+    drop(repo);
+    let scope = || {
+        use fjall::Readable;
+        let db = fjall::SingleWriterTxDatabase::builder(directory.path().join("ledger/data"))
+            .open()
+            .unwrap();
+        let meta = db
+            .keyspace("meta", fjall::KeyspaceCreateOptions::default)
+            .unwrap();
+        let value = db.read_tx().get(&meta, b"binding").unwrap().unwrap();
+        serde_json::from_slice::<serde_json::Value>(&value).unwrap()["scope"]
+            .as_str()
+            .unwrap()
+            .to_owned()
+    };
+    let first_scope = scope();
+    let mut extended = ca.clone();
+    extended.push(b'f');
+    assert_eq!(
+        [ca.as_slice(), b"foo"].concat(),
+        [extended.as_slice(), b"oo"].concat()
+    );
+    let mut second = original;
+    second.remote.tls.as_mut().unwrap().domain_name = Some("oo".into());
+    let repo = RemoteRepository::open_with_ca_certificate(
+        direct,
+        cache,
+        &directory.path().join("ledger"),
+        &directory.path().join("staging"),
+        second,
+        Some(Arc::from(extended)),
+    )
+    .unwrap();
+    drop(repo);
+    assert_ne!(
+        first_scope,
+        scope(),
+        "TLS namespaces must frame CA identity and optional server name independently"
+    );
+    server.stop().await;
 }

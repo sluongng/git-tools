@@ -87,12 +87,8 @@ impl RemoteObjectIo {
         descriptor: m::Descriptor,
     ) -> Result<Arc<local_cas::CachedBlob>> {
         let artifact = self.artifact(descriptor);
-        if let Some(blob) = self
-            .inner
-            .cache
-            .clone()
-            .cached_content(artifact.clone())
-            .await?
+        if let Some(blob) =
+            io::cached(self.inner.cache.clone().cached_content(artifact.clone())).await?
         {
             return Ok(blob);
         }
@@ -113,16 +109,14 @@ impl RemoteObjectIo {
             .refresh_scope_hold(root_id)
             .await?;
         }
-        self.inner
-            .cache
-            .clone()
-            .content_from(
-                artifact,
-                Arc::new(RemoteSource {
-                    inner: self.inner.clone(),
-                }),
-            )
-            .await
+        io::cached(self.inner.cache.clone().content_from(
+            artifact,
+            Arc::new(RemoteSource {
+                inner: self.inner.clone(),
+                scope: io::scope(),
+            }),
+        ))
+        .await
     }
 }
 #[async_trait]
@@ -181,91 +175,103 @@ impl NativeObjectIo for RemoteObjectIo {
 }
 struct RemoteSource {
     inner: Arc<Inner>,
+    scope: Option<Arc<io::ControlScope>>,
 }
 #[async_trait]
 impl BlobSource for RemoteSource {
     async fn fetch(&self, artifact: &Artifact, target: &mut std::fs::File) -> Result<()> {
-        let deadline = self.inner.deadline();
-        tokio::time::timeout_at(deadline, async {
-            ensure!(
-                artifact.backend
-                    == format!("tinytree-native-v1:{}", self.inner.ledger.binding.scope)
-                    && artifact.instance == self.inner.config.remote.repository_id
-                    && artifact.digest_function == 9,
-                "native cache artifact authorization scope mismatch"
+        let operation = async {
+            let deadline = self.scope.as_ref().map_or_else(
+                || self.inner.deadline(),
+                |scope| scope.deadline.min(self.inner.deadline()),
             );
-            let client = self.inner.connector.get().await?;
-            let verified = client
-                .download_file(m::ObjectId(unhex(&artifact.hash)?), &self.inner.staging)
+            tokio::time::timeout_at(deadline, async {
+                ensure!(
+                    artifact.backend
+                        == format!("tinytree-native-v1:{}", self.inner.ledger.binding.scope)
+                        && artifact.instance == self.inner.config.remote.repository_id
+                        && artifact.digest_function == 9,
+                    "native cache artifact authorization scope mismatch"
+                );
+                let client = self.inner.connector.get().await?;
+                let verified = io::network(
+                    client.download_file(m::ObjectId(unhex(&artifact.hash)?), &self.inner.staging),
+                )
                 .await?;
-            ensure!(
-                verified.descriptor().size_bytes == artifact.size,
-                "native fetched file length conflicts with admitted tree"
-            );
-            let reader = verified.open()?;
-            let quota = Arc::new(
-                self.inner
-                    .spool
-                    .clone()
-                    .acquire_many_owned(u32::try_from(artifact.size)?)
-                    .await?,
-            );
-            let target = target.try_clone()?;
-            let cancelled = Arc::new(std::sync::atomic::AtomicBool::new(false));
-            struct Cancel(Arc<std::sync::atomic::AtomicBool>);
-            impl Drop for Cancel {
-                fn drop(&mut self) {
-                    self.0.store(true, std::sync::atomic::Ordering::Release);
-                }
-            }
-            let _cancel = Cancel(cancelled.clone());
-            let inner = self.inner.clone();
-            let expected = artifact.size;
-            io::blocking(move || {
-                use std::io::{Read, Write};
-                // Field order closes both descriptors before releasing either the
-                // native transfer budget or ownership of the shared cache directory.
-                struct Copy {
-                    reader: tinytree_client::VerifiedReader,
-                    target: std::fs::File,
-                    _quota: Arc<tokio::sync::OwnedSemaphorePermit>,
-                    _inner: Arc<Inner>,
-                }
-                let mut copy = Copy {
-                    reader,
-                    target,
-                    _quota: quota,
-                    _inner: inner,
-                };
-                let mut buffer = vec![0; 65536];
-                let mut count = 0u64;
-                loop {
-                    ensure!(
-                        !cancelled.load(std::sync::atomic::Ordering::Acquire)
-                            && tokio::time::Instant::now() < deadline,
-                        "native cache copy cancelled or timed out"
-                    );
-                    let n = copy.reader.read(&mut buffer)?;
-                    if n == 0 {
-                        break;
+                ensure!(
+                    verified.descriptor().size_bytes == artifact.size,
+                    "native fetched file length conflicts with admitted tree"
+                );
+                let reader = verified.open()?;
+                let quota = Arc::new(
+                    self.inner
+                        .spool
+                        .clone()
+                        .acquire_many_owned(u32::try_from(artifact.size)?)
+                        .await?,
+                );
+                let target = target.try_clone()?;
+                let cancelled = Arc::new(std::sync::atomic::AtomicBool::new(false));
+                struct Cancel(Arc<std::sync::atomic::AtomicBool>);
+                impl Drop for Cancel {
+                    fn drop(&mut self) {
+                        self.0.store(true, std::sync::atomic::Ordering::Release);
                     }
-                    count = count
-                        .checked_add(n as u64)
-                        .context("native cache copy length overflow")?;
-                    ensure!(
-                        count <= expected,
-                        "native cache copy exceeds promised length"
-                    );
-                    copy.target.write_all(&buffer[..n])?;
                 }
-                ensure!(count == expected, "native cache copy is incomplete");
+                let _cancel = Cancel(cancelled.clone());
+                let inner = self.inner.clone();
+                let expected = artifact.size;
+                io::blocking(move || {
+                    use std::io::{Read, Write};
+                    // Field order closes both descriptors before releasing either the
+                    // native transfer budget or ownership of the shared cache directory.
+                    struct Copy {
+                        reader: tinytree_client::VerifiedReader,
+                        target: std::fs::File,
+                        _quota: Arc<tokio::sync::OwnedSemaphorePermit>,
+                        _inner: Arc<Inner>,
+                    }
+                    let mut copy = Copy {
+                        reader,
+                        target,
+                        _quota: quota,
+                        _inner: inner,
+                    };
+                    let mut buffer = vec![0; 65536];
+                    let mut count = 0u64;
+                    loop {
+                        ensure!(
+                            !cancelled.load(std::sync::atomic::Ordering::Acquire)
+                                && tokio::time::Instant::now() < deadline,
+                            "native cache copy cancelled or timed out"
+                        );
+                        let n = copy.reader.read(&mut buffer)?;
+                        if n == 0 {
+                            break;
+                        }
+                        count = count
+                            .checked_add(n as u64)
+                            .context("native cache copy length overflow")?;
+                        ensure!(
+                            count <= expected,
+                            "native cache copy exceeds promised length"
+                        );
+                        copy.target.write_all(&buffer[..n])?;
+                    }
+                    ensure!(count == expected, "native cache copy is incomplete");
+                    Ok(())
+                })
+                .await?;
                 Ok(())
             })
-            .await?;
-            Ok(())
-        })
-        .await
-        .map_err(|_| anyhow::anyhow!("native cache hydration deadline exceeded"))?
+            .await
+            .map_err(|_| anyhow::anyhow!("native cache hydration deadline exceeded"))?
+        };
+        if let Some(scope) = &self.scope {
+            io::control_scope(scope.clone(), operation).await
+        } else {
+            operation.await
+        }
     }
     async fn missing(&self, artifacts: &[Artifact]) -> Result<Vec<Artifact>> {
         let client = self.inner.connector.get().await?;
@@ -282,11 +288,193 @@ impl BlobSource for RemoteSource {
                 id: m::ObjectId(unhex(&artifact.hash)?),
             });
         }
-        let missing = client.find_missing(keys).await?;
+        let missing = io::network(client.find_missing(keys)).await?;
         Ok(artifacts
             .iter()
             .filter(|artifact| missing.iter().any(|key| hex(&key.id.0) == artifact.hash))
             .cloned()
             .collect())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{Config, RemoteRepository};
+    use p::repository_server::{Repository, RepositoryServer};
+    use std::{
+        path::Path,
+        sync::atomic::{AtomicUsize, Ordering},
+        time::Duration,
+    };
+    use tinytree_client::protocol as p;
+    use tonic::{Request, Response, Status, Streaming};
+    struct UnusedSource;
+    #[async_trait]
+    impl BlobSource for UnusedSource {
+        async fn fetch(&self, _: &Artifact, _: &mut std::fs::File) -> Result<()> {
+            anyhow::bail!("unexpected default cache source")
+        }
+        async fn missing(&self, a: &[Artifact]) -> Result<Vec<Artifact>> {
+            Ok(a.to_vec())
+        }
+    }
+    struct DelayedFile {
+        inner: tinytree_server::RepositoryService,
+        calls: Arc<AtomicUsize>,
+    }
+    #[tonic::async_trait]
+    impl Repository for DelayedFile {
+        async fn open_repository(
+            &self,
+            r: Request<p::OpenRepositoryRequest>,
+        ) -> Result<Response<p::RepositoryView>, Status> {
+            self.inner.open_repository(r).await
+        }
+        async fn get_commit_graph(
+            &self,
+            r: Request<p::GetCommitGraphRequest>,
+        ) -> Result<Response<p::CommitGraphPage>, Status> {
+            self.inner.get_commit_graph(r).await
+        }
+        type BatchReadObjectsStream =
+            <tinytree_server::RepositoryService as Repository>::BatchReadObjectsStream;
+        async fn batch_read_objects(
+            &self,
+            r: Request<p::BatchReadObjectsRequest>,
+        ) -> Result<Response<Self::BatchReadObjectsStream>, Status> {
+            self.inner.batch_read_objects(r).await
+        }
+        async fn find_missing_objects(
+            &self,
+            r: Request<p::FindMissingObjectsRequest>,
+        ) -> Result<Response<p::MissingObjects>, Status> {
+            self.inner.find_missing_objects(r).await
+        }
+        type ReadFileStream = <tinytree_server::RepositoryService as Repository>::ReadFileStream;
+        async fn read_file(
+            &self,
+            r: Request<p::ReadFileRequest>,
+        ) -> Result<Response<Self::ReadFileStream>, Status> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            self.inner.read_file(r).await
+        }
+        async fn write_object(
+            &self,
+            r: Request<Streaming<p::WriteFrame>>,
+        ) -> Result<Response<p::WriteReceipt>, Status> {
+            self.inner.write_object(r).await
+        }
+        async fn publish_reference(
+            &self,
+            r: Request<p::PublishReferenceRequest>,
+        ) -> Result<Response<p::Publication>, Status> {
+            self.inner.publish_reference(r).await
+        }
+        async fn get_publication(
+            &self,
+            r: Request<p::GetPublicationRequest>,
+        ) -> Result<Response<p::Publication>, Status> {
+            self.inner.get_publication(r).await
+        }
+    }
+    fn private(path: &Path) {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+    }
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn detached_native_hydration_uses_original_control_deadline_not_fresh_allowance() {
+        let root = tempfile::tempdir().unwrap();
+        private(root.path());
+        let store =
+            tinytree_store::Store::open(root.path().join("server"), Default::default()).unwrap();
+        store.create_repository("default").unwrap();
+        let bytes = b"bounded native source";
+        let descriptor = m::describe_file(bytes);
+        store.put("default", descriptor, bytes, 0).unwrap();
+        let service = tinytree_server::RepositoryService::new(
+            store,
+            Default::default(),
+            vec!["default".into()],
+            vec![],
+        )
+        .unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (stop, stopped) = tokio::sync::oneshot::channel();
+        let count = calls.clone();
+        let server = tokio::spawn(async move {
+            tonic::transport::Server::builder()
+                .add_service(RepositoryServer::new(DelayedFile {
+                    inner: service,
+                    calls: count,
+                }))
+                .serve_with_incoming_shutdown(
+                    tokio_stream::wrappers::TcpListenerStream::new(listener),
+                    async {
+                        let _ = stopped.await;
+                    },
+                )
+                .await
+                .unwrap();
+        });
+        let local = root.path().join("local");
+        std::fs::create_dir(&local).unwrap();
+        let direct =
+            Arc::new(jj_native_backend::DirectObjectIo::init(&local, Default::default()).unwrap());
+        let cache = local_cas::LocalCas::open(
+            root.path().join("cache"),
+            Arc::new(UnusedSource),
+            Default::default(),
+        )
+        .unwrap();
+        let mut config = Config::default();
+        config.operation_timeout_ms = 2000;
+        config.remote.endpoint = format!("http://{address}");
+        config.remote.compression = false;
+        let repo = RemoteRepository::open(
+            direct,
+            cache,
+            &root.path().join("ledger"),
+            &root.path().join("staging"),
+            config,
+        )
+        .unwrap();
+        repo.io.inner.connector.get().await.unwrap();
+        let permit = repo.io.inner.control.clone().acquire_owned().await.unwrap();
+        let scope = Arc::new(io::ControlScope::new(
+            permit,
+            tokio::time::Instant::now() + Duration::from_millis(50),
+        ));
+        let source = RemoteSource {
+            inner: repo.io.inner.clone(),
+            scope: Some(scope),
+        };
+        let artifact = repo.io.artifact(descriptor);
+        let mut target = tempfile::tempfile().unwrap();
+        // The outer allowance is intentionally shorter than the server delay,
+        // but longer than the original control deadline. Fresh-deadline behavior
+        // would hit this outer timeout rather than finish its scoped failure.
+        let result = tokio::time::timeout(
+            Duration::from_millis(250),
+            source.fetch(&artifact, &mut target),
+        )
+        .await
+        .expect("hydration renewed an expired control deadline");
+        assert!(result.is_err());
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(target.metadata().unwrap().len(), 0);
+        drop(source);
+        repo.control.drain_control().await;
+        stop.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(2), server)
+            .await
+            .unwrap()
+            .unwrap();
     }
 }

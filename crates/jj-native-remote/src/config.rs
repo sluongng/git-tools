@@ -1,7 +1,7 @@
 use anyhow::{Result, bail, ensure};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::{io::Read, path::Path};
-#[derive(Clone, Deserialize)]
+#[derive(Clone, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct ClosureLimits {
     pub max_objects: usize,
@@ -14,18 +14,19 @@ pub struct ClosureLimits {
 impl Default for ClosureLimits {
     fn default() -> Self {
         Self {
-            max_objects: 100_000,
-            max_edges: 1_000_000,
-            max_metadata_bytes: 64 * 1024 * 1024,
-            max_path_contexts: 100_000,
-            max_path_context_bytes: 32 * 1024 * 1024,
+            max_objects: 5_000,
+            max_edges: 50_000,
+            max_metadata_bytes: 16 * 1024 * 1024,
+            max_path_contexts: 5_000,
+            max_path_context_bytes: 2 * 1024 * 1024,
             max_path_bytes: 65536,
         }
     }
 }
-#[derive(Clone, Deserialize)]
+#[derive(Clone, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Config {
+    #[serde(default = "remote_default", deserialize_with = "deserialize_remote")]
     pub remote: tinytree_client::Config,
     /// Trusted broker-selected effective authorization profile, not an RPC field.
     pub authorization_profile: String,
@@ -41,20 +42,99 @@ pub struct Config {
 impl Default for Config {
     fn default() -> Self {
         Self {
-            remote: Default::default(),
+            remote: remote_default(),
             authorization_profile: "default".into(),
             closure: Default::default(),
             operation_timeout_ms: 120_000,
-            max_ledger_bytes: 256 * 1024 * 1024,
-            max_pending_operations: 1024,
-            max_admitted_roots: 4096,
-            max_file_index_entries: 1_000_000,
-            max_upload_spool_bytes: 512 * 1024 * 1024,
+            max_ledger_bytes: 32 * 1024 * 1024,
+            max_pending_operations: 128,
+            max_admitted_roots: 256,
+            max_file_index_entries: 50_000,
+            max_upload_spool_bytes: 128 * 1024 * 1024,
             max_staging_files: 4096,
         }
     }
 }
+fn remote_default() -> tinytree_client::Config {
+    let mut config = tinytree_client::Config::default();
+    config.limits.max_metadata_bytes = 4 * 1024 * 1024;
+    config.limits.max_batch_bytes = 4 * 1024 * 1024;
+    config.limits.max_graph_bytes = 8 * 1024 * 1024;
+    config.limits.max_buffered_bytes = 32 * 1024 * 1024;
+    config.limits.max_file_bytes = 64 * 1024 * 1024;
+    config.limits.max_temporary_bytes = 128 * 1024 * 1024;
+    config
+}
+fn deserialize_remote<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<tinytree_client::Config, D::Error> {
+    let patch = toml::Value::deserialize(deserializer)?;
+    let mut defaults = toml::Value::try_from(remote_default())
+        .map_err(|_| serde::de::Error::custom("invalid native remote defaults"))?;
+    fn merge(defaults: &mut toml::Value, patch: toml::Value) {
+        match (defaults, patch) {
+            (toml::Value::Table(defaults), toml::Value::Table(patch)) => {
+                for (key, value) in patch {
+                    if let Some(default) = defaults.get_mut(&key) {
+                        merge(default, value);
+                    } else {
+                        defaults.insert(key, value);
+                    }
+                }
+            }
+            (defaults, patch) => *defaults = patch,
+        }
+    }
+    merge(&mut defaults, patch);
+    defaults
+        .try_into()
+        .map_err(|_| serde::de::Error::custom("invalid native remote client configuration"))
+}
 impl Config {
+    /// Conservative whole-control work, including decoded native objects,
+    /// returned client metadata, growable containers, catalog/transaction copies
+    /// and the two simultaneous file snapshots. Permanent object bytes are not
+    /// transient request memory. Registration must reject a smaller shared pool.
+    pub fn control_work_budget(&self) -> native_broker::ControlResources {
+        use std::mem::size_of;
+        use tinytree_model::{Descriptor, ObjectId, ObjectKey, TreeId};
+        let nodes = self.closure.max_objects as u64;
+        let edges = self.closure.max_edges as u64;
+        let contexts = self.closure.max_path_contexts as u64;
+        let node_unit = (4 * size_of::<(ObjectKey, crate::closure::Node)>()
+            + 10 * size_of::<ObjectKey>()
+            + 2 * size_of::<Descriptor>()) as u64;
+        let edge_unit = (4 * size_of::<(ObjectKey, bool)>()
+            + 6 * size_of::<(ObjectId, u64, ObjectId)>()
+            + 4 * size_of::<ObjectKey>()
+            + 2 * size_of::<Descriptor>()) as u64;
+        let context_unit = (8 * size_of::<(TreeId, String)>()) as u64;
+        let index_unit = (4 * size_of::<Vec<u8>>() + 64) as u64;
+        let memory = (self.remote.limits.max_buffered_bytes as u64)
+            .saturating_add((self.closure.max_metadata_bytes as u64).saturating_mul(8))
+            .saturating_add((self.remote.limits.max_metadata_bytes as u64).saturating_mul(8))
+            .saturating_add(nodes.saturating_mul(node_unit))
+            .saturating_add(edges.saturating_mul(edge_unit))
+            .saturating_add(contexts.saturating_mul(context_unit))
+            .saturating_add((self.closure.max_path_context_bytes as u64).saturating_mul(2))
+            .saturating_add((self.max_ledger_bytes as u64).saturating_mul(4))
+            .saturating_add((self.max_file_index_entries as u64).saturating_mul(index_unit))
+            .saturating_add(
+                (self.max_admitted_roots as u64)
+                    .saturating_add((self.max_pending_operations as u64).saturating_mul(2))
+                    .saturating_mul(16 * 1024),
+            )
+            .saturating_add(8 * 1024 * 1024);
+        native_broker::ControlResources {
+            memory_bytes: memory,
+            temporary_bytes: self
+                .remote
+                .limits
+                .max_file_bytes
+                .saturating_mul(2)
+                .max(self.remote.limits.max_metadata_bytes as u64),
+        }
+    }
     pub fn load(path: &Path) -> Result<Self> {
         let mut bytes = Vec::new();
         std::fs::File::open(path)

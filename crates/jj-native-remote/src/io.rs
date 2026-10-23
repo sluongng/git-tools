@@ -25,31 +25,94 @@ fn runtime() -> io::Result<&'static Runtime> {
     .as_ref()
     .map_err(|_| io::Error::other("native remote I/O runtime unavailable"))
 }
-tokio::task_local! {static CONTROL_LEASE:Arc<tokio::sync::OwnedSemaphorePermit>;}
+pub(crate) struct ControlScope {
+    _lease: tokio::sync::OwnedSemaphorePermit,
+    pub deadline: tokio::time::Instant,
+}
+impl ControlScope {
+    pub fn new(lease: tokio::sync::OwnedSemaphorePermit, deadline: tokio::time::Instant) -> Self {
+        Self {
+            _lease: lease,
+            deadline,
+        }
+    }
+}
+tokio::task_local! {static CONTROL_SCOPE:Arc<ControlScope>;}
+pub(crate) fn scope() -> Option<Arc<ControlScope>> {
+    CONTROL_SCOPE.try_with(Arc::clone).ok()
+}
 pub(crate) fn in_control() -> bool {
-    CONTROL_LEASE.try_with(|_| ()).is_ok()
+    scope().is_some()
+}
+pub(crate) fn check_deadline() -> anyhow::Result<()> {
+    if scope().is_some_and(|scope| tokio::time::Instant::now() >= scope.deadline) {
+        return Err(
+            tonic::Status::deadline_exceeded("native remote operation deadline exceeded").into(),
+        );
+    }
+    Ok(())
 }
 pub(crate) async fn control_scope<T>(
-    lease: Arc<tokio::sync::OwnedSemaphorePermit>,
+    scope: Arc<ControlScope>,
     future: impl Future<Output = T>,
 ) -> T {
-    CONTROL_LEASE.scope(lease, future).await
+    CONTROL_SCOPE.scope(scope, future).await
+}
+pub(crate) async fn network<T>(
+    future: impl Future<Output = Result<T, tonic::Status>>,
+) -> Result<T, tonic::Status> {
+    if let Some(scope) = scope() {
+        if tokio::time::Instant::now() >= scope.deadline {
+            return Err(tonic::Status::deadline_exceeded(
+                "native remote operation deadline exceeded",
+            ));
+        }
+        let result = tokio::time::timeout_at(scope.deadline, future)
+            .await
+            .map_err(|_| {
+                tonic::Status::deadline_exceeded("native remote operation deadline exceeded")
+            })?;
+        if tokio::time::Instant::now() >= scope.deadline {
+            return Err(tonic::Status::deadline_exceeded(
+                "native remote operation deadline exceeded",
+            ));
+        }
+        result
+    } else {
+        future.await
+    }
+}
+pub(crate) async fn cached<T>(
+    future: impl Future<Output = anyhow::Result<T>>,
+) -> anyhow::Result<T> {
+    if let Some(scope) = scope() {
+        check_deadline()?;
+        let result = tokio::time::timeout_at(scope.deadline, future)
+            .await
+            .map_err(|_| tonic::Status::deadline_exceeded("native cache wait deadline exceeded"))?;
+        check_deadline()?;
+        result
+    } else {
+        future.await
+    }
 }
 pub(crate) async fn blocking<T: Send + 'static>(
     job: impl FnOnce() -> anyhow::Result<T> + Send + 'static,
 ) -> anyhow::Result<T> {
-    let lease = CONTROL_LEASE.try_with(Arc::clone).ok();
+    let lease = scope();
     let (result, _lease) = runtime()?
         .spawn_blocking(move || {
             let result = job();
             (result, lease)
         })
         .await?;
+    check_deadline()?;
     result
 }
 struct OwnedFile {
     file: std::fs::File,
     _lease: Arc<CachedBlob>,
+    _scope: Option<Arc<ControlScope>>,
 }
 pub(crate) struct Reader {
     source: Option<OwnedFile>,
@@ -60,11 +123,13 @@ pub(crate) struct Reader {
 }
 impl Reader {
     pub async fn open(lease: Arc<CachedBlob>) -> anyhow::Result<Self> {
+        let scope = scope();
         let source = blocking(move || {
             let file = std::fs::File::open(lease.path())?;
             Ok(OwnedFile {
                 file,
                 _lease: lease,
+                _scope: scope,
             })
         })
         .await?;

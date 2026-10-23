@@ -691,7 +691,26 @@ async fn tls_client_verifies_explicit_roots_and_server_name() {
     assert!(NativeClient::connect(config.clone()).await.is_err());
     config.tls.as_mut().unwrap().domain_name = Some("localhost".into());
     config.tls.as_mut().unwrap().ca_certificate = env!("TLS_WRONG_CA_CERT").into();
-    assert!(NativeClient::connect(config).await.is_err());
+    assert!(NativeClient::connect(config.clone()).await.is_err());
+    let roots: Arc<[u8]> = std::fs::read(env!("TLS_CA_CERT")).unwrap().into();
+    let frozen = NativeClient::connect_with_ca_certificate(config.clone(), roots.clone())
+        .await
+        .unwrap();
+    assert_eq!(
+        frozen
+            .open(vec!["main".into()])
+            .await
+            .unwrap()
+            .repository_id,
+        "example"
+    );
+    drop(frozen);
+    config.tls.as_mut().unwrap().domain_name = Some("wrong.example".into());
+    assert!(
+        NativeClient::connect_with_ca_certificate(config, roots)
+            .await
+            .is_err()
+    );
     stop.send(()).unwrap();
     task.await.unwrap().unwrap();
 }

@@ -1,5 +1,6 @@
 //! Broker-hosted lazy native I/O. Canonical local objects remain authoritative;
 //! the admission ledger records roots/proofs, never fabricated file residency.
+mod broker;
 mod closure;
 mod config;
 mod control;
@@ -10,7 +11,8 @@ mod staging;
 use anyhow::{Context, Result, ensure};
 pub use config::{ClosureLimits, Config};
 pub use control::{
-    AdmittedHead, AdmittedReference, ConfirmedPublication, PublishRequest, RemoteRepositoryControl,
+    AdmittedHead, AdmittedReference, ConfirmedPublication, ObservedReference, PublishRequest,
+    RemoteRepositoryControl,
 };
 use jj_native_backend::DirectObjectIo;
 use local_cas::LocalCas;
@@ -59,7 +61,68 @@ impl RemoteRepository {
         private_staging: &Path,
         config: Config,
     ) -> Result<Self> {
+        let ca_certificate = match &config.remote.tls {
+            Some(tls) => Some(read_ca(&tls.ca_certificate)?),
+            None => None,
+        };
+        Self::open_with_ca_certificate(
+            local,
+            cache,
+            ledger_path,
+            private_staging,
+            config,
+            ca_certificate,
+        )
+    }
+    /// Open with the daemon's already-captured trust snapshot. Lazy connection
+    /// never rereads a mutable CA path or substitutes different trust material.
+    pub fn open_with_ca_certificate(
+        local: Arc<DirectObjectIo>,
+        cache: Arc<LocalCas>,
+        ledger_path: &Path,
+        private_staging: &Path,
+        config: Config,
+        ca_certificate: Option<Arc<[u8]>>,
+    ) -> Result<Self> {
         config.validate()?;
+        ensure!(
+            config.remote.tls.is_some() == ca_certificate.is_some(),
+            "native TLS configuration requires a captured CA snapshot"
+        );
+        if let Some(ca) = &ca_certificate {
+            ensure!(
+                !ca.is_empty() && ca.len() <= 1024 * 1024,
+                "native CA snapshot exceeds configured bounds"
+            );
+        }
+        let trust = if let Some(ca) = &ca_certificate {
+            let mut hash = blake3::Hasher::new();
+            hash.update(b"native-tls-scope-v2\0");
+            hash.update(blake3::hash(ca).as_bytes());
+            match config
+                .remote
+                .tls
+                .as_ref()
+                .and_then(|tls| tls.domain_name.as_deref())
+            {
+                None => {
+                    hash.update(&[0]);
+                }
+                Some(domain) => {
+                    hash.update(&[1]);
+                    hash.update(&(domain.len() as u64).to_be_bytes());
+                    hash.update(domain.as_bytes());
+                }
+            }
+            hash.finalize().to_hex().to_string()
+        } else {
+            "native-local-plaintext-v1".into()
+        };
+        let online = config
+            .remote
+            .token_env
+            .as_ref()
+            .is_none_or(|name| std::env::var(name).is_ok());
         let fresh = ledger::preflight(ledger_path)?;
         let staging_plan = staging::preflight(private_staging, config.max_staging_files)?;
         if fresh {
@@ -72,12 +135,14 @@ impl RemoteRepository {
         }
         let staging_owner = staging::open(private_staging, staging_plan)?;
         let staging = private_staging.canonicalize()?;
-        let ledger = Arc::new(ledger::Ledger::open(ledger_path, &config)?);
+        let ledger = Arc::new(ledger::Ledger::open(ledger_path, &config, &trust)?);
         let connector = Arc::new(Connector {
             config: config.remote.clone(),
             credential: ledger.binding.credential.clone(),
             client: tokio::sync::OnceCell::new(),
             owner: staging_owner.clone(),
+            ca_certificate,
+            online,
         });
         let inner = Arc::new(Inner {
             local,
@@ -105,9 +170,15 @@ pub(crate) struct Connector {
     credential: String,
     client: tokio::sync::OnceCell<NativeClient>,
     owner: Arc<std::fs::File>,
+    ca_certificate: Option<Arc<[u8]>>,
+    online: bool,
 }
 impl Connector {
     pub async fn get(&self) -> Result<NativeClient> {
+        ensure!(
+            self.online,
+            "native repository was opened offline; reopen with credentials before network access"
+        );
         let actual = match &self.config.token_env {
             None => "anonymous".into(),
             Some(name) => {
@@ -123,17 +194,31 @@ impl Connector {
             actual == self.credential,
             "native credentials changed; reopen the broker repository before network access"
         );
-        Ok(self
-            .client
-            .get_or_try_init(|| async {
-                Ok::<_, tonic::Status>(
-                    NativeClient::connect(self.config.clone())
-                        .await?
-                        .with_lifetime_guard(self.owner.clone()),
-                )
-            })
-            .await?
-            .clone())
+        let client = io::network(async {
+            Ok::<_, tonic::Status>(
+                self.client
+                    .get_or_try_init(|| async {
+                        let client = if let Some(ca) = &self.ca_certificate {
+                            NativeClient::connect_with_ca_certificate(
+                                self.config.clone(),
+                                ca.clone(),
+                            )
+                            .await?
+                        } else {
+                            NativeClient::connect(self.config.clone()).await?
+                        };
+                        Ok::<_, tonic::Status>(client.with_lifetime_guard(self.owner.clone()))
+                    })
+                    .await?
+                    .clone(),
+            )
+        })
+        .await?;
+        Ok(if let Some(scope) = io::scope() {
+            client.with_lifetime_guard(scope)
+        } else {
+            client
+        })
     }
 }
 pub(crate) fn backend(error: jj_lib::backend::BackendError) -> anyhow::Error {
@@ -203,4 +288,19 @@ fn check_private(path: &Path) -> Result<()> {
         anyhow::bail!("private native storage ACL verification is unavailable on this platform");
     }
     Ok(())
+}
+
+fn read_ca(path: &Path) -> Result<Arc<[u8]>> {
+    use std::io::Read;
+    let mut bytes = Vec::new();
+    std::fs::File::open(path)
+        .map_err(|_| anyhow::anyhow!("cannot capture native TLS trust"))?
+        .take(1024 * 1024 + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|_| anyhow::anyhow!("cannot capture native TLS trust"))?;
+    ensure!(
+        !bytes.is_empty() && bytes.len() <= 1024 * 1024,
+        "native CA snapshot exceeds configured bounds"
+    );
+    Ok(Arc::from(bytes))
 }

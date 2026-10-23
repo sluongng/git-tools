@@ -3100,16 +3100,27 @@ dependencies = [
 name = "jj-native-cli"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
+ "async-trait",
  "clap",
+ "fs2",
  "futures",
  "jj-cli",
  "jj-lib",
  "jj-native-backend",
+ "jj-native-remote",
+ "local-cas",
  "native-broker",
  "serde",
  "tempfile",
+ "tinytree-fixture",
+ "tinytree-model",
+ "tinytree-server",
+ "tinytree-store",
  "tokio",
+ "tokio-stream",
  "toml",
+ "uuid",
 ]
 
 [[package]]
@@ -3127,6 +3138,7 @@ dependencies = [
  "jj-native-backend",
  "libc",
  "local-cas",
+ "native-broker",
  "serde",
  "serde_json",
  "tempfile",
@@ -6391,6 +6403,7 @@ dependencies = [
  "git-proxy",
  "hyper-util",
  "jj-native-backend",
+ "jj-native-remote",
  "libc",
  "local-cas",
  "native-broker",

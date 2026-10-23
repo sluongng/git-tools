@@ -20,6 +20,10 @@ rust_test(
     srcs = ["tests/cli.rs"],
     aliases = aliases(),
     data = [":tinytree-jj"],
+    env = {
+        "TINYTREE_CLI_WRITER_TOKEN": "public-cli-writer-token-not-a-secret",
+        "TINYTREE_CLI_READER_TOKEN": "public-cli-reader-token-not-a-secret",
+    },
     edition = "2024",
     rustc_env = {"CARGO_BIN_EXE_tinytree-jj": "$(rootpath :tinytree-jj)"},
     version = "0.1.0",

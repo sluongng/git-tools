@@ -1,5 +1,7 @@
-//! Local native-store entry point. Remote commands and mounts are separate work.
+//! Native jj entry point. Source mounts remain separate work.
 mod broker;
+mod remote;
+mod remote_state;
 use std::path::{Path, PathBuf};
 
 use jj_cli::cli_util::{CliRunner, CommandHelper};
@@ -23,6 +25,35 @@ enum NativeCommand {
 
 #[derive(clap::Subcommand, Clone, Debug)]
 enum TinytreeCommand {
+    /// Clone a selected native reference into an ordinary materialized workspace.
+    Clone {
+        destination: PathBuf,
+        #[arg(long)]
+        broker: PathBuf,
+        #[arg(long)]
+        store: String,
+        #[arg(long)]
+        reference: String,
+        #[arg(long)]
+        bookmark: String,
+    },
+    /// Fetch one native reference, merging it into a selected local bookmark.
+    Fetch {
+        #[arg(long)]
+        reference: String,
+        #[arg(long)]
+        bookmark: String,
+        /// Archive a pending local push intent before fetching; does not cancel upstream work.
+        #[arg(long)]
+        abandon_pending_push: bool,
+    },
+    /// Publish a selected local bookmark using this workspace's observed generation.
+    Push {
+        #[arg(long)]
+        reference: String,
+        #[arg(long)]
+        bookmark: String,
+    },
     /// Initialize a local native repository and ordinary materialized workspace.
     Init {
         #[arg(default_value = ".", value_hint = clap::ValueHint::DirPath)]
@@ -42,6 +73,31 @@ async fn run_native_command(
     args: NativeCommand,
 ) -> Result<(), CommandError> {
     match args {
+        NativeCommand::Tinytree {
+            command:
+                TinytreeCommand::Clone {
+                    destination,
+                    broker,
+                    store,
+                    reference,
+                    bookmark,
+                },
+        } => remote::clone(ui, command, destination, broker, store, reference, bookmark).await,
+        NativeCommand::Tinytree {
+            command:
+                TinytreeCommand::Fetch {
+                    reference,
+                    bookmark,
+                    abandon_pending_push,
+                },
+        } => remote::fetch(ui, command, reference, bookmark, abandon_pending_push).await,
+        NativeCommand::Tinytree {
+            command:
+                TinytreeCommand::Push {
+                    reference,
+                    bookmark,
+                },
+        } => remote::push(ui, command, reference, bookmark).await,
         NativeCommand::Tinytree {
             command:
                 TinytreeCommand::Init {

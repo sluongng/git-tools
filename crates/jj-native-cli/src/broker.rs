@@ -21,8 +21,8 @@ type Failure = Box<dyn std::error::Error + Send + Sync>;
 #[serde(deny_unknown_fields)]
 pub(crate) struct Locator {
     version: u32,
-    socket: PathBuf,
-    store: String,
+    pub(crate) socket: PathBuf,
+    pub(crate) store: String,
 }
 impl Locator {
     pub fn new(socket: PathBuf, store: String) -> Result<Self, io::Error> {
@@ -99,6 +99,28 @@ pub(crate) fn init(path: &Path, locator: Locator) -> Result<Box<dyn Backend>, Ba
         Ok(Box::new(backend))
     };
     initialize().map_err(BackendInitError)
+}
+
+pub(crate) fn locator(path: &Path) -> Result<Locator, Failure> {
+    let locator = path.join(LOCATOR);
+    let metadata = fs::symlink_metadata(&locator)?;
+    if !metadata.is_file() || metadata.len() > 16 * 1024 {
+        return Err(io::Error::other("invalid native broker locator file").into());
+    }
+    let mut bytes = Vec::new();
+    File::open(locator)?
+        .take(16 * 1024 + 1)
+        .read_to_end(&mut bytes)?;
+    if bytes.len() > 16 * 1024 {
+        return Err(io::Error::other("native broker locator exceeds byte limit").into());
+    }
+    let locator: Locator = toml::from_str(
+        std::str::from_utf8(&bytes)
+            .map_err(|_| io::Error::other("invalid native broker locator encoding"))?,
+    )
+    .map_err(|_| io::Error::other("invalid native broker locator configuration"))?;
+    locator.validate()?;
+    Ok(locator)
 }
 
 fn load(path: &Path) -> Result<Box<dyn Backend>, BackendLoadError> {

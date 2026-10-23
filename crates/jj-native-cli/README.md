@@ -1,29 +1,33 @@
-# jj-native-cli · local prototype executable
+# jj-native-cli · experimental executable
 
-`tinytree-jj` runs ordinary jj commands with native Tinytree objects and each
-workspace's own operation, index and working-copy state. Git is not required.
+`tinytree-jj` runs ordinary jj commands with native objects, keeping each
+workspace's operation, index and working-copy state independent. Use a configured
+native remote alias in the [workspace daemon](../workspace-daemon); the CLI only
+receives its private socket and alias, never upstream credentials.
 
 ```sh
 bazel build --config=rbe //crates/jj-native-cli:tinytree-jj
-jj="$PWD/bazel-bin/crates/jj-native-cli/tinytree-jj"
-"$jj" tinytree init workspace
-cd workspace
-"$jj" status
+JJ="$PWD/bazel-bin/crates/jj-native-cli/tinytree-jj"
+"$JJ" tinytree clone project --broker /path/to/rbe.sock --store example \
+  --reference main --bookmark main
+cd project
+"$JJ" status
+"$JJ" tinytree fetch --reference main --bookmark main
+# Make changes, then select the bookmark to publish.
+"$JJ" bookmark set main -r @
+"$JJ" tinytree push --reference main --bookmark main
 ```
 
-To share objects through `workspace`, enable `[native.repositories.example]` in
-[the daemon configuration](../../examples/workspace.toml) and start the daemon.
-Then use its private socket and configured store alias:
+Clone uses a normal **materialized** working copy, not a lazy mount. Native `init`
+remains available locally or with `--broker SOCKET --store ALIAS`. Fetch an absent
+reference explicitly before its first push. Native publication is not Git push.
 
-```sh
-"$jj" tinytree init agent --broker /path/to/private/rbe.sock --store example
-```
+Push uses this workspace's durable observed generation, which jj undo cannot
+roll back. Interrupted pushes retain their original replay intent. Retry that
+push to reconcile it; `fetch --abandon-pending-push` explicitly archives the local
+intent before fetching. This does **not** cancel or roll back upstream work.
+Observations and replay archives are bounded; failures never silently discard them.
 
-Broker mode lets independent processes share immutable objects, not edits or jj
-operation state. The workspace saves a locator; later commands reconnect. Direct
-mode remains single-owner. Both modes conservatively retain authoritative data.
-
-Remote clone/fetch/push and lazy native mounts are not implemented yet. Native
-publication remains separate from future bidirectional Git transformation.
-`//crates/jj-native-cli:cli_tests` runs actual commands without Git, including
-concurrent broker-backed workspaces; it is not remote or mounted acceptance.
+Source mounts, client GC/offloading and standalone crash acceptance remain
+separate work. Tests use actual jj subprocesses without Git and real loopback
+native services; they do not establish mounted or full-stack acceptance.

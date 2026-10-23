@@ -50,7 +50,7 @@ impl Client {
             empty_path,
         }
     }
-    fn run(&self, args: &[&str]) -> Output {
+    fn spawn(&self, args: &[&str]) -> OwnedChild {
         let child = Command::new(&self.binary)
             .current_dir(&self.root)
             .args(["--no-pager", "--color=never"])
@@ -67,7 +67,12 @@ impl Client {
             .stderr(Stdio::piped())
             .spawn()
             .unwrap();
-        let mut child = OwnedChild(Some(child));
+        OwnedChild(Some(child))
+    }
+    fn run(&self, args: &[&str]) -> Output {
+        self.wait(self.spawn(args), args)
+    }
+    fn wait(&self, mut child: OwnedChild, args: &[&str]) -> Output {
         let deadline = Instant::now() + Duration::from_secs(30);
         loop {
             if child.0.as_mut().unwrap().try_wait().unwrap().is_some() {
@@ -295,4 +300,764 @@ async fn independent_jj_processes_share_broker_objects_not_workspace_state() {
         .await
         .unwrap()
         .unwrap();
+}
+
+#[cfg(unix)]
+#[derive(Default)]
+struct PublicationPause {
+    enabled: std::sync::atomic::AtomicBool,
+    started: tokio::sync::Notify,
+    resume: tokio::sync::Notify,
+}
+#[cfg(unix)]
+struct PausingControl {
+    inner: jj_native_remote::RemoteRepositoryControl,
+    pause: std::sync::Arc<PublicationPause>,
+}
+#[cfg(unix)]
+impl std::fmt::Debug for PausingControl {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("PausingControl")
+            .finish_non_exhaustive()
+    }
+}
+#[cfg(unix)]
+#[async_trait::async_trait]
+impl native_broker::NativeRepositoryControl for PausingControl {
+    fn resources(&self) -> native_broker::ControlResources {
+        native_broker::NativeRepositoryControl::resources(&self.inner)
+    }
+    async fn observe_reference(
+        &self,
+        name: &str,
+    ) -> Result<native_broker::ReferenceSnapshot, native_broker::ControlStatus> {
+        native_broker::NativeRepositoryControl::observe_reference(&self.inner, name).await
+    }
+    async fn admit_commit(
+        &self,
+        head: native_broker::CommitId,
+    ) -> Result<native_broker::AdmittedCommit, native_broker::ControlStatus> {
+        native_broker::NativeRepositoryControl::admit_commit(&self.inner, head).await
+    }
+    async fn publish(
+        &self,
+        request: native_broker::PublishRequest,
+    ) -> Result<native_broker::ConfirmedPublication, native_broker::ControlStatus> {
+        let confirmed =
+            native_broker::NativeRepositoryControl::publish(&self.inner, request).await?;
+        // The real remote provider/server have committed and acknowledged; only
+        // this broker response is paused for actual child failure injection.
+        if self
+            .pause
+            .enabled
+            .swap(false, std::sync::atomic::Ordering::SeqCst)
+        {
+            self.pause.started.notify_one();
+            self.pause.resume.notified().await;
+        }
+        Ok(confirmed)
+    }
+    async fn publication(
+        &self,
+        key: &str,
+    ) -> Result<Option<native_broker::ConfirmedPublication>, native_broker::ControlStatus> {
+        native_broker::NativeRepositoryControl::publication(&self.inner, key).await
+    }
+}
+
+#[cfg(unix)]
+struct NativeRemoteFixture {
+    _root: tempfile::TempDir,
+    socket: PathBuf,
+    store: tinytree_store::Store,
+    head: String,
+    pause: std::sync::Arc<PublicationPause>,
+    broker_stop: Option<tokio::sync::oneshot::Sender<()>>,
+    server_stop: Option<tokio::sync::oneshot::Sender<()>>,
+    broker_task: Option<tokio::task::JoinHandle<()>>,
+    server_task: Option<tokio::task::JoinHandle<()>>,
+}
+#[cfg(unix)]
+impl Drop for NativeRemoteFixture {
+    fn drop(&mut self) {
+        if let Some(stop) = self.broker_stop.take() {
+            let _ = stop.send(());
+        }
+        if let Some(stop) = self.server_stop.take() {
+            let _ = stop.send(());
+        }
+        if let Some(task) = self.broker_task.take() {
+            task.abort();
+        }
+        if let Some(task) = self.server_task.take() {
+            task.abort();
+        }
+    }
+}
+#[cfg(unix)]
+impl NativeRemoteFixture {
+    async fn start() -> Self {
+        use std::{collections::HashMap, os::unix::fs::PermissionsExt, sync::Arc};
+        let root = tempfile::tempdir().unwrap();
+        fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        let path = root.path().canonicalize().unwrap();
+        let server_path = path.join("server");
+        fs::create_dir(&server_path).unwrap();
+        let store = tinytree_store::Store::open(&server_path, Default::default()).unwrap();
+        store.create_repository("example").unwrap();
+        let fixture = tinytree_fixture::build_fixture(tinytree_fixture::FixtureConfig {
+            unused_files: 2,
+            bytes_per_file: 64,
+        })
+        .unwrap();
+        let mut head = None;
+        for object in fixture.objects() {
+            store
+                .put("example", object.descriptor, &object.bytes, 0)
+                .unwrap();
+            if object.descriptor.key.kind == tinytree_model::Kind::Commit {
+                head = Some(tinytree_model::CommitId(object.descriptor.key.id.0));
+            }
+        }
+        let head = head.unwrap();
+        store
+            .publish(
+                "example",
+                &tinytree_store::PublishRequest {
+                    idempotency_key: "seed".into(),
+                    reference_name: "main".into(),
+                    expected_generation: 0,
+                    new_commit: Some(head),
+                    staging_leases: vec![],
+                },
+                0,
+            )
+            .unwrap();
+        let service = tinytree_server::RepositoryService::new(
+            store.clone(),
+            Default::default(),
+            vec!["example".into()],
+            vec![
+                tinytree_server::Principal::new(
+                    "writer",
+                    "public-cli-writer-token-not-a-secret",
+                    vec!["example".into()],
+                    true,
+                )
+                .unwrap()
+                .with_retention(true),
+                tinytree_server::Principal::new(
+                    "reader",
+                    "public-cli-reader-token-not-a-secret",
+                    vec!["example".into()],
+                    false,
+                )
+                .unwrap()
+                .with_retention(true),
+            ],
+        )
+        .unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (server_stop, stopped) = tokio::sync::oneshot::channel();
+        let server_task = tokio::spawn(async move {
+            tinytree_server::serve_tcp(listener, service, None, async {
+                let _ = stopped.await;
+            })
+            .await
+            .unwrap();
+        });
+        struct NoDefaultSource;
+        #[async_trait::async_trait]
+        impl local_cas::BlobSource for NoDefaultSource {
+            async fn fetch(
+                &self,
+                _: &local_cas::Artifact,
+                _: &mut std::fs::File,
+            ) -> anyhow::Result<()> {
+                anyhow::bail!("native test must use its scoped source")
+            }
+            async fn missing(
+                &self,
+                artifacts: &[local_cas::Artifact],
+            ) -> anyhow::Result<Vec<local_cas::Artifact>> {
+                Ok(artifacts.to_vec())
+            }
+        }
+        let cache = local_cas::LocalCas::open(
+            path.join("cache"),
+            Arc::new(NoDefaultSource),
+            Default::default(),
+        )
+        .unwrap();
+        let local_path = path.join("local");
+        fs::create_dir(&local_path).unwrap();
+        fs::set_permissions(&local_path, fs::Permissions::from_mode(0o700)).unwrap();
+        let direct = Arc::new(
+            jj_native_backend::DirectObjectIo::init(&local_path, Default::default()).unwrap(),
+        );
+        let mut config = jj_native_remote::Config::default();
+        config.remote.endpoint = format!("http://{address}");
+        config.remote.repository_id = "example".into();
+        config.remote.token_env = Some("TINYTREE_CLI_WRITER_TOKEN".into());
+        config.authorization_profile = "cli-writer".into();
+        let reader_config = {
+            let mut config = config.clone();
+            config.remote.token_env = Some("TINYTREE_CLI_READER_TOKEN".into());
+            config.authorization_profile = "cli-reader".into();
+            config
+        };
+        let remote = jj_native_remote::RemoteRepository::open(
+            direct,
+            cache.clone(),
+            &path.join("ledger"),
+            &path.join("staging"),
+            config,
+        )
+        .unwrap();
+        let reader_path = path.join("reader-local");
+        fs::create_dir(&reader_path).unwrap();
+        fs::set_permissions(&reader_path, fs::Permissions::from_mode(0o700)).unwrap();
+        let reader = jj_native_remote::RemoteRepository::open(
+            Arc::new(
+                jj_native_backend::DirectObjectIo::init(&reader_path, Default::default()).unwrap(),
+            ),
+            cache,
+            &path.join("reader-ledger"),
+            &path.join("reader-staging"),
+            reader_config,
+        )
+        .unwrap();
+        let reader_provider: Arc<dyn jj_native_backend::NativeObjectIo> = reader.io;
+        let reader_control: Arc<dyn native_broker::NativeRepositoryControl> =
+            Arc::new(reader.control);
+        let provider: Arc<dyn jj_native_backend::NativeObjectIo> = remote.io;
+        let pause = Arc::new(PublicationPause::default());
+        let control: Arc<dyn native_broker::NativeRepositoryControl> = Arc::new(PausingControl {
+            inner: remote.control,
+            pause: pause.clone(),
+        });
+        let broker = native_broker::BrokerService::new(
+            HashMap::from([
+                ("example".into(), provider),
+                ("reader".into(), reader_provider),
+            ]),
+            Default::default(),
+        )
+        .unwrap()
+        .with_controls(HashMap::from([
+            ("example".into(), control),
+            ("reader".into(), reader_control),
+        ]))
+        .unwrap();
+        let socket = path.join("broker.sock");
+        let serve_path = socket.clone();
+        let (broker_stop, stopped) = tokio::sync::oneshot::channel();
+        let broker_task = tokio::spawn(async move {
+            native_broker::serve_unix(&serve_path, broker, async {
+                let _ = stopped.await;
+            })
+            .await
+            .unwrap();
+        });
+        let fixture = Self {
+            _root: root,
+            socket,
+            store,
+            head: head.0.iter().map(|b| format!("{b:02x}")).collect(),
+            pause,
+            broker_stop: Some(broker_stop),
+            server_stop: Some(server_stop),
+            broker_task: Some(broker_task),
+            server_task: Some(server_task),
+        };
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                assert!(
+                    !fixture.broker_task.as_ref().unwrap().is_finished(),
+                    "native broker startup failed"
+                );
+                if fs::metadata(&fixture.socket)
+                    .is_ok_and(|metadata| metadata.permissions().mode() & 0o777 == 0o600)
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap();
+        fixture
+    }
+    fn public(&self) -> tinytree_store::Reference {
+        self.store
+            .references("example", &["main".into()])
+            .unwrap()
+            .remove(0)
+    }
+    fn clone(&self, client: &Client) {
+        self.clone_store(client, "example");
+    }
+    fn clone_store(&self, client: &Client, store: &str) {
+        client.success(&[
+            "tinytree",
+            "clone",
+            ".",
+            "--broker",
+            self.socket.to_str().unwrap(),
+            "--store",
+            store,
+            "--reference",
+            "main",
+            "--bookmark",
+            "main",
+        ]);
+    }
+    async fn stop(mut self) {
+        let _ = self.broker_stop.take().unwrap().send(());
+        tokio::time::timeout(Duration::from_secs(5), self.broker_task.take().unwrap())
+            .await
+            .unwrap()
+            .unwrap();
+        let _ = self.server_stop.take().unwrap().send(());
+        tokio::time::timeout(Duration::from_secs(5), self.server_task.take().unwrap())
+            .await
+            .unwrap()
+            .unwrap();
+    }
+}
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn real_native_remote_cli_preserves_workspace_generations_conflicts_and_undo() {
+    let fixture = NativeRemoteFixture::start().await;
+    let first = Client::new();
+    let second = Client::new();
+    fixture.clone(&first);
+    fixture.clone(&second);
+    for client in [&first, &second] {
+        client.assert_native();
+        assert_eq!(client.revision("main"), fixture.head);
+        assert_eq!(client.revision("@-"), fixture.head);
+    }
+    first.success(&["bookmark", "set", "created", "-r", "@"]);
+    first.success(&[
+        "tinytree",
+        "fetch",
+        "--reference",
+        "created",
+        "--bookmark",
+        "created",
+    ]);
+    first.success(&[
+        "tinytree",
+        "push",
+        "--reference",
+        "created",
+        "--bookmark",
+        "created",
+    ]);
+    assert_eq!(
+        fixture
+            .store
+            .references("example", &["created".into()])
+            .unwrap()[0]
+            .generation,
+        1,
+        "an explicitly observed absent reference carries generation zero into its first publication"
+    );
+    fs::write(second.root.join("agent.txt"), "client B data\n").unwrap();
+    second.success(&["describe", "-m", "client B change"]);
+    second.success(&["bookmark", "set", "main", "-r", "@"]);
+    let bhead = second.revision("@");
+    second.success(&[
+        "tinytree",
+        "push",
+        "--reference",
+        "main",
+        "--bookmark",
+        "main",
+    ]);
+    assert_eq!(fixture.public().generation, 2);
+    assert_eq!(
+        fixture
+            .public()
+            .commit
+            .unwrap()
+            .key
+            .id
+            .0
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect::<String>(),
+        bhead
+    );
+    let sidecar = second.root.join(".jj/working_copy/native-remote.toml");
+    let observed = fs::read(&sidecar).unwrap();
+    second.success(&["undo"]);
+    assert_eq!(
+        fs::read(&sidecar).unwrap(),
+        observed,
+        "jj undo cannot roll back an external observed generation"
+    );
+    let rejected = second.run(&[
+        "tinytree",
+        "push",
+        "--reference",
+        "main",
+        "--bookmark",
+        "main",
+    ]);
+    assert!(!rejected.status.success());
+    assert_eq!(fixture.public().generation, 2);
+    second.success(&[
+        "tinytree",
+        "fetch",
+        "--reference",
+        "main",
+        "--bookmark",
+        "main",
+    ]);
+    second.success(&[
+        "bookmark",
+        "set",
+        "main",
+        "--allow-backwards",
+        "-r",
+        &fixture.head,
+    ]);
+    second.success(&[
+        "tinytree",
+        "push",
+        "--reference",
+        "main",
+        "--bookmark",
+        "main",
+    ]);
+    assert_eq!(fixture.public().generation, 3);
+    assert_eq!(first.revision("main"), fixture.head);
+    let old = fs::read(first.root.join(".jj/working_copy/native-remote.toml")).unwrap();
+    let stale = first.run(&[
+        "tinytree",
+        "push",
+        "--reference",
+        "main",
+        "--bookmark",
+        "main",
+    ]);
+    assert!(
+        !stale.status.success(),
+        "same head after ABA still requires the workspace's old generation"
+    );
+    assert_eq!(fixture.public().generation, 3);
+    assert_eq!(
+        fs::read(first.root.join(".jj/working_copy/native-remote.toml")).unwrap(),
+        old
+    );
+    first.success(&[
+        "tinytree",
+        "fetch",
+        "--reference",
+        "main",
+        "--bookmark",
+        "main",
+    ]);
+    fs::write(first.root.join("agent.txt"), "client A data\n").unwrap();
+    first.success(&["describe", "-m", "client A change"]);
+    first.success(&["bookmark", "set", "main", "-r", "@"]);
+    let ahead = first.revision("@");
+    first.success(&[
+        "tinytree",
+        "push",
+        "--reference",
+        "main",
+        "--bookmark",
+        "main",
+    ]);
+    assert_eq!(fixture.public().generation, 4);
+    second.success(&["bookmark", "set", "main", "--allow-backwards", "-r", &bhead]);
+    second.success(&[
+        "tinytree",
+        "fetch",
+        "--reference",
+        "main",
+        "--bookmark",
+        "main",
+    ]);
+    assert_eq!(
+        second.success(&["file", "show", "agent.txt"]),
+        "client B data\n",
+        "fetch must preserve the independent working copy"
+    );
+    let conflict = second.run(&[
+        "tinytree",
+        "push",
+        "--reference",
+        "main",
+        "--bookmark",
+        "main",
+    ]);
+    assert!(
+        !conflict.status.success(),
+        "divergent bookmarks must merge, not silently overwrite local work"
+    );
+    assert_eq!(fixture.public().generation, 4);
+    second.success(&["rebase", "-r", "@", "-d", &ahead]);
+    assert!(second.success(&["status"]).contains("conflict"));
+    let rebased = second.revision("@");
+    second.success(&["bookmark", "set", "main", "--allow-backwards", "-r", "@"]);
+    second.success(&[
+        "tinytree",
+        "push",
+        "--reference",
+        "main",
+        "--bookmark",
+        "main",
+    ]);
+    assert_eq!(fixture.public().generation, 5);
+    let third = Client::new();
+    fixture.clone(&third);
+    assert_eq!(
+        third.revision("main"),
+        rebased,
+        "native tree conflicts survive publication and another materialized clone"
+    );
+    assert!(
+        third
+            .success(&["file", "show", "agent.txt"])
+            .contains("<<<<<<<")
+    );
+    assert_eq!(
+        first.success(&["file", "show", "agent.txt"]),
+        "client A data\n"
+    );
+    fixture.stop().await;
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn real_publication_recovery_reuses_one_intent_after_client_death_or_local_state_failure() {
+    enum Failure {
+        ClientDies,
+        StateCommitCollision,
+    }
+    for failure in [Failure::ClientDies, Failure::StateCommitCollision] {
+        let fixture = NativeRemoteFixture::start().await;
+        let client = Client::new();
+        let quoted_bookmark = "\"feature name\"";
+        client.success(&[
+            "tinytree",
+            "clone",
+            ".",
+            "--broker",
+            fixture.socket.to_str().unwrap(),
+            "--store",
+            "example",
+            "--reference",
+            "main",
+            "--bookmark",
+            quoted_bookmark,
+        ]);
+        fs::write(
+            client.root.join("recovery.txt"),
+            "durable publication data\n",
+        )
+        .unwrap();
+        client.success(&["describe", "-m", "recover exact native intent"]);
+        client.success(&["bookmark", "set", quoted_bookmark, "-r", "@"]);
+        let head = client.revision("@");
+        fixture
+            .pause
+            .enabled
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let args = [
+            "tinytree",
+            "push",
+            "--reference",
+            "main",
+            "--bookmark",
+            quoted_bookmark,
+        ];
+        let mut child = client.spawn(&args);
+        tokio::time::timeout(Duration::from_secs(10), fixture.pause.started.notified())
+            .await
+            .unwrap();
+        assert_eq!(fixture.public().generation, 2);
+        let sidecar = client.root.join(".jj/working_copy/native-remote.toml");
+        assert!(fs::read_to_string(&sidecar).unwrap().contains("request_id"));
+        match failure {
+            Failure::ClientDies => {
+                assert!(child.0.as_mut().unwrap().try_wait().unwrap().is_none());
+                child.0.as_mut().unwrap().kill().unwrap();
+                assert!(!child.0.take().unwrap().wait().unwrap().success());
+                fixture.pause.resume.notify_one();
+            }
+            Failure::StateCommitCollision => {
+                let saved = sidecar.with_extension("saved");
+                fs::rename(&sidecar, &saved).unwrap();
+                fs::create_dir(&sidecar).unwrap();
+                fixture.pause.resume.notify_one();
+                let result = client.wait(child, &args);
+                assert!(
+                    !result.status.success(),
+                    "local durable-state failure must not report completion"
+                );
+                fs::remove_dir(&sidecar).unwrap();
+                fs::rename(saved, &sidecar).unwrap();
+            }
+        }
+        client.success(&args);
+        assert_eq!(
+            fixture.public().generation,
+            2,
+            "recovery must not create a second publication generation"
+        );
+        assert_eq!(client.revision("\"feature name\"@tinytree"), head);
+        assert!(!fs::read_to_string(&sidecar).unwrap().contains("request_id"));
+        fixture.stop().await;
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn readonly_failed_push_requires_explicit_bounded_local_replay_abandonment() {
+    let fixture = NativeRemoteFixture::start().await;
+    let client = Client::new();
+    fixture.clone_store(&client, "reader");
+    fs::write(
+        client.root.join("local-only.txt"),
+        "readonly clients can edit locally\n",
+    )
+    .unwrap();
+    client.success(&["describe", "-m", "local readonly work"]);
+    client.success(&["bookmark", "set", "main", "-r", "@"]);
+    let push = [
+        "tinytree",
+        "push",
+        "--reference",
+        "main",
+        "--bookmark",
+        "main",
+    ];
+    assert!(!client.run(&push).status.success());
+    assert_eq!(fixture.public().generation, 1);
+    let fetch = [
+        "tinytree",
+        "fetch",
+        "--reference",
+        "main",
+        "--bookmark",
+        "main",
+    ];
+    assert!(
+        !client.run(&fetch).status.success(),
+        "default recovery must not assume a failed publication never committed"
+    );
+    let path = client.root.join(".jj/working_copy/native-remote.toml");
+    let original = fs::read_to_string(&path).unwrap();
+    let mut boundary: toml::Value = toml::from_str(&original).unwrap();
+    let intent = boundary["pending"].clone();
+    let archived = (0..128)
+        .map(|index| {
+            let mut intent = intent.clone();
+            intent["request_id"] = toml::Value::String(format!("{index:032x}"));
+            intent
+        })
+        .collect();
+    boundary["archived_pushes"] = toml::Value::Array(archived);
+    fs::write(&path, toml::to_string(&boundary).unwrap()).unwrap();
+    let full = fs::read(&path).unwrap();
+    let abandon = [
+        "tinytree",
+        "fetch",
+        "--reference",
+        "main",
+        "--bookmark",
+        "main",
+        "--abandon-pending-push",
+    ];
+    assert!(!client.run(&abandon).status.success());
+    assert_eq!(
+        fs::read(&path).unwrap(),
+        full,
+        "a full archive must preserve the active replay intent without mutation"
+    );
+    fs::write(&path, &original).unwrap();
+    client.success(&abandon);
+    let state: toml::Value = toml::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+    assert!(state.get("pending").is_none());
+    assert_eq!(state["archived_pushes"].as_array().unwrap().len(), 1);
+    assert_eq!(
+        client.success(&["file", "show", "local-only.txt"]),
+        "readonly clients can edit locally\n"
+    );
+    assert_eq!(
+        fixture.public().generation,
+        1,
+        "abandoning local replay is not an upstream write or rollback"
+    );
+    fixture.stop().await;
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn native_fetch_preflights_observation_capacity_before_snapshot_or_pending_state() {
+    let fixture = NativeRemoteFixture::start().await;
+    let client = Client::new();
+    fixture.clone(&client);
+    let path = client.root.join(".jj/working_copy/native-remote.toml");
+    let mut state: toml::Value = toml::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+    let observations = state["observations"].as_array_mut().unwrap();
+    for index in 0..127 {
+        let mut entry = toml::map::Map::new();
+        entry.insert(
+            "reference".into(),
+            toml::Value::String(format!("boundary-{index}")),
+        );
+        entry.insert(
+            "bookmark".into(),
+            toml::Value::String(format!("boundary-{index}")),
+        );
+        entry.insert("generation".into(), toml::Value::Integer(0));
+        observations.push(toml::Value::Table(entry));
+    }
+    fs::write(&path, toml::to_string(&state).unwrap()).unwrap();
+    let saved = fs::read(&path).unwrap();
+    let before = client.revision("@");
+    fs::write(
+        client.root.join("must-not-snapshot.txt"),
+        "pending ordinary edit\n",
+    )
+    .unwrap();
+    let rejected = client.run(&[
+        "tinytree",
+        "fetch",
+        "--reference",
+        "one-too-many",
+        "--bookmark",
+        "extra",
+    ]);
+    assert!(!rejected.status.success());
+    assert_eq!(
+        fs::read(&path).unwrap(),
+        saved,
+        "admission failure must not leave a pending fetch"
+    );
+    assert_eq!(
+        client
+            .success(&[
+                "--ignore-working-copy",
+                "log",
+                "--no-graph",
+                "-r",
+                "@",
+                "-T",
+                "commit_id"
+            ])
+            .trim(),
+        before,
+        "capacity must be checked before jj snapshots or commits local work"
+    );
+    assert_eq!(fixture.public().generation, 1);
+    fixture.stop().await;
 }

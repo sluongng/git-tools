@@ -16,6 +16,8 @@ pub struct Challenge {
 pub(crate) struct Credentials {
     pub cache: Option<String>,
     pub bes: Option<String>,
+    pub native: std::collections::BTreeMap<String, Option<String>>,
+    pub native_ca: std::collections::BTreeMap<String, std::sync::Arc<[u8]>>,
 }
 
 fn credential(name: &str) -> Result<Option<String>> {
@@ -28,7 +30,34 @@ fn credential(name: &str) -> Result<Option<String>> {
 
 impl Credentials {
     pub fn load(config: &Config) -> Result<Self> {
+        let mut native = std::collections::BTreeMap::new();
+        let mut native_ca = std::collections::BTreeMap::new();
+        for (alias, repository) in &config.native.repositories {
+            if let Some(remote) = &repository.remote {
+                let value = match &remote.remote.token_env {
+                    Some(name) => credential(name)?,
+                    None => None,
+                };
+                native.insert(alias.clone(), value);
+                if let Some(tls) = &remote.remote.tls {
+                    use std::io::Read;
+                    let mut bytes = Vec::new();
+                    std::fs::File::open(&tls.ca_certificate)
+                        .map_err(|_| anyhow::anyhow!("cannot read native trust roots"))?
+                        .take(1024 * 1024 + 1)
+                        .read_to_end(&mut bytes)
+                        .map_err(|_| anyhow::anyhow!("cannot read native trust roots"))?;
+                    ensure!(
+                        !bytes.is_empty() && bytes.len() <= 1024 * 1024,
+                        "invalid native trust root snapshot size"
+                    );
+                    native_ca.insert(alias.clone(), bytes.into());
+                }
+            }
+        }
         Ok(Self {
+            native,
+            native_ca,
             cache: credential(&config.cache.api_key_env)?,
             bes: if config.bes.enabled {
                 credential(if config.bes.api_key_env.is_empty() {
@@ -109,6 +138,20 @@ impl Challenge {
         // settings captured by an enabled service affect daemon reuse.
         if !config.native.repositories.is_empty() {
             material["native"] = serde_json::to_value(&config.native)?;
+            if config
+                .native
+                .repositories
+                .values()
+                .any(|repository| repository.remote.is_some())
+            {
+                material["native_credentials"] = serde_json::to_value(&credentials.native)?;
+                let roots: std::collections::BTreeMap<_, _> = credentials
+                    .native_ca
+                    .iter()
+                    .map(|(alias, bytes)| (alias, blake3::hash(bytes).to_hex().to_string()))
+                    .collect();
+                material["native_trust"] = serde_json::to_value(roots)?;
+            }
         }
         let material = serde_json::to_vec(&material)?;
         // A fresh per-process key avoids a stable credential-derived identifier.
@@ -154,6 +197,8 @@ mod tests {
         let mut config = Config::default();
         config.state_dir = root.path().to_owned();
         let credentials = Credentials {
+            native_ca: Default::default(),
+            native: Default::default(),
             cache: Some("synthetic-cache-credential".into()),
             bes: Some("synthetic-bes-credential".into()),
         };
@@ -197,18 +242,26 @@ mod tests {
         }
         for changed in [
             Credentials {
+                native_ca: Default::default(),
+                native: Default::default(),
                 cache: None,
                 bes: credentials.bes.clone(),
             },
             Credentials {
+                native_ca: Default::default(),
+                native: Default::default(),
                 cache: credentials.cache.clone(),
                 bes: None,
             },
             Credentials {
+                native_ca: Default::default(),
+                native: Default::default(),
                 cache: Some("rotated-cache-credential".into()),
                 bes: credentials.bes.clone(),
             },
             Credentials {
+                native_ca: Default::default(),
+                native: Default::default(),
                 cache: credentials.cache.clone(),
                 bes: Some("rotated-bes-credential".into()),
             },
@@ -242,6 +295,8 @@ mod tests {
         let mut config = Config::default();
         config.state_dir = root.path().to_owned();
         let credentials = Credentials {
+            native_ca: Default::default(),
+            native: Default::default(),
             cache: None,
             bes: None,
         };
@@ -297,11 +352,100 @@ mod tests {
     }
 
     #[test]
+    fn native_remote_reuse_binds_effective_policy_and_credential_scope() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let mut config = Config::default();
+        config.state_dir = root.path().to_owned();
+        let mut repository = crate::config::NativeRepository::default();
+        repository.remote = Some(jj_native_remote::Config::default());
+        config
+            .native
+            .repositories
+            .insert("example".into(), repository);
+        let mut credentials = Credentials {
+            native_ca: Default::default(),
+            native: [("example".into(), Some("synthetic-native-credential".into()))].into(),
+            cache: None,
+            bes: None,
+        };
+        let identity = Identity::new(&config, &credentials)?;
+        let challenge = identity.challenge();
+        identity.validate(VERSION, &challenge.digest(&config, &credentials)?)?;
+        let mut changed = config.clone();
+        changed
+            .native
+            .repositories
+            .get_mut("example")
+            .unwrap()
+            .remote
+            .as_mut()
+            .unwrap()
+            .remote
+            .rpc
+            .rpc_timeout_ms += 1;
+        assert!(
+            identity
+                .validate(VERSION, &challenge.digest(&changed, &credentials)?)
+                .is_err()
+        );
+        credentials.native.insert(
+            "example".into(),
+            Some("synthetic-rotated-native-credential".into()),
+        );
+        assert!(
+            identity
+                .validate(VERSION, &challenge.digest(&config, &credentials)?)
+                .is_err()
+        );
+        let response = serde_json::to_string(challenge)?;
+        assert!(!response.contains("synthetic"));
+        assert!(!response.contains("native"));
+        Ok(())
+    }
+
+    #[test]
+    fn native_remote_reuse_detects_replaced_trust_contents_at_the_same_path() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let ca = root.path().join("roots.pem");
+        std::fs::write(&ca, b"first public trust snapshot")?;
+        let mut config = Config::default();
+        config.state_dir = root.path().to_owned();
+        config.cache.api_key_env = "UNSET_NATIVE_FIXTURE_KEY".into();
+        config.bes.enabled = false;
+        let mut remote = jj_native_remote::Config::default();
+        remote.remote.endpoint = "https://localhost:8093".into();
+        remote.remote.tls = Some(toml::from_str(&format!("ca_certificate = {ca:?}"))?);
+        let mut repository = crate::config::NativeRepository::default();
+        repository.remote = Some(remote);
+        config
+            .native
+            .repositories
+            .insert("example".into(), repository);
+        let before = Credentials::load(&config)?;
+        let identity = Identity::new(&config, &before)?;
+        std::fs::write(ca, b"replacement public trust snapshot")?;
+        let after = Credentials::load(&config)?;
+        assert_eq!(
+            before.native_ca["example"].as_ref(),
+            b"first public trust snapshot"
+        );
+        assert!(
+            identity
+                .validate(VERSION, &identity.challenge().digest(&config, &after)?)
+                .is_err()
+        );
+        assert!(!serde_json::to_string(identity.challenge())?.contains("snapshot"));
+        Ok(())
+    }
+
+    #[test]
     fn git_executable_is_service_configuration_only_when_proxy_is_enabled() -> Result<()> {
         let root = tempfile::tempdir()?;
         let mut config = Config::default();
         config.state_dir = root.path().to_owned();
         let credentials = Credentials {
+            native_ca: Default::default(),
+            native: Default::default(),
             cache: None,
             bes: None,
         };

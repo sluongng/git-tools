@@ -39,6 +39,7 @@ impl Closure {
         let mut bytes = 0usize;
         let mut edges = 0usize;
         while let Some((key, exit)) = pending.pop() {
+            crate::io::check_deadline()?;
             if key.kind == m::Kind::Commit && key.id.0 == [0; 32] {
                 continue;
             }
@@ -74,6 +75,7 @@ impl Closure {
                     .read_metadata(key)
                     .await
                     .map_err(crate::backend)?;
+                crate::io::check_deadline()?;
                 let descriptor = object.descriptor();
                 let bytes = object.bytes().to_vec();
                 Node {
@@ -84,7 +86,7 @@ impl Closure {
             } else {
                 ensure!(remote, "native local metadata closure is incomplete");
                 let client = inner.connector.get().await?;
-                let mut outcomes = client.read_objects(vec![key]).await?;
+                let mut outcomes = crate::io::network(client.read_objects(vec![key])).await?;
                 match outcomes
                     .pop()
                     .context("native metadata response omitted key")?

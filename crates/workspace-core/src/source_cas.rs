@@ -9,7 +9,7 @@ use std::{
     fs::File,
     io::{Seek, Write},
     path::PathBuf,
-    sync::{Arc, mpsc},
+    sync::{Arc, Mutex, mpsc},
 };
 use tokio::{
     runtime::Handle,
@@ -28,7 +28,13 @@ pub struct SourceCas {
     cache: Arc<LocalCas>,
     backend: String,
     instance: String,
-    jobs: mpsc::SyncSender<Job>,
+    jobs: Mutex<Option<mpsc::SyncSender<Job>>>,
+    worker: Mutex<BridgeWorker>,
+    runtime_id: tokio::runtime::Id,
+}
+struct BridgeWorker {
+    handle: Option<std::thread::JoinHandle<()>>,
+    failed: bool,
 }
 impl SourceCas {
     /// `backend` and `instance` must match the authorized BOS/cache-proxy scope
@@ -38,7 +44,7 @@ impl SourceCas {
         let (jobs, receiver) = mpsc::sync_channel::<Job>(32);
         let (ready, initialized) = mpsc::sync_channel(1);
         let owned_cache = cache.clone();
-        std::thread::Builder::new()
+        let worker = std::thread::Builder::new()
             .name("source-cas-bridge".into())
             .spawn(move || {
                 let runtime = tokio::runtime::Builder::new_multi_thread()
@@ -47,7 +53,7 @@ impl SourceCas {
                     .build();
                 match runtime {
                     Ok(runtime) => {
-                        let _ = ready.send(Ok(()));
+                        let _ = ready.send(Ok(runtime.handle().id()));
                         let slots = Arc::new(Semaphore::new(32));
                         while let Ok(job) = receiver.recv() {
                             let permit = runtime.block_on(slots.clone().acquire_owned()).unwrap();
@@ -65,15 +71,51 @@ impl SourceCas {
                     }
                 }
             })?;
-        initialized
+        let runtime_id = initialized
             .recv()
             .context("initialize source CAS runtime")??;
         Ok(Arc::new(Self {
             cache,
             backend,
             instance,
-            jobs,
+            jobs: Mutex::new(Some(jobs)),
+            worker: Mutex::new(BridgeWorker {
+                handle: Some(worker),
+                failed: false,
+            }),
+            runtime_id,
         }))
+    }
+    fn submit(&self, job: Job) -> Result<()> {
+        let sender = self
+            .jobs
+            .lock()
+            .unwrap()
+            .as_ref()
+            .cloned()
+            .context("source CAS bridge stopped")?;
+        sender
+            .send(job)
+            .map_err(|_| anyhow::anyhow!("source CAS bridge stopped"))
+    }
+    /// Stop admission and join the bridge after all accepted work drains. This
+    /// blocking, idempotent operation must run outside the bridge runtime, after
+    /// source consumers stop. Ordinary Drop remains nonblocking for active reads.
+    pub fn shutdown(&self) -> Result<()> {
+        ensure!(
+            Handle::try_current().map_or(true, |handle| handle.id() != self.runtime_id),
+            "cannot shut down source CAS from its own runtime"
+        );
+        let mut worker = self.worker.lock().unwrap();
+        ensure!(!worker.failed, "source CAS bridge failed during shutdown");
+        drop(self.jobs.lock().unwrap().take());
+        if let Some(handle) = worker.handle.take() {
+            if handle.join().is_err() {
+                worker.failed = true;
+                anyhow::bail!("source CAS bridge failed during shutdown");
+            }
+        }
+        Ok(())
     }
     pub fn artifact(&self, hash: [u8; 32], size: u64) -> Artifact {
         Artifact {
@@ -90,14 +132,12 @@ impl SourceCas {
     pub(crate) fn cached(&self, artifact: Artifact) -> Result<Option<Arc<CachedBlob>>> {
         let cache = self.cache.clone();
         let (send, receive) = mpsc::sync_channel(1);
-        self.jobs
-            .send(Box::new(move |runtime, permit| {
-                runtime.spawn(async move {
-                    let _permit = permit;
-                    let _ = send.send(cache.cached_content(artifact).await);
-                });
-            }))
-            .map_err(|_| anyhow::anyhow!("source CAS bridge stopped"))?;
+        self.submit(Box::new(move |runtime, permit| {
+            runtime.spawn(async move {
+                let _permit = permit;
+                let _ = send.send(cache.cached_content(artifact).await);
+            });
+        }))?;
         receive.recv().context("source CAS worker stopped")?
     }
     pub(crate) fn fallback(&self) -> Arc<dyn BlobSource> {
@@ -110,15 +150,13 @@ impl SourceCas {
     ) -> Result<Arc<CachedBlob>> {
         let cache = self.cache.clone();
         let (send, receive) = mpsc::sync_channel(1);
-        self.jobs
-            .send(Box::new(move |runtime, permit| {
-                runtime.spawn(async move {
-                    let _permit = permit;
-                    let result = cache.content_from(artifact, source).await;
-                    let _ = send.send(result);
-                });
-            }))
-            .map_err(|_| anyhow::anyhow!("source CAS bridge stopped"))?;
+        self.submit(Box::new(move |runtime, permit| {
+            runtime.spawn(async move {
+                let _permit = permit;
+                let result = cache.content_from(artifact, source).await;
+                let _ = send.send(result);
+            });
+        }))?;
         receive.recv().context("source CAS worker stopped")?
     }
 }
@@ -293,6 +331,31 @@ mod tests {
         assert!(cache.metrics().evictions >= 1);
         assert_eq!(repo.read_blob(&oid).unwrap(), b"base");
         assert_eq!(cache.metrics().fetches, 3);
+        drop(repo);
+        std::thread::scope(|scope| {
+            let first = scope.spawn(|| shared.shutdown().unwrap());
+            let second = scope.spawn(|| shared.shutdown().unwrap());
+            first.join().unwrap();
+            second.join().unwrap();
+        });
+        assert!(
+            shared
+                .cached(shared.artifact(*blake3::hash(b"base").as_bytes(), 4))
+                .is_err()
+        );
+        let ownership = Arc::downgrade(&cache);
+        drop(cache);
+        drop(shared);
+        assert!(
+            ownership.upgrade().is_none(),
+            "shutdown must join the cache owner"
+        );
+        LocalCas::open(
+            temp.path().join("cas"),
+            Arc::new(Bytes(vec![])),
+            CacheConfig::default(),
+        )
+        .unwrap();
     }
     #[test]
     fn mapped_git_bytes_are_not_interchangeable_with_unverified_payloads() {
@@ -374,6 +437,51 @@ mod tests {
             Ok(vec![])
         }
     }
+    #[tokio::test]
+    async fn explicit_bridge_shutdown_drains_active_work_and_releases_cache_ownership() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = Arc::new(GatedBytes {
+            entered: tokio::sync::Semaphore::new(0),
+            release: tokio::sync::Semaphore::new(0),
+        });
+        let cache = LocalCas::open(temp.path(), source.clone(), CacheConfig::default()).unwrap();
+        let ownership = Arc::downgrade(&cache);
+        let shared = SourceCas::new(cache.clone(), "tenant-a".into(), "".into()).unwrap();
+        let artifact = shared.artifact(*blake3::hash(b"base").as_bytes(), 4);
+        let reader = shared.clone();
+        let bytes = source.clone();
+        let hydration = tokio::task::spawn_blocking(move || reader.content(artifact, bytes));
+        source.entered.acquire().await.unwrap().forget();
+        let first = shared.clone();
+        let mut first = tokio::task::spawn_blocking(move || {
+            let result = first.shutdown();
+            drop(first);
+            result
+        });
+        let second = shared.clone();
+        let second = tokio::task::spawn_blocking(move || {
+            let result = second.shutdown();
+            drop(second);
+            result
+        });
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(30), &mut first)
+                .await
+                .is_err()
+        );
+        assert!(!second.is_finished());
+        source.release.add_permits(1);
+        let blob = hydration.await.unwrap().unwrap();
+        assert_eq!(std::fs::read(blob.path()).unwrap(), b"base");
+        first.await.unwrap().unwrap();
+        second.await.unwrap().unwrap();
+        drop(blob);
+        drop(shared);
+        drop(cache);
+        assert!(ownership.upgrade().is_none());
+        LocalCas::open(temp.path(), source, CacheConfig::default()).unwrap();
+    }
+
     #[tokio::test]
     async fn local_only_probe_does_not_join_or_poison_upstream_hydration() {
         let temp = tempfile::tempdir().unwrap();

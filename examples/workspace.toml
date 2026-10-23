@@ -77,6 +77,14 @@ buildbuddy = "https://github.com/buildbuddy-io/buildbuddy.git"
 # [native.repositories.example]
 # max_repository_bytes = 17179869184
 # max_file_bytes = 268435456
+# Optional remote provider, with metadata-first admission and lazy file contents:
+# [native.repositories.example.remote]
+# authorization_profile = "agent-profile"
+# [native.repositories.example.remote.remote]
+# endpoint = "http://127.0.0.1:8093"
+# repository_id = "example"
+# token_env = "TINYTREE_AGENT_TOKEN"
+# compression = true
 
 [bos]
 # Opt in to strictly lazy outputs; metadata publication is not yet batched.

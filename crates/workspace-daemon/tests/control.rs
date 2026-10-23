@@ -432,7 +432,13 @@ async fn public_state_directory_is_rejected_before_binding() -> Result<()> {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn offline_upstream_does_not_prevent_durable_bes_admission_startup() -> Result<()> {
-    let dir = tempfile::tempdir()?;
+    use std::os::unix::fs::PermissionsExt;
+    // The tool launcher may use a writable TEST_TMPDIR ancestor. Native storage
+    // requires the same trusted ancestry as production, not a relaxed test rule.
+    let dir = tempfile::Builder::new()
+        .prefix("native-daemon-")
+        .permissions(std::fs::Permissions::from_mode(0o700))
+        .tempdir_in("/tmp")?;
     let unavailable = std::net::TcpListener::bind("127.0.0.1:0")?;
     let upstream_port = unavailable.local_addr()?.port();
     drop(unavailable);
@@ -445,18 +451,31 @@ async fn offline_upstream_does_not_prevent_durable_bes_admission_startup() -> Re
         .native
         .repositories
         .insert("other".into(), Default::default());
+    let mut remote = jj_native_remote::Config::default();
+    remote.remote.endpoint = format!("http://127.0.0.1:{upstream_port}");
+    config.native.repositories.get_mut("other").unwrap().remote = Some(remote);
     let socket = config.socket();
-    let task = tokio::spawn(workspace_daemon::daemon::serve(config.clone()));
+    let mut task = tokio::spawn(workspace_daemon::daemon::serve(config.clone()));
     let status = tokio::time::timeout(Duration::from_secs(5), async {
         loop {
+            if task.is_finished() {
+                panic!("daemon exited before readiness: {:?}", (&mut task).await);
+            }
             if let Ok(status) = call(socket.clone(), ControlRequest::Status).await {
                 break status;
             }
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
     })
-    .await?;
+    .await
+    .map_err(|error| anyhow::anyhow!("initial native daemon readiness: {error}"))?;
     assert_eq!(status["bes_endpoint"], config.bes_endpoint());
+    assert!(
+        config
+            .state_dir
+            .join("native-remote/other/ledger/admission.format")
+            .is_file()
+    );
     assert_eq!(status["native"]["endpoint"], config.rbe_endpoint());
     assert_eq!(
         status["native"]["repositories"],
@@ -542,18 +561,27 @@ async fn offline_upstream_does_not_prevent_durable_bes_admission_startup() -> Re
         "a second daemon cannot open another copy of configured native stores"
     );
     call(socket.clone(), ControlRequest::Shutdown).await?;
-    tokio::time::timeout(Duration::from_secs(5), task).await???;
+    tokio::time::timeout(Duration::from_secs(5), task)
+        .await
+        .map_err(|error| anyhow::anyhow!("initial native daemon drain: {error}"))???;
     assert!(!config.state_dir.join("native/example/.jj").exists());
-    let task = tokio::spawn(workspace_daemon::daemon::serve(config.clone()));
+    let mut task = tokio::spawn(workspace_daemon::daemon::serve(config.clone()));
     tokio::time::timeout(Duration::from_secs(5), async {
         loop {
+            if task.is_finished() {
+                panic!(
+                    "daemon exited before restart readiness: {:?}",
+                    (&mut task).await
+                );
+            }
             if call(socket.clone(), ControlRequest::Status).await.is_ok() {
                 break;
             }
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
     })
-    .await?;
+    .await
+    .map_err(|error| anyhow::anyhow!("restarted native daemon readiness: {error}"))?;
     let mut reopened = native_client(&config).await?;
     assert_eq!(
         native_read(&mut reopened, &descriptor).await?,
@@ -561,7 +589,9 @@ async fn offline_upstream_does_not_prevent_durable_bes_admission_startup() -> Re
         "authoritative objects survive daemon restart with upstream unavailable"
     );
     call(socket, ControlRequest::Shutdown).await?;
-    tokio::time::timeout(Duration::from_secs(5), task).await???;
+    tokio::time::timeout(Duration::from_secs(5), task)
+        .await
+        .map_err(|error| anyhow::anyhow!("restarted native daemon drain: {error}"))???;
     Ok(())
 }
 

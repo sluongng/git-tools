@@ -487,10 +487,15 @@ fn git_cas_endpoint(upstream: &str) -> Result<String> {
 
 /// Open each configured native store exactly once under daemon ownership.
 /// A partial/unrecognized existing directory is never guessed or reinitialized.
-fn open_native_repositories(config: &Config) -> Result<Option<native_broker::BrokerService>> {
+fn open_native_repositories(
+    config: &Config,
+    cache: &Arc<LocalCas>,
+    native_ca: &BTreeMap<String, Arc<[u8]>>,
+) -> Result<Option<native_broker::BrokerService>> {
     if config.native.repositories.is_empty() {
         return Ok(None);
     }
+
     let root = config.state_dir.join("native");
     private_dir(&root)?;
     // Persist directory names as well as the files subsequently acknowledged
@@ -500,6 +505,11 @@ fn open_native_repositories(config: &Config) -> Result<Option<native_broker::Bro
     }
     let mut stores: std::collections::HashMap<String, Arc<dyn jj_native_backend::NativeObjectIo>> =
         std::collections::HashMap::new();
+    let mut controls: std::collections::HashMap<
+        String,
+        Arc<dyn native_broker::NativeRepositoryControl>,
+    > = std::collections::HashMap::new();
+
     for (alias, settings) in &config.native.repositories {
         let path = root.join(alias);
         private_dir(&path)?;
@@ -512,9 +522,35 @@ fn open_native_repositories(config: &Config) -> Result<Option<native_broker::Bro
             jj_native_backend::DirectObjectIo::load(&path, settings.materialize())
         }
         .map_err(|_| anyhow::anyhow!("cannot open configured native repository; state retained"))?;
-        stores.insert(alias.clone(), Arc::new(provider));
+
+        let provider = Arc::new(provider);
+        if let Some(remote_config) = &settings.remote {
+            let remote_root = config.state_dir.join("native-remote");
+            private_dir(&remote_root)?;
+            let remote_root = remote_root.join(alias);
+            private_dir(&remote_root)?;
+            File::open(remote_root.parent().unwrap())?.sync_all()?;
+            File::open(&config.state_dir)?.sync_all()?;
+
+            let remote = jj_native_remote::RemoteRepository::open_with_ca_certificate(
+                provider,
+                cache.clone(),
+                &remote_root.join("ledger"),
+                &remote_root.join("staging"),
+                remote_config.clone(),
+                native_ca.get(alias).cloned(),
+            )
+            .map_err(|_| anyhow::anyhow!("cannot open configured native remote; state retained"))?;
+
+            stores.insert(alias.clone(), remote.io);
+            controls.insert(alias.clone(), Arc::new(remote.control));
+        } else {
+            stores.insert(alias.clone(), provider);
+        }
     }
+
     native_broker::BrokerService::new(stores, config.native.broker_config(&config.reapi))
+        .and_then(|broker| broker.with_controls(controls))
         .map(Some)
         .map_err(|_| anyhow::anyhow!("cannot configure native broker"))
 }
@@ -626,14 +662,22 @@ pub async fn serve(mut config: Config) -> Result<()> {
     let proxy = cache_proxy::CacheProxy::new(upstream, cache.clone());
     let mut rbe_router = proxy.clone().unix_router();
     let native_config = config.clone();
-    let native = tokio::task::spawn_blocking(move || open_native_repositories(&native_config))
-        .await
-        .context("native repository startup worker failed")??;
+    let native_cache = cache.clone();
+    let native_ca = credentials.native_ca.clone();
+    let native = tokio::task::spawn_blocking(move || {
+        open_native_repositories(&native_config, &native_cache, &native_ca)
+    })
+    .await
+    .context("native repository startup worker failed")??;
+
     if let Some(broker) = &native {
         // This wrapper carries pre-decode admission and independent body
         // deadlines; never embed the raw generated ObjectIo service instead.
-        rbe_router = rbe_router.add_service(broker.rpc_service());
+        rbe_router = rbe_router
+            .add_service(broker.rpc_service())
+            .add_service(broker.control_rpc_service());
     }
+
     let bes = if config.bes.enabled {
         let settings = &config.bes;
         let bes_key = credentials.bes.clone();
@@ -954,10 +998,23 @@ pub async fn serve(mut config: Config) -> Result<()> {
         let _ = std::fs::remove_file(state.config.state_dir.join("bos-mount.json"));
     }
     state.proxy.wait_for_reads_idle().await?;
+    #[cfg(target_os = "linux")]
+    {
+        let source = state.source_cas.clone();
+        tokio::task::spawn_blocking(move || {
+            let result = source.shutdown();
+            drop(source);
+            result
+        })
+        .await
+        .context("source cache shutdown worker failed")??;
+    }
     state.cache.wait_for_idle().await?;
     state.cache.flush_recency()?;
     let _ = std::fs::remove_file(socket);
     let _ = std::fs::remove_file(cache_socket);
+    drop(state);
+    drop(proxy);
     drop(lock);
     run
 }
@@ -966,26 +1023,42 @@ pub async fn serve(mut config: Config) -> Result<()> {
 mod tests {
     use super::*;
 
+    struct UnusedNativeCacheSource;
+    #[async_trait::async_trait]
+    impl local_cas::BlobSource for UnusedNativeCacheSource {
+        async fn fetch(&self, _: &local_cas::Artifact, _: &mut File) -> Result<()> {
+            anyhow::bail!("native startup fixture must not fetch remote bytes")
+        }
+        async fn missing(&self, _: &[local_cas::Artifact]) -> Result<Vec<local_cas::Artifact>> {
+            anyhow::bail!("native startup fixture must not query remote objects")
+        }
+    }
+
     #[test]
     fn native_store_initialization_reuses_one_owner_and_refuses_partial_or_unrelated_state()
     -> Result<()> {
         let directory = tempfile::tempdir()?;
+        let cache = LocalCas::open(
+            directory.path().join("cas"),
+            Arc::new(UnusedNativeCacheSource),
+            CacheConfig::default(),
+        )?;
         let mut config = Config::default();
         config.state_dir = directory.path().join("state");
         private_dir(&config.state_dir)?;
-        assert!(open_native_repositories(&config)?.is_none());
+        assert!(open_native_repositories(&config, &cache, &BTreeMap::new())?.is_none());
         assert!(!config.state_dir.join("native").exists());
         config
             .native
             .repositories
             .insert("example".into(), Default::default());
-        let broker = open_native_repositories(&config)?.unwrap();
+        let broker = open_native_repositories(&config, &cache, &BTreeMap::new())?.unwrap();
         assert!(
-            open_native_repositories(&config).is_err(),
+            open_native_repositories(&config, &cache, &BTreeMap::new()).is_err(),
             "a second provider must not steal the live owner lock"
         );
         drop(broker);
-        let reopened = open_native_repositories(&config)?.unwrap();
+        let reopened = open_native_repositories(&config, &cache, &BTreeMap::new())?.unwrap();
         drop(reopened);
 
         for partial in [false, true] {
@@ -1001,7 +1074,7 @@ mod tests {
             } else {
                 std::fs::write(path.join("sentinel"), b"unrelated bytes")?;
             }
-            assert!(open_native_repositories(&config).is_err());
+            assert!(open_native_repositories(&config, &cache, &BTreeMap::new()).is_err());
             if partial {
                 assert!(
                     std::fs::read_dir(path.join("native-objects"))?
