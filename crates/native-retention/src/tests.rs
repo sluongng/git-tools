@@ -1081,6 +1081,713 @@ async fn dirty_capture_drains_physical_jobs_and_commits_after_the_caller_is_canc
 }
 
 #[test]
+fn redundant_capture_retirement_advances_beyond_capacity_and_replays_durable_cleanup_after_reopen()
+{
+    block_on(async {
+        let directory = tempfile::tempdir().unwrap();
+        let limits = Limits {
+            max_pending_captures: 2,
+            ..Limits::default()
+        };
+        let mut registry = Registry::init(
+            directory.path(),
+            RegistryId([1; 16]),
+            Tracking::ManagedFresh,
+            limits.clone(),
+        )
+        .await
+        .unwrap();
+        let registration = registry
+            .register(WorkspaceId([2; 16]), OpStoreId([3; 16]))
+            .await
+            .unwrap();
+        let mut previous: Option<PendingCapture> = None;
+        for seed in 4..11 {
+            let command = registry.begin_command(registration).await.unwrap();
+            let path = directory.path().to_owned();
+            let current = registry
+                .capture_dirty(command.token(), move || async move {
+                    let mut captured = staged_capture(&path, seed);
+                    captured
+                        .checkpoint
+                        .roots
+                        .extend((4..seed).map(|old| checkpoint(old).roots[0]));
+                    Ok(captured)
+                })
+                .await
+                .unwrap();
+            drop(command);
+            if let Some(old) = previous {
+                let before = registry.workspace(registration).await.unwrap();
+                let cleanup = registry
+                    .retire_redundant_capture(old.clone(), current.clone(), cleanup_upload(seed))
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    registry.workspace(registration).await.unwrap(),
+                    before,
+                    "retirement never changes Dirty state or current operation"
+                );
+                assert!(cleanup.remove_bundle);
+                assert!(registry.capture_cleanup_pending().unwrap());
+                assert_eq!(cleanup.retired_binding, old.binding());
+                assert_eq!(cleanup.successor_binding, current.binding());
+                assert_eq!(
+                    registry.pending_captures().await.unwrap(),
+                    vec![current.clone()]
+                );
+                assert_eq!(
+                    registry
+                        .retire_redundant_capture(
+                            old.clone(),
+                            current.clone(),
+                            cleanup_upload(seed)
+                        )
+                        .await
+                        .unwrap(),
+                    cleanup,
+                    "exact lost-reply replay returns the same fixed obligation"
+                );
+                assert!(matches!(
+                    registry.read_capture(old.id).await,
+                    Err(Error::UnknownCapture)
+                ));
+                assert!(
+                    directory
+                        .path()
+                        .join(format!("bundle-{}", seed - 1))
+                        .exists(),
+                    "registry retirement never unlinks capsule or native data"
+                );
+                drop(registry);
+                registry =
+                    Registry::open_existing(directory.path(), RegistryId([1; 16]), limits.clone())
+                        .await
+                        .unwrap();
+                assert_eq!(
+                    registry.capture_cleanup().await.unwrap(),
+                    Some(cleanup.clone())
+                );
+                assert!(registry.capture_cleanup_pending().unwrap());
+                let guard = registry.try_capture_cleanup().await.unwrap().unwrap();
+                assert_eq!(guard.obligation(), &cleanup);
+                assert!(
+                    matches!(registry.try_host_access(), Err(Error::Busy)),
+                    "physical cleanup excludes writers/readers through fsync and ACK"
+                );
+                guard.acknowledge_capture_cleanup().await.unwrap();
+                assert_eq!(registry.capture_cleanup().await.unwrap(), None);
+                assert!(!registry.capture_cleanup_pending().unwrap());
+                assert!(registry.try_capture_cleanup().await.unwrap().is_none());
+                assert_eq!(
+                    registry.pending_captures().await.unwrap(),
+                    vec![current.clone()]
+                );
+            }
+            previous = Some(current);
+        }
+        assert_eq!(
+            registry.workspace(registration).await.unwrap().state,
+            WorkspaceState::Dirty
+        );
+        assert!(matches!(
+            registry.acquire_collector().await,
+            Err(Error::DirtyWorkspace)
+        ));
+        drop(registry);
+        let registry = Registry::open_existing(directory.path(), RegistryId([1; 16]), limits)
+            .await
+            .unwrap();
+        assert_eq!(
+            registry.pending_captures().await.unwrap(),
+            vec![previous.unwrap()]
+        );
+        assert!(registry.capture_cleanup().await.unwrap().is_none());
+    });
+}
+
+fn cleanup_upload(seed: u8) -> CaptureUploadCleanup {
+    CaptureUploadCleanup {
+        job: Some(BundleDescriptor {
+            blake3: [seed; 32],
+            size_bytes: 64,
+        }),
+        published: BundleDescriptor {
+            blake3: [seed.wrapping_add(1); 32],
+            size_bytes: 64,
+        },
+    }
+}
+
+#[test]
+fn canonical_capture_coverage_proves_anchored_typed_paths_without_file_payloads() {
+    use tinytree_model as m;
+    let file = m::describe_file(b"selected file body stays outside the proof");
+    let leaf = m::encode(
+        &m::Object::Tree(m::Tree {
+            entries: vec![m::TreeEntry {
+                name: "file".into(),
+                value: m::TreeValue::File {
+                    id: m::FileId(file.key.id.0),
+                    executable: false,
+                    size_bytes: file.size_bytes,
+                    copy_id: None,
+                },
+            }],
+        }),
+        m::Limits::default(),
+    )
+    .unwrap();
+    let tree = m::encode(
+        &m::Object::Tree(m::Tree {
+            entries: vec![m::TreeEntry {
+                name: "dir".into(),
+                value: m::TreeValue::Tree(m::TreeId(leaf.descriptor.key.id.0)),
+            }],
+        }),
+        m::Limits::default(),
+    )
+    .unwrap();
+    let commit_for = |tree: ObjectKey| {
+        let mut commit = m::synthetic_root();
+        commit.parents = vec![m::CommitId::ROOT];
+        commit.change_id = m::ChangeId([9; 16]);
+        commit.root_tree.terms = vec![m::TreeId(tree.id.0)];
+        m::encode(&m::Object::Commit(commit), m::Limits::default()).unwrap()
+    };
+    let commit = commit_for(tree.descriptor.key);
+    let one_hop = commit_for(leaf.descriptor.key);
+    let mut wrong_hash = commit.clone();
+    wrong_hash.bytes[0] ^= 1;
+    let mut wrong_kind = commit.clone();
+    wrong_kind.descriptor.key.kind = Kind::Tree;
+    struct Case {
+        name: &'static str,
+        roots: Vec<ObjectKey>,
+        successor: Vec<ObjectKey>,
+        proof: Vec<m::EncodedObject>,
+        success: bool,
+    }
+    let many_edges = m::encode(
+        &m::Object::Tree(m::Tree {
+            entries: (0..100_000)
+                .map(|i| m::TreeEntry {
+                    name: format!("file-{i:06}"),
+                    value: m::TreeValue::File {
+                        id: m::FileId(file.key.id.0),
+                        executable: false,
+                        size_bytes: file.size_bytes,
+                        copy_id: Some(m::CopyId([8; 32])),
+                    },
+                })
+                .collect(),
+        }),
+        m::Limits::default(),
+    )
+    .unwrap();
+    let cases = vec![
+        Case {
+            name: "old working-copy tree retained through historical commit",
+            roots: vec![leaf.descriptor.key],
+            successor: vec![one_hop.descriptor.key],
+            proof: vec![one_hop],
+            success: true,
+        },
+        Case {
+            name: "multi-hop typed file edge with order-independent metadata",
+            roots: vec![leaf.descriptor.key, file.key],
+            successor: vec![commit.descriptor.key],
+            proof: vec![leaf.clone(), commit.clone(), tree.clone()],
+            success: true,
+        },
+        Case {
+            name: "wrong witness hash",
+            roots: vec![file.key],
+            successor: vec![commit.descriptor.key],
+            proof: vec![wrong_hash],
+            success: false,
+        },
+        Case {
+            name: "wrong witness kind",
+            roots: vec![file.key],
+            successor: vec![commit.descriptor.key],
+            proof: vec![wrong_kind],
+            success: false,
+        },
+        Case {
+            name: "unanchored but otherwise valid proof",
+            roots: vec![file.key],
+            successor: vec![m::empty_tree().descriptor.key],
+            proof: vec![commit.clone(), tree.clone(), leaf.clone()],
+            success: false,
+        },
+        Case {
+            name: "missing intermediate metadata",
+            roots: vec![file.key],
+            successor: vec![commit.descriptor.key],
+            proof: vec![commit.clone(), leaf.clone()],
+            success: false,
+        },
+        Case {
+            name: "same digest wrong typed destination",
+            roots: vec![ObjectKey {
+                kind: Kind::Symlink,
+                id: file.key.id,
+            }],
+            successor: vec![commit.descriptor.key],
+            proof: vec![commit.clone(), tree.clone(), leaf.clone()],
+            success: false,
+        },
+        Case {
+            name: "FILE payload is never metadata proof",
+            roots: vec![file.key],
+            successor: vec![commit.descriptor.key],
+            proof: vec![m::EncodedObject {
+                descriptor: file,
+                bytes: b"selected file body stays outside the proof".to_vec(),
+            }],
+            success: false,
+        },
+        Case {
+            name: "oversized raw proof",
+            roots: vec![file.key],
+            successor: vec![commit.descriptor.key],
+            proof: vec![m::EncodedObject {
+                descriptor: tree.descriptor,
+                bytes: vec![0; MAX_CAPTURE_COVERAGE_BYTES + 1],
+            }],
+            success: false,
+        },
+        Case {
+            name: "too many proof records",
+            roots: vec![file.key],
+            successor: vec![commit.descriptor.key],
+            proof: vec![commit.clone(); MAX_CAPTURE_COVERAGE_OBJECTS + 1],
+            success: false,
+        },
+        Case {
+            name: "too many canonical graph edges",
+            roots: vec![file.key],
+            successor: vec![many_edges.descriptor.key],
+            proof: vec![many_edges],
+            success: false,
+        },
+    ];
+    block_on(async {
+        for case in cases {
+            let (directory, registry) = registry().await;
+            let registration = registry
+                .register(WorkspaceId([2; 16]), OpStoreId([3; 16]))
+                .await
+                .unwrap();
+            let mut tickets = Vec::new();
+            for (seed, roots) in [(4, case.roots), (5, case.successor)] {
+                let command = registry.begin_command(registration).await.unwrap();
+                let path = directory.path().to_owned();
+                tickets.push(
+                    registry
+                        .capture_dirty(command.token(), move || async move {
+                            let mut bundle = staged_capture(&path, seed);
+                            bundle.checkpoint.roots = roots;
+                            Ok(bundle)
+                        })
+                        .await
+                        .unwrap(),
+                );
+                drop(command);
+            }
+            let result = registry
+                .retire_redundant_capture_with_coverage(
+                    tickets[0].clone(),
+                    tickets[1].clone(),
+                    cleanup_upload(1),
+                    OwnedCaptureCoverage::new(case.proof, Arc::new(())),
+                )
+                .await;
+            assert_eq!(result.is_ok(), case.success, "{}: {result:?}", case.name);
+            if case.success {
+                assert_eq!(
+                    registry.pending_captures().await.unwrap(),
+                    vec![tickets[1].clone()]
+                );
+                assert!(registry.capture_cleanup_pending().unwrap());
+            } else {
+                tickets.sort_by_key(|ticket| ticket.id);
+                assert_eq!(registry.pending_captures().await.unwrap(), tickets);
+                assert!(!registry.capture_cleanup_pending().unwrap());
+            }
+            assert_eq!(
+                registry.workspace(registration).await.unwrap().state,
+                WorkspaceState::Dirty
+            );
+        }
+    });
+}
+
+#[tokio::test]
+async fn capture_retirement_rejects_stale_uncovered_and_foreign_rows_and_preserves_shared_packs() {
+    let (directory, registry) = registry().await;
+    let registration = registry
+        .register(WorkspaceId([2; 16]), OpStoreId([3; 16]))
+        .await
+        .unwrap();
+    let mut tickets = Vec::new();
+    for seed in [4, 5, 6] {
+        let command = registry.begin_command(registration).await.unwrap();
+        let path = directory.path().to_owned();
+        let ticket = registry
+            .capture_dirty(command.token(), move || async move {
+                let mut captured = staged_capture(&path, seed);
+                if seed == 6 {
+                    captured.checkpoint.roots.push(checkpoint(4).roots[0]);
+                }
+                Ok(captured)
+            })
+            .await
+            .unwrap();
+        drop(command);
+        tickets.push(ticket);
+    }
+    let old = tickets[0].clone();
+    let successor = tickets[2].clone();
+    let read = registry.read_capture(old.id).await.unwrap();
+    assert!(matches!(
+        registry
+            .retire_redundant_capture(old.clone(), successor.clone(), cleanup_upload(1))
+            .await,
+        Err(Error::Busy)
+    ));
+    drop(read);
+    assert!(
+        matches!(
+            registry
+                .retire_redundant_capture(old.clone(), tickets[1].clone(), cleanup_upload(1))
+                .await,
+            Err(Error::Invalid(_))
+        ),
+        "a later timestamp is not root coverage"
+    );
+    assert!(
+        matches!(
+            registry
+                .retire_redundant_capture(successor.clone(), old.clone(), cleanup_upload(1))
+                .await,
+            Err(Error::Invalid(_))
+        ),
+        "latest cannot be retired into an older capsule"
+    );
+    assert!(matches!(
+        registry
+            .retire_redundant_capture(old.clone(), old.clone(), cleanup_upload(1))
+            .await,
+        Err(Error::Invalid(_))
+    ));
+    let mut stale = successor.clone();
+    stale.bundle.size_bytes += 1;
+    assert_eq!(
+        registry
+            .retire_redundant_capture(old.clone(), stale, cleanup_upload(1))
+            .await
+            .unwrap_err(),
+        Error::CheckpointConflict
+    );
+    let mut missing = old.clone();
+    missing.id = CaptureId([0; 32]);
+    assert_eq!(
+        registry
+            .retire_redundant_capture(missing, successor.clone(), cleanup_upload(1))
+            .await
+            .unwrap_err(),
+        Error::UnknownCapture
+    );
+    let other = registry
+        .register(WorkspaceId([7; 16]), OpStoreId([8; 16]))
+        .await
+        .unwrap();
+    let command = registry.begin_command(other).await.unwrap();
+    let shared_bundle = old.bundle;
+    let shared = registry
+        .capture_dirty(command.token(), move || async move {
+            Ok(CaptureBundle {
+                checkpoint: checkpoint(4),
+                bundle: shared_bundle,
+            })
+        })
+        .await
+        .unwrap();
+    drop(command);
+    assert!(matches!(
+        registry
+            .retire_redundant_capture(old.clone(), shared.clone(), cleanup_upload(1))
+            .await,
+        Err(Error::Invalid(_))
+    ));
+    let cleanup = registry
+        .retire_redundant_capture(old.clone(), successor.clone(), cleanup_upload(1))
+        .await
+        .unwrap();
+    assert!(
+        !cleanup.remove_bundle,
+        "a shared digest is never a pack unlink permit"
+    );
+    assert!(
+        matches!(
+            registry
+                .retire_redundant_capture(tickets[1].clone(), successor, cleanup_upload(1))
+                .await,
+            Err(Error::Busy)
+        ),
+        "fixed cleanup slot cannot accumulate obligations"
+    );
+    assert!(registry.read_capture(shared.id).await.is_ok());
+    let guard = registry.try_capture_cleanup().await.unwrap().unwrap();
+    assert_eq!(guard.obligation(), &cleanup);
+    drop(guard);
+    assert_eq!(registry.capture_cleanup().await.unwrap(), Some(cleanup));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cancelled_retirement_keeps_its_exclusive_fence_until_the_transaction_finishes() {
+    struct CoverageOwner {
+        registry: Registry,
+        dropped: Option<tokio::sync::oneshot::Sender<u64>>,
+    }
+    impl Drop for CoverageOwner {
+        fn drop(&mut self) {
+            self.dropped
+                .take()
+                .unwrap()
+                .send(self.registry.storage_stats().transactions)
+                .unwrap();
+        }
+    }
+    let (directory, registry) = registry().await;
+    let registration = registry
+        .register(WorkspaceId([2; 16]), OpStoreId([3; 16]))
+        .await
+        .unwrap();
+    let mut tickets = Vec::new();
+    for seed in [4, 5] {
+        let command = registry.begin_command(registration).await.unwrap();
+        let path = directory.path().to_owned();
+        tickets.push(
+            registry
+                .capture_dirty(command.token(), move || async move {
+                    let mut bundle = staged_capture(&path, seed);
+                    bundle.checkpoint.roots.push(checkpoint(4).roots[0]);
+                    bundle
+                        .checkpoint
+                        .roots
+                        .push(tinytree_model::empty_tree().descriptor.key);
+                    Ok(bundle)
+                })
+                .await
+                .unwrap(),
+        );
+        drop(command);
+    }
+    let locked = registry.inner.clone();
+    let (entered, arrived) = tokio::sync::oneshot::channel();
+    let (release, released) = std::sync::mpsc::channel();
+    let mutex_owner = std::thread::spawn(move || {
+        let _data = locked.data.lock().unwrap();
+        entered.send(()).unwrap();
+        released.recv().unwrap();
+    });
+    arrived.await.unwrap();
+    let retiring = registry.clone();
+    assert_eq!(registry.capture_cleanup_pending(), Err(Error::Busy));
+    let old = tickets[0].clone();
+    let successor = tickets[1].clone();
+    let before = registry.storage_stats().transactions;
+    let (proof_dropped, dropped) = tokio::sync::oneshot::channel();
+    let proof = OwnedCaptureCoverage::new(
+        vec![tinytree_model::empty_tree()],
+        Arc::new(CoverageOwner {
+            registry: registry.clone(),
+            dropped: Some(proof_dropped),
+        }),
+    );
+    let waiter = tokio::spawn(async move {
+        retiring
+            .retire_redundant_capture_with_coverage(old, successor, cleanup_upload(1), proof)
+            .await
+    });
+    tokio::time::timeout(Duration::from_secs(3), async {
+        while registry.inner.fence.try_read().is_ok() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    waiter.abort();
+    assert!(waiter.await.unwrap_err().is_cancelled());
+    assert!(matches!(registry.try_host_access(), Err(Error::Busy)));
+    release.send(()).unwrap();
+    mutex_owner.join().unwrap();
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(3), dropped)
+            .await
+            .unwrap()
+            .unwrap(),
+        before + 1,
+        "coverage payload admission survives canonical verification and actual SyncAll after cancellation"
+    );
+    let cleanup = tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            if let Some(cleanup) = registry.capture_cleanup().await.unwrap() {
+                break cleanup;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(cleanup.retired.id, tickets[0].id);
+    assert_eq!(
+        registry.pending_captures().await.unwrap(),
+        vec![tickets[1].clone()]
+    );
+    assert_eq!(
+        registry.workspace(registration).await.unwrap().state,
+        WorkspaceState::Dirty
+    );
+    let guard = registry.try_capture_cleanup().await.unwrap().unwrap();
+    let locked = registry.inner.clone();
+    let (entered, arrived) = tokio::sync::oneshot::channel();
+    let (release, released) = std::sync::mpsc::channel();
+    let mutex_owner = std::thread::spawn(move || {
+        let _data = locked.data.lock().unwrap();
+        entered.send(()).unwrap();
+        released.recv().unwrap();
+    });
+    arrived.await.unwrap();
+    let (accepted, acceptance) = tokio::sync::oneshot::channel();
+    let waiter = tokio::spawn(async move {
+        let mut ack = std::pin::pin!(guard.acknowledge_capture_cleanup());
+        assert!(futures::poll!(&mut ack).is_pending());
+        accepted.send(()).unwrap();
+        ack.await
+    });
+    acceptance.await.unwrap();
+    waiter.abort();
+    assert!(waiter.await.unwrap_err().is_cancelled());
+    assert!(
+        matches!(registry.try_host_access(), Err(Error::Busy)),
+        "ACK cancellation retains the real exclusive cleanup owner"
+    );
+    release.send(()).unwrap();
+    mutex_owner.join().unwrap();
+    tokio::time::timeout(Duration::from_secs(3), async {
+        while registry.capture_cleanup().await.unwrap().is_some() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+}
+
+#[test]
+fn retired_capture_reopen_rejects_missing_or_rebound_cleanup_state() {
+    use fjall::Readable;
+    #[derive(Clone, Copy, Debug)]
+    enum Corruption {
+        MissingCleanup,
+        MissingCommitment,
+        ReboundUpload,
+        MissingSuccessor,
+        Downgrade,
+    }
+    block_on(async {
+        for corruption in [
+            Corruption::MissingCleanup,
+            Corruption::MissingCommitment,
+            Corruption::ReboundUpload,
+            Corruption::MissingSuccessor,
+            Corruption::Downgrade,
+        ] {
+            let (directory, registry) = registry().await;
+            let registration = registry
+                .register(WorkspaceId([2; 16]), OpStoreId([3; 16]))
+                .await
+                .unwrap();
+            let mut tickets = Vec::new();
+            for seed in [4, 5] {
+                let command = registry.begin_command(registration).await.unwrap();
+                let path = directory.path().to_owned();
+                tickets.push(
+                    registry
+                        .capture_dirty(command.token(), move || async move {
+                            let mut bundle = staged_capture(&path, seed);
+                            bundle.checkpoint.roots.push(checkpoint(4).roots[0]);
+                            Ok(bundle)
+                        })
+                        .await
+                        .unwrap(),
+                );
+                drop(command);
+            }
+            registry
+                .retire_redundant_capture(tickets[0].clone(), tickets[1].clone(), cleanup_upload(1))
+                .await
+                .unwrap();
+            drop(registry);
+            {
+                let db = fjall::SingleWriterTxDatabase::builder(directory.path().join("metadata"))
+                    .manual_journal_persist(true)
+                    .open()
+                    .unwrap();
+                let meta = db
+                    .keyspace("meta", fjall::KeyspaceCreateOptions::default)
+                    .unwrap();
+                let captures = db
+                    .keyspace("captures", fjall::KeyspaceCreateOptions::default)
+                    .unwrap();
+                let raw = db.read_tx().get(&meta, b"manifest").unwrap().unwrap();
+                let mut manifest: serde_json::Value = serde_json::from_slice(&raw).unwrap();
+                assert_eq!(
+                    manifest["version"], 3,
+                    "pre-retirement readers explicitly reject this version"
+                );
+                let mut tx = db.write_tx().durability(Some(fjall::PersistMode::SyncAll));
+                match corruption {
+                    Corruption::MissingCleanup => {
+                        manifest.as_object_mut().unwrap().remove("cleanup");
+                    }
+                    Corruption::MissingCommitment => {
+                        manifest
+                            .as_object_mut()
+                            .unwrap()
+                            .remove("cleanup_commitment");
+                    }
+                    Corruption::ReboundUpload => {
+                        manifest["cleanup"]["upload"]["published"]["size_bytes"] = 65.into();
+                    }
+                    Corruption::MissingSuccessor => tx.remove(&captures, tickets[1].id.0),
+                    Corruption::Downgrade => {
+                        manifest["version"] = 2.into();
+                    }
+                }
+                tx.insert(&meta, b"manifest", serde_json::to_vec(&manifest).unwrap());
+                tx.commit().unwrap();
+            }
+            assert!(
+                matches!(
+                    Registry::open_existing(
+                        directory.path(),
+                        RegistryId([1; 16]),
+                        Limits::default()
+                    )
+                    .await,
+                    Err(Error::Corrupt(_))
+                ),
+                "{corruption:?}"
+            );
+        }
+    });
+}
+
+#[test]
 fn dirty_capture_errors_and_aggregate_limits_never_clean_or_erase_queued_tickets() {
     block_on(async {
         for limits in [

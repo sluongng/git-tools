@@ -1131,6 +1131,11 @@ impl NativeCommandHost {
     pub(crate) fn capture_registry(&self) -> Registry {
         self.inner.registry.clone()
     }
+    pub(crate) async fn pause_capture_cleanup(
+        &self,
+    ) -> Result<Arc<crate::native_capture::SpoolCleanupGuard>> {
+        self.inner.capture.pause_for_cleanup().await
+    }
     pub(crate) async fn collect_native(
         &self,
         store: Arc<jj_native_backend::DirectObjectIo>,
@@ -1181,7 +1186,15 @@ impl NativeCommandHost {
     }
     pub fn status(&self) -> serde_json::Value {
         let stats = self.inner.registry.storage_stats();
-        serde_json::json!({"active_commands":self.inner.sessions.lock().map(|s|s.len()).unwrap_or(MAX_ACTIVE),"registered_workspaces":self.inner.workspaces.read().map(|w|w.len()).unwrap_or(4096),"collection_enabled":self.inner.gc.config.policy==crate::config::NativeGcPolicy::LocalComplete,"local_gc":self.inner.gc.status(),"local_capture":self.inner.capture.status(),"capture_upload":self.inner.upload_status.get().map(|stats|stats.status()),
+        // A durable obligation remains visible even when upload is disabled or
+        // switched back to retention-only. Busy/unknown is null, never false.
+        let cleanup_pending = self.inner.registry.capture_cleanup_pending().ok();
+        let upload = self.inner.upload_status.get().map(|stats| {
+            let mut status = stats.status();
+            status["cleanup_pending"] = serde_json::json!(cleanup_pending);
+            status
+        });
+        serde_json::json!({"active_commands":self.inner.sessions.lock().map(|s|s.len()).unwrap_or(MAX_ACTIVE),"registered_workspaces":self.inner.workspaces.read().map(|w|w.len()).unwrap_or(4096),"collection_enabled":self.inner.gc.config.policy==crate::config::NativeGcPolicy::LocalComplete,"local_gc":self.inner.gc.status(),"local_capture":self.inner.capture.status(),"capture_upload":upload,"capture_cleanup_pending":cleanup_pending,
             "dirty_transitions":self.inner.dirty_transitions.load(Ordering::Relaxed),"dirty_transition_ns":self.inner.dirty_transition_ns.load(Ordering::Relaxed),"physical_drains":self.inner.drains.load(Ordering::Relaxed),"physical_drain_ns":self.inner.physical_drain_ns.load(Ordering::Relaxed),"retention_transactions":stats.transactions,"retention_encoded_write_bytes":stats.encoded_write_bytes})
     }
     pub async fn workspace_state(&self, mount: &str) -> Result<native_retention::WorkspaceInfo> {

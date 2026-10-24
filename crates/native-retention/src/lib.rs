@@ -261,6 +261,127 @@ pub struct PendingCapture {
     pub bundle: BundleDescriptor,
     pub checkpoint: RootCheckpoint,
 }
+impl PendingCapture {
+    /// Stable binding used by local upload journals; not a backup receipt.
+    pub fn binding(&self) -> [u8; 32] {
+        let mut h = blake3::Hasher::new();
+        h.update(b"native-upload-pending-ticket-v1\0");
+        h.update(&self.id.0);
+        h.update(&self.registry.0);
+        h.update(&self.registration.workspace.0);
+        h.update(&self.registration.op_store.0);
+        for n in [
+            self.registration.generation,
+            self.command_epoch,
+            self.registry_epoch,
+            self.bundle.size_bytes,
+        ] {
+            h.update(&n.to_le_bytes());
+        }
+        h.update(&self.fingerprint);
+        h.update(&self.bundle.blake3);
+        h.update(&(self.checkpoint.roots.len() as u64).to_le_bytes());
+        for root in &self.checkpoint.roots {
+            h.update(&[root.kind as u8]);
+            h.update(&root.id.0);
+        }
+        h.update(&(self.checkpoint.op_heads.len() as u64).to_le_bytes());
+        for id in &self.checkpoint.op_heads {
+            h.update(&(id.len() as u64).to_le_bytes());
+            h.update(id);
+        }
+        match &self.checkpoint.working_copy_operation {
+            Some(id) => {
+                h.update(&[1]);
+                h.update(&(id.len() as u64).to_le_bytes());
+                h.update(id);
+            }
+            None => {
+                h.update(&[0]);
+            }
+        }
+        *h.finalize().as_bytes()
+    }
+}
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CaptureCleanupTarget {
+    pub id: CaptureId,
+    pub bundle: BundleDescriptor,
+}
+/// Exact immutable local upload-journal bytes verified by the trusted host.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CaptureUploadCleanup {
+    pub job: Option<BundleDescriptor>,
+    pub published: BundleDescriptor,
+}
+pub const MAX_CAPTURE_COVERAGE_OBJECTS: usize = 4096;
+pub const MAX_CAPTURE_COVERAGE_BYTES: usize = 16 * 1024 * 1024;
+pub const MAX_CAPTURE_COVERAGE_EDGES: usize = 100_000;
+/// Conservative logical reservation for raw metadata, validation scratch and
+/// the bounded reachability graph, not eager allocation or an RSS guarantee.
+pub const MAX_CAPTURE_COVERAGE_WORK_BYTES: usize = 128 * 1024 * 1024;
+/// Canonical metadata witnesses and their admitted physical memory/I/O owner.
+/// Payload drops before the owner, including discarded cancelled worker results.
+pub struct OwnedCaptureCoverage {
+    objects: Vec<tinytree_model::EncodedObject>,
+    _owner: Arc<dyn std::any::Any + Send + Sync>,
+}
+impl OwnedCaptureCoverage {
+    pub fn new(
+        objects: Vec<tinytree_model::EncodedObject>,
+        owner: Arc<dyn std::any::Any + Send + Sync>,
+    ) -> Self {
+        Self {
+            objects,
+            _owner: owner,
+        }
+    }
+}
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CaptureCleanupObligation {
+    pub id: [u8; 32],
+    pub registry: RegistryId,
+    pub registration: Registration,
+    pub registry_epoch: u64,
+    pub retired: CaptureCleanupTarget,
+    pub successor: CaptureCleanupTarget,
+    pub retired_binding: [u8; 32],
+    pub successor_binding: [u8; 32],
+    pub upload: CaptureUploadCleanup,
+    /// False whenever another pending capture names this pack digest.
+    pub remove_bundle: bool,
+}
+/// Exclusive physical cleanup ownership. Retain this whole guard through exact
+/// file validation, unlink and directory fsync, then acknowledge. Dropping it
+/// never clears the durable obligation or changes workspace Dirty state.
+pub struct CaptureCleanupGuard {
+    obligation: CaptureCleanupObligation,
+    _write: OwnedRwLockWriteGuard<()>,
+    registry: Arc<storage::Inner>,
+}
+impl fmt::Debug for CaptureCleanupGuard {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("CaptureCleanupGuard")
+            .field("id", &self.obligation.id)
+            .finish_non_exhaustive()
+    }
+}
+impl CaptureCleanupGuard {
+    pub fn obligation(&self) -> &CaptureCleanupObligation {
+        &self.obligation
+    }
+    pub async fn acknowledge_capture_cleanup(self) -> Result<()> {
+        storage::blocking(move || {
+            let result = self.registry.acknowledge_capture_cleanup(&self.obligation);
+            drop(self); // Keep the whole exclusive owner through actual SyncAll.
+            result
+        })
+        .await
+    }
+}
 /// An exact durable pending ticket plus an independent collector/read fence.
 /// This is not a command token, live frontend proof, or remote backup receipt.
 /// It remains valid after the originating workspace is forgotten or advanced.
@@ -822,6 +943,91 @@ impl Registry {
     pub async fn pending_captures(&self) -> Result<Vec<PendingCapture>> {
         let inner = self.inner.clone();
         storage::blocking(move || inner.pending_captures()).await
+    }
+    /// Trusted-host attestation: before calling, freshly verify the old exact
+    /// remote retained capture and that the successor's synced local capsule
+    /// semantically covers every old OP/VIEW/index descriptor. This crate only
+    /// checks exact rows, typed roots and ordering; it performs no networking or
+    /// capsule parsing. Drop read guards first. Busy does not queue behind a
+    /// command/read owner. Once accepted, the physical transaction survives
+    /// waiter cancellation and retains the exclusive fence and process owner.
+    pub async fn retire_redundant_capture(
+        &self,
+        expected_old: PendingCapture,
+        expected_successor: PendingCapture,
+        upload: CaptureUploadCleanup,
+    ) -> Result<CaptureCleanupObligation> {
+        self.retire_redundant_capture_with_coverage(
+            expected_old,
+            expected_successor,
+            upload,
+            OwnedCaptureCoverage::new(Vec::new(), Arc::new(())),
+        )
+        .await
+    }
+    /// Like strict direct-root retirement, but allow bounded canonical metadata
+    /// witnesses proving old roots reachable from the exact successor roots.
+    /// No FILE payloads, unanchored witnesses, graph truncation or persisted
+    /// proof blobs are accepted. The physical owner survives verification and
+    /// SyncAll even if the logical waiter is cancelled.
+    pub async fn retire_redundant_capture_with_coverage(
+        &self,
+        expected_old: PendingCapture,
+        expected_successor: PendingCapture,
+        upload: CaptureUploadCleanup,
+        coverage: OwnedCaptureCoverage,
+    ) -> Result<CaptureCleanupObligation> {
+        self.inner.check()?;
+        let write = self
+            .inner
+            .fence
+            .clone()
+            .try_write_owned()
+            .map_err(|_| Error::Busy)?;
+        let inner = self.inner.clone();
+        storage::blocking(move || {
+            let _write = write;
+            let result = inner.retire_redundant_capture(
+                &expected_old,
+                &expected_successor,
+                upload,
+                &coverage.objects,
+            );
+            drop(coverage); // Retain full payload/admission through actual commit.
+            result
+        })
+        .await
+    }
+    /// Inspect the one durable cleanup slot; this value alone is not an unlink
+    /// permit. Use `try_capture_cleanup` for physical filesystem work.
+    pub async fn capture_cleanup(&self) -> Result<Option<CaptureCleanupObligation>> {
+        let inner = self.inner.clone();
+        storage::blocking(move || inner.capture_cleanup()).await
+    }
+    /// Bounded in-memory status only: no I/O, fence or unlink permission. Busy
+    /// or poisoned state is an error, never a false "no cleanup pending" claim.
+    pub fn capture_cleanup_pending(&self) -> Result<bool> {
+        self.inner.capture_cleanup_pending()
+    }
+    pub async fn try_capture_cleanup(&self) -> Result<Option<CaptureCleanupGuard>> {
+        self.inner.check()?;
+        let write = self
+            .inner
+            .fence
+            .clone()
+            .try_write_owned()
+            .map_err(|_| Error::Busy)?;
+        let inner = self.inner.clone();
+        storage::blocking(move || {
+            Ok(inner
+                .capture_cleanup()?
+                .map(|obligation| CaptureCleanupGuard {
+                    obligation,
+                    _write: write,
+                    registry: inner,
+                }))
+        })
+        .await
     }
     /// Pin one exact pending ticket and its native roots against collection.
     /// Lookup does not require a current workspace registration or command and

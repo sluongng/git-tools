@@ -228,6 +228,20 @@ impl Fixture {
         workspace_daemon::config::Config::load(&self.daemon_config).unwrap();
     }
 
+    fn enable_capture_retirement(&mut self) {
+        self.capture_policy("after_command_best_effort");
+        self.enable_capture_upload();
+        let mut config: toml::Value =
+            toml::from_str(&fs::read_to_string(&self.daemon_config).unwrap()).unwrap();
+        config["native"]["workspaces"]["capture"]
+            .as_table_mut()
+            .unwrap()
+            .insert("max_pending".into(), 2.into());
+        config["native"]["workspaces"]["upload"]["policy"] = "publish_retiring_redundant".into();
+        fs::write(&self.daemon_config, toml::to_string(&config).unwrap()).unwrap();
+        workspace_daemon::config::Config::load(&self.daemon_config).unwrap();
+    }
+
     fn start(&mut self) {
         assert!(self.daemon.is_none());
         let log = fs::File::create(self.base().join("daemon.log")).unwrap();
@@ -849,19 +863,29 @@ struct CountFileReads<S> {
     reads: Arc<AtomicUsize>,
     metadata: Arc<MetadataReads>,
 }
-impl<S, B> tower::Service<http::Request<B>> for CountFileReads<S>
+impl<S, B, R> tower::Service<http::Request<B>> for CountFileReads<S>
 where
-    S: tower::Service<http::Request<B>>,
+    S: tower::Service<http::Request<B>, Response = http::Response<R>>,
+    R: Default,
 {
     type Response = S::Response;
     type Error = S::Error;
-    type Future = S::Future;
+    type Future =
+        futures::future::Either<std::future::Ready<Result<Self::Response, Self::Error>>, S::Future>;
 
     fn poll_ready(&mut self, context: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
         self.inner.poll_ready(context)
     }
 
     fn call(&mut self, request: http::Request<B>) -> Self::Future {
+        if request.uri().path() == "/tinytree.cloud.v1.WorkspaceCloud/GetVersion"
+            && self.metadata.unavailable_versions.load(Ordering::Acquire)
+        {
+            return futures::future::Either::Left(std::future::ready(Ok(Status::not_found(
+                "fixture retained version temporarily unavailable",
+            )
+            .into_http())));
+        }
         self.metadata.transport_calls.fetch_add(1, Ordering::SeqCst);
         if request.uri().path() == "/tinytree.v1.Repository/ReadFile" {
             self.reads.fetch_add(1, Ordering::SeqCst);
@@ -883,12 +907,13 @@ where
         {
             self.metadata.landing_calls.fetch_add(1, Ordering::SeqCst);
         }
-        self.inner.call(request)
+        futures::future::Either::Right(self.inner.call(request))
     }
 }
 
 #[derive(Default)]
 struct MetadataReads {
+    unavailable_versions: AtomicBool,
     transport_calls: AtomicUsize,
     file_keys: Mutex<HashSet<[u8; 32]>>,
     writes: AtomicUsize,
@@ -2843,6 +2868,286 @@ fn federated_index_production_factory_preserves_operations_and_drains_cli_querie
     }
 }
 
+#[test]
+#[ignore = "requires usable /dev/fuse and fusermount3; run mounted_tests locally"]
+fn published_capture_retirement_continues_distinct_edits_and_restores_old_versions() {
+    let upstream = RemoteServer::start_with_cloud();
+    let mut fixture = Fixture::new();
+    fixture.configure_remote(&upstream.endpoint);
+    fixture.index_mode("federated");
+    fixture.enable_capture_retirement();
+    fixture.start();
+    let base = fixture.base().to_owned();
+    let root = base.join("retiring");
+    fixture.clone_remote(&root);
+    let binding = fixture.binding(&root);
+    let public = upstream.public();
+    let mut captures = Vec::new();
+    let mut first_pack = None;
+    let mut high_water_bytes = 0;
+    let mut largest_pack_bytes = 0;
+    let mut expected_publications = 0;
+    // More distinct edits than the configured TWO-ticket capacity. Do not use
+    // revision/log helpers here: those would create additional captures.
+    for edit in 0..5 {
+        if edit == 2 {
+            // New publications are still permitted while exact retained-version
+            // reads fail. An old proof failure must not starve the new upload.
+            upstream
+                .metadata
+                .unavailable_versions
+                .store(true, Ordering::Release);
+        }
+        let bytes = format!("private captured workspace file revision {edit}\n").into_bytes();
+        fs::write(root.join("capture-only.txt"), &bytes).unwrap();
+        fixture.success(&root, &["status"]);
+        let captured = local_capture_status(&fixture);
+        let queued = captured["queued"].as_u64().unwrap();
+        assert!(
+            queued > expected_publications,
+            "unique edit was not captured: {captured}"
+        );
+        expected_publications = queued;
+        assert_eq!(captured["pending_clean"], 0);
+        assert!(captured["pending_count"].as_u64().unwrap() <= 2);
+        let (wc, _) =
+            jj_vfs::native::read_retained_state_for_capture(&binding.projection(), 1024 * 1024)
+                .unwrap();
+        assert!(!wc.pending);
+        captures.push((wc.operation.hex(), bytes));
+        if edit == 2 {
+            let deadline = Instant::now() + Duration::from_secs(90);
+            while cloud_generation(&upstream, binding.workspace_id) < queued {
+                assert!(
+                    Instant::now() < deadline,
+                    "old proof failure starved newer backup upload"
+                );
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            let uncertain = local_capture_status(&fixture);
+            assert_eq!(
+                uncertain["pending_count"], 2,
+                "uncertain old and new capsules must remain local"
+            );
+            assert_eq!(uncertain["pending_clean"], 0);
+            assert_eq!(local_capture_bundles(&fixture).len(), 2);
+            upstream
+                .metadata
+                .unavailable_versions
+                .store(false, Ordering::Release);
+        }
+        let deadline = Instant::now() + Duration::from_secs(90);
+        loop {
+            let status = fixture.control(Request::Status).unwrap();
+            let local = &status["native"]["commands"]["local_capture"];
+            let upload = &status["native"]["commands"]["capture_upload"];
+            high_water_bytes = high_water_bytes.max(local["charged_spool_bytes"].as_u64().unwrap());
+            if local["pending_count"] == 1
+                && upload["historical_published_count"] == 1
+                && upload["cleanup_pending"] == false
+                && upload["retired_local_capture_count"].as_u64().unwrap() >= queued - 1
+            {
+                assert_eq!(upload["policy"], "publish_retiring_redundant");
+                assert_eq!(upload["policy_retires_redundant_capsules"], true);
+                assert_eq!(local["pending_dirty"], 1);
+                assert_eq!(local["pending_clean"], 0);
+                assert_eq!(local["pending_unavailable"], 0);
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "capture retirement did not progress: local={local};upload={upload};daemon={}",
+                fs::read_to_string(fixture.base().join("daemon.log")).unwrap()
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        let packs = local_capture_bundles(&fixture);
+        assert_eq!(packs.len(), 1, "old unique packs must actually be removed");
+        let actual_bytes: u64 = packs.values().map(|bytes| bytes.len() as u64).sum();
+        largest_pack_bytes = largest_pack_bytes.max(actual_bytes);
+        assert_eq!(
+            local_capture_status(&fixture)["charged_spool_bytes"],
+            actual_bytes
+        );
+        let upload = files_in(
+            &fixture
+                .socket
+                .parent()
+                .unwrap()
+                .join("native-commands/upload"),
+        );
+        assert_eq!(
+            upload.len(),
+            2,
+            "only the newest job and publication record remain"
+        );
+        if let Some(first) = &first_pack {
+            assert!(
+                !packs.contains_key(first),
+                "the old exact capsule remained local"
+            );
+        } else {
+            first_pack = Some(packs.keys().next().unwrap().clone());
+        }
+        assert_eq!(
+            upstream.public(),
+            public,
+            "private backup must not land edits"
+        );
+        assert_eq!(
+            upstream.file_reads(),
+            0,
+            "backup must not hydrate historical source FILEs"
+        );
+    }
+    assert!(expected_publications >= 5);
+    assert!(high_water_bytes > 0 && high_water_bytes <= 2 * largest_pack_bytes);
+    fixture.success(&base, &["tinytree", "unmount", root.to_str().unwrap()]);
+    fixture.stop_daemon();
+    fixture.start();
+    assert_eq!(local_capture_status(&fixture)["pending_count"], 1);
+    assert_eq!(local_capture_bundles(&fixture).len(), 1);
+    let versions =
+        retained_capture_versions(&upstream, binding.workspace_id, expected_publications);
+    fixture.success(&base, &["tinytree", "resume", root.to_str().unwrap()]);
+    let oldest_snapshot = versions
+        .iter()
+        .find_map(|(_, _, _, manifest, _)| {
+            let wc = &manifest.history.recovery.working_copy;
+            (capture_identity(&wc.wc_operation) == captures[0].0)
+                .then(|| capture_identity(&wc.snapshot_commit))
+        })
+        .expect("oldest captured operation missing remotely");
+    assert_eq!(
+        fixture
+            .success(
+                &root,
+                &[
+                    "--ignore-working-copy",
+                    "--at-op",
+                    &captures[0].0,
+                    "log",
+                    "--no-graph",
+                    "-r",
+                    "@",
+                    "-T",
+                    "commit_id",
+                ]
+            )
+            .trim(),
+        oldest_snapshot,
+        "old operation/index associations must resolve the exact former snapshot"
+    );
+    assert_eq!(
+        fs::read(root.join("capture-only.txt")).unwrap(),
+        captures.last().unwrap().1
+    );
+    fixture.success(&base, &["tinytree", "unmount", root.to_str().unwrap()]);
+    fixture.stop_daemon();
+
+    // Read only the actual remote retained versions. Old private packs have
+    // already gone; neither restore may depend on a saved local capsule.
+    for selected in [captures.first().unwrap(), captures.last().unwrap()] {
+        let (generation, manifest_id, raw, _manifest, capsule) = versions
+            .iter()
+            .find(|(_, _, _, manifest, _)| {
+                capture_identity(&manifest.history.recovery.working_copy.wc_operation) == selected.0
+            })
+            .expect("distinct edited snapshot missing from retained cloud history");
+        let data = tinytree_cloud::decode_data(
+            capsule,
+            tinytree_cloud::CaptureDataId::of(capsule).0,
+            &Default::default(),
+        )
+        .unwrap();
+        let selection = workspace_daemon::control::NativeRestoreSelection {
+            workspace_id: binding.workspace_id,
+            generation: *generation,
+            manifest_id: manifest_id.0,
+            manifest_blake3: raw.blake3,
+            manifest_size_bytes: raw.size_bytes,
+        };
+        restore_retired_capture(&upstream, &selection, &data, &selected.1);
+    }
+}
+
+fn cloud_generation(upstream: &RemoteServer, workspace: [u8; 32]) -> u64 {
+    use tinytree_client::cloud_protocol as c;
+    upstream.runtime.as_ref().unwrap().block_on(async {
+        let mut client =
+            c::workspace_cloud_client::WorkspaceCloudClient::connect(upstream.endpoint.clone())
+                .await
+                .unwrap()
+                .accept_compressed(CompressionEncoding::Zstd);
+        let mut request = RpcRequest::new(c::GetWorkspaceRequest {
+            repository_id: "example".into(),
+            workspace_id: workspace.to_vec(),
+        });
+        request.metadata_mut().insert(
+            "authorization",
+            format!("Bearer {REMOTE_TOKEN}").parse().unwrap(),
+        );
+        request.set_timeout(Duration::from_secs(10));
+        client
+            .get_workspace(request)
+            .await
+            .unwrap()
+            .into_inner()
+            .generation
+    })
+}
+
+fn restore_retired_capture(
+    upstream: &RemoteServer,
+    selection: &workspace_daemon::control::NativeRestoreSelection,
+    data: &tinytree_cloud::CaptureData,
+    expected_bytes: &[u8],
+) {
+    let mut fixture = Fixture::new();
+    fixture.configure_remote(&upstream.endpoint);
+    fixture.start();
+    let base = fixture.base().to_owned();
+    let root = base.join("retired-restore");
+    let configuration = fixture.daemon_config.to_str().unwrap().to_owned();
+    fixture.success(
+        &base,
+        &[
+            "tinytree",
+            "restore",
+            root.to_str().unwrap(),
+            "--daemon-config",
+            &configuration,
+            "--store",
+            "example",
+            "--workspace-id",
+            &capture_identity(&[0x6d; 32]),
+            "--source-workspace",
+            &capture_identity(&selection.workspace_id),
+            "--generation",
+            &selection.generation.to_string(),
+            "--manifest",
+            &capture_identity(&selection.manifest_id),
+            "--manifest-blake3",
+            &capture_identity(&selection.manifest_blake3),
+            "--manifest-bytes",
+            &selection.manifest_size_bytes.to_string(),
+        ],
+    );
+    let binding = fixture.binding(&root);
+    assert_eq!(native_operation_heads(&binding), data.operation_heads);
+    let (wc, _) =
+        jj_vfs::native::read_retained_state_for_capture(&binding.projection(), 1024 * 1024)
+            .unwrap();
+    assert!(!wc.pending);
+    assert_eq!(wc.operation.hex(), data.working_copy.wc_operation);
+    assert_eq!(
+        fs::read(root.join("capture-only.txt")).unwrap(),
+        expected_bytes
+    );
+    fixture.success(&base, &["tinytree", "unmount", root.to_str().unwrap()]);
+    fixture.stop_daemon();
+}
+
 fn wait_for_capture_publications(fixture: &Fixture, expected: u64) -> serde_json::Value {
     let deadline = Instant::now() + Duration::from_secs(90);
     loop {
@@ -2923,13 +3228,19 @@ struct VerifiedRestoreCapture {
     objects: Vec<tinytree_cloud::VerifiedObject>,
 }
 
-fn verify_uploaded_capture(
+type RetainedCaptureVersion = (
+    u64,
+    tinytree_cloud::ManifestId,
+    tinytree_cloud::BlobDigest,
+    tinytree_cloud::ManifestV3,
+    Vec<u8>,
+);
+
+fn retained_capture_versions(
     upstream: &RemoteServer,
-    fixture: &Fixture,
-    binding: &native_workspace_admin::Binding,
-    packs: &BTreeMap<String, Vec<u8>>,
+    workspace_id: [u8; 32],
     expected_publications: u64,
-) -> VerifiedRestoreCapture {
+) -> Vec<RetainedCaptureVersion> {
     use tinytree_client::cloud_protocol as c;
     fn authenticated<T>(value: T) -> RpcRequest<T> {
         let mut request = RpcRequest::new(value);
@@ -2951,12 +3262,12 @@ fn verify_uploaded_capture(
             let workspace = client
                 .get_workspace(authenticated(c::GetWorkspaceRequest {
                     repository_id: "example".into(),
-                    workspace_id: binding.workspace_id.to_vec(),
+                    workspace_id: workspace_id.to_vec(),
                 }))
                 .await
                 .unwrap()
                 .into_inner();
-            assert_eq!(workspace.workspace_id, binding.workspace_id);
+            assert_eq!(workspace.workspace_id, workspace_id);
             assert!((1..=256).contains(&workspace.generation));
             assert_eq!(
                 workspace.generation, expected_publications,
@@ -2968,13 +3279,13 @@ fn verify_uploaded_capture(
                 let version = client
                     .get_version(authenticated(c::GetVersionRequest {
                         repository_id: "example".into(),
-                        workspace_id: binding.workspace_id.to_vec(),
+                        workspace_id: workspace_id.to_vec(),
                         generation,
                     }))
                     .await
                     .unwrap()
                     .into_inner();
-                assert_eq!(version.workspace_id, binding.workspace_id);
+                assert_eq!(version.workspace_id, workspace_id);
                 assert_eq!(version.generation, generation);
                 let manifest_id = tinytree_cloud::ManifestId::of(&version.manifest);
                 assert_eq!(version.manifest_id, manifest_id.0);
@@ -2990,7 +3301,7 @@ fn verify_uploaded_capture(
                     tinytree_cloud::encode_manifest_v3(&manifest, Default::default()).unwrap(),
                     version.manifest
                 );
-                assert_eq!(manifest.history.recovery.workspace, binding.workspace_id);
+                assert_eq!(manifest.history.recovery.workspace, workspace_id);
                 let raw = tinytree_cloud::BlobDigest::of(&version.manifest);
                 let authority = version.native_authority.as_ref().unwrap();
                 assert_eq!(authority.version, 1);
@@ -3003,7 +3314,7 @@ fn verify_uploaded_capture(
                     m::cloud_native_binding_digest(
                         "example",
                         owner,
-                        binding.workspace_id,
+                        workspace_id,
                         generation,
                         manifest_id.0,
                         raw.blake3,
@@ -3015,7 +3326,7 @@ fn verify_uploaded_capture(
                     .read_capture(authenticated(c::ReadCaptureRequest {
                         repository_id: "example".into(),
                         selector: Some(c::RetainedVersionSelector {
-                            workspace_id: binding.workspace_id.to_vec(),
+                            workspace_id: workspace_id.to_vec(),
                             generation,
                             manifest_id: manifest_id.0.to_vec(),
                         }),
@@ -3057,6 +3368,18 @@ fn verify_uploaded_capture(
         .await
         .expect("retained capture verification timed out")
     });
+    selections
+}
+
+fn verify_uploaded_capture(
+    upstream: &RemoteServer,
+    fixture: &Fixture,
+    binding: &native_workspace_admin::Binding,
+    packs: &BTreeMap<String, Vec<u8>>,
+    expected_publications: u64,
+) -> VerifiedRestoreCapture {
+    let selections =
+        retained_capture_versions(upstream, binding.workspace_id, expected_publications);
     fn identity<const N: usize>(text: &str) -> [u8; N] {
         assert_eq!(text.len(), N * 2);
         let mut id = [0; N];

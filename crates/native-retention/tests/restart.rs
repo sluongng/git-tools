@@ -41,7 +41,7 @@ fn driver() -> PathBuf {
 }
 #[test]
 fn killed_owner_preserves_only_syncall_acknowledged_checkpoints_and_invalidates_tokens() {
-    for mode in ["dirty", "clean", "capture"] {
+    for mode in ["dirty", "clean", "capture", "retire"] {
         let clean = mode == "clean";
         let directory = tempfile::tempdir().unwrap();
         let mut child = OwnedChild(
@@ -94,14 +94,14 @@ fn killed_owner_preserves_only_syncall_acknowledged_checkpoints_and_invalidates_
                 generation,
             };
             let info = registry.workspace(registration).await.unwrap();
-            assert_eq!(info.command_epoch, 1);
+            assert_eq!(info.command_epoch, if mode == "retire" { 2 } else { 1 });
             assert_eq!(info.fingerprint, expected_fingerprint);
             assert!(matches!(
                 registry.resolve(CommandToken::from_bytes(token)),
                 Err(Error::ClosedCommand)
             ));
             let pending = registry.pending_captures().await.unwrap();
-            if mode == "capture" {
+            if mode == "capture" || mode == "retire" {
                 assert_eq!(pending.len(), 1);
                 assert_eq!(pending[0].fingerprint, expected_fingerprint.unwrap());
                 assert_eq!(
@@ -113,6 +113,27 @@ fn killed_owner_preserves_only_syncall_acknowledged_checkpoints_and_invalidates_
                 );
             } else {
                 assert!(pending.is_empty());
+            }
+            if mode == "retire" {
+                let cleanup = registry.capture_cleanup().await.unwrap().unwrap();
+                assert_eq!(cleanup.successor.id, pending[0].id);
+                assert_ne!(cleanup.retired.id, pending[0].id);
+                assert!(
+                    std::path::Path::new(directory.path())
+                        .join("immutable-bundle")
+                        .exists()
+                );
+                registry
+                    .try_capture_cleanup()
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .acknowledge_capture_cleanup()
+                    .await
+                    .unwrap();
+                assert!(registry.capture_cleanup().await.unwrap().is_none());
+            } else {
+                assert!(registry.capture_cleanup().await.unwrap().is_none());
             }
             if clean {
                 assert_eq!(info.state, WorkspaceState::Clean);

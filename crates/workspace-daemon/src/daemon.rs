@@ -702,6 +702,7 @@ fn open_native_host(
                 query: raw_queries.get(alias).cloned(),
                 upload: upload_sources.remove(alias).map(|(io, control, restore)| {
                     Arc::new(crate::native_capture_upload::Source {
+                        local: local_objects[alias].clone(),
                         io,
                         control,
                         restore,

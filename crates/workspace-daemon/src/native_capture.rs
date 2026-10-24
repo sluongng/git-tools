@@ -80,41 +80,10 @@ impl Coordinator {
         } else {
             Some(Arc::new(PrivateDir::create(path)?))
         };
-        let (mut bytes, mut files) = (0u64, 0usize);
-        if let Some(directory) = &directory {
-            for entry in std::fs::read_dir(directory.path())? {
-                let entry = entry?;
-                files += 1;
-                ensure!(
-                    files <= config.max_pending.saturating_mul(4),
-                    "local capture spool requires bounded reconciliation"
-                );
-                let name = entry.file_name();
-                let name = name.to_str().context("unknown local capture spool entry")?;
-                let known = name
-                    .strip_suffix(".pack")
-                    .is_some_and(|id| id.len() == 64 && id.bytes().all(|b| b.is_ascii_hexdigit()))
-                    || name
-                        .strip_prefix("capture-")
-                        .and_then(|id| id.strip_suffix(".part"))
-                        .is_some_and(|id| uuid::Uuid::parse_str(id).is_ok());
-                let metadata = std::fs::symlink_metadata(entry.path())?;
-                use std::os::unix::fs::MetadataExt;
-                ensure!(
-                    metadata.uid() == unsafe { libc::geteuid() } && metadata.mode() & 0o077 == 0,
-                    "untrusted local capture spool file"
-                );
-                ensure!(
-                    known && entry.file_type()?.is_file() && !metadata.file_type().is_symlink(),
-                    "unknown local capture spool state; preserve it"
-                );
-                bytes = bytes
-                    .checked_add(metadata.len())
-                    .context("capture spool bytes overflow")?;
-            }
-            File::open(directory.path())?.sync_all()?;
-            File::open(directory.path().parent().context("capture spool parent")?)?.sync_all()?;
-        }
+        let (files, bytes) = match &directory {
+            Some(directory) => scan_spool(directory, config.max_pending)?,
+            None => (0, 0),
+        };
         let this = Arc::new(Self {
             config,
             directory,
@@ -131,6 +100,15 @@ impl Coordinator {
         });
         this.refresh(registry).await;
         Ok(this)
+    }
+    /// Pause capture staging before deleting an exact retired bundle. The
+    /// physical cleanup worker must retain this guard through namespace sync.
+    pub(crate) async fn pause_for_cleanup(self: &Arc<Self>) -> Result<Arc<SpoolCleanupGuard>> {
+        let permit = self.active.clone().acquire_owned().await?;
+        Ok(Arc::new(SpoolCleanupGuard {
+            coordinator: self.clone(),
+            _permit: permit,
+        }))
     }
     pub(crate) async fn refresh(&self, registry: &native_retention::Registry) {
         let _single = self.refresh_lock.lock().await;
@@ -237,6 +215,53 @@ impl Coordinator {
         let value = self.inventory.lock().unwrap_or_else(|e| e.into_inner());
         serde_json::json!({"policy":self.config.policy,"pending_count":value.count,"pending_bytes":value.bytes,"pending_dirty":value.dirty,"pending_clean":value.clean,"pending_unavailable":value.unavailable,"pending_root_claims":value.root_claims,"inventory_available":value.available,"charged_spool_bytes":self.directory.as_ref().map(|_|self.disk_bytes.load(Ordering::Relaxed)),"attempted":self.attempted.load(Ordering::Relaxed),"queued":self.queued.load(Ordering::Relaxed),"skipped":self.skipped.load(Ordering::Relaxed),"failed":self.failed.load(Ordering::Relaxed),"last_disposition":*self.last.lock().unwrap_or_else(|e|e.into_inner())})
     }
+}
+pub(crate) struct SpoolCleanupGuard {
+    coordinator: Arc<Coordinator>,
+    _permit: OwnedSemaphorePermit,
+}
+impl SpoolCleanupGuard {
+    /// Recount real files only after unlink+fsync. Holding the staging permit
+    /// ensures no reservation can later uncharge this newly observed inventory.
+    pub(crate) fn reconcile_disk(&self) -> Result<()> {
+        if let Some(directory) = &self.coordinator.directory {
+            let (files, bytes) = scan_spool(directory, self.coordinator.config.max_pending)?;
+            self.coordinator.disk_bytes.store(bytes, Ordering::Release);
+            self.coordinator.disk_files.store(files, Ordering::Release);
+        }
+        Ok(())
+    }
+    pub(crate) async fn refresh(&self, registry: &native_retention::Registry) {
+        self.coordinator.refresh(registry).await;
+    }
+}
+fn scan_spool(directory: &PrivateDir, max_pending: usize) -> Result<(usize, u64)> {
+    let (mut files, mut bytes) = (0usize, 0u64);
+    for entry in std::fs::read_dir(directory.path())? {
+        files += 1;
+        ensure!(
+            files <= max_pending.saturating_mul(4),
+            "local capture spool requires bounded reconciliation"
+        );
+        let entry = entry?;
+        let name = entry.file_name();
+        let name = name.to_str().context("unknown local capture spool entry")?;
+        let known = name
+            .strip_suffix(".pack")
+            .is_some_and(|id| id.len() == 64 && id.bytes().all(|byte| byte.is_ascii_hexdigit()))
+            || name
+                .strip_prefix("capture-")
+                .and_then(|id| id.strip_suffix(".part"))
+                .is_some_and(|id| uuid::Uuid::parse_str(id).is_ok());
+        ensure!(known, "unknown local capture spool state; preserve it");
+        let file = directory.open_existing_file(name, u64::MAX)?;
+        bytes = bytes
+            .checked_add(file.metadata()?.len())
+            .context("capture spool bytes overflow")?;
+    }
+    File::open(directory.path())?.sync_all()?;
+    File::open(directory.path().parent().context("capture spool parent")?)?.sync_all()?;
+    Ok((files, bytes))
 }
 #[derive(Default)]
 pub(crate) struct Completion {

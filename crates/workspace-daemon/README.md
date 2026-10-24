@@ -70,6 +70,20 @@ current availability proof, a Clean transition, or permission to evict data.
 Use the native CLI's [restore guide](../jj-native-cli#restore-a-retained-capture)
 for an exact selected capture and scoped current-state resume.
 
+Alternatively, `"publish_retiring_redundant"` explicitly permits an older saved
+local capsule to become remote-only. It requires at least two capture slots and
+retains the newest capsule for each workspace. Retirement needs a freshly verified
+exact remote capture, a newer durable capture for the same registration, and exact
+OP/VIEW/index representation coverage in that newer capture. Native roots must
+remain reachable through verified local canonical metadata; unavailable proof
+never triggers background history or file hydration. Unsynced, uncertain
+or uncovered capsules remain local. A durable cleanup obligation protects
+unlink/fsync/restart recovery; status reports `cleanup_pending` and
+`retired_local_capture_count` (this daemon incarnation). This policy does not
+clean workspace state, delete native objects or operations, or promise bounded
+total operation history. Independent workspaces each need retained capacity plus
+headroom for a successor; exhausting the configured quota still rejects capture.
+
 Bazel needs the
 [Unix authority fix](https://github.com/bazelbuild/bazel/commit/242563f1a14378801725e5f6b0ee397ef0d307f2)
 and required BLAKE3/xattr/r2c2 support. Select a compatible client with `session.bazel`.

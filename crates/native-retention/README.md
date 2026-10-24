@@ -18,6 +18,27 @@ remote services.
   an independent immutable-bundle ticket, leaving the workspace dirty. The host
   must sync the bundle before callback success. Pending tickets survive newer
   checkpoints and explicit forget; no upload or acknowledgement is implied.
+- A trusted host may retire an older redundant capsule only after freshly
+  verifying its exact retained remote version and the successor capsule's full
+  operation/view/index dependency coverage. `retire_redundant_capture` rechecks
+  both exact rows, the same registration, strict age ordering and typed-root
+  inclusion. One `SyncAll` transaction removes the old ticket and records one
+  bounded cleanup obligation; it never cleans a workspace or deletes native,
+  operation or capsule bytes. This is not general remote offloading or GC.
+- `retire_redundant_capture_with_coverage` can instead prove typed-root reachability
+  through bounded canonical metadata, for example an old working-copy tree named
+  by a retained historical commit. Witnesses are verified and traversed only from
+  exact successor roots, never arbitrary matching objects. FILE payloads,
+  unanchored or incomplete paths, and excessive object/byte/edge work are rejected.
+  `OwnedCaptureCoverage` retains the admitted payload owner through validation and
+  durable publication after cancellation. Proof blobs are not stored in the ledger.
+- Physical cleanup uses `try_capture_cleanup` and retains its exclusive guard
+  through exact file validation, unlink and directory sync, then calls
+  `acknowledge_capture_cleanup`. The obligation binds exact upload-record bytes;
+  shared pack digests are not unlinkable. A pending slot blocks further retirement
+  and new tickets for a pack awaiting unlink. Errors preserve the slot for replay,
+  not an unbounded list of cleanup tombstones. Retirement does not require Clean
+  workspaces, but active commands and capture readers return Busy.
 - Collector admission requires no active/draining commands, no dirty workspace,
   and no untracked access. Its exclusive guard pins a coherent bounded union of
   roots, including the real empty tree. The intrinsic zero commit is a root marker,
@@ -43,3 +64,6 @@ retain independent ticket roots. This is not an immutable-root-set optimization.
 
 Registries with pending captures require a capture-aware reader. Older readers
 fail closed on the versioned inventory rather than omitting its root claims.
+The first capsule retirement advances the durable manifest to version 3, even
+after cleanup acknowledgement. Pre-retirement readers reject it. Reopening checks
+both capture and cleanup commitments; process restart does not acknowledge cleanup.

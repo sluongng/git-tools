@@ -1,22 +1,23 @@
-//! Optional saved-capture publication. A historical Published record never
-//! grants eviction: tickets, roots and private packs remain untouched.
+//! Optional saved-capture publication and exact-proof redundant capsule cleanup.
+//! A historical Published record alone never grants local retirement.
 use crate::{
     config::{Config, NativeCaptureUpload, NativeCaptureUploadPolicy},
     native_commands::NativeCommandHost,
 };
 use anyhow::{Context, Result, ensure};
+use jj_native_backend::NativeObjectIo as _;
 use native_capture_pack::{Limits as PackLimits, VerifiedPack};
 use native_retention::{CaptureReadGuard, PendingCapture};
 use private_fs::PrivateDir;
 use serde::{Deserialize, Serialize};
 use std::{
     any::Any,
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet, VecDeque},
     fs::{File, OpenOptions},
     io::{Read, Write},
     sync::{
         Arc, Mutex,
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
     time::Duration,
 };
@@ -29,6 +30,7 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore, watch};
 type Owner = Arc<dyn Any + Send + Sync>;
 pub(crate) struct Source {
     pub io: Arc<jj_native_remote::RemoteObjectIo>,
+    pub local: Arc<jj_native_backend::DirectObjectIo>,
     pub restore: jj_native_remote::RemoteRestoreIo,
     pub control: jj_native_remote::RemoteRepositoryControl,
     pub identity: [u8; 32],
@@ -38,11 +40,25 @@ pub(crate) struct Stats {
     attempts: AtomicU64,
     published: AtomicU64,
     failed: AtomicU64,
+    retired: AtomicU64,
+    retiring: AtomicBool,
+    cleanup_pending: AtomicBool,
     last: Mutex<&'static str>,
 }
 impl Stats {
     pub fn status(&self) -> serde_json::Value {
-        serde_json::json!({"policy":"publish_retaining_roots","attempted":self.attempts.load(Ordering::Relaxed),"historical_published_count":self.published.load(Ordering::Relaxed),"failed":self.failed.load(Ordering::Relaxed),"last_disposition":self.last.lock().map(|v|*v).unwrap_or("unavailable"),"local_roots_retained":true,"current_backup_availability_verified":false})
+        let retiring = self.retiring.load(Ordering::Relaxed);
+        serde_json::json!({
+            "policy":if retiring {"publish_retiring_redundant"} else {"publish_retaining_roots"},
+            "attempted":self.attempts.load(Ordering::Relaxed),
+            "historical_published_count":self.published.load(Ordering::Relaxed),
+            "failed":self.failed.load(Ordering::Relaxed),
+            "retired_local_capture_count":self.retired.load(Ordering::Relaxed),
+            "cleanup_pending":self.cleanup_pending.load(Ordering::Acquire),
+            "policy_retires_redundant_capsules":retiring,
+            "last_disposition":self.last.lock().map(|v|*v).unwrap_or("unavailable"),
+            "local_roots_retained":true,"current_backup_availability_verified":false
+        })
     }
     fn set(&self, s: &'static str) {
         if let Ok(mut v) = self.last.lock() {
@@ -98,6 +114,17 @@ async fn blocking_owned<T: Send + 'static>(
 }
 struct Admission {
     _permit: OwnedSemaphorePermit,
+}
+struct RetirementProof {
+    upload: native_retention::CaptureUploadCleanup,
+    // This owner contains admission only, NEVER a CaptureReadGuard. Raw
+    // immutable witness bytes retain their budget through exclusive commit.
+    coverage: native_retention::OwnedCaptureCoverage,
+}
+struct RetirementOwner {
+    _old: Arc<CaptureReadGuard>,
+    _newer: Arc<CaptureReadGuard>,
+    _admission: Arc<Admission>,
 }
 struct JobOwner {
     _read: Arc<CaptureReadGuard>,
@@ -192,6 +219,10 @@ struct TestHooks {
     fail_namespace: std::sync::atomic::AtomicBool,
     #[cfg(test)]
     catalog_pause: Mutex<Option<Arc<CatalogPause>>>,
+    #[cfg(test)]
+    cleanup_pause: Mutex<Option<Arc<CatalogPause>>>,
+    #[cfg(test)]
+    fail_after_alias_sync: AtomicBool,
 }
 #[cfg(test)]
 #[derive(Default)]
@@ -223,6 +254,7 @@ struct Worker {
     stats: Arc<Stats>,
     admission: Arc<Semaphore>,
     next_ticket: Mutex<Option<(u64, native_retention::CaptureId)>>,
+    next_retirement: Mutex<Option<(u64, native_retention::CaptureId)>>,
     _hooks: Arc<TestHooks>,
 }
 pub(crate) async fn start(
@@ -243,6 +275,10 @@ async fn start_inner(
         return Ok(None);
     }
     let stats = Arc::new(Stats::default());
+    stats.retiring.store(
+        policy.policy == NativeCaptureUploadPolicy::PublishRetiringRedundant,
+        Ordering::Relaxed,
+    );
     stats.set("idle");
     host.set_upload_status(stats.clone())?;
     let directory = match PrivateDir::create(config.state_dir.join("native-commands/upload"))
@@ -266,6 +302,7 @@ async fn start_inner(
         stats,
         admission: Arc::new(Semaphore::new(1)),
         next_ticket: Mutex::new(None),
+        next_retirement: Mutex::new(None),
         _hooks: hooks,
     });
     #[cfg(test)]
@@ -436,6 +473,9 @@ impl Worker {
             _permit: tokio::time::timeout_at(deadline, self.admission.clone().acquire_owned())
                 .await??,
         });
+        if self.policy.policy == NativeCaptureUploadPolicy::PublishRetiringRedundant {
+            tokio::time::timeout_at(deadline, self.complete_cleanup(admission.clone())).await??;
+        }
         let worker = self.clone();
         let physical = admission.clone();
         let inventory = tokio::time::timeout_at(
@@ -501,10 +541,487 @@ impl Worker {
                     self.stats.set("retry_or_reconcile");
                 }
             }
-            // One accepted job per poll; successes advance on the next poll.
+            // One upload and bounded retirement work share this absolute deadline.
             break;
         }
+        // Publish pending work BEFORE proving retirement of old versions. A
+        // missing/unavailable old proof must retain it, not starve new backups.
+        if self.policy.policy == NativeCaptureUploadPolicy::PublishRetiringRedundant {
+            match tokio::time::timeout_at(deadline, self.retire_one(deadline, admission.clone()))
+                .await
+            {
+                Ok(Ok(())) => {}
+                _ => {
+                    self.stats.failed.fetch_add(1, Ordering::Relaxed);
+                    self.stats.set("retirement_retry_preserved");
+                }
+            }
+        }
         Ok(())
+    }
+    async fn complete_cleanup(self: &Arc<Self>, admission: Arc<Admission>) -> Result<()> {
+        let worker = self.clone();
+        // Accepted cleanup owns both fences and admission after waiter expiry.
+        tokio::spawn(async move { worker.cleanup_owned(admission).await }).await?
+    }
+    async fn cleanup_owned(self: Arc<Self>, admission: Arc<Admission>) -> Result<()> {
+        let registry = self.host.capture_registry();
+        let pending = registry.capture_cleanup().await?;
+        self.stats
+            .cleanup_pending
+            .store(pending.is_some(), Ordering::Release);
+        if pending.is_none() {
+            return Ok(());
+        }
+        // Capture callbacks acquire this permit before taking registry read
+        // fences. Preserve that order, otherwise cleanup could deadlock a writer.
+        let paused = self.host.pause_capture_cleanup().await?;
+        let Some(guard) = registry.try_capture_cleanup().await? else {
+            self.stats.cleanup_pending.store(false, Ordering::Release);
+            return Ok(());
+        };
+        let worker = self.clone();
+        let physical = paused.clone();
+        let completed = blocking_owned(admission as Owner, move || {
+            worker.unlink_retired(guard.obligation())?;
+            physical.reconcile_disk()?;
+            let published = worker.inventory()?.2;
+            Ok((guard, published))
+        })
+        .await?;
+        let (guard, published) = completed.value;
+        guard.acknowledge_capture_cleanup().await?;
+        self.stats.published.store(published, Ordering::Relaxed);
+        // The capture permit remains held until real disk and registry counts
+        // agree. Never uncharge on a logical ticket removal or upload ACK alone.
+        paused.refresh(&registry).await;
+        self.stats.retired.fetch_add(1, Ordering::Relaxed);
+        self.stats.cleanup_pending.store(false, Ordering::Release);
+        self.stats.set("retired_redundant_local_capture");
+        Ok(())
+    }
+    fn unlink_retired(
+        &self,
+        obligation: &native_retention::CaptureCleanupObligation,
+    ) -> Result<()> {
+        #[cfg(test)]
+        if let Some(pause) = self._hooks.cleanup_pause.lock().unwrap().take() {
+            pause.block();
+        }
+        let captures =
+            PrivateDir::open_existing(self.config.state_dir.join("native-commands/captures"))?;
+        let name = hex(&obligation.retired.id.0);
+        let mut files = Vec::new();
+        let job = format!("{name}.job");
+        match obligation.upload.job {
+            Some(expected) => files.push(validate_cleanup_file(&self.directory, &job, expected)?),
+            None => ensure!(
+                std::fs::symlink_metadata(self.directory.path().join(&job))
+                    .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound),
+                "unexpected retired capture job; preserve it"
+            ),
+        }
+        files.push(validate_cleanup_file(
+            &self.directory,
+            &format!("{name}.published"),
+            obligation.upload.published,
+        )?);
+        if obligation.remove_bundle {
+            files.push(validate_cleanup_file(
+                &captures,
+                &format!("{}.pack", hex(&obligation.retired.bundle.blake3)),
+                obligation.retired.bundle,
+            )?);
+        }
+        // Validate ALL present files before removing any. Missing known files
+        // are the durable commit/unlink crash prefix, never discovery authority.
+        for item in files.into_iter().flatten() {
+            item.remove(&self._hooks)?;
+        }
+        self.sync_namespace()?;
+        File::open(captures.path())?.sync_all()?;
+        Ok(())
+    }
+    async fn retire_one(
+        self: &Arc<Self>,
+        deadline: tokio::time::Instant,
+        admission: Arc<Admission>,
+    ) -> Result<()> {
+        let worker = self.clone();
+        tokio::spawn(async move { worker.retire_one_owned(deadline, admission).await }).await?
+    }
+    async fn retire_one_owned(
+        self: Arc<Self>,
+        deadline: tokio::time::Instant,
+        admission: Arc<Admission>,
+    ) -> Result<()> {
+        let registry = self.host.capture_registry();
+        if registry.capture_cleanup().await?.is_some() {
+            return self.cleanup_owned(admission).await;
+        }
+        let mut tickets = registry.pending_captures().await?;
+        ensure!(
+            tickets.len() <= self.policy.max_jobs,
+            "capture retirement inventory limit"
+        );
+        tickets.sort_by_key(|ticket| (ticket.registry_epoch, ticket.id));
+        let mut candidates = tickets.clone();
+        if let Some(last) = *self
+            .next_retirement
+            .lock()
+            .map_err(|_| anyhow::anyhow!("capture retirement cursor unavailable"))?
+        {
+            let split =
+                candidates.partition_point(|ticket| (ticket.registry_epoch, ticket.id) <= last);
+            candidates.rotate_left(split);
+        }
+        for old in candidates {
+            let Some(newer) = tickets
+                .iter()
+                .rev()
+                .find(|newer| {
+                    newer.registration == old.registration
+                        && newer.registry == old.registry
+                        && newer.registry_epoch > old.registry_epoch
+                })
+                .cloned()
+            else {
+                continue;
+            };
+            let published_name = format!("{}.published", hex(&old.id.0));
+            if !self.directory.path().join(&published_name).try_exists()? {
+                continue;
+            }
+            *self
+                .next_retirement
+                .lock()
+                .map_err(|_| anyhow::anyhow!("capture retirement cursor unavailable"))? =
+                Some((old.registry_epoch, old.id));
+            let Some(proof) = self
+                .prove_redundant(&old, &newer, deadline, admission.clone())
+                .await?
+            else {
+                self.stats.set("local_capture_not_covered");
+                return Ok(());
+            };
+            ensure!(
+                tokio::time::Instant::now() < deadline,
+                "capture retirement deadline exceeded"
+            );
+            // All read guards, verified packs, payloads and SDK owners were
+            // dropped in prove_redundant before taking this exclusive fence.
+            registry
+                .retire_redundant_capture_with_coverage(old, newer, proof.upload, proof.coverage)
+                .await?;
+            self.stats.cleanup_pending.store(true, Ordering::Release);
+            return self.cleanup_owned(admission).await;
+        }
+        Ok(())
+    }
+    async fn prove_redundant(
+        self: &Arc<Self>,
+        old: &PendingCapture,
+        newer: &PendingCapture,
+        deadline: tokio::time::Instant,
+        admission: Arc<Admission>,
+    ) -> Result<Option<RetirementProof>> {
+        let (mount, alias, identity) = self.host.capture_mapping(old)?;
+        ensure!(
+            self.host.capture_mapping(newer)? == (mount.clone(), alias.clone(), identity),
+            "capture successor provider differs"
+        );
+        let source = self
+            .sources
+            .get(&alias)
+            .context("capture retirement provider unavailable")?;
+        ensure!(
+            source.identity == identity,
+            "capture retirement provider changed"
+        );
+        let workspace = crate::native_workspaces::capture_upload_workspace(
+            &self.config.state_dir,
+            &mount,
+            &alias,
+            &identity,
+        )?;
+        let registry = self.host.capture_registry();
+        let old_read = Arc::new(registry.read_capture(old.id).await?);
+        let newer_read = Arc::new(registry.read_capture(newer.id).await?);
+        ensure!(
+            old_read.pending() == old && newer_read.pending() == newer,
+            "capture retirement ticket changed"
+        );
+        let coverage_owner: Owner = admission.clone();
+        let owner: Owner = Arc::new(RetirementOwner {
+            _old: old_read,
+            _newer: newer_read,
+            _admission: admission,
+        });
+        let worker = self.clone();
+        let expected = old.clone();
+        let intent = blocking_owned(owner.clone(), move || {
+            let job = worker.read_durable(&format!("{}.job", hex(&expected.id.0)))?;
+            let intent = Intent::decode(&job)?;
+            let published = worker.read_durable(&format!("{}.published", hex(&expected.id.0)))?;
+            ensure!(
+                serde_json::from_slice::<Header>(&published)? == intent.header,
+                "retired publication record differs"
+            );
+            ensure!(
+                intent.header.ticket_binding == expected.binding()
+                    && intent.header.provider == identity
+                    && intent.header.workspace == workspace,
+                "retired capture publication binding differs"
+            );
+            Ok((
+                intent,
+                native_retention::CaptureUploadCleanup {
+                    job: Some(raw_descriptor(&job)),
+                    published: raw_descriptor(&published),
+                },
+            ))
+        })
+        .await?;
+        let client = source
+            .control
+            .client_for_owned_work(owner.clone(), deadline)
+            .await?;
+        let selected = client
+            .cloud_retained_version_selected(
+                RetainedVersionSelector {
+                    workspace_id: workspace,
+                    generation: intent
+                        .0
+                        .header
+                        .expected_generation
+                        .checked_add(1)
+                        .context("capture retirement generation overflow")?,
+                    manifest_id: CloudManifestId(intent.0.header.manifest_id),
+                },
+                CloudRawDigest::of(&intent.0.manifest),
+            )
+            .await?;
+        ensure!(
+            selected.manifest() == intent.0.manifest,
+            "retained retirement manifest differs"
+        );
+        let selected = client.cloud_captured_version(selected)?;
+        let attachment = client.cloud_read_capture(&selected).await?;
+        ensure!(
+            attachment.payload() == intent.0.capture,
+            "retained retirement attachment differs"
+        );
+        let worker = self.clone();
+        let old_ticket = old.clone();
+        let newer_ticket = newer.clone();
+        let proof_owner = owner.clone();
+        let result = blocking_owned(owner.clone(), move || {
+            let snapshot = worker.verify_saved(&old_ticket, &intent.0, proof_owner.clone())?;
+            // Fully verify the successor's semantic OP/VIEW/index graph and its
+            // checkpoint binding even if it has not yet reached the server.
+            let successor = worker.prepare(
+                &newer_ticket,
+                c::CaptureExportIdentity {
+                    workspace,
+                    exporter: newer_ticket.registration.workspace.0,
+                    sequence: newer_ticket.registry_epoch,
+                    parents: Vec::new(),
+                },
+                0,
+                proof_owner.clone(),
+            )?;
+            drop(successor);
+            if !worker.descriptor_coverage(&old_ticket, &newer_ticket, proof_owner)? {
+                return Ok(None);
+            }
+            Ok(Some((intent.1.clone(), snapshot)))
+        })
+        .await?;
+        let Some((upload, snapshot)) = result.value else {
+            return Ok(None);
+        };
+        ensure!(
+            self.policy.max_memory_bytes
+                >= native_retention::MAX_CAPTURE_COVERAGE_WORK_BYTES as u64,
+            "capture coverage proof admission too small"
+        );
+        let objects = self
+            .canonical_coverage(
+                source.local.clone(),
+                old,
+                newer,
+                snapshot,
+                owner.clone(),
+                deadline,
+            )
+            .await?;
+        // Return immutable raw witness bytes with admission ONLY. All local
+        // read fences, pack leases and SDK owners drop before exclusive retire.
+        Ok(Some(RetirementProof {
+            upload,
+            coverage: native_retention::OwnedCaptureCoverage::new(objects, coverage_owner),
+        }))
+    }
+    async fn canonical_coverage(
+        &self,
+        local: Arc<jj_native_backend::DirectObjectIo>,
+        old: &PendingCapture,
+        newer: &PendingCapture,
+        snapshot: [u8; 32],
+        owner: Owner,
+        deadline: tokio::time::Instant,
+    ) -> Result<Vec<tinytree_model::EncodedObject>> {
+        use native_retention::{
+            MAX_CAPTURE_COVERAGE_BYTES, MAX_CAPTURE_COVERAGE_EDGES, MAX_CAPTURE_COVERAGE_OBJECTS,
+        };
+        use tinytree_model as m;
+        let typed = |key: &m::ObjectKey| (key.kind as u8, key.id.0);
+        let mut reachable: BTreeSet<_> = newer.checkpoint.roots.iter().map(typed).collect();
+        let mut missing: BTreeSet<_> = old
+            .checkpoint
+            .roots
+            .iter()
+            .map(typed)
+            .filter(|key| !reachable.contains(key))
+            .collect();
+        if missing.is_empty() {
+            return Ok(Vec::new());
+        }
+        // Most transitions replace the direct current-WC TREE root. The old WC
+        // COMMIT remains a successor root through retained operation history;
+        // try that single canonical edge before any bounded general traversal.
+        let preferred = m::ObjectKey {
+            kind: m::Kind::Commit,
+            id: m::ObjectId(snapshot),
+        };
+        let mut pending = VecDeque::new();
+        if reachable.contains(&typed(&preferred)) {
+            pending.push_back(preferred);
+        }
+        pending.extend(
+            newer
+                .checkpoint
+                .roots
+                .iter()
+                .copied()
+                .filter(|key| *key != preferred),
+        );
+        let mut read = BTreeSet::new();
+        let mut objects = Vec::new();
+        let (mut bytes, mut edges, mut attempts) = (0usize, 0usize, 0usize);
+        while !missing.is_empty() {
+            ensure!(
+                tokio::time::Instant::now() < deadline,
+                "capture coverage deadline exceeded"
+            );
+            let key = pending
+                .pop_front()
+                .context("successor does not prove retained canonical root coverage")?;
+            if key.kind == m::Kind::File
+                || key.kind == m::Kind::Symlink
+                || (key.kind == m::Kind::Commit && key.id.0 == [0; 32])
+                || !read.insert(typed(&key))
+            {
+                continue;
+            }
+            attempts += 1;
+            ensure!(
+                attempts <= MAX_CAPTURE_COVERAGE_OBJECTS,
+                "capture coverage object work limit"
+            );
+            let descriptor =
+                tokio::time::timeout_at(deadline, local.descriptor_with_owner(key, owner.clone()))
+                    .await??;
+            let Some(descriptor) = descriptor else {
+                // Thin public metadata may be absent locally. Do not hydrate
+                // it in the background merely to make retirement succeed.
+                continue;
+            };
+            ensure!(
+                descriptor.key == key && descriptor.format_version == m::FORMAT_VERSION,
+                "capture coverage metadata descriptor differs"
+            );
+            let size =
+                usize::try_from(descriptor.size_bytes).context("capture coverage object size")?;
+            let total = bytes
+                .checked_add(size)
+                .context("capture coverage byte work overflow")?;
+            ensure!(
+                total <= MAX_CAPTURE_COVERAGE_BYTES,
+                "capture coverage byte work limit"
+            );
+            let metadata = tokio::time::timeout_at(
+                deadline,
+                local.read_metadata_with_owner(key, owner.clone()),
+            )
+            .await??;
+            ensure!(
+                metadata.descriptor() == descriptor && metadata.bytes().len() == size,
+                "capture coverage canonical object differs"
+            );
+            let encoded = m::EncodedObject {
+                descriptor,
+                bytes: metadata.bytes().to_vec(),
+            };
+            let object = metadata.into_object();
+            let references = object.references();
+            edges = edges
+                .checked_add(references.len())
+                .context("capture coverage edge work overflow")?;
+            ensure!(
+                edges <= MAX_CAPTURE_COVERAGE_EDGES,
+                "capture coverage edge work limit"
+            );
+            for reference in references {
+                let reference_id = typed(&reference);
+                missing.remove(&reference_id);
+                if reachable.insert(reference_id) {
+                    pending.push_back(reference);
+                }
+            }
+            bytes = total;
+            objects.push(encoded);
+        }
+        Ok(objects)
+    }
+    fn descriptor_coverage(
+        &self,
+        old: &PendingCapture,
+        newer: &PendingCapture,
+        owner: Owner,
+    ) -> Result<bool> {
+        let directory = Arc::new(PrivateDir::open_existing(
+            self.config.state_dir.join("native-commands/captures"),
+        )?);
+        let open = |ticket: &PendingCapture| -> Result<VerifiedPack> {
+            Ok(VerifiedPack::open(
+                directory.clone(),
+                ticket.bundle.blake3,
+                ticket.bundle.size_bytes,
+                PackLimits {
+                    max_pack_bytes: self.policy.max_bundle_bytes,
+                    max_scan_bytes: self.policy.max_bundle_bytes,
+                    ..Default::default()
+                },
+                owner.clone(),
+            )?)
+        };
+        let newer = open(newer)?;
+        let descriptors: BTreeSet<_> = newer
+            .portable_entries()
+            .filter_map(|lease| {
+                let entry = lease.descriptor();
+                (entry.kind <= 4).then(|| (entry.kind, entry.id.clone(), entry.blake3, entry.size))
+            })
+            .collect();
+        let old = open(old)?;
+        Ok(old
+            .portable_entries()
+            .filter(|lease| lease.descriptor().kind <= 4)
+            .all(|lease| {
+                let entry = lease.descriptor();
+                descriptors.contains(&(entry.kind, entry.id.clone(), entry.blake3, entry.size))
+            }))
     }
     async fn process(
         self: Arc<Self>,
@@ -931,7 +1448,12 @@ impl Worker {
             capture,
         })
     }
-    fn verify_saved(&self, ticket: &PendingCapture, intent: &Intent, owner: Owner) -> Result<()> {
+    fn verify_saved(
+        &self,
+        ticket: &PendingCapture,
+        intent: &Intent,
+        owner: Owner,
+    ) -> Result<[u8; 32]> {
         let (objects, artifacts, roots, capture) = self.proofs(ticket, owner)?;
         ensure!(capture == intent.capture, "saved capture DATA differs");
         let graph =
@@ -975,48 +1497,164 @@ impl Worker {
             manifest.history.recovery.native_roots == ticket.checkpoint.roots,
             "capture retained root binding differs"
         );
+        Ok(data.working_copy.snapshot_commit)
+    }
+}
+fn raw_descriptor(bytes: &[u8]) -> native_retention::BundleDescriptor {
+    native_retention::BundleDescriptor {
+        blake3: *blake3::hash(bytes).as_bytes(),
+        size_bytes: bytes.len() as u64,
+    }
+}
+fn validate_cleanup_file(
+    directory: &PrivateDir,
+    name: &str,
+    expected: native_retention::BundleDescriptor,
+) -> Result<Option<CleanupFile>> {
+    let path = directory.path().join(name);
+    match std::fs::symlink_metadata(&path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+        Ok(_) => {}
+    }
+    let mut file = directory.open_existing_file(name, expected.size_bytes)?;
+    ensure!(
+        file.metadata()?.len() == expected.size_bytes,
+        "retired local file size differs; preserve it"
+    );
+    let mut hash = blake3::Hasher::new();
+    let mut buffer = [0; 64 * 1024];
+    let mut read = 0u64;
+    loop {
+        let count = file.read(&mut buffer)?;
+        if count == 0 {
+            break;
+        }
+        read = read
+            .checked_add(count as u64)
+            .context("cleanup file work overflow")?;
+        ensure!(
+            read <= expected.size_bytes,
+            "retired local file grew; preserve it"
+        );
+        hash.update(&buffer[..count]);
+    }
+    ensure!(
+        read == expected.size_bytes && hash.finalize().as_bytes() == &expected.blake3,
+        "retired local file digest differs; preserve it"
+    );
+    ensure_same_file(&path, &file)?;
+    let inspected = file.metadata()?;
+    use std::os::unix::fs::MetadataExt;
+    let mut aliases = Vec::new();
+    if inspected.nlink() > 1 {
+        let prefix = if name.ends_with(".pack") {
+            "capture-"
+        } else {
+            "upload-"
+        };
+        let mut count = 0usize;
+        for entry in std::fs::read_dir(directory.path())? {
+            count += 1;
+            ensure!(count <= 4096, "retired staging alias inventory limit");
+            let entry = entry?;
+            let alias = entry.file_name();
+            let Some(alias) = alias.to_str() else {
+                continue;
+            };
+            let known = alias
+                .strip_prefix(prefix)
+                .and_then(|id| id.strip_suffix(".part"))
+                .is_some_and(|id| uuid::Uuid::parse_str(id).is_ok_and(|id2| id2.to_string() == id));
+            if !known {
+                continue;
+            }
+            let metadata = std::fs::symlink_metadata(entry.path())?;
+            if metadata.dev() == inspected.dev() && metadata.ino() == inspected.ino() {
+                // Only exact known writer-created temporary hardlinks may be
+                // reconciled. Arbitrary aliases, including outside this private
+                // namespace, keep nlink unmatched and preserve every file.
+                let alias_file = directory.open_existing_file(alias, expected.size_bytes)?;
+                ensure_same_file(&entry.path(), &alias_file)?;
+                ensure!(
+                    metadata.len() == expected.size_bytes,
+                    "retired staging alias size differs"
+                );
+                aliases.push(entry.path());
+            }
+        }
+    }
+    ensure!(
+        file.metadata()?.nlink() == aliases.len() as u64 + 1,
+        "retired file has unknown hardlinks; preserve it"
+    );
+    Ok(Some(CleanupFile {
+        path,
+        file,
+        aliases,
+    }))
+}
+struct CleanupFile {
+    path: std::path::PathBuf,
+    file: File,
+    aliases: Vec<std::path::PathBuf>,
+}
+impl CleanupFile {
+    fn remove(self, hooks: &TestHooks) -> Result<()> {
+        use std::os::unix::fs::MetadataExt;
+        let mut remaining = self.aliases.len();
+        let had_aliases = remaining > 0;
+        for alias in self.aliases {
+            ensure_same_file(&self.path, &self.file)?;
+            ensure_same_file(&alias, &self.file)?;
+            ensure!(
+                self.file.metadata()?.nlink() == remaining as u64 + 1,
+                "retired staging alias identity changed; preserve it"
+            );
+            std::fs::remove_file(alias)?;
+            remaining -= 1;
+        }
+        if had_aliases {
+            // Aliases are discoverable only while the final name exists. Make
+            // their deletion durable BEFORE removing that discovery anchor.
+            File::open(self.path.parent().context("cleanup file parent absent")?)?.sync_all()?;
+            #[cfg(test)]
+            ensure!(
+                !hooks.fail_after_alias_sync.load(Ordering::Acquire),
+                "injected failure after staging alias durability"
+            );
+        }
+        #[cfg(not(test))]
+        let _ = hooks;
+        ensure_same_file(&self.path, &self.file)?;
+        ensure!(
+            self.file.metadata()?.nlink() == 1,
+            "retired file gained an unknown hardlink; preserve it"
+        );
+        std::fs::remove_file(self.path)?;
         Ok(())
     }
 }
-fn ticket_binding(ticket: &PendingCapture) -> [u8; 32] {
-    let mut h = blake3::Hasher::new();
-    h.update(b"native-upload-pending-ticket-v1\0");
-    h.update(&ticket.id.0);
-    h.update(&ticket.registry.0);
-    h.update(&ticket.registration.workspace.0);
-    h.update(&ticket.registration.op_store.0);
-    for n in [
-        ticket.registration.generation,
-        ticket.command_epoch,
-        ticket.registry_epoch,
-        ticket.bundle.size_bytes,
-    ] {
-        h.update(&n.to_le_bytes());
-    }
-    h.update(&ticket.fingerprint);
-    h.update(&ticket.bundle.blake3);
-    h.update(&(ticket.checkpoint.roots.len() as u64).to_le_bytes());
-    for root in &ticket.checkpoint.roots {
-        h.update(&[root.kind as u8]);
-        h.update(&root.id.0);
-    }
-    h.update(&(ticket.checkpoint.op_heads.len() as u64).to_le_bytes());
-    for id in &ticket.checkpoint.op_heads {
-        h.update(&(id.len() as u64).to_le_bytes());
-        h.update(id);
-    }
-    match &ticket.checkpoint.working_copy_operation {
-        Some(id) => {
-            h.update(&[1]);
-            h.update(&(id.len() as u64).to_le_bytes());
-            h.update(id);
-        }
-        None => {
-            h.update(&[0]);
-        }
-    }
-    *h.finalize().as_bytes()
+fn ensure_same_file(path: &std::path::Path, file: &File) -> Result<()> {
+    use std::os::unix::fs::MetadataExt;
+    let actual = std::fs::symlink_metadata(path)?;
+    let inspected = file.metadata()?;
+    ensure!(
+        actual.is_file()
+            && !actual.file_type().is_symlink()
+            && actual.dev() == inspected.dev()
+            && actual.ino() == inspected.ino()
+            && actual.len() == inspected.len()
+            && actual.uid() == unsafe { libc::geteuid() }
+            && actual.mode() & 0o077 == 0,
+        "retired local file identity changed; preserve it"
+    );
+    Ok(())
 }
+fn ticket_binding(ticket: &PendingCapture) -> [u8; 32] {
+    ticket.binding()
+}
+
 fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
@@ -1034,12 +1672,29 @@ fn decode_hex<const N: usize>(text: &str) -> Result<[u8; N]> {
 mod tests {
     use super::*;
     async fn fixture(hooks: Arc<TestHooks>) -> Result<(tempfile::TempDir, Handle)> {
+        fixture_with_policy(hooks, NativeCaptureUploadPolicy::PublishRetainingRoots).await
+    }
+    async fn fixture_with_policy(
+        hooks: Arc<TestHooks>,
+        policy: NativeCaptureUploadPolicy,
+    ) -> Result<(tempfile::TempDir, Handle)> {
         let root = tempfile::Builder::new().tempdir_in(std::env::temp_dir().canonicalize()?)?;
         let state = PrivateDir::create(root.path().join("state"))?;
-        let host = Arc::new(NativeCommandHost::open(&state.path().join("native-commands")).await?);
         let mut config = Config::default();
         config.state_dir = state.path().to_owned();
-        config.native.workspaces.upload.policy = NativeCaptureUploadPolicy::PublishRetainingRoots;
+        config.native.workspaces.upload.policy = policy;
+        if policy == NativeCaptureUploadPolicy::PublishRetiringRedundant {
+            config.native.workspaces.capture.policy =
+                crate::config::NativeCapturePolicy::AfterCommandBestEffort;
+            config.native.workspaces.capture.max_pending = 2;
+        }
+        let host = Arc::new(
+            NativeCommandHost::open_with_capture(
+                &state.path().join("native-commands"),
+                config.native.workspaces.capture.clone(),
+            )
+            .await?,
+        );
         config.native.workspaces.upload.timeout_ms = 1000;
         config.native.workspaces.upload.poll_ms = 250;
         Ok((
@@ -1048,6 +1703,387 @@ mod tests {
                 .await?
                 .unwrap(),
         ))
+    }
+    fn private_file(path: &std::path::Path, bytes: &[u8]) -> Result<()> {
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(path)?;
+        file.write_all(bytes)?;
+        file.sync_all()?;
+        File::open(path.parent().unwrap())?.sync_all()?;
+        Ok(())
+    }
+    // Filesystem/registry cleanup fixture, not a remote-backup proof. Real
+    // capture semantic verification and fresh authenticated proof are exercised
+    // by the mounted CLI workflow before this trusted-host API is called.
+    async fn staged_cleanup(
+        worker: &Arc<Worker>,
+        shared: bool,
+    ) -> Result<(
+        native_retention::CaptureCleanupObligation,
+        std::path::PathBuf,
+        std::path::PathBuf,
+        Vec<u8>,
+    )> {
+        let registry = worker.host.capture_registry();
+        let registration = registry
+            .register(
+                native_retention::WorkspaceId([11; 16]),
+                native_retention::OpStoreId([12; 16]),
+            )
+            .await?;
+        let captures =
+            PrivateDir::open_existing(worker.config.state_dir.join("native-commands/captures"))?;
+        let mut tickets = Vec::new();
+        for seed in [1u8, 2] {
+            let bytes = vec![seed; 128 + seed as usize];
+            let descriptor = raw_descriptor(&bytes);
+            private_file(
+                &captures
+                    .path()
+                    .join(format!("{}.pack", hex(&descriptor.blake3))),
+                &bytes,
+            )?;
+            let command = registry.begin_command(registration).await?;
+            tickets.push(
+                registry
+                    .capture_dirty(command.token(), move || async move {
+                        Ok(native_retention::CaptureBundle {
+                            checkpoint: native_retention::RootCheckpoint {
+                                roots: vec![tinytree_model::ObjectKey {
+                                    kind: tinytree_model::Kind::Commit,
+                                    id: tinytree_model::ObjectId([33; 32]),
+                                }],
+                                op_heads: vec![vec![seed; 64]],
+                                working_copy_operation: Some(vec![seed; 64]),
+                            },
+                            bundle: descriptor,
+                        })
+                    })
+                    .await?,
+            );
+            drop(command);
+        }
+        if shared {
+            let other = registry
+                .register(
+                    native_retention::WorkspaceId([13; 16]),
+                    native_retention::OpStoreId([14; 16]),
+                )
+                .await?;
+            let command = registry.begin_command(other).await?;
+            let old = tickets[0].clone();
+            registry
+                .capture_dirty(command.token(), move || async move {
+                    Ok(native_retention::CaptureBundle {
+                        checkpoint: old.checkpoint,
+                        bundle: old.bundle,
+                    })
+                })
+                .await?;
+            drop(command);
+        }
+        let old = &tickets[0];
+        let header = Header {
+            version: 1,
+            ticket: old.id.0,
+            ticket_binding: old.binding(),
+            provider: [3; 32],
+            workspace: [4; 32],
+            expected_generation: 0,
+            key: format!("capture_{}", hex(&old.id.0)),
+            manifest_id: [5; 32],
+            manifest_size: 0,
+            capture_size: 0,
+        };
+        let published = serde_json::to_vec(&header)?;
+        let publication = worker
+            .directory
+            .path()
+            .join(format!("{}.published", hex(&old.id.0)));
+        private_file(&publication, &published)?;
+        let paused = worker.host.pause_capture_cleanup().await?;
+        paused.reconcile_disk()?;
+        paused.refresh(&registry).await;
+        drop(paused);
+        let cleanup = registry
+            .retire_redundant_capture(
+                old.clone(),
+                tickets[1].clone(),
+                native_retention::CaptureUploadCleanup {
+                    job: None,
+                    published: raw_descriptor(&published),
+                },
+            )
+            .await?;
+        let pack = captures
+            .path()
+            .join(format!("{}.pack", hex(&old.bundle.blake3)));
+        Ok((cleanup, pack, publication, published))
+    }
+    async fn cleanup_admission(worker: &Arc<Worker>) -> Result<Arc<Admission>> {
+        Ok(Arc::new(Admission {
+            _permit: worker.admission.clone().acquire_owned().await?,
+        }))
+    }
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cleanup_preserves_mismatched_files_and_recovers_unlink_before_ack() -> Result<()> {
+        let hooks = Arc::new(TestHooks::default());
+        let (_root, handle) = fixture_with_policy(
+            hooks.clone(),
+            NativeCaptureUploadPolicy::PublishRetiringRedundant,
+        )
+        .await?;
+        let worker = handle.worker.clone();
+        handle.shutdown().await;
+        let registry = worker.host.capture_registry();
+        let (cleanup, pack, publication, published) = staged_cleanup(&worker, false).await?;
+        let old_bytes = std::fs::read(&pack)?;
+        let original_charged = worker.host.status()["local_capture"]["charged_spool_bytes"].clone();
+        private_file(&publication, &vec![b'x'; published.len()])?;
+        assert!(
+            worker
+                .complete_cleanup(cleanup_admission(&worker).await?)
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            std::fs::read(&pack)?,
+            old_bytes,
+            "wrong publication bytes cannot unlink any pack"
+        );
+        assert_eq!(registry.capture_cleanup().await?, Some(cleanup.clone()));
+        private_file(&publication, &published)?;
+        let saved = worker.config.state_dir.join("saved-old-pack");
+        std::fs::rename(&pack, &saved)?;
+        std::os::unix::fs::symlink(&saved, &pack)?;
+        assert!(
+            worker
+                .complete_cleanup(cleanup_admission(&worker).await?)
+                .await
+                .is_err()
+        );
+        assert!(std::fs::symlink_metadata(&pack)?.file_type().is_symlink());
+        assert_eq!(std::fs::read(&publication)?, published);
+        std::fs::remove_file(&pack)?;
+        std::fs::rename(saved, &pack)?;
+        hooks.fail_namespace.store(true, Ordering::Release);
+        assert!(
+            worker
+                .complete_cleanup(cleanup_admission(&worker).await?)
+                .await
+                .is_err()
+        );
+        assert!(!pack.exists() && !publication.exists());
+        assert_eq!(registry.capture_cleanup().await?, Some(cleanup));
+        assert_eq!(
+            worker.host.status()["local_capture"]["charged_spool_bytes"],
+            original_charged,
+            "uncertain namespace deletion cannot uncharge admission"
+        );
+        hooks.fail_namespace.store(false, Ordering::Release);
+        worker
+            .complete_cleanup(cleanup_admission(&worker).await?)
+            .await?;
+        assert!(registry.capture_cleanup().await?.is_none());
+        assert_eq!(registry.pending_captures().await?.len(), 1);
+        assert_eq!(worker.host.status()["local_capture"]["pending_count"], 1);
+        assert_eq!(
+            worker.host.status()["local_capture"]["charged_spool_bytes"],
+            130
+        );
+        assert_eq!(worker.stats.status()["retired_local_capture_count"], 1);
+        assert_eq!(worker.stats.status()["cleanup_pending"], false);
+        Ok(())
+    }
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cleanup_reconciles_only_exact_writer_staging_hardlinks() -> Result<()> {
+        use std::os::unix::fs::MetadataExt;
+        let hooks = Arc::new(TestHooks::default());
+        let (_root, handle) = fixture_with_policy(
+            hooks.clone(),
+            NativeCaptureUploadPolicy::PublishRetiringRedundant,
+        )
+        .await?;
+        let worker = handle.worker.clone();
+        handle.shutdown().await;
+        let registry = worker.host.capture_registry();
+        let (cleanup, pack, publication, published) = staged_cleanup(&worker, false).await?;
+        let foreign = worker.config.state_dir.join("unknown-hardlink");
+        std::fs::hard_link(&publication, &foreign)?;
+        assert!(
+            worker
+                .complete_cleanup(cleanup_admission(&worker).await?)
+                .await
+                .is_err()
+        );
+        assert!(pack.exists() && publication.exists() && foreign.exists());
+        assert_eq!(registry.capture_cleanup().await?, Some(cleanup.clone()));
+        std::fs::remove_file(foreign)?;
+        std::fs::remove_file(&publication)?;
+        // Exercise persist's actual hardlink-before-temp-unlink crash prefix,
+        // not an invented recovery record or a relaxed nlink check.
+        hooks.fail_namespace.store(true, Ordering::Release);
+        assert!(
+            worker
+                .persist(
+                    publication.file_name().unwrap().to_str().unwrap(),
+                    &published
+                )
+                .is_err()
+        );
+        hooks.fail_namespace.store(false, Ordering::Release);
+        assert_eq!(std::fs::metadata(&publication)?.nlink(), 2);
+        let capture_part = pack
+            .parent()
+            .unwrap()
+            .join(format!("capture-{}.part", uuid::Uuid::new_v4()));
+        std::fs::hard_link(&pack, &capture_part)?;
+        assert_eq!(std::fs::metadata(&pack)?.nlink(), 2);
+        hooks.fail_after_alias_sync.store(true, Ordering::Release);
+        assert!(
+            worker
+                .complete_cleanup(cleanup_admission(&worker).await?)
+                .await
+                .is_err()
+        );
+        assert!(publication.exists() && pack.exists());
+        assert_eq!(
+            std::fs::metadata(&publication)?.nlink(),
+            1,
+            "durable alias removal precedes deleting the final discovery anchor"
+        );
+        assert_eq!(std::fs::read_dir(worker.directory.path())?.count(), 1);
+        assert_eq!(registry.capture_cleanup().await?, Some(cleanup));
+        hooks.fail_after_alias_sync.store(false, Ordering::Release);
+        worker
+            .complete_cleanup(cleanup_admission(&worker).await?)
+            .await?;
+        assert!(!pack.exists() && !publication.exists() && !capture_part.exists());
+        assert_eq!(std::fs::read_dir(worker.directory.path())?.count(), 0);
+        assert!(registry.capture_cleanup().await?.is_none());
+        Ok(())
+    }
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn reopened_cleanup_is_visible_without_authorizing_retirement_policy() -> Result<()> {
+        let (_root, handle) = fixture_with_policy(
+            Arc::new(TestHooks::default()),
+            NativeCaptureUploadPolicy::PublishRetiringRedundant,
+        )
+        .await?;
+        let worker = handle.worker.clone();
+        handle.shutdown().await;
+        let (_, pack, publication, _) = staged_cleanup(&worker, false).await?;
+        let state = worker.config.state_dir.clone();
+        assert_eq!(worker.host.status()["capture_cleanup_pending"], true);
+        drop(worker);
+        for policy in [
+            NativeCaptureUploadPolicy::Disabled,
+            NativeCaptureUploadPolicy::PublishRetainingRoots,
+        ] {
+            let host = Arc::new(NativeCommandHost::open(&state.join("native-commands")).await?);
+            let mut config = Config::default();
+            config.state_dir = state.clone();
+            config.native.workspaces.upload.policy = policy;
+            let upload = start_inner(
+                config,
+                host.clone(),
+                BTreeMap::new(),
+                Arc::new(TestHooks::default()),
+            )
+            .await?;
+            let status = host.status();
+            assert_eq!(status["capture_cleanup_pending"], true);
+            if policy == NativeCaptureUploadPolicy::PublishRetainingRoots {
+                assert_eq!(status["capture_upload"]["cleanup_pending"], true);
+            } else {
+                assert_eq!(status["capture_upload"], serde_json::Value::Null);
+            }
+            assert!(
+                pack.exists() && publication.exists(),
+                "policy switch never silently authorizes deletion"
+            );
+            if let Some(upload) = upload {
+                upload.shutdown().await;
+            }
+            drop(host);
+        }
+        Ok(())
+    }
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn shared_pack_cleanup_keeps_the_other_registration_payload() -> Result<()> {
+        let (_root, handle) = fixture_with_policy(
+            Arc::new(TestHooks::default()),
+            NativeCaptureUploadPolicy::PublishRetiringRedundant,
+        )
+        .await?;
+        let worker = handle.worker.clone();
+        handle.shutdown().await;
+        let registry = worker.host.capture_registry();
+        let (cleanup, pack, publication, _) = staged_cleanup(&worker, true).await?;
+        assert!(!cleanup.remove_bundle);
+        let bytes = std::fs::read(&pack)?;
+        worker
+            .complete_cleanup(cleanup_admission(&worker).await?)
+            .await?;
+        assert_eq!(std::fs::read(pack)?, bytes);
+        assert!(!publication.exists());
+        assert_eq!(registry.pending_captures().await?.len(), 2);
+        assert!(registry.capture_cleanup().await?.is_none());
+        Ok(())
+    }
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cancelled_cleanup_waiter_retains_physical_fences_until_namespace_sync() -> Result<()> {
+        struct Release(Arc<CatalogPause>);
+        impl Drop for Release {
+            fn drop(&mut self) {
+                self.0.release();
+            }
+        }
+        let hooks = Arc::new(TestHooks::default());
+        let (_root, handle) = fixture_with_policy(
+            hooks.clone(),
+            NativeCaptureUploadPolicy::PublishRetiringRedundant,
+        )
+        .await?;
+        let worker = handle.worker.clone();
+        handle.shutdown().await;
+        let registry = worker.host.capture_registry();
+        staged_cleanup(&worker, false).await?;
+        let pause = Arc::new(CatalogPause::default());
+        let _release = Release(pause.clone());
+        *hooks.cleanup_pause.lock().unwrap() = Some(pause.clone());
+        let admission = cleanup_admission(&worker).await?;
+        let physical = worker.clone();
+        let waiter = tokio::spawn(async move { physical.complete_cleanup(admission).await });
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !pause.entered.load(Ordering::Acquire) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await?;
+        waiter.abort();
+        assert!(waiter.await.unwrap_err().is_cancelled());
+        assert!(matches!(
+            registry.try_host_access(),
+            Err(native_retention::Error::Busy)
+        ));
+        assert!(worker.admission.clone().try_acquire_owned().is_err());
+        pause.release();
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while registry.capture_cleanup().await.unwrap().is_some()
+                || worker.stats.status()["cleanup_pending"] != false
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await?;
+        assert_eq!(worker.stats.status()["cleanup_pending"], false);
+        Ok(())
     }
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn visible_record_retry_reestablishes_namespace_barrier_without_rewriting() -> Result<()>

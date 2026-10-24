@@ -668,13 +668,14 @@ max_manifest_members=1024
             tinytree_client::NativeClient::connect(remote_config.remote.clone()).await?;
         let ledger = private(root.path(), "remote")?;
         let remote = jj_native_remote::RemoteRepository::open(
-            direct,
+            direct.clone(),
             cache.clone(),
             &ledger.path().join("ledger"),
             &ledger.path().join("staging"),
             remote_config.clone(),
         )?;
         let source = Arc::new(Source {
+            local: direct,
             restore: jj_native_remote::RemoteRestoreIo::new(
                 remote.io.clone(),
                 remote.query.clone(),

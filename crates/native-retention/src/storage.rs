@@ -48,6 +48,10 @@ pub(crate) struct Manifest {
     workspace_commitment: [u8; 32],
     #[serde(default, skip_serializing_if = "Option::is_none")]
     captures: Option<CaptureInventory>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    cleanup: Option<CaptureCleanupObligation>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    cleanup_commitment: Option<[u8; 32]>,
 }
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -254,6 +258,8 @@ impl Inner {
                 workspace_count: 0,
                 workspace_commitment: inventory_commitment(&BTreeMap::new()),
                 captures: None,
+                cleanup: None,
+                cleanup_commitment: None,
             };
             let bytes = encode(&manifest)?;
             if bytes.len() + MANIFEST.len() > limits.max_ledger_bytes {
@@ -288,7 +294,12 @@ impl Inner {
             manifest = Some(decode::<Manifest>(&value)?);
         }
         let manifest = manifest.ok_or(Error::Corrupt("missing manifest"))?;
-        if manifest.version != 2 {
+        if !matches!(manifest.version, 2 | 3)
+            || (manifest.version == 2
+                && (manifest.cleanup.is_some() || manifest.cleanup_commitment.is_some()))
+            || (manifest.version == 3
+                && manifest.cleanup_commitment != Some(cleanup_inventory(&manifest.cleanup)))
+        {
             return Err(Error::Corrupt("unsupported format"));
         }
         if manifest.id != id {
@@ -334,6 +345,9 @@ impl Inner {
             _ => return Err(Error::Corrupt("capture inventory commitment")),
         }
         capture_limits(captures.values(), &limits)?;
+        if let Some(cleanup) = &manifest.cleanup {
+            validate_cleanup(cleanup, &manifest, &captures)?;
+        }
         let mut entries = HashMap::new();
         let mut row_digests = BTreeMap::new();
         let mut generations = HashSet::new();
@@ -632,6 +646,11 @@ impl Inner {
         }
         self.check()?;
         let mut data = self.data.lock().map_err(|_| Error::Poisoned)?;
+        if data.manifest.cleanup.as_ref().is_some_and(|cleanup| {
+            cleanup.remove_bundle && cleanup.retired.bundle.blake3 == bundle.blake3
+        }) {
+            return Err(Error::Busy);
+        }
         let mut entry = data.get(registration)?.clone();
         if entry.command_epoch != epoch || entry.state != WorkspaceState::Dirty {
             return Err(Error::ClosedCommand);
@@ -683,6 +702,150 @@ impl Inner {
         self.check()?;
         let data = self.data.lock().map_err(|_| Error::Poisoned)?;
         data.captures.values().map(StoredCapture::pending).collect()
+    }
+    pub fn capture_cleanup(&self) -> Result<Option<CaptureCleanupObligation>> {
+        self.check()?;
+        Ok(self
+            .data
+            .lock()
+            .map_err(|_| Error::Poisoned)?
+            .manifest
+            .cleanup
+            .clone())
+    }
+    pub fn capture_cleanup_pending(&self) -> Result<bool> {
+        self.check()?;
+        let data = self.data.try_lock().map_err(|error| match error {
+            std::sync::TryLockError::WouldBlock => Error::Busy,
+            std::sync::TryLockError::Poisoned(_) => Error::Poisoned,
+        })?;
+        self.check()?;
+        Ok(data.manifest.cleanup.is_some())
+    }
+    pub fn retire_redundant_capture(
+        &self,
+        old: &PendingCapture,
+        successor: &PendingCapture,
+        upload: CaptureUploadCleanup,
+        coverage: &[tinytree_model::EncodedObject],
+    ) -> Result<CaptureCleanupObligation> {
+        self.check()?;
+        validate_upload_cleanup(&upload)?;
+        coverage_limits(coverage)?;
+        let mut data = self.data.lock().map_err(|_| Error::Poisoned)?;
+        if let Some(cleanup) = &data.manifest.cleanup {
+            if cleanup.retired_binding == old.binding()
+                && cleanup.successor_binding == successor.binding()
+                && cleanup.upload == upload
+            {
+                return Ok(cleanup.clone());
+            }
+            return Err(Error::Busy);
+        }
+        let old_row = data.captures.get(&old.id).ok_or(Error::UnknownCapture)?;
+        let successor_row = data
+            .captures
+            .get(&successor.id)
+            .ok_or(Error::UnknownCapture)?;
+        if old_row.pending()? != *old || successor_row.pending()? != *successor {
+            return Err(Error::CheckpointConflict);
+        }
+        if old.registry != self.id
+            || successor.registry != self.id
+            || old.registration != successor.registration
+            || old.registry_epoch >= successor.registry_epoch
+            || old.command_epoch >= successor.command_epoch
+            || old.id == successor.id
+        {
+            return Err(Error::Invalid("capture retirement order or registration"));
+        }
+        verify_capture_coverage(old, successor, coverage)?;
+        let mut cleanup = CaptureCleanupObligation {
+            id: [0; 32],
+            registry: self.id,
+            registration: old.registration,
+            registry_epoch: data.next()?,
+            retired: CaptureCleanupTarget {
+                id: old.id,
+                bundle: old.bundle,
+            },
+            successor: CaptureCleanupTarget {
+                id: successor.id,
+                bundle: successor.bundle,
+            },
+            retired_binding: old.binding(),
+            successor_binding: successor.binding(),
+            upload,
+            remove_bundle: !data
+                .captures
+                .values()
+                .any(|capture| capture.id != old.id && capture.bundle.blake3 == old.bundle.blake3),
+        };
+        cleanup.id = cleanup_binding(&cleanup)?;
+        let mut manifest = data.manifest.clone();
+        manifest.version = 3; // Permanent fail-closed boundary for pre-retirement readers.
+        manifest.epoch = cleanup.registry_epoch;
+        manifest.cleanup = Some(cleanup.clone());
+        let mut capture_digests = data.capture_digests.clone();
+        capture_digests
+            .remove(&old.id)
+            .ok_or(Error::Corrupt("capture digest missing"))?;
+        manifest.captures = Some(CaptureInventory {
+            version: 1,
+            count: capture_digests.len() as u64,
+            commitment: capture_commitment(&capture_digests),
+        });
+        let removed = encode(old_row)?.len() + 32;
+        self.persist_capture_lifecycle(&mut data, manifest, Some((old.id, removed)))?;
+        data.capture_digests = capture_digests;
+        data.captures.remove(&old.id);
+        Ok(cleanup)
+    }
+    pub fn acknowledge_capture_cleanup(&self, expected: &CaptureCleanupObligation) -> Result<()> {
+        self.check()?;
+        let mut data = self.data.lock().map_err(|_| Error::Poisoned)?;
+        if data.manifest.cleanup.as_ref() != Some(expected) {
+            return Err(Error::CheckpointConflict);
+        }
+        let mut manifest = data.manifest.clone();
+        manifest.epoch = data.next()?;
+        manifest.cleanup = None;
+        self.persist_capture_lifecycle(&mut data, manifest, None)
+    }
+    fn persist_capture_lifecycle(
+        &self,
+        data: &mut Data,
+        mut manifest: Manifest,
+        removed: Option<(CaptureId, usize)>,
+    ) -> Result<()> {
+        manifest.cleanup_commitment = Some(cleanup_inventory(&manifest.cleanup));
+        let bytes = encode(&manifest)?;
+        if bytes.len() > 4096 {
+            return Err(Error::Limit("registry manifest bytes"));
+        }
+        let logical = data
+            .logical_bytes
+            .checked_sub(encode(&data.manifest)?.len())
+            .and_then(|n| n.checked_sub(removed.map_or(0, |(_, bytes)| bytes)))
+            .and_then(|n| n.checked_add(bytes.len()))
+            .filter(|n| *n <= self.limits.max_ledger_bytes)
+            .ok_or(Error::Limit("ledger bytes"))?;
+        let written = MANIFEST.len() + bytes.len() + removed.map_or(0, |_| 32);
+        let mut tx = self.db.write_tx().durability(Some(PersistMode::SyncAll));
+        tx.insert(&self.meta, MANIFEST, bytes);
+        if let Some((id, _)) = removed {
+            tx.remove(&self.captures, id.0);
+        }
+        if tx.commit().is_err() {
+            self.poisoned.store(true, Ordering::Release);
+            return Err(Error::Storage);
+        }
+        self.transactions.fetch_add(1, Ordering::Relaxed);
+        self.encoded_write_bytes
+            .fetch_add(written as u64, Ordering::Relaxed);
+        data.manifest = manifest;
+        data.logical_bytes = logical;
+        Ok(())
     }
     pub fn forget(&self, registration: Registration) -> Result<Registration> {
         self.check()?;
@@ -788,6 +951,157 @@ impl Inner {
 }
 fn encode<T: Serialize>(value: &T) -> Result<Vec<u8>> {
     serde_json::to_vec(value).map_err(|_| Error::Corrupt("record encoding"))
+}
+fn validate_upload_cleanup(upload: &CaptureUploadCleanup) -> Result<()> {
+    if upload.published.size_bytes == 0
+        || upload.published.size_bytes > 4096
+        || upload
+            .job
+            .is_some_and(|job| job.size_bytes == 0 || job.size_bytes > 32 * 1024 * 1024)
+    {
+        return Err(Error::Invalid("capture cleanup upload bytes"));
+    }
+    Ok(())
+}
+fn coverage_limits(objects: &[tinytree_model::EncodedObject]) -> Result<()> {
+    if objects.len() > MAX_CAPTURE_COVERAGE_OBJECTS {
+        return Err(Error::Limit("capture coverage objects"));
+    }
+    let mut bytes = 0usize;
+    for object in objects {
+        bytes = bytes
+            .checked_add(object.bytes.len())
+            .filter(|bytes| *bytes <= MAX_CAPTURE_COVERAGE_BYTES)
+            .ok_or(Error::Limit("capture coverage bytes"))?;
+        if object.descriptor.key.kind == Kind::File {
+            return Err(Error::Invalid(
+                "FILE payload is not a metadata coverage witness",
+            ));
+        }
+    }
+    Ok(())
+}
+fn verify_capture_coverage(
+    old: &PendingCapture,
+    successor: &PendingCapture,
+    objects: &[tinytree_model::EncodedObject],
+) -> Result<()> {
+    use tinytree_model as m;
+    coverage_limits(objects)?;
+    let root = |key: &ObjectKey| {
+        successor
+            .checkpoint
+            .roots
+            .binary_search_by_key(&(key.kind as u8, key.id.0), |key| {
+                (key.kind as u8, key.id.0)
+            })
+            .is_ok()
+    };
+    let mut graph = HashMap::with_capacity(objects.len());
+    let limits = m::Limits {
+        max_object_bytes: MAX_CAPTURE_COVERAGE_BYTES,
+        ..m::Limits::default()
+    };
+    let mut edge_count = 0usize;
+    for encoded in objects {
+        m::verify(&encoded.descriptor, &encoded.bytes, limits)
+            .map_err(|_| Error::Invalid("invalid canonical capture coverage witness"))?;
+        let object = m::decode(&encoded.bytes, limits)
+            .map_err(|_| Error::Invalid("invalid canonical capture coverage witness"))?;
+        let canonical = m::encode(&object, limits)
+            .map_err(|_| Error::Invalid("invalid canonical capture coverage witness"))?;
+        if canonical != *encoded {
+            return Err(Error::Invalid("noncanonical capture coverage witness"));
+        }
+        let edges = object.references();
+        edge_count = edge_count
+            .checked_add(edges.len())
+            .filter(|edges| *edges <= MAX_CAPTURE_COVERAGE_EDGES)
+            .ok_or(Error::Limit("capture coverage edges"))?;
+        if graph.insert(encoded.descriptor.key, edges).is_some() {
+            return Err(Error::Invalid("duplicate capture coverage witness"));
+        }
+    }
+    let mut reachable = HashSet::new();
+    let mut queue = std::collections::VecDeque::new();
+    for key in graph.keys().filter(|key| root(key)) {
+        reachable.insert(*key);
+        queue.push_back(*key);
+    }
+    while let Some(key) = queue.pop_front() {
+        if let Some(edges) = graph.get(&key) {
+            for edge in edges {
+                if reachable.insert(*edge) {
+                    queue.push_back(*edge);
+                }
+            }
+        }
+    }
+    if graph.keys().any(|key| !reachable.contains(key)) {
+        return Err(Error::Invalid("unanchored capture coverage witness"));
+    }
+    if old
+        .checkpoint
+        .roots
+        .iter()
+        .any(|key| !root(key) && !reachable.contains(key))
+    {
+        return Err(Error::Invalid("successor omits retained typed roots"));
+    }
+    Ok(())
+}
+fn cleanup_inventory(cleanup: &Option<CaptureCleanupObligation>) -> [u8; 32] {
+    let mut hash = blake3::Hasher::new();
+    hash.update(b"native-retention-cleanup-slot-v1\0");
+    match cleanup {
+        Some(cleanup) => {
+            hash.update(&[1]);
+            hash.update(&cleanup.id);
+        }
+        None => {
+            hash.update(&[0]);
+        }
+    }
+    *hash.finalize().as_bytes()
+}
+fn cleanup_binding(cleanup: &CaptureCleanupObligation) -> Result<[u8; 32]> {
+    let mut normalized = cleanup.clone();
+    normalized.id = [0; 32];
+    let mut hash = blake3::Hasher::new();
+    hash.update(b"native-retention-capture-cleanup-v1\0");
+    hash.update(&encode(&normalized)?);
+    Ok(*hash.finalize().as_bytes())
+}
+fn validate_cleanup(
+    cleanup: &CaptureCleanupObligation,
+    manifest: &Manifest,
+    captures: &BTreeMap<CaptureId, StoredCapture>,
+) -> Result<()> {
+    let successor = captures
+        .get(&cleanup.successor.id)
+        .ok_or(Error::Corrupt("cleanup successor missing"))?
+        .pending()?;
+    if manifest.version != 3
+        || cleanup.registry != manifest.id
+        || cleanup.registry_epoch == 0
+        || cleanup.registry_epoch > manifest.epoch
+        || cleanup.retired.id == cleanup.successor.id
+        || cleanup.retired.bundle.size_bytes == 0
+        || captures.contains_key(&cleanup.retired.id)
+        || successor.registration != cleanup.registration
+        || successor.registry_epoch >= cleanup.registry_epoch
+        || successor.bundle != cleanup.successor.bundle
+        || successor.binding() != cleanup.successor_binding
+        || cleanup.id != cleanup_binding(cleanup)?
+        || (cleanup.remove_bundle
+            && captures
+                .values()
+                .any(|capture| capture.bundle.blake3 == cleanup.retired.bundle.blake3))
+        || validate_upload_cleanup(&cleanup.upload).is_err()
+    {
+        return Err(Error::Corrupt("capture cleanup obligation"));
+    }
+    Ok(())
 }
 fn decode<T: serde::de::DeserializeOwned>(bytes: &[u8]) -> Result<T> {
     serde_json::from_slice(bytes).map_err(|_| Error::Corrupt("record encoding"))

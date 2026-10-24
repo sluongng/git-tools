@@ -125,6 +125,12 @@ impl NativeWorkspaces {
         self.capture.validate()?;
         self.upload.validate()?;
         self.gc.validate()?;
+        if self.upload.policy == NativeCaptureUploadPolicy::PublishRetiringRedundant {
+            ensure!(
+                self.capture.max_pending >= 2 && self.upload.max_jobs >= 2,
+                "redundant capture retirement requires at least two capture and upload slots"
+            );
+        }
         if self.gc.policy == NativeGcPolicy::LocalComplete {
             ensure!(
                 self.index_mode == NativeIndexMode::Legacy,
@@ -234,13 +240,14 @@ impl NativeGc {
     }
 }
 
-/// Background publication retains every local pending ticket, root and pack.
+/// Background publication and optional exact-proof local capsule retirement.
 #[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum NativeCaptureUploadPolicy {
     #[default]
     Disabled,
     PublishRetainingRoots,
+    PublishRetiringRedundant,
 }
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
@@ -996,6 +1003,17 @@ mod tests {
         assert!(upload_enabled.validate().is_ok());
         upload_enabled.native.workspaces.upload.max_jobs = 0;
         assert!(upload_enabled.validate().is_err());
+        let mut retiring = old.clone();
+        retiring.native.workspaces.upload.policy =
+            NativeCaptureUploadPolicy::PublishRetiringRedundant;
+        assert!(retiring.validate().is_ok());
+        retiring.native.workspaces.capture.max_pending = 1;
+        assert!(retiring.validate().is_err());
+        retiring.native.workspaces.capture.max_pending = 2;
+        retiring.native.workspaces.upload.max_jobs = 1;
+        assert!(retiring.validate().is_err());
+        retiring.native.workspaces.upload.max_jobs = 2;
+        assert!(retiring.validate().is_ok());
         let mut bad_capture = enabled.clone();
         bad_capture.native.workspaces.capture.max_pending = 0;
         assert!(bad_capture.validate().is_err());
