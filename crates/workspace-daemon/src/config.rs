@@ -81,6 +81,7 @@ pub enum NativeIndexMode {
 pub struct NativeWorkspaces {
     /// Experimental opt-in; existing index/type always wins on reload.
     pub index_mode: NativeIndexMode,
+    pub capture: NativeCapture,
     /// None uses the per-user registry shared with the native jj client.
     pub registry_path: Option<PathBuf>,
     pub max_workspaces: usize,
@@ -93,6 +94,7 @@ impl Default for NativeWorkspaces {
     fn default() -> Self {
         Self {
             index_mode: NativeIndexMode::Legacy,
+            capture: NativeCapture::default(),
             registry_path: None,
             max_workspaces: 128,
             max_entries: 100_000,
@@ -104,6 +106,7 @@ impl Default for NativeWorkspaces {
 }
 impl NativeWorkspaces {
     fn validate(&self) -> Result<()> {
+        self.capture.validate()?;
         ensure!(
             (1..=4096).contains(&self.max_workspaces)
                 && (1..=1_000_000).contains(&self.max_entries)
@@ -119,6 +122,48 @@ impl NativeWorkspaces {
                 "native workspace registry must be a bounded absolute path"
             );
         }
+        Ok(())
+    }
+}
+
+/// Local capture staging only; this does not enable cloud backup or collection.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum NativeCapturePolicy {
+    #[default]
+    Disabled,
+    AfterCommandBestEffort,
+}
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct NativeCapture {
+    pub policy: NativeCapturePolicy,
+    pub max_bundle_bytes: u64,
+    pub max_pending_bytes: u64,
+    pub max_pending: usize,
+    pub timeout_ms: u64,
+}
+impl Default for NativeCapture {
+    fn default() -> Self {
+        Self {
+            policy: NativeCapturePolicy::Disabled,
+            max_bundle_bytes: 256 * 1024 * 1024,
+            max_pending_bytes: 4 * 1024 * 1024 * 1024,
+            max_pending: 64,
+            timeout_ms: 30_000,
+        }
+    }
+}
+impl NativeCapture {
+    pub(crate) fn validate(&self) -> Result<()> {
+        ensure!(
+            (4096..=1024 * 1024 * 1024).contains(&self.max_bundle_bytes)
+                && self.max_pending_bytes >= self.max_bundle_bytes
+                && self.max_pending_bytes <= 16 * 1024 * 1024 * 1024
+                && (1..=1024).contains(&self.max_pending)
+                && (1..=120_000).contains(&self.timeout_ms),
+            "invalid native local capture bounds"
+        );
         Ok(())
     }
 }
@@ -750,6 +795,24 @@ mod tests {
         assert!(old.native.repositories.is_empty());
         assert_eq!(old.native.workspaces.max_workspaces, 128);
         assert_eq!(old.native.workspaces.index_mode, NativeIndexMode::Legacy);
+        assert_eq!(
+            old.native.workspaces.capture.policy,
+            NativeCapturePolicy::Disabled
+        );
+        let parsed: Config = toml::from_str(
+            "[native.workspaces.capture]\npolicy='after_command_best_effort'\nmax_pending=8\n",
+        )
+        .unwrap();
+        let mut enabled = old.clone();
+        enabled.native.workspaces.capture = parsed.native.workspaces.capture;
+        assert_eq!(
+            enabled.native.workspaces.capture.policy,
+            NativeCapturePolicy::AfterCommandBestEffort
+        );
+        assert!(enabled.validate().is_ok());
+        let mut bad_capture = enabled.clone();
+        bad_capture.native.workspaces.capture.max_pending = 0;
+        assert!(bad_capture.validate().is_err());
         assert_eq!(
             toml::from_str::<Config>("[native.workspaces]\nindex_mode='federated'\n")
                 .unwrap()

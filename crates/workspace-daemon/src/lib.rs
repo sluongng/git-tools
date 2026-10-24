@@ -18,3 +18,6 @@ pub mod native_workspaces;
 
 #[cfg(unix)]
 mod native_commands;
+
+#[cfg(unix)]
+mod native_capture;

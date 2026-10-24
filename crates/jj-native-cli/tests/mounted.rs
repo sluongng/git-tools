@@ -174,6 +174,23 @@ impl Fixture {
         fs::write(&self.daemon_config, toml::to_string(&config).unwrap()).unwrap();
     }
 
+    fn capture_policy(&mut self, policy: &str) {
+        let mut config: toml::Value =
+            toml::from_str(&fs::read_to_string(&self.daemon_config).unwrap()).unwrap();
+        config["native"]["workspaces"]
+            .as_table_mut()
+            .unwrap()
+            .insert(
+                "capture".into(),
+                toml::Value::Table(toml::map::Map::from_iter([(
+                    "policy".into(),
+                    policy.into(),
+                )])),
+            );
+        fs::write(&self.daemon_config, toml::to_string(&config).unwrap()).unwrap();
+        workspace_daemon::config::Config::load(&self.daemon_config).unwrap();
+    }
+
     fn start(&mut self) {
         assert!(self.daemon.is_none());
         let log = fs::File::create(self.base().join("daemon.log")).unwrap();
@@ -1494,6 +1511,7 @@ fn federated_index_production_factory_preserves_operations_and_drains_cli_querie
     // Creation policy does not rotate the live security identity or replace an
     // existing repository's recorded native index with the legacy index.
     fixture.index_mode("legacy");
+    fixture.capture_policy("after_command_best_effort");
     fixture.start();
     fixture.success(&base, &["tinytree", "resume", root.to_str().unwrap()]);
     fixture.success(&root, &["status"]);
@@ -1502,6 +1520,66 @@ fn federated_index_production_factory_preserves_operations_and_drains_cli_querie
         fs::read_to_string(index.join("type")).unwrap(),
         jj_native_index::NAME
     );
+
+    let captured = local_capture_status(&fixture);
+    assert_eq!(captured["policy"], "after_command_best_effort");
+    assert!(
+        captured["queued"].as_u64().unwrap() > 0,
+        "a successful pristine federated command must queue an actual host-sealed capture: {captured}"
+    );
+    let pending = captured["pending_count"].as_u64().unwrap();
+    let pending_bytes = captured["pending_bytes"].as_u64().unwrap();
+    assert!(pending > 0 && pending_bytes > 0);
+    assert_eq!(captured["inventory_available"], true);
+    assert_eq!(captured["pending_dirty"].as_u64().unwrap(), pending);
+    assert_eq!(
+        captured["pending_clean"], 0,
+        "local staging does not acknowledge remote backup"
+    );
+    assert_eq!(captured["pending_unavailable"], 0);
+    assert_eq!(
+        upstream.file_reads(),
+        0,
+        "local capture must not hydrate source FILE bodies"
+    );
+    let bundles = local_capture_bundles(&fixture);
+    assert!(!bundles.is_empty());
+    fixture.success(&base, &["tinytree", "unmount", root.to_str().unwrap()]);
+    fixture.stop_daemon();
+    fixture.start();
+    let reopened = local_capture_status(&fixture);
+    assert_eq!(reopened["pending_count"].as_u64().unwrap(), pending);
+    assert_eq!(reopened["pending_bytes"].as_u64().unwrap(), pending_bytes);
+    assert_eq!(reopened["pending_dirty"].as_u64().unwrap(), pending);
+    assert_eq!(reopened["pending_clean"], 0);
+    assert_eq!(reopened["inventory_available"], true);
+    assert_eq!(
+        local_capture_bundles(&fixture),
+        bundles,
+        "pending immutable local bundles survive daemon restart before another command"
+    );
+    fixture.success(&base, &["tinytree", "resume", root.to_str().unwrap()]);
+
+    let before_fallback = local_capture_status(&fixture);
+    let dirty = root.join("capture-untracked.txt");
+    fs::write(&dirty, b"unsnapshotted source bytes\n").unwrap();
+    let output = fixture.run(&root, &["--ignore-working-copy", "log", "-n", "1"]);
+    assert!(
+        output.status.success(),
+        "best-effort capture must preserve successful jj command: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(!String::from_utf8_lossy(&output.stdout).contains("<Error"));
+    let fallback = local_capture_status(&fixture);
+    assert!(
+        fallback["attempted"].as_u64().unwrap() > before_fallback["attempted"].as_u64().unwrap()
+    );
+    assert_eq!(fallback["queued"], before_fallback["queued"]);
+    assert_eq!(fallback["last_disposition"], "candidate_unavailable");
+    assert_eq!(fallback["pending_count"], before_fallback["pending_count"]);
+    assert_eq!(fallback["pending_clean"], 0);
+    assert_eq!(upstream.file_reads(), 0);
+    fs::remove_file(dirty).unwrap();
 
     // Missing operation associations fail closed and are never rebuilt from
     // fetched ancestry or silently replaced with a default index.
@@ -1548,6 +1626,38 @@ fn federated_index_production_factory_preserves_operations_and_drains_cli_querie
         jj_native_index::NAME
     );
     assert!(index.join("manifest").is_file());
+}
+
+fn local_capture_status(fixture: &Fixture) -> serde_json::Value {
+    let status = fixture.control(Request::Status).unwrap();
+    assert_eq!(status["native"]["commands"]["active_commands"], 0);
+    assert_eq!(status["native"]["commands"]["collection_enabled"], false);
+    status["native"]["commands"]["local_capture"].clone()
+}
+
+fn local_capture_bundles(fixture: &Fixture) -> BTreeMap<String, Vec<u8>> {
+    let directory = fixture
+        .socket
+        .parent()
+        .unwrap()
+        .join("native-commands/captures");
+    fs::read_dir(directory)
+        .unwrap()
+        .filter_map(|entry| {
+            let entry = entry.unwrap();
+            let path = entry.path();
+            if path.extension().and_then(|value| value.to_str()) != Some("pack") {
+                return None;
+            }
+            let bytes = fs::read(&path).unwrap();
+            assert!(!bytes.is_empty());
+            assert_eq!(
+                path.file_stem().unwrap().to_str().unwrap(),
+                blake3::hash(&bytes).to_hex().as_str()
+            );
+            Some((entry.file_name().to_str().unwrap().to_owned(), bytes))
+        })
+        .collect()
 }
 
 fn write_synced(path: &Path, bytes: &[u8]) {
@@ -1838,6 +1948,7 @@ struct StartupTrialFailure<'a> {
     history: usize,
     trial: usize,
     index_mode: &'static str,
+    capture_policy: &'static str,
     phase: &'static str,
     started: Instant,
     before: StartupCounters,
@@ -1849,12 +1960,14 @@ impl<'a> StartupTrialFailure<'a> {
         history: usize,
         trial: usize,
         index_mode: &'static str,
+        capture_policy: &'static str,
     ) -> Self {
         Self {
             upstream,
             history,
             trial,
             index_mode,
+            capture_policy,
             phase: "fixture_configuration",
             started: Instant::now(),
             before: upstream.startup_counters(),
@@ -1876,7 +1989,7 @@ impl Drop for StartupTrialFailure<'_> {
                 "{}",
                 serde_json::json!({
                     "schema":1,"benchmark":"native_mounted_startup","measurement":false,
-                    "status":"failed_or_timeout","historical_commits":self.history,"trial":self.trial,"index_mode":self.index_mode,
+                    "status":"failed_or_timeout","historical_commits":self.history,"trial":self.trial,"index_mode":self.index_mode,"local_capture_policy":self.capture_policy,
                     "phase":self.phase,"phase_elapsed_ns":self.started.elapsed().as_nanos(),
                     "partial_phase_counters":self.upstream.startup_counters().subtract(self.before),
                     "cli_timeout_seconds":30,"daemon_readiness_timeout_seconds":20,
@@ -1935,6 +2048,29 @@ fn mounted_command_retention_cumulative(fixture: &Fixture) -> serde_json::Value 
         "dirty_transition_includes_registry_queueing".into(),
         true.into(),
     );
+    if let Some(capture) = stats.get("local_capture") {
+        let mut counters = serde_json::Map::new();
+        for field in [
+            "policy",
+            "pending_count",
+            "pending_bytes",
+            "pending_dirty",
+            "pending_clean",
+            "pending_unavailable",
+            "inventory_available",
+            "pending_root_claims",
+            "attempted",
+            "queued",
+            "skipped",
+            "failed",
+            "last_disposition",
+        ] {
+            if let Some(value) = capture.get(field) {
+                counters.insert(field.into(), value.clone());
+            }
+        }
+        output.insert("local_capture".into(), counters.into());
+    }
     output.insert(
         "physical_drain_includes_accepted_job_wait".into(),
         true.into(),
@@ -1971,6 +2107,18 @@ fn native_mounted_startup_benchmark_ladder() {
         Err(std::env::VarError::NotPresent) => "legacy",
         _ => panic!("TINYTREE_MOUNTED_STARTUP_INDEX_MODE must be legacy or federated"),
     };
+    let capture_policy = match std::env::var("TINYTREE_MOUNTED_STARTUP_CAPTURE_POLICY") {
+        Ok(value) if value == "disabled" => "disabled",
+        Ok(value) if value == "after_command_best_effort" => "after_command_best_effort",
+        Err(std::env::VarError::NotPresent) => "disabled",
+        _ => panic!(
+            "TINYTREE_MOUNTED_STARTUP_CAPTURE_POLICY must be disabled or after_command_best_effort"
+        ),
+    };
+    assert!(
+        capture_policy == "disabled" || index_mode == "federated",
+        "capture benchmark requires the supported federated index"
+    );
     let expected_index = match index_mode {
         "legacy" => jj_lib::default_index::DefaultIndexStore::NAME,
         "federated" => jj_native_index::NAME,
@@ -1998,12 +2146,14 @@ fn native_mounted_startup_benchmark_ladder() {
             // Declare the owner before the failure tracker, so its actual
             // FUSE/daemon cleanup runs AFTER the sanitized failure record.
             let mut fixture_owner = std::cell::OnceCell::new();
-            let mut failure = StartupTrialFailure::new(&upstream, history, trial, index_mode);
+            let mut failure =
+                StartupTrialFailure::new(&upstream, history, trial, index_mode, capture_policy);
             let fixture_started = Instant::now();
             assert!(fixture_owner.set(Fixture::new()).is_ok());
             let fixture = fixture_owner.get_mut().unwrap();
             fixture.configure_remote(&upstream.endpoint);
             fixture.index_mode(index_mode);
+            fixture.capture_policy(capture_policy);
             let fixture_setup_ns = fixture_started.elapsed().as_nanos();
             let daemon = mounted_startup_phase(&mut failure, "daemon_start", || fixture.start());
             let base = fixture.base().to_owned();
@@ -2064,6 +2214,7 @@ fn native_mounted_startup_benchmark_ladder() {
                     "schema":1,"benchmark":"native_mounted_startup","measurement":true,"status":"completed",
                     "historical_commits":history,"reachable_stored_commits":history+1,
                     "index_ingested_commits":history+2,"trial":trial,"trials":3,"index_mode":index_mode,
+                    "local_capture_policy":capture_policy,"best_effort_capture_cost_included_in_command_latency":capture_policy!="disabled",
                     "workspace_provider":"actual_linux_fuse","checkout":"lazy_no_full_checkout_substitute",
                     "source_setup_ns":upstream.setup_ns,"index_ready_ns":upstream.index_ready_ns,
                     "index_ready_before_daemon":true,"upstream_total_setup_ns":upstream_total_ns,

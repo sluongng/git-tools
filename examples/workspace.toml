@@ -81,6 +81,12 @@ buildbuddy = "https://github.com/buildbuddy-io/buildbuddy.git"
 # [native.workspaces]
 # index_mode = "legacy" # Experimental "federated" avoids eager jj history indexing.
 # Existing workspaces retain their recorded index type.
+# [native.workspaces.capture]
+# policy = "disabled" # Opt in: "after_command_best_effort" (Linux + federated).
+# max_bundle_bytes = 268435456
+# max_pending_bytes = 4294967296
+# max_pending = 64
+# timeout_ms = 30000
 # [native.repositories.example]
 # max_repository_bytes = 17179869184
 # max_file_bytes = 268435456

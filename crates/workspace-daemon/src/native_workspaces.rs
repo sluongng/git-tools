@@ -25,6 +25,7 @@ const MAX_RECORD: usize = 32 * 1024;
 
 #[derive(Clone)]
 pub(crate) struct Repository {
+    pub local_objects: Arc<jj_native_backend::DirectObjectIo>,
     pub io: Arc<dyn NativeObjectIo>,
     pub scope: Scope,
     pub remote: bool,
@@ -468,11 +469,36 @@ impl Manager {
         self.entries.get_mut(&workspace_id).unwrap().controller = Some(controller.clone());
         if self
             .service
-            .register(workspace_id.clone(), controller, binding.projection())
+            .register(
+                workspace_id.clone(),
+                controller.clone(),
+                binding.projection(),
+            )
             .is_err()
         {
             self.failed(&workspace_id)?;
             anyhow::bail!("native projection registration failed; provider retained for recovery");
+        }
+        if let Some(commands) = &self.commands {
+            let endpoint = self.config.state_dir.join("rbe.sock");
+            commands.set_capture_target(
+                &workspace_id,
+                Some(Arc::new(crate::native_capture::Target {
+                    controller: Arc::downgrade(&controller),
+                    registry: registry.clone(),
+                    binding: binding.clone(),
+                    local: repository.local_objects.clone(),
+                    index: jj_native_index::Config {
+                        endpoint: jj_native_index::Endpoint::UnixSocket(endpoint.clone()),
+                        store_alias: binding.repository.clone(),
+                        provider_fingerprint: repository.identity,
+                    },
+                    remote_scope: native_workspace_admin::remote_state::RemoteScope::new(
+                        endpoint,
+                        binding.repository.clone(),
+                    )?,
+                })),
+            )?;
         }
         let entry = self.entries.get_mut(&workspace_id).unwrap();
         entry.registered = true;
@@ -552,6 +578,9 @@ impl Manager {
                 .is_some_and(|commands| commands.active(id)),
             "native workspace has active command writers; preserve the mount"
         );
+        if let Some(commands) = &self.commands {
+            commands.set_capture_target(id, None)?;
+        }
         let entry = self
             .entries
             .get_mut(id)
@@ -864,6 +893,7 @@ mod tests {
             BTreeMap::from([(
                 "example".into(),
                 Repository {
+                    local_objects: provider.clone(),
                     io: provider,
                     scope: Scope::from_configured_identity("example", &[8; 32])?,
                     remote: false,

@@ -584,6 +584,7 @@ fn open_native_host(
         std::collections::HashMap::new();
 
     let mut retained = BTreeMap::new();
+    let mut local_objects = BTreeMap::new();
     for (alias, settings) in &config.native.repositories {
         let path = root.join(alias);
         private_dir(&path)?;
@@ -598,6 +599,7 @@ fn open_native_host(
         .map_err(|_| anyhow::anyhow!("cannot open configured native repository; state retained"))?;
 
         let provider = Arc::new(provider);
+        local_objects.insert(alias.clone(), provider.clone());
         if let Some(remote_config) = &settings.remote {
             let remote_root = config.state_dir.join("native-remote");
             private_dir(&remote_root)?;
@@ -687,6 +689,9 @@ fn open_native_host(
         retained.insert(
             alias.clone(),
             crate::native_workspaces::Repository {
+                local_objects: local_objects
+                    .remove(alias)
+                    .expect("configured local native provider"),
                 io: broker
                     .source_io(alias)
                     .map_err(|_| anyhow::anyhow!("cannot configure native source provider"))?,
@@ -814,8 +819,9 @@ pub async fn serve(mut config: Config) -> Result<()> {
         None
     } else {
         Some(Arc::new(
-            crate::native_commands::NativeCommandHost::open(
+            crate::native_commands::NativeCommandHost::open_with_capture(
                 &config.state_dir.join("native-commands"),
+                config.native.workspaces.capture.clone(),
             )
             .await?,
         ))
@@ -1594,7 +1600,14 @@ mod tests {
             rpc_mount_id: "workspace".into(),
         };
         let path = private.path().join("retention");
-        let host = crate::native_commands::NativeCommandHost::open(&path).await?;
+        let host = crate::native_commands::NativeCommandHost::open_with_capture(
+            &path,
+            crate::config::NativeCapture {
+                policy: crate::config::NativeCapturePolicy::AfterCommandBestEffort,
+                ..Default::default()
+            },
+        )
+        .await?;
         host.register(&binding, [8; 32]).await?;
         assert_eq!(
             host.workspace_state("workspace").await?.state,
@@ -1667,6 +1680,13 @@ mod tests {
             native_retention::WorkspaceState::Dirty
         );
         assert_eq!(host.status()["collection_enabled"], false);
+        assert_eq!(
+            host.status()["local_capture"]["last_disposition"],
+            "target_unavailable"
+        );
+        assert_eq!(host.status()["local_capture"]["queued"], 0);
+        assert_eq!(host.status()["local_capture"]["pending_count"], 0);
+        assert!(host.status()["local_capture"]["skipped"].as_u64().unwrap() > 0);
         // Old closed A and old never-accepted preparations cannot mint a ghost
         // epoch merely because a later CLI now holds the same kernel lock.
         let unaccepted_a = host.prepare("workspace", [2; 32]).await?;

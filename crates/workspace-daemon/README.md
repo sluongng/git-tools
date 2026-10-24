@@ -38,6 +38,11 @@ also use `rbe.sock` for shared object I/O and native reference control. Configur
 [`tinytree-jj`](../jj-native-cli) for native clone/fetch/push through daemon-owned
 lazy Linux mounts. Native client GC/offloading is not automatic.
 
+With federated indexes on Linux, set `native.workspaces.capture.policy` to
+`"after_command_best_effort"` to queue a durable local capture after each command.
+It is disabled by default and adds command-completion work. Status reports queued
+and skipped captures; this is not upstream backup, a Clean state, or GC permission.
+
 Bazel needs the
 [Unix authority fix](https://github.com/bazelbuild/bazel/commit/242563f1a14378801725e5f6b0ee397ef0d307f2)
 and required BLAKE3/xattr/r2c2 support. Select a compatible client with `session.bazel`.

@@ -44,6 +44,7 @@ struct Workspace {
     lease: PathBuf,
     lease_identity: (u64, u64),
     closed: Mutex<Option<[u8; 32]>>,
+    capture: Mutex<Option<Arc<crate::native_capture::Target>>>,
     pending: Mutex<Option<([u8; 32], CommandPreparation)>>,
 }
 struct Session {
@@ -52,7 +53,7 @@ struct Session {
     preparation: CommandPreparation,
     token: [u8; 32],
     epoch: u64,
-    owner: Mutex<Option<CommandOwner>>,
+    owner: Mutex<Option<Arc<CommandOwner>>>,
     physical: Mutex<Option<CommandJobGuard>>,
     probe: File,
     released: AtomicBool,
@@ -63,6 +64,7 @@ struct Session {
 }
 struct Inner {
     registry: Registry,
+    capture: Arc<crate::native_capture::Coordinator>,
     incarnation: [u8; 16],
     records: PrivateDir,
     workspaces: RwLock<HashMap<String, Arc<Workspace>>>,
@@ -116,6 +118,12 @@ fn existing_lease(path: &Path, identity: Option<(u64, u64)>) -> std::io::Result<
 }
 impl NativeCommandHost {
     pub async fn open(path: &Path) -> Result<Self> {
+        Self::open_with_capture(path, crate::config::NativeCapture::default()).await
+    }
+    pub async fn open_with_capture(
+        path: &Path,
+        capture: crate::config::NativeCapture,
+    ) -> Result<Self> {
         let directory = PrivateDir::create(path)?;
         let fresh = !directory.path().join("identity.json").try_exists()?;
         let header = match directory.read("identity.json", MAX_RECORD) {
@@ -152,9 +160,16 @@ impl NativeCommandHost {
             Registry::init(&ledger, header.id, Tracking::Untracked, Default::default()).await?
         };
         let records = PrivateDir::create(directory.path().join("records"))?;
+        let capture = crate::native_capture::Coordinator::open(
+            &directory.path().join("captures"),
+            capture,
+            &registry,
+        )
+        .await?;
         let host = Self {
             inner: Arc::new(Inner {
                 registry,
+                capture,
                 incarnation: *uuid::Uuid::new_v4().as_bytes(),
                 records,
                 workspaces: Default::default(),
@@ -246,6 +261,7 @@ impl NativeCommandHost {
             lease,
             lease_identity,
             closed: Mutex::new(None),
+            capture: Mutex::new(None),
             pending: Mutex::new(None),
         });
         let mut entries = self
@@ -273,6 +289,28 @@ impl NativeCommandHost {
             );
             entries.insert(mount, workspace);
         }
+        Ok(())
+    }
+    pub(crate) fn set_capture_target(
+        &self,
+        mount: &str,
+        target: Option<Arc<crate::native_capture::Target>>,
+    ) -> Result<()> {
+        let workspace = self
+            .workspace(mount)
+            .map_err(|_| anyhow::anyhow!("native capture workspace unavailable"))?;
+        if let Some(target) = &target {
+            ensure!(
+                target.binding.rpc_mount_id == mount
+                    && target.binding.repository == workspace.mapping.alias
+                    && target.index.provider_fingerprint == workspace.mapping.identity,
+                "native capture target identity differs"
+            );
+        }
+        *workspace
+            .capture
+            .lock()
+            .map_err(|_| anyhow::anyhow!("native capture target unavailable"))? = target;
         Ok(())
     }
     fn workspace(&self, mount: &str) -> std::result::Result<Arc<Workspace>, Status> {
@@ -458,7 +496,7 @@ impl NativeCommandHost {
             preparation,
             token,
             epoch,
-            owner: Mutex::new(Some(owner)),
+            owner: Mutex::new(Some(Arc::new(owner))),
             physical: Mutex::new(Some(physical)),
             probe,
             released: AtomicBool::new(false),
@@ -518,14 +556,31 @@ impl NativeCommandHost {
         if session.drain_started.swap(true, Ordering::AcqRel) {
             return;
         }
+        // Policy/target/admission are frozen before either sealing operation.
+        // Never drain_dirty first and then try to capture its closed token.
+        let target = session
+            .workspace
+            .capture
+            .lock()
+            .ok()
+            .and_then(|target| target.clone());
+        let plan = self.inner.capture.select(target);
         let host = self.clone();
         tokio::spawn(async move {
             let drain_started = std::time::Instant::now();
-            let result = host
-                .inner
-                .registry
-                .drain_dirty(CommandToken::from_bytes(session.token))
-                .await;
+            let result = match plan {
+                crate::native_capture::Plan::DrainOnly => host
+                    .inner
+                    .registry
+                    .drain_dirty(CommandToken::from_bytes(session.token))
+                    .await
+                    .map_err(status),
+                crate::native_capture::Plan::Capture {
+                    target,
+                    permit,
+                    disk,
+                } => host.capture_session(&session, target, permit, disk).await,
+            };
             match result {
                 Ok(()) => {
                     host.inner.drains.fetch_add(1, Ordering::Relaxed);
@@ -546,16 +601,140 @@ impl NativeCommandHost {
                 }
                 Err(error) => {
                     if let Ok(mut failure) = session.failure.lock() {
-                        *failure = Some(status(error));
+                        *failure = Some(error);
                     }
                 }
             }
             session.changed.notify_waiters();
         });
     }
+    async fn capture_session(
+        &self,
+        session: &Arc<Session>,
+        target: Arc<crate::native_capture::Target>,
+        permit: Arc<tokio::sync::OwnedSemaphorePermit>,
+        disk: Arc<crate::native_capture::DiskReservation>,
+    ) -> std::result::Result<(), Status> {
+        use crate::native_capture::{Attempt, Completion};
+        let command = session
+            .owner
+            .lock()
+            .map_err(|_| Status::internal("native command owner unavailable"))?
+            .clone()
+            .ok_or_else(|| Status::failed_precondition("native command owner closed"))?;
+        let attempt = Arc::new(Mutex::new(Attempt::Selected));
+        let completion = Arc::new(Completion::default());
+        let phase = attempt.clone();
+        let done = completion.clone();
+        let coordinator = self.inner.capture.clone();
+        let lease = session.workspace.lease.clone();
+        let identity = session.workspace.lease_identity;
+        let _host_admission = permit.clone(); // Includes post-commit inventory memory.
+        let callback = move || async move {
+            // This is entered only after Registry has sealed and drained jobs.
+            *phase.lock().unwrap_or_else(|e| e.into_inner()) = Attempt::Entered;
+            let deadline = tokio::time::Instant::now() + coordinator.timeout();
+            let kernel = loop {
+                match existing_lease(&lease, Some(identity)) {
+                    Ok(file) => match file.try_lock_exclusive() {
+                        Ok(()) => break file,
+                        Err(error)
+                            if error.kind() == std::io::ErrorKind::WouldBlock
+                                && tokio::time::Instant::now() < deadline => {}
+                        Err(_) => {
+                            *phase.lock().unwrap_or_else(|e| e.into_inner()) =
+                                Attempt::Unavailable("lease_unavailable");
+                            done.complete();
+                            return Err(native_retention::Error::Storage);
+                        }
+                    },
+                    Err(_) => {
+                        *phase.lock().unwrap_or_else(|e| e.into_inner()) =
+                            Attempt::Unavailable("lease_unavailable");
+                        done.complete();
+                        return Err(native_retention::Error::Storage);
+                    }
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            };
+            crate::native_capture::capture(
+                coordinator,
+                target,
+                command,
+                kernel,
+                permit,
+                disk,
+                done,
+                phase,
+            )
+            .await
+            .map_err(|_| native_retention::Error::Storage)
+        };
+        let result = self
+            .inner
+            .registry
+            .capture_dirty_owned(CommandToken::from_bytes(session.token), callback)
+            .await;
+        let phase = *attempt
+            .lock()
+            .map_err(|_| Status::internal("native capture status unavailable"))?;
+        match result {
+            Ok(_) => {
+                self.inner.capture.queued();
+                self.inner.capture.refresh(&self.inner.registry).await;
+                if !completion.wait(self.inner.capture.timeout()).await {
+                    self.inner.capture.disposition("indeterminate", true);
+                    return Err(Status::failed_precondition(
+                        "native capture physical teardown requires recovery",
+                    ));
+                }
+                Ok(())
+            }
+            Err(error)
+                if matches!(phase, Attempt::Unavailable(_))
+                    || (phase == Attempt::Staged
+                        && matches!(error, native_retention::Error::Limit(_))) =>
+            {
+                if !completion.wait(self.inner.capture.timeout()).await {
+                    self.inner.capture.disposition("indeterminate", true);
+                    return Err(Status::failed_precondition(
+                        "native capture physical teardown requires recovery",
+                    ));
+                }
+                let state = self
+                    .inner
+                    .registry
+                    .workspace(session.workspace.registration)
+                    .await
+                    .map_err(status)?;
+                if state.state != native_retention::WorkspaceState::Dirty
+                    || state.command_epoch != session.epoch
+                {
+                    return Err(Status::failed_precondition(
+                        "native capture requires dirty recovery",
+                    ));
+                }
+                let category = match phase {
+                    Attempt::Unavailable(category) => category,
+                    Attempt::Staged => "retention_full",
+                    _ => unreachable!(),
+                };
+                self.inner.capture.disposition(category, true);
+                // Expected exact-capture unavailability does not undo or fail
+                // the already-completed user command. No Clean or queued claim.
+                Ok(())
+            }
+            Err(_) => {
+                self.inner.capture.disposition("indeterminate", true);
+                Err(Status::failed_precondition(
+                    "native capture publication requires recovery",
+                ))
+            }
+        }
+    }
     pub fn status(&self) -> serde_json::Value {
         let stats = self.inner.registry.storage_stats();
-        serde_json::json!({"active_commands":self.inner.sessions.lock().map(|s|s.len()).unwrap_or(MAX_ACTIVE),"registered_workspaces":self.inner.workspaces.read().map(|w|w.len()).unwrap_or(4096),"collection_enabled":false,
+        serde_json::json!({"active_commands":self.inner.sessions.lock().map(|s|s.len()).unwrap_or(MAX_ACTIVE),"registered_workspaces":self.inner.workspaces.read().map(|w|w.len()).unwrap_or(4096),"collection_enabled":false,"local_capture":self.inner.capture.status(),
             "dirty_transitions":self.inner.dirty_transitions.load(Ordering::Relaxed),"dirty_transition_ns":self.inner.dirty_transition_ns.load(Ordering::Relaxed),"physical_drains":self.inner.drains.load(Ordering::Relaxed),"physical_drain_ns":self.inner.physical_drain_ns.load(Ordering::Relaxed),"retention_transactions":stats.transactions,"retention_encoded_write_bytes":stats.encoded_write_bytes})
     }
     pub async fn workspace_state(&self, mount: &str) -> Result<native_retention::WorkspaceInfo> {
