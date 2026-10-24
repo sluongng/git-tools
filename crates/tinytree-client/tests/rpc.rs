@@ -819,6 +819,44 @@ async fn operation_deadline_covers_disk_admission_and_cancel_releases_quota() {
 }
 
 #[tokio::test]
+async fn transient_absolute_deadline_survives_phases_guard_clones_and_rebinding() {
+    let (_dir, _store, service) = setup();
+    let running = Running::start(service, Mode::Normal).await;
+    let mut config = running.config();
+    config.rpc.operation_timeout_ms = 5000;
+    let client = NativeClient::connect(config).await.unwrap();
+    let bound = tokio::time::Instant::now() + Duration::from_millis(500);
+    let bounded = client.clone().with_operation_deadline(bound);
+    let key = tinytree_model::empty_tree().descriptor.key;
+    bounded.read_objects(vec![key]).await.unwrap();
+    let before = running.metadata.load(Ordering::SeqCst);
+    // Simulate another phase consuming the ORIGINAL remaining operation budget.
+    tokio::time::sleep_until(bound).await;
+    let bounded = bounded
+        .with_lifetime_guard(Arc::new(()))
+        .with_rpc_lifetime_guard(Arc::new(()))
+        .with_operation_deadline(tokio::time::Instant::now() + Duration::from_secs(5));
+    assert_eq!(
+        bounded
+            .read_objects(vec![key])
+            .await
+            .err()
+            .expect("expired clone must fail")
+            .code(),
+        Code::DeadlineExceeded
+    );
+    assert_eq!(
+        running.metadata.load(Ordering::SeqCst),
+        before,
+        "expired clone must fail before RPC, without a renewed retry budget"
+    );
+    // Binding is per-clone, not Inner or config: independent work still runs.
+    client.read_objects(vec![key]).await.unwrap();
+    assert_eq!(running.metadata.load(Ordering::SeqCst), before + 1);
+    running.stop().await;
+}
+
+#[tokio::test]
 async fn cancelling_stream_cleans_temp_and_later_operations_still_run() {
     let (_dir, store, service) = setup();
     let bytes = vec![17; 3000];

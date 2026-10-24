@@ -33,6 +33,7 @@ pub struct NativeClient {
     inner: Arc<Inner>,
     guards: crate::verified::LifetimeGuards,
     rpc_guards: crate::verified::LifetimeGuards,
+    operation_deadline: Option<Instant>,
 }
 struct Inner {
     config: Config,
@@ -58,6 +59,18 @@ fn query_headroom(limits: &crate::Limits) -> usize {
     unary_memory(limits).max(query::CLEANUP_MEMORY)
 }
 impl NativeClient {
+    /// Bound successive operations on this clone by one absolute deadline.
+    /// Rebinding can only shorten it. The base client, configuration and
+    /// authenticated proof identity are unchanged. Query execution retains its
+    /// existing Begin-captured whole-query deadline; independent cleanup retains
+    /// its own bounded grace period rather than inheriting this transient bound.
+    pub fn with_operation_deadline(mut self, deadline: Instant) -> Self {
+        self.operation_deadline = Some(
+            self.operation_deadline
+                .map_or(deadline, |old| old.min(deadline)),
+        );
+        self
+    }
     /// Pin external resource owners through temporary creation, readers,
     /// snapshots and cancelled blocking work produced by this client. Existing
     /// client clones are unchanged; the guard does not authorize remote access.
@@ -68,6 +81,7 @@ impl NativeClient {
             inner: self.inner,
             guards: Arc::new(guards),
             rpc_guards: self.rpc_guards,
+            operation_deadline: self.operation_deadline,
         }
     }
     /// Pin a physical request/job owner through actual codec and blocking work.
@@ -81,6 +95,7 @@ impl NativeClient {
             inner: self.inner,
             guards: self.guards,
             rpc_guards: Arc::new(guards),
+            operation_deadline: self.operation_deadline,
         }
     }
     fn without_rpc_guards(&self) -> Self {
@@ -88,6 +103,10 @@ impl NativeClient {
             inner: self.inner.clone(),
             guards: self.guards.clone(),
             rpc_guards: Default::default(),
+            // Stored query clients / deferred Drop cleanup must not inherit a
+            // caller's transient request bound. The query's explicit execution
+            // deadline remains captured separately by Begin.
+            operation_deadline: None,
         }
     }
     fn rpc_lifetime_guards(&self) -> crate::verified::LifetimeGuards {
@@ -232,6 +251,7 @@ impl NativeClient {
         let (query_cleanup, cleanup_receiver) =
             tokio::sync::mpsc::channel(config.limits.query_cleanup_capacity);
         let client = Self {
+            operation_deadline: None,
             guards: Default::default(),
             rpc_guards: Default::default(),
             inner: Arc::new(Inner {
@@ -255,7 +275,9 @@ impl NativeClient {
         Ok(client)
     }
     fn deadline(&self) -> Instant {
-        Instant::now() + self.inner.config.rpc.operation_timeout()
+        let configured = Instant::now() + self.inner.config.rpc.operation_timeout();
+        self.operation_deadline
+            .map_or(configured, |bound| bound.min(configured))
     }
     async fn admit(&self, deadline: Instant, bytes: usize) -> Result<Arc<Budget>, Status> {
         if bytes > self.inner.config.limits.max_buffered_bytes {
