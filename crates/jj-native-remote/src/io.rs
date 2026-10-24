@@ -90,10 +90,12 @@ pub(crate) async fn blocking_owned<T: Send + 'static>(
     completed.result
 }
 pub(crate) struct ControlScope {
-    _lease: Option<tokio::sync::OwnedSemaphorePermit>,
-    _parent: Option<Arc<ControlScope>>,
     pub deadline: tokio::time::Instant,
     _owner: Arc<dyn std::any::Any + Send + Sync>,
+    _parent: Option<Arc<ControlScope>>,
+    // Admission is the physical drain barrier: release only after external
+    // command owners and inherited scopes have completed their teardown.
+    _lease: Option<tokio::sync::OwnedSemaphorePermit>,
 }
 impl ControlScope {
     pub fn with_owner(parent: Arc<Self>, owner: Arc<dyn std::any::Any + Send + Sync>) -> Arc<Self> {

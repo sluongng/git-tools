@@ -29,6 +29,18 @@ impl RemoteObjectIo {
         id: m::FileId,
         owner: Arc<dyn std::any::Any + Send + Sync>,
     ) -> Result<Option<m::Descriptor>> {
+        if let Some(descriptor) = self.resident_cloud_descriptor(id, owner.clone()).await? {
+            return Ok(Some(descriptor));
+        }
+        if let Some(authority) = self.cloud_file_authority(id, owner.clone()).await? {
+            // An explicit FILE terminal need not have a parent TREE size. Use
+            // the bounded, version-scoped verified transfer, never invent one.
+            return Ok(Some(
+                self.download_cloud_file_owned(authority, id, owner)
+                    .await?
+                    .descriptor(),
+            ));
+        }
         let ledger = self.inner.ledger.clone();
         let claim = io::blocking_owned(owner.clone(), move || ledger.claim(id.0)).await?;
         let Some(claim) = claim else { return Ok(None) };
@@ -78,6 +90,141 @@ impl RemoteObjectIo {
             format_version: m::FORMAT_VERSION,
         }))
     }
+    async fn resident_cloud_descriptor(
+        &self,
+        id: m::FileId,
+        owner: Arc<dyn std::any::Any + Send + Sync>,
+    ) -> Result<Option<m::Descriptor>> {
+        if let Some(descriptor) = self
+            .terminal_cloud_file_descriptor(id, owner.clone())
+            .await?
+        {
+            return Ok(Some(descriptor));
+        }
+        if let Some(authority) = self.cloud_file_authority(id, owner.clone()).await? {
+            if authority.terminal(m::ObjectKey {
+                kind: m::Kind::File,
+                id: m::ObjectId(id.0),
+            })? {
+                // A current exact terminal without a verified descriptor is a
+                // network miss, not permission to reuse an older TREE claim.
+                return Ok(None);
+            }
+        }
+        let ledger = self.inner.ledger.clone();
+        let Some(claim) = io::blocking_owned(owner.clone(), move || ledger.claim(id.0)).await?
+        else {
+            return Ok(None);
+        };
+        if !claim.root.starts_with("v/") {
+            return Ok(None);
+        }
+        let tree = m::ObjectKey {
+            kind: m::Kind::Tree,
+            id: m::ObjectId(unhex(&claim.tree)?),
+        };
+        let ledger = self.inner.ledger.clone();
+        let root = claim.root.clone();
+        io::blocking_owned(owner.clone(), move || {
+            let authority = ledger
+                .authority(&root)?
+                .context("native cloud file authority missing")?;
+            ensure!(
+                matches!(&authority, crate::ledger::Authority::CloudVersion(_)),
+                "native cloud file authority kind mismatch"
+            );
+            ledger.validate_authority(&authority)?;
+            ensure!(
+                ledger.member(&root, tree)?,
+                "native cloud file tree membership missing"
+            );
+            Ok(())
+        })
+        .await?;
+        if self
+            .inner
+            .local
+            .descriptor_with_owner(tree, owner.clone())
+            .await
+            .map_err(backend)?
+            .is_none()
+        {
+            return Ok(None);
+        }
+        let metadata = self
+            .inner
+            .local
+            .read_metadata_with_owner(tree, owner)
+            .await
+            .map_err(backend)?;
+        let m::Object::Tree(tree) = metadata.into_object() else {
+            anyhow::bail!("native file provenance is not a tree")
+        };
+        let mut found = false;
+        for entry in tree.entries {
+            if let m::TreeValue::File {
+                id: candidate,
+                size_bytes,
+                ..
+            } = entry.value
+            {
+                if candidate == id {
+                    ensure!(
+                        size_bytes == claim.size,
+                        "native file size differs from canonical tree"
+                    );
+                    found = true;
+                }
+            }
+        }
+        ensure!(found, "native file missing from canonical tree");
+        Ok(Some(m::Descriptor {
+            key: m::ObjectKey {
+                kind: m::Kind::File,
+                id: m::ObjectId(id.0),
+            },
+            size_bytes: claim.size,
+            format_version: m::FORMAT_VERSION,
+        }))
+    }
+    async fn cloud_file_read(
+        &self,
+        id: m::FileId,
+        owner: Arc<dyn std::any::Any + Send + Sync>,
+    ) -> Result<Option<FileRead>> {
+        if let Some(descriptor) = self.resident_cloud_descriptor(id, owner.clone()).await? {
+            if let Some(blob) = io::cached(
+                self.inner
+                    .cache
+                    .clone()
+                    .cached_content(self.artifact(descriptor)),
+            )
+            .await?
+            {
+                let reader = io::Reader::open_for_delivery(blob, owner.clone()).await?;
+                return Ok(Some(
+                    FileRead::from_preverified_pinned_source(descriptor, Box::pin(reader))
+                        .map_err(backend)?,
+                ));
+            }
+        }
+        let Some(authority) = self.cloud_file_authority(id, owner.clone()).await? else {
+            return Ok(None);
+        };
+        let verified = self
+            .download_cloud_file_owned(authority, id, owner.clone())
+            .await?;
+        let descriptor = verified.descriptor();
+        let reader = io::blocking_owned(owner.clone(), move || {
+            verified.open().map_err(anyhow::Error::from)
+        })
+        .await?;
+        let reader = io::Reader::verified(reader, owner);
+        Ok(Some(
+            FileRead::from_preverified_pinned_source(descriptor, Box::pin(reader))
+                .map_err(backend)?,
+        ))
+    }
     pub(crate) fn artifact(&self, descriptor: m::Descriptor) -> Artifact {
         Artifact {
             backend: format!("tinytree-native-v1:{}", self.inner.ledger.binding.scope),
@@ -97,7 +244,13 @@ impl RemoteObjectIo {
         {
             return Ok(blob);
         }
-        self.refresh_file_scope(descriptor).await?;
+        if self
+            .cloud_file_authority(m::FileId(descriptor.key.id.0), Arc::new(()))
+            .await?
+            .is_none()
+        {
+            self.refresh_file_scope(descriptor).await?;
+        }
         io::cached(self.inner.cache.clone().content_from(
             artifact,
             Arc::new(RemoteSource {
@@ -226,6 +379,13 @@ impl NativeObjectIo for RemoteObjectIo {
         {
             return self.inner.local.read_file_for_cache(id, owner).await;
         }
+        if let Some(read) = self
+            .cloud_file_read(id, owner.clone())
+            .await
+            .map_err(backend_error)?
+        {
+            return Ok(read);
+        }
         let deadline = io::scope().map_or_else(
             || self.inner.deadline(),
             |scope| scope.deadline.min(self.inner.deadline()),
@@ -301,9 +461,7 @@ impl NativeObjectIo for RemoteObjectIo {
         limits: CopyCatalogLimits,
         owner: Arc<dyn std::any::Any + Send + Sync>,
     ) -> BackendResult<CopyCatalogSnapshot> {
-        self.owned_catalog(limits, owner)
-            .await
-            .map_err(backend_error)
+        self.owned_catalog(limits, owner).await
     }
 }
 struct RemoteSource {
@@ -330,18 +488,30 @@ impl RemoteSource {
                         && artifact.digest_function == 9,
                     "native cache artifact authorization scope mismatch"
                 );
-                let client = self.inner.connector.get().await?;
-                // NativeClient forwards this owner into download spools, pinned
-                // readers and its non-cancellable physical workers.
-                let client = if let Some(context) = context.clone() {
-                    client.with_lifetime_guard(Arc::new(context))
-                } else {
-                    client
+                // This is the lower-level raw download inside the existing
+                // cache fill, never another public read/cache request.
+                let owner: Arc<dyn std::any::Any + Send + Sync> =
+                    Arc::new((context.clone(), self.scope.clone()));
+                let provider = RemoteObjectIo {
+                    inner: self.inner.clone(),
                 };
-                let verified = io::network(
-                    client.download_file(m::ObjectId(unhex(&artifact.hash)?), &self.inner.staging),
-                )
-                .await?;
+                let id = m::FileId(unhex(&artifact.hash)?);
+                let verified = if let Some(authority) =
+                    provider.cloud_file_authority(id, owner.clone()).await?
+                {
+                    provider
+                        .download_cloud_file_owned(authority, id, owner)
+                        .await?
+                } else {
+                    let client = self
+                        .inner
+                        .connector
+                        .get()
+                        .await?
+                        .with_rpc_lifetime_guard(Arc::new(owner));
+                    io::network(client.download_file(m::ObjectId(id.0), &self.inner.staging))
+                        .await?
+                };
                 ensure!(
                     verified.descriptor().size_bytes == artifact.size,
                     "native fetched file length conflicts with admitted tree"
@@ -638,5 +808,86 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
+    }
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn first_cloud_admission_during_copy_catalog_snapshot_refuses_partial_success() {
+        let directory = tempfile::tempdir().unwrap();
+        private(directory.path());
+        let local = directory.path().join("local");
+        std::fs::create_dir(&local).unwrap();
+        private(&local);
+        let direct =
+            Arc::new(jj_native_backend::DirectObjectIo::init(&local, Default::default()).unwrap());
+        let cache = local_cas::LocalCas::open(
+            directory.path().join("cache"),
+            Arc::new(UnusedSource),
+            Default::default(),
+        )
+        .unwrap();
+        let repo = RemoteRepository::open(
+            direct.clone(),
+            cache,
+            &directory.path().join("ledger"),
+            &directory.path().join("staging"),
+            Config::default(),
+        )
+        .unwrap();
+        let boundary = Arc::new(crate::metadata::CatalogBoundary::default());
+        *repo.io.inner.catalog_boundary.lock().unwrap() = Some(boundary.clone());
+        let provider = repo.io.clone();
+        let request = tokio::spawn(async move {
+            provider
+                .copy_catalog_snapshot(CopyCatalogLimits {
+                    max_objects: 16,
+                    max_metadata_bytes: 16384,
+                    max_edges: 32,
+                })
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(5), boundary.entered.notified())
+            .await
+            .unwrap();
+        let copy = m::Object::CopyHistory(m::CopyHistory {
+            current_path: "copy".into(),
+            parents: vec![],
+            salt: b"catalog boundary".to_vec(),
+        });
+        let descriptor = m::encode(&copy, Default::default()).unwrap().descriptor;
+        let ledger = repo.io.inner.ledger.clone();
+        let verified = copy.clone();
+        io::blocking(move || {
+            let authority = ledger.install_catalog_test_authority(descriptor.key)?;
+            ledger.verified_cloud_metadata_batch(
+                &crate::ledger::Authority::CloudVersion(authority),
+                &[(descriptor, verified)],
+            )
+        })
+        .await
+        .unwrap();
+        direct.write_metadata(copy).await.unwrap();
+        // Prove the real Direct snapshot would contain fetched partial data.
+        assert_eq!(
+            direct
+                .copy_catalog_snapshot(CopyCatalogLimits {
+                    max_objects: 16,
+                    max_metadata_bytes: 16384,
+                    max_edges: 32,
+                })
+                .await
+                .unwrap()
+                .into_entries()
+                .len(),
+            1
+        );
+        boundary.release.notify_one();
+        let result = tokio::time::timeout(Duration::from_secs(5), request)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            matches!(&result, Err(jj_lib::backend::BackendError::Unsupported(_))),
+            "concurrent first admission must not publish a complete catalog: {result:?}"
+        );
+        repo.wait_for_idle().await;
     }
 }

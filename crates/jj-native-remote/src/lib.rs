@@ -2,6 +2,8 @@
 //! the admission ledger records roots/proofs, never fabricated file residency.
 mod broker;
 mod closure;
+mod cloud;
+pub use cloud::AdmittedCloudVersion;
 mod config;
 mod control;
 mod io;
@@ -43,6 +45,8 @@ pub(crate) struct Inner {
     pub control: Arc<tokio::sync::Semaphore>,
     pub metadata: Arc<tokio::sync::Mutex<()>>,
     pub metadata_work: Arc<io::OwnedWork>,
+    #[cfg(test)]
+    pub catalog_boundary: std::sync::Mutex<Option<Arc<metadata::CatalogBoundary>>>,
     pub spool: Arc<tokio::sync::Semaphore>,
 }
 impl Inner {
@@ -166,6 +170,8 @@ impl RemoteRepository {
             control: Arc::new(tokio::sync::Semaphore::new(1)),
             metadata: Arc::new(tokio::sync::Mutex::new(())),
             metadata_work: Arc::new(io::OwnedWork::default()),
+            #[cfg(test)]
+            catalog_boundary: std::sync::Mutex::new(None),
             spool: Arc::new(tokio::sync::Semaphore::new(
                 config.max_upload_spool_bytes as usize,
             )),

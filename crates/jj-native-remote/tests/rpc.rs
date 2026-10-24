@@ -232,8 +232,17 @@ impl Server {
         counts: Counters,
         tls: Option<tonic::transport::Identity>,
     ) -> Self {
+        Self::start_service_at(service, counts, tls, "127.0.0.1:0".parse().unwrap()).await
+    }
+    async fn start_service_at(
+        service: RepositoryService,
+        counts: Counters,
+        tls: Option<tonic::transport::Identity>,
+        bind: std::net::SocketAddr,
+    ) -> Self {
         let query = service.query_grpc_service();
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let cloud = service.cloud_grpc_service();
+        let listener = tokio::net::TcpListener::bind(bind).await.unwrap();
         let address = listener.local_addr().unwrap();
         let (stop, stopped) = tokio::sync::oneshot::channel();
         let task = tokio::spawn(async move {
@@ -252,6 +261,7 @@ impl Server {
                         .max_encoding_message_size(20 * 1024 * 1024),
                 )
                 .add_service(query)
+                .add_service(cloud)
                 .serve_with_incoming_shutdown(
                     tokio_stream::wrappers::TcpListenerStream::new(listener).map(|accepted| {
                         accepted.and_then(|stream| {
@@ -903,7 +913,7 @@ async fn legacy_complete_ledger_upgrades_without_losing_resident_provenance() {
     assert_eq!(counts.metadata_rpcs.load(Ordering::SeqCst), before);
     assert_eq!(
         std::fs::read(directory.path().join("ledger/admission.format")).unwrap(),
-        b"tinytree-native-admission-3\n"
+        b"tinytree-native-admission-4\n"
     );
     assert_eq!(counts.files.load(Ordering::SeqCst), 0);
     server.stop().await;
@@ -5388,14 +5398,9 @@ fn owned_remote_publication_keeps_command_guard_after_deadline_and_cancelled_sdk
         );
         drop(release);
         blocker.await.unwrap();
-        tokio::time::timeout(Duration::from_secs(3), async {
-            while weak.upgrade().is_some() {
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .unwrap();
-        assert!(permits.clone().try_acquire_owned().is_ok());
+        // Weak::upgrade(None) only observes the strong count reaching zero,
+        // not completion of the final owner's destructor. The actual next
+        // control operation is the public physical-drain completion barrier.
         let next = repo
             .control
             .observe_reference_with_owner("absent", Arc::new(()))
@@ -5405,6 +5410,596 @@ fn owned_remote_publication_keeps_command_guard_after_deadline_and_cancelled_sdk
             next.head.is_none(),
             "actual codec/worker teardown must release control admission for the next command"
         );
+        assert!(weak.upgrade().is_none());
+        assert!(permits.clone().try_acquire_owned().is_ok());
         server.stop().await;
     });
+}
+
+// Complete retained-version authority acceptance, not an index import/restore.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn retained_version_roots_are_lazy_durable_and_never_fall_back_to_generic_repository_reads() {
+    use jj_lib::{
+        backend::{MillisSinceEpoch, Timestamp},
+        object_id::ObjectId as _,
+        op_store::{
+            OpStore as _, Operation, OperationMetadata, RootOperationData, TimestampRange, View,
+        },
+        simple_op_store::SimpleOpStore,
+    };
+    use tinytree_client::{
+        CloudManifestId, CloudObjectId, CloudPublishIntent, CloudRawDigest, RetainedVersionSelector,
+    };
+    let profile: tinytree_server::Config = toml::from_str(
+        r#"
+[service]
+max_metadata_bytes=4194304
+[service.cloud]
+enabled=true
+indexed_versions=true
+max_manifest_bytes=524288
+max_staging_leases=256
+max_inflight=2
+max_inflight_per_repository=1
+max_buffered_bytes=1073741824
+[store]
+max_retention_validation_records=1024
+max_retention_validation_bytes=2097152
+max_closure_objects=4096
+max_closure_edges=16384
+max_path_contexts=4096
+max_path_context_bytes=4194304
+[store.cloud]
+max_object_bytes=4194304
+max_decode_bytes=16777216
+max_version_decode_bytes=134217728
+max_manifest_bytes=524288
+max_manifest_decode_bytes=16777216
+max_manifest_members=1024
+"#,
+    )
+    .unwrap();
+    profile.validate().unwrap();
+    let store_configuration = profile
+        .store
+        .materialize(profile.service.max_metadata_bytes);
+    let server_dir = private_dir();
+    let store = Store::open(server_dir.path(), store_configuration.clone()).unwrap();
+    store.create_repository("example").unwrap();
+    let data = tinytree_fixture::build_fixture(tinytree_fixture::FixtureConfig {
+        unused_files: 20,
+        bytes_per_file: 3000,
+    })
+    .unwrap();
+    for object in data.objects() {
+        store
+            .put("example", object.descriptor, &object.bytes, 0)
+            .unwrap();
+    }
+    let standalone_bytes = b"standalone retained file".to_vec();
+    let standalone = m::describe_file(&standalone_bytes);
+    store
+        .put("example", standalone, &standalone_bytes, 0)
+        .unwrap();
+    let copy_parent = m::encode(
+        &m::Object::CopyHistory(m::CopyHistory {
+            current_path: "prior-copy".into(),
+            parents: vec![],
+            salt: b"retained parent".to_vec(),
+        }),
+        Default::default(),
+    )
+    .unwrap();
+    let copy_head = m::encode(
+        &m::Object::CopyHistory(m::CopyHistory {
+            current_path: "current-copy".into(),
+            parents: vec![m::CopyId(copy_parent.descriptor.key.id.0)],
+            salt: b"retained head".to_vec(),
+        }),
+        Default::default(),
+    )
+    .unwrap();
+    for object in [&copy_parent, &copy_head] {
+        store
+            .put("example", object.descriptor, &object.bytes, 0)
+            .unwrap();
+    }
+    let head_object = data
+        .objects()
+        .iter()
+        .rev()
+        .find(|o| o.descriptor.key.kind == m::Kind::Commit)
+        .unwrap();
+    let head = head_object.descriptor.key;
+    let m::Object::Commit(commit) = m::decode(&head_object.bytes, Default::default()).unwrap()
+    else {
+        panic!()
+    };
+    let tree_key = m::ObjectKey {
+        kind: m::Kind::Tree,
+        id: m::ObjectId(commit.root_tree.terms[0].0),
+    };
+    let tree_object = data
+        .objects()
+        .iter()
+        .find(|o| o.descriptor.key == tree_key)
+        .unwrap();
+    let m::Object::Tree(tree) = m::decode(&tree_object.bytes, Default::default()).unwrap() else {
+        panic!()
+    };
+    let files = tree
+        .entries
+        .iter()
+        .filter_map(|entry| match entry.value {
+            m::TreeValue::File { id, .. } => Some(id),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert!(files.len() >= 2);
+    let source_dir = private_dir();
+    let source = SimpleOpStore::init(
+        source_dir.path(),
+        RootOperationData {
+            root_commit_id: jj_lib::backend::CommitId::from_bytes(&[0; 32]),
+        },
+    )
+    .unwrap();
+    let mut view = View::make_root(jj_lib::backend::CommitId::from_bytes(&head.id.0));
+    view.wc_commit_ids.insert(
+        "task".into(),
+        jj_lib::backend::CommitId::from_bytes(&head.id.0),
+    );
+    let view_id = source.write_view(&view).await.unwrap();
+    let time = Timestamp {
+        timestamp: MillisSinceEpoch(0),
+        tz_offset: 0,
+    };
+    let operation = Operation {
+        view_id: view_id.clone(),
+        parents: vec![jj_lib::op_store::OperationId::from_bytes(&[0; 64])],
+        metadata: OperationMetadata {
+            time: TimestampRange {
+                start: time.clone(),
+                end: time,
+            },
+            description: "retained native fixture".into(),
+            hostname: "fixture".into(),
+            username: "fixture".into(),
+            is_snapshot: true,
+            workspace_name: Some("task".into()),
+            attributes: Default::default(),
+        },
+        commit_predecessors: None,
+    };
+    let op_id = source.write_operation(&operation).await.unwrap();
+    let objects = vec![
+        tinytree_cloud::export_view(&source, &view_id, Default::default())
+            .await
+            .unwrap(),
+        tinytree_cloud::export_operation(&source, &op_id, Default::default())
+            .await
+            .unwrap(),
+    ];
+    let op: [u8; 64] = op_id.as_bytes().try_into().unwrap();
+    let mut members = objects
+        .iter()
+        .map(|o| tinytree_cloud::Member {
+            id: o.id(),
+            selected: o.digest().unwrap(),
+        })
+        .collect::<Vec<_>>();
+    members.sort_by_key(|m| m.id);
+    let tree_terminal = m::ObjectKey {
+        kind: m::Kind::File,
+        id: m::ObjectId(files[0].0),
+    };
+    let mut roots = vec![
+        head,
+        standalone.key,
+        tree_terminal,
+        copy_head.descriptor.key,
+    ];
+    roots.extend(commit.root_tree.terms.iter().map(|id| m::ObjectKey {
+        kind: m::Kind::Tree,
+        id: m::ObjectId(id.0),
+    }));
+    roots.sort_by_key(|key| (key.kind as u8, key.id.0));
+    roots.dedup();
+    let manifest = tinytree_cloud::Manifest {
+        workspace: [71; 32],
+        exporter: [72; 16],
+        sequence: 1,
+        operation_heads: vec![op],
+        undo_operations: vec![],
+        intent_operations: vec![],
+        working_copy: tinytree_cloud::WorkingCopy {
+            workspace_name: "task".into(),
+            wc_operation: op,
+            snapshot_operation: op,
+            snapshot_commit: head.id.0,
+            tree: commit.root_tree,
+        },
+        parents: vec![],
+        members,
+        intent_roots: vec![tinytree_cloud::IntentRoots {
+            kind: tinytree_cloud::IntentKind::Recovery,
+            id: [73; 32],
+            roots: {
+                let mut roots = vec![standalone.key, tree_terminal, copy_head.descriptor.key];
+                roots.sort_by_key(|key| (key.kind as u8, key.id.0));
+                roots
+            },
+        }],
+        native_roots: roots.clone(),
+        coverage: tinytree_cloud::Coverage::FullRequired,
+        detached: vec![],
+    };
+    let manifest_bytes = tinytree_cloud::encode_manifest(&manifest, Default::default()).unwrap();
+    let selected = CloudRawDigest::of(&manifest_bytes);
+    let selector = RetainedVersionSelector {
+        workspace_id: manifest.workspace,
+        generation: 1,
+        manifest_id: CloudManifestId::of(&manifest_bytes),
+    };
+    let principals = || {
+        vec![
+            Principal::new("test", TOKEN, vec!["example".into()], true)
+                .unwrap()
+                .with_cloud(true),
+            Principal::new(
+                "other",
+                "native-remote-other-loopback-test-token",
+                vec!["example".into()],
+                true,
+            )
+            .unwrap()
+            .with_cloud(true),
+        ]
+    };
+    let service = RepositoryService::new(
+        store.clone(),
+        profile.service.clone(),
+        vec!["example".into()],
+        principals(),
+    )
+    .unwrap();
+    let counts = Counters::new();
+    let server = Server::start_service(service, counts.clone(), None).await;
+    let directory = private_dir();
+    let configuration = config(&server);
+    let client = tinytree_client::NativeClient::connect(configuration.remote.clone())
+        .await
+        .unwrap();
+    let mut leases = Vec::new();
+    for object in &objects {
+        let id = match object.id() {
+            tinytree_cloud::ObjectId::Operation(id) => CloudObjectId::Operation(id),
+            tinytree_cloud::ObjectId::View(id) => CloudObjectId::View(id),
+        };
+        leases.push(
+            client
+                .cloud_put_object(id, object.payload().unwrap())
+                .await
+                .unwrap()
+                .staging_lease,
+        );
+    }
+    client
+        .cloud_publish_version(&CloudPublishIntent {
+            workspace_id: manifest.workspace,
+            expected_generation: 0,
+            idempotency_key: "native-retained-version".into(),
+            manifest: manifest_bytes,
+            staging_leases: leases,
+        })
+        .await
+        .unwrap();
+    let shared = cache(directory.path());
+    let (direct, repo) = local(
+        directory.path(),
+        shared.clone(),
+        configuration.clone(),
+        true,
+    );
+    let admitted = repo
+        .control
+        .admit_retained_version(selector, selected, Arc::new(()))
+        .await
+        .unwrap();
+    assert_eq!(admitted.native_root_count(), roots.len());
+    async fn assert_unproven_catalog(repo: &RemoteRepository) {
+        assert!(matches!(
+            complete_copy_metadata(repo).await,
+            Err(jj_lib::backend::BackendError::Unsupported(_))
+        ));
+    }
+    async fn related_copy_error(
+        repo: &RemoteRepository,
+        copy: m::CopyId,
+    ) -> jj_lib::backend::BackendError {
+        use jj_lib::backend::Backend as _;
+        let backend =
+            jj_native_backend::NativeBackend::from_io(repo.io.clone(), Default::default())
+                .await
+                .unwrap();
+        backend
+            .get_related_copies(&jj_lib::backend::CopyId::from_bytes(&copy.0))
+            .await
+            .err()
+            .expect("unproven retained-version copy history must not return a partial result")
+    }
+    assert_unproven_catalog(&repo).await;
+    assert!(
+        direct.descriptor(head).await.unwrap().is_none(),
+        "admitting a canonical manifest must not hydrate native commit bodies"
+    );
+    assert_eq!(
+        repo.io.read_metadata(head).await.unwrap().descriptor(),
+        head_object.descriptor
+    );
+    repo.io.read_metadata(tree_key).await.unwrap();
+    let nested_tree = tree
+        .entries
+        .iter()
+        .find_map(|entry| match entry.value {
+            m::TreeValue::Tree(id) => Some(m::ObjectKey {
+                kind: m::Kind::Tree,
+                id: m::ObjectId(id.0),
+            }),
+            _ => None,
+        })
+        .unwrap();
+    assert!(direct.descriptor(nested_tree).await.unwrap().is_none());
+    repo.io.read_metadata(nested_tree).await.unwrap();
+    assert_eq!(counts.metadata_rpcs.load(Ordering::SeqCst), 0);
+    assert_eq!(counts.files.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        counts.holds.load(Ordering::SeqCst),
+        0,
+        "cloud authority must not manufacture reference holds"
+    );
+    let expected_file = data
+        .objects()
+        .iter()
+        .find(|o| o.descriptor.key.kind == m::Kind::File && o.descriptor.key.id.0 == files[0].0)
+        .unwrap()
+        .bytes
+        .clone();
+    assert_eq!(bytes(repo.io.as_ref(), files[0]).await, expected_file);
+    assert_eq!(
+        counts.files.load(Ordering::SeqCst),
+        0,
+        "version-only FILE delivery cannot use generic ReadFile"
+    );
+    assert_eq!(
+        bytes(repo.io.as_ref(), m::FileId(standalone.key.id.0)).await,
+        standalone_bytes,
+        "standalone FILE terminal has no invented TREE size claim"
+    );
+    assert_eq!(
+        repo.io.descriptor(standalone.key).await.unwrap(),
+        Some(standalone)
+    );
+    assert_eq!(
+        bytes(repo.io.as_ref(), m::FileId(standalone.key.id.0)).await,
+        standalone_bytes,
+        "warm standalone FILE reuses its verified terminal descriptor and CAS bytes"
+    );
+    // Force a real parent-publication failure AFTER the CopyHistory dependency
+    // can be installed. Native descriptor lookup is index-backed, so an
+    // unindexed destination directory does not masquerade as a resident object.
+    let copy_hash = copy_head
+        .descriptor
+        .key
+        .id
+        .0
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect::<String>();
+    let copy_blocker = directory
+        .path()
+        .join("local/native-objects/repos/local/5")
+        .join(copy_hash);
+    std::fs::create_dir(&copy_blocker).unwrap();
+    assert!(
+        repo.io
+            .read_metadata(copy_head.descriptor.key)
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        direct.descriptor(copy_parent.descriptor.key).await.unwrap(),
+        Some(copy_parent.descriptor),
+        "dependency bytes were physically published before the forced parent error"
+    );
+    assert!(
+        direct
+            .descriptor(copy_head.descriptor.key)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    std::fs::remove_dir(&copy_blocker).unwrap();
+    drop(repo);
+    drop(direct);
+    let mut foreign = configuration.clone();
+    foreign.remote.token_env = Some("TINYTREE_REMOTE_OTHER_TOKEN".into());
+    let (_direct, other) = local(directory.path(), shared.clone(), foreign, false);
+    assert_unproven_catalog(&other).await;
+    // Foreign metadata is denied before the catalog is reached. Neither this
+    // request nor the direct catalog API may expose a partial result.
+    let _ = related_copy_error(&other, m::CopyId(copy_parent.descriptor.key.id.0)).await;
+    assert!(
+        other
+            .io
+            .read_metadata(copy_parent.descriptor.key)
+            .await
+            .is_err(),
+        "partially published fetched dependency must retain cloud provenance, never authored fallback"
+    );
+    assert!(
+        other.io.read_metadata(head).await.is_err(),
+        "old fetched metadata is not authored content under new credentials"
+    );
+    assert!(
+        other
+            .io
+            .descriptor(m::ObjectKey {
+                kind: m::Kind::File,
+                id: m::ObjectId(files[0].0)
+            })
+            .await
+            .is_err(),
+        "old canonical TREE claims cannot be relabeled across credential bindings"
+    );
+    assert!(
+        other
+            .io
+            .read_file(m::FileId(standalone.key.id.0))
+            .await
+            .is_err(),
+        "old FILE-terminal descriptors do not authorize a different credential binding"
+    );
+    assert!(
+        other
+            .control
+            .admit_retained_version(selector, selected, Arc::new(()))
+            .await
+            .is_err(),
+        "a raw selector is not a transferable private-owner grant"
+    );
+    drop(other);
+    drop(_direct);
+    let mut wrong_repo = configuration.clone();
+    wrong_repo.remote.repository_id = "different".into();
+    let foreign_direct = Arc::new(
+        DirectObjectIo::load(&directory.path().join("local"), Default::default()).unwrap(),
+    );
+    assert!(
+        RemoteRepository::open(
+            foreign_direct,
+            shared.clone(),
+            &directory.path().join("ledger"),
+            &directory.path().join("staging"),
+            wrong_repo
+        )
+        .is_err(),
+        "a portable selector must not rebind an existing provider to another repository"
+    );
+    let address = server.address;
+    drop(client);
+    server.stop().await;
+    // Rotate credentials while preserving the authenticated owner. Existing
+    // cached bytes were denied above; fresh admission may authorize a refill,
+    // but cannot reuse the stale binding's terminal descriptor.
+    let rotated_service = RepositoryService::new(
+        store.clone(),
+        profile.service.clone(),
+        vec!["example".into()],
+        vec![
+            Principal::new(
+                "test",
+                "native-remote-other-loopback-test-token",
+                vec!["example".into()],
+                true,
+            )
+            .unwrap()
+            .with_cloud(true),
+        ],
+    )
+    .unwrap();
+    let rotated_server =
+        Server::start_service_at(rotated_service, Counters::new(), None, address).await;
+    let mut rotated_config = configuration.clone();
+    rotated_config.remote.token_env = Some("TINYTREE_REMOTE_OTHER_TOKEN".into());
+    let (rotated_direct, rotated) = local(directory.path(), shared.clone(), rotated_config, false);
+    assert!(
+        rotated
+            .io
+            .read_file(m::FileId(standalone.key.id.0))
+            .await
+            .is_err(),
+        "credential rotation alone cannot reuse stale cached authority"
+    );
+    rotated
+        .control
+        .admit_retained_version(selector, selected, Arc::new(()))
+        .await
+        .unwrap();
+    assert_eq!(
+        bytes(rotated.io.as_ref(), m::FileId(standalone.key.id.0)).await,
+        standalone_bytes,
+        "fresh same-owner admission authorizes a verified FILE refill"
+    );
+    assert_eq!(
+        bytes(rotated.io.as_ref(), files[0]).await,
+        expected_file,
+        "current exact FILE terminal supersedes an old TREE claim without borrowing its descriptor"
+    );
+    drop(rotated);
+    drop(rotated_direct);
+    rotated_server.stop().await;
+    // Same endpoint/auth profile, but the retained version is now unavailable.
+    // No deletion API or fake public reference is needed to exercise expiry/loss.
+    let empty_dir = private_dir();
+    let empty = Store::open(empty_dir.path(), store_configuration).unwrap();
+    empty.create_repository("example").unwrap();
+    let second_counts = Counters::new();
+    let service = RepositoryService::new(
+        empty,
+        profile.service.clone(),
+        vec!["example".into()],
+        principals(),
+    )
+    .unwrap();
+    let second = Server::start_service_at(service, second_counts.clone(), None, address).await;
+    let (_direct, reopened) = local(directory.path(), shared, configuration, false);
+    assert_eq!(
+        reopened
+            .io
+            .read_metadata(copy_parent.descriptor.key)
+            .await
+            .unwrap()
+            .descriptor(),
+        copy_parent.descriptor,
+        "same-binding resident dependency proves its durable canonical path even when parent payload is absent"
+    );
+    let catalog_error =
+        related_copy_error(&reopened, m::CopyId(copy_parent.descriptor.key.id.0)).await;
+    assert!(
+        matches!(
+            &catalog_error,
+            jj_lib::backend::BackendError::Unsupported(_)
+        ),
+        "authorized resident copy must reach typed incomplete-catalog refusal: {catalog_error}"
+    );
+
+    assert_eq!(
+        reopened.io.read_metadata(head).await.unwrap().descriptor(),
+        head_object.descriptor,
+        "same-binding verified resident metadata remains usable without reauthorizing a network read"
+    );
+    assert_eq!(
+        bytes(reopened.io.as_ref(), files[0]).await,
+        expected_file,
+        "verified resident FILE survives unavailable source version"
+    );
+    assert_eq!(
+        bytes(reopened.io.as_ref(), m::FileId(standalone.key.id.0)).await,
+        standalone_bytes,
+        "verified standalone FILE remains offline-readable under its captured binding"
+    );
+    assert!(
+        reopened.io.read_file(files[1]).await.is_err(),
+        "a missing cloud-only file must reauthorize the exact selected version"
+    );
+    assert_eq!(second_counts.files.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        second_counts.metadata_rpcs.load(Ordering::SeqCst),
+        0,
+        "no generic fallback after version reauthorization fails"
+    );
+    drop(reopened);
+    drop(_direct);
+    second.stop().await;
 }

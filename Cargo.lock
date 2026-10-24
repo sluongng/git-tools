@@ -3187,6 +3187,7 @@ dependencies = [
  "serde_json",
  "tempfile",
  "tinytree-client",
+ "tinytree-cloud",
  "tinytree-fixture",
  "tinytree-index",
  "tinytree-model",

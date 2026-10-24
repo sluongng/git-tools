@@ -1,7 +1,9 @@
 //! Durable admission/retention bookkeeping, never authoritative object storage.
 use crate::{Config, hex, unhex};
+mod cloud;
 mod query;
 use anyhow::{Context, Result, ensure};
+pub(crate) use cloud::CloudVersionAuthority;
 use fjall::Readable;
 pub(crate) use query::{Authority, QueryAuthority};
 use serde::{Deserialize, Serialize};
@@ -131,6 +133,7 @@ pub(crate) struct Ledger {
     receipts: fjall::SingleWriterTxKeyspace,
     query_authorities: fjall::SingleWriterTxKeyspace,
     query_grants: fjall::SingleWriterTxKeyspace,
+    cloud_authorities: fjall::SingleWriterTxKeyspace,
     gate: Mutex<()>,
     config: Config,
     _owner: File,
@@ -141,7 +144,8 @@ pub(crate) struct Ledger {
 const MARKER: &str = "admission.format";
 const LEGACY_FORMAT: &[u8] = b"tinytree-native-admission-1\n";
 const SPARSE_FORMAT: &[u8] = b"tinytree-native-admission-2\n";
-const FORMAT: &[u8] = b"tinytree-native-admission-3\n";
+const QUERY_FORMAT: &[u8] = b"tinytree-native-admission-3\n";
+const FORMAT: &[u8] = b"tinytree-native-admission-4\n";
 pub(crate) fn preflight(path: &Path) -> Result<bool> {
     match std::fs::symlink_metadata(path) {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(true),
@@ -161,7 +165,10 @@ pub(crate) fn preflight(path: &Path) -> Result<bool> {
             );
             let marker = std::fs::read(path.join(MARKER))?;
             ensure!(
-                marker == FORMAT || marker == SPARSE_FORMAT || marker == LEGACY_FORMAT,
+                marker == FORMAT
+                    || marker == QUERY_FORMAT
+                    || marker == SPARSE_FORMAT
+                    || marker == LEGACY_FORMAT,
                 "unrecognized native admission ledger format"
             );
             require_file(&path.join("owner"))?;
@@ -240,7 +247,7 @@ impl Ledger {
         }
         let meta = db.keyspace("meta", fjall::KeyspaceCreateOptions::default)?;
         if !fresh
-            && matches!(db.read_tx().get(&meta, b"format")?.as_deref(), Some(value) if value == FORMAT || value == SPARSE_FORMAT)
+            && matches!(db.read_tx().get(&meta, b"format")?.as_deref(), Some(value) if value == FORMAT || value == QUERY_FORMAT || value == SPARSE_FORMAT)
         {
             ensure!(
                 db.keyspace_exists("known-references-v2")
@@ -248,12 +255,24 @@ impl Ledger {
                 "recognized sparse admission keyspace missing"
             );
         }
-        if !fresh && db.read_tx().get(&meta, b"format")?.as_deref() == Some(FORMAT) {
+        if !fresh
+            && matches!(db.read_tx().get(&meta,b"format")?.as_deref(),Some(value) if value==FORMAT||value==QUERY_FORMAT)
+        {
             ensure!(
                 db.keyspace_exists("query-authorities-v3") && db.keyspace_exists("query-grants-v3"),
                 "recognized query admission keyspace missing"
             );
         }
+        if !fresh && db.read_tx().get(&meta, b"format")?.as_deref() == Some(FORMAT) {
+            ensure!(
+                db.keyspace_exists("cloud-authorities-v4"),
+                "recognized cloud admission keyspace missing"
+            );
+        }
+        let cloud_authorities = db.keyspace(
+            "cloud-authorities-v4",
+            fjall::KeyspaceCreateOptions::default,
+        )?;
         let query_authorities = db.keyspace(
             "query-authorities-v3",
             fjall::KeyspaceCreateOptions::default,
@@ -273,7 +292,7 @@ impl Ledger {
         if !fresh {
             let stored_format = db.read_tx().get(&meta, b"format")?;
             ensure!(
-                matches!(stored_format.as_deref(), Some(value) if value == FORMAT || value == SPARSE_FORMAT || value == LEGACY_FORMAT),
+                matches!(stored_format.as_deref(), Some(value) if value == FORMAT || value == QUERY_FORMAT || value == SPARSE_FORMAT || value == LEGACY_FORMAT),
                 "native admission ledger format identity missing"
             );
             let counter = db
@@ -374,6 +393,7 @@ impl Ledger {
             receipts,
             query_authorities,
             query_grants,
+            cloud_authorities,
             gate: Mutex::new(()),
             config: config.clone(),
             _owner: owner,
