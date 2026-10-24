@@ -25,11 +25,12 @@ use tinytree_model::{CommitId, Descriptor, Kind, Limits, ObjectId, ObjectKey};
 
 mod cloud;
 pub use cloud::{
-    CloudConfig, CloudIndexReadLease, CloudIndexWriteReceipt, CloudNativeReadLease,
-    CloudNativeReadLimits, CloudObjectDescriptor, CloudOwner, CloudPublication,
-    CloudPublicationLimits, CloudReadLease, CloudResourceProfile, CloudSnapshotCommit,
-    CloudSnapshotReadGuard, CloudVersion, CloudVersionReadGuard, CloudVersionSelector,
-    CloudWorkspace, CloudWriteReceipt, PublishCloudRequest,
+    CloudCaptureReadLease, CloudConfig, CloudIndexReadLease, CloudIndexWriteReceipt,
+    CloudNativeReadLease, CloudNativeReadLimits, CloudObjectDescriptor, CloudOwner,
+    CloudPublication, CloudPublicationLimits, CloudReadLease, CloudResourceProfile,
+    CloudSnapshotCommit, CloudSnapshotReadGuard, CloudVersion, CloudVersionReadGuard,
+    CloudVersionSelector, CloudWorkspace, CloudWriteReceipt, PublishCapturedCloudRequest,
+    PublishCloudRequest,
 };
 mod client_gc;
 mod closure;
@@ -356,6 +357,7 @@ fn store_feature(value: Option<&[u8]>) -> Result<u8> {
         Some(b"tinytree-store-2") => Ok(2),
         Some(b"tinytree-store-3") => Ok(3),
         Some(b"tinytree-store-4") => Ok(4),
+        Some(b"tinytree-store-5") => Ok(5),
         _ => Err(Error::Corrupt("store format")),
     }
 }
@@ -370,6 +372,7 @@ fn advance_feature(
             2 => b"tinytree-store-2".as_slice(),
             3 => b"tinytree-store-3".as_slice(),
             4 => b"tinytree-store-4".as_slice(),
+            5 => b"tinytree-store-5".as_slice(),
             _ => return Err(Error::Invalid("store feature")),
         };
         tx.insert(meta, b"format", value);

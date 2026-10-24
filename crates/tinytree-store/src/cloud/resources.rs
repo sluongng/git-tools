@@ -8,6 +8,8 @@ pub struct CloudResourceProfile {
     pub index_artifact_bytes: u64,
     pub version_v1_bytes: u64,
     pub version_v2_bytes: u64,
+    pub version_v3_bytes: u64,
+    pub capture_read_bytes: u64,
     pub native_read_bytes: u64,
 }
 impl Config {
@@ -57,6 +59,13 @@ impl Config {
             ])?
             .checked_mul(1024),
         ])?;
+        // Capture decoding/binding shares max_version_decode_bytes with live
+        // OP/VIEW+index data. Additional conservative raw-envelope/copy slack
+        // covers the inline request/immutable row while that proof is admitted.
+        let capture = tinytree_cloud::CaptureDataLimits::default().max_bytes as u64;
+        let version_v3_bytes = add(&[Some(version_v2_bytes), capture.checked_mul(3), Some(4096)])?;
+        let capture_read_bytes =
+            add(&[Some(version_v3_bytes), capture.checked_mul(2), Some(4096)])?;
         let object_bytes = add(&[
             Some(self.cloud.max_decode_bytes as u64),
             (self.cloud.max_object_bytes as u64).checked_mul(4),
@@ -70,7 +79,7 @@ impl Config {
         // The version guard stays live while sequential canonical proof/read
         // scratch and one packed reconstruction are owned by the same call.
         let native_read_bytes = add(&[
-            Some(version_v1_bytes.max(version_v2_bytes)),
+            Some(version_v1_bytes.max(version_v2_bytes).max(version_v3_bytes)),
             (self.model_limits.max_object_bytes as u64).checked_mul(16),
             Some(self.max_packed_read_memory_bytes),
             Some(1024 * 1024),
@@ -80,6 +89,8 @@ impl Config {
             index_artifact_bytes,
             version_v1_bytes,
             version_v2_bytes,
+            version_v3_bytes,
+            capture_read_bytes,
             native_read_bytes,
         })
     }

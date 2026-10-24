@@ -10,6 +10,7 @@ use tinytree_cloud::{
 enum RecoveryManifest {
     V1(Manifest),
     V2(ManifestV2),
+    V3(tinytree_cloud::ManifestV3),
 }
 fn v2_error(error: tinytree_cloud::Error, invalid: &'static str) -> Error {
     match error {
@@ -23,6 +24,7 @@ impl std::ops::Deref for RecoveryManifest {
         match self {
             Self::V1(v) => v,
             Self::V2(v) => &v.recovery,
+            Self::V3(v) => &v.history.recovery,
         }
     }
 }
@@ -31,6 +33,20 @@ impl RecoveryManifest {
         match self {
             Self::V1(_) => 1,
             Self::V2(_) => 2,
+            Self::V3(_) => 3,
+        }
+    }
+    fn indexed(&self) -> Option<&ManifestV2> {
+        match self {
+            Self::V1(_) => None,
+            Self::V2(v) => Some(v),
+            Self::V3(v) => Some(&v.history),
+        }
+    }
+    fn capture(&self) -> Option<tinytree_cloud::CaptureDescriptor> {
+        match self {
+            Self::V3(value) => Some(value.capture),
+            _ => None,
         }
     }
 }
@@ -149,7 +165,7 @@ struct VersionRoots {
     extra: ExtraWork,
 }
 impl Inner {
-    fn v2_limits(&self, limits: ManifestLimits) -> Result<ManifestV2Limits> {
+    pub(super) fn v2_limits(&self, limits: ManifestLimits) -> Result<ManifestV2Limits> {
         Ok(ManifestV2Limits {
             recovery: self.manifest_limits(limits)?,
             artifacts: self.index_limits(self.config.cloud.index_artifacts)?,
@@ -176,6 +192,13 @@ impl Inner {
             Some([2, 0]) => decode_manifest_v2(bytes, id, self.v2_limits(limits)?)
                 .map(RecoveryManifest::V2)
                 .map_err(|error| v2_error(error, "cloud v2 manifest encoding")),
+            Some([3, 0]) => tinytree_cloud::decode_manifest_v3(
+                bytes,
+                id,
+                self.v3_limits(limits, self.config.cloud.max_version_decode_bytes)?,
+            )
+            .map(RecoveryManifest::V3)
+            .map_err(|error| v2_error(error, "cloud v3 manifest encoding")),
             _ => Err(Error::Invalid("cloud manifest version")),
         }
     }
@@ -507,6 +530,7 @@ impl Drop for ValidationGuard {
 pub struct CloudVersionReadGuard {
     version: CloudVersion,
     manifest: Vec<u8>,
+    capture: Option<super::captures::CaptureRecord>,
     _guard: ValidationGuard,
 }
 impl CloudVersionReadGuard {
@@ -518,6 +542,12 @@ impl CloudVersionReadGuard {
     }
     pub fn manifest_bytes(&self) -> &[u8] {
         &self.manifest
+    }
+    pub fn capture_descriptor(&self) -> Option<tinytree_cloud::CaptureDescriptor> {
+        self.capture.as_ref().map(|capture| capture.descriptor)
+    }
+    pub(super) fn take_capture(&mut self) -> Option<super::captures::CaptureRecord> {
+        self.capture.take()
     }
 }
 impl Inner {
@@ -645,9 +675,9 @@ impl Inner {
                 ));
             }
         }
-        let artifacts = match manifest {
-            RecoveryManifest::V1(_) => Vec::new(),
-            RecoveryManifest::V2(value) => value
+        let artifacts = match manifest.indexed() {
+            None => Vec::new(),
+            Some(value) => value
                 .index_roots
                 .iter()
                 .map(|root| {
@@ -718,8 +748,17 @@ impl Inner {
         manifest: &RecoveryManifest,
         limits: ManifestLimits,
         files: Option<bool>,
+        capture: Option<&[u8]>,
     ) -> Result<VersionRoots> {
-        self.validate_manifest_packing(repo, owner, manifest, limits, files, &HashSet::new())
+        self.validate_manifest_packing(
+            repo,
+            owner,
+            manifest,
+            limits,
+            files,
+            &HashSet::new(),
+            capture,
+        )
     }
     fn validate_manifest_packing(
         &self,
@@ -729,8 +768,11 @@ impl Inner {
         limits: ManifestLimits,
         files: Option<bool>,
         planned: &HashSet<ObjectKey>,
+        capture: Option<&[u8]>,
     ) -> Result<VersionRoots> {
-        self.validate_manifest_selection(repo, owner, manifest, limits, files, planned, None)
+        self.validate_manifest_selection(
+            repo, owner, manifest, limits, files, planned, None, capture,
+        )
     }
     fn validate_manifest_selection(
         &self,
@@ -741,13 +783,31 @@ impl Inner {
         files: Option<bool>,
         planned: &HashSet<ObjectKey>,
         mut selection: Option<&mut SnapshotSelection<'_>>,
+        capture: Option<&[u8]>,
     ) -> Result<VersionRoots> {
+        match (manifest.capture(), capture) {
+            (Some(expected), Some(bytes))
+                if expected == tinytree_cloud::CaptureDescriptor::of(bytes)
+                    && !bytes.is_empty() => {}
+            (None, None) => {}
+            _ => return Err(Error::Invalid("cloud capture attachment selection")),
+        }
         self.check_version_work(manifest)?;
         let mut objects = Vec::with_capacity(manifest.members.len());
         let mut retained = objects
             .capacity()
             .checked_mul(std::mem::size_of::<VerifiedObject>())
             .ok_or(Error::Limit("cloud version member allocation"))?;
+        let capture_raw = capture.map_or(0, |bytes| bytes.len());
+        retained = retained
+            .checked_add(
+                capture_raw
+                    .checked_mul(3)
+                    .and_then(|n| n.checked_add(if capture.is_some() { 4096 } else { 0 }))
+                    .ok_or(Error::Limit("cloud capture input memory"))?,
+            )
+            .filter(|n| *n <= self.config.cloud.max_version_decode_bytes)
+            .ok_or(Error::Limit("cloud capture input memory"))?;
         if let Some(selected) = selection
             .as_mut()
             .filter(|selected| selected.collect_anchors)
@@ -775,7 +835,7 @@ impl Inner {
             if let Some(selected) = selection.as_ref() {
                 selected.check_deadline()?;
             }
-            let (record, metadata_scratch) = if matches!(manifest, RecoveryManifest::V2(_)) {
+            let (record, metadata_scratch) = if manifest.indexed().is_some() {
                 let key = object_key(repo, owner, member.id);
                 let bytes = self
                     .db
@@ -810,7 +870,7 @@ impl Inner {
                     "retained cloud member representation changed",
                 ));
             }
-            if matches!(manifest, RecoveryManifest::V2(_)) {
+            if manifest.indexed().is_some() {
                 // Admit the actual configured OP codec worker plus its bounded
                 // raw input/copy buffers while prior decoded members and this
                 // selected-record JSON remain live. Schema1 policy is unchanged.
@@ -843,14 +903,30 @@ impl Inner {
         }
         let op_retained = retained;
         let mut extra = ExtraWork::default();
+        if let Some(bytes) = capture {
+            // Repeated validation reads one immutable version-scoped capsule
+            // row and processes its raw payload. Keep prospective publication
+            // quotas identical to reopen/GC accounting; these are actual row
+            // units, not the pure codec's separate bounded CPU-work counter.
+            extra.records = 1;
+            extra.metadata = scope(repo, owner)
+                .len()
+                .checked_add(40)
+                .and_then(|n| n.checked_add(super::captures::HEADER))
+                .and_then(|n| n.checked_add(bytes.len()))
+                .ok_or(Error::Limit("cloud capture validation metadata"))?
+                as u64;
+            extra.payload = bytes.len() as u64;
+            extra.check(self)?;
+        }
         let mut artifacts = Vec::new();
         let mut frozen_retained = 0usize;
-        match manifest {
-            RecoveryManifest::V1(value) => {
-                verify_coverage(value, &objects, limits)
+        match manifest.indexed() {
+            None => {
+                verify_coverage(manifest, &objects, limits)
                     .map_err(|_| Error::Invalid("cloud manifest coverage"))?;
             }
-            RecoveryManifest::V2(value) => {
+            Some(value) => {
                 let mut policy = self.v2_limits(limits)?;
                 let loaded =
                     self.load_index_artifacts(repo, owner, value, &mut extra, &mut retained)?;
@@ -950,6 +1026,31 @@ impl Inner {
                         .filter(|n| *n <= self.config.cloud.max_version_decode_bytes)
                         .ok_or(Error::Limit("cloud frozen index memory"))?;
                 }
+                if let RecoveryManifest::V3(captured) = manifest {
+                    let graph_memory = loaded
+                        .len()
+                        .checked_mul(512)
+                        .and_then(|n| n.checked_add(4096))
+                        .ok_or(Error::Limit("cloud capture graph memory"))?;
+                    let remaining = self
+                        .config
+                        .cloud
+                        .max_version_decode_bytes
+                        .checked_sub(retained)
+                        .and_then(|n| n.checked_sub(graph_memory))
+                        .ok_or(Error::Limit("cloud capture binding memory"))?;
+                    let binding_limits = self.v3_limits(limits, remaining)?;
+                    let verified = tinytree_cloud::verify_capture_export_binding(
+                        captured,
+                        capture.ok_or(Error::Invalid("cloud capture attachment missing"))?,
+                        &objects,
+                        &loaded,
+                        &graph,
+                        binding_limits,
+                    )
+                    .map_err(|error| v2_error(error, "cloud capture export binding"))?;
+                    drop(verified);
+                }
                 artifacts = loaded
                     .iter()
                     .map(|artifact| artifact.descriptor())
@@ -958,7 +1059,7 @@ impl Inner {
             }
         }
         let wc = &manifest.working_copy;
-        if matches!(manifest, RecoveryManifest::V2(_)) {
+        if manifest.indexed().is_some() {
             // Decoded artifact graphs and snapshot models have dropped here.
             // OP/VIEWs and the selected closure descriptors remain live while
             // validating the WC commit, even for ROOT-only index snapshots.
@@ -1548,7 +1649,7 @@ impl Store {
         self.read_cloud_version_checked(repo, owner, workspace, generation, limits, false)?
             .ok_or(Error::Corrupt("cloud version schema dispatch"))
     }
-    /// Read only schema1. None denotes an indexed schema2 version without
+    /// Read only schema1. None denotes an indexed schema2/3 version without
     /// decoding its artifact graph; metadata lookup is not a retention proof.
     pub fn read_cloud_version_v1(
         &self,
@@ -1582,7 +1683,7 @@ impl Store {
         mut selection: Option<&mut SnapshotSelection<'_>>,
     ) -> Result<Option<CloudVersionReadGuard>> {
         let limits = self.inner.manifest_limits(limits)?;
-        let (record, manifest_bytes, manifest, mut guard, indexed) = {
+        let (record, manifest_bytes, manifest, mut guard, indexed, capture) = {
             let mut gate = self.inner.lock()?;
             self.inner.repository(repo)?;
             let key = version_key(repo, owner, workspace, generation);
@@ -1593,14 +1694,14 @@ impl Store {
                 .get(&self.inner.spaces.cloud.versions, &key)?
                 .ok_or(Error::Invalid("cloud version unavailable"))?;
             let record: VersionRecord = decode(&bytes)?;
-            if ![1, 2].contains(&record.format)
+            if ![1, 2, 3].contains(&record.format)
                 || record.workspace != workspace
                 || record.generation != generation
                 || generation == 0
             {
                 return Err(Error::Corrupt("cloud version identity"));
             }
-            if v1_only && record.format == 2 {
+            if v1_only && record.format >= 2 {
                 return Ok(None);
             }
             let id = ManifestId(record.manifest);
@@ -1622,9 +1723,9 @@ impl Store {
                 return Err(Error::Corrupt("cloud version manifest format"));
             }
             if let Some(selected) = selection.as_ref() {
-                let RecoveryManifest::V2(indexed) = &manifest else {
-                    return Err(Error::Invalid("cloud snapshots require indexed version"));
-                };
+                let indexed = manifest
+                    .indexed()
+                    .ok_or(Error::Invalid("cloud snapshots require indexed version"))?;
                 if selected.ids.iter().any(|id| {
                     indexed
                         .index_roots
@@ -1657,10 +1758,13 @@ impl Store {
             if gate.cloud_version_readers.get(&reader) == Some(&usize::MAX) {
                 return Err(Error::Limit("cloud version readers"));
             }
+            // All fallible attachment reads must precede guard construction:
+            // dropping a pin guard while this gate is held would reacquire it.
+            let capture = self.inner.capture_record(&key, manifest.capture())?;
             let mut guard = self.inner.pin_manifest(repo, owner, &manifest, &mut gate)?;
             *gate.cloud_version_readers.entry(reader).or_default() += 1;
             guard.version = Some((workspace, generation));
-            (record, bytes, manifest, guard, indexed)
+            (record, bytes, manifest, guard, indexed, capture)
         };
         let verified = self.inner.validate_manifest_selection(
             repo,
@@ -1670,6 +1774,7 @@ impl Store {
             Some(false),
             &HashSet::new(),
             selection.as_deref_mut(),
+            capture.as_ref().map(|capture| capture.bytes.as_slice()),
         )?;
         if verified.artifacts != indexed.artifacts || verified.extra != indexed.extra {
             return Err(Error::Corrupt("cloud version artifact proof"));
@@ -1681,6 +1786,7 @@ impl Store {
         Ok(Some(CloudVersionReadGuard {
             version: version(&record),
             manifest: manifest_bytes,
+            capture,
             _guard: guard,
         }))
     }
@@ -1689,6 +1795,17 @@ impl Store {
         repo: &str,
         owner: CloudOwner,
         request: &PublishCloudRequest,
+        now: i64,
+        limits: &CloudPublicationLimits,
+    ) -> Result<CloudPublication> {
+        self.publish_cloud_version_attachment(repo, owner, request, None, now, limits)
+    }
+    pub(super) fn publish_cloud_version_attachment(
+        &self,
+        repo: &str,
+        owner: CloudOwner,
+        request: &PublishCloudRequest,
+        capture_data: Option<&[u8]>,
         now: i64,
         limits: &CloudPublicationLimits,
     ) -> Result<CloudPublication> {
@@ -1703,7 +1820,22 @@ impl Store {
         {
             return Err(Error::Limit("cloud publication request"));
         }
-        let fingerprint = fingerprint(request);
+        if capture_data.is_some_and(|bytes| {
+            bytes.len() > tinytree_cloud::CaptureDataLimits::default().max_bytes
+        }) {
+            return Err(Error::Limit("cloud capture attachment bytes"));
+        }
+        let fingerprint = match capture_data {
+            None => fingerprint(request),
+            Some(bytes) => {
+                let mut hash = blake3::Hasher::new();
+                hash.update(b"tinytree-cloud-captured-publication-v1\0");
+                hash.update(&fingerprint(request));
+                hash.update(&(bytes.len() as u64).to_be_bytes());
+                hash.update(bytes);
+                *hash.finalize().as_bytes()
+            }
+        };
         {
             let _gate = self.inner.lock()?;
             self.inner.repository(repo)?;
@@ -1730,9 +1862,14 @@ impl Store {
             }
             self.inner.pin_manifest(repo, owner, &manifest, &mut gate)?
         };
-        let roots = self
-            .inner
-            .validate_manifest(repo, owner, &manifest, policy, Some(true))?;
+        let roots = self.inner.validate_manifest(
+            repo,
+            owner,
+            &manifest,
+            policy,
+            Some(true),
+            capture_data,
+        )?;
         let mut _gate = self.inner.lock()?;
         self.inner.repository(repo)?;
         if let Some(receipt) = self.inner.cloud_replay(repo, owner, request, fingerprint)? {
@@ -1876,8 +2013,21 @@ impl Store {
             || view
                 .get(&self.inner.spaces.cloud.roots, &version_key)?
                 .is_some()
+            || view
+                .get(&self.inner.spaces.cloud.captures, &version_key)?
+                .is_some()
         {
             return Err(Error::Corrupt("cloud version slot already occupied"));
+        }
+        if let Some(bytes) = capture_data {
+            let descriptor = manifest
+                .capture()
+                .ok_or(Error::Invalid("capture requires v3 manifest"))?;
+            changes.push((
+                &self.inner.spaces.cloud.captures,
+                version_key.clone(),
+                Some(super::captures::encode_record(descriptor, bytes)?),
+            ));
         }
         changes.push((
             &self.inner.spaces.cloud.workspaces,
@@ -1919,7 +2069,11 @@ impl Store {
         advance_feature(
             &mut tx,
             &self.inner.spaces.meta,
-            if manifest.format() == 2 { 4 } else { 3 },
+            match manifest.format() {
+                3 => 5,
+                2 => 4,
+                _ => 3,
+            },
         )?;
         let payload_work = manifest.members.iter().try_fold(0u64, |sum, member| {
             sum.checked_add(member.selected.size_bytes)
@@ -2027,7 +2181,7 @@ impl Inner {
             let record: VersionRecord = decode(&bytes)?;
             let workspace: [u8; 32] = suffix[..32].try_into().unwrap();
             let generation = u64::from_be_bytes(suffix[32..].try_into().unwrap());
-            if ![1, 2].contains(&record.format)
+            if ![1, 2, 3].contains(&record.format)
                 || record.workspace != workspace
                 || record.generation != generation
                 || generation == 0
@@ -2073,7 +2227,7 @@ impl Inner {
             }
             for root in indexed.native.iter().copied() {
                 plan.native.insert(root);
-                if planned.is_empty() || record.format == 2 {
+                if planned.is_empty() || record.format >= 2 {
                     native_by_repo
                         .entry(actual.to_owned())
                         .or_default()
@@ -2117,9 +2271,16 @@ impl Inner {
                     .checked_add(member.selected.size_bytes)
                     .ok_or(Error::Limit("cloud version validation bytes"))?;
             }
-            if validate && (planned.is_empty() || record.format == 2) {
+            let capture = self.capture_record(&key, manifest.capture())?;
+            if validate && (planned.is_empty() || record.format >= 2) {
                 let verified = self.validate_manifest_packing(
-                    actual, principal, &manifest, limits, None, planned,
+                    actual,
+                    principal,
+                    &manifest,
+                    limits,
+                    None,
+                    planned,
+                    capture.as_ref().map(|capture| capture.bytes.as_slice()),
                 )?;
                 if verified.artifacts != indexed.artifacts || verified.extra != indexed.extra {
                     return Err(Error::Corrupt("cloud indexed version proof mismatch"));
@@ -2198,7 +2359,7 @@ impl Inner {
             let (key, bytes) = entry.into_inner()?;
             scan.visit(self, &key, &bytes)?;
             let record: VersionRecord = decode(&bytes)?;
-            if record.format == 2 {
+            if record.format >= 2 {
                 indexed = true;
                 break;
             }
@@ -2400,6 +2561,7 @@ impl Inner {
             (5, &self.spaces.cloud.versions),
             (6, &self.spaces.cloud.roots),
             (7, &self.spaces.cloud.receipts),
+            (11, &self.spaces.cloud.captures),
         ] {
             for item in view.iter(space) {
                 let (key, bytes) = item.into_inner()?;
@@ -2489,6 +2651,21 @@ impl Inner {
                             return Err(Error::Corrupt("cloud receipt replay history"));
                         }
                         adjust(&mut account.receipts, 1)?;
+                    }
+                    11 => {
+                        if suffix.len() != 40
+                            || plan
+                                .versions
+                                .get(key.as_ref())
+                                .is_none_or(|version| version.format != 3)
+                            || store_feature(view.get(&self.spaces.meta, b"format")?.as_deref())?
+                                < 5
+                        {
+                            return Err(Error::Corrupt(
+                                "unreferenced cloud capture or missing feature",
+                            ));
+                        }
+                        super::captures::decode_record(&bytes)?;
                     }
                     _ => unreachable!(),
                 }
@@ -2685,9 +2862,11 @@ impl Store {
         let CloudVersionReadGuard {
             version,
             manifest,
+            capture,
             _guard,
         } = value;
         drop(manifest);
+        drop(capture);
         Ok(CloudSnapshotReadGuard {
             version,
             selector,

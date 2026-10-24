@@ -98,6 +98,8 @@ mod resources;
 pub use resources::CloudResourceProfile;
 mod artifacts;
 pub use artifacts::{CloudIndexReadLease, CloudIndexWriteReceipt};
+mod captures;
+pub use captures::{CloudCaptureReadLease, PublishCapturedCloudRequest};
 mod versions;
 pub use versions::{
     CloudPublication, CloudPublicationLimits, CloudSnapshotCommit, CloudSnapshotReadGuard,
@@ -109,7 +111,7 @@ fn decode<T: serde::de::DeserializeOwned>(bytes: &[u8]) -> Result<T> {
     }
     serde_json::from_slice(bytes).map_err(|_| Error::Corrupt("cloud metadata encoding"))
 }
-const TABLES: [&str; 11] = [
+const TABLES: [&str; 12] = [
     "cloud-objects-v1",
     "cloud-blobs-v1",
     "cloud-staging-v1",
@@ -121,6 +123,7 @@ const TABLES: [&str; 11] = [
     "cloud-accounting-v1",
     "cloud-index-artifacts-v1",
     "cloud-index-staging-v1",
+    "cloud-captures-v1",
 ];
 pub(super) struct Spaces {
     objects: SingleWriterTxKeyspace,
@@ -134,14 +137,18 @@ pub(super) struct Spaces {
     accounting: SingleWriterTxKeyspace,
     index_artifacts: SingleWriterTxKeyspace,
     index_staging: SingleWriterTxKeyspace,
+    captures: SingleWriterTxKeyspace,
 }
 impl Spaces {
     pub(super) fn open(db: &SingleWriterTxDatabase, feature: u8) -> Result<Self> {
         if feature >= 3 && TABLES[..9].iter().any(|name| !db.keyspace_exists(name)) {
             return Err(Error::Corrupt("cloud keyspace missing"));
         }
-        if feature >= 4 && TABLES[9..].iter().any(|name| !db.keyspace_exists(name)) {
+        if feature >= 4 && TABLES[9..11].iter().any(|name| !db.keyspace_exists(name)) {
             return Err(Error::Corrupt("cloud index keyspace missing"));
+        }
+        if feature >= 5 && !db.keyspace_exists(TABLES[11]) {
+            return Err(Error::Corrupt("cloud capture keyspace missing"));
         }
         Ok(Self {
             objects: db.keyspace(TABLES[0], KeyspaceCreateOptions::default)?,
@@ -155,9 +162,10 @@ impl Spaces {
             accounting: db.keyspace(TABLES[8], KeyspaceCreateOptions::default)?,
             index_artifacts: db.keyspace(TABLES[9], KeyspaceCreateOptions::default)?,
             index_staging: db.keyspace(TABLES[10], KeyspaceCreateOptions::default)?,
+            captures: db.keyspace(TABLES[11], KeyspaceCreateOptions::default)?,
         })
     }
-    fn all(&self) -> [&SingleWriterTxKeyspace; 11] {
+    fn all(&self) -> [&SingleWriterTxKeyspace; 12] {
         [
             &self.objects,
             &self.blobs,
@@ -170,6 +178,7 @@ impl Spaces {
             &self.accounting,
             &self.index_artifacts,
             &self.index_staging,
+            &self.captures,
         ]
     }
 }
@@ -740,7 +749,8 @@ impl Inner {
             match value {
                 Some(value) => {
                     let binary = std::ptr::eq(space, &self.spaces.cloud.manifests)
-                        || std::ptr::eq(space, &self.spaces.cloud.roots);
+                        || std::ptr::eq(space, &self.spaces.cloud.roots)
+                        || std::ptr::eq(space, &self.spaces.cloud.captures);
                     if value.len()
                         > if binary {
                             CLOUD_BINARY_ROW_BYTES

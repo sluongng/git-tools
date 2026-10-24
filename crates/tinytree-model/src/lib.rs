@@ -17,6 +17,15 @@ pub fn cloud_manifest_id(bytes: &[u8]) -> [u8; 32] {
     *hash.finalize().as_bytes()
 }
 
+/// Hash portable capture DATA in its own identity domain. This does not decode
+/// the schema, prove frontend quiescence, or grant retained-version authority.
+pub fn cloud_capture_data_id(bytes: &[u8]) -> [u8; 32] {
+    let mut hash = blake3::Hasher::new();
+    hash.update(b"tinytree-local-capture-data-v1\0");
+    hash.update(bytes);
+    *hash.finalize().as_bytes()
+}
+
 /// Hash canonical portable-index root bytes in their separate identity domain.
 /// This does not decode the artifact, validate graph coverage or grant access.
 pub fn cloud_index_root_id(bytes: &[u8]) -> [u8; 32] {

@@ -2628,6 +2628,16 @@ fn cloud_capture_with_refs(
     root: Descriptor,
     bookmarks: usize,
 ) -> (tinytree_cloud::Manifest, Vec<CloudWriteReceipt>) {
+    cloud_capture_with_parent_edges(store, owner, head, root, bookmarks, 1)
+}
+fn cloud_capture_with_parent_edges(
+    store: &Store,
+    owner: CloudOwner,
+    head: Descriptor,
+    root: Descriptor,
+    bookmarks: usize,
+    parent_edges: usize,
+) -> (tinytree_cloud::Manifest, Vec<CloudWriteReceipt>) {
     use jj_lib::{
         backend::{MillisSinceEpoch, Timestamp as JjTimestamp},
         object_id::ObjectId as _,
@@ -2661,7 +2671,7 @@ fn cloud_capture_with_refs(
         };
         let op = Operation {
             view_id: view_id.clone(),
-            parents: vec![jj_lib::op_store::OperationId::from_bytes(&[0; 64])],
+            parents: vec![jj_lib::op_store::OperationId::from_bytes(&[0; 64]); parent_edges],
             metadata: OperationMetadata {
                 time: TimestampRange {
                     start: timestamp.clone(),
@@ -3931,7 +3941,24 @@ fn cloud_v2_capture(
     Vec<String>,
     Vec<tinytree_cloud::IndexArtifactDescriptor>,
 ) {
-    let (mut recovery, ordinary) = cloud_capture(store, owner, head, root);
+    cloud_v2_capture_from_recovery(
+        store,
+        owner,
+        logical,
+        cloud_capture(store, owner, head, root),
+    )
+}
+fn cloud_v2_capture_from_recovery(
+    store: &Store,
+    owner: CloudOwner,
+    logical: tinytree_cloud::PortableIndexSnapshot,
+    recovery: (tinytree_cloud::Manifest, Vec<CloudWriteReceipt>),
+) -> (
+    tinytree_cloud::ManifestV2,
+    Vec<String>,
+    Vec<tinytree_cloud::IndexArtifactDescriptor>,
+) {
+    let (mut recovery, ordinary) = recovery;
     let intrinsic = tinytree_cloud::build_index_artifacts(
         &tinytree_cloud::PortableIndexSnapshot {
             roots: vec![CommitId::ROOT],
@@ -5395,5 +5422,627 @@ fn cloud_resource_profile_matches_open_store_and_rejects_overflow() {
     assert!(matches!(
         impossible.cloud_resource_profile(),
         Err(Error::Limit(_))
+    ));
+}
+
+fn captured_cloud_request(
+    store: &Store,
+    owner: CloudOwner,
+    history: tinytree_cloud::ManifestV2,
+    leases: Vec<String>,
+    artifacts: &[tinytree_cloud::IndexArtifactDescriptor],
+    expected_generation: u64,
+    token: &str,
+) -> PublishCapturedCloudRequest {
+    use jj_lib::object_id::ObjectId as _;
+    use tinytree_cloud as c;
+    let mut operations = vec![c::OperationRecord {
+        operation: hex(&[0; 64]),
+        view: hex(&[0; 64]),
+        parents: vec![],
+    }];
+    let mut blobs = Vec::new();
+    for member in &history.recovery.members {
+        let mut lease = store
+            .read_cloud_object("demo", owner, member.id, Default::default())
+            .unwrap();
+        let mut bytes = Vec::new();
+        lease.read_to_end(&mut bytes).unwrap();
+        let object =
+            c::VerifiedObject::verify(member.id, member.selected, &bytes, Default::default())
+                .unwrap();
+        if let Some(operation) = object.operation() {
+            operations.push(c::OperationRecord {
+                operation: hex(member.id.bytes()),
+                view: operation.view_id.hex(),
+                parents: operation
+                    .parents
+                    .iter()
+                    .map(|parent| parent.hex())
+                    .collect(),
+            });
+        }
+        blobs.push(c::BlobRecord {
+            kind: match member.id {
+                c::ObjectId::Operation(_) => 1,
+                c::ObjectId::View(_) => 2,
+            },
+            id: hex(member.id.bytes()),
+            blake3: member.selected.blake3,
+            size: member.selected.size_bytes,
+        });
+    }
+    for artifact in artifacts {
+        let (kind, id) = match artifact.id {
+            c::IndexArtifactId::Root(id) => (3, id.0),
+            c::IndexArtifactId::Node(id) => (4, id.0),
+        };
+        blobs.push(c::BlobRecord {
+            kind,
+            id: hex(&id),
+            blake3: artifact.selected.blake3,
+            size: artifact.selected.size_bytes,
+        });
+    }
+    operations.sort_by(|left, right| left.operation.cmp(&right.operation));
+    blobs.sort_by(|left, right| (left.kind, &left.id).cmp(&(right.kind, &right.id)));
+    let recovery = &history.recovery;
+    let data = c::CaptureData {
+        version: 1,
+        policy: c::CapturePolicy::HostQuiescentV1,
+        codec: c::CODEC.into(),
+        operation_heads: recovery.operation_heads.iter().map(|id| hex(id)).collect(),
+        working_copy: c::PortableWorkingCopy {
+            workspace: recovery.working_copy.workspace_name.clone(),
+            wc_operation: hex(&recovery.working_copy.wc_operation),
+            snapshot_operation: hex(&recovery.working_copy.snapshot_operation),
+            snapshot_commit: recovery.working_copy.snapshot_commit,
+            tree: c::CaptureTree {
+                terms: recovery
+                    .working_copy
+                    .tree
+                    .terms
+                    .iter()
+                    .map(|id| id.0)
+                    .collect(),
+                labels: recovery.working_copy.tree.labels.clone(),
+            },
+        },
+        operations,
+        indexes: history
+            .operation_indexes
+            .iter()
+            .map(|index| c::IndexRecord {
+                operation: hex(&index.operation),
+                root: index.root.0,
+            })
+            .collect(),
+        blobs,
+        roots: recovery
+            .native_roots
+            .iter()
+            .map(|root| c::CapturedRoot {
+                kind: root.kind as u8,
+                id: root.id.0,
+            })
+            .collect(),
+        remote: None,
+    };
+    let capture_data = c::encode_capture_data(&data, Default::default()).unwrap();
+    let manifest = c::ManifestV3 {
+        history,
+        capture: c::CaptureDescriptor::of(&capture_data),
+    };
+    let bytes = c::encode_manifest_v3(&manifest, Default::default()).unwrap();
+    PublishCapturedCloudRequest {
+        publication: PublishCloudRequest {
+            workspace: manifest.history.recovery.workspace,
+            expected_generation,
+            idempotency_key: token.into(),
+            manifest: c::ManifestId::of(&bytes),
+            manifest_bytes: bytes,
+            staging_leases: leases,
+        },
+        capture_data,
+    }
+}
+
+#[test]
+fn captured_versions_publish_atomically_replay_and_retain_the_exact_capsule_through_gc_pack_restart()
+ {
+    let (directory, store) = open();
+    let owner = CloudOwner {
+        principal: [91; 32],
+    };
+    let (_, root, head) = fixture(&store, "captured anchor");
+    let mut hidden = commit(TreeId(root.key.id.0), "captured hidden draft");
+    hidden.parents = vec![CommitId(head.key.id.0)];
+    let hidden = put_object(&store, Object::Commit(hidden), 0);
+    let (history, leases, artifacts) = cloud_v2_capture(
+        &store,
+        owner,
+        head,
+        root,
+        tinytree_cloud::PortableIndexSnapshot {
+            roots: vec![CommitId(head.key.id.0)],
+            drafts: vec![cloud_index_draft(&store, hidden, 9)],
+        },
+    );
+    let request = captured_cloud_request(
+        &store,
+        owner,
+        history,
+        leases,
+        &artifacts,
+        0,
+        "captured-first",
+    );
+    assert!(
+        store
+            .publish_cloud_version("demo", owner, &request.publication, 1, &Default::default())
+            .is_err(),
+        "legacy API cannot acknowledge a history-only V3 publication"
+    );
+    assert_eq!(
+        store
+            .get_cloud_workspace("demo", owner, request.publication.workspace)
+            .unwrap()
+            .generation,
+        0
+    );
+    assert!(
+        store
+            .cloud_publication("demo", owner, "captured-first")
+            .unwrap()
+            .is_none()
+    );
+    let mut malformed = PublishCapturedCloudRequest {
+        publication: request.publication.clone(),
+        capture_data: request.capture_data.clone(),
+    };
+    malformed.publication.idempotency_key = "captured-malformed".into();
+    malformed.capture_data.push(b' ');
+    assert!(
+        store
+            .publish_captured_cloud_version("demo", owner, &malformed, 1, &Default::default())
+            .is_err()
+    );
+    assert_eq!(
+        store
+            .get_cloud_workspace("demo", owner, request.publication.workspace)
+            .unwrap()
+            .generation,
+        0
+    );
+    for (name, policy, workspace) in [
+        (
+            "capture-unfenced-policy",
+            tinytree_cloud::CapturePolicy::TreeFreezeCandidateV1,
+            "task",
+        ),
+        (
+            "capture-wc-mismatch",
+            tinytree_cloud::CapturePolicy::HostQuiescentV1,
+            "other",
+        ),
+    ] {
+        let mut data = tinytree_cloud::decode_data(
+            &request.capture_data,
+            tinytree_cloud::CaptureDataId::of(&request.capture_data).0,
+            &Default::default(),
+        )
+        .unwrap();
+        data.policy = policy;
+        data.working_copy.workspace = workspace.into();
+        let capture_data = tinytree_cloud::encode_capture_data(&data, Default::default()).unwrap();
+        let mut manifest = tinytree_cloud::decode_manifest_v3(
+            &request.publication.manifest_bytes,
+            request.publication.manifest,
+            Default::default(),
+        )
+        .unwrap();
+        manifest.capture = tinytree_cloud::CaptureDescriptor::of(&capture_data);
+        let bytes = tinytree_cloud::encode_manifest_v3(&manifest, Default::default()).unwrap();
+        let mut publication = request.publication.clone();
+        publication.idempotency_key = name.into();
+        publication.manifest = tinytree_cloud::ManifestId::of(&bytes);
+        publication.manifest_bytes = bytes;
+        let invalid = PublishCapturedCloudRequest {
+            publication,
+            capture_data,
+        };
+        assert!(
+            store
+                .publish_captured_cloud_version("demo", owner, &invalid, 1, &Default::default())
+                .is_err(),
+            "{name}"
+        );
+        assert!(
+            store
+                .cloud_publication("demo", owner, name)
+                .unwrap()
+                .is_none(),
+            "{name}"
+        );
+        assert_eq!(
+            store
+                .get_cloud_workspace("demo", owner, request.publication.workspace)
+                .unwrap()
+                .generation,
+            0,
+            "{name}"
+        );
+    }
+    let published = store
+        .publish_captured_cloud_version("demo", owner, &request, 1, &Default::default())
+        .unwrap();
+    assert_eq!(published.workspace.generation, 1);
+    assert_eq!(
+        store
+            .publish_captured_cloud_version("demo", owner, &request, 2, &Default::default())
+            .unwrap(),
+        published
+    );
+    malformed.publication.idempotency_key = "captured-first".into();
+    assert!(matches!(
+        store.publish_captured_cloud_version("demo", owner, &malformed, 2, &Default::default()),
+        Err(Error::IdempotencyConflict)
+    ));
+    malformed.capture_data.clear();
+    assert!(matches!(
+        store.publish_captured_cloud_version("demo", owner, &malformed, 2, &Default::default()),
+        Err(Error::IdempotencyConflict)
+    ));
+    let descriptor = tinytree_cloud::CaptureDescriptor::of(&request.capture_data);
+    let selector = CloudVersionSelector {
+        workspace: request.publication.workspace,
+        generation: 1,
+        manifest: request.publication.manifest,
+        selected: tinytree_cloud::BlobDigest::of(&request.publication.manifest_bytes),
+    };
+    assert!(
+        store
+            .read_cloud_version_v1("demo", owner, selector.workspace, 1, Default::default())
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        store
+            .read_cloud_capture(
+                "demo",
+                CloudOwner {
+                    principal: [92; 32]
+                },
+                selector,
+                descriptor.id
+            )
+            .is_err()
+    );
+    assert!(
+        store
+            .read_cloud_capture(
+                "demo",
+                owner,
+                selector,
+                tinytree_cloud::CaptureDataId([0; 32])
+            )
+            .is_err()
+    );
+    let mut lease = store
+        .read_cloud_capture("demo", owner, selector, descriptor.id)
+        .unwrap();
+    assert_eq!(lease.descriptor(), descriptor);
+    let mut bytes = vec![0; 16];
+    lease.read_exact(&mut bytes).unwrap();
+    store.gc("demo", 100).unwrap();
+    lease.read_to_end(&mut bytes).unwrap();
+    assert_eq!(bytes, request.capture_data);
+    drop(lease);
+    store.pack("demo", PackOptions::default()).unwrap();
+    assert_eq!(
+        store
+            .inner
+            .db
+            .read_tx()
+            .get(&store.inner.spaces.meta, b"format")
+            .unwrap()
+            .unwrap()
+            .as_ref(),
+        b"tinytree-store-5"
+    );
+    let indexed = tinytree_cloud::decode_manifest_v3(
+        &request.publication.manifest_bytes,
+        request.publication.manifest,
+        Default::default(),
+    )
+    .unwrap();
+    let selected = indexed
+        .history
+        .operation_indexes
+        .iter()
+        .find(|entry| entry.operation != [0; 64])
+        .unwrap()
+        .root;
+    let guard = store
+        .open_cloud_snapshot("demo", owner, selector, &[selected], 4)
+        .unwrap();
+    assert_eq!(guard.frozen_commits()[0].descriptor, hidden);
+    drop(guard);
+    drop(store);
+    let store = Store::open_existing(directory.path(), config()).unwrap();
+    let mut lease = store
+        .read_cloud_capture("demo", owner, selector, descriptor.id)
+        .unwrap();
+    let mut recovered = Vec::new();
+    lease.read_to_end(&mut recovered).unwrap();
+    assert_eq!(recovered, request.capture_data);
+    drop(lease);
+    assert_eq!(
+        store
+            .cloud_publication("demo", owner, "captured-first")
+            .unwrap()
+            .unwrap(),
+        published
+    );
+}
+
+#[test]
+fn capture_size_boundary_accepts_a_large_canonical_operation_inventory_as_a_binary_row() {
+    let (directory, store) = open();
+    let owner = CloudOwner {
+        principal: [95; 32],
+    };
+    let (_, root, head) = fixture(&store, "large capture inventory");
+    // Ordered parent edges are preserved by the actual operation codec, including
+    // repeated intrinsic parents. Their hex representation is legitimate capture
+    // data, not padding in an otherwise small attachment.
+    let recovery = cloud_capture_with_parent_edges(&store, owner, head, root, 0, 9_000);
+    let (history, leases, artifacts) = cloud_v2_capture_from_recovery(
+        &store,
+        owner,
+        tinytree_cloud::PortableIndexSnapshot {
+            roots: vec![CommitId(head.key.id.0)],
+            drafts: vec![],
+        },
+        recovery,
+    );
+    let request = captured_cloud_request(
+        &store,
+        owner,
+        history,
+        leases,
+        &artifacts,
+        0,
+        "large-capture",
+    );
+    assert!(request.capture_data.len() > 1024 * 1024);
+    let id = tinytree_cloud::CaptureDataId::of(&request.capture_data);
+    let publication = store
+        .publish_captured_cloud_version("demo", owner, &request, 1, &Default::default())
+        .unwrap();
+    let selector = CloudVersionSelector {
+        workspace: request.publication.workspace,
+        generation: publication.workspace.generation,
+        manifest: request.publication.manifest,
+        selected: tinytree_cloud::BlobDigest::of(&request.publication.manifest_bytes),
+    };
+    let mut lease = store
+        .read_cloud_capture("demo", owner, selector, id)
+        .unwrap();
+    let mut bytes = Vec::new();
+    lease.read_to_end(&mut bytes).unwrap();
+    assert_eq!(bytes, request.capture_data);
+    drop(lease);
+    drop(store);
+    let store = Store::open_existing(directory.path(), config()).unwrap();
+    let mut lease = store
+        .read_cloud_capture("demo", owner, selector, id)
+        .unwrap();
+    bytes.clear();
+    lease.read_to_end(&mut bytes).unwrap();
+    assert_eq!(bytes, request.capture_data);
+}
+
+#[test]
+fn capture_binding_uses_remaining_version_budget_without_changing_history_only_admission() {
+    let directory = tempfile::tempdir().unwrap();
+    let small = small_index_cloud_config();
+    let store = Store::open(directory.path(), small).unwrap();
+    store.create_repository("demo").unwrap();
+    let owner = CloudOwner {
+        principal: [93; 32],
+    };
+    let (_, root, head) = fixture(&store, "small capture budget");
+    let (mut history, leases, artifacts) = cloud_v2_capture(
+        &store,
+        owner,
+        head,
+        root,
+        tinytree_cloud::PortableIndexSnapshot {
+            roots: vec![CommitId(head.key.id.0)],
+            drafts: vec![],
+        },
+    );
+    let ordinary = cloud_v2_request(&history, 0, "history-without-capsule", leases);
+    store
+        .publish_cloud_version("demo", owner, &ordinary, 1, &Default::default())
+        .unwrap();
+    history.recovery.sequence = 2;
+    let captured = captured_cloud_request(
+        &store,
+        owner,
+        history,
+        vec![],
+        &artifacts,
+        1,
+        "remaining-capture-budget",
+    );
+    assert!(matches!(
+        store.publish_captured_cloud_version("demo", owner, &captured, 2, &Default::default()),
+        Err(Error::Limit(_))
+    ));
+    assert_eq!(
+        store
+            .get_cloud_workspace("demo", owner, captured.publication.workspace)
+            .unwrap()
+            .generation,
+        1
+    );
+    assert!(
+        store
+            .cloud_publication("demo", owner, "remaining-capture-budget")
+            .unwrap()
+            .is_none()
+    );
+    let captures = store
+        .inner
+        .db
+        .keyspace("cloud-captures-v1", KeyspaceCreateOptions::default)
+        .unwrap();
+    assert!(store.inner.db.read_tx().iter(&captures).next().is_none());
+}
+
+#[test]
+fn captured_version_missing_orphan_corrupt_and_downgraded_rows_fail_closed_on_reopen() {
+    let (directory, store) = open();
+    let owner = CloudOwner {
+        principal: [94; 32],
+    };
+    let (_, root, head) = fixture(&store, "capture integrity");
+    let (history, leases, artifacts) = cloud_v2_capture(
+        &store,
+        owner,
+        head,
+        root,
+        tinytree_cloud::PortableIndexSnapshot {
+            roots: vec![CommitId(head.key.id.0)],
+            drafts: vec![],
+        },
+    );
+    let request = captured_cloud_request(
+        &store,
+        owner,
+        history,
+        leases,
+        &artifacts,
+        0,
+        "capture-integrity",
+    );
+    store
+        .publish_captured_cloud_version("demo", owner, &request, 1, &Default::default())
+        .unwrap();
+    let space = store
+        .inner
+        .db
+        .keyspace("cloud-captures-v1", KeyspaceCreateOptions::default)
+        .unwrap();
+    let (key, row) = store
+        .inner
+        .db
+        .read_tx()
+        .iter(&space)
+        .next()
+        .unwrap()
+        .into_inner()
+        .unwrap();
+    let key = key.to_vec();
+    let row = row.to_vec();
+    let mut tx = store
+        .inner
+        .db
+        .write_tx()
+        .durability(Some(PersistMode::SyncAll));
+    tx.remove(&space, &key);
+    tx.commit().unwrap();
+    let selector = CloudVersionSelector {
+        workspace: request.publication.workspace,
+        generation: 1,
+        manifest: request.publication.manifest,
+        selected: tinytree_cloud::BlobDigest::of(&request.publication.manifest_bytes),
+    };
+    assert!(matches!(
+        store.read_cloud_capture(
+            "demo",
+            owner,
+            selector,
+            tinytree_cloud::CaptureDataId::of(&request.capture_data)
+        ),
+        Err(Error::Corrupt("cloud version capture missing"))
+    ));
+    drop(space);
+    drop(store);
+    assert!(matches!(
+        Store::open_existing(directory.path(), config()),
+        Err(Error::Corrupt("cloud version capture missing"))
+    ));
+    fn repair(path: &Path, key: &[u8], value: Option<&[u8]>, feature: Option<&[u8]>) {
+        let db = SingleWriterTxDatabase::builder(path.join("metadata"))
+            .open()
+            .unwrap();
+        let captures = db
+            .keyspace("cloud-captures-v1", KeyspaceCreateOptions::default)
+            .unwrap();
+        let meta = db.keyspace("meta", KeyspaceCreateOptions::default).unwrap();
+        let mut tx = db.write_tx().durability(Some(PersistMode::SyncAll));
+        match value {
+            Some(value) => tx.insert(&captures, key, value),
+            None => tx.remove(&captures, key),
+        }
+        if let Some(feature) = feature {
+            tx.insert(&meta, b"format", feature);
+        }
+        tx.commit().unwrap();
+    }
+    repair(directory.path(), &key, Some(&row), None);
+    drop(Store::open_existing(directory.path(), config()).unwrap());
+    let mut orphan = key.clone();
+    *orphan.last_mut().unwrap() ^= 0x80;
+    repair(directory.path(), &orphan, Some(&row), None);
+    assert!(matches!(
+        Store::open_existing(directory.path(), config()),
+        Err(Error::Corrupt(
+            "unreferenced cloud capture or missing feature"
+        ))
+    ));
+    repair(directory.path(), &orphan, None, None);
+    let mut corrupt = row.clone();
+    *corrupt.last_mut().unwrap() ^= 1;
+    repair(directory.path(), &key, Some(&corrupt), None);
+    assert!(matches!(
+        Store::open_existing(directory.path(), config()),
+        Err(Error::Corrupt("cloud capture record identity"))
+    ));
+    repair(
+        directory.path(),
+        &key,
+        Some(&row),
+        Some(b"tinytree-store-4"),
+    );
+    assert!(matches!(
+        Store::open_existing(directory.path(), config()),
+        Err(Error::Corrupt(
+            "unreferenced cloud capture or missing feature"
+        ))
+    ));
+    repair(
+        directory.path(),
+        &key,
+        Some(&row),
+        Some(b"tinytree-store-5"),
+    );
+    {
+        let db = SingleWriterTxDatabase::builder(directory.path().join("metadata"))
+            .open()
+            .unwrap();
+        let captures = db
+            .keyspace("cloud-captures-v1", KeyspaceCreateOptions::default)
+            .unwrap();
+        db.inner()
+            .delete_keyspace(captures.inner().clone())
+            .unwrap();
+    }
+    assert!(matches!(
+        Store::open_existing(directory.path(), config()),
+        Err(Error::Corrupt("cloud capture keyspace missing"))
     ));
 }

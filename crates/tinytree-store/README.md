@@ -39,6 +39,10 @@ Callers must authorize repository access and protect local jj operation, undo an
 workspace roots. An upload receipt alone is not permission to discard local data.
 Process-crash/write-failure tests are not proof of machine power-loss durability.
 
+Captured recovery versions atomically bind portable workspace metadata and native
+roots. The first such publication upgrades storage to format 5; earlier binaries
+cannot reopen it. Capture data remains retained with its immutable version.
+
 `client_gc` is a separate, bounded unreachable-only collector seam for lazy
 clients; it is not enabled by a broker or workspace API. Callers must fence the
 complete workspace/operation/in-flight root registry through completion. Exact

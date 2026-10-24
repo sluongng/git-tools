@@ -130,10 +130,7 @@ pub struct CapturedRoot {
     pub id: [u8; 32],
 }
 pub fn data_digest(bytes: &[u8]) -> [u8; 32] {
-    let mut hash = blake3::Hasher::new();
-    hash.update(b"tinytree-local-capture-data-v1\0");
-    hash.update(bytes);
-    *hash.finalize().as_bytes()
+    m::cloud_capture_data_id(bytes)
 }
 /// Digest/canonical-schema check only, NOT source quiescence or capture authority.
 /// Only read_candidate can create LocalCaptureCandidate with physical ownership.
