@@ -1,9 +1,11 @@
 //! Durable admission/retention bookkeeping, never authoritative object storage.
 use crate::{Config, hex, unhex};
 mod cloud;
+mod cloud_query;
 mod query;
 use anyhow::{Context, Result, ensure};
 pub(crate) use cloud::CloudVersionAuthority;
+pub(crate) use cloud_query::CloudQueryAuthority;
 use fjall::Readable;
 pub(crate) use query::{Authority, QueryAuthority};
 use serde::{Deserialize, Serialize};
@@ -134,6 +136,8 @@ pub(crate) struct Ledger {
     query_authorities: fjall::SingleWriterTxKeyspace,
     query_grants: fjall::SingleWriterTxKeyspace,
     cloud_authorities: fjall::SingleWriterTxKeyspace,
+    cloud_queries: fjall::SingleWriterTxKeyspace,
+    poisoned: std::sync::atomic::AtomicBool,
     gate: Mutex<()>,
     config: Config,
     _owner: File,
@@ -146,6 +150,7 @@ const LEGACY_FORMAT: &[u8] = b"tinytree-native-admission-1\n";
 const SPARSE_FORMAT: &[u8] = b"tinytree-native-admission-2\n";
 const QUERY_FORMAT: &[u8] = b"tinytree-native-admission-3\n";
 const FORMAT: &[u8] = b"tinytree-native-admission-4\n";
+const CLOUD_QUERY_FORMAT: &[u8] = b"tinytree-native-admission-5\n";
 pub(crate) fn preflight(path: &Path) -> Result<bool> {
     match std::fs::symlink_metadata(path) {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(true),
@@ -166,6 +171,7 @@ pub(crate) fn preflight(path: &Path) -> Result<bool> {
             let marker = std::fs::read(path.join(MARKER))?;
             ensure!(
                 marker == FORMAT
+                    || marker == CLOUD_QUERY_FORMAT
                     || marker == QUERY_FORMAT
                     || marker == SPARSE_FORMAT
                     || marker == LEGACY_FORMAT,
@@ -209,6 +215,52 @@ fn require_bytes(path: &Path, expected: &[u8]) -> Result<()> {
     Ok(())
 }
 impl Ledger {
+    fn check(&self) -> Result<()> {
+        ensure!(
+            !self.poisoned.load(std::sync::atomic::Ordering::Acquire),
+            "native ledger requires reopening"
+        );
+        Ok(())
+    }
+    fn enable_cloud_queries(&self) -> Result<()> {
+        self.check()?;
+        let _gate = self
+            .gate
+            .lock()
+            .map_err(|_| anyhow::anyhow!("native ledger requires recovery"))?;
+        let format = self
+            .db
+            .read_tx()
+            .get(&self.meta, b"format")?
+            .context("native feature gate missing")?;
+        if format.as_ref() == CLOUD_QUERY_FORMAT {
+            return Ok(());
+        }
+        ensure!(
+            format.as_ref() == FORMAT,
+            "native cloud query feature gate unsupported"
+        );
+        ensure!(
+            self.db.read_tx().iter(&self.cloud_queries).next().is_none(),
+            "ungated native cloud query records"
+        );
+        let mut tx = self
+            .db
+            .write_tx()
+            .durability(Some(fjall::PersistMode::SyncAll));
+        tx.insert(&self.meta, b"format", CLOUD_QUERY_FORMAT);
+        if let Err(error) = tx.commit() {
+            self.poisoned
+                .store(true, std::sync::atomic::Ordering::Release);
+            return Err(error.into());
+        }
+        if let Err(error) = self._directory.replace(MARKER, CLOUD_QUERY_FORMAT) {
+            self.poisoned
+                .store(true, std::sync::atomic::Ordering::Release);
+            return Err(error.into());
+        }
+        Ok(())
+    }
     pub fn open(path: &Path, config: &Config, trust: &str) -> Result<Self> {
         let fresh = preflight(path)?;
         if fresh {
@@ -247,7 +299,7 @@ impl Ledger {
         }
         let meta = db.keyspace("meta", fjall::KeyspaceCreateOptions::default)?;
         if !fresh
-            && matches!(db.read_tx().get(&meta, b"format")?.as_deref(), Some(value) if value == FORMAT || value == QUERY_FORMAT || value == SPARSE_FORMAT)
+            && matches!(db.read_tx().get(&meta, b"format")?.as_deref(), Some(value) if value == CLOUD_QUERY_FORMAT || value == FORMAT || value == QUERY_FORMAT || value == SPARSE_FORMAT)
         {
             ensure!(
                 db.keyspace_exists("known-references-v2")
@@ -256,19 +308,35 @@ impl Ledger {
             );
         }
         if !fresh
-            && matches!(db.read_tx().get(&meta,b"format")?.as_deref(),Some(value) if value==FORMAT||value==QUERY_FORMAT)
+            && matches!(db.read_tx().get(&meta,b"format")?.as_deref(),Some(value) if value==CLOUD_QUERY_FORMAT||value==FORMAT||value==QUERY_FORMAT)
         {
             ensure!(
                 db.keyspace_exists("query-authorities-v3") && db.keyspace_exists("query-grants-v3"),
                 "recognized query admission keyspace missing"
             );
         }
-        if !fresh && db.read_tx().get(&meta, b"format")?.as_deref() == Some(FORMAT) {
+        if !fresh
+            && matches!(db.read_tx().get(&meta, b"format")?.as_deref(), Some(value) if value == FORMAT || value == CLOUD_QUERY_FORMAT)
+        {
             ensure!(
                 db.keyspace_exists("cloud-authorities-v4"),
                 "recognized cloud admission keyspace missing"
             );
         }
+        let has_cloud_queries =
+            db.read_tx().get(&meta, b"format")?.as_deref() == Some(CLOUD_QUERY_FORMAT);
+        ensure!(
+            fresh || !has_cloud_queries || db.keyspace_exists("cloud-query-authorities-v5"),
+            "recognized cloud query keyspace missing"
+        );
+        let cloud_queries = db.keyspace(
+            "cloud-query-authorities-v5",
+            fjall::KeyspaceCreateOptions::default,
+        )?;
+        ensure!(
+            has_cloud_queries || db.read_tx().iter(&cloud_queries).next().is_none(),
+            "cloud query feature gate is missing"
+        );
         let cloud_authorities = db.keyspace(
             "cloud-authorities-v4",
             fjall::KeyspaceCreateOptions::default,
@@ -292,7 +360,7 @@ impl Ledger {
         if !fresh {
             let stored_format = db.read_tx().get(&meta, b"format")?;
             ensure!(
-                matches!(stored_format.as_deref(), Some(value) if value == FORMAT || value == QUERY_FORMAT || value == SPARSE_FORMAT || value == LEGACY_FORMAT),
+                matches!(stored_format.as_deref(), Some(value) if value == CLOUD_QUERY_FORMAT || value == FORMAT || value == QUERY_FORMAT || value == SPARSE_FORMAT || value == LEGACY_FORMAT),
                 "native admission ledger format identity missing"
             );
             let counter = db
@@ -373,14 +441,19 @@ impl Ledger {
         let mut tx = db.write_tx().durability(Some(fjall::PersistMode::SyncAll));
         // The durable database feature gate precedes the marker replacement.
         // Old readers reject the database even after a crash between these writes.
-        tx.insert(&meta, b"format", FORMAT);
+        let format = if has_cloud_queries {
+            CLOUD_QUERY_FORMAT
+        } else {
+            FORMAT
+        };
+        tx.insert(&meta, b"format", format);
         if fresh {
             tx.insert(&meta, b"bytes", serde_json::to_vec(&0u64)?);
         }
         tx.insert(&meta, b"binding", serde_json::to_vec(&binding)?);
         tx.insert(&meta, b"client", client);
         tx.commit()?;
-        directory.replace(MARKER, FORMAT)?;
+        directory.replace(MARKER, format)?;
         Ok(Self {
             db,
             meta,
@@ -394,6 +467,8 @@ impl Ledger {
             query_authorities,
             query_grants,
             cloud_authorities,
+            cloud_queries,
+            poisoned: std::sync::atomic::AtomicBool::new(false),
             gate: Mutex::new(()),
             config: config.clone(),
             _owner: owner,
@@ -876,6 +951,7 @@ impl Ledger {
         space: &fjall::SingleWriterTxKeyspace,
         key: impl AsRef<[u8]>,
     ) -> Result<Option<T>> {
+        self.check()?;
         self.db
             .read_tx()
             .get(space, key)?
@@ -887,6 +963,7 @@ impl Ledger {
         space: &fjall::SingleWriterTxKeyspace,
         max: usize,
     ) -> Result<Vec<T>> {
+        self.check()?;
         let mut values = Vec::new();
         for item in self.db.read_tx().iter(space) {
             ensure!(
@@ -912,6 +989,7 @@ impl Ledger {
         &self,
         changes: Vec<(&fjall::SingleWriterTxKeyspace, Vec<u8>, Option<Vec<u8>>)>,
     ) -> Result<()> {
+        self.check()?;
         let mut tx = self
             .db
             .write_tx()
@@ -941,7 +1019,11 @@ impl Ledger {
             }
         }
         tx.insert(&self.meta, b"bytes", serde_json::to_vec(&bytes)?);
-        tx.commit()?;
+        if let Err(error) = tx.commit() {
+            self.poisoned
+                .store(true, std::sync::atomic::Ordering::Release);
+            return Err(error.into());
+        }
         Ok(())
     }
 }

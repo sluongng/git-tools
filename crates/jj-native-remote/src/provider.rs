@@ -56,12 +56,15 @@ impl RemoteObjectIo {
         self.inner.ledger.validate_authority(&retained)?;
         self.prove_owned(&retained, tree, owner.clone(), self.inner.deadline())
             .await?;
-        let metadata = self
-            .inner
-            .local
-            .read_metadata_with_owner(tree, owner)
-            .await
-            .map_err(backend)?;
+        let metadata = if matches!(retained, crate::ledger::Authority::CloudQuery(_)) {
+            self.verified_metadata_with_owner(tree, owner).await?
+        } else {
+            self.inner
+                .local
+                .read_metadata_with_owner(tree, owner)
+                .await
+                .map_err(backend)?
+        };
         let m::Object::Tree(tree) = metadata.into_object() else {
             anyhow::bail!("native derived file provenance is not a tree")
         };
@@ -333,6 +336,9 @@ impl NativeObjectIo for RemoteObjectIo {
     }
 
     async fn read_file(&self, id: m::FileId) -> BackendResult<FileRead> {
+        self.snapshot_file_authority(id, Arc::new(()))
+            .await
+            .map_err(backend_error)?;
         let key = m::ObjectKey {
             kind: m::Kind::File,
             id: m::ObjectId(id.0),
@@ -366,6 +372,9 @@ impl NativeObjectIo for RemoteObjectIo {
         id: m::FileId,
         owner: Arc<dyn std::any::Any + Send + Sync>,
     ) -> BackendResult<FileRead> {
+        self.snapshot_file_authority(id, owner.clone())
+            .await
+            .map_err(backend_error)?;
         let key = m::ObjectKey {
             kind: m::Kind::File,
             id: m::ObjectId(id.0),
@@ -406,21 +415,30 @@ impl NativeObjectIo for RemoteObjectIo {
                     .map_err(backend);
             }
             self.refresh_file_scope(descriptor).await?;
-            let client = self
-                .inner
-                .connector
-                .get()
-                .await?
-                .with_lifetime_guard(Arc::new(owner.clone()));
-            let verified =
-                io::network(client.download_file(m::ObjectId(id.0), &self.inner.staging)).await?;
+            let verified = if let Some(authority) =
+                self.snapshot_file_authority(id, owner.clone()).await?
+            {
+                self.download_snapshot_file_owned(authority, id, owner.clone())
+                    .await?
+            } else {
+                let client = self
+                    .inner
+                    .connector
+                    .get()
+                    .await?
+                    .with_rpc_lifetime_guard(Arc::new(owner.clone()));
+                io::network(client.download_file(m::ObjectId(id.0), &self.inner.staging)).await?
+            };
             ensure!(
                 verified.descriptor() == descriptor,
                 "native fetched file differs from admitted tree"
             );
             // No second spool and no cache hydration. The verified temporary's
             // reader owns client quota, staging ownership and delivery guards.
-            let reader = io::blocking(move || verified.open().map_err(anyhow::Error::from)).await?;
+            let reader = io::blocking_owned(owner.clone(), move || {
+                verified.open().map_err(anyhow::Error::from)
+            })
+            .await?;
             let reader = io::Reader::verified(reader, owner);
             FileRead::from_preverified_pinned_source(descriptor, Box::pin(reader)).map_err(backend)
         };
@@ -497,6 +515,12 @@ impl RemoteSource {
                 };
                 let id = m::FileId(unhex(&artifact.hash)?);
                 let verified = if let Some(authority) =
+                    provider.snapshot_file_authority(id, owner.clone()).await?
+                {
+                    provider
+                        .download_snapshot_file_owned(authority, id, owner)
+                        .await?
+                } else if let Some(authority) =
                     provider.cloud_file_authority(id, owner.clone()).await?
                 {
                     provider

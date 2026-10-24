@@ -44,3 +44,8 @@ owner-private directories; other platforms fail closed pending ACL verification.
 **Not complete client GC:** all authoritative local objects are initially retained.
 Never run ordinary `Store::gc` on this partial lazy store. Root-aware client GC
 and safe offloading remain separate work; no upload receipt is a retention lease.
+
+Selected-snapshot query grants upgrade the local admission ledger to format 5 on
+first use. Ordinary workflows retain format 4. After upgrade, older binaries
+must not reopen that ledger; preserve it and use a compatible binary or export
+needed local state before changing versions. No ledger reset is automatic.

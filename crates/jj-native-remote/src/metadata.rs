@@ -50,8 +50,9 @@ impl RemoteObjectIo {
                 if key.kind != m::Kind::File {
                     let ledger = provider.inner.ledger.clone();
                     io::blocking_owned(owner.clone(), move || {
-                        if let Some(authority @ Authority::CloudVersion(_)) =
-                            ledger.metadata_authority(key)?
+                        if let Some(
+                            authority @ (Authority::CloudVersion(_) | Authority::CloudQuery(_)),
+                        ) = ledger.metadata_authority(key)?
                         {
                             ledger.validate_authority(&authority)?;
                         }
@@ -111,7 +112,8 @@ impl RemoteObjectIo {
         let catalog_is_unproven = tokio::time::timeout_at(
             deadline,
             io::blocking_owned(job.clone(), move || {
-                Ok(!ledger.cloud_authorities()?.is_empty())
+                Ok(!ledger.cloud_authorities()?.is_empty()
+                    || !ledger.cloud_query_authorities()?.is_empty())
             }),
         )
         .await
@@ -167,7 +169,8 @@ impl RemoteObjectIo {
         let catalog_is_unproven = tokio::time::timeout_at(
             deadline,
             io::blocking_owned(final_job.clone(), move || {
-                Ok(!ledger.cloud_authorities()?.is_empty())
+                Ok(!ledger.cloud_authorities()?.is_empty()
+                    || !ledger.cloud_query_authorities()?.is_empty())
             }),
         )
         .await
@@ -189,6 +192,17 @@ impl RemoteObjectIo {
         deadline: tokio::time::Instant,
     ) -> Result<()> {
         self.inner.ledger.validate_authority(authority)?;
+        if let Authority::CloudQuery(query) = authority {
+            let ledger = self.inner.ledger.clone();
+            let captured = query.clone();
+            io::blocking_owned(owner, move || {
+                ledger
+                    .cloud_query_path(&captured, key, &HashMap::new())
+                    .map(|_| ())
+            })
+            .await?;
+            return Ok(());
+        }
         if let Authority::CloudVersion(version) = authority {
             let ledger = self.inner.ledger.clone();
             let captured = version.clone();
@@ -350,7 +364,7 @@ impl RemoteObjectIo {
                     )
                     .await
                     .map_err(|_| anyhow::anyhow!("native metadata admission deadline exceeded"))?;
-                    if matches!(root, Authority::CloudVersion(_)) {
+                    if matches!(root, Authority::CloudVersion(_) | Authority::CloudQuery(_)) {
                         tokio::time::timeout_at(
                             deadline,
                             provider.load_metadata(root, key, deadline, owner),
@@ -427,6 +441,23 @@ impl RemoteObjectIo {
                     descriptor: verified.descriptor(),
                     bytes: verified.bytes().to_vec(),
                     object: verified.into_object(),
+                }
+            } else if let Authority::CloudQuery(query) = &root {
+                let metadata = Arc::new(
+                    self.snapshot_metadata(query, current, &cloud_parents, owner.clone())
+                        .await?,
+                );
+                ensure!(
+                    cloud_replies.len() < self.inner.config.closure.max_objects,
+                    "snapshot metadata reply count exceeded"
+                );
+                cloud_replies.push(metadata.clone());
+                let bytes = metadata.canonical_bytes().to_vec();
+                let object = m::decode(&bytes, self.inner.model_limits())?;
+                crate::closure::Node {
+                    descriptor: metadata.descriptor(),
+                    bytes,
+                    object,
                 }
             } else if let Authority::CloudVersion(version) = &root {
                 let metadata = Arc::new(
@@ -525,7 +556,7 @@ impl RemoteObjectIo {
                         id: m::ObjectId(parent.0),
                     };
                     if !done.contains(&parent) {
-                        if matches!(root, Authority::CloudVersion(_)) {
+                        if matches!(root, Authority::CloudVersion(_) | Authority::CloudQuery(_)) {
                             cloud_parents.entry(parent).or_insert(current);
                         }
                         pending.push((parent, false));
@@ -540,7 +571,7 @@ impl RemoteObjectIo {
             .map(|node| (node.descriptor, node.object.clone()))
             .collect();
         let ledger = self.inner.ledger.clone();
-        let cloud = matches!(root, Authority::CloudVersion(_));
+        let cloud = matches!(root, Authority::CloudVersion(_) | Authority::CloudQuery(_));
         io::blocking_owned(owner.clone(), move || {
             if cloud {
                 ledger.verified_cloud_metadata_batch(&head, &plan)

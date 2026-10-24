@@ -11,6 +11,7 @@ mod ledger;
 mod metadata;
 mod provider;
 mod query;
+mod snapshot;
 mod staging;
 use anyhow::{Context, Result, ensure};
 pub use config::{ClosureLimits, Config, QueryLimits};

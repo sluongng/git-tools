@@ -133,16 +133,7 @@ impl Ledger {
             return Ok(authority);
         }
         ensure!(
-            self.cloud_authorities()?
-                .len()
-                .checked_add(
-                    self.list::<QueryAuthority>(
-                        &self.query_authorities,
-                        self.config.query.max_authorities
-                    )?
-                    .len()
-                )
-                .is_some_and(|n| n < self.config.query.max_authorities),
+            self.authority_count()? < self.config.query.max_authorities,
             "native authority count exceeded"
         );
         self.write_locked(vec![(
@@ -337,12 +328,6 @@ impl Ledger {
         ])
     }
     pub fn terminal_cloud_file_descriptor(&self, id: FileId) -> Result<Option<Descriptor>> {
-        if self
-            .claim(id.0)?
-            .is_some_and(|claim| !claim.root.starts_with("v/"))
-        {
-            return Ok(None);
-        }
         let key = ObjectKey {
             kind: Kind::File,
             id: ObjectId(id.0),
@@ -372,10 +357,18 @@ impl Ledger {
         }
         // Fresh admission can authorize a network refill, but must not borrow
         // an old binding's descriptor to serve resident bytes offline.
-        ensure!(
-            !stale || current_terminal,
-            "cloud terminal file binding is not current"
-        );
+        if stale && !current_terminal {
+            let independently_current = match self.claim(id.0)? {
+                Some(claim) if !claim.root.starts_with("v/") => {
+                    self.authority(&claim.root)?.is_some()
+                }
+                _ => false,
+            };
+            ensure!(
+                independently_current,
+                "cloud terminal file binding is not current"
+            );
+        }
         Ok(None)
     }
     pub fn cloud_file_authority(&self, id: FileId) -> Result<Option<CloudVersionAuthority>> {

@@ -7,6 +7,7 @@ pub(crate) enum Authority {
     Root(Root),
     Query(QueryAuthority),
     CloudVersion(CloudVersionAuthority),
+    CloudQuery(CloudQueryAuthority),
 }
 impl Authority {
     pub fn key(&self) -> String {
@@ -14,12 +15,13 @@ impl Authority {
             Self::Root(root) => root.head.clone(),
             Self::Query(query) => format!("q/{}", query.id),
             Self::CloudVersion(version) => version.key(),
+            Self::CloudQuery(query) => query.key(),
         }
     }
     pub fn root(&self) -> Option<&Root> {
         match self {
             Self::Root(root) => Some(root),
-            Self::Query(_) | Self::CloudVersion(_) => None,
+            Self::Query(_) | Self::CloudVersion(_) | Self::CloudQuery(_) => None,
         }
     }
 }
@@ -146,6 +148,10 @@ impl Ledger {
                 self.valid_query_authority(query)?,
                 "native query anchors are no longer retained"
             ),
+            Authority::CloudQuery(query) => ensure!(
+                self.valid_cloud_query(query)?,
+                "native cloud query binding is not current"
+            ),
             Authority::CloudVersion(version) => ensure!(
                 self.valid_cloud_authority(version)?,
                 "native cloud version binding is not current"
@@ -154,6 +160,14 @@ impl Ledger {
         Ok(())
     }
     pub fn authority(&self, key: &str) -> Result<Option<Authority>> {
+        if let Some(id) = key.strip_prefix("cq/") {
+            return match self.cloud_query(id)? {
+                Some(query) if self.valid_cloud_query(&query)? => {
+                    Ok(Some(Authority::CloudQuery(query)))
+                }
+                _ => Ok(None),
+            };
+        }
         if let Some(id) = key.strip_prefix("v/") {
             return match self.cloud_authority(id)? {
                 Some(v) if self.valid_cloud_authority(&v)? => Ok(Some(Authority::CloudVersion(v))),
@@ -198,6 +212,11 @@ impl Ledger {
                 authorities.push(Authority::CloudVersion(version));
             }
         }
+        for query in self.cloud_query_authorities()? {
+            if self.valid_cloud_query(&query)? {
+                authorities.push(Authority::CloudQuery(query));
+            }
+        }
         Ok(authorities)
     }
     pub fn metadata_authority(&self, key: ObjectKey) -> Result<Option<Authority>> {
@@ -219,6 +238,20 @@ impl Ledger {
                 return Ok(Some(Authority::Query(query)));
             }
         }
+        let mut stale_query = None;
+        for query in self.cloud_query_authorities()? {
+            let name = query.key();
+            if self.reference(&name, key)?.is_some()
+                || self
+                    .get::<Grant>(&self.query_grants, member_key(&name, key))?
+                    .is_some()
+            {
+                if self.valid_cloud_query(&query)? {
+                    return Ok(Some(Authority::CloudQuery(query)));
+                }
+                stale_query.get_or_insert(query);
+            }
+        }
         let mut stale_cloud = None;
         for version in self.cloud_authorities()? {
             let current = self.valid_cloud_authority(&version)?;
@@ -231,7 +264,9 @@ impl Ledger {
                 stale_cloud.get_or_insert(version);
             }
         }
-        Ok(stale_cloud.map(Authority::CloudVersion))
+        Ok(stale_cloud
+            .map(Authority::CloudVersion)
+            .or_else(|| stale_query.map(Authority::CloudQuery)))
     }
     /// A terminal is an explicit authenticated membership witness, never a fake parent.
     pub fn query_terminal(&self, authority: &Authority, key: ObjectKey) -> Result<bool> {
@@ -239,20 +274,20 @@ impl Ledger {
             self.validate_authority(authority)?;
             return version.terminal(key);
         }
-        let Authority::Query(query) = authority else {
-            return Ok(false);
+        let name = match authority {
+            Authority::Query(query) => query.key(),
+            Authority::CloudQuery(query) => query.key(),
+            _ => return Ok(false),
         };
         self.validate_authority(authority)?;
-        let Some(grant) = self.get::<Grant>(&self.query_grants, member_key(&query.key(), key))?
-        else {
+        let Some(grant) = self.get::<Grant>(&self.query_grants, member_key(&name, key))? else {
             return Ok(false);
         };
         ensure!(
             grant.descriptor.descriptor()?.key == key && key.kind == Kind::Commit,
             "query membership witness is corrupt"
         );
-        let Some(member) =
-            self.get::<StoredDescriptor>(&self.members, member_key(&query.key(), key))?
+        let Some(member) = self.get::<StoredDescriptor>(&self.members, member_key(&name, key))?
         else {
             return Ok(false);
         };
@@ -277,7 +312,7 @@ impl Ledger {
                 let changes = self.query_changes(query, nodes, None)?;
                 self.check_changes(&changes)
             }
-            Authority::CloudVersion(_) => {
+            Authority::CloudVersion(_) | Authority::CloudQuery(_) => {
                 let _gate = self
                     .gate
                     .lock()
@@ -307,7 +342,7 @@ impl Ledger {
                     None,
                 )?)
             }
-            Authority::CloudVersion(_) => {
+            Authority::CloudVersion(_) | Authority::CloudQuery(_) => {
                 let _gate = self
                     .gate
                     .lock()
@@ -328,7 +363,10 @@ impl Ledger {
         nodes: &[(Descriptor, tinytree_model::Object)],
     ) -> Result<()> {
         ensure!(
-            matches!(authority, Authority::CloudVersion(_)),
+            matches!(
+                authority,
+                Authority::CloudVersion(_) | Authority::CloudQuery(_)
+            ),
             "expected retained-version metadata authority"
         );
         let _gate = self
@@ -337,6 +375,32 @@ impl Ledger {
             .map_err(|_| anyhow::anyhow!("native ledger requires recovery"))?;
         let changes = self.authority_changes(authority, nodes, None)?;
         self.write_locked(changes)
+    }
+    pub fn check_captured_page(
+        &self,
+        authority: &Authority,
+        nodes: &[(Descriptor, tinytree_model::Object)],
+        scope: [u8; 32],
+        epoch: [u8; 16],
+    ) -> Result<()> {
+        let _gate = self
+            .gate
+            .lock()
+            .map_err(|_| anyhow::anyhow!("native ledger requires recovery"))?;
+        self.check_changes(&self.authority_changes(authority, nodes, Some((scope, epoch)))?)
+    }
+    pub fn admit_captured_page(
+        &self,
+        authority: &Authority,
+        nodes: &[(Descriptor, tinytree_model::Object)],
+        scope: [u8; 32],
+        epoch: [u8; 16],
+    ) -> Result<()> {
+        let _gate = self
+            .gate
+            .lock()
+            .map_err(|_| anyhow::anyhow!("native ledger requires recovery"))?;
+        self.write_locked(self.authority_changes(authority, nodes, Some((scope, epoch)))?)
     }
     pub fn check_query_page(
         &self,
@@ -475,7 +539,8 @@ impl Ledger {
             );
         }
         ensure!(
-            provenance.is_none() || matches!(authority, Authority::Query(_)),
+            provenance.is_none()
+                || matches!(authority, Authority::Query(_) | Authority::CloudQuery(_)),
             "cloud metadata cannot create query grants"
         );
         ensure!(
@@ -498,18 +563,33 @@ impl Ledger {
                     "native query authority is not installed"
                 );
                 ensure!(
-                    self.list::<QueryAuthority>(
-                        &self.query_authorities,
-                        self.config.query.max_authorities
-                    )?
-                    .len()
-                    .checked_add(self.cloud_authorities()?.len())
-                    .is_some_and(|n| n < self.config.query.max_authorities),
+                    self.authority_count()? < self.config.query.max_authorities,
                     "native query authority count exceeded"
                 );
                 if !nodes.is_empty() {
                     changes.push((
                         &self.query_authorities,
+                        query.id.as_bytes().to_vec(),
+                        Some(serde_json::to_vec(query)?),
+                    ));
+                }
+            }
+        }
+        if let Authority::CloudQuery(query) = authority {
+            if let Some(existing) = self.cloud_query(&query.id)? {
+                ensure!(existing == *query, "cloud query authority changed identity");
+            } else {
+                ensure!(
+                    provenance.is_some(),
+                    "cloud query authority is not installed"
+                );
+                ensure!(
+                    self.authority_count()? < self.config.query.max_authorities,
+                    "query authority count exceeded"
+                );
+                if !nodes.is_empty() {
+                    changes.push((
+                        &self.cloud_queries,
                         query.id.as_bytes().to_vec(),
                         Some(serde_json::to_vec(query)?),
                     ));

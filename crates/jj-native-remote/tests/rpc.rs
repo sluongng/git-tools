@@ -5685,12 +5685,17 @@ max_manifest_members=1024
             .with_cloud(true),
         ]
     };
+    let query_index_directory = private_dir();
+    let query_index =
+        tinytree_index::Index::open(query_index_directory.path(), &Default::default()).unwrap();
     let service = RepositoryService::new(
         store.clone(),
         profile.service.clone(),
         vec!["example".into()],
         principals(),
     )
+    .unwrap()
+    .with_query_index(query_index)
     .unwrap();
     let counts = Counters::new();
     let server = Server::start_service(service, counts.clone(), None).await;
@@ -5723,6 +5728,16 @@ max_manifest_members=1024
         })
         .await
         .unwrap();
+    let query_rotation = exercise_retained_query_facade(
+        &store,
+        &client,
+        &manifest,
+        head_object,
+        &data,
+        configuration.clone(),
+        &counts,
+    )
+    .await;
     let shared = cache(directory.path());
     let (direct, repo) = local(
         directory.path(),
@@ -5965,6 +5980,47 @@ max_manifest_members=1024
         expected_file,
         "current exact FILE terminal supersedes an old TREE claim without borrowing its descriptor"
     );
+    assert_eq!(query_rotation.file, files[0]);
+    let mut query_configuration = query_rotation.configuration.clone();
+    query_configuration.remote.token_env = Some("TINYTREE_REMOTE_OTHER_TOKEN".into());
+    let (mixed_direct, mixed) = local(
+        query_rotation.directory.path(),
+        query_rotation.cache.clone(),
+        query_configuration,
+        false,
+    );
+    assert!(
+        mixed.io.read_file(query_rotation.file).await.is_err(),
+        "old CQ TREE claim alone stays denied after credential rotation"
+    );
+    mixed
+        .control
+        .admit_retained_version(selector, selected, Arc::new(()))
+        .await
+        .unwrap();
+    assert_eq!(
+        bytes(mixed.io.as_ref(), query_rotation.file).await,
+        query_rotation.bytes,
+        "fresh current exact FILE terminal takes precedence over stale CQ TREE authority"
+    );
+    let read = mixed
+        .io
+        .read_file_for_cache(query_rotation.file, Arc::new(()))
+        .await
+        .unwrap();
+    let (descriptor, mut reader) = read.into_parts();
+    let mut delivered = Vec::new();
+    reader.read_to_end(&mut delivered).await.unwrap();
+    assert_eq!(delivered, query_rotation.bytes);
+    assert_eq!(
+        mixed.io.descriptor(descriptor.key).await.unwrap(),
+        Some(descriptor),
+        "descriptor/CAS paths use the same independently current authority"
+    );
+    drop(reader);
+    mixed.wait_for_idle().await;
+    drop(mixed);
+    drop(mixed_direct);
     drop(rotated);
     drop(rotated_direct);
     rotated_server.stop().await;
@@ -6031,4 +6087,566 @@ max_manifest_members=1024
     drop(reopened);
     drop(_direct);
     second.stop().await;
+}
+
+struct QueryRotationFixture {
+    directory: tempfile::TempDir,
+    cache: Arc<LocalCas>,
+    configuration: Config,
+    file: m::FileId,
+    bytes: Vec<u8>,
+}
+// Extend the retained-version fixture with an independent local provider. This
+// keeps its V1 residency assertions intact while exercising the V2 full chain.
+async fn exercise_retained_query_facade(
+    store: &Store,
+    publisher: &tinytree_client::NativeClient,
+    recovery: &tinytree_cloud::Manifest,
+    base: &m::EncodedObject,
+    fixture: &tinytree_fixture::Fixture,
+    configuration: Config,
+    counts: &Counters,
+) -> QueryRotationFixture {
+    use native_broker::{NativeQueryIo as _, query_protocol as q};
+    let m::Object::Commit(mut model) = m::decode(&base.bytes, Default::default()).unwrap() else {
+        panic!()
+    };
+    model.parents = vec![m::CommitId(base.descriptor.key.id.0)];
+    model.change_id = m::ChangeId([114; 16]);
+    model.description = "frozen selected baseline".into();
+    let frozen = m::encode(&m::Object::Commit(model.clone()), Default::default()).unwrap();
+    store
+        .put("example", frozen.descriptor, &frozen.bytes, 0)
+        .unwrap();
+    let selected_index = tinytree_cloud::build_index_artifacts(
+        &tinytree_cloud::PortableIndexSnapshot {
+            roots: vec![m::CommitId(base.descriptor.key.id.0)],
+            drafts: vec![tinytree_cloud::IndexDraft {
+                descriptor: frozen.descriptor,
+                change: model.change_id,
+                parents: model.parents.clone(),
+                order: 1,
+            }],
+        },
+        Default::default(),
+    )
+    .unwrap();
+    let intrinsic = tinytree_cloud::build_index_artifacts(
+        &tinytree_cloud::PortableIndexSnapshot {
+            roots: vec![m::CommitId::ROOT],
+            drafts: vec![],
+        },
+        Default::default(),
+    )
+    .unwrap();
+    let mut leases = Vec::new();
+    for artifact in selected_index.artifacts.iter().chain(&intrinsic.artifacts) {
+        let id = match artifact.descriptor.id {
+            tinytree_cloud::IndexArtifactId::Root(id) => {
+                tinytree_client::CloudIndexArtifactId::Root(id.0)
+            }
+            tinytree_cloud::IndexArtifactId::Node(id) => {
+                tinytree_client::CloudIndexArtifactId::Node(id.0)
+            }
+        };
+        leases.push(
+            publisher
+                .cloud_put_index_artifact(id, &artifact.bytes)
+                .await
+                .unwrap()
+                .staging_lease,
+        );
+    }
+    let mut next = recovery.clone();
+    next.sequence = 2;
+    next.parents = vec![tinytree_cloud::ManifestId::of(
+        &tinytree_cloud::encode_manifest(recovery, Default::default()).unwrap(),
+    )];
+    next.native_roots.push(frozen.descriptor.key);
+    next.native_roots
+        .sort_by_key(|key| (key.kind as u8, key.id.0));
+    next.native_roots.dedup();
+    let mut index_roots = vec![intrinsic.root, selected_index.root];
+    index_roots.sort_by_key(|root| root.id);
+    index_roots.dedup_by_key(|root| root.id);
+    let manifest = tinytree_cloud::ManifestV2 {
+        recovery: next,
+        index_roots,
+        operation_indexes: vec![
+            tinytree_cloud::OperationIndex {
+                operation: [0; 64],
+                root: intrinsic.root.id,
+            },
+            tinytree_cloud::OperationIndex {
+                operation: recovery.working_copy.snapshot_operation,
+                root: selected_index.root.id,
+            },
+        ],
+    };
+    let manifest_bytes = tinytree_cloud::encode_manifest_v2(&manifest, Default::default()).unwrap();
+    publisher
+        .cloud_publish_version(&tinytree_client::CloudPublishIntent {
+            workspace_id: recovery.workspace,
+            expected_generation: 1,
+            idempotency_key: "selected-index-query-version".into(),
+            manifest: manifest_bytes.clone(),
+            staging_leases: leases,
+        })
+        .await
+        .unwrap();
+    let source = native_broker::CloudQuerySource {
+        provider_identity: [41; 32],
+        workspace_id: recovery.workspace,
+        generation: 2,
+        manifest_id: tinytree_client::CloudManifestId::of(&manifest_bytes).0,
+        manifest_blake3: *blake3::hash(&manifest_bytes).as_bytes(),
+        manifest_size_bytes: manifest_bytes.len() as u64,
+        index_root_ids: vec![selected_index.root.id.0],
+        expected_anchors: vec![m::CommitId(base.descriptor.key.id.0)],
+    };
+    let directory = private_dir();
+    let shared = cache(directory.path());
+    let (direct, remote) = local(
+        directory.path(),
+        shared.clone(),
+        configuration.clone(),
+        true,
+    );
+    assert_eq!(
+        std::fs::read(directory.path().join("ledger/admission.format")).unwrap(),
+        b"tinytree-native-admission-4\n"
+    );
+    let mut broker_config = native_broker::Config::default();
+    broker_config.max_inflight = 1;
+    let broker = native_broker::BrokerService::new(
+        std::collections::HashMap::from([(
+            "example".into(),
+            remote.io.clone() as Arc<dyn NativeObjectIo>,
+        )]),
+        broker_config.clone(),
+    )
+    .unwrap()
+    .with_queries(std::collections::HashMap::from([(
+        "example".into(),
+        remote.query.clone() as Arc<dyn native_broker::NativeQueryIo>,
+    )]))
+    .unwrap()
+    .with_provider_descriptions(std::collections::HashMap::from([(
+        "example".into(),
+        native_broker::ProviderDescription {
+            identity: [41; 32],
+            query_capable: true,
+            index_mode: native_broker::ProviderIndexMode::Legacy,
+        },
+    )]))
+    .unwrap();
+    let socket = directory.path().join("snapshot.sock");
+    let serving = socket.clone();
+    let (stop, stopped) = tokio::sync::oneshot::channel();
+    let task = tokio::spawn(async move {
+        native_broker::serve_unix(&serving, broker, async {
+            let _ = stopped.await;
+        })
+        .await
+    });
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while !socket.exists() {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let query = native_broker::BrokerQueryClient::connect(&socket, "example", broker_config)
+        .await
+        .unwrap();
+    let input = native_broker::OpenCloudQueryScope {
+        source: source.clone(),
+        overlay: vec![],
+        replay_key: [111; 32],
+    };
+    let mut oversized_selection = input.clone();
+    oversized_selection.replay_key = [108; 32];
+    oversized_selection.source.index_root_ids = (0..257u32)
+        .map(|value| {
+            let mut id = [0; 32];
+            id[..4].copy_from_slice(&value.to_be_bytes());
+            id
+        })
+        .collect();
+    let before = counts.query_rpcs.load(Ordering::SeqCst);
+    assert_eq!(
+        remote
+            .query
+            .open_cloud_scope(oversized_selection, Arc::new(()))
+            .await
+            .unwrap_err()
+            .code(),
+        tonic::Code::ResourceExhausted
+    );
+    assert_eq!(counts.query_rpcs.load(Ordering::SeqCst), before);
+    let mut wrong_anchors = input.clone();
+    wrong_anchors.replay_key = [109; 32];
+    wrong_anchors.source.expected_anchors = vec![m::CommitId::ROOT];
+    assert!(
+        query
+            .open_cloud_scope(wrong_anchors, Arc::new(()))
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        std::fs::read(directory.path().join("ledger/admission.format")).unwrap(),
+        b"tinytree-native-admission-4\n",
+        "failed source check cannot enable or install snapshot grants"
+    );
+    let opened = query
+        .open_cloud_scope(input.clone(), Arc::new(()))
+        .await
+        .unwrap();
+    assert_eq!(opened.value.cloud_source_digest, Some(source.digest()));
+    assert_eq!(opened.value.query_identity_version, 2);
+    assert_eq!(
+        query
+            .open_cloud_scope(input.clone(), Arc::new(()))
+            .await
+            .unwrap()
+            .value,
+        opened.value
+    );
+    let mut changed = input;
+    changed.source.manifest_blake3[0] ^= 1;
+    assert_eq!(
+        query
+            .open_cloud_scope(changed, Arc::new(()))
+            .await
+            .unwrap_err()
+            .code(),
+        tonic::Code::AlreadyExists
+    );
+    assert_eq!(
+        std::fs::read(directory.path().join("ledger/admission.format")).unwrap(),
+        b"tinytree-native-admission-5\n"
+    );
+    assert!(
+        direct
+            .descriptor(frozen.descriptor.key)
+            .await
+            .unwrap()
+            .is_none(),
+        "opening selected snapshot must not hydrate its frozen draft bodies"
+    );
+    let frozen_id = m::CommitId(frozen.descriptor.key.id.0);
+    let facts = vec![q::GraphFact {
+        fact: Some(q::graph_fact::Fact::HasId(q::HasId {
+            commit: Some(q::CommitId {
+                value: frozen_id.0.to_vec(),
+            }),
+        })),
+    }];
+    let answer = query
+        .facts(opened.value.handle, facts.clone(), Arc::new(()))
+        .await
+        .unwrap();
+    assert!(matches!(
+        answer.value.answers[0].answer,
+        Some(q::graph_fact_answer::Answer::HasId(true))
+    ));
+    drop(answer);
+    let prefix = query
+        .resolve_commit_prefix(
+            opened.value.handle,
+            blake3::Hash::from(frozen_id.0).to_hex().to_string(),
+            Arc::new(()),
+        )
+        .await
+        .unwrap();
+    assert!(matches!(
+        prefix.value.result,
+        Some(q::commit_prefix_result::Result::Single(_))
+    ));
+    drop(prefix);
+    let expression = q::GraphExpr {
+        version: 1,
+        expression: Some(q::graph_expr::Expression::Commits(q::CommitSet {
+            commits: vec![q::CommitId {
+                value: frozen_id.0.to_vec(),
+            }],
+        })),
+    };
+    let handle = query
+        .begin(
+            native_broker::BeginQuery {
+                scope: opened.value.handle,
+                expression,
+                projection: q::Projection::Canonical,
+                page_size: 1,
+                replay_key: opened.value.bound_query_id([1; 16]).unwrap(),
+            },
+            Arc::new(()),
+        )
+        .await
+        .unwrap()
+        .value;
+    let mut sequence = 0;
+    let mut rows = 0;
+    loop {
+        let page = query
+            .page(handle.handle, sequence, Arc::new(()))
+            .await
+            .unwrap();
+        for row in &page.value.rows {
+            assert_eq!(row.commit.as_ref().unwrap().value, frozen_id.0);
+            assert!(row.canonical.is_some());
+            rows += 1;
+        }
+        // A held canonical reply cannot retain the sole broker physical slot.
+        query
+            .facts(opened.value.handle, facts.clone(), Arc::new(()))
+            .await
+            .unwrap();
+        if page.value.exhausted {
+            break;
+        }
+        sequence += 1;
+    }
+    assert_eq!(rows, 1);
+    query
+        .close_query(handle.handle, Arc::new(()))
+        .await
+        .unwrap();
+    assert_eq!(
+        query
+            .read_commit(opened.value.handle, frozen_id, Arc::new(()))
+            .await
+            .unwrap()
+            .value
+            .descriptor(),
+        frozen.descriptor
+    );
+    let mut private_model = model.clone();
+    private_model.parents = vec![frozen_id];
+    private_model.change_id = m::ChangeId([115; 16]);
+    private_model.description = "post-restore private delta".into();
+    let private = m::encode(&m::Object::Commit(private_model), Default::default()).unwrap();
+    let mut fork = native_broker::ForkQueryScope {
+        parent: opened.value.handle,
+        expected_cloud_source_digest: Some([99; 32]),
+        overlay: vec![private.bytes.clone()],
+        replay_key: [112; 32],
+    };
+    let before = counts.query_rpcs.load(Ordering::SeqCst);
+    assert_eq!(
+        query
+            .fork_scope(fork.clone(), Arc::new(()))
+            .await
+            .unwrap_err()
+            .code(),
+        tonic::Code::FailedPrecondition
+    );
+    assert_eq!(
+        counts.query_rpcs.load(Ordering::SeqCst),
+        before,
+        "changed source rejects before replay/upstream fork"
+    );
+    fork.expected_cloud_source_digest = opened.value.cloud_source_digest;
+    let child = query.fork_scope(fork.clone(), Arc::new(())).await.unwrap();
+    assert_eq!(
+        query.fork_scope(fork, Arc::new(())).await.unwrap().value,
+        child.value
+    );
+    assert_eq!(
+        query
+            .read_commit(
+                child.value.handle,
+                m::CommitId(private.descriptor.key.id.0),
+                Arc::new(())
+            )
+            .await
+            .unwrap()
+            .value
+            .descriptor(),
+        private.descriptor
+    );
+    assert!(
+        direct
+            .descriptor(private.descriptor.key)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        store
+            .descriptor("example", private.descriptor.key)
+            .unwrap()
+            .is_none(),
+        "private delta is not published"
+    );
+    let tree_key = m::ObjectKey {
+        kind: m::Kind::Tree,
+        id: m::ObjectId(model.root_tree.terms[0].0),
+    };
+    remote.io.read_metadata(tree_key).await.unwrap();
+    let tree = m::decode(
+        &fixture
+            .objects()
+            .iter()
+            .find(|object| object.descriptor.key == tree_key)
+            .unwrap()
+            .bytes,
+        Default::default(),
+    )
+    .unwrap();
+    let m::Object::Tree(tree) = tree else {
+        panic!()
+    };
+    let file = tree
+        .entries
+        .iter()
+        .find_map(|entry| match entry.value {
+            m::TreeValue::File { id, .. } => Some(id),
+            _ => None,
+        })
+        .unwrap();
+    let expected_file = fixture
+        .objects()
+        .iter()
+        .find(|object| {
+            object.descriptor.key.kind == m::Kind::File && object.descriptor.key.id.0 == file.0
+        })
+        .unwrap()
+        .bytes
+        .clone();
+    assert_eq!(bytes(remote.io.as_ref(), file).await, expected_file);
+    query
+        .close_scope(child.value.handle, Arc::new(()))
+        .await
+        .unwrap();
+    query
+        .close_scope(opened.value.handle, Arc::new(()))
+        .await
+        .unwrap();
+    drop((opened, child, query));
+    stop.send(()).unwrap();
+    task.await.unwrap().unwrap();
+    remote.wait_for_idle().await;
+    drop(remote);
+    drop(direct);
+    // Use the supported local store collector to evict fetched payloads while
+    // keeping the separate provenance ledger. No fabricated body/path edits.
+    {
+        let local_store = Store::open_existing(
+            directory.path().join("local/native-objects"),
+            Default::default(),
+        )
+        .unwrap();
+        local_store.gc("local", i64::MAX / 4).unwrap();
+        assert!(
+            local_store
+                .descriptor("local", frozen.descriptor.key)
+                .unwrap()
+                .is_none()
+        );
+    }
+    // Simulate the safe feature-gate crash window: DB5 is already SyncAll while
+    // marker replacement was interrupted. A legacy reader rejects the DB gate.
+    std::fs::write(
+        directory.path().join("ledger/admission.format"),
+        b"tinytree-native-admission-4\n",
+    )
+    .unwrap();
+    let cold_cache_root = directory.path().join("cold-cache");
+    assert!(!cold_cache_root.exists());
+    std::fs::create_dir(&cold_cache_root).unwrap();
+    let cold_cache = cache(&cold_cache_root);
+    let (direct, reopened) = local(
+        directory.path(),
+        cold_cache.clone(),
+        configuration.clone(),
+        false,
+    );
+    assert_eq!(
+        std::fs::read(directory.path().join("ledger/admission.format")).unwrap(),
+        b"tinytree-native-admission-5\n"
+    );
+    assert!(
+        direct
+            .descriptor(frozen.descriptor.key)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(
+        reopened
+            .io
+            .read_metadata(frozen.descriptor.key)
+            .await
+            .unwrap()
+            .descriptor(),
+        frozen.descriptor,
+        "deep commit refetch uses retained snapshot membership after all query scopes close"
+    );
+    assert_eq!(
+        reopened
+            .io
+            .read_metadata(tree_key)
+            .await
+            .unwrap()
+            .descriptor()
+            .key,
+        tree_key
+    );
+    assert_eq!(bytes(reopened.io.as_ref(), file).await, expected_file);
+    assert_eq!(counts.holds.load(Ordering::SeqCst), 0);
+    assert_eq!(counts.metadata_rpcs.load(Ordering::SeqCst), 0);
+    assert_eq!(counts.graph_rpcs.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        counts.files.load(Ordering::SeqCst),
+        0,
+        "snapshot reads must never use generic repository reads"
+    );
+    reopened.wait_for_idle().await;
+    drop(reopened);
+    drop(direct);
+    let mut foreign = configuration.clone();
+    foreign.remote.token_env = Some("TINYTREE_REMOTE_OTHER_TOKEN".into());
+    let (foreign_direct, other) = local(directory.path(), cold_cache.clone(), foreign, false);
+    let before = counts.query_rpcs.load(Ordering::SeqCst);
+    assert!(
+        other.io.read_metadata(frozen.descriptor.key).await.is_err(),
+        "fetched canonical snapshot bytes cannot become authored under another credential"
+    );
+    assert!(other.io.descriptor(tree_key).await.is_err());
+    assert!(
+        other.io.read_file(file).await.is_err(),
+        "warm fetched snapshot FILE bytes remain bound to their current authority"
+    );
+    assert_eq!(
+        counts.query_rpcs.load(Ordering::SeqCst),
+        before,
+        "stale local provenance must fail before upstream query attempts"
+    );
+    assert!(
+        other
+            .query
+            .open_cloud_scope(
+                native_broker::OpenCloudQueryScope {
+                    source,
+                    overlay: vec![],
+                    replay_key: [113; 32]
+                },
+                Arc::new(())
+            )
+            .await
+            .is_err(),
+        "private retained selectors cannot cross owners"
+    );
+    other.wait_for_idle().await;
+    drop(other);
+    drop(foreign_direct);
+    QueryRotationFixture {
+        directory,
+        cache: cold_cache,
+        configuration,
+        file,
+        bytes: expected_file,
+    }
 }

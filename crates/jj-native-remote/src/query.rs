@@ -1,11 +1,11 @@
 //! Captured broker queries. Server membership is authenticated, not a hash proof.
-use crate::{Inner, backend, io, ledger::QueryAuthority};
+use crate::{Inner, backend, io, ledger::Authority};
 use anyhow::{Context, Result, ensure};
 use async_trait::async_trait;
 use jj_native_backend::NativeObjectIo;
 use native_broker::{
-    BeginQuery, ForkQueryScope, NativeQueryIo, OpenQueryScope, QueryHandle, QueryOwner, QueryPage,
-    QueryReply, QueryResources, QueryScope, query_protocol as q,
+    BeginQuery, ForkQueryScope, NativeQueryIo, OpenCloudQueryScope, OpenQueryScope, QueryHandle,
+    QueryOwner, QueryPage, QueryReply, QueryResources, QueryScope, query_protocol as q,
 };
 use prost::Message;
 use std::{
@@ -68,14 +68,23 @@ struct ScopeRecord {
     closed: bool,
     close_acked: bool,
     query_identity_version: u32,
+    cloud_source_digest: Option<[u8; 32]>,
 }
 struct CapturedScope {
     client: NativeClient,
     checked: CheckedScopeHandle,
-    authority: QueryAuthority,
+    authority: Authority,
     overlays: BTreeMap<m::CommitId, Arc<Vec<u8>>>,
     _parent: Option<Arc<CapturedScope>>,
     _memory: OwnedSemaphorePermit,
+}
+impl CapturedScope {
+    fn source_digest(&self) -> Option<[u8; 32]> {
+        match &self.authority {
+            Authority::CloudQuery(source) => Some(source.digest()),
+            _ => None,
+        }
+    }
 }
 enum CheckedQuery {
     Ids(CheckedIdsQuery),
@@ -393,9 +402,7 @@ impl RemoteQueryIo {
     }
     async fn online(&self, scope: &CapturedScope) -> Result<()> {
         let _ = self.inner.connector.get().await?;
-        self.inner
-            .ledger
-            .validate_authority(&crate::ledger::Authority::Query(scope.authority.clone()))
+        self.inner.ledger.validate_authority(&scope.authority)
     }
     async fn overlay(
         &self,
@@ -503,7 +510,11 @@ impl RemoteQueryIo {
         let digest = *scope.checked.content_digest();
         let epoch = *scope.checked.index_epoch();
         io::blocking_owned(owner.clone(), move || {
-            ledger.check_query_page(&authority, &plan, digest, epoch)
+            if matches!(authority, Authority::CloudQuery(_)) {
+                ledger.admit_captured_page(&authority, &plan, digest, epoch)
+            } else {
+                ledger.check_captured_page(&authority, &plan, digest, epoch)
+            }
         })
         .await?;
         // This private fetched-data path installs canonical objects, not authored
@@ -522,8 +533,11 @@ impl RemoteQueryIo {
         }
         let ledger = self.inner.ledger.clone();
         let authority = scope.authority.clone();
+        if matches!(authority, Authority::CloudQuery(_)) {
+            return Ok(());
+        }
         io::blocking_owned(owner, move || {
-            ledger.admit_query_page(&authority, &nodes, digest, epoch)
+            ledger.admit_captured_page(&authority, &nodes, digest, epoch)
         })
         .await
     }
@@ -691,6 +705,179 @@ impl NativeQueryIo for RemoteQueryIo {
                 .saturating_add(self.inner.config.remote.limits.max_buffered_bytes as u64),
         }
     }
+    async fn open_cloud_scope(
+        &self,
+        input: OpenCloudQueryScope,
+        owner: QueryOwner,
+    ) -> std::result::Result<QueryReply<QueryScope>, tonic::Status> {
+        self.run(owner, move |this, operation| async move {
+            this.input_bounds(&input.source.expected_anchors, &input.overlay)?;
+            ensure!(
+                input.source.index_root_ids.len() <= 256,
+                tonic::Status::resource_exhausted("snapshot selection count exceeded")
+            );
+            ensure!(
+                !input.source.index_root_ids.is_empty()
+                    && input.source.index_root_ids.len() <= 256
+                    && input.source.index_root_ids.windows(2).all(|p| p[0] < p[1])
+                    && !input.source.expected_anchors.is_empty()
+                    && input
+                        .source
+                        .expected_anchors
+                        .windows(2)
+                        .all(|p| p[0] < p[1])
+                    && input.source.provider_identity != [0; 32]
+                    && input.source.generation > 0
+                    && input.source.manifest_size_bytes > 0
+                    && input.source.manifest_size_bytes
+                        <= this.inner.config.remote.cloud.max_manifest_bytes as u64,
+                tonic::Status::invalid_argument("invalid selected snapshot query source")
+            );
+            let source_digest = input.source.digest();
+            let overlay_digest = scope_fingerprint(&[], &input.overlay);
+            let fingerprint = hash(&[
+                b"native-cloud-open-scope-v1\0",
+                &source_digest,
+                &overlay_digest,
+            ]);
+            this.clean_expired().await?;
+            let mut registry = this.registry.lock().await;
+            if let Some(handle) = registry.replay(4, input.replay_key, fingerprint)? {
+                let scope = registry.scope(handle)?;
+                ensure!(
+                    scope.source_digest() == Some(source_digest),
+                    "cloud scope replay source changed"
+                );
+                return Ok(QueryReply {
+                    value: QueryScope {
+                        handle,
+                        expires_at_unix_seconds: scope.checked.expires_at_unix_seconds(),
+                        query_identity_version: 2,
+                        cloud_source_digest: scope.source_digest(),
+                    },
+                    owner: scope,
+                });
+            }
+            ensure!(
+                registry
+                    .scopes
+                    .values()
+                    .filter(|scope| !scope.closed)
+                    .count()
+                    < this.inner.config.query.max_scopes,
+                "native query scope count exceeded"
+            );
+            let expires = now()?
+                .saturating_add(86400)
+                .saturating_add((this.inner.config.operation_timeout_ms / 1000 + 1) as i64);
+            let handle =
+                this.replay_reservation(&mut registry, 4, input.replay_key, fingerprint, expires)?;
+            let result: Result<Arc<CapturedScope>> = async {
+                let bytes = input.overlay.iter().try_fold(0usize, |sum, bytes| {
+                    sum.checked_add(bytes.len())
+                        .context("snapshot overlay byte overflow")
+                })?;
+                let charge = this.charge(
+                    8192usize
+                        .saturating_add(bytes.saturating_mul(8))
+                        .saturating_add(input.overlay.len().saturating_mul(512))
+                        .saturating_add(
+                            input
+                                .source
+                                .expected_anchors
+                                .len()
+                                .saturating_add(input.source.index_root_ids.len())
+                                .saturating_mul(1024),
+                        ),
+                )?;
+                let client = this.inner.connector.get().await?;
+                let rpc = client.clone().with_rpc_lifetime_guard(operation.clone());
+                let proof = Arc::new(
+                    rpc.cloud_retained_version_selected(
+                        tinytree_client::RetainedVersionSelector {
+                            workspace_id: input.source.workspace_id,
+                            generation: input.source.generation,
+                            manifest_id: tinytree_client::CloudManifestId(input.source.manifest_id),
+                        },
+                        tinytree_client::CloudRawDigest {
+                            blake3: input.source.manifest_blake3,
+                            size_bytes: input.source.manifest_size_bytes,
+                        },
+                    )
+                    .await?,
+                );
+                let (overlay, overlays) = this.overlay(&rpc, input.overlay).await?;
+                let checked = rpc
+                    .open_cloud_query_scope(
+                        &proof,
+                        input.source.index_root_ids.clone(),
+                        input.source.expected_anchors.clone(),
+                        overlay,
+                    )
+                    .await?;
+                ensure!(
+                    checked.query_identity_version() == 2,
+                    "snapshot identity negotiation failed"
+                );
+                let ledger = this.inner.ledger.clone();
+                let captured = proof.clone();
+                let authority = io::blocking_owned(operation.clone(), move || {
+                    ledger.cloud_query_authority(input.source, &captured)
+                })
+                .await?;
+                Ok(Arc::new(CapturedScope {
+                    client,
+                    checked,
+                    authority: Authority::CloudQuery(authority),
+                    overlays,
+                    _parent: None,
+                    _memory: charge,
+                }))
+            }
+            .await;
+            match result {
+                Ok(scope) => {
+                    let expires = scope.checked.expires_at_unix_seconds();
+                    let replay = registry.replays.get_mut(&(4, input.replay_key)).unwrap();
+                    replay.error = None;
+                    replay.expires = expires;
+                    registry.scopes.insert(
+                        handle,
+                        ScopeRecord {
+                            captured: Some(scope.clone()),
+                            expires,
+                            closed: false,
+                            close_acked: false,
+                            query_identity_version: 2,
+                            cloud_source_digest: scope.source_digest(),
+                        },
+                    );
+                    Ok(QueryReply {
+                        value: QueryScope {
+                            handle,
+                            expires_at_unix_seconds: expires,
+                            query_identity_version: 2,
+                            cloud_source_digest: scope.source_digest(),
+                        },
+                        owner: scope,
+                    })
+                }
+                Err(error) => {
+                    registry
+                        .replays
+                        .get_mut(&(4, input.replay_key))
+                        .unwrap()
+                        .error = Some(
+                        error
+                            .downcast_ref::<tonic::Status>()
+                            .map_or(tonic::Code::FailedPrecondition, tonic::Status::code),
+                    );
+                    Err(error)
+                }
+            }
+        })
+        .await
+    }
     async fn open_scope(
         &self,
         input: OpenQueryScope,
@@ -713,7 +900,7 @@ impl NativeQueryIo for RemoteQueryIo {
                 let scope = registry.scope(handle)?;
                 return Ok(QueryReply {
                     value: QueryScope {
-                        cloud_source_digest: None,
+                        cloud_source_digest: scope.source_digest(),
                         handle,
                         expires_at_unix_seconds: scope.checked.expires_at_unix_seconds(),
                         query_identity_version: scope.checked.query_identity_version(),
@@ -766,7 +953,7 @@ impl NativeQueryIo for RemoteQueryIo {
                 Ok(Arc::new(CapturedScope {
                     client,
                     checked,
-                    authority,
+                    authority: Authority::Query(authority),
                     overlays,
                     _parent: None,
                     _memory: charge,
@@ -787,11 +974,12 @@ impl NativeQueryIo for RemoteQueryIo {
                             closed: false,
                             close_acked: false,
                             query_identity_version: scope.checked.query_identity_version(),
+                            cloud_source_digest: scope.source_digest(),
                         },
                     );
                     Ok(QueryReply {
                         value: QueryScope {
-                            cloud_source_digest: None,
+                            cloud_source_digest: scope.source_digest(),
                             handle,
                             expires_at_unix_seconds: expires,
                             query_identity_version: scope.checked.query_identity_version(),
@@ -820,22 +1008,35 @@ impl NativeQueryIo for RemoteQueryIo {
         input: ForkQueryScope,
         owner: QueryOwner,
     ) -> std::result::Result<QueryReply<QueryScope>, tonic::Status> {
-        if input.expected_cloud_source_digest.is_some() {
-            return Err(tonic::Status::unimplemented(
-                "native retained query forks unsupported",
-            ));
-        }
         self.run(owner, move |this, operation| async move {
             this.input_bounds(&[], &input.overlay)?;
             let overlay_hash = scope_fingerprint(&[], &input.overlay);
-            let fingerprint = hash(&[&input.parent, &overlay_hash]);
+            let fingerprint = if let Some(source) = input.expected_cloud_source_digest {
+                hash(&[&input.parent, &overlay_hash, &source])
+            } else {
+                hash(&[&input.parent, &overlay_hash])
+            };
             this.clean_expired().await?;
             let mut registry = this.registry.lock().await;
+            let source = registry
+                .scopes
+                .get(&input.parent)
+                .and_then(|scope| scope.cloud_source_digest);
+            if source != input.expected_cloud_source_digest {
+                if source.is_none() {
+                    anyhow::bail!(tonic::Status::unimplemented(
+                        "ordinary scope cannot accept a cloud source"
+                    ));
+                }
+                anyhow::bail!(tonic::Status::failed_precondition(
+                    "snapshot fork source changed"
+                ));
+            }
             if let Some(handle) = registry.replay(2, input.replay_key, fingerprint)? {
                 let scope = registry.scope(handle)?;
                 return Ok(QueryReply {
                     value: QueryScope {
-                        cloud_source_digest: None,
+                        cloud_source_digest: scope.source_digest(),
                         handle,
                         expires_at_unix_seconds: scope.checked.expires_at_unix_seconds(),
                         query_identity_version: scope.checked.query_identity_version(),
@@ -911,11 +1112,12 @@ impl NativeQueryIo for RemoteQueryIo {
                             closed: false,
                             close_acked: false,
                             query_identity_version: scope.checked.query_identity_version(),
+                            cloud_source_digest: scope.source_digest(),
                         },
                     );
                     Ok(QueryReply {
                         value: QueryScope {
-                            cloud_source_digest: None,
+                            cloud_source_digest: scope.source_digest(),
                             handle,
                             expires_at_unix_seconds: expires,
                             query_identity_version: scope.checked.query_identity_version(),
