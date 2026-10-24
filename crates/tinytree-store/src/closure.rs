@@ -208,7 +208,7 @@ impl Inner {
         self.metadata(repo, descriptor)
     }
 
-    fn metadata(&self, repo: &str, descriptor: Descriptor) -> Result<Object> {
+    pub(super) fn metadata(&self, repo: &str, descriptor: Descriptor) -> Result<Object> {
         if descriptor.key.kind == Kind::File {
             return Err(Error::Invalid("file is not metadata"));
         }

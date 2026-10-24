@@ -43,6 +43,16 @@ Captured recovery versions atomically bind portable workspace metadata and nativ
 roots. The first such publication upgrades storage to format 5; earlier binaries
 cannot reopen it. Capture data remains retained with its immutable version.
 
+Landing APIs persist scoped replayable intents, candidate roots and exact-check
+bindings. Finalization atomically updates the reference and rewrite receipt;
+stale targets cannot reuse a check. First acceptance upgrades storage to format 6,
+which older binaries cannot reopen. A trusted embedding must authorize requests
+and supply real check verdicts; no runner or RPC service is provided here.
+Committed jobs retain source and candidate recovery roots until explicit expiry;
+clock passage alone does not release them. Expiry retires roots, not replay
+records. Bounded ledger quotas fail closed rather than discard accepted results;
+released historical receipts do not promise permanent object residency. Landing state requires authoritative server GC.
+
 `client_gc` is a separate, bounded unreachable-only collector seam for lazy
 clients; it is not enabled by a broker or workspace API. Callers must fence the
 complete workspace/operation/in-flight root registry through completion. Exact

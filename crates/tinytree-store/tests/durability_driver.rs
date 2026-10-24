@@ -34,6 +34,25 @@ impl Read for InterruptedUpload {
 }
 
 #[cfg(unix)]
+fn fail_regular_file_writes() -> io::Result<()> {
+    // This process is disposable. Its own regular-file writes fail with EFBIG;
+    // the parent, host filesystem capacity and pipe checkpoints are unaffected.
+    unsafe {
+        if libc::signal(libc::SIGXFSZ, libc::SIG_IGN) == libc::SIG_ERR {
+            return Err(io::Error::last_os_error());
+        }
+        let limit = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        if libc::setrlimit(libc::RLIMIT_FSIZE, &limit) != 0 {
+            return Err(io::Error::last_os_error());
+        }
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
 fn fail_publication(store: &Store, retention: bool) -> Result<(), Box<dyn std::error::Error>> {
     let replacement = common::replacement();
     common::upload(store, &replacement)?;
@@ -43,20 +62,7 @@ fn fail_publication(store: &Store, retention: bool) -> Result<(), Box<dyn std::e
         client: [2; 16],
     };
     let hold = common::retention_publication("retention-attempt", 0, common::initial().head, true);
-    // This process is disposable. Its own regular-file writes fail with EFBIG;
-    // the parent, host filesystem capacity and pipe checkpoints are unaffected.
-    unsafe {
-        if libc::signal(libc::SIGXFSZ, libc::SIG_IGN) == libc::SIG_ERR {
-            return Err(io::Error::last_os_error().into());
-        }
-        let limit = libc::rlimit {
-            rlim_cur: 0,
-            rlim_max: 0,
-        };
-        if libc::setrlimit(libc::RLIMIT_FSIZE, &limit) != 0 {
-            return Err(io::Error::last_os_error().into());
-        }
-    }
+    fail_regular_file_writes()?;
     let result = if retention {
         store.publish_retention(
             common::REPOSITORY,
@@ -90,6 +96,73 @@ fn fail_publication(store: &Store, retention: bool) -> Result<(), Box<dyn std::e
     wait_for_kill()
 }
 
+fn landing(store: &Store, mode: &str) -> Result<(), Box<dyn std::error::Error>> {
+    common::upload(store, &common::replacement())?;
+    store.begin_landing(
+        common::REPOSITORY,
+        common::LANDING_OWNER,
+        &common::landing_request(),
+        100,
+    )?;
+    let prepared =
+        store.prepare_landing(common::REPOSITORY, common::LANDING_OWNER, "landing", 100)?;
+    if mode == "landing-prepared" {
+        checkpoint("LANDING_PREPARED_ACK")?;
+        wait_for_kill()
+    }
+    // This trusted test fixture records a deterministic verdict; it does not
+    // claim that a Bazel runner or external execution actually took place.
+    store.record_landing_check(
+        common::REPOSITORY,
+        common::LANDING_OWNER,
+        "landing",
+        &common::landing_identity(&prepared),
+        tinytree_store::LandingVerdict {
+            passed: true,
+            evidence: [8; 32],
+        },
+        100,
+    )?;
+    if mode == "landing-checked" {
+        checkpoint("LANDING_CHECKED_ACK")?;
+        wait_for_kill()
+    }
+    #[cfg(unix)]
+    if mode == "landing-write-failure" {
+        checkpoint("LANDING_CHECKED_ACK")?;
+        fail_regular_file_writes()?;
+        let error = store
+            .finalize_landing(common::REPOSITORY, common::LANDING_OWNER, "landing", 100)
+            .expect_err("journal write must fail");
+        if !matches!(error,Error::Database(fjall::Error::Io(ref io)) if io.raw_os_error()==Some(libc::EFBIG))
+        {
+            return Err(format!("expected journal EFBIG, got {error}").into());
+        }
+        if !matches!(
+            store.landing_job(common::REPOSITORY, common::LANDING_OWNER, "landing"),
+            Err(Error::Poisoned)
+        ) || !matches!(
+            store.begin_landing(
+                common::REPOSITORY,
+                common::LANDING_OWNER,
+                &common::landing_request(),
+                100
+            ),
+            Err(Error::Poisoned)
+        ) || !matches!(
+            store.references(common::REPOSITORY, &[common::REFERENCE.into()]),
+            Err(Error::Poisoned)
+        ) {
+            return Err("uncertain landing write did not poison subsequent ACKs".into());
+        }
+        checkpoint("WRITE_FAILED_POISONED")?;
+        wait_for_kill()
+    }
+    store.finalize_landing(common::REPOSITORY, common::LANDING_OWNER, "landing", 100)?;
+    checkpoint("LANDING_COMMITTED_ACK")?;
+    wait_for_kill()
+}
+
 fn run() -> Result<(), Box<dyn std::error::Error>> {
     let mut args = std::env::args_os().skip(1);
     let mode = args.next().ok_or("missing fixture mode")?;
@@ -108,6 +181,11 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     )?;
     checkpoint("BASELINE_DURABLE")?;
     match mode.to_str().ok_or("non-UTF8 fixture mode")? {
+        mode @ ("landing-prepared" | "landing-checked" | "landing-committed") => {
+            landing(&store, mode)
+        }
+        #[cfg(unix)]
+        "landing-write-failure" => landing(&store, "landing-write-failure"),
         "after-ack" => {
             checkpoint("DURABLE_ACK")?;
             wait_for_kill()

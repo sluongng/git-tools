@@ -111,3 +111,37 @@ pub fn retention_publication(
         staging_leases: vec![],
     }
 }
+
+pub const LANDING_OWNER: tinytree_store::LandingOwner = tinytree_store::LandingOwner([7; 32]);
+pub fn landing_request() -> tinytree_store::LandingRequest {
+    let person = Signature {
+        name: "Landing fixture".into(),
+        email: "landing@example.invalid".into(),
+        timestamp: Timestamp {
+            millis_since_epoch: 100,
+            tz_offset_minutes: 0,
+        },
+    };
+    tinytree_store::LandingRequest {
+        idempotency_key: "landing".into(),
+        source_base: CommitId(initial().head.key.id.0),
+        source_head: CommitId(replacement().head.key.id.0),
+        reference_name: REFERENCE.into(),
+        expected_generation: 1,
+        expected_head: CommitId(initial().head.key.id.0),
+        committer: person,
+        check_profile: tinytree_store::LandingCheckProfile {
+            name: "fixture".into(),
+            version: "v1".into(),
+        },
+        expires_at: 10000,
+    }
+}
+pub fn landing_identity(job: &tinytree_store::LandingJob) -> tinytree_store::LandingCheckIdentity {
+    let candidate = job.candidate.as_ref().unwrap();
+    tinytree_store::LandingCheckIdentity {
+        candidate: candidate.head,
+        root_tree: candidate.root_tree,
+        profile: job.profile.clone(),
+    }
+}

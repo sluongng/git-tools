@@ -350,3 +350,133 @@ fn real_private_hold_write_failure_recovers_atomic_accounting_and_reserved_relea
         Err(tinytree_store::Error::Limit(_))
     ));
 }
+
+#[test]
+fn acknowledged_landing_preparation_checks_and_atomic_receipt_survive_process_termination() {
+    use tinytree_store::LandingState;
+    for (mode, ack, state) in [
+        (
+            "landing-prepared",
+            "LANDING_PREPARED_ACK",
+            LandingState::Prepared,
+        ),
+        (
+            "landing-checked",
+            "LANDING_CHECKED_ACK",
+            LandingState::Checked,
+        ),
+        (
+            "landing-committed",
+            "LANDING_COMMITTED_ACK",
+            LandingState::Committed,
+        ),
+    ] {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("store");
+        let mut driver = Driver::start(&root, mode);
+        driver.checkpoint("BASELINE_DURABLE");
+        driver.checkpoint(ack);
+        driver.kill_and_reap();
+        let store = Store::open_existing(&root, Config::default()).unwrap();
+        let job = store
+            .landing_job(common::REPOSITORY, common::LANDING_OWNER, "landing")
+            .unwrap()
+            .unwrap();
+        assert_eq!(job.state, state);
+        let candidate = job.candidate.as_ref().unwrap();
+        store.gc(common::REPOSITORY, 100000).unwrap();
+        assert!(
+            store
+                .read(
+                    common::REPOSITORY,
+                    tinytree_model::ObjectKey {
+                        kind: tinytree_model::Kind::Commit,
+                        id: tinytree_model::ObjectId(candidate.head.0)
+                    }
+                )
+                .is_ok()
+        );
+        if state == LandingState::Prepared {
+            store
+                .record_landing_check(
+                    common::REPOSITORY,
+                    common::LANDING_OWNER,
+                    "landing",
+                    &common::landing_identity(&job),
+                    tinytree_store::LandingVerdict {
+                        passed: true,
+                        evidence: [8; 32],
+                    },
+                    101,
+                )
+                .unwrap();
+        }
+        let done = store
+            .finalize_landing(common::REPOSITORY, common::LANDING_OWNER, "landing", 101)
+            .unwrap();
+        assert_eq!(done.state, LandingState::Committed);
+        let receipt = done.receipt.as_ref().unwrap();
+        assert_eq!(receipt.reference.generation, 2);
+        assert_eq!(receipt.reference.commit.unwrap().key.id.0, candidate.head.0);
+        assert_eq!(receipt.rewrites.len(), 1);
+        assert_eq!(receipt.evidence, [8; 32]);
+        assert_eq!(
+            store
+                .references(common::REPOSITORY, &[common::REFERENCE.into()])
+                .unwrap()[0],
+            receipt.reference
+        );
+        assert_eq!(
+            store
+                .begin_landing(
+                    common::REPOSITORY,
+                    common::LANDING_OWNER,
+                    &common::landing_request(),
+                    100000
+                )
+                .unwrap(),
+            done
+        );
+    }
+}
+
+#[test]
+#[cfg(unix)]
+fn real_landing_journal_write_failure_recovers_reference_and_rewrite_receipt_atomically() {
+    use tinytree_store::LandingState;
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path().join("store");
+    let mut driver = Driver::start(&root, "landing-write-failure");
+    driver.checkpoint("BASELINE_DURABLE");
+    driver.checkpoint("LANDING_CHECKED_ACK");
+    driver.checkpoint("WRITE_FAILED_POISONED");
+    driver.kill_and_reap();
+    let store = Store::open_existing(&root, Config::default()).unwrap();
+    let job = store
+        .landing_job(common::REPOSITORY, common::LANDING_OWNER, "landing")
+        .unwrap()
+        .unwrap();
+    let reference = store
+        .references(common::REPOSITORY, &[common::REFERENCE.into()])
+        .unwrap()
+        .remove(0);
+    match job.state {
+        LandingState::Checked => {
+            assert_eq!(reference.generation, 1);
+            assert_eq!(reference.commit, Some(common::initial().head));
+            assert!(job.receipt.is_none());
+        }
+        LandingState::Committed => {
+            let receipt = job.receipt.as_ref().unwrap();
+            assert_eq!(reference, receipt.reference);
+            assert_eq!(reference.generation, 2);
+            assert_eq!(
+                reference.commit.unwrap().key.id.0,
+                job.candidate.as_ref().unwrap().head.0
+            );
+            assert_eq!(receipt.rewrites.len(), 1);
+            assert_eq!(receipt.evidence, [8; 32]);
+        }
+        other => panic!("non-atomic recovered landing state: {other:?}"),
+    }
+}

@@ -32,6 +32,13 @@ pub use cloud::{
     CloudVersionSelector, CloudWorkspace, CloudWriteReceipt, PublishCapturedCloudRequest,
     PublishCloudRequest,
 };
+mod landing;
+pub use landing::{
+    LandingCandidate, LandingCandidateLease, LandingCheckIdentity, LandingCheckProfile,
+    LandingConfig, LandingHandle, LandingJob, LandingOwner, LandingReceipt, LandingRequest,
+    LandingScanCursor, LandingScanLimits, LandingScanPage, LandingState, LandingVerdict,
+    PendingLanding,
+};
 mod client_gc;
 mod closure;
 pub use client_gc::{
@@ -101,6 +108,7 @@ impl From<tinytree_model::Error> for Error {
 pub struct Config {
     pub model_limits: Limits,
     pub cloud: CloudConfig,
+    pub landing: LandingConfig,
     pub max_file_bytes: u64,
     pub max_repository_bytes: u64,
     pub max_objects_per_repository: u64,
@@ -121,6 +129,7 @@ impl Default for Config {
         Self {
             model_limits: Limits::default(),
             cloud: CloudConfig::default(),
+            landing: LandingConfig::default(),
             max_file_bytes: 256 * 1024 * 1024,
             max_repository_bytes: 16 * 1024 * 1024 * 1024,
             max_objects_per_repository: 1_000_000,
@@ -200,6 +209,7 @@ struct Spaces {
     locations: SingleWriterTxKeyspace,
     packs: SingleWriterTxKeyspace,
     cloud: cloud::Spaces,
+    landing: SingleWriterTxKeyspace,
 }
 #[derive(Default)]
 struct Runtime {
@@ -208,6 +218,7 @@ struct Runtime {
     index_artifact_readers: HashMap<(String, [u8; 32], tinytree_cloud::IndexArtifactId), usize>,
     cloud_reservations: HashMap<(String, [u8; 32]), (u64, u64, u64)>,
     cloud_version_readers: HashMap<(String, [u8; 32], [u8; 32], u64), usize>,
+    landing_builders: HashSet<(String, [u8; 32])>,
     staging_bytes: u64,
     staging_uploads: usize,
     repository_reservations: HashMap<String, (u64, u64)>,
@@ -360,6 +371,7 @@ fn store_feature(value: Option<&[u8]>) -> Result<u8> {
         Some(b"tinytree-store-3") => Ok(3),
         Some(b"tinytree-store-4") => Ok(4),
         Some(b"tinytree-store-5") => Ok(5),
+        Some(b"tinytree-store-6") => Ok(6),
         _ => Err(Error::Corrupt("store format")),
     }
 }
@@ -375,6 +387,7 @@ fn advance_feature(
             3 => b"tinytree-store-3".as_slice(),
             4 => b"tinytree-store-4".as_slice(),
             5 => b"tinytree-store-5".as_slice(),
+            6 => b"tinytree-store-6".as_slice(),
             _ => return Err(Error::Invalid("store feature")),
         };
         tx.insert(meta, b"format", value);
@@ -549,6 +562,7 @@ impl Store {
             return Err(Error::Invalid("store configuration"));
         }
         config.cloud.validate()?;
+        config.landing.validate()?;
         let planned = preflight_root(root)?;
         if existing_only && planned.fresh {
             return Err(Error::Invalid("existing store required"));
@@ -604,6 +618,13 @@ impl Store {
         {
             return Err(Error::Corrupt("packed store keyspace missing"));
         }
+        if feature >= 6 && !db.keyspace_exists("landing-jobs-v1") {
+            return Err(Error::Corrupt("landing keyspace missing"));
+        }
+        let landing = db.keyspace("landing-jobs-v1", KeyspaceCreateOptions::default)?;
+        if feature < 6 && db.read_tx().iter(&landing).next().is_some() {
+            return Err(Error::Corrupt("landing state without store feature"));
+        }
         let cloud_spaces = cloud::Spaces::open(&db, feature)?;
         if feature >= 3 {
             let metadata = fs::symlink_metadata(root.join("cloud"))
@@ -625,6 +646,7 @@ impl Store {
             locations: db.keyspace("pack-locations-v1", KeyspaceCreateOptions::default)?,
             packs: db.keyspace("packs-v1", KeyspaceCreateOptions::default)?,
             cloud: cloud_spaces,
+            landing,
         };
         let mut tx = db.write_tx().durability(Some(PersistMode::SyncAll));
         match tx.get(&spaces.meta, b"format")? {
@@ -665,6 +687,7 @@ impl Store {
             store.inner.validate_retention_on_reopen()?;
             store.inner.validate_packs_on_reopen()?;
             store.inner.validate_cloud_on_reopen()?;
+            store.inner.validate_landing_on_reopen()?;
         }
         Ok(store)
     }
@@ -1257,6 +1280,7 @@ impl Store {
             }
         }
         roots.extend(cloud.strict.iter().copied());
+        roots.extend(self.inner.landing_roots(repo)?);
         let mut retained = self.inner.closure(repo, roots, true, false)?;
         let mut expired = Vec::new();
         let mut stage_roots = HashSet::new();

@@ -6213,3 +6213,1486 @@ fn captured_version_missing_orphan_corrupt_and_downgraded_rows_fail_closed_on_re
         Err(Error::Corrupt("cloud capture keyspace missing"))
     ));
 }
+
+// Landing fixtures use the real Store API and strict canonical closures. They do
+// not stand in for a trusted check runner or server/CLI landing acceptance.
+fn landing_commit(
+    store: &Store,
+    repo: &str,
+    parent: CommitId,
+    root: TreeId,
+    change: u8,
+    description: &str,
+) -> Descriptor {
+    let mut object = commit(root, description);
+    object.parents = vec![parent];
+    object.change_id = ChangeId([change; 16]);
+    let encoded = tinytree_model::encode(&Object::Commit(object), Limits::default()).unwrap();
+    store
+        .put(repo, encoded.descriptor, &encoded.bytes, 0)
+        .unwrap();
+    encoded.descriptor
+}
+fn landing_fixture(store: &Store, repo: &str) -> (Descriptor, Descriptor, Descriptor) {
+    let empty = tinytree_model::empty_tree();
+    let base = landing_commit(
+        store,
+        repo,
+        CommitId::ROOT,
+        TreeId(empty.descriptor.key.id.0),
+        1,
+        "base",
+    );
+    let make_tree = |name: &str, bytes: &[u8]| {
+        let file = tinytree_model::describe_file(bytes);
+        store.put(repo, file, bytes, 0).unwrap();
+        let encoded = tinytree_model::encode(
+            &Object::Tree(Tree {
+                entries: vec![TreeEntry {
+                    name: name.into(),
+                    value: TreeValue::File {
+                        id: FileId(file.key.id.0),
+                        executable: false,
+                        size_bytes: file.size_bytes,
+                        copy_id: None,
+                    },
+                }],
+            }),
+            Limits::default(),
+        )
+        .unwrap();
+        store
+            .put(repo, encoded.descriptor, &encoded.bytes, 0)
+            .unwrap();
+        TreeId(encoded.descriptor.key.id.0)
+    };
+    let source = landing_commit(
+        store,
+        repo,
+        CommitId(base.key.id.0),
+        make_tree("source.txt", b"source"),
+        2,
+        "source change",
+    );
+    let dest = landing_commit(
+        store,
+        repo,
+        CommitId(base.key.id.0),
+        make_tree("destination.txt", b"destination"),
+        3,
+        "destination change",
+    );
+    store
+        .publish(repo, &request("landing-initial", 0, Some(dest)), 0)
+        .unwrap();
+    (base, source, dest)
+}
+fn landing_request(
+    base: Descriptor,
+    source: Descriptor,
+    dest: Descriptor,
+    token: &str,
+) -> LandingRequest {
+    LandingRequest {
+        idempotency_key: token.into(),
+        source_base: CommitId(base.key.id.0),
+        source_head: CommitId(source.key.id.0),
+        reference_name: "Main/feature".into(),
+        expected_generation: 1,
+        expected_head: CommitId(dest.key.id.0),
+        committer: Signature {
+            name: "Landing service".into(),
+            email: "landing@example.invalid".into(),
+            timestamp: Timestamp {
+                millis_since_epoch: 42,
+                tz_offset_minutes: 0,
+            },
+        },
+        check_profile: LandingCheckProfile {
+            name: "checks".into(),
+            version: "v1".into(),
+        },
+        expires_at: 100,
+    }
+}
+fn landing_identity(job: &LandingJob) -> LandingCheckIdentity {
+    let candidate = job.candidate.as_ref().unwrap();
+    LandingCheckIdentity {
+        candidate: candidate.head,
+        root_tree: candidate.root_tree,
+        profile: job.profile.clone(),
+    }
+}
+
+#[test]
+fn landing_restart_check_finalize_and_historical_replay_are_exact_and_atomic() {
+    let (directory, store) = open();
+    let owner = LandingOwner([1; 32]);
+    let (base, source, dest) = landing_fixture(&store, "demo");
+    let input = landing_request(base, source, dest, "land");
+    let accepted = store.begin_landing("demo", owner, &input, 0).unwrap();
+    assert_eq!(accepted.state, LandingState::Intent);
+    drop(store);
+    let store = Store::open_existing(directory.path(), config()).unwrap();
+    let prepared = store.prepare_landing("demo", owner, "land", 1).unwrap();
+    assert_eq!(prepared.state, LandingState::Prepared);
+    let candidate = prepared.candidate.as_ref().unwrap();
+    let (_, bytes) = store
+        .read_metadata(
+            "demo",
+            ObjectKey {
+                kind: Kind::Commit,
+                id: ObjectId(candidate.head.0),
+            },
+        )
+        .unwrap();
+    let Object::Commit(new) = tinytree_model::decode(&bytes, Limits::default()).unwrap() else {
+        panic!()
+    };
+    assert_eq!(new.parents, [CommitId(dest.key.id.0)]);
+    assert_eq!(new.change_id, ChangeId([2; 16]));
+    assert_eq!(new.committer, input.committer);
+    let (_, bytes) = store
+        .read_metadata(
+            "demo",
+            ObjectKey {
+                kind: Kind::Tree,
+                id: ObjectId(candidate.root_tree.0),
+            },
+        )
+        .unwrap();
+    let Object::Tree(tree) = tinytree_model::decode(&bytes, Limits::default()).unwrap() else {
+        panic!()
+    };
+    assert_eq!(
+        tree.entries
+            .iter()
+            .map(|e| e.name.as_str())
+            .collect::<Vec<_>>(),
+        ["destination.txt", "source.txt"]
+    );
+    let identity = landing_identity(&prepared);
+    drop(store);
+    let store = Store::open_existing(directory.path(), config()).unwrap();
+    let checked = store
+        .record_landing_check(
+            "demo",
+            owner,
+            "land",
+            &identity,
+            LandingVerdict {
+                passed: true,
+                evidence: [9; 32],
+            },
+            2,
+        )
+        .unwrap();
+    assert_eq!(checked.state, LandingState::Checked);
+    drop(store);
+    let store = Store::open_existing(directory.path(), config()).unwrap();
+    let done = store.finalize_landing("demo", owner, "land", 3).unwrap();
+    assert_eq!(done.state, LandingState::Committed);
+    let receipt = done.receipt.as_ref().unwrap();
+    assert_eq!(receipt.reference.generation, 2);
+    assert_eq!(
+        receipt.reference.commit.unwrap().key.id.0,
+        identity.candidate.0
+    );
+    assert_eq!(receipt.rewrites.len(), 1);
+    assert_eq!(receipt.rewrites[0].old, input.source_head);
+    assert_eq!(receipt.evidence, [9; 32]);
+    assert_eq!(
+        store
+            .references("demo", &[input.reference_name.clone()])
+            .unwrap()[0],
+        receipt.reference
+    );
+    store
+        .publish("demo", &request("move-after-land", 2, Some(base)), 4)
+        .unwrap();
+    let done = store.expire_landing("demo", owner, "land", 100).unwrap();
+    assert!(!done.roots_retained);
+    store.gc("demo", 1000).unwrap();
+    assert!(matches!(
+        store.read("demo", source.key),
+        Err(Error::MissingObject(_))
+    ));
+    let mut retry = input.clone();
+    retry.committer.timestamp.millis_since_epoch = 5000;
+    retry.expires_at = 5001;
+    assert_eq!(
+        store.begin_landing("demo", owner, &retry, 5000).unwrap(),
+        done
+    );
+    assert_eq!(
+        store.finalize_landing("demo", owner, "land", 5000).unwrap(),
+        done
+    );
+    assert_eq!(
+        store.references("demo", &[input.reference_name]).unwrap()[0].generation,
+        3
+    );
+    drop(store);
+    let store = Store::open_existing(directory.path(), config()).unwrap();
+    assert_eq!(
+        store.landing_job("demo", owner, "land").unwrap().unwrap(),
+        done
+    );
+}
+
+#[test]
+fn landing_checks_bind_candidate_root_profile_and_cannot_turn_failure_into_publication() {
+    let (_directory, store) = open();
+    let owner = LandingOwner([2; 32]);
+    let (base, source, dest) = landing_fixture(&store, "demo");
+    let input = landing_request(base, source, dest, "reject");
+    store.begin_landing("demo", owner, &input, 0).unwrap();
+    let prepared = store.prepare_landing("demo", owner, "reject", 1).unwrap();
+    let identity = landing_identity(&prepared);
+    let mut wrong = identity.clone();
+    wrong.candidate = CommitId([7; 32]);
+    assert!(matches!(
+        store.record_landing_check(
+            "demo",
+            owner,
+            "reject",
+            &wrong,
+            LandingVerdict {
+                passed: true,
+                evidence: [1; 32]
+            },
+            2
+        ),
+        Err(Error::Invalid("landing check identity"))
+    ));
+    let mut wrong = identity.clone();
+    wrong.root_tree = TreeId([7; 32]);
+    assert!(
+        store
+            .record_landing_check(
+                "demo",
+                owner,
+                "reject",
+                &wrong,
+                LandingVerdict {
+                    passed: true,
+                    evidence: [1; 32]
+                },
+                2
+            )
+            .is_err()
+    );
+    let mut wrong = identity.clone();
+    wrong.profile.version = "other".into();
+    assert!(
+        store
+            .record_landing_check(
+                "demo",
+                owner,
+                "reject",
+                &wrong,
+                LandingVerdict {
+                    passed: true,
+                    evidence: [1; 32]
+                },
+                2
+            )
+            .is_err()
+    );
+    assert!(store.finalize_landing("demo", owner, "reject", 2).is_err());
+    let failed = store
+        .record_landing_check(
+            "demo",
+            owner,
+            "reject",
+            &identity,
+            LandingVerdict {
+                passed: false,
+                evidence: [1; 32],
+            },
+            2,
+        )
+        .unwrap();
+    assert_eq!(failed.state, LandingState::CheckFailed);
+    assert!(matches!(
+        store.record_landing_check(
+            "demo",
+            owner,
+            "reject",
+            &identity,
+            LandingVerdict {
+                passed: true,
+                evidence: [1; 32]
+            },
+            3
+        ),
+        Err(Error::IdempotencyConflict)
+    ));
+    assert_eq!(
+        store.finalize_landing("demo", owner, "reject", 3).unwrap(),
+        failed
+    );
+    assert_eq!(
+        store.references("demo", &[input.reference_name]).unwrap()[0].commit,
+        Some(dest)
+    );
+}
+
+#[test]
+fn landing_competing_jobs_have_one_atomic_winner_and_a_durable_stale_result() {
+    let (directory, store) = open();
+    let owner = LandingOwner([3; 32]);
+    let (base, source, dest) = landing_fixture(&store, "demo");
+    let mut jobs = Vec::new();
+    for token in ["first", "second"] {
+        let input = landing_request(base, source, dest, token);
+        store.begin_landing("demo", owner, &input, 0).unwrap();
+        let job = store.prepare_landing("demo", owner, token, 1).unwrap();
+        store
+            .record_landing_check(
+                "demo",
+                owner,
+                token,
+                &landing_identity(&job),
+                LandingVerdict {
+                    passed: true,
+                    evidence: [2; 32],
+                },
+                2,
+            )
+            .unwrap();
+    }
+    let barrier = Arc::new(std::sync::Barrier::new(3));
+    for token in ["first", "second"] {
+        let store = store.clone();
+        let barrier = Arc::clone(&barrier);
+        jobs.push(std::thread::spawn(move || {
+            barrier.wait();
+            store.finalize_landing("demo", owner, token, 3).unwrap()
+        }));
+    }
+    barrier.wait();
+    let results = jobs
+        .into_iter()
+        .map(|j| j.join().unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        results
+            .iter()
+            .filter(|j| j.state == LandingState::Committed)
+            .count(),
+        1
+    );
+    assert_eq!(
+        results
+            .iter()
+            .filter(|j| j.state == LandingState::StaleTarget)
+            .count(),
+        1
+    );
+    let winner = results
+        .iter()
+        .find(|j| j.state == LandingState::Committed)
+        .unwrap();
+    assert_eq!(
+        store.references("demo", &["Main/feature".into()]).unwrap()[0],
+        winner.receipt.as_ref().unwrap().reference
+    );
+    drop(store);
+    let store = Store::open_existing(directory.path(), config()).unwrap();
+    for (token, expected) in ["first", "second"].into_iter().zip(results) {
+        assert_eq!(
+            store.finalize_landing("demo", owner, token, 4).unwrap(),
+            expected
+        );
+    }
+}
+
+#[test]
+fn landing_expiry_is_durable_and_gc_does_not_infer_expiry_from_clock() {
+    let (directory, store) = open();
+    let owner = LandingOwner([4; 32]);
+    let (base, source, dest) = landing_fixture(&store, "demo");
+    let input = landing_request(base, source, dest, "expire");
+    store.begin_landing("demo", owner, &input, 0).unwrap();
+    store.gc("demo", 1000).unwrap();
+    assert!(store.read("demo", source.key).is_ok());
+    assert!(
+        store
+            .prepare_landing("demo", owner, "expire", 1000)
+            .is_err()
+    );
+    assert!(store.expire_landing("demo", owner, "expire", 99).is_err());
+    let expired = store.expire_landing("demo", owner, "expire", 100).unwrap();
+    assert_eq!(expired.state, LandingState::Expired);
+    store.gc("demo", 1000).unwrap();
+    assert!(matches!(
+        store.read("demo", source.key),
+        Err(Error::MissingObject(_))
+    ));
+    assert_eq!(
+        store.prepare_landing("demo", owner, "expire", 0).unwrap(),
+        expired
+    );
+    assert_eq!(
+        store.begin_landing("demo", owner, &input, 0).unwrap(),
+        expired
+    );
+    drop(store);
+    let store = Store::open_existing(directory.path(), config()).unwrap();
+    assert_eq!(
+        store.prepare_landing("demo", owner, "expire", 0).unwrap(),
+        expired
+    );
+}
+
+#[test]
+fn landing_runtime_owners_protect_inputs_and_installed_outputs_during_expiry() {
+    for phase in ["inputs", "outputs"] {
+        let (_directory, store) = open();
+        let owner = LandingOwner([5; 32]);
+        let (base, source, dest) = landing_fixture(&store, "demo");
+        let input = landing_request(base, source, dest, "inflight");
+        store.begin_landing("demo", owner, &input, 0).unwrap();
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (resume_tx, resume_rx) = mpsc::channel();
+        let worker_store = store.clone();
+        let worker = std::thread::spawn(move || {
+            landing::test_checkpoint(Some(Box::new(move |current| {
+                if current == phase {
+                    entered_tx.send(()).unwrap();
+                    resume_rx.recv().unwrap();
+                }
+            })));
+            let result = worker_store.prepare_landing("demo", owner, "inflight", 1);
+            landing::test_checkpoint(None);
+            result
+        });
+        entered_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+        store
+            .expire_landing("demo", owner, "inflight", 100)
+            .unwrap();
+        store.gc("demo", 1000).unwrap();
+        assert!(store.read("demo", source.key).is_ok());
+        resume_tx.send(()).unwrap();
+        assert_eq!(worker.join().unwrap().unwrap().state, LandingState::Expired);
+        store.gc("demo", 1000).unwrap();
+        assert!(matches!(
+            store.read("demo", source.key),
+            Err(Error::MissingObject(_))
+        ));
+    }
+}
+
+#[test]
+fn landing_scoped_replay_and_quota_fail_closed_without_forgetting_accepted_results() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut limits = config();
+    limits.landing.max_jobs_per_repository = 1;
+    let store = Store::open(directory.path(), limits.clone()).unwrap();
+    store.create_repository("demo").unwrap();
+    let owner = LandingOwner([6; 32]);
+    let (base, source, dest) = landing_fixture(&store, "demo");
+    let input = landing_request(base, source, dest, "same");
+    let accepted = store.begin_landing("demo", owner, &input, 0).unwrap();
+    assert!(
+        store
+            .landing_job("demo", LandingOwner([7; 32]), "same")
+            .unwrap()
+            .is_none()
+    );
+    let mut different = input.clone();
+    different.source_head = CommitId([99; 32]);
+    assert!(matches!(
+        store.begin_landing("demo", owner, &different, 0),
+        Err(Error::IdempotencyConflict)
+    ));
+    different = input.clone();
+    different.check_profile.version = "v2".into();
+    assert!(matches!(
+        store.begin_landing("demo", owner, &different, 0),
+        Err(Error::IdempotencyConflict)
+    ));
+    let expired = store.expire_landing("demo", owner, "same", 100).unwrap();
+    different = input.clone();
+    different.idempotency_key = "new".into();
+    different.expires_at = 200;
+    assert!(matches!(
+        store.begin_landing("demo", owner, &different, 100),
+        Err(Error::Limit("landing accepted job quota"))
+    ));
+    assert_eq!(
+        store.landing_job("demo", owner, "same").unwrap().unwrap(),
+        expired
+    );
+    assert_eq!(accepted.id, expired.id);
+    drop(store);
+    assert!(Store::open_existing(directory.path(), limits).is_ok());
+}
+
+#[test]
+fn landing_feature_layout_and_downgrade_checks_fail_closed_on_reopen() {
+    let (directory, store) = open();
+    let owner = LandingOwner([8; 32]);
+    let (base, source, dest) = landing_fixture(&store, "demo");
+    store
+        .begin_landing(
+            "demo",
+            owner,
+            &landing_request(base, source, dest, "feature"),
+            0,
+        )
+        .unwrap();
+    assert_eq!(
+        store
+            .inner
+            .db
+            .read_tx()
+            .get(&store.inner.spaces.meta, b"format")
+            .unwrap()
+            .unwrap()
+            .as_ref(),
+        b"tinytree-store-6"
+    );
+    assert!(directory.path().join("cloud").is_dir());
+    assert!(matches!(
+        store.plan_client_gc("demo", &client_collection(&store, 100)),
+        Err(Error::Invalid(
+            "authoritative service state requires server GC"
+        ))
+    ));
+    drop(store);
+    drop(Store::open_existing(directory.path(), config()).unwrap());
+    let set_format = |format: &[u8]| {
+        let db = SingleWriterTxDatabase::builder(directory.path().join("metadata"))
+            .open()
+            .unwrap();
+        let meta = db.keyspace("meta", KeyspaceCreateOptions::default).unwrap();
+        let mut tx = db.write_tx().durability(Some(PersistMode::SyncAll));
+        tx.insert(&meta, b"format", format);
+        tx.commit().unwrap();
+    };
+    set_format(b"tinytree-store-5");
+    assert!(matches!(
+        Store::open_existing(directory.path(), config()),
+        Err(Error::Corrupt("landing state without store feature"))
+    ));
+    set_format(b"tinytree-store-6");
+    {
+        let db = SingleWriterTxDatabase::builder(directory.path().join("metadata"))
+            .open()
+            .unwrap();
+        let jobs = db
+            .keyspace("landing-jobs-v1", KeyspaceCreateOptions::default)
+            .unwrap();
+        db.inner().delete_keyspace(jobs.inner().clone()).unwrap();
+    }
+    assert!(matches!(
+        Store::open_existing(directory.path(), config()),
+        Err(Error::Corrupt("landing keyspace missing"))
+    ));
+}
+
+#[test]
+fn landing_checked_candidate_and_check_binding_corruption_are_rejected() {
+    let (directory, store) = open();
+    let owner = LandingOwner([9; 32]);
+    let (base, source, dest) = landing_fixture(&store, "demo");
+    let input = landing_request(base, source, dest, "corruption");
+    let id = store.begin_landing("demo", owner, &input, 0).unwrap().id;
+    let prepared = store
+        .prepare_landing("demo", owner, "corruption", 1)
+        .unwrap();
+    store
+        .record_landing_check(
+            "demo",
+            owner,
+            "corruption",
+            &landing_identity(&prepared),
+            LandingVerdict {
+                passed: true,
+                evidence: [4; 32],
+            },
+            2,
+        )
+        .unwrap();
+    let physical = key("demo", &id);
+    let original = store
+        .inner
+        .db
+        .read_tx()
+        .get(&store.inner.spaces.landing, &physical)
+        .unwrap()
+        .unwrap()
+        .to_vec();
+    drop(store);
+    let replace = |bytes: &[u8]| {
+        let db = SingleWriterTxDatabase::builder(directory.path().join("metadata"))
+            .open()
+            .unwrap();
+        let jobs = db
+            .keyspace("landing-jobs-v1", KeyspaceCreateOptions::default)
+            .unwrap();
+        let mut tx = db.write_tx().durability(Some(PersistMode::SyncAll));
+        tx.insert(&jobs, &physical, bytes);
+        tx.commit().unwrap();
+    };
+    let mut row: serde_json::Value = serde_json::from_slice(&original).unwrap();
+    row["candidate"]["tree"][0] = serde_json::json!(255);
+    replace(&serde_json::to_vec(&row).unwrap());
+    assert!(matches!(
+        Store::open_existing(directory.path(), config()),
+        Err(Error::Corrupt("landing candidate digest"))
+    ));
+    let mut row: serde_json::Value = serde_json::from_slice(&original).unwrap();
+    let value = row["check"]["binding"][0].as_u64().unwrap();
+    row["check"]["binding"][0] = serde_json::json!(value ^ 1);
+    replace(&serde_json::to_vec(&row).unwrap());
+    assert!(matches!(
+        Store::open_existing(directory.path(), config()),
+        Err(Error::Corrupt("landing check binding"))
+    ));
+    replace(&original);
+    assert!(Store::open_existing(directory.path(), config()).is_ok());
+}
+
+#[test]
+fn landing_global_record_and_candidate_budgets_reject_before_acknowledgement() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut limits = config();
+    limits.max_retention_validation_bytes = 6000;
+    let store = Store::open(directory.path(), limits.clone()).unwrap();
+    let owner = LandingOwner([10; 32]);
+    let mut requests = Vec::new();
+    for repo in ["demo", "other"] {
+        store.create_repository(repo).unwrap();
+        let (base, source, dest) = landing_fixture(&store, repo);
+        let mut input = landing_request(base, source, dest, "budget");
+        input.committer.name = "n".repeat(1024);
+        input.committer.email = "e".repeat(1024);
+        requests.push((repo, input));
+    }
+    store
+        .begin_landing(requests[0].0, owner, &requests[0].1, 0)
+        .unwrap();
+    assert!(matches!(
+        store.begin_landing(requests[1].0, owner, &requests[1].1, 0),
+        Err(Error::Limit("landing record scan budget"))
+    ));
+    assert!(
+        store
+            .landing_job(requests[1].0, owner, "budget")
+            .unwrap()
+            .is_none()
+    );
+    drop(store);
+    drop(Store::open_existing(directory.path(), limits).unwrap());
+    let directory = tempfile::tempdir().unwrap();
+    let mut limits = config();
+    limits.landing.max_validation_metadata_bytes = 4096;
+    let store = Store::open(directory.path(), limits.clone()).unwrap();
+    store.create_repository("demo").unwrap();
+    let (base, source, dest) = landing_fixture(&store, "demo");
+    let mut prepared = 0;
+    let mut rejected = false;
+    for index in 0..16 {
+        let token = format!("candidate-{index}");
+        store
+            .begin_landing(
+                "demo",
+                owner,
+                &landing_request(base, source, dest, &token),
+                0,
+            )
+            .unwrap();
+        match store.prepare_landing("demo", owner, &token, 1) {
+            Ok(job) => {
+                assert_eq!(job.state, LandingState::Prepared);
+                prepared += 1
+            }
+            Err(Error::Limit("landing validation bytes")) => {
+                assert_eq!(
+                    store
+                        .landing_job("demo", owner, &token)
+                        .unwrap()
+                        .unwrap()
+                        .state,
+                    LandingState::Intent
+                );
+                rejected = true;
+                break;
+            }
+            other => panic!("unexpected prepare result: {other:?}"),
+        }
+    }
+    assert!(prepared > 0 && rejected);
+    drop(store);
+    assert!(Store::open_existing(directory.path(), limits).is_ok());
+}
+
+#[test]
+fn landing_expiry_uses_reserved_space_when_accepted_replay_ledger_is_full() {
+    let (directory, store) = open();
+    let owner = LandingOwner([11; 32]);
+    let (base, source, dest) = landing_fixture(&store, "demo");
+    let input = landing_request(base, source, dest, "last-byte");
+    let accepted = store.begin_landing("demo", owner, &input, 0).unwrap();
+    let physical = key("demo", &accepted.id);
+    let bytes = store
+        .inner
+        .db
+        .read_tx()
+        .get(&store.inner.spaces.landing, &physical)
+        .unwrap()
+        .unwrap();
+    let budget = physical.len() + bytes.len() + 1;
+    drop(bytes);
+    drop(store);
+    for (maximum, accepted) in [(budget - 1, false), (budget, true)] {
+        let fresh = tempfile::tempdir().unwrap();
+        let mut limits = config();
+        limits.max_retention_validation_bytes = maximum as u64;
+        let fresh_store = Store::open(fresh.path(), limits.clone()).unwrap();
+        fresh_store.create_repository("demo").unwrap();
+        let (base, source, dest) = landing_fixture(&fresh_store, "demo");
+        let input = landing_request(base, source, dest, "last-byte");
+        let result = fresh_store.begin_landing("demo", owner, &input, 0);
+        if accepted {
+            assert_eq!(result.unwrap().state, LandingState::Intent);
+            assert_eq!(
+                fresh_store
+                    .expire_landing("demo", owner, "last-byte", 100)
+                    .unwrap()
+                    .state,
+                LandingState::Expired
+            );
+        } else {
+            assert!(matches!(
+                result,
+                Err(Error::Limit("landing record scan budget"))
+            ));
+            assert!(
+                fresh_store
+                    .landing_job("demo", owner, "last-byte")
+                    .unwrap()
+                    .is_none()
+            );
+        }
+        drop(fresh_store);
+        drop(Store::open_existing(fresh.path(), limits).unwrap());
+    }
+    let mut limits = config();
+    limits.max_retention_validation_bytes = budget as u64;
+    let store = Store::open_existing(directory.path(), limits.clone()).unwrap();
+    assert_eq!(
+        store
+            .expire_landing("demo", owner, "last-byte", 100)
+            .unwrap()
+            .state,
+        LandingState::Expired
+    );
+    store.gc("demo", 1000).unwrap();
+    drop(store);
+    assert!(Store::open_existing(directory.path(), limits).is_ok());
+}
+
+#[test]
+fn landing_roots_join_ordinary_publication_and_candidate_gc_admission_budgets() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut limits = config();
+    limits.max_closure_objects = 8;
+    let store = Store::open(directory.path(), limits.clone()).unwrap();
+    store.create_repository("demo").unwrap();
+    let owner = LandingOwner([13; 32]);
+    let (base, source, dest) = landing_fixture(&store, "demo");
+    let input = landing_request(base, source, dest, "union");
+    store.begin_landing("demo", owner, &input, 0).unwrap();
+    assert!(matches!(
+        store.prepare_landing("demo", owner, "union", 1),
+        Err(Error::Limit("object closure"))
+    ));
+    assert_eq!(
+        store
+            .landing_job("demo", owner, "union")
+            .unwrap()
+            .unwrap()
+            .state,
+        LandingState::Intent
+    );
+    let empty = tinytree_model::empty_tree();
+    let other = landing_commit(
+        &store,
+        "demo",
+        CommitId::ROOT,
+        TreeId(empty.descriptor.key.id.0),
+        9,
+        "new unrelated target",
+    );
+    assert!(matches!(
+        store.publish("demo", &request("over-union", 1, Some(other)), 2),
+        Err(Error::Limit("object closure"))
+    ));
+    assert_eq!(
+        store
+            .references("demo", &[input.reference_name.clone()])
+            .unwrap()[0]
+            .commit,
+        Some(dest)
+    );
+    store.gc("demo", 1000).unwrap();
+    assert!(store.read("demo", source.key).is_ok());
+    drop(store);
+    let store = Store::open_existing(directory.path(), limits).unwrap();
+    store.expire_landing("demo", owner, "union", 100).unwrap();
+    let other = landing_commit(
+        &store,
+        "demo",
+        CommitId::ROOT,
+        TreeId(empty.descriptor.key.id.0),
+        9,
+        "new unrelated target",
+    );
+    store
+        .publish("demo", &request("after-release", 1, Some(other)), 100)
+        .unwrap();
+}
+
+#[test]
+fn landing_conflicts_and_unsupported_stacks_are_durable_non_publications() {
+    let (directory, store) = open();
+    let owner = LandingOwner([14; 32]);
+    let (base, source, dest) = landing_fixture(&store, "demo");
+    let bytes = b"different addition";
+    let file = tinytree_model::describe_file(bytes);
+    store.put("demo", file, bytes, 0).unwrap();
+    let tree = put_object(&store, Object::Tree(tree(file, file.size_bytes)), 0);
+    let conflict = landing_commit(
+        &store,
+        "demo",
+        CommitId(base.key.id.0),
+        TreeId(tree.key.id.0),
+        4,
+        "conflicting target",
+    );
+    store
+        .publish("demo", &request("conflicting-target", 1, Some(conflict)), 0)
+        .unwrap();
+    let mut input = landing_request(base, source, conflict, "conflict");
+    input.expected_generation = 2;
+    store.begin_landing("demo", owner, &input, 0).unwrap();
+    let result = store.prepare_landing("demo", owner, "conflict", 1).unwrap();
+    assert_eq!(result.state, LandingState::Conflict);
+    assert_eq!(result.conflict_path.as_deref(), Some("source.txt"));
+    assert!(result.receipt.is_none());
+    assert_eq!(
+        store
+            .finalize_landing("demo", owner, "conflict", 2)
+            .unwrap(),
+        result
+    );
+    let mut merge = commit(TreeId(tree.key.id.0), "unsupported merge");
+    merge.parents = vec![CommitId(base.key.id.0), CommitId(dest.key.id.0)];
+    merge.change_id = ChangeId([7; 16]);
+    let merge = put_object(&store, Object::Commit(merge), 0);
+    let mut input = landing_request(base, merge, conflict, "merge");
+    input.expected_generation = 2;
+    store.begin_landing("demo", owner, &input, 0).unwrap();
+    let unsupported = store.prepare_landing("demo", owner, "merge", 1).unwrap();
+    assert_eq!(unsupported.state, LandingState::Unsupported);
+    assert!(unsupported.receipt.is_none());
+    assert_eq!(
+        store.references("demo", &[input.reference_name]).unwrap()[0].commit,
+        Some(conflict)
+    );
+    drop(store);
+    let store = Store::open_existing(directory.path(), config()).unwrap();
+    assert_eq!(
+        store
+            .landing_job("demo", owner, "conflict")
+            .unwrap()
+            .unwrap(),
+        result
+    );
+    assert_eq!(
+        store.landing_job("demo", owner, "merge").unwrap().unwrap(),
+        unsupported
+    );
+}
+
+#[test]
+fn landing_pending_discovery_resumes_after_restart_and_progresses_over_terminal_rows() {
+    let (directory, store) = open();
+    let owner = LandingOwner([15; 32]);
+    let (base, source, dest) = landing_fixture(&store, "demo");
+    let mut expected = HashSet::new();
+    for index in 0..12 {
+        let token = format!("discovery-{index}");
+        let job = store
+            .begin_landing(
+                "demo",
+                owner,
+                &landing_request(base, source, dest, &token),
+                0,
+            )
+            .unwrap();
+        if index < 3 {
+            expected.insert(job.id);
+            if index > 0 {
+                let prepared = store.prepare_landing("demo", owner, &token, 1).unwrap();
+                if index == 2 {
+                    store
+                        .record_landing_check(
+                            "demo",
+                            owner,
+                            &token,
+                            &landing_identity(&prepared),
+                            LandingVerdict {
+                                passed: true,
+                                evidence: [3; 32],
+                            },
+                            2,
+                        )
+                        .unwrap();
+                }
+            }
+        } else {
+            store.expire_landing("demo", owner, &token, 100).unwrap();
+        }
+    }
+    drop(store);
+    let store = Store::open_existing(directory.path(), config()).unwrap();
+    store.create_repository("other").unwrap();
+    let mut cursor = None;
+    let mut found = HashSet::new();
+    let mut terminal_page = false;
+    let mut handles = Vec::new();
+    let limits = LandingScanLimits {
+        max_records: 1,
+        max_jobs: 1,
+        ..Default::default()
+    };
+    loop {
+        let page = store
+            .scan_pending_landings("demo", cursor.as_ref(), limits)
+            .unwrap();
+        assert!(page.scanned_records <= 1);
+        assert!(page.scanned_bytes <= limits.max_scan_bytes);
+        if page.jobs.is_empty() && page.scanned_records == 1 {
+            terminal_page = true;
+        }
+        for pending in page.jobs {
+            assert!(found.insert(pending.id));
+            let job = pending.handle.status(&store).unwrap();
+            assert_eq!(pending.id, job.id);
+            assert_eq!(pending.state, job.state);
+            assert!(!format!("{:?}", pending.handle).contains("discovery-"));
+            handles.push(pending.handle);
+        }
+        if page.scan_complete {
+            break;
+        }
+        let next = page.next.expect("bounded scan must progress");
+        assert!(
+            store
+                .scan_pending_landings("other", Some(&next), limits)
+                .is_err()
+        );
+        cursor = Some(next);
+    }
+    assert_eq!(found, expected);
+    assert!(terminal_page);
+    assert_eq!(handles.len(), 3);
+    let first = store.scan_pending_landings("demo", None, limits).unwrap();
+    let old_cursor = first.next.unwrap();
+    let handle = handles.remove(0);
+    let other_directory = tempfile::tempdir().unwrap();
+    let other = Store::open(other_directory.path(), config()).unwrap();
+    other.create_repository("demo").unwrap();
+    assert!(handle.status(&other).is_err());
+    assert!(
+        other
+            .scan_pending_landings("demo", Some(&old_cursor), limits)
+            .is_err()
+    );
+    drop(other);
+    for handle in &handles {
+        let job = handle.status(&store).unwrap();
+        if job.state == LandingState::Intent {
+            assert_eq!(
+                handle.prepare(&store, 1).unwrap().state,
+                LandingState::Prepared
+            );
+        }
+    }
+    drop(store);
+    let store = Store::open_existing(directory.path(), config()).unwrap();
+    assert!(handle.status(&store).is_err());
+    assert!(
+        store
+            .scan_pending_landings("demo", Some(&old_cursor), limits)
+            .is_err()
+    );
+    assert!(
+        store
+            .scan_pending_landings("other", None, limits)
+            .unwrap()
+            .scan_complete
+    );
+}
+
+#[test]
+fn landing_pending_pages_do_not_skip_unreturned_live_jobs_at_output_boundaries() {
+    let (_directory, store) = open();
+    let owner = LandingOwner([16; 32]);
+    let (base, source, dest) = landing_fixture(&store, "demo");
+    let mut expected = HashSet::new();
+    for index in 0..3 {
+        let job = store
+            .begin_landing(
+                "demo",
+                owner,
+                &landing_request(base, source, dest, &format!("output-{index}")),
+                0,
+            )
+            .unwrap();
+        expected.insert(job.id);
+    }
+    let limits = LandingScanLimits {
+        max_output_bytes: 512,
+        ..Default::default()
+    };
+    let mut cursor = None;
+    let mut found = HashSet::new();
+    loop {
+        let page = store
+            .scan_pending_landings("demo", cursor.as_ref(), limits)
+            .unwrap();
+        assert!(page.jobs.len() <= 1);
+        for pending in page.jobs {
+            assert!(found.insert(pending.id));
+        }
+        if page.scan_complete {
+            break;
+        }
+        cursor = page.next;
+        assert!(matches!(
+            store.scan_pending_landings(
+                "demo",
+                cursor.as_ref(),
+                LandingScanLimits {
+                    max_output_bytes: 1,
+                    ..limits
+                }
+            ),
+            Err(Error::Limit("landing scan output bytes"))
+        ));
+    }
+    assert_eq!(found, expected);
+    assert!(matches!(
+        store.scan_pending_landings(
+            "demo",
+            None,
+            LandingScanLimits {
+                max_scan_bytes: 1,
+                ..limits
+            }
+        ),
+        Err(Error::Limit("landing scan row bytes"))
+    ));
+    assert!(
+        store
+            .scan_pending_landings(
+                "demo",
+                None,
+                LandingScanLimits {
+                    max_records: 0,
+                    ..limits
+                }
+            )
+            .is_err()
+    );
+}
+
+#[test]
+fn landing_check_owner_survives_expiry_without_authorizing_a_late_verdict() {
+    let (_directory, store) = open();
+    let owner = LandingOwner([17; 32]);
+    let (base, source, dest) = landing_fixture(&store, "demo");
+    let input = landing_request(base, source, dest, "check-owner");
+    store.begin_landing("demo", owner, &input, 0).unwrap();
+    let prepared = store
+        .prepare_landing("demo", owner, "check-owner", 1)
+        .unwrap();
+    let lease = store
+        .pin_landing_candidate("demo", owner, "check-owner", 2)
+        .unwrap();
+    assert_eq!(lease.identity(), &landing_identity(&prepared));
+    let key = ObjectKey {
+        kind: Kind::Commit,
+        id: ObjectId(lease.identity().candidate.0),
+    };
+    store
+        .expire_landing("demo", owner, "check-owner", 100)
+        .unwrap();
+    store.gc("demo", 1000).unwrap();
+    assert!(store.read("demo", key).is_ok());
+    assert!(
+        store
+            .record_landing_check(
+                "demo",
+                owner,
+                "check-owner",
+                lease.identity(),
+                LandingVerdict {
+                    passed: true,
+                    evidence: [3; 32]
+                },
+                101
+            )
+            .is_err()
+    );
+    assert_eq!(
+        store
+            .finalize_landing("demo", owner, "check-owner", 101)
+            .unwrap()
+            .state,
+        LandingState::Expired
+    );
+    drop(lease);
+    store.gc("demo", 1000).unwrap();
+    assert!(matches!(
+        store.read("demo", key),
+        Err(Error::MissingObject(_))
+    ));
+    assert!(
+        store
+            .pin_landing_candidate("demo", owner, "check-owner", 0)
+            .is_err()
+    );
+}
+
+#[test]
+fn landing_committed_recovery_roots_survive_lost_ack_reference_move_gc_and_restart() {
+    let (directory, store) = open();
+    let owner = LandingOwner([18; 32]);
+    let (base, source, dest) = landing_fixture(&store, "demo");
+    let input = landing_request(base, source, dest, "lost-ack");
+    store.begin_landing("demo", owner, &input, 0).unwrap();
+    let prepared = store.prepare_landing("demo", owner, "lost-ack", 1).unwrap();
+    let identity = landing_identity(&prepared);
+    store
+        .record_landing_check(
+            "demo",
+            owner,
+            "lost-ack",
+            &identity,
+            LandingVerdict {
+                passed: true,
+                evidence: [9; 32],
+            },
+            2,
+        )
+        .unwrap();
+    // Discard the final result, as if the durable ACK were lost in transit.
+    store
+        .finalize_landing("demo", owner, "lost-ack", 3)
+        .unwrap();
+    store
+        .publish("demo", &request("disjoint-move", 2, Some(base)), 4)
+        .unwrap();
+    assert!(store.expire_landing("demo", owner, "lost-ack", 99).is_err());
+    store.gc("demo", 1000).unwrap();
+    assert!(store.read("demo", source.key).is_ok());
+    let candidate = ObjectKey {
+        kind: Kind::Commit,
+        id: ObjectId(identity.candidate.0),
+    };
+    assert!(store.read("demo", candidate).is_ok());
+    drop(store);
+    let store = Store::open_existing(directory.path(), config()).unwrap();
+    let replay = store.begin_landing("demo", owner, &input, 5000).unwrap();
+    assert_eq!(replay.state, LandingState::Committed);
+    assert!(replay.roots_retained);
+    assert_eq!(replay.receipt.as_ref().unwrap().reference.generation, 2);
+    let admission = store.pin_root("demo", candidate).unwrap();
+    let (_, bytes) = store.read_metadata("demo", candidate).unwrap();
+    let Object::Commit(commit) = tinytree_model::decode(&bytes, Limits::default()).unwrap() else {
+        panic!()
+    };
+    assert_eq!(commit.root_tree.terms, [identity.root_tree]);
+    assert_eq!(
+        store
+            .scan_pending_landings("demo", None, LandingScanLimits::default())
+            .unwrap()
+            .jobs[0]
+            .state,
+        LandingState::Committed
+    );
+    drop(admission);
+    let released = store
+        .expire_landing("demo", owner, "lost-ack", 5000)
+        .unwrap();
+    assert_eq!(released.state, LandingState::Committed);
+    assert!(!released.roots_retained);
+    assert_eq!(released.receipt, replay.receipt);
+    store.gc("demo", 5000).unwrap();
+    assert!(matches!(
+        store.read("demo", candidate),
+        Err(Error::MissingObject(_))
+    ));
+    assert!(matches!(
+        store.read("demo", source.key),
+        Err(Error::MissingObject(_))
+    ));
+    assert_eq!(
+        store
+            .finalize_landing("demo", owner, "lost-ack", 5000)
+            .unwrap(),
+        released
+    );
+    assert_eq!(
+        store.references("demo", &[input.reference_name]).unwrap()[0].generation,
+        3
+    );
+    assert!(
+        store
+            .scan_pending_landings("demo", None, LandingScanLimits::default())
+            .unwrap()
+            .jobs
+            .is_empty()
+    );
+}
+
+#[test]
+#[ignore = "manual authoritative Store phase benchmark"]
+fn benchmark_landing_store_phases_with_verified_file_closures() {
+    use std::time::Instant;
+    fn inventory(store: &Store) -> Vec<(u8, usize)> {
+        [
+            Kind::File,
+            Kind::Tree,
+            Kind::Commit,
+            Kind::Symlink,
+            Kind::CopyHistory,
+        ]
+        .into_iter()
+        .map(|kind| {
+            let mut count = 0;
+            let mut after = None;
+            loop {
+                let page = store.list_objects("demo", kind, after, 1024).unwrap();
+                count += page.len();
+                if page.len() < 1024 {
+                    break;
+                }
+                after = page.last().map(|d| d.key.id);
+            }
+            (kind as u8, count)
+        })
+        .collect()
+    }
+    for files in [64, 1024] {
+        for trial in 0..3 {
+            let (_directory, store) = open();
+            let mut values = Vec::new();
+            for index in 0..files {
+                let mut bytes = vec![0u8; 4096];
+                bytes[..8].copy_from_slice(&(index as u64).to_le_bytes());
+                let d = tinytree_model::describe_file(&bytes);
+                store.put("demo", d, &bytes, 0).unwrap();
+                values.push(TreeEntry {
+                    name: format!("file-{index:04}"),
+                    value: TreeValue::File {
+                        id: FileId(d.key.id.0),
+                        executable: false,
+                        size_bytes: 4096,
+                        copy_id: None,
+                    },
+                });
+            }
+            let base_tree = put_object(
+                &store,
+                Object::Tree(Tree {
+                    entries: values.clone(),
+                }),
+                0,
+            );
+            let base = landing_commit(
+                &store,
+                "demo",
+                CommitId::ROOT,
+                TreeId(base_tree.key.id.0),
+                1,
+                "benchmark base",
+            );
+            let changed = |index: usize, marker: u8| {
+                let mut bytes = vec![0u8; 4096];
+                bytes[..8].copy_from_slice(&(index as u64).to_le_bytes());
+                bytes[4095] = marker;
+                let d = tinytree_model::describe_file(&bytes);
+                store.put("demo", d, &bytes, 0).unwrap();
+                TreeValue::File {
+                    id: FileId(d.key.id.0),
+                    executable: false,
+                    size_bytes: 4096,
+                    copy_id: None,
+                }
+            };
+            let mut first_entries = values.clone();
+            first_entries[0].value = changed(0, 1);
+            let first_tree = put_object(
+                &store,
+                Object::Tree(Tree {
+                    entries: first_entries.clone(),
+                }),
+                0,
+            );
+            let first = landing_commit(
+                &store,
+                "demo",
+                CommitId(base.key.id.0),
+                TreeId(first_tree.key.id.0),
+                2,
+                "first source",
+            );
+            let mut second_entries = first_entries.clone();
+            second_entries[1].value = changed(1, 2);
+            let second_tree = put_object(
+                &store,
+                Object::Tree(Tree {
+                    entries: second_entries.clone(),
+                }),
+                0,
+            );
+            let second = landing_commit(
+                &store,
+                "demo",
+                CommitId(first.key.id.0),
+                TreeId(second_tree.key.id.0),
+                3,
+                "second source",
+            );
+            let destination_value = changed(2, 3);
+            let mut destination_entries = values.clone();
+            destination_entries[2].value = destination_value.clone();
+            let destination_tree = put_object(
+                &store,
+                Object::Tree(Tree {
+                    entries: destination_entries,
+                }),
+                0,
+            );
+            let dest = landing_commit(
+                &store,
+                "demo",
+                CommitId(base.key.id.0),
+                TreeId(destination_tree.key.id.0),
+                4,
+                "independent destination",
+            );
+            store
+                .publish("demo", &request("benchmark-initial", 0, Some(dest)), 0)
+                .unwrap();
+            let owner = LandingOwner([19; 32]);
+            let input = landing_request(base, second, dest, "benchmark");
+            first_entries[2].value = destination_value.clone();
+            second_entries[2].value = destination_value;
+            let expected_first = tinytree_model::encode(
+                &Object::Tree(Tree {
+                    entries: first_entries,
+                }),
+                Limits::default(),
+            )
+            .unwrap();
+            let expected_second = tinytree_model::encode(
+                &Object::Tree(Tree {
+                    entries: second_entries,
+                }),
+                Limits::default(),
+            )
+            .unwrap();
+            let expected_commit = |source: Descriptor, parent: CommitId, tree: TreeId| {
+                let (_, bytes) = store.read_metadata("demo", source.key).unwrap();
+                let Object::Commit(mut c) =
+                    tinytree_model::decode(&bytes, Limits::default()).unwrap()
+                else {
+                    panic!()
+                };
+                c.parents = vec![parent];
+                c.root_tree.terms = vec![tree];
+                c.committer = input.committer.clone();
+                tinytree_model::encode(&Object::Commit(c), Limits::default()).unwrap()
+            };
+            let expected_first_commit = expected_commit(
+                first,
+                CommitId(dest.key.id.0),
+                TreeId(expected_first.descriptor.key.id.0),
+            );
+            let expected_second_commit = expected_commit(
+                second,
+                CommitId(expected_first_commit.descriptor.key.id.0),
+                TreeId(expected_second.descriptor.key.id.0),
+            );
+            let before = inventory(&store);
+            let start = Instant::now();
+            let accepted = store.begin_landing("demo", owner, &input, 0).unwrap();
+            let begin_ns = start.elapsed().as_nanos();
+            assert_eq!(accepted.state, LandingState::Intent);
+            let start = Instant::now();
+            let prepared = store
+                .prepare_landing("demo", owner, "benchmark", 1)
+                .unwrap();
+            let prepare_ns = start.elapsed().as_nanos();
+            let candidate = prepared.candidate.as_ref().unwrap();
+            assert_eq!(candidate.head.0, expected_second_commit.descriptor.key.id.0);
+            assert_eq!(candidate.root_tree.0, expected_second.descriptor.key.id.0);
+            assert_eq!(
+                candidate
+                    .rewrites
+                    .iter()
+                    .map(|r| r.change_id)
+                    .collect::<Vec<_>>(),
+                [ChangeId([2; 16]), ChangeId([3; 16])]
+            );
+            let identity = landing_identity(&prepared);
+            let start = Instant::now();
+            store
+                .record_landing_check(
+                    "demo",
+                    owner,
+                    "benchmark",
+                    &identity,
+                    LandingVerdict {
+                        passed: true,
+                        evidence: [1; 32],
+                    },
+                    2,
+                )
+                .unwrap();
+            let check_ns = start.elapsed().as_nanos();
+            let start = Instant::now();
+            let done = store
+                .finalize_landing("demo", owner, "benchmark", 3)
+                .unwrap();
+            let finalize_ns = start.elapsed().as_nanos();
+            let receipt = done.receipt.as_ref().unwrap();
+            assert_eq!(receipt.rewrites.len(), 2);
+            assert_eq!(
+                receipt.reference.commit.unwrap().key.id.0,
+                identity.candidate.0
+            );
+            assert_eq!(
+                store.references("demo", &[input.reference_name]).unwrap()[0],
+                receipt.reference
+            );
+            let after = inventory(&store);
+            assert_eq!(before[0], after[0]);
+            assert_eq!(after[1].1 - before[1].1, 2);
+            assert_eq!(after[2].1 - before[2].1, 2);
+            println!(
+                "TINYTREE_LANDING_STORE_PHASE_V1 {}",
+                serde_json::json!({"files":files,"file_bytes":4096,"trial":trial,"begin_ns":begin_ns,"prepare_ns":prepare_ns,"record_check_ns":check_ns,"finalize_ns":finalize_ns,"logical_strict_file_closure_bytes":(files+3)*4096,"builder":{"metadata_reads":candidate.stats.metadata_reads,"metadata_bytes":candidate.stats.metadata_bytes,"work":candidate.stats.work,"encoded_output_bytes":candidate.stats.output_bytes},"inventory_before":before,"inventory_after":after,"scope":"authoritative Store component; setup excluded; strict FILE verification enabled; check verdict fixture only; not RPC, runner, WAN, or IO-byte measurement"})
+            );
+        }
+    }
+}

@@ -8,6 +8,7 @@ description = "Durable native repository objects and compare-and-set references"
 [dependencies]
 packblob = { path = "../packblob" }
 tinytree-model = { path = "../tinytree-model" }
+tinytree-landing = { path = "../tinytree-landing" }
 tinytree-cloud = { path = "../tinytree-cloud" }
 blake3 = "1"
 fjall = "=3.1.12"

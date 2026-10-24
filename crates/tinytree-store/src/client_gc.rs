@@ -203,9 +203,9 @@ impl Store {
         gate: &Runtime,
     ) -> Result<ClientGcPlan> {
         let repository = self.inner.repository(repo)?;
-        if self.inner.has_cloud_state(repo)? {
+        if self.inner.has_cloud_state(repo)? || self.inner.has_landing_state(repo)? {
             return Err(Error::Invalid(
-                "cloud state requires authoritative server GC",
+                "authoritative service state requires server GC",
             ));
         }
         if !Weak::ptr_eq(&request.epoch.owner, &Arc::downgrade(&self.inner))

@@ -2452,10 +2452,12 @@ impl Inner {
             payload: 0,
         };
         let plan = self.retained_cloud_plan(Some(repo), None, false, &mut scan)?;
-        if added.is_empty() && plan.versions.is_empty() {
+        let landing = self.landing_roots(repo)?;
+        if added.is_empty() && plan.versions.is_empty() && landing.is_empty() {
             return Ok(());
         }
         let mut roots = plan.native;
+        roots.extend(landing);
         roots.insert(tinytree_model::empty_tree().descriptor.key);
         roots.extend(added.iter().copied());
         let changed_key = replacement.map(|(name, _)| key(repo, name.as_bytes()));
