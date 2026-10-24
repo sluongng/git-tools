@@ -1697,7 +1697,10 @@ fn federated_index_production_factory_preserves_operations_and_drains_cli_querie
     let packs_before_upload = local_capture_bundles(&fixture);
     fixture.stop_daemon();
     fixture.enable_capture_upload();
+    let upload_benchmark = (std::env::var("TINYTREE_CAPTURE_UPLOAD_BENCH").as_deref() == Ok("1"))
+        .then(|| (upstream.startup_counters(), Instant::now()));
     fixture.start();
+    let daemon_ready = Instant::now();
     let expected_publications = queued_before_upload["pending_count"].as_u64().unwrap();
     let deadline = Instant::now() + Duration::from_secs(90);
     let published = loop {
@@ -1713,6 +1716,17 @@ fn federated_index_production_factory_preserves_operations_and_drains_cli_querie
         );
         std::thread::sleep(Duration::from_millis(50));
     };
+    // Snapshot before verification adds any traffic. Reporting remains optional
+    // and uses the existing readiness/publication observations, not extra RPCs.
+    let upload_measurement = upload_benchmark.map(|(before, started)| {
+        let observed = Instant::now();
+        (
+            started,
+            daemon_ready,
+            observed,
+            upstream.startup_counters().subtract(before),
+        )
+    });
     assert_eq!(published["local_roots_retained"], true);
     assert_eq!(published["current_backup_availability_verified"], false);
     assert_eq!(published["last_disposition"], "published_roots_retained");
@@ -1829,6 +1843,36 @@ fn federated_index_production_factory_preserves_operations_and_drains_cli_querie
         jj_native_index::NAME
     );
     assert!(index.join("manifest").is_file());
+    if let Some((started, ready, observed, counters)) = upload_measurement {
+        // Emit only after the full semantic, retention and restart proofs pass.
+        // These are local-loopback backlog measurements, not wire byte counts
+        // or isolated upload latency; source caches reflect preceding commands.
+        eprintln!(
+            "{}",
+            serde_json::json!({
+                "schema":1,"benchmark":"native_capture_upload_backlog",
+                "measurement":true,"status":"completed",
+                "workspace_provider":"actual_linux_fuse","transport":"authenticated_zstd_loopback",
+                "source_metadata_cache":"warm_after_commands",
+                "daemon_process":"restarted_with_existing_private_state",
+                "target":"base_history_present_authored_draft_file_missing",
+                "queued_capture_count":expected_publications,
+                "pending_capture_accounted_bytes":queued_before_upload["pending_bytes"],
+                "pending_root_claims":queued_before_upload["pending_root_claims"],
+                "local_pack_encoded_bytes":packs_before_upload.values().map(Vec::len).sum::<usize>(),
+                "known_new_authored_file_bytes":authored_bytes.len(),
+                "daemon_start_observed_ns":ready.duration_since(started).as_nanos(),
+                "daemon_ready_to_all_published_observed_ns":observed.duration_since(ready).as_nanos(),
+                "startup_to_all_published_observed_ns":observed.duration_since(started).as_nanos(),
+                "source_read_counters":counters,
+                "source_read_counters_exclude_upload_and_cloud_rpcs":true,
+                "daemon_readiness_poll_ms":20,"publication_observation_poll_ms":50,"uploader_poll_ms":250,
+                "every_retained_capture_verified":true,"restart_verified":true,
+                "public_refs_unchanged":true,"local_roots_and_packs_retained":true,
+                "not_wan_wire_bytes_rss_or_bazel_startup":true
+            })
+        );
+    }
 }
 
 fn local_capture_status(fixture: &Fixture) -> serde_json::Value {
