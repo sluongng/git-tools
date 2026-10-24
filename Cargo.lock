@@ -3723,12 +3723,22 @@ dependencies = [
  "getrandom 0.3.4",
  "jj-lib",
  "jj-native-backend",
+ "jj-native-index",
  "jj-vfs",
  "native-broker",
+ "native-vfs",
+ "native-vfs-controller",
+ "native-workspace",
+ "output-core",
  "private-fs",
  "serde",
  "serde_json",
  "tempfile",
+ "tinytree-cloud",
+ "tinytree-model",
+ "tokio",
+ "toml",
+ "tonic",
 ]
 
 [[package]]
@@ -5595,8 +5605,11 @@ dependencies = [
 name = "tinytree-cloud"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "blake3",
  "jj-lib",
+ "serde",
+ "serde_json",
  "tempfile",
  "thiserror 2.0.21",
  "tinytree-model",

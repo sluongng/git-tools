@@ -1551,3 +1551,105 @@ fn radix_history_reuses_artifacts_across_one_thousand_draft_operations() {
         unique.values().map(|(_, b)| b.len()).max().unwrap()
     );
 }
+
+#[test]
+fn capture_data_is_bounded_portable_data_not_frontend_authority() {
+    let zero = "00".repeat(64);
+    let root = [7; 32];
+    let mut data = CaptureData {
+        version: 1,
+        policy: CapturePolicy::HostQuiescentV1,
+        codec: CODEC.into(),
+        operation_heads: vec![zero.clone()],
+        working_copy: PortableWorkingCopy {
+            workspace: "default".into(),
+            wc_operation: zero.clone(),
+            snapshot_operation: zero.clone(),
+            snapshot_commit: [0; 32],
+            tree: CaptureTree {
+                terms: vec![m::empty_tree().descriptor.key.id.0],
+                labels: vec![],
+            },
+        },
+        operations: vec![OperationRecord {
+            operation: zero.clone(),
+            view: zero.clone(),
+            parents: vec![],
+        }],
+        indexes: vec![IndexRecord {
+            operation: zero.clone(),
+            root,
+        }],
+        blobs: vec![BlobRecord {
+            kind: 3,
+            id: "07".repeat(32),
+            blake3: [8; 32],
+            size: 128,
+        }],
+        roots: vec![],
+        remote: Some(PortableRemoteState {
+            observations: vec![],
+            archived_pushes: vec![ArchivedIntent {
+                reference: "refs/heads/main".into(),
+                bookmark: "main".into(),
+                generation: 1,
+                head: Some("09".repeat(32)),
+                request_id: "0a".repeat(16),
+                base_operation: zero.clone(),
+                confirmed_generation: Some(2),
+            }],
+        }),
+    };
+    let limits = CaptureDataLimits::default();
+    let bytes = encode_capture_data(&data, limits).unwrap();
+    let decoded = decode_data(&bytes, data_digest(&bytes), &limits).unwrap();
+    assert_eq!(
+        decoded, data,
+        "a policy label is portable data, not a live host proof"
+    );
+    let text = std::str::from_utf8(&bytes).unwrap();
+    for forbidden in [
+        "socket",
+        "repository_path",
+        "projection_generation",
+        "acknowledgement",
+        "receipt",
+    ] {
+        assert!(!text.contains(forbidden));
+    }
+    assert!(decode_data(&bytes, [0; 32], &limits).is_err());
+    assert!(
+        decode_data(
+            &bytes,
+            data_digest(&bytes),
+            &CaptureDataLimits {
+                max_bytes: bytes.len() - 1,
+                ..limits
+            }
+        )
+        .is_err()
+    );
+    let mut unknown: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    unknown["host_path"] = "/private/source".into();
+    let unknown = serde_json::to_vec(&unknown).unwrap();
+    assert!(decode_data(&unknown, data_digest(&unknown), &limits).is_err());
+    data.remote.as_mut().unwrap().archived_pushes[0].base_operation = "01".repeat(64);
+    assert!(
+        encode_capture_data(&data, limits).is_err(),
+        "archived intents retain exact OP ancestry"
+    );
+    data.remote = None;
+    data.operations.push(OperationRecord {
+        operation: "01".repeat(64),
+        view: zero,
+        parents: vec!["02".repeat(64)],
+    });
+    data.indexes.push(IndexRecord {
+        operation: "01".repeat(64),
+        root,
+    });
+    assert!(
+        encode_capture_data(&data, limits).is_err(),
+        "missing retained orphan parents are not ignored"
+    );
+}

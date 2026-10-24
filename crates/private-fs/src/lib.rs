@@ -135,6 +135,56 @@ impl PrivateDir {
     pub fn read(&self, name: impl AsRef<OsStr>, max_bytes: usize) -> io::Result<Vec<u8>> {
         let name = name.as_ref();
         single_name(name)?;
+        Self::read_regular(&self.path.join(name), max_bytes)
+    }
+
+    /// Read beneath this already owner-private directory without requiring
+    /// jj-created inner directories to have owner-only modes themselves. Every
+    /// parent remains no-follow, trusted-owner and non-unsafe-writable; the
+    /// inspected chain stays owned through the bounded regular-file read.
+    /// This never adopts a child as PrivateDir or changes permissions.
+    pub fn read_descendant(
+        &self,
+        relative: impl AsRef<Path>,
+        max_bytes: usize,
+    ) -> io::Result<Vec<u8>> {
+        let relative = relative.as_ref();
+        if relative.as_os_str().len() > 4096 {
+            return Err(invalid("private descendant path too long"));
+        }
+        let mut count = 0usize;
+        for component in relative.components() {
+            let Component::Normal(name) = component else {
+                return Err(invalid(
+                    "private descendant requires relative normal components",
+                ));
+            };
+            single_name(name)?;
+            count += 1;
+            if count > 16 {
+                return Err(invalid("private descendant path too deep"));
+            }
+        }
+        if count == 0 {
+            return Err(invalid("empty private descendant path"));
+        }
+        let path = self.path.join(relative);
+        let parent = path
+            .parent()
+            .ok_or_else(|| invalid("private descendant has no parent"))?;
+        #[cfg(unix)]
+        let _chain = unix::open_chain(parent, false)?;
+        #[cfg(windows)]
+        let _chain = windows::open_chain(parent, false)?;
+        #[cfg(not(any(unix, windows)))]
+        return Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "private descendant reads unsupported",
+        ));
+        Self::read_regular(&path, max_bytes)
+    }
+
+    fn read_regular(path: &Path, max_bytes: usize) -> io::Result<Vec<u8>> {
         if max_bytes == 0 || max_bytes > 64 * 1024 * 1024 {
             return Err(invalid("private file read limit must be within 1..64 MiB"));
         }
@@ -152,7 +202,7 @@ impl PrivateDir {
                 windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT,
             );
         }
-        let file = options.open(self.path.join(name))?;
+        let file = options.open(path)?;
         let metadata = file.metadata()?;
         if !metadata.is_file() || metadata.len() > max_bytes as u64 {
             return Err(invalid("private file is not regular or exceeds read limit"));

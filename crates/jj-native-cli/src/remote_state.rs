@@ -1,216 +1,20 @@
-//! Workspace-local publication state. This is deliberately outside jj's undoable
-//! operation graph: an undo cannot restore an old upstream CAS generation.
+//! Workspace-local I/O adapter over the shared validated remote-state codec.
 use crate::broker::Locator;
 use fs2::FileExt;
-use serde::{Deserialize, Serialize};
+use native_workspace_admin::remote_state::RemoteScope;
+pub(crate) use native_workspace_admin::remote_state::{
+    Kind, Observation, Pending, State, valid_hex, validate_names,
+};
 use std::{
     fs::{self, File, OpenOptions},
     io::{self, Read, Write},
     path::{Path, PathBuf},
 };
-
-const VERSION: u32 = 1;
 const MAX_BYTES: u64 = 1024 * 1024;
-const MAX_REFERENCES: usize = 128;
+fn scope(locator: &Locator) -> io::Result<RemoteScope> {
+    RemoteScope::new(locator.socket.clone(), locator.store.clone())
+}
 
-#[derive(Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct Observation {
-    pub reference: String,
-    pub bookmark: String,
-    pub generation: u64,
-    pub head: Option<String>,
-}
-#[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub(crate) enum Kind {
-    Fetch,
-    Push,
-}
-#[derive(Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct Pending {
-    pub kind: Kind,
-    pub reference: String,
-    pub bookmark: String,
-    pub generation: u64,
-    pub head: Option<String>,
-    pub request_id: String,
-    pub base_operation: String,
-    pub confirmed_generation: Option<u64>,
-}
-#[derive(Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct State {
-    version: u32,
-    socket: PathBuf,
-    store: String,
-    pub observations: Vec<Observation>,
-    pub pending: Option<Pending>,
-    #[serde(default)]
-    pub archived_pushes: Vec<Pending>,
-}
-impl State {
-    fn new(locator: &Locator) -> Self {
-        Self {
-            version: VERSION,
-            socket: locator.socket.clone(),
-            store: locator.store.clone(),
-            observations: vec![],
-            pending: None,
-            archived_pushes: vec![],
-        }
-    }
-    fn validate(&self, locator: &Locator) -> io::Result<()> {
-        if self.version != VERSION
-            || self.socket != locator.socket
-            || self.store != locator.store
-            || self.observations.len() > MAX_REFERENCES
-            || self.archived_pushes.len() > MAX_REFERENCES
-        {
-            return Err(io::Error::other(
-                "native remote state scope/version mismatch",
-            ));
-        }
-        let mut names = std::collections::HashSet::new();
-        let mut bookmarks = std::collections::HashSet::new();
-        for observation in &self.observations {
-            validate_names(&observation.reference, &observation.bookmark)?;
-            if !names.insert(&observation.reference)
-                || !bookmarks.insert(&observation.bookmark)
-                || (observation.head.is_some() && observation.generation == 0)
-                || observation
-                    .head
-                    .as_ref()
-                    .is_some_and(|id| !valid_hex(id, 64))
-            {
-                return Err(io::Error::other("invalid native remote observation"));
-            }
-        }
-        let mut intents = std::collections::HashSet::new();
-        for pending in self.pending.iter().chain(self.archived_pushes.iter()) {
-            validate_names(&pending.reference, &pending.bookmark)?;
-            if pending.head.as_ref().is_some_and(|id| !valid_hex(id, 64))
-                || !valid_hex(&pending.request_id, 32)
-                || pending.base_operation.is_empty()
-                || pending.base_operation.len() > 256
-                || pending
-                    .base_operation
-                    .bytes()
-                    .any(|b| !b.is_ascii_hexdigit())
-                || (pending.kind == Kind::Push && pending.head.is_none())
-                || !intents.insert(&pending.request_id)
-                || pending
-                    .confirmed_generation
-                    .is_some_and(|generation| pending.generation.checked_add(1) != Some(generation))
-            {
-                return Err(io::Error::other("invalid pending native operation"));
-            }
-        }
-        if let Some(pending) = &self.pending {
-            if pending.kind == Kind::Push
-                && self
-                    .observation(&pending.reference, &pending.bookmark)?
-                    .is_none_or(|observation| observation.generation != pending.generation)
-            {
-                return Err(io::Error::other(
-                    "pending native publication has a different observation",
-                ));
-            }
-        }
-        if self
-            .archived_pushes
-            .iter()
-            .any(|intent| intent.kind != Kind::Push)
-        {
-            return Err(io::Error::other("invalid archived native replay intent"));
-        }
-        Ok(())
-    }
-    pub fn prepare(&self, reference: &str, bookmark: &str) -> io::Result<()> {
-        if self.observation(reference, bookmark)?.is_none()
-            && self.observations.len() >= MAX_REFERENCES
-        {
-            return Err(io::Error::other(
-                "native reference observation limit exceeded",
-            ));
-        }
-        Ok(())
-    }
-    pub fn archive_pending_push(&mut self) -> io::Result<()> {
-        if self
-            .pending
-            .as_ref()
-            .is_some_and(|pending| pending.kind == Kind::Push)
-        {
-            if self.archived_pushes.len() >= MAX_REFERENCES {
-                return Err(io::Error::other(
-                    "native replay archive limit exceeded; original intent retained",
-                ));
-            }
-            self.archived_pushes.push(self.pending.take().unwrap());
-        }
-        Ok(())
-    }
-    pub fn observation(&self, reference: &str, bookmark: &str) -> io::Result<Option<&Observation>> {
-        let found = self
-            .observations
-            .iter()
-            .find(|entry| entry.reference == reference);
-        if (found.is_none()
-            && self
-                .observations
-                .iter()
-                .any(|entry| entry.bookmark == bookmark))
-            || found.is_some_and(|entry| entry.bookmark != bookmark)
-        {
-            return Err(io::Error::other(
-                "native reference is associated with another local bookmark",
-            ));
-        }
-        Ok(found)
-    }
-    pub fn record(&mut self, observation: Observation) -> io::Result<()> {
-        if let Some(current) = self
-            .observations
-            .iter_mut()
-            .find(|entry| entry.reference == observation.reference)
-        {
-            if current.bookmark != observation.bookmark {
-                return Err(io::Error::other("native reference bookmark changed"));
-            }
-            *current = observation;
-        } else {
-            if self.observations.len() >= MAX_REFERENCES {
-                return Err(io::Error::other(
-                    "native reference observation limit exceeded",
-                ));
-            }
-            self.observations.push(observation);
-        }
-        Ok(())
-    }
-}
-pub(crate) fn valid_hex(value: &str, length: usize) -> bool {
-    value.len() == length
-        && value
-            .bytes()
-            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
-}
-pub(crate) fn validate_names(reference: &str, bookmark: &str) -> io::Result<()> {
-    if reference.is_empty()
-        || reference.len() > 512
-        || reference.contains('\0')
-        || reference == "_tinytree"
-        || reference.starts_with("_tinytree/")
-        || bookmark.is_empty()
-        || bookmark.len() > 512
-        || bookmark.contains('\0')
-    {
-        return Err(io::Error::other("invalid native reference or bookmark"));
-    }
-    Ok(())
-}
 pub(crate) struct LockedState {
     root: PathBuf,
     _lock: File,
@@ -257,10 +61,10 @@ impl LockedState {
                 )
                 .map_err(|_| io::Error::other("invalid native remote state schema"))?
             }
-            Err(error) if error.kind() == io::ErrorKind::NotFound => State::new(locator),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => State::new(&scope(locator)?),
             Err(error) => return Err(error),
         };
-        state.validate(locator)?;
+        state.validate(&scope(locator)?)?;
         Ok(Self {
             root: root.to_owned(),
             _lock: lock,
@@ -327,7 +131,7 @@ pub(crate) fn retained_roots(
     .map_err(|_| io::Error::other("invalid native remote retention schema"))?;
     let locator = crate::broker::locator(&repo_path.join("store"))
         .map_err(|_| io::Error::other("native remote retention locator is unavailable"))?;
-    state.validate(&locator)?;
+    state.validate(&scope(&locator)?)?;
     let mut heads = state
         .observations
         .iter()
@@ -348,11 +152,7 @@ pub(crate) fn retained_roots(
             "native sidecar cannot retain an intrinsic commit as a publication target",
         ));
     }
-    let active_operations = state
-        .pending
-        .iter()
-        .map(|intent| intent.base_operation.clone())
-        .collect();
+    let active_operations = state.retained_operations().map(str::to_owned).collect();
     Ok(Some(RetentionInput {
         commit_heads: heads,
         active_operations,

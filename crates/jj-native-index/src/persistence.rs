@@ -428,7 +428,7 @@ impl Storage {
     ) -> Result<(Vec<SegmentId>, CheckpointSource), Error> {
         self.operation_export(id, limits, None)
     }
-    fn operation_export(
+    pub(super) fn operation_export(
         &self,
         id: &[u8; 64],
         limits: &Limits,

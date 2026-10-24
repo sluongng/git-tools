@@ -2532,8 +2532,24 @@ impl IndexArtifactSink for PortableArtifactSink {
 #[test]
 fn portable_export_preserves_exact_historical_indexes_and_never_invents_root_operation() {
     block_on(async {
-        let (_directory, _objects_directory, store, io, objects, _config) = fixture();
+        let (directory, _objects_directory, store, io, objects, config) = fixture();
         let mut sink = PortableArtifactSink::default();
+        let large_limits = Limits {
+            max_checkpoint_bytes: 256 * 1024 * 1024,
+            ..Limits::default()
+        };
+        assert!(
+            matches!(
+                LocalIndexExportReader::open_existing(
+                    &directory.path().join("must-not-be-opened"),
+                    &config,
+                    large_limits,
+                    4096
+                ),
+                Err(Error::Limit)
+            ),
+            "local open rejects an unadmitted loader before touching source paths"
+        );
         assert!(matches!(
             store
                 .export_operation_indexes(&[[0; 64]], Default::default(), &mut sink, Arc::new(()))
@@ -2648,6 +2664,43 @@ fn portable_export_preserves_exact_historical_indexes_and_never_invents_root_ope
             "hidden/promoted records survive exactly"
         );
         assert_eq!(result.artifacts().len(), sink.emitted.len());
+        let reader = LocalIndexExportReader::open_existing(
+            &directory.path().join("index"),
+            &config,
+            Limits::default(),
+            PortableExportLimits::default().max_working_bytes,
+        )
+        .unwrap();
+        let mut local_sink = PortableArtifactSink::default();
+        let local = reader
+            .export_operation_indexes(
+                &[[0; 64], [1; 64], [2; 64], [3; 64], [4; 64]],
+                Default::default(),
+                &mut local_sink,
+                Arc::new(()),
+            )
+            .await
+            .unwrap();
+        assert_eq!(local.operation_indexes(), result.operation_indexes());
+        assert_eq!(local.index_roots(), result.index_roots());
+        assert_eq!(local.artifacts(), result.artifacts());
+        assert_eq!(io.opens.load(Ordering::SeqCst), before_opens);
+        assert_eq!(io.facts_count.load(Ordering::SeqCst), before_facts);
+        let local_graph = tinytree_cloud::verify_index_artifact_graph(
+            local.index_roots(),
+            &local_sink.values,
+            Default::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            local_graph
+                .snapshot(local.operation_indexes()[4].root)
+                .unwrap(),
+            after
+        );
+        drop(local_graph);
+        drop(local);
+        drop(local_sink);
         drop(graph);
         drop(result);
         drop(sink);
@@ -2683,6 +2736,25 @@ fn portable_export_preserves_exact_historical_indexes_and_never_invents_root_ope
         );
         drop(held);
         assert!(owner_probe.upgrade().is_none());
+        let mut held = HoldSink(vec![]);
+        let retained = store
+            .export_operation_indexes(&[[0; 64]], Default::default(), &mut held, Arc::new(()))
+            .await
+            .unwrap();
+        let first_read = retained.reserve_local_read(&Limits::default()).unwrap();
+        assert!(
+            matches!(
+                retained.reserve_local_read(&Limits::default()),
+                Err(Error::Limit)
+            ),
+            "retained artifacts and source rechecks share one pool"
+        );
+        assert!(!held.0.is_empty());
+        drop(held);
+        let second_read = retained.reserve_local_read(&Limits::default()).unwrap();
+        drop(first_read);
+        drop(second_read);
+        drop(retained);
         for limits in [
             PortableExportLimits {
                 max_source_reads: 1,

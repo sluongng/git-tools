@@ -16,9 +16,19 @@ native-broker = { path = "../native-broker" }
 private-fs = { path = "../private-fs" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+toml = "1.1"
+output-core = { path = "../output-core" }
+native-vfs-controller = { path = "../native-vfs-controller" }
+native-workspace = { path = "../native-workspace" }
+jj-native-index = { path = "../jj-native-index" }
+jj-native-backend = { path = "../jj-native-backend" }
+tinytree-cloud = { path = "../tinytree-cloud" }
+tinytree-model = { path = "../tinytree-model" }
+async-trait = "0.1"
 
 [dev-dependencies]
-async-trait = "0.1"
+native-vfs = { path = "../native-vfs" }
+tokio = { version = "1", features = ["full"] }
+tonic = { version = "0.14", features = ["zstd"] }
 futures = "0.3"
-jj-native-backend = { path = "../jj-native-backend" }
 tempfile = "3"

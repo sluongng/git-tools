@@ -2,9 +2,11 @@
 //! Persisted descriptors do not prove object residency or remote retention.
 mod cleanup;
 pub use cleanup::CleanupHandle;
+mod local_export;
 mod memo;
 mod persistence;
 mod portable;
+pub use local_export::LocalIndexExportReader;
 mod portable_import;
 pub use portable_import::{PortableImportLimits, PortableImportReceipt, PortableImportVersion};
 mod source;

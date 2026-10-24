@@ -1,6 +1,9 @@
 //! External, per-workspace jj administration for mandatory lazy native mounts.
 //! The projected control marker contains an opaque ID, never an admin path.
 //! Only an owner-private registry supplies paths and local transport authority.
+pub mod capture;
+pub mod remote_state;
+
 use std::{
     fs::{self, File},
     io::Read,

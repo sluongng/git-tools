@@ -55,6 +55,31 @@ fn permissive_existing_directories_are_not_repaired() {
     assert!(PrivateDir::open_existing(&path).is_err());
     assert!(PrivateDir::create(&path).is_err());
     assert_eq!(std::fs::metadata(path).unwrap().mode() & 0o777, 0o755);
+    let private = PrivateDir::create(root.path().join("private")).unwrap();
+    let child = private.path().join("jj-store");
+    std::fs::create_dir(&child).unwrap();
+    std::fs::set_permissions(&child, std::fs::Permissions::from_mode(0o755)).unwrap();
+    std::fs::write(child.join("type"), b"native").unwrap();
+    assert!(PrivateDir::open_existing(&child).is_err());
+    assert_eq!(
+        private.read_descendant("jj-store/type", 6).unwrap(),
+        b"native"
+    );
+    assert_eq!(
+        std::fs::metadata(&child).unwrap().mode() & 0o777,
+        0o755,
+        "readonly descendant access never repairs or adopts the child"
+    );
+    assert!(private.read_descendant("jj-store/type", 5).is_err());
+    assert!(private.read_descendant("../escape", 6).is_err());
+    assert!(private.read_descendant(&child, 6).is_err());
+    assert!(private.read_descendant("jj-store", 6).is_err());
+    std::os::unix::fs::symlink(&child, private.path().join("alias")).unwrap();
+    assert!(private.read_descendant("alias/type", 6).is_err());
+    std::os::unix::fs::symlink(child.join("type"), child.join("type-link")).unwrap();
+    assert!(private.read_descendant("jj-store/type-link", 6).is_err());
+    std::fs::set_permissions(&child, std::fs::Permissions::from_mode(0o777)).unwrap();
+    assert!(private.read_descendant("jj-store/type", 6).is_err());
 }
 #[cfg(unix)]
 #[test]

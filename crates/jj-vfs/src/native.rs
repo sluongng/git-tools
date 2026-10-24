@@ -686,15 +686,47 @@ pub fn read_retained_state_bounded(
     repository: &str,
     max_bytes: usize,
 ) -> Result<RetainedState> {
+    let binding = binding(root, state_path, repository)?;
+    Ok(read_retained_state_for_capture(&binding, max_bytes)?.0)
+}
+
+/// Read private WC state against a previously trusted host binding without
+/// touching the mounted root. This is data validation, not frontend quiescence;
+/// a capture caller must independently retain its actual frontend fence.
+pub fn read_retained_state_for_capture(
+    binding: &ProjectionBinding,
+    max_bytes: usize,
+) -> Result<(RetainedState, ProjectionState)> {
     ensure!(
         max_bytes > 0,
         "native retained-state read limit must be positive"
     );
-    let binding = binding(root, state_path, repository)?;
+    for path in [&binding.root, &binding.state_path] {
+        ensure!(
+            path.is_absolute()
+                && path.as_os_str().len() <= 4096
+                && path.components().all(|part| match part {
+                    std::path::Component::RootDir | std::path::Component::Normal(_) => true,
+                    #[cfg(windows)]
+                    std::path::Component::Prefix(prefix) => matches!(
+                        prefix.kind(),
+                        std::path::Prefix::Disk(_) | std::path::Prefix::VerbatimDisk(_)
+                    ),
+                    _ => false,
+                }),
+            "capture binding paths must be normalized and absolute"
+        );
+    }
+    ensure!(
+        !binding.root.starts_with(&binding.state_path)
+            && !binding.state_path.starts_with(&binding.root),
+        "native working-copy state must be outside the projection"
+    );
     let directory = PrivateDir::open_existing(&binding.state_path)?;
     let bytes = directory.read(STATE, max_bytes.min(MAX_STATE_BYTES))?;
     let state: State = serde_json::from_slice(&bytes)?;
-    state.validate(&binding)?;
+    state.validate(binding)?;
+    let projection = state.projection.clone();
     let encoded_bytes = bytes.len();
     let state_fingerprint = jj_lib::content_hash::blake2b_hash(bytes.as_slice()).into();
     let persisted_bytes = Arc::from(bytes.into_boxed_slice());
@@ -719,17 +751,20 @@ pub fn read_retained_state_bounded(
             trees.push(receipt.after.tree.clone());
         }
     }
-    Ok(RetainedState {
-        operation: OperationId::try_from_hex(&state.operation).unwrap(),
-        workspace: state.workspace.into(),
-        trees,
-        pending: state.pending.is_some()
-            || state.unfinished.is_some()
-            || state.acknowledgement.is_some(),
-        persisted_bytes,
-        state_fingerprint,
-        encoded_bytes,
-    })
+    Ok((
+        RetainedState {
+            operation: OperationId::try_from_hex(&state.operation).unwrap(),
+            workspace: state.workspace.into(),
+            trees,
+            pending: state.pending.is_some()
+                || state.unfinished.is_some()
+                || state.acknowledgement.is_some(),
+            persisted_bytes,
+            state_fingerprint,
+            encoded_bytes,
+        },
+        projection,
+    ))
 }
 
 impl WorkingCopyFactory for NativeVfsWorkingCopyFactory {
@@ -1505,6 +1540,47 @@ mod tests {
             .unwrap();
             assert_eq!(first.persisted_bytes.as_ref(), original);
             assert_eq!(first.encoded_bytes, original.len());
+            let trusted = binding(&fixture.root, &fixture.state_path, "fixture").unwrap();
+            #[cfg(windows)]
+            {
+                assert!(
+                    matches!(trusted.root.components().next(), Some(std::path::Component::Prefix(prefix))
+                    if matches!(prefix.kind(), std::path::Prefix::Disk(_) | std::path::Prefix::VerbatimDisk(_)))
+                );
+                for root in [
+                    r"relative",
+                    r"C:\capture\..\escape",
+                    r"\\server\share\capture",
+                    r"\\.\pipe\capture",
+                ] {
+                    let mut invalid = trusted.clone();
+                    invalid.root = root.into();
+                    let error =
+                        read_retained_state_for_capture(&invalid, original.len()).unwrap_err();
+                    assert!(error.to_string().contains("normalized and absolute"));
+                }
+            }
+            let hidden = fixture.root.with_extension("capture-paused");
+            std::fs::rename(&fixture.root, &hidden).unwrap();
+            let (captured, projection) =
+                read_retained_state_for_capture(&trusted, original.len()).unwrap();
+            assert_eq!(captured.persisted_bytes, first.persisted_bytes);
+            assert_eq!(projection.tree, first.trees[0]);
+            assert!(
+                read_retained_state_bounded(
+                    &fixture.root,
+                    &fixture.state_path,
+                    "fixture",
+                    original.len()
+                )
+                .is_err(),
+                "ordinary reader still resolves the mount; trusted capture reader never probes it"
+            );
+            let mut foreign = trusted.clone();
+            foreign.root = hidden.clone();
+            assert!(read_retained_state_for_capture(&foreign, original.len()).is_err());
+            assert!(read_retained_state_for_capture(&trusted, original.len() - 1).is_err());
+            std::fs::rename(&hidden, &fixture.root).unwrap();
             let mut changed = original.clone();
             changed.push(b' ');
             PrivateDir::open_existing(&fixture.state_path)
