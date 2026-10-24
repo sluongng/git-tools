@@ -106,9 +106,9 @@ fn group_active(_: i32) -> Result<bool> {
     anyhow::bail!("native process-group proof requires Linux")
 }
 async fn teardown(group: i32) -> Result<()> {
-    if !group_active(group)? {
-        return Ok(());
-    }
+    ensure!(group > 0, "invalid process group");
+    // The unreaped leader reserves this group identity. A /proc census is not
+    // atomic with fork/exit, so an empty observation cannot replace signaling.
     #[cfg(unix)]
     unsafe {
         libc::kill(-group, libc::SIGTERM);
@@ -117,15 +117,13 @@ async fn teardown(group: i32) -> Result<()> {
     while group_active(group)? && Instant::now() < deadline {
         sleep(Duration::from_millis(25)).await;
     }
-    if group_active(group)? {
-        #[cfg(unix)]
-        unsafe {
-            libc::kill(-group, libc::SIGKILL);
-        }
-        let deadline = Instant::now() + Duration::from_secs(2);
-        while group_active(group)? && Instant::now() < deadline {
-            sleep(Duration::from_millis(25)).await;
-        }
+    #[cfg(unix)]
+    unsafe {
+        libc::kill(-group, libc::SIGKILL);
+    }
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while group_active(group)? && Instant::now() < deadline {
+        sleep(Duration::from_millis(25)).await;
     }
     ensure!(!group_active(group)?, "process group is not quiescent");
     Ok(())
