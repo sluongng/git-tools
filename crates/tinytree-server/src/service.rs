@@ -33,6 +33,7 @@ pub struct RepositoryService {
     inner: Arc<Inner>,
     query: Option<Arc<crate::query_index::QueryHost>>,
     cloud: Option<Arc<crate::cloud::CloudHost>>,
+    landing: Arc<crate::landing::LandingHost>,
 }
 struct Inner {
     store: tinytree_store::Store,
@@ -73,7 +74,15 @@ impl RepositoryService {
         {
             return Err(ConfigError("invalid native repository identifiers"));
         }
+        config.landing.validate_repositories(&repositories)?;
+        for principal in &principals {
+            config
+                .landing
+                .validate_grants(&principal.landing_profiles)?;
+        }
         let auth = Authorization::new(principals, &repositories)?;
+        let landing =
+            crate::landing::LandingHost::new(store.clone(), config.landing.clone(), &repositories)?;
         let cloud = if config.cloud.enabled {
             Some(crate::cloud::CloudHost::new(
                 store.clone(),
@@ -98,6 +107,7 @@ impl RepositoryService {
         Ok(Self {
             query: None,
             cloud,
+            landing,
             inner: Arc::new(Inner {
                 store,
                 global: Arc::new(Semaphore::new(config.max_inflight)),
@@ -126,6 +136,20 @@ impl RepositoryService {
             &self.inner.config,
         )?);
         Ok(self)
+    }
+    pub fn landing_grpc_service(&self) -> crate::LandingGrpcService {
+        crate::LandingGrpcService::new(self.clone())
+    }
+    pub(crate) fn landing_host(&self) -> Arc<crate::landing::LandingHost> {
+        self.landing.clone()
+    }
+    /// Start bounded preparation/expiry discovery when assembling a custom
+    /// transport. The supported TCP and Unix listener helpers call this once.
+    pub fn start_landing_worker(&self) -> Result<(), Status> {
+        self.landing.start()
+    }
+    pub async fn drain_landing(&self) {
+        self.landing.drain().await;
     }
     pub fn cloud_grpc_service(&self) -> crate::CloudGrpcService {
         crate::CloudGrpcService::new(self.clone())
@@ -1113,7 +1137,7 @@ fn descriptor(value: &p::ObjectDescriptor) -> Result<Descriptor, Status> {
         format_version: tinytree_model::FORMAT_VERSION,
     })
 }
-fn descriptor_wire(value: Descriptor) -> p::ObjectDescriptor {
+pub(crate) fn descriptor_wire(value: Descriptor) -> p::ObjectDescriptor {
     p::ObjectDescriptor {
         key: Some(key_wire(value.key)),
         content_blake3: value.key.id.0.to_vec(),

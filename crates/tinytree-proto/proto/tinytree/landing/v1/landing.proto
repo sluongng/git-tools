@@ -1,0 +1,77 @@
+syntax = "proto3";
+package tinytree.landing.v1;
+import "tinytree/v1/repository.proto";
+
+// Preparation/status only. No client verdict or publication RPC is provided.
+service Landing {
+  rpc StartLanding(StartLandingRequest) returns (LandingResponse);
+  rpc GetLanding(GetLandingRequest) returns (LandingResponse);
+}
+message StartLandingRequest {
+  string repository_id = 1;
+  string idempotency_key = 2;
+  bytes source_base = 3; // Exactly 32 bytes, including the intrinsic root.
+  bytes source_head = 4;
+  string destination = 5;
+  uint64 expected_generation = 6;
+  bytes expected_head = 7;
+  string profile_name = 8;
+  string expected_profile_version = 9;
+}
+message GetLandingRequest {
+  string repository_id = 1;
+  string idempotency_key = 2;
+}
+message LandingResponse {
+  LandingJob job = 1;
+  string repository_id = 2;
+  string idempotency_key = 3;
+}
+enum Phase {
+  PHASE_UNSPECIFIED = 0;
+  INTENT = 1;
+  PREPARED_PENDING_CHECKS = 2;
+  CHECKED = 3;
+  COMMITTED = 4;
+  CONFLICT = 5;
+  UNSUPPORTED = 6;
+  CHECK_FAILED = 7;
+  STALE_TARGET = 8;
+  EXPIRED = 9;
+}
+enum PreparationAvailability {
+  PREPARATION_UNSPECIFIED = 0;
+  PROFILE_CONFIGURED = 1;
+  PROFILE_UNAVAILABLE = 2;
+  PREPARATION_DISABLED = 3;
+}
+message Rewrite {
+  bytes old_commit = 1;
+  bytes new_commit = 2;
+  bytes change_id = 3; // 16-byte native ChangeId.
+}
+message Candidate {
+  bytes head = 1;
+  bytes root_tree = 2;
+  // Non-identity relations only; unchanged commits are not evolution edges.
+  repeated Rewrite rewrites = 3;
+}
+message Receipt {
+  tinytree.v1.Reference reference = 1;
+  repeated Rewrite rewrites = 2;
+  bytes evidence = 3;
+}
+message LandingJob {
+  bytes id = 1;
+  Phase phase = 2;
+  bool roots_retained = 3;
+  int64 expires_at_seconds = 4;
+  string profile_name = 5;
+  string profile_version = 6;
+  Candidate candidate = 7;
+  Receipt receipt = 8;
+  optional string conflict_path = 9;
+  // Current configuration readiness, not a check verdict. Accepted intent
+  // authorization is frozen; removing a launch grant does not cancel the job.
+  PreparationAvailability preparation = 10;
+}

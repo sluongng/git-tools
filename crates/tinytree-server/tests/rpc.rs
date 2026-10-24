@@ -1146,6 +1146,7 @@ async fn failed_startup_never_creates_storage_or_runs_gc() {
         write: true,
         retain: false,
         cloud: false,
+        landing_profiles: Vec::new(),
     }];
     assert!(serve(config.clone(), std::future::pending()).await.is_err());
     assert!(!config.storage.exists());
@@ -1241,6 +1242,41 @@ async fn unix_listener_requires_private_real_parent_and_preserves_replacement() 
         std::fs::metadata(&socket).unwrap().permissions().mode() & 0o777,
         0o600
     );
+    let endpoint_socket = socket.clone();
+    let channel = Endpoint::from_static("http://localhost")
+        .connect_with_connector(tower::service_fn(move |_| {
+            let path = endpoint_socket.clone();
+            async move {
+                tokio::net::UnixStream::connect(path)
+                    .await
+                    .map(hyper_util::rt::TokioIo::new)
+            }
+        }))
+        .await
+        .unwrap();
+    let mut landing = tinytree_proto::landing_v1::landing_client::LandingClient::new(channel)
+        .send_compressed(CompressionEncoding::Zstd)
+        .accept_compressed(CompressionEncoding::Zstd);
+    assert_eq!(
+        landing
+            .get_landing(tinytree_proto::landing_v1::GetLandingRequest {
+                repository_id: "alpha".into(),
+                idempotency_key: "absent".into()
+            })
+            .await
+            .unwrap_err()
+            .code(),
+        Code::NotFound
+    );
+    assert_eq!(
+        landing
+            .start_landing(tinytree_proto::landing_v1::StartLandingRequest::default())
+            .await
+            .unwrap_err()
+            .code(),
+        Code::Unavailable
+    );
+    drop(landing);
     std::fs::rename(&socket, temporary.path().join("old.sock")).unwrap();
     std::fs::write(&socket, "replacement owned by caller").unwrap();
     stop.send(()).unwrap();
@@ -7675,4 +7711,671 @@ async fn benchmark_indexed_search_cold_warm_and_single_file_iteration() {
             }
         }
     }).await.unwrap();
+}
+
+fn landing_config() -> tinytree_server::Config {
+    let mut config: tinytree_server::Config =
+        toml::from_str(include_str!("../examples/landing.toml")).unwrap();
+    config.repositories = vec!["alpha".into(), "beta".into()];
+    config.service.landing.profiles[0].repositories = vec!["alpha".into()];
+    config.principals.clear();
+    config.service.landing.poll_interval_ms = 10;
+    config.validate().unwrap();
+    config
+}
+fn landing_principals(grant: bool) -> Vec<Principal> {
+    vec![
+        Principal::new("alpha", ALPHA, vec!["alpha".into()], grant)
+            .unwrap()
+            .with_landing_profiles(if grant { vec!["checks".into()] } else { vec![] }),
+        Principal::new("peer", PEER, vec!["alpha".into()], true)
+            .unwrap()
+            .with_landing_profiles(vec!["checks".into()]),
+        Principal::new("beta", BETA, vec!["beta".into()], true)
+            .unwrap()
+            .with_landing_profiles(vec!["checks".into()]),
+        Principal::new("reader", READER, vec!["alpha".into()], false)
+            .unwrap()
+            .with_landing_profiles(vec!["checks".into()]),
+    ]
+}
+fn landing_setup() -> (
+    tempfile::TempDir,
+    Store,
+    tinytree_server::Config,
+    tinytree_proto::landing_v1::StartLandingRequest,
+) {
+    let config = landing_config();
+    let temporary = tempfile::tempdir().unwrap();
+    let store = Store::open(
+        temporary.path(),
+        config.store.materialize(config.service.max_metadata_bytes),
+    )
+    .unwrap();
+    store.create_repository("alpha").unwrap();
+    store.create_repository("beta").unwrap();
+    let fixture = fixture();
+    for object in fixture.objects() {
+        store
+            .put("alpha", object.descriptor, &object.bytes, 0)
+            .unwrap();
+    }
+    let base = root(&fixture);
+    let (_, bytes) = store.read_metadata("alpha", base).unwrap();
+    let Object::Commit(mut draft) = tinytree_model::decode(&bytes, Limits::default()).unwrap()
+    else {
+        panic!()
+    };
+    draft.parents = vec![CommitId(base.id.0)];
+    draft.change_id = tinytree_model::ChangeId([99; 16]);
+    draft.description = "private source draft".into();
+    let source = tinytree_model::encode(&Object::Commit(draft), Limits::default()).unwrap();
+    store
+        .put("alpha", source.descriptor, &source.bytes, 0)
+        .unwrap();
+    store
+        .publish(
+            "alpha",
+            &tinytree_store::PublishRequest {
+                idempotency_key: "landing-baseline".into(),
+                reference_name: "main".into(),
+                expected_generation: 0,
+                new_commit: Some(CommitId(base.id.0)),
+                staging_leases: vec![],
+            },
+            0,
+        )
+        .unwrap();
+    let input = tinytree_proto::landing_v1::StartLandingRequest {
+        repository_id: "alpha".into(),
+        idempotency_key: "landing-rpc".into(),
+        source_base: base.id.0.to_vec(),
+        source_head: source.descriptor.key.id.0.to_vec(),
+        destination: "main".into(),
+        expected_generation: 1,
+        expected_head: base.id.0.to_vec(),
+        profile_name: "checks".into(),
+        expected_profile_version: "v1".into(),
+    };
+    (temporary, store, config, input)
+}
+impl Running {
+    async fn landing_client(
+        &self,
+    ) -> tinytree_proto::landing_v1::landing_client::LandingClient<Channel> {
+        let channel = Endpoint::from_shared(format!("http://{}", self.address))
+            .unwrap()
+            .connect()
+            .await
+            .unwrap();
+        tinytree_proto::landing_v1::landing_client::LandingClient::new(channel)
+            .send_compressed(CompressionEncoding::Zstd)
+            .accept_compressed(CompressionEncoding::Zstd)
+    }
+    async fn start_landing(
+        store: Store,
+        config: ServiceConfig,
+        principals: Vec<Principal>,
+        dispatch: bool,
+    ) -> Self {
+        let service = RepositoryService::new(
+            store,
+            config,
+            vec!["alpha".into(), "beta".into()],
+            principals,
+        )
+        .unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (stop, stopped) = oneshot::channel();
+        let task = if dispatch {
+            tokio::spawn(serve_tcp(listener, service, None, async {
+                let _ = stopped.await;
+            }))
+        } else {
+            // Crash-window fixture: accept through the actual compressed RPC
+            // boundary before starting dispatch, then reopen with the listener
+            // helper which must discover accepted work without a client retry.
+            tokio::spawn(async move {
+                tonic::transport::Server::builder()
+                    .layer(service.deadline_layer())
+                    .add_service(service.landing_grpc_service())
+                    .serve_with_incoming_shutdown(
+                        tokio_stream::wrappers::TcpListenerStream::new(listener),
+                        async {
+                            let _ = stopped.await;
+                        },
+                    )
+                    .await?;
+                service.drain_landing().await;
+                Ok(())
+            })
+        };
+        Self {
+            address,
+            stop: Some(stop),
+            task: Some(task),
+        }
+    }
+}
+
+#[tokio::test]
+async fn landing_preparation_is_owner_scoped_compressed_replayable_and_never_publishes() {
+    use tinytree_proto::landing_v1 as l;
+    let (_temporary, store, config, input) = landing_setup();
+    let running = Running::start_landing(
+        store.clone(),
+        config.service,
+        landing_principals(true),
+        true,
+    )
+    .await;
+    let mut client = running.landing_client().await;
+    let initial = client
+        .start_landing(request(input.clone(), ALPHA))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(initial.repository_id, input.repository_id);
+    assert_eq!(initial.idempotency_key, input.idempotency_key);
+    let initial = initial.job.unwrap();
+    assert_eq!(initial.phase, l::Phase::Intent as i32);
+    assert!(initial.candidate.is_none());
+    assert_eq!(initial.profile_version, "v1");
+    assert!(initial.roots_retained);
+    let get = l::GetLandingRequest {
+        repository_id: "alpha".into(),
+        idempotency_key: input.idempotency_key.clone(),
+    };
+    let echo = client
+        .get_landing(request(get.clone(), ALPHA))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(echo.repository_id, get.repository_id);
+    assert_eq!(echo.idempotency_key, get.idempotency_key);
+
+    let prepared = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let job = client
+                .get_landing(request(get.clone(), ALPHA))
+                .await
+                .unwrap()
+                .into_inner()
+                .job
+                .unwrap();
+            if job.phase == l::Phase::PreparedPendingChecks as i32 {
+                break job;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert!(prepared.candidate.is_some());
+    assert!(prepared.receipt.is_none());
+    assert_eq!(
+        prepared.preparation,
+        l::PreparationAvailability::ProfileConfigured as i32
+    );
+    assert_eq!(
+        store.references("alpha", &["main".into()]).unwrap()[0].generation,
+        1
+    );
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    let replay = client
+        .start_landing(request(input.clone(), ALPHA))
+        .await
+        .unwrap()
+        .into_inner()
+        .job
+        .unwrap();
+    assert_eq!(replay.id, initial.id);
+    assert_eq!(replay.expires_at_seconds, initial.expires_at_seconds);
+    assert_eq!(replay.candidate, prepared.candidate);
+    assert_eq!(
+        client
+            .get_landing(request(get.clone(), PEER))
+            .await
+            .unwrap_err()
+            .code(),
+        Code::NotFound
+    );
+    assert_eq!(
+        client
+            .get_landing(request(get.clone(), BETA))
+            .await
+            .unwrap_err()
+            .code(),
+        Code::PermissionDenied
+    );
+    let mut changed = input.clone();
+    changed.source_head = [7u8; 32].to_vec();
+    assert_eq!(
+        client
+            .start_landing(request(changed, ALPHA))
+            .await
+            .unwrap_err()
+            .code(),
+        Code::AlreadyExists
+    );
+    let mut high_ratio = input.clone();
+    high_ratio.idempotency_key = "decompression-cap".into();
+    high_ratio.destination = "a".repeat(128 * 1024);
+    let error = client
+        .start_landing(request(high_ratio, ALPHA))
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        error.code(),
+        Code::ResourceExhausted | Code::OutOfRange
+    ));
+    assert_eq!(
+        client
+            .get_landing(request(
+                l::GetLandingRequest {
+                    repository_id: "alpha".into(),
+                    idempotency_key: "decompression-cap".into()
+                },
+                ALPHA
+            ))
+            .await
+            .unwrap_err()
+            .code(),
+        Code::NotFound
+    );
+    let mut malformed = input.clone();
+    malformed.source_head.pop();
+    assert_eq!(
+        client
+            .start_landing(request(malformed, ALPHA))
+            .await
+            .unwrap_err()
+            .code(),
+        Code::InvalidArgument
+    );
+    let mut wrong = input.clone();
+    wrong.idempotency_key = "wrong-profile".into();
+    wrong.profile_name = "other".into();
+    assert_eq!(
+        client
+            .start_landing(request(wrong, ALPHA))
+            .await
+            .unwrap_err()
+            .code(),
+        Code::PermissionDenied
+    );
+    let mut wrong = input.clone();
+    wrong.idempotency_key = "wrong-version".into();
+    wrong.expected_profile_version = "v2".into();
+    assert_eq!(
+        client
+            .start_landing(request(wrong, ALPHA))
+            .await
+            .unwrap_err()
+            .code(),
+        Code::FailedPrecondition
+    );
+    assert_eq!(
+        client
+            .start_landing(request(input.clone(), READER))
+            .await
+            .unwrap_err()
+            .code(),
+        Code::PermissionDenied
+    );
+    let mut wrong = input;
+    wrong.repository_id = "beta".into();
+    assert_eq!(
+        client
+            .start_landing(request(wrong, BETA))
+            .await
+            .unwrap_err()
+            .code(),
+        Code::FailedPrecondition
+    );
+    running.stop().await;
+}
+
+#[tokio::test]
+async fn landing_restart_discovers_intents_revalidates_profiles_and_preserves_owner_recovery_reads()
+{
+    use tinytree_proto::landing_v1 as l;
+    let (temporary, store, mut config, input) = landing_setup();
+    let running = Running::start_landing(
+        store.clone(),
+        config.service.clone(),
+        landing_principals(true),
+        false,
+    )
+    .await;
+    let mut client = running.landing_client().await;
+    let accepted = client
+        .start_landing(request(input.clone(), ALPHA))
+        .await
+        .unwrap()
+        .into_inner()
+        .job
+        .unwrap();
+    assert_eq!(accepted.phase, l::Phase::Intent as i32);
+    running.stop().await;
+    drop(client);
+    drop(store);
+    config.service.landing.profiles[0].version = "v2".into();
+    let store = Store::open_existing(
+        temporary.path(),
+        config.store.materialize(config.service.max_metadata_bytes),
+    )
+    .unwrap();
+    let running = Running::start_landing(
+        store.clone(),
+        config.service.clone(),
+        landing_principals(false),
+        true,
+    )
+    .await;
+    let mut client = running.landing_client().await;
+    let get = l::GetLandingRequest {
+        repository_id: "alpha".into(),
+        idempotency_key: input.idempotency_key.clone(),
+    };
+    tokio::time::sleep(Duration::from_millis(30)).await;
+    let unchanged = client
+        .get_landing(request(get.clone(), ALPHA))
+        .await
+        .unwrap()
+        .into_inner()
+        .job
+        .unwrap();
+    assert_eq!(unchanged.phase, l::Phase::Intent as i32);
+    assert_eq!(
+        unchanged.preparation,
+        l::PreparationAvailability::ProfileUnavailable as i32
+    );
+    assert_eq!(
+        client
+            .start_landing(request(input.clone(), ALPHA))
+            .await
+            .unwrap_err()
+            .code(),
+        Code::PermissionDenied
+    );
+    running.stop().await;
+    drop(client);
+    drop(store);
+    config.service.landing.profiles[0].version = "v1".into();
+    let store = Store::open_existing(
+        temporary.path(),
+        config.store.materialize(config.service.max_metadata_bytes),
+    )
+    .unwrap();
+    let running = Running::start_landing(
+        store.clone(),
+        config.service.clone(),
+        landing_principals(false),
+        true,
+    )
+    .await;
+    let mut client = running.landing_client().await;
+    let prepared = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let job = client
+                .get_landing(request(get.clone(), ALPHA))
+                .await
+                .unwrap()
+                .into_inner()
+                .job
+                .unwrap();
+            if job.phase == l::Phase::PreparedPendingChecks as i32 {
+                break job;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(prepared.id, accepted.id);
+    assert!(prepared.receipt.is_none());
+    assert_eq!(
+        store.references("alpha", &["main".into()]).unwrap()[0].generation,
+        1
+    );
+    running.stop().await;
+}
+
+#[tokio::test]
+async fn landing_local_owner_launch_requires_explicit_scoped_opt_in_and_disabled_status_still_reads()
+ {
+    use tinytree_proto::landing_v1 as l;
+    let (_temporary, store, mut config, input) = landing_setup();
+    let running = Running::start_landing(store.clone(), config.service.clone(), vec![], true).await;
+    let mut client = running.landing_client().await;
+    assert_eq!(
+        client
+            .start_landing(input.clone())
+            .await
+            .unwrap_err()
+            .code(),
+        Code::PermissionDenied
+    );
+    running.stop().await;
+    config.service.landing.local_owner_profiles = vec!["checks".into()];
+    let running = Running::start_landing(store.clone(), config.service.clone(), vec![], true).await;
+    let mut client = running.landing_client().await;
+    let accepted = client
+        .start_landing(input.clone())
+        .await
+        .unwrap()
+        .into_inner()
+        .job
+        .unwrap();
+    running.stop().await;
+    let named = vec![Principal::new("local-owner", ALPHA, vec!["alpha".into()], true).unwrap()];
+    let running = Running::start_landing(store.clone(), config.service.clone(), named, true).await;
+    let mut client = running.landing_client().await;
+    assert_eq!(
+        client
+            .start_landing(request(input.clone(), ALPHA))
+            .await
+            .unwrap_err()
+            .code(),
+        Code::PermissionDenied
+    );
+    assert_eq!(
+        client
+            .get_landing(request(
+                l::GetLandingRequest {
+                    repository_id: "alpha".into(),
+                    idempotency_key: input.idempotency_key.clone()
+                },
+                ALPHA
+            ))
+            .await
+            .unwrap_err()
+            .code(),
+        Code::NotFound
+    );
+    running.stop().await;
+    config.service.landing.enabled = false;
+    let running = Running::start_landing(store.clone(), config.service, vec![], true).await;
+    let mut client = running.landing_client().await;
+    let job = client
+        .get_landing(l::GetLandingRequest {
+            repository_id: "alpha".into(),
+            idempotency_key: input.idempotency_key,
+        })
+        .await
+        .unwrap()
+        .into_inner()
+        .job
+        .unwrap();
+    assert_eq!(job.id, accepted.id);
+    assert_eq!(
+        job.preparation,
+        l::PreparationAvailability::PreparationDisabled as i32
+    );
+    running.stop().await;
+}
+
+#[tokio::test]
+async fn landing_poison_intent_does_not_starve_later_jobs_or_expiry_under_one_heavy_slot() {
+    use tinytree_proto::landing_v1 as l;
+    let (_temporary, store, mut config, input) = landing_setup();
+    let base = ObjectKey {
+        kind: Kind::Commit,
+        id: ObjectId(input.source_base.clone().try_into().unwrap()),
+    };
+    let (_, bytes) = store.read_metadata("alpha", base).unwrap();
+    let Object::Commit(template) = tinytree_model::decode(&bytes, Limits::default()).unwrap()
+    else {
+        panic!()
+    };
+    let mut parent = CommitId(base.id.0);
+    for index in 0..65 {
+        let mut commit = template.clone();
+        commit.parents = vec![parent];
+        let mut change = [(index + 1) as u8; 16];
+        if tinytree_model::ChangeId(change) == template.change_id {
+            change[15] ^= 1;
+        }
+        commit.change_id = tinytree_model::ChangeId(change);
+        commit.description = format!("oversized stack {index}");
+        let encoded = tinytree_model::encode(&Object::Commit(commit), Limits::default()).unwrap();
+        store
+            .put("alpha", encoded.descriptor, &encoded.bytes, 0)
+            .unwrap();
+        parent = CommitId(encoded.descriptor.key.id.0);
+    }
+    let running = Running::start_landing(
+        store.clone(),
+        config.service.clone(),
+        landing_principals(true),
+        false,
+    )
+    .await;
+    let mut client = running.landing_client().await;
+    let mut valid = input.clone();
+    valid.idempotency_key = "valid-after-poison".into();
+    let accepted = client
+        .start_landing(request(valid.clone(), ALPHA))
+        .await
+        .unwrap()
+        .into_inner()
+        .job
+        .unwrap();
+    let mut poison = input.clone();
+    poison.source_head = parent.0.to_vec();
+    let mut first_poison = None;
+    for index in 0..64 {
+        poison.idempotency_key = format!("poison-{index}");
+        let job = client
+            .start_landing(request(poison.clone(), ALPHA))
+            .await
+            .unwrap()
+            .into_inner()
+            .job
+            .unwrap();
+        if job.id < accepted.id {
+            first_poison = Some(poison.idempotency_key.clone());
+            break;
+        }
+    }
+    let first_poison =
+        first_poison.expect("fixed fixture must include a poison ID before the valid job");
+    running.stop().await;
+    config.service.landing.job_ttl_seconds = 1;
+    let running = Running::start_landing(
+        store.clone(),
+        config.service.clone(),
+        landing_principals(true),
+        false,
+    )
+    .await;
+    let mut client = running.landing_client().await;
+    let mut due = input.clone();
+    due.idempotency_key = "due-amid-poison".into();
+    let expiring = client
+        .start_landing(request(due.clone(), ALPHA))
+        .await
+        .unwrap()
+        .into_inner()
+        .job
+        .unwrap();
+    running.stop().await;
+    config.service.landing.job_ttl_seconds = 86400;
+    let running = Running::start_landing(
+        store.clone(),
+        config.service,
+        landing_principals(true),
+        true,
+    )
+    .await;
+    let mut client = running.landing_client().await;
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let job = client
+                .get_landing(request(
+                    l::GetLandingRequest {
+                        repository_id: "alpha".into(),
+                        idempotency_key: valid.idempotency_key.clone(),
+                    },
+                    ALPHA,
+                ))
+                .await
+                .unwrap()
+                .into_inner()
+                .job
+                .unwrap();
+            if job.phase == l::Phase::PreparedPendingChecks as i32 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let poison_job = client
+        .get_landing(request(
+            l::GetLandingRequest {
+                repository_id: "alpha".into(),
+                idempotency_key: first_poison,
+            },
+            ALPHA,
+        ))
+        .await
+        .unwrap()
+        .into_inner()
+        .job
+        .unwrap();
+    assert_eq!(poison_job.phase, l::Phase::Intent as i32);
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let job = client
+                .get_landing(request(
+                    l::GetLandingRequest {
+                        repository_id: "alpha".into(),
+                        idempotency_key: due.idempotency_key.clone(),
+                    },
+                    ALPHA,
+                ))
+                .await
+                .unwrap()
+                .into_inner()
+                .job
+                .unwrap();
+            if job.phase == l::Phase::Expired as i32 {
+                assert!(!job.roots_retained);
+                assert_eq!(job.id, expiring.id);
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(
+        store.references("alpha", &["main".into()]).unwrap()[0].generation,
+        1
+    );
+    running.stop().await;
 }

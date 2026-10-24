@@ -9,6 +9,7 @@ pub struct Principal {
     pub write: bool,
     pub retain: bool,
     pub cloud: bool,
+    pub landing_profiles: Vec<String>,
     token_hash: [u8; 32],
 }
 impl Principal {
@@ -37,8 +38,14 @@ impl Principal {
             write,
             retain: false,
             cloud: false,
+            landing_profiles: Vec::new(),
             token_hash: *blake3::hash(token.as_bytes()).as_bytes(),
         })
+    }
+    /// Explicit launch grants; repository write alone grants no landing work.
+    pub fn with_landing_profiles(mut self, profiles: Vec<String>) -> Self {
+        self.landing_profiles = profiles;
+        self
     }
     /// Private workspace history is an independent opt-in capability.
     pub fn with_cloud(mut self, enabled: bool) -> Self {
@@ -67,6 +74,23 @@ impl Authorization {
         };
         let mut ids = HashSet::new();
         for principal in principals {
+            if principal.landing_profiles.len() > 32
+                || principal.landing_profiles.iter().any(|p| {
+                    p.is_empty()
+                        || p.len() > 64
+                        || !p
+                            .bytes()
+                            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+                })
+                || principal
+                    .landing_profiles
+                    .iter()
+                    .collect::<HashSet<_>>()
+                    .len()
+                    != principal.landing_profiles.len()
+            {
+                return Err(ConfigError("invalid landing profile grants"));
+            }
             if !ids.insert(principal.id.clone())
                 || principal
                     .repositories
@@ -90,6 +114,8 @@ impl Authorization {
                 write: true,
                 retain: true,
                 cloud: true,
+                authenticated: false,
+                landing_profiles: Vec::new(),
             });
         }
         let header = metadata
@@ -111,6 +137,8 @@ impl Authorization {
             write: p.write,
             retain: p.retain,
             cloud: p.cloud,
+            authenticated: true,
+            landing_profiles: p.landing_profiles.clone(),
         })
     }
 }
@@ -120,8 +148,46 @@ pub(crate) struct Identity {
     write: bool,
     retain: bool,
     cloud: bool,
+    authenticated: bool,
+    landing_profiles: Vec<String>,
 }
 impl Identity {
+    pub fn landing_owner_hash(&self) -> [u8; 32] {
+        let mut hash = blake3::Hasher::new();
+        hash.update(b"tinytree-landing-owner-v1\0");
+        hash.update(&[u8::from(self.authenticated)]);
+        hash.update(&crate::retention::owner_hash(self));
+        *hash.finalize().as_bytes()
+    }
+    pub fn landing_capability(&self, local: &[String]) -> Result<(), Status> {
+        let profiles = if self.authenticated {
+            &self.landing_profiles
+        } else {
+            local
+        };
+        if !self.write || profiles.is_empty() {
+            return Err(Status::permission_denied("landing launch access denied"));
+        }
+        Ok(())
+    }
+    pub fn authorize_landing(
+        &self,
+        repo: &str,
+        profile: &str,
+        local: &[String],
+    ) -> Result<(), Status> {
+        self.authorize(repo, true)?;
+        self.landing_capability(local)?;
+        let profiles = if self.authenticated {
+            &self.landing_profiles
+        } else {
+            local
+        };
+        if !profiles.iter().any(|p| p == profile) {
+            return Err(Status::permission_denied("landing profile access denied"));
+        }
+        Ok(())
+    }
     pub fn cloud_capability(&self) -> Result<(), Status> {
         if !self.cloud {
             return Err(Status::permission_denied("private workspace access denied"));

@@ -83,6 +83,7 @@ async fn configured_tls_authenticates_principals_and_verifies_server_identity() 
             write: false,
             retain: false,
             cloud: false,
+            landing_profiles: Vec::new(),
         }],
         tls: Some(TlsConfig {
             certificate: PathBuf::from(env!("TLS_SERVER_CERT"))

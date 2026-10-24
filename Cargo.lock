@@ -5740,6 +5740,7 @@ dependencies = [
  "grpc-transport",
  "http",
  "http-body",
+ "hyper-util",
  "jj-lib",
  "libc",
  "private-fs",

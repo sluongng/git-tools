@@ -22,6 +22,16 @@ principals can hold their own `_tinytree/hold/v1/<client>/<commit>` references
 without public-write permission. Holds persist until explicit release; quotas
 reject new promises, not existing ones. A historical receipt is not current proof.
 
+Landing preparation/status is opt-in: use [the bounded landing TOML](examples/landing.toml)
+and grant both repository write and an explicit `landing_profiles` entry.
+`StartLanding` accepts a durable intent; `GetLanding` is owner-scoped and remains
+readable after launch-grant removal or preparation disablement. Accepted work
+keeps its authorization, but preparation rechecks the configured profile version
+and repository. Anonymous local-owner launch needs a separate explicit profile
+allowlist. Restart discovery prepares intents and expires due recovery holds.
+**Prepared means pending checks:** this service does not run checks or publish
+landings. No client verdict or finalization RPC is exposed.
+
 Private workspace history is opt-in: start from [the cloud profile](examples/cloud.toml),
 set `service.cloud.enabled = true` and grant each principal `cloud = true`.
 Reads and uploads are owner-scoped; uploads/publication also require `write = true`.

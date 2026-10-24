@@ -8,6 +8,10 @@ mod body_deadline;
 pub use body_deadline::DeadlineLayer;
 mod cloud;
 mod cloud_ingress;
+mod landing;
+mod landing_ingress;
+pub use landing::{LandingConfig, LandingProfile};
+pub use landing_ingress::LandingGrpcService;
 mod config;
 pub use cloud::CloudConfig;
 pub use cloud_ingress::CloudGrpcService;
@@ -67,6 +71,9 @@ pub async fn serve_tcp(
             .tls_config(ServerTlsConfig::new().identity(identity))
             .map_err(|_| anyhow::anyhow!("cannot configure native TLS"))?;
     }
+    service
+        .start_landing_worker()
+        .map_err(|_| anyhow::anyhow!("cannot start landing worker"))?;
     let drain = service.clone();
     let result = server
         .layer(service.deadline_layer())
@@ -74,6 +81,7 @@ pub async fn serve_tcp(
         .add_service(service.grpc_service())
         .add_service(service.query_grpc_service())
         .add_service(service.cloud_grpc_service())
+        .add_service(service.landing_grpc_service())
         .serve_with_incoming_shutdown(
             tokio_stream::wrappers::TcpListenerStream::new(listener).map(|accepted| {
                 accepted.and_then(|stream| {
@@ -88,6 +96,7 @@ pub async fn serve_tcp(
         .context("native gRPC listener failed");
     let query_drain = drain.drain_query().await;
     drain.drain_cloud().await;
+    drain.drain_landing().await;
     query_drain.context("native query shutdown failed")?;
     result
 }
@@ -107,6 +116,9 @@ async fn run_unix(
     service: RepositoryService,
     shutdown: impl Future<Output = ()> + Send + 'static,
 ) -> Result<()> {
+    service
+        .start_landing_worker()
+        .map_err(|_| anyhow::anyhow!("cannot start landing worker"))?;
     let drain = service.clone();
     let result = Server::builder()
         .layer(service.deadline_layer())
@@ -114,6 +126,7 @@ async fn run_unix(
         .add_service(service.grpc_service())
         .add_service(service.query_grpc_service())
         .add_service(service.cloud_grpc_service())
+        .add_service(service.landing_grpc_service())
         .serve_with_incoming_shutdown(
             tokio_stream::wrappers::UnixListenerStream::new(listener),
             shutdown,
@@ -122,6 +135,7 @@ async fn run_unix(
         .context("native Unix gRPC listener failed");
     let query_drain = drain.drain_query().await;
     drain.drain_cloud().await;
+    drain.drain_landing().await;
     query_drain.context("native query shutdown failed")?;
     result
 }
@@ -142,8 +156,14 @@ pub async fn serve(
             .map(|p| {
                 let token = std::env::var(&p.token_env)
                     .map_err(|_| ConfigError("cannot resolve native principal token"))?;
-                Principal::new(p.id.clone(), &token, p.repositories.clone(), p.write)
-                    .map(|principal| principal.with_retention(p.retain).with_cloud(p.cloud))
+                Principal::new(p.id.clone(), &token, p.repositories.clone(), p.write).map(
+                    |principal| {
+                        principal
+                            .with_retention(p.retain)
+                            .with_cloud(p.cloud)
+                            .with_landing_profiles(p.landing_profiles.clone())
+                    },
+                )
             })
             .collect::<std::result::Result<Vec<_>, _>>()?;
         auth::Authorization::new(principals.clone(), &setup.repositories)?;
@@ -386,6 +406,7 @@ mod tests {
             write: true,
             retain: false,
             cloud: false,
+            landing_profiles: Vec::new(),
         });
         assert!(config.validate().is_err());
         config.tls = Some(TlsConfig {

@@ -1,0 +1,47 @@
+# Preparation/status only: no check runner or automatic publication.
+storage = "tinytree-data"
+listen = "127.0.0.1:8093"
+repositories = ["example"]
+
+[[principals]]
+id = "agent"
+token_env = "TINYTREE_AGENT_TOKEN"
+repositories = ["example"]
+write = true
+landing_profiles = ["checks"]
+
+[service.landing]
+enabled = true
+committer_name = "Tinytree landing"
+committer_email = "landing@example.invalid"
+job_ttl_seconds = 86400
+max_heavy_jobs = 1
+# RPC limit; background preparation shares the bounded heavy-work pool above.
+max_inflight_per_repository = 2
+# Conservative logical work reservations, not preallocated process memory.
+max_buffered_bytes = 3221225472
+# No anonymous launch grant, including on an owner-private Unix socket.
+local_owner_profiles = []
+
+[[service.landing.profiles]]
+name = "checks"
+version = "v1"
+repositories = ["example"]
+
+# Bound the catalogs traversed by canonical root-union validation, even when
+# the cloud RPC service is disabled. Capacity exhaustion does not evict history.
+[store]
+max_retention_validation_records = 1024
+max_retention_validation_bytes = 2097152
+max_closure_objects = 4096
+max_closure_edges = 16384
+max_path_contexts = 4096
+max_path_context_bytes = 4194304
+
+[store.cloud]
+max_object_bytes = 4194304
+max_decode_bytes = 16777216
+max_version_decode_bytes = 134217728
+max_manifest_bytes = 524288
+max_manifest_decode_bytes = 16777216
+max_manifest_members = 1024

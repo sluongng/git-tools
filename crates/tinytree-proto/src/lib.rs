@@ -7,6 +7,11 @@
 
 // Preserve protobuf package nesting for generated cross-package type paths.
 pub mod tinytree {
+    pub mod landing {
+        pub mod v1 {
+            tonic::include_proto!("tinytree.landing.v1");
+        }
+    }
     pub mod cloud {
         pub mod v1 {
             tonic::include_proto!("tinytree.cloud.v1");
@@ -21,7 +26,7 @@ pub mod tinytree {
         }
     }
 }
-pub use tinytree::{cloud::v1 as cloud_v1, query::v1 as query_v1, v1};
+pub use tinytree::{cloud::v1 as cloud_v1, landing::v1 as landing_v1, query::v1 as query_v1, v1};
 
 /// Descriptor set for the native-only protocol, including streaming cardinality.
 pub const FILE_DESCRIPTOR_SET: &[u8] = tonic::include_file_descriptor_set!("tinytree_descriptor");
@@ -35,7 +40,7 @@ mod tests {
     #[test]
     fn native_repository_contract_preserves_rpc_streaming_and_public_bindings() {
         let descriptors = prost_types::FileDescriptorSet::decode(FILE_DESCRIPTOR_SET).unwrap();
-        assert_eq!(descriptors.file.len(), 3);
+        assert_eq!(descriptors.file.len(), 4);
         let file = descriptors
             .file
             .iter()
@@ -122,6 +127,24 @@ mod tests {
                 ("Blame", false, false),
                 ("Search", false, false),
             ]
+        );
+
+        let landing_file = descriptors
+            .file
+            .iter()
+            .find(|f| f.package.as_deref() == Some("tinytree.landing.v1"))
+            .unwrap();
+        assert_eq!(
+            landing_file.service[0]
+                .method
+                .iter()
+                .map(|m| (
+                    m.name.as_deref().unwrap(),
+                    m.client_streaming.unwrap_or(false),
+                    m.server_streaming.unwrap_or(false)
+                ))
+                .collect::<Vec<_>>(),
+            [("StartLanding", false, false), ("GetLanding", false, false)]
         );
 
         // Check the public generated builders without constructing a mock

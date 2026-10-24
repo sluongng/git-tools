@@ -31,6 +31,7 @@ pub struct ServiceConfig {
     pub retention: tinytree_store::RetentionLimits,
     pub query: crate::QueryConfig,
     pub cloud: crate::CloudConfig,
+    pub landing: crate::LandingConfig,
 }
 impl Default for ServiceConfig {
     fn default() -> Self {
@@ -48,6 +49,7 @@ impl Default for ServiceConfig {
             retention: Default::default(),
             query: Default::default(),
             cloud: Default::default(),
+            landing: Default::default(),
         }
     }
 }
@@ -55,6 +57,7 @@ impl ServiceConfig {
     pub fn validate(&self) -> Result<(), ConfigError> {
         self.query.validate(self.max_request_bytes)?;
         self.cloud.validate()?;
+        self.landing.validate()?;
         self.retention
             .validate()
             .map_err(|_| ConfigError("invalid native retention limits"))?;
@@ -218,6 +221,8 @@ pub struct PrincipalConfig {
     pub retain: bool,
     #[serde(default)]
     pub cloud: bool,
+    #[serde(default)]
+    pub landing_profiles: Vec<String>,
 }
 #[derive(Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -278,6 +283,12 @@ impl Config {
                 .cloud
                 .validate_store_profile(&self.store.materialize(self.service.max_metadata_bytes))?;
         }
+        self.service
+            .landing
+            .validate_repositories(&self.repositories)?;
+        self.service
+            .landing
+            .validate_store(&self.store.materialize(self.service.max_metadata_bytes))?;
         if self.repositories.is_empty()
             || self.repositories.len() > 1024
             || self.gc_interval_seconds > 86400
@@ -295,6 +306,9 @@ impl Config {
         }
         let mut ids = HashSet::new();
         for principal in &self.principals {
+            self.service
+                .landing
+                .validate_grants(&principal.landing_profiles)?;
             if principal.id.is_empty()
                 || principal.id.len() > 128
                 || !ids.insert(&principal.id)
