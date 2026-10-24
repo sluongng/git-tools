@@ -101,6 +101,7 @@ entry points. Most also expose Rust libraries; `jj-native-cli` is executable-onl
 | [`native-workspace-admin`](crates/native-workspace-admin) | Private external jj administration and restart-safe provisioning. |
 | [`native-vfs-controller`](crates/native-vfs-controller), [`native-vfs-rpc`](crates/native-vfs-rpc) | Dirty-only snapshots, checked root changes and private projection control. |
 | [`native-retention`](crates/native-retention) | Durable workspace root claims and collection fences; not yet automatic client GC. |
+| [`native-capture-pack`](crates/native-capture-pack) | Bounded local capture framing and verification; portable leases exclude private workspace state. |
 | [`private-fs`](crates/private-fs) | Owner-private persisted state and filesystem identity checks. |
 | [`grpc-transport`](crates/grpc-transport) | Response-body deadlines and resource lifetime guards for gRPC services. |
 | [`git-pack-cache`](crates/git-pack-cache) | Reusable Git fetch/pack responses. |

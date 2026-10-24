@@ -3115,6 +3115,7 @@ dependencies = [
  "jj-vfs",
  "local-cas",
  "native-broker",
+ "native-capture-pack",
  "native-vfs-rpc",
  "native-workspace-admin",
  "private-fs",
@@ -3589,6 +3590,17 @@ dependencies = [
  "tonic-prost-build",
  "tower",
  "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "native-capture-pack"
+version = "0.1.0"
+dependencies = [
+ "blake3",
+ "private-fs",
+ "serde",
+ "serde_json",
+ "tempfile",
 ]
 
 [[package]]
@@ -6676,6 +6688,7 @@ dependencies = [
  "libc",
  "local-cas",
  "native-broker",
+ "native-capture-pack",
  "native-retention",
  "native-vfs",
  "native-vfs-controller",

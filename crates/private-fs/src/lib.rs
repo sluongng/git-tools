@@ -188,6 +188,26 @@ impl PrivateDir {
         if max_bytes == 0 || max_bytes > 64 * 1024 * 1024 {
             return Err(invalid("private file read limit must be within 1..64 MiB"));
         }
+        let file = Self::open_regular(path, max_bytes as u64, false)?;
+        let mut bytes = Vec::new();
+        file.take(max_bytes as u64 + 1).read_to_end(&mut bytes)?;
+        if bytes.len() > max_bytes {
+            return Err(invalid("private file exceeds read limit"));
+        }
+        Ok(bytes)
+    }
+
+    /// Open one existing owner-private regular child read-only without following
+    /// symlinks/reparse points or creating anything. Retain this directory guard
+    /// while using the returned file. `max_bytes` bounds its current size only;
+    /// callers must separately bound all later reads and handle mutation.
+    pub fn open_existing_file(&self, name: impl AsRef<OsStr>, max_bytes: u64) -> io::Result<File> {
+        let name = name.as_ref();
+        single_name(name)?;
+        Self::open_regular(&self.path.join(name), max_bytes, true)
+    }
+
+    fn open_regular(path: &Path, max_bytes: u64, owner_private: bool) -> io::Result<File> {
         let mut options = OpenOptions::new();
         options.read(true);
         #[cfg(unix)]
@@ -204,7 +224,7 @@ impl PrivateDir {
         }
         let file = options.open(path)?;
         let metadata = file.metadata()?;
-        if !metadata.is_file() || metadata.len() > max_bytes as u64 {
+        if !metadata.is_file() || metadata.len() > max_bytes {
             return Err(invalid("private file is not regular or exceeds read limit"));
         }
         #[cfg(windows)]
@@ -217,12 +237,21 @@ impl PrivateDir {
                 return Err(denied("private file cannot be a reparse point"));
             }
         }
-        let mut bytes = Vec::new();
-        file.take(max_bytes as u64 + 1).read_to_end(&mut bytes)?;
-        if bytes.len() > max_bytes {
-            return Err(invalid("private file exceeds read limit"));
+        if owner_private {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::MetadataExt;
+                if metadata.uid() != unsafe { libc::geteuid() } || metadata.mode() & 0o077 != 0 {
+                    return Err(denied("file must be owner-private"));
+                }
+            }
+            #[cfg(windows)]
+            {
+                use std::os::windows::io::AsRawHandle;
+                unsafe { windows::verify_private_child_handle(file.as_raw_handle()) }?;
+            }
         }
-        Ok(bytes)
+        Ok(file)
     }
 
     /// Fsync a new file, then replace a single child atomically. Unix additionally

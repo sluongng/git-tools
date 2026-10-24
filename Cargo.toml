@@ -18,6 +18,7 @@ members = [
     "crates/native-workspace-admin",
     "crates/private-fs",
     "crates/native-retention",
+    "crates/native-capture-pack",
     "crates/packblob",
     "crates/tinytree-proto",
     "crates/tinytree-model",

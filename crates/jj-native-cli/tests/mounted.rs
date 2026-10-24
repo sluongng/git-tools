@@ -1641,7 +1641,8 @@ fn local_capture_bundles(fixture: &Fixture) -> BTreeMap<String, Vec<u8>> {
         .parent()
         .unwrap()
         .join("native-commands/captures");
-    fs::read_dir(directory)
+    let private = Arc::new(private_fs::PrivateDir::open_existing(&directory).unwrap());
+    fs::read_dir(&directory)
         .unwrap()
         .filter_map(|entry| {
             let entry = entry.unwrap();
@@ -1655,6 +1656,28 @@ fn local_capture_bundles(fixture: &Fixture) -> BTreeMap<String, Vec<u8>> {
                 path.file_stem().unwrap().to_str().unwrap(),
                 blake3::hash(&bytes).to_hex().as_str()
             );
+            // Exercise the shared structural reader against bytes emitted by
+            // the actual daemon, including after restart. Neither the private
+            // WC nor the optional private sidecar receives a portable lease.
+            let pack = native_capture_pack::VerifiedPack::open(
+                private.clone(),
+                *blake3::hash(&bytes).as_bytes(),
+                bytes.len() as u64,
+                native_capture_pack::Limits::default(),
+                Arc::new(()), // This bounded native fixture has no parallel readers.
+            )
+            .unwrap();
+            let mut kinds = Vec::new();
+            for lease in pack.portable_entries() {
+                let descriptor = lease.descriptor();
+                assert!((1..=5).contains(&descriptor.kind));
+                kinds.push(descriptor.kind);
+                let payload = lease.read_verified().unwrap();
+                assert_eq!(payload.bytes().len() as u64, descriptor.size);
+                assert_eq!(blake3::hash(payload.bytes()).as_bytes(), &descriptor.blake3);
+            }
+            assert!(kinds.contains(&1) && kinds.contains(&2));
+            assert_eq!(kinds.iter().filter(|kind| **kind == 5).count(), 1);
             Some((entry.file_name().to_str().unwrap().to_owned(), bytes))
         })
         .collect()

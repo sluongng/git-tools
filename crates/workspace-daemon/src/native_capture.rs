@@ -1,6 +1,7 @@
 //! Bounded local-only capture staging. No cloud upload, Clean or collection.
 use crate::config::{NativeCapture, NativeCapturePolicy};
 use anyhow::{Context, Result, ensure};
+use native_capture_pack::{Entry, MAGIC, TABLE_MAGIC, encode_table, frame_header};
 use native_retention::{BundleDescriptor, CommandOwner, OwnedCaptureBundle, RootCheckpoint};
 use native_workspace_admin::{
     Binding, Registry,
@@ -293,14 +294,7 @@ struct Lifetime {
     _permit: Arc<OwnedSemaphorePermit>,
     _complete: CompleteOnDrop,
 }
-#[derive(Clone, Serialize)]
-struct Entry {
-    kind: u8,
-    id: String,
-    blake3: [u8; 32],
-    size: u64,
-    offset: u64,
-}
+
 struct Pack {
     file: File,
     directory: Arc<PrivateDir>,
@@ -363,12 +357,7 @@ impl Pack {
             "duplicate capture pack entry"
         );
         let blake3 = *blake3::hash(bytes).as_bytes();
-        let mut header = Vec::with_capacity(42 + id.len());
-        header.push(kind);
-        header.push(id.len() as u8);
-        header.extend_from_slice(id.as_bytes());
-        header.extend_from_slice(&(bytes.len() as u64).to_le_bytes());
-        header.extend_from_slice(&blake3);
+        let header = frame_header(kind, &id, bytes.len() as u64, blake3)?;
         self.write(&header)?;
         let offset = self.size;
         self.write(bytes)?;
@@ -526,9 +515,9 @@ impl Writer {
                 .checked_mul(512)
                 .context("capture table overflow")?;
             ensure!(bound <= MAX_TABLE, "capture table budget exceeded");
-            let table = serde_json::to_vec(&writer.entries)?;
+            let table = encode_table(&writer.entries)?;
             ensure!(table.len() <= MAX_TABLE, "capture table too large");
-            writer.write(b"TTLTABLE")?;
+            writer.write(TABLE_MAGIC)?;
             writer.write(&(table.len() as u64).to_le_bytes())?;
             writer.write(&table)?;
             let descriptor = BundleDescriptor {
@@ -647,7 +636,7 @@ pub(crate) async fn capture(
             disk_files: coordinator.disk_files.clone(),
             _lifetime: lifetime.clone(),
         }));
-        inner.lock().unwrap().write(b"TTLOCP01")?;
+        inner.lock().unwrap().write(MAGIC)?;
         let mut writer = Writer {
             inner,
             attempt: attempt.clone(),

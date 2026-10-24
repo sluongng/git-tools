@@ -118,3 +118,51 @@ fn windows_owner_only_acl_and_directory_lifetime_are_native() {
     drop(private);
     std::fs::rename(&path, parent.path().join("moved")).unwrap();
 }
+
+#[test]
+fn existing_file_handle_is_bounded_readonly_and_never_creates() {
+    let root = root();
+    let private = PrivateDir::create(root.path().join("private")).unwrap();
+    assert!(private.open_existing_file("missing", 100).is_err());
+    assert!(!private.path().join("missing").exists());
+    // The persistent private lock is a convenient supported private-file fixture.
+    let mut writer = private.open_lock("payload").unwrap();
+    writer.write_all(b"bounded").unwrap();
+    drop(writer);
+    let mut reader = private.open_existing_file("payload", 7).unwrap();
+    let mut bytes = Vec::new();
+    reader.read_to_end(&mut bytes).unwrap();
+    assert_eq!(bytes, b"bounded");
+    assert!(reader.write_all(b"bad").is_err());
+    assert!(private.open_existing_file("payload", 6).is_err());
+    assert!(private.open_existing_file("../payload", 7).is_err());
+    assert!(private.open_existing_file(".", 7).is_err());
+    #[cfg(unix)]
+    {
+        use std::{
+            ffi::CString,
+            os::unix::{
+                ffi::OsStrExt,
+                fs::{PermissionsExt, symlink},
+            },
+        };
+        symlink(private.path().join("payload"), private.path().join("link")).unwrap();
+        assert!(private.open_existing_file("link", 7).is_err());
+        let fifo = CString::new(private.path().join("fifo").as_os_str().as_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
+        assert!(
+            private.open_existing_file("fifo", 7).is_err(),
+            "must not block on FIFO"
+        );
+        std::fs::set_permissions(
+            private.path().join("payload"),
+            std::fs::Permissions::from_mode(0o644),
+        )
+        .unwrap();
+        assert!(private.open_existing_file("payload", 7).is_err());
+        assert_eq!(
+            std::fs::read(private.path().join("payload")).unwrap(),
+            b"bounded"
+        );
+    }
+}
