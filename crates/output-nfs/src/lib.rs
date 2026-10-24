@@ -59,6 +59,7 @@ fn status_ref(error: &anyhow::Error) -> nfsstat3 {
     }
     if let Some(error) = error.downcast_ref::<CoreError>() {
         return match error {
+            CoreError::ReadOnly => nfsstat3::NFS3ERR_ROFS,
             CoreError::NotFound => nfsstat3::NFS3ERR_NOENT,
             CoreError::AlreadyExists => nfsstat3::NFS3ERR_EXIST,
             CoreError::NotDirectory => nfsstat3::NFS3ERR_NOTDIR,
@@ -224,6 +225,7 @@ impl OutputNfs {
         attr: sattr3,
         guarded: bool,
     ) -> std::result::Result<(u64, fattr3), nfsstat3> {
+        self.tree.require_source_writable().map_err(status)?;
         let attr = convert_attr(attr)?;
         let _admission = self.admit_hydration()?;
         let filename = name(filename)?;
@@ -251,7 +253,11 @@ impl NFSFileSystem for OutputNfs {
         128
     }
     fn capabilities(&self) -> VFSCapabilities {
-        VFSCapabilities::ReadWrite
+        if self.tree.source_access().is_read_write() {
+            VFSCapabilities::ReadWrite
+        } else {
+            VFSCapabilities::ReadOnly
+        }
     }
     fn root_dir(&self) -> u64 {
         self.tree.root_id()
@@ -314,6 +320,7 @@ impl NFSFileSystem for OutputNfs {
         attr: sattr3,
         guard: Option<nfstime3>,
     ) -> std::result::Result<fattr3, nfsstat3> {
+        self.tree.require_source_writable().map_err(status)?;
         let change = convert_attr(attr)?;
         let node = self.tree.get(id).map_err(status)?;
         // A same-mode synthetic chmod exists only to deliver fresh post-op attrs.
@@ -366,6 +373,7 @@ impl NFSFileSystem for OutputNfs {
         offset: u64,
         data: &[u8],
     ) -> std::result::Result<fattr3, nfsstat3> {
+        self.tree.require_source_writable().map_err(status)?;
         if data.len() > 1024 * 1024 {
             return Err(nfsstat3::NFS3ERR_INVAL);
         }
@@ -395,6 +403,7 @@ impl NFSFileSystem for OutputNfs {
         n: &filename3,
         v: [u8; 8],
     ) -> std::result::Result<u64, nfsstat3> {
+        self.tree.require_source_writable().map_err(status)?;
         Ok(self
             .tree
             .create_exclusive(p, name(n)?, 0o644, v)
@@ -403,13 +412,16 @@ impl NFSFileSystem for OutputNfs {
             .id)
     }
     async fn mkdir(&self, p: u64, n: &filename3) -> std::result::Result<(u64, fattr3), nfsstat3> {
+        self.tree.require_source_writable().map_err(status)?;
         let node = self.tree.mkdir(p, name(n)?, 0o755).await.map_err(status)?;
         Ok((node.id, attrs(node)))
     }
     async fn remove(&self, p: u64, n: &filename3) -> std::result::Result<(), nfsstat3> {
+        self.tree.require_source_writable().map_err(status)?;
         self.tree.unlink_file(p, name(n)?).await.map_err(status)
     }
     async fn rmdir(&self, p: u64, n: &filename3) -> std::result::Result<(), nfsstat3> {
+        self.tree.require_source_writable().map_err(status)?;
         self.tree
             .unlink_directory(p, name(n)?)
             .await
@@ -422,6 +434,7 @@ impl NFSFileSystem for OutputNfs {
         d: u64,
         t: &filename3,
     ) -> std::result::Result<(), nfsstat3> {
+        self.tree.require_source_writable().map_err(status)?;
         let _admission = self.admit_hydration()?;
         self.tree
             .rename(p, name(n)?, d, name(t)?)
@@ -460,6 +473,7 @@ impl NFSFileSystem for OutputNfs {
         t: &nfspath3,
         _a: &sattr3,
     ) -> std::result::Result<(u64, fattr3), nfsstat3> {
+        self.tree.require_source_writable().map_err(status)?;
         let target = std::str::from_utf8(&t.0).map_err(|_| nfsstat3::NFS3ERR_INVAL)?;
         if target.contains('\0') {
             return Err(nfsstat3::NFS3ERR_INVAL);

@@ -490,6 +490,9 @@ impl Fixture {
 
 impl Drop for Fixture {
     fn drop(&mut self) {
+        if self.directory.is_none() {
+            return;
+        }
         if self.daemon.is_none() {
             self.retain_scratch_if_mounted();
             return;
@@ -4178,5 +4181,151 @@ mod native_gc_measurements {
                 }
             }
         }
+    }
+}
+
+#[test]
+#[ignore = "requires usable /dev/fuse and fusermount3; run mounted_tests locally"]
+fn immutable_unpublished_candidate_mount_survives_restart_without_editable_downgrade() {
+    let upstream = RemoteServer::start();
+    let mut fixture = Fixture::new();
+    fixture.configure_remote(&upstream.endpoint);
+    fixture.start();
+    let original = upstream.public();
+    let descriptor = original.commit.unwrap();
+    let (_, bytes) = upstream
+        .store
+        .read_metadata("example", descriptor.key)
+        .unwrap();
+    let m::Object::Commit(mut candidate) = m::decode(&bytes, m::Limits::default()).unwrap() else {
+        unreachable!()
+    };
+    candidate.description = "unpublished immutable check candidate".into();
+    candidate.change_id = m::ChangeId([0xc1; 16]);
+    let candidate = m::encode(&m::Object::Commit(candidate), m::Limits::default()).unwrap();
+    upstream
+        .store
+        .put("example", candidate.descriptor, &candidate.bytes, 0)
+        .unwrap();
+    let commit = blake3::Hash::from(candidate.descriptor.key.id.0)
+        .to_hex()
+        .to_string();
+    assert_ne!(commit, upstream.head);
+    let root = fixture.base().join("candidate");
+    let id = "c1".repeat(32);
+    let args = [
+        "native-candidate-mount",
+        root.to_str().unwrap(),
+        "--store",
+        "example",
+        "--commit",
+        &commit,
+        "--workspace-id",
+        &id,
+    ];
+    let creating = fixture.workspace(&args);
+    assert!(
+        creating.status.success(),
+        "{}",
+        String::from_utf8_lossy(&creating.stderr)
+    );
+    assert_fuse_mounted(&root);
+    assert_eq!(upstream.file_reads(), 0);
+    let record_path = fixture
+        .base()
+        .join("daemon/native-workspaces")
+        .join(&id)
+        .join("workspace.json");
+    let recorded = fs::read(&record_path).unwrap();
+    let record: serde_json::Value = serde_json::from_slice(&recorded).unwrap();
+    assert_eq!(record["version"], 3);
+    assert_eq!(record["origin"]["kind"], "candidate");
+    assert!(
+        fixture
+            .control(Request::NativeMount {
+                root: root.clone(),
+                store: "example".into(),
+                commit: commit.clone(),
+                workspace_id: id.clone()
+            })
+            .is_err()
+    );
+    let changed = fixture.workspace(&[
+        "native-candidate-mount",
+        root.to_str().unwrap(),
+        "--store",
+        "example",
+        "--commit",
+        &upstream.head,
+        "--workspace-id",
+        &id,
+    ]);
+    assert!(!changed.status.success());
+    assert_eq!(fs::read(&record_path).unwrap(), recorded);
+    let file = root.join("hello.cc");
+    assert_eq!(
+        fs::OpenOptions::new()
+            .write(true)
+            .open(&file)
+            .unwrap_err()
+            .raw_os_error(),
+        Some(30)
+    );
+    assert_eq!(
+        fs::write(root.join("new"), b"blocked")
+            .unwrap_err()
+            .raw_os_error(),
+        Some(30)
+    );
+    assert_eq!(
+        fs::rename(&file, root.join("renamed"))
+            .unwrap_err()
+            .raw_os_error(),
+        Some(30)
+    );
+    assert_eq!(upstream.file_reads(), 0);
+    assert_eq!(fs::read(&file).unwrap(), upstream.source_bytes);
+    assert_eq!(
+        upstream.public(),
+        original,
+        "candidate admission must not move the public reference"
+    );
+    fixture
+        .control(Request::NativeUnmount {
+            workspace_id: id.clone(),
+        })
+        .unwrap();
+    assert!(!fuse_mounted(&root));
+    fixture.stop_daemon();
+    fixture.start();
+    let resumed = fixture.workspace(&["native-resume", root.to_str().unwrap()]);
+    assert!(
+        resumed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&resumed.stderr)
+    );
+    let replay = fixture.workspace(&args);
+    assert!(
+        replay.status.success(),
+        "{}",
+        String::from_utf8_lossy(&replay.stderr)
+    );
+    assert_fuse_mounted(&root);
+    assert_eq!(
+        fs::write(root.join("after-restart"), b"blocked")
+            .unwrap_err()
+            .raw_os_error(),
+        Some(30)
+    );
+    assert_eq!(fs::read(&file).unwrap(), upstream.source_bytes);
+    fixture
+        .control(Request::NativeUnmount { workspace_id: id })
+        .unwrap();
+    fixture.stop_daemon();
+    if std::env::var_os("TINYTREE_TEST_RETAIN_CANDIDATE").as_deref()
+        == Some(std::ffi::OsStr::new("1"))
+    {
+        let kept = fixture.directory.take().unwrap().keep();
+        eprintln!("TINYTREE_IMMUTABLE_FIXTURE={}", kept.display());
     }
 }

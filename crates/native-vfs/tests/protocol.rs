@@ -520,3 +520,215 @@ async fn recovery_guard_pins_existing_state_without_looking_up_or_repairing_the_
         "missing ownership evidence is not repaired"
     );
 }
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[tokio::test]
+async fn immutable_candidate_is_lazy_sealed_and_recovers_only_with_its_access_policy() {
+    use output_core::{
+        Artifact, CoreError, SetAttr, SourceAccess, SourceContent, SourceEntry, SourceLimits,
+        SourceManifest,
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let (config, provider) = common::fixture(dir.path());
+    let cache = common::cache(dir.path());
+    let candidate =
+        native_vfs::prepare_immutable_candidate(config.clone(), provider.clone(), cache.clone())
+            .await
+            .unwrap();
+    let tree = candidate.tree();
+    let root_tree = config.root_merge.terms[0].0;
+    assert_eq!(
+        tree.source_access(),
+        SourceAccess::ImmutableCandidate { root_tree }
+    );
+    let assert_readonly = |e: anyhow::Error| {
+        assert_eq!(
+            e.downcast_ref::<CoreError>(),
+            Some(&CoreError::ReadOnly),
+            "{e:#}"
+        )
+    };
+    let artifact = Artifact {
+        backend: config.scope.backend().into(),
+        instance: String::new(),
+        digest_function: 9,
+        hash: "a".repeat(64),
+        size: 5,
+    };
+    assert_readonly(tree.create(1, "new", 0o644).await.unwrap_err());
+    assert_readonly(
+        tree.create_exclusive(1, "new", 0o644, [1; 8])
+            .await
+            .unwrap_err(),
+    );
+    assert_readonly(tree.mkdir(1, "new", 0o755).await.unwrap_err());
+    assert_readonly(tree.symlink(1, "new", "tool").await.unwrap_err());
+    assert_readonly(tree.ensure_dir("new/child").await.unwrap_err());
+    assert_readonly(tree.unlink(1, "tool").await.unwrap_err());
+    assert_readonly(tree.unlink_file(1, "tool").await.unwrap_err());
+    assert_readonly(tree.unlink_directory(1, "unvisited").await.unwrap_err());
+    assert_readonly(tree.rename(1, "tool", 1, "moved").await.unwrap_err());
+    assert_readonly(tree.stage("new", artifact.clone()).await.unwrap_err());
+    assert_readonly(tree.prepare_stage("new", artifact).await.err().unwrap());
+    assert_readonly(tree.prepare_refresh("").await.err().unwrap());
+    assert_readonly(tree.clean("").await.unwrap_err());
+    assert_readonly(tree.write(1, 0, b"blocked").await.unwrap_err());
+    assert_readonly(
+        tree.setattr(
+            1,
+            SetAttr {
+                mode: Some(0o777),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap_err(),
+    );
+    assert_eq!(
+        provider.metadata_reads.load(Ordering::SeqCst),
+        0,
+        "rejected mutations cannot hydrate directories"
+    );
+    assert_eq!(provider.file_reads.load(Ordering::SeqCst), 0);
+    let tool = tree.resolve_source("tool").await.unwrap();
+    assert_readonly(tree.write(tool.id, 0, b"blocked").await.unwrap_err());
+    assert_readonly(
+        tree.setattr(
+            tool.id,
+            SetAttr {
+                size: Some(0),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap_err(),
+    );
+    assert_eq!(
+        provider.file_reads.load(Ordering::SeqCst),
+        0,
+        "rejected write/truncate cannot copy up a payload"
+    );
+    let baseline_snapshot = candidate.capture_lazy_tree_only().unwrap();
+    let baseline = baseline_snapshot.version().clone();
+    drop(baseline_snapshot);
+    let install = candidate
+        .compiler()
+        .lazy_tree_for_source(config.root_merge.terms[0], 1, config.source_limits.clone())
+        .unwrap();
+    tree.install_immutable_lazy_source(
+        install.source_root(tree.identity()),
+        "native-candidate-bootstrap-v1",
+        &config.source_limits,
+    )
+    .unwrap();
+    drop(install);
+    let replacement = candidate
+        .compiler()
+        .lazy_tree_for_source(config.root_merge.terms[0], 2, config.source_limits.clone())
+        .unwrap();
+    assert_readonly(
+        tree.install_lazy_source(
+            replacement.source_root(tree.identity()),
+            Some(baseline.clone()),
+            "replace",
+            &config.source_limits,
+        )
+        .unwrap_err(),
+    );
+    drop(replacement);
+    assert_readonly(
+        tree.install_source(
+            SourceManifest {
+                identity: tree.identity().into(),
+                root: [7; 32],
+                entries: vec![SourceEntry {
+                    path: "other".into(),
+                    mode: 0o755,
+                    content: SourceContent::Directory,
+                }],
+            },
+            Some(baseline),
+            "replace-full",
+            &SourceLimits::default(),
+        )
+        .unwrap_err(),
+    );
+    let snapshot = candidate.capture_lazy_tree_only().unwrap();
+    let expected = snapshot.version().clone();
+    let replacement = candidate
+        .compiler()
+        .lazy_tree_for_source(config.root_merge.terms[0], 2, config.source_limits.clone())
+        .unwrap();
+    assert_readonly(
+        snapshot
+            .acknowledge_root(
+                replacement.source_root(tree.identity()),
+                Vec::new(),
+                expected,
+                "advance",
+                &config.source_limits,
+            )
+            .unwrap_err(),
+    );
+    drop(replacement);
+    assert_eq!(
+        tree.read(tool.id, 0, 100).await.unwrap(),
+        b"native source\n"
+    );
+    let identity = tree.identity().to_owned();
+    drop(tree);
+    drop(candidate);
+    cache.wait_for_idle().await.unwrap();
+    let state = private_fs::PrivateDir::open_existing(&config.state).unwrap();
+    let before = state.read("native-vfs.json", 8192).unwrap();
+    let mut header: serde_json::Value = serde_json::from_slice(&before).unwrap();
+    assert_eq!(header["format"], 2);
+    assert!(
+        prepare(config.clone(), provider.clone(), cache.clone())
+            .await
+            .is_err(),
+        "editable open must not downgrade candidate state"
+    );
+    assert_eq!(state.read("native-vfs.json", 8192).unwrap(), before);
+    // Model a crash after the namespace/receipt commit but before ready marker.
+    header["ready"] = false.into();
+    state
+        .replace("native-vfs.json", &serde_json::to_vec(&header).unwrap())
+        .unwrap();
+    drop(state);
+    let candidate =
+        native_vfs::prepare_immutable_candidate(config.clone(), provider.clone(), cache.clone())
+            .await
+            .unwrap();
+    assert_eq!(candidate.tree().identity(), identity);
+    assert_eq!(
+        candidate.tree().source_access(),
+        SourceAccess::ImmutableCandidate { root_tree }
+    );
+    assert_eq!(
+        candidate.tree().read(tool.id, 0, 100).await.unwrap(),
+        b"native source\n"
+    );
+    drop(candidate);
+    cache.wait_for_idle().await.unwrap();
+    let candidate = native_vfs::prepare_existing_immutable_candidate(config, provider, cache)
+        .await
+        .unwrap();
+    assert_eq!(candidate.tree().identity(), identity);
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+#[tokio::test]
+async fn unsupported_immutable_provider_has_no_provisioning_side_effects() {
+    let dir = tempfile::tempdir().unwrap();
+    let (config, provider) = common::fixture(dir.path());
+    let cache = common::cache(dir.path());
+    assert!(!config.state.exists() && !config.root.exists());
+    let error = native_vfs::prepare_immutable_candidate(config.clone(), provider.clone(), cache)
+        .await
+        .unwrap_err();
+    assert!(error.is::<native_vfs::ImmutableCandidateUnsupported>());
+    assert!(!config.state.exists() && !config.root.exists());
+    assert_eq!(provider.file_reads.load(Ordering::SeqCst), 0);
+    assert_eq!(provider.metadata_reads.load(Ordering::SeqCst), 0);
+}

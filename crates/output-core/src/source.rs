@@ -81,8 +81,25 @@ pub(super) struct Receipt {
     pub(super) intent: [u8; 32],
     pub(super) result: SourceReceipt,
 }
+/// Access is fixed at fresh namespace initialization. Derived lazy population
+/// and verified cache hydration do not grant permission to edit the source.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub enum SourceAccess {
+    #[default]
+    ReadWrite,
+    ImmutableCandidate {
+        root_tree: [u8; 32],
+    },
+}
+impl SourceAccess {
+    pub fn is_read_write(&self) -> bool {
+        matches!(self, Self::ReadWrite)
+    }
+}
 #[derive(Clone, Serialize, Deserialize)]
 pub(super) struct SourceMeta {
+    #[serde(default, skip_serializing_if = "SourceAccess::is_read_write")]
+    pub(super) access: SourceAccess,
     pub(super) root: [u8; 32],
     pub(super) generation: u64,
     pub(super) revision: u64,
@@ -219,6 +236,7 @@ impl SourceSnapshot {
         request_id: &str,
         limits: &SourceLimits,
     ) -> Result<SourceReceipt> {
+        self.tree.require_source_writable()?;
         limits.validate()?;
         validate_request_id(request_id)?;
         ensure!(root != [0; 32], "invalid source baseline root");
@@ -514,6 +532,7 @@ impl Tree {
         request_id: &str,
         limits: &SourceLimits,
     ) -> Result<SourceReceipt> {
+        self.require_source_writable()?;
         validate_request_id(request_id)?;
         let entries = self.validate_manifest(&manifest, limits)?;
         let encoded = serde_json::to_vec(&(
@@ -618,6 +637,7 @@ impl Tree {
             // together with the atomic binding replacement, not a later write.
             touch(state, 1);
             state.source = Some(SourceMeta {
+                access: SourceAccess::ReadWrite,
                 root: manifest.root,
                 generation,
                 revision,
@@ -807,7 +827,20 @@ pub(super) fn validate_control_change(previous: &State, next: &State) -> Result<
     Ok(())
 }
 impl Tree {
+    pub fn source_access(&self) -> SourceAccess {
+        self.namespace
+            .lock()
+            .unwrap()
+            .state
+            .source
+            .as_ref()
+            .map_or(SourceAccess::ReadWrite, |s| s.access)
+    }
+    pub fn require_source_writable(&self) -> Result<()> {
+        require(self.source_access().is_read_write(), CoreError::ReadOnly)
+    }
     pub(super) fn source_writable_node(&self, id: u64) -> Result<()> {
+        self.require_source_writable()?;
         let ns = self.namespace.lock().unwrap();
         ensure!(
             ns.state.source.is_none() || !is_control(&ns.state, id)?,
@@ -825,6 +858,7 @@ impl Tree {
         Ok(())
     }
     pub(super) fn source_writable_path(&self, path: &str) -> Result<()> {
+        self.require_source_writable()?;
         let ns = self.namespace.lock().unwrap();
         ensure!(
             ns.state.source.is_none()
@@ -896,7 +930,7 @@ impl Tree {
             );
             return Ok(node.clone());
         }
-        Self::change_locked(&mut ns, |state| {
+        Self::change_locked_mode(&mut ns, true, |state| {
             let admin = allocate(state, 1, ".jj", NodeKind::Directory, 0o555, None, true)?;
             let marker = allocate(
                 state,

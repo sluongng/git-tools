@@ -95,6 +95,7 @@ fn errno(error: anyhow::Error) -> i32 {
     }
     if let Some(e) = error.downcast_ref::<CoreError>() {
         return match e {
+            CoreError::ReadOnly => libc::EROFS,
             CoreError::NotFound => libc::ENOENT,
             CoreError::AlreadyExists => libc::EEXIST,
             CoreError::NotDirectory => libc::ENOTDIR,
@@ -643,6 +644,12 @@ impl Filesystem for Adapter {
         }
     }
     fn open(&mut self, _: &Request<'_>, ino: u64, flags: i32, reply: ReplyOpen) {
+        if (flags & libc::O_ACCMODE != libc::O_RDONLY
+            || flags & (libc::O_TRUNC | libc::O_APPEND | libc::O_CREAT) != 0)
+            && !self.tree.source_access().is_read_write()
+        {
+            return reply.error(libc::EROFS);
+        }
         let marker_read = self.startup_marker.is_some_and(|m| m.file == ino)
             && flags & libc::O_ACCMODE == libc::O_RDONLY
             && flags & (libc::O_TRUNC | libc::O_APPEND | libc::O_CREAT) == 0;
@@ -1452,6 +1459,7 @@ async fn start_named(
             references: Mutex::new(References::default()),
             changed: Notify::new(),
         });
+        let readonly = !tree.source_access().is_read_write();
         let adapter = Adapter {
             tree,
             references,
@@ -1472,17 +1480,17 @@ async fn start_named(
             startup_marker,
             stopped: Arc::new(AtomicBool::new(false)),
         };
-        let mut session = Session::new(
-            adapter.clone(),
-            &root,
-            &[
-                MountOption::FSName(source_name),
-                MountOption::DefaultPermissions,
-                MountOption::NoAtime,
-                MountOption::NoSuid,
-                MountOption::NoDev,
-            ],
-        )?;
+        let mut mount_options = vec![
+            MountOption::FSName(source_name),
+            MountOption::DefaultPermissions,
+            MountOption::NoAtime,
+            MountOption::NoSuid,
+            MountOption::NoDev,
+        ];
+        if readonly {
+            mount_options.push(MountOption::RO);
+        }
+        let mut session = Session::new(adapter.clone(), &root, &mount_options)?;
         let notifier = session.notifier();
         let unmounter = session.unmount_callable();
         let stop = Arc::new(AtomicBool::new(false));

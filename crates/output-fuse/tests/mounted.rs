@@ -9,7 +9,7 @@ use std::{
     io::{Read, Seek, SeekFrom, Write},
     os::{
         fd::AsRawFd,
-        unix::fs::{MetadataExt, PermissionsExt, symlink},
+        unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt, symlink},
     },
     sync::{
         Arc, Mutex,
@@ -952,4 +952,177 @@ fn cached_metadata_publication_drains_without_blocking_pool_starvation() {
         .expect("committed publication did not finish after caller cancellation");
         mount.shutdown().await.unwrap();
     });
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires usable /dev/fuse and fusermount3"]
+async fn immutable_native_mount_rejects_source_writes_and_shared_writable_mmap() {
+    let directory = tempfile::tempdir().unwrap();
+    let source = Arc::new(Source::new());
+    let bytes = vec![b'a'; 4096];
+    let provider = Arc::new(CaptureDirectories {
+        artifact: source.artifact(&bytes),
+        entered: Notify::new(),
+        release: Semaphore::new(0),
+    });
+    let state = directory.path().join("state");
+    let tree = Tree::open(&state, "test", source.clone(), CacheConfig::default()).unwrap();
+    tree.install_immutable_lazy_source(
+        output_core::LazySourceRoot {
+            identity: tree.identity().into(),
+            root_tree: [1; 32],
+            pin: output_core::SourcePin {
+                root: [1; 32],
+                generation: 1,
+            },
+            provider: provider.clone(),
+            load_limits: Default::default(),
+        },
+        "immutable",
+        &Default::default(),
+    )
+    .unwrap();
+    let root = directory.path().join("source");
+    let mount = output_fuse::start_native_source(tree.clone(), &root, [8; 32])
+        .await
+        .unwrap();
+    let observed = root.clone();
+    let observed_source = source.clone();
+    let result = io(move || -> Result<()> {
+        let readonly = |result: std::io::Result<()>| -> Result<()> {
+            let error = result
+                .err()
+                .ok_or_else(|| anyhow::anyhow!("immutable source mutation succeeded"))?;
+            anyhow::ensure!(
+                error.raw_os_error() == Some(libc::EROFS),
+                "unexpected immutable mutation error: {error}"
+            );
+            Ok(())
+        };
+        let path = observed.join("mapped");
+        readonly(OpenOptions::new().write(true).open(&path).map(drop))?;
+        readonly(OpenOptions::new().append(true).open(&path).map(drop))?;
+        readonly(
+            OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&path)
+                .map(drop),
+        )?;
+        readonly(
+            OpenOptions::new()
+                .read(true)
+                .custom_flags(libc::O_TRUNC)
+                .open(&path)
+                .map(drop),
+        )?;
+        readonly(fs::write(observed.join("new"), b"blocked"))?;
+        readonly(fs::create_dir(observed.join("new-dir")))?;
+        readonly(fs::set_permissions(
+            &path,
+            fs::Permissions::from_mode(0o777),
+        ))?;
+        readonly(fs::rename(&path, observed.join("renamed")))?;
+        readonly(fs::remove_file(&path))?;
+        readonly(symlink("mapped", observed.join("new-link")))?;
+        let name = std::ffi::CString::new("user.blake3").unwrap();
+        let encoded = std::ffi::CString::new(path.as_os_str().as_encoded_bytes()).unwrap();
+        anyhow::ensure!(
+            unsafe { libc::getxattr(encoded.as_ptr(), name.as_ptr(), std::ptr::null_mut(), 0) }
+                == 32
+        );
+        let mut digest = [0u8; 32];
+        anyhow::ensure!(
+            unsafe {
+                libc::getxattr(
+                    encoded.as_ptr(),
+                    name.as_ptr(),
+                    digest.as_mut_ptr().cast(),
+                    digest.len(),
+                )
+            } == 32
+        );
+        anyhow::ensure!(
+            digest == *blake3::hash(&vec![b'a'; 4096]).as_bytes(),
+            "wrong native digest xattr"
+        );
+        anyhow::ensure!(
+            unsafe {
+                libc::getxattr(
+                    encoded.as_ptr(),
+                    name.as_ptr(),
+                    digest.as_mut_ptr().cast(),
+                    31,
+                )
+            } == -1
+        );
+        anyhow::ensure!(std::io::Error::last_os_error().raw_os_error() == Some(libc::ERANGE));
+        let file = File::open(&path)?;
+        let address = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                4096,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_SHARED,
+                file.as_raw_fd(),
+                0,
+            )
+        };
+        if address != libc::MAP_FAILED {
+            unsafe {
+                libc::munmap(address, 4096);
+            }
+            anyhow::bail!("read-only fd unexpectedly admitted writable shared mapping");
+        }
+        anyhow::ensure!(
+            matches!(
+                std::io::Error::last_os_error().raw_os_error(),
+                Some(libc::EACCES | libc::EROFS)
+            ),
+            "unexpected writable mapping error"
+        );
+        anyhow::ensure!(
+            observed_source.fetches.load(Ordering::SeqCst) == 0,
+            "rejected mutations hydrated file contents"
+        );
+        anyhow::ensure!(
+            fs::read(&path)? == vec![b'a'; 4096],
+            "candidate contents changed"
+        );
+        Ok(())
+    })
+    .await;
+    mount.shutdown().await.unwrap();
+    result.unwrap();
+    assert_eq!(source.fetches.load(Ordering::SeqCst), 1);
+    let namespace = tree.identity().to_owned();
+    drop(mount);
+    drop(tree);
+    let reopened = Tree::open(&state, "test", source.clone(), CacheConfig::default()).unwrap();
+    assert_eq!(reopened.identity(), namespace);
+    reopened
+        .attach_lazy_source(
+            provider,
+            output_core::SourcePin {
+                root: [1; 32],
+                generation: 1,
+            },
+        )
+        .unwrap();
+    let mount = output_fuse::start_native_source(reopened, &root, [8; 32])
+        .await
+        .unwrap();
+    let result = io(move || -> Result<()> {
+        anyhow::ensure!(fs::read(root.join("mapped"))? == vec![b'a'; 4096]);
+        anyhow::ensure!(
+            fs::write(root.join("new-after-restart"), b"blocked")
+                .unwrap_err()
+                .raw_os_error()
+                == Some(libc::EROFS)
+        );
+        Ok(())
+    })
+    .await;
+    mount.shutdown().await.unwrap();
+    result.unwrap();
 }

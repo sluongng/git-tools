@@ -2857,3 +2857,67 @@ fn strict_database_recovery_preserves_rejected_bytes_and_finishes_before_new_syn
         assert!(namespace.get(b"must-not-write").unwrap().is_none());
     }
 }
+
+#[tokio::test]
+async fn immutable_lazy_namespace_reopens_and_never_downgrades_its_sealed_root() {
+    let (dir, source, tree) = setup(CacheConfig::default());
+    let directories = Arc::new(Directories::default());
+    tree.install_immutable_lazy_source(
+        lazy_fixture(&tree, &source, &directories),
+        "candidate",
+        &SourceLimits::default(),
+    )
+    .unwrap();
+    let a = tree.lookup_source(1, "a").await.unwrap();
+    assert!(
+        tree.write(a.id, 0, b"blocked")
+            .await
+            .unwrap_err()
+            .is::<CoreError>()
+    );
+    assert_eq!(source.calls.load(Ordering::SeqCst), 0);
+    let identity = tree.identity().to_owned();
+    let state = tree.state_dir().to_owned();
+    drop(tree);
+    let reopened = Tree::open(state, "test", source.clone(), CacheConfig::default()).unwrap();
+    assert_eq!(reopened.identity(), identity);
+    assert_eq!(
+        reopened.source_access(),
+        SourceAccess::ImmutableCandidate { root_tree: [1; 32] }
+    );
+    reopened
+        .attach_lazy_source(
+            directories.clone(),
+            SourcePin {
+                root: [1; 32],
+                generation: 1,
+            },
+        )
+        .unwrap();
+    let root = lazy_fixture(&reopened, &source, &directories);
+    reopened
+        .install_immutable_lazy_source(root, "candidate", &SourceLimits::default())
+        .unwrap();
+    assert_eq!(
+        reopened
+            .create(1, "blocked", 0o644)
+            .await
+            .unwrap_err()
+            .downcast_ref::<CoreError>(),
+        Some(&CoreError::ReadOnly)
+    );
+    let mut replacement = lazy_fixture(&reopened, &source, &directories);
+    replacement.root_tree = [9; 32];
+    replacement.pin.root = [9; 32];
+    assert_eq!(
+        reopened
+            .install_immutable_lazy_source(replacement, "new-intent", &SourceLimits::default())
+            .unwrap_err()
+            .downcast_ref::<CoreError>(),
+        Some(&CoreError::ReadOnly)
+    );
+    assert_eq!(reopened.lazy_source_pin().unwrap().root, [1; 32]);
+    assert_eq!(source.calls.load(Ordering::SeqCst), 0);
+    drop(reopened);
+    drop(dir);
+}

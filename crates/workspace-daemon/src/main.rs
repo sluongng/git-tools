@@ -63,6 +63,22 @@ enum Operation {
         #[arg(long)]
         apply: bool,
     },
+    /// Provision a sealed native check source by exact unpublished commit.
+    #[command(hide = true)]
+    NativeCandidateMount {
+        root: PathBuf,
+        #[arg(long)]
+        store: String,
+        #[arg(long)]
+        commit: String,
+        #[arg(long)]
+        workspace_id: String,
+    },
+    /// Resume a privately recorded native mount using its original access policy.
+    #[command(hide = true)]
+    NativeResume {
+        root: PathBuf,
+    },
     /// Create a private writable source workspace; pin a full commit SHA.
     Create {
         session: PathBuf,
@@ -205,6 +221,22 @@ async fn run(cli: Cli) -> Result<serde_json::Value> {
         Operation::RetryBes => return controller.call(Request::RetryBes),
         Operation::NativeGc { store, apply } => {
             return controller.call(Request::NativeGc { store, apply });
+        }
+        Operation::NativeCandidateMount {
+            root,
+            store,
+            commit,
+            workspace_id,
+        } => {
+            return controller.call(Request::NativeCandidateMount {
+                root,
+                store,
+                commit,
+                workspace_id,
+            });
+        }
+        Operation::NativeResume { root } => {
+            return controller.call(Request::NativeResume { root });
         }
         Operation::Shutdown => return controller.call(Request::Shutdown),
         Operation::Status {

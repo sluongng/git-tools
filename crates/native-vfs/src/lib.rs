@@ -6,7 +6,8 @@ use jj_native_backend::NativeObjectIo;
 use local_cas::LocalCas;
 use native_workspace::{Compiler, Limits, Scope};
 use output_core::{
-    Projection, SourceDeltaSnapshot, SourceFrontendFence, SourceLimits, SourceSnapshot, Tree,
+    Projection, SourceAccess, SourceDeltaSnapshot, SourceFrontendFence, SourceLimits,
+    SourceSnapshot, Tree,
 };
 use private_fs::PrivateDir;
 use serde::{Deserialize, Serialize};
@@ -34,6 +35,8 @@ pub struct Config {
 #[serde(deny_unknown_fields)]
 struct Header {
     format: u32,
+    #[serde(default, skip_serializing_if = "SourceAccess::is_read_write")]
+    access: SourceAccess,
     workspace_identity: [u8; 32],
     backend: String,
     mount_root: PathBuf,
@@ -66,6 +69,7 @@ pub struct PreparedWorkspace {
     owner: Arc<StateOwner>,
     tree: Arc<Tree>,
     compiler: Arc<Compiler>,
+    access: SourceAccess,
 }
 impl std::fmt::Debug for PreparedWorkspace {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -76,6 +80,10 @@ impl PreparedWorkspace {
     pub fn tree(&self) -> Arc<Tree> {
         self.tree.clone()
     }
+    pub fn source_access(&self) -> SourceAccess {
+        self.access
+    }
+
     pub fn compiler(&self) -> Arc<Compiler> {
         self.compiler.clone()
     }
@@ -120,7 +128,7 @@ pub async fn prepare(
     provider: Arc<dyn NativeObjectIo>,
     cache: Arc<LocalCas>,
 ) -> Result<PreparedWorkspace> {
-    prepare_mode(config, provider, cache, false).await
+    prepare_mode(config, provider, cache, false, SourceAccess::ReadWrite).await
 }
 /// Reattach recognized ready lazy state only, using the original saved bootstrap
 /// seed solely for identity recognition. The current baseline, generation and
@@ -131,13 +139,60 @@ pub async fn prepare_existing(
     provider: Arc<dyn NativeObjectIo>,
     cache: Arc<LocalCas>,
 ) -> Result<PreparedWorkspace> {
-    prepare_mode(config, provider, cache, true).await
+    prepare_mode(config, provider, cache, true, SourceAccess::ReadWrite).await
+}
+/// A fresh sealed source for trusted checks. Normal agent workspaces remain editable.
+/// Windows is deliberately unsupported until native NTFS write prevention exists.
+#[derive(Clone, Copy, Debug)]
+pub struct ImmutableCandidateUnsupported;
+impl std::fmt::Display for ImmutableCandidateUnsupported {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("immutable native candidates are unsupported by this provider")
+    }
+}
+impl std::error::Error for ImmutableCandidateUnsupported {}
+pub async fn prepare_immutable_candidate(
+    config: Config,
+    provider: Arc<dyn NativeObjectIo>,
+    cache: Arc<LocalCas>,
+) -> Result<PreparedWorkspace> {
+    prepare_candidate_mode(config, provider, cache, false).await
+}
+pub async fn prepare_existing_immutable_candidate(
+    config: Config,
+    provider: Arc<dyn NativeObjectIo>,
+    cache: Arc<LocalCas>,
+) -> Result<PreparedWorkspace> {
+    prepare_candidate_mode(config, provider, cache, true).await
+}
+async fn prepare_candidate_mode(
+    config: Config,
+    provider: Arc<dyn NativeObjectIo>,
+    cache: Arc<LocalCas>,
+    existing_only: bool,
+) -> Result<PreparedWorkspace> {
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    return Err(ImmutableCandidateUnsupported.into());
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    {
+        validate(&config)?;
+        let root_tree = resolved_tree(&config.root_merge)?.0;
+        prepare_mode(
+            config,
+            provider,
+            cache,
+            existing_only,
+            SourceAccess::ImmutableCandidate { root_tree },
+        )
+        .await
+    }
 }
 async fn prepare_mode(
     config: Config,
     provider: Arc<dyn NativeObjectIo>,
     cache: Arc<LocalCas>,
     existing_only: bool,
+    access: SourceAccess,
 ) -> Result<PreparedWorkspace> {
     validate(&config)?;
     let projected = canonical_candidate(&config.root)?;
@@ -149,7 +204,8 @@ async fn prepare_mode(
     );
     let state_config = config.clone();
     let (owner, header) =
-        tokio::task::spawn_blocking(move || open_state(&state_config, existing_only)).await??;
+        tokio::task::spawn_blocking(move || open_state(&state_config, existing_only, access))
+            .await??;
     let compiler = Arc::new(
         Compiler::new(
             provider,
@@ -201,6 +257,16 @@ async fn prepare_mode(
         );
     }
     if header.ready {
+        ensure!(
+            tree.source_access() == access,
+            "native source access policy mismatch"
+        );
+        if let SourceAccess::ImmutableCandidate { root_tree } = access {
+            ensure!(
+                tree.source_baseline()?.0 == root_tree,
+                "immutable candidate root mismatch"
+            );
+        }
         if let Some(pin) = tree.lazy_source_pin() {
             // The inode root is always a local namespace handle. The persisted
             // source baseline is the canonical immutable tree identity instead.
@@ -254,7 +320,15 @@ async fn prepare_mode(
         tokio::task::spawn_blocking(move || -> Result<()> {
             let _owner = install_owner;
             // Exact receipt replay only; never replace a recognized dirty view.
-            install_tree.install_lazy_source(source, None, "native-bootstrap-v1", &limits)?;
+            if access.is_read_write() {
+                install_tree.install_lazy_source(source, None, "native-bootstrap-v1", &limits)?;
+            } else {
+                install_tree.install_immutable_lazy_source(
+                    source,
+                    "native-candidate-bootstrap-v1",
+                    &limits,
+                )?;
+            }
             Ok(())
         })
         .await??;
@@ -273,6 +347,7 @@ async fn prepare_mode(
             owner,
             tree,
             compiler,
+            access,
         });
     }
     let marker = hex(&config.workspace_identity).into_bytes();
@@ -295,6 +370,7 @@ async fn prepare_mode(
         owner,
         tree,
         compiler,
+        access,
     })
 }
 
@@ -624,6 +700,10 @@ pub async fn mount_prepared_with_metadata_ttl(
     prepared: PreparedWorkspace,
     metadata_ttl: std::time::Duration,
 ) -> Result<NativeMount> {
+    ensure!(
+        prepared.tree.source_access() == prepared.access,
+        "native prepared access mismatch"
+    );
     #[cfg(not(target_os = "linux"))]
     ensure!(
         metadata_ttl.is_zero(),
@@ -741,7 +821,9 @@ fn lock_recovery_linux(
         .context("native workspace state remains owned")?;
     let header: Header = serde_json::from_slice(&directory.read("native-vfs.json", 32 * 1024)?)?;
     ensure!(
-        header.format == 1
+        ((header.format == 1 && header.access.is_read_write())
+            || (header.format == 2
+                && matches!(header.access, SourceAccess::ImmutableCandidate { root_tree } if root_tree == header.bootstrap_root)))
             && header.ready
             && header.workspace_identity == workspace_identity
             && header.mount_root == root
@@ -851,7 +933,11 @@ fn canonical_candidate(path: &Path) -> Result<PathBuf> {
     }
     Ok(resolved)
 }
-fn open_state(config: &Config, existing_only: bool) -> Result<(Arc<StateOwner>, Header)> {
+fn open_state(
+    config: &Config,
+    existing_only: bool,
+    access: SourceAccess,
+) -> Result<(Arc<StateOwner>, Header)> {
     let directory = if existing_only || config.state.try_exists()? {
         PrivateDir::open_existing(&config.state)?
     } else {
@@ -872,7 +958,8 @@ fn open_state(config: &Config, existing_only: bool) -> Result<(Arc<StateOwner>, 
         "existing native workspace is not ready"
     );
     let expected = Header {
-        format: 1,
+        format: if access.is_read_write() { 1 } else { 2 },
+        access,
         workspace_identity: config.workspace_identity,
         backend: config.scope.backend().to_owned(),
         mount_root: config.root.clone(),

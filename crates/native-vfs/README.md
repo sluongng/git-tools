@@ -16,3 +16,10 @@ the Windows provider's NTFS capture groundwork is not yet wired into this API.
 Checked checkout uses the provider's publication fence; unsupported providers
 return an error, never a raw namespace replacement. Native kernel acceptance is
 separate from the portable protocol tests.
+
+Explicit immutable-candidate APIs seal a fresh mount to one commit/root. Linux
+FUSE enforces read-only access; NFS advertises read-only and rejects mutations.
+Windows rejects this mode before provisioning; native macOS/Windows acceptance
+remains separate. Candidate state fails closed on older binaries, while ordinary
+editable formats and defaults stay unchanged. This is a mount primitive, not a
+trusted check runner.

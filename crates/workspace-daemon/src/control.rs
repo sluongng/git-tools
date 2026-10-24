@@ -42,6 +42,13 @@ pub enum Request {
         commit: String,
         workspace_id: String,
     },
+    /// Exact unpublished commit for an immutable trusted-check source.
+    NativeCandidateMount {
+        root: PathBuf,
+        store: String,
+        commit: String,
+        workspace_id: String,
+    },
     NativeRestore {
         root: PathBuf,
         store: String,

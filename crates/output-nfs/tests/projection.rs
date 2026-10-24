@@ -937,3 +937,90 @@ async fn lazy_source_metadata_is_loaded_and_busy_is_not_absence() {
         assert_eq!(source.fetches.load(Ordering::SeqCst), 0);
     }
 }
+
+#[tokio::test]
+async fn immutable_candidate_nfs_rejects_mutations_without_hydration() {
+    use nfsserve::vfs::VFSCapabilities;
+    let (_dir, tree, source) = fixture();
+    let directories = Arc::new(DirectorySource {
+        busy: false,
+        timeout: false,
+        calls: AtomicUsize::new(0),
+    });
+    tree.install_immutable_lazy_source(
+        output_core::LazySourceRoot {
+            identity: tree.identity().into(),
+            root_tree: [1; 32],
+            pin: output_core::SourcePin {
+                root: [1; 32],
+                generation: 1,
+            },
+            provider: directories.clone(),
+            load_limits: Default::default(),
+        },
+        "immutable",
+        &Default::default(),
+    )
+    .unwrap();
+    let fs = OutputNfs::new(tree);
+    assert!(matches!(fs.capabilities(), VFSCapabilities::ReadOnly));
+    let name = filename3::from(&b"new"[..]);
+    assert!(matches!(
+        fs.create(1, &name, Default::default()).await,
+        Err(nfsstat3::NFS3ERR_ROFS)
+    ));
+    assert!(matches!(
+        fs.create_exclusive(1, &name, [1; 8]).await,
+        Err(nfsstat3::NFS3ERR_ROFS)
+    ));
+    assert!(matches!(
+        fs.mkdir(1, &name).await,
+        Err(nfsstat3::NFS3ERR_ROFS)
+    ));
+    assert!(matches!(
+        fs.remove(1, &name).await,
+        Err(nfsstat3::NFS3ERR_ROFS)
+    ));
+    assert!(matches!(
+        fs.rmdir(1, &name).await,
+        Err(nfsstat3::NFS3ERR_ROFS)
+    ));
+    assert!(matches!(
+        fs.rename(1, &name, 1, &filename3::from(&b"other"[..]))
+            .await,
+        Err(nfsstat3::NFS3ERR_ROFS)
+    ));
+    assert!(matches!(
+        fs.symlink(
+            1,
+            &name,
+            &nfspath3::from(&b"target"[..]),
+            &Default::default()
+        )
+        .await,
+        Err(nfsstat3::NFS3ERR_ROFS)
+    ));
+    assert!(matches!(
+        fs.write(1, 0, b"blocked").await,
+        Err(nfsstat3::NFS3ERR_ROFS)
+    ));
+    assert!(matches!(
+        fs.setattr(
+            1,
+            sattr3 {
+                mode: set_mode3::mode(0o777),
+                ..Default::default()
+            }
+        )
+        .await,
+        Err(nfsstat3::NFS3ERR_ROFS)
+    ));
+    assert_eq!(directories.calls.load(Ordering::SeqCst), 0);
+    assert_eq!(source.fetches.load(Ordering::SeqCst), 0);
+    let listing = fs.readdir(1, 0, 10).await.unwrap();
+    assert_eq!(listing.entries.len(), 1);
+    let link = fs.lookup(1, &filename3::from(&b"link"[..])).await.unwrap();
+    assert_eq!(fs.readlink(link).await.unwrap().0, b"target");
+    assert_eq!(directories.calls.load(Ordering::SeqCst), 1);
+    assert_eq!(source.fetches.load(Ordering::SeqCst), 0);
+}

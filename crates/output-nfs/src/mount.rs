@@ -297,8 +297,13 @@ impl NativeSession {
             std::fs::read_dir(root)?.next().is_none(),
             "unmounted output root contains files; refusing to hide them"
         );
+        let access = if self.fs.tree.source_access().is_read_write() {
+            "rw"
+        } else {
+            "ro"
+        };
         let options = format!(
-            "vers=3,tcp,locallocks,noresvport,port={},mountport={},retrycnt=0,nobrowse,nosuid,nodev",
+            "{access},vers=3,tcp,locallocks,noresvport,port={},mountport={},retrycnt=0,nobrowse,nosuid,nodev",
             self.port, self.port
         );
         self.mount_child = Some(

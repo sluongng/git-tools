@@ -311,6 +311,14 @@ fn checked_path(path: &str, limits: &SourceLimits) -> Result<()> {
 pub(super) fn validate_reopen(state: &State) -> Result<()> {
     let Some(meta) = state.source.as_ref().and_then(|s| s.lazy.as_ref()) else {
         ensure!(
+            state.version != 5
+                && state
+                    .source
+                    .as_ref()
+                    .is_none_or(|s| s.access.is_read_write()),
+            "immutable candidate lacks lazy source"
+        );
+        ensure!(
             state
                 .nodes
                 .values()
@@ -320,9 +328,23 @@ pub(super) fn validate_reopen(state: &State) -> Result<()> {
         return Ok(());
     };
     ensure!(
-        state.version == 4 && meta.pin.root != [0; 32] && meta.root_tree != [0; 32],
+        matches!(state.version, 4 | 5) && meta.pin.root != [0; 32] && meta.root_tree != [0; 32],
         "lazy source format mismatch"
     );
+    match state.source.as_ref().unwrap().access {
+        SourceAccess::ReadWrite => ensure!(state.version == 4, "immutable source policy missing"),
+        SourceAccess::ImmutableCandidate { root_tree } => {
+            ensure!(
+                state.version == 5
+                    && root_tree == meta.root_tree
+                    && root_tree == meta.pin.root
+                    && meta.changes.is_empty()
+                    && meta.change_bytes == 0
+                    && state.pending.map.is_empty(),
+                "immutable candidate namespace mismatch"
+            );
+        }
+    }
     meta.load_limits.validate()?;
     meta.limits.validate()?;
     ensure!(
@@ -695,12 +717,40 @@ impl Tree {
         let _freeze = self.source_freeze()?;
         self.install_lazy_source_frozen(root, expected, request_id, limits)
     }
+    pub fn install_immutable_lazy_source(
+        &self,
+        root: LazySourceRoot,
+        request_id: &str,
+        limits: &SourceLimits,
+    ) -> Result<SourceReceipt> {
+        let _freeze = self.source_freeze()?;
+        let access = SourceAccess::ImmutableCandidate {
+            root_tree: root.root_tree,
+        };
+        self.install_lazy_source_frozen_access(root, None, request_id, limits, access)
+    }
     fn install_lazy_source_frozen(
         &self,
         root: LazySourceRoot,
         expected: Option<SourceVersion>,
         request_id: &str,
         limits: &SourceLimits,
+    ) -> Result<SourceReceipt> {
+        self.install_lazy_source_frozen_access(
+            root,
+            expected,
+            request_id,
+            limits,
+            SourceAccess::ReadWrite,
+        )
+    }
+    fn install_lazy_source_frozen_access(
+        &self,
+        root: LazySourceRoot,
+        expected: Option<SourceVersion>,
+        request_id: &str,
+        limits: &SourceLimits,
+        access: SourceAccess,
     ) -> Result<SourceReceipt> {
         limits.validate()?;
         root.load_limits.validate()?;
@@ -709,8 +759,19 @@ impl Tree {
             root.identity == self.identity && root.root_tree != [0; 32] && root.pin.root != [0; 32],
             "lazy source identity mismatch"
         );
+        if let SourceAccess::ImmutableCandidate { root_tree } = access {
+            require(
+                root_tree == root.root_tree && root.pin.root == root_tree && expected.is_none(),
+                CoreError::ReadOnly,
+            )?;
+        }
+        let intent_tag = if access.is_read_write() {
+            "install-lazy-v1"
+        } else {
+            "install-immutable-lazy-v1"
+        };
         let intent = *blake3::hash(&serde_json::to_vec(&(
-            "install-lazy-v1",
+            intent_tag,
             &root.identity,
             root.root_tree,
             &root.pin,
@@ -724,6 +785,9 @@ impl Tree {
                 !ns.failed && ns.state.pending.map.is_empty(),
                 "source namespace unavailable or pending publication"
             );
+            if let Some(existing) = &ns.state.source {
+                require(existing.access == access, CoreError::ReadOnly)?;
+            }
             let replay = ns
                 .state
                 .source
@@ -737,6 +801,17 @@ impl Tree {
                 );
                 receipt.result.clone()
             } else {
+                require(
+                    ns.state
+                        .source
+                        .as_ref()
+                        .is_none_or(|s| s.access.is_read_write()),
+                    CoreError::ReadOnly,
+                )?;
+                require(
+                    access.is_read_write() || ns.state.source.is_none(),
+                    CoreError::ReadOnly,
+                )?;
                 let (generation, revision, mut receipts) = match &ns.state.source {
                     Some(source) => {
                         let actual = if source.lazy.is_some() {
@@ -788,7 +863,7 @@ impl Tree {
                             state.nodes.get_mut(id).unwrap().node.linked = false;
                         }
                     }
-                    state.version = 4;
+                    state.version = if access.is_read_write() { 4 } else { 5 };
                     let record = state.nodes.get_mut(&1).unwrap();
                     record.source_directory = Some(DirectoryBase {
                         tree_id: root.root_tree,
@@ -798,6 +873,7 @@ impl Tree {
                     record.source_clean_ctime = None;
                     touch(state, 1);
                     state.source = Some(source::SourceMeta {
+                        access,
                         root: root.root_tree,
                         generation,
                         revision,
@@ -1574,6 +1650,7 @@ impl SourceDeltaSnapshot {
         request_id: &str,
         limits: &SourceLimits,
     ) -> Result<SourceReceipt> {
+        self.tree.require_source_writable()?;
         limits.validate()?;
         root.load_limits.validate()?;
         source::validate_request_id(request_id)?;

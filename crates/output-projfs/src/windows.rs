@@ -822,6 +822,8 @@ impl Drop for ProjfsMount {
 /// State must be outside the mount. An existing nonempty mount requires the
 /// matching durable root GUID; native edits are never imported into core state.
 pub async fn start(tree: Arc<Tree>, root: &Path, state: &Path) -> Result<ProjfsMount> {
+    // NTFS writes can bypass Tree; notification callbacks cannot veto every edit.
+    tree.require_source_writable()?;
     let runtime =
         tokio::runtime::Handle::try_current().context("start ProjFS inside a Tokio runtime")?;
     ensure!(

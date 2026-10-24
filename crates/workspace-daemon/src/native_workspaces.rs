@@ -57,6 +57,9 @@ struct Record {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 enum Origin {
+    Candidate {
+        bootstrap_commit: [u8; 32],
+    },
     Clone {
         bootstrap_commit: [u8; 32],
     },
@@ -101,7 +104,7 @@ fn read_record(bytes: &[u8]) -> Result<Record> {
                 native_mount: old.native_mount,
             })
         }
-        2 => Ok(serde_json::from_slice(bytes)?),
+        2 | 3 => Ok(serde_json::from_slice(bytes)?),
         _ => anyhow::bail!("unsupported native workspace record version"),
     }
 }
@@ -304,6 +307,32 @@ impl Manager {
         commit: String,
         workspace_id: String,
     ) -> Result<Mounted> {
+        self.create_mode(root, store, commit, workspace_id, false)
+            .await
+    }
+    /// Fresh immutable check source; ordinary native creation stays writable.
+    pub async fn create_candidate(
+        &mut self,
+        root: PathBuf,
+        store: String,
+        commit: String,
+        workspace_id: String,
+    ) -> Result<Mounted> {
+        self.create_mode(root, store, commit, workspace_id, true)
+            .await
+    }
+    async fn create_mode(
+        &mut self,
+        root: PathBuf,
+        store: String,
+        commit: String,
+        workspace_id: String,
+        immutable: bool,
+    ) -> Result<Mounted> {
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        if immutable {
+            return Err(native_vfs::ImmutableCandidateUnsupported.into());
+        }
         let access = self
             .commands
             .as_ref()
@@ -312,6 +341,10 @@ impl Manager {
         let id = unhex(&workspace_id)?;
         ensure!(id != [0; 32], "native workspace identity must be nonzero");
         let commit = unhex(&commit)?;
+        ensure!(
+            !immutable || commit != [0; 32],
+            "candidate requires an exact nonempty commit"
+        );
         normalized(&root)?;
         let root = canonical_candidate(&root)?;
         let repository = self
@@ -321,12 +354,18 @@ impl Manager {
             .clone();
         let registry = self.open_registry()?;
         let record = Record {
-            version: 2,
+            version: if immutable { 3 } else { 2 },
             workspace_id: id,
             root: root.clone(),
             store: store.clone(),
-            origin: Origin::Clone {
-                bootstrap_commit: commit,
+            origin: if immutable {
+                Origin::Candidate {
+                    bootstrap_commit: commit,
+                }
+            } else {
+                Origin::Clone {
+                    bootstrap_commit: commit,
+                }
             },
             scope: repository.scope.backend().into(),
             state: Lifecycle::Pending,
@@ -452,7 +491,12 @@ impl Manager {
             compiler_limits,
             source_limits: source_limits.clone(),
         };
-        let prepared = match native_vfs::prepare(config, io.clone(), self.cache.clone()).await {
+        let preparation = if immutable {
+            native_vfs::prepare_immutable_candidate(config, io.clone(), self.cache.clone()).await
+        } else {
+            native_vfs::prepare(config, io.clone(), self.cache.clone()).await
+        };
+        let prepared = match preparation {
             Ok(prepared) => prepared,
             Err(error) => {
                 self.failed(&workspace_id)?;
@@ -586,7 +630,7 @@ impl Manager {
             self.failed(&workspace_id)?;
             anyhow::bail!("native projection registration failed; provider retained for recovery");
         }
-        if let Some(commands) = &self.commands {
+        if let Some(commands) = self.commands.as_ref().filter(|_| !immutable) {
             let endpoint = self.config.state_dir.join("rbe.sock");
             commands.set_capture_target(
                 &workspace_id,
@@ -638,6 +682,10 @@ impl Manager {
             .record
             .clone();
         match &record.origin {
+            Origin::Candidate { bootstrap_commit } => {
+                self.create_candidate(record.root, record.store, hex(bootstrap_commit), id.into())
+                    .await
+            }
             Origin::Clone { bootstrap_commit } => {
                 self.create(record.root, record.store, hex(bootstrap_commit), id.into())
                     .await
@@ -1669,7 +1717,10 @@ fn same_intent(a: &Record, b: &Record) -> bool {
 }
 fn validate_record(record: &Record) -> Result<()> {
     ensure!(
-        record.version == 2 && record.workspace_id != [0; 32],
+        ((record.version == 2 && !matches!(record.origin, Origin::Candidate { .. }))
+            || (record.version == 3
+                && matches!(record.origin, Origin::Candidate { bootstrap_commit } if bootstrap_commit != [0; 32])))
+            && record.workspace_id != [0; 32],
         "invalid native workspace record"
     );
     normalized(&record.root)?;

@@ -1137,6 +1137,13 @@ pub async fn serve(mut config: Config) -> Result<()> {
                         None => Err(anyhow::anyhow!("native repositories are not configured")),
                     }
                 }
+                Ok(Request::NativeCandidateMount { root, store, commit, workspace_id }) => {
+                    if !configuration_scoped { Err(anyhow::anyhow!("candidate creation requires configuration-scoped control")) }
+                    else {match state_slot.as_mut().unwrap().native_workspaces.as_mut() {
+                        Some(manager) => manager.create_candidate(root, store, commit, workspace_id).await.and_then(|value| serde_json::to_value(value).map_err(Into::into)),
+                        None => Err(anyhow::anyhow!("native repositories are not configured")),
+                    }}
+                }
                 Ok(Request::NativeGc { store, apply }) => {
                     if !configuration_scoped { Err(anyhow::anyhow!("native collection requires configuration-scoped control")) }
                     else { match state_slot.as_ref().unwrap().native_workspaces.as_ref() {

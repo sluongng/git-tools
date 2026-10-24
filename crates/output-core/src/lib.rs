@@ -21,9 +21,9 @@ pub use local_cas::{
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 pub use source::{
-    SourceContent, SourceEntry, SourceFreezeBusy, SourceFreezeTimeout, SourceFrontendFence,
-    SourceLimits, SourceManifest, SourceOperation, SourceReceipt, SourceSnapshot,
-    SourceSnapshotEntry, SourceVersion,
+    SourceAccess, SourceContent, SourceEntry, SourceFreezeBusy, SourceFreezeTimeout,
+    SourceFrontendFence, SourceLimits, SourceManifest, SourceOperation, SourceReceipt,
+    SourceSnapshot, SourceSnapshotEntry, SourceVersion,
 };
 use std::{
     collections::{HashMap, HashSet},
@@ -49,6 +49,7 @@ pub enum CoreError {
     InvalidInput,
     NotSync,
     Stale,
+    ReadOnly,
 }
 impl std::fmt::Display for CoreError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -641,7 +642,7 @@ impl Tree {
                 "existing namespace identity missing"
             );
             ensure!(
-                matches!(header.version, 2 | 3 | 4) && header.backend == backend,
+                matches!(header.version, 2 | 3 | 4 | 5) && header.backend == backend,
                 "output state backend/version mismatch"
             );
             let mut state = State {
@@ -831,7 +832,10 @@ impl Tree {
             );
             tree.existing_source_control(&marker)?;
         } else {
-            tree.change(|_| Ok(()))?;
+            {
+                let mut ns = tree.namespace.lock().unwrap();
+                Self::change_locked_mode(&mut ns, true, |_| Ok(()))?;
+            }
             tree.drain_retired_payloads(usize::MAX)?;
         }
         Ok(tree)
@@ -873,8 +877,33 @@ impl Tree {
             !ns.failed,
             "output namespace commit failed; reopen for recovery"
         );
+        if !population {
+            require(
+                ns.state
+                    .source
+                    .as_ref()
+                    .is_none_or(|s| s.access.is_read_write()),
+                CoreError::ReadOnly,
+            )?;
+        }
         let mut next = ns.state.clone();
         let result = f(&mut next)?;
+        if let Some(source) = ns
+            .state
+            .source
+            .as_ref()
+            .filter(|s| !s.access.is_read_write())
+        {
+            require(
+                next.version == 5
+                    && next.source.as_ref().is_some_and(|n| {
+                        n.access == source.access
+                            && n.root == source.root
+                            && n.generation == source.generation
+                    }),
+                CoreError::ReadOnly,
+            )?;
+        }
         if !population {
             lazy_source::track_changes(&ns.state, &mut next)?;
         }
@@ -1347,6 +1376,7 @@ impl Tree {
             .await
     }
     pub async fn ensure_dir(&self, path: &str) -> Result<Node> {
+        self.require_source_writable()?;
         let _job = self.source_job()?;
         self.ensure_source_path_ancestors(path).await?;
         let names = parts(path)?;
@@ -1435,6 +1465,7 @@ impl Tree {
         result
     }
     pub async fn create(&self, parent: u64, name: &str, mode: u32) -> Result<Node> {
+        self.require_source_writable()?;
         let _job = self.source_job()?;
         self.ensure_directory_loaded(parent).await?;
         self.create_record(parent, name, NodeKind::File, mode, None, None)
@@ -1446,16 +1477,19 @@ impl Tree {
         mode: u32,
         verifier: [u8; 8],
     ) -> Result<Node> {
+        self.require_source_writable()?;
         let _job = self.source_job()?;
         self.ensure_directory_loaded(parent).await?;
         self.create_record(parent, name, NodeKind::File, mode, None, Some(verifier))
     }
     pub async fn mkdir(&self, parent: u64, name: &str, mode: u32) -> Result<Node> {
+        self.require_source_writable()?;
         let _job = self.source_job()?;
         self.ensure_directory_loaded(parent).await?;
         self.create_record(parent, name, NodeKind::Directory, mode, None, None)
     }
     pub async fn symlink(&self, parent: u64, name: &str, target: &str) -> Result<Node> {
+        self.require_source_writable()?;
         let _job = self.source_job()?;
         self.ensure_directory_loaded(parent).await?;
         ensure!(!target.contains('\0'), "invalid symlink target");
@@ -1486,6 +1520,7 @@ impl Tree {
         })
     }
     pub async fn unlink(&self, parent: u64, name: &str) -> Result<()> {
+        self.require_source_writable()?;
         let _job = self.source_job()?;
         self.ensure_directory_loaded(parent).await?;
         let candidate = self.lookup(parent, name)?;
@@ -1495,11 +1530,13 @@ impl Tree {
         self.unlink_kind(parent, name, None)
     }
     pub async fn unlink_file(&self, parent: u64, name: &str) -> Result<()> {
+        self.require_source_writable()?;
         let _job = self.source_job()?;
         self.ensure_directory_loaded(parent).await?;
         self.unlink_kind(parent, name, Some(NodeKind::File))
     }
     pub async fn unlink_directory(&self, parent: u64, name: &str) -> Result<()> {
+        self.require_source_writable()?;
         let _job = self.source_job()?;
         self.ensure_directory_loaded(parent).await?;
         let candidate = self.lookup(parent, name)?;
@@ -1515,6 +1552,7 @@ impl Tree {
         new_parent: u64,
         new_name: &str,
     ) -> Result<()> {
+        self.require_source_writable()?;
         let _job = self.source_job()?;
         self.ensure_directory_loaded(parent).await?;
         self.ensure_directory_loaded(new_parent).await?;
@@ -1579,6 +1617,7 @@ impl Tree {
         })
     }
     pub async fn prepare_stage(&self, path: &str, artifact: Artifact) -> Result<PreparedStage> {
+        self.require_source_writable()?;
         let _job = self.source_job()?;
         self.source_writable_path(path)?;
         self.validate_artifact(&artifact)?;
@@ -1626,6 +1665,7 @@ impl Tree {
         prepared_valid(&self.namespace.lock().unwrap().state, prepared)
     }
     pub async fn commit_stage(&self, prepared: PreparedStage) -> Result<Node> {
+        self.require_source_writable()?;
         self.change(|s| {
             ensure!(
                 prepared_valid(s, &prepared)?,
@@ -1666,6 +1706,7 @@ impl Tree {
         })
     }
     pub async fn abort_stage(&self, prepared: PreparedStage) -> Result<()> {
+        self.require_source_writable()?;
         self.change(|s| {
             s.pending.remove(&prepared.node.id);
             Ok(())
@@ -1674,6 +1715,7 @@ impl Tree {
     /// Atomic namespace-only publication. Channels needing a pre-publication
     /// native update must instead use prepare_stage/commit_stage.
     pub async fn stage(&self, path: &str, artifact: Artifact) -> Result<Node> {
+        self.require_source_writable()?;
         let _job = self.source_job()?;
         self.source_writable_path(path)?;
         self.validate_artifact(&artifact)?;
@@ -1832,6 +1874,7 @@ impl Tree {
         })
     }
     pub async fn write(&self, id: u64, offset: u64, bytes: &[u8]) -> Result<usize> {
+        self.require_source_writable()?;
         let deadline = tokio::time::Instant::now() + self.cache.config().operation_timeout;
         self.bounded_operation(deadline, self.write_inner(id, offset, bytes, deadline))
             .await
@@ -1879,6 +1922,7 @@ impl Tree {
         attrs: SetAttr,
         expected_ctime: Option<u64>,
     ) -> Result<Node> {
+        self.require_source_writable()?;
         let deadline = tokio::time::Instant::now() + self.cache.config().operation_timeout;
         self.bounded_operation(
             deadline,
@@ -1971,6 +2015,7 @@ impl Tree {
             .collect())
     }
     pub async fn prepare_refresh(&self, prefix: &str) -> Result<RefreshPlan> {
+        self.require_source_writable()?;
         self.require_complete_source_namespace()?;
         let candidates = {
             let ns = self.namespace.lock().unwrap();
@@ -2009,6 +2054,7 @@ impl Tree {
         })
     }
     pub async fn apply_refresh(&self, plan: RefreshPlan) -> Result<Vec<String>> {
+        self.require_source_writable()?;
         ensure!(
             plan.identity == self.identity,
             "refresh plan belongs to another tree"
@@ -2045,6 +2091,7 @@ impl Tree {
         self.apply_refresh(plan).await
     }
     pub async fn clean(&self, prefix: &str) -> Result<()> {
+        self.require_source_writable()?;
         self.require_complete_source_namespace()?;
         parts(prefix)?;
         self.change(|s| {
