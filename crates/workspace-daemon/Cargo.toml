@@ -16,6 +16,7 @@ tinytree-model = { path = "../tinytree-model" }
 native-workspace = { path = "../native-workspace" }
 private-fs = { path = "../private-fs" }
 native-workspace-admin = { path = "../native-workspace-admin" }
+jj-lib = { version = "=0.46.0", default-features = false }
 native-vfs-rpc = { path = "../native-vfs-rpc" }
 native-vfs-controller = { path = "../native-vfs-controller" }
 native-vfs = { path = "../native-vfs" }
@@ -55,6 +56,9 @@ workspace-fuse = { path = "../workspace-fuse" }
 workspace-core = { path = "../workspace-core" }
 
 [dev-dependencies]
+tinytree-index = { path = "../tinytree-index" }
+tinytree-server = { path = "../tinytree-server" }
+tinytree-store = { path = "../tinytree-store" }
 futures = "0.3"
 tinytree-model = { path = "../tinytree-model" }
 tempfile = "3"

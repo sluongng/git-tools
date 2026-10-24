@@ -359,12 +359,166 @@ async fn load_ready(
     Ok((workspace, repo))
 }
 
+fn restore_identity(text: &str) -> Result<[u8; 32], CommandError> {
+    if text.len() != 64
+        || !text
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    {
+        return Err(failure(
+            "restore identities require 64 lowercase hexadecimal digits",
+        ));
+    }
+    Ok(*blake3::Hash::from_hex(text).map_err(failure)?.as_bytes())
+}
+fn restore_control(
+    config_path: &Path,
+) -> Result<workspace_daemon::control::ScopedClient, CommandError> {
+    let config = workspace_daemon::config::Config::load(config_path).map_err(failure)?;
+    let expected = native_workspace_admin::Registry::default_path().map_err(failure)?;
+    let configured = config
+        .native
+        .workspaces
+        .registry_path
+        .clone()
+        .unwrap_or_else(|| expected.clone());
+    if configured != expected {
+        return Err(failure(
+            "daemon registry differs from TINYTREE_REGISTRY; select its matching registry before restore/resume",
+        ));
+    }
+    let client = workspace_daemon::control::ScopedClient::new(&config);
+    client.validate_identity().map_err(failure)?;
+    Ok(client)
+}
+fn restored_response(
+    value: serde_json::Value,
+    destination: &Path,
+    store: Option<&str>,
+    id: Option<[u8; 32]>,
+) -> Result<native_workspace_admin::Binding, CommandError> {
+    #[derive(serde::Deserialize)]
+    struct Mounted {
+        binding: native_workspace_admin::Binding,
+        registry_path: PathBuf,
+    }
+    let mounted: Mounted = serde_json::from_value(value).map_err(failure)?;
+    let registry =
+        native_workspace_admin::Registry::open_existing(&mounted.registry_path).map_err(failure)?;
+    let expected = native_workspace_admin::Registry::default_path().map_err(failure)?;
+    if registry.path() != expected
+        || mounted.binding.root != destination.canonicalize().map_err(failure)?
+        || store.is_some_and(|s| mounted.binding.repository != s)
+        || id.is_some_and(|id| mounted.binding.workspace_id != id)
+    {
+        return Err(failure(
+            "daemon returned a different native restore binding; preserve state",
+        ));
+    }
+    if registry.lookup(&mounted.binding.root).map_err(failure)? != mounted.binding {
+        return Err(failure(
+            "native restore Ready registry differs; preserve state",
+        ));
+    }
+    Ok(mounted.binding)
+}
+pub(crate) async fn restore(
+    ui: &Ui,
+    command: &CommandHelper,
+    destination: &Path,
+    daemon_config: PathBuf,
+    store: String,
+    workspace_id: String,
+    source_workspace: String,
+    generation: u64,
+    manifest: String,
+    manifest_blake3: String,
+    manifest_bytes: u64,
+) -> Result<(), CommandError> {
+    reject_recovery_overrides(command)?;
+    #[cfg(any(not(target_os = "linux"), feature = "protocol-fixture"))]
+    {
+        let _ = (
+            ui,
+            destination,
+            daemon_config,
+            store,
+            workspace_id,
+            source_workspace,
+            generation,
+            manifest,
+            manifest_blake3,
+            manifest_bytes,
+        );
+        return Err(failure(
+            "startup-gated native restore requires the production Linux daemon; no checkout was created",
+        ));
+    }
+    #[cfg(all(target_os = "linux", not(feature = "protocol-fixture")))]
+    {
+        use std::io::Write as _;
+        let id = restore_identity(&workspace_id)?;
+        let source = workspace_daemon::control::NativeRestoreSelection {
+            workspace_id: restore_identity(&source_workspace)?,
+            generation,
+            manifest_id: restore_identity(&manifest)?,
+            manifest_blake3: restore_identity(&manifest_blake3)?,
+            manifest_size_bytes: manifest_bytes,
+        };
+        let client = restore_control(&command.cwd().join(daemon_config))?;
+        let value = client
+            .call(workspace_daemon::control::Request::NativeRestore {
+                root: destination.to_owned(),
+                store: store.clone(),
+                workspace_id,
+                source,
+            })
+            .map_err(failure)?;
+        let binding = restored_response(value, destination, Some(&store), Some(id))?;
+        writeln!(
+            ui.stdout(),
+            "Restored retained native workspace into {}",
+            binding.root.display()
+        )?;
+        Ok(())
+    }
+}
+fn resume_scoped(
+    command: &CommandHelper,
+    destination: &Path,
+    config: &Path,
+) -> Result<(), CommandError> {
+    #[cfg(any(not(target_os = "linux"), feature = "protocol-fixture"))]
+    {
+        let _ = (command, destination, config);
+        return Err(failure(
+            "startup-gated restored resume requires the production Linux daemon",
+        ));
+    }
+    #[cfg(all(target_os = "linux", not(feature = "protocol-fixture")))]
+    {
+        let client = restore_control(config)?;
+        let value = client
+            .call(workspace_daemon::control::Request::NativeResume {
+                root: destination.to_owned(),
+            })
+            .map_err(failure)?;
+        restored_response(value, destination, None, None)?;
+        // Do not load_at_head or merge concurrent operation heads during resume.
+        Ok(())
+    }
+}
+
 pub(crate) async fn resume(
     ui: &Ui,
     command: &CommandHelper,
     destination: &Path,
+    daemon_config: Option<PathBuf>,
 ) -> Result<(), CommandError> {
     reject_recovery_overrides(command)?;
+    if let Some(config) = daemon_config {
+        return resume_scoped(command, destination, &command.cwd().join(config));
+    }
     let destination = destination.canonicalize().map_err(failure)?;
     let destination = destination.as_path();
     #[cfg(any(not(unix), feature = "protocol-fixture"))]
@@ -445,7 +599,11 @@ pub(crate) async fn resume(
             .map_err(failure)?;
             intent.complete(&binding).map_err(failure)?;
         } else {
-            let ready = registry.resume_info(destination).map_err(failure)?;
+            let ready = registry.resume_info(destination).map_err(|error| {
+                failure(format!(
+                    "{error}; restored origins require tinytree resume --daemon-config PATH"
+                ))
+            })?;
             let binding = mount(
                 &registry,
                 &ready.binding.root,
@@ -502,8 +660,10 @@ pub(crate) fn unmount(command: &CommandHelper, destination: &Path) -> Result<(),
                     .collect(),
             ),
             None => {
-                let ready = registry.resume_info(&root).map_err(failure)?;
-                (ready.binding.endpoint.local(), ready.binding.id())
+                // Stopping needs the validated mounted binding, not clone-only
+                // resume admission or any replay of a restored source.
+                let binding = registry.lookup(&root).map_err(failure)?;
+                (binding.endpoint.local(), binding.id())
             }
         };
         control_call(

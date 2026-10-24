@@ -24,3 +24,6 @@ mod native_capture;
 
 #[cfg(unix)]
 mod native_capture_upload;
+
+#[cfg(unix)]
+mod native_restore_source;

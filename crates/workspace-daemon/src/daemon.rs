@@ -619,7 +619,12 @@ fn open_native_host(
             )
             .map_err(|_| anyhow::anyhow!("cannot open configured native remote; state retained"))?;
 
-            upload_sources.insert(alias.clone(), (remote.io.clone(), remote.control.clone()));
+            let restore =
+                jj_native_remote::RemoteRestoreIo::new(remote.io.clone(), remote.query.clone())?;
+            upload_sources.insert(
+                alias.clone(),
+                (remote.io.clone(), remote.control.clone(), restore),
+            );
             queries.insert(alias.clone(), remote.query);
             stores.insert(alias.clone(), remote.io);
             controls.insert(alias.clone(), Arc::new(remote.control));
@@ -671,6 +676,7 @@ fn open_native_host(
         .iter()
         .map(|(alias, description)| (alias.clone(), description.identity))
         .collect::<BTreeMap<_, _>>();
+    let raw_queries = queries.clone();
     let broker =
         native_broker::BrokerService::new(stores, config.native.broker_config(&config.reapi))
             .and_then(|broker| broker.with_controls(controls))
@@ -691,10 +697,12 @@ fn open_native_host(
         retained.insert(
             alias.clone(),
             crate::native_workspaces::Repository {
-                upload: upload_sources.remove(alias).map(|(io, control)| {
+                query: raw_queries.get(alias).cloned(),
+                upload: upload_sources.remove(alias).map(|(io, control, restore)| {
                     Arc::new(crate::native_capture_upload::Source {
                         io,
                         control,
+                        restore,
                         identity: identities[alias],
                     })
                 }),
@@ -1084,6 +1092,7 @@ pub async fn serve(mut config: Config) -> Result<()> {
                 Ok(Ok(_)) if bytes.len() <= 65536 => serde_json::from_slice::<Request>(&bytes).map_err(anyhow::Error::from),
                 _ => Err(anyhow::anyhow!("invalid or oversized control request")),
             };
+            let configuration_scoped = matches!(&request,Ok(Request::Scoped {..}));
             // Validate and execute against this same owned state. A client that
             // connected to a replacement daemon cannot reuse an old proof.
             let request = match request {
@@ -1115,6 +1124,14 @@ pub async fn serve(mut config: Config) -> Result<()> {
                         Some(manager) => manager.create(root, store, commit, workspace_id).await.and_then(|value| serde_json::to_value(value).map_err(Into::into)),
                         None => Err(anyhow::anyhow!("native repositories are not configured")),
                     }
+                }
+                Ok(Request::NativeRestore {root,store,workspace_id,source}) => {
+                    if !configuration_scoped {Err(anyhow::anyhow!("native restore requires matching scoped daemon configuration"))}
+                    else {match state_slot.as_mut().unwrap().native_workspaces.as_mut(){Some(manager)=>manager.restore(root,store,workspace_id,source).await.and_then(|value|serde_json::to_value(value).map_err(Into::into)),None=>Err(anyhow::anyhow!("native repositories are not configured"))}}
+                }
+                Ok(Request::NativeResume {root}) => {
+                    if !configuration_scoped {Err(anyhow::anyhow!("native resume requires matching scoped daemon configuration"))}
+                    else {match state_slot.as_mut().unwrap().native_workspaces.as_mut(){Some(manager)=>manager.resume_root(root).await.and_then(|value|serde_json::to_value(value).map_err(Into::into)),None=>Err(anyhow::anyhow!("native repositories are not configured"))}}
                 }
                 Ok(Request::NativeUnmount { workspace_id }) => {
                     match state_slot.as_mut().unwrap().native_workspaces.as_mut() {

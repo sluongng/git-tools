@@ -109,6 +109,8 @@ struct Initialization {
     initial_commit: Vec<u8>,
     workspace: String,
     ready: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    restore_origin: Option<[u8; 32]>,
 }
 
 pub struct Registry {
@@ -350,6 +352,7 @@ impl Registry {
                 && !journal.workspace.is_empty(),
             "native initialization is incomplete or has another binding; preserve state and reconcile explicitly"
         );
+        restore::ready_attachment(binding, &journal)?;
         let wc = PrivateDir::open_existing(&binding.working_copy)?;
         ensure!(
             wc.read("type", 128)? == jj_vfs::native::NAME.as_bytes(),
@@ -596,6 +599,7 @@ pub async fn initialize_with_index(
         initial_commit: initial_commit.as_bytes().to_vec(),
         workspace: workspace_name.as_str().into(),
         ready: false,
+        restore_origin: None,
     };
     admin.replace(JOURNAL, &bounded_encode(&journal)?)?;
     let repo_directory = PrivateDir::create(&binding.repo)?;

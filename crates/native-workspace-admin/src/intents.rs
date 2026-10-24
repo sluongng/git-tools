@@ -103,6 +103,10 @@ impl Registry {
             let admin = PrivateDir::open_existing(&binding.admin)?;
             let journal: Initialization =
                 serde_json::from_slice(&admin.read(JOURNAL, MAX_RECORD)?)?;
+            ensure!(
+                crate::restore::ready_attachment(&binding, &journal)?.is_none(),
+                "restored origin requires typed current-state resume, not clone admission"
+            );
             found = Some(ResumeInfo {
                 binding,
                 initial_commit: CommitId::new(journal.initial_commit),

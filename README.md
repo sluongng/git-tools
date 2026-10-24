@@ -76,7 +76,7 @@ entry points. Most also expose Rust libraries; `jj-native-cli` is executable-onl
 | [`workspace-projfs`](crates/workspace-projfs) | `git-projfs` | Windows source mounts using ProjFS. |
 | [`jj-vfs`](crates/jj-vfs) | `git-jj` | Jujutsu working-copy integration with the source VFS. |
 | [`tinytree-server`](crates/tinytree-server) | `tinytree` | Separate jj-native object, reference and graph-query server over compressed gRPC. |
-| [`jj-native-cli`](crates/jj-native-cli) | `tinytree-jj` | Native jj commands through daemon-owned lazy workspaces; broker-backed clone/fetch/push. |
+| [`jj-native-cli`](crates/jj-native-cli) | `tinytree-jj` | Native jj commands through daemon-owned lazy workspaces; clone/fetch/push and exact capture restore. |
 | [`bazel-output-service`](crates/bazel-output-service) | `git-output-service` | Lazy Bazel output service backed by remote CAS. |
 
 ### Library-only crates
@@ -98,7 +98,7 @@ entry points. Most also expose Rust libraries; `jj-native-cli` is executable-onl
 | [`jj-native-remote`](crates/jj-native-remote) | Lazy native object I/O, checked query admission and durable publication. |
 | [`native-broker`](crates/native-broker) | Private object, reference and query I/O over one local endpoint. |
 | [`native-workspace`](crates/native-workspace), [`native-vfs`](crates/native-vfs) | Directory-at-a-time native source projection and platform mount ownership. |
-| [`native-workspace-admin`](crates/native-workspace-admin) | Private external jj administration and restart-safe provisioning. |
+| [`native-workspace-admin`](crates/native-workspace-admin) | Private external jj administration, sealed restore finalization and current-state resume. |
 | [`native-vfs-controller`](crates/native-vfs-controller), [`native-vfs-rpc`](crates/native-vfs-rpc) | Dirty-only snapshots, checked root changes and private projection control. |
 | [`native-retention`](crates/native-retention) | Durable workspace root claims and collection fences; not yet automatic client GC. |
 | [`native-capture-pack`](crates/native-capture-pack) | Bounded local capture framing and verification; portable leases exclude private workspace state. |

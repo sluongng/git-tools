@@ -1438,6 +1438,35 @@ async fn fresh_restore_stages_original_plural_operations_and_wc_without_publishi
             .await
             .unwrap(),
     ];
+    // Supported codec compatibility case: the final view_id wins on decode,
+    // while local import normalizes the selected raw protobuf representation.
+    let old_at = objects
+        .iter()
+        .position(|object| {
+            object.id() == c::ObjectId::Operation(wc_operation.as_bytes().try_into().unwrap())
+        })
+        .unwrap();
+    let mut alternate = vec![0x0a, 64];
+    alternate.extend_from_slice(&[1; 64]);
+    alternate.extend_from_slice(objects[old_at].payload().unwrap());
+    objects[old_at] = c::VerifiedObject::verify(
+        objects[old_at].id(),
+        c::BlobDigest::of(&alternate),
+        &alternate,
+        Default::default(),
+    )
+    .unwrap();
+    assert_eq!(objects[old_at].operation(), Some(&old));
+    let source_records = objects
+        .iter()
+        .map(|object| {
+            (
+                object.id(),
+                object.digest().unwrap(),
+                object.payload().unwrap().to_vec(),
+            )
+        })
+        .collect::<Vec<_>>();
     objects.sort_by_key(|object| object.id());
     let encoded = c::build_index_artifacts(
         &c::PortableIndexSnapshot {
@@ -1669,33 +1698,141 @@ async fn fresh_restore_stages_original_plural_operations_and_wc_without_publishi
         objects,
         artifacts,
     };
-    let prepared =
-        restore::prepare_restore(client, inputs, provider, Default::default(), Arc::new(()))
-            .await
-            .unwrap();
+    let source_permit = Arc::new(tokio::sync::Semaphore::new(1));
+    let source_owner = Arc::new(source_permit.clone().acquire_owned().await.unwrap());
+    let source_weak = Arc::downgrade(&source_owner);
+    let prepared = restore::prepare_restore(
+        client.clone(),
+        inputs,
+        provider.clone(),
+        Default::default(),
+        source_owner.clone(),
+    )
+    .await
+    .unwrap();
     assert!(
         !fixture.binding.admin.exists(),
         "source preparation must not initialize the destination"
     );
-    let intent = fixture
+    assert_eq!(prepared.projection_seed().wc_operation, wc_operation.hex());
+    assert_eq!(
+        prepared.projection_seed().snapshot_operation,
+        snapshot_operation.hex()
+    );
+    assert_eq!(prepared.source_identity().workspace_id(), [42; 32]);
+    assert_ne!(
+        prepared.source_identity().workspace_id(),
+        fixture.binding.workspace_id
+    );
+    let mut intent = fixture
         .registry
         .begin_restore(&fixture.binding, &prepared)
         .unwrap();
+    intent.prepare_working_copy_directory().unwrap();
     let busy = fixture
         .registry
         .begin_restore(&fixture.binding, &prepared)
         .err()
         .expect("second restore admission must fail without blocking");
     assert!(busy.is::<restore::RestoreBusy>());
-    let receipt = restore::initialize_restored(
-        intent,
+    struct ReleaseRestorePause(Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>);
+    impl Drop for ReleaseRestorePause {
+        fn drop(&mut self) {
+            *self.0.0.lock().unwrap_or_else(|e| e.into_inner()) = true;
+            self.0.1.notify_all();
+        }
+    }
+    let pause = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
+    let release = ReleaseRestorePause(pause.clone());
+    let (entered, waiting) = tokio::sync::oneshot::channel();
+    let entered = std::sync::Mutex::new(Some(entered));
+    let host = restore::RestoreHost {
+        settings: fixture.settings.clone(),
+        signer: Signer::new(None, vec![]),
+        connector: fixture.connector.clone(),
+        backend_config: Default::default(),
+        backend_metadata: Arc::new(move |_| {
+            if let Some(entered) = entered.lock().unwrap().take() {
+                let _ = entered.send(());
+            }
+            let mut released = pause.0.lock().unwrap();
+            while !*released {
+                released = pause.1.wait(released).unwrap();
+            }
+            Ok(())
+        }),
+    };
+    let task = tokio::spawn(restore::initialize_restored(intent, prepared, host));
+    waiting.await.unwrap();
+    drop(source_owner);
+    task.abort();
+    assert!(task.await.unwrap_err().is_cancelled());
+    assert!(
+        source_weak.upgrade().is_some(),
+        "cancelled stage retains its physical source owner"
+    );
+    assert_eq!(source_permit.available_permits(), 0);
+    assert!(
+        restore::wait_for_restore_work_until(
+            std::time::Instant::now() + std::time::Duration::from_millis(5)
+        )
+        .await
+        .is_err()
+    );
+    drop(release);
+    restore::wait_for_restore_work_until(
+        std::time::Instant::now() + std::time::Duration::from_secs(30),
+    )
+    .await
+    .unwrap();
+    assert!(
+        !fixture.binding.admin.join("initialization.json").exists(),
+        "cancelled stage cannot acknowledge Ready"
+    );
+
+    // The accepted worker completed exact staging after waiter cancellation.
+    // A fresh authenticated source is required to reconcile its lost receipt.
+    let version = client
+        .cloud_captured_version(client.cloud_retained_version([42; 32], 1).await.unwrap())
+        .unwrap();
+    let fresh_objects = source_records
+        .iter()
+        .map(|(id, raw, bytes)| {
+            c::VerifiedObject::verify(*id, *raw, bytes, Default::default()).unwrap()
+        })
+        .collect();
+    let fresh_artifacts = encoded
+        .artifacts
+        .iter()
+        .map(|artifact| {
+            c::decode_index_artifact(&artifact.bytes, artifact.descriptor, Default::default())
+                .unwrap()
+        })
+        .collect();
+    let prepared = restore::prepare_restore(
+        client.clone(),
+        restore::RestoreInputs {
+            version,
+            objects: fresh_objects,
+            artifacts: fresh_artifacts,
+        },
+        provider.clone(),
+        Default::default(),
+        Arc::new(()),
+    )
+    .await
+    .unwrap();
+    assert!(source_weak.upgrade().is_none());
+    assert_eq!(source_permit.available_permits(), 1);
+    let mut receipt = restore::reopen_staged_restore(
+        fixture.registry.clone(),
+        fixture.binding.clone(),
         prepared,
-        restore::RestoreHost {
+        restore::RestoreReadbackHost {
             settings: fixture.settings.clone(),
-            signer: Signer::new(None, vec![]),
             connector: fixture.connector.clone(),
             backend_config: Default::default(),
-            backend_metadata: Arc::new(|_| Ok(())),
+            backend_metadata_check: Arc::new(|_| Ok(())),
         },
     )
     .await
@@ -1723,6 +1860,22 @@ async fn fresh_restore_stages_original_plural_operations_and_wc_without_publishi
         current
     );
     assert_eq!(restored.read_view(&view_id).await.unwrap(), view);
+    let local_raw = restored
+        .read_cloud_operation_payload(&wc_operation, Default::default())
+        .unwrap();
+    let original_raw = source_records
+        .iter()
+        .find(|(id, _, _)| {
+            *id == c::ObjectId::Operation(wc_operation.as_bytes().try_into().unwrap())
+        })
+        .unwrap()
+        .1;
+    assert_ne!(
+        c::BlobDigest::of(&local_raw),
+        original_raw,
+        "local codec normalization must preserve semantic contents rather than the source wire representation"
+    );
+
     assert_eq!(
         jj_lib::simple_op_heads_store::SimpleOpHeadsStore::load(
             &fixture.binding.repo.join("op_heads")
@@ -1738,5 +1891,180 @@ async fn fresh_restore_stages_original_plural_operations_and_wc_without_publishi
     assert!(fixture.registry.resume_info(&fixture.binding.root).is_err());
     assert!(fixture.binding.admin.join("restore-stage.json").exists());
     assert!(!fixture.binding.admin.join("initialization.json").exists());
+    // Caller-editable diagnostic fields are never publication authority.
+    receipt.wc_operation[0] ^= 1;
+    let readback_host = || restore::RestoreReadbackHost {
+        settings: fixture.settings.clone(),
+        connector: fixture.connector.clone(),
+        backend_config: Default::default(),
+        backend_metadata_check: Arc::new(|_| Ok(())),
+    };
+    assert!(
+        restore::finalize_staged_restore(receipt, readback_host())
+            .await
+            .is_err()
+    );
+    assert!(!fixture.binding.admin.join("initialization.json").exists());
+    let journal_path = fixture.binding.admin.join("restore-stage.json");
+    let journal_bytes = fs::read(&journal_path).unwrap();
+    let mut legacy: serde_json::Value = serde_json::from_slice(&journal_bytes).unwrap();
+    legacy.as_object_mut().unwrap().remove("index_fingerprint");
+    fs::write(&journal_path, serde_json::to_vec(&legacy).unwrap()).unwrap();
+    assert!(
+        fixture
+            .registry
+            .restore_resume_eligibility(&fixture.binding, [7; 32])
+            .unwrap_err()
+            .is::<restore::RestoreRecoveryRequired>()
+    );
+    fs::write(&journal_path, &journal_bytes).unwrap();
+
+    let calls = queries.calls.load(Ordering::SeqCst);
+    let version = client
+        .cloud_captured_version(client.cloud_retained_version([42; 32], 1).await.unwrap())
+        .unwrap();
+    let fresh_objects = source_records
+        .iter()
+        .map(|(id, raw, bytes)| {
+            c::VerifiedObject::verify(*id, *raw, bytes, Default::default()).unwrap()
+        })
+        .collect();
+    let fresh_artifacts = encoded
+        .artifacts
+        .iter()
+        .map(|artifact| {
+            c::decode_index_artifact(&artifact.bytes, artifact.descriptor, Default::default())
+                .unwrap()
+        })
+        .collect();
+    let prepared = restore::prepare_restore_until(
+        client.clone(),
+        restore::RestoreInputs {
+            version,
+            objects: fresh_objects,
+            artifacts: fresh_artifacts,
+        },
+        provider.clone(),
+        Default::default(),
+        Arc::new(()),
+        std::time::Instant::now() + std::time::Duration::from_secs(30),
+    )
+    .await
+    .unwrap();
+    assert!(
+        queries.calls.load(Ordering::SeqCst) > calls,
+        "reopen requires fresh current provider authorization"
+    );
+    let reopened = restore::reopen_staged_restore(
+        fixture.registry.clone(),
+        fixture.binding.clone(),
+        prepared,
+        readback_host(),
+    )
+    .await
+    .unwrap();
+    let ready = restore::finalize_staged_restore(reopened, readback_host())
+        .await
+        .unwrap();
+    assert_eq!(ready.binding(), &fixture.binding);
+    assert_eq!(ready.source_identity().workspace_id(), [42; 32]);
+    assert_eq!(
+        fixture.registry.lookup(&fixture.binding.root).unwrap(),
+        fixture.binding
+    );
+    // The independent normal-initialization origin prevents a missing capture
+    // attachment from silently downgrading an eligible restore to clone mode.
+    let finalized_journal = fs::read(&journal_path).unwrap();
+    fs::remove_file(&journal_path).unwrap();
+    assert!(fixture.registry.lookup(&fixture.binding.root).is_err());
+    assert!(
+        fixture
+            .registry
+            .resume_info(&fixture.binding.root)
+            .unwrap_err()
+            .is::<restore::RestoreRecoveryRequired>()
+    );
+    assert!(
+        fixture
+            .registry
+            .restore_resume_eligibility(&fixture.binding, [7; 32])
+            .unwrap_err()
+            .is::<restore::RestoreRecoveryRequired>()
+    );
+    fs::write(&journal_path, &finalized_journal).unwrap();
+    assert!(
+        fixture.registry.resume_info(&fixture.binding.root).is_err(),
+        "clone resume must not admit a restored origin"
+    );
+
+    // Eligibility is monotone. Subsequent ordinary state must not be compared
+    // to or rewritten from the captured plural heads or fetched old source.
+    use jj_lib::op_heads_store::OpHeadsStore as _;
+    let current_heads = jj_lib::simple_op_heads_store::SimpleOpHeadsStore::load(
+        &fixture.binding.repo.join("op_heads"),
+    );
+    current_heads
+        .update_op_heads(&heads, &snapshot_operation)
+        .await
+        .unwrap();
+    queries.deny_cloud.store(true, Ordering::Release);
+    let calls = queries.calls.load(Ordering::SeqCst);
+    assert!(
+        fixture
+            .registry
+            .restore_resume_eligibility(&fixture.binding, [7; 32])
+            .unwrap()
+            .is_some()
+    );
+    assert_eq!(
+        fixture
+            .registry
+            .restored_resume_info(&fixture.binding.root, [7; 32])
+            .unwrap()
+            .binding,
+        fixture.binding
+    );
+    assert_eq!(
+        current_heads.get_op_heads_bounded(2).unwrap(),
+        vec![snapshot_operation.clone()]
+    );
+    assert!(
+        fixture
+            .registry
+            .restore_resume_eligibility(&fixture.binding, [8; 32])
+            .is_err()
+    );
+    assert_eq!(queries.calls.load(Ordering::SeqCst), calls);
+
+    let missing_admin = fixture.binding.admin.with_extension("preserved");
+    fs::rename(&fixture.binding.admin, &missing_admin).unwrap();
+    assert!(
+        fixture
+            .registry
+            .restore_resume_eligibility(&fixture.binding, [7; 32])
+            .unwrap_err()
+            .is::<restore::RestoreRecoveryRequired>()
+    );
+    fs::rename(&missing_admin, &fixture.binding.admin).unwrap();
+    let record = fixture
+        .registry
+        .path()
+        .join("records")
+        .join(format!("{}.json", fixture.binding.id()));
+    fs::remove_file(record).unwrap();
+    assert!(
+        fixture
+            .registry
+            .restore_resume_eligibility(&fixture.binding, [7; 32])
+            .unwrap()
+            .is_some(),
+        "Finalized before registry ACK is ordinary-resume eligible"
+    );
+    fixture.registry.publish_ready(&fixture.binding).unwrap();
+    assert_eq!(
+        current_heads.get_op_heads_bounded(2).unwrap(),
+        vec![snapshot_operation]
+    );
+    assert_eq!(queries.calls.load(Ordering::SeqCst), calls);
     server.abort();
 }

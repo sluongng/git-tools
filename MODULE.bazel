@@ -69,6 +69,7 @@ use_repo(crate, "crates")
 
 include("//build_defs:filesystems.MODULE.bazel")
 include("//build_defs:jj.MODULE.bazel")
+include("//build_defs:storage.MODULE.bazel")
 
 # Use the pinned Cargo protoc archive as a declared tool, not a Rust library
 # retaining an absolute CARGO_MANIFEST_DIR in its compiled output.

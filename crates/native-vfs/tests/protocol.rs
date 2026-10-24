@@ -1,5 +1,5 @@
 mod common;
-use native_vfs::prepare;
+use native_vfs::{prepare, prepare_existing};
 use std::{fs, sync::atomic::Ordering};
 
 #[tokio::test]
@@ -7,6 +7,17 @@ async fn prepare_is_metadata_only_and_restart_preserves_dirty_files_and_control_
     let dir = tempfile::tempdir().unwrap();
     let (config, provider) = common::fixture(dir.path());
     let cache = common::cache(dir.path());
+    let mut missing = config.clone();
+    missing.state = dir.path().join("missing-parent/state");
+    assert!(
+        prepare_existing(missing.clone(), provider.clone(), cache.clone())
+            .await
+            .is_err()
+    );
+    assert!(!missing.state.parent().unwrap().exists());
+    assert!(!config.root.exists());
+    assert!(!config.state.exists());
+    assert_eq!(provider.metadata_reads.load(Ordering::SeqCst), 0);
     let workspace = prepare(config.clone(), provider.clone(), cache.clone())
         .await
         .unwrap();
@@ -120,6 +131,17 @@ async fn pending_exact_bootstrap_replay_does_not_reset_dirty_state() {
         .replace("native-vfs.json", &serde_json::to_vec(&header).unwrap())
         .unwrap();
     drop(state);
+    let incomplete = fs::read(config.state.join("native-vfs.json")).unwrap();
+    assert!(
+        prepare_existing(config.clone(), provider.clone(), cache.clone())
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        fs::read(config.state.join("native-vfs.json")).unwrap(),
+        incomplete,
+        "strict reopen cannot complete an interrupted bootstrap"
+    );
     let workspace = prepare(config, provider.clone(), cache).await.unwrap();
     let tree = workspace.tree();
     assert_eq!(
@@ -139,6 +161,15 @@ async fn changed_identity_seed_or_unknown_state_is_rejected_without_adoption() {
     let workspace = prepare(config.clone(), provider.clone(), cache.clone())
         .await
         .unwrap();
+    let marker = workspace
+        .tree()
+        .existing_source_control("03".repeat(32).as_bytes())
+        .unwrap();
+    let marker_path = workspace
+        .tree()
+        .state_dir()
+        .join("local")
+        .join(marker.id.to_string());
     drop(workspace);
     let before = fs::read(config.state.join("native-vfs.json")).unwrap();
     let mut changed = config.clone();
@@ -159,12 +190,97 @@ async fn changed_identity_seed_or_unknown_state_is_rejected_without_adoption() {
         fs::read(config.state.join("native-vfs.json")).unwrap(),
         before
     );
+    // Exact-size corrupt marker bytes pass local-size checks, but must be
+    // rejected before application maintenance or marker/header repair.
+    let original_marker = fs::read(&marker_path).unwrap();
+    let bad_marker = vec![b'x'; original_marker.len()];
+    fs::write(&marker_path, &bad_marker).unwrap();
+    assert!(
+        prepare_existing(config.clone(), provider.clone(), cache.clone())
+            .await
+            .is_err()
+    );
+    assert_eq!(fs::read(&marker_path).unwrap(), bad_marker);
+    assert_eq!(
+        fs::read(config.state.join("native-vfs.json")).unwrap(),
+        before
+    );
+    fs::write(&marker_path, original_marker).unwrap();
+    // Corruption fixture: removing an immutable control payload must not be
+    // repaired by strict reopen or by rewriting the ready header.
+    fs::remove_file(&marker_path).unwrap();
+    assert!(
+        prepare_existing(config.clone(), provider.clone(), cache.clone())
+            .await
+            .is_err()
+    );
+    assert!(!marker_path.exists());
+    assert_eq!(
+        fs::read(config.state.join("native-vfs.json")).unwrap(),
+        before
+    );
+    // Pinned KV-layout corruption: the ordinary opener could create a fresh
+    // active journal before discovering missing application data. Strict prepare
+    // must reject without that repair or deletion of incomplete keyspaces.
+    let database = config.state.join("namespace/namespace.fjall");
+    let saved_journals = dir.path().join("saved-journals");
+    fs::create_dir(&saved_journals).unwrap();
+    for entry in fs::read_dir(&database).unwrap() {
+        let entry = entry.unwrap();
+        if entry.path().extension().is_some_and(|ext| ext == "jnl") {
+            fs::rename(entry.path(), saved_journals.join(entry.file_name())).unwrap();
+        }
+    }
+    let before_layout: std::collections::BTreeSet<_> = fs::read_dir(&database)
+        .unwrap()
+        .map(|e| e.unwrap().file_name())
+        .collect();
+    assert!(
+        prepare_existing(config.clone(), provider.clone(), cache.clone())
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        fs::read_dir(&database)
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect::<std::collections::BTreeSet<_>>(),
+        before_layout
+    );
+    for entry in fs::read_dir(&saved_journals).unwrap() {
+        let entry = entry.unwrap();
+        fs::rename(entry.path(), database.join(entry.file_name())).unwrap();
+    }
+    let current = database.join("keyspaces/1/current");
+    let saved_current = fs::read(&current).unwrap();
+    fs::remove_file(&current).unwrap();
+    assert!(
+        prepare_existing(config.clone(), provider.clone(), cache.clone())
+            .await
+            .is_err()
+    );
+    assert!(!current.exists());
+    assert!(
+        database.join("keyspaces/1/tables").is_dir(),
+        "incomplete keyspace must not be deleted"
+    );
+    assert_eq!(
+        fs::read(config.state.join("native-vfs.json")).unwrap(),
+        before
+    );
+    // Restore only this deliberate fixture corruption for clean teardown.
+    fs::write(current, saved_current).unwrap();
     let unknown = dir.path().join("unknown");
     let guard = private_fs::PrivateDir::create(&unknown).unwrap();
     guard.replace("sentinel", b"unrelated").unwrap();
     drop(guard);
     let mut changed = config;
     changed.state = unknown.clone();
+    assert!(
+        prepare_existing(changed.clone(), provider.clone(), cache.clone())
+            .await
+            .is_err()
+    );
     assert!(prepare(changed, provider, cache).await.is_err());
     assert_eq!(fs::read(unknown.join("sentinel")).unwrap(), b"unrelated");
     assert_eq!(fs::read_dir(unknown).unwrap().count(), 1);
@@ -216,11 +332,32 @@ async fn restart_authorizes_durable_current_base_without_replacing_it_with_boots
         .unwrap();
     let local = tree.create(tree.root_id(), "dirty", 0o644).await.unwrap();
     tree.write(local.id, 0, b"dirty on new base").await.unwrap();
+    let current = workspace.capture_lazy_tree_only().unwrap();
+    let expected = current.version().clone();
+    drop(current);
+    let pin = tree.lazy_source_pin();
+    let header = fs::read(config.state.join("native-vfs.json")).unwrap();
+    let reads = provider.metadata_reads.load(Ordering::SeqCst);
     drop(lazy);
     drop(tree);
     drop(workspace);
-    let workspace = prepare(config, provider.clone(), cache).await.unwrap();
+    let workspace = prepare_existing(config.clone(), provider.clone(), cache)
+        .await
+        .unwrap();
+    assert_eq!(
+        provider.metadata_reads.load(Ordering::SeqCst),
+        reads,
+        "strict reopen attaches current pin without fetching original bootstrap or current ancestry"
+    );
+    assert_eq!(
+        fs::read(config.state.join("native-vfs.json")).unwrap(),
+        header
+    );
+    let current = workspace.capture_lazy_tree_only().unwrap();
+    assert_eq!(current.version(), &expected);
+    drop(current);
     let tree = workspace.tree();
+    assert_eq!(tree.lazy_source_pin(), pin);
     assert!(tree.resolve_source("tool").await.is_err());
     assert_eq!(
         tree.read(tree.resolve_source("next").await.unwrap().id, 0, 100)

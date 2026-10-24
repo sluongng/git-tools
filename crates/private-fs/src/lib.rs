@@ -184,6 +184,77 @@ impl PrivateDir {
         Self::read_regular(&path, max_bytes)
     }
 
+    /// Create one fresh regular file beneath this private anchor. Known inner
+    /// directories may use ordinary trusted-owner modes; no directory is adopted
+    /// or repaired. Existing files (including symlinks) are never replaced.
+    /// Keep the inspected chain through file SyncAll (and Unix parent SyncAll).
+    pub fn create_descendant_file(
+        &self,
+        relative: impl AsRef<Path>,
+        bytes: &[u8],
+    ) -> io::Result<()> {
+        let relative = relative.as_ref();
+        if relative.as_os_str().len() > 4096 {
+            return Err(invalid("private descendant path too long"));
+        }
+        let mut count = 0usize;
+        for component in relative.components() {
+            let Component::Normal(name) = component else {
+                return Err(invalid(
+                    "private descendant requires relative normal components",
+                ));
+            };
+            single_name(name)?;
+            count += 1;
+            if count > 16 {
+                return Err(invalid("private descendant path too deep"));
+            }
+        }
+        if count == 0 {
+            return Err(invalid("empty private descendant path"));
+        }
+        let path = self.path.join(relative);
+        let parent = path
+            .parent()
+            .ok_or_else(|| invalid("private descendant has no parent"))?;
+        #[cfg(unix)]
+        let chain = unix::open_chain(parent, false)?;
+        #[cfg(windows)]
+        let _chain = windows::open_chain(parent, false)?;
+        #[cfg(not(any(unix, windows)))]
+        return Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "private descendant writes unsupported",
+        ));
+        let mut options = OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options
+                .mode(0o600)
+                .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK);
+        }
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::OpenOptionsExt;
+            options.custom_flags(
+                windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT,
+            );
+        }
+        let mut file = options.open(path)?;
+        #[cfg(windows)]
+        {
+            use std::os::windows::io::AsRawHandle;
+            unsafe { windows::verify_private_child_handle(file.as_raw_handle()) }?;
+        }
+        file.write_all(bytes)?;
+        file.sync_all()?;
+        #[cfg(unix)]
+        chain.last().expect("directory chain").sync_all()?;
+        Ok(())
+    }
+
     fn read_regular(path: &Path, max_bytes: usize) -> io::Result<Vec<u8>> {
         if max_bytes == 0 || max_bytes > 64 * 1024 * 1024 {
             return Err(invalid("private file read limit must be within 1..64 MiB"));

@@ -26,6 +26,7 @@ pub struct RemoteQueryIo {
     registry: Arc<Mutex<Registry>>,
     memory: Arc<Semaphore>,
     operations: Arc<Semaphore>,
+    restore_bound: Option<Arc<crate::restore_io::RestoreBound>>,
 }
 impl std::fmt::Debug for RemoteQueryIo {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -113,10 +114,23 @@ struct PageState {
     _memory: OwnedSemaphorePermit,
 }
 struct PhysicalOperation {
+    deadline: tokio::time::Instant,
+    cleanup: bool,
     _provider: Arc<Inner>,
     _owner: QueryOwner,
     _lease: OwnedSemaphorePermit,
     _ticket: io::WorkTicket,
+}
+impl PhysicalOperation {
+    fn client(self: &Arc<Self>, client: &NativeClient) -> NativeClient {
+        let client = client.clone().with_operation_deadline(self.deadline);
+        let client = if self.cleanup {
+            client.with_cleanup_deadline(self.deadline)
+        } else {
+            client
+        };
+        client.with_rpc_lifetime_guard(self.clone())
+    }
 }
 fn now() -> Result<i64> {
     Ok(i64::try_from(
@@ -328,7 +342,16 @@ impl RemoteQueryIo {
             registry,
             memory,
             operations,
+            restore_bound: None,
         })
+    }
+    pub(crate) fn shares_inner(&self, objects: &crate::RemoteObjectIo) -> bool {
+        Arc::ptr_eq(&self.inner, &objects.inner)
+    }
+    pub(crate) fn for_restore(&self, bound: Arc<crate::restore_io::RestoreBound>) -> Self {
+        let mut this = self.clone();
+        this.restore_bound = Some(bound);
+        this
     }
     async fn clean_expired(&self) -> Result<()> {
         let retired = {
@@ -374,6 +397,37 @@ impl RemoteQueryIo {
         owner: QueryOwner,
         make: impl FnOnce(Self, Arc<PhysicalOperation>) -> F + Send + 'static,
     ) -> std::result::Result<T, tonic::Status> {
+        self.run_mode(owner, false, make).await
+    }
+    async fn run_mode<T: Send + 'static, F: Future<Output = Result<T>> + Send + 'static>(
+        &self,
+        owner: QueryOwner,
+        cleanup: bool,
+        make: impl FnOnce(Self, Arc<PhysicalOperation>) -> F + Send + 'static,
+    ) -> std::result::Result<T, tonic::Status> {
+        if let Some(bound) = &self.restore_bound {
+            let deadline = if cleanup {
+                tokio::time::Instant::now() + bound.cleanup
+            } else {
+                bound.deadline
+            };
+            let owner: QueryOwner = Arc::new((owner, bound.owner.clone()));
+            io::operation_context_scope(
+                deadline,
+                owner.clone(),
+                self.run_inner(owner, cleanup, make),
+            )
+            .await
+        } else {
+            self.run_inner(owner, false, make).await
+        }
+    }
+    async fn run_inner<T: Send + 'static, F: Future<Output = Result<T>> + Send + 'static>(
+        &self,
+        owner: QueryOwner,
+        cleanup: bool,
+        make: impl FnOnce(Self, Arc<PhysicalOperation>) -> F + Send + 'static,
+    ) -> std::result::Result<T, tonic::Status> {
         let deadline = self.inner.deadline();
         let lease = tokio::time::timeout_at(deadline, self.operations.clone().acquire_owned())
             .await
@@ -382,6 +436,8 @@ impl RemoteQueryIo {
             })?
             .map_err(|_| tonic::Status::unavailable("native query adapter draining"))?;
         let operation = Arc::new(PhysicalOperation {
+            deadline,
+            cleanup,
             _provider: self.inner.clone(),
             _owner: owner,
             _lease: lease,
@@ -401,7 +457,7 @@ impl RemoteQueryIo {
         .map_err(status)
     }
     async fn online(&self, scope: &CapturedScope) -> Result<()> {
-        let _ = self.inner.connector.get().await?;
+        let _ = self.inner.connector.get_bare().await?;
         self.inner.ledger.validate_authority(&scope.authority)
     }
     async fn overlay(
@@ -675,7 +731,7 @@ impl RemoteQueryIo {
         self.run(owner, move |this, operation| async move {
             let scope = this.captured(scope).await?;
             this.online(&scope).await?;
-            let rpc_client = scope.client.clone().with_rpc_lifetime_guard(operation);
+            let rpc_client = operation.client(&scope.client);
             let value = call(scope.clone(), rpc_client).await?;
             // Tiny nested protobuf values can allocate much more than their
             // encoded length. Returned facts/prefix payloads need independent
@@ -790,8 +846,8 @@ impl NativeQueryIo for RemoteQueryIo {
                                 .saturating_mul(1024),
                         ),
                 )?;
-                let client = this.inner.connector.get().await?;
-                let rpc = client.clone().with_rpc_lifetime_guard(operation.clone());
+                let client = this.inner.connector.get_bare().await?;
+                let rpc = operation.client(&client);
                 let proof = Arc::new(
                     rpc.cloud_retained_version_selected(
                         tinytree_client::RetainedVersionSelector {
@@ -934,8 +990,8 @@ impl NativeQueryIo for RemoteQueryIo {
                 let authority =
                     io::blocking_owned(operation.clone(), move || ledger.query_authority(&roots))
                         .await?;
-                let client = this.inner.connector.get().await?;
-                let rpc_client = client.clone().with_rpc_lifetime_guard(operation.clone());
+                let client = this.inner.connector.get_bare().await?;
+                let rpc_client = operation.client(&client);
                 let (overlay, overlays) = this.overlay(&rpc_client, input.overlay).await?;
                 let checked = if version == 2 {
                     rpc_client
@@ -1070,7 +1126,7 @@ impl NativeQueryIo for RemoteQueryIo {
                             (parent.overlays.len() + input.overlay.len()).saturating_mul(512),
                         ),
                 )?;
-                let rpc_client = parent.client.clone().with_rpc_lifetime_guard(operation);
+                let rpc_client = operation.client(&parent.client);
                 let (overlay, added) = this.overlay(&rpc_client, input.overlay).await?;
                 let checked = rpc_client
                     .fork_query_scope(&parent.checked, overlay)
@@ -1487,7 +1543,7 @@ impl NativeQueryIo for RemoteQueryIo {
         input: BeginQuery,
         owner: QueryOwner,
     ) -> std::result::Result<QueryReply<QueryHandle>, tonic::Status> {
-        self.run(owner, move |this, _operation| async move {
+        self.run(owner, move |this, operation| async move {
             ensure!(
                 matches!(
                     input.projection,
@@ -1553,7 +1609,9 @@ impl NativeQueryIo for RemoteQueryIo {
                 // Scope guards contain only independent persistent quotas/roots,
                 // never the incoming broker inflight permit. Physical SDK work
                 // keeps them after logical query close or caller cancellation.
-                let query_client = scope.client.clone().with_lifetime_guard(scope.clone());
+                let query_client = operation
+                    .client(&scope.client)
+                    .with_lifetime_guard(scope.clone());
                 let checked = if version == 2 {
                     let mut nonce = blake3::Hasher::new();
                     nonce.update(b"tinytree-native-query-upstream-nonce-v2\0");
@@ -1690,10 +1748,7 @@ impl NativeQueryIo for RemoteQueryIo {
                 .clone()
                 .context("native query scope unavailable")?;
             this.online(&scope).await?;
-            let rpc_client = scope
-                .client
-                .clone()
-                .with_rpc_lifetime_guard(operation.clone());
+            let rpc_client = operation.client(&scope.client);
             let (value, checked) = match record
                 .checked
                 .as_mut()
@@ -1802,10 +1857,10 @@ impl NativeQueryIo for RemoteQueryIo {
                     commits: vec![wire_commit(id)],
                 })),
             };
-            let query_client = scope.client.clone().with_lifetime_guard(scope.clone());
-            let rpc_client = query_client
-                .clone()
-                .with_rpc_lifetime_guard(operation.clone());
+            let query_client = operation
+                .client(&scope.client)
+                .with_lifetime_guard(scope.clone());
+            let rpc_client = operation.client(&query_client);
             let mut query = query_client
                 .begin_graph_query(&scope.checked, &expression, 1, true)
                 .await?;
@@ -1838,7 +1893,20 @@ impl NativeQueryIo for RemoteQueryIo {
                     found = Some((verified, charge));
                 }
             }
-            rpc_client.close_graph_query(&mut query).await?;
+            // This inline release is still part of the data operation, unlike
+            // explicit release-only RPCs. Never renew its original allowance.
+            let cleanup_deadline =
+                this.restore_bound
+                    .as_ref()
+                    .map_or(operation.deadline, |bound| {
+                        operation
+                            .deadline
+                            .min(tokio::time::Instant::now() + bound.cleanup)
+                    });
+            rpc_client
+                .with_cleanup_deadline(cleanup_deadline)
+                .close_graph_query(&mut query)
+                .await?;
             let (value, charge) = found.context("native commit is outside the captured scope")?;
             Ok(QueryReply {
                 value,
@@ -1852,7 +1920,7 @@ impl NativeQueryIo for RemoteQueryIo {
         handle: [u8; 32],
         owner: QueryOwner,
     ) -> std::result::Result<(), tonic::Status> {
-        self.run(owner, move |this, operation| async move {
+        self.run_mode(owner, true, move |this, operation| async move {
             this.clean_expired().await?;
             let mut registry = this.registry.lock().await;
             let Some(record) = registry.queries.get_mut(&handle) else {
@@ -1863,10 +1931,7 @@ impl NativeQueryIo for RemoteQueryIo {
             record.pending_ids = None;
             record.replay = None;
             record.scope = None;
-            let rpc_client = record
-                .client
-                .clone()
-                .with_rpc_lifetime_guard(operation.clone());
+            let rpc_client = operation.client(&record.client);
             if let Some(query) = record.checked.as_mut() {
                 match query {
                     CheckedQuery::Ids(query) => rpc_client.close_ids_query(query).await?,
@@ -1893,7 +1958,7 @@ impl NativeQueryIo for RemoteQueryIo {
         handle: [u8; 32],
         owner: QueryOwner,
     ) -> std::result::Result<(), tonic::Status> {
-        self.run(owner, move |this, operation| async move {
+        self.run_mode(owner, true, move |this, operation| async move {
             this.clean_expired().await?;
             let mut registry = this.registry.lock().await;
             let Some(record) = registry.scopes.get_mut(&handle) else {
@@ -1901,10 +1966,8 @@ impl NativeQueryIo for RemoteQueryIo {
             };
             record.closed = true;
             if let Some(scope) = &record.captured {
-                scope
-                    .client
-                    .clone()
-                    .with_rpc_lifetime_guard(operation.clone())
+                operation
+                    .client(&scope.client)
                     .close_query_scope(&scope.checked)
                     .await?;
             }

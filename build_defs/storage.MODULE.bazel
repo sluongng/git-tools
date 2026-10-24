@@ -1,0 +1,16 @@
+crate = use_extension("@rules_rs//rs:extensions.bzl", "crate")
+
+# Existing native state is inspected before recovery maintenance is admitted.
+crate.annotation(
+    crate = "lsm-tree",
+    version = "3.1.10",
+    patches = ["//third_party/patches:lsm-tree-preserve-existing-recovery.patch"],
+    patch_args = ["-p1"],
+)
+
+crate.annotation(
+    crate = "fjall",
+    version = "3.1.12",
+    patches = ["//third_party/patches:fjall-strict-existing-recovery.patch"],
+    patch_args = ["-p1"],
+)

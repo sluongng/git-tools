@@ -78,8 +78,48 @@ fn permissive_existing_directories_are_not_repaired() {
     assert!(private.read_descendant("alias/type", 6).is_err());
     std::os::unix::fs::symlink(child.join("type"), child.join("type-link")).unwrap();
     assert!(private.read_descendant("jj-store/type-link", 6).is_err());
+    private
+        .create_descendant_file("jj-store/locator", b"configured")
+        .unwrap();
+    assert_eq!(
+        private.read_descendant("jj-store/locator", 10).unwrap(),
+        b"configured"
+    );
+    assert_eq!(
+        std::fs::metadata(child.join("locator")).unwrap().mode() & 0o777,
+        0o600
+    );
+    assert!(
+        private
+            .create_descendant_file("jj-store/locator", b"replacement")
+            .is_err()
+    );
+    assert_eq!(std::fs::read(child.join("locator")).unwrap(), b"configured");
+    assert!(
+        private
+            .create_descendant_file("alias/new", b"denied")
+            .is_err()
+    );
+    assert!(!child.join("new").exists());
+    assert!(
+        private
+            .create_descendant_file("jj-store/type-link", b"denied")
+            .is_err()
+    );
+    assert_eq!(std::fs::read(child.join("type")).unwrap(), b"native");
+    assert!(
+        private
+            .create_descendant_file("../escape", b"denied")
+            .is_err()
+    );
+    assert!(private.create_descendant_file(&child, b"denied").is_err());
     std::fs::set_permissions(&child, std::fs::Permissions::from_mode(0o777)).unwrap();
     assert!(private.read_descendant("jj-store/type", 6).is_err());
+    assert!(
+        private
+            .create_descendant_file("jj-store/unsafe", b"denied")
+            .is_err()
+    );
 }
 #[cfg(unix)]
 #[test]

@@ -97,6 +97,29 @@ impl RemoteRepositoryControl {
             .await
             .map_err(|_| tonic::Status::deadline_exceeded("native host work deadline exceeded"))?
     }
+    /// Admit immutable cloud roots under an independently owned host budget and
+    /// one original deadline. This creates no native reference or retention
+    /// hold. The inherited scope reaches cloud SDK and ledger blocking workers.
+    pub async fn admit_retained_version_until(
+        &self,
+        selector: tinytree_client::RetainedVersionSelector,
+        selected: tinytree_client::CloudRawDigest,
+        owner: Arc<dyn std::any::Any + Send + Sync>,
+        original: tokio::time::Instant,
+    ) -> Result<crate::AdmittedCloudVersion> {
+        ensure!(
+            !io::in_control(),
+            "cloud host admission requires an independent scope"
+        );
+        // run_owned acquires the sole control lease once. The cloud admission
+        // method inherits this scope in its owned job; it never reacquires it.
+        self.run_owned(
+            original,
+            owner.clone(),
+            self.admit_retained_version(selector, selected, owner),
+        )
+        .await
+    }
     /// Drain independently accepted host/connector work after stopping producers.
     pub async fn wait_for_owned_work(&self) {
         self.drain_control().await;

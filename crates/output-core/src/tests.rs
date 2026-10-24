@@ -917,6 +917,8 @@ async fn server_generation_and_persisted_placeholder_fences_are_not_request_coun
     assert_eq!(tree.read(node.id, 0, 99).await.unwrap(), b"old handle");
     drop(generation);
     tree.retain_placeholder_generations().unwrap();
+    let cache = tree.cache.clone();
+    let identity = tree.identity().to_owned();
     drop(tree);
     {
         // Compatibility fixture: the prior schema had only an all-generations
@@ -937,6 +939,32 @@ async fn server_generation_and_persisted_placeholder_fences_are_not_request_coun
         let mut tx = db.write_tx().durability(Some(PersistMode::SyncAll));
         tx.insert(&keyspace, b"header", serde_json::to_vec(&header).unwrap());
         tx.commit().unwrap();
+    }
+    assert!(
+        Tree::open_existing_lazy_source_with_cache_and_source(
+            dir.path(),
+            "test",
+            cache,
+            source.clone(),
+            &identity,
+            b"expected-marker",
+        )
+        .is_err(),
+        "strict lazy resume must reject a legacy complete namespace"
+    );
+    {
+        let db = SingleWriterTxDatabase::builder(dir.path().join("namespace.fjall"))
+            .open()
+            .unwrap();
+        let keyspace = db
+            .keyspace("namespace", KeyspaceCreateOptions::default)
+            .unwrap();
+        let header: serde_json::Value =
+            serde_json::from_slice(&keyspace.get(b"header").unwrap().unwrap()).unwrap();
+        assert_eq!(
+            header["version"], 2,
+            "failed strict resume cannot upgrade the application header"
+        );
     }
     let tree = Tree::open(dir.path(), "test", source.clone(), CacheConfig::default()).unwrap();
     assert_eq!(tree.reclaim_retired(64).unwrap().reclaimed_nodes, 0);
@@ -2273,5 +2301,305 @@ async fn lazy_authoritative_payload_recovery_keeps_same_size_and_growing_edits_d
             bytes,
             "{behavior}"
         );
+    }
+}
+
+#[test]
+fn strict_database_recovery_preserves_rejected_bytes_and_finishes_before_new_synced_writes() {
+    use std::collections::BTreeMap;
+    // Physical file bytes (not just returned rows) establish non-destructive
+    // inspection. Paths are relative and directories are included in the proof.
+    fn disk_snapshot(root: &Path) -> BTreeMap<PathBuf, (bool, u64, [u8; 32])> {
+        fn visit(root: &Path, path: &Path, out: &mut BTreeMap<PathBuf, (bool, u64, [u8; 32])>) {
+            for entry in fs::read_dir(path).unwrap() {
+                let entry = entry.unwrap();
+                let path = entry.path();
+                let metadata = fs::symlink_metadata(&path).unwrap();
+                let key = path.strip_prefix(root).unwrap().to_owned();
+                if metadata.is_dir() {
+                    out.insert(key, (true, 0, [0; 32]));
+                    visit(root, &path, out);
+                } else {
+                    assert!(metadata.is_file() && !metadata.file_type().is_symlink());
+                    let mut hash = blake3::Hasher::new();
+                    let mut file = File::open(path).unwrap();
+                    let mut bytes = [0; 65536];
+                    loop {
+                        let n = file.read(&mut bytes).unwrap();
+                        if n == 0 {
+                            break;
+                        }
+                        hash.update(&bytes[..n]);
+                    }
+                    out.insert(key, (false, metadata.len(), *hash.finalize().as_bytes()));
+                }
+            }
+        }
+        let mut out = BTreeMap::new();
+        visit(root, root, &mut out);
+        out
+    }
+    let directory = TempDir::new().unwrap();
+    let root = directory.path().join("database");
+    {
+        let db = SingleWriterTxDatabase::builder(&root).open().unwrap();
+        let namespace = db
+            .keyspace("namespace", KeyspaceCreateOptions::default)
+            .unwrap();
+        let mut tx = db.write_tx().durability(Some(PersistMode::SyncAll));
+        tx.insert(&namespace, b"before", b"synced-before-validation");
+        tx.commit().unwrap();
+    }
+    let journal = fs::read_dir(&root)
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .find(|p| p.extension().is_some_and(|e| e == "jnl"))
+        .unwrap();
+    let mut prefix = Vec::new();
+    File::open(&journal)
+        .unwrap()
+        .take(65536)
+        .read_to_end(&mut prefix)
+        .unwrap();
+    let end = prefix.windows(4).rposition(|p| p == b"FJL\x03").unwrap() + 4;
+    assert!(end > 13 && prefix[end..].iter().all(|b| *b == 0));
+    // Keep a bounded, valid all-zero preallocation suffix in this fixture.
+    // Neither this trim nor deliberate corruption models a power-loss test.
+    let original = prefix[..end + 4096].to_vec();
+    fs::write(&journal, &original).unwrap();
+    for (name, damaged) in [
+        ("unknown record tag", {
+            let mut b = original.clone();
+            b[0] = 0xff;
+            b
+        }),
+        ("batch checksum mismatch", {
+            let mut b = original.clone();
+            b[end - 12] ^= 0x80;
+            b
+        }),
+        ("torn terminal marker", original[..end - 1].to_vec()),
+        ("nonzero after padding", {
+            let mut b = original.clone();
+            b.push(0xff);
+            b
+        }),
+        ("oversized declared record", {
+            let mut b = original.clone();
+            assert_eq!(
+                b[13], 2,
+                "pinned WAL fixture starts with an Item after Start"
+            );
+            b[13 + 13..13 + 17].copy_from_slice(&(64u32 * 1024 * 1024 + 1).to_le_bytes());
+            b
+        }),
+    ] {
+        fs::write(&journal, damaged).unwrap();
+        let before = disk_snapshot(&root);
+        assert!(
+            SingleWriterTxDatabase::builder(&root)
+                .strict_existing_recovery(true)
+                .open()
+                .is_err(),
+            "{name}"
+        );
+        assert_eq!(
+            disk_snapshot(&root),
+            before,
+            "rejected {name} changed physical files"
+        );
+    }
+    fs::write(&journal, &original).unwrap();
+    // Physical scan admission counts sparse zero padding BEFORE parsing it.
+    // The configured small ceiling avoids a large fixture or proportional read.
+    File::options()
+        .write(true)
+        .open(&journal)
+        .unwrap()
+        .set_len(1024 * 1024)
+        .unwrap();
+    let before = disk_snapshot(&root);
+    assert!(
+        SingleWriterTxDatabase::builder(&root)
+            .strict_existing_recovery(true)
+            .strict_recovery_max_scan_bytes(65536)
+            .open()
+            .is_err()
+    );
+    assert_eq!(
+        disk_snapshot(&root),
+        before,
+        "scan-budget rejection changed sparse journal"
+    );
+    fs::write(&journal, &original).unwrap();
+    let extra_journal = root.join("777.jnl");
+    fs::write(&extra_journal, []).unwrap();
+    let before = disk_snapshot(&root);
+    assert!(
+        SingleWriterTxDatabase::builder(&root)
+            .strict_existing_recovery(true)
+            .strict_recovery_max_journals(1)
+            .open()
+            .is_err()
+    );
+    assert_eq!(
+        disk_snapshot(&root),
+        before,
+        "journal-count rejection changed files"
+    );
+    fs::remove_file(extra_journal).unwrap();
+    let orphan = root.join("keyspaces/99");
+    fs::create_dir(&orphan).unwrap();
+    fs::write(orphan.join("sentinel"), b"keep incomplete keyspace").unwrap();
+    let before = disk_snapshot(&root);
+    assert!(
+        SingleWriterTxDatabase::builder(&root)
+            .strict_existing_recovery(true)
+            .open()
+            .is_err()
+    );
+    assert_eq!(
+        disk_snapshot(&root),
+        before,
+        "unknown/incomplete keyspace must not be deleted"
+    );
+    fs::remove_file(orphan.join("sentinel")).unwrap();
+    fs::remove_dir(orphan).unwrap();
+    let current = root.join("keyspaces/1/current");
+    let saved_current = fs::read(&current).unwrap();
+    fs::remove_file(&current).unwrap();
+    let before = disk_snapshot(&root);
+    assert!(
+        SingleWriterTxDatabase::builder(&root)
+            .strict_existing_recovery(true)
+            .open()
+            .is_err()
+    );
+    assert_eq!(
+        disk_snapshot(&root),
+        before,
+        "missing keyspace marker cannot trigger repair"
+    );
+    fs::write(current, saved_current).unwrap();
+    let tables = root.join("keyspaces/1/tables");
+    let next_id = fs::read_dir(&tables)
+        .unwrap()
+        .map(|e| {
+            e.unwrap()
+                .file_name()
+                .to_str()
+                .unwrap()
+                .parse::<u64>()
+                .unwrap()
+        })
+        .max()
+        .unwrap_or(0)
+        + 1;
+    let preserved_table = tables.join(next_id.to_string());
+    fs::write(
+        &preserved_table,
+        b"preserve orphan table until separate recovery",
+    )
+    .unwrap();
+    let impossible_successor = tables.join(u64::MAX.to_string());
+    fs::write(&impossible_successor, b"overflow boundary").unwrap();
+    let before = disk_snapshot(&root);
+    assert!(
+        SingleWriterTxDatabase::builder(&root)
+            .strict_existing_recovery(true)
+            .open()
+            .is_err()
+    );
+    assert_eq!(
+        disk_snapshot(&root),
+        before,
+        "orphan allocator overflow must reject without deletion"
+    );
+    fs::remove_file(impossible_successor).unwrap();
+    let before = disk_snapshot(&root);
+    {
+        let db = SingleWriterTxDatabase::builder(&root)
+            .strict_existing_recovery(true)
+            .open()
+            .unwrap();
+        let namespace = db
+            .keyspace("namespace", KeyspaceCreateOptions::default)
+            .unwrap();
+        assert_eq!(
+            namespace.get(b"before").unwrap().unwrap().as_ref(),
+            b"synced-before-validation"
+        );
+        let mut tx = db.write_tx().durability(Some(PersistMode::SyncAll));
+        tx.insert(&namespace, b"must-not-write", b"closed");
+        assert!(
+            tx.commit().is_err(),
+            "mutations stay closed until validation finishes"
+        );
+    }
+    assert_eq!(
+        disk_snapshot(&root),
+        before,
+        "dropping inspected database cannot trim valid zero padding"
+    );
+    {
+        let db = SingleWriterTxDatabase::builder(&root)
+            .strict_existing_recovery(true)
+            .open()
+            .unwrap();
+        let namespace = db
+            .keyspace("namespace", KeyspaceCreateOptions::default)
+            .unwrap();
+        db.finish_recovery_validation().unwrap();
+        let mut tx = db.write_tx().durability(Some(PersistMode::SyncAll));
+        tx.insert(&namespace, b"after", b"synced-after-validation");
+        tx.commit().unwrap();
+        namespace.inner().rotate_memtable_and_wait().unwrap();
+        // The worker immediately schedules leveled compaction after flushing;
+        // a disjoint first run may move directly from L0 to the deepest level.
+        // Count registered SSTs across ALL levels and verify actual new files.
+        let registered = namespace.inner().table_count();
+        let new_tables: Vec<_> = fs::read_dir(&tables)
+            .unwrap()
+            .map(|entry| entry.unwrap())
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_str()
+                    .and_then(|id| id.parse::<u64>().ok())
+                    .is_some_and(|id| id > next_id)
+            })
+            .filter(|entry| {
+                entry.metadata().unwrap().is_file() && entry.metadata().unwrap().len() > 0
+            })
+            .map(|entry| entry.file_name())
+            .collect();
+        assert!(
+            registered > 0 && !new_tables.is_empty(),
+            "regression requires registered on-disk SSTs above preserved orphan {next_id}: registered={registered}, files={new_tables:?}"
+        );
+        assert_eq!(
+            fs::read(&preserved_table).unwrap(),
+            b"preserve orphan table until separate recovery",
+            "new table allocation cannot collide with a preserved orphan"
+        );
+    }
+    {
+        let db = SingleWriterTxDatabase::builder(&root)
+            .strict_existing_recovery(true)
+            .open()
+            .unwrap();
+        let namespace = db
+            .keyspace("namespace", KeyspaceCreateOptions::default)
+            .unwrap();
+        assert_eq!(
+            namespace.get(b"before").unwrap().unwrap().as_ref(),
+            b"synced-before-validation"
+        );
+        assert_eq!(
+            namespace.get(b"after").unwrap().unwrap().as_ref(),
+            b"synced-after-validation",
+            "new SyncAll write must not be appended beyond an earlier zero tail"
+        );
+        assert!(namespace.get(b"must-not-write").unwrap().is_none());
     }
 }

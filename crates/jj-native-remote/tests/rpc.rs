@@ -50,6 +50,9 @@ struct Counters {
     files: Arc<AtomicUsize>,
     holds: Arc<AtomicUsize>,
     metadata_rpcs: Arc<AtomicUsize>,
+    capture_timeouts: Arc<AtomicBool>,
+    metadata_timeouts: Arc<std::sync::Mutex<Vec<String>>>,
+    query_timeouts: Arc<std::sync::Mutex<Vec<String>>>,
     graph_rpcs: Arc<AtomicUsize>,
     query_rpcs: Arc<AtomicUsize>,
     cloud_rpcs: Arc<AtomicUsize>,
@@ -70,6 +73,9 @@ impl Counters {
             files: Arc::new(AtomicUsize::new(0)),
             holds: Arc::new(AtomicUsize::new(0)),
             metadata_rpcs: Arc::new(AtomicUsize::new(0)),
+            capture_timeouts: Arc::new(AtomicBool::new(false)),
+            metadata_timeouts: Arc::new(std::sync::Mutex::new(Vec::new())),
+            query_timeouts: Arc::new(std::sync::Mutex::new(Vec::new())),
             graph_rpcs: Arc::new(AtomicUsize::new(0)),
             query_rpcs: Arc::new(AtomicUsize::new(0)),
             cloud_rpcs: Arc::new(AtomicUsize::new(0)),
@@ -111,6 +117,15 @@ impl Repository for Counting {
         &self,
         r: Request<p::BatchReadObjectsRequest>,
     ) -> Result<Response<Self::BatchReadObjectsStream>, Status> {
+        if self.counts.capture_timeouts.load(Ordering::SeqCst) {
+            self.counts.metadata_timeouts.lock().unwrap().push(
+                r.metadata()
+                    .get("grpc-timeout")
+                    .and_then(|v| v.to_str().ok())
+                    .unwrap_or("missing")
+                    .to_owned(),
+            );
+        }
         self.counts.metadata_rpcs.fetch_add(1, Ordering::SeqCst);
         self.counts
             .metadata_requests
@@ -245,10 +260,22 @@ impl Server {
         bind: std::net::SocketAddr,
     ) -> Self {
         let query_requests = counts.query_rpcs.clone();
+        let capture_timeouts = counts.capture_timeouts.clone();
+        let query_timeouts = counts.query_timeouts.clone();
         let query = tonic::service::interceptor::InterceptedService::new(
             service.query_grpc_service(),
             move |request: Request<()>| {
                 query_requests.fetch_add(1, Ordering::SeqCst);
+                if capture_timeouts.load(Ordering::SeqCst) {
+                    query_timeouts.lock().unwrap().push(
+                        request
+                            .metadata()
+                            .get("grpc-timeout")
+                            .and_then(|v| v.to_str().ok())
+                            .unwrap_or("missing")
+                            .to_owned(),
+                    );
+                }
                 Ok(request)
             },
         );
@@ -7422,4 +7449,271 @@ async fn exercise_retained_query_facade(
         file,
         bytes: expected_file,
     }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn restore_factory_bounds_independent_runtime_data_but_allows_release_only_cleanup() {
+    use native_broker::{NativeQueryIo, OpenQueryScope, query_protocol as q};
+    let (_serverdir, store, _fixture, head) = seed();
+    let indexdir = private_dir();
+    let index = tinytree_index::Index::open(indexdir.path(), &Default::default()).unwrap();
+    for object in _fixture
+        .objects()
+        .iter()
+        .filter(|object| object.descriptor.key.kind == m::Kind::Commit)
+    {
+        index
+            .ingest("example", object.descriptor, &object.bytes)
+            .unwrap();
+    }
+    let service = RepositoryService::new(
+        store,
+        ServiceConfig::default(),
+        vec!["example".into()],
+        vec![
+            Principal::new("test", TOKEN, vec!["example".into()], true)
+                .unwrap()
+                .with_retention(true),
+        ],
+    )
+    .unwrap()
+    .with_query_index(index)
+    .unwrap();
+    let counts = Counters::new();
+    let server = Server::start_service(service, counts.clone(), None).await;
+    let directory = private_dir();
+    let (direct, repo) = local(
+        directory.path(),
+        cache(directory.path()),
+        config(&server),
+        true,
+    );
+    let factory =
+        jj_native_remote::RemoteRestoreIo::new(repo.io.clone(), repo.query.clone()).unwrap();
+    let raw_objects: Arc<dyn NativeObjectIo> = repo.io.clone();
+    let raw_query: Arc<dyn NativeQueryIo> = repo.query.clone();
+    assert!(factory.matches(&raw_objects, &raw_query));
+    let otherdir = private_dir();
+    let (_other_direct, other) = local(
+        otherdir.path(),
+        cache(otherdir.path()),
+        config(&server),
+        true,
+    );
+    assert!(jj_native_remote::RemoteRestoreIo::new(repo.io.clone(), other.query.clone()).is_err());
+    let other_query: Arc<dyn NativeQueryIo> = other.query.clone();
+    assert!(!factory.matches(&raw_objects, &other_query));
+
+    repo.control.admit_reference("main").await.unwrap();
+    let object = repo
+        .io
+        .read_metadata(m::ObjectKey {
+            kind: m::Kind::Commit,
+            id: m::ObjectId(head.0),
+        })
+        .await
+        .unwrap()
+        .into_object();
+    let m::Object::Commit(commit) = object else {
+        unreachable!()
+    };
+    let tree = m::ObjectKey {
+        kind: m::Kind::Tree,
+        id: m::ObjectId(commit.root_tree.terms[0].0),
+    };
+    assert!(direct.descriptor(tree).await.unwrap().is_none());
+    counts.paused.store(true, Ordering::SeqCst);
+    counts.capture_timeouts.store(true, Ordering::SeqCst);
+    let original = tokio::time::Instant::now() + Duration::from_millis(400);
+    let (objects, _) = factory
+        .bind(original, Duration::from_secs(5), Arc::new(()))
+        .unwrap();
+    let file = first_file(&_fixture).descriptor.key;
+    let before_file = counts.files.load(Ordering::SeqCst);
+    assert!(objects.descriptor(file).await.is_err());
+    assert!(objects.read_metadata(file).await.is_err());
+    assert_eq!(
+        counts.files.load(Ordering::SeqCst),
+        before_file,
+        "metadata-only FILE requests must fail before raw delegation"
+    );
+    // This is the same boundary as the admin worker: a new runtime has no
+    // inherited task-local. Only the explicitly bound provider carries time.
+    let read = tokio::task::spawn_blocking(move || {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(objects.read_metadata(tree))
+    });
+    let result = tokio::time::timeout(Duration::from_secs(2), read)
+        .await
+        .expect("metadata renewed the configured wire deadline")
+        .unwrap();
+    assert!(result.is_err());
+    let timeouts = counts.metadata_timeouts.lock().unwrap().clone();
+    assert_eq!(timeouts.len(), 1, "one bounded, non-retrying physical read");
+    let encoded = &timeouts[0];
+    let (digits, unit) = encoded.split_at(encoded.len() - 1);
+    let amount: u64 = digits.parse().expect("valid grpc-timeout header required");
+    let duration = match unit {
+        "n" => Duration::from_nanos(amount),
+        "u" => Duration::from_micros(amount),
+        "m" => Duration::from_millis(amount),
+        "S" => Duration::from_secs(amount),
+        _ => panic!("wire deadline was not bounded to the original operation"),
+    };
+    assert!(
+        duration <= Duration::from_millis(400),
+        "wire must retain original allowance"
+    );
+    assert!(direct.descriptor(tree).await.unwrap().is_none());
+    counts.paused.store(false, Ordering::SeqCst);
+    repo.wait_for_idle().await;
+    counts.capture_timeouts.store(false, Ordering::SeqCst);
+
+    let original = tokio::time::Instant::now() + Duration::from_secs(2);
+    let (objects, query) = factory
+        .bind(original, Duration::from_millis(300), Arc::new(()))
+        .unwrap();
+    let opened = query
+        .open_scope(
+            OpenQueryScope {
+                roots: vec![head],
+                overlay: vec![],
+                replay_key: [231; 32],
+                query_identity_version: 2,
+            },
+            Arc::new(()),
+        )
+        .await
+        .unwrap();
+    let scope = opened.value.handle;
+    let query_replay = opened.value.bound_query_id([233; 16]).unwrap();
+    drop(opened);
+    // A real non-root canonical read performs its own internal CloseQuery.
+    // Capture that final RPC separately from the later explicit cleanup pair.
+    counts.query_timeouts.lock().unwrap().clear();
+    counts.capture_timeouts.store(true, Ordering::SeqCst);
+    let canonical = query.read_commit(scope, head, Arc::new(())).await.unwrap();
+    assert_eq!(canonical.value.descriptor().key.id.0, head.0);
+    drop(canonical);
+    counts.capture_timeouts.store(false, Ordering::SeqCst);
+    let timeouts = counts.query_timeouts.lock().unwrap().clone();
+    assert!(
+        timeouts.len() >= 2,
+        "canonical read must evaluate then explicitly close"
+    );
+    let encoded = timeouts
+        .last()
+        .expect("canonical read must release its upstream query");
+    let (digits, unit) = encoded.split_at(encoded.len() - 1);
+    let amount: u64 = digits
+        .parse()
+        .expect("inline cleanup grpc-timeout required");
+    let duration = match unit {
+        "n" => Duration::from_nanos(amount),
+        "u" => Duration::from_micros(amount),
+        "m" => Duration::from_millis(amount),
+        "S" => Duration::from_secs(amount),
+        _ => panic!("inline cleanup renewed its wire allowance"),
+    };
+    assert!(
+        duration <= Duration::from_millis(300),
+        "inline close must obey original and facade cleanup bounds"
+    );
+    let begun = query
+        .begin(
+            native_broker::BeginQuery {
+                scope,
+                expression: q::GraphExpr {
+                    version: 1,
+                    expression: Some(q::graph_expr::Expression::Commits(q::CommitSet {
+                        commits: vec![q::CommitId {
+                            value: m::CommitId::ROOT.0.to_vec(),
+                        }],
+                    })),
+                },
+                projection: q::Projection::Ids,
+                page_size: 1,
+                replay_key: query_replay,
+            },
+            Arc::new(()),
+        )
+        .await
+        .unwrap();
+    let handle = begun.value.handle;
+    drop(begun);
+    let page = query.page(handle, 0, Arc::new(())).await.unwrap();
+    assert_eq!(page.value.rows.len(), 1);
+    drop(page);
+    tokio::time::sleep_until(original + Duration::from_millis(1)).await;
+    let before_query = counts.query_rpcs.load(Ordering::SeqCst);
+    let before_metadata = counts.metadata_rpcs.load(Ordering::SeqCst);
+    let error = query
+        .facts(
+            scope,
+            vec![q::GraphFact {
+                fact: Some(q::graph_fact::Fact::HasId(q::HasId {
+                    commit: Some(q::CommitId { value: vec![0; 32] }),
+                })),
+            }],
+            Arc::new(()),
+        )
+        .await;
+    let error = match error {
+        Err(error) => error,
+        Ok(_) => panic!("expired data request succeeded"),
+    };
+    assert_eq!(error.code(), tonic::Code::DeadlineExceeded);
+    assert!(objects.read_metadata(tree).await.is_err());
+    assert_eq!(counts.query_rpcs.load(Ordering::SeqCst), before_query);
+    assert_eq!(counts.metadata_rpcs.load(Ordering::SeqCst), before_metadata);
+    // Both release RPCs are permitted after data expiry. Their physical SDK
+    // wire budgets must use the cleanup bound, not configured fresh allowances.
+    counts.query_timeouts.lock().unwrap().clear();
+    counts.capture_timeouts.store(true, Ordering::SeqCst);
+    query.close_query(handle, Arc::new(())).await.unwrap();
+    query.close_scope(scope, Arc::new(())).await.unwrap();
+    counts.capture_timeouts.store(false, Ordering::SeqCst);
+    let cleanup_timeouts = counts.query_timeouts.lock().unwrap().clone();
+    assert_eq!(cleanup_timeouts.len(), 2);
+    for encoded in cleanup_timeouts {
+        let (digits, unit) = encoded.split_at(encoded.len() - 1);
+        let amount: u64 = digits.parse().expect("cleanup grpc-timeout required");
+        let duration = match unit {
+            "n" => Duration::from_nanos(amount),
+            "u" => Duration::from_micros(amount),
+            "m" => Duration::from_millis(amount),
+            "S" => Duration::from_secs(amount),
+            _ => panic!("cleanup renewed a configured wire allowance"),
+        };
+        assert!(duration <= Duration::from_millis(300));
+    }
+    assert!(counts.query_rpcs.load(Ordering::SeqCst) > before_query);
+    let opened = repo
+        .query
+        .open_scope(
+            OpenQueryScope {
+                roots: vec![m::CommitId::ROOT],
+                overlay: vec![],
+                replay_key: [232; 32],
+                query_identity_version: 2,
+            },
+            Arc::new(()),
+        )
+        .await
+        .unwrap();
+    repo.query
+        .close_scope(opened.value.handle, Arc::new(()))
+        .await
+        .unwrap();
+    drop(opened);
+    assert!(
+        repo.io.read_metadata(tree).await.is_ok(),
+        "ordinary provider must not inherit restore expiry"
+    );
+    assert_eq!(counts.files.load(Ordering::SeqCst), 0);
+    repo.wait_for_idle().await;
+    server.stop().await;
 }

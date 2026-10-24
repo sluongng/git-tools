@@ -836,6 +836,37 @@ impl Tree {
         );
         Ok(())
     }
+    /// Validate an already-installed immutable control marker without directory
+    /// hydration, installation, repair, or namespace mutation.
+    pub fn existing_source_control(&self, locator: &[u8]) -> Result<Node> {
+        ensure!(
+            !locator.is_empty() && locator.len() <= 4096,
+            "invalid source control marker"
+        );
+        let ns = self.namespace.lock().unwrap();
+        ensure!(
+            !ns.failed && ns.state.pending.map.is_empty(),
+            "source namespace unavailable or pending publication"
+        );
+        ensure!(ns.state.source.is_some(), "not a source namespace");
+        let admin = child(&ns.state, 1, ".jj").context("missing source control state")?;
+        let id = child(&ns.state, admin, "native-workspace")
+            .context("incomplete source control state")?;
+        let directory = &record(&ns.state, admin)?.node;
+        let node = &record(&ns.state, id)?.node;
+        ensure!(
+            directory.kind == NodeKind::Directory
+                && directory.remote.is_none()
+                && directory.mode & 0o222 == 0
+                && node.kind == NodeKind::File
+                && node.remote.is_none()
+                && node.mode & 0o222 == 0
+                && node.size == locator.len() as u64
+                && read_range(&self.local_path(id), 0, locator.len() + 1)? == locator,
+            "source control identity mismatch"
+        );
+        Ok(node.clone())
+    }
     /// Install an opaque, immutable frontend identity marker. This is a trusted
     /// control-plane operation, not a filesystem mutation entry point. The
     /// marker is never interpreted as a host path or included in source uploads.

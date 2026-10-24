@@ -120,6 +120,25 @@ pub async fn prepare(
     provider: Arc<dyn NativeObjectIo>,
     cache: Arc<LocalCas>,
 ) -> Result<PreparedWorkspace> {
+    prepare_mode(config, provider, cache, false).await
+}
+/// Reattach recognized ready lazy state only, using the original saved bootstrap
+/// seed solely for identity recognition. The current baseline, generation and
+/// dirty delta remain authoritative. Missing/unready state is never initialized,
+/// repaired or replaced, and complete/materialized namespaces are unsupported.
+pub async fn prepare_existing(
+    config: Config,
+    provider: Arc<dyn NativeObjectIo>,
+    cache: Arc<LocalCas>,
+) -> Result<PreparedWorkspace> {
+    prepare_mode(config, provider, cache, true).await
+}
+async fn prepare_mode(
+    config: Config,
+    provider: Arc<dyn NativeObjectIo>,
+    cache: Arc<LocalCas>,
+    existing_only: bool,
+) -> Result<PreparedWorkspace> {
     validate(&config)?;
     let projected = canonical_candidate(&config.root)?;
     let state = canonical_candidate(&config.state)?;
@@ -129,7 +148,8 @@ pub async fn prepare(
         "native workspace mount, state and shared cache overlap"
     );
     let state_config = config.clone();
-    let (owner, header) = tokio::task::spawn_blocking(move || open_state(&state_config)).await??;
+    let (owner, header) =
+        tokio::task::spawn_blocking(move || open_state(&state_config, existing_only)).await??;
     let compiler = Arc::new(
         Compiler::new(
             provider,
@@ -142,13 +162,34 @@ pub async fn prepare(
     let source = compiler.source();
     let backend = config.scope.backend().to_owned();
     let ready = header.ready;
+    let expected_namespace = header.namespace_identity.clone();
+    let control_marker = hex(&config.workspace_identity).into_bytes();
     let tree = tokio::task::spawn_blocking(move || -> Result<Arc<Tree>> {
         let namespace = open_owner.directory.path().join("namespace");
         let existing = preflight_namespace(&namespace, ready)?;
-        let _directory = PrivateDir::create(&namespace)?;
-        if existing {
+        let _directory = if existing_only {
+            PrivateDir::open_existing(&namespace)?
+        } else {
+            PrivateDir::create(&namespace)?
+        };
+        if existing_only {
+            Tree::open_existing_lazy_source_with_cache_and_source(
+                namespace,
+                backend,
+                cache,
+                source,
+                expected_namespace
+                    .as_deref()
+                    .context("existing namespace identity missing")?,
+                &control_marker,
+            )
+        } else if existing {
             Tree::open_existing_with_cache_and_source(namespace, backend, cache, source)
         } else {
+            ensure!(
+                !existing_only,
+                "existing native workspace namespace missing"
+            );
             Tree::open_with_cache_and_source(namespace, backend, cache, source)
         }
     })
@@ -174,6 +215,13 @@ pub async fn prepare(
             compiler.restore_lazy_artifacts(&tree.lazy_source_artifacts()?)?;
             tree.attach_lazy_source(source.provider, pin)?;
         } else {
+            ensure!(
+                !existing_only,
+                std::io::Error::new(
+                    std::io::ErrorKind::Unsupported,
+                    "existing-only native prepare requires a lazy namespace"
+                )
+            );
             // Existing complete namespaces retain their explicit full metadata
             // authorization path; do not reinterpret them as partial lazy state.
             let current = {
@@ -211,6 +259,21 @@ pub async fn prepare(
         })
         .await??;
         compiler.restore_lazy_artifacts(&tree.lazy_source_artifacts()?)?;
+    }
+    if existing_only {
+        let finish_tree = tree.clone();
+        let finish_owner = owner.clone();
+        tokio::task::spawn_blocking(move || {
+            let _owner = finish_owner;
+            finish_tree.finish_existing_source_validation()
+        })
+        .await??;
+        return Ok(PreparedWorkspace {
+            config,
+            owner,
+            tree,
+            compiler,
+        });
     }
     let marker = hex(&config.workspace_identity).into_bytes();
     let control_tree = tree.clone();
@@ -740,8 +803,8 @@ fn canonical_candidate(path: &Path) -> Result<PathBuf> {
     }
     Ok(resolved)
 }
-fn open_state(config: &Config) -> Result<(Arc<StateOwner>, Header)> {
-    let directory = if config.state.try_exists()? {
+fn open_state(config: &Config, existing_only: bool) -> Result<(Arc<StateOwner>, Header)> {
+    let directory = if existing_only || config.state.try_exists()? {
         PrivateDir::open_existing(&config.state)?
     } else {
         PrivateDir::create(&config.state)?
@@ -756,6 +819,10 @@ fn open_state(config: &Config) -> Result<(Arc<StateOwner>, Header)> {
                 .context("unrecognized native workspace state")?,
         )
     };
+    ensure!(
+        !existing_only || previous.as_ref().is_some_and(|header| header.ready),
+        "existing native workspace is not ready"
+    );
     let expected = Header {
         format: 1,
         workspace_identity: config.workspace_identity,
@@ -786,6 +853,16 @@ fn open_state(config: &Config) -> Result<(Arc<StateOwner>, Header)> {
             "native workspace owner lock missing"
         );
     }
+    // A live owner must be rejected before probing its potentially mounted
+    // root (especially read_dir, which could hydrate a lazy source directory).
+    let existing_lock = if existing_only {
+        let lock = directory.open_existing_file("owner.lock", 4096)?;
+        lock.try_lock_exclusive()
+            .context("native workspace state already owned")?;
+        Some(lock)
+    } else {
+        None
+    };
     #[cfg(windows)]
     let mount_root = if previous.as_ref().is_some_and(|h| h.ready)
         && directory
@@ -805,7 +882,11 @@ fn open_state(config: &Config) -> Result<(Arc<StateOwner>, Header)> {
             )?,
         }
     } else {
-        let root = PrivateDir::create(&config.root)?;
+        let root = if existing_only {
+            PrivateDir::open_existing(&config.root)?
+        } else {
+            PrivateDir::create(&config.root)?
+        };
         ensure!(
             fs::read_dir(root.path())?.next().is_none(),
             "native workspace mountpoint must be empty"
@@ -814,16 +895,25 @@ fn open_state(config: &Config) -> Result<(Arc<StateOwner>, Header)> {
     };
     #[cfg(not(windows))]
     let mount_root = {
-        let root = PrivateDir::create(&config.root)?;
+        let root = if existing_only {
+            PrivateDir::open_existing(&config.root)?
+        } else {
+            PrivateDir::create(&config.root)?
+        };
         ensure!(
             fs::read_dir(root.path())?.next().is_none(),
             "native workspace mountpoint must be empty"
         );
         RootGuard::Private { _directory: root }
     };
-    let lock = directory.open_lock("owner.lock")?;
-    lock.try_lock_exclusive()
-        .context("native workspace state already owned")?;
+    let lock = if let Some(lock) = existing_lock {
+        lock
+    } else {
+        let lock = directory.open_lock("owner.lock")?;
+        lock.try_lock_exclusive()
+            .context("native workspace state already owned")?;
+        lock
+    };
     let header = previous.unwrap_or(expected);
     if empty {
         directory.replace("native-vfs.json", &serde_json::to_vec(&header)?)?;

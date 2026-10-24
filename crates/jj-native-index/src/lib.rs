@@ -428,12 +428,31 @@ impl NativeIndexStore {
             .downcast::<NativeMutableIndex>()
             .ok_or(Error::Foreign)?;
         self.core.same(&mutable.inner.core)?;
-        let tips = self.core.storage.persist_checkpoint(
-            &mutable.parents,
-            &[],
-            &mutable.pending,
-            &self.core.limits,
-        )?;
+        let tips = if mutable.rebase_frozen_source {
+            // An exact snapshot must not conceal a missing/corrupt authoritative
+            // parent behind cached normalized rows. The empty-delta path reads
+            // and validates the complete bounded parent layout without writing;
+            // its decoded buffers drop before exact-snapshot planning begins.
+            self.core
+                .storage
+                .persist_checkpoint(&mutable.parents, &[], &[], &self.core.limits)?;
+            // Parent segments merge ordinals with MIN. A newly selected frozen
+            // baseline may require a later authenticated ordinal than a prior
+            // authored checkpoint. Persist the bounded exact normalized metadata
+            // instead; old segments and operation associations stay untouched.
+            self.core.storage.persist_exact_snapshot(
+                &mutable.inner.checkpoint.roots,
+                &mutable.inner.checkpoint.drafts,
+                &self.core.limits,
+            )?
+        } else {
+            self.core.storage.persist_checkpoint(
+                &mutable.parents,
+                &[],
+                &mutable.pending,
+                &self.core.limits,
+            )?
+        };
         self.core
             .load_source(tips, mutable.inner.checkpoint.source.clone())
     }
@@ -494,6 +513,7 @@ impl Drop for Checkpoint {
 }
 struct NativeMutableIndex {
     inner: NativeReadonlyIndex,
+    rebase_frozen_source: bool,
     parents: Vec<SegmentId>,
     pending: Vec<Arc<Draft>>,
 }
@@ -572,6 +592,7 @@ impl ReadonlyIndex for NativeReadonlyIndex {
     fn start_modification(&self) -> Box<dyn MutableIndex> {
         Box::new(NativeMutableIndex {
             inner: self.clone(),
+            rebase_frozen_source: false,
             parents: self.checkpoint.tips.clone(),
             pending: Vec::new(),
         })
@@ -672,9 +693,12 @@ impl MutableIndex for NativeMutableIndex {
             .downcast_ref::<NativeReadonlyIndex>()
             .ok_or_else(|| err(Error::Foreign))?;
         self.inner.core.same(&other.core).map_err(err)?;
-        if self.inner.checkpoint.source != other.checkpoint.source {
-            return Err(err(Error::Unsupported));
-        }
+        let source = self
+            .inner
+            .checkpoint
+            .source
+            .merge(&other.checkpoint.source, &self.inner.core.limits)
+            .map_err(err)?;
         let mut roots: BTreeSet<_> = self.inner.checkpoint.roots.iter().copied().collect();
         roots.extend(other.checkpoint.roots.iter().copied());
         let mut drafts: BTreeMap<_, _> = self
@@ -704,14 +728,50 @@ impl MutableIndex for NativeMutableIndex {
         if parents.len() > self.inner.core.limits.max_segments {
             return Err(err(Error::Limit));
         }
+        // Frozen membership/order comes from the exact selected snapshots,
+        // not a post-restore delta that happens to have the same canonical ID.
+        let mut rebase_frozen_source = source != self.inner.checkpoint.source;
+        if let CheckpointSource::CloudSnapshot { baseline_tips, .. } = &source {
+            let (baseline_roots, baseline) = self
+                .inner
+                .core
+                .storage
+                .load(baseline_tips, &self.inner.core.limits)
+                .map_err(err)?;
+            if baseline_roots.iter().copied().ne(roots.iter().copied()) {
+                return Err(err(Error::Corrupt));
+            }
+            for draft in baseline {
+                let actual = drafts.get(&draft.id()).ok_or_else(|| err(Error::Corrupt))?;
+                if !actual.canonical_eq(&draft) {
+                    return Err(err(Error::Corrupt));
+                }
+                rebase_frozen_source |= actual.order != draft.order;
+                drafts.insert(draft.id(), draft);
+            }
+        }
         let drafts = persistence::order_drafts(drafts, &self.inner.core.limits).map_err(err)?;
+        let roots: Vec<_> = roots.into_iter().collect();
+        let baseline = source
+            .validate_checkpoint(
+                &self.inner.core.storage,
+                &roots,
+                &drafts,
+                &self.inner.core.limits,
+            )
+            .map_err(err)?;
+        // A newly selected frozen commit is already durably present in the
+        // verified baseline segments. Do not persist an older local ordinal for
+        // that same ID as a pending delta. Failure above leaves pending intact.
+        self.rebase_frozen_source |= rebase_frozen_source;
+        self.pending.retain(|draft| !baseline.contains(&draft.id()));
         self.parents = parents.into_iter().collect();
         self.inner.checkpoint = Arc::new(Checkpoint::new(
             self.parents.clone(),
-            roots.into_iter().collect(),
+            roots,
             drafts,
-            self.inner.checkpoint.source.clone(),
-            self.inner.checkpoint.baseline.clone(),
+            source,
+            baseline,
         ));
         Ok(())
     }

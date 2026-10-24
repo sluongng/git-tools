@@ -178,23 +178,54 @@ impl NativeQueryIo for FixtureIo {
         owner: QueryOwner,
     ) -> Result<QueryReply<QueryScope>, tonic::Status> {
         self.cloud_opens.fetch_add(1, Ordering::SeqCst);
-        if input.source.index_root_ids.len() != 1 || !input.overlay.is_empty() {
+        if input.source.index_root_ids.is_empty()
+            || input.source.index_root_ids.len() > 4096
+            || !input.source.index_root_ids.windows(2).all(|w| w[0] < w[1])
+            || !input.overlay.is_empty()
+        {
             return Err(tonic::Status::invalid_argument(
                 "fixture exact cloud selection",
             ));
         }
-        let (expected, nodes) = self
-            .cloud_snapshots
-            .lock()
-            .unwrap()
-            .get(&input.source.index_root_ids[0])
-            .cloned()
-            .ok_or_else(|| tonic::Status::unimplemented("fixture cloud snapshot unavailable"))?;
-        if expected != input.source {
-            return Err(tonic::Status::permission_denied(
-                "fixture cloud selection differs",
-            ));
-        }
+        let nodes = {
+            let snapshots = self.cloud_snapshots.lock().unwrap();
+            let mut expected = None;
+            let mut anchors = BTreeSet::new();
+            let mut nodes = BTreeMap::new();
+            for root in &input.source.index_root_ids {
+                let (selection, selected_nodes) = snapshots.get(root).ok_or_else(|| {
+                    tonic::Status::unimplemented("fixture cloud snapshot unavailable")
+                })?;
+                let mut binding = selection.clone();
+                anchors.extend(binding.expected_anchors.iter().copied());
+                binding.expected_anchors.clear();
+                binding.index_root_ids.clear();
+                if expected.as_ref().is_some_and(|old| old != &binding) {
+                    return Err(tonic::Status::permission_denied(
+                        "fixture cloud versions differ",
+                    ));
+                }
+                expected = Some(binding);
+                for node in selected_nodes {
+                    if let Some(old) = nodes.insert(model_commit_id(node), node.clone()) {
+                        if old != *node {
+                            return Err(tonic::Status::data_loss(
+                                "fixture canonical node conflict",
+                            ));
+                        }
+                    }
+                }
+            }
+            let mut expected = expected.unwrap();
+            expected.index_root_ids = input.source.index_root_ids.clone();
+            expected.expected_anchors = anchors.into_iter().collect();
+            if expected != input.source {
+                return Err(tonic::Status::permission_denied(
+                    "fixture cloud selection differs",
+                ));
+            }
+            nodes.into_values().collect()
+        };
         let mut reply = self.install_scope(nodes, owner);
         reply.value.cloud_source_digest = Some(input.source.digest());
         self.cloud_scope_sources
@@ -2974,7 +3005,20 @@ fn portable_import_preserves_exact_cloud_baselines_without_canonical_hydration_o
             .await
             .unwrap();
         original.associate_operation(&[3; 64], &promoted).unwrap();
-        let operations = [[0; 64], [1; 64], [2; 64], [3; 64]];
+        original
+            .associate_operation(&[7; 64], &branches[0])
+            .unwrap();
+        original
+            .associate_operation(&[8; 64], &branches[1])
+            .unwrap();
+        let mut ordered = seed.start_modification();
+        ordered.add_commit(&commits[0]).await.unwrap();
+        ordered.add_commit(&commits[1]).await.unwrap();
+        let ordered = original.persist_index(ordered).unwrap();
+        original.associate_operation(&[9; 64], &ordered).unwrap();
+        let operations = [
+            [0; 64], [1; 64], [2; 64], [3; 64], [7; 64], [8; 64], [9; 64],
+        ];
         let mut artifacts = PortableArtifactSink::default();
         let exported = original
             .export_operation_indexes(
@@ -3195,13 +3239,402 @@ fn portable_import_preserves_exact_cloud_baselines_without_canonical_hydration_o
                 .iter()
                 .all(|key| key.id.0 == model_id(delta.id()).unwrap().0)
         );
-        let mut branch = historical.start_modification();
-        assert!(
-            branch
-                .merge_in(&reopened.index_at_operation(&[0; 64]).unwrap())
-                .is_err(),
-            "different frozen snapshot sources cannot silently merge"
+        // Match jj's actual plural-operation reconciliation order: merge the
+        // common operation index, then the other operation head. Each source is
+        // an exact selection from the SAME retained version, never live roots.
+        let left = reopened.index_at_operation(&[7; 64]).unwrap();
+        let right = reopened.index_at_operation(&[8; 64]).unwrap();
+        let mut branch = left.start_modification();
+        branch
+            .merge_in(&reopened.index_at_operation(&[0; 64]).unwrap())
+            .unwrap();
+        branch.merge_in(&right).unwrap();
+        let merged_heads = restored.persist_index(branch).unwrap();
+        restored
+            .associate_operation(&[6; 64], &merged_heads)
+            .unwrap();
+        let source::CheckpointSource::CloudSnapshot { pins, .. } = &merged_heads.checkpoint.source
+        else {
+            panic!()
+        };
+        assert_eq!(pins.index_root_ids.len(), 3);
+        assert_eq!(pins.manifest_id, version.manifest_id);
+        assert_eq!(merged_heads.checkpoint.baseline.len(), 2);
+        let opens_before = io.cloud_opens.load(Ordering::SeqCst);
+        let rows = merged_heads
+            .evaluate_revset(&expression, &jj_store)
+            .unwrap()
+            .stream()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 2);
+        assert!(commits.iter().all(|commit| rows.contains(commit.id())));
+        assert!(io.cloud_opens.load(Ordering::SeqCst) > opens_before);
+        let multi_encoded = merged_heads
+            .checkpoint
+            .source
+            .encode(&Limits::default())
+            .unwrap();
+        assert_eq!(multi_encoded[0], 2);
+        let single_encoded = historical
+            .checkpoint
+            .source
+            .encode(&Limits::default())
+            .unwrap();
+        assert_eq!(single_encoded[0], 1);
+        let single_decoded =
+            source::CheckpointSource::decode(&single_encoded, &Limits::default()).unwrap();
+        assert_eq!(
+            single_decoded.encode(&Limits::default()).unwrap(),
+            single_encoded,
+            "legacy single-selection framing remains byte-stable"
         );
+        let reread = NativeIndexStore::open(
+            &path,
+            &config,
+            Default::default(),
+            io.clone(),
+            observed.clone(),
+        )
+        .unwrap();
+        let saved_merge = reread.index_at_operation(&[6; 64]).unwrap();
+        assert_eq!(
+            saved_merge.checkpoint.source,
+            merged_heads.checkpoint.source
+        );
+        let rows = saved_merge
+            .evaluate_revset(&expression, &jj_store)
+            .unwrap()
+            .stream()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 2);
+        let mut merged_artifacts = PortableArtifactSink::default();
+        let merged_export = reread
+            .export_operation_indexes(
+                &[[0; 64], [6; 64]],
+                Default::default(),
+                &mut merged_artifacts,
+                Arc::new(()),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            merged_export.operation_indexes()[1].root,
+            exported.operation_indexes()[1].root,
+            "local multi-source provenance exports as an ordinary exact merged portable snapshot"
+        );
+        assert_eq!(observed.files.load(Ordering::SeqCst), 0);
+        assert!(
+            observed
+                .reads
+                .lock()
+                .unwrap()
+                .iter()
+                .all(|key| key.id.0 == model_id(delta.id()).unwrap().0),
+            "merging/reopening/exporting frozen baseline must not hydrate canonical history"
+        );
+        // Corrupted/local-foreign checkpoint security cases use the real public
+        // merge operation: no changed immutable selector or live mode is adopted.
+        #[derive(Debug)]
+        enum Mismatch {
+            Provider,
+            Workspace,
+            Generation,
+            Manifest,
+            Raw,
+            Size,
+            Mode,
+        }
+        for mismatch in [
+            Mismatch::Provider,
+            Mismatch::Workspace,
+            Mismatch::Generation,
+            Mismatch::Manifest,
+            Mismatch::Raw,
+            Mismatch::Size,
+            Mismatch::Mode,
+        ] {
+            let mut foreign = right.clone();
+            let mut changed = foreign.checkpoint.source.clone();
+            if matches!(mismatch, Mismatch::Mode) {
+                changed = source::CheckpointSource::LiveRoots;
+            } else if let source::CheckpointSource::CloudSnapshot { pins, .. } = &mut changed {
+                match mismatch {
+                    Mismatch::Provider => pins.provider_identity[0] ^= 1,
+                    Mismatch::Workspace => pins.workspace_id[0] ^= 1,
+                    Mismatch::Generation => pins.generation += 1,
+                    Mismatch::Manifest => pins.manifest_id[0] ^= 1,
+                    Mismatch::Raw => pins.manifest_blake3[0] ^= 1,
+                    Mismatch::Size => pins.manifest_size_bytes += 1,
+                    Mismatch::Mode => unreachable!(),
+                }
+            }
+            foreign.checkpoint = Arc::new(Checkpoint::new(
+                foreign.checkpoint.tips.clone(),
+                foreign.checkpoint.roots.clone(),
+                foreign.checkpoint.drafts.clone(),
+                changed,
+                foreign.checkpoint.baseline.clone(),
+            ));
+            let mut rejected = left.start_modification();
+            assert!(
+                rejected.merge_in(&foreign).is_err(),
+                "must reject {mismatch:?} mismatch"
+            );
+            let unchanged = restored.persist_index(rejected).unwrap();
+            assert_eq!(unchanged.checkpoint.source, left.checkpoint.source);
+        }
+        let mut corrupt = right.clone();
+        let mut drafts = corrupt.checkpoint.drafts.clone();
+        let mut bad = drafts[0].as_ref().clone();
+        bad.change.0[0] ^= 1;
+        drafts[0] = Arc::new(bad);
+        corrupt.checkpoint = Arc::new(Checkpoint::new(
+            corrupt.checkpoint.tips.clone(),
+            corrupt.checkpoint.roots.clone(),
+            drafts,
+            corrupt.checkpoint.source.clone(),
+            corrupt.checkpoint.baseline.clone(),
+        ));
+        let mut rejected = merged_heads.start_modification();
+        assert!(
+            rejected.merge_in(&corrupt).is_err(),
+            "shared canonical metadata cannot disagree"
+        );
+        let mut small = Limits::default();
+        small.max_roots = 1;
+        let limited_store =
+            NativeIndexStore::open(&path, &config, small, io.clone(), observed.clone()).unwrap();
+        let limited = limited_store.index_at_operation(&[7; 64]).unwrap();
+        let mut limited = limited.start_modification();
+        assert!(
+            limited.merge_in(&right).is_err(),
+            "selected root union obeys configured bounds"
+        );
+        let mut rejected_pending = reread
+            .index_at_operation(&[0; 64])
+            .unwrap()
+            .start_modification();
+        rejected_pending.add_commit(&commits[1]).await.unwrap();
+        let mut changed_version = right.clone();
+        let mut changed_source = changed_version.checkpoint.source.clone();
+        if let source::CheckpointSource::CloudSnapshot { pins, .. } = &mut changed_source {
+            pins.manifest_blake3[0] ^= 1;
+        }
+        changed_version.checkpoint = Arc::new(Checkpoint::new(
+            changed_version.checkpoint.tips.clone(),
+            changed_version.checkpoint.roots.clone(),
+            changed_version.checkpoint.drafts.clone(),
+            changed_source,
+            changed_version.checkpoint.baseline.clone(),
+        ));
+        assert!(rejected_pending.merge_in(&changed_version).is_err());
+        let preserved_pending = restored.persist_index(rejected_pending).unwrap();
+        assert_eq!(
+            preserved_pending
+                .checkpoint
+                .drafts
+                .iter()
+                .map(|d| (d.id(), d.order))
+                .collect::<Vec<_>>(),
+            vec![(model_id(commits[1].id()).unwrap(), 1)],
+            "failed merge must preserve pending authored data and its ordinal"
+        );
+        let mut pending = reread
+            .index_at_operation(&[0; 64])
+            .unwrap()
+            .start_modification();
+        pending.add_commit(&commits[1]).await.unwrap();
+        let reads_before_merge = observed.reads.lock().unwrap().len();
+        pending
+            .merge_in(&reread.index_at_operation(&[9; 64]).unwrap())
+            .unwrap();
+        let pending = restored.persist_index(pending).unwrap();
+        restored.associate_operation(&[10; 64], &pending).unwrap();
+        let right_order = pending
+            .checkpoint
+            .drafts
+            .iter()
+            .find(|d| d.id() == model_id(commits[1].id()).unwrap())
+            .unwrap()
+            .order;
+        assert_eq!(
+            right_order, 2,
+            "authenticated frozen ordinal replaces earlier local pending ordinal"
+        );
+        let again = NativeIndexStore::open(
+            &path,
+            &config,
+            Default::default(),
+            io.clone(),
+            observed.clone(),
+        )
+        .unwrap();
+        assert_eq!(
+            again
+                .index_at_operation(&[10; 64])
+                .unwrap()
+                .checkpoint
+                .drafts,
+            pending.checkpoint.drafts
+        );
+        assert_eq!(
+            observed.reads.lock().unwrap().len(),
+            reads_before_merge,
+            "frozen merge/save/reopen needs no further canonical reads"
+        );
+        let mut authored = reread
+            .index_at_operation(&[0; 64])
+            .unwrap()
+            .start_modification();
+        authored.add_commit(&commits[1]).await.unwrap();
+        let authored = restored.persist_index(authored).unwrap();
+        restored.associate_operation(&[11; 64], &authored).unwrap();
+        let after_authored_reads = observed.reads.lock().unwrap().len();
+        let stored = NativeIndexStore::open(
+            &path,
+            &config,
+            Default::default(),
+            io.clone(),
+            observed.clone(),
+        )
+        .unwrap();
+        let authored = stored.index_at_operation(&[11; 64]).unwrap();
+        assert_eq!(authored.checkpoint.drafts[0].order, 1);
+        let mut rebased = authored.start_modification();
+        rebased
+            .merge_in(&stored.index_at_operation(&[9; 64]).unwrap())
+            .unwrap();
+        let rebased = restored.persist_index(rebased).unwrap();
+        restored.associate_operation(&[12; 64], &rebased).unwrap();
+        let stored = NativeIndexStore::open(
+            &path,
+            &config,
+            Default::default(),
+            io.clone(),
+            observed.clone(),
+        )
+        .unwrap();
+        assert_eq!(
+            stored
+                .index_at_operation(&[12; 64])
+                .unwrap()
+                .checkpoint
+                .drafts
+                .iter()
+                .find(|d| d.id() == model_id(commits[1].id()).unwrap())
+                .unwrap()
+                .order,
+            2,
+            "persisted parent ordinal cannot override authenticated selected baseline"
+        );
+        assert_eq!(
+            stored
+                .index_at_operation(&[11; 64])
+                .unwrap()
+                .checkpoint
+                .drafts[0]
+                .order,
+            1,
+            "exact source rebase must not rewrite historical authored operations"
+        );
+        assert_eq!(
+            observed.reads.lock().unwrap().len(),
+            after_authored_reads,
+            "persisted ordinal rebase is metadata-only, not ancestor hydration"
+        );
+        let mut repeated = stored
+            .index_at_operation(&[12; 64])
+            .unwrap()
+            .start_modification();
+        repeated
+            .merge_in(&stored.index_at_operation(&[11; 64]).unwrap())
+            .unwrap();
+        let repeated = restored.persist_index(repeated).unwrap();
+        assert_eq!(
+            repeated
+                .checkpoint
+                .drafts
+                .iter()
+                .find(|d| d.id() == model_id(commits[1].id()).unwrap())
+                .unwrap()
+                .order,
+            2,
+            "a subset source cannot reintroduce an old ordinal after the union was already selected"
+        );
+        // Cached normalized rows cannot repair/conceal a damaged authored
+        // parent during exact rebase. This tip is not a frozen baseline tip.
+        let parent_path = path.join("segments").join(
+            authored.checkpoint.tips[0]
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect::<String>(),
+        );
+        let parent_bytes = std::fs::read(&parent_path).unwrap();
+        let association_path = path.join("operations").join("0b".repeat(64));
+        let old_association = std::fs::read(&association_path).unwrap();
+        #[derive(Debug)]
+        enum ParentDamage {
+            Missing,
+            Corrupt,
+        }
+        for damage in [ParentDamage::Missing, ParentDamage::Corrupt] {
+            let mut candidate = authored.start_modification();
+            candidate
+                .merge_in(&stored.index_at_operation(&[9; 64]).unwrap())
+                .unwrap();
+            match damage {
+                ParentDamage::Missing => std::fs::remove_file(&parent_path).unwrap(),
+                ParentDamage::Corrupt => {
+                    let mut corrupt = parent_bytes.clone();
+                    *corrupt.last_mut().unwrap() ^= 1;
+                    std::fs::write(&parent_path, corrupt).unwrap();
+                }
+            }
+            let segments_before: BTreeSet<_> = std::fs::read_dir(path.join("segments"))
+                .unwrap()
+                .map(|e| e.unwrap().file_name())
+                .collect();
+            let operations_before: BTreeSet<_> = std::fs::read_dir(path.join("operations"))
+                .unwrap()
+                .map(|e| e.unwrap().file_name())
+                .collect();
+            assert!(
+                restored.persist_index(candidate).is_err(),
+                "rebase must reject {damage:?} persisted parent"
+            );
+            assert_eq!(
+                std::fs::read_dir(path.join("segments"))
+                    .unwrap()
+                    .map(|e| e.unwrap().file_name())
+                    .collect::<BTreeSet<_>>(),
+                segments_before,
+                "rejected parent cannot publish a cached replacement snapshot"
+            );
+            assert_eq!(
+                std::fs::read_dir(path.join("operations"))
+                    .unwrap()
+                    .map(|e| e.unwrap().file_name())
+                    .collect::<BTreeSet<_>>(),
+                operations_before
+            );
+            assert_eq!(std::fs::read(&association_path).unwrap(), old_association);
+            // Restore only the explicitly damaged fixture for later cases.
+            std::fs::write(&parent_path, &parent_bytes).unwrap();
+        }
+        assert_eq!(
+            stored
+                .index_at_operation(&[11; 64])
+                .unwrap()
+                .checkpoint
+                .drafts[0]
+                .order,
+            1
+        );
+        assert_eq!(observed.reads.lock().unwrap().len(), after_authored_reads);
         let view_only = restored
             .persist_index(historical.start_modification())
             .unwrap();

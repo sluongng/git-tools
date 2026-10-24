@@ -6,13 +6,13 @@ use crate::{
     query_index::{QueryConfig, QueryHost, Scoped, Work, index_error},
 };
 use prost::Message;
-use q::repository_query_server::{RepositoryQuery, RepositoryQueryServer};
+use q::repository_query_server::RepositoryQuery;
 use std::sync::Arc;
 use tinytree_index::{PrefixResolution, WorkBudget};
 use tinytree_model as m;
 use tinytree_proto::query_v1 as q;
 use tokio::time::Instant;
-use tonic::{Request, Response, Status, Streaming, codec::CompressionEncoding};
+use tonic::{Request, Response, Status, Streaming};
 #[derive(Clone)]
 pub struct QueryService {
     repository: RepositoryService,
@@ -20,14 +20,6 @@ pub struct QueryService {
 impl QueryService {
     pub(crate) fn new(repository: RepositoryService) -> Self {
         Self { repository }
-    }
-    pub(crate) fn grpc(self) -> RepositoryQueryServer<Self> {
-        let config = self.repository.service_config();
-        RepositoryQueryServer::new(self)
-            .accept_compressed(CompressionEncoding::Zstd)
-            .send_compressed(CompressionEncoding::Zstd)
-            .max_decoding_message_size(config.max_request_bytes.min(config.query.max_request_bytes))
-            .max_encoding_message_size(config.query.max_response_bytes)
     }
     fn context<T>(
         &self,

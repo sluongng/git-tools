@@ -11,6 +11,8 @@ mod ledger;
 mod metadata;
 mod provider;
 mod query;
+mod restore_io;
+pub use restore_io::RemoteRestoreIo;
 mod snapshot;
 mod staging;
 mod transfer;
@@ -61,7 +63,9 @@ impl Inner {
         }
     }
     pub fn deadline(&self) -> tokio::time::Instant {
-        tokio::time::Instant::now() + Duration::from_millis(self.config.operation_timeout_ms)
+        io::bounded_deadline(
+            tokio::time::Instant::now() + Duration::from_millis(self.config.operation_timeout_ms),
+        )
     }
 }
 impl RemoteRepository {
@@ -199,6 +203,23 @@ pub(crate) struct Connector {
 }
 impl Connector {
     pub async fn get(&self) -> Result<NativeClient> {
+        let client = self.get_bare().await?;
+        let client = if let Some(scope) = io::scope() {
+            client.with_lifetime_guard(scope)
+        } else {
+            client
+        };
+        Ok(if let Some(bound) = io::operation_context() {
+            client
+                .with_operation_deadline(bound.deadline)
+                .with_rpc_lifetime_guard(bound)
+        } else {
+            client
+        })
+    }
+    // Query registries retain only stable configured provenance, never a caller's
+    // transient deadline, physical job owner, or control semaphore.
+    pub(crate) async fn get_bare(&self) -> Result<NativeClient> {
         ensure!(
             self.online,
             "native repository was opened offline; reopen with credentials before network access"
@@ -238,11 +259,7 @@ impl Connector {
             )
         })
         .await?;
-        Ok(if let Some(scope) = io::scope() {
-            client.with_lifetime_guard(scope)
-        } else {
-            client
-        })
+        Ok(client)
     }
 }
 pub(crate) fn backend(error: jj_lib::backend::BackendError) -> anyhow::Error {

@@ -1,0 +1,1056 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Storage Maintainers <26684313+sluongng@users.noreply.github.com>
+Date: Sat, 24 Oct 2026 00:00:00 +0000
+Subject: [PATCH] storage: Defer strict recovery writes
+
+Applications must recognize an existing namespace before recovery can
+change its files. Normal recovery can truncate a damaged journal or
+remove incomplete keyspaces before that application check runs.
+
+Add opt-in existing-only recovery with an explicit validation finish.
+Inspect checksummed journal batches without trimming, permit only
+zero padding between complete batches, and bound record and pending
+batch allocations. Bound total physical journal bytes and fragment
+inventory before decoding or scanning padding. Reject Clear records in
+this mode instead of performing a persistent replay. Preserve files
+and defer background maintenance and supported mutation APIs until
+the application finishes validation.
+
+After validation, trim verified padding before append writes resume and
+start normal maintenance. Ordinary database recovery remains unchanged.
+
+---
+diff --git a/src/batch/mod.rs b/src/batch/mod.rs
+index 1bba5ef..cd0aad2 100644
+--- a/src/batch/mod.rs
++++ b/src/batch/mod.rs
+@@ -98,6 +98,7 @@ impl WriteBatch {
+     /// Will return `Err` if an IO error occurs.
+     #[allow(clippy::missing_panics_doc)]
+     pub fn commit(mut self) -> crate::Result<()> {
++        self.db.ensure_recovery_finished()?;
+         if self.is_empty() {
+             return Ok(());
+         }
+diff --git a/src/builder.rs b/src/builder.rs
+index 6fc7a7c..5766104 100644
+--- a/src/builder.rs
++++ b/src/builder.rs
+@@ -35,6 +35,53 @@ impl<O: Openable> Builder<O> {
+         O::open(self.inner)
+     }
+ 
++    /// Inspect an existing database without repair, cleanup or background writes.
++    /// Call `finish_recovery_validation` after application-level validation.
++    /// Missing state, invalid WAL batches and Clear records are rejected.
++    #[must_use]
++    pub fn strict_existing_recovery(mut self, strict: bool) -> Self {
++        self.inner.strict_existing_recovery = strict;
++        self
++    }
++
++    /// Bound encoded and decoded record sizes during strict recovery.
++    /// The default is 64 MiB; ordinary recovery is unchanged.
++    #[must_use]
++    pub fn strict_recovery_max_record_bytes(mut self, bytes: usize) -> Self {
++        self.inner.strict_recovery_max_record_bytes = bytes;
++        self
++    }
++
++    /// Bound retained bytes in a strict recovery batch (default 256 MiB).
++    #[must_use]
++    pub fn strict_recovery_max_batch_bytes(mut self, bytes: usize) -> Self {
++        self.inner.strict_recovery_max_batch_bytes = bytes;
++        self
++    }
++
++    /// Bound the number of entries in a strict recovery batch (default one million).
++    #[must_use]
++    pub fn strict_recovery_max_batch_items(mut self, count: usize) -> Self {
++        self.inner.strict_recovery_max_batch_items = count;
++        self
++    }
++
++    /// Bound total physical WAL bytes inspected in strict recovery (default 1 GiB).
++    /// File sizes are checked before journal decoding or zero-padding scans.
++    #[must_use]
++    pub fn strict_recovery_max_scan_bytes(mut self, bytes: u64) -> Self {
++        self.inner.strict_recovery_max_scan_bytes = bytes;
++        self
++    }
++
++    /// Bound journal fragments during strict recovery (default 1024).
++    /// Directory enumeration is also bounded, allowing sixteen other database entries.
++    #[must_use]
++    pub fn strict_recovery_max_journals(mut self, count: usize) -> Self {
++        self.inner.strict_recovery_max_journals = count;
++        self
++    }
++
+     /// Sets the cache capacity in bytes.
+     ///
+     /// It is recommended to configure the block cache capacity to be ~20-25% of the available memory - or more **if** the data set _fully_ fits into memory.
+diff --git a/src/db.rs b/src/db.rs
+index 791d357..5ec6c73 100644
+--- a/src/db.rs
++++ b/src/db.rs
+@@ -58,6 +58,8 @@ pub struct DatabaseInner {
+     pub worker_pool: WorkerPool,
+ 
+     pub(crate) lock_file: LockedFileGuard,
++    recovery_validation: Mutex<()>,
++    pub(crate) recovery_trims: Arc<Mutex<Vec<(std::path::PathBuf, u64, u64)>>>,
+ }
+ 
+ impl Drop for DatabaseInner {
+@@ -348,6 +350,7 @@ impl Database {
+     ///
+     /// Returns error, if an IO error occurred.
+     pub fn persist(&self, mode: PersistMode) -> crate::Result<()> {
++        self.ensure_recovery_finished()?;
+         if self.is_poisoned.is_poisoned() {
+             return Err(crate::Error::Poisoned);
+         }
+@@ -401,8 +404,13 @@ impl Database {
+     /// Should not be user-facing.
+     #[doc(hidden)]
+     pub fn create_or_recover(config: Config) -> crate::Result<Self> {
++        if config.strict_existing_recovery && config.clean_path_on_drop {
++            return Err(crate::Error::Unrecoverable);
++        }
+         if config.path.join(VERSION_MARKER).try_exists()? {
+             Self::recover(config)
++        } else if config.strict_existing_recovery {
++            Err(crate::Error::Unrecoverable)
+         } else {
+             Self::create_new(config)
+         }
+@@ -418,6 +426,7 @@ impl Database {
+     /// Will return `Err` if an IO error occurs.
+     #[expect(clippy::needless_pass_by_value)]
+     pub fn delete_keyspace(&self, handle: Keyspace) -> crate::Result<()> {
++        self.ensure_recovery_finished()?;
+         self.meta_keyspace.remove_keyspace(&handle.name)?;
+ 
+         handle
+@@ -470,6 +479,7 @@ impl Database {
+             log::trace!("Opening existing keyspace {name:?}");
+             keyspace.clone()
+         } else {
++            self.ensure_recovery_finished()?;
+             let keyspace_id = self.allocate_keyspace_id()?;
+ 
+             let name: KeyspaceKey = name.into();
+@@ -558,10 +568,14 @@ impl Database {
+ 
+         if let Some(version) = FormatVersion::parse_file_header(&bytes) {
+             if version == FormatVersion::V2 {
+-                log::error!("It looks like you are trying to open a V2 database - the database needs a manual migration, a tool is available at https://github.com/fjall-rs/migrate-v2-v3.");
++                log::error!(
++                    "It looks like you are trying to open a V2 database - the database needs a manual migration, a tool is available at https://github.com/fjall-rs/migrate-v2-v3."
++                );
+             }
+             if version as u8 > 3 {
+-                log::error!("It looks like you are trying to open a database from the future. Are you a time traveller?");
++                log::error!(
++                    "It looks like you are trying to open a database from the future. Are you a time traveller?"
++                );
+             }
+             if version != FormatVersion::V3 {
+                 return Err(crate::Error::InvalidVersion(Some(version)));
+@@ -577,6 +591,9 @@ impl Database {
+     #[expect(clippy::too_many_lines)]
+     #[doc(hidden)]
+     pub fn recover(config: Config) -> crate::Result<Self> {
++        if config.strict_existing_recovery && config.clean_path_on_drop {
++            return Err(crate::Error::Unrecoverable);
++        }
+         log::info!("Recovering database at {}", config.path.display());
+ 
+         // Check version
+@@ -588,15 +605,27 @@ impl Database {
+         // let recovery_mode = config.journal_recovery_mode;
+ 
+         // Reload active journal
+-        let journal_recovery = Journal::recover(
+-            &config.path,
+-            config.journal_compression_type,
+-            config.journal_compression_threshold,
+-        )?;
++        let journal_recovery = if config.strict_existing_recovery {
++            Journal::recover_existing(
++                &config.path,
++                config.journal_compression_type,
++                config.journal_compression_threshold,
++                config.strict_recovery_max_scan_bytes,
++                config.strict_recovery_max_journals,
++            )?
++        } else {
++            Journal::recover(
++                &config.path,
++                config.journal_compression_type,
++                config.journal_compression_threshold,
++            )?
++        };
+         log::debug!("journal recovery result: {journal_recovery:#?}");
+ 
+         let active_journal = Arc::new(journal_recovery.active);
+-        active_journal.get_writer()?.persist(PersistMode::SyncAll)?;
++        if !config.strict_existing_recovery {
++            active_journal.get_writer()?.persist(PersistMode::SyncAll)?;
++        }
+ 
+         let sealed_journals = journal_recovery.sealed;
+ 
+@@ -610,6 +639,7 @@ impl Database {
+             seqno.clone(),
+             visible_seqno.clone(),
+         )
++        .preserve_existing_recovery(config.strict_existing_recovery)
+         .use_cache(config.cache.clone())
+         .use_descriptor_table(config.descriptor_table.clone())
+         .expect_point_read_hits(true)
+@@ -664,6 +694,8 @@ impl Database {
+             is_poisoned: PoisonSignal::default(),
+             stats,
+             lock_file,
++            recovery_validation: Mutex::new(()),
++            recovery_trims: Arc::default(),
+         };
+ 
+         let db = Self(Arc::new(inner));
+@@ -688,7 +720,10 @@ impl Database {
+             // was not correctly rotated
+             for keyspace in keyspaces.values() {
+                 if keyspace.tree.active_memtable().size() > 0 {
+-                    log::error!("Active memtable is not empty after recovery for keyspace {:?} - recovery failed", keyspace.name);
++                    log::error!(
++                        "Active memtable is not empty after recovery for keyspace {:?} - recovery failed",
++                        keyspace.name
++                    );
+                     return Err(crate::Error::Unrecoverable);
+                 }
+             }
+@@ -700,7 +735,18 @@ impl Database {
+             if !journal_recovery.was_active_created {
+                 log::trace!("Replaying active journal");
+ 
+-                let reader = db.supervisor.journal.get_reader()?;
++                let reader = if db.config.strict_existing_recovery {
++                    db.supervisor.journal.get_strict_reader(
++                        db.recovery_trims.clone(),
++                        (
++                            db.config.strict_recovery_max_record_bytes,
++                            db.config.strict_recovery_max_batch_bytes,
++                            db.config.strict_recovery_max_batch_items,
++                        ),
++                    )?
++                } else {
++                    db.supervisor.journal.get_reader()?
++                };
+ 
+                 for batch in reader {
+                     let batch = batch?;
+@@ -788,7 +834,68 @@ impl Database {
+ 
+         db.supervisor.snapshot_tracker.gc();
+ 
+-        for keyspace in db
++        if !db.config.strict_existing_recovery {
++            db.start_recovered_workers()?;
++        }
++
++        log::trace!("Database recovery successful");
++
++        Ok(db)
++    }
++
++    pub(crate) fn ensure_recovery_finished(&self) -> crate::Result<()> {
++        self.supervisor.journal.ensure_writes_enabled()
++    }
++
++    /// Finish an opt-in strict recovery after application-level validation.
++    /// Until this succeeds, supported mutation APIs reject writes. Rejected
++    /// inspection can be dropped without trimming or cleaning existing files.
++    pub fn finish_recovery_validation(&self) -> crate::Result<()> {
++        let _validation = self
++            .recovery_validation
++            .lock()
++            .map_err(|_| crate::Error::Poisoned)?;
++        if !self.config.strict_existing_recovery {
++            return Ok(());
++        }
++        let writer = self.supervisor.journal.get_writer()?;
++        if !writer
++            .validation_pending
++            .load(std::sync::atomic::Ordering::Acquire)
++        {
++            return Ok(());
++        }
++        if self.is_poisoned.is_poisoned() {
++            return Err(crate::Error::Poisoned);
++        }
++        let trims = self
++            .recovery_trims
++            .lock()
++            .map_err(|_| crate::Error::Poisoned)?;
++        for (path, logical_end, original_len) in trims.iter() {
++            let file = std::fs::OpenOptions::new().write(true).open(path)?;
++            if file.metadata()?.len() != *original_len || logical_end > original_len {
++                return Err(crate::Error::Unrecoverable);
++            }
++            if logical_end < original_len {
++                file.set_len(*logical_end)?;
++                file.sync_all()?;
++            }
++        }
++        // All application checks have succeeded; only now may maintenance run.
++        if let Err(error) = self.start_recovered_workers() {
++            self.is_poisoned.poison();
++            self.stop_signal.send();
++            return Err(error);
++        }
++        writer
++            .validation_pending
++            .store(false, std::sync::atomic::Ordering::Release);
++        Ok(())
++    }
++
++    fn start_recovered_workers(&self) -> crate::Result<()> {
++        for keyspace in self
+             .supervisor
+             .keyspaces
+             .read()
+@@ -802,7 +909,7 @@ impl Database {
+                 );
+ 
+                 // IMPORTANT: Add task to flush manager, so it can be flushed
+-                db.supervisor
++                self.supervisor
+                     .flush_manager
+                     .enqueue(Arc::new(crate::flush::Task {
+                         keyspace: keyspace.clone(),
+@@ -822,21 +929,22 @@ impl Database {
+             }
+         }
+ 
+-        db.worker_pool.start(
+-            db.config.worker_threads,
+-            &db.supervisor,
+-            &db.stats,
+-            &PoisonDart::new(db.is_poisoned.clone()),
+-            &db.active_thread_counter,
++        self.worker_pool.start(
++            self.config.worker_threads,
++            &self.supervisor,
++            &self.stats,
++            &PoisonDart::new(self.is_poisoned.clone()),
++            &self.active_thread_counter,
+         )?;
+ 
+-        log::trace!("Database recovery successful");
+-
+-        Ok(db)
++        Ok(())
+     }
+ 
+     #[doc(hidden)]
+     pub fn create_new(config: Config) -> crate::Result<Self> {
++        if config.strict_existing_recovery {
++            return Err(crate::Error::Unrecoverable);
++        }
+         log::info!("Creating database at {}", config.path.display());
+ 
+         std::fs::create_dir_all(&config.path)?;
+@@ -925,6 +1033,8 @@ impl Database {
+             is_poisoned: PoisonSignal::default(),
+             stats,
+             lock_file,
++            recovery_validation: Mutex::new(()),
++            recovery_trims: Arc::default(),
+         };
+ 
+         let db = Self(Arc::new(inner));
+diff --git a/src/db_config.rs b/src/db_config.rs
+index 0ea7222..47d92a6 100644
+--- a/src/db_config.rs
++++ b/src/db_config.rs
+@@ -37,6 +37,12 @@ pub struct Config {
+     pub(crate) max_write_buffer_size_in_bytes: Option<u64>, // TODO: should be configurable during runtime: AtomicU64
+ 
+     pub(crate) manual_journal_persist: bool,
++    pub(crate) strict_existing_recovery: bool,
++    pub(crate) strict_recovery_max_record_bytes: usize,
++    pub(crate) strict_recovery_max_batch_bytes: usize,
++    pub(crate) strict_recovery_max_batch_items: usize,
++    pub(crate) strict_recovery_max_scan_bytes: u64,
++    pub(crate) strict_recovery_max_journals: usize,
+ 
+     /// Number of concurrent worker threads
+     pub(crate) worker_threads: usize,
+@@ -78,6 +84,12 @@ impl Config {
+             worker_threads,
+             // journal_recovery_mode: RecoveryMode::default(),
+             manual_journal_persist: false,
++            strict_existing_recovery: false,
++            strict_recovery_max_record_bytes: 64 * 1024 * 1024,
++            strict_recovery_max_batch_bytes: 256 * 1024 * 1024,
++            strict_recovery_max_batch_items: 1_000_000,
++            strict_recovery_max_scan_bytes: 1024 * 1024 * 1024,
++            strict_recovery_max_journals: 1024,
+ 
+             #[cfg(not(feature = "lz4"))]
+             journal_compression_type: CompressionType::None,
+diff --git a/src/journal/batch_reader.rs b/src/journal/batch_reader.rs
+index 4b858d8..c4ca141 100644
+--- a/src/journal/batch_reader.rs
++++ b/src/journal/batch_reader.rs
+@@ -31,6 +31,7 @@ pub struct JournalBatchReader {
+     batch_counter: u32,
+     batch_seqno: SeqNo,
+     last_valid_pos: u64,
++    retained_bytes: usize,
+     checksum_builder: xxhash_rust::xxh3::Xxh3,
+ }
+ 
+@@ -45,11 +46,15 @@ impl JournalBatchReader {
+             batch_seqno: 0,
+             last_valid_pos: 0,
+             batch_counter: 0,
++            retained_bytes: 0,
+         }
+     }
+ 
+     // TODO: reallocate space
+     fn truncate_to(&self, last_valid_pos: u64) -> crate::Result<()> {
++        if self.reader.strict_trims.is_some() {
++            return Err(crate::Error::Unrecoverable);
++        }
+         log::trace!("Truncating journal to {last_valid_pos}");
+ 
+         // TODO: on windows, reading file probably needs to be closed first...?
+@@ -63,12 +68,15 @@ impl JournalBatchReader {
+ 
+     fn on_close(&self) -> crate::Result<()> {
+         if self.is_in_batch {
+-            log::debug!("Invalid batch: missing terminator, but last batch, so probably incomplete, discarding to keep atomicity");
++            log::debug!(
++                "Invalid batch: missing terminator, but last batch, so probably incomplete, discarding to keep atomicity"
++            );
+ 
+             // Discard batch
+             self.truncate_to(self.last_valid_pos)?;
+         }
+ 
++        self.reader.record_valid_end(self.last_valid_pos)?;
+         Ok(())
+     }
+ }
+@@ -100,6 +108,12 @@ impl Iterator for JournalBatchReader {
+                         return None;
+                     }
+ 
++                    if self.reader.strict_trims.is_some()
++                        && item_count as usize > self.reader.strict_limits.2
++                    {
++                        return Some(Err(crate::Error::Unrecoverable));
++                    }
++                    self.retained_bytes = 0;
+                     self.is_in_batch = true;
+                     self.batch_counter = item_count;
+                     self.batch_seqno = seqno;
+@@ -125,7 +139,9 @@ impl Iterator for JournalBatchReader {
+                     self.checksum_builder = xxhash_rust::xxh3::Xxh3::new();
+ 
+                     if got_checksum != expected_checksum {
+-                        log::error!("Invalid batch: checksum check failed, expected: {expected_checksum}, got: {got_checksum}");
++                        log::error!(
++                            "Invalid batch: checksum check failed, expected: {expected_checksum}, got: {got_checksum}"
++                        );
+                         return Some(Err(JournalRecovery(JournalRecoveryError::ChecksumMismatch)));
+                     }
+ 
+@@ -150,6 +166,18 @@ impl Iterator for JournalBatchReader {
+                     value_type,
+                     compression,
+                 } => {
++                    if self.reader.strict_trims.is_some() {
++                        let charged = key
++                            .len()
++                            .checked_add(value.len())
++                            .and_then(|n| n.checked_add(std::mem::size_of::<ReadBatchItem>() + 64))
++                            .and_then(|n| self.retained_bytes.checked_add(n));
++                        let Some(charged) = charged.filter(|n| *n <= self.reader.strict_limits.1)
++                        else {
++                            return Some(Err(crate::Error::Unrecoverable));
++                        };
++                        self.retained_bytes = charged;
++                    }
+                     let item = Entry::Item {
+                         keyspace_id,
+                         key: key.clone(),
+@@ -186,6 +214,9 @@ impl Iterator for JournalBatchReader {
+                     });
+                 }
+                 Entry::Clear { keyspace_id } => {
++                    if self.reader.strict_trims.is_some() {
++                        return Some(Err(crate::Error::Unrecoverable));
++                    }
+                     let entry = Entry::Clear { keyspace_id };
+                     let mut bytes = Vec::with_capacity(16);
+                     fail_iter!(entry.encode_into(&mut bytes));
+diff --git a/src/journal/mod.rs b/src/journal/mod.rs
+index 7b656d0..e55ba08 100644
+--- a/src/journal/mod.rs
++++ b/src/journal/mod.rs
+@@ -27,6 +27,7 @@ use writer::Writer;
+ 
+ pub struct Journal {
+     writer: Mutex<Writer>,
++    validation_pending: std::sync::Arc<std::sync::atomic::AtomicBool>,
+ }
+ 
+ impl std::fmt::Debug for Journal {
+@@ -69,8 +70,17 @@ impl Journal {
+     }
+ 
+     fn from_file<P: AsRef<Path>>(path: P) -> crate::Result<Self> {
++        Self::from_file_mode(path, false)
++    }
++
++    fn from_file_mode<P: AsRef<Path>>(path: P, strict: bool) -> crate::Result<Self> {
++        let writer = Writer::from_file_mode(path, strict)?;
++        writer
++            .validation_pending
++            .store(strict, std::sync::atomic::Ordering::Release);
+         Ok(Self {
+-            writer: Mutex::new(Writer::from_file(path)?),
++            validation_pending: writer.validation_pending.clone(),
++            writer: Mutex::new(writer),
+         })
+     }
+ 
+@@ -96,10 +106,21 @@ impl Journal {
+         crate::drop::increment_drop_counter();
+ 
+         Ok(Self {
++            validation_pending: writer.validation_pending.clone(),
+             writer: Mutex::new(writer),
+         })
+     }
+ 
++    pub(crate) fn ensure_writes_enabled(&self) -> crate::Result<()> {
++        if self
++            .validation_pending
++            .load(std::sync::atomic::Ordering::Acquire)
++        {
++            return Err(crate::Error::Unrecoverable);
++        }
++        Ok(())
++    }
++
+     /// Hands out write access to the journal.
+     ///
+     /// # Errors
+@@ -124,11 +145,47 @@ impl Journal {
+         journal_writer.persist(mode).map_err(Into::into)
+     }
+ 
++    pub fn get_strict_reader(
++        &self,
++        trims: std::sync::Arc<std::sync::Mutex<Vec<(PathBuf, u64, u64)>>>,
++        limits: (usize, usize, usize),
++    ) -> crate::Result<JournalBatchReader> {
++        Ok(JournalBatchReader::new(JournalReader::new_strict(
++            self.path()?,
++            trims,
++            limits,
++        )?))
++    }
++
++    pub fn recover_existing<P: AsRef<Path>>(
++        path: P,
++        compression: CompressionType,
++        compression_threshold: usize,
++        max_scan_bytes: u64,
++        max_journals: usize,
++    ) -> crate::Result<RecoveryResult> {
++        recover_journals(
++            path,
++            compression,
++            compression_threshold,
++            true,
++            max_scan_bytes,
++            max_journals,
++        )
++    }
++
+     pub fn recover<P: AsRef<Path>>(
+         path: P,
+         compression: CompressionType,
+         compression_threshold: usize,
+     ) -> crate::Result<RecoveryResult> {
+-        recover_journals(path, compression, compression_threshold)
++        recover_journals(
++            path,
++            compression,
++            compression_threshold,
++            false,
++            u64::MAX,
++            usize::MAX,
++        )
+     }
+ }
+diff --git a/src/journal/reader.rs b/src/journal/reader.rs
+index e1cb6eb..42558ea 100644
+--- a/src/journal/reader.rs
++++ b/src/journal/reader.rs
+@@ -5,7 +5,7 @@
+ use super::entry::Entry;
+ use std::{
+     fs::{File, OpenOptions},
+-    io::{BufReader, Seek},
++    io::{BufReader, Read, Seek, SeekFrom},
+     path::{Path, PathBuf},
+ };
+ 
+@@ -19,6 +19,10 @@ pub struct JournalReader {
+     pub(crate) path: PathBuf,
+     pub(crate) reader: BufReader<File>,
+     pub(crate) last_valid_pos: u64,
++    pub(crate) strict_trims: Option<std::sync::Arc<std::sync::Mutex<Vec<(PathBuf, u64, u64)>>>>,
++    original_len: u64,
++    finished: bool,
++    pub(crate) strict_limits: (usize, usize, usize),
+ }
+ 
+ impl JournalReader {
+@@ -29,9 +33,42 @@ impl JournalReader {
+             path: path.as_ref().into(),
+             reader: BufReader::new(file),
+             last_valid_pos: 0,
++            strict_trims: None,
++            original_len: 0,
++            finished: false,
++            strict_limits: (usize::MAX, usize::MAX, usize::MAX),
+         })
+     }
+ 
++    pub fn new_strict<P: AsRef<Path>>(
++        path: P,
++        trims: std::sync::Arc<std::sync::Mutex<Vec<(PathBuf, u64, u64)>>>,
++        limits: (usize, usize, usize),
++    ) -> crate::Result<Self> {
++        let file = OpenOptions::new().read(true).open(&path)?;
++        let original_len = file.metadata()?.len();
++        Ok(Self {
++            path: path.as_ref().into(),
++            reader: BufReader::new(file),
++            last_valid_pos: 0,
++            strict_trims: Some(trims),
++            original_len,
++            finished: false,
++            strict_limits: limits,
++        })
++    }
++
++    pub(crate) fn record_valid_end(&self, end: u64) -> crate::Result<()> {
++        if let Some(trims) = &self.strict_trims {
++            trims.lock().map_err(|_| crate::Error::Poisoned)?.push((
++                self.path.clone(),
++                end,
++                self.original_len,
++            ));
++        }
++        Ok(())
++    }
++
+     fn truncate_file(&mut self, pos: u64) -> crate::Result<()> {
+         log::debug!("truncating journal to {pos}");
+         self.reader.get_mut().set_len(pos)?;
+@@ -54,12 +91,70 @@ impl Iterator for JournalReader {
+     type Item = crate::Result<Entry>;
+ 
+     fn next(&mut self) -> Option<Self::Item> {
++        if self.finished {
++            return None;
++        }
++        if self.strict_trims.is_some() {
++            let pos = fail_iter!(self.reader.stream_position());
++            let mut first = [0u8; 1];
++            let count = fail_iter!(self.reader.read(&mut first));
++            if count == 0 {
++                self.finished = true;
++                return None;
++            }
++            let [first_byte] = first;
++            if first_byte == 0 {
++                let mut chunk = [0u8; 8192];
++                loop {
++                    let n = fail_iter!(self.reader.read(&mut chunk));
++                    if n == 0 {
++                        break;
++                    }
++                    let bytes = match chunk.get(..n) {
++                        Some(bytes) => bytes,
++                        None => return Some(Err(crate::Error::Unrecoverable)),
++                    };
++                    if bytes.iter().any(|b| *b != 0) {
++                        self.finished = true;
++                        return Some(Err(crate::Error::Unrecoverable));
++                    }
++                }
++                self.finished = true;
++                return None;
++            }
++            fail_iter!(self.reader.seek(SeekFrom::Start(pos)));
++            if first_byte == 2 {
++                // Check all allocation-driving lengths before the ordinary decoder.
++                let mut header = [0u8; 21];
++                fail_iter!(self.reader.read_exact(&mut header));
++                let [_, _, compression, _, _, _, _, _, _, _, _, k0, k1, v0, v1, v2, v3, p0, p1, p2, p3] =
++                    header;
++                let key = u64::from(u16::from_le_bytes([k0, k1]));
++                let value = u64::from(u32::from_le_bytes([v0, v1, v2, v3]));
++                let packed = u64::from(u32::from_le_bytes([p0, p1, p2, p3]));
++                let cap = self.strict_limits.0 as u64;
++                let encoded = 21 + key + packed;
++                if encoded > cap
++                    || 21 + key + value > cap
++                    || encoded > self.original_len.saturating_sub(pos)
++                    || (compression == 0 && value != packed)
++                {
++                    self.finished = true;
++                    return Some(Err(crate::Error::Unrecoverable));
++                }
++                fail_iter!(self.reader.seek(SeekFrom::Start(pos)));
++            }
++        }
+         match Entry::decode_from(&mut self.reader) {
+             Ok(item) => {
+                 self.last_valid_pos = fail_iter!(self.reader.stream_position());
+                 Some(Ok(item))
+             }
+             Err(e) => {
++                if self.strict_trims.is_some() {
++                    self.finished = true;
++                    return Some(Err(e));
++                }
+                 if let crate::Error::Io(e) = e {
+                     match e.kind() {
+                         std::io::ErrorKind::UnexpectedEof | std::io::ErrorKind::Other => {
+diff --git a/src/journal/recovery.rs b/src/journal/recovery.rs
+index bfea2e8..550733c 100644
+--- a/src/journal/recovery.rs
++++ b/src/journal/recovery.rs
+@@ -19,16 +19,27 @@ pub fn recover_journals<P: AsRef<Path>>(
+     path: P,
+     compression: CompressionType,
+     compression_threshold: usize,
++    strict: bool,
++    max_scan_bytes: u64,
++    max_journals: usize,
+ ) -> crate::Result<RecoveryResult> {
+     let path = path.as_ref();
+ 
+     let mut max_journal_id: JournalId = 0;
+     let mut journal_fragments = Vec::<(JournalId, PathBuf)>::new();
++    let mut physical_bytes = 0u64;
++    let mut entries = 0usize;
+ 
+     log::trace!("Got journal fragments: {journal_fragments:#?}");
+ 
+     for dirent in std::fs::read_dir(path)? {
+         let dirent = dirent?;
++        if strict {
++            entries = entries.checked_add(1).ok_or(crate::Error::Unrecoverable)?;
++            if entries > max_journals.saturating_add(16) {
++                return Err(crate::Error::Unrecoverable);
++            }
++        }
+         let path = dirent.path();
+         let filename = dirent.file_name();
+ 
+@@ -46,7 +57,19 @@ pub fn recover_journals<P: AsRef<Path>>(
+             continue;
+         }
+ 
+-        assert!(dirent.file_type()?.is_file());
++        if strict {
++            if !dirent.file_type()?.is_file() || journal_fragments.len() >= max_journals {
++                return Err(crate::Error::Unrecoverable);
++            }
++            physical_bytes = physical_bytes
++                .checked_add(dirent.metadata()?.len())
++                .ok_or(crate::Error::Unrecoverable)?;
++            if physical_bytes > max_scan_bytes {
++                return Err(crate::Error::Unrecoverable);
++            }
++        } else {
++            assert!(dirent.file_type()?.is_file());
++        }
+ 
+         let Some(basename) = filename.strip_suffix(".jnl") else {
+             log::error!("Invalid journal file name: {filename}");
+@@ -72,11 +95,12 @@ pub fn recover_journals<P: AsRef<Path>>(
+ 
+     Ok(match journal_fragments.pop() {
+         Some((_, active)) => RecoveryResult {
+-            active: Journal::from_file(active)?
++            active: Journal::from_file_mode(active, strict)?
+                 .with_compression(compression, compression_threshold),
+             sealed: journal_fragments,
+             was_active_created: false,
+         },
++        None if strict => return Err(crate::Error::Unrecoverable),
+         None => RecoveryResult {
+             active: {
+                 let id: JournalId = max_journal_id + 1;
+diff --git a/src/journal/writer.rs b/src/journal/writer.rs
+index 9cac11c..2534659 100644
+--- a/src/journal/writer.rs
++++ b/src/journal/writer.rs
+@@ -25,6 +25,7 @@ pub struct Writer {
+     file: BufWriter<File>,
+     buf: Vec<u8>,
+     is_buffer_dirty: bool,
++    pub(crate) validation_pending: std::sync::Arc<std::sync::atomic::AtomicBool>,
+ 
+     compression: CompressionType,
+     compression_threshold: usize,
+@@ -50,6 +51,16 @@ pub enum PersistMode {
+ }
+ 
+ impl Writer {
++    pub(crate) fn ensure_writes_enabled(&self) -> crate::Result<()> {
++        if self
++            .validation_pending
++            .load(std::sync::atomic::Ordering::Acquire)
++        {
++            return Err(crate::Error::Unrecoverable);
++        }
++        Ok(())
++    }
++
+     pub fn set_compression(&mut self, comp: CompressionType, threshold: usize) {
+         self.compression = comp;
+         self.compression_threshold = threshold;
+@@ -64,6 +75,7 @@ impl Writer {
+     }
+ 
+     pub fn rotate(&mut self) -> crate::Result<(PathBuf, PathBuf)> {
++        self.ensure_writes_enabled()?;
+         self.persist(PersistMode::SyncAll)?;
+ 
+         log::debug!(
+@@ -144,15 +156,23 @@ impl Writer {
+             file: BufWriter::new(file),
+             buf: Vec::new(),
+             is_buffer_dirty: false,
++            validation_pending: Default::default(),
+             compression: CompressionType::None,
+             compression_threshold: 0,
+         })
+     }
+ 
+     pub fn from_file<P: AsRef<Path>>(path: P) -> crate::Result<Self> {
+-        let path = path.as_ref();
++        Self::from_file_mode(path, false)
++    }
+ 
+-        if !path.try_exists()? {
++    pub fn from_file_mode<P: AsRef<Path>>(path: P, strict: bool) -> crate::Result<Self> {
++        let path = path.as_ref();
++        if strict && !path.try_exists()? {
++            return Err(crate::Error::Unrecoverable);
++        }
++
++        if !strict && !path.try_exists()? {
+             let file = OpenOptions::new()
+                 .create_new(true)
+                 .write(true)
+@@ -177,6 +197,7 @@ impl Writer {
+                 file: BufWriter::with_capacity(JOURNAL_BUFFER_BYTES, file),
+                 buf: Vec::new(),
+                 is_buffer_dirty: false,
++                validation_pending: Default::default(),
+                 compression: CompressionType::None,
+                 compression_threshold: 0,
+             });
+@@ -194,6 +215,7 @@ impl Writer {
+             file: BufWriter::with_capacity(JOURNAL_BUFFER_BYTES, file),
+             buf: Vec::new(),
+             is_buffer_dirty: false,
++            validation_pending: Default::default(),
+             compression: CompressionType::None,
+             compression_threshold: 0,
+         })
+@@ -201,6 +223,12 @@ impl Writer {
+ 
+     /// Persists the journal file.
+     pub(crate) fn persist(&mut self, mode: PersistMode) -> std::io::Result<()> {
++        if self
++            .validation_pending
++            .load(std::sync::atomic::Ordering::Acquire)
++        {
++            return Err(std::io::Error::other("recovery validation is pending"));
++        }
+         log::trace!(
+             "Persisting journal at {} with mode={mode:?}",
+             self.path.display(),
+@@ -263,6 +291,7 @@ impl Writer {
+         value_type: ValueType,
+         seqno: u64,
+     ) -> crate::Result<usize> {
++        self.ensure_writes_enabled()?;
+         self.is_buffer_dirty = true;
+ 
+         let mut hasher = xxhash_rust::xxh3::Xxh3::default();
+@@ -302,6 +331,7 @@ impl Writer {
+         keyspace_id: InternalKeyspaceId,
+         seqno: SeqNo,
+     ) -> crate::Result<usize> {
++        self.ensure_writes_enabled()?;
+         self.is_buffer_dirty = true;
+ 
+         let mut hasher = xxhash_rust::xxh3::Xxh3::default();
+@@ -333,6 +363,7 @@ impl Writer {
+             return Ok(0);
+         }
+ 
++        self.ensure_writes_enabled()?;
+         self.is_buffer_dirty = true;
+ 
+         self.buf.clear();
+diff --git a/src/keyspace/mod.rs b/src/keyspace/mod.rs
+index cd65af2..d927810 100644
+--- a/src/keyspace/mod.rs
++++ b/src/keyspace/mod.rs
+@@ -235,8 +235,10 @@ impl Keyspace {
+     ///
+     /// Will return `Err` if an IO error occurs.
+     pub fn clear(&self) -> crate::Result<()> {
++        self.supervisor.journal.ensure_writes_enabled()?;
+         let mut journal_writer = self.supervisor.journal.get_writer()?;
+ 
++        journal_writer.ensure_writes_enabled()?;
+         // IMPORTANT: Check the poisoned flag after getting journal mutex, otherwise TOCTOU
+         if self.is_poisoned.is_poisoned() {
+             return Err(crate::Error::Poisoned);
+@@ -300,6 +302,7 @@ impl Keyspace {
+     ///
+     /// Panics if the input iterator is not sorted in ascending order.
+     pub fn start_ingestion(&self) -> crate::Result<Ingestion<'_>> {
++        self.supervisor.journal.ensure_writes_enabled()?;
+         Ingestion::new(self)
+     }
+ 
+@@ -725,6 +728,7 @@ impl Keyspace {
+ 
+     #[doc(hidden)]
+     pub fn rotate_memtable(&self) -> crate::Result<bool> {
++        self.supervisor.journal.ensure_writes_enabled()?;
+         log::trace!("acquiring journal lock");
+         let journal_writer = self.supervisor.journal.get_writer()?;
+         let active_memtable_id = self.tree.active_memtable().id();
+@@ -873,6 +877,7 @@ impl Keyspace {
+     /// Will return `Err` if an IO error occurs.
+     #[doc(hidden)]
+     pub fn major_compact(&self) -> crate::Result<()> {
++        self.supervisor.journal.ensure_writes_enabled()?;
+         self.tree.major_compact(
+             64_000_000,
+             self.supervisor.snapshot_tracker.get_seqno_safe_to_gc(),
+@@ -925,6 +930,7 @@ impl Keyspace {
+ 
+         let mut journal_writer = self.supervisor.journal.get_writer()?;
+ 
++        journal_writer.ensure_writes_enabled()?;
+         // IMPORTANT: Check the poisoned flag after getting journal mutex, otherwise TOCTOU
+         if self.is_poisoned.is_poisoned() {
+             return Err(crate::Error::Poisoned);
+@@ -999,6 +1005,7 @@ impl Keyspace {
+ 
+         let mut journal_writer = self.supervisor.journal.get_writer()?;
+ 
++        journal_writer.ensure_writes_enabled()?;
+         // IMPORTANT: Check the poisoned flag after getting journal mutex, otherwise TOCTOU
+         if self.is_poisoned.is_poisoned() {
+             return Err(crate::Error::Poisoned);
+@@ -1085,6 +1092,7 @@ impl Keyspace {
+ 
+         let mut journal_writer = self.supervisor.journal.get_writer()?;
+ 
++        journal_writer.ensure_writes_enabled()?;
+         // IMPORTANT: Check the poisoned flag after getting journal mutex, otherwise TOCTOU
+         if self.is_poisoned.is_poisoned() {
+             return Err(crate::Error::Poisoned);
+diff --git a/src/recovery.rs b/src/recovery.rs
+index 46c638c..3703ef7 100644
+--- a/src/recovery.rs
++++ b/src/recovery.rs
+@@ -54,6 +54,9 @@ pub fn recover_keyspaces(db: &Database, meta_keyspace: &MetaKeyspace) -> crate::
+         highest_keyspace_id = highest_keyspace_id.max(keyspace_id);
+ 
+         let Some(keyspace_name) = meta_keyspace.resolve_id(keyspace_id)? else {
++            if db.config.strict_existing_recovery {
++                return Err(crate::Error::Unrecoverable);
++            }
+             log::debug!("Deleting unreferenced keyspace id={keyspace_id}");
+             std::fs::remove_dir_all(keyspace_path)?;
+             continue;
+@@ -66,6 +69,9 @@ pub fn recover_keyspaces(db: &Database, meta_keyspace: &MetaKeyspace) -> crate::
+             .join(LSM_CURRENT_VERSION_MARKER)
+             .try_exists()?
+         {
++            if db.config.strict_existing_recovery {
++                return Err(crate::Error::Unrecoverable);
++            }
+             log::debug!("Deleting uninitialized keyspace {keyspace_name:?}");
+             std::fs::remove_dir_all(keyspace_path)?;
+             continue;
+@@ -90,6 +96,7 @@ pub fn recover_keyspaces(db: &Database, meta_keyspace: &MetaKeyspace) -> crate::
+             db.supervisor.seqno.clone(),
+             db.supervisor.snapshot_tracker.get_ref(),
+         )
++        .preserve_existing_recovery(db.config.strict_existing_recovery)
+         .use_descriptor_table(db.config.descriptor_table.clone())
+         .use_cache(db.config.cache.clone());
+ 
+@@ -145,7 +152,19 @@ pub fn recover_sealed_memtables(
+ 
+         log::debug!("Replaying sealed journal at {}", journal_path.display());
+ 
+-        let raw_reader = JournalReader::new(journal_path)?;
++        let raw_reader = if db.config.strict_existing_recovery {
++            JournalReader::new_strict(
++                journal_path,
++                db.recovery_trims.clone(),
++                (
++                    db.config.strict_recovery_max_record_bytes,
++                    db.config.strict_recovery_max_batch_bytes,
++                    db.config.strict_recovery_max_batch_items,
++                ),
++            )?
++        } else {
++            JournalReader::new(journal_path)?
++        };
+         let reader = JournalBatchReader::new(raw_reader);
+ 
+         let mut watermarks: HashMap<_, EvictionWatermark> = HashMap::default();
+diff --git a/src/tx/single_writer/mod.rs b/src/tx/single_writer/mod.rs
+index 4aa5723..d5e7ccc 100644
+--- a/src/tx/single_writer/mod.rs
++++ b/src/tx/single_writer/mod.rs
+@@ -42,6 +42,11 @@ impl Openable for TxDatabase {
+ }
+ 
+ impl TxDatabase {
++    /// Enable normal writes after validating an opt-in strict recovery.
++    pub fn finish_recovery_validation(&self) -> crate::Result<()> {
++        self.inner.finish_recovery_validation()
++    }
++
+     /// Creates a new database builder to create or open a database at `path`.
+     pub fn builder(path: impl AsRef<Path>) -> crate::DatabaseBuilder<Self> {
+         crate::DatabaseBuilder::new(path.as_ref())

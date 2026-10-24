@@ -64,11 +64,57 @@ impl Drop for WorkTicket {
         }
     }
 }
+/// A caller's absolute work bound, deliberately independent of control admission.
+/// It never proves that a control semaphore has been acquired.
+pub(crate) struct OperationContext {
+    pub deadline: tokio::time::Instant,
+    _owner: Arc<dyn std::any::Any + Send + Sync>,
+}
+tokio::task_local! {static OPERATION_CONTEXT:Arc<OperationContext>;}
+pub(crate) fn operation_context() -> Option<Arc<OperationContext>> {
+    OPERATION_CONTEXT.try_with(Arc::clone).ok()
+}
+pub(crate) fn bounded_deadline(deadline: tokio::time::Instant) -> tokio::time::Instant {
+    operation_context().map_or(deadline, |bound| deadline.min(bound.deadline))
+}
+pub(crate) async fn operation_context_scope<T>(
+    deadline: tokio::time::Instant,
+    owner: Arc<dyn std::any::Any + Send + Sync>,
+    future: impl Future<Output = T>,
+) -> T {
+    let parent = operation_context();
+    let context = Arc::new(OperationContext {
+        deadline: parent
+            .as_ref()
+            .map_or(deadline, |p| deadline.min(p.deadline)),
+        _owner: Arc::new((owner, parent)),
+    });
+    OPERATION_CONTEXT.scope(context, future).await
+}
 /// Owned provider work remains alive when its waiter is cancelled.
 pub(crate) async fn owned<T: Send + 'static>(
     future: impl Future<Output = anyhow::Result<T>> + Send + 'static,
 ) -> anyhow::Result<T> {
-    runtime()?.spawn(future).await?
+    // Tokio may retain the completed result after its waiter is cancelled.
+    // Keep the result payload before the physical context through discard too.
+    struct Completed<T> {
+        result: anyhow::Result<T>,
+        _context: Option<Arc<OperationContext>>,
+    }
+    let context = operation_context();
+    let completed = runtime()?
+        .spawn(async move {
+            let result = match context.clone() {
+                Some(context) => OPERATION_CONTEXT.scope(context, future).await,
+                None => future.await,
+            };
+            Completed {
+                result,
+                _context: context,
+            }
+        })
+        .await?;
+    completed.result
 }
 pub(crate) async fn blocking_owned<T: Send + 'static>(
     owner: Arc<dyn std::any::Any + Send + Sync>,
@@ -127,7 +173,9 @@ pub(crate) fn in_control() -> bool {
     scope().is_some()
 }
 pub(crate) fn check_deadline() -> anyhow::Result<()> {
-    if scope().is_some_and(|scope| tokio::time::Instant::now() >= scope.deadline) {
+    if operation_context().is_some_and(|bound| tokio::time::Instant::now() >= bound.deadline)
+        || scope().is_some_and(|scope| tokio::time::Instant::now() >= scope.deadline)
+    {
         return Err(
             tonic::Status::deadline_exceeded("native remote operation deadline exceeded").into(),
         );
@@ -143,18 +191,23 @@ pub(crate) async fn control_scope<T>(
 pub(crate) async fn network<T>(
     future: impl Future<Output = Result<T, tonic::Status>>,
 ) -> Result<T, tonic::Status> {
-    if let Some(scope) = scope() {
-        if tokio::time::Instant::now() >= scope.deadline {
+    let deadline = scope()
+        .map(|scope| scope.deadline)
+        .into_iter()
+        .chain(operation_context().map(|bound| bound.deadline))
+        .min();
+    if let Some(deadline) = deadline {
+        if tokio::time::Instant::now() >= deadline {
             return Err(tonic::Status::deadline_exceeded(
                 "native remote operation deadline exceeded",
             ));
         }
-        let result = tokio::time::timeout_at(scope.deadline, future)
+        let result = tokio::time::timeout_at(deadline, future)
             .await
             .map_err(|_| {
                 tonic::Status::deadline_exceeded("native remote operation deadline exceeded")
             })?;
-        if tokio::time::Instant::now() >= scope.deadline {
+        if tokio::time::Instant::now() >= deadline {
             return Err(tonic::Status::deadline_exceeded(
                 "native remote operation deadline exceeded",
             ));
@@ -167,9 +220,14 @@ pub(crate) async fn network<T>(
 pub(crate) async fn cached<T>(
     future: impl Future<Output = anyhow::Result<T>>,
 ) -> anyhow::Result<T> {
-    if let Some(scope) = scope() {
+    let deadline = scope()
+        .map(|scope| scope.deadline)
+        .into_iter()
+        .chain(operation_context().map(|bound| bound.deadline))
+        .min();
+    if let Some(deadline) = deadline {
         check_deadline()?;
-        let result = tokio::time::timeout_at(scope.deadline, future)
+        let result = tokio::time::timeout_at(deadline, future)
             .await
             .map_err(|_| tonic::Status::deadline_exceeded("native cache wait deadline exceeded"))?;
         check_deadline()?;
@@ -181,15 +239,19 @@ pub(crate) async fn cached<T>(
 pub(crate) async fn blocking<T: Send + 'static>(
     job: impl FnOnce() -> anyhow::Result<T> + Send + 'static,
 ) -> anyhow::Result<T> {
-    let lease = scope();
-    let (result, _lease) = runtime()?
-        .spawn_blocking(move || {
-            let result = job();
-            (result, lease)
+    struct Completed<T> {
+        result: anyhow::Result<T>,
+        _contexts: (Option<Arc<ControlScope>>, Option<Arc<OperationContext>>),
+    }
+    let contexts = (scope(), operation_context());
+    let completed = runtime()?
+        .spawn_blocking(move || Completed {
+            result: job(),
+            _contexts: contexts,
         })
         .await?;
     check_deadline()?;
-    result
+    completed.result
 }
 enum ReadOwner {
     Cached {

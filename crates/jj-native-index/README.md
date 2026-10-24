@@ -1,48 +1,32 @@
 # jj-native-index · library
 
-A jj 0.46 index over immutable remote checkpoints and all admitted local drafts,
-including hidden siblings. Host settings and immutable checkpoint source pins
-are persisted. Queries never fall back to a truncated DefaultIndex or hydrate
-complete public history.
+An experimental jj 0.46 index over immutable remote checkpoints and admitted
+local drafts, including hidden siblings. The daemon/CLI can select it with
+`[native.workspaces] index_mode = "federated"`; it is not the default. Queries
+never fall back to a truncated index or download complete public history.
 
-Hosts inject matching `NativeQueryIo` and `NativeObjectIo` instances. For CLI
-use, both must dispatch I/O independently of the caller's Tokio runtime; the
-broker clients provide that contract. A separate four-job bounded worker bridge
-handles jj's synchronous `is_empty` inside current-thread and futures runtimes.
-`sync_query_timeout_ms` bounds the caller wait (120 seconds by default); timed-out
-physical jobs retain their owners and admission until they actually finish. Scopes reopen from fixed checkpoints,
-not current references. `with_remote_roots` verifies explicit admitted roots,
-retains old checkpoints, and filters newly remote-covered drafts from uploads
-without deleting local history. `init_fresh_for_root_operation` seeds and associates the captured
-root operation during journal-owned initialization.
+Hosts inject matching `NativeQueryIo` and `NativeObjectIo` providers that dispatch
+I/O independently of the caller's runtime. Queries use fixed checkpoints, not
+current references. `import_fresh_operation_indexes`
+stages exact retained indexes without live-reference fallback; it does not by
+itself restore operation/view data or establish backup completion.
 
-`import_fresh_operation_indexes` stages exact retained operation indexes in a
-fresh private directory. It requires explicit cloud snapshot support, preserves
-frozen draft membership without canonical history downloads, and never falls
-back to live refs. It does not restore OP/VIEW data, publish a workspace, or
-establish backup completion. Different source checkpoints cannot silently merge.
+Selections from one exact retained version can merge lazily. Cross-version and
+live/cloud mixing fail closed. Merges preserve canonical metadata and frozen
+ordinals; normalization can rewrite bounded local metadata while retaining old
+operation associations. Older readers reject multi-selection checkpoints.
 
-Checksummed immutable segments and no-clobber, synced operation associations
-support multiple processes. Unix publication also syncs directory entries,
-including identical-entry retries; hosts must supply already-durable parent
-ancestors. Durable writer APIs return `Unsupported` on non-Unix platforms until
-an equivalent publisher is implemented and verified; read-only loading does not
-promise durable publication. Missing associations and unsupported revset
-predicates return errors. Complete index GC enumeration is unsupported; this
-crate never deletes segments or operation associations. View-only checkpoints
-reuse existing segments; changed checkpoints periodically flatten into bounded
-parentless shards. Every historical operation remains exact and readable, so
-disk usage still grows with retained operations. Default limits include 4096
-local drafts, 4096 roots, 4 MiB per segment and 16 MiB per checkpoint; exceeding
-limits is an error, not truncation. Storage collection is not implemented.
-Rewrite inference remains opted out pending integrated acceptance.
+Checksummed immutable segments and synced, no-clobber operation associations
+preserve historical operations. Missing/corrupt parents and unsupported predicates
+return errors, not incomplete results. Durable publication is Unix-only; storage
+collection and automatic client offloading are not implemented, so retained
+history consumes disk. Default limits include 4096 local drafts, 4096 roots,
+4 MiB per segment and 16 MiB per checkpoint; excess is rejected, not truncated.
+Rewrite inference remains opted out.
 
-Streams explicitly close queries at EOF; early drops use one bounded cleanup
-worker per store context, with absolute queue deadlines and expiry fallback.
-Hosts must drop repositories/helpers, then drain `cleanup_handle().wait(timeout)`
-(or async `drain`) before normal process exit; the handle retains no index cycle.
-Canonical draft bytes remain in the authoritative object provider. Descriptors
-and checkpoints are not retention leases.
-
-This crate is a prerequisite, not the production default index. Broker-backed
-CLI/factory wiring and end-to-end no-history-hydration acceptance remain separate.
+Timed-out physical work retains its owners and admission until completion.
+Streams close queries at EOF; early drops use bounded cleanup with expiry
+fallback. Hosts must drop repositories/helpers, then drain
+`cleanup_handle().wait(timeout)` or async `drain` before normal process exit.
+Canonical draft bytes remain in the authoritative provider; descriptors and
+checkpoints are not retention leases.

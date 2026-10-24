@@ -7,6 +7,16 @@ use std::{
     path::{Path, PathBuf},
     time::Duration,
 };
+/// Exact retained source DATA; never an endpoint, credential or authority token.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NativeRestoreSelection {
+    pub workspace_id: [u8; 32],
+    pub generation: u64,
+    pub manifest_id: [u8; 32],
+    pub manifest_blake3: [u8; 32],
+    pub manifest_size_bytes: u64,
+}
 #[derive(Serialize, Deserialize)]
 #[serde(tag = "operation", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Request {
@@ -31,6 +41,15 @@ pub enum Request {
         store: String,
         commit: String,
         workspace_id: String,
+    },
+    NativeRestore {
+        root: PathBuf,
+        store: String,
+        workspace_id: String,
+        source: NativeRestoreSelection,
+    },
+    NativeResume {
+        root: PathBuf,
     },
     NativeUnmount {
         workspace_id: String,
@@ -189,3 +208,42 @@ macro_rules! impl_controller {
 }
 impl_controller!(Client);
 impl_controller!(ScopedClient);
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn retained_restore_requests_are_exact_pins_not_connection_or_credential_configuration() {
+        let request = Request::NativeRestore {
+            root: PathBuf::from("/workspace"),
+            store: "example".into(),
+            workspace_id: "01".repeat(32),
+            source: NativeRestoreSelection {
+                workspace_id: [2; 32],
+                generation: 3,
+                manifest_id: [4; 32],
+                manifest_blake3: [5; 32],
+                manifest_size_bytes: 1024,
+            },
+        };
+        let value = serde_json::to_value(&request).unwrap();
+        let decoded: Request = serde_json::from_value(value.clone()).unwrap();
+        assert_eq!(serde_json::to_value(decoded).unwrap(), value);
+        let mut endpoint = value.clone();
+        endpoint["source"]["endpoint"] = "http://example.invalid".into();
+        assert!(serde_json::from_value::<Request>(endpoint).is_err());
+        let mut credential = value;
+        credential["source"]["token"] = "not-a-supported-field".into();
+        assert!(serde_json::from_value::<Request>(credential).is_err());
+        let resume = Request::NativeResume {
+            root: PathBuf::from("/workspace"),
+        };
+        assert_eq!(
+            serde_json::to_value(
+                serde_json::from_value::<Request>(serde_json::to_value(&resume).unwrap()).unwrap()
+            )
+            .unwrap(),
+            serde_json::to_value(resume).unwrap()
+        );
+    }
+}

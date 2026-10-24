@@ -8,7 +8,10 @@ use std::{
     sync::{Arc, Mutex},
     task::{Context, Poll},
 };
-use tonic::{Status, body::Body, metadata::MetadataMap, server::NamedService};
+use tinytree_proto::query_v1::repository_query_server::{RepositoryQuery, RepositoryQueryServer};
+use tonic::{
+    Status, body::Body, codec::CompressionEncoding, metadata::MetadataMap, server::NamedService,
+};
 use tower::{Layer, Service};
 
 /// Authenticated, globally bounded transport for the repository query service.
@@ -22,7 +25,19 @@ pub struct QueryGrpcService {
 }
 impl QueryGrpcService {
     pub(crate) fn new(repository: RepositoryService) -> Self {
-        let raw = repository.query_service().grpc();
+        let adapter = repository.query_service();
+        Self::with_adapter(repository, adapter)
+    }
+    fn with_adapter<T: RepositoryQuery + 'static>(
+        repository: RepositoryService,
+        adapter: T,
+    ) -> Self {
+        let config = repository.service_config();
+        let raw = RepositoryQueryServer::new(adapter)
+            .accept_compressed(CompressionEncoding::Zstd)
+            .send_compressed(CompressionEncoding::Zstd)
+            .max_decoding_message_size(config.max_request_bytes.min(config.query.max_request_bytes))
+            .max_encoding_message_size(config.query.max_response_bytes);
         let timed = repository.deadline_layer().layer(Gate {
             inner: raw,
             repository,
@@ -33,6 +48,18 @@ impl QueryGrpcService {
         Self {
             inner: tower::util::BoxCloneSyncService::new(mapped),
         }
+    }
+}
+impl RepositoryService {
+    /// Wrap a trusted server-side query adapter with the same authenticated,
+    /// predecode admission, codec limits and deadline policy as the default
+    /// transport. Observing adapters must forward request and response extensions
+    /// when delegating to this repository's query service.
+    pub fn query_grpc_service_with_adapter<T: RepositoryQuery + 'static>(
+        &self,
+        adapter: T,
+    ) -> QueryGrpcService {
+        QueryGrpcService::with_adapter(self.clone(), adapter)
     }
 }
 impl NamedService for QueryGrpcService {
@@ -311,7 +338,7 @@ mod tests {
                 tokio::time::Instant::now() + Duration::from_secs(1),
             )
             .unwrap();
-        let service = repository.query_grpc_service();
+        let service = repository.query_grpc_service_with_adapter(repository.query_service());
         let (mut blocked, polls) = request(true);
         *blocked.uri_mut() = "/tinytree.query.v1.RepositoryQuery/OpenCloudScope"
             .parse()

@@ -25,7 +25,33 @@ enum NativeCommand {
 #[derive(clap::Subcommand, Clone, Debug)]
 enum TinytreeCommand {
     /// Resume a stopped or interrupted lazy workspace using its original identity.
-    Resume { destination: PathBuf },
+    Resume {
+        destination: PathBuf,
+        /// Matching daemon configuration is required for restored origins.
+        #[arg(long)]
+        daemon_config: Option<PathBuf>,
+    },
+    /// Restore an exact retained V3 capture into a mandatory lazy workspace.
+    Restore {
+        destination: PathBuf,
+        #[arg(long)]
+        daemon_config: PathBuf,
+        #[arg(long)]
+        store: String,
+        /// New destination identity, retained for exact retries.
+        #[arg(long)]
+        workspace_id: String,
+        #[arg(long)]
+        source_workspace: String,
+        #[arg(long)]
+        generation: u64,
+        #[arg(long)]
+        manifest: String,
+        #[arg(long)]
+        manifest_blake3: String,
+        #[arg(long)]
+        manifest_bytes: u64,
+    },
     /// Stop an explicit lazy mount; run from outside its directory.
     Unmount { destination: PathBuf },
     /// Reconcile pending native mutations against authoritative controller receipts.
@@ -95,8 +121,41 @@ async fn run_native_command(
 ) -> Result<(), CommandError> {
     match args {
         NativeCommand::Tinytree {
-            command: TinytreeCommand::Resume { destination },
-        } => vfs::resume(ui, command, &command.cwd().join(destination)).await,
+            command:
+                TinytreeCommand::Resume {
+                    destination,
+                    daemon_config,
+                },
+        } => vfs::resume(ui, command, &command.cwd().join(destination), daemon_config).await,
+        NativeCommand::Tinytree {
+            command:
+                TinytreeCommand::Restore {
+                    destination,
+                    daemon_config,
+                    store,
+                    workspace_id,
+                    source_workspace,
+                    generation,
+                    manifest,
+                    manifest_blake3,
+                    manifest_bytes,
+                },
+        } => {
+            vfs::restore(
+                ui,
+                command,
+                &command.cwd().join(destination),
+                daemon_config,
+                store,
+                workspace_id,
+                source_workspace,
+                generation,
+                manifest,
+                manifest_blake3,
+                manifest_bytes,
+            )
+            .await
+        }
         NativeCommand::Tinytree {
             command: TinytreeCommand::Unmount { destination },
         } => vfs::unmount(command, &command.cwd().join(destination)),
@@ -336,4 +395,82 @@ fn main() -> std::process::ExitCode {
     broker::drain_cleanup(deadline);
     commands::finish(deadline);
     status.into()
+}
+
+#[cfg(test)]
+mod restore_arguments_tests {
+    use super::*;
+    use clap::Parser as _;
+    #[test]
+    fn retained_restore_requires_exact_source_and_configuration_without_clone_fallback() {
+        let args = vec![
+            "fixture".into(),
+            "tinytree".into(),
+            "restore".into(),
+            "workspace".into(),
+            "--daemon-config".into(),
+            "daemon.toml".into(),
+            "--store".into(),
+            "example".into(),
+            "--workspace-id".into(),
+            "01".repeat(32),
+            "--source-workspace".into(),
+            "02".repeat(32),
+            "--generation".into(),
+            "3".into(),
+            "--manifest".into(),
+            "04".repeat(32),
+            "--manifest-blake3".into(),
+            "05".repeat(32),
+            "--manifest-bytes".into(),
+            "1024".into(),
+        ];
+        let parsed = NativeCommand::try_parse_from(args.clone()).unwrap();
+        assert!(matches!(
+            parsed,
+            NativeCommand::Tinytree {
+                command: TinytreeCommand::Restore {
+                    generation: 3,
+                    manifest_bytes: 1024,
+                    ..
+                }
+            }
+        ));
+        let mut missing = args.clone();
+        let config = missing.iter().position(|s| s == "--daemon-config").unwrap();
+        missing.drain(config..config + 2);
+        assert!(NativeCommand::try_parse_from(missing).is_err());
+        let mut broker = args;
+        broker.extend(["--broker".into(), "unconfigured.sock".into()]);
+        assert!(
+            NativeCommand::try_parse_from(broker).is_err(),
+            "restore cannot select an arbitrary connector instead of configured daemon identity"
+        );
+        assert!(matches!(
+            NativeCommand::try_parse_from(["fixture", "tinytree", "resume", "workspace"]).unwrap(),
+            NativeCommand::Tinytree {
+                command: TinytreeCommand::Resume {
+                    daemon_config: None,
+                    ..
+                }
+            }
+        ));
+        assert!(matches!(
+            NativeCommand::try_parse_from([
+                "fixture",
+                "tinytree",
+                "resume",
+                "workspace",
+                "--daemon-config",
+                "daemon.toml"
+            ])
+            .unwrap(),
+            NativeCommand::Tinytree {
+                command: TinytreeCommand::Resume {
+                    daemon_config: Some(_),
+                    ..
+                }
+            }
+        ));
+    }
 }

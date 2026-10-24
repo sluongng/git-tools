@@ -1,0 +1,240 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Storage Maintainers <26684313+sluongng@users.noreply.github.com>
+Date: Sat, 24 Oct 2026 00:00:00 +0000
+Subject: [PATCH] storage: Preserve existing recovery files
+
+An application may need to validate a recovered namespace before any
+repair or cleanup occurs. Opening an incomplete tree must not create
+a replacement, and a later validation failure must not remove orphaned
+versions, tables or blob files.
+
+Add a default-off preservation option for existing recovery. Require an
+existing current manifest and required directories, and leave recovery
+cleanup to a later ordinary open. This option does not make a tree
+a read-only API; its database owner controls when writes become allowed.
+
+Reserve table and blob identifiers above all retained files, not just
+those referenced by the current version. This prevents resumed writes
+from colliding with or overwriting crash orphans. Reject exhausted
+IDs without changing files. Ordinary recovery and allocation remain
+unchanged.
+
+---
+diff --git a/src/blob_tree/mod.rs b/src/blob_tree/mod.rs
+index 42baff1..f0bf9c8 100644
+--- a/src/blob_tree/mod.rs
++++ b/src/blob_tree/mod.rs
+@@ -108,7 +108,8 @@ fn resolve_value_handle(
+             Ok(None) => {
+                 panic!(
+                     "value handle ({:?} => {:?}) did not match any blob - this is a bug; version={}",
+-                    item.key.user_key, vptr.vhandle,
++                    item.key.user_key,
++                    vptr.vhandle,
+                     version.id(),
+                 );
+             }
+@@ -142,16 +143,21 @@ impl BlobTree {
+         let index = crate::Tree::open(config)?;
+ 
+         let blobs_folder = index.config.path.join(BLOBS_FOLDER);
+-        std::fs::create_dir_all(&blobs_folder)?;
+-        fsync_directory(&blobs_folder)?;
++        if index.config.preserve_existing_recovery {
++            if !blobs_folder.is_dir() {
++                return Err(crate::Error::Unrecoverable);
++            }
++        } else {
++            std::fs::create_dir_all(&blobs_folder)?;
++            fsync_directory(&blobs_folder)?;
++        }
+ 
+-        let blob_file_id_to_continue_with = index
+-            .current_version()
+-            .blob_files
+-            .list_ids()
+-            .max()
+-            .map(|x| x + 1)
+-            .unwrap_or_default();
++        let highest_blob_file_id = index.current_version().blob_files.list_ids().copied().max();
++        let blob_file_id_to_continue_with = if index.config.preserve_existing_recovery {
++            crate::Tree::preserved_next_file_id(&blobs_folder, highest_blob_file_id)?
++        } else {
++            highest_blob_file_id.map(|x| x + 1).unwrap_or_default()
++        };
+ 
+         index
+             .0
+@@ -375,7 +381,9 @@ impl AbstractTree for BlobTree {
+         let index_partitioning = self.index.config.index_block_partitioning_policy.get(0);
+         let filter_partitioning = self.index.config.filter_block_partitioning_policy.get(0);
+ 
+-        log::debug!("Flushing memtable(s) and performing key-value separation, data_block_restart_interval={data_block_restart_interval}, index_block_restart_interval={index_block_restart_interval}, data_block_size={data_block_size}, data_block_compression={data_block_compression:?}, index_block_compression={index_block_compression:?}");
++        log::debug!(
++            "Flushing memtable(s) and performing key-value separation, data_block_restart_interval={data_block_restart_interval}, index_block_restart_interval={index_block_restart_interval}, data_block_size={data_block_size}, data_block_compression={data_block_compression:?}, index_block_compression={index_block_compression:?}"
++        );
+         log::debug!("=> to table(s) in {}", table_folder.display());
+         log::debug!("=> to blob file(s) at {}", self.blobs_folder.display());
+ 
+diff --git a/src/config/mod.rs b/src/config/mod.rs
+index 8b8aac8..2b5993a 100644
+--- a/src/config/mod.rs
++++ b/src/config/mod.rs
+@@ -160,6 +160,9 @@ impl KvSeparationOptions {
+ 
+ /// Tree configuration builder
+ pub struct Config {
++    /// Preserve all existing files during recovery; refuse creation.
++    #[doc(hidden)]
++    pub preserve_existing_recovery: bool,
+     /// Folder path
+     #[doc(hidden)]
+     pub path: PathBuf,
+@@ -245,6 +248,7 @@ impl Default for Config {
+     fn default() -> Self {
+         Self {
+             path: absolute_path(Path::new(DEFAULT_FILE_FOLDER)),
++            preserve_existing_recovery: false,
+             descriptor_table: Some(Arc::new(DescriptorTable::new(256))),
+             seqno: SequenceNumberCounter::default(),
+             visible_seqno: SequenceNumberCounter::default(),
+@@ -299,6 +303,13 @@ impl Default for Config {
+ }
+ 
+ impl Config {
++    /// Refuse creation and defer recovery cleanup for application validation.
++    #[must_use]
++    pub fn preserve_existing_recovery(mut self, preserve: bool) -> Self {
++        self.preserve_existing_recovery = preserve;
++        self
++    }
++
+     /// Initializes a new config
+     pub fn new<P: AsRef<Path>>(
+         path: P,
+diff --git a/src/tree/mod.rs b/src/tree/mod.rs
+index 4249dbc..14cdb08 100644
+--- a/src/tree/mod.rs
++++ b/src/tree/mod.rs
+@@ -456,7 +456,9 @@ impl AbstractTree for Tree {
+             .iter()
+             .any(|id| !version_lock.latest_version().sealed_memtables.contains(id))
+         {
+-            log::debug!("Not registering tables because flush task processed some sealed memtables which do not exist (anymore)");
++            log::debug!(
++                "Not registering tables because flush task processed some sealed memtables which do not exist (anymore)"
++            );
+             return Ok(());
+         }
+ 
+@@ -821,12 +823,16 @@ impl Tree {
+ 
+         // Check for old version
+         if config.path.join("version").try_exists()? {
+-            log::error!("It looks like you are trying to open a V1 database - the database needs a manual migration, however a migration tool is not provided, as V1 is extremely outdated.");
++            log::error!(
++                "It looks like you are trying to open a V1 database - the database needs a manual migration, however a migration tool is not provided, as V1 is extremely outdated."
++            );
+             return Err(crate::Error::InvalidVersion(FormatVersion::V1.into()));
+         }
+ 
+         let tree = if config.path.join(CURRENT_VERSION_FILE).try_exists()? {
+             Self::recover(config)
++        } else if config.preserve_existing_recovery {
++            return Err(crate::Error::Unrecoverable);
+         } else {
+             Self::create_new(config)
+         }?;
+@@ -978,10 +984,19 @@ impl Tree {
+             .max()
+             .unwrap_or_default();
+ 
++        let next_table_id = if config.preserve_existing_recovery {
++            Self::preserved_next_file_id(
++                &config.path.join(crate::file::TABLES_FOLDER),
++                Some(highest_table_id),
++            )?
++        } else {
++            highest_table_id + 1
++        };
++
+         let inner = TreeInner {
+             id: tree_id,
+             memtable_id_counter: SequenceNumberCounter::new(1),
+-            table_id_counter: SequenceNumberCounter::new(highest_table_id + 1),
++            table_id_counter: SequenceNumberCounter::new(next_table_id),
+             blob_file_id_counter: SequenceNumberCounter::default(),
+             version_history: Arc::new(RwLock::new(SuperVersions::new(version))),
+             stop_signal: StopSignal::default(),
+@@ -997,6 +1012,35 @@ impl Tree {
+         Ok(Self(Arc::new(inner)))
+     }
+ 
++    // Retained crash orphans still occupy names even though the current version
++    // does not reference them. Do not reuse those IDs after validation finishes.
++    pub(crate) fn preserved_next_file_id(
++        folder: &Path,
++        mut highest_id: Option<u64>,
++    ) -> crate::Result<u64> {
++        for entry in std::fs::read_dir(folder)? {
++            let name = entry?.file_name();
++            if name == ".DS_Store" || name.to_string_lossy().starts_with("._") {
++                continue;
++            }
++            let id = name
++                .to_str()
++                .and_then(|name| name.parse::<u64>().ok())
++                .ok_or(crate::Error::Unrecoverable)?;
++            highest_id = Some(highest_id.map_or(id, |highest| highest.max(id)));
++        }
++
++        let next_id = match highest_id {
++            Some(id) => id.checked_add(1).ok_or(crate::Error::Unrecoverable)?,
++            None => 0,
++        };
++        // SequenceNumberCounter reserves the MSB and cannot allocate this range.
++        if next_id >= 0x8000_0000_0000_0000 {
++            return Err(crate::Error::Unrecoverable);
++        }
++        Ok(next_id)
++    }
++
+     /// Creates a new LSM-tree in a directory.
+     fn create_new(config: Config) -> crate::Result<Self> {
+         use crate::file::{fsync_directory, TABLES_FOLDER};
+@@ -1074,6 +1118,9 @@ impl Tree {
+         let table_base_folder = tree_path.join(TABLES_FOLDER);
+ 
+         if !table_base_folder.try_exists()? {
++            if config.preserve_existing_recovery {
++                return Err(crate::Error::Unrecoverable);
++            }
+             std::fs::create_dir_all(&table_base_folder)?;
+             fsync_directory(&table_base_folder)?;
+         }
+@@ -1155,14 +1202,22 @@ impl Tree {
+ 
+         // NOTE: Cleanup old versions
+         // But only after we definitely recovered the latest version
+-        Self::cleanup_orphaned_version(tree_path, version.id())?;
++        if !config.preserve_existing_recovery {
++            Self::cleanup_orphaned_version(tree_path, version.id())?;
++        }
+ 
+-        for table_path in orphaned_tables {
++        for table_path in orphaned_tables
++            .into_iter()
++            .filter(|_| !config.preserve_existing_recovery)
++        {
+             log::debug!("Deleting orphaned table {}", table_path.display());
+             std::fs::remove_file(&table_path)?;
+         }
+ 
+-        for blob_file_path in orphaned_blob_files {
++        for blob_file_path in orphaned_blob_files
++            .into_iter()
++            .filter(|_| !config.preserve_existing_recovery)
++        {
+             log::debug!("Deleting orphaned blob file {}", blob_file_path.display());
+             std::fs::remove_file(&blob_file_path)?;
+         }

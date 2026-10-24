@@ -29,6 +29,7 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore, watch};
 type Owner = Arc<dyn Any + Send + Sync>;
 pub(crate) struct Source {
     pub io: Arc<jj_native_remote::RemoteObjectIo>,
+    pub restore: jj_native_remote::RemoteRestoreIo,
     pub control: jj_native_remote::RemoteRepositoryControl,
     pub identity: [u8; 32],
 }

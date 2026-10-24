@@ -40,12 +40,15 @@ lazy Linux mounts. Native client GC/offloading is not automatic.
 
 With federated indexes on Linux, set `native.workspaces.capture.policy` to
 `"after_command_best_effort"` to queue a durable local capture after each command.
-It is disabled by default and adds command-completion work. To publish queued
-captures asynchronously, also set `native.workspaces.upload.policy` to
-`"publish_retaining_roots"` and enable captured versions on the remote server.
+To publish queued captures asynchronously, also set
+`native.workspaces.upload.policy` to `"publish_retaining_roots"` and enable captured
+versions on the remote server. Both policies are disabled by default; capture
+adds command-completion work, while upload runs in the background.
 Status distinguishes local queuing from historical publication. Upload never
 moves public references or removes local tickets, roots or packs; it is not
 current availability proof, a Clean transition, or permission to evict data.
+Use the native CLI's [restore guide](../jj-native-cli#restore-a-retained-capture)
+for an exact selected capture and scoped current-state resume.
 
 Bazel needs the
 [Unix authority fix](https://github.com/bazelbuild/bazel/commit/242563f1a14378801725e5f6b0ee397ef0d307f2)

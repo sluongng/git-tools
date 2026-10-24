@@ -3,8 +3,9 @@
 #![cfg(target_os = "linux")]
 
 use futures::StreamExt;
+use jj_lib::object_id::ObjectId as _;
 use p::repository_server::{Repository, RepositoryServer};
-use q::repository_query_server::{RepositoryQuery, RepositoryQueryServer};
+use q::repository_query_server::RepositoryQuery;
 use std::{
     collections::{BTreeMap, HashSet},
     fs,
@@ -817,8 +818,8 @@ impl Repository for CountMetadata {
     }
 }
 
-/// Observe query payloads after the actual authenticated query implementation;
-/// preserve its response extensions, admission and transport policy.
+/// Observe logical query payloads while forwarding all extensions. Registration
+/// uses the repository's guarded transport to preserve predecode admission.
 #[derive(Clone)]
 struct CountQueryMetadata {
     inner: tinytree_server::QueryService,
@@ -1105,7 +1106,6 @@ max_manifest_members=1024
             .max_request_bytes
             .max(configuration.max_frame_bytes + 1024);
         let response_bytes = configuration.max_metadata_bytes + 4096;
-        let query_response_bytes = configuration.query.max_response_bytes;
         let service = runtime.block_on(async {
             tinytree_server::RepositoryService::new(
                 store.clone(),
@@ -1160,13 +1160,7 @@ max_manifest_members=1024
                             .max_decoding_message_size(request_bytes)
                             .max_encoding_message_size(response_bytes),
                     )
-                    .add_service(
-                        RepositoryQueryServer::new(query)
-                            .accept_compressed(CompressionEncoding::Zstd)
-                            .send_compressed(CompressionEncoding::Zstd)
-                            .max_decoding_message_size(request_bytes)
-                            .max_encoding_message_size(query_response_bytes),
-                    )
+                    .add_service(service.query_grpc_service_with_adapter(query))
                     .add_service(cloud)
                     .serve_with_incoming_shutdown(
                         tokio_stream::wrappers::TcpListenerStream::new(listener).map(|accepted| {
@@ -1692,7 +1686,21 @@ fn federated_index_production_factory_preserves_operations_and_drains_cli_querie
     );
     fs::rename(saved, &association).unwrap();
     fixture.success(&root, &["status"]);
+    // Keep a genuine concurrent operation head without letting another normal
+    // source command reconcile it before capture. This changes metadata only;
+    // the active working copy still contains the newly authored file above.
+    fixture.success(
+        &root,
+        &[
+            "--at-op",
+            &operation,
+            "describe",
+            "-m",
+            "parallel retained operation",
+        ],
+    );
     fixture.success(&base, &["tinytree", "unmount", root.to_str().unwrap()]);
+    assert!(native_operation_heads(&binding).len() >= 2);
     let queued_before_upload = local_capture_status(&fixture);
     let packs_before_upload = local_capture_bundles(&fixture);
     fixture.stop_daemon();
@@ -1702,20 +1710,7 @@ fn federated_index_production_factory_preserves_operations_and_drains_cli_querie
     fixture.start();
     let daemon_ready = Instant::now();
     let expected_publications = queued_before_upload["pending_count"].as_u64().unwrap();
-    let deadline = Instant::now() + Duration::from_secs(90);
-    let published = loop {
-        let status = fixture.control(Request::Status).unwrap();
-        let upload = &status["native"]["commands"]["capture_upload"];
-        if upload["historical_published_count"].as_u64().unwrap() >= expected_publications {
-            break upload.clone();
-        }
-        assert!(
-            Instant::now() < deadline,
-            "queued upload timed out: {upload}; daemon={}",
-            fs::read_to_string(fixture.base().join("daemon.log")).unwrap()
-        );
-        std::thread::sleep(Duration::from_millis(50));
-    };
+    let published = wait_for_capture_publications(&fixture, expected_publications);
     // Snapshot before verification adds any traffic. Reporting remains optional
     // and uses the existing readiness/publication observations, not extra RPCs.
     let upload_measurement = upload_benchmark.map(|(before, started)| {
@@ -1757,7 +1752,7 @@ fn federated_index_production_factory_preserves_operations_and_drains_cli_querie
         .read_to_end(&mut uploaded_file)
         .unwrap();
     assert_eq!(uploaded_file, authored_bytes);
-    verify_uploaded_capture(
+    let restore_capture = verify_uploaded_capture(
         &upstream,
         &fixture,
         &binding,
@@ -1798,10 +1793,16 @@ fn federated_index_production_factory_preserves_operations_and_drains_cli_querie
     );
     fixture.stop_daemon();
     fixture.start();
-    let resumed = fixture.control(Request::Status).unwrap();
+    // Daemon readiness does not wait for the independently owned background
+    // catalog scan. Observe that durable inventory before comparing its count.
+    let resumed = wait_for_capture_publications(&fixture, expected_publications);
     assert_eq!(
-        resumed["native"]["commands"]["capture_upload"]["historical_published_count"],
+        resumed["historical_published_count"],
         published["historical_published_count"]
+    );
+    assert_eq!(
+        resumed["attempted"], 0,
+        "published jobs must not be uploaded again"
     );
     assert_eq!(
         files_in(&upload_directory),
@@ -1814,6 +1815,12 @@ fn federated_index_production_factory_preserves_operations_and_drains_cli_querie
         queued_before_upload["pending_count"]
     );
     fixture.stop_daemon();
+
+    // A separate daemon has no source pack, native objects or shared FILE
+    // cache. Restore must collect the selected retained state from the service.
+    restore_captured_workspace(&upstream, &restore_capture, authored_bytes);
+    assert_eq!(upstream.public(), public_before_upload);
+    assert_eq!(local_capture_bundles(&fixture), packs_before_upload);
 
     let mut config: toml::Value =
         toml::from_str(&fs::read_to_string(&fixture.daemon_config).unwrap()).unwrap();
@@ -1875,6 +1882,23 @@ fn federated_index_production_factory_preserves_operations_and_drains_cli_querie
     }
 }
 
+fn wait_for_capture_publications(fixture: &Fixture, expected: u64) -> serde_json::Value {
+    let deadline = Instant::now() + Duration::from_secs(90);
+    loop {
+        let status = fixture.control(Request::Status).unwrap();
+        let upload = &status["native"]["commands"]["capture_upload"];
+        if upload["historical_published_count"].as_u64().unwrap() >= expected {
+            return upload.clone();
+        }
+        assert!(
+            Instant::now() < deadline,
+            "capture publication inventory timed out: {upload}; daemon={}",
+            fs::read_to_string(fixture.base().join("daemon.log")).unwrap()
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
 fn local_capture_status(fixture: &Fixture) -> serde_json::Value {
     let status = fixture.control(Request::Status).unwrap();
     assert_eq!(status["native"]["commands"]["active_commands"], 0);
@@ -1932,13 +1956,19 @@ fn local_capture_bundles(fixture: &Fixture) -> BTreeMap<String, Vec<u8>> {
 
 /// Read every immutable retained generation from the actual authenticated
 /// service, then independently match its full semantic proof to a saved pack.
+struct VerifiedRestoreCapture {
+    selection: workspace_daemon::control::NativeRestoreSelection,
+    data: tinytree_cloud::CaptureData,
+    objects: Vec<tinytree_cloud::VerifiedObject>,
+}
+
 fn verify_uploaded_capture(
     upstream: &RemoteServer,
     fixture: &Fixture,
     binding: &native_workspace_admin::Binding,
     packs: &BTreeMap<String, Vec<u8>>,
     expected_publications: u64,
-) {
+) -> VerifiedRestoreCapture {
     use tinytree_client::cloud_protocol as c;
     fn authenticated<T>(value: T) -> RpcRequest<T> {
         let mut request = RpcRequest::new(value);
@@ -2058,7 +2088,7 @@ fn verify_uploaded_capture(
                     tinytree_cloud::CaptureDescriptor::of(&capsule),
                     manifest.capture
                 );
-                selections.push((manifest, capsule));
+                selections.push((generation, manifest_id, raw, manifest, capsule));
             }
             assert_eq!(workspace.manifest_id, previous);
             selections
@@ -2084,7 +2114,13 @@ fn verify_uploaded_capture(
         )
         .unwrap(),
     );
-    for (manifest, capsule) in selections {
+    let source_heads = native_operation_heads(binding);
+    let (source_wc, _) =
+        jj_vfs::native::read_retained_state_for_capture(&binding.projection(), 1024 * 1024)
+            .unwrap();
+    assert!(!source_wc.pending);
+    let mut restore = None;
+    for (generation, manifest_id, raw, manifest, capsule) in selections {
         let mut matched = false;
         for bytes in packs.values() {
             let pack = native_capture_pack::VerifiedPack::open(
@@ -2170,13 +2206,29 @@ fn verify_uploaded_capture(
             assert_eq!(manifest.history.recovery.members.len(), objects.len());
             // Portable manifests describe only semantic OP/VIEW64 and radix
             // root/node32 artifacts. Private local kinds128/129 remain pack-only.
-            assert!(
+            let data =
                 tinytree_cloud::decode_data(&capsule, manifest.capture.id.0, &Default::default())
-                    .unwrap()
-                    .blobs
-                    .iter()
-                    .all(|blob| (1..=4).contains(&blob.kind))
-            );
+                    .unwrap();
+            assert!(data.blobs.iter().all(|blob| (1..=4).contains(&blob.kind)));
+            if data.operation_heads == source_heads
+                && data.working_copy.wc_operation == source_wc.operation.hex()
+                && data.working_copy.workspace == source_wc.workspace.as_str()
+                && source_wc.trees.len() == 1
+                && data.working_copy.tree.terms == source_wc.trees[0].terms
+                && data.working_copy.tree.labels == source_wc.trees[0].labels
+            {
+                restore = Some(VerifiedRestoreCapture {
+                    selection: workspace_daemon::control::NativeRestoreSelection {
+                        workspace_id: binding.workspace_id,
+                        generation,
+                        manifest_id: manifest_id.0,
+                        manifest_blake3: raw.blake3,
+                        manifest_size_bytes: raw.size_bytes,
+                    },
+                    data,
+                    objects,
+                });
+            }
             matched = true;
             break;
         }
@@ -2185,6 +2237,234 @@ fn verify_uploaded_capture(
             "authenticated retained capture has no matching immutable local pack"
         );
     }
+    let restore = restore.expect("retained capture must match the actual stopped source heads/WC");
+    assert!(restore.data.operation_heads.len() >= 2);
+    restore
+}
+
+fn native_operation_heads(binding: &native_workspace_admin::Binding) -> Vec<String> {
+    jj_lib::simple_op_heads_store::SimpleOpHeadsStore::load(&binding.repo.join("op_heads"))
+        .get_op_heads_bounded(1024)
+        .unwrap()
+        .iter()
+        .map(|id| id.hex())
+        .collect()
+}
+
+fn capture_identity(bytes: &[u8]) -> String {
+    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+fn assert_restored_metadata(
+    binding: &native_workspace_admin::Binding,
+    capture: &VerifiedRestoreCapture,
+) {
+    use tinytree_cloud as c;
+    assert_eq!(
+        native_operation_heads(binding),
+        capture.data.operation_heads
+    );
+    assert!(capture.data.operation_heads.len() >= 2);
+    assert_eq!(
+        fs::read_to_string(binding.repo.join("index/type")).unwrap(),
+        jj_native_index::NAME
+    );
+    let mut actual_objects = Vec::new();
+    for expected in &capture.objects {
+        if expected.payload().is_none() {
+            continue;
+        }
+        let (directory, name) = match expected.id() {
+            c::ObjectId::Operation(id) => ("operations", capture_identity(&id)),
+            c::ObjectId::View(id) => ("views", capture_identity(&id)),
+        };
+        let bytes = fs::read(binding.repo.join("op_store").join(directory).join(name)).unwrap();
+        let actual = c::VerifiedObject::verify(
+            expected.id(),
+            c::BlobDigest::of(&bytes),
+            &bytes,
+            Default::default(),
+        )
+        .unwrap();
+        // jj may normalize a legal protobuf representation during import, but
+        // every semantic operation/view and its identity must remain exact.
+        assert!(actual.operation() == expected.operation());
+        assert!(actual.view() == expected.view());
+        actual_objects.push(actual);
+    }
+    let wc = &capture.data.working_copy;
+    let snapshot_operation = actual_objects
+        .iter()
+        .find(|object| {
+            matches!(object.id(), c::ObjectId::Operation(id) if capture_identity(&id) == wc.snapshot_operation)
+        })
+        .unwrap()
+        .operation()
+        .unwrap();
+    let snapshot_view = actual_objects
+        .iter()
+        .find(|object| {
+            matches!(object.id(), c::ObjectId::View(id) if id.as_slice() == snapshot_operation.view_id.as_bytes())
+        })
+        .unwrap()
+        .view()
+        .unwrap();
+    assert_eq!(
+        snapshot_view
+            .wc_commit_ids
+            .iter()
+            .find(|(name, _)| name.as_str() == wc.workspace)
+            .unwrap()
+            .1
+            .as_bytes(),
+        wc.snapshot_commit.as_slice()
+    );
+    let (actual_wc, _) =
+        jj_vfs::native::read_retained_state_for_capture(&binding.projection(), 1024 * 1024)
+            .unwrap();
+    assert!(!actual_wc.pending);
+    assert_eq!(actual_wc.operation.hex(), wc.wc_operation);
+    assert_eq!(actual_wc.workspace.as_str(), wc.workspace);
+    assert_eq!(actual_wc.trees.len(), 1);
+    assert_eq!(actual_wc.trees[0].terms, wc.tree.terms);
+    assert_eq!(actual_wc.trees[0].labels, wc.tree.labels);
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct NativeAdminState {
+    heads: Vec<String>,
+    operations: BTreeMap<PathBuf, Vec<u8>>,
+    views: BTreeMap<PathBuf, Vec<u8>>,
+    index_associations: BTreeMap<PathBuf, Vec<u8>>,
+    working_copy: Vec<u8>,
+}
+fn native_admin_state(binding: &native_workspace_admin::Binding) -> NativeAdminState {
+    let (wc, _) =
+        jj_vfs::native::read_retained_state_for_capture(&binding.projection(), 1024 * 1024)
+            .unwrap();
+    assert!(!wc.pending);
+    NativeAdminState {
+        heads: native_operation_heads(binding),
+        operations: files_in(&binding.repo.join("op_store/operations")),
+        views: files_in(&binding.repo.join("op_store/views")),
+        index_associations: files_in(&binding.repo.join("index/operations")),
+        working_copy: wc.persisted_bytes.to_vec(),
+    }
+}
+
+fn restore_captured_workspace(
+    upstream: &RemoteServer,
+    capture: &VerifiedRestoreCapture,
+    authored_bytes: &[u8],
+) {
+    let mut fixture = Fixture::new();
+    fixture.configure_remote(&upstream.endpoint);
+    fixture.start();
+    let base = fixture.base().to_owned();
+    let root = base.join("restored");
+    let configuration = fixture.daemon_config.to_str().unwrap().to_owned();
+    let destination_id = [0x6d; 32];
+    assert_ne!(destination_id, capture.selection.workspace_id);
+    let selection = &capture.selection;
+    let cache_before = fixture.control(Request::Status).unwrap()["cache"].clone();
+    assert_eq!(cache_before["fetches"], 0);
+    assert_eq!(cache_before["verified_bytes"], 0);
+    let file_reads_before = upstream.file_reads();
+    fixture.success(
+        &base,
+        &[
+            "tinytree",
+            "restore",
+            root.to_str().unwrap(),
+            "--daemon-config",
+            &configuration,
+            "--store",
+            "example",
+            "--workspace-id",
+            &capture_identity(&destination_id),
+            "--source-workspace",
+            &capture_identity(&selection.workspace_id),
+            "--generation",
+            &selection.generation.to_string(),
+            "--manifest",
+            &capture_identity(&selection.manifest_id),
+            "--manifest-blake3",
+            &capture_identity(&selection.manifest_blake3),
+            "--manifest-bytes",
+            &selection.manifest_size_bytes.to_string(),
+        ],
+    );
+    assert_fuse_mounted(&root);
+    let binding = fixture.binding(&root);
+    assert_eq!(binding.workspace_id, destination_id);
+    assert_ne!(binding.workspace_id, selection.workspace_id);
+    // No jj workspace command may run before these exact saved metadata checks:
+    // default loading could otherwise merge the captured concurrent heads.
+    assert_restored_metadata(&binding, capture);
+    let cache_after_restore = fixture.control(Request::Status).unwrap()["cache"].clone();
+    assert_eq!(cache_after_restore["fetches"], cache_before["fetches"]);
+    assert_eq!(
+        cache_after_restore["verified_bytes"],
+        cache_before["verified_bytes"]
+    );
+    assert_eq!(upstream.file_reads(), file_reads_before);
+    assert_eq!(
+        fs::read(root.join("capture-only.txt")).unwrap(),
+        authored_bytes
+    );
+    let cache_after_read = fixture.control(Request::Status).unwrap()["cache"].clone();
+    assert!(
+        cache_after_read["fetches"].as_u64().unwrap() > cache_before["fetches"].as_u64().unwrap()
+    );
+    assert!(cache_after_read["verified_bytes"].as_u64().unwrap() >= authored_bytes.len() as u64);
+
+    fs::write(
+        root.join("capture-only.txt"),
+        b"restored and snapshotted edit\n",
+    )
+    .unwrap();
+    fixture.success(&root, &["status"]);
+    let current = native_admin_state(&binding);
+    let (wc, _) =
+        jj_vfs::native::read_retained_state_for_capture(&binding.projection(), 1024 * 1024)
+            .unwrap();
+    assert_ne!(wc.operation.hex(), capture.data.working_copy.wc_operation);
+    let dirty = b"unsnapshotted restored edit across restart\n";
+    fs::write(root.join("capture-only.txt"), dirty).unwrap();
+    fixture.success(&base, &["tinytree", "unmount", root.to_str().unwrap()]);
+    assert!(
+        !root.join("capture-only.txt").exists(),
+        "no materialized checkout remains"
+    );
+    fixture.stop_daemon();
+    fixture.start();
+    fixture.success(
+        &base,
+        &[
+            "tinytree",
+            "resume",
+            root.to_str().unwrap(),
+            "--daemon-config",
+            &configuration,
+        ],
+    );
+    assert_fuse_mounted(&root);
+    assert_eq!(fixture.binding(&root), binding);
+    assert_eq!(
+        native_admin_state(&binding),
+        current,
+        "committed resume must preserve CURRENT metadata, not reapply the capture"
+    );
+    assert_eq!(fs::read(root.join("capture-only.txt")).unwrap(), dirty);
+    fixture.success(&root, &["status"]);
+    assert_eq!(
+        fixture
+            .success(&root, &["file", "show", "capture-only.txt"])
+            .as_bytes(),
+        dirty
+    );
+    fixture.success(&base, &["tinytree", "unmount", root.to_str().unwrap()]);
+    fixture.stop_daemon();
 }
 
 fn write_synced(path: &Path, bytes: &[u8]) {

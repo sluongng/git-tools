@@ -430,6 +430,75 @@ fn touch(s: &mut State, id: u64) {
         r.node.ctime = t;
     }
 }
+// This pinned layout check rejects incomplete/bootstrap candidates before
+// entering the database opener. It is NOT a substitute for non-destructive WAL
+// recovery: damaged records must also fail in the dependency's strict mode.
+fn preflight_existing_source_database(path: &Path) -> Result<()> {
+    let mut journals = 0usize;
+    let mut count = 0usize;
+    for entry in fs::read_dir(path)? {
+        let entry = entry?;
+        count += 1;
+        ensure!(
+            count <= 4096,
+            "existing source database layout exceeds limit"
+        );
+        let name = entry.file_name();
+        let name = name
+            .to_str()
+            .context("invalid existing source database name")?;
+        let kind = entry.file_type()?;
+        match name {
+            "version" | "lock" => ensure!(kind.is_file(), "existing database file is invalid"),
+            "keyspaces" => ensure!(kind.is_dir(), "existing keyspace directory is invalid"),
+            _ => {
+                ensure!(
+                    kind.is_file()
+                        && name.strip_suffix(".jnl").is_some_and(|id| !id.is_empty()
+                            && id.bytes().all(|b| b.is_ascii_digit())
+                            && id.parse::<u64>().is_ok()),
+                    "unsupported existing source database entry"
+                );
+                journals += 1;
+            }
+        }
+    }
+    ensure!(
+        journals != 0
+            && fs::symlink_metadata(path.join("lock"))?
+                .file_type()
+                .is_file(),
+        "existing source database journal or lock missing"
+    );
+    let keyspaces = path.join("keyspaces");
+    let mut seen = [false; 2];
+    for entry in fs::read_dir(&keyspaces)? {
+        let entry = entry?;
+        let id = match entry.file_name().to_str() {
+            Some("0") => 0,
+            Some("1") => 1,
+            _ => anyhow::bail!("unsupported existing source keyspace"),
+        };
+        ensure!(
+            entry.file_type()?.is_dir(),
+            "existing source keyspace is invalid"
+        );
+        let current = fs::symlink_metadata(entry.path().join("current"))?;
+        ensure!(
+            current.file_type().is_file()
+                && current.len() > 0
+                && fs::symlink_metadata(entry.path().join("tables"))?
+                    .file_type()
+                    .is_dir()
+                && !entry.path().join(".deleted").try_exists()?,
+            "existing source keyspace is incomplete"
+        );
+        seen[id] = true;
+    }
+    ensure!(seen == [true; 2], "existing source keyspace missing");
+    Ok(())
+}
+
 impl Tree {
     pub fn open(
         state_dir: impl AsRef<Path>,
@@ -463,6 +532,7 @@ impl Tree {
             cache,
             source,
             false,
+            None,
         )
     }
     /// Reopen a recognized namespace without creating missing directories,
@@ -479,6 +549,34 @@ impl Tree {
             cache,
             source,
             true,
+            None,
+        )
+    }
+    /// Open a recognized lazy source without application recovery, header
+    /// upgrades or retired-payload collection. Identity/control validation is
+    /// completed before exposing the Tree or running any maintenance.
+    pub fn open_existing_lazy_source_with_cache_and_source(
+        state_dir: impl AsRef<Path>,
+        backend_identity: impl Into<String>,
+        cache: Arc<LocalCas>,
+        source: Arc<dyn BlobSource>,
+        expected_identity: &str,
+        control_marker: &[u8],
+    ) -> Result<Arc<Self>> {
+        ensure!(
+            !expected_identity.is_empty()
+                && expected_identity.len() <= 4096
+                && !control_marker.is_empty()
+                && control_marker.len() <= 4096,
+            "invalid existing lazy source identity"
+        );
+        Self::open_namespace(
+            state_dir.as_ref(),
+            backend_identity.into(),
+            cache,
+            source,
+            true,
+            Some((expected_identity.to_owned(), control_marker.to_vec())),
         )
     }
     fn open_namespace(
@@ -487,6 +585,7 @@ impl Tree {
         cache: Arc<LocalCas>,
         source: Arc<dyn BlobSource>,
         require_existing: bool,
+        existing_source: Option<(String, Vec<u8>)>,
     ) -> Result<Arc<Self>> {
         if require_existing {
             for path in [
@@ -519,7 +618,12 @@ impl Tree {
             fs::create_dir_all(state_dir.join("local"))?;
         }
         let dir = state_dir.canonicalize()?;
-        let db = SingleWriterTxDatabase::builder(dir.join("namespace.fjall")).open()?;
+        if existing_source.is_some() {
+            preflight_existing_source_database(&dir.join("namespace.fjall"))?;
+        }
+        let db = SingleWriterTxDatabase::builder(dir.join("namespace.fjall"))
+            .strict_existing_recovery(existing_source.is_some())
+            .open()?;
         ensure!(
             !require_existing || db.keyspace_exists("namespace"),
             "existing namespace keyspace missing"
@@ -713,9 +817,34 @@ impl Tree {
             self_ref: weak.clone(),
             lazy_runtime: Mutex::new(None),
         });
-        tree.change(|_| Ok(()))?;
-        tree.drain_retired_payloads(usize::MAX)?;
+        if let Some((identity, marker)) = existing_source {
+            ensure!(
+                tree.identity() == identity,
+                "existing lazy namespace identity changed"
+            );
+            ensure!(
+                tree.lazy_source_pin().is_some(),
+                std::io::Error::new(
+                    std::io::ErrorKind::Unsupported,
+                    "existing-only source requires a lazy namespace"
+                )
+            );
+            tree.existing_source_control(&marker)?;
+        } else {
+            tree.change(|_| Ok(()))?;
+            tree.drain_retired_payloads(usize::MAX)?;
+        }
         Ok(tree)
+    }
+    /// Commit the validated existing-source admission. Until this explicit
+    /// barrier, strict database recovery leaves writes and maintenance disabled.
+    /// The host must first validate all source pin, artifact scope and control
+    /// bindings; this does not authorize a mount or mark a workspace Ready.
+    pub fn finish_existing_source_validation(&self) -> Result<()> {
+        let ns = self.namespace.lock().unwrap();
+        ensure!(!ns.failed, "existing source namespace validation failed");
+        ns.db.finish_recovery_validation()?;
+        Ok(())
     }
     fn change<T>(&self, f: impl FnOnce(&mut State) -> Result<T>) -> Result<T> {
         let gate = self.source_gate.lock().unwrap();
