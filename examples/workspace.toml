@@ -87,6 +87,14 @@ buildbuddy = "https://github.com/buildbuddy-io/buildbuddy.git"
 # max_pending_bytes = 4294967296
 # max_pending = 64
 # timeout_ms = 30000
+# [native.workspaces.upload]
+# policy = "disabled" # Opt in: "publish_retaining_roots"; requires remote cloud support.
+# poll_ms = 30000
+# timeout_ms = 120000
+# max_jobs = 256
+# max_disk_bytes = 536870912
+# max_memory_bytes = 2147483648
+# Publication retains every local recovery ticket and pack; no automatic eviction.
 # [native.repositories.example]
 # max_repository_bytes = 17179869184
 # max_file_bytes = 268435456

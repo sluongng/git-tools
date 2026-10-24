@@ -486,7 +486,8 @@ impl RemoteObjectIo {
                     .connector
                     .get()
                     .await?
-                    .with_lifetime_guard(Arc::new(owner.clone()));
+                    .with_lifetime_guard(Arc::new(owner.clone()))
+                    .with_operation_deadline(deadline);
                 let mut outcomes = tokio::time::timeout_at(
                     deadline,
                     io::network(client.read_objects(vec![current])),

@@ -191,6 +191,23 @@ impl Fixture {
         workspace_daemon::config::Config::load(&self.daemon_config).unwrap();
     }
 
+    fn enable_capture_upload(&mut self) {
+        let mut config: toml::Value =
+            toml::from_str(&fs::read_to_string(&self.daemon_config).unwrap()).unwrap();
+        config["native"]["workspaces"]
+            .as_table_mut()
+            .unwrap()
+            .insert(
+                "upload".into(),
+                toml::Value::Table(toml::map::Map::from_iter([
+                    ("policy".into(), "publish_retaining_roots".into()),
+                    ("poll_ms".into(), 250.into()),
+                ])),
+            );
+        fs::write(&self.daemon_config, toml::to_string(&config).unwrap()).unwrap();
+        workspace_daemon::config::Config::load(&self.daemon_config).unwrap();
+    }
+
     fn start(&mut self) {
         assert!(self.daemon.is_none());
         let log = fs::File::create(self.base().join("daemon.log")).unwrap();
@@ -905,11 +922,59 @@ impl RemoteServer {
         Self::start_with_history(8)
     }
     fn start_with_history(history: usize) -> Self {
+        Self::start_with_history_and_cloud(history, false)
+    }
+    fn start_with_cloud() -> Self {
+        Self::start_with_history_and_cloud(8, true)
+    }
+    fn start_with_history_and_cloud(history: usize, cloud_enabled: bool) -> Self {
         assert!((1..=1024).contains(&history));
         let setup_started = Instant::now();
         let directory = tempfile::tempdir().unwrap();
-        let store = tinytree_store::Store::open(directory.path().join("store"), Default::default())
+        let (configuration, store_configuration) = if cloud_enabled {
+            let profile: tinytree_server::Config = toml::from_str(
+                r#"
+[service]
+max_metadata_bytes=4194304
+[service.cloud]
+enabled=true
+indexed_versions=true
+captured_versions=true
+max_capture_bytes=262144
+max_manifest_bytes=524288
+max_staging_leases=256
+max_buffered_bytes=2147483648
+[store]
+max_retention_validation_records=4096
+max_retention_validation_bytes=8388608
+max_closure_objects=8192
+max_closure_edges=32768
+max_path_contexts=8192
+max_path_context_bytes=8388608
+[store.cloud]
+max_object_bytes=4194304
+max_decode_bytes=16777216
+max_version_decode_bytes=268435456
+max_manifest_bytes=524288
+max_manifest_decode_bytes=16777216
+max_manifest_members=1024
+"#,
+            )
             .unwrap();
+            profile.validate().unwrap();
+            let store = profile
+                .store
+                .materialize(profile.service.max_metadata_bytes);
+            (profile.service, store)
+        } else {
+            (
+                tinytree_server::ServiceConfig::default(),
+                tinytree_store::Config::default(),
+            )
+        };
+        let store =
+            tinytree_store::Store::open(directory.path().join("store"), store_configuration)
+                .unwrap();
         store.create_repository("example").unwrap();
         let seed = tinytree_fixture::build_fixture(tinytree_fixture::FixtureConfig {
             unused_files: 2,
@@ -1036,7 +1101,6 @@ impl RemoteServer {
             .enable_all()
             .build()
             .unwrap();
-        let configuration = tinytree_server::ServiceConfig::default();
         let request_bytes = configuration
             .max_request_bytes
             .max(configuration.max_frame_bytes + 1024);
@@ -1055,7 +1119,8 @@ impl RemoteServer {
                         true,
                     )
                     .unwrap()
-                    .with_retention(true),
+                    .with_retention(true)
+                    .with_cloud(cloud_enabled),
                 ],
             )
             .unwrap()
@@ -1074,6 +1139,7 @@ impl RemoteServer {
             reads: metadata.clone(),
         };
         let query_counter = metadata.clone();
+        let cloud = service.cloud_grpc_service();
         let (stop, stopped) = tokio::sync::oneshot::channel();
         let (endpoint, task) = runtime.block_on(async move {
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1101,6 +1167,7 @@ impl RemoteServer {
                             .max_decoding_message_size(request_bytes)
                             .max_encoding_message_size(query_response_bytes),
                     )
+                    .add_service(cloud)
                     .serve_with_incoming_shutdown(
                         tokio_stream::wrappers::TcpListenerStream::new(listener).map(|accepted| {
                             accepted.and_then(|stream| {
@@ -1393,7 +1460,7 @@ fn shipped_remote_cli_clones_lazily_and_publishes_between_isolated_mounts() {
 #[test]
 #[ignore = "requires usable /dev/fuse and fusermount3; run mounted_tests locally"]
 fn federated_index_production_factory_preserves_operations_and_drains_cli_queries() {
-    let upstream = RemoteServer::start();
+    let upstream = RemoteServer::start_with_cloud();
     let mut fixture = Fixture::new();
     fixture.configure_remote(&upstream.endpoint);
     fixture.index_mode("federated");
@@ -1521,6 +1588,36 @@ fn federated_index_production_factory_preserves_operations_and_drains_cli_querie
         jj_native_index::NAME
     );
 
+    // The queued capture includes newly authored native objects which the
+    // target does not already possess, not merely an already-published root.
+    fixture.success(&root, &["new", "-m", "capture-only private draft"]);
+    let authored_bytes = b"private captured workspace file\n";
+    fs::write(root.join("capture-only.txt"), authored_bytes).unwrap();
+    fixture.success(&root, &["status"]);
+    let authored_commit = m::ObjectKey {
+        kind: m::Kind::Commit,
+        id: m::ObjectId(
+            *blake3::Hash::from_hex(&fixture.revision(&root, "@"))
+                .unwrap()
+                .as_bytes(),
+        ),
+    };
+    let authored_file = m::describe_file(authored_bytes);
+    assert!(
+        upstream
+            .store
+            .descriptor("example", authored_commit)
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        upstream
+            .store
+            .descriptor("example", authored_file.key)
+            .unwrap()
+            .is_none()
+    );
+    let public_before_upload = upstream.public();
     let captured = local_capture_status(&fixture);
     assert_eq!(captured["policy"], "after_command_best_effort");
     assert!(
@@ -1596,6 +1693,112 @@ fn federated_index_production_factory_preserves_operations_and_drains_cli_querie
     fs::rename(saved, &association).unwrap();
     fixture.success(&root, &["status"]);
     fixture.success(&base, &["tinytree", "unmount", root.to_str().unwrap()]);
+    let queued_before_upload = local_capture_status(&fixture);
+    let packs_before_upload = local_capture_bundles(&fixture);
+    fixture.stop_daemon();
+    fixture.enable_capture_upload();
+    fixture.start();
+    let expected_publications = queued_before_upload["pending_count"].as_u64().unwrap();
+    let deadline = Instant::now() + Duration::from_secs(90);
+    let published = loop {
+        let status = fixture.control(Request::Status).unwrap();
+        let upload = &status["native"]["commands"]["capture_upload"];
+        if upload["historical_published_count"].as_u64().unwrap() >= expected_publications {
+            break upload.clone();
+        }
+        assert!(
+            Instant::now() < deadline,
+            "queued upload timed out: {upload}; daemon={}",
+            fs::read_to_string(fixture.base().join("daemon.log")).unwrap()
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    assert_eq!(published["local_roots_retained"], true);
+    assert_eq!(published["current_backup_availability_verified"], false);
+    assert_eq!(published["last_disposition"], "published_roots_retained");
+    assert_eq!(
+        upstream.public(),
+        public_before_upload,
+        "saved capture upload must not move a public native reference"
+    );
+    assert!(
+        upstream
+            .store
+            .descriptor("example", authored_commit)
+            .unwrap()
+            .is_some()
+    );
+    assert_eq!(
+        upstream
+            .store
+            .descriptor("example", authored_file.key)
+            .unwrap(),
+        Some(authored_file)
+    );
+    let mut uploaded_file = Vec::new();
+    upstream
+        .store
+        .read("example", authored_file.key)
+        .unwrap()
+        .read_to_end(&mut uploaded_file)
+        .unwrap();
+    assert_eq!(uploaded_file, authored_bytes);
+    verify_uploaded_capture(
+        &upstream,
+        &fixture,
+        &binding,
+        &packs_before_upload,
+        expected_publications,
+    );
+    let retained = local_capture_status(&fixture);
+    for field in [
+        "pending_count",
+        "pending_bytes",
+        "pending_dirty",
+        "pending_clean",
+        "pending_root_claims",
+        "charged_spool_bytes",
+    ] {
+        assert_eq!(
+            retained[field], queued_before_upload[field],
+            "publication must retain local {field}"
+        );
+    }
+    assert_eq!(
+        local_capture_bundles(&fixture),
+        packs_before_upload,
+        "upload cannot remove or rewrite the private local pack"
+    );
+    let upload_directory = fixture
+        .socket
+        .parent()
+        .unwrap()
+        .join("native-commands/upload");
+    let immutable_jobs = files_in(&upload_directory);
+    assert_eq!(
+        immutable_jobs
+            .keys()
+            .filter(|path| path.extension().and_then(|s| s.to_str()) == Some("published"))
+            .count() as u64,
+        expected_publications
+    );
+    fixture.stop_daemon();
+    fixture.start();
+    let resumed = fixture.control(Request::Status).unwrap();
+    assert_eq!(
+        resumed["native"]["commands"]["capture_upload"]["historical_published_count"],
+        published["historical_published_count"]
+    );
+    assert_eq!(
+        files_in(&upload_directory),
+        immutable_jobs,
+        "restart must preserve original durable publication intents and receipts"
+    );
+    assert_eq!(local_capture_bundles(&fixture), packs_before_upload);
+    assert_eq!(
+        local_capture_status(&fixture)["pending_count"],
+        queued_before_upload["pending_count"]
+    );
     fixture.stop_daemon();
 
     let mut config: toml::Value =
@@ -1681,6 +1884,263 @@ fn local_capture_bundles(fixture: &Fixture) -> BTreeMap<String, Vec<u8>> {
             Some((entry.file_name().to_str().unwrap().to_owned(), bytes))
         })
         .collect()
+}
+
+/// Read every immutable retained generation from the actual authenticated
+/// service, then independently match its full semantic proof to a saved pack.
+fn verify_uploaded_capture(
+    upstream: &RemoteServer,
+    fixture: &Fixture,
+    binding: &native_workspace_admin::Binding,
+    packs: &BTreeMap<String, Vec<u8>>,
+    expected_publications: u64,
+) {
+    use tinytree_client::cloud_protocol as c;
+    fn authenticated<T>(value: T) -> RpcRequest<T> {
+        let mut request = RpcRequest::new(value);
+        request.metadata_mut().insert(
+            "authorization",
+            format!("Bearer {REMOTE_TOKEN}").parse().unwrap(),
+        );
+        request.set_timeout(Duration::from_secs(10));
+        request
+    }
+    let selections = upstream.runtime.as_ref().unwrap().block_on(async {
+        tokio::time::timeout(Duration::from_secs(30), async {
+            let mut client =
+                c::workspace_cloud_client::WorkspaceCloudClient::connect(upstream.endpoint.clone())
+                    .await
+                    .unwrap()
+                    .accept_compressed(CompressionEncoding::Zstd)
+                    .send_compressed(CompressionEncoding::Zstd);
+            let workspace = client
+                .get_workspace(authenticated(c::GetWorkspaceRequest {
+                    repository_id: "example".into(),
+                    workspace_id: binding.workspace_id.to_vec(),
+                }))
+                .await
+                .unwrap()
+                .into_inner();
+            assert_eq!(workspace.workspace_id, binding.workspace_id);
+            assert!((1..=256).contains(&workspace.generation));
+            assert_eq!(
+                workspace.generation, expected_publications,
+                "every durable Published record must correspond to a retained generation"
+            );
+            let mut selections = Vec::new();
+            let mut previous = None;
+            for generation in 1..=workspace.generation {
+                let version = client
+                    .get_version(authenticated(c::GetVersionRequest {
+                        repository_id: "example".into(),
+                        workspace_id: binding.workspace_id.to_vec(),
+                        generation,
+                    }))
+                    .await
+                    .unwrap()
+                    .into_inner();
+                assert_eq!(version.workspace_id, binding.workspace_id);
+                assert_eq!(version.generation, generation);
+                let manifest_id = tinytree_cloud::ManifestId::of(&version.manifest);
+                assert_eq!(version.manifest_id, manifest_id.0);
+                assert_eq!(version.previous_manifest_id, previous);
+                previous = Some(manifest_id.0.to_vec());
+                let manifest = tinytree_cloud::decode_manifest_v3(
+                    &version.manifest,
+                    manifest_id,
+                    Default::default(),
+                )
+                .unwrap();
+                assert_eq!(
+                    tinytree_cloud::encode_manifest_v3(&manifest, Default::default()).unwrap(),
+                    version.manifest
+                );
+                assert_eq!(manifest.history.recovery.workspace, binding.workspace_id);
+                let raw = tinytree_cloud::BlobDigest::of(&version.manifest);
+                let authority = version.native_authority.as_ref().unwrap();
+                assert_eq!(authority.version, 1);
+                let selected = authority.manifest_selected.as_ref().unwrap();
+                assert_eq!(selected.blake3, raw.blake3);
+                assert_eq!(selected.size_bytes, raw.size_bytes);
+                let owner: [u8; 32] = authority.owner_binding.as_slice().try_into().unwrap();
+                assert_eq!(
+                    authority.binding_digest,
+                    m::cloud_native_binding_digest(
+                        "example",
+                        owner,
+                        binding.workspace_id,
+                        generation,
+                        manifest_id.0,
+                        raw.blake3,
+                        raw.size_bytes
+                    )
+                );
+
+                let mut stream = client
+                    .read_capture(authenticated(c::ReadCaptureRequest {
+                        repository_id: "example".into(),
+                        selector: Some(c::RetainedVersionSelector {
+                            workspace_id: binding.workspace_id.to_vec(),
+                            generation,
+                            manifest_id: manifest_id.0.to_vec(),
+                        }),
+                        expected_capture_id: manifest.capture.id.0.to_vec(),
+                        manifest_selected: Some(c::RawDigest {
+                            blake3: raw.blake3.to_vec(),
+                            size_bytes: raw.size_bytes,
+                        }),
+                    }))
+                    .await
+                    .unwrap()
+                    .into_inner();
+                let mut capsule = Vec::new();
+                let mut eof = false;
+                while let Some(chunk) = stream.message().await.unwrap() {
+                    assert!(!eof, "capture frames after EOF");
+                    assert_eq!(chunk.manifest_id, manifest_id.0);
+                    assert_eq!(chunk.offset, capsule.len() as u64);
+                    let descriptor = chunk.descriptor.unwrap();
+                    assert_eq!(descriptor.capture_id, manifest.capture.id.0);
+                    let selected = descriptor.selected.unwrap();
+                    assert_eq!(selected.blake3, manifest.capture.selected.blake3);
+                    assert_eq!(selected.size_bytes, manifest.capture.selected.size_bytes);
+                    assert!(capsule.len() + chunk.data.len() <= selected.size_bytes as usize);
+                    assert!(!chunk.data.is_empty() || chunk.eof);
+                    capsule.extend_from_slice(&chunk.data);
+                    eof = chunk.eof;
+                }
+                assert!(eof);
+                assert_eq!(
+                    tinytree_cloud::CaptureDescriptor::of(&capsule),
+                    manifest.capture
+                );
+                selections.push((manifest, capsule));
+            }
+            assert_eq!(workspace.manifest_id, previous);
+            selections
+        })
+        .await
+        .expect("retained capture verification timed out")
+    });
+    fn identity<const N: usize>(text: &str) -> [u8; N] {
+        assert_eq!(text.len(), N * 2);
+        let mut id = [0; N];
+        for (i, byte) in id.iter_mut().enumerate() {
+            *byte = u8::from_str_radix(&text[i * 2..i * 2 + 2], 16).unwrap();
+        }
+        id
+    }
+    let directory = Arc::new(
+        private_fs::PrivateDir::open_existing(
+            fixture
+                .socket
+                .parent()
+                .unwrap()
+                .join("native-commands/captures"),
+        )
+        .unwrap(),
+    );
+    for (manifest, capsule) in selections {
+        let mut matched = false;
+        for bytes in packs.values() {
+            let pack = native_capture_pack::VerifiedPack::open(
+                directory.clone(),
+                *blake3::hash(bytes).as_bytes(),
+                bytes.len() as u64,
+                Default::default(),
+                Arc::new(()),
+            )
+            .unwrap();
+            let capsule_entry = pack
+                .portable_entries()
+                .find(|e| e.descriptor().kind == 5)
+                .unwrap();
+            if capsule_entry.descriptor().blake3 != manifest.capture.selected.blake3 {
+                continue;
+            }
+            assert_eq!(capsule_entry.read_verified().unwrap().bytes(), capsule);
+            let mut objects = Vec::new();
+            let mut artifacts = Vec::new();
+            for entry in pack.portable_entries() {
+                let descriptor = entry.descriptor();
+                let payload = entry.read_verified().unwrap();
+                let selected = tinytree_cloud::BlobDigest {
+                    blake3: descriptor.blake3,
+                    size_bytes: descriptor.size,
+                };
+                match descriptor.kind {
+                    1 | 2 => {
+                        let id = identity(&descriptor.id);
+                        let id = if descriptor.kind == 1 {
+                            tinytree_cloud::ObjectId::Operation(id)
+                        } else {
+                            tinytree_cloud::ObjectId::View(id)
+                        };
+                        objects.push(
+                            tinytree_cloud::VerifiedObject::verify(
+                                id,
+                                selected,
+                                payload.bytes(),
+                                Default::default(),
+                            )
+                            .unwrap(),
+                        );
+                    }
+                    3 | 4 => {
+                        let id = identity(&descriptor.id);
+                        let id = if descriptor.kind == 3 {
+                            tinytree_cloud::IndexArtifactId::Root(tinytree_cloud::IndexRootId(id))
+                        } else {
+                            tinytree_cloud::IndexArtifactId::Node(tinytree_cloud::IndexNodeId(id))
+                        };
+                        artifacts.push(
+                            tinytree_cloud::decode_index_artifact(
+                                payload.bytes(),
+                                tinytree_cloud::IndexArtifactDescriptor { id, selected },
+                                Default::default(),
+                            )
+                            .unwrap(),
+                        );
+                    }
+                    5 => {}
+                    _ => {
+                        panic!("private WC/remote sidecars must not become portable cloud objects")
+                    }
+                }
+            }
+            let graph = tinytree_cloud::verify_index_artifact_graph(
+                &manifest.history.index_roots,
+                &artifacts,
+                Default::default(),
+            )
+            .unwrap();
+            tinytree_cloud::verify_capture_export_binding(
+                &manifest,
+                &capsule,
+                &objects,
+                &artifacts,
+                &graph,
+                Default::default(),
+            )
+            .unwrap();
+            assert_eq!(manifest.history.recovery.members.len(), objects.len());
+            // Portable manifests describe only semantic OP/VIEW64 and radix
+            // root/node32 artifacts. Private local kinds128/129 remain pack-only.
+            assert!(
+                tinytree_cloud::decode_data(&capsule, manifest.capture.id.0, &Default::default())
+                    .unwrap()
+                    .blobs
+                    .iter()
+                    .all(|blob| (1..=4).contains(&blob.kind))
+            );
+            matched = true;
+            break;
+        }
+        assert!(
+            matched,
+            "authenticated retained capture has no matching immutable local pack"
+        );
+    }
 }
 
 fn write_synced(path: &Path, bytes: &[u8]) {

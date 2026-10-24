@@ -70,6 +70,7 @@ struct Inner {
     workspaces: RwLock<HashMap<String, Arc<Workspace>>>,
     sessions: Mutex<HashMap<[u8; 32], Arc<Session>>>,
     starts: tokio::sync::Mutex<()>,
+    upload_status: std::sync::OnceLock<Arc<crate::native_capture_upload::Stats>>,
     dirty_transitions: AtomicU64,
     dirty_transition_ns: AtomicU64,
     drains: AtomicU64,
@@ -175,6 +176,7 @@ impl NativeCommandHost {
                 workspaces: Default::default(),
                 sessions: Default::default(),
                 starts: Default::default(),
+                upload_status: Default::default(),
                 dirty_transitions: AtomicU64::new(0),
                 dirty_transition_ns: AtomicU64::new(0),
                 drains: AtomicU64::new(0),
@@ -732,9 +734,47 @@ impl NativeCommandHost {
             }
         }
     }
+    pub(crate) fn capture_registry(&self) -> Registry {
+        self.inner.registry.clone()
+    }
+    pub(crate) fn set_upload_status(
+        &self,
+        stats: Arc<crate::native_capture_upload::Stats>,
+    ) -> Result<()> {
+        self.inner
+            .upload_status
+            .set(stats)
+            .map_err(|_| anyhow::anyhow!("capture uploader already configured"))
+    }
+    pub(crate) fn capture_mapping(
+        &self,
+        ticket: &native_retention::PendingCapture,
+    ) -> Result<(String, String, [u8; 32])> {
+        let mut found = None;
+        let mut count = 0;
+        for item in std::fs::read_dir(self.inner.records.path())? {
+            count += 1;
+            ensure!(count <= 4096, "capture mapping scan limit exceeded");
+            let item = item?;
+            let name = item.file_name();
+            let mapping: Mapping =
+                serde_json::from_slice(&self.inner.records.read(&name, MAX_RECORD)?)?;
+            ensure!(
+                mapping.version == 1 && name.to_str() == Some(&format!("{}.json", mapping.mount)),
+                "invalid capture mapping record"
+            );
+            if mapping.workspace == ticket.registration.workspace
+                && mapping.op_store == ticket.registration.op_store
+            {
+                ensure!(found.is_none(), "ambiguous capture mapping");
+                found = Some((mapping.mount, mapping.alias, mapping.identity));
+            }
+        }
+        found.context("capture mapping unavailable")
+    }
     pub fn status(&self) -> serde_json::Value {
         let stats = self.inner.registry.storage_stats();
-        serde_json::json!({"active_commands":self.inner.sessions.lock().map(|s|s.len()).unwrap_or(MAX_ACTIVE),"registered_workspaces":self.inner.workspaces.read().map(|w|w.len()).unwrap_or(4096),"collection_enabled":false,"local_capture":self.inner.capture.status(),
+        serde_json::json!({"active_commands":self.inner.sessions.lock().map(|s|s.len()).unwrap_or(MAX_ACTIVE),"registered_workspaces":self.inner.workspaces.read().map(|w|w.len()).unwrap_or(4096),"collection_enabled":false,"local_capture":self.inner.capture.status(),"capture_upload":self.inner.upload_status.get().map(|stats|stats.status()),
             "dirty_transitions":self.inner.dirty_transitions.load(Ordering::Relaxed),"dirty_transition_ns":self.inner.dirty_transition_ns.load(Ordering::Relaxed),"physical_drains":self.inner.drains.load(Ordering::Relaxed),"physical_drain_ns":self.inner.physical_drain_ns.load(Ordering::Relaxed),"retention_transactions":stats.transactions,"retention_encoded_write_bytes":stats.encoded_write_bytes})
     }
     pub async fn workspace_state(&self, mount: &str) -> Result<native_retention::WorkspaceInfo> {

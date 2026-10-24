@@ -66,7 +66,8 @@ impl RemoteRepositoryControl {
                     .connector
                     .get()
                     .await?
-                    .with_lifetime_guard(job.clone());
+                    .with_lifetime_guard(job.clone())
+                    .with_operation_deadline(deadline);
                 let proof = Arc::new(
                     io::network(client.cloud_retained_version_selected(selector, selected)).await?,
                 );
@@ -205,6 +206,10 @@ impl RemoteObjectIo {
             .get()
             .await?
             .with_lifetime_guard(Arc::new(owner));
+        let client = match io::scope() {
+            Some(scope) => client.with_operation_deadline(scope.deadline),
+            None => client,
+        };
         let proof = io::network(
             client.cloud_retained_version_selected(authority.selector(), authority.selected()),
         )

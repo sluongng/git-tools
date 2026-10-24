@@ -61,9 +61,46 @@ impl RemoteRepositoryControl {
     pub(crate) async fn physical_client(&self) -> Result<NativeClient> {
         let client = self.inner.connector.get().await?;
         Ok(match io::scope() {
-            Some(scope) => client.with_rpc_lifetime_guard(scope),
+            Some(scope) => client
+                .with_operation_deadline(scope.deadline)
+                .with_rpc_lifetime_guard(scope),
             None => client,
         })
+    }
+    /// Obtain the already configured SDK client for independently admitted host
+    /// work. No control semaphore is retained by this client: callers may use
+    /// the no-ref transfer helper while the client is alive. The original
+    /// deadline bounds waiting; detached connector work retains its owner and
+    /// participates in provider shutdown until it physically completes.
+    pub async fn client_for_owned_work(
+        &self,
+        owner: Arc<dyn std::any::Any + Send + Sync>,
+        deadline: tokio::time::Instant,
+    ) -> Result<NativeClient> {
+        let inner = self.inner.clone();
+        let work = inner.metadata_work.enter();
+        let job = io::owned(async move {
+            ensure!(
+                tokio::time::Instant::now() < deadline,
+                "native host work deadline exceeded"
+            );
+            let client = inner.connector.get().await?;
+            ensure!(
+                tokio::time::Instant::now() < deadline,
+                "native host work deadline exceeded"
+            );
+            Ok(client
+                .with_operation_deadline(deadline)
+                .with_rpc_lifetime_guard(Arc::new((owner, work, inner))))
+        });
+        tokio::time::timeout_at(deadline, job)
+            .await
+            .map_err(|_| tonic::Status::deadline_exceeded("native host work deadline exceeded"))?
+    }
+    /// Drain independently accepted host/connector work after stopping producers.
+    pub async fn wait_for_owned_work(&self) {
+        self.drain_control().await;
+        self.inner.metadata_work.wait_for_idle().await;
     }
     pub fn client_id(&self) -> [u8; 16] {
         self.inner.ledger.client

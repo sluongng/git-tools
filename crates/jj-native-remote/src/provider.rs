@@ -427,6 +427,10 @@ impl NativeObjectIo for RemoteObjectIo {
                     .get()
                     .await?
                     .with_rpc_lifetime_guard(Arc::new(owner.clone()));
+                let client = match io::scope() {
+                    Some(scope) => client.with_operation_deadline(scope.deadline),
+                    None => client,
+                };
                 io::network(client.download_file(m::ObjectId(id.0), &self.inner.staging)).await?
             };
             ensure!(
@@ -533,6 +537,10 @@ impl RemoteSource {
                         .get()
                         .await?
                         .with_rpc_lifetime_guard(Arc::new(owner));
+                    let client = match io::scope() {
+                        Some(scope) => client.with_operation_deadline(scope.deadline),
+                        None => client,
+                    };
                     io::network(client.download_file(m::ObjectId(id.0), &self.inner.staging))
                         .await?
                 };
@@ -630,6 +638,10 @@ impl BlobSource for RemoteSource {
     }
     async fn missing(&self, artifacts: &[Artifact]) -> Result<Vec<Artifact>> {
         let client = self.inner.connector.get().await?;
+        let client = match io::scope() {
+            Some(scope) => client.with_operation_deadline(scope.deadline),
+            None => client,
+        };
         let mut keys = Vec::new();
         for artifact in artifacts {
             ensure!(

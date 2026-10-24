@@ -36,6 +36,7 @@ toml = "1.1"
 tonic = { version = "0.14", features = ["zstd"] }
 
 [dev-dependencies]
+tinytree-cloud = { path = "../tinytree-cloud" }
 native-capture-pack = { path = "../native-capture-pack" }
 tinytree-index = { path = "../tinytree-index" }
 tinytree-client = { path = "../tinytree-client" }

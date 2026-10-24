@@ -82,6 +82,7 @@ pub struct NativeWorkspaces {
     /// Experimental opt-in; existing index/type always wins on reload.
     pub index_mode: NativeIndexMode,
     pub capture: NativeCapture,
+    pub upload: NativeCaptureUpload,
     /// None uses the per-user registry shared with the native jj client.
     pub registry_path: Option<PathBuf>,
     pub max_workspaces: usize,
@@ -95,6 +96,7 @@ impl Default for NativeWorkspaces {
         Self {
             index_mode: NativeIndexMode::Legacy,
             capture: NativeCapture::default(),
+            upload: NativeCaptureUpload::default(),
             registry_path: None,
             max_workspaces: 128,
             max_entries: 100_000,
@@ -107,6 +109,7 @@ impl Default for NativeWorkspaces {
 impl NativeWorkspaces {
     fn validate(&self) -> Result<()> {
         self.capture.validate()?;
+        self.upload.validate()?;
         ensure!(
             (1..=4096).contains(&self.max_workspaces)
                 && (1..=1_000_000).contains(&self.max_entries)
@@ -122,6 +125,60 @@ impl NativeWorkspaces {
                 "native workspace registry must be a bounded absolute path"
             );
         }
+        Ok(())
+    }
+}
+
+/// Background publication retains every local pending ticket, root and pack.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum NativeCaptureUploadPolicy {
+    #[default]
+    Disabled,
+    PublishRetainingRoots,
+}
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct NativeCaptureUpload {
+    pub policy: NativeCaptureUploadPolicy,
+    pub poll_ms: u64,
+    pub timeout_ms: u64,
+    pub max_jobs: usize,
+    pub max_job_bytes: usize,
+    pub max_disk_bytes: u64,
+    pub max_memory_bytes: u64,
+    pub max_temporary_bytes: u64,
+    pub max_bundle_bytes: u64,
+}
+impl Default for NativeCaptureUpload {
+    fn default() -> Self {
+        Self {
+            policy: NativeCaptureUploadPolicy::Disabled,
+            poll_ms: 30_000,
+            timeout_ms: 120_000,
+            max_jobs: 256,
+            max_job_bytes: 20 * 1024 * 1024,
+            max_disk_bytes: 512 * 1024 * 1024,
+            max_memory_bytes: 2 * 1024 * 1024 * 1024,
+            max_temporary_bytes: 512 * 1024 * 1024,
+            max_bundle_bytes: 256 * 1024 * 1024,
+        }
+    }
+}
+impl NativeCaptureUpload {
+    pub(crate) fn validate(&self) -> Result<()> {
+        ensure!(
+            (250..=3_600_000).contains(&self.poll_ms)
+                && (1000..=600_000).contains(&self.timeout_ms)
+                && (1..=1024).contains(&self.max_jobs)
+                && (4096..=32 * 1024 * 1024).contains(&self.max_job_bytes)
+                && self.max_disk_bytes >= self.max_job_bytes as u64
+                && self.max_disk_bytes <= 4 * 1024 * 1024 * 1024
+                && (512 * 1024 * 1024..=4 * 1024 * 1024 * 1024).contains(&self.max_memory_bytes)
+                && self.max_temporary_bytes <= 2 * 1024 * 1024 * 1024
+                && (4096..=1024 * 1024 * 1024).contains(&self.max_bundle_bytes),
+            "invalid native capture upload bounds"
+        );
         Ok(())
     }
 }
@@ -810,6 +867,19 @@ mod tests {
             NativeCapturePolicy::AfterCommandBestEffort
         );
         assert!(enabled.validate().is_ok());
+        assert_eq!(
+            old.native.workspaces.upload.policy,
+            NativeCaptureUploadPolicy::Disabled
+        );
+        let upload: Config = toml::from_str(
+            "[native.workspaces.upload]\npolicy='publish_retaining_roots'\npoll_ms=250\n",
+        )
+        .unwrap();
+        let mut upload_enabled = old.clone();
+        upload_enabled.native.workspaces.upload = upload.native.workspaces.upload;
+        assert!(upload_enabled.validate().is_ok());
+        upload_enabled.native.workspaces.upload.max_jobs = 0;
+        assert!(upload_enabled.validate().is_err());
         let mut bad_capture = enabled.clone();
         bad_capture.native.workspaces.capture.max_pending = 0;
         assert!(bad_capture.validate().is_err());

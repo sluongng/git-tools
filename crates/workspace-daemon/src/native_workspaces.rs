@@ -26,6 +26,7 @@ const MAX_RECORD: usize = 32 * 1024;
 #[derive(Clone)]
 pub(crate) struct Repository {
     pub local_objects: Arc<jj_native_backend::DirectObjectIo>,
+    pub(crate) upload: Option<Arc<crate::native_capture_upload::Source>>,
     pub io: Arc<dyn NativeObjectIo>,
     pub scope: Scope,
     pub remote: bool,
@@ -894,6 +895,7 @@ mod tests {
                 "example".into(),
                 Repository {
                     local_objects: provider.clone(),
+                    upload: None,
                     io: provider,
                     scope: Scope::from_configured_identity("example", &[8; 32])?,
                     remote: false,
@@ -942,4 +944,25 @@ mod tests {
         assert_eq!(fs::read(&preserved)?, b"preserve this file");
         Ok(())
     }
+}
+
+/// Validate only the private saved record; never probe the possibly stopped or
+/// paused mount. The saved command mapping already selected this exact ID.
+pub(crate) fn capture_upload_workspace(
+    state: &Path,
+    mount: &str,
+    alias: &str,
+    identity: &[u8; 32],
+) -> Result<[u8; 32]> {
+    let id = unhex(mount)?;
+    let directory = PrivateDir::open_existing(state.join("native-workspaces").join(mount))?;
+    let record: Record = serde_json::from_slice(&directory.read("workspace.json", MAX_RECORD)?)?;
+    validate_record(&record)?;
+    ensure!(
+        record.workspace_id == id
+            && record.store == alias
+            && record.scope == Scope::from_configured_identity(alias, identity)?.backend(),
+        "capture route differs from workspace record"
+    );
+    Ok(id)
 }

@@ -585,6 +585,7 @@ fn open_native_host(
 
     let mut retained = BTreeMap::new();
     let mut local_objects = BTreeMap::new();
+    let mut upload_sources = BTreeMap::new();
     for (alias, settings) in &config.native.repositories {
         let path = root.join(alias);
         private_dir(&path)?;
@@ -618,6 +619,7 @@ fn open_native_host(
             )
             .map_err(|_| anyhow::anyhow!("cannot open configured native remote; state retained"))?;
 
+            upload_sources.insert(alias.clone(), (remote.io.clone(), remote.control.clone()));
             queries.insert(alias.clone(), remote.query);
             stores.insert(alias.clone(), remote.io);
             controls.insert(alias.clone(), Arc::new(remote.control));
@@ -689,6 +691,13 @@ fn open_native_host(
         retained.insert(
             alias.clone(),
             crate::native_workspaces::Repository {
+                upload: upload_sources.remove(alias).map(|(io, control)| {
+                    Arc::new(crate::native_capture_upload::Source {
+                        io,
+                        control,
+                        identity: identities[alias],
+                    })
+                }),
                 local_objects: local_objects
                     .remove(alias)
                     .expect("configured local native provider"),
@@ -839,6 +848,10 @@ pub async fn serve(mut config: Config) -> Result<()> {
     .await
     .context("native repository startup worker failed")??;
 
+    let capture_upload_sources = native_repositories
+        .iter()
+        .filter_map(|(alias, repo)| repo.upload.clone().map(|source| (alias.clone(), source)))
+        .collect();
     if let Some(broker) = &native {
         // This wrapper carries pre-decode admission and independent body
         // deadlines; never embed the raw generated ObjectIo service instead.
@@ -1046,7 +1059,11 @@ pub async fn serve(mut config: Config) -> Result<()> {
 
     let mut state_slot = Some(state);
     let mut proxy_completed = false;
+    let mut capture_upload = None;
     let run: Result<()> = async {
+        if let Some(commands)=&native_commands {
+            capture_upload=crate::native_capture_upload::start(state_slot.as_ref().unwrap().config.clone(),commands.clone(),capture_upload_sources).await?;
+        }
         loop {
             let stream = tokio::select! {
                 result = reapi::server_io::accept_unix(&listener, &control_accept) => result.context("accepting control connection")?,
@@ -1177,6 +1194,9 @@ pub async fn serve(mut config: Config) -> Result<()> {
     }.await;
     let mut state =
         state_slot.context("mount worker lost daemon state; registry retained for recovery")?;
+    if let Some(upload) = &capture_upload {
+        upload.request_stop();
+    }
     // Native provider ownership must be settled before any later fallible
     // cleanup can return from serve() and drop the daemon state.
     cleanup_native_workspaces(&mut state, &listener, &token).await;
@@ -1214,6 +1234,9 @@ pub async fn serve(mut config: Config) -> Result<()> {
             proxy_task.abort();
             let _ = proxy_task.await;
         }
+    }
+    if let Some(upload) = capture_upload {
+        upload.shutdown().await;
     }
     if let Some(native) = &state.native {
         native
@@ -1609,6 +1632,44 @@ mod tests {
         )
         .await?;
         host.register(&binding, [8; 32]).await?;
+        // An uncertain optional outbox must disable only upload, not the real
+        // managed command lifecycle exercised below. No credentials or payload
+        // processing may precede safe catalog validation.
+        let upload_parent = private_fs::PrivateDir::create(private.path().join("native-commands"))?;
+        let upload_directory = private_fs::PrivateDir::create(upload_parent.path().join("upload"))?;
+        upload_directory.replace("unknown-state", b"preserve this unrelated state")?;
+        let mut upload_config = Config::default();
+        upload_config.state_dir = private.path().to_owned();
+        upload_config.native.workspaces.upload.policy =
+            crate::config::NativeCaptureUploadPolicy::PublishRetainingRoots;
+        upload_config.native.workspaces.upload.poll_ms = 250;
+        let upload = crate::native_capture_upload::start(
+            upload_config,
+            Arc::new(host.clone()),
+            BTreeMap::new(),
+        )
+        .await?
+        .expect("validated private directory starts auxiliary worker");
+        for _ in 0..100 {
+            if host.status()["capture_upload"]["last_disposition"] == "inventory_unavailable" {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert_eq!(
+            host.status()["capture_upload"]["last_disposition"],
+            "inventory_unavailable"
+        );
+        assert_eq!(
+            host.status()["capture_upload"]["attempted"],
+            0,
+            "unsafe catalog never reaches route/auth/upload work"
+        );
+        assert_eq!(
+            upload_directory.read("unknown-state", 64)?,
+            b"preserve this unrelated state"
+        );
+
         assert_eq!(
             host.workspace_state("workspace").await?.state,
             native_retention::WorkspaceState::Dirty
@@ -1723,6 +1784,7 @@ mod tests {
             host.register(&binding, [9; 32]).await.is_err(),
             "changed provider identity must not be adopted"
         );
+        upload.shutdown().await;
         drop(host);
         let reopened = tokio::time::timeout(Duration::from_secs(5), async {
             loop {

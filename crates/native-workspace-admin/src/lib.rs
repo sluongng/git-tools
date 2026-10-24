@@ -3,6 +3,7 @@
 //! Only an owner-private registry supplies paths and local transport authority.
 pub mod capture;
 pub mod remote_state;
+pub mod restore;
 
 use std::{
     fs::{self, File},
