@@ -575,6 +575,15 @@ impl p::workspace_cloud_server::WorkspaceCloud for CloudService {
                 "private workspace publication exceeds budget",
             ));
         }
+        // Indexed manifests require the separate artifact-aware RPC admission.
+        // This adapter intentionally retains its schema1 resource contract.
+        if input.manifest.get(..8) == Some(b"TTCLOUD\0".as_slice())
+            && input.manifest.get(8..10) == Some([2u8, 0].as_slice())
+        {
+            return Err(Status::unimplemented(
+                "indexed cloud manifests are not enabled by this RPC adapter",
+            ));
+        }
         let publish = s::PublishCloudRequest {
             workspace: array(&input.workspace_id)?,
             expected_generation: input.expected_generation,
@@ -627,7 +636,7 @@ impl p::workspace_cloud_server::WorkspaceCloud for CloudService {
         limits.max_manifest_bytes = host.config.max_manifest_bytes;
         let value = execute(work.clone(), move || {
             store
-                .read_cloud_version(
+                .read_cloud_version_v1(
                     &input.repository_id,
                     owner,
                     workspace_id,
@@ -636,7 +645,10 @@ impl p::workspace_cloud_server::WorkspaceCloud for CloudService {
                 )
                 .map_err(status)
         })
-        .await?;
+        .await?
+        .ok_or_else(|| {
+            Status::unimplemented("indexed cloud manifests are not enabled by this RPC adapter")
+        })?;
         let version = value.version();
         let output = p::Version {
             workspace_id: version.workspace.to_vec(),
@@ -668,5 +680,212 @@ impl p::workspace_cloud_server::WorkspaceCloud for CloudService {
             work,
             (),
         ))
+    }
+}
+
+#[cfg(test)]
+mod indexed_adapter_tests {
+    use super::*;
+    use p::workspace_cloud_server::WorkspaceCloud;
+    #[tokio::test]
+    async fn legacy_rpc_rejects_indexed_publish_and_read_before_artifact_work() {
+        let directory = tempfile::tempdir().unwrap();
+        let profile: crate::Config =
+            toml::from_str(include_str!("../examples/cloud.toml")).unwrap();
+        let store = s::Store::open(
+            directory.path(),
+            profile
+                .store
+                .materialize(profile.service.max_metadata_bytes),
+        )
+        .unwrap();
+        store.create_repository("example").unwrap();
+        let repository = RepositoryService::new(
+            store.clone(),
+            profile.service,
+            vec!["example".into()],
+            Vec::new(),
+        )
+        .unwrap();
+        let identity = repository.query_identity(&Default::default()).unwrap();
+        let owner = s::CloudOwner {
+            principal: crate::retention::owner_hash(&identity),
+        };
+        let indexed = tinytree_cloud::build_index_artifacts(
+            &tinytree_cloud::PortableIndexSnapshot {
+                roots: vec![tinytree_model::CommitId::ROOT],
+                drafts: vec![],
+            },
+            Default::default(),
+        )
+        .unwrap();
+        for artifact in &indexed.artifacts {
+            store
+                .put_cloud_index_artifact(
+                    "example",
+                    owner,
+                    artifact.descriptor,
+                    &artifact.bytes,
+                    0,
+                    Default::default(),
+                )
+                .unwrap();
+        }
+        let value = tinytree_cloud::ManifestV2 {
+            recovery: tinytree_cloud::Manifest {
+                workspace: [41; 32],
+                exporter: [42; 16],
+                sequence: 1,
+                operation_heads: vec![[0; 64]],
+                undo_operations: vec![],
+                intent_operations: vec![],
+                working_copy: tinytree_cloud::WorkingCopy {
+                    workspace_name: "task".into(),
+                    wc_operation: [0; 64],
+                    snapshot_operation: [0; 64],
+                    snapshot_commit: [0; 32],
+                    tree: tinytree_model::synthetic_root().root_tree,
+                },
+                parents: vec![],
+                members: vec![],
+                intent_roots: vec![],
+                native_roots: vec![tinytree_model::empty_tree().descriptor.key],
+                coverage: tinytree_cloud::Coverage::FullRequired,
+                detached: vec![],
+            },
+            operation_indexes: vec![tinytree_cloud::OperationIndex {
+                operation: [0; 64],
+                root: indexed.root.id,
+            }],
+            index_roots: vec![indexed.root],
+        };
+        let manifest = tinytree_cloud::encode_manifest_v2(&value, Default::default()).unwrap();
+        let id = tinytree_cloud::ManifestId::of(&manifest);
+        let host = repository.cloud_host().unwrap();
+        let service = CloudService::new(repository);
+        let mut request = Request::new(p::PublishVersionRequest {
+            repository_id: "example".into(),
+            workspace_id: vec![41; 32],
+            expected_generation: 0,
+            idempotency_key: "indexed-adapter-gate".into(),
+            manifest_id: id.0.to_vec(),
+            manifest: manifest.clone(),
+            staging_leases: vec![],
+        });
+        request.extensions_mut().insert(
+            host.admit(
+                "PublishVersion",
+                Instant::now() + std::time::Duration::from_secs(2),
+            )
+            .unwrap(),
+        );
+        assert_eq!(
+            service.publish_version(request).await.unwrap_err().code(),
+            tonic::Code::Unimplemented
+        );
+        assert_eq!(
+            store
+                .get_cloud_workspace("example", owner, [41; 32])
+                .unwrap()
+                .generation,
+            0
+        );
+        assert_eq!(
+            store
+                .cloud_publication("example", owner, "indexed-adapter-gate")
+                .unwrap(),
+            None
+        );
+        store
+            .publish_cloud_version(
+                "example",
+                owner,
+                &s::PublishCloudRequest {
+                    workspace: [41; 32],
+                    expected_generation: 0,
+                    idempotency_key: "indexed-adapter-gate".into(),
+                    manifest: id,
+                    manifest_bytes: manifest,
+                    staging_leases: vec![],
+                },
+                1,
+                &Default::default(),
+            )
+            .unwrap();
+        // Removing actual payloads makes a heavy/general read fail. The legacy
+        // adapter must still report its unsupported schema without loading them.
+        let namespace = std::fs::read_dir(directory.path().join("cloud"))
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path();
+        for artifact in &indexed.artifacts {
+            let digest = artifact
+                .descriptor
+                .selected
+                .blake3
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>();
+            std::fs::remove_file(namespace.join(digest)).unwrap();
+        }
+        let mut metadata = Request::new(p::GetWorkspaceRequest {
+            repository_id: "example".into(),
+            workspace_id: vec![41; 32],
+        });
+        metadata.extensions_mut().insert(
+            host.admit(
+                "GetWorkspace",
+                Instant::now() + std::time::Duration::from_secs(2),
+            )
+            .unwrap(),
+        );
+        assert_eq!(
+            service
+                .get_workspace(metadata)
+                .await
+                .unwrap()
+                .into_inner()
+                .generation,
+            1
+        );
+        let mut metadata = Request::new(p::GetPublicationRequest {
+            repository_id: "example".into(),
+            idempotency_key: "indexed-adapter-gate".into(),
+        });
+        metadata.extensions_mut().insert(
+            host.admit(
+                "GetPublication",
+                Instant::now() + std::time::Duration::from_secs(2),
+            )
+            .unwrap(),
+        );
+        assert!(
+            service
+                .get_publication(metadata)
+                .await
+                .unwrap()
+                .into_inner()
+                .publication
+                .is_some()
+        );
+        let mut request = Request::new(p::GetVersionRequest {
+            repository_id: "example".into(),
+            workspace_id: vec![41; 32],
+            generation: 1,
+        });
+        request.extensions_mut().insert(
+            host.admit(
+                "GetVersion",
+                Instant::now() + std::time::Duration::from_secs(2),
+            )
+            .unwrap(),
+        );
+        assert_eq!(
+            service.get_version(request).await.unwrap_err().code(),
+            tonic::Code::Unimplemented
+        );
+        assert_eq!(host.active_jobs(), 0);
     }
 }

@@ -1,6 +1,185 @@
 //! Atomic workspace versions. All published history is retained in this format.
+use super::artifacts::{IndexStage, artifact_key};
 use super::*;
-use tinytree_cloud::{Manifest, ManifestId, ManifestLimits, decode_manifest, verify_coverage};
+use tinytree_cloud::{
+    IndexArtifactDescriptor, IndexArtifactId, IndexRootId, Manifest, ManifestId, ManifestLimits,
+    ManifestV2, ManifestV2Limits, VerifiedIndexArtifact, decode_manifest, decode_manifest_v2,
+    verify_coverage, verify_coverage_v2, verify_index_artifact_graph,
+};
+
+enum RecoveryManifest {
+    V1(Manifest),
+    V2(ManifestV2),
+}
+fn v2_error(error: tinytree_cloud::Error, invalid: &'static str) -> Error {
+    match error {
+        tinytree_cloud::Error::Limit(_) => Error::Limit("cloud index validation budget"),
+        _ => Error::Invalid(invalid),
+    }
+}
+impl std::ops::Deref for RecoveryManifest {
+    type Target = Manifest;
+    fn deref(&self) -> &Manifest {
+        match self {
+            Self::V1(v) => v,
+            Self::V2(v) => &v.recovery,
+        }
+    }
+}
+impl RecoveryManifest {
+    fn format(&self) -> u8 {
+        match self {
+            Self::V1(_) => 1,
+            Self::V2(_) => 2,
+        }
+    }
+}
+#[derive(Clone, Copy, Default, Debug, Eq, PartialEq)]
+struct ExtraWork {
+    records: u64,
+    metadata: u64,
+    payload: u64,
+}
+impl ExtraWork {
+    fn row(&mut self, key: &[u8], bytes: &[u8]) -> Result<()> {
+        self.records = self
+            .records
+            .checked_add(1)
+            .ok_or(Error::Limit("cloud index proof work"))?;
+        self.metadata = self
+            .metadata
+            .checked_add((key.len() + bytes.len()) as u64)
+            .ok_or(Error::Limit("cloud index proof work"))?;
+        Ok(())
+    }
+    fn raw(&mut self, bytes: u64) -> Result<()> {
+        self.payload = self
+            .payload
+            .checked_add(bytes)
+            .ok_or(Error::Limit("cloud index proof work"))?;
+        Ok(())
+    }
+    fn check(&self, inner: &Inner) -> Result<()> {
+        if self.records > inner.config.max_retention_validation_records as u64
+            || self.metadata > inner.config.max_retention_validation_bytes
+            || self.payload > inner.config.cloud.max_validation_payload_bytes
+        {
+            return Err(Error::Limit("cloud index proof work"));
+        }
+        Ok(())
+    }
+    fn charge(&self, inner: &Inner, scan: &mut Scan) -> Result<()> {
+        scan.records = scan
+            .records
+            .checked_add(
+                usize::try_from(self.records)
+                    .map_err(|_| Error::Limit("cloud index proof work"))?,
+            )
+            .ok_or(Error::Limit("cloud index proof work"))?;
+        scan.bytes = scan
+            .bytes
+            .checked_add(self.metadata)
+            .ok_or(Error::Limit("cloud index proof work"))?;
+        scan.payload(inner, self.payload)?;
+        if scan.records > inner.config.max_retention_validation_records
+            || scan.bytes > inner.config.max_retention_validation_bytes
+        {
+            return Err(Error::Limit("cloud catalog scan"));
+        }
+        Ok(())
+    }
+}
+struct ProofMemory {
+    used: usize,
+    maximum: usize,
+}
+impl ProofMemory {
+    fn charge(&mut self, bytes: usize) -> Result<()> {
+        self.used = self
+            .used
+            .checked_add(bytes)
+            .filter(|n| *n <= self.maximum)
+            .ok_or(Error::Limit("cloud index native proof memory"))?;
+        Ok(())
+    }
+    fn release(&mut self, bytes: usize) {
+        self.used = self
+            .used
+            .checked_sub(bytes)
+            .expect("native proof memory ownership");
+    }
+}
+fn snapshot_memory(value: &tinytree_cloud::PortableIndexSnapshot) -> Result<usize> {
+    let mut bytes = std::mem::size_of_val(value)
+        .checked_add(4096)
+        .and_then(|n| {
+            n.checked_add(
+                value
+                    .roots
+                    .capacity()
+                    .checked_mul(std::mem::size_of::<CommitId>())?,
+            )
+        })
+        .and_then(|n| {
+            n.checked_add(
+                value
+                    .drafts
+                    .capacity()
+                    .checked_mul(std::mem::size_of::<tinytree_cloud::IndexDraft>())?,
+            )
+        })
+        .ok_or(Error::Limit("cloud index snapshot memory"))?;
+    for draft in &value.drafts {
+        bytes = bytes
+            .checked_add(
+                draft
+                    .parents
+                    .capacity()
+                    .checked_mul(std::mem::size_of::<CommitId>())
+                    .ok_or(Error::Limit("cloud index snapshot memory"))?,
+            )
+            .ok_or(Error::Limit("cloud index snapshot memory"))?;
+    }
+    Ok(bytes)
+}
+#[derive(Clone)]
+struct VersionRoots {
+    native: Vec<ObjectKey>,
+    artifacts: Vec<IndexArtifactDescriptor>,
+    extra: ExtraWork,
+}
+impl Inner {
+    fn v2_limits(&self, limits: ManifestLimits) -> Result<ManifestV2Limits> {
+        Ok(ManifestV2Limits {
+            recovery: self.manifest_limits(limits)?,
+            artifacts: self.index_limits(self.config.cloud.index_artifacts)?,
+            max_index_roots: self.config.cloud.index_artifacts.max_snapshots,
+            max_operation_indexes: self
+                .config
+                .cloud
+                .manifest_limits
+                .max_members
+                .checked_add(1)
+                .ok_or(Error::Limit("cloud operation index count"))?,
+        })
+    }
+    fn decode_recovery(
+        &self,
+        bytes: &[u8],
+        id: ManifestId,
+        limits: ManifestLimits,
+    ) -> Result<RecoveryManifest> {
+        match bytes.get(8..10) {
+            Some([1, 0]) => decode_manifest(bytes, id, self.manifest_limits(limits)?)
+                .map(RecoveryManifest::V1)
+                .map_err(|_| Error::Invalid("cloud manifest encoding")),
+            Some([2, 0]) => decode_manifest_v2(bytes, id, self.v2_limits(limits)?)
+                .map(RecoveryManifest::V2)
+                .map_err(|error| v2_error(error, "cloud v2 manifest encoding")),
+            _ => Err(Error::Invalid("cloud manifest version")),
+        }
+    }
+}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CloudWorkspace {
@@ -157,9 +336,122 @@ fn decode_roots(bytes: &[u8], id: ManifestId, maximum: usize) -> Result<Vec<Obje
     }
     Ok(roots)
 }
+fn encode_version_roots(id: ManifestId, value: &VersionRoots, format: u8) -> Result<Vec<u8>> {
+    let mut bytes = encode_roots(id, &value.native)?;
+    if format == 1 {
+        if !value.artifacts.is_empty() || value.extra != ExtraWork::default() {
+            return Err(Error::Corrupt("v1 index roots"));
+        }
+        return Ok(bytes);
+    }
+    bytes[..8].copy_from_slice(b"TTROOT02");
+    bytes.extend_from_slice(&1u16.to_le_bytes());
+    for n in [
+        value.extra.records,
+        value.extra.metadata,
+        value.extra.payload,
+    ] {
+        bytes.extend_from_slice(&n.to_le_bytes());
+    }
+    bytes.extend_from_slice(
+        &u32::try_from(value.artifacts.len())
+            .map_err(|_| Error::Limit("cloud artifact closure"))?
+            .to_le_bytes(),
+    );
+    for d in &value.artifacts {
+        match d.id {
+            IndexArtifactId::Root(id) => {
+                bytes.push(1);
+                bytes.extend_from_slice(&id.0);
+            }
+            IndexArtifactId::Node(id) => {
+                bytes.push(2);
+                bytes.extend_from_slice(&id.0);
+            }
+        }
+        bytes.extend_from_slice(&d.selected.blake3);
+        bytes.extend_from_slice(&d.selected.size_bytes.to_le_bytes());
+    }
+    if bytes.len() > CLOUD_BINARY_ROW_BYTES {
+        return Err(Error::Limit("cloud root record"));
+    }
+    Ok(bytes)
+}
+fn decode_version_roots(
+    bytes: &[u8],
+    id: ManifestId,
+    native_max: usize,
+    artifact_max: usize,
+    format: u8,
+) -> Result<VersionRoots> {
+    if format == 1 {
+        return Ok(VersionRoots {
+            native: decode_roots(bytes, id, native_max)?,
+            artifacts: Vec::new(),
+            extra: ExtraWork::default(),
+        });
+    }
+    if bytes.len() < 74
+        || bytes.len() > CLOUD_BINARY_ROW_BYTES
+        || &bytes[..8] != b"TTROOT02"
+        || bytes[8..40] != id.0
+    {
+        return Err(Error::Corrupt("cloud v2 root record"));
+    }
+    let count = u32::from_le_bytes(bytes[40..44].try_into().unwrap()) as usize;
+    let end = count
+        .checked_mul(33)
+        .and_then(|n| n.checked_add(44))
+        .filter(|n| n.checked_add(30).is_some_and(|n| n <= bytes.len()))
+        .ok_or(Error::Corrupt("cloud v2 root count"))?;
+    let mut legacy = bytes[..end].to_vec();
+    legacy[..8].copy_from_slice(b"TTROOT01");
+    let native = decode_roots(&legacy, id, native_max)?;
+    if bytes[end..end + 2] != 1u16.to_le_bytes() {
+        return Err(Error::Corrupt("cloud v2 proof policy"));
+    }
+    let extra = ExtraWork {
+        records: u64::from_le_bytes(bytes[end + 2..end + 10].try_into().unwrap()),
+        metadata: u64::from_le_bytes(bytes[end + 10..end + 18].try_into().unwrap()),
+        payload: u64::from_le_bytes(bytes[end + 18..end + 26].try_into().unwrap()),
+    };
+    let n = u32::from_le_bytes(bytes[end + 26..end + 30].try_into().unwrap()) as usize;
+    if n > artifact_max
+        || n.checked_mul(73).and_then(|n| n.checked_add(end + 30)) != Some(bytes.len())
+    {
+        return Err(Error::Corrupt("cloud artifact closure count"));
+    }
+    let mut artifacts = Vec::with_capacity(n);
+    let mut previous = None;
+    for raw in bytes[end + 30..].chunks_exact(73) {
+        let digest: [u8; 32] = raw[1..33].try_into().unwrap();
+        let key = match raw[0] {
+            1 => IndexArtifactId::Root(IndexRootId(digest)),
+            2 => IndexArtifactId::Node(tinytree_cloud::IndexNodeId(digest)),
+            _ => return Err(Error::Corrupt("cloud artifact closure kind")),
+        };
+        if previous.is_some_and(|old| old >= key) {
+            return Err(Error::Corrupt("cloud artifact closure order"));
+        }
+        previous = Some(key);
+        artifacts.push(IndexArtifactDescriptor {
+            id: key,
+            selected: BlobDigest {
+                blake3: raw[33..65].try_into().unwrap(),
+                size_bytes: u64::from_le_bytes(raw[65..73].try_into().unwrap()),
+            },
+        });
+    }
+    Ok(VersionRoots {
+        native,
+        artifacts,
+        extra,
+    })
+}
 struct ValidationGuard {
     native: Vec<ObjectKey>,
     cloud: Vec<CloudId>,
+    artifacts: Vec<IndexArtifactId>,
     version: Option<([u8; 32], u64)>,
     repo: String,
     owner: CloudOwner,
@@ -188,6 +480,15 @@ impl Drop for ValidationGuard {
                     *count -= 1;
                     if *count == 0 {
                         gate.readers.remove(&key);
+                    }
+                }
+            }
+            for id in &self.artifacts {
+                let key = (self.repo.clone(), self.owner.principal, *id);
+                if let Some(count) = gate.index_artifact_readers.get_mut(&key) {
+                    *count -= 1;
+                    if *count == 0 {
+                        gate.index_artifact_readers.remove(&key);
                     }
                 }
             }
@@ -327,7 +628,7 @@ impl Inner {
         self: &Arc<Self>,
         repo: &str,
         owner: CloudOwner,
-        manifest: &Manifest,
+        manifest: &RecoveryManifest,
         gate: &mut Runtime,
     ) -> Result<ValidationGuard> {
         self.check_version_work(manifest)?;
@@ -341,6 +642,30 @@ impl Inner {
                 ));
             }
         }
+        let artifacts = match manifest {
+            RecoveryManifest::V1(_) => Vec::new(),
+            RecoveryManifest::V2(value) => value
+                .index_roots
+                .iter()
+                .map(|root| {
+                    let id = IndexArtifactId::Root(root.id);
+                    let record = self
+                        .index_record(repo, owner, id)?
+                        .ok_or(Error::Invalid("cloud index root unavailable"))?;
+                    if record.selected.descriptor()?.selected != root.selected {
+                        return Err(Error::Invalid("cloud index selected root mismatch"));
+                    }
+                    if gate
+                        .index_artifact_readers
+                        .get(&(repo.into(), owner.principal, id))
+                        == Some(&usize::MAX)
+                    {
+                        return Err(Error::Limit("cloud index root readers"));
+                    }
+                    Ok(id)
+                })
+                .collect::<Result<Vec<_>>>()?,
+        };
         for key in &manifest.native_roots {
             self.descriptor(repo, *key)?
                 .ok_or(Error::MissingObject(*key))?;
@@ -367,9 +692,16 @@ impl Inner {
                 .entry((repo.into(), owner.principal, *id))
                 .or_default() += 1;
         }
+        for id in &artifacts {
+            *gate
+                .index_artifact_readers
+                .entry((repo.into(), owner.principal, *id))
+                .or_default() += 1;
+        }
         Ok(ValidationGuard {
             native,
             cloud,
+            artifacts,
             version: None,
             repo: repo.into(),
             owner,
@@ -380,10 +712,21 @@ impl Inner {
         &self,
         repo: &str,
         owner: CloudOwner,
-        manifest: &Manifest,
+        manifest: &RecoveryManifest,
         limits: ManifestLimits,
         files: Option<bool>,
-    ) -> Result<Vec<ObjectKey>> {
+    ) -> Result<VersionRoots> {
+        self.validate_manifest_packing(repo, owner, manifest, limits, files, &HashSet::new())
+    }
+    fn validate_manifest_packing(
+        &self,
+        repo: &str,
+        owner: CloudOwner,
+        manifest: &RecoveryManifest,
+        limits: ManifestLimits,
+        files: Option<bool>,
+        planned: &HashSet<ObjectKey>,
+    ) -> Result<VersionRoots> {
         self.check_version_work(manifest)?;
         let mut objects = Vec::with_capacity(manifest.members.len());
         let mut retained = objects
@@ -396,13 +739,58 @@ impl Inner {
             payload: 0,
         };
         for member in &manifest.members {
-            let record = self
-                .cloud_object(repo, owner, member.id)?
-                .ok_or(Error::Corrupt("retained cloud member missing"))?;
+            let (record, metadata_scratch) = if matches!(manifest, RecoveryManifest::V2(_)) {
+                let key = object_key(repo, owner, member.id);
+                let bytes = self
+                    .db
+                    .read_tx()
+                    .get(&self.spaces.cloud.objects, &key)?
+                    .ok_or(Error::Corrupt("retained cloud member missing"))?;
+                let scratch = bytes
+                    .len()
+                    .checked_mul(16)
+                    .and_then(|n| n.checked_add(4096))
+                    .ok_or(Error::Limit("cloud version decoded object budget"))?;
+                if retained
+                    .checked_add(scratch)
+                    .is_none_or(|n| n > self.config.cloud.max_version_decode_bytes)
+                {
+                    return Err(Error::Limit("cloud version decoded object budget"));
+                }
+                let record: ObjectRecord = decode(&bytes)?;
+                if record.version != 1 || record.selected.descriptor()?.id != member.id {
+                    return Err(Error::Corrupt("cloud catalog identity"));
+                }
+                (record, scratch)
+            } else {
+                (
+                    self.cloud_object(repo, owner, member.id)?
+                        .ok_or(Error::Corrupt("retained cloud member missing"))?,
+                    0,
+                )
+            };
             if record.selected.descriptor()?.selected != member.selected {
                 return Err(Error::Corrupt(
                     "retained cloud member representation changed",
                 ));
+            }
+            if matches!(manifest, RecoveryManifest::V2(_)) {
+                // Admit the actual configured OP codec worker plus its bounded
+                // raw input/copy buffers while prior decoded members and this
+                // selected-record JSON remain live. Schema1 policy is unchanged.
+                let scratch = usize::try_from(member.selected.size_bytes)
+                    .ok()
+                    .and_then(|n| n.checked_mul(3))
+                    .and_then(|n| n.checked_add(self.config.cloud.max_decode_bytes))
+                    .and_then(|n| n.checked_add(metadata_scratch))
+                    .and_then(|n| n.checked_add(4096))
+                    .ok_or(Error::Limit("cloud version decoded object budget"))?;
+                if retained
+                    .checked_add(scratch)
+                    .is_none_or(|n| n > self.config.cloud.max_version_decode_bytes)
+                {
+                    return Err(Error::Limit("cloud version decoded object budget"));
+                }
             }
             let object = self.verify_cloud_backing(repo, owner, &record, &mut scan)?;
             retained = retained
@@ -417,42 +805,485 @@ impl Inner {
             }
             objects.push(object);
         }
-        let verified = verify_coverage(manifest, &objects, limits)
-            .map_err(|_| Error::Invalid("cloud manifest coverage"))?;
-        let wc = verified.working_copy();
-        let actual = if wc.snapshot_commit == [0; 32] {
-            tinytree_model::synthetic_root()
+        let op_retained = retained;
+        let mut extra = ExtraWork::default();
+        let mut artifacts = Vec::new();
+        match manifest {
+            RecoveryManifest::V1(value) => {
+                verify_coverage(value, &objects, limits)
+                    .map_err(|_| Error::Invalid("cloud manifest coverage"))?;
+            }
+            RecoveryManifest::V2(value) => {
+                let mut policy = self.v2_limits(limits)?;
+                let loaded =
+                    self.load_index_artifacts(repo, owner, value, &mut extra, &mut retained)?;
+                let spare_slots = policy
+                    .artifacts
+                    .max_artifacts
+                    .checked_mul(std::mem::size_of::<VerifiedIndexArtifact>())
+                    .ok_or(Error::Limit("cloud index artifact allocation"))?;
+                policy.artifacts.max_decode_bytes = policy.artifacts.max_decode_bytes.min(
+                    self.config
+                        .cloud
+                        .max_version_decode_bytes
+                        .checked_sub(op_retained)
+                        .and_then(|n| n.checked_sub(spare_slots))
+                        .ok_or(Error::Limit("cloud version decoded object budget"))?,
+                );
+                let graph =
+                    verify_index_artifact_graph(&value.index_roots, &loaded, policy.artifacts)
+                        .map_err(|error| v2_error(error, "cloud index artifact coverage"))?;
+                verify_coverage_v2(value, &objects, &graph, policy)
+                    .map_err(|error| v2_error(error, "cloud v2 manifest coverage"))?;
+                let mut steps = 0usize;
+                for root in &value.index_roots {
+                    let snapshot = graph
+                        .snapshot(root.id)
+                        .map_err(|error| v2_error(error, "cloud index logical snapshot"))?;
+                    // The codec's graph validation already admitted one whole
+                    // reconstructed snapshot. Its temporary walk scratch has
+                    // dropped; keep the actual owned vectors and the live graph
+                    // lookup/decoded artifacts charged while proving ancestry.
+                    let graph_lookup = loaded
+                        .len()
+                        .checked_mul(512)
+                        .and_then(|n| n.checked_add(4096))
+                        .ok_or(Error::Limit("cloud index graph memory"))?;
+                    let available = self
+                        .config
+                        .cloud
+                        .max_version_decode_bytes
+                        .checked_sub(retained)
+                        .and_then(|n| n.checked_sub(graph_lookup))
+                        .and_then(|n| n.checked_sub(snapshot_memory(&snapshot).ok()?))
+                        .ok_or(Error::Limit("cloud index native proof memory"))?;
+                    self.prove_index_native(
+                        repo, &snapshot, &mut extra, &mut steps, available, planned,
+                    )?;
+                }
+                artifacts = loaded
+                    .iter()
+                    .map(|artifact| artifact.descriptor())
+                    .collect();
+                artifacts.sort_by_key(|artifact| artifact.id);
+            }
+        }
+        let wc = &manifest.working_copy;
+        if matches!(manifest, RecoveryManifest::V2(_)) {
+            // Decoded artifact graphs and snapshot models have dropped here.
+            // OP/VIEWs and the selected closure descriptors remain live while
+            // validating the WC commit, even for ROOT-only index snapshots.
+            let descriptors = artifacts
+                .capacity()
+                .checked_mul(std::mem::size_of::<IndexArtifactDescriptor>())
+                .and_then(|n| n.checked_add(4096))
+                .ok_or(Error::Limit("cloud index native proof memory"))?;
+            let available = self
+                .config
+                .cloud
+                .max_version_decode_bytes
+                .checked_sub(op_retained)
+                .and_then(|n| n.checked_sub(descriptors))
+                .ok_or(Error::Limit("cloud index native proof memory"))?;
+            let mut memory = ProofMemory {
+                used: 0,
+                maximum: available,
+            };
+            let (actual, scratch) = if wc.snapshot_commit == [0; 32] {
+                memory.charge(4096)?;
+                (tinytree_model::synthetic_root(), 4096)
+            } else {
+                self.read_index_commit(
+                    repo,
+                    CommitId(wc.snapshot_commit),
+                    None,
+                    &mut extra,
+                    &mut memory,
+                    planned,
+                )?
+            };
+            let matches = actual.root_tree == wc.tree;
+            drop(actual);
+            memory.release(scratch);
+            if !matches {
+                return Err(Error::Invalid(
+                    "cloud working-copy checkpoint tree mismatch",
+                ));
+            }
         } else {
-            let key = ObjectKey {
-                kind: Kind::Commit,
-                id: ObjectId(wc.snapshot_commit),
+            let actual = if wc.snapshot_commit == [0; 32] {
+                tinytree_model::synthetic_root()
+            } else {
+                let key = ObjectKey {
+                    kind: Kind::Commit,
+                    id: ObjectId(wc.snapshot_commit),
+                };
+                let d = self
+                    .descriptor(repo, key)?
+                    .ok_or(Error::MissingObject(key))?;
+                let mut file = self.open_backing(repo, d)?;
+                let mut bytes = Vec::new();
+                file.read_to_end(&mut bytes)?;
+                tinytree_model::verify(&d, &bytes, self.config.model_limits)?;
+                let tinytree_model::Object::Commit(commit) =
+                    tinytree_model::decode(&bytes, self.config.model_limits)?
+                else {
+                    return Err(Error::Corrupt("cloud snapshot commit kind"));
+                };
+                commit
             };
-            let d = self
-                .descriptor(repo, key)?
-                .ok_or(Error::MissingObject(key))?;
-            let mut file = self.open_backing(repo, d)?;
-            let mut bytes = Vec::new();
-            file.read_to_end(&mut bytes)?;
-            tinytree_model::verify(&d, &bytes, self.config.model_limits)?;
-            let tinytree_model::Object::Commit(commit) =
-                tinytree_model::decode(&bytes, self.config.model_limits)?
-            else {
-                return Err(Error::Corrupt("cloud snapshot commit kind"));
-            };
-            commit
-        };
-        if actual.root_tree != wc.tree {
-            return Err(Error::Invalid(
-                "cloud working-copy checkpoint tree mismatch",
-            ));
+            if actual.root_tree != wc.tree {
+                return Err(Error::Invalid(
+                    "cloud working-copy checkpoint tree mismatch",
+                ));
+            }
         }
+        extra.check(self)?;
         if let Some(files) = files {
-            self.closure(repo, verified.native_roots().iter().copied(), true, files)?;
+            self.closure(repo, manifest.native_roots.iter().copied(), true, files)?;
         }
-        Ok(verified.native_roots().to_vec())
+        Ok(VersionRoots {
+            native: manifest.native_roots.clone(),
+            artifacts,
+            extra,
+        })
     }
 }
 
+impl Inner {
+    fn load_index_artifacts(
+        &self,
+        repo: &str,
+        owner: CloudOwner,
+        value: &ManifestV2,
+        work: &mut ExtraWork,
+        retained: &mut usize,
+    ) -> Result<Vec<VerifiedIndexArtifact>> {
+        let limits = self.index_limits(self.config.cloud.index_artifacts)?;
+        let slots = limits
+            .max_artifacts
+            .checked_mul(std::mem::size_of::<VerifiedIndexArtifact>())
+            .ok_or(Error::Limit("cloud index artifact allocation"))?;
+        *retained = retained
+            .checked_add(slots)
+            .filter(|n| *n <= self.config.cloud.max_version_decode_bytes)
+            .ok_or(Error::Limit("cloud version decoded object budget"))?;
+        let mut loader_scratch = 4096usize;
+        *retained = retained
+            .checked_add(loader_scratch)
+            .filter(|n| *n <= self.config.cloud.max_version_decode_bytes)
+            .ok_or(Error::Limit("cloud index loader memory"))?;
+        let mut loaded = Vec::with_capacity(limits.max_artifacts);
+        let mut seen = HashSet::new();
+        let mut pending = Vec::new();
+        for root in &value.index_roots {
+            let id = IndexArtifactId::Root(root.id);
+            if !seen.contains(&id) {
+                if seen.len() >= limits.max_artifacts {
+                    return Err(Error::Limit("cloud index artifact count"));
+                }
+                *retained = retained
+                    .checked_add(512)
+                    .filter(|n| *n <= self.config.cloud.max_version_decode_bytes)
+                    .ok_or(Error::Limit("cloud index loader memory"))?;
+                loader_scratch = loader_scratch
+                    .checked_add(512)
+                    .ok_or(Error::Limit("cloud index loader memory"))?;
+                seen.insert(id);
+                pending.push(id);
+            }
+        }
+        let mut raw = 0u64;
+        let mut steps = 0usize;
+        while let Some(id) = pending.pop() {
+            let key = artifact_key(repo, owner, id);
+            let bytes = self
+                .db
+                .read_tx()
+                .get(&self.spaces.cloud.index_artifacts, &key)?
+                .ok_or(Error::Invalid("cloud index artifact missing"))?;
+            work.row(&key, &bytes)?;
+            work.row(&key, &bytes)?;
+            work.row(&key, &bytes)?;
+            work.row(&key, &bytes)?;
+            work.check(self)?;
+            let record = self
+                .index_record(repo, owner, id)?
+                .ok_or(Error::Invalid("cloud index artifact missing"))?;
+            let d = record.selected.descriptor()?;
+            raw = raw
+                .checked_add(d.selected.size_bytes)
+                .filter(|n| *n <= limits.max_total_artifact_bytes)
+                .ok_or(Error::Limit("cloud index aggregate payload"))?;
+            work.raw(d.selected.size_bytes)?;
+            work.check(self)?;
+            let mut scan = Scan {
+                records: 0,
+                bytes: 0,
+                payload: 0,
+            };
+            let raw_memory = usize::try_from(d.selected.size_bytes)
+                .map_err(|_| Error::Limit("cloud index raw decode memory"))?;
+            let available = self
+                .config
+                .cloud
+                .max_version_decode_bytes
+                .checked_sub(*retained)
+                .and_then(|n| n.checked_sub(raw_memory))
+                .filter(|n| *n >= 4096)
+                .ok_or(Error::Limit("cloud index decoded allocation"))?;
+            let mut decode_limits = limits;
+            decode_limits.max_decode_bytes = decode_limits.max_decode_bytes.min(available);
+            let artifact =
+                self.verify_index_backing_limited(repo, owner, &record, &mut scan, decode_limits)?;
+            *retained = retained
+                .checked_add(
+                    artifact
+                        .retained_size_upper_bound()
+                        .map_err(|_| Error::Limit("cloud index decoded allocation"))?,
+                )
+                .filter(|n| *n <= self.config.cloud.max_version_decode_bytes)
+                .ok_or(Error::Limit("cloud version decoded object budget"))?;
+            let children = super::artifacts::artifact_children(artifact.artifact());
+            steps = steps
+                .checked_add(1)
+                .and_then(|n| n.checked_add(children.len()))
+                .filter(|n| *n <= limits.max_graph_steps)
+                .ok_or(Error::Limit("cloud index graph work"))?;
+            for child in children {
+                if !seen.contains(&child) {
+                    if seen.len() >= limits.max_artifacts {
+                        return Err(Error::Limit("cloud index artifact count"));
+                    }
+                    *retained = retained
+                        .checked_add(512)
+                        .filter(|n| *n <= self.config.cloud.max_version_decode_bytes)
+                        .ok_or(Error::Limit("cloud index loader memory"))?;
+                    loader_scratch = loader_scratch
+                        .checked_add(512)
+                        .ok_or(Error::Limit("cloud index loader memory"))?;
+                    seen.insert(child);
+                    pending.push(child);
+                }
+            }
+            loaded.push(artifact);
+        }
+        drop(pending);
+        drop(seen);
+        *retained = retained
+            .checked_sub(loader_scratch)
+            .ok_or(Error::Corrupt("cloud index loader memory ownership"))?;
+        Ok(loaded)
+    }
+    fn read_index_commit(
+        &self,
+        repo: &str,
+        id: CommitId,
+        expected: Option<Descriptor>,
+        work: &mut ExtraWork,
+        memory: &mut ProofMemory,
+        planned: &HashSet<ObjectKey>,
+    ) -> Result<(tinytree_model::Commit, usize)> {
+        if id == CommitId::ROOT {
+            return Err(Error::Invalid("intrinsic cloud index commit payload"));
+        }
+        let key = ObjectKey {
+            kind: Kind::Commit,
+            id: ObjectId(id.0),
+        };
+        let physical = super::super::object_key(repo, key);
+        let bytes = self
+            .db
+            .read_tx()
+            .get(&self.spaces.objects, &physical)?
+            .ok_or(Error::MissingObject(key))?;
+        let metadata = bytes
+            .len()
+            .checked_mul(16)
+            .and_then(|n| n.checked_add(4096))
+            .ok_or(Error::Limit("cloud index native proof memory"))?;
+        memory.charge(metadata)?;
+        work.row(&physical, &bytes)?;
+        work.row(&physical, &bytes)?;
+        let d = super::super::decode::<StoredDescriptor>(&bytes)?.descriptor()?;
+        if d.key != key || d.size_bytes > self.config.model_limits.max_object_bytes as u64 {
+            return Err(Error::Corrupt("cloud index native descriptor"));
+        }
+        if expected.is_some_and(|expected| expected != d) {
+            return Err(Error::Invalid("cloud index draft descriptor mismatch"));
+        }
+        drop(bytes);
+        memory.release(metadata);
+        let scratch = usize::try_from(d.size_bytes)
+            .ok()
+            .and_then(|n| n.checked_mul(16))
+            .and_then(|n| n.checked_add(4096))
+            .ok_or(Error::Limit("cloud index native proof memory"))?;
+        memory.charge(scratch)?;
+        // Loose metadata has no packed reconstruction allocation. A packed
+        // read must additionally own the actual Store's reconstruction policy.
+        let packed = if self.is_packed(repo, key)? || planned.contains(&key) {
+            usize::try_from(crate::pack::PACK_READ_CHARGE)
+                .map_err(|_| Error::Limit("cloud index packed proof memory"))?
+        } else {
+            0
+        };
+        memory.charge(packed)?;
+        work.raw(d.size_bytes)?;
+        work.check(self)?;
+        self.check_backing(repo, d)?;
+        let mut file = self.open_backing(repo, d)?;
+        let mut raw = Vec::new();
+        (&mut file).take(d.size_bytes + 1).read_to_end(&mut raw)?;
+        tinytree_model::verify(&d, &raw, self.config.model_limits)?;
+        let tinytree_model::Object::Commit(commit) =
+            tinytree_model::decode(&raw, self.config.model_limits)?
+        else {
+            return Err(Error::Corrupt("cloud index native commit kind"));
+        };
+        drop(raw);
+        drop(file);
+        memory.release(packed);
+        // Caller retains this scratch charge until the owned Commit and its
+        // parent vector have actually dropped, before admitting another node.
+        Ok((commit, scratch))
+    }
+    fn prove_index_native(
+        &self,
+        repo: &str,
+        snapshot: &tinytree_cloud::PortableIndexSnapshot,
+        work: &mut ExtraWork,
+        steps: &mut usize,
+        available: usize,
+        planned: &HashSet<ObjectKey>,
+    ) -> Result<()> {
+        let limits = self.config.cloud.index_artifacts;
+        let mut memory = ProofMemory {
+            used: 0,
+            maximum: available,
+        };
+        let mut anchors = HashSet::new();
+        let mut pending = Vec::new();
+        // 512 bytes per unique ID covers hash-table load/capacity slack and the
+        // pending Vec's amortized capacity (including minimum allocations).
+        for id in &snapshot.roots {
+            if *id != CommitId::ROOT && !anchors.contains(id) {
+                if anchors.len() >= self.config.max_closure_objects {
+                    return Err(Error::Limit("cloud index anchor proof"));
+                }
+                memory.charge(512)?;
+                anchors.insert(*id);
+                pending.push(*id);
+            }
+        }
+        while let Some(id) = pending.pop() {
+            let (mut commit, scratch) =
+                self.read_index_commit(repo, id, None, work, &mut memory, planned)?;
+            *steps = steps
+                .checked_add(1)
+                .and_then(|n| n.checked_add(commit.parents.len()))
+                .filter(|n| *n <= limits.max_graph_steps)
+                .ok_or(Error::Limit("cloud index native proof steps"))?;
+            let parents = std::mem::take(&mut commit.parents);
+            for parent in parents {
+                if parent != CommitId::ROOT && !anchors.contains(&parent) {
+                    if anchors.len() >= self.config.max_closure_objects {
+                        return Err(Error::Limit("cloud index anchor proof"));
+                    }
+                    memory.charge(512)?;
+                    anchors.insert(parent);
+                    pending.push(parent);
+                }
+            }
+            drop(commit);
+            memory.release(scratch);
+        }
+        // The anchor membership set remains live. Admit the separate draft
+        // lookup before collect; no allocation is justified by record count
+        // alone without the remaining shared version budget.
+        memory.charge(
+            snapshot
+                .drafts
+                .len()
+                .checked_mul(256)
+                .ok_or(Error::Limit("cloud index native proof memory"))?,
+        )?;
+        let drafts = snapshot
+            .drafts
+            .iter()
+            .map(|draft| draft.commit())
+            .collect::<HashSet<_>>();
+        for draft in &snapshot.drafts {
+            let (commit, scratch) = self.read_index_commit(
+                repo,
+                draft.commit(),
+                Some(draft.descriptor),
+                work,
+                &mut memory,
+                planned,
+            )?;
+            if commit.change_id != draft.change || commit.parents != draft.parents {
+                return Err(Error::Invalid(
+                    "cloud index draft canonical fields mismatch",
+                ));
+            }
+            *steps = steps
+                .checked_add(1)
+                .and_then(|n| n.checked_add(draft.parents.len()))
+                .filter(|n| *n <= limits.max_graph_steps)
+                .ok_or(Error::Limit("cloud index native proof steps"))?;
+            for parent in &draft.parents {
+                if *parent != CommitId::ROOT
+                    && !drafts.contains(parent)
+                    && !anchors.contains(parent)
+                {
+                    return Err(Error::Invalid(
+                        "cloud index draft parent outside exact anchors",
+                    ));
+                }
+            }
+            drop(commit);
+            memory.release(scratch);
+        }
+        Ok(())
+    }
+}
+impl ValidationGuard {
+    fn pin_artifacts(
+        &mut self,
+        descriptors: &[IndexArtifactDescriptor],
+        gate: &mut Runtime,
+    ) -> Result<()> {
+        let existing = self.artifacts.iter().copied().collect::<HashSet<_>>();
+        for d in descriptors {
+            if self
+                .inner
+                .index_record(&self.repo, self.owner, d.id)?
+                .is_none_or(|record| record.selected.descriptor().ok() != Some(*d))
+            {
+                return Err(Error::Corrupt("cloud validated artifact changed"));
+            }
+            if !existing.contains(&d.id)
+                && gate
+                    .index_artifact_readers
+                    .get(&(self.repo.clone(), self.owner.principal, d.id))
+                    == Some(&usize::MAX)
+            {
+                return Err(Error::Limit("cloud artifact readers"));
+            }
+        }
+        for d in descriptors {
+            if !existing.contains(&d.id) {
+                *gate
+                    .index_artifact_readers
+                    .entry((self.repo.clone(), self.owner.principal, d.id))
+                    .or_default() += 1;
+                self.artifacts.push(d.id);
+            }
+        }
+        Ok(())
+    }
+}
 impl Store {
     pub fn get_cloud_workspace(
         &self,
@@ -497,8 +1328,32 @@ impl Store {
         generation: u64,
         limits: ManifestLimits,
     ) -> Result<CloudVersionReadGuard> {
+        self.read_cloud_version_checked(repo, owner, workspace, generation, limits, false)?
+            .ok_or(Error::Corrupt("cloud version schema dispatch"))
+    }
+    /// Read only schema1. None denotes an indexed schema2 version without
+    /// decoding its artifact graph; metadata lookup is not a retention proof.
+    pub fn read_cloud_version_v1(
+        &self,
+        repo: &str,
+        owner: CloudOwner,
+        workspace: [u8; 32],
+        generation: u64,
+        limits: ManifestLimits,
+    ) -> Result<Option<CloudVersionReadGuard>> {
+        self.read_cloud_version_checked(repo, owner, workspace, generation, limits, true)
+    }
+    fn read_cloud_version_checked(
+        &self,
+        repo: &str,
+        owner: CloudOwner,
+        workspace: [u8; 32],
+        generation: u64,
+        limits: ManifestLimits,
+        v1_only: bool,
+    ) -> Result<Option<CloudVersionReadGuard>> {
         let limits = self.inner.manifest_limits(limits)?;
-        let (record, manifest_bytes, manifest, guard) = {
+        let (record, manifest_bytes, manifest, mut guard, indexed) = {
             let mut gate = self.inner.lock()?;
             self.inner.repository(repo)?;
             let key = version_key(repo, owner, workspace, generation);
@@ -509,12 +1364,15 @@ impl Store {
                 .get(&self.inner.spaces.cloud.versions, &key)?
                 .ok_or(Error::Invalid("cloud version unavailable"))?;
             let record: VersionRecord = decode(&bytes)?;
-            if record.format != 1
+            if ![1, 2].contains(&record.format)
                 || record.workspace != workspace
                 || record.generation != generation
                 || generation == 0
             {
                 return Err(Error::Corrupt("cloud version identity"));
+            }
+            if v1_only && record.format == 2 {
+                return Ok(None);
             }
             let id = ManifestId(record.manifest);
             let bytes = self
@@ -527,8 +1385,13 @@ impl Store {
                 )?
                 .ok_or(Error::Corrupt("cloud version manifest missing"))?
                 .to_vec();
-            let manifest = decode_manifest(&bytes, id, limits)
+            let manifest = self
+                .inner
+                .decode_recovery(&bytes, id, limits)
                 .map_err(|_| Error::Corrupt("cloud version manifest"))?;
+            if manifest.format() != record.format {
+                return Err(Error::Corrupt("cloud version manifest format"));
+            }
             if manifest.workspace != workspace {
                 return Err(Error::Corrupt("cloud version workspace"));
             }
@@ -538,7 +1401,14 @@ impl Store {
                 .read_tx()
                 .get(&self.inner.spaces.cloud.roots, &key)?
                 .ok_or(Error::Corrupt("cloud version roots missing"))?;
-            if decode_roots(&roots, id, limits.max_native_roots)? != manifest.native_roots {
+            let indexed = decode_version_roots(
+                &roots,
+                id,
+                limits.max_native_roots,
+                self.inner.config.cloud.index_artifacts.max_artifacts,
+                record.format,
+            )?;
+            if indexed.native != manifest.native_roots {
                 return Err(Error::Corrupt("cloud version native roots"));
             }
             let reader = (repo.to_owned(), owner.principal, workspace, generation);
@@ -548,15 +1418,23 @@ impl Store {
             let mut guard = self.inner.pin_manifest(repo, owner, &manifest, &mut gate)?;
             *gate.cloud_version_readers.entry(reader).or_default() += 1;
             guard.version = Some((workspace, generation));
-            (record, bytes, manifest, guard)
+            (record, bytes, manifest, guard, indexed)
         };
-        self.inner
+        let verified = self
+            .inner
             .validate_manifest(repo, owner, &manifest, limits, Some(false))?;
-        Ok(CloudVersionReadGuard {
+        if verified.artifacts != indexed.artifacts || verified.extra != indexed.extra {
+            return Err(Error::Corrupt("cloud version artifact proof"));
+        }
+        {
+            let mut gate = self.inner.lock()?;
+            guard.pin_artifacts(&verified.artifacts, &mut gate)?;
+        }
+        Ok(Some(CloudVersionReadGuard {
             version: version(&record),
             manifest: manifest_bytes,
             _guard: guard,
-        })
+        }))
     }
     pub fn publish_cloud_version(
         &self,
@@ -586,12 +1464,13 @@ impl Store {
             }
         }
         let policy = self.inner.manifest_limits(limits.manifest)?;
-        let manifest = decode_manifest(&request.manifest_bytes, request.manifest, policy)
-            .map_err(|_| Error::Invalid("cloud manifest encoding"))?;
+        let manifest =
+            self.inner
+                .decode_recovery(&request.manifest_bytes, request.manifest, policy)?;
         if manifest.workspace != request.workspace {
             return Err(Error::Invalid("cloud manifest workspace"));
         }
-        let guard = {
+        let mut guard = {
             let mut gate = self.inner.lock()?;
             self.inner.repository(repo)?;
             if let Some(receipt) = self.inner.cloud_replay(repo, owner, request, fingerprint)? {
@@ -606,7 +1485,7 @@ impl Store {
         let roots = self
             .inner
             .validate_manifest(repo, owner, &manifest, policy, Some(true))?;
-        let _gate = self.inner.lock()?;
+        let mut _gate = self.inner.lock()?;
         self.inner.repository(repo)?;
         if let Some(receipt) = self.inner.cloud_replay(repo, owner, request, fingerprint)? {
             return Ok(receipt);
@@ -649,7 +1528,8 @@ impl Store {
                 return Err(Error::Corrupt("validated cloud member changed"));
             }
         }
-        for key in &roots {
+        guard.pin_artifacts(&roots.artifacts, &mut _gate)?;
+        for key in &roots.native {
             self.inner
                 .descriptor(repo, *key)?
                 .ok_or(Error::MissingObject(*key))?;
@@ -687,28 +1567,55 @@ impl Store {
             }
             let mut key = scope(repo, owner);
             key.extend_from_slice(lease.as_bytes());
-            let bytes = view
-                .get(&self.inner.spaces.cloud.staging, &key)?
-                .ok_or(Error::Invalid("cloud staging lease unavailable"))?;
-            let stage: StageRecord = decode(&bytes)?;
-            let selected = stage.selected.descriptor()?;
-            if stage.expires <= now {
-                return Err(Error::Invalid("cloud staging lease expired"));
+            let ordinary = view.get(&self.inner.spaces.cloud.staging, &key)?;
+            let artifact = view.get(&self.inner.spaces.cloud.index_staging, &key)?;
+            match (ordinary, artifact) {
+                (Some(bytes), None) => {
+                    let stage: StageRecord = decode(&bytes)?;
+                    let selected = stage.selected.descriptor()?;
+                    if stage.expires <= now {
+                        return Err(Error::Invalid("cloud staging lease expired"));
+                    }
+                    if !manifest
+                        .members
+                        .binary_search_by_key(&selected.id, |member| member.id)
+                        .ok()
+                        .is_some_and(|index| manifest.members[index].selected == selected.selected)
+                    {
+                        return Err(Error::Invalid("unrelated cloud staging lease"));
+                    }
+                    changes.push((&self.inner.spaces.cloud.staging, key, None));
+                }
+                (None, Some(bytes)) => {
+                    let stage: IndexStage = decode(&bytes)?;
+                    let selected = stage.selected.descriptor()?;
+                    if stage.expires <= now {
+                        return Err(Error::Invalid("cloud staging lease expired"));
+                    }
+                    if !roots
+                        .artifacts
+                        .binary_search_by_key(&selected.id, |artifact| artifact.id)
+                        .ok()
+                        .is_some_and(|index| roots.artifacts[index] == selected)
+                    {
+                        return Err(Error::Invalid("unrelated cloud index staging lease"));
+                    }
+                    changes.push((&self.inner.spaces.cloud.index_staging, key, None));
+                }
+                (Some(_), Some(_)) => return Err(Error::Corrupt("ambiguous cloud staging lease")),
+                (None, None) => return Err(Error::Invalid("cloud staging lease unavailable")),
             }
-            if !manifest
-                .members
-                .iter()
-                .any(|member| member.id == selected.id && member.selected == selected.selected)
-            {
-                return Err(Error::Invalid("unrelated cloud staging lease"));
-            }
-            changes.push((&self.inner.spaces.cloud.staging, key, None));
             consumed += 1;
         }
-        self.inner
-            .check_cloud_promise_quota(repo, owner, &manifest, &limits.retention)?;
+        self.inner.check_cloud_promise_quota(
+            repo,
+            owner,
+            &manifest,
+            &roots.artifacts,
+            &limits.retention,
+        )?;
         let version = VersionRecord {
-            format: 1,
+            format: manifest.format(),
             workspace: request.workspace,
             generation,
             manifest: request.manifest.0,
@@ -740,7 +1647,11 @@ impl Store {
         changes.push((
             &self.inner.spaces.cloud.roots,
             version_key,
-            Some(encode_roots(request.manifest, &roots)?),
+            Some(encode_version_roots(
+                request.manifest,
+                &roots,
+                manifest.format(),
+            )?),
         ));
         changes.push((
             &self.inner.spaces.cloud.receipts,
@@ -757,18 +1668,26 @@ impl Store {
             .db
             .write_tx()
             .durability(Some(PersistMode::SyncAll));
-        advance_feature(&mut tx, &self.inner.spaces.meta, 3)?;
+        advance_feature(
+            &mut tx,
+            &self.inner.spaces.meta,
+            if manifest.format() == 2 { 4 } else { 3 },
+        )?;
         let payload_work = manifest.members.iter().try_fold(0u64, |sum, member| {
             sum.checked_add(member.selected.size_bytes)
                 .ok_or(Error::Limit("cloud version validation bytes"))
         })?;
+        let payload_work = payload_work
+            .checked_add(roots.extra.payload)
+            .ok_or(Error::Limit("cloud version validation bytes"))?;
         let metadata_work = (version_key_for(repo, owner, request.workspace, generation).len() * 2
             + manifest_key_for(repo, owner, request.manifest).len()
             + encode(&version)?.len()
-            + encode_roots(request.manifest, &roots)?.len()
+            + encode_version_roots(request.manifest, &roots, manifest.format())?.len()
             + request.manifest_bytes.len()) as u64;
         let metadata_work = metadata_work
             .checked_add(member_metadata_work)
+            .and_then(|n| n.checked_add(roots.extra.metadata))
             .ok_or(Error::Limit("cloud version validation metadata"))?;
         self.inner.cloud_changes(
             &mut tx,
@@ -782,7 +1701,9 @@ impl Store {
                 receipts: 1,
                 version_payload_bytes: payload_work as i128,
                 version_metadata_bytes: metadata_work as i128,
-                version_records: 3 + 2 * manifest.members.len() as i128,
+                version_records: 3
+                    + 2 * manifest.members.len() as i128
+                    + roots.extra.records as i128,
                 ..Default::default()
             },
         )?;
@@ -799,6 +1720,7 @@ fn manifest_key_for(repo: &str, owner: CloudOwner, id: ManifestId) -> Vec<u8> {
 pub(super) struct RetainedPlan {
     pub native: HashSet<ObjectKey>,
     pub cloud: HashSet<(CloudOwner, CloudId)>,
+    pub index: HashSet<(CloudOwner, IndexArtifactId)>,
     blobs: HashMap<(CloudOwner, [u8; 32]), u64>,
     versions: HashMap<Vec<u8>, VersionRecord>,
     current: HashMap<Vec<u8>, VersionRecord>,
@@ -815,9 +1737,20 @@ impl Inner {
         validate: bool,
         scan: &mut Scan,
     ) -> Result<RetainedPlan> {
+        self.retained_cloud_plan_packing(repo, owner, validate, scan, &HashSet::new())
+    }
+    fn retained_cloud_plan_packing(
+        &self,
+        repo: Option<&str>,
+        owner: Option<CloudOwner>,
+        validate: bool,
+        scan: &mut Scan,
+        planned: &HashSet<ObjectKey>,
+    ) -> Result<RetainedPlan> {
         let mut plan = RetainedPlan {
             native: HashSet::new(),
             cloud: HashSet::new(),
+            index: HashSet::new(),
             blobs: HashMap::new(),
             versions: HashMap::new(),
             current: HashMap::new(),
@@ -846,7 +1779,7 @@ impl Inner {
             let record: VersionRecord = decode(&bytes)?;
             let workspace: [u8; 32] = suffix[..32].try_into().unwrap();
             let generation = u64::from_be_bytes(suffix[32..].try_into().unwrap());
-            if record.format != 1
+            if ![1, 2].contains(&record.format)
                 || record.workspace != workspace
                 || record.generation != generation
                 || generation == 0
@@ -866,8 +1799,12 @@ impl Inner {
                 .get(&self.spaces.cloud.manifests, &manifest_key)?
                 .ok_or(Error::Corrupt("cloud manifest missing"))?;
             scan.visit(self, &manifest_key, &manifest_bytes)?;
-            let manifest = decode_manifest(&manifest_bytes, id, limits)
+            let manifest = self
+                .decode_recovery(&manifest_bytes, id, limits)
                 .map_err(|_| Error::Corrupt("cloud manifest encoding"))?;
+            if manifest.format() != record.format {
+                return Err(Error::Corrupt("cloud manifest record format"));
+            }
             if manifest.workspace != workspace {
                 return Err(Error::Corrupt("cloud manifest workspace"));
             }
@@ -876,16 +1813,24 @@ impl Inner {
                 .get(&self.spaces.cloud.roots, &key)?
                 .ok_or(Error::Corrupt("cloud version roots missing"))?;
             scan.visit(self, &key, &root_bytes)?;
-            let roots = decode_roots(&root_bytes, id, limits.max_native_roots)?;
-            if roots != manifest.native_roots {
+            let indexed = decode_version_roots(
+                &root_bytes,
+                id,
+                limits.max_native_roots,
+                self.config.cloud.index_artifacts.max_artifacts,
+                record.format,
+            )?;
+            if indexed.native != manifest.native_roots {
                 return Err(Error::Corrupt("cloud native root index changed"));
             }
-            for root in roots {
+            for root in indexed.native.iter().copied() {
                 plan.native.insert(root);
-                native_by_repo
-                    .entry(actual.to_owned())
-                    .or_default()
-                    .insert(root);
+                if planned.is_empty() || record.format == 2 {
+                    native_by_repo
+                        .entry(actual.to_owned())
+                        .or_default()
+                        .insert(root);
+                }
             }
             let mut payload_work = 0u64;
             let mut member_metadata_work = 0u64;
@@ -924,9 +1869,35 @@ impl Inner {
                     .checked_add(member.selected.size_bytes)
                     .ok_or(Error::Limit("cloud version validation bytes"))?;
             }
-            if validate {
-                self.validate_manifest(actual, principal, &manifest, limits, None)?;
+            if validate && (planned.is_empty() || record.format == 2) {
+                let verified = self.validate_manifest_packing(
+                    actual, principal, &manifest, limits, None, planned,
+                )?;
+                if verified.artifacts != indexed.artifacts || verified.extra != indexed.extra {
+                    return Err(Error::Corrupt("cloud indexed version proof mismatch"));
+                }
             }
+            for d in &indexed.artifacts {
+                if self
+                    .index_record(actual, principal, d.id)?
+                    .is_none_or(|record| record.selected.descriptor().ok() != Some(*d))
+                {
+                    return Err(Error::Corrupt("cloud retained artifact selection"));
+                }
+                plan.index.insert((principal, d.id));
+                if plan
+                    .blobs
+                    .insert((principal, d.selected.blake3), d.selected.size_bytes)
+                    .is_some_and(|old| old != d.selected.size_bytes)
+                {
+                    return Err(Error::Corrupt("cloud index promised blob length"));
+                }
+            }
+            indexed.extra.check(self)?;
+            indexed.extra.charge(self, scan)?;
+            payload_work = payload_work
+                .checked_add(indexed.extra.payload)
+                .ok_or(Error::Limit("cloud version validation bytes"))?;
             plan.payload_work.insert(key.to_vec(), payload_work);
             let metadata_work = (key.len() * 2
                 + manifest_key.len()
@@ -937,10 +1908,13 @@ impl Inner {
                 key.to_vec(),
                 metadata_work
                     .checked_add(member_metadata_work)
+                    .and_then(|n| n.checked_add(indexed.extra.metadata))
                     .ok_or(Error::Limit("cloud version validation metadata"))?,
             );
-            plan.record_work
-                .insert(key.to_vec(), 3 + 2 * manifest.members.len() as u64);
+            plan.record_work.insert(
+                key.to_vec(),
+                3 + 2 * manifest.members.len() as u64 + indexed.extra.records,
+            );
             plan.manifests.insert(manifest_key);
             plan.current.insert(workspace_key, record.clone());
             plan.versions.insert(key.to_vec(), record);
@@ -951,6 +1925,46 @@ impl Inner {
             }
         }
         Ok(plan)
+    }
+    /// Caller owns the native maintenance/GC gate. Validate the exact future
+    /// reconstruction charge before writing any new pack or location journal.
+    pub(crate) fn validate_cloud_pack(
+        &self,
+        repo: &str,
+        planned: &HashSet<ObjectKey>,
+    ) -> Result<()> {
+        if planned.is_empty() {
+            return Ok(());
+        }
+        let mut scan = Scan {
+            records: 0,
+            bytes: 0,
+            payload: 0,
+        };
+        let mut indexed = false;
+        for entry in self
+            .db
+            .read_tx()
+            .prefix(&self.spaces.cloud.versions, repo_prefix(repo))
+        {
+            let (key, bytes) = entry.into_inner()?;
+            scan.visit(self, &key, &bytes)?;
+            let record: VersionRecord = decode(&bytes)?;
+            if record.format == 2 {
+                indexed = true;
+                break;
+            }
+        }
+        if !indexed {
+            return Ok(());
+        }
+        let mut scan = Scan {
+            records: 0,
+            bytes: 0,
+            payload: 0,
+        };
+        self.retained_cloud_plan_packing(Some(repo), None, true, &mut scan, planned)?;
+        Ok(())
     }
     fn legacy_principal_roots(
         &self,
@@ -1004,7 +2018,9 @@ impl Inner {
         };
         let plan =
             self.retained_cloud_plan(Some(repo), Some(CloudOwner { principal }), false, &mut scan)?;
-        if plan.native.len() > maximum || plan.cloud.len() > maximum {
+        if plan.native.len() > maximum
+            || plan.cloud.len().saturating_add(plan.index.len()) > maximum
+        {
             return Err(Error::Limit("cloud promise quota scan"));
         }
         let bytes = plan.blobs.values().try_fold(0u64, |sum, size| {
@@ -1060,7 +2076,8 @@ impl Inner {
         &self,
         repo: &str,
         owner: CloudOwner,
-        manifest: &Manifest,
+        manifest: &RecoveryManifest,
+        artifacts: &[IndexArtifactDescriptor],
         limits: &RetentionLimits,
     ) -> Result<()> {
         let mut scan = Scan {
@@ -1087,8 +2104,18 @@ impl Inner {
                 }
             }
         }
+        for d in artifacts {
+            plan.index.insert((owner, d.id));
+            if plan
+                .blobs
+                .insert((owner, d.selected.blake3), d.selected.size_bytes)
+                .is_some_and(|old| old != d.selected.size_bytes)
+            {
+                return Err(Error::Corrupt("cloud index promised blob length"));
+            }
+        }
         if plan.native.len() > limits.max_quota_scan_roots
-            || plan.cloud.len() > limits.max_quota_scan_roots
+            || plan.cloud.len().saturating_add(plan.index.len()) > limits.max_quota_scan_roots
         {
             return Err(Error::Limit("cloud promised root quota scan"));
         }

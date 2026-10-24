@@ -243,6 +243,15 @@ impl Store {
             report.logical_bytes = 0;
             return Ok(report);
         }
+        // The gate has fenced readers/uploads since selection. Planned native
+        // commit reconstruction must not invalidate any retained indexed cloud
+        // version's memory contract. Rejection precedes pack files and journals.
+        let planned = selected
+            .iter()
+            .filter(|(descriptor, _)| descriptor.key.kind == Kind::Commit)
+            .map(|(descriptor, _)| descriptor.key)
+            .collect::<HashSet<_>>();
+        self.inner.validate_cloud_pack(repo, &planned)?;
         // Same-kind largest anchors provide a bounded, simple grouping policy.
         // Every member independently falls back when its anchor is unhelpful.
         selected.sort_by(|(a, _), (b, _)| {

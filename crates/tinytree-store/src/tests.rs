@@ -3903,3 +3903,914 @@ fn preexisting_verified_index_raw_payload_is_reused_without_overwrite() {
     drop(store);
     Store::open_existing(directory.path(), config()).unwrap();
 }
+
+fn cloud_index_draft(
+    store: &Store,
+    descriptor: Descriptor,
+    order: u64,
+) -> tinytree_cloud::IndexDraft {
+    let (_, bytes) = store.read_metadata("demo", descriptor.key).unwrap();
+    let Object::Commit(commit) = tinytree_model::decode(&bytes, Limits::default()).unwrap() else {
+        panic!("commit fixture");
+    };
+    tinytree_cloud::IndexDraft {
+        descriptor,
+        change: commit.change_id,
+        parents: commit.parents,
+        order,
+    }
+}
+fn cloud_v2_capture(
+    store: &Store,
+    owner: CloudOwner,
+    head: Descriptor,
+    root: Descriptor,
+    logical: tinytree_cloud::PortableIndexSnapshot,
+) -> (
+    tinytree_cloud::ManifestV2,
+    Vec<String>,
+    Vec<tinytree_cloud::IndexArtifactDescriptor>,
+) {
+    let (mut recovery, ordinary) = cloud_capture(store, owner, head, root);
+    let intrinsic = tinytree_cloud::build_index_artifacts(
+        &tinytree_cloud::PortableIndexSnapshot {
+            roots: vec![CommitId::ROOT],
+            drafts: vec![],
+        },
+        Default::default(),
+    )
+    .unwrap();
+    let selected = tinytree_cloud::build_index_artifacts(&logical, Default::default()).unwrap();
+    let operation = recovery.operation_heads[0];
+    for id in &logical.roots {
+        if *id != CommitId::ROOT {
+            recovery.native_roots.push(ObjectKey {
+                kind: Kind::Commit,
+                id: ObjectId(id.0),
+            });
+        }
+    }
+    recovery
+        .native_roots
+        .extend(logical.drafts.iter().map(|draft| draft.descriptor.key));
+    recovery
+        .native_roots
+        .sort_by_key(|key| (key.kind as u8, key.id.0));
+    recovery.native_roots.dedup();
+    let mut roots = vec![intrinsic.root, selected.root];
+    roots.sort_by_key(|root| root.id);
+    roots.dedup_by_key(|root| root.id);
+    let mut artifacts = std::collections::BTreeMap::new();
+    for artifact in intrinsic.artifacts.into_iter().chain(selected.artifacts) {
+        artifacts.entry(artifact.descriptor.id).or_insert(artifact);
+    }
+    let mut leases = ordinary
+        .into_iter()
+        .map(|receipt| receipt.staging_lease)
+        .collect::<Vec<_>>();
+    let mut descriptors = Vec::new();
+    for artifact in artifacts.into_values() {
+        let receipt = store
+            .put_cloud_index_artifact(
+                "demo",
+                owner,
+                artifact.descriptor,
+                &artifact.bytes,
+                0,
+                Default::default(),
+            )
+            .unwrap();
+        leases.push(receipt.staging_lease);
+        descriptors.push(receipt.descriptor);
+    }
+    let value = tinytree_cloud::ManifestV2 {
+        recovery,
+        operation_indexes: vec![
+            tinytree_cloud::OperationIndex {
+                operation: [0; 64],
+                root: intrinsic.root.id,
+            },
+            tinytree_cloud::OperationIndex {
+                operation,
+                root: selected.root.id,
+            },
+        ],
+        index_roots: roots,
+    };
+    (value, leases, descriptors)
+}
+fn cloud_v2_request(
+    value: &tinytree_cloud::ManifestV2,
+    generation: u64,
+    token: &str,
+    leases: Vec<String>,
+) -> PublishCloudRequest {
+    let bytes = tinytree_cloud::encode_manifest_v2(value, Default::default()).unwrap();
+    PublishCloudRequest {
+        workspace: value.recovery.workspace,
+        expected_generation: generation,
+        idempotency_key: token.into(),
+        manifest: tinytree_cloud::ManifestId::of(&bytes),
+        manifest_bytes: bytes,
+        staging_leases: leases,
+    }
+}
+#[test]
+fn indexed_cloud_versions_preserve_hidden_drafts_artifacts_and_mixed_schema_history_after_gc_restart()
+ {
+    let (directory, store) = open();
+    let owner = CloudOwner {
+        principal: [71; 32],
+    };
+    let (_, root, head) = fixture(&store, "visible index anchor");
+    let bytes = b"private hidden source";
+    let hidden_file = tinytree_model::describe_file(bytes);
+    store.put("demo", hidden_file, bytes, 0).unwrap();
+    let hidden_tree = put_object(
+        &store,
+        Object::Tree(tree(hidden_file, bytes.len() as u64)),
+        0,
+    );
+    let mut hidden = commit(TreeId(hidden_tree.key.id.0), "hidden draft");
+    hidden.parents = vec![CommitId(head.key.id.0)];
+    let hidden = put_object(&store, Object::Commit(hidden), 0);
+    let logical = tinytree_cloud::PortableIndexSnapshot {
+        roots: vec![CommitId(head.key.id.0)],
+        drafts: vec![cloud_index_draft(&store, hidden, 7)],
+    };
+    let (value, leases, artifacts) = cloud_v2_capture(&store, owner, head, root, logical);
+    let first = cloud_v2_request(&value, 0, "indexed-first", leases);
+    let publication = store
+        .publish_cloud_version("demo", owner, &first, 1, &Default::default())
+        .unwrap();
+    assert_eq!(publication.workspace.generation, 1);
+    assert!(
+        store
+            .read_cloud_version_v1(
+                "demo",
+                owner,
+                value.recovery.workspace,
+                1,
+                Default::default()
+            )
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(
+        store
+            .read_cloud_version(
+                "demo",
+                owner,
+                value.recovery.workspace,
+                1,
+                Default::default()
+            )
+            .unwrap()
+            .manifest_bytes(),
+        first.manifest_bytes
+    );
+    let (_, next_root, next_head) = fixture(&store, "later visible history");
+    let (mut next, leases) = cloud_capture(&store, owner, next_head, next_root);
+    next.parents = vec![first.manifest];
+    let second = cloud_request(&next, 1, "legacy-second", &leases);
+    store
+        .publish_cloud_version("demo", owner, &second, 2, &Default::default())
+        .unwrap();
+    assert!(
+        store
+            .read_cloud_version_v1(
+                "demo",
+                owner,
+                value.recovery.workspace,
+                2,
+                Default::default()
+            )
+            .unwrap()
+            .is_some()
+    );
+    store.gc("demo", 100).unwrap();
+    assert_eq!(
+        store.descriptor("demo", hidden_file.key).unwrap(),
+        Some(hidden_file)
+    );
+    for artifact in &artifacts {
+        assert_eq!(
+            store
+                .lookup_cloud_index_artifacts("demo", owner, &[artifact.id])
+                .unwrap(),
+            vec![Some(*artifact)]
+        );
+    }
+    assert_eq!(
+        store
+            .publish_cloud_version("demo", owner, &first, 100, &Default::default())
+            .unwrap(),
+        publication
+    );
+    drop(store);
+    let store = Store::open_existing(directory.path(), config()).unwrap();
+    assert_eq!(
+        store
+            .read_cloud_version(
+                "demo",
+                owner,
+                value.recovery.workspace,
+                1,
+                Default::default()
+            )
+            .unwrap()
+            .manifest_bytes(),
+        first.manifest_bytes
+    );
+    assert_eq!(
+        store
+            .get_cloud_workspace("demo", owner, value.recovery.workspace)
+            .unwrap()
+            .generation,
+        2
+    );
+    assert_eq!(store.descriptor("demo", hidden.key).unwrap(), Some(hidden));
+}
+
+#[test]
+fn indexed_cloud_publication_rejects_canonical_draft_mismatch_and_non_anchor_parents_atomically() {
+    enum Failure {
+        Change,
+        ParentOrder,
+        UnrelatedAnchor,
+        PredecessorOnly,
+    }
+    for failure in [
+        Failure::Change,
+        Failure::ParentOrder,
+        Failure::UnrelatedAnchor,
+        Failure::PredecessorOnly,
+    ] {
+        let (directory, store) = open();
+        let owner = CloudOwner {
+            principal: [72; 32],
+        };
+        let (_, root, base) = fixture(&store, "index proof base");
+        let side = put_object(
+            &store,
+            Object::Commit(commit(TreeId(root.key.id.0), "index side")),
+            0,
+        );
+        let head = if matches!(failure, Failure::PredecessorOnly) {
+            let mut c = commit(TreeId(root.key.id.0), "predecessor-only anchor");
+            c.predecessors = vec![CommitId(side.key.id.0)];
+            put_object(&store, Object::Commit(c), 0)
+        } else {
+            base
+        };
+        let mut hidden = commit(TreeId(root.key.id.0), "index draft proof");
+        hidden.parents = if matches!(failure, Failure::ParentOrder) {
+            vec![CommitId(head.key.id.0), CommitId(side.key.id.0)]
+        } else if matches!(failure, Failure::PredecessorOnly) {
+            vec![CommitId(side.key.id.0)]
+        } else {
+            vec![CommitId(head.key.id.0)]
+        };
+        let hidden = put_object(&store, Object::Commit(hidden), 0);
+        let mut record = cloud_index_draft(&store, hidden, 9);
+        if matches!(failure, Failure::Change) {
+            record.change = ChangeId([19; 16]);
+        }
+        if matches!(failure, Failure::ParentOrder) {
+            record.parents.reverse();
+        }
+        let roots = match failure {
+            Failure::UnrelatedAnchor => vec![CommitId::ROOT],
+            Failure::ParentOrder => {
+                let mut ids = vec![CommitId(head.key.id.0), CommitId(side.key.id.0)];
+                ids.sort();
+                ids
+            }
+            _ => vec![CommitId(head.key.id.0)],
+        };
+        let (value, leases, _) = cloud_v2_capture(
+            &store,
+            owner,
+            head,
+            root,
+            tinytree_cloud::PortableIndexSnapshot {
+                roots,
+                drafts: vec![record],
+            },
+        );
+        let request = cloud_v2_request(&value, 0, "invalid-index-proof", leases);
+        assert!(matches!(
+            store.publish_cloud_version("demo", owner, &request, 1, &Default::default()),
+            Err(Error::Invalid(_))
+        ));
+        assert_eq!(
+            store
+                .get_cloud_workspace("demo", owner, value.recovery.workspace)
+                .unwrap()
+                .generation,
+            0
+        );
+        assert_eq!(
+            store
+                .cloud_publication("demo", owner, "invalid-index-proof")
+                .unwrap(),
+            None
+        );
+        drop(store);
+        Store::open_existing(directory.path(), config()).unwrap();
+    }
+}
+
+#[test]
+fn indexed_version_read_and_gc_fail_closed_on_missing_artifact_but_v1_gate_does_no_proof_work() {
+    let (directory, store) = open();
+    let owner = CloudOwner {
+        principal: [73; 32],
+    };
+    let (_, root, head) = fixture(&store, "closed indexed proof");
+    let (value, leases, artifacts) = cloud_v2_capture(
+        &store,
+        owner,
+        head,
+        root,
+        tinytree_cloud::PortableIndexSnapshot {
+            roots: vec![CommitId(head.key.id.0)],
+            drafts: vec![],
+        },
+    );
+    let request = cloud_v2_request(&value, 0, "closed-indexed-proof", leases);
+    store
+        .publish_cloud_version("demo", owner, &request, 1, &Default::default())
+        .unwrap();
+    let spare = tinytree_model::describe_file(b"must survive invalid mark");
+    store
+        .put("demo", spare, b"must survive invalid mark", 0)
+        .unwrap();
+    let artifact = artifacts
+        .iter()
+        .find(|d| matches!(d.id, tinytree_cloud::IndexArtifactId::Node(_)))
+        .unwrap();
+    let namespace = fs::read_dir(directory.path().join("cloud"))
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+    let path = namespace.join(hex(&artifact.selected.blake3));
+    let bytes = fs::read(&path).unwrap();
+    fs::remove_file(&path).unwrap();
+    assert!(
+        store
+            .read_cloud_version_v1(
+                "demo",
+                owner,
+                value.recovery.workspace,
+                1,
+                Default::default()
+            )
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        store
+            .read_cloud_version(
+                "demo",
+                owner,
+                value.recovery.workspace,
+                1,
+                Default::default()
+            )
+            .is_err()
+    );
+    assert!(store.gc("demo", 100).is_err());
+    assert_eq!(store.descriptor("demo", spare.key).unwrap(), Some(spare));
+    fs::write(path, bytes).unwrap();
+    assert_eq!(
+        store
+            .read_cloud_version(
+                "demo",
+                owner,
+                value.recovery.workspace,
+                1,
+                Default::default()
+            )
+            .unwrap()
+            .manifest_bytes(),
+        request.manifest_bytes
+    );
+    drop(store);
+    Store::open_existing(directory.path(), config()).unwrap();
+}
+#[test]
+fn indexed_version_prospective_payload_budget_includes_artifact_and_canonical_native_rereads() {
+    let (directory, store) = open();
+    let owner = CloudOwner {
+        principal: [74; 32],
+    };
+    let (_, root, head) = fixture(&store, "proof budget anchor");
+    let mut hidden = commit(TreeId(root.key.id.0), "proof budget draft");
+    hidden.parents = vec![CommitId(head.key.id.0)];
+    let hidden = put_object(&store, Object::Commit(hidden), 0);
+    let (value, leases, artifacts) = cloud_v2_capture(
+        &store,
+        owner,
+        head,
+        root,
+        tinytree_cloud::PortableIndexSnapshot {
+            roots: vec![CommitId(head.key.id.0)],
+            drafts: vec![cloud_index_draft(&store, hidden, 1)],
+        },
+    );
+    let selected = value
+        .recovery
+        .members
+        .iter()
+        .map(|member| member.selected.size_bytes)
+        .sum::<u64>()
+        + artifacts.iter().map(|d| d.selected.size_bytes).sum::<u64>();
+    let request = cloud_v2_request(&value, 0, "indexed-proof-budget", leases);
+    drop(store);
+    let mut cfg = config();
+    cfg.cloud.max_validation_payload_bytes =
+        2 * selected + 2 * head.size_bytes + hidden.size_bytes - 1;
+    let store = Store::open_existing(directory.path(), cfg.clone()).unwrap();
+    assert!(matches!(
+        store.publish_cloud_version("demo", owner, &request, 1, &Default::default()),
+        Err(Error::Limit("cloud validation catalog budget"))
+    ));
+    assert_eq!(
+        store
+            .get_cloud_workspace("demo", owner, value.recovery.workspace)
+            .unwrap()
+            .generation,
+        0
+    );
+    assert_eq!(
+        store
+            .cloud_publication("demo", owner, "indexed-proof-budget")
+            .unwrap(),
+        None
+    );
+    drop(store);
+    let store = Store::open_existing(directory.path(), cfg).unwrap();
+    drop(store);
+    let store = Store::open_existing(directory.path(), config()).unwrap();
+    store
+        .publish_cloud_version("demo", owner, &request, 1, &Default::default())
+        .unwrap();
+}
+
+#[test]
+fn indexed_artifacts_share_exact_principal_promise_quota_with_legacy_holds() {
+    let (_directory, store) = open();
+    let owner = CloudOwner {
+        principal: [75; 32],
+    };
+    let (file, root, head) = fixture(&store, "joint indexed quota");
+    let mut hidden = commit(TreeId(root.key.id.0), "joint indexed hidden");
+    hidden.parents = vec![CommitId(head.key.id.0)];
+    let hidden = put_object(&store, Object::Commit(hidden), 0);
+    let (value, leases, artifacts) = cloud_v2_capture(
+        &store,
+        owner,
+        head,
+        root,
+        tinytree_cloud::PortableIndexSnapshot {
+            roots: vec![CommitId(head.key.id.0)],
+            drafts: vec![cloud_index_draft(&store, hidden, 2)],
+        },
+    );
+    let raw = value
+        .recovery
+        .members
+        .iter()
+        .map(|member| member.selected.size_bytes)
+        .sum::<u64>()
+        + artifacts.iter().map(|d| d.selected.size_bytes).sum::<u64>();
+    let exact = file.size_bytes + root.size_bytes + head.size_bytes + hidden.size_bytes + raw;
+    let retention = RetentionLimits {
+        max_unique_bytes_per_principal: exact,
+        ..Default::default()
+    };
+    let legacy = hold_owner(75, 1);
+    store
+        .publish_retention(
+            "demo",
+            legacy,
+            &hold_request(legacy, head, "indexed-old-hold", 0, true),
+            &retention,
+            0,
+        )
+        .unwrap();
+    let request = cloud_v2_request(&value, 0, "joint-indexed-quota", leases);
+    let mut limits = CloudPublicationLimits {
+        retention: retention.clone(),
+        ..Default::default()
+    };
+    limits.retention.max_unique_bytes_per_principal = exact - 1;
+    assert!(matches!(
+        store.publish_cloud_version("demo", owner, &request, 1, &limits),
+        Err(Error::Limit("principal promised closure byte quota"))
+    ));
+    limits.retention.max_unique_bytes_per_principal = exact;
+    store
+        .publish_cloud_version("demo", owner, &request, 1, &limits)
+        .unwrap();
+    let peer = hold_owner(75, 2);
+    store
+        .publish_retention(
+            "demo",
+            peer,
+            &hold_request(peer, hidden, "same-indexed-history", 0, true),
+            &retention,
+            2,
+        )
+        .unwrap();
+    let extra = put_object(
+        &store,
+        Object::Commit(commit(
+            TreeId(root.key.id.0),
+            "excess joint indexed history",
+        )),
+        2,
+    );
+    assert!(matches!(
+        store.publish_retention(
+            "demo",
+            peer,
+            &hold_request(peer, extra, "excess-indexed-history", 0, true),
+            &retention,
+            2
+        ),
+        Err(Error::Limit(_))
+    ));
+}
+#[test]
+fn unrelated_index_stage_rejects_atomic_publication_without_consuming_required_leases() {
+    let (_directory, store) = open();
+    let owner = CloudOwner {
+        principal: [76; 32],
+    };
+    let (_, root, head) = fixture(&store, "typed stage selection");
+    let (value, leases, _) = cloud_v2_capture(
+        &store,
+        owner,
+        head,
+        root,
+        tinytree_cloud::PortableIndexSnapshot {
+            roots: vec![CommitId(head.key.id.0)],
+            drafts: vec![],
+        },
+    );
+    let extra = cloud_index_artifacts(CommitId([77; 32])).remove(0);
+    let extra_receipt = store
+        .put_cloud_index_artifact(
+            "demo",
+            owner,
+            extra.descriptor,
+            &extra.bytes,
+            0,
+            Default::default(),
+        )
+        .unwrap();
+    let mut unrelated = leases.clone();
+    unrelated.push(extra_receipt.staging_lease);
+    let invalid = cloud_v2_request(&value, 0, "typed-stage-selection", unrelated);
+    assert!(matches!(
+        store.publish_cloud_version("demo", owner, &invalid, 1, &Default::default()),
+        Err(Error::Invalid("unrelated cloud index staging lease"))
+    ));
+    assert_eq!(
+        store
+            .cloud_publication("demo", owner, "typed-stage-selection")
+            .unwrap(),
+        None
+    );
+    let valid = cloud_v2_request(&value, 0, "typed-stage-selection", leases);
+    store
+        .publish_cloud_version("demo", owner, &valid, 1, &Default::default())
+        .unwrap();
+    store.gc("demo", 100).unwrap();
+    assert_eq!(
+        store
+            .lookup_cloud_index_artifacts("demo", owner, &[extra.descriptor.id])
+            .unwrap(),
+        vec![None]
+    );
+}
+
+fn small_index_cloud_config() -> Config {
+    let mut small = config();
+    small.cloud.max_version_decode_bytes = 65536;
+    small.cloud.max_object_bytes = 1024;
+    small.cloud.max_decode_bytes = 32768;
+    small.cloud.max_field_bytes = 1024;
+    small.cloud.index_artifacts.max_artifacts = 4;
+    small.cloud.index_artifacts.max_snapshots = 2;
+    small.cloud.index_artifacts.max_artifact_bytes = 4096;
+    small.cloud.index_artifacts.max_total_artifact_bytes = 65536;
+    small.cloud.index_artifacts.max_decode_bytes = 262144;
+    small.cloud.index_artifacts.max_graph_steps = 100000;
+    small.cloud.index_artifacts.snapshot.max_decode_bytes = 8192;
+    small.cloud.index_artifacts.snapshot.max_roots = 2;
+    small.cloud.index_artifacts.snapshot.max_drafts = 1;
+    small.cloud.index_artifacts.snapshot.max_parents = 2;
+    small.cloud.index_artifacts.snapshot.max_edges = 4;
+    small.cloud.index_artifacts.snapshot.max_encoded_bytes = 4096;
+    small
+}
+#[test]
+fn indexed_native_ancestry_proof_admits_frontier_and_decode_within_remaining_version_memory() {
+    let directory = tempfile::tempdir().unwrap();
+    let small = small_index_cloud_config();
+    let store = Store::open(directory.path(), small.clone()).unwrap();
+    store.create_repository("demo").unwrap();
+    let tree = tinytree_model::empty_tree().descriptor;
+    let mut parent = CommitId::ROOT;
+    let mut head = None;
+    for index in 0..1000 {
+        let mut object = commit(TreeId(tree.key.id.0), &format!("bounded anchor {index}"));
+        object.parents = vec![parent];
+        let descriptor = put_object(&store, Object::Commit(object), 0);
+        parent = CommitId(descriptor.key.id.0);
+        head = Some(descriptor);
+    }
+    let head = head.unwrap();
+    let owner = CloudOwner {
+        principal: [78; 32],
+    };
+    let (value, leases, _) = cloud_v2_capture(
+        &store,
+        owner,
+        head,
+        tree,
+        tinytree_cloud::PortableIndexSnapshot {
+            roots: vec![parent],
+            drafts: vec![],
+        },
+    );
+    let request = cloud_v2_request(&value, 0, "bounded-index-native-memory", leases);
+    assert!(matches!(
+        store.publish_cloud_version("demo", owner, &request, 1, &Default::default()),
+        Err(Error::Limit("cloud index native proof memory"))
+    ));
+    assert_eq!(
+        store
+            .get_cloud_workspace("demo", owner, value.recovery.workspace)
+            .unwrap()
+            .generation,
+        0
+    );
+    assert_eq!(
+        store
+            .cloud_publication("demo", owner, "bounded-index-native-memory")
+            .unwrap(),
+        None
+    );
+    drop(store);
+    let store = Store::open_existing(directory.path(), small.clone()).unwrap();
+    drop(store);
+    let mut adequate = small;
+    adequate.cloud.max_version_decode_bytes = 2 * 1024 * 1024;
+    let store = Store::open_existing(directory.path(), adequate.clone()).unwrap();
+    store
+        .publish_cloud_version("demo", owner, &request, 1, &Default::default())
+        .unwrap();
+    assert_eq!(
+        store
+            .read_cloud_version(
+                "demo",
+                owner,
+                value.recovery.workspace,
+                1,
+                Default::default()
+            )
+            .unwrap()
+            .manifest_bytes(),
+        request.manifest_bytes
+    );
+    drop(store);
+    let store = Store::open_existing(directory.path(), adequate).unwrap();
+    assert_eq!(
+        store
+            .read_cloud_version(
+                "demo",
+                owner,
+                value.recovery.workspace,
+                1,
+                Default::default()
+            )
+            .unwrap()
+            .manifest_bytes(),
+        request.manifest_bytes
+    );
+}
+
+#[test]
+fn root_only_index_cannot_bypass_working_copy_commit_decode_memory_admission() {
+    let directory = tempfile::tempdir().unwrap();
+    let small = small_index_cloud_config();
+    let store = Store::open(directory.path(), small.clone()).unwrap();
+    store.create_repository("demo").unwrap();
+    let tree = tinytree_model::empty_tree().descriptor;
+    let head = put_object(
+        &store,
+        Object::Commit(commit(
+            TreeId(tree.key.id.0),
+            &"large working-copy metadata".repeat(400),
+        )),
+        0,
+    );
+    let owner = CloudOwner {
+        principal: [79; 32],
+    };
+    // The index has no nonzero anchors or drafts, but OP/VIEW records retain a
+    // real WC commit. Its canonical-byte check must own its own memory budget.
+    let (value, leases, _) = cloud_v2_capture(
+        &store,
+        owner,
+        head,
+        tree,
+        tinytree_cloud::PortableIndexSnapshot {
+            roots: vec![CommitId::ROOT],
+            drafts: vec![],
+        },
+    );
+    let request = cloud_v2_request(&value, 0, "bounded-index-wc-memory", leases);
+    assert!(matches!(
+        store.publish_cloud_version("demo", owner, &request, 1, &Default::default()),
+        Err(Error::Limit("cloud index native proof memory"))
+    ));
+    assert_eq!(
+        store
+            .get_cloud_workspace("demo", owner, value.recovery.workspace)
+            .unwrap()
+            .generation,
+        0
+    );
+    assert_eq!(
+        store
+            .cloud_publication("demo", owner, "bounded-index-wc-memory")
+            .unwrap(),
+        None
+    );
+    drop(store);
+    let store = Store::open_existing(directory.path(), small.clone()).unwrap();
+    drop(store);
+    let mut adequate = small;
+    adequate.cloud.max_version_decode_bytes = 512 * 1024;
+    let store = Store::open_existing(directory.path(), adequate.clone()).unwrap();
+    store
+        .publish_cloud_version("demo", owner, &request, 1, &Default::default())
+        .unwrap();
+    assert_eq!(
+        store
+            .read_cloud_version(
+                "demo",
+                owner,
+                value.recovery.workspace,
+                1,
+                Default::default()
+            )
+            .unwrap()
+            .manifest_bytes(),
+        request.manifest_bytes
+    );
+    drop(store);
+    let store = Store::open_existing(directory.path(), adequate).unwrap();
+    assert_eq!(
+        store
+            .read_cloud_version(
+                "demo",
+                owner,
+                value.recovery.workspace,
+                1,
+                Default::default()
+            )
+            .unwrap()
+            .manifest_bytes(),
+        request.manifest_bytes
+    );
+}
+#[test]
+fn packing_native_metadata_preserves_retained_indexed_version_memory_contract() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut tight = small_index_cloud_config();
+    tight.cloud.max_version_decode_bytes = 512 * 1024;
+    let store = Store::open(directory.path(), tight.clone()).unwrap();
+    store.create_repository("demo").unwrap();
+    let tree = tinytree_model::empty_tree().descriptor;
+    let head = put_object(
+        &store,
+        Object::Commit(commit(
+            TreeId(tree.key.id.0),
+            &"working-copy packing proof".repeat(400),
+        )),
+        0,
+    );
+    let unrelated = put_object(
+        &store,
+        Object::Commit(commit(TreeId(tree.key.id.0), "unrelated packing candidate")),
+        0,
+    );
+    let owner = CloudOwner {
+        principal: [80; 32],
+    };
+    let (value, leases, _) = cloud_v2_capture(
+        &store,
+        owner,
+        head,
+        tree,
+        tinytree_cloud::PortableIndexSnapshot {
+            roots: vec![CommitId::ROOT],
+            drafts: vec![],
+        },
+    );
+    let request = cloud_v2_request(&value, 0, "indexed-pack-poststate", leases);
+    store
+        .publish_cloud_version("demo", owner, &request, 1, &Default::default())
+        .unwrap();
+    // Only small unrelated commit metadata is selected. The large WC commit
+    // stays loose and must not pay another object's reconstruction reservation.
+    store
+        .pack(
+            "demo",
+            PackOptions {
+                max_object_bytes: 1024,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    assert!(store.inner.is_packed("demo", unrelated.key).unwrap());
+    assert!(!store.inner.is_packed("demo", head.key).unwrap());
+    let packs = store
+        .inner
+        .db
+        .read_tx()
+        .iter(&store.inner.spaces.packs)
+        .count();
+    assert!(matches!(
+        store.pack("demo", PackOptions::default()),
+        Err(Error::Limit("cloud index native proof memory"))
+    ));
+    assert_eq!(
+        store
+            .inner
+            .db
+            .read_tx()
+            .iter(&store.inner.spaces.packs)
+            .count(),
+        packs
+    );
+    assert!(!store.inner.is_packed("demo", head.key).unwrap());
+    assert!(store.inner.path("demo", head.key).exists());
+    assert_eq!(
+        store
+            .read_cloud_version(
+                "demo",
+                owner,
+                value.recovery.workspace,
+                1,
+                Default::default()
+            )
+            .unwrap()
+            .manifest_bytes(),
+        request.manifest_bytes
+    );
+    drop(store);
+    let store = Store::open_existing(directory.path(), tight.clone()).unwrap();
+    drop(store);
+    let mut adequate = tight;
+    adequate.cloud.max_version_decode_bytes = 4 * 1024 * 1024;
+    let store = Store::open_existing(directory.path(), adequate.clone()).unwrap();
+    store.pack("demo", PackOptions::default()).unwrap();
+    assert!(store.inner.is_packed("demo", head.key).unwrap());
+    assert_eq!(
+        store
+            .read_cloud_version(
+                "demo",
+                owner,
+                value.recovery.workspace,
+                1,
+                Default::default()
+            )
+            .unwrap()
+            .manifest_bytes(),
+        request.manifest_bytes
+    );
+    drop(store);
+    let store = Store::open_existing(directory.path(), adequate).unwrap();
+    assert_eq!(
+        store
+            .read_cloud_version(
+                "demo",
+                owner,
+                value.recovery.workspace,
+                1,
+                Default::default()
+            )
+            .unwrap()
+            .manifest_bytes(),
+        request.manifest_bytes
+    );
+}

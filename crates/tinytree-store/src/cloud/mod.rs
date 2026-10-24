@@ -1413,6 +1413,7 @@ impl Inner {
             expired: 0,
         };
         let mut pending = Vec::new();
+        let published_index = published.index;
         let mut marked = published.cloud;
         for item in view.prefix(&self.spaces.cloud.staging, &prefix) {
             let (key, value) = item.into_inner()?;
@@ -1515,7 +1516,15 @@ impl Inner {
                 .or_insert((owner, 0));
             references.1 += 1;
         }
-        self.index_gc_into(repo, now, gate, &mut scan, &mut plan, &mut victim_refs)?;
+        self.index_gc_into(
+            repo,
+            now,
+            gate,
+            &published_index,
+            &mut scan,
+            &mut plan,
+            &mut victim_refs,
+        )?;
         for (key, (owner, removed)) in victim_refs {
             let bytes = view
                 .get(&self.spaces.cloud.blobs, &key)?

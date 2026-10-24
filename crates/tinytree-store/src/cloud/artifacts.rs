@@ -8,7 +8,7 @@ use tinytree_cloud::{
 
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct IndexSelected {
+pub(super) struct IndexSelected {
     kind: u8,
     id: [u8; 32],
     digest: [u8; 32],
@@ -27,7 +27,7 @@ impl IndexSelected {
             size: value.selected.size_bytes,
         }
     }
-    fn descriptor(&self) -> Result<IndexArtifactDescriptor> {
+    pub(super) fn descriptor(&self) -> Result<IndexArtifactDescriptor> {
         let id = match self.kind {
             1 => IndexArtifactId::Root(IndexRootId(self.id)),
             2 => IndexArtifactId::Node(IndexNodeId(self.id)),
@@ -44,15 +44,15 @@ impl IndexSelected {
 }
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct IndexRecord {
+pub(super) struct IndexRecord {
     version: u8,
-    selected: IndexSelected,
+    pub(super) selected: IndexSelected,
 }
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct IndexStage {
-    selected: IndexSelected,
-    expires: i64,
+pub(super) struct IndexStage {
+    pub(super) selected: IndexSelected,
+    pub(super) expires: i64,
 }
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CloudIndexWriteReceipt {
@@ -60,7 +60,7 @@ pub struct CloudIndexWriteReceipt {
     pub staging_lease: String,
     pub expires_at: i64,
 }
-fn artifact_key(repo: &str, owner: CloudOwner, id: IndexArtifactId) -> Vec<u8> {
+pub(super) fn artifact_key(repo: &str, owner: CloudOwner, id: IndexArtifactId) -> Vec<u8> {
     let mut key = scope(repo, owner);
     match id {
         IndexArtifactId::Root(id) => {
@@ -91,7 +91,22 @@ fn artifact_stage_key(repo: &str, owner: CloudOwner, token: [u8; 32]) -> Vec<u8>
 }
 // Outgoing canonical references are read from the bounded artifact itself,
 // never expanded into a potentially unreadable JSON dependency summary.
-fn outgoing(value: &IndexArtifact) -> (Vec<IndexArtifactId>, Vec<ObjectKey>) {
+pub(super) fn artifact_children(value: &IndexArtifact) -> Vec<IndexArtifactId> {
+    match value {
+        IndexArtifact::Root(root) => std::iter::once(root.anchors)
+            .chain(root.drafts)
+            .map(IndexArtifactId::Node)
+            .collect(),
+        IndexArtifact::Node(node) => match &node.payload {
+            IndexNodePayload::Branch(values) => values
+                .iter()
+                .map(|child| IndexArtifactId::Node(child.node))
+                .collect(),
+            _ => Vec::new(),
+        },
+    }
+}
+pub(super) fn outgoing(value: &IndexArtifact) -> (Vec<IndexArtifactId>, Vec<ObjectKey>) {
     let mut children = Vec::new();
     let mut native = Vec::new();
     let mut commit = |id: tinytree_model::CommitId| {
@@ -161,7 +176,10 @@ impl Drop for CloudIndexReadLease {
     }
 }
 impl Inner {
-    fn index_limits(&self, mut limits: IndexArtifactLimits) -> Result<IndexArtifactLimits> {
+    pub(super) fn index_limits(
+        &self,
+        mut limits: IndexArtifactLimits,
+    ) -> Result<IndexArtifactLimits> {
         limits
             .validate()
             .map_err(|_| Error::Invalid("cloud index artifact limits"))?;
@@ -193,7 +211,7 @@ impl Inner {
             .min(actual.max_metadata_bytes);
         Ok(limits)
     }
-    fn index_record(
+    pub(super) fn index_record(
         &self,
         repo: &str,
         owner: CloudOwner,
@@ -214,16 +232,44 @@ impl Inner {
             })
             .transpose()
     }
-    fn verify_index_backing(
+    pub(super) fn verify_index_backing(
         &self,
         repo: &str,
         owner: CloudOwner,
         record: &IndexRecord,
         scan: &mut Scan,
     ) -> Result<VerifiedIndexArtifact> {
+        self.verify_index_backing_policy(
+            repo,
+            owner,
+            record,
+            scan,
+            self.config.cloud.index_artifacts,
+            false,
+        )
+    }
+    pub(super) fn verify_index_backing_limited(
+        &self,
+        repo: &str,
+        owner: CloudOwner,
+        record: &IndexRecord,
+        scan: &mut Scan,
+        limits: IndexArtifactLimits,
+    ) -> Result<VerifiedIndexArtifact> {
+        self.verify_index_backing_policy(repo, owner, record, scan, limits, true)
+    }
+    fn verify_index_backing_policy(
+        &self,
+        repo: &str,
+        owner: CloudOwner,
+        record: &IndexRecord,
+        scan: &mut Scan,
+        limits: IndexArtifactLimits,
+        budgeted: bool,
+    ) -> Result<VerifiedIndexArtifact> {
         let d = record.selected.descriptor()?;
         scan.payload(self, d.selected.size_bytes)?;
-        let limits = self.index_limits(self.config.cloud.index_artifacts)?;
+        let limits = self.index_limits(limits)?;
         if d.selected.size_bytes > limits.max_artifact_bytes as u64 {
             return Err(Error::Corrupt("cloud index stored payload size"));
         }
@@ -235,8 +281,12 @@ impl Inner {
             return Err(Error::Corrupt("cloud index backing type or size"));
         }
         let bytes = fs::read(path)?;
-        tinytree_cloud::decode_index_artifact(&bytes, d, limits)
-            .map_err(|_| Error::Corrupt("cloud index backing verification"))
+        tinytree_cloud::decode_index_artifact(&bytes, d, limits).map_err(|error| match error {
+            tinytree_cloud::Error::Limit(_) if budgeted => {
+                Error::Limit("cloud index decoded allocation")
+            }
+            _ => Error::Corrupt("cloud index backing verification"),
+        })
     }
 }
 impl Store {
@@ -605,6 +655,7 @@ impl Inner {
         repo: &str,
         now: i64,
         gate: &Runtime,
+        published: &HashSet<(CloudOwner, IndexArtifactId)>,
         scan: &mut Scan,
         plan: &mut CloudGcPlan,
         victim_refs: &mut HashMap<Vec<u8>, (CloudOwner, u64)>,
@@ -626,7 +677,10 @@ impl Inner {
             }
             objects.insert((owner, d.id), (key.to_vec(), record));
         }
-        let mut marked = HashSet::<(CloudOwner, IndexArtifactId)>::new();
+        let mut marked = published.clone();
+        if marked.iter().any(|key| !objects.contains_key(key)) {
+            return Err(Error::Corrupt("cloud published index artifact missing"));
+        }
         let mut pending = Vec::new();
         for entry in view.prefix(&self.spaces.cloud.index_staging, &prefix) {
             let (key, bytes) = entry.into_inner()?;
