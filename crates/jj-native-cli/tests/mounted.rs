@@ -3377,6 +3377,83 @@ fn restore_captured_workspace(
         cache_before["verified_bytes"]
     );
     assert_eq!(upstream.file_reads(), file_reads_before);
+    let public_before_queries = upstream.public();
+    let writes_before_queries = upstream.metadata.writes.load(Ordering::SeqCst);
+    let remote_state_path = binding.working_copy.join("native-remote.toml");
+    let remote_state_before = fs::read(&remote_state_path).ok();
+    let captured_revision = capture_identity(&capture.data.working_copy.snapshot_commit);
+    let history: serde_json::Value = serde_json::from_str(&fixture.success(
+        &root,
+        &[
+            "tinytree",
+            "history",
+            "capture-only.txt",
+            "-r",
+            &captured_revision,
+            "--json",
+        ],
+    ))
+    .unwrap();
+    assert_eq!(history["coverage"], "complete");
+    assert_eq!(history["revision"], captured_revision);
+    assert!(
+        history["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|entry| { entry["commit"] == captured_revision && entry["local"] == false })
+    );
+    let blame: serde_json::Value = serde_json::from_str(&fixture.success(
+        &root,
+        &[
+            "tinytree",
+            "blame",
+            "capture-only.txt",
+            "-r",
+            &captured_revision,
+            "--json",
+        ],
+    ))
+    .unwrap();
+    assert_eq!(blame["coverage"], "complete");
+    assert_eq!(blame["revision"], captured_revision);
+    assert_eq!(blame["local_commits"], 0);
+    assert_eq!(blame["lines"][0]["origin"]["commit"], captured_revision);
+    assert_eq!(blame["lines"][0]["origin"]["original_line"], 1);
+    assert_eq!(
+        blame["lines"][0]["bytes"],
+        serde_json::json!(authored_bytes)
+    );
+    let search: serde_json::Value = serde_json::from_str(&fixture.success(
+        &root,
+        &[
+            "tinytree",
+            "search",
+            "-F",
+            "private captured workspace",
+            "--path-prefix",
+            "capture-only.txt",
+            "-r",
+            &captured_revision,
+            "--json",
+        ],
+    ))
+    .unwrap();
+    assert_eq!(search["coverage"], "complete");
+    assert_eq!(search["revision"], captured_revision);
+    assert_eq!(search["hits"].as_array().unwrap().len(), 1);
+    assert_eq!(search["hits"][0]["path"], "capture-only.txt");
+    assert_eq!(
+        upstream.file_reads(),
+        file_reads_before,
+        "retained queries must not download historical FILE bodies to the client"
+    );
+    assert_eq!(upstream.public(), public_before_queries);
+    assert_eq!(
+        upstream.metadata.writes.load(Ordering::SeqCst),
+        writes_before_queries
+    );
+    assert_eq!(fs::read(&remote_state_path).ok(), remote_state_before);
     assert_eq!(
         fs::read(root.join("capture-only.txt")).unwrap(),
         authored_bytes
@@ -3387,19 +3464,21 @@ fn restore_captured_workspace(
     );
     assert!(cache_after_read["verified_bytes"].as_u64().unwrap() >= authored_bytes.len() as u64);
 
-    fs::write(
-        root.join("capture-only.txt"),
-        b"restored and snapshotted edit\n",
-    )
-    .unwrap();
+    // A new private child is not part of the frozen cloud selection. Its FILE
+    // bytes must be composed locally, not mistaken for remotely readable data.
+    fixture.success(&root, &["new", "-m", "post-restore private edit"]);
+    let mut private_bytes = authored_bytes.to_vec();
+    private_bytes.extend_from_slice(b"restored and snapshotted edit\n");
+    fs::write(root.join("capture-only.txt"), &private_bytes).unwrap();
     fixture.success(&root, &["status"]);
     let current = native_admin_state(&binding);
     let (wc, _) =
         jj_vfs::native::read_retained_state_for_capture(&binding.projection(), 1024 * 1024)
             .unwrap();
     assert_ne!(wc.operation.hex(), capture.data.working_copy.wc_operation);
-    let dirty = b"unsnapshotted restored edit across restart\n";
-    fs::write(root.join("capture-only.txt"), dirty).unwrap();
+    let mut dirty = private_bytes;
+    dirty.extend_from_slice(b"unsnapshotted restored edit across restart\n");
+    fs::write(root.join("capture-only.txt"), &dirty).unwrap();
     fixture.success(&base, &["tinytree", "unmount", root.to_str().unwrap()]);
     assert!(
         !root.join("capture-only.txt").exists(),
@@ -3425,6 +3504,76 @@ fn restore_captured_workspace(
         "committed resume must preserve CURRENT metadata, not reapply the capture"
     );
     assert_eq!(fs::read(root.join("capture-only.txt")).unwrap(), dirty);
+    let reads_before_dirty_queries = upstream.file_reads();
+    let dirty_blame: serde_json::Value = serde_json::from_str(
+        &fixture.success(&root, &["tinytree", "blame", "capture-only.txt", "--json"]),
+    )
+    .unwrap();
+    assert_eq!(dirty_blame["coverage"], "complete");
+    assert!(dirty_blame["local_commits"].as_u64().unwrap() >= 1);
+    assert_eq!(
+        dirty_blame["lines"][0]["origin"],
+        blame["lines"][0]["origin"]
+    );
+    let dirty_revision = fixture.revision(&root, "@");
+    assert_eq!(dirty_blame["revision"], dirty_revision);
+    assert_eq!(dirty_blame["lines"][2]["origin"]["commit"], dirty_revision);
+    let reconstructed: Vec<u8> = dirty_blame["lines"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .flat_map(|line| {
+            line["bytes"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|byte| byte.as_u64().unwrap() as u8)
+        })
+        .collect();
+    assert_eq!(reconstructed, dirty);
+    let dirty_search: serde_json::Value = serde_json::from_str(&fixture.success(
+        &root,
+        &[
+            "tinytree",
+            "search",
+            "-F",
+            "restored edit",
+            "--path-prefix",
+            "capture-only.txt",
+            "--json",
+        ],
+    ))
+    .unwrap();
+    assert_eq!(dirty_search["coverage"], "complete");
+    assert_eq!(dirty_search["revision"], dirty_revision);
+    assert_eq!(dirty_search["hits"].as_array().unwrap().len(), 1);
+    assert_eq!(dirty_search["hits"][0]["line"], 3);
+    // Removing the captured line must suppress its frozen remote search hit,
+    // not merge an obsolete result back into the current local file.
+    dirty.drain(..authored_bytes.len());
+    fs::write(root.join("capture-only.txt"), &dirty).unwrap();
+    let removed: serde_json::Value = serde_json::from_str(&fixture.success(
+        &root,
+        &[
+            "tinytree",
+            "search",
+            "-F",
+            "private captured workspace",
+            "--path-prefix",
+            "capture-only.txt",
+            "--json",
+        ],
+    ))
+    .unwrap();
+    assert_eq!(removed["coverage"], "complete");
+    assert!(removed["hits"].as_array().unwrap().is_empty());
+    assert_eq!(upstream.file_reads(), reads_before_dirty_queries);
+    assert_eq!(upstream.public(), public_before_queries);
+    assert_eq!(
+        upstream.metadata.writes.load(Ordering::SeqCst),
+        writes_before_queries
+    );
+    assert_eq!(fs::read(&remote_state_path).ok(), remote_state_before);
     fixture.success(&root, &["status"]);
     assert_eq!(
         fixture

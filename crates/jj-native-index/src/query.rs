@@ -35,6 +35,14 @@ fn set(value: q::CommitSet, limit: usize) -> Result<Vec<CommitId>, Error> {
     Ok(result)
 }
 impl NativeReadonlyIndex {
+    /// Exact retained baseline for independent file queries. Local index deltas
+    /// are deliberately excluded: COMMIT overlays do not authorize FILE reads.
+    pub fn cloud_query_source(&self) -> Option<native_broker::CloudQuerySource> {
+        match &self.checkpoint.source {
+            CheckpointSource::LiveRoots => None,
+            CheckpointSource::CloudSnapshot { pins, .. } => Some(pins.clone()),
+        }
+    }
     pub(super) fn verify_draft(
         &self,
         descriptor: m::Descriptor,

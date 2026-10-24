@@ -52,12 +52,13 @@ recovery roots. First submission upgrades local state; use a matching
 landing-aware CLI afterward. There is no Git publication or materialized fallback.
 
 `history` and `blame` pin the selected revision (`-r REV`, default `@`) and
-compose local drafts and dirty edits over this workspace's observed remote
+compose local drafts and dirty edits over this workspace's immutable remote
 baseline, without uploading them. They use fixed-path, linear-history semantics;
 merges, conflicts and exhausted limits are explicit, not complete results.
-These commands currently require a clone/fetch observation; restored cloud-only
-workspaces are not yet supported. Ordinary `jj file annotate` is not wired to
-this service and remains unsupported with the Federated index.
+Queries use an observed clone/fetch baseline or the exact retained version of a
+restored cloud workspace; later private edits stay local. Ordinary
+`jj file annotate` is not wired to this service and remains unsupported with the
+Federated index.
 
 `search` interprets its pattern as a case-sensitive regular expression in regular
 files at the selected revision, merging remote results with local additions,
@@ -72,7 +73,7 @@ and contain no literal newline. Results use byte offsets and byte columns, with
 bounded line snippets; a match longer than 1024 bytes exceeds search limits
 instead of yielding a truncated match. Search does not follow symlinks. Index
 warming is asynchronous; output reports incomplete coverage when limits apply.
-The same observed-baseline requirement applies.
+The same observed or exact retained-cloud baseline selection applies.
 Private baseline discovery is currently linear-only; the server can search
 resolved merge trees directly.
 

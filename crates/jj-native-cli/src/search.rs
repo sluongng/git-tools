@@ -1,6 +1,6 @@
 //! Exact selected-tree search. Clean paths stay remote; changed canonical
 //! branches are inspected locally without publishing private objects.
-use crate::{broker, remote_state::LockedState};
+use crate::{broker, query_source};
 use futures::io::AsyncReadExt as _;
 use jj_cli::{
     cli_util::{CommandHelper, RevisionArg},
@@ -10,8 +10,8 @@ use jj_cli::{
 use jj_lib::{commit::Commit, object_id::ObjectId as _};
 use jj_native_backend::NativeObjectIo as _;
 use native_broker::{
-    BrokerObjectIo, BrokerQueryClient, NativeQueryIo, OpenQueryScope, QueryOwner, QueryScope,
-    ScopedSearchQuery, query_protocol as q,
+    BrokerObjectIo, BrokerQueryClient, NativeQueryIo, QueryOwner, QueryScope, ScopedSearchQuery,
+    query_protocol as q,
 };
 use serde::Serialize;
 use std::{
@@ -702,31 +702,12 @@ async fn run_query(
     let loader = command.workspace_loader()?;
     let locator = broker::locator(&loader.repo_path().join("store"))
         .map_err(|_| user_error("native search requires a broker-backed workspace"))?;
-    let state = LockedState::open(
+    let query_source = query_source::Source::resolve(
+        helper.repo().readonly_index(),
         &crate::vfs::working_copy_path(loader.workspace_root()).map_err(failure)?,
         &locator,
     )
     .map_err(failure)?;
-    let mut roots = state
-        .state
-        .observations
-        .iter()
-        .filter_map(|item| item.head.as_ref())
-        .map(|head| {
-            let bytes = (0..32)
-                .map(|n| u8::from_str_radix(&head[n * 2..n * 2 + 2], 16))
-                .collect::<Result<Vec<_>, _>>()
-                .map_err(failure)?;
-            m::CommitId::from_slice(&bytes).map_err(failure)
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-    if roots.is_empty() {
-        return Err(user_error(
-            "native search requires an observed remote reference; cloud-only sources are not yet supported",
-        ));
-    }
-    roots.sort();
-    roots.dedup();
     let query = tokio::time::timeout_at(
         deadline,
         BrokerQueryClient::connect(&locator.socket, &locator.store, Default::default()),
@@ -758,18 +739,7 @@ async fn run_query(
     let cleanup = query.clone();
     let query = query.with_operation_deadline(deadline);
     let io = io.with_operation_deadline(deadline);
-    let scope = query
-        .open_scope(
-            OpenQueryScope {
-                roots,
-                overlay: vec![],
-                replay_key: random(),
-                query_identity_version: 2,
-            },
-            Arc::new(()),
-        )
-        .await
-        .map_err(failure)?;
+    let scope = query_source.open(&query, random()).await.map_err(failure)?;
     let owner = Arc::new(PhysicalBudget {
         usage: Mutex::new(Usage::default()),
         _scope: scope.owner.clone(),

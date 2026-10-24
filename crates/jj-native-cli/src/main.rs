@@ -3,6 +3,7 @@ mod broker;
 mod commands;
 mod history;
 mod landing;
+mod query_source;
 mod remote;
 mod remote_state;
 mod roots;

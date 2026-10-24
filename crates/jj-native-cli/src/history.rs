@@ -1,6 +1,6 @@
 //! Revision-pinned path queries. Private file bodies stay in the local provider;
-//! only an observed canonical baseline is queried remotely.
-use crate::{broker, remote_state::LockedState};
+//! only an observed or exactly retained canonical baseline is queried remotely.
+use crate::{broker, query_source};
 use futures::io::AsyncReadExt as _;
 use jj_cli::{
     cli_util::{CommandHelper, RevisionArg},
@@ -17,8 +17,7 @@ use jj_lib::{
     store::Store,
 };
 use native_broker::{
-    BrokerQueryClient, NativeQueryIo, OpenQueryScope, QueryScope, ScopedPathQuery,
-    query_protocol as q,
+    BrokerQueryClient, NativeQueryIo, QueryScope, ScopedPathQuery, query_protocol as q,
 };
 use serde::Serialize;
 use std::{
@@ -699,31 +698,12 @@ async fn run_query(
     let loader = command.workspace_loader()?;
     let locator = broker::locator(&loader.repo_path().join("store"))
         .map_err(|_| user_error("native path queries require a broker-backed workspace"))?;
-    let state = LockedState::open(
+    let query_source = query_source::Source::resolve(
+        helper.repo().readonly_index(),
         &crate::vfs::working_copy_path(loader.workspace_root()).map_err(failure)?,
         &locator,
     )
     .map_err(failure)?;
-    let mut roots = state
-        .state
-        .observations
-        .iter()
-        .filter_map(|observation| observation.head.as_ref())
-        .map(|head| {
-            let bytes = (0..32)
-                .map(|n| u8::from_str_radix(&head[n * 2..n * 2 + 2], 16))
-                .collect::<Result<Vec<_>, _>>()
-                .map_err(failure)?;
-            CommitId::from_slice(&bytes).map_err(failure)
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-    if roots.is_empty() {
-        return Err(user_error(
-            "native path queries require an observed remote reference; retained-cloud source queries are not yet supported",
-        ));
-    }
-    roots.sort();
-    roots.dedup();
     let query = tokio::time::timeout_at(
         deadline,
         BrokerQueryClient::connect(&locator.socket, locator.store, Default::default()),
@@ -738,18 +718,7 @@ async fn run_query(
     };
     let cleanup = query.clone();
     let query = query.with_operation_deadline(deadline);
-    let scope = query
-        .open_scope(
-            OpenQueryScope {
-                roots,
-                overlay: vec![],
-                replay_key: random(),
-                query_identity_version: 2,
-            },
-            Arc::new(()),
-        )
-        .await
-        .map_err(failure)?;
+    let scope = query_source.open(&query, random()).await.map_err(failure)?;
     let result = tokio::time::timeout_at(deadline, async {
         let captured = capture_path(
             &query,
