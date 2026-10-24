@@ -1,0 +1,45 @@
+load("@crates//:defs.bzl", "aliases", "all_crate_deps")
+load("@rules_rs//rs:rust_binary.bzl", "rust_binary")
+load("@rules_rs//rs:rust_library.bzl", "rust_library")
+load("@rules_rs//rs:rust_test.bzl", "rust_test")
+
+package(default_visibility = ["//visibility:public"])
+
+rust_library(
+    name = "tinytree-check-runner",
+    srcs = glob(["src/**/*.rs"], exclude = ["src/main.rs"]),
+    crate_name = "tinytree_check_runner",
+    crate_root = "src/lib.rs",
+    edition = "2024",
+    version = "0.1.0",
+    aliases = aliases(),
+    deps = all_crate_deps(normal = True),
+)
+
+rust_binary(
+    name = "tinytree-check-runner-bin",
+    srcs = ["src/main.rs"],
+    crate_name = "tinytree_check_runner",
+    edition = "2024",
+    aliases = aliases(),
+    deps = [":tinytree-check-runner"] + all_crate_deps(normal = True),
+)
+
+rust_test(
+    name = "unit_tests",
+    aliases = aliases(),
+    crate = ":tinytree-check-runner",
+    edition = "2024",
+    compile_data = ["example.toml"],
+    data = [":process_fixture"],
+    rustc_env = {"CHECK_PROCESS_FIXTURE": "$(rootpath :process_fixture)"},
+    deps = all_crate_deps(normal = True, normal_dev = True),
+)
+
+rust_binary(
+    name = "process_fixture",
+    testonly = True,
+    srcs = ["tests/process_fixture.rs"],
+    edition = "2024",
+    deps = ["@crates//:libc"],
+)

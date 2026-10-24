@@ -5587,6 +5587,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "tinytree-check-runner"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "blake3",
+ "clap",
+ "fs2",
+ "libc",
+ "private-fs",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "tempfile",
+ "tokio",
+ "toml",
+]
+
+[[package]]
 name = "tinytree-client"
 version = "0.1.0"
 dependencies = [

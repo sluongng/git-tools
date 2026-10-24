@@ -25,3 +25,4 @@ alias(name = "git-jj", actual = ":jj-vfs", visibility = ["//visibility:public"])
 alias(name = "git-output-service", actual = ":bazel-output-service", visibility = ["//visibility:public"])
 
 alias(name = "tinytree-import", actual = "//crates/tinytree-import:tinytree-import-bin", visibility = ["//visibility:public"])
+alias(name = "tinytree-check-runner", actual = "//crates/tinytree-check-runner:tinytree-check-runner-bin", visibility = ["//visibility:public"])

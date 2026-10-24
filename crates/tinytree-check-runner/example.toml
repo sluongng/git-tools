@@ -1,0 +1,23 @@
+# Replace paths and SHA256 pins. Keep real settings and credentials untracked.
+scratch = "/var/lib/tinytree/checks"
+daemon_config = "/etc/tinytree/workspace.toml"
+rbe_socket = "/var/run/tinytree/rbe.sock"
+remote_instance_name = ""
+runner_sha256 = "0000000000000000000000000000000000000000000000000000000000000000"
+workspace_environment = ["TINYTREE_TOKEN"]
+
+[workspace]
+path = "/usr/local/bin/workspace"
+sha256 = "0000000000000000000000000000000000000000000000000000000000000000"
+
+[bazel]
+path = "/usr/local/bin/bazel"
+sha256 = "0000000000000000000000000000000000000000000000000000000000000000"
+
+[[profiles]]
+name = "unit"
+repositories = ["example"]
+store = "example"
+mode = "test"
+targets = ["//app:unit"]
+timeout_seconds = 1800
