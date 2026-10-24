@@ -32,8 +32,8 @@ separate RPC memory pool; it does not silently shrink existing native limits.
 Set `indexed_versions = true` for portable indexes, then `captured_versions = true`
 to accept bound capture capsules. Configure `max_capture_bytes` and the RPC pool
 together; the cloud profile includes bounded opt-in settings. The first captured
-publication upgrades Store format to 5. The daemon does not yet upload its local
-capture queue automatically.
+publication upgrades Store format to 5. The daemon's opt-in asynchronous capture
+uploader is configured separately in the [workspace daemon](../workspace-daemon).
 
 The separate query service supports retained root scopes, exact graph facts and
 prefix resolution. Its rebuildable index warms asynchronously; unavailable
@@ -56,6 +56,10 @@ exhaustion and prevents replay until its absolute tombstone expiry. Closing befo
 the first evaluation also prevents a late request from creating that query. Canonical rows
 include verified commit envelopes, while graph edges describe the selected set.
 Response-byte limits can shorten pages; unsupported operators return explicit errors.
+Revision-pinned `PathHistory` and `Blame` support bounded fixed-path linear
+history. Only the selected file body is returned; private metadata-only overlays
+do not grant file access. Unsupported ancestry and exhausted budgets carry
+explicit incomplete coverage. Limits are configurable under `[service.query]`.
 Active graph/canonical work and retained replay bytes share a configurable cursor
 memory pool; completed queries retain their actual cached page size.
 

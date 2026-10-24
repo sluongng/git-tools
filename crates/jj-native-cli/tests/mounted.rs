@@ -862,6 +862,9 @@ where
         if request.uri().path() == "/tinytree.v1.Repository/ReadFile" {
             self.reads.fetch_add(1, Ordering::SeqCst);
         }
+        if request.uri().path() == "/tinytree.v1.Repository/WriteObject" {
+            self.metadata.writes.fetch_add(1, Ordering::SeqCst);
+        }
         if request
             .uri()
             .path()
@@ -875,6 +878,7 @@ where
 
 #[derive(Default)]
 struct MetadataReads {
+    writes: AtomicUsize,
     keys: Mutex<HashSet<(i32, [u8; 32])>>,
     calls: AtomicUsize,
     canonical_bytes: AtomicUsize,
@@ -1026,6 +1030,18 @@ struct CountQueryMetadata {
 }
 #[tonic::async_trait]
 impl RepositoryQuery for CountQueryMetadata {
+    async fn path_history(
+        &self,
+        r: RpcRequest<q::PathHistoryRequest>,
+    ) -> Result<RpcResponse<q::PathHistoryResult>, Status> {
+        self.inner.path_history(r).await
+    }
+    async fn blame(
+        &self,
+        r: RpcRequest<q::BlameRequest>,
+    ) -> Result<RpcResponse<q::BlameResult>, Status> {
+        self.inner.blame(r).await
+    }
     async fn open_scope(
         &self,
         r: RpcRequest<Streaming<q::OpenScopeFrame>>,
@@ -1128,10 +1144,16 @@ impl RemoteServer {
         Self::start_with_history_and_cloud(8, true)
     }
     fn start_with_history_and_cloud(history: usize, cloud_enabled: bool) -> Self {
+        Self::start_configured(history, cloud_enabled, None)
+    }
+    fn start_with_blame_limit(bytes: usize) -> Self {
+        Self::start_configured(8, false, Some(bytes))
+    }
+    fn start_configured(history: usize, cloud_enabled: bool, blame_bytes: Option<usize>) -> Self {
         assert!((1..=1024).contains(&history));
         let setup_started = Instant::now();
         let directory = tempfile::tempdir().unwrap();
-        let (configuration, store_configuration) = if cloud_enabled {
+        let (mut configuration, store_configuration) = if cloud_enabled {
             let profile: tinytree_server::Config = toml::from_str(
                 r#"
 [service]
@@ -1172,6 +1194,9 @@ max_manifest_members=1024
                 tinytree_store::Config::default(),
             )
         };
+        if let Some(bytes) = blame_bytes {
+            configuration.query.max_blame_file_bytes = bytes;
+        }
         let store =
             tinytree_store::Store::open(directory.path().join("store"), store_configuration)
                 .unwrap();
@@ -1444,6 +1469,310 @@ fn remote_observation(binding: &native_workspace_admin::Binding) -> (Vec<u8>, to
     let bytes = fs::read(binding.working_copy.join("native-remote.toml")).unwrap();
     let value = toml::from_str(std::str::from_utf8(&bytes).unwrap()).unwrap();
     (bytes, value)
+}
+
+fn assert_builtin_blame_parity(fixture: &mut Fixture, root: &Path, result: &serde_json::Value) {
+    let oracle = fixture.success(
+        root,
+        &[
+            "file",
+            "annotate",
+            "hello.cc",
+            "--revision",
+            "@",
+            "--template",
+            "commit.commit_id() ++ \":\" ++ original_line_number ++ \"\\n\"",
+        ],
+    );
+    let expected = oracle.lines().map(str::to_owned).collect::<Vec<_>>();
+    let actual = result["lines"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|line| {
+            let origin = &line["origin"];
+            format!(
+                "{}:{}",
+                origin["commit"].as_str().unwrap(),
+                origin["original_line"].as_u64().unwrap()
+            )
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        actual, expected,
+        "remote/local composition must match pinned jj FileAnnotator origins, not rendered fallback labels"
+    );
+}
+
+#[test]
+#[ignore = "requires usable /dev/fuse and fusermount3; run mounted_tests locally"]
+fn shipped_remote_blame_composes_private_and_dirty_paths_without_uploading() {
+    let upstream = RemoteServer::start();
+    let mut fixture = Fixture::new();
+    fixture.configure_remote(&upstream.endpoint);
+    fixture.index_mode("legacy");
+    fixture.start();
+    let base = fixture.base().to_owned();
+    let root = base.join("path-query");
+    fixture.clone_remote(&root);
+    let binding = fixture.binding(&root);
+    assert_eq!(
+        fs::read_to_string(binding.repo.join("index/type")).unwrap(),
+        jj_lib::default_index::DefaultIndexStore::NAME
+    );
+    let observation = remote_observation(&binding).0;
+    let public = upstream.public();
+    let writes = upstream.metadata.writes.load(Ordering::SeqCst);
+    let reads = upstream.file_reads();
+    let public_result: serde_json::Value = serde_json::from_str(&fixture.success(
+        &root,
+        &[
+            "tinytree",
+            "blame",
+            "hello.cc",
+            "--revision",
+            "main",
+            "--json",
+        ],
+    ))
+    .unwrap();
+    assert_eq!(public_result["coverage"], "complete");
+    assert_eq!(public_result["revision"], upstream.head);
+    assert_eq!(public_result["local_commits"], 0);
+    let public_history: serde_json::Value = serde_json::from_str(&fixture.success(
+        &root,
+        &[
+            "tinytree",
+            "history",
+            "hello.cc",
+            "--revision",
+            "main",
+            "--json",
+        ],
+    ))
+    .unwrap();
+    assert_eq!(public_history["coverage"], "complete");
+    assert_eq!(public_history["entries"].as_array().unwrap().len(), 1);
+    assert_eq!(
+        upstream.file_reads(),
+        reads,
+        "remote history/blame transfers only selected target bytes inside Blame, never historical FILE RPCs to the client"
+    );
+    // Provisioning checks out the public commit by creating jj's ordinary
+    // private working-copy child. It remains part of the ancestry we scan,
+    // even though this path's bytes are unchanged in that child.
+    assert_ne!(fixture.revision(&root, "@"), upstream.head);
+    assert_eq!(fixture.revision(&root, "@-"), upstream.head);
+
+    fixture.success(&root, &["new", "-m", "private path base"]);
+    let mut first = b"repeat\nrepeat\nlocal base\n".to_vec();
+    first.extend_from_slice(&upstream.source_bytes);
+    fs::write(root.join("hello.cc"), &first).unwrap();
+    fixture.success(&root, &["status"]);
+    fixture.success(&root, &["new", "-m", "private path child"]);
+    let mut dirty = b"repeat\nlocal child\nrepeat\n".to_vec();
+    dirty.extend_from_slice(&upstream.source_bytes);
+    dirty.extend_from_slice(b"dirty\0\xff without newline");
+    fs::write(root.join("hello.cc"), &dirty).unwrap();
+    // No status/snapshot command here: the query must capture the actual dirty @.
+    let result: serde_json::Value =
+        serde_json::from_str(&fixture.success(&root, &["tinytree", "blame", "hello.cc", "--json"]))
+            .unwrap();
+    assert_eq!(result["coverage"], "complete");
+    assert_eq!(result["local_commits"], 3);
+    assert_eq!(fixture.revision(&root, "@---"), upstream.head);
+    assert_eq!(result["revision"], fixture.revision(&root, "@"));
+    let decoded = result["lines"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .flat_map(|line| {
+            line["bytes"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|byte| byte.as_u64().unwrap() as u8)
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(decoded, dirty);
+    assert_eq!(
+        upstream.file_reads(),
+        reads,
+        "local overlays must not hydrate remote historical files or unrelated assets"
+    );
+    assert_eq!(
+        upstream.metadata.writes.load(Ordering::SeqCst),
+        writes,
+        "querying private/dirty content must not publish its objects"
+    );
+    let private_id = m::ObjectId(
+        *blake3::Hash::from_hex(result["revision"].as_str().unwrap())
+            .unwrap()
+            .as_bytes(),
+    );
+    assert!(
+        upstream
+            .store
+            .descriptor(
+                "example",
+                m::ObjectKey {
+                    kind: m::Kind::Commit,
+                    id: private_id
+                }
+            )
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(remote_observation(&binding).0, observation);
+    assert_eq!(upstream.public(), public);
+    // The oracle may read historical bodies. Counter assertions above precede it.
+    assert_builtin_blame_parity(&mut fixture, &root, &result);
+
+    // A type transition ends the old fixed-path lifetime even if exactly the
+    // same bytes are re-added later. Do not blame the earlier incarnation.
+    fixture.success(&root, &["new", "-m", "path becomes directory"]);
+    fs::remove_file(root.join("hello.cc")).unwrap();
+    fs::create_dir(root.join("hello.cc")).unwrap();
+    fs::write(root.join("hello.cc/nested"), b"directory incarnation\n").unwrap();
+    fixture.success(&root, &["status"]);
+    fixture.success(&root, &["new", "-m", "path returns as file"]);
+    fs::remove_dir_all(root.join("hello.cc")).unwrap();
+    fs::write(root.join("hello.cc"), &dirty).unwrap();
+    let returned: serde_json::Value =
+        serde_json::from_str(&fixture.success(&root, &["tinytree", "blame", "hello.cc", "--json"]))
+            .unwrap();
+    assert_eq!(returned["coverage"], "complete");
+    assert!(
+        returned["lines"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|line| line["origin"]["commit"] == returned["revision"])
+    );
+    assert_builtin_blame_parity(&mut fixture, &root, &returned);
+    assert_eq!(upstream.metadata.writes.load(Ordering::SeqCst), writes);
+    assert_eq!(remote_observation(&binding).0, observation);
+    fixture.success(&base, &["tinytree", "unmount", root.to_str().unwrap()]);
+    fixture.stop_daemon();
+
+    // The server may return a typed incomplete result without target bytes when
+    // its configured file cap is too small. It must not become complete-empty.
+    let limited_upstream = RemoteServer::start_with_blame_limit(1);
+    let mut limited = Fixture::new();
+    limited.configure_remote(&limited_upstream.endpoint);
+    limited.start();
+    let limited_base = limited.base().to_owned();
+    let limited_root = limited_base.join("limited-path-query");
+    limited.clone_remote(&limited_root);
+    let rejected = limited.run(
+        &limited_root,
+        &[
+            "tinytree",
+            "blame",
+            "hello.cc",
+            "--revision",
+            "main",
+            "--json",
+        ],
+    );
+    assert!(
+        !rejected.status.success(),
+        "missing over-budget baseline cannot be a complete empty file"
+    );
+    assert!(rejected.stdout.is_empty());
+    assert!(String::from_utf8_lossy(&rejected.stderr).contains("baseline content unavailable"));
+    assert_eq!(limited_upstream.file_reads(), 0);
+    limited.success(
+        &limited_base,
+        &["tinytree", "unmount", limited_root.to_str().unwrap()],
+    );
+    limited.stop_daemon();
+
+    // Exercise the actual thin-index factory as well. Ordinary jj annotate's
+    // file predicate is unsupported there; the Legacy oracle above is distinct.
+    let mut thin = Fixture::new();
+    thin.configure_remote(&upstream.endpoint);
+    thin.index_mode("federated");
+    thin.start();
+    let thin_base = thin.base().to_owned();
+    let thin_root = thin_base.join("thin-path-query");
+    thin.clone_remote(&thin_root);
+    let thin_binding = thin.binding(&thin_root);
+    assert_eq!(
+        fs::read_to_string(thin_binding.repo.join("index/type")).unwrap(),
+        jj_native_index::NAME
+    );
+    let thin_observation = remote_observation(&thin_binding).0;
+    let thin_reads = upstream.file_reads();
+    let thin_writes = upstream.metadata.writes.load(Ordering::SeqCst);
+    let thin_public: serde_json::Value = serde_json::from_str(&thin.success(
+        &thin_root,
+        &[
+            "tinytree",
+            "blame",
+            "hello.cc",
+            "--revision",
+            "main",
+            "--json",
+        ],
+    ))
+    .unwrap();
+    assert_eq!(thin_public["coverage"], "complete");
+    assert_eq!(thin_public["revision"], upstream.head);
+    assert_eq!(thin_public["local_commits"], 0);
+    assert_eq!(thin.revision(&thin_root, "@-"), upstream.head);
+    thin.success(&thin_root, &["new", "-m", "thin private path"]);
+    let mut thin_dirty = b"thin dirty line\n".to_vec();
+    thin_dirty.extend_from_slice(&upstream.source_bytes);
+    fs::write(thin_root.join("hello.cc"), &thin_dirty).unwrap();
+    let thin_result: serde_json::Value = serde_json::from_str(
+        &thin.success(&thin_root, &["tinytree", "blame", "hello.cc", "--json"]),
+    )
+    .unwrap();
+    assert_eq!(thin_result["coverage"], "complete");
+    assert_eq!(thin_result["local_commits"], 2);
+    assert_eq!(thin.revision(&thin_root, "@--"), upstream.head);
+    assert_eq!(thin_result["revision"], thin.revision(&thin_root, "@"));
+    let thin_lines = thin_result["lines"].as_array().unwrap();
+    assert_eq!(
+        thin_lines.len(),
+        thin_public["lines"].as_array().unwrap().len() + 1
+    );
+    assert_eq!(
+        thin_lines[0]["bytes"],
+        serde_json::json!(b"thin dirty line\n".as_slice())
+    );
+    assert_eq!(thin_lines[0]["origin"]["commit"], thin_result["revision"]);
+    assert_eq!(thin_lines[0]["origin"]["original_line"], 1);
+    for (actual, expected) in thin_lines[1..]
+        .iter()
+        .zip(thin_public["lines"].as_array().unwrap())
+    {
+        assert_eq!(actual["origin"], expected["origin"]);
+        assert_eq!(actual["bytes"], expected["bytes"]);
+    }
+    let thin_history: serde_json::Value = serde_json::from_str(
+        &thin.success(&thin_root, &["tinytree", "history", "hello.cc", "--json"]),
+    )
+    .unwrap();
+    assert_eq!(thin_history["coverage"], "complete");
+    assert_eq!(thin_history["local_commits"], 2);
+    assert_eq!(
+        upstream.file_reads(),
+        thin_reads,
+        "thin source queries must not hydrate historical or unrelated FILEs"
+    );
+    assert_eq!(
+        upstream.metadata.writes.load(Ordering::SeqCst),
+        thin_writes,
+        "thin private queries must not publish authoritative objects"
+    );
+    assert_eq!(remote_observation(&thin_binding).0, thin_observation);
+    thin.success(
+        &thin_base,
+        &["tinytree", "unmount", thin_root.to_str().unwrap()],
+    );
+    thin.stop_daemon();
 }
 
 #[test]

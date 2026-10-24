@@ -6,6 +6,7 @@ license = "MIT AND Apache-2.0"
 description = "Native repository gRPC service and standalone server"
 
 [dependencies]
+jj-lib = { version = "=0.46.0", default-features = false }
 anyhow = "1"
 async-stream = "0.3"
 blake3 = "1"
@@ -32,7 +33,6 @@ tonic = { version = "0.14", features = ["zstd", "tls-ring"] }
 uuid = { version = "1", features = ["v4"] }
 
 [dev-dependencies]
-jj-lib = { version = "=0.46.0", default-features = false }
 tonic-prost = "0.14"
 tempfile = "3"
 tinytree-fixture = { path = "../tinytree-fixture" }

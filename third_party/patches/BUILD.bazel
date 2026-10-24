@@ -13,3 +13,11 @@ rust_test(
         '--check-cfg=cfg(fuser_mount_impl, values("pure-rust", "libfuse2", "libfuse3"))',
     ],
 )
+
+# Compare the bounded public API against the unmodified literal jj policy.
+rust_test(
+    name = "jj_bounded_diff_tests",
+    srcs = ["jj_bounded_diff_test.rs"],
+    edition = "2024",
+    deps = ["@crates//:jj-lib"],
+)

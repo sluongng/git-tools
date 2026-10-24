@@ -194,6 +194,174 @@ pub struct QueryPage {
     pub rows: Vec<q::GraphRow>,
     pub exhausted: bool,
 }
+/// An exact path at an immutable revision in one captured local scope. This is
+/// not an upstream object-read capability or a moving reference selection.
+#[derive(Clone, Debug)]
+pub struct ScopedPathQuery {
+    pub scope: [u8; 32],
+    pub revision: CommitId,
+    pub path: String,
+    pub policy: q::HistoryPolicy,
+    pub max_commits: u32,
+}
+impl ScopedPathQuery {
+    pub(crate) fn validate(&self, cap: usize) -> Result<(), Status> {
+        crate::query_service::bounded_input(self.path.len().saturating_add(128), cap)?;
+        if self.policy != q::HistoryPolicy::LinearFixedPathV1 {
+            return Err(Status::unimplemented("native history policy unsupported"));
+        }
+        if self.path.is_empty()
+            || self.path.contains(['\\', '\0'])
+            || self
+                .path
+                .split('/')
+                .any(|part| matches!(part, "" | "." | ".."))
+        {
+            return Err(Status::invalid_argument("invalid native history path"));
+        }
+        Ok(())
+    }
+    fn check_echo(
+        &self,
+        revision: Option<&q::CommitId>,
+        path: &str,
+        policy: i32,
+        digest: &[u8],
+        epoch: &[u8],
+        coverage: i32,
+        boundary: Option<&q::CommitId>,
+    ) -> Result<(), Status> {
+        if revision.is_none_or(|id| id.value.as_slice() != self.revision.0)
+            || path != self.path
+            || policy != self.policy as i32
+            || digest.len() != 32
+            || epoch.len() != 16
+            || !(1..=7).contains(&coverage)
+            || (coverage == 1 && boundary.is_some())
+            || (coverage != 1 && boundary.is_none())
+            || boundary.is_some_and(|id| id.value.len() != 32)
+        {
+            return Err(Status::data_loss(
+                "native history response binding mismatch",
+            ));
+        }
+        Ok(())
+    }
+    pub(crate) fn check_history(&self, value: &q::PathHistoryResult) -> Result<(), Status> {
+        self.check_echo(
+            value.revision.as_ref(),
+            &value.path,
+            value.policy,
+            &value.scope_digest,
+            &value.index_epoch,
+            value.coverage,
+            value.boundary.as_ref(),
+        )?;
+        if self.max_commits != 0 && value.scanned_commits > self.max_commits {
+            return Err(Status::data_loss("native history scan bound mismatch"));
+        }
+        if value.entries.len() > value.scanned_commits as usize {
+            return Err(Status::data_loss("native history result count mismatch"));
+        }
+        let mut previous = std::collections::HashSet::new();
+        for entry in &value.entries {
+            let id = entry.commit.as_ref().ok_or_else(history_integrity)?;
+            if id.value.len() != 32 || !previous.insert(id.value.as_slice()) {
+                return Err(history_integrity());
+            }
+            path_state(entry.state.as_ref().ok_or_else(history_integrity)?)?;
+            path_state(entry.parent_state.as_ref().ok_or_else(history_integrity)?)?;
+            if entry.state == entry.parent_state {
+                return Err(history_integrity());
+            }
+        }
+        Ok(())
+    }
+    pub(crate) fn check_blame(
+        &self,
+        value: &q::BlameResult,
+        limits: tinytree_model::Limits,
+    ) -> Result<(), Status> {
+        self.check_echo(
+            value.revision.as_ref(),
+            &value.path,
+            value.policy,
+            &value.scope_digest,
+            &value.index_epoch,
+            value.coverage,
+            value.boundary.as_ref(),
+        )?;
+        if self.max_commits != 0 && value.scanned_commits > self.max_commits {
+            return Err(history_integrity());
+        }
+        let Some(target) = value.target.as_ref() else {
+            if value.coverage == 1 || !value.target_bytes.is_empty() || !value.ranges.is_empty() {
+                return Err(history_integrity());
+            }
+            return Ok(());
+        };
+        let key = target.key.as_ref().ok_or_else(history_integrity)?;
+        let id: [u8; 32] = key
+            .native_id
+            .as_slice()
+            .try_into()
+            .map_err(|_| history_integrity())?;
+        if key.kind != tinytree_model::Kind::File as i32
+            || target.content_blake3.as_slice() != id
+            || target.object_format_version != tinytree_model::FORMAT_VERSION as u32
+        {
+            return Err(history_integrity());
+        }
+        let descriptor = tinytree_model::Descriptor {
+            key: tinytree_model::ObjectKey {
+                kind: tinytree_model::Kind::File,
+                id: tinytree_model::ObjectId(id),
+            },
+            size_bytes: target.size_bytes,
+            format_version: tinytree_model::FORMAT_VERSION,
+        };
+        tinytree_model::verify(&descriptor, &value.target_bytes, limits)
+            .map_err(|_| history_integrity())?;
+        let lines = value
+            .target_bytes
+            .iter()
+            .filter(|&&byte| byte == b'\n')
+            .count()
+            + usize::from(value.target_bytes.last().is_some_and(|&byte| byte != b'\n'));
+        let mut next = 0usize;
+        for range in &value.ranges {
+            if range.start_line as usize != next
+                || range.end_line <= range.start_line
+                || range.end_line as usize > lines
+                || range.origin.as_ref().is_some_and(|id| id.value.len() != 32)
+                || (value.coverage == 1 && range.origin.is_none())
+                || range
+                    .original_line
+                    .checked_add(range.end_line - range.start_line)
+                    .is_none()
+            {
+                return Err(history_integrity());
+            }
+            next = range.end_line as usize;
+        }
+        if next != lines {
+            return Err(history_integrity());
+        }
+        Ok(())
+    }
+}
+fn history_integrity() -> Status {
+    Status::data_loss("invalid native history response")
+}
+fn path_state(value: &q::HistoryPathState) -> Result<(), Status> {
+    match value.kind {
+        1 if value.native_id.is_empty() && value.size_bytes == 0 && !value.executable => Ok(()),
+        2 if value.native_id.len() == 32 => Ok(()),
+        3 if value.native_id.len() == 32 && !value.executable => Ok(()),
+        4 if value.native_id.len() == 32 && value.size_bytes == 0 && !value.executable => Ok(()),
+        _ => Err(history_integrity()),
+    }
+}
 /// Aliases explicitly registered with the same adapter Arc are trusted synonyms
 /// for the same handles/capability, not isolation boundaries. Distinct repository
 /// or trust scopes require distinct adapters.
@@ -308,6 +476,20 @@ pub trait NativeQueryIo: Send + Sync + std::fmt::Debug {
         commit: CommitId,
         owner: QueryOwner,
     ) -> Result<QueryReply<jj_native_backend::VerifiedMetadata>, Status>;
+    async fn path_history(
+        &self,
+        _input: ScopedPathQuery,
+        _owner: QueryOwner,
+    ) -> Result<QueryReply<q::PathHistoryResult>, Status> {
+        Err(Status::unimplemented("native path history unsupported"))
+    }
+    async fn blame(
+        &self,
+        _input: ScopedPathQuery,
+        _owner: QueryOwner,
+    ) -> Result<QueryReply<q::BlameResult>, Status> {
+        Err(Status::unimplemented("native blame unsupported"))
+    }
     async fn close_query(&self, query: [u8; 32], owner: QueryOwner) -> Result<(), Status>;
     async fn close_scope(&self, scope: [u8; 32], owner: QueryOwner) -> Result<(), Status>;
 }

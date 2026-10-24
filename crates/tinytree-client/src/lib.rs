@@ -12,6 +12,7 @@ pub use client::cloud::{
     CloudPublication, CloudPublishIntent, CloudRawDigest, CloudVersion, CloudWorkspace,
     CloudWriteReceipt, RetainedVersionSelector, VerifiedCapturedVersion, VerifiedRetainedVersion,
 };
+pub use client::history::{CheckedBlame, CheckedPathHistory};
 pub use client::query::{
     ChangeMatch, ChangePrefix, ChangeTarget, CheckedGraphPage, CheckedGraphQuery, CheckedGraphRows,
     CheckedIdsPage, CheckedIdsQuery, CheckedScopeHandle, CommitPrefix, FactAnswer, GraphEdge,

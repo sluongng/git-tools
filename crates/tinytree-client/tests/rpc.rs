@@ -1459,6 +1459,21 @@ use tinytree_proto::query_v1 as q;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum QueryMode {
     Normal,
+    HistoryWrongDigest,
+    HistoryWrongRevision,
+    HistoryWrongPath,
+    HistoryWrongPolicy,
+    HistoryInvalidCoverage,
+    HistoryFalseComplete,
+    HistoryMalformedState,
+    HistoryDuplicateEntry,
+    BlameWrongHash,
+    BlameGap,
+    BlameUnresolvedComplete,
+    BlameOriginWidth,
+    BlameOriginOverflow,
+    BlamePartialReply,
+    BlameUnavailableTarget,
     CloudMissingBinding,
     CloudWrongBinding,
     CloudBindingWidth,
@@ -1525,6 +1540,8 @@ struct QueryCounts {
     fork_release: tokio::sync::Notify,
     closes: AtomicUsize,
     facts: AtomicUsize,
+    histories: AtomicUsize,
+    blames: AtomicUsize,
     commit_prefixes: AtomicUsize,
     change_prefixes: AtomicUsize,
     shortest_prefixes: AtomicUsize,
@@ -1546,6 +1563,65 @@ struct QueryFaults {
 }
 #[tonic::async_trait]
 impl RepositoryQuery for QueryFaults {
+    async fn path_history(
+        &self,
+        request: Request<q::PathHistoryRequest>,
+    ) -> Result<Response<q::PathHistoryResult>, Status> {
+        self.counts.histories.fetch_add(1, Ordering::SeqCst);
+        let mut reply = self.service.path_history(request).await?;
+        let result = reply.get_mut();
+        match self.mode {
+            QueryMode::HistoryWrongDigest => result.scope_digest[0] ^= 1,
+            QueryMode::HistoryWrongRevision => result.revision.as_mut().unwrap().value[0] ^= 1,
+            QueryMode::HistoryWrongPath => result.path.push_str(".different"),
+            QueryMode::HistoryWrongPolicy => result.policy = 0,
+            QueryMode::HistoryInvalidCoverage => result.coverage = 99,
+            QueryMode::HistoryFalseComplete => result.boundary = result.revision.clone(),
+            QueryMode::HistoryMalformedState => {
+                result.entries[0].state.as_mut().unwrap().native_id.clear()
+            }
+            QueryMode::HistoryDuplicateEntry => {
+                result.entries.push(result.entries[0].clone());
+                result.scanned_commits += 1;
+            }
+            _ => {}
+        }
+        Ok(reply)
+    }
+    async fn blame(
+        &self,
+        request: Request<q::BlameRequest>,
+    ) -> Result<Response<q::BlameResult>, Status> {
+        self.counts.blames.fetch_add(1, Ordering::SeqCst);
+        let mut reply = self.service.blame(request).await?;
+        let result = reply.get_mut();
+        match self.mode {
+            QueryMode::BlameWrongHash => result.target_bytes[0] ^= 1,
+            QueryMode::BlameGap => result.ranges[0].start_line += 1,
+            QueryMode::BlameUnresolvedComplete => result.ranges[0].origin = None,
+            QueryMode::BlameOriginWidth => {
+                result.ranges[0].origin.as_mut().unwrap().value.pop();
+            }
+            QueryMode::BlameOriginOverflow => result.ranges[0].original_line = u32::MAX,
+            QueryMode::BlamePartialReply => {
+                result.coverage = q::HistoryCoverage::HistoryScanLimit as i32;
+                result.boundary = result.revision.clone();
+                for range in &mut result.ranges {
+                    range.origin = None;
+                    range.original_line = 0;
+                }
+            }
+            QueryMode::BlameUnavailableTarget => {
+                result.coverage = q::HistoryCoverage::HistoryReadLimit as i32;
+                result.boundary = result.revision.clone();
+                result.target = None;
+                result.target_bytes.clear();
+                result.ranges.clear();
+            }
+            _ => {}
+        }
+        Ok(reply)
+    }
     // SDK transport boundary fixture: no claim that this synthetic echo
     // authorizes a real stored portable index. Server acceptance is separate.
     async fn open_cloud_scope(
@@ -7382,4 +7458,242 @@ async fn captured_version_transport_checks_client_footer_stream_and_original_pub
     assert_eq!(faults.calls.load(Ordering::SeqCst), before);
     server.abort();
     let _ = server.await;
+}
+
+#[tokio::test]
+async fn checked_path_history_and_blame_bind_revision_and_retain_only_result_owners() {
+    let fixture = setup_query_retained();
+    let running = QueryRunning::start(fixture.service.clone(), QueryMode::Normal).await;
+    let mut config = running.config.clone();
+    config.limits.max_inflight = 1;
+    let client = NativeClient::connect(config).await.unwrap();
+    let scope = client.open_query_scope(vec![fixture.root]).await.unwrap();
+    let result_drops = Arc::new(AtomicUsize::new(0));
+    let rpc_drops = Arc::new(AtomicUsize::new(0));
+    let operation = client
+        .clone()
+        .with_lifetime_guard(Arc::new(LifetimeProbe(result_drops.clone())))
+        .with_rpc_lifetime_guard(Arc::new(LifetimeProbe(rpc_drops.clone())));
+    let history = operation
+        .path_history(
+            &scope,
+            fixture.root,
+            "BUILD.bazel",
+            q::HistoryPolicy::LinearFixedPathV1,
+            0,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        history.result().coverage,
+        q::HistoryCoverage::HistoryComplete as i32
+    );
+    assert_eq!(history.result().entries.len(), 1);
+    assert_eq!(
+        history.result().entries[0].commit.as_ref().unwrap().value,
+        fixture.root.0
+    );
+    // A held result must not retain the sole inflight slot.
+    let blame = operation
+        .blame(
+            &scope,
+            fixture.root,
+            "BUILD.bazel",
+            q::HistoryPolicy::LinearFixedPathV1,
+            0,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        blame.result().coverage,
+        q::HistoryCoverage::HistoryComplete as i32
+    );
+    assert!(!blame.result().target_bytes.is_empty());
+    assert!(
+        blame
+            .result()
+            .ranges
+            .iter()
+            .all(|range| range.origin.as_ref().unwrap().value == fixture.root.0)
+    );
+    drop(operation);
+    assert_released(&rpc_drops).await;
+    assert_eq!(result_drops.load(Ordering::SeqCst), 0);
+    let history_clone = history.clone();
+    drop(history);
+    drop(blame);
+    assert_eq!(result_drops.load(Ordering::SeqCst), 0);
+    drop(history_clone);
+    assert_released(&result_drops).await;
+    client.close_query_scope(&scope).await.unwrap();
+    assert_eq!(
+        client
+            .path_history(
+                &scope,
+                fixture.root,
+                "BUILD.bazel",
+                q::HistoryPolicy::LinearFixedPathV1,
+                0
+            )
+            .await
+            .unwrap_err()
+            .code(),
+        Code::FailedPrecondition
+    );
+    running.stop().await;
+}
+
+#[tokio::test]
+async fn checked_path_history_rejects_unbound_and_malformed_server_replies() {
+    for mode in [
+        QueryMode::HistoryWrongDigest,
+        QueryMode::HistoryWrongRevision,
+        QueryMode::HistoryWrongPath,
+        QueryMode::HistoryWrongPolicy,
+        QueryMode::HistoryInvalidCoverage,
+        QueryMode::HistoryFalseComplete,
+        QueryMode::HistoryMalformedState,
+        QueryMode::HistoryDuplicateEntry,
+    ] {
+        let fixture = setup_query_retained();
+        let running = QueryRunning::start(fixture.service.clone(), mode).await;
+        let client = running.client().await;
+        let scope = client.open_query_scope(vec![fixture.root]).await.unwrap();
+        let error = client
+            .path_history(
+                &scope,
+                fixture.root,
+                "BUILD.bazel",
+                q::HistoryPolicy::LinearFixedPathV1,
+                0,
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(error.code(), Code::DataLoss, "{mode:?}: {error}");
+        client.close_query_scope(&scope).await.unwrap();
+        running.stop().await;
+    }
+}
+
+#[tokio::test]
+async fn checked_blame_rejects_corrupt_bytes_gaps_and_false_attribution() {
+    for mode in [
+        QueryMode::BlameWrongHash,
+        QueryMode::BlameGap,
+        QueryMode::BlameUnresolvedComplete,
+        QueryMode::BlameOriginWidth,
+        QueryMode::BlameOriginOverflow,
+    ] {
+        let fixture = setup_query_retained();
+        let running = QueryRunning::start(fixture.service.clone(), mode).await;
+        let client = running.client().await;
+        let scope = client.open_query_scope(vec![fixture.root]).await.unwrap();
+        let error = client
+            .blame(
+                &scope,
+                fixture.root,
+                "BUILD.bazel",
+                q::HistoryPolicy::LinearFixedPathV1,
+                0,
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(error.code(), Code::DataLoss, "{mode:?}: {error}");
+        client.close_query_scope(&scope).await.unwrap();
+        running.stop().await;
+    }
+}
+
+#[tokio::test]
+async fn fixed_path_history_rejects_invalid_inputs_before_rpc() {
+    let fixture = setup_query_retained();
+    let running = QueryRunning::start(fixture.service.clone(), QueryMode::Normal).await;
+    let client = running.client().await;
+    let scope = client.open_query_scope(vec![fixture.root]).await.unwrap();
+    for path in [
+        "",
+        "/BUILD.bazel",
+        "a/../BUILD.bazel",
+        "a//file",
+        "a\\file",
+        "file\0suffix",
+    ] {
+        assert_eq!(
+            client
+                .path_history(
+                    &scope,
+                    fixture.root,
+                    path,
+                    q::HistoryPolicy::LinearFixedPathV1,
+                    0
+                )
+                .await
+                .unwrap_err()
+                .code(),
+            Code::InvalidArgument
+        );
+        assert_eq!(
+            client
+                .blame(
+                    &scope,
+                    fixture.root,
+                    path,
+                    q::HistoryPolicy::LinearFixedPathV1,
+                    0
+                )
+                .await
+                .unwrap_err()
+                .code(),
+            Code::InvalidArgument
+        );
+    }
+    assert_eq!(running.counts.histories.load(Ordering::SeqCst), 0);
+    assert_eq!(running.counts.blames.load(Ordering::SeqCst), 0);
+    client.close_query_scope(&scope).await.unwrap();
+    running.stop().await;
+}
+
+#[tokio::test]
+async fn checked_blame_preserves_explicit_partial_coverage_without_invented_origins() {
+    // Structural transport fixture: server-side budget and authority behavior
+    // are verified by the real service's RPC cases, not by these altered replies.
+    for (mode, coverage, has_target) in [
+        (
+            QueryMode::BlamePartialReply,
+            q::HistoryCoverage::HistoryScanLimit,
+            true,
+        ),
+        (
+            QueryMode::BlameUnavailableTarget,
+            q::HistoryCoverage::HistoryReadLimit,
+            false,
+        ),
+    ] {
+        let fixture = setup_query_retained();
+        let running = QueryRunning::start(fixture.service.clone(), mode).await;
+        let client = running.client().await;
+        let scope = client.open_query_scope(vec![fixture.root]).await.unwrap();
+        let blame = client
+            .blame(
+                &scope,
+                fixture.root,
+                "BUILD.bazel",
+                q::HistoryPolicy::LinearFixedPathV1,
+                0,
+            )
+            .await
+            .unwrap();
+        assert_eq!(blame.result().coverage, coverage as i32, "{mode:?}");
+        assert_eq!(blame.result().target.is_some(), has_target, "{mode:?}");
+        assert!(blame.result().boundary.is_some());
+        assert!(
+            blame
+                .result()
+                .ranges
+                .iter()
+                .all(|range| range.origin.is_none())
+        );
+        client.close_query_scope(&scope).await.unwrap();
+        running.stop().await;
+    }
 }

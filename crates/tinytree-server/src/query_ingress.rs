@@ -97,6 +97,8 @@ where
         self.inner.poll_ready(cx)
     }
     fn call(&mut self, mut request: http::Request<Body>) -> Self::Future {
+        let history = request.uri().path().ends_with("/PathHistory")
+            || request.uri().path().ends_with("/Blame");
         let cloud_open = request.uri().path().ends_with("/OpenCloudScope");
         let streaming = cloud_open
             || request.uri().path().ends_with("/OpenScope")
@@ -133,7 +135,12 @@ where
                 Ok(context) => context,
                 Err(status) => return Ok(status.into_http()),
             };
-            let work: Arc<Work> = match host.admit(deadline).await {
+            let admission = if history {
+                host.admit_history(deadline).await
+            } else {
+                host.admit(deadline).await
+            };
+            let work: Arc<Work> = match admission {
                 Ok(work) => work,
                 Err(status) => return Ok(status.into_http()),
             };
@@ -297,6 +304,81 @@ mod tests {
                 .await
                 .is_ok()
         );
+    }
+    #[tokio::test]
+    async fn history_buffers_are_admitted_before_decoding_without_taxing_graph_calls() {
+        let temporary = tempfile::tempdir().unwrap();
+        let index =
+            tinytree_index::Index::open(temporary.path().join("index"), &Default::default())
+                .unwrap();
+        let store =
+            tinytree_store::Store::open(temporary.path().join("objects"), Default::default())
+                .unwrap();
+        store.create_repository("example").unwrap();
+        let mut config = ServiceConfig::default();
+        // Two existing graph reservations fit, but a graph plus history does
+        // not. Do not enlarge the pool to hide a new tax on ordinary queries.
+        config.query.max_request_memory_bytes =
+            2 * config.query.request_memory(config.max_request_bytes);
+        let repository = RepositoryService::new(
+            store,
+            config,
+            vec!["example".into()],
+            vec![Principal::new("agent", TOKEN, vec!["example".into()], true).unwrap()],
+        )
+        .unwrap()
+        .with_query_index(index)
+        .unwrap();
+        let host = repository.query_host().unwrap();
+        let held = host
+            .admit(tokio::time::Instant::now() + Duration::from_secs(1))
+            .await
+            .unwrap();
+        assert!(!held.has_history_memory());
+        let service = repository.query_grpc_service();
+        for method in ["PathHistory", "Blame"] {
+            let (mut blocked, polls) = request(true);
+            *blocked.uri_mut() = format!("/tinytree.query.v1.RepositoryQuery/{method}")
+                .parse()
+                .unwrap();
+            let response = service.clone().oneshot(blocked).await.unwrap();
+            assert_eq!(response.headers().get("grpc-status").unwrap(), "4");
+            assert_eq!(
+                polls.load(Ordering::SeqCst),
+                0,
+                "history buffers must be reserved before decoding"
+            );
+            drop(response);
+        }
+        let (ordinary, polls) = request(true);
+        let response = service.clone().oneshot(ordinary).await.unwrap();
+        assert_eq!(
+            response.headers().get("grpc-status").unwrap(),
+            "9",
+            "the second ordinary graph call still reaches scope lookup"
+        );
+        assert!(polls.load(Ordering::SeqCst) > 0);
+        drop(response);
+        drop(held);
+        for method in ["PathHistory", "Blame"] {
+            let (mut accepted, polls) = request(true);
+            *accepted.uri_mut() = format!("/tinytree.query.v1.RepositoryQuery/{method}")
+                .parse()
+                .unwrap();
+            let response = service.clone().oneshot(accepted).await.unwrap();
+            assert_eq!(
+                response.headers().get("grpc-status").unwrap(),
+                "9",
+                "handler must reuse the one complete ingress reservation"
+            );
+            assert!(polls.load(Ordering::SeqCst) > 0);
+            drop(response);
+        }
+        let history = host
+            .admit_history(tokio::time::Instant::now() + Duration::from_secs(1))
+            .await
+            .unwrap();
+        assert!(history.has_history_memory());
     }
     #[tokio::test]
     async fn cloud_proof_admission_precedes_body_without_taxing_ordinary_queries() {

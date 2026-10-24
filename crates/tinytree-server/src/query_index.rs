@@ -87,6 +87,18 @@ pub struct QueryConfig {
     pub max_scope_overlay_bytes: usize,
     pub max_scope_overlay_nodes: usize,
     pub max_overlay_layers: usize,
+    pub max_history_commits: usize,
+    pub max_history_object_bytes: usize,
+    pub max_history_read_bytes: usize,
+    pub max_history_path_depth: usize,
+    pub max_blame_file_bytes: usize,
+    pub max_blame_lines: usize,
+    /// Aggregate comparison work across one blame request.
+    pub max_blame_diff_steps: usize,
+    /// Conservative allocation charge for one comparison, not total allocation
+    /// across history or exact resident bytes. Physical admission is separate.
+    pub max_blame_diff_memory_bytes: usize,
+    pub max_blame_diff_depth: usize,
 }
 impl Default for QueryConfig {
     fn default() -> Self {
@@ -155,6 +167,15 @@ impl Default for QueryConfig {
             max_scope_overlay_bytes: 16 * 1024 * 1024,
             max_scope_overlay_nodes: 4096,
             max_overlay_layers: 32,
+            max_history_commits: 256,
+            max_history_object_bytes: 1024 * 1024,
+            max_history_read_bytes: 16 * 1024 * 1024,
+            max_history_path_depth: 128,
+            max_blame_file_bytes: 256 * 1024,
+            max_blame_lines: 16_384,
+            max_blame_diff_steps: 16_000_000,
+            max_blame_diff_memory_bytes: 8 * 1024 * 1024,
+            max_blame_diff_depth: 64,
         }
     }
 }
@@ -168,6 +189,17 @@ impl QueryConfig {
             .saturating_add(self.max_index_record_bytes.saturating_mul(4))
             .saturating_add(self.max_scope_overlay_bytes.saturating_mul(2))
             .saturating_add(8 * 1024 * 1024)
+    }
+    // Only path history/blame reserve these additional buffers. Charging every
+    // graph/close request would reduce existing progress while a response is held.
+    pub(crate) fn history_memory(&self) -> usize {
+        self.max_history_object_bytes
+            .max(self.max_commit_bytes)
+            .saturating_mul(8)
+            .saturating_add(self.max_blame_file_bytes.saturating_mul(8))
+            .saturating_add(self.max_blame_diff_memory_bytes.saturating_mul(2))
+            .saturating_add(self.max_blame_lines.saturating_mul(256))
+            .saturating_add(self.max_history_commits.saturating_mul(512))
     }
     fn warm_memory(&self) -> usize {
         self.max_warm_bytes
@@ -197,7 +229,10 @@ impl QueryConfig {
             || !(1024..=1024 * 1024).contains(&self.max_request_bytes)
             || !(1..=32).contains(&self.max_inflight)
             || self.max_request_memory_bytes > 1024 * 1024 * 1024
-            || self.request_memory(request_bytes) > self.max_request_memory_bytes
+            || self
+                .request_memory(request_bytes)
+                .saturating_add(self.history_memory())
+                > self.max_request_memory_bytes
             || !(1..=1024).contains(&self.max_facts)
             || !(1..=100_000).contains(&self.max_input_ids)
             || !(1..=100_000).contains(&self.max_result_ids)
@@ -237,6 +272,15 @@ impl QueryConfig {
             || !(1..=64 * 1024 * 1024).contains(&self.max_scope_overlay_bytes)
             || !(1..=65_536).contains(&self.max_scope_overlay_nodes)
             || !(1..=128).contains(&self.max_overlay_layers)
+            || !(1..=4096).contains(&self.max_history_commits)
+            || !(1024..=4 * 1024 * 1024).contains(&self.max_history_object_bytes)
+            || !(1024..=256 * 1024 * 1024).contains(&self.max_history_read_bytes)
+            || !(1..=1024).contains(&self.max_history_path_depth)
+            || !(1..=1024 * 1024).contains(&self.max_blame_file_bytes)
+            || !(1..=65_536).contains(&self.max_blame_lines)
+            || !(1..=100_000_000).contains(&self.max_blame_diff_steps)
+            || !(1024..=64 * 1024 * 1024).contains(&self.max_blame_diff_memory_bytes)
+            || !(1..=256).contains(&self.max_blame_diff_depth)
             || self
                 .max_scope_overlay_bytes
                 .saturating_mul(4)
@@ -480,9 +524,13 @@ pub(crate) struct Work {
     _memory: OwnedSemaphorePermit,
     _inflight: OwnedSemaphorePermit,
     _host: Arc<QueryHost>,
+    history_admitted: bool,
 }
 
 impl Work {
+    pub fn has_history_memory(&self) -> bool {
+        self.history_admitted
+    }
     pub fn belongs_to(&self, host: &Arc<QueryHost>) -> bool {
         Arc::ptr_eq(&self._host, host)
     }
@@ -709,6 +757,19 @@ impl QueryHost {
         self: &Arc<Self>,
         deadline: tokio::time::Instant,
     ) -> Result<Arc<Work>, Status> {
+        self.admit_kind(deadline, false).await
+    }
+    pub async fn admit_history(
+        self: &Arc<Self>,
+        deadline: tokio::time::Instant,
+    ) -> Result<Arc<Work>, Status> {
+        self.admit_kind(deadline, true).await
+    }
+    async fn admit_kind(
+        self: &Arc<Self>,
+        deadline: tokio::time::Instant,
+        history: bool,
+    ) -> Result<Arc<Work>, Status> {
         if self.closing.load(Ordering::Acquire) {
             return Err(Status::unavailable("query host draining"));
         }
@@ -716,11 +777,16 @@ impl QueryHost {
             .await
             .map_err(|_| Status::deadline_exceeded("query admission expired"))?
             .map_err(|_| Status::unavailable("query host draining"))?;
+        // One weighted acquisition, before decoding. Never hold the base memory
+        // reservation while waiting to upgrade to history buffers.
+        let bytes = self.request_memory.saturating_add(if history {
+            self.config.history_memory()
+        } else {
+            0
+        });
         let memory = tokio::time::timeout_at(
             deadline,
-            self.memory
-                .clone()
-                .acquire_many_owned(self.request_memory as u32),
+            self.memory.clone().acquire_many_owned(bytes as u32),
         )
         .await
         .map_err(|_| Status::deadline_exceeded("query admission expired"))?
@@ -733,6 +799,7 @@ impl QueryHost {
             deadline,
             _inflight: permit,
             _memory: memory,
+            history_admitted: history,
             scopes: Mutex::new(Vec::new()),
             query_owners: Mutex::new(Vec::new()),
         }))

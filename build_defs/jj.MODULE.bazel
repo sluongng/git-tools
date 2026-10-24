@@ -16,3 +16,11 @@ crate.annotation(
     ],
     version = "0.46.0",
 )
+
+# Remote annotation uses jj's literal matching policy with bounded physical work.
+crate.annotation(
+    crate = "jj-core",
+    patch_args = ["-p1"],
+    patches = ["//third_party/patches:jj-core-bounded-line-diff.patch"],
+    version = "0.46.0",
+)

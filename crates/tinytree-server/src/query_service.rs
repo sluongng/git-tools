@@ -326,6 +326,23 @@ async fn admitted(
         host.admit(deadline).await
     }
 }
+async fn admitted_history(
+    host: &Arc<QueryHost>,
+    deadline: Instant,
+    existing: Option<Arc<Work>>,
+) -> Result<Arc<Work>, Status> {
+    if let Some(work) = existing {
+        if !work.belongs_to(host) || !work.has_history_memory() {
+            return Err(Status::internal("history ingress owner mismatch"));
+        }
+        if Instant::now() >= deadline {
+            return Err(Status::deadline_exceeded("history admission expired"));
+        }
+        Ok(work)
+    } else {
+        host.admit_history(deadline).await
+    }
+}
 async fn execute<T: Send + 'static>(
     host: Arc<QueryHost>,
     work: Arc<Work>,
@@ -917,6 +934,74 @@ impl RepositoryQuery for QueryService {
             },
         )
         .await
+    }
+    async fn path_history(
+        &self,
+        request: Request<q::PathHistoryRequest>,
+    ) -> Result<Response<q::PathHistoryResult>, Status> {
+        let (identity, deadline, host) = self.context(&request, false)?;
+        let admission = request.extensions().get::<Arc<Work>>().cloned();
+        self.bounded(request.get_ref())?;
+        let input = request.into_inner();
+        let key = scope_key(input.scope.clone())?;
+        identity.authorize(&key.repository_id, false)?;
+        let work = admitted_history(&host, deadline, admission).await?;
+        let (value, work) = execute(host, work, deadline, move |host, work| {
+            let scope = host.lookup(&identity.id, &key.repository_id, &key.handle)?;
+            if scope.is_cloud() {
+                identity.cloud_capability()?;
+            }
+            work.scopes.lock().unwrap().push(scope.clone());
+            let mut budget = host.config.budget();
+            crate::query_history::path_history(
+                host,
+                &scope,
+                &key.repository_id,
+                input,
+                &mut budget,
+                deadline,
+            )
+        })
+        .await?;
+        response(
+            value,
+            work,
+            self.repository.service_config().query.max_response_bytes,
+        )
+    }
+    async fn blame(
+        &self,
+        request: Request<q::BlameRequest>,
+    ) -> Result<Response<q::BlameResult>, Status> {
+        let (identity, deadline, host) = self.context(&request, false)?;
+        let admission = request.extensions().get::<Arc<Work>>().cloned();
+        self.bounded(request.get_ref())?;
+        let input = request.into_inner();
+        let key = scope_key(input.scope.clone())?;
+        identity.authorize(&key.repository_id, false)?;
+        let work = admitted_history(&host, deadline, admission).await?;
+        let (value, work) = execute(host, work, deadline, move |host, work| {
+            let scope = host.lookup(&identity.id, &key.repository_id, &key.handle)?;
+            if scope.is_cloud() {
+                identity.cloud_capability()?;
+            }
+            work.scopes.lock().unwrap().push(scope.clone());
+            let mut budget = host.config.budget();
+            crate::query_history::blame(
+                host,
+                &scope,
+                &key.repository_id,
+                input,
+                &mut budget,
+                deadline,
+            )
+        })
+        .await?;
+        response(
+            value,
+            work,
+            self.repository.service_config().query.max_response_bytes,
+        )
     }
     async fn close_query(
         &self,

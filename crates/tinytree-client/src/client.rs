@@ -1,5 +1,7 @@
 #[path = "cloud.rs"]
 pub(crate) mod cloud;
+#[path = "history.rs"]
+pub(crate) mod history;
 #[path = "query.rs"]
 pub(crate) mod query;
 use crate::transport::Client as RepositoryClient;

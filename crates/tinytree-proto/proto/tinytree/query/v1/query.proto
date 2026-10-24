@@ -22,6 +22,8 @@ service RepositoryQuery {
   rpc ShortestPrefix(ShortestPrefixRequest) returns (ShortestPrefixResult);
   rpc Evaluate(EvaluateRequest) returns (EvaluatePage);
   rpc CloseQuery(CloseQueryRequest) returns (CloseQueryResponse);
+  rpc PathHistory(PathHistoryRequest) returns (PathHistoryResult);
+  rpc Blame(BlameRequest) returns (BlameResult);
 }
 
 message CommitId { bytes value = 1; } // Exactly 32 bytes; zero is intrinsic root.
@@ -351,4 +353,93 @@ message CloudSnapshotSource {
   tinytree.cloud.v1.RetainedVersionSelector selector = 1;
   tinytree.cloud.v1.NativeVersionAuthority authority = 2;
   repeated bytes index_root_ids = 3; // Nonempty, strictly sorted unique32.
+}
+
+
+// Explicit fixed-path semantics: linear ancestry only, no copy/rename following.
+// A merge or unresolved tree is a typed incomplete boundary, never first-parent
+// attribution. The starting immutable commit must have canonical source authority
+// in this exact scope; uploaded COMMIT-only overlays confer no FILE access.
+enum HistoryPolicy {
+  HISTORY_POLICY_UNSPECIFIED = 0;
+  LINEAR_FIXED_PATH_V1 = 1;
+}
+enum HistoryCoverage {
+  HISTORY_COVERAGE_UNSPECIFIED = 0;
+  HISTORY_COMPLETE = 1;
+  HISTORY_SCAN_LIMIT = 2;
+  HISTORY_MERGE_BOUNDARY = 3;
+  HISTORY_CONFLICT_BOUNDARY = 4;
+  HISTORY_PRIVATE_OVERLAY = 5;
+  HISTORY_READ_LIMIT = 6;
+  HISTORY_DIFF_LIMIT = 7;
+}
+// Repo-relative UTF-8 path: nonempty slash-separated components, no empty,
+// '.' or '..' components, backslashes, NUL or leading/trailing slash.
+message PathHistoryRequest {
+  ScopeKey scope = 1;
+  CommitId revision = 2;
+  string path = 3;
+  HistoryPolicy policy = 4;
+  uint32 max_commits = 5; // Zero uses server default; cannot raise server caps.
+}
+enum HistoryPathKind {
+  HISTORY_PATH_KIND_UNSPECIFIED = 0;
+  HISTORY_PATH_ABSENT = 1;
+  HISTORY_PATH_FILE = 2;
+  HISTORY_PATH_SYMLINK = 3;
+  HISTORY_PATH_TREE = 4;
+}
+message HistoryPathState {
+  HistoryPathKind kind = 1;
+  bytes native_id = 2; // Empty for absent; exact32 otherwise. Not read authority.
+  uint64 size_bytes = 3; // FILE byte length or symlink target length; zero for tree.
+  bool executable = 4; // FILE only.
+}
+message PathHistoryEntry {
+  CommitId commit = 1;
+  HistoryPathState state = 2;
+  HistoryPathState parent_state = 3;
+}
+message PathHistoryResult {
+  bytes scope_digest = 1;
+  bytes index_epoch = 2;
+  CommitId revision = 3;
+  string path = 4;
+  HistoryPolicy policy = 5;
+  HistoryCoverage coverage = 6;
+  uint32 scanned_commits = 7;
+  repeated PathHistoryEntry entries = 8; // Changed states, newest first.
+  // First unscanned/boundary revision when incomplete. This is progress only,
+  // not a cursor or authority to restart outside the caller's immutable scope.
+  CommitId boundary = 9;
+}
+message BlameRequest {
+  ScopeKey scope = 1;
+  CommitId revision = 2;
+  string path = 3;
+  HistoryPolicy policy = 4;
+  uint32 max_commits = 5;
+}
+// Zero-based target line range, [start_line,end_line). Lines include their LF;
+// the final non-LF suffix also counts. Original line is zero-based at origin.
+// Absent origin is unresolved, never a guessed boundary/root attribution.
+message BlameRange {
+  uint32 start_line = 1;
+  uint32 end_line = 2;
+  CommitId origin = 3;
+  uint32 original_line = 4;
+}
+message BlameResult {
+  bytes scope_digest = 1;
+  bytes index_epoch = 2;
+  CommitId revision = 3;
+  string path = 4;
+  HistoryPolicy policy = 5;
+  HistoryCoverage coverage = 6;
+  uint32 scanned_commits = 7;
+  CommitId boundary = 8;
+  tinytree.v1.ObjectDescriptor target = 9; // Verified raw FILE descriptor.
+  bytes target_bytes = 10; // Only selected FILE bytes, never historical bodies.
+  repeated BlameRange ranges = 11; // Exact partition of selected file lines.
 }

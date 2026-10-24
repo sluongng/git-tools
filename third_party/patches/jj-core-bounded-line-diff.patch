@@ -1,0 +1,682 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: sluongng <26684313+sluongng@users.noreply.github.com>
+Date: Sat, 24 Oct 2026 11:12:00 +0000
+Subject: [PATCH] jj-core: Bound exact two-sided line comparisons
+
+Remote annotation and local overlays need the same repeated-line choices
+as ordinary jj annotation. A timeout around the eager histogram diff does
+not stop its quadratic longest-common-subsequence work or recursive gap
+processing, and a byte cap alone does not bound that work.
+
+Add a separate two-sided literal line API with cumulative input, line,
+work and conservative allocation budgets, bounded recursion and a caller
+cancellation predicate. Check before allocation and during histogram
+probes, LCS comparisons and gap traversal; return no partial diff after
+exhaustion. Keep all existing entry points unchanged.
+
+Use the same rare-token selection, LCS ties and leading/trailing fallback
+as the existing implementation. Index shared tokens by source position
+instead of sorting serial labels, preserving the identical permutation
+while allowing cancellation during ordering. Bound allocations separately
+from work and cap recursion at 128 frames even for permissive callers.
+Allocation charges cover algorithm capacity, not borrowed input storage,
+allocator metadata or process RSS; callers retain input/admission owners.
+
+Test repeated lines, arbitrary bytes and newline boundaries against the
+existing API, as well as pre-allocation rejection, cumulative quotas,
+quadratic-work exhaustion and cancellation.
+---
+diff --git a/src/diff.rs b/src/diff.rs
+--- a/src/diff.rs
++++ b/src/diff.rs
+@@ -22,6 +22,9 @@
+ use std::iter;
+ use std::ops::Range;
+ use std::slice;
++
++mod bounded;
++pub use bounded::{LineDiffBudget, LineDiffError, LineDiffLimits, LineDiffUsage};
+ 
+ use bstr::BStr;
+ use hashbrown::HashTable;
+diff --git a/src/diff/bounded.rs b/src/diff/bounded.rs
+new file mode 100644
+--- /dev/null
++++ b/src/diff/bounded.rs
+@@ -0,0 +1,634 @@
++// Copyright 2026 The Jujutsu Authors
++//
++// Licensed under the Apache License, Version 2.0 (the "License");
++// you may not use this file except in compliance with the License.
++// You may obtain a copy of the License at
++//
++// https://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing, software
++// distributed under the License is distributed on an "AS IS" BASIS,
++// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++// See the License for the specific language governing permissions and
++// limitations under the License.
++
++use super::*;
++
++/// Limits shared by one or more exact two-sided line comparisons.
++///
++/// Counts are cumulative, including failed calls. Depth is additionally capped at
++/// 128 frames even if a caller requests more. Allocation accounting charges
++/// conservative algorithm capacity before allocation, not allocator metadata,
++/// borrowed input storage, or process RSS. Recursion depth is per comparison.
++#[derive(Clone, Copy, Debug)]
++pub struct LineDiffLimits {
++    pub max_input_bytes: usize,
++    pub max_lines: usize,
++    pub max_work: usize,
++    pub max_allocation_bytes: usize,
++    pub max_recursion_depth: usize,
++}
++
++#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
++pub struct LineDiffUsage {
++    pub input_bytes: usize,
++    pub lines: usize,
++    pub work: usize,
++    pub allocation_bytes: usize,
++}
++
++#[derive(Clone, Copy, Debug, Eq, PartialEq)]
++pub enum LineDiffError {
++    LimitExceeded,
++    Cancelled,
++}
++
++impl std::fmt::Display for LineDiffError {
++    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
++        match self {
++            Self::LimitExceeded => f.write_str("line diff budget exceeded"),
++            Self::Cancelled => f.write_str("line diff cancelled"),
++        }
++    }
++}
++impl std::error::Error for LineDiffError {}
++
++#[derive(Clone, Debug)]
++pub struct LineDiffBudget {
++    limits: LineDiffLimits,
++    usage: LineDiffUsage,
++}
++impl LineDiffBudget {
++    pub fn new(limits: LineDiffLimits) -> Self {
++        Self {
++            limits,
++            usage: LineDiffUsage::default(),
++        }
++    }
++    pub fn usage(&self) -> LineDiffUsage {
++        self.usage
++    }
++
++    fn add(value: &mut usize, amount: usize, maximum: usize) -> Result<(), LineDiffError> {
++        *value = value
++            .checked_add(amount)
++            .ok_or(LineDiffError::LimitExceeded)?;
++        if *value > maximum {
++            return Err(LineDiffError::LimitExceeded);
++        }
++        Ok(())
++    }
++    fn allocate(&mut self, amount: usize) -> Result<(), LineDiffError> {
++        Self::add(
++            &mut self.usage.allocation_bytes,
++            amount,
++            self.limits.max_allocation_bytes,
++        )
++    }
++    fn work(
++        &mut self,
++        amount: usize,
++        check: &mut impl FnMut() -> bool,
++    ) -> Result<(), LineDiffError> {
++        if !check() {
++            return Err(LineDiffError::Cancelled);
++        }
++        Self::add(&mut self.usage.work, amount, self.limits.max_work)
++    }
++    fn capacity(&mut self, count: usize, bytes_per_item: usize) -> Result<(), LineDiffError> {
++        self.allocate(
++            count
++                .checked_mul(bytes_per_item)
++                .ok_or(LineDiffError::LimitExceeded)?,
++        )
++    }
++    fn eq(
++        &mut self,
++        left: &[u8],
++        right: &[u8],
++        check: &mut impl FnMut() -> bool,
++    ) -> Result<bool, LineDiffError> {
++        // Slice equality never inspects more than the shorter slice. Charge
++        // the worst case even if length or an early mismatch saves work.
++        self.work(left.len().min(right.len()).saturating_add(1), check)?;
++        Ok(left == right)
++    }
++}
++
++fn histogram<'input>(
++    source: &LocalDiffSource<'input, '_>,
++    budget: &mut LineDiffBudget,
++    check: &mut impl FnMut() -> bool,
++) -> Result<Histogram<'input>, LineDiffError> {
++    // A pre-sized hash table needs fewer than 4 buckets per source token.
++    // Each bucket holds a hash, borrowed byte slice and SmallVec positions.
++    // SmallVec overflow and growth, all positions, and control bytes fit in
++    // this conservative charge. No table growth occurs after reservation.
++    budget.capacity(source.ranges.len(), 1024)?;
++    let mut word_to_positions: HashTable<HistogramEntry> =
++        HashTable::with_capacity(source.ranges.len());
++    for (i, word) in source.hashed_words().enumerate() {
++        budget.work(1, check)?;
++        let mut failure = None;
++        let entry = word_to_positions.entry(
++            word.hash,
++            |(w, _)| match budget.eq(w.text, word.text, check) {
++                Ok(equal) => equal,
++                Err(error) => {
++                    failure = Some(error);
++                    // Stop probing immediately; the apparent match is never
++                    // consumed after the failure check below.
++                    true
++                }
++            },
++            |(w, _)| w.hash,
++        );
++        if let Some(error) = failure {
++            return Err(error);
++        }
++        entry
++            .and_modify(|(_, positions)| {
++                if positions.len() <= 100 {
++                    positions.push(LocalWordPosition(i));
++                }
++            })
++            .or_insert_with(|| (word, smallvec![LocalWordPosition(i)]));
++    }
++    Ok(Histogram { word_to_positions })
++}
++
++fn lcs(
++    input: &[usize],
++    budget: &mut LineDiffBudget,
++    check: &mut impl FnMut() -> bool,
++) -> Result<Vec<(usize, usize)>, LineDiffError> {
++    if input.is_empty() {
++        return Ok(vec![]);
++    }
++    budget.capacity(input.len(), 64)?;
++    let mut chain = vec![(0, 0, 0); input.len()];
++    let mut global_longest = 0;
++    let mut global_longest_right_pos = 0;
++    for (right_pos, &left_pos) in input.iter().enumerate() {
++        budget.work(1, check)?;
++        let mut longest_from_here = 1;
++        let mut previous_right_pos = usize::MAX;
++        for i in (0..right_pos).rev() {
++            budget.work(1, check)?;
++            let (previous_len, previous_left_pos, _) = chain[i];
++            if previous_left_pos < left_pos {
++                let len = previous_len + 1;
++                if len > longest_from_here {
++                    longest_from_here = len;
++                    previous_right_pos = i;
++                    if len > global_longest {
++                        global_longest = len;
++                        global_longest_right_pos = right_pos;
++                        break;
++                    }
++                }
++            }
++        }
++        chain[right_pos] = (longest_from_here, left_pos, previous_right_pos);
++    }
++    let mut result = Vec::with_capacity(input.len());
++    let mut right_pos = global_longest_right_pos;
++    loop {
++        budget.work(1, check)?;
++        let (_, left_pos, previous_right_pos) = chain[right_pos];
++        result.push((left_pos, right_pos));
++        if previous_right_pos == usize::MAX {
++            break;
++        }
++        right_pos = previous_right_pos;
++    }
++    result.reverse();
++    Ok(result)
++}
++
++fn collect(
++    found: &mut Vec<(WordPosition, WordPosition)>,
++    left: &LocalDiffSource,
++    right: &LocalDiffSource,
++    depth: usize,
++    budget: &mut LineDiffBudget,
++    check: &mut impl FnMut() -> bool,
++) -> Result<(), LineDiffError> {
++    budget.work(1, check)?;
++    if left.ranges.is_empty() || right.ranges.is_empty() {
++        return Ok(());
++    }
++    if depth > budget.limits.max_recursion_depth.min(128) {
++        return Err(LineDiffError::LimitExceeded);
++    }
++    let old_len = found.len();
++    collect_lcs(found, left, right, depth, budget, check)?;
++    if found.len() != old_len {
++        return Ok(());
++    }
++
++    let mut leading = 0;
++    for (l, r) in iter::zip(left.hashed_words(), right.hashed_words()) {
++        budget.work(1, check)?;
++        if l.hash != r.hash || !budget.eq(l.text, r.text, check)? {
++            break;
++        }
++        leading += 1;
++    }
++    let mut trailing = 0;
++    for (l, r) in iter::zip(
++        left.hashed_words().skip(leading).rev(),
++        right.hashed_words().skip(leading).rev(),
++    ) {
++        budget.work(1, check)?;
++        if l.hash != r.hash || !budget.eq(l.text, r.text, check)? {
++            break;
++        }
++        trailing += 1;
++    }
++    budget.work(leading.saturating_add(trailing), check)?;
++    found.extend((0..leading).map(|i| {
++        (
++            left.map_to_global(LocalWordPosition(i)),
++            right.map_to_global(LocalWordPosition(i)),
++        )
++    }));
++    found.extend((1..=trailing).rev().map(|i| {
++        (
++            left.map_to_global(LocalWordPosition(left.ranges.len() - i)),
++            right.map_to_global(LocalWordPosition(right.ranges.len() - i)),
++        )
++    }));
++    Ok(())
++}
++
++fn collect_lcs(
++    found: &mut Vec<(WordPosition, WordPosition)>,
++    left: &LocalDiffSource,
++    right: &LocalDiffSource,
++    depth: usize,
++    budget: &mut LineDiffBudget,
++    check: &mut impl FnMut() -> bool,
++) -> Result<(), LineDiffError> {
++    let left_histogram = histogram(left, budget, check)?;
++    // There are at most 101 occurrence-count buckets. Charge tree nodes,
++    // references and vector growth before constructing that grouping.
++    budget.capacity(left.ranges.len(), 1024)?;
++    budget.work(left.ranges.len().saturating_mul(128), check)?;
++    let counts = left_histogram.build_count_to_entries();
++    if *counts.keys().next().unwrap() > 100 {
++        return Ok(());
++    }
++    let right_histogram = histogram(right, budget, check)?;
++    budget.capacity(left.ranges.len(), 64)?;
++    let mut shared = Vec::with_capacity(left.ranges.len());
++    for entries in counts.values() {
++        for &(word, positions) in entries {
++            budget.work(1, check)?;
++            let mut failure = None;
++            let matching = right_histogram.word_to_positions.find(word.hash, |(w, _)| {
++                match budget.eq(w.text, word.text, check) {
++                    Ok(equal) => equal,
++                    Err(error) => {
++                        failure = Some(error);
++                        // Stop probing; the apparent match is discarded below.
++                        true
++                    }
++                }
++            });
++            if let Some(error) = failure {
++                return Err(error);
++            }
++            if let Some((_, others)) = matching {
++                if positions.len() == others.len() {
++                    shared.push((positions, others));
++                }
++            }
++        }
++        if !shared.is_empty() {
++            break;
++        }
++    }
++    if shared.is_empty() {
++        return Ok(());
++    }
++
++    // The unbounded implementation sorts serial-labelled word positions.
++    // Indexing by unique source position gives the identical order and LCS
++    // permutation, without an uninterruptible comparison sort.
++    budget.capacity(left.ranges.len().saturating_add(right.ranges.len()), 64)?;
++    let mut other_at_left = vec![None; left.ranges.len()];
++    for (lefts, rights) in shared {
++        for (&l, &r) in iter::zip(lefts, rights) {
++            budget.work(1, check)?;
++            other_at_left[l.0] = Some(r);
++        }
++    }
++    let mut left_index_at_right = vec![None; right.ranges.len()];
++    let mut left_positions = Vec::with_capacity(left.ranges.len());
++    for (position, other) in other_at_left.into_iter().enumerate() {
++        budget.work(1, check)?;
++        if let Some(other) = other {
++            left_index_at_right[other.0] = Some(left_positions.len());
++            left_positions.push(LocalWordPosition(position));
++        }
++    }
++    let mut right_positions = Vec::with_capacity(right.ranges.len());
++    let mut permutation = Vec::with_capacity(right.ranges.len());
++    for (position, index) in left_index_at_right.into_iter().enumerate() {
++        budget.work(1, check)?;
++        if let Some(index) = index {
++            right_positions.push(LocalWordPosition(position));
++            permutation.push(index);
++        }
++    }
++    let matched = lcs(&permutation, budget, check)?;
++    let mut previous_left = LocalWordPosition(0);
++    let mut previous_right = LocalWordPosition(0);
++    for (li, ri) in matched {
++        budget.work(1, check)?;
++        let lp = left_positions[li];
++        let rp = right_positions[ri];
++        collect(
++            found,
++            &left.narrowed(previous_left..lp),
++            &right.narrowed(previous_right..rp),
++            depth + 1,
++            budget,
++            check,
++        )?;
++        found.push((left.map_to_global(lp), right.map_to_global(rp)));
++        previous_left = LocalWordPosition(lp.0 + 1);
++        previous_right = LocalWordPosition(rp.0 + 1);
++    }
++    collect(
++        found,
++        &left.narrowed(previous_left..LocalWordPosition(left.ranges.len())),
++        &right.narrowed(previous_right..LocalWordPosition(right.ranges.len())),
++        depth + 1,
++        budget,
++        check,
++    )
++}
++
++impl<'input> ContentDiff<'input> {
++    /// Exactly the two-sided literal `by_line` policy, with bounded work.
++    ///
++    /// A failed comparison returns no partial diff. The cancellation predicate
++    /// is checked during input scanning, hashing, histogram probes, quadratic
++    /// LCS comparisons and recursive traversal. Successful matching choices are
++    /// identical to `by_line`, including repeated lines and arbitrary bytes.
++    pub fn by_line_bounded(
++        inputs: [&'input [u8]; 2],
++        budget: &mut LineDiffBudget,
++        mut check: impl FnMut() -> bool,
++    ) -> Result<Self, LineDiffError> {
++        let bytes = inputs[0]
++            .len()
++            .checked_add(inputs[1].len())
++            .ok_or(LineDiffError::LimitExceeded)?;
++        LineDiffBudget::add(
++            &mut budget.usage.input_bytes,
++            bytes,
++            budget.limits.max_input_bytes,
++        )?;
++        let mut line_counts = [0usize; 2];
++        for (input, count) in iter::zip(inputs, &mut line_counts) {
++            for chunk in input.chunks(256) {
++                budget.work(chunk.len(), &mut check)?;
++                *count += chunk.iter().filter(|&&b| b == b'\n').count();
++            }
++            if !input.is_empty() && input.last() != Some(&b'\n') {
++                *count += 1;
++            }
++        }
++        let lines = line_counts[0]
++            .checked_add(line_counts[1])
++            .ok_or(LineDiffError::LimitExceeded)?;
++        LineDiffBudget::add(&mut budget.usage.lines, lines, budget.limits.max_lines)?;
++        budget.work(1, &mut check)?;
++        // Token ranges, hashes, matched positions and returned/compacted ranges
++        // are charged here; recursive histogram/LCS capacities separately below.
++        budget.capacity(lines.saturating_add(2), 256)?;
++        let tokenize = !inputs.iter().any(|input| input.is_empty());
++        let ranges = inputs.map(|input| {
++            if tokenize {
++                find_line_ranges(input)
++            } else {
++                vec![]
++            }
++        });
++        let comp = WordComparator::new(CompareBytesExactly);
++        let mut sources = Vec::with_capacity(2);
++        for (input, ranges) in iter::zip(inputs, &ranges) {
++            let mut hashes = Vec::with_capacity(ranges.len());
++            for range in ranges {
++                budget.work(range.len().saturating_add(1), &mut check)?;
++                hashes.push(comp.hash_one(&input[range.clone()]));
++            }
++            sources.push(DiffSource {
++                text: BStr::new(input),
++                ranges,
++                hashes,
++            });
++        }
++        let mut positions = Vec::with_capacity(line_counts[0].min(line_counts[1]));
++        collect(
++            &mut positions,
++            &sources[0].local(),
++            &sources[1].local(),
++            1,
++            budget,
++            &mut check,
++        )?;
++        budget.work(
++            positions.len().saturating_mul(8).saturating_add(1),
++            &mut check,
++        )?;
++        let mut unchanged_regions = Vec::with_capacity(positions.len().saturating_add(2));
++        unchanged_regions.push(UnchangedRange {
++            base: 0..0,
++            others: smallvec![0..0],
++        });
++        unchanged_regions.extend(positions.into_iter().map(|(l, r)| UnchangedRange {
++            base: sources[0].range_at(l),
++            others: smallvec![sources[1].range_at(r)],
++        }));
++        unchanged_regions.push(UnchangedRange {
++            base: inputs[0].len()..inputs[0].len(),
++            others: smallvec![inputs[1].len()..inputs[1].len()],
++        });
++        let mut diff = Self {
++            base_input: BStr::new(inputs[0]),
++            other_inputs: smallvec![BStr::new(inputs[1])],
++            unchanged_regions,
++        };
++        diff.compact_unchanged_regions();
++        Ok(diff)
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    fn limits() -> LineDiffLimits {
++        LineDiffLimits {
++            max_input_bytes: 1 << 24,
++            max_lines: 1 << 20,
++            max_work: 1 << 28,
++            max_allocation_bytes: 1 << 28,
++            max_recursion_depth: 64,
++        }
++    }
++    fn compare(left: &[u8], right: &[u8]) {
++        let expected = ContentDiff::by_line([left, right]).hunks().collect_vec();
++        let actual =
++            ContentDiff::by_line_bounded([left, right], &mut LineDiffBudget::new(limits()), || {
++                true
++            })
++            .unwrap();
++        assert_eq!(
++            actual.hunks().collect_vec(),
++            expected,
++            "{left:?} -> {right:?}"
++        );
++    }
++    #[test]
++    fn bounded_line_diff_matches_literal_policy() {
++        // Exhaust small repeated-line permutations, including all short gaps
++        // around rare anchors. Different hash-table seeds must not change ties.
++        let mut texts = vec![vec![]];
++        for len in 1..=4 {
++            for mut value in 0..3usize.pow(len) {
++                let mut text = vec![];
++                for _ in 0..len {
++                    text.push(b'a' + (value % 3) as u8);
++                    text.push(b'\n');
++                    value /= 3;
++                }
++                texts.push(text);
++            }
++        }
++        for left in &texts {
++            for right in &texts {
++                compare(left, right);
++            }
++        }
++        for (left, right) in [
++            (&b"a\na\nb\na\n"[..], &b"a\nb\na\na\n"[..]),
++            (
++                &b"without final newline"[..],
++                &b"without final newline\n"[..],
++            ),
++            (&b"\0\xff\n\xfe"[..], &b"\0\xff\n\xfd"[..]),
++        ] {
++            compare(left, right);
++        }
++        compare(&b"a\n".repeat(120), &b"a\n".repeat(121));
++        compare(&b"a\n".repeat(120), &b"b\n".repeat(121));
++    }
++    #[test]
++    fn bounded_line_diff_rejects_before_unadmitted_allocations() {
++        let mut l = limits();
++        l.max_input_bytes = 0;
++        let mut b = LineDiffBudget::new(l);
++        assert_eq!(
++            ContentDiff::by_line_bounded([b"a", b"b"], &mut b, || true).unwrap_err(),
++            LineDiffError::LimitExceeded
++        );
++        assert_eq!(b.usage().allocation_bytes, 0);
++        let mut l = limits();
++        l.max_lines = 0;
++        let mut b = LineDiffBudget::new(l);
++        assert_eq!(
++            ContentDiff::by_line_bounded([b"a", b"b"], &mut b, || true).unwrap_err(),
++            LineDiffError::LimitExceeded
++        );
++        assert_eq!(b.usage().allocation_bytes, 0);
++        let mut l = limits();
++        l.max_allocation_bytes = 0;
++        assert_eq!(
++            ContentDiff::by_line_bounded([b"a", b"b"], &mut LineDiffBudget::new(l), || true)
++                .unwrap_err(),
++            LineDiffError::LimitExceeded
++        );
++    }
++    #[test]
++    fn bounded_line_diff_shares_work_across_calls() {
++        let mut b = LineDiffBudget::new(limits());
++        ContentDiff::by_line_bounded([b"same\n", b"same\n"], &mut b, || true).unwrap();
++        let work = b.usage().work;
++        let mut l = limits();
++        l.max_work = work;
++        let mut b = LineDiffBudget::new(l);
++        ContentDiff::by_line_bounded([b"same\n", b"same\n"], &mut b, || true).unwrap();
++        assert_eq!(
++            ContentDiff::by_line_bounded([b"same\n", b"same\n"], &mut b, || true).unwrap_err(),
++            LineDiffError::LimitExceeded
++        );
++        assert!(b.usage().work > work);
++    }
++    #[test]
++    fn bounded_line_diff_stops_after_first_cancellation() {
++        let text = (0..400)
++            .map(|i| format!("line {}\n", i % 200))
++            .collect::<String>();
++        // Exercise cancellation across scanning, hashing and hash-table probes.
++        // A failed probe must not keep asking the predicate about other buckets.
++        for stop_at in 1..=1_024 {
++            let mut checks = 0;
++            let result = ContentDiff::by_line_bounded(
++                [text.as_bytes(), text.as_bytes()],
++                &mut LineDiffBudget::new(limits()),
++                || {
++                    checks += 1;
++                    checks < stop_at
++                },
++            );
++            assert_eq!(result.unwrap_err(), LineDiffError::Cancelled);
++            assert_eq!(checks, stop_at);
++        }
++    }
++    #[test]
++    fn bounded_line_diff_stops_recursion_and_quadratic_work() {
++        let mut l = limits();
++        l.max_recursion_depth = 1;
++        assert_eq!(
++            ContentDiff::by_line_bounded(
++                [b"a\nx\nc\n", b"a\ny\nc\n"],
++                &mut LineDiffBudget::new(l),
++                || true
++            )
++            .unwrap_err(),
++            LineDiffError::LimitExceeded
++        );
++        let left = (0..100).map(|i| format!("{i}\n")).collect::<String>();
++        let right = (0..100).rev().map(|i| format!("{i}\n")).collect::<String>();
++        let mut l = limits();
++        l.max_work = 16_000;
++        assert_eq!(
++            ContentDiff::by_line_bounded(
++                [left.as_bytes(), right.as_bytes()],
++                &mut LineDiffBudget::new(l),
++                || true
++            )
++            .unwrap_err(),
++            LineDiffError::LimitExceeded
++        );
++        let mut checks = 0;
++        assert_eq!(
++            ContentDiff::by_line_bounded(
++                [left.as_bytes(), right.as_bytes()],
++                &mut LineDiffBudget::new(limits()),
++                || {
++                    checks += 1;
++                    checks < 2_500
++                }
++            )
++            .unwrap_err(),
++            LineDiffError::Cancelled
++        );
++        assert_eq!(checks, 2_500);
++    }
++}
+-- 
+2.51.0

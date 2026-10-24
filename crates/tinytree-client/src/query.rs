@@ -85,7 +85,7 @@ impl CheckedScopeHandle {
     pub fn expires_at_unix_seconds(&self) -> i64 {
         self.expires_at
     }
-    fn key(&self) -> q::ScopeKey {
+    pub(super) fn key(&self) -> q::ScopeKey {
         q::ScopeKey {
             repository_id: self.repository.clone(),
             handle: self.handle.to_vec(),
@@ -149,7 +149,11 @@ pub enum PrefixTarget {
 }
 
 impl NativeClient {
-    fn checked_scope(&self, scope: &CheckedScopeHandle, allow_expired: bool) -> Result<(), Status> {
+    pub(super) fn checked_scope(
+        &self,
+        scope: &CheckedScopeHandle,
+        allow_expired: bool,
+    ) -> Result<(), Status> {
         if scope.repository != self.inner.config.repository_id {
             return Err(Status::invalid_argument(
                 "query scope belongs to another repository",

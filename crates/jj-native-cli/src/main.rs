@@ -1,6 +1,7 @@
 //! Native jj entry point. User workspaces require daemon-owned lazy jj-vfs.
 mod broker;
 mod commands;
+mod history;
 mod remote;
 mod remote_state;
 mod roots;
@@ -24,6 +25,10 @@ enum NativeCommand {
 
 #[derive(clap::Subcommand, Clone, Debug)]
 enum TinytreeCommand {
+    /// Inspect exact-path history without downloading historical file bodies.
+    History(history::PathArgs),
+    /// Attribute a file using remote history and local draft/working-copy edits.
+    Blame(history::PathArgs),
     /// Resume a stopped or interrupted lazy workspace using its original identity.
     Resume {
         destination: PathBuf,
@@ -120,6 +125,12 @@ async fn run_native_command(
     args: NativeCommand,
 ) -> Result<(), CommandError> {
     match args {
+        NativeCommand::Tinytree {
+            command: TinytreeCommand::History(args),
+        } => history::run(ui, command, args, false).await,
+        NativeCommand::Tinytree {
+            command: TinytreeCommand::Blame(args),
+        } => history::run(ui, command, args, true).await,
         NativeCommand::Tinytree {
             command:
                 TinytreeCommand::Resume {

@@ -333,6 +333,28 @@ impl Client {
         )
         .await
     }
+    pub async fn path_history(
+        &mut self,
+        request: Request<q::PathHistoryRequest>,
+    ) -> Result<Response<q::PathHistoryResult>, Status> {
+        self.unary(
+            request,
+            "/tinytree.query.v1.RepositoryQuery/PathHistory",
+            Shape::PathHistory,
+        )
+        .await
+    }
+    pub async fn blame(
+        &mut self,
+        request: Request<q::BlameRequest>,
+    ) -> Result<Response<q::BlameResult>, Status> {
+        self.unary(
+            request,
+            "/tinytree.query.v1.RepositoryQuery/Blame",
+            Shape::Blame,
+        )
+        .await
+    }
     pub async fn resolve_commit_prefix(
         &mut self,
         r: Request<q::ResolveCommitPrefixRequest>,
@@ -507,6 +529,11 @@ impl Client {
 }
 #[derive(Clone, Copy)]
 pub(crate) enum Shape {
+    PathHistory,
+    PathHistoryEntry,
+    HistoryPathState,
+    Blame,
+    BlameRange,
     QueryScope,
     ScopeKey,
     QueryFacts,
@@ -773,6 +800,7 @@ fn scan(
                             4
                         )
                         | (Shape::ShortestPrefix, 3)
+                        | (Shape::HistoryPathState, 4)
                         | (Shape::CloudNativeChunk, 4)
                 )
             {
@@ -796,11 +824,13 @@ fn scan(
                         | (Shape::IdsPage | Shape::GraphPage | Shape::CanonicalPage, 1)
                         | (Shape::ScopeKey, 2)
                         | (Shape::CommitId, 1)
-                        | (Shape::QueryFacts, 2) => Some(32),
+                        | (Shape::QueryFacts, 2)
+                        | (Shape::PathHistory | Shape::Blame, 1) => Some(32),
                         (Shape::QueryScope, 3)
                         | (Shape::IdsPage | Shape::GraphPage | Shape::CanonicalPage, 2)
                         | (Shape::ChangeId, 1)
-                        | (Shape::QueryFacts, 3) => Some(16),
+                        | (Shape::QueryFacts, 3)
+                        | (Shape::PathHistory | Shape::Blame, 2) => Some(16),
                         _ => None,
                     };
                     if exact.is_some_and(|n| data.len() != n) {
@@ -820,6 +850,11 @@ fn scan(
         }
     }
     let required = match shape {
+        Shape::PathHistory | Shape::Blame => {
+            (1 << 1) | (1 << 2) | (1 << 3) | (1 << 4) | (1 << 5) | (1 << 6)
+        }
+        Shape::PathHistoryEntry => (1 << 1) | (1 << 2) | (1 << 3),
+        Shape::HistoryPathState => 1 << 1,
         Shape::CloudId | Shape::CloudIndexId => (1 << 1) | (1 << 2),
         Shape::CloudDigest => 1 << 1,
         Shape::CloudDescriptor
@@ -883,6 +918,30 @@ fn rule(shape: Shape, n: u32, l: &Limits) -> Option<(u8, Option<Shape>, usize, u
     let nested = |child| Some((2, Some(child), 1, 0));
     let repeated = |child, count, allocation| Some((2, Some(child), count, allocation));
     match (shape, n) {
+        (Shape::PathHistory | Shape::Blame, 1) => text(32),
+        (Shape::PathHistory | Shape::Blame, 2) => text(16),
+        (Shape::PathHistory | Shape::Blame, 3) => nested(Shape::CommitId),
+        (Shape::PathHistory | Shape::Blame, 4) => text(4096),
+        (Shape::PathHistory | Shape::Blame, 5 | 6 | 7) => scalar(),
+        (Shape::PathHistory, 8) => repeated(
+            Shape::PathHistoryEntry,
+            l.max_graph_objects,
+            4 * std::mem::size_of::<q::PathHistoryEntry>(),
+        ),
+        (Shape::PathHistory, 9) | (Shape::Blame, 8) => nested(Shape::CommitId),
+        (Shape::PathHistoryEntry, 1) => nested(Shape::CommitId),
+        (Shape::PathHistoryEntry, 2 | 3) => nested(Shape::HistoryPathState),
+        (Shape::HistoryPathState, 1 | 3 | 4) => scalar(),
+        (Shape::HistoryPathState, 2) => text(32),
+        (Shape::Blame, 9) => nested(Shape::Descriptor),
+        (Shape::Blame, 10) => text(l.max_file_bytes.min(l.max_batch_bytes as u64) as usize),
+        (Shape::Blame, 11) => repeated(
+            Shape::BlameRange,
+            l.max_query_edges,
+            4 * std::mem::size_of::<q::BlameRange>(),
+        ),
+        (Shape::BlameRange, 1 | 2 | 4) => scalar(),
+        (Shape::BlameRange, 3) => nested(Shape::CommitId),
         (Shape::CloudCaptureDescriptor, 1) | (Shape::CloudCaptureChunk, 5) => text(32),
         (Shape::CloudCaptureDescriptor, 2) => nested(Shape::CloudDigest),
         (Shape::CloudCaptureChunk, 1) => nested(Shape::CloudCaptureDescriptor),

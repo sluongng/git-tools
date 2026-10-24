@@ -5,7 +5,8 @@ use async_trait::async_trait;
 use jj_native_backend::NativeObjectIo;
 use native_broker::{
     BeginQuery, ForkQueryScope, NativeQueryIo, OpenCloudQueryScope, OpenQueryScope, QueryHandle,
-    QueryOwner, QueryPage, QueryReply, QueryResources, QueryScope, query_protocol as q,
+    QueryOwner, QueryPage, QueryReply, QueryResources, QueryScope, ScopedPathQuery,
+    query_protocol as q,
 };
 use prost::Message;
 use std::{
@@ -1911,6 +1912,85 @@ impl NativeQueryIo for RemoteQueryIo {
             Ok(QueryReply {
                 value,
                 owner: Arc::new((scope, charge)),
+            })
+        })
+        .await
+    }
+    async fn path_history(
+        &self,
+        input: ScopedPathQuery,
+        owner: QueryOwner,
+    ) -> std::result::Result<QueryReply<q::PathHistoryResult>, tonic::Status> {
+        if input.path.len().saturating_add(128) > self.inner.config.remote.limits.max_request_bytes
+        {
+            return Err(tonic::Status::resource_exhausted(
+                "native history request limit exceeded",
+            ));
+        }
+        self.run(owner, move |this, operation| async move {
+            let scope = this.captured(input.scope).await?;
+            this.online(&scope).await?;
+            let client = operation.client(&scope.client);
+            let checked = client
+                .path_history(
+                    &scope.checked,
+                    input.revision,
+                    &input.path,
+                    input.policy,
+                    input.max_commits,
+                )
+                .await?;
+            // The SDK's checked result retains its independent output budget.
+            // Reserve the broker wire copy before cloning, and retain both
+            // owners without keeping the physical RPC/inflight permit alive.
+            let bytes = checked
+                .result()
+                .encoded_len()
+                .checked_mul(128)
+                .and_then(|n| n.checked_add(4096))
+                .context("native history reply allocation bound overflow")?;
+            let retained = this.charge(bytes)?;
+            Ok(QueryReply {
+                value: checked.result().clone(),
+                owner: Arc::new((scope, checked, retained)),
+            })
+        })
+        .await
+    }
+    async fn blame(
+        &self,
+        input: ScopedPathQuery,
+        owner: QueryOwner,
+    ) -> std::result::Result<QueryReply<q::BlameResult>, tonic::Status> {
+        if input.path.len().saturating_add(128) > self.inner.config.remote.limits.max_request_bytes
+        {
+            return Err(tonic::Status::resource_exhausted(
+                "native history request limit exceeded",
+            ));
+        }
+        self.run(owner, move |this, operation| async move {
+            let scope = this.captured(input.scope).await?;
+            this.online(&scope).await?;
+            let client = operation.client(&scope.client);
+            let checked = client
+                .blame(
+                    &scope.checked,
+                    input.revision,
+                    &input.path,
+                    input.policy,
+                    input.max_commits,
+                )
+                .await?;
+            let bytes = checked
+                .result()
+                .encoded_len()
+                .checked_mul(128)
+                .and_then(|n| n.checked_add(4096))
+                .context("native history reply allocation bound overflow")?;
+            let retained = this.charge(bytes)?;
+            Ok(QueryReply {
+                value: checked.result().clone(),
+                owner: Arc::new((scope, checked, retained)),
             })
         })
         .await

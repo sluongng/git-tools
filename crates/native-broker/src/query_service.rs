@@ -61,6 +61,18 @@ fn commits(values: Vec<Vec<u8>>) -> Result<Vec<tinytree_model::CommitId>, Status
         .map(|v| handle(&v).map(tinytree_model::CommitId))
         .collect()
 }
+fn path_query(value: p::QueryPathRequest, cap: usize) -> Result<ScopedPathQuery, Status> {
+    let input = ScopedPathQuery {
+        scope: handle(&value.scope)?,
+        revision: tinytree_model::CommitId(handle(&value.revision)?),
+        path: value.path,
+        policy: q::HistoryPolicy::try_from(value.policy)
+            .map_err(|_| Status::unimplemented("native history policy unsupported"))?,
+        max_commits: value.max_commits,
+    };
+    input.validate(cap)?;
+    Ok(input)
+}
 fn input<T: Message>(request: Request<T>, cap: usize) -> Result<(T, Arc<Work>), Status> {
     let work = request
         .extensions()
@@ -713,6 +725,36 @@ impl p::query_io_server::QueryIo for BrokerService {
             self.query_limit(),
         )
     }
+    async fn path_history(
+        &self,
+        request: Request<p::QueryPathRequest>,
+    ) -> Result<Response<q::PathHistoryResult>, Status> {
+        let (input, work) = input(request, self.query_limit())?;
+        self.authorize_command(&input.store_id, &work)?;
+        let provider = self.query_provider(&input.store_id)?;
+        let input = path_query(input, self.query_limit())?;
+        let result = provider
+            .path_history(input.clone(), work.clone())
+            .await
+            .map_err(crate::query::status)?;
+        input.check_history(&result.value)?;
+        reply(result, work, self.query_limit())
+    }
+    async fn blame(
+        &self,
+        request: Request<p::QueryPathRequest>,
+    ) -> Result<Response<q::BlameResult>, Status> {
+        let (input, work) = input(request, self.query_limit())?;
+        self.authorize_command(&input.store_id, &work)?;
+        let provider = self.query_provider(&input.store_id)?;
+        let input = path_query(input, self.query_limit())?;
+        let result = provider
+            .blame(input.clone(), work.clone())
+            .await
+            .map_err(crate::query::status)?;
+        input.check_blame(&result.value, self.query_config().model_limits())?;
+        reply(result, work, self.query_limit())
+    }
     async fn close_query(
         &self,
         request: Request<p::QueryCloseRequest>,
@@ -841,7 +883,9 @@ message_size!(
     q::GraphFacts,
     q::CommitPrefixResult,
     q::ChangePrefixResult,
-    q::ShortestPrefixResult
+    q::ShortestPrefixResult,
+    q::PathHistoryResult,
+    q::BlameResult
 );
 impl WireSize for QueryScope {
     fn wire_size(&self) -> usize {
@@ -1118,6 +1162,33 @@ impl NativeQueryIo for GuardedQuery {
                 return Err(Status::data_loss("native query commit mismatch"));
             }
             Ok(r)
+        })
+        .await
+    }
+    async fn path_history(
+        &self,
+        input: ScopedPathQuery,
+        owner: QueryOwner,
+    ) -> Result<QueryReply<q::PathHistoryResult>, Status> {
+        input.validate(self.service.query_limit())?;
+        self.run(owner, move |provider, owner| async move {
+            let result = provider.path_history(input.clone(), owner).await?;
+            input.check_history(&result.value)?;
+            Ok(result)
+        })
+        .await
+    }
+    async fn blame(
+        &self,
+        input: ScopedPathQuery,
+        owner: QueryOwner,
+    ) -> Result<QueryReply<q::BlameResult>, Status> {
+        input.validate(self.service.query_limit())?;
+        let limits = self.service.query_config().model_limits();
+        self.run(owner, move |provider, owner| async move {
+            let result = provider.blame(input.clone(), owner).await?;
+            input.check_blame(&result.value, limits)?;
+            Ok(result)
         })
         .await
     }

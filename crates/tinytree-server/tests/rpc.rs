@@ -5412,6 +5412,24 @@ async fn cloud_rpc_private_compressed_history_replay_gc_and_restart() {
         Some(q::graph_fact_answer::Answer::HasId(false)),
         "other snapshot's frozen drafts must not leak into intrinsic-only selection"
     );
+    assert_eq!(
+        query
+            .blame(request(
+                q::BlameRequest {
+                    scope: intrinsic_scope.key.clone(),
+                    revision: Some(query_id(frozen[1].descriptor.key)),
+                    path: "BUILD.bazel".into(),
+                    policy: q::HistoryPolicy::LinearFixedPathV1 as i32,
+                    max_commits: 0,
+                },
+                ALPHA
+            ))
+            .await
+            .unwrap_err()
+            .code(),
+        Code::InvalidArgument,
+        "another retained snapshot cannot authorize frozen canonical file reads",
+    );
     let full_prefix = frozen[1]
         .descriptor
         .key
@@ -5482,6 +5500,67 @@ async fn cloud_rpc_private_compressed_history_replay_gc_and_restart() {
             .unwrap()
             .into_inner(),
         scope
+    );
+    // Frozen cloud drafts are not in the live index; their selected retained
+    // source, not COMMIT-only overlay membership, authorizes canonical path I/O.
+    let frozen_blame_response = query
+        .blame(request(
+            q::BlameRequest {
+                scope: scope.key.clone(),
+                revision: Some(query_id(frozen[1].descriptor.key)),
+                path: "BUILD.bazel".into(),
+                policy: q::HistoryPolicy::LinearFixedPathV1 as i32,
+                max_commits: 0,
+            },
+            ALPHA,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        frozen_blame_response
+            .metadata()
+            .get("grpc-encoding")
+            .unwrap(),
+        "zstd"
+    );
+    let frozen_blame = frozen_blame_response.into_inner();
+    assert_eq!(
+        frozen_blame.coverage,
+        q::HistoryCoverage::HistoryComplete as i32
+    );
+    assert_eq!(
+        frozen_blame.revision,
+        Some(query_id(frozen[1].descriptor.key))
+    );
+    assert!(!frozen_blame.target_bytes.is_empty());
+    assert!(
+        frozen_blame
+            .ranges
+            .iter()
+            .all(|range| range.origin == Some(query_id(root(&data))))
+    );
+    let frozen_history = query
+        .path_history(request(
+            q::PathHistoryRequest {
+                scope: scope.key.clone(),
+                revision: Some(query_id(frozen[1].descriptor.key)),
+                path: "BUILD.bazel".into(),
+                policy: q::HistoryPolicy::LinearFixedPathV1 as i32,
+                max_commits: 0,
+            },
+            ALPHA,
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(
+        frozen_history.coverage,
+        q::HistoryCoverage::HistoryComplete as i32
+    );
+    assert_eq!(frozen_history.entries.len(), 1);
+    assert_eq!(
+        frozen_history.entries[0].commit,
+        Some(query_id(root(&data)))
     );
     let selected_prefix = query
         .resolve_commit_prefix(request(
@@ -6158,4 +6237,764 @@ async fn standalone_cloud_profile_registers_private_workspace_service() {
     assert!(workspace.manifest_id.is_none());
     drop(client);
     server.stop().await;
+}
+
+fn history_file(store: &Store, bytes: &[u8], executable: bool) -> tinytree_model::TreeValue {
+    let descriptor = tinytree_model::describe_file(bytes);
+    store.put("alpha", descriptor, bytes, 0).unwrap();
+    tinytree_model::TreeValue::File {
+        id: tinytree_model::FileId(descriptor.key.id.0),
+        executable,
+        size_bytes: bytes.len() as u64,
+        copy_id: None,
+    }
+}
+fn history_commit(
+    store: &Store,
+    index: &tinytree_index::Index,
+    parents: &[ObjectKey],
+    value: Option<tinytree_model::TreeValue>,
+    change: u8,
+) -> tinytree_model::EncodedObject {
+    let tree = tinytree_model::encode(
+        &Object::Tree(tinytree_model::Tree {
+            entries: value
+                .into_iter()
+                .map(|value| tinytree_model::TreeEntry {
+                    name: "file".into(),
+                    value,
+                })
+                .collect(),
+        }),
+        Limits::default(),
+    )
+    .unwrap();
+    store.put("alpha", tree.descriptor, &tree.bytes, 0).unwrap();
+    let mut commit = tinytree_model::synthetic_root();
+    commit.parents = if parents.is_empty() {
+        vec![CommitId::ROOT]
+    } else {
+        parents.iter().map(|parent| CommitId(parent.id.0)).collect()
+    };
+    commit.change_id = tinytree_model::ChangeId([change; 16]);
+    commit.description = format!("history {change}");
+    commit.root_tree = tinytree_model::TreeMerge {
+        terms: vec![TreeId(tree.descriptor.key.id.0)],
+        labels: vec![String::new()],
+    };
+    let object = tinytree_model::encode(&Object::Commit(commit), Limits::default()).unwrap();
+    store
+        .put("alpha", object.descriptor, &object.bytes, 0)
+        .unwrap();
+    index
+        .ingest("alpha", object.descriptor, &object.bytes)
+        .unwrap();
+    object
+}
+fn history_request(
+    scope: &q::QueryScope,
+    revision: ObjectKey,
+    maximum: u32,
+) -> q::PathHistoryRequest {
+    q::PathHistoryRequest {
+        scope: scope.key.clone(),
+        revision: Some(query_id(revision)),
+        path: "file".into(),
+        policy: q::HistoryPolicy::LinearFixedPathV1 as i32,
+        max_commits: maximum,
+    }
+}
+fn blame_request(scope: &q::QueryScope, revision: ObjectKey, maximum: u32) -> q::BlameRequest {
+    let input = history_request(scope, revision, maximum);
+    q::BlameRequest {
+        scope: input.scope,
+        revision: input.revision,
+        path: input.path,
+        policy: input.policy,
+        max_commits: input.max_commits,
+    }
+}
+fn expanded_origins(result: &q::BlameResult) -> Vec<Option<(Vec<u8>, u32)>> {
+    result
+        .ranges
+        .iter()
+        .flat_map(|range| {
+            (range.start_line..range.end_line).map(move |line| {
+                range.origin.as_ref().map(|origin| {
+                    (
+                        origin.value.clone(),
+                        range.original_line + line - range.start_line,
+                    )
+                })
+            })
+        })
+        .collect()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn path_history_and_blame_pin_revision_and_distinguish_partial_attribution() {
+    let (temporary, store) = setup();
+    let index =
+        tinytree_index::Index::open(temporary.path().join("derived"), &Default::default()).unwrap();
+    let a = history_commit(
+        &store,
+        &index,
+        &[],
+        Some(history_file(&store, b"old\nshared\n", false)),
+        1,
+    )
+    .descriptor
+    .key;
+    let b = history_commit(
+        &store,
+        &index,
+        &[a],
+        Some(history_file(&store, b"new\nshared\n", false)),
+        2,
+    )
+    .descriptor
+    .key;
+    let mode = history_commit(
+        &store,
+        &index,
+        &[b],
+        Some(history_file(&store, b"new\nshared\n", true)),
+        3,
+    )
+    .descriptor
+    .key;
+    let deleted = history_commit(&store, &index, &[mode], None, 4)
+        .descriptor
+        .key;
+    let readded = history_commit(
+        &store,
+        &index,
+        &[deleted],
+        Some(history_file(&store, b"old\nshared\n", false)),
+        5,
+    )
+    .descriptor
+    .key;
+    let symlink =
+        tinytree_model::encode(&Object::Symlink("elsewhere".into()), Limits::default()).unwrap();
+    store
+        .put("alpha", symlink.descriptor, &symlink.bytes, 0)
+        .unwrap();
+    let link = history_commit(
+        &store,
+        &index,
+        &[readded],
+        Some(tinytree_model::TreeValue::Symlink {
+            id: tinytree_model::SymlinkId(symlink.descriptor.key.id.0),
+            target_bytes: 9,
+        }),
+        6,
+    )
+    .descriptor
+    .key;
+    let binary = history_commit(
+        &store,
+        &index,
+        &[link],
+        Some(history_file(&store, b"tail\xff\0", false)),
+        7,
+    )
+    .descriptor
+    .key;
+    let server = Running::start_query(store, ServiceConfig::default(), index).await;
+    let mut client = server.query_client().await;
+    let scope = query_ready(&mut client, &[binary], 81).await;
+    let history = client
+        .path_history(request(history_request(&scope, mode, 0), ALPHA))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(history.coverage, q::HistoryCoverage::HistoryComplete as i32);
+    assert!(history.boundary.is_none());
+    assert_eq!(history.scanned_commits, 3);
+    assert_eq!(
+        history
+            .entries
+            .iter()
+            .map(|entry| entry.commit.as_ref().unwrap().value.clone())
+            .collect::<Vec<_>>(),
+        vec![mode.id.0.to_vec(), b.id.0.to_vec(), a.id.0.to_vec()]
+    );
+    assert_eq!(history.scope_digest, scope.content_digest);
+    assert_eq!(history.index_epoch, scope.index_epoch);
+    assert_eq!(history.revision, Some(query_id(mode)));
+    let limited = client
+        .path_history(request(history_request(&scope, mode, 1), ALPHA))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(
+        limited.coverage,
+        q::HistoryCoverage::HistoryScanLimit as i32
+    );
+    assert_eq!(limited.scanned_commits, 1);
+    assert_eq!(limited.boundary, Some(query_id(b)));
+    let blame = client
+        .blame(request(blame_request(&scope, b, 0), ALPHA))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(blame.coverage, q::HistoryCoverage::HistoryComplete as i32);
+    assert_eq!(blame.target_bytes, b"new\nshared\n");
+    assert_eq!(
+        blame.target.as_ref().unwrap().content_blake3,
+        blake3::hash(&blame.target_bytes).as_bytes()
+    );
+    assert_eq!(
+        expanded_origins(&blame),
+        vec![Some((b.id.0.to_vec(), 0)), Some((a.id.0.to_vec(), 1))]
+    );
+    let limited = client
+        .blame(request(blame_request(&scope, b, 1), ALPHA))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(
+        limited.coverage,
+        q::HistoryCoverage::HistoryScanLimit as i32
+    );
+    assert_eq!(limited.boundary, Some(query_id(a)));
+    assert_eq!(
+        expanded_origins(&limited),
+        vec![Some((b.id.0.to_vec(), 0)), None]
+    );
+    let readded_blame = client
+        .blame(request(blame_request(&scope, readded, 0), ALPHA))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(
+        readded_blame.coverage,
+        q::HistoryCoverage::HistoryComplete as i32
+    );
+    assert_eq!(
+        expanded_origins(&readded_blame),
+        vec![
+            Some((readded.id.0.to_vec(), 0)),
+            Some((readded.id.0.to_vec(), 1))
+        ],
+        "identical bytes before deletion cannot cross the missing-file boundary"
+    );
+    let binary_blame = client
+        .blame(request(blame_request(&scope, binary, 0), ALPHA))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(
+        binary_blame.coverage,
+        q::HistoryCoverage::HistoryComplete as i32
+    );
+    assert_eq!(binary_blame.target_bytes, b"tail\xff\0");
+    assert_eq!(
+        expanded_origins(&binary_blame),
+        vec![Some((binary.id.0.to_vec(), 0))]
+    );
+    for (revision, code) in [(deleted, Code::NotFound), (link, Code::FailedPrecondition)] {
+        assert_eq!(
+            client
+                .blame(request(blame_request(&scope, revision, 0), ALPHA))
+                .await
+                .unwrap_err()
+                .code(),
+            code
+        );
+    }
+    for path in [
+        "",
+        "/file",
+        "file/",
+        "a//b",
+        "a/../file",
+        "./file",
+        "a\\file",
+        "file\0",
+    ] {
+        let mut input = history_request(&scope, mode, 0);
+        input.path = path.into();
+        assert_eq!(
+            client
+                .path_history(request(input, ALPHA))
+                .await
+                .unwrap_err()
+                .code(),
+            Code::InvalidArgument,
+            "{path:?}"
+        );
+    }
+    client
+        .close_scope(request(
+            q::CloseScopeRequest {
+                scope: scope.key.clone(),
+            },
+            ALPHA,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        client
+            .blame(request(blame_request(&scope, b, 0), ALPHA))
+            .await
+            .unwrap_err()
+            .code(),
+        Code::FailedPrecondition
+    );
+    drop(client);
+    server.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn history_canonical_source_excludes_private_metadata_only_overlays() {
+    let (temporary, store) = setup();
+    let index =
+        tinytree_index::Index::open(temporary.path().join("derived"), &Default::default()).unwrap();
+    let base = history_commit(
+        &store,
+        &index,
+        &[],
+        Some(history_file(&store, b"base\n", false)),
+        11,
+    )
+    .descriptor
+    .key;
+    let secret = history_commit(
+        &store,
+        &index,
+        &[],
+        Some(history_file(&store, b"not in selected ancestry\n", false)),
+        12,
+    );
+    // Even though its trees/files happen to exist, this metadata-only overlay
+    // lacks selected canonical source authority. Repo-wide readers still cannot
+    // make a graph-only scope silently read that unselected FILE closure.
+    let Object::Commit(mut draft) =
+        tinytree_model::decode(&secret.bytes, Limits::default()).unwrap()
+    else {
+        unreachable!()
+    };
+    draft.parents = vec![CommitId(base.id.0)];
+    draft.change_id = tinytree_model::ChangeId([13; 16]);
+    let draft = tinytree_model::encode(&Object::Commit(draft), Limits::default()).unwrap();
+    let server = Running::start_query(store, ServiceConfig::default(), index).await;
+    let mut client = server.query_client().await;
+    let scope = query_ready(&mut client, &[base], 82).await;
+    assert_eq!(
+        client
+            .blame(request(
+                blame_request(&scope, secret.descriptor.key, 0),
+                ALPHA
+            ))
+            .await
+            .unwrap_err()
+            .code(),
+        Code::InvalidArgument
+    );
+    let overlay = client
+        .open_scope(request(
+            tokio_stream::iter(private_query_frames(&[base], 83, &[&draft])),
+            ALPHA,
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+    for key in [scope.key.clone(), overlay.key.clone()] {
+        let mut input = blame_request(&overlay, draft.descriptor.key, 0);
+        input.scope = key;
+        if input.scope == scope.key {
+            assert_eq!(
+                client
+                    .blame(request(input, ALPHA))
+                    .await
+                    .unwrap_err()
+                    .code(),
+                Code::InvalidArgument
+            );
+        } else {
+            let response = client
+                .blame(request(input, ALPHA))
+                .await
+                .unwrap()
+                .into_inner();
+            assert_eq!(
+                response.coverage,
+                q::HistoryCoverage::HistoryPrivateOverlay as i32
+            );
+            assert!(response.target.is_none());
+            assert!(response.target_bytes.is_empty());
+            assert!(response.ranges.is_empty());
+            let response = client
+                .path_history(request(
+                    history_request(&overlay, draft.descriptor.key, 0),
+                    ALPHA,
+                ))
+                .await
+                .unwrap()
+                .into_inner();
+            assert_eq!(
+                response.coverage,
+                q::HistoryCoverage::HistoryPrivateOverlay as i32
+            );
+            assert!(response.entries.is_empty());
+        }
+    }
+    assert_eq!(
+        client
+            .blame(request(blame_request(&overlay, base, 0), BETA))
+            .await
+            .unwrap_err()
+            .code(),
+        Code::PermissionDenied
+    );
+    assert_eq!(
+        client
+            .blame(request(blame_request(&overlay, base, 0), PEER))
+            .await
+            .unwrap_err()
+            .code(),
+        Code::PermissionDenied
+    );
+    drop(client);
+    server.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn history_limits_and_unsupported_graphs_never_claim_complete_blame() {
+    for (name, configure, expected, has_target) in [
+        (
+            "diff work",
+            (|config: &mut ServiceConfig| config.query.max_blame_diff_steps = 1)
+                as fn(&mut ServiceConfig),
+            q::HistoryCoverage::HistoryDiffLimit,
+            true,
+        ),
+        (
+            "file bytes",
+            |config: &mut ServiceConfig| config.query.max_blame_file_bytes = 1,
+            q::HistoryCoverage::HistoryReadLimit,
+            false,
+        ),
+        (
+            "selected lines",
+            |config: &mut ServiceConfig| config.query.max_blame_lines = 1,
+            q::HistoryCoverage::HistoryDiffLimit,
+            false,
+        ),
+        (
+            "commit scan",
+            |config: &mut ServiceConfig| config.query.max_history_commits = 1,
+            q::HistoryCoverage::HistoryScanLimit,
+            true,
+        ),
+    ] {
+        let (temporary, store) = setup();
+        let index =
+            tinytree_index::Index::open(temporary.path().join("derived"), &Default::default())
+                .unwrap();
+        let a = history_commit(
+            &store,
+            &index,
+            &[],
+            Some(history_file(&store, b"old\nshared\n", false)),
+            21,
+        )
+        .descriptor
+        .key;
+        let b = history_commit(
+            &store,
+            &index,
+            &[a],
+            Some(history_file(&store, b"new\nshared\n", false)),
+            22,
+        )
+        .descriptor
+        .key;
+        let mut config = ServiceConfig::default();
+        configure(&mut config);
+        let server = Running::start_query(store, config, index).await;
+        let mut client = server.query_client().await;
+        let scope = query_ready(&mut client, &[b], 84).await;
+        let result = client
+            .blame(request(blame_request(&scope, b, u32::MAX), ALPHA))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(result.coverage, expected as i32, "{name}");
+        assert!(result.boundary.is_some(), "{name}");
+        assert_eq!(result.target.is_some(), has_target, "{name}");
+        if has_target {
+            assert!(
+                result.ranges.iter().any(|range| range.origin.is_none()),
+                "{name}: unresolved lines cannot receive a guessed origin"
+            );
+            assert_eq!(expanded_origins(&result).len(), 2, "{name}");
+        } else {
+            assert!(result.target_bytes.is_empty(), "{name}");
+            assert!(result.ranges.is_empty(), "{name}");
+        }
+        drop(client);
+        server.stop().await;
+    }
+    // A medium file across many edits reuses physically released diff scratch,
+    // while aggregate CPU work still spans all comparisons in the request.
+    let (medium_directory, medium_store) = setup();
+    let medium_index =
+        tinytree_index::Index::open(medium_directory.path().join("derived"), &Default::default())
+            .unwrap();
+    let mut chain = Vec::new();
+    for version in 0..16 {
+        let mut bytes = format!("version {version:04}\n").into_bytes();
+        for line in 1..1024 {
+            bytes.extend_from_slice(format!("shared line {line:06} fixed content\n").as_bytes());
+        }
+        let parents = chain.last().copied().into_iter().collect::<Vec<_>>();
+        chain.push(
+            history_commit(
+                &medium_store,
+                &medium_index,
+                &parents,
+                Some(history_file(&medium_store, &bytes, false)),
+                version + 1,
+            )
+            .descriptor
+            .key,
+        );
+    }
+    let head = *chain.last().unwrap();
+    for (aggregate_work, expected) in [
+        (Some(1_000_000), q::HistoryCoverage::HistoryDiffLimit),
+        (None, q::HistoryCoverage::HistoryComplete),
+    ] {
+        let mut config = ServiceConfig::default();
+        if let Some(work) = aggregate_work {
+            config.query.max_blame_diff_steps = work;
+        }
+        assert_eq!(
+            config.query.max_blame_diff_memory_bytes,
+            8 * 1024 * 1024,
+            "reuse must not require a larger scratch reservation"
+        );
+        let server = Running::start_query(medium_store.clone(), config, medium_index.clone()).await;
+        let mut client = server.query_client().await;
+        let scope = query_ready(&mut client, &[head], 86).await;
+        let result = client
+            .blame(request(blame_request(&scope, head, 0), ALPHA))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(result.coverage, expected as i32);
+        let origins = expanded_origins(&result);
+        assert_eq!(origins.len(), 1024);
+        if expected == q::HistoryCoverage::HistoryComplete {
+            assert_eq!(result.scanned_commits, 16);
+            assert_eq!(origins[0], Some((head.id.0.to_vec(), 0)));
+            for (line, origin) in origins.iter().enumerate().skip(1) {
+                assert_eq!(*origin, Some((chain[0].id.0.to_vec(), line as u32)));
+            }
+        } else {
+            assert!(result.scanned_commits > 0 && result.scanned_commits < 16);
+            assert!(
+                origins.iter().any(Option::is_none),
+                "aggregate work must not reset with scratch"
+            );
+        }
+        drop(client);
+        server.stop().await;
+    }
+    let (temporary, store) = setup();
+    let index =
+        tinytree_index::Index::open(temporary.path().join("derived"), &Default::default()).unwrap();
+    let a = history_commit(
+        &store,
+        &index,
+        &[],
+        Some(history_file(&store, b"left\n", false)),
+        31,
+    )
+    .descriptor
+    .key;
+    let b = history_commit(
+        &store,
+        &index,
+        &[],
+        Some(history_file(&store, b"right\n", false)),
+        32,
+    )
+    .descriptor
+    .key;
+    let merge = history_commit(
+        &store,
+        &index,
+        &[a, b],
+        Some(history_file(&store, b"resolved\n", false)),
+        33,
+    );
+    let Object::Commit(mut conflict) =
+        tinytree_model::decode(&merge.bytes, Limits::default()).unwrap()
+    else {
+        unreachable!()
+    };
+    let tree = conflict.root_tree.terms[0];
+    conflict.parents = vec![CommitId(merge.descriptor.key.id.0)];
+    conflict.change_id = tinytree_model::ChangeId([34; 16]);
+    conflict.root_tree = tinytree_model::TreeMerge {
+        terms: vec![tree, tree, tree],
+        labels: vec!["left".into(), "base".into(), "right".into()],
+    };
+    let conflict = tinytree_model::encode(&Object::Commit(conflict), Limits::default()).unwrap();
+    store
+        .put("alpha", conflict.descriptor, &conflict.bytes, 0)
+        .unwrap();
+    index
+        .ingest("alpha", conflict.descriptor, &conflict.bytes)
+        .unwrap();
+    let server = Running::start_query(store, ServiceConfig::default(), index).await;
+    let mut client = server.query_client().await;
+    let scope = query_ready(&mut client, &[conflict.descriptor.key], 85).await;
+    for (revision, expected) in [
+        (
+            merge.descriptor.key,
+            q::HistoryCoverage::HistoryMergeBoundary,
+        ),
+        (
+            conflict.descriptor.key,
+            q::HistoryCoverage::HistoryConflictBoundary,
+        ),
+    ] {
+        let history = client
+            .path_history(request(history_request(&scope, revision, 0), ALPHA))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(history.coverage, expected as i32);
+        assert!(history.boundary.is_some());
+        assert!(history.entries.is_empty());
+        let blame = client
+            .blame(request(blame_request(&scope, revision, 0), ALPHA))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(blame.coverage, expected as i32);
+        assert!(blame.boundary.is_some());
+        assert!(blame.ranges.iter().all(|range| range.origin.is_none()));
+    }
+    drop(client);
+    server.stop().await;
+}
+
+// Warm canonical Store and derived index; each trial opens a fresh scope.
+// This is not a shallow-clone comparison or an OS-cache-cold benchmark.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "manual bounded default-limit history/blame RPC benchmark"]
+async fn benchmark_remote_blame_default_limits() {
+    tokio::time::timeout(Duration::from_secs(60), async {
+        for (lines, versions) in [(128usize,4usize),(128,16),(1024,4),(1024,16),(4096,4)] {
+            let (temporary,store)=setup();
+            let index=tinytree_index::Index::open(temporary.path().join("derived"),&Default::default()).unwrap();
+            let mut commits=Vec::with_capacity(versions);
+            let mut files=Vec::with_capacity(versions);
+            for version in 0..versions {
+                let mut bytes=format!("version {version:04}\n").into_bytes();
+                for line in 1..lines {
+                    bytes.extend_from_slice(format!("shared line {line:06} fixed content\n").as_bytes());
+                }
+                let file=tinytree_model::describe_file(&bytes);
+                let value=history_file(&store,&bytes,false);
+                let parents=commits.last().copied().into_iter().collect::<Vec<_>>();
+                let commit=history_commit(&store,&index,&parents,Some(value),version as u8 + 1).descriptor.key;
+                commits.push(commit); files.push((file,bytes));
+            }
+            let config=ServiceConfig::default();
+            let max_diff_work=config.query.max_blame_diff_steps;
+            let max_diff_allocation=config.query.max_blame_diff_memory_bytes;
+            let max_scan=config.query.max_history_commits;
+            let server=Running::start_query(store,config,index).await;
+            let mut query=server.query_client().await;
+            let mut objects=server.client().await;
+            let first=commits[0];
+            let selected=*commits.last().unwrap();
+            let selected_bytes=&files.last().unwrap().1;
+            let known_historical_file_bytes=files.iter().map(|(descriptor,_)|descriptor.size_bytes).sum::<u64>();
+            for trial in 0..3 {
+                let started=std::time::Instant::now();
+                let scope=query_ready(&mut query,&[selected],90+trial).await;
+                let scope_open_ms=started.elapsed().as_secs_f64()*1000.0;
+                let started=std::time::Instant::now();
+                let response=query.blame(request(blame_request(&scope,selected,0),ALPHA)).await.unwrap();
+                assert_eq!(response.metadata().get("grpc-encoding").unwrap(),"zstd");
+                let blame=response.into_inner();
+                let blame_ms=started.elapsed().as_secs_f64()*1000.0;
+                let coverage=q::HistoryCoverage::try_from(blame.coverage).unwrap();
+                assert_eq!(blame.target_bytes,*selected_bytes);
+                let line_origins=expanded_origins(&blame);
+                assert_eq!(line_origins.len(),lines);
+                let unresolved=line_origins.iter().filter(|origin|origin.is_none()).count();
+                let complete=coverage==q::HistoryCoverage::HistoryComplete;
+                if complete {
+                    assert!(blame.boundary.is_none());assert_eq!(unresolved,0);
+                    assert_eq!(line_origins[0],Some((selected.id.0.to_vec(),0)));
+                    for (line,origin) in line_origins.iter().enumerate().skip(1) {
+                        assert_eq!(*origin,Some((first.id.0.to_vec(),line as u32)));
+                    }
+                } else {
+                    assert!(blame.boundary.is_some());assert!(unresolved>0);
+                }
+                let blame_protobuf_bytes=prost::Message::encoded_len(&blame);
+                // Actual serial Repository.ReadFile calls for all known versions.
+                // This only measures a naive transfer baseline: no client blame
+                // CPU, clone/index checkout, directory traversal or WAN latency.
+                let started=std::time::Instant::now();
+                let mut download_file_bytes=0usize;
+                let mut download_protobuf_bytes=0usize;
+                for (descriptor,expected) in &files {
+                    let response=objects.read_file(request(p::ReadFileRequest {
+                        repository_id:"alpha".into(), native_file_id:descriptor.key.id.0.to_vec(),
+                    },ALPHA)).await.unwrap();
+                    assert_eq!(response.metadata().get("grpc-encoding").unwrap(),"zstd");
+                    let mut stream=response.into_inner();
+                    let mut received=Vec::with_capacity(expected.len());
+                    let mut header=false;
+                    while let Some(frame)=stream.message().await.unwrap() {
+                        download_protobuf_bytes+=prost::Message::encoded_len(&frame);
+                        match frame.frame.unwrap() {
+                            p::file_frame::Frame::Header(value)=>{
+                                assert!(!header);assert_eq!(value,crate::descriptor(*descriptor));header=true;
+                            }
+                            p::file_frame::Frame::Chunk(chunk)=>{
+                                assert!(header);assert_eq!(chunk.offset,received.len() as u64);received.extend(chunk.data);
+                            }
+                        }
+                    }
+                    assert!(header);assert_eq!(received,*expected);
+                    download_file_bytes+=received.len();
+                }
+                let naive_download_ms=started.elapsed().as_secs_f64()*1000.0;
+                assert_eq!(download_file_bytes as u64,known_historical_file_bytes);
+                println!("TINYTREE_REMOTE_BLAME_DEFAULT_LIMITS_V1 {}",serde_json::json!({
+                    "lines":lines,"changing_versions":versions,"trial":trial,
+                    "scope_open_ms":scope_open_ms,"blame_ms":blame_ms,
+                    "coverage":coverage.as_str_name(),"complete":complete,
+                    "scanned_commits":blame.scanned_commits,"unresolved_lines":unresolved,
+                    "selected_file_bytes":blame.target_bytes.len(),
+                    "blame_uncompressed_protobuf_bytes":blame_protobuf_bytes,
+                    "naive_history_file_rpcs":versions,"naive_history_download_ms":naive_download_ms,
+                    "naive_history_download_file_bytes":download_file_bytes,
+                    "naive_history_download_uncompressed_protobuf_bytes":download_protobuf_bytes,
+                    "max_scan_commits":max_scan,"max_diff_work":max_diff_work,
+                    "max_diff_scratch_allocation_bytes":max_diff_allocation,
+                    "diff_allocation_policy":"per-comparison conservative scratch charge; aggregate input, line and work limits",
+                    "storage_state":"warm canonical Store and derived index; fresh scope each trial; OS cache uncontrolled",
+                    "transport":"production loopback TCP with Zstd request and response compression",
+                    "byte_measurement":"decoded application and uncompressed protobuf bytes; compressed wire bytes not measured",
+                    "baseline_scope":"actual naive serial full-history FILE downloads only; not clone or complete client blame",
+                    "latency_comparability":if complete {"phase timings only; different computations"} else {"incomplete blame is not comparable to a complete-history result"}
+                }));
+                query.close_scope(request(q::CloseScopeRequest {scope:scope.key},ALPHA)).await.unwrap();
+            }
+            drop(objects);drop(query);server.stop().await;
+        }
+    }).await.expect("bounded remote blame benchmark expired");
 }

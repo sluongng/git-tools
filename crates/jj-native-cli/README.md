@@ -13,6 +13,8 @@ JJ="$PWD/bazel-bin/crates/jj-native-cli/tinytree-jj"
   --reference main --bookmark main
 cd project
 "$JJ" status
+"$JJ" tinytree history path/to/file.rs
+"$JJ" tinytree blame path/to/file.rs --json
 "$JJ" tinytree fetch --reference main --bookmark main
 # Make changes, then select the bookmark to publish.
 "$JJ" bookmark set main -r @
@@ -30,6 +32,14 @@ For new remote workspaces, experimental `[native.workspaces] index_mode =
 "federated"` uses immutable native index checkpoints and broker queries rather
 than building a full local history index. The default remains `"legacy"`. Existing
 workspaces keep their recorded index type; missing native state fails closed.
+
+`history` and `blame` pin the selected revision (`-r REV`, default `@`) and
+compose local drafts and dirty edits over this workspace's observed remote
+baseline, without uploading them. They use fixed-path, linear-history semantics;
+merges, conflicts and exhausted limits are explicit, not complete results.
+These commands currently require a clone/fetch observation; restored cloud-only
+workspaces are not yet supported. Ordinary `jj file annotate` is not wired to
+this service and remains unsupported with the Federated index.
 
 Push uses this workspace's durable observed generation, which jj undo cannot
 roll back. Retry an interrupted push to reconcile its original intent.

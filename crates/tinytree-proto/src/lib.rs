@@ -118,6 +118,8 @@ mod tests {
                 ("ShortestPrefix", false, false),
                 ("Evaluate", false, false),
                 ("CloseQuery", false, false),
+                ("PathHistory", false, false),
+                ("Blame", false, false),
             ]
         );
 
@@ -174,6 +176,21 @@ mod tests {
             decoded.exhausted,
             query_v1::EvaluatePage::default().exhausted
         );
+        // Line zero and an unresolved origin are distinct from an attributed
+        // intrinsic-root line, including when crossing a proxy boundary.
+        let blame = query_v1::BlameResult {
+            coverage: query_v1::HistoryCoverage::HistoryScanLimit as i32,
+            ranges: vec![query_v1::BlameRange {
+                start_line: 0,
+                end_line: 1,
+                origin: None,
+                original_line: 0,
+            }],
+            ..Default::default()
+        };
+        let decoded = query_v1::BlameResult::decode(blame.encode_to_vec().as_slice()).unwrap();
+        assert_eq!(decoded, blame);
+        assert_eq!(decoded.ranges[0].origin, None);
         let marker = query_v1::OpenScopeFrame {
             frame: Some(query_v1::open_scope_frame::Frame::ScopeEnd(
                 query_v1::ScopeEnd::default(),

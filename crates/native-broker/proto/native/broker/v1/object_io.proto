@@ -62,6 +62,8 @@ service QueryIo {
   rpc Begin(QueryBeginRequest) returns (QueryHandleReply);
   rpc Page(QueryPageRequest) returns (QueryPageReply);
   rpc ReadCommit(QueryReadCommitRequest) returns (Metadata);
+  rpc PathHistory(QueryPathRequest) returns (tinytree.query.v1.PathHistoryResult);
+  rpc Blame(QueryPathRequest) returns (tinytree.query.v1.BlameResult);
   rpc CloseQuery(QueryCloseRequest) returns (QueryCloseReply);
   rpc CloseScope(QueryCloseRequest) returns (QueryCloseReply);
 }
@@ -125,6 +127,16 @@ message QueryPageReply {
   optional bool exhausted = 3; // Required; cancellation is not EOF.
 }
 message QueryReadCommitRequest { string store_id = 1; bytes scope = 2; bytes commit = 3; }
+// Only broker-local scope handles cross this facade. The host resolves the
+// captured upstream source; this request cannot supply upstream scope keys.
+message QueryPathRequest {
+  string store_id = 1;
+  bytes scope = 2;
+  bytes revision = 3;
+  string path = 4;
+  tinytree.query.v1.HistoryPolicy policy = 5;
+  uint32 max_commits = 6;
+}
 message QueryCloseRequest { string store_id = 1; bytes handle = 2; }
 message QueryCloseReply {}
 

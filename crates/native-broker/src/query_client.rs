@@ -145,6 +145,7 @@ impl tower::Service<http::Request<tonic::body::Body>> for OwnedQueryChannel {
 #[derive(Clone)]
 pub struct BrokerQueryClient {
     inner: Arc<Inner>,
+    operation_deadline: Option<Instant>,
 }
 #[derive(Clone)]
 struct Inner {
@@ -161,6 +162,16 @@ impl std::fmt::Debug for BrokerQueryClient {
     }
 }
 impl BrokerQueryClient {
+    /// Limit this clone's entire operation, including local queueing and RPC
+    /// retries. Repeated calls can only shorten the absolute deadline; sibling
+    /// clones retain their own allowance and share only transport/resource pools.
+    pub fn with_operation_deadline(mut self, deadline: Instant) -> Self {
+        self.operation_deadline = Some(
+            self.operation_deadline
+                .map_or(deadline, |old| old.min(deadline)),
+        );
+        self
+    }
     /// Bind subsequent local RPCs to a live host command. Runtime only: shared
     /// channel/pools and configured provider identity remain unchanged.
     pub fn with_command_token(mut self, token: [u8; 32]) -> Self {
@@ -201,6 +212,7 @@ impl BrokerQueryClient {
             let channel = crate::transport::connect_local_channel(endpoint, &config).await?;
             let channel = CommandChannel::new(channel);
             Ok(Self {
+                operation_deadline: None,
                 inner: Arc::new(Inner {
                     channel,
                     store,
@@ -275,8 +287,13 @@ impl BrokerQueryClient {
         Fut: Future<Output = Result<T, Status>> + Send + 'static,
     {
         let inner = self.inner.clone();
+        // Derive the deadline before dispatch to the independent runtime. Time
+        // waiting to be polled there or for an admission slot is not renewed.
+        let configured = Instant::now() + inner.config.policy.operation_timeout();
+        let deadline = self
+            .operation_deadline
+            .map_or(configured, |bound| bound.min(configured));
         crate::client::run_control(async move {
-            let deadline = Instant::now() + inner.config.policy.operation_timeout();
             reapi::policy::timeout(deadline, async move {
                 let call = inner
                     .calls
@@ -967,6 +984,64 @@ impl NativeQueryIo for BrokerQueryClient {
             value,
             owner: r.owner,
         })
+    }
+    async fn path_history(
+        &self,
+        input: ScopedPathQuery,
+        owner: QueryOwner,
+    ) -> Result<QueryReply<q::PathHistoryResult>, Status> {
+        input.validate(self.inner.config.max_query_bytes)?;
+        self.preflight(input.path.len().saturating_add(128))?;
+        let expected = input.clone();
+        let result = self
+            .execute(owner, move |mut client, deadline, store_id, cap| {
+                let payload = p::QueryPathRequest {
+                    store_id,
+                    scope: input.scope.to_vec(),
+                    revision: input.revision.0.to_vec(),
+                    path: input.path.clone(),
+                    policy: input.policy as i32,
+                    max_commits: input.max_commits,
+                };
+                async move {
+                    Ok(client
+                        .path_history(request(payload, deadline, cap)?)
+                        .await?
+                        .into_inner())
+                }
+            })
+            .await?;
+        expected.check_history(&result.value)?;
+        Ok(result)
+    }
+    async fn blame(
+        &self,
+        input: ScopedPathQuery,
+        owner: QueryOwner,
+    ) -> Result<QueryReply<q::BlameResult>, Status> {
+        input.validate(self.inner.config.max_query_bytes)?;
+        self.preflight(input.path.len().saturating_add(128))?;
+        let expected = input.clone();
+        let result = self
+            .execute(owner, move |mut client, deadline, store_id, cap| {
+                let payload = p::QueryPathRequest {
+                    store_id,
+                    scope: input.scope.to_vec(),
+                    revision: input.revision.0.to_vec(),
+                    path: input.path.clone(),
+                    policy: input.policy as i32,
+                    max_commits: input.max_commits,
+                };
+                async move {
+                    Ok(client
+                        .blame(request(payload, deadline, cap)?)
+                        .await?
+                        .into_inner())
+                }
+            })
+            .await?;
+        expected.check_blame(&result.value, self.inner.config.model_limits())?;
+        Ok(result)
     }
     async fn close_query(&self, h: [u8; 32], o: QueryOwner) -> Result<(), Status> {
         self.execute(o, move |mut c, d, store_id, cap| async move {

@@ -1732,6 +1732,9 @@ struct FakeQuery {
     transient_pages: std::sync::atomic::AtomicUsize,
     page_calls: std::sync::Mutex<Vec<([u8; 32], u64)>>,
     fact_calls: std::sync::atomic::AtomicUsize,
+    history_calls: std::sync::atomic::AtomicUsize,
+    malformed_history_echo: std::sync::atomic::AtomicBool,
+    corrupt_blame_bytes: std::sync::atomic::AtomicBool,
     page_pause: Option<Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>>,
     page_entered: Arc<std::sync::atomic::AtomicBool>,
     page_finished: Arc<std::sync::atomic::AtomicBool>,
@@ -1752,6 +1755,9 @@ impl FakeQuery {
             transient_pages: Default::default(),
             page_calls: Default::default(),
             fact_calls: Default::default(),
+            history_calls: Default::default(),
+            malformed_history_echo: Default::default(),
+            corrupt_blame_bytes: Default::default(),
             page_pause: None,
             page_entered: Default::default(),
             page_finished: Default::default(),
@@ -2050,6 +2056,87 @@ impl native_broker::NativeQueryIo for FakeQuery {
     ) -> Result<native_broker::QueryReply<jj_native_backend::VerifiedMetadata>, tonic::Status> {
         Err(tonic::Status::unimplemented("fixture private read detail"))
     }
+    async fn path_history(
+        &self,
+        input: native_broker::ScopedPathQuery,
+        _: native_broker::QueryOwner,
+    ) -> Result<
+        native_broker::QueryReply<native_broker::query_protocol::PathHistoryResult>,
+        tonic::Status,
+    > {
+        use native_broker::query_protocol as q;
+        self.scope(input.scope)?;
+        self.history_calls
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let revision = if self
+            .malformed_history_echo
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            vec![99; 32]
+        } else {
+            input.revision.0.to_vec()
+        };
+        Ok(self.reply(q::PathHistoryResult {
+            scope_digest: vec![self.marker; 32],
+            index_epoch: vec![self.marker; 16],
+            revision: Some(q::CommitId { value: revision }),
+            path: input.path,
+            policy: input.policy as i32,
+            coverage: q::HistoryCoverage::HistoryComplete as i32,
+            scanned_commits: 1,
+            entries: vec![],
+            boundary: None,
+        }))
+    }
+    async fn blame(
+        &self,
+        input: native_broker::ScopedPathQuery,
+        _: native_broker::QueryOwner,
+    ) -> Result<native_broker::QueryReply<native_broker::query_protocol::BlameResult>, tonic::Status>
+    {
+        use native_broker::query_protocol as q;
+        self.scope(input.scope)?;
+        let bytes = b"selected line\n";
+        let id = blake3::hash(bytes).as_bytes().to_vec();
+        let target_bytes = if self
+            .corrupt_blame_bytes
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            b"wrong bytes\n".to_vec()
+        } else {
+            bytes.to_vec()
+        };
+        Ok(self.reply(q::BlameResult {
+            scope_digest: vec![self.marker; 32],
+            index_epoch: vec![self.marker; 16],
+            revision: Some(q::CommitId {
+                value: input.revision.0.to_vec(),
+            }),
+            path: input.path,
+            policy: input.policy as i32,
+            coverage: q::HistoryCoverage::HistoryComplete as i32,
+            scanned_commits: 1,
+            boundary: None,
+            target: Some(tinytree_proto::v1::ObjectDescriptor {
+                key: Some(tinytree_proto::v1::ObjectKey {
+                    kind: 1,
+                    native_id: id.clone(),
+                }),
+                content_blake3: id,
+                size_bytes: bytes.len() as u64,
+                object_format_version: 1,
+            }),
+            target_bytes,
+            ranges: vec![q::BlameRange {
+                start_line: 0,
+                end_line: 1,
+                origin: Some(q::CommitId {
+                    value: input.revision.0.to_vec(),
+                }),
+                original_line: 0,
+            }],
+        }))
+    }
     async fn close_query(
         &self,
         _: [u8; 32],
@@ -2093,6 +2180,129 @@ fn query_service(root: &Path, a: Arc<FakeQuery>, b: Arc<FakeQuery>, cfg: Config)
     ]))
     .unwrap()
 }
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn scoped_path_queries_route_exact_aliases_and_reject_invalid_results() {
+    use native_broker::{NativeQueryIo, ScopedPathQuery, query_protocol as q};
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path().canonicalize().unwrap();
+    private(&root);
+    let cfg = Config {
+        max_inflight: 1,
+        ..query_config()
+    };
+    let first_provider = Arc::new(FakeQuery::new(1, 1024));
+    let second_provider = Arc::new(FakeQuery::new(2, 1024));
+    let service = query_service(&root, first_provider.clone(), second_provider, cfg.clone());
+    let socket = root.join("history.sock");
+    let _host = Running::start_service(&socket, service.clone()).await;
+    let first = native_broker::BrokerQueryClient::connect(&socket, "first", cfg.clone())
+        .await
+        .unwrap();
+    let second = native_broker::BrokerQueryClient::connect(&socket, "second", cfg)
+        .await
+        .unwrap();
+    let input = ScopedPathQuery {
+        scope: [1; 32],
+        revision: native_broker::CommitId([5; 32]),
+        path: "src/main.rs".into(),
+        policy: q::HistoryPolicy::LinearFixedPathV1,
+        max_commits: 4,
+    };
+    let history = first
+        .path_history(input.clone(), Arc::new(()))
+        .await
+        .unwrap();
+    assert_eq!(history.value.scope_digest, vec![1; 32]);
+    // Retaining history and blame replies cannot retain the one transport slot.
+    let blame = first.blame(input.clone(), Arc::new(())).await.unwrap();
+    assert_eq!(blame.value.target_bytes, b"selected line\n");
+    let second_history = second
+        .path_history(
+            ScopedPathQuery {
+                scope: [2; 32],
+                ..input.clone()
+            },
+            Arc::new(()),
+        )
+        .await
+        .unwrap();
+    assert_eq!(second_history.value.scope_digest, vec![2; 32]);
+    assert_eq!(
+        second
+            .path_history(input.clone(), Arc::new(()))
+            .await
+            .unwrap_err()
+            .code(),
+        tonic::Code::PermissionDenied
+    );
+
+    let calls = first_provider
+        .history_calls
+        .load(std::sync::atomic::Ordering::SeqCst);
+    let invalid_path = ScopedPathQuery {
+        path: "src/../private".into(),
+        ..input.clone()
+    };
+    assert_eq!(
+        first
+            .path_history(invalid_path.clone(), Arc::new(()))
+            .await
+            .unwrap_err()
+            .code(),
+        tonic::Code::InvalidArgument
+    );
+    let local = service.query_io("first").unwrap();
+    assert_eq!(
+        local
+            .path_history(invalid_path, Arc::new(()))
+            .await
+            .unwrap_err()
+            .code(),
+        tonic::Code::InvalidArgument
+    );
+    assert_eq!(
+        first_provider
+            .history_calls
+            .load(std::sync::atomic::Ordering::SeqCst),
+        calls
+    );
+
+    first_provider
+        .malformed_history_echo
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    assert_eq!(
+        first
+            .path_history(input.clone(), Arc::new(()))
+            .await
+            .unwrap_err()
+            .code(),
+        tonic::Code::DataLoss
+    );
+    assert_eq!(
+        local
+            .path_history(input.clone(), Arc::new(()))
+            .await
+            .unwrap_err()
+            .code(),
+        tonic::Code::DataLoss
+    );
+    first_provider
+        .corrupt_blame_bytes
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    assert_eq!(
+        first
+            .blame(input.clone(), Arc::new(()))
+            .await
+            .unwrap_err()
+            .code(),
+        tonic::Code::DataLoss
+    );
+    assert_eq!(
+        local.blame(input, Arc::new(())).await.unwrap_err().code(),
+        tonic::Code::DataLoss
+    );
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn query_aliases_preserve_scopes_replay_pages_and_cancellation_without_holding_client_slots()
 {
@@ -2647,6 +2857,106 @@ async fn composed_query_brokers_release_physical_owner_without_pinning_completed
     drop((first, second, scope, synonym, local));
     outer.drain().await.unwrap();
     drop(outer);
+    host.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn query_client_absolute_deadline_bounds_queued_calls_without_renewal() {
+    use native_broker::{NativeQueryIo, query_protocol as q};
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path().canonicalize().unwrap();
+    private(&root);
+    let gate = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
+    let release = Release(gate.clone());
+    let mut slow = FakeQuery::new(1, 1024);
+    slow.page_pause = Some(gate);
+    let provider = Arc::new(slow);
+    let mut cfg = Config {
+        max_inflight: 1,
+        ..query_config()
+    };
+    cfg.policy.operation_timeout_ms = 2000;
+    let service = query_service(
+        &root,
+        provider.clone(),
+        Arc::new(FakeQuery::new(2, 1024)),
+        cfg.clone(),
+    );
+    let socket = root.join("deadline.sock");
+    let host = Running::start_service(&socket, service).await;
+    let client = native_broker::BrokerQueryClient::connect(&socket, "first", cfg)
+        .await
+        .unwrap();
+    let occupied = client.clone();
+    let waiting = tokio::spawn(async move { occupied.page([11; 32], 0, Arc::new(())).await });
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while !provider
+            .page_entered
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    let fact = || q::GraphFact {
+        fact: Some(q::graph_fact::Fact::HasId(q::HasId {
+            commit: Some(q::CommitId { value: vec![1; 32] }),
+        })),
+    };
+    let original_deadline = tokio::time::Instant::now() + Duration::from_millis(80);
+    let bounded = client
+        .clone()
+        .with_operation_deadline(original_deadline)
+        .with_operation_deadline(tokio::time::Instant::now() + Duration::from_secs(2));
+    assert_eq!(
+        bounded
+            .facts([1; 32], vec![fact()], Arc::new(()))
+            .await
+            .unwrap_err()
+            .code(),
+        tonic::Code::DeadlineExceeded
+    );
+    assert_eq!(
+        provider
+            .fact_calls
+            .load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "queue deadline must expire before provider invocation"
+    );
+    assert_eq!(
+        bounded
+            .facts([1; 32], vec![fact()], Arc::new(()))
+            .await
+            .unwrap_err()
+            .code(),
+        tonic::Code::DeadlineExceeded
+    );
+    assert_eq!(
+        provider
+            .fact_calls
+            .load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "a later operation cannot renew the same absolute deadline"
+    );
+    release.release();
+    let page = tokio::time::timeout(Duration::from_secs(2), waiting)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    let facts = client
+        .facts([1; 32], vec![fact()], Arc::new(()))
+        .await
+        .unwrap();
+    assert_eq!(
+        provider
+            .fact_calls
+            .load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "the deadline belongs to the clone, not shared transport state"
+    );
+    drop((page, facts, bounded, client));
     host.stop().await;
 }
 
