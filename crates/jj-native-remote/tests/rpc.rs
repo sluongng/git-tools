@@ -5445,7 +5445,7 @@ fn owned_remote_publication_keeps_command_guard_after_deadline_and_cancelled_sdk
     });
 }
 
-// Complete retained-version authority acceptance, not an index import/restore.
+// Retained-version authority and exact-index acceptance, not workspace restore.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn retained_version_roots_are_lazy_durable_and_never_fall_back_to_generic_repository_reads() {
     use jj_lib::{
@@ -6118,6 +6118,13 @@ async fn exercise_retained_query_facade(
     store
         .put("example", frozen.descriptor, &frozen.bytes, 0)
         .unwrap();
+    let mut unselected_model = model.clone();
+    unselected_model.change_id = m::ChangeId([123; 16]);
+    unselected_model.description = "outside selected retained snapshot".into();
+    let unselected = m::encode(&m::Object::Commit(unselected_model), Default::default()).unwrap();
+    store
+        .put("example", unselected.descriptor, &unselected.bytes, 0)
+        .unwrap();
     let selected_index = tinytree_cloud::build_index_artifacts(
         &tinytree_cloud::PortableIndexSnapshot {
             roots: vec![m::CommitId(base.descriptor.key.id.0)],
@@ -6256,9 +6263,10 @@ async fn exercise_retained_query_facade(
     })
     .await
     .unwrap();
-    let query = native_broker::BrokerQueryClient::connect(&socket, "example", broker_config)
-        .await
-        .unwrap();
+    let query =
+        native_broker::BrokerQueryClient::connect(&socket, "example", broker_config.clone())
+            .await
+            .unwrap();
     let input = native_broker::OpenCloudQueryScope {
         source: source.clone(),
         overlay: vec![],
@@ -6364,6 +6372,298 @@ async fn exercise_retained_query_facade(
         Some(q::commit_prefix_result::Result::Single(_))
     ));
     drop(prefix);
+    // Actual index/provider acceptance, not OPVIEW restore or a Ready workspace.
+    // The importer receives only compact artifacts and selected manifest bytes;
+    // its query and object adapters both traverse this SAME broker/Remote pair.
+    {
+        use futures::TryStreamExt as _;
+        use jj_lib::{
+            index::{Index as _, ReadonlyIndex as _},
+            object_id::{HexPrefix, ObjectId as _, PrefixResolution},
+            revset::ResolvedExpression,
+        };
+        let description = query.describe_provider().await.unwrap();
+        assert_eq!(description.identity, source.provider_identity);
+        let verified_artifacts: Vec<_> = selected_index
+            .artifacts
+            .iter()
+            .chain(&intrinsic.artifacts)
+            .map(|artifact| {
+                (
+                    artifact.descriptor.id,
+                    tinytree_cloud::decode_index_artifact(
+                        &artifact.bytes,
+                        artifact.descriptor,
+                        Default::default(),
+                    )
+                    .unwrap(),
+                )
+            })
+            .collect::<std::collections::BTreeMap<_, _>>()
+            .into_values()
+            .collect();
+        let graph = tinytree_cloud::verify_index_artifact_graph(
+            &manifest.index_roots,
+            &verified_artifacts,
+            Default::default(),
+        )
+        .unwrap();
+        let spool = directory.path().join("index-spool");
+        make_private(&spool);
+        let objects = Arc::new(
+            native_broker::BrokerObjectIo::connect(
+                &socket,
+                "example",
+                &spool,
+                broker_config.clone(),
+            )
+            .await
+            .unwrap(),
+        );
+        let index_path = directory.path().join("imported-index");
+        assert!(!index_path.exists());
+        let configuration = jj_native_index::Config {
+            endpoint: jj_native_index::Endpoint::UnixSocket(socket.clone()),
+            store_alias: "example".into(),
+            provider_fingerprint: description.identity,
+        };
+        let query_calls_before_import = counts.query_rpcs.load(Ordering::SeqCst);
+        let imported = jj_native_index::NativeIndexStore::import_fresh_operation_indexes(
+            &index_path,
+            configuration.clone(),
+            Default::default(),
+            Arc::new(query.clone()),
+            objects.clone(),
+            jj_native_index::PortableImportVersion {
+                provider_identity: description.identity,
+                workspace_id: source.workspace_id,
+                generation: source.generation,
+                manifest_id: source.manifest_id,
+                manifest_blake3: source.manifest_blake3,
+                manifest_size_bytes: source.manifest_size_bytes,
+            },
+            &manifest_bytes,
+            &graph,
+            Default::default(),
+            Arc::new(()),
+        )
+        .await
+        .unwrap();
+        assert!(
+            counts.query_rpcs.load(Ordering::SeqCst) > query_calls_before_import,
+            "the importer must traverse the real remote query service"
+        );
+        assert_eq!(imported.operation_indexes, manifest.operation_indexes);
+        assert_eq!(imported.unique_snapshots, manifest.index_roots.len());
+        let imported = imported.store;
+        let cleanup = imported.cleanup_handle();
+        let root_index = imported.index_at_operation(&[0; 64]).unwrap();
+        let selected = imported
+            .index_at_operation(&recovery.working_copy.snapshot_operation)
+            .unwrap();
+        let frozen_jj = jj_lib::backend::CommitId::from_bytes(&frozen_id.0);
+        assert!(selected.has_id(&frozen_jj).await.unwrap());
+        assert!(
+            !root_index.has_id(&frozen_jj).await.unwrap(),
+            "exact op0 association must not acquire another snapshot's frozen membership"
+        );
+        let full_prefix =
+            HexPrefix::try_from_hex(blake3::Hash::from(frozen_id.0).to_hex().to_string()).unwrap();
+        assert_eq!(
+            selected
+                .resolve_commit_id_prefix(&full_prefix)
+                .await
+                .unwrap(),
+            PrefixResolution::SingleMatch(frozen_jj.clone())
+        );
+        assert_eq!(
+            root_index
+                .resolve_commit_id_prefix(&full_prefix)
+                .await
+                .unwrap(),
+            PrefixResolution::NoMatch
+        );
+        let backend =
+            jj_native_backend::NativeBackend::from_io(objects.clone(), Default::default())
+                .await
+                .unwrap();
+        let jj_store = jj_lib::store::Store::new(
+            Box::new(backend),
+            jj_lib::signing::Signer::new(None, vec![]),
+            jj_lib::tree_merge::MergeOptions {
+                hunk_level: jj_lib::files::FileMergeHunkLevel::Line,
+                same_change: jj_lib::merge::SameChange::Accept,
+            },
+        );
+        assert!(
+            direct
+                .descriptor(frozen.descriptor.key)
+                .await
+                .unwrap()
+                .is_none(),
+            "import/facts/prefix must not hydrate frozen canonical bodies"
+        );
+        assert!(
+            direct
+                .descriptor(base.descriptor.key)
+                .await
+                .unwrap()
+                .is_none(),
+            "import must not hydrate anchor history"
+        );
+        assert_eq!(counts.holds.load(Ordering::SeqCst), 0);
+        assert_eq!(counts.metadata_rpcs.load(Ordering::SeqCst), 0);
+        assert_eq!(counts.graph_rpcs.load(Ordering::SeqCst), 0);
+        assert_eq!(counts.files.load(Ordering::SeqCst), 0);
+        let query_calls_before_render = counts.query_rpcs.load(Ordering::SeqCst);
+        // NativeRevset::stream deliberately requests selected canonical metadata
+        // for jj rendering. This phase is NOT a zero-selected-body log claim.
+        let history = selected
+            .evaluate_revset(
+                &ResolvedExpression::Ancestors {
+                    heads: Box::new(ResolvedExpression::Commits(vec![frozen_jj.clone()])),
+                    generation: 0..2,
+                    parents_range: 0..u32::MAX,
+                },
+                &jj_store,
+            )
+            .unwrap()
+            .stream()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        assert_eq!(
+            history,
+            vec![
+                frozen_jj.clone(),
+                jj_lib::backend::CommitId::from_bytes(&base.descriptor.key.id.0)
+            ]
+        );
+        assert!(counts.query_rpcs.load(Ordering::SeqCst) > query_calls_before_render);
+        assert_eq!(
+            direct
+                .read_metadata(frozen.descriptor.key)
+                .await
+                .unwrap()
+                .bytes(),
+            frozen.bytes
+        );
+        assert_eq!(
+            direct
+                .read_metadata(base.descriptor.key)
+                .await
+                .unwrap()
+                .bytes(),
+            base.bytes
+        );
+        assert!(
+            direct
+                .descriptor(unselected.descriptor.key)
+                .await
+                .unwrap()
+                .is_none(),
+            "rendering selected rows must not hydrate an unrelated server COMMIT"
+        );
+        for object in fixture.objects().iter().filter(|object| {
+            matches!(
+                object.descriptor.key.kind,
+                m::Kind::Tree | m::Kind::File | m::Kind::Symlink | m::Kind::CopyHistory
+            ) && object.descriptor.key != m::empty_tree().descriptor.key
+        }) {
+            assert!(
+                direct
+                    .descriptor(object.descriptor.key)
+                    .await
+                    .unwrap()
+                    .is_none(),
+                "selected canonical rendering must not hydrate TREE/FILE or unrelated bodies"
+            );
+        }
+        assert_eq!(counts.holds.load(Ordering::SeqCst), 0);
+        assert_eq!(counts.metadata_rpcs.load(Ordering::SeqCst), 0);
+        assert_eq!(counts.graph_rpcs.load(Ordering::SeqCst), 0);
+        assert_eq!(counts.files.load(Ordering::SeqCst), 0);
+        // A normal local authored COMMIT becomes a delta, while the frozen
+        // baseline is not re-uploaded as an overlay body.
+        let mut authored = model.clone();
+        authored.parents = vec![frozen_id];
+        authored.change_id = m::ChangeId([122; 16]);
+        authored.description = "imported-index local delta".into();
+        let authored = m::encode(&m::Object::Commit(authored), Default::default()).unwrap();
+        let object = m::decode(&authored.bytes, Default::default()).unwrap();
+        assert_eq!(
+            objects.write_metadata(object).await.unwrap(),
+            authored.descriptor
+        );
+        let authored_jj = jj_lib::backend::CommitId::from_bytes(&authored.descriptor.key.id.0);
+        let authored_commit = jj_store.get_commit_async(&authored_jj).await.unwrap();
+        let mut mutable = selected.start_modification();
+        mutable.add_commit(&authored_commit).await.unwrap();
+        let updated = imported.persist_index(mutable).unwrap();
+        let history = updated
+            .evaluate_revset(
+                &ResolvedExpression::Commits(vec![frozen_jj.clone(), authored_jj.clone()]),
+                &jj_store,
+            )
+            .unwrap()
+            .stream()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        assert_eq!(history.len(), 2);
+        assert!(history.contains(&frozen_jj) && history.contains(&authored_jj));
+        assert_eq!(
+            updated
+                .resolve_commit_id_prefix(&HexPrefix::try_from_hex(authored_jj.hex()).unwrap())
+                .await
+                .unwrap(),
+            PrefixResolution::SingleMatch(authored_jj)
+        );
+        assert_eq!(
+            direct
+                .read_metadata(frozen.descriptor.key)
+                .await
+                .unwrap()
+                .descriptor(),
+            frozen.descriptor,
+            "selected frozen metadata is expected after intentional canonical rendering"
+        );
+        assert!(
+            direct
+                .descriptor(unselected.descriptor.key)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        for object in fixture.objects().iter().filter(|object| {
+            matches!(
+                object.descriptor.key.kind,
+                m::Kind::Tree | m::Kind::File | m::Kind::Symlink | m::Kind::CopyHistory
+            ) && object.descriptor.key != m::empty_tree().descriptor.key
+        }) {
+            assert!(
+                direct
+                    .descriptor(object.descriptor.key)
+                    .await
+                    .unwrap()
+                    .is_none(),
+                "delta canonical rendering must remain metadata-only"
+            );
+        }
+        assert!(
+            store
+                .descriptor("example", authored.descriptor.key)
+                .unwrap()
+                .is_none(),
+            "local delta is not a canonical server publication"
+        );
+        assert_eq!(counts.holds.load(Ordering::SeqCst), 0);
+        assert_eq!(counts.metadata_rpcs.load(Ordering::SeqCst), 0);
+        assert_eq!(counts.graph_rpcs.load(Ordering::SeqCst), 0);
+        assert_eq!(counts.files.load(Ordering::SeqCst), 0);
+        drop((updated, selected, root_index, imported, jj_store, objects));
+        cleanup.drain(Duration::from_secs(5)).await.unwrap();
+    }
     let expression = q::GraphExpr {
         version: 1,
         expression: Some(q::graph_expr::Expression::Commits(q::CommitSet {
