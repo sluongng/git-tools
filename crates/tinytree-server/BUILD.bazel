@@ -47,10 +47,24 @@ rust_test(
     srcs = ["tests/rpc.rs"],
     aliases = aliases(),
     edition = "2024",
+    data = [":checker_fixture"],
+    rustc_env = {"TINYTREE_CHECKER_FIXTURE": "$(rootpath :checker_fixture)"},
     deps = [":tinytree-server"] + all_crate_deps(
         normal = True,
         normal_dev = True,
     ),
+)
+
+rust_binary(
+    name = "checker_fixture",
+    testonly = True,
+    srcs = ["tests/checker_fixture.rs"],
+    edition = "2024",
+    deps = [
+        "//crates/tinytree-check-runner:tinytree-check-runner",
+        "@crates//:serde_json",
+        "@crates//:libc",
+    ],
 )
 
 rust_test(

@@ -2,7 +2,8 @@ syntax = "proto3";
 package tinytree.landing.v1;
 import "tinytree/v1/repository.proto";
 
-// Preparation/status only. No client verdict or publication RPC is provided.
+// Landing intent/status. Configured server checks may publish automatically.
+// Clients cannot submit verdicts or request unchecked publication.
 service Landing {
   rpc StartLanding(StartLandingRequest) returns (LandingResponse);
   rpc GetLanding(GetLandingRequest) returns (LandingResponse);

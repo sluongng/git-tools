@@ -22,15 +22,21 @@ principals can hold their own `_tinytree/hold/v1/<client>/<commit>` references
 without public-write permission. Holds persist until explicit release; quotas
 reject new promises, not existing ones. A historical receipt is not current proof.
 
-Landing preparation/status is opt-in: use [the bounded landing TOML](examples/landing.toml)
-and grant both repository write and an explicit `landing_profiles` entry.
-`StartLanding` accepts a durable intent; `GetLanding` is owner-scoped and remains
-readable after launch-grant removal or preparation disablement. Accepted work
-keeps its authorization, but preparation rechecks the configured profile version
-and repository. Anonymous local-owner launch needs a separate explicit profile
-allowlist. Restart discovery prepares intents and expires due recovery holds.
-**Prepared means pending checks:** this service does not run checks or publish
-landings. No client verdict or finalization RPC is exposed.
+Landing is opt-in: use [the bounded TOML](examples/landing.toml), granting
+repository write and explicit `landing_profiles`. Start/Get are owner-scoped;
+accepted authorization survives launch-grant removal. By default preparation
+stops at pending checks. Optional `service.landing.checker` runs a pinned
+[trusted checker](../tinytree-check-runner/README.md) and automatically publishes
+only its exact verified candidate with destination-generation CAS. No client
+verdict or raw finalization RPC is exposed.
+
+Checker activation upgrades storage to format7. Its fixed Store-owned journals
+survive configuration removal; uncertain cleanup retains roots past TTL.
+Restart reconciles the same attempt before retrying, and shutdown drains physical
+work. Check slots are independent of preparation/status; canonical transitions
+share the bounded Store-work pool. Capacity exhaustion fails closed, without
+pruning history or silently discarding recovery obligations. Initially checks
+support operator-trusted Linux source only, not hostile-source isolation.
 
 Private workspace history is opt-in: start from [the cloud profile](examples/cloud.toml),
 set `service.cloud.enabled = true` and grant each principal `cloud = true`.

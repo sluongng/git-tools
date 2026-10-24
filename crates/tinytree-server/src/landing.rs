@@ -1,5 +1,5 @@
-//! Bounded preparation/status transport. This module never runs a check or
-//! finalizes a landing; accepted authorization does not depend on a live token.
+//! Bounded landing transport with optional operator-owned check orchestration.
+//! Accepted authorization does not depend on a live token; clients never submit verdicts.
 use crate::{RepositoryService, auth::Identity, config::ConfigError};
 use prost::Message;
 use serde::Deserialize;
@@ -38,6 +38,7 @@ pub struct LandingProfile {
 pub struct LandingConfig {
     pub enabled: bool,
     pub profiles: Vec<LandingProfile>,
+    pub checker: Option<crate::LandingCheckerConfig>,
     pub local_owner_profiles: Vec<String>,
     pub committer_name: String,
     pub committer_email: String,
@@ -59,6 +60,7 @@ impl Default for LandingConfig {
         Self {
             enabled: false,
             profiles: Vec::new(),
+            checker: None,
             local_owner_profiles: Vec::new(),
             committer_name: "Tinytree landing".into(),
             committer_email: "landing@example.invalid".into(),
@@ -78,6 +80,9 @@ impl Default for LandingConfig {
 }
 impl LandingConfig {
     pub(crate) fn validate(&self) -> Result<(), ConfigError> {
+        if let Some(checker) = &self.checker {
+            checker.validate()?;
+        }
         if self.profiles.len() > 32
             || (self.enabled && self.profiles.is_empty())
             || self.local_owner_profiles.len() > 32
@@ -251,6 +256,7 @@ pub(crate) struct Charges {
 pub(crate) struct LandingHost {
     pub config: LandingConfig,
     store: s::Store,
+    checker: Option<Arc<crate::landing_check::CheckerHost>>,
     charges: Charges,
     calls: Arc<Semaphore>,
     heavy: Arc<Semaphore>,
@@ -295,7 +301,46 @@ impl LandingHost {
         repos: &[String],
     ) -> Result<Arc<Self>, ConfigError> {
         let charges = config.validate_store(&store.resource_config())?;
-        Ok(Arc::new(Self {
+        let checker_expected = store
+            .external_checks_directory()
+            .map_err(|_| ConfigError("external checker state unavailable"))?
+            .is_some()
+            || (config.enabled
+                && config
+                    .checker
+                    .as_ref()
+                    .is_some_and(|checker| checker.enabled));
+        let checker_memory = if checker_expected {
+            crate::landing_check::CheckerHost::catalog_work()
+        } else {
+            0
+        };
+        let minimum = checker_memory
+            .checked_add(if config.enabled {
+                charges
+                    .heavy
+                    .checked_mul(config.max_heavy_jobs as u64)
+                    .and_then(|n| n.checked_add(charges.maintenance))
+                    .and_then(|n| {
+                        n.checked_add(charges.status.checked_mul(config.max_inflight as u64)?)
+                    })
+                    .and_then(|n| n.checked_add(charges.coordinator))
+                    .ok_or(ConfigError("landing checker resource overflow"))?
+            } else {
+                charges.status
+            })
+            .ok_or(ConfigError("landing checker memory overflow"))?;
+        if minimum > config.max_buffered_bytes {
+            return Err(ConfigError("landing checker catalogs exceed memory pool"));
+        }
+        let checker = crate::landing_check::CheckerHost::open(
+            store.clone(),
+            config.checker.clone(),
+            config.profiles.clone(),
+            repos,
+            config.enabled,
+        )?;
+        let host = Arc::new(Self {
             calls: Arc::new(Semaphore::new(config.max_inflight)),
             heavy: Arc::new(Semaphore::new(config.max_heavy_jobs)),
             maintenance: Arc::new(Semaphore::new(1)),
@@ -310,6 +355,7 @@ impl LandingHost {
                 })
                 .collect(),
             charges,
+            checker,
             store,
             config,
             active: AtomicUsize::new(0),
@@ -321,7 +367,23 @@ impl LandingHost {
             preparing: Mutex::new(HashSet::new()),
             #[cfg(test)]
             pause: Mutex::new(None),
-        }))
+        });
+        if let Some(checker) = &host.checker {
+            let memory = host
+                .bytes
+                .clone()
+                .try_acquire_many_owned(kib(checker_memory)?)
+                .map_err(|_| ConfigError("checker catalog memory exhausted"))?;
+            checker.attach(Arc::downgrade(&host), memory);
+        }
+        Ok(host)
+    }
+    pub(crate) fn admit_check_transition(self: &Arc<Self>) -> Result<Arc<Work>, Status> {
+        self.reserve(
+            "Prepare",
+            Instant::now() + Duration::from_millis(self.config.operation_timeout_ms),
+            false,
+        )
     }
     fn reserve(
         self: &Arc<Self>,
@@ -408,6 +470,9 @@ impl LandingHost {
         Ok(s::LandingOwner(identity.landing_owner_hash()))
     }
     pub fn start(self: &Arc<Self>) -> Result<(), Status> {
+        if let Some(checker) = &self.checker {
+            checker.start()?;
+        }
         if !self.config.enabled {
             return Ok(());
         }
@@ -551,6 +616,7 @@ impl LandingHost {
         let deadline = Instant::now() + Duration::from_millis(self.config.operation_timeout_ms);
         let work = self.reserve("Maintenance", deadline, false)?;
         let store = self.store.clone();
+        let checker = self.checker.clone();
         let limits = s::LandingScanLimits {
             max_records: self.config.scan_records,
             max_scan_bytes: self.config.scan_bytes,
@@ -570,7 +636,11 @@ impl LandingHost {
                     }
                     let now = crate::service::now()?;
                     if job.expires_at <= now {
-                        let _ = job.handle.expire(&store, now);
+                        if let Some(checker) = &checker {
+                            let _ = checker.expire_if_safe(job, &store, &repo, now);
+                        } else {
+                            let _ = job.handle.expire(&store, now);
+                        }
                     }
                 }
                 page.jobs.clear();
@@ -639,6 +709,9 @@ impl LandingHost {
         self.active.load(Ordering::Acquire)
     }
     pub async fn drain(&self) {
+        if let Some(checker) = &self.checker {
+            checker.close();
+        }
         self.closing.store(true, Ordering::Release);
         self.wake.notify_one();
         let worker = self.worker.lock().ok().and_then(|mut w| w.take());
@@ -650,6 +723,9 @@ impl LandingHost {
             tokio::pin!(changed);
             changed.as_mut().enable();
             if self.active.load(Ordering::Acquire) == 0 {
+                if let Some(checker) = &self.checker {
+                    checker.drain().await;
+                }
                 return;
             }
             changed.await;

@@ -1,4 +1,4 @@
-# Preparation/status only: no check runner or automatic publication.
+# By default preparation stops at pending checks. Optional trusted checks below.
 storage = "tinytree-data"
 listen = "127.0.0.1:8093"
 repositories = ["example"]
@@ -19,7 +19,7 @@ max_heavy_jobs = 1
 # RPC limit; background preparation shares the bounded heavy-work pool above.
 max_inflight_per_repository = 2
 # Conservative logical work reservations, not preallocated process memory.
-max_buffered_bytes = 3221225472
+max_buffered_bytes = 4294967296
 # No anonymous launch grant, including on an owner-private Unix socket.
 local_owner_profiles = []
 
@@ -27,6 +27,19 @@ local_owner_profiles = []
 name = "checks"
 version = "v1"
 repositories = ["example"]
+
+# To enable automatic checked publication, set profile.version above to the
+# runner's profile-version output and configure its checksum-pinned executable.
+# The checker guard reserves additional logical catalog memory, not physical RSS.
+# [service.landing.checker]
+# enabled = true
+# executable = "/usr/local/bin/tinytree-check-runner"
+# sha256 = "0000000000000000000000000000000000000000000000000000000000000000"
+# config = "/etc/tinytree/checker.toml"
+# max_checks = 2
+# max_checks_per_repository = 1
+# execution_timeout_seconds = 3600
+# cleanup_grace_seconds = 600
 
 # Bound the catalogs traversed by canonical root-union validation, even when
 # the cloud RPC service is disabled. Capacity exhaustion does not evict history.

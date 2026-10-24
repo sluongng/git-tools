@@ -7799,6 +7799,321 @@ fn landing_setup() -> (
     };
     (temporary, store, config, input)
 }
+
+// Pinned executable fixture validates service orchestration only; native/RBE
+// acceptance is a separate workflow using the actual check runner.
+fn checked_landing_setup(
+    mode: &str,
+) -> (
+    tempfile::TempDir,
+    Store,
+    tinytree_server::Config,
+    tinytree_proto::landing_v1::StartLandingRequest,
+    std::path::PathBuf,
+) {
+    use sha2::{Digest, Sha256};
+    let (temporary, store, mut config, mut input) = landing_setup();
+    let directory = private_fs::PrivateDir::create(temporary.path().join("operator")).unwrap();
+    let executable = std::path::Path::new(env!("TINYTREE_CHECKER_FIXTURE"))
+        .canonicalize()
+        .unwrap();
+    let pin = format!("{:x}", Sha256::digest(std::fs::read(&executable).unwrap()));
+    let daemon = directory.path().join("daemon.toml");
+    std::fs::write(&daemon, b"# public protocol fixture\n").unwrap();
+    let scratch = directory.path().join("fixture-state");
+    let policy = directory.path().join("checker.toml");
+    let quoted = |path: &std::path::Path| serde_json::to_string(path.to_str().unwrap()).unwrap();
+    let text = format!(
+        r#"scratch={}
+daemon_config={}
+rbe_socket={}
+runner_sha256="{}"
+[workspace]
+path={}
+sha256="{}"
+[bazel]
+path={}
+sha256="{}"
+[[profiles]]
+name="checks"
+repositories=["alpha"]
+store="alpha"
+mode="build"
+targets=["//fixture:checks"]
+flags=["--define=fixture_mode={}"]
+timeout_seconds=60
+"#,
+        quoted(&scratch),
+        quoted(&daemon),
+        quoted(&directory.path().join("rbe.sock")),
+        pin,
+        quoted(&executable),
+        pin,
+        quoted(&executable),
+        pin,
+        mode
+    );
+    std::fs::write(&policy, text).unwrap();
+    let runner = tinytree_check_runner::Config::load(&policy).unwrap();
+    let version = runner.profile_version("checks").unwrap();
+    config.service.landing.profiles[0].version = version.clone();
+    input.expected_profile_version = version;
+    config.service.landing.max_buffered_bytes = 6 * 1024 * 1024 * 1024;
+    config.service.landing.job_ttl_seconds = 30;
+    config.service.landing.checker = Some(tinytree_server::LandingCheckerConfig {
+        enabled: true,
+        executable,
+        sha256: pin,
+        config: policy,
+        max_checks: 1,
+        max_checks_per_repository: 1,
+        max_jobs: 16,
+        max_attempts: 2,
+        max_recovery_attempts: 8,
+        retry_delay_seconds: 1,
+        execution_timeout_seconds: 30,
+        cleanup_grace_seconds: 10,
+    });
+    (temporary, store, config, input, scratch)
+}
+async fn wait_landing_phase(
+    client: &mut tinytree_proto::landing_v1::landing_client::LandingClient<Channel>,
+    input: &tinytree_proto::landing_v1::StartLandingRequest,
+    phase: tinytree_proto::landing_v1::Phase,
+) -> tinytree_proto::landing_v1::LandingJob {
+    let mut last = None;
+    let result = tokio::time::timeout(Duration::from_secs(15), async {
+        loop {
+            let job = client
+                .get_landing(request(
+                    tinytree_proto::landing_v1::GetLandingRequest {
+                        repository_id: input.repository_id.clone(),
+                        idempotency_key: input.idempotency_key.clone(),
+                    },
+                    ALPHA,
+                ))
+                .await
+                .unwrap()
+                .into_inner()
+                .job
+                .unwrap();
+            last = Some(job.phase);
+            if job.phase == phase as i32 {
+                return job;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await;
+    result.unwrap_or_else(|_| panic!("landing did not reach {phase:?}; last phase {last:?}"))
+}
+
+#[tokio::test]
+async fn pinned_checker_receipts_publish_or_reject_and_recover_lost_reply() {
+    use tinytree_proto::landing_v1 as l;
+    for (mode, phase, generation, expect_recovery) in [
+        ("pass", l::Phase::Committed, 2, false),
+        ("fail", l::Phase::CheckFailed, 1, false),
+        ("lost_reply", l::Phase::Committed, 2, true),
+    ] {
+        let (_temporary, store, config, input, scratch) = checked_landing_setup(mode);
+        let running = Running::start_landing(
+            store.clone(),
+            config.service,
+            landing_principals(true),
+            true,
+        )
+        .await;
+        let mut client = running.landing_client().await;
+        client
+            .start_landing(request(input.clone(), ALPHA))
+            .await
+            .unwrap();
+        let job = wait_landing_phase(&mut client, &input, phase).await;
+        assert_eq!(
+            store.references("alpha", &["main".into()]).unwrap()[0].generation,
+            generation,
+            "{mode}"
+        );
+        if phase == l::Phase::Committed {
+            assert_eq!(
+                job.receipt
+                    .as_ref()
+                    .unwrap()
+                    .reference
+                    .as_ref()
+                    .unwrap()
+                    .generation,
+                2
+            );
+            assert_eq!(job.receipt.as_ref().unwrap().evidence.len(), 32);
+        }
+        let replay = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                match client.start_landing(request(input.clone(), ALPHA)).await {
+                    Ok(response) => break response.into_inner().job.unwrap(),
+                    Err(status) if status.code() == Code::ResourceExhausted => {
+                        tokio::time::sleep(Duration::from_millis(10)).await
+                    }
+                    Err(status) => panic!("unexpected replay error: {status}"),
+                }
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(replay.id, job.id);
+        assert_eq!(replay.receipt, job.receipt);
+        let executions = std::fs::read_to_string(scratch.join("executions")).unwrap();
+        assert_eq!(executions.lines().filter(|line| *line == "run").count(), 1);
+        if expect_recovery {
+            assert!(executions.lines().any(|line| line == "recover"));
+        }
+        running.stop().await;
+    }
+}
+
+#[tokio::test]
+async fn target_movement_while_checking_rejects_exact_old_candidate() {
+    use tinytree_proto::landing_v1 as l;
+    let (_temporary, store, config, input, scratch) = checked_landing_setup("pause");
+    let running = Running::start_landing(
+        store.clone(),
+        config.service,
+        landing_principals(true),
+        true,
+    )
+    .await;
+    let mut client = running.landing_client().await;
+    client
+        .start_landing(request(input.clone(), ALPHA))
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while !scratch.join("started").exists() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let mut queued = input.clone();
+    queued.idempotency_key = "preparation-during-check".into();
+    client
+        .start_landing(request(queued.clone(), ALPHA))
+        .await
+        .unwrap();
+    wait_landing_phase(&mut client, &queued, l::Phase::PreparedPendingChecks).await;
+    store
+        .publish(
+            "alpha",
+            &tinytree_store::PublishRequest {
+                idempotency_key: "advance-during-check".into(),
+                reference_name: "main".into(),
+                expected_generation: 1,
+                new_commit: Some(CommitId(input.expected_head.clone().try_into().unwrap())),
+                staging_leases: vec![],
+            },
+            0,
+        )
+        .unwrap();
+    std::fs::write(scratch.join("release"), b"release fixture").unwrap();
+    let job = wait_landing_phase(&mut client, &input, l::Phase::StaleTarget).await;
+    assert!(job.receipt.is_none());
+    assert_eq!(
+        store.references("alpha", &["main".into()]).unwrap()[0].generation,
+        2
+    );
+    running.stop().await;
+}
+
+#[tokio::test]
+async fn uncertain_cleanup_vetoes_ttl_and_gc_across_checker_disabled_restart() {
+    use tinytree_proto::landing_v1 as l;
+    let (temporary, store, mut config, input, scratch) = checked_landing_setup("uncertain");
+    config.service.landing.job_ttl_seconds = 2;
+    let running = Running::start_landing(
+        store.clone(),
+        config.service.clone(),
+        landing_principals(true),
+        true,
+    )
+    .await;
+    let mut client = running.landing_client().await;
+    client
+        .start_landing(request(input.clone(), ALPHA))
+        .await
+        .unwrap();
+    let job = wait_landing_phase(&mut client, &input, l::Phase::PreparedPendingChecks).await;
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while !scratch.join("executions").exists() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    let retained = wait_landing_phase(&mut client, &input, l::Phase::PreparedPendingChecks).await;
+    assert!(retained.roots_retained);
+    running.stop().await;
+    drop(client);
+    drop(store);
+    let store = Store::open_existing(
+        temporary.path(),
+        config.store.materialize(config.service.max_metadata_bytes),
+    )
+    .unwrap();
+    config.service.landing.checker = None;
+    let running = Running::start_landing(
+        store.clone(),
+        config.service,
+        landing_principals(false),
+        true,
+    )
+    .await;
+    let mut client = running.landing_client().await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let retained = wait_landing_phase(&mut client, &input, l::Phase::PreparedPendingChecks).await;
+    assert!(retained.roots_retained);
+    store.gc("alpha", i64::MAX - 1).unwrap();
+    let candidate = ObjectKey {
+        kind: Kind::Commit,
+        id: ObjectId(job.candidate.unwrap().head.try_into().unwrap()),
+    };
+    assert!(store.read_metadata("alpha", candidate).is_ok());
+    std::fs::write(scratch.join("release"), b"fixture cleanup now confirmed").unwrap();
+    let checked_input = input.clone();
+    let result = tokio::spawn(async move {
+        wait_landing_phase(&mut client, &checked_input, l::Phase::Expired).await
+    })
+    .await;
+    if result.is_err() {
+        eprintln!(
+            "fixture executions: {:?}",
+            std::fs::read_to_string(scratch.join("executions"))
+        );
+        let jobs = store
+            .external_checks_directory()
+            .unwrap()
+            .unwrap()
+            .join("jobs");
+        for entry in std::fs::read_dir(jobs).unwrap() {
+            let entry = entry.unwrap();
+            let value: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(entry.path().join("state.json")).unwrap())
+                    .unwrap();
+            eprintln!(
+                "checker state {}",
+                serde_json::json!({"phase":value["record"]["phase"],"recoveries":value["record"]["recoveries"],"retry_at":value["record"]["retry_at"],"receipt":value["record"]["receipt"]})
+            );
+        }
+    }
+    let expired = result.unwrap();
+    assert!(!expired.roots_retained);
+    assert_eq!(
+        store.references("alpha", &["main".into()]).unwrap()[0].generation,
+        1
+    );
+    running.stop().await;
+}
 impl Running {
     async fn landing_client(
         &self,
@@ -8373,6 +8688,381 @@ async fn landing_poison_intent_does_not_starve_later_jobs_or_expiry_under_one_he
     })
     .await
     .unwrap();
+    assert_eq!(
+        store.references("alpha", &["main".into()]).unwrap()[0].generation,
+        1
+    );
+    running.stop().await;
+}
+
+#[tokio::test]
+async fn mismatched_checker_receipt_never_checks_or_publishes() {
+    use tinytree_proto::landing_v1 as l;
+    let (_temporary, store, config, input, scratch) = checked_landing_setup("mismatch");
+    let running = Running::start_landing(
+        store.clone(),
+        config.service,
+        landing_principals(true),
+        true,
+    )
+    .await;
+    let mut client = running.landing_client().await;
+    client
+        .start_landing(request(input.clone(), ALPHA))
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while !scratch.join("executions").exists() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    wait_checker_record(&store, &["Uncertain"]).await;
+    let job = wait_landing_phase(&mut client, &input, l::Phase::PreparedPendingChecks).await;
+    assert!(job.roots_retained && job.receipt.is_none());
+    assert_eq!(
+        store.references("alpha", &["main".into()]).unwrap()[0].generation,
+        1
+    );
+    running.stop().await;
+}
+
+#[tokio::test]
+async fn changed_checker_policy_cannot_authorize_a_completed_old_check() {
+    use tinytree_proto::landing_v1 as l;
+    let (_temporary, store, config, input, scratch) = checked_landing_setup("pause");
+    let policy = config
+        .service
+        .landing
+        .checker
+        .as_ref()
+        .unwrap()
+        .config
+        .clone();
+    let running = Running::start_landing(
+        store.clone(),
+        config.service,
+        landing_principals(true),
+        true,
+    )
+    .await;
+    let mut client = running.landing_client().await;
+    client
+        .start_landing(request(input.clone(), ALPHA))
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while !scratch.join("started").exists() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let bytes = std::fs::read_to_string(&policy)
+        .unwrap()
+        .replace("fixture_mode=pause", "fixture_mode=pass");
+    std::fs::write(policy, bytes).unwrap();
+    std::fs::write(scratch.join("release"), b"complete old check").unwrap();
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            if std::fs::read_dir(&scratch).unwrap().any(|item| {
+                item.unwrap()
+                    .path()
+                    .extension()
+                    .is_some_and(|s| s == "json")
+            }) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    wait_checker_record(&store, &["Verified"]).await;
+    let job = wait_landing_phase(&mut client, &input, l::Phase::PreparedPendingChecks).await;
+    assert!(job.receipt.is_none());
+    assert_eq!(
+        store.references("alpha", &["main".into()]).unwrap()[0].generation,
+        1
+    );
+    running.stop().await;
+}
+
+#[tokio::test]
+async fn a_bare_checked_state_does_not_authorize_coordinator_finalization() {
+    use tinytree_proto::landing_v1 as l;
+    let (_temporary, store, config, input, scratch) = checked_landing_setup("pass");
+    let running = Running::start_landing(
+        store.clone(),
+        config.service.clone(),
+        landing_principals(true),
+        false,
+    )
+    .await;
+    let mut client = running.landing_client().await;
+    client
+        .start_landing(request(input.clone(), ALPHA))
+        .await
+        .unwrap();
+    running.stop().await;
+    drop(client);
+    let pending = store
+        .scan_pending_landings("alpha", None, Default::default())
+        .unwrap()
+        .jobs
+        .pop()
+        .unwrap();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+    pending.handle.prepare(&store, now).unwrap();
+    let lease = pending.handle.pin_candidate(&store, now).unwrap();
+    pending
+        .handle
+        .record_check(
+            &store,
+            lease.identity(),
+            tinytree_store::LandingVerdict {
+                passed: true,
+                evidence: [9; 32],
+            },
+            now,
+        )
+        .unwrap();
+    drop(lease);
+    let running = Running::start_landing(
+        store.clone(),
+        config.service,
+        landing_principals(true),
+        true,
+    )
+    .await;
+    let mut client = running.landing_client().await;
+    let job = wait_landing_phase(&mut client, &input, l::Phase::Checked).await;
+    assert!(job.receipt.is_none());
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(
+        store.references("alpha", &["main".into()]).unwrap()[0].generation,
+        1
+    );
+    assert!(
+        !scratch.exists(),
+        "no coordinator receipt means no unchecked finalize or replacement check"
+    );
+    running.stop().await;
+}
+
+#[tokio::test]
+async fn unpublished_reservation_prefix_is_recovered_but_foreign_data_is_preserved() {
+    for foreign in [false, true] {
+        let (_temporary, store, config, _input, _scratch) = checked_landing_setup("pass");
+        let root = store.enable_external_checks().unwrap();
+        let staging =
+            root.join("jobs")
+                .join(format!(".pending-{}-{}", "11".repeat(32), "22".repeat(32)));
+        let directory = private_fs::PrivateDir::create(&staging).unwrap();
+        let child = if foreign {
+            "foreign.txt"
+        } else {
+            ".private-1-1.tmp"
+        };
+        std::fs::write(directory.path().join(child), b"partial reservation").unwrap();
+        drop(directory);
+        let result = RepositoryService::new(
+            store,
+            config.service,
+            vec!["alpha".into(), "beta".into()],
+            landing_principals(true),
+        );
+        if foreign {
+            assert!(result.is_err());
+            assert_eq!(
+                std::fs::read(staging.join(child)).unwrap(),
+                b"partial reservation"
+            );
+        } else {
+            assert!(result.is_ok());
+            assert!(!staging.exists());
+        }
+    }
+}
+
+#[tokio::test]
+async fn disabled_master_never_activates_fresh_checker_layout_on_open_or_reopen() {
+    let (temporary, store, mut config, _input, _scratch) = checked_landing_setup("pass");
+    config.service.landing.enabled = false;
+    config.service.landing.max_buffered_bytes = 512 * 1024 * 1024;
+    let service = RepositoryService::new(
+        store.clone(),
+        config.service.clone(),
+        vec!["alpha".into(), "beta".into()],
+        landing_principals(true),
+    )
+    .unwrap();
+    assert!(store.external_checks_directory().unwrap().is_none());
+    drop(service);
+    drop(store);
+    let store = Store::open_existing(
+        temporary.path(),
+        config.store.materialize(config.service.max_metadata_bytes),
+    )
+    .unwrap();
+    let _service = RepositoryService::new(
+        store.clone(),
+        config.service,
+        vec!["alpha".into(), "beta".into()],
+        landing_principals(true),
+    )
+    .unwrap();
+    assert!(store.external_checks_directory().unwrap().is_none());
+}
+
+#[tokio::test]
+async fn different_checked_evidence_cannot_be_replaced_by_a_later_runner_receipt() {
+    use tinytree_proto::landing_v1 as l;
+    let (_temporary, store, config, input, scratch) = checked_landing_setup("pause");
+    let running = Running::start_landing(
+        store.clone(),
+        config.service.clone(),
+        landing_principals(true),
+        true,
+    )
+    .await;
+    let mut client = running.landing_client().await;
+    client
+        .start_landing(request(input.clone(), ALPHA))
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while !scratch.join("started").exists() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let pending = store
+        .scan_pending_landings("alpha", None, Default::default())
+        .unwrap()
+        .jobs
+        .into_iter()
+        .find(|j| j.state == tinytree_store::LandingState::Prepared)
+        .unwrap();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+    let lease = pending.handle.pin_candidate(&store, now).unwrap();
+    pending
+        .handle
+        .record_check(
+            &store,
+            lease.identity(),
+            tinytree_store::LandingVerdict {
+                passed: true,
+                evidence: [9; 32],
+            },
+            now,
+        )
+        .unwrap();
+    drop(lease);
+    std::fs::write(scratch.join("release"), b"complete differently bound check").unwrap();
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while !std::fs::read_dir(&scratch).unwrap().any(|item| {
+            item.unwrap()
+                .path()
+                .extension()
+                .is_some_and(|s| s == "json")
+        }) {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    wait_checker_record(&store, &["Verified"]).await;
+    running.stop().await;
+    drop(client);
+    let running = Running::start_landing(
+        store.clone(),
+        config.service,
+        landing_principals(true),
+        true,
+    )
+    .await;
+    let mut client = running.landing_client().await;
+    let job = wait_landing_phase(&mut client, &input, l::Phase::Checked).await;
+    assert!(job.receipt.is_none());
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(
+        store.references("alpha", &["main".into()]).unwrap()[0].generation,
+        1
+    );
+    assert_eq!(
+        std::fs::read_to_string(scratch.join("executions"))
+            .unwrap()
+            .lines()
+            .filter(|line| *line == "run")
+            .count(),
+        1
+    );
+    running.stop().await;
+}
+
+// The private journal is the durable consumption witness; verdict assertions
+// remain on the public RPC/reference state, not on a fabricated callback.
+async fn wait_checker_record(store: &Store, phases: &[&str]) -> serde_json::Value {
+    tokio::time::timeout(Duration::from_secs(20), async {
+        loop {
+            let jobs = store
+                .external_checks_directory()
+                .unwrap()
+                .unwrap()
+                .join("jobs");
+            for entry in std::fs::read_dir(&jobs).unwrap() {
+                let path = entry.unwrap().path().join("state.json");
+                if let Ok(bytes) = std::fs::read(path) {
+                    if let Ok(value) = serde_json::from_slice::<serde_json::Value>(&bytes) {
+                        if value["record"]["phase"]
+                            .as_str()
+                            .is_some_and(|phase| phases.contains(&phase))
+                        {
+                            return value["record"].clone();
+                        }
+                    }
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap()
+}
+#[tokio::test]
+async fn a_late_passing_receipt_after_transport_timeout_is_cleanup_only() {
+    use tinytree_proto::landing_v1 as l;
+    let (_temporary, store, mut config, input, _scratch) = checked_landing_setup("late_pass");
+    let checker = config.service.landing.checker.as_mut().unwrap();
+    checker.execution_timeout_seconds = 10;
+    checker.max_attempts = 1;
+    let running = Running::start_landing(
+        store.clone(),
+        config.service,
+        landing_principals(true),
+        true,
+    )
+    .await;
+    let mut client = running.landing_client().await;
+    client
+        .start_landing(request(input.clone(), ALPHA))
+        .await
+        .unwrap();
+    let record = wait_checker_record(&store, &["RetryReady", "Terminal"]).await;
+    assert_eq!(record["verdict_eligible"], false);
+    assert_eq!(record["receipt"]["outcome"], "passed");
+    assert_eq!(record["receipt"]["cleanup_confirmed"], true);
+    let job = wait_landing_phase(&mut client, &input, l::Phase::PreparedPendingChecks).await;
+    assert!(job.receipt.is_none());
     assert_eq!(
         store.references("alpha", &["main".into()]).unwrap()[0].generation,
         1
