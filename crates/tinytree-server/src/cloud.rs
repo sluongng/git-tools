@@ -1044,21 +1044,42 @@ impl p::workspace_cloud_server::WorkspaceCloud for CloudService {
                 "native proof path exceeds budget",
             ));
         }
-        let root = match proof.terminal {
-            Some(p::native_closure_proof::Terminal::VersionRoot(value)) => native_key(Some(value))?,
+        enum NativeTerminal {
+            VersionRoot(tinytree_model::ObjectKey),
+            SnapshotCommit(Vec<tinytree_cloud::IndexRootId>, tinytree_model::CommitId),
+        }
+        let terminal = match proof.terminal {
+            Some(p::native_closure_proof::Terminal::VersionRoot(value)) => {
+                NativeTerminal::VersionRoot(native_key(Some(value))?)
+            }
             Some(p::native_closure_proof::Terminal::SnapshotCommit(value)) => {
                 if value.index_root_ids.len() > host.config.max_native_proof_steps {
                     return Err(Status::resource_exhausted(
                         "snapshot terminal exceeds budget",
                     ));
                 }
-                let _: [u8; 32] = array(&value.commit_id)?;
+                if value.index_root_ids.is_empty()
+                    || value
+                        .index_root_ids
+                        .windows(2)
+                        .any(|pair| pair[0] >= pair[1])
+                {
+                    return Err(Status::invalid_argument(
+                        "snapshot roots must be sorted unique",
+                    ));
+                }
+                let commit = tinytree_model::CommitId(array(&value.commit_id)?);
                 for id in &value.index_root_ids {
                     let _: [u8; 32] = array(id)?;
                 }
-                return Err(Status::unimplemented(
-                    "snapshot membership terminals are not supported",
-                ));
+                NativeTerminal::SnapshotCommit(
+                    value
+                        .index_root_ids
+                        .iter()
+                        .map(|id| array(id).map(tinytree_cloud::IndexRootId))
+                        .collect::<Result<Vec<_>, _>>()?,
+                    commit,
+                )
             }
             None => return Err(Status::invalid_argument("missing native proof terminal")),
         };
@@ -1075,25 +1096,37 @@ impl p::workspace_cloud_server::WorkspaceCloud for CloudService {
             deadline: Some(work.deadline.into_std()),
         };
         let lease = execute(work.clone(), move || {
-            store
-                .read_cloud_native(
+            let selector = s::CloudVersionSelector {
+                workspace,
+                generation: selector.generation,
+                manifest: tinytree_cloud::ManifestId(manifest),
+                selected: tinytree_cloud::BlobDigest {
+                    blake3: raw,
+                    size_bytes: selected.size_bytes,
+                },
+            };
+            match terminal {
+                NativeTerminal::VersionRoot(root) => store.read_cloud_native(
                     &input.repository_id,
                     owner,
-                    s::CloudVersionSelector {
-                        workspace,
-                        generation: selector.generation,
-                        manifest: tinytree_cloud::ManifestId(manifest),
-                        selected: tinytree_cloud::BlobDigest {
-                            blake3: raw,
-                            size_bytes: selected.size_bytes,
-                        },
-                    },
+                    selector,
                     requested,
                     root,
                     &path,
                     limits,
-                )
-                .map_err(status)
+                ),
+                NativeTerminal::SnapshotCommit(roots, commit) => store.read_cloud_snapshot_native(
+                    &input.repository_id,
+                    owner,
+                    selector,
+                    requested,
+                    &roots,
+                    commit,
+                    &path,
+                    limits,
+                ),
+            }
+            .map_err(status)
         })
         .await?;
         let descriptor = native_descriptor(lease.descriptor());

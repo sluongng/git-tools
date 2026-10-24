@@ -748,7 +748,10 @@ impl Inner {
             .capacity()
             .checked_mul(std::mem::size_of::<VerifiedObject>())
             .ok_or(Error::Limit("cloud version member allocation"))?;
-        if let Some(selected) = selection.as_mut() {
+        if let Some(selected) = selection
+            .as_mut()
+            .filter(|selected| selected.collect_anchors)
+        {
             let charge = selected
                 .maximum
                 .checked_mul(std::mem::size_of::<CommitId>())
@@ -769,6 +772,9 @@ impl Inner {
             payload: 0,
         };
         for member in &manifest.members {
+            if let Some(selected) = selection.as_ref() {
+                selected.check_deadline()?;
+            }
             let (record, metadata_scratch) = if matches!(manifest, RecoveryManifest::V2(_)) {
                 let key = object_key(repo, owner, member.id);
                 let bytes = self
@@ -868,6 +874,9 @@ impl Inner {
                     .map_err(|error| v2_error(error, "cloud v2 manifest coverage"))?;
                 let mut steps = 0usize;
                 for root in &value.index_roots {
+                    if let Some(selected) = selection.as_ref() {
+                        selected.check_deadline()?;
+                    }
                     // The codec charges one full configured snapshot worker.
                     // Previously retained frozen rows must also fit BEFORE
                     // another reconstruction can allocate its model/scratch.
@@ -885,7 +894,8 @@ impl Inner {
                         .snapshot(root.id)
                         .map_err(|error| v2_error(error, "cloud index logical snapshot"))?;
                     if let Some(selected) = selection.as_mut() {
-                        if selected.ids.binary_search(&root.id).is_ok() {
+                        if selected.collect_anchors && selected.ids.binary_search(&root.id).is_ok()
+                        {
                             for id in &snapshot.roots {
                                 match selected.anchors.binary_search(id) {
                                     Ok(_) => {}
@@ -918,15 +928,19 @@ impl Inner {
                         .and_then(|n| n.checked_sub(graph_lookup))
                         .and_then(|n| n.checked_sub(snapshot_memory(&snapshot).ok()?))
                         .ok_or(Error::Limit("cloud index native proof memory"))?;
-                    let frozen = selection.as_mut().and_then(|selected| {
-                        selected
-                            .ids
-                            .binary_search(&root.id)
-                            .is_ok()
-                            .then_some(&mut selected.frozen)
-                    });
+                    let proof_deadline = selection.as_ref().and_then(|selected| selected.deadline);
+                    let proof_selection = selection
+                        .as_deref_mut()
+                        .filter(|selected| selected.ids.binary_search(&root.id).is_ok());
                     let frozen_bytes = self.prove_index_native(
-                        repo, &snapshot, &mut extra, &mut steps, available, planned, frozen,
+                        repo,
+                        &snapshot,
+                        &mut extra,
+                        &mut steps,
+                        available,
+                        planned,
+                        proof_selection,
+                        proof_deadline,
                     )?;
                     frozen_retained = frozen_retained
                         .checked_add(frozen_bytes)
@@ -1232,7 +1246,8 @@ impl Inner {
         steps: &mut usize,
         available: usize,
         planned: &HashSet<ObjectKey>,
-        mut frozen: Option<&mut FrozenCommits>,
+        mut selection: Option<&mut SnapshotSelection<'_>>,
+        deadline: Option<std::time::Instant>,
     ) -> Result<usize> {
         let limits = self.config.cloud.index_artifacts;
         let mut frozen_bytes = 0usize;
@@ -1255,6 +1270,9 @@ impl Inner {
             }
         }
         while let Some(id) = pending.pop() {
+            if deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline) {
+                return Err(Error::Limit("cloud snapshot proof deadline"));
+            }
             let (mut commit, scratch) =
                 self.read_index_commit(repo, id, None, work, &mut memory, planned)?;
             *steps = steps
@@ -1276,6 +1294,11 @@ impl Inner {
             drop(commit);
             memory.release(scratch);
         }
+        if let Some(selected) = selection.as_mut() {
+            if selected.candidate.is_some_and(|id| anchors.contains(&id)) {
+                selected.candidate_found = true;
+            }
+        }
         // The anchor membership set remains live. Admit the separate draft
         // lookup before collect; no allocation is justified by record count
         // alone without the remaining shared version budget.
@@ -1292,6 +1315,9 @@ impl Inner {
             .map(|draft| draft.commit())
             .collect::<HashSet<_>>();
         for draft in &snapshot.drafts {
+            if deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline) {
+                return Err(Error::Limit("cloud snapshot proof deadline"));
+            }
             let (mut commit, scratch) = self.read_index_commit(
                 repo,
                 draft.commit(),
@@ -1320,7 +1346,16 @@ impl Inner {
                     ));
                 }
             }
-            if let Some(frozen) = frozen.as_mut() {
+            if let Some(selected) = selection.as_mut() {
+                if selected.candidate == Some(draft.commit()) {
+                    selected.candidate_found = true;
+                }
+            }
+            if let Some(selected) = selection
+                .as_mut()
+                .filter(|selected| selected.collect_frozen)
+            {
+                let frozen = &mut selected.frozen;
                 let millis = commit.committer.timestamp.millis_since_epoch;
                 let has_conflict = commit.root_tree.terms.len() > 1;
                 let at = frozen
@@ -2480,6 +2515,22 @@ struct SnapshotSelection<'a> {
     maximum: usize,
     anchors: Vec<CommitId>,
     frozen: FrozenCommits,
+    collect_anchors: bool,
+    collect_frozen: bool,
+    candidate: Option<CommitId>,
+    candidate_found: bool,
+    deadline: Option<std::time::Instant>,
+}
+impl SnapshotSelection<'_> {
+    fn check_deadline(&self) -> Result<()> {
+        if self
+            .deadline
+            .is_some_and(|deadline| std::time::Instant::now() >= deadline)
+        {
+            return Err(Error::Limit("cloud snapshot proof deadline"));
+        }
+        Ok(())
+    }
 }
 #[derive(Default)]
 struct FrozenCommits {
@@ -2605,6 +2656,11 @@ impl Store {
             maximum: max_anchors,
             anchors: Vec::new(),
             frozen: FrozenCommits::default(),
+            collect_anchors: true,
+            collect_frozen: true,
+            candidate: None,
+            candidate_found: false,
+            deadline: None,
         };
         let value = self
             .read_cloud_version_selection(
@@ -2640,5 +2696,57 @@ impl Store {
             frozen: selection.frozen.nodes,
             pins: _guard,
         })
+    }
+    pub(super) fn read_cloud_snapshot_commit_version(
+        &self,
+        repo: &str,
+        owner: CloudOwner,
+        selector: super::CloudVersionSelector,
+        selected: &[IndexRootId],
+        commit: CommitId,
+        deadline: Option<std::time::Instant>,
+    ) -> Result<CloudVersionReadGuard> {
+        if selector.generation == 0
+            || commit == CommitId::ROOT
+            || selected.is_empty()
+            || selected.len() > self.inner.config.cloud.index_artifacts.max_snapshots
+            || selected.windows(2).any(|pair| pair[0] >= pair[1])
+        {
+            return Err(Error::Invalid("cloud snapshot commit selection"));
+        }
+        let mut selection = SnapshotSelection {
+            ids: selected,
+            maximum: 0,
+            anchors: Vec::new(),
+            frozen: FrozenCommits::default(),
+            collect_anchors: false,
+            collect_frozen: false,
+            candidate: Some(commit),
+            candidate_found: false,
+            deadline,
+        };
+        let value = self
+            .read_cloud_version_selection(
+                repo,
+                owner,
+                selector.workspace,
+                selector.generation,
+                self.inner.config.cloud.manifest_limits,
+                false,
+                Some(&mut selection),
+            )?
+            .ok_or(Error::Corrupt("cloud snapshot schema dispatch"))?;
+        if value.version.manifest != selector.manifest
+            || value.manifest.len() as u64 != selector.selected.size_bytes
+            || blake3::hash(&value.manifest).as_bytes() != &selector.selected.blake3
+        {
+            return Err(Error::Invalid("cloud snapshot version selection"));
+        }
+        if !selection.candidate_found {
+            return Err(Error::Invalid(
+                "native commit is outside selected cloud snapshots",
+            ));
+        }
+        Ok(value)
     }
 }

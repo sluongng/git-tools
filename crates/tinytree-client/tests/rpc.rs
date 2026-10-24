@@ -4846,6 +4846,7 @@ struct CloudFaults {
     publication: Arc<std::sync::Mutex<Option<tinytree_client::cloud_protocol::Publication>>>,
     index_entered: Arc<tokio::sync::Notify>,
     index_release: Arc<tokio::sync::Notify>,
+    native_snapshot_calls: Arc<AtomicUsize>,
 }
 #[tonic::async_trait]
 impl tinytree_client::cloud_protocol::workspace_cloud_server::WorkspaceCloud for CloudFaults {
@@ -5170,6 +5171,20 @@ impl tinytree_client::cloud_protocol::workspace_cloud_server::WorkspaceCloud for
         self.calls.fetch_add(1, Ordering::SeqCst);
         let request = request.into_inner();
         let mode = self.mode.load(Ordering::SeqCst);
+        if let Some(c::native_closure_proof::Terminal::SnapshotCommit(terminal)) = request
+            .proof
+            .as_ref()
+            .and_then(|proof| proof.terminal.as_ref())
+        {
+            self.native_snapshot_calls.fetch_add(1, Ordering::SeqCst);
+            assert_eq!(terminal.index_root_ids, vec![vec![11; 32], vec![12; 32]]);
+            assert_eq!(terminal.commit_id, vec![13; 32]);
+            if mode == 36 {
+                return Err(Status::unimplemented(
+                    "snapshot native terminal unavailable",
+                ));
+            }
+        }
         let requested = request.requested.unwrap();
         let (descriptor, mut bytes) = if requested.kind == Kind::File as i32 {
             let bytes = vec![0x5a; 5 * 1024 * 1024];
@@ -6513,11 +6528,40 @@ async fn retained_native_reads_bind_fresh_versions_and_stream_files_beyond_cloud
         .await
         .unwrap();
     assert_eq!(metadata.canonical_bytes(), encoded.bytes);
+    let selected_roots = [[11; 32], [12; 32]];
+    let terminal_commit = tinytree_model::CommitId([13; 32]);
+    let snapshot_metadata = calls
+        .cloud_read_snapshot_metadata(&version, &selected_roots, terminal_commit, &[key], key)
+        .await
+        .unwrap();
+    assert_eq!(snapshot_metadata.canonical_bytes(), encoded.bytes);
+    let before_invalid = faults.calls.load(Ordering::SeqCst);
+    for roots in [vec![], vec![[11; 32], [11; 32]], vec![[12; 32], [11; 32]]] {
+        assert_eq!(
+            client
+                .cloud_read_snapshot_metadata(&version, &roots, terminal_commit, &[key], key)
+                .await
+                .err()
+                .unwrap()
+                .code(),
+            Code::InvalidArgument
+        );
+    }
+    assert_eq!(faults.calls.load(Ordering::SeqCst), before_invalid);
     let other = NativeClient::connect(config.clone()).await.unwrap();
     let before = faults.calls.load(Ordering::SeqCst);
     assert_eq!(
         other
             .cloud_read_native_metadata(&version, key, &[], key)
+            .await
+            .err()
+            .unwrap()
+            .code(),
+        Code::FailedPrecondition
+    );
+    assert_eq!(
+        other
+            .cloud_read_snapshot_metadata(&version, &selected_roots, terminal_commit, &[key], key)
             .await
             .err()
             .unwrap()
@@ -6540,6 +6584,19 @@ async fn retained_native_reads_bind_fresh_versions_and_stream_files_beyond_cloud
         .await
         .unwrap();
     assert_eq!(file.descriptor(), descriptor);
+    let snapshot_file = calls
+        .cloud_download_snapshot_file(
+            &version,
+            &selected_roots,
+            terminal_commit,
+            &[descriptor.key],
+            tinytree_model::FileId(descriptor.key.id.0),
+            directory.path(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(snapshot_file.descriptor(), descriptor);
+    assert_eq!(faults.native_snapshot_calls.load(Ordering::SeqCst), 2);
     drop(calls);
     assert_released(&physical_drops).await;
     assert!(
@@ -6557,6 +6614,8 @@ async fn retained_native_reads_bind_fresh_versions_and_stream_files_beyond_cloud
     drop(file);
     drop(version);
     drop(metadata);
+    drop(snapshot_metadata);
+    drop(snapshot_file);
     assert_eq!(
         drops.load(Ordering::SeqCst),
         0,
@@ -6582,7 +6641,49 @@ async fn retained_native_reads_bind_fresh_versions_and_stream_files_beyond_cloud
                 .code(),
             Code::DataLoss
         );
+        assert_eq!(
+            client
+                .cloud_read_snapshot_metadata(
+                    &version,
+                    &selected_roots,
+                    terminal_commit,
+                    &[key],
+                    key
+                )
+                .await
+                .err()
+                .unwrap()
+                .code(),
+            Code::DataLoss
+        );
     }
+    faults.mode.store(36, Ordering::SeqCst);
+    let unavailable = client
+        .cloud_retained_version_selected(selector, selected)
+        .await
+        .unwrap();
+    let before = faults.calls.load(Ordering::SeqCst);
+    assert_eq!(
+        client
+            .cloud_read_snapshot_metadata(
+                &unavailable,
+                &selected_roots,
+                terminal_commit,
+                &[key],
+                key
+            )
+            .await
+            .err()
+            .unwrap()
+            .code(),
+        Code::Unimplemented
+    );
+    assert_eq!(
+        faults.calls.load(Ordering::SeqCst),
+        before + 1,
+        "no generic or VersionRoot fallback"
+    );
+    drop(unavailable);
     faults.mode.store(35, Ordering::SeqCst);
     assert_eq!(
         client

@@ -4023,6 +4023,10 @@ fn indexed_cloud_versions_preserve_hidden_drafts_artifacts_and_mixed_schema_hist
         principal: [71; 32],
     };
     let (_, root, head) = fixture(&store, "visible index anchor");
+    let ancestor = head;
+    let mut visible = commit(TreeId(root.key.id.0), "visible descendant anchor");
+    visible.parents = vec![CommitId(ancestor.key.id.0)];
+    let head = put_object(&store, Object::Commit(visible), 0);
     let bytes = b"private hidden source";
     let hidden_file = tinytree_model::describe_file(bytes);
     store.put("demo", hidden_file, bytes, 0).unwrap();
@@ -4199,7 +4203,114 @@ fn indexed_cloud_versions_preserve_hidden_drafts_artifacts_and_mixed_schema_hist
     );
     drop(snapshot);
     drop(intrinsic);
+    // Snapshot membership is the selected anchor ancestry PLUS its frozen
+    // drafts, not every object retained elsewhere by this manifest.
+    for terminal in [hidden, ancestor] {
+        let mut lease = store
+            .read_cloud_snapshot_native(
+                "demo",
+                owner,
+                selector,
+                terminal.key,
+                &[selected_index],
+                CommitId(terminal.key.id.0),
+                &[],
+                Default::default(),
+            )
+            .unwrap();
+        let mut bytes = Vec::new();
+        lease.read_to_end(&mut bytes).unwrap();
+        assert_eq!(blake3::hash(&bytes).as_bytes(), &terminal.key.id.0);
+    }
+    assert!(matches!(
+        store.read_cloud_snapshot_native(
+            "demo",
+            owner,
+            selector,
+            hidden.key,
+            &[intrinsic_index],
+            CommitId(hidden.key.id.0),
+            &[],
+            Default::default()
+        ),
+        Err(Error::Invalid(
+            "native commit is outside selected cloud snapshots"
+        ))
+    ));
+    assert!(
+        store
+            .read_cloud_snapshot_native(
+                "demo",
+                owner,
+                selector,
+                hidden.key,
+                &[selected_index],
+                CommitId::ROOT,
+                &[],
+                Default::default()
+            )
+            .is_err()
+    );
+    assert!(
+        store
+            .read_cloud_snapshot_native(
+                "demo",
+                owner,
+                selector,
+                hidden.key,
+                &[selected_index, selected_index],
+                CommitId(hidden.key.id.0),
+                &[],
+                Default::default()
+            )
+            .is_err()
+    );
+    let mut expired = CloudNativeReadLimits::default();
+    expired.deadline = Some(std::time::Instant::now());
+    assert!(matches!(
+        store.read_cloud_snapshot_native(
+            "demo",
+            owner,
+            selector,
+            hidden.key,
+            &[selected_index],
+            CommitId(hidden.key.id.0),
+            &[],
+            expired
+        ),
+        Err(Error::Limit(_))
+    ));
     let path = [hidden_tree.key, hidden_file.key];
+    let mut snapshot_file = store
+        .read_cloud_snapshot_native(
+            "demo",
+            owner,
+            selector,
+            hidden_file.key,
+            &[selected_index],
+            CommitId(hidden.key.id.0),
+            &path,
+            Default::default(),
+        )
+        .unwrap();
+    let mut snapshot_bytes = Vec::new();
+    snapshot_file.read_to_end(&mut snapshot_bytes).unwrap();
+    assert_eq!(snapshot_bytes, bytes);
+    drop(snapshot_file);
+    assert!(
+        store
+            .read_cloud_snapshot_native(
+                "demo",
+                owner,
+                selector,
+                hidden_file.key,
+                &[selected_index],
+                CommitId(hidden.key.id.0),
+                &[hidden_file.key],
+                Default::default()
+            )
+            .is_err()
+    );
     let mut read = store
         .read_cloud_native(
             "demo",

@@ -1,5 +1,6 @@
 //! Exact retained-version roots and real canonical edges, not generic CAS grants.
 use super::*;
+use tinytree_cloud::IndexRootId;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct CloudVersionSelector {
@@ -96,6 +97,70 @@ impl Store {
         if !version.native_roots().contains(&root) {
             return Err(Error::Invalid("cloud native root is outside version"));
         }
+        self.read_cloud_native_path(repo, requested, root, path, limits, version)
+    }
+    /// Prove membership in only the selected immutable snapshots during the
+    /// existing version validation pass, then follow the same real-edge path.
+    pub fn read_cloud_snapshot_native(
+        &self,
+        repo: &str,
+        owner: CloudOwner,
+        selector: CloudVersionSelector,
+        requested: ObjectKey,
+        selected: &[IndexRootId],
+        terminal: CommitId,
+        path: &[ObjectKey],
+        limits: CloudNativeReadLimits,
+    ) -> Result<CloudNativeReadLease> {
+        if selector.generation == 0
+            || limits.max_path_steps == 0
+            || limits.max_metadata_bytes == 0
+            || limits.max_edges == 0
+        {
+            return Err(Error::Invalid("cloud native read bounds"));
+        }
+        if path.len()
+            > limits
+                .max_path_steps
+                .min(self.inner.config.max_closure_objects)
+            || selected.len()
+                > limits
+                    .max_path_steps
+                    .min(self.inner.config.cloud.index_artifacts.max_snapshots)
+        {
+            return Err(Error::Limit("cloud native proof selection or path"));
+        }
+        limits.check_deadline()?;
+        let version = self.read_cloud_snapshot_commit_version(
+            repo,
+            owner,
+            selector,
+            selected,
+            terminal,
+            limits.deadline,
+        )?;
+        limits.check_deadline()?;
+        self.read_cloud_native_path(
+            repo,
+            requested,
+            ObjectKey {
+                kind: Kind::Commit,
+                id: ObjectId(terminal.0),
+            },
+            path,
+            limits,
+            version,
+        )
+    }
+    fn read_cloud_native_path(
+        &self,
+        repo: &str,
+        requested: ObjectKey,
+        root: ObjectKey,
+        path: &[ObjectKey],
+        limits: CloudNativeReadLimits,
+        version: CloudVersionReadGuard,
+    ) -> Result<CloudNativeReadLease> {
         let mut current = root;
         let mut metadata = 0u64;
         let mut edges = 0usize;

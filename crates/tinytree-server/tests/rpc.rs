@@ -5195,21 +5195,51 @@ async fn cloud_rpc_private_compressed_history_replay_gc_and_restart() {
             .code(),
         Code::InvalidArgument
     );
-    let mut future = native_request.clone();
-    future.proof.as_mut().unwrap().terminal = Some(
+    for terminal in [root(&data), frozen[1].descriptor.key] {
+        let mut snapshot = native_request.clone();
+        snapshot.proof.as_mut().unwrap().terminal = Some(
+            c::native_closure_proof::Terminal::SnapshotCommit(c::SnapshotCommitTerminal {
+                index_root_ids: vec![selected_index.root.id.0.to_vec()],
+                commit_id: terminal.id.0.to_vec(),
+            }),
+        );
+        let response = client
+            .read_native_closure(request(snapshot, ALPHA))
+            .await
+            .unwrap();
+        assert_eq!(response.metadata().get("grpc-encoding").unwrap(), "zstd");
+        let mut stream = response.into_inner();
+        let mut bytes = Vec::new();
+        let mut eof = false;
+        while let Some(chunk) = stream.message().await.unwrap() {
+            assert_eq!(chunk.source_binding_digest, authority.binding_digest);
+            assert_eq!(chunk.offset, bytes.len() as u64);
+            assert_eq!(
+                chunk.descriptor.as_ref().unwrap().key,
+                Some(wire_key(file_key))
+            );
+            bytes.extend(chunk.data);
+            eof = chunk.eof;
+        }
+        assert!(eof);
+        assert_eq!(blake3::hash(&bytes).as_bytes(), &file_key.id.0);
+    }
+    let mut outside = native_request.clone();
+    outside.proof.as_mut().unwrap().terminal = Some(
         c::native_closure_proof::Terminal::SnapshotCommit(c::SnapshotCommitTerminal {
-            index_root_ids: vec![selected_index.root.id.0.to_vec()],
-            commit_id: root(&data).id.0.to_vec(),
+            index_root_ids: vec![intrinsic.root.id.0.to_vec()],
+            commit_id: frozen[1].descriptor.key.id.0.to_vec(),
         }),
     );
     assert_eq!(
         client
-            .read_native_closure(request(future, ALPHA))
+            .read_native_closure(request(outside, ALPHA))
             .await
             .err()
             .unwrap()
             .code(),
-        Code::Unimplemented
+        Code::InvalidArgument,
+        "another retained snapshot must not grant this selected snapshot's private draft"
     );
     let selected_ids = vec![selected_index.root.id.0];
     let source = q::CloudSnapshotSource {

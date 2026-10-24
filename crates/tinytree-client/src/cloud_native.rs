@@ -70,6 +70,61 @@ impl VerifiedRetainedVersion {
             .expect("verified authority")
     }
 }
+#[derive(Clone, Copy)]
+enum NativeReadTerminal<'a> {
+    VersionRoot(ObjectKey),
+    SnapshotCommit {
+        roots: &'a [[u8; 32]],
+        commit: tinytree_model::CommitId,
+    },
+}
+impl NativeReadTerminal<'_> {
+    fn key(self) -> ObjectKey {
+        match self {
+            Self::VersionRoot(key) => key,
+            Self::SnapshotCommit { commit, .. } => ObjectKey {
+                kind: Kind::Commit,
+                id: ObjectId(commit.0),
+            },
+        }
+    }
+    fn request_bytes(self, path: &[ObjectKey]) -> Result<usize, Status> {
+        if path.len() > 256 {
+            return Err(limit());
+        }
+        let roots = match self {
+            Self::VersionRoot(_) => 0,
+            Self::SnapshotCommit { roots, commit } => {
+                if roots.len() > 256 {
+                    return Err(limit());
+                }
+                if roots.is_empty()
+                    || commit == tinytree_model::CommitId::ROOT
+                    || roots.windows(2).any(|pair| pair[0] >= pair[1])
+                {
+                    return Err(Status::invalid_argument("invalid snapshot native terminal"));
+                }
+                roots.len()
+            }
+        };
+        path.len()
+            .checked_mul(40)
+            .and_then(|n| roots.checked_mul(64).and_then(|roots| n.checked_add(roots)))
+            .and_then(|n| n.checked_add(1024))
+            .ok_or_else(limit)
+    }
+    fn wire(self) -> c::native_closure_proof::Terminal {
+        match self {
+            Self::VersionRoot(key) => c::native_closure_proof::Terminal::VersionRoot(wire_key(key)),
+            Self::SnapshotCommit { roots, commit } => {
+                c::native_closure_proof::Terminal::SnapshotCommit(c::SnapshotCommitTerminal {
+                    index_root_ids: roots.iter().map(|id| id.to_vec()).collect(),
+                    commit_id: commit.0.to_vec(),
+                })
+            }
+        }
+    }
+}
 impl NativeClient {
     pub async fn cloud_retained_version(
         &self,
@@ -146,7 +201,7 @@ impl NativeClient {
     fn closure_request(
         &self,
         version: &VerifiedRetainedVersion,
-        terminal: ObjectKey,
+        terminal: NativeReadTerminal<'_>,
         path: &[ObjectKey],
         requested: ObjectKey,
     ) -> Result<c::ReadNativeClosureRequest, Status> {
@@ -155,14 +210,10 @@ impl NativeClient {
                 "retained version belongs to another client",
             ));
         }
-        if path.len() > 256 || path.last().copied().unwrap_or(terminal) != requested {
+        if path.len() > 256 || path.last().copied().unwrap_or(terminal.key()) != requested {
             return Err(Status::invalid_argument("invalid native version edge path"));
         }
-        let size = path
-            .len()
-            .checked_mul(40)
-            .and_then(|n| n.checked_add(1024))
-            .ok_or_else(limit)?;
+        let size = terminal.request_bytes(path)?;
         if size > self.inner.config.limits.max_request_bytes {
             return Err(limit());
         }
@@ -176,9 +227,7 @@ impl NativeClient {
             authority: Some(version.authority.clone()),
             requested: Some(wire_key(requested)),
             proof: Some(c::NativeClosureProof {
-                terminal: Some(c::native_closure_proof::Terminal::VersionRoot(wire_key(
-                    terminal,
-                ))),
+                terminal: Some(terminal.wire()),
                 edge_path: path.iter().copied().map(wire_key).collect(),
             }),
         })
@@ -190,6 +239,43 @@ impl NativeClient {
         path: &[ObjectKey],
         requested: ObjectKey,
     ) -> Result<VerifiedMetadata, Status> {
+        self.cloud_read_native_metadata_terminal(
+            version,
+            NativeReadTerminal::VersionRoot(terminal),
+            path,
+            requested,
+        )
+        .await
+    }
+    /// Read through exact selected snapshot membership, never an implicit root
+    /// or generic repository fallback. Selection is validated before copying.
+    pub async fn cloud_read_snapshot_metadata(
+        &self,
+        version: &VerifiedRetainedVersion,
+        index_roots: &[[u8; 32]],
+        terminal_commit: tinytree_model::CommitId,
+        path: &[ObjectKey],
+        requested: ObjectKey,
+    ) -> Result<VerifiedMetadata, Status> {
+        self.cloud_read_native_metadata_terminal(
+            version,
+            NativeReadTerminal::SnapshotCommit {
+                roots: index_roots,
+                commit: terminal_commit,
+            },
+            path,
+            requested,
+        )
+        .await
+    }
+    async fn cloud_read_native_metadata_terminal(
+        &self,
+        version: &VerifiedRetainedVersion,
+        terminal: NativeReadTerminal<'_>,
+        path: &[ObjectKey],
+        requested: ObjectKey,
+    ) -> Result<VerifiedMetadata, Status> {
+        version.check_query_client(self)?;
         if requested.kind == Kind::File || intrinsic(requested) {
             return Err(Status::invalid_argument(
                 "expected nonintrinsic native metadata",
@@ -199,11 +285,7 @@ impl NativeClient {
         if path.len() > 256 {
             return Err(limit());
         }
-        let request_bytes = path
-            .len()
-            .checked_mul(40)
-            .and_then(|n| n.checked_add(1024))
-            .ok_or_else(limit)?;
+        let request_bytes = terminal.request_bytes(path)?;
         if request_bytes > self.inner.config.limits.max_request_bytes {
             return Err(limit());
         }
@@ -330,6 +412,47 @@ impl NativeClient {
         file: tinytree_model::FileId,
         parent: &Path,
     ) -> Result<VerifiedFile, Status> {
+        self.cloud_download_native_file_terminal(
+            version,
+            NativeReadTerminal::VersionRoot(terminal),
+            path,
+            file,
+            parent,
+        )
+        .await
+    }
+    /// Stream FILE bytes under native file/disk limits after exact snapshot
+    /// membership and canonical edge-path validation; never fall back.
+    pub async fn cloud_download_snapshot_file(
+        &self,
+        version: &VerifiedRetainedVersion,
+        index_roots: &[[u8; 32]],
+        terminal_commit: tinytree_model::CommitId,
+        path: &[ObjectKey],
+        file: tinytree_model::FileId,
+        parent: &Path,
+    ) -> Result<VerifiedFile, Status> {
+        self.cloud_download_native_file_terminal(
+            version,
+            NativeReadTerminal::SnapshotCommit {
+                roots: index_roots,
+                commit: terminal_commit,
+            },
+            path,
+            file,
+            parent,
+        )
+        .await
+    }
+    async fn cloud_download_native_file_terminal(
+        &self,
+        version: &VerifiedRetainedVersion,
+        terminal: NativeReadTerminal<'_>,
+        path: &[ObjectKey],
+        file: tinytree_model::FileId,
+        parent: &Path,
+    ) -> Result<VerifiedFile, Status> {
+        version.check_query_client(self)?;
         let requested = ObjectKey {
             kind: Kind::File,
             id: ObjectId(file.0),
@@ -337,11 +460,7 @@ impl NativeClient {
         if path.len() > 256 || parent.as_os_str().len() > 4096 {
             return Err(limit());
         }
-        let request_bytes = path
-            .len()
-            .checked_mul(40)
-            .and_then(|n| n.checked_add(1024))
-            .ok_or_else(limit)?;
+        let request_bytes = terminal.request_bytes(path)?;
         if request_bytes > self.inner.config.limits.max_request_bytes {
             return Err(limit());
         }
