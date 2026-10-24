@@ -1,0 +1,94 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Git Tools Contributors <noreply@users.noreply.github.com>
+Date: Sat, 24 Oct 2026 02:47:00 +0000
+Subject: [PATCH] jj: Restore exact operation heads durably
+
+A restore must install its recorded plural operation heads before
+normal repository loading. Ordinary head updates do not provide a
+bounded, fresh-only initializer with a directory durability contract.
+
+Add an initializer that validates the complete head set before writing,
+then syncs every marker and its directories without creating an
+operation or selecting or merging a head. Keep ordinary initialization
+unchanged.
+
+The durable initializer is Unix-only. The caller owns an exclusive
+restore journal and must verify referenced operations first. Errors
+may leave partial or complete state for explicit recovery, not
+automatic adoption.
+
+---
+diff --git a/src/simple_op_heads_store.rs b/src/simple_op_heads_store.rs
+--- a/src/simple_op_heads_store.rs
++++ b/src/simple_op_heads_store.rs
+@@ -67,6 +67,70 @@
+         let store = Self { dir: op_heads_dir };
+         store.add_op_head(root_op_id)?;
+         Ok(store)
++    }
++
++    /// Initialize an exact retained head set in a fresh isolated directory.
++    ///
++    /// The caller must verify every referenced operation and hold an exclusive
++    /// restore journal/fence. This writes no operation and performs no merge.
++    /// Success syncs all head markers and directory entries on Unix. An error
++    /// can leave partial or complete state; preserve it for explicit recovery.
++    /// Existing or unknown contents are never overwritten or adopted.
++    pub fn init_cloud_restore(
++        dir: &Path,
++        heads: &[OperationId],
++        max_heads: usize,
++    ) -> Result<Self, SimpleOpHeadsStoreInitError> {
++        let initialize = || -> io::Result<Self> {
++            if !cfg!(unix) {
++                return Err(io::Error::new(
++                    io::ErrorKind::Unsupported,
++                    "durable operation head restore is unsupported on this platform",
++                ));
++            }
++            if max_heads == 0
++                || max_heads > 65_536
++                || heads.is_empty()
++                || heads.len() > max_heads
++                || heads.iter().any(|id| id.as_bytes().len() != 64)
++                || !heads.windows(2).all(|pair| pair[0] < pair[1])
++            {
++                return Err(io::Error::new(
++                    io::ErrorKind::InvalidInput,
++                    "retained operation heads must be bounded, sorted unique 64-byte IDs",
++                ));
++            }
++            let metadata = fs::symlink_metadata(dir)?;
++            if !metadata.is_dir()
++                || metadata.file_type().is_symlink()
++                || fs::read_dir(dir)?.next().is_some()
++            {
++                return Err(io::Error::new(
++                    io::ErrorKind::AlreadyExists,
++                    "operation head restore requires a fresh directory",
++                ));
++            }
++            let directory = dir.join("heads");
++            fs::create_dir(&directory)?;
++            for head in heads {
++                let file = fs::OpenOptions::new()
++                    .write(true)
++                    .create_new(true)
++                    .open(directory.join(head.hex()))?;
++                file.sync_all()?;
++            }
++            fs::File::open(&directory)?.sync_all()?;
++            fs::File::open(dir)?.sync_all()?;
++            fs::File::open(dir.parent().ok_or_else(|| {
++                io::Error::new(
++                    io::ErrorKind::InvalidInput,
++                    "operation head directory has no parent",
++                )
++            })?)?
++            .sync_all()?;
++            Ok(Self { dir: directory })
++        };
++        initialize().context(dir).map_err(Into::into)
+     }
+ 
+     pub fn load(dir: &Path) -> Self {

@@ -445,6 +445,90 @@ impl NativeVfsWorkingCopyFactory {
         controller.inspect()?.validate(&self.repository)?;
         Ok((binding, directory, controller))
     }
+    /// Install metadata for an exact retained working-copy snapshot on a fresh
+    /// lazy projection, without creating a jj operation or changing user files.
+    ///
+    /// The caller must hold its restore journal/command fence and independently
+    /// verify OP/VIEW identity, exact index associations and supported quiescent
+    /// capture provenance. These arguments do not prove source intent absence.
+    /// Source request IDs/receipts and host-bound state must never be replayed.
+    /// Existing state is never adopted, overwritten or repaired on failure.
+    pub fn restore_fresh_working_copy(
+        &self,
+        store: Arc<Store>,
+        root: PathBuf,
+        state_path: PathBuf,
+        operation: OperationId,
+        workspace: WorkspaceNameBuf,
+        expected_tree: &NativeTree,
+    ) -> std::result::Result<Box<dyn WorkingCopy>, WorkingCopyStateError> {
+        let restore = || -> Result<Box<dyn WorkingCopy>> {
+            ensure!(
+                operation.as_bytes().len() == 64,
+                "retained operation identity must be 64 bytes"
+            );
+            expected_tree.validate()?;
+            self.initialize_fresh(
+                store,
+                root,
+                state_path,
+                operation,
+                workspace,
+                Some(expected_tree),
+            )
+        };
+        restore().map_err(state_error)
+    }
+    fn initialize_fresh(
+        &self,
+        store: Arc<Store>,
+        root: PathBuf,
+        state_path: PathBuf,
+        operation: OperationId,
+        workspace: WorkspaceNameBuf,
+        expected_tree: Option<&NativeTree>,
+    ) -> Result<Box<dyn WorkingCopy>> {
+        let (binding, directory, controller) = self.connect(&root, &state_path, &store)?;
+        let lock = directory.open_lock(LOCK)?;
+        lock.lock_exclusive()?;
+        if expected_tree.is_some() {
+            // A restore must not adopt pending state or unknown foreign files.
+            ensure!(
+                std::fs::read_dir(directory.path())?
+                    .all(|entry| entry.is_ok_and(|entry| entry.file_name() == LOCK)),
+                "native working-copy directory is not fresh"
+            );
+        } else {
+            match directory.read(STATE, MAX_STATE_BYTES) {
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error.into()),
+                Ok(_) => bail!("native working-copy state already exists"),
+            }
+        }
+        let projection = controller.inspect()?;
+        projection.validate(&binding.repository)?;
+        if let Some(expected) = expected_tree {
+            ensure!(
+                &projection.tree == expected,
+                "restored native projection differs from retained tree"
+            );
+        }
+        let state = State {
+            version: 1,
+            root: binding.root.clone(),
+            repository: binding.repository.clone(),
+            operation: operation.hex(),
+            workspace: workspace.as_str().into(),
+            projection,
+            pending: None,
+            unfinished: None,
+            acknowledgement: None,
+        };
+        state.save(&directory, &binding)?;
+        Ok(Box::new(NativeWorkingCopy::new(
+            store, binding, directory, controller, state,
+        )?))
+    }
     /// Explicit recovery, not an automatic reset. The caller supplies an actual
     /// retained jj operation from this workspace's op store. For an applied
     /// mutation its WC commit tree must equal the authoritative receipt exactly.
@@ -658,38 +742,8 @@ impl WorkingCopyFactory for NativeVfsWorkingCopyFactory {
         workspace: WorkspaceNameBuf,
         _: &UserSettings,
     ) -> std::result::Result<Box<dyn WorkingCopy>, WorkingCopyStateError> {
-        let initialize = || -> Result<Box<dyn WorkingCopy>> {
-            let (binding, directory, controller) = self.connect(&root, &state_path, &store)?;
-            let lock = directory.open_lock(LOCK)?;
-            lock.lock_exclusive()?;
-            match directory.read(STATE, MAX_STATE_BYTES) {
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                Err(error) => return Err(error.into()),
-                Ok(_) => bail!("native working-copy state already exists"),
-            }
-            let projection = controller.inspect()?;
-            projection.validate(&binding.repository)?;
-            let state = State {
-                version: 1,
-                root: binding.root.clone(),
-                repository: binding.repository.clone(),
-                operation: operation.hex(),
-                workspace: workspace.as_str().into(),
-                projection,
-                pending: None,
-                unfinished: None,
-                acknowledgement: None,
-            };
-            state.save(&directory, &binding)?;
-            Ok(Box::new(NativeWorkingCopy::new(
-                store.clone(),
-                binding,
-                directory,
-                controller,
-                state,
-            )?))
-        };
-        initialize().map_err(state_error)
+        self.initialize_fresh(store, root, state_path, operation, workspace, None)
+            .map_err(state_error)
     }
     fn load_working_copy(
         &self,
@@ -1228,11 +1282,203 @@ mod tests {
             let fixture = Fixture::new().await;
             fixture.controller.0.lock().unwrap().mounted = false;
             assert!(fixture.init().is_err());
+            let tree = fixture.controller.0.lock().unwrap().current.tree.clone();
+            assert!(
+                fixture
+                    .factory
+                    .restore_fresh_working_copy(
+                        fixture.store.clone(),
+                        fixture.root.clone(),
+                        fixture.state_path.clone(),
+                        fixture.operation.id().clone(),
+                        WorkspaceName::DEFAULT.to_owned(),
+                        &tree,
+                    )
+                    .is_err()
+            );
             assert!(!fixture.state_path.join(STATE).exists());
             assert!(!fixture.state_path.join(LOCK).exists());
             assert!(!fixture.root.join(".jj").exists());
             assert!(std::fs::read_dir(&fixture.root).unwrap().next().is_none());
         });
+    }
+
+    #[test]
+    fn fresh_restore_preserves_operation_workspace_and_exact_tree_without_mutation() {
+        futures::executor::block_on(async {
+            let fixture = Fixture::new().await;
+            let tree = NativeTree {
+                terms: vec![[21; 32], [22; 32], [23; 32]],
+                labels: vec!["our side".into(), "base".into(), "their side".into()],
+            };
+            fixture.controller.0.lock().unwrap().current = ProjectionState {
+                repository: "fixture".into(),
+                generation: 73,
+                tree: tree.clone(),
+            };
+            let operation = fixture.operation.id().clone();
+            let workspace: WorkspaceNameBuf = "restored-agent".into();
+            let wrong = NativeTree {
+                terms: vec![[24; 32]],
+                labels: vec![],
+            };
+            assert!(
+                fixture
+                    .factory
+                    .restore_fresh_working_copy(
+                        fixture.store.clone(),
+                        fixture.root.clone(),
+                        fixture.state_path.clone(),
+                        operation.clone(),
+                        workspace.clone(),
+                        &wrong
+                    )
+                    .is_err()
+            );
+            assert!(!fixture.state_path.join(STATE).exists());
+            let sentinel = fixture.state_path.join("foreign-state");
+            std::fs::write(&sentinel, b"preserve").unwrap();
+            assert!(
+                fixture
+                    .factory
+                    .restore_fresh_working_copy(
+                        fixture.store.clone(),
+                        fixture.root.clone(),
+                        fixture.state_path.clone(),
+                        operation.clone(),
+                        workspace.clone(),
+                        &tree
+                    )
+                    .is_err()
+            );
+            assert_eq!(std::fs::read(&sentinel).unwrap(), b"preserve");
+            assert!(!fixture.state_path.join(STATE).exists());
+            std::fs::remove_file(&sentinel).unwrap(); // Explicit fixture setup, not API recovery.
+            let restored = fixture
+                .factory
+                .restore_fresh_working_copy(
+                    fixture.store.clone(),
+                    fixture.root.clone(),
+                    fixture.state_path.clone(),
+                    operation.clone(),
+                    workspace.clone(),
+                    &tree,
+                )
+                .unwrap();
+            assert_eq!(restored.operation_id(), &operation);
+            assert_eq!(restored.workspace_name().as_str(), workspace.as_str());
+            assert_eq!(
+                NativeTree::from_merged_tree(restored.tree().unwrap()).unwrap(),
+                tree
+            );
+            let retained =
+                read_retained_state(&fixture.root, &fixture.state_path, "fixture").unwrap();
+            assert_eq!(retained.operation, operation);
+            assert_eq!(retained.workspace, workspace);
+            assert!(!retained.pending);
+            assert_eq!(retained.trees, vec![tree.clone()]);
+            let bytes = fixture.persisted();
+            let state: State = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(state.root, fixture.root.canonicalize().unwrap());
+            assert_eq!(
+                state.projection.generation, 73,
+                "use the new destination epoch, not a source epoch"
+            );
+            assert!(
+                fixture
+                    .factory
+                    .restore_fresh_working_copy(
+                        fixture.store.clone(),
+                        fixture.root.clone(),
+                        fixture.state_path.clone(),
+                        operation.clone(),
+                        workspace.clone(),
+                        &tree
+                    )
+                    .is_err()
+            );
+            assert_eq!(fixture.persisted(), bytes);
+            let reopened = fixture.load().unwrap();
+            assert_eq!(reopened.operation_id(), &operation);
+            assert_eq!(reopened.workspace_name().as_str(), workspace.as_str());
+            let controller = fixture.controller.0.lock().unwrap();
+            assert_eq!(
+                (
+                    controller.calls,
+                    controller.sessions,
+                    controller.acknowledgements
+                ),
+                (0, 0, 0)
+            );
+            assert!(
+                std::fs::read_dir(&fixture.root).unwrap().next().is_none(),
+                "metadata initialization must not materialize user files"
+            );
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn exact_restored_heads_are_plural_durable_and_fresh_only() {
+        use jj_lib::simple_op_heads_store::SimpleOpHeadsStore;
+        let directory = tempfile::tempdir().unwrap();
+        let heads = vec![
+            OperationId::from_bytes(&[1; 64]),
+            OperationId::from_bytes(&[2; 64]),
+        ];
+        for (name, values, cap) in [
+            ("empty", vec![], 2),
+            ("duplicate", vec![heads[0].clone(), heads[0].clone()], 2),
+            ("unsorted", vec![heads[1].clone(), heads[0].clone()], 2),
+            ("short-identity", vec![OperationId::from_hex("01")], 2),
+            ("over-budget", heads.clone(), 1),
+        ] {
+            let path = directory.path().join(name);
+            std::fs::create_dir(&path).unwrap();
+            assert!(
+                SimpleOpHeadsStore::init_cloud_restore(&path, &values, cap).is_err(),
+                "{name}"
+            );
+            assert!(
+                std::fs::read_dir(&path).unwrap().next().is_none(),
+                "invalid input must precede marker creation: {name}"
+            );
+        }
+        let path = directory.path().join("exact-heads");
+        std::fs::create_dir(&path).unwrap();
+        let restored = SimpleOpHeadsStore::init_cloud_restore(&path, &heads, 2).unwrap();
+        assert_eq!(restored.get_op_heads_bounded(2).unwrap(), heads);
+        assert_eq!(
+            SimpleOpHeadsStore::load(&path)
+                .get_op_heads_bounded(2)
+                .unwrap(),
+            heads
+        );
+        assert!(
+            SimpleOpHeadsStore::init_cloud_restore(&path, &heads, 2).is_err(),
+            "a completed directory is not fresh or automatically adopted"
+        );
+        assert_eq!(restored.get_op_heads_bounded(2).unwrap(), heads);
+        assert_eq!(
+            std::fs::read_dir(&path).unwrap().count(),
+            1,
+            "only marker metadata is installed, not an operation or checkout"
+        );
+        let foreign = directory.path().join("foreign");
+        std::fs::create_dir(&foreign).unwrap();
+        std::fs::write(foreign.join("sentinel"), b"preserve").unwrap();
+        assert!(SimpleOpHeadsStore::init_cloud_restore(&foreign, &heads, 2).is_err());
+        assert_eq!(
+            std::fs::read(foreign.join("sentinel")).unwrap(),
+            b"preserve"
+        );
+        assert!(!foreign.join("heads").exists());
+        let target = directory.path().join("target");
+        std::fs::create_dir(&target).unwrap();
+        let link = directory.path().join("linked");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        assert!(SimpleOpHeadsStore::init_cloud_restore(&link, &heads, 2).is_err());
+        assert!(std::fs::read_dir(&target).unwrap().next().is_none());
     }
 
     #[test]
