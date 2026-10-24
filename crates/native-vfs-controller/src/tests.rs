@@ -1258,6 +1258,18 @@ async fn backup_capture_cancelled_or_busy_admission_does_not_leak_the_controller
     let controller = fixture.open(Some(config)).await;
     let before = controller.inspect().unwrap();
     let session = controller.begin_session(&before).await.unwrap();
+    let error = controller
+        .capture_for_backup_until(
+            &before,
+            tokio::time::Instant::now() + Duration::from_millis(20),
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("capture admission deadline elapsed")
+    );
     assert!(
         tokio::time::timeout(
             Duration::from_millis(20),
@@ -1377,7 +1389,13 @@ async fn controller_backup_capture_owns_the_actual_frontend_pause_and_resumes_on
     assert_eq!(provider.reads.load(Ordering::SeqCst), 0);
     let actual_root = config.root.canonicalize().unwrap();
     let actual_working_copy = working_copy.path().to_owned();
-    let capture = controller.capture_for_backup(&expected).await.unwrap();
+    let capture = controller
+        .capture_for_backup_until(
+            &expected,
+            tokio::time::Instant::now() + Duration::from_secs(5),
+        )
+        .await
+        .unwrap();
     assert_eq!(capture.projection_state(), &expected);
     assert_eq!(capture.binding().root(), actual_root);
     assert_eq!(

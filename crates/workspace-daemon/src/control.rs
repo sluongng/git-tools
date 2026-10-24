@@ -57,6 +57,11 @@ pub enum Request {
     NativeMounted {
         workspace_id: String,
     },
+    /// Preview by default; apply only unreachable objects in a managed cohort.
+    NativeGc {
+        store: String,
+        apply: bool,
+    },
     /// Detach only a privately recorded, proven disconnected native mount.
     NativeRecover {
         workspace_id: String,

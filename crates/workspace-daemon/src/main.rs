@@ -56,6 +56,13 @@ enum Operation {
     },
     /// Retry retained BES events after a forwarding failure, without stopping mounts.
     RetryBes,
+    /// Preview native unreachable objects; --apply performs the bounded sweep.
+    NativeGc {
+        #[arg(long)]
+        store: String,
+        #[arg(long)]
+        apply: bool,
+    },
     /// Create a private writable source workspace; pin a full commit SHA.
     Create {
         session: PathBuf,
@@ -196,6 +203,9 @@ async fn run(cli: Cli) -> Result<serde_json::Value> {
     let report = match cli.command {
         Operation::Status { session: None } => return controller.call(Request::Status),
         Operation::RetryBes => return controller.call(Request::RetryBes),
+        Operation::NativeGc { store, apply } => {
+            return controller.call(Request::NativeGc { store, apply });
+        }
         Operation::Shutdown => return controller.call(Request::Shutdown),
         Operation::Status {
             session: Some(session),

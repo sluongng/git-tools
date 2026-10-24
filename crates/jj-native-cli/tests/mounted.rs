@@ -1,6 +1,7 @@
 //! Shipped CLI acceptance against an actual Linux FUSE mount. Protocol fixtures
 //! must not count as acceptance of lazy, externally administered workspaces.
 #![cfg(target_os = "linux")]
+#![cfg_attr(feature = "native-gc-benchmark", recursion_limit = "256")]
 
 use futures::StreamExt;
 use jj_lib::object_id::ObjectId as _;
@@ -187,6 +188,24 @@ impl Fixture {
                     "policy".into(),
                     policy.into(),
                 )])),
+            );
+        fs::write(&self.daemon_config, toml::to_string(&config).unwrap()).unwrap();
+        workspace_daemon::config::Config::load(&self.daemon_config).unwrap();
+    }
+
+    fn enable_local_gc(&mut self) {
+        let mut config: toml::Value =
+            toml::from_str(&fs::read_to_string(&self.daemon_config).unwrap()).unwrap();
+        config["native"]["workspaces"]
+            .as_table_mut()
+            .unwrap()
+            .insert(
+                "gc".into(),
+                toml::Value::Table(toml::map::Map::from_iter([
+                    ("policy".into(), "local_complete".into()),
+                    // Fixture-only: production retains the conservative grace.
+                    ("grace_seconds".into(), 0.into()),
+                ])),
             );
         fs::write(&self.daemon_config, toml::to_string(&config).unwrap()).unwrap();
         workspace_daemon::config::Config::load(&self.daemon_config).unwrap();
@@ -556,6 +575,7 @@ fn shipped_cli_uses_lazy_mounts_and_external_per_workspace_state() {
         !rejected.exists(),
         "a missing broker must not create a checkout"
     );
+    fixture.enable_local_gc();
     fixture.start();
     let root = base_dir.join("workspace");
     fixture.initialize(&root);
@@ -606,10 +626,55 @@ fn shipped_cli_uses_lazy_mounts_and_external_per_workspace_state() {
     fixture.success(&second, &["status"]);
     assert!(!root.join("independent.txt").exists());
     assert!(!second.join("hello.txt").exists());
+    let status = fixture.control(Request::Status).unwrap();
+    assert_eq!(status["native"]["commands"]["collection_enabled"], true);
+    assert!(
+        status["native"]["commands"]["local_gc"]["clean_checkpoints"]
+            .as_u64()
+            .unwrap()
+            > 0
+    );
+    assert_eq!(
+        status["native"]["commands"]["local_gc"]["automatic_collection"],
+        false
+    );
+
+    // The old child is no longer an ancestor after describe. Its undo/index
+    // history must nevertheless remain a complete root across explicit GC.
+    fixture.success(&root, &["describe", "-m", "amended child retained by GC"]);
+    let amended_child = fixture.revision(&root, "@");
+    assert_ne!(amended_child, child);
+    assert_eq!(native_gc_report(&mut fixture, false)["status"], "planned");
+    assert_eq!(native_gc_report(&mut fixture, true)["status"], "collected");
+    fixture.success(&root, &["undo"]);
+    assert_eq!(fixture.revision(&root, "@"), child);
+    fixture.success(&root, &["edit", &amended_child]);
+    fixture.success(&root, &["edit", &child]);
+    assert_eq!(
+        fs::read(root.join("hello.txt")).unwrap(),
+        b"second native version\n"
+    );
 
     // Do not snapshot this last edit. Stopping and resuming must preserve
     // unsnapshotted bytes as well as the previous canonical operation state.
     fs::write(root.join("hello.txt"), "dirty across restart\n").unwrap();
+    fs::write(
+        second.join("independent.txt"),
+        "second dirty across restart\n",
+    )
+    .unwrap();
+    // Core's dirty bytes are outside the authoritative native Store sweep.
+    // They need not block collection, but neither workspace may lose them.
+    assert_eq!(native_gc_report(&mut fixture, false)["status"], "planned");
+    assert_eq!(native_gc_report(&mut fixture, true)["status"], "collected");
+    assert_eq!(
+        fs::read(root.join("hello.txt")).unwrap(),
+        b"dirty across restart\n"
+    );
+    assert_eq!(
+        fs::read(second.join("independent.txt")).unwrap(),
+        b"second dirty across restart\n"
+    );
     fixture.success(
         &base_dir,
         &["tinytree", "unmount", second.to_str().unwrap()],
@@ -620,8 +685,60 @@ fn shipped_cli_uses_lazy_mounts_and_external_per_workspace_state() {
         "no materialized fallback remains"
     );
     fixture.stop_daemon();
+    let store_path = fixture
+        .socket
+        .parent()
+        .unwrap()
+        .join("native/example/native-objects");
+    let orphan_bytes = b"unreachable offline GC fixture file\n";
+    let orphan = m::describe_file(orphan_bytes);
+    // Deliberate fault injection, not a supported editing path: the daemon is
+    // stopped and this Store owns the exclusive lock throughout the append.
+    {
+        let store = tinytree_store::Store::open_existing(&store_path, Default::default()).unwrap();
+        store.put("local", orphan, orphan_bytes, 0).unwrap();
+    }
+    let orphan_path = store_path
+        .join("repos/local")
+        .join((m::Kind::File as u8).to_string())
+        .join(capture_identity(&orphan.key.id.0));
+    assert_eq!(fs::read(&orphan_path).unwrap(), orphan_bytes);
     fixture.start();
+    let unscoped = workspace_daemon::control::Client {
+        socket: fixture.socket.clone(),
+    }
+    .call(Request::NativeGc {
+        store: "example".into(),
+        apply: true,
+    });
+    assert!(
+        unscoped
+            .unwrap_err()
+            .to_string()
+            .contains("configuration-scoped")
+    );
+    assert_eq!(fs::read(&orphan_path).unwrap(), orphan_bytes);
+    let preview = native_gc_report(&mut fixture, false);
+    assert_eq!(preview["status"], "planned");
+    assert!(preview["would_delete_objects"].as_u64().unwrap() >= 1);
+    assert!(preview["would_delete_logical_bytes"].as_u64().unwrap() >= orphan.size_bytes);
+    assert_eq!(
+        fs::read(&orphan_path).unwrap(),
+        orphan_bytes,
+        "preview cannot unlink a candidate"
+    );
+    let applied = native_gc_report(&mut fixture, true);
+    assert_eq!(applied["status"], "collected");
+    assert!(applied["deleted_objects"].as_u64().unwrap() >= 1);
+    assert!(applied["unlinked_payloads"].as_u64().unwrap() >= 1);
+    assert!(!orphan_path.exists());
     fixture.success(&base_dir, &["tinytree", "resume", root.to_str().unwrap()]);
+    fixture.success(&base_dir, &["tinytree", "resume", second.to_str().unwrap()]);
+    assert_eq!(fixture.binding(&second), second_binding);
+    assert_eq!(
+        fs::read(second.join("independent.txt")).unwrap(),
+        b"second dirty across restart\n"
+    );
     assert_fuse_mounted(&root);
     assert_eq!(fixture.binding(&root), binding);
     assert_eq!(
@@ -633,8 +750,90 @@ fn shipped_cli_uses_lazy_mounts_and_external_per_workspace_state() {
         fixture.success(&root, &["file", "show", "hello.txt"]),
         "dirty across restart\n"
     );
+    fixture.success(&second, &["status"]);
+    assert_eq!(
+        fixture.success(&second, &["file", "show", "independent.txt"]),
+        "second dirty across restart\n"
+    );
+    assert_eq!(native_gc_report(&mut fixture, true)["status"], "collected");
+    fixture.success(
+        &base_dir,
+        &["tinytree", "unmount", second.to_str().unwrap()],
+    );
     fixture.success(&base_dir, &["tinytree", "unmount", root.to_str().unwrap()]);
     fixture.stop_daemon();
+    // Final offline inspection has no live daemon or native provider owner.
+    {
+        let store = tinytree_store::Store::open_existing(&store_path, Default::default()).unwrap();
+        assert_eq!(store.descriptor("local", orphan.key).unwrap(), None);
+        for bytes in [
+            b"first native version\n".as_slice(),
+            b"second native version\n".as_slice(),
+            b"second agent\n".as_slice(),
+            b"dirty across restart\n".as_slice(),
+            b"second dirty across restart\n".as_slice(),
+        ] {
+            let descriptor = m::describe_file(bytes);
+            assert_eq!(
+                store.descriptor("local", descriptor.key).unwrap(),
+                Some(descriptor)
+            );
+            let mut actual = Vec::new();
+            store
+                .read("local", descriptor.key)
+                .unwrap()
+                .read_to_end(&mut actual)
+                .unwrap();
+            assert_eq!(actual, bytes);
+        }
+        for id in [&base, &child, &amended_child] {
+            let key = m::ObjectKey {
+                kind: m::Kind::Commit,
+                id: m::ObjectId(*blake3::Hash::from_hex(id).unwrap().as_bytes()),
+            };
+            assert!(store.descriptor("local", key).unwrap().is_some());
+        }
+    }
+    assert_gc_rejects_unenrolled_state();
+}
+
+fn native_gc_report(fixture: &mut Fixture, apply: bool) -> serde_json::Value {
+    let args = if apply {
+        vec!["native-gc", "--store", "example", "--apply"]
+    } else {
+        vec!["native-gc", "--store", "example"]
+    };
+    let output = fixture.workspace(&args);
+    assert!(
+        output.status.success(),
+        "native GC {args:?}: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let envelope: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(envelope["ok"], true);
+    envelope
+        .get("report")
+        .filter(|report| report.is_object())
+        .expect("native GC CLI must return its report object")
+        .clone()
+}
+
+fn assert_gc_rejects_unenrolled_state() {
+    let mut fixture = Fixture::new();
+    fixture.start();
+    let base = fixture.base().to_owned();
+    let root = base.join("unenrolled");
+    fixture.initialize(&root);
+    let binding = fixture.binding(&root);
+    fixture.success(&base, &["tinytree", "unmount", root.to_str().unwrap()]);
+    fixture.stop_daemon();
+    let retained = native_admin_state(&binding);
+    fixture.enable_local_gc();
+    let rejected = fixture.workspace(&["serve"]);
+    assert!(!rejected.status.success());
+    assert!(String::from_utf8_lossy(&rejected.stderr).contains("cohort"));
+    assert_eq!(native_admin_state(&binding), retained);
+    assert!(!fuse_mounted(&root));
 }
 
 const REMOTE_TOKEN: &str = "public-mounted-native-token-not-a-secret";
@@ -2339,6 +2538,14 @@ struct NativeAdminState {
     working_copy: Vec<u8>,
 }
 fn native_admin_state(binding: &native_workspace_admin::Binding) -> NativeAdminState {
+    let index_type = fs::read_to_string(binding.repo.join("index/type")).unwrap();
+    let associations = if index_type == jj_native_index::NAME {
+        "operations"
+    } else if index_type == jj_lib::default_index::DefaultIndexStore::NAME {
+        "op_links"
+    } else {
+        panic!("unsupported recorded index type for native admin state");
+    };
     let (wc, _) =
         jj_vfs::native::read_retained_state_for_capture(&binding.projection(), 1024 * 1024)
             .unwrap();
@@ -2347,7 +2554,7 @@ fn native_admin_state(binding: &native_workspace_admin::Binding) -> NativeAdminS
         heads: native_operation_heads(binding),
         operations: files_in(&binding.repo.join("op_store/operations")),
         views: files_in(&binding.repo.join("op_store/views")),
-        index_associations: files_in(&binding.repo.join("index/operations")),
+        index_associations: files_in(&binding.repo.join("index").join(associations)),
         working_copy: wc.persisted_bytes.to_vec(),
     }
 }
@@ -3040,6 +3247,261 @@ fn native_mounted_startup_benchmark_ladder() {
                     "default_log_template_unchanged":true,"native_index_store_default_not_assumed":true
                 })
             );
+        }
+    }
+}
+
+// The dedicated manual Bazel fixture enables this feature; ordinary mounted
+// acceptance does not compile or run the iterative measurement workload.
+#[cfg(feature = "native-gc-benchmark")]
+mod native_gc_measurements {
+    use super::*;
+    use std::os::unix::fs::MetadataExt;
+
+    const FILE_BYTES: usize = 4096;
+    const TRIALS: usize = 3;
+
+    fn nanos(started: Instant) -> u64 {
+        u64::try_from(started.elapsed().as_nanos()).unwrap()
+    }
+    fn file_version(iteration: usize) -> Vec<u8> {
+        let mut bytes = vec![b'x'; FILE_BYTES];
+        let prefix = format!("native local snapshot {iteration:04}\n");
+        bytes[..prefix.len()].copy_from_slice(prefix.as_bytes());
+        bytes
+    }
+    fn number(value: &serde_json::Value, name: &str) -> u64 {
+        value[name].as_u64().unwrap()
+    }
+    fn command_statistics(samples: &[u64]) -> serde_json::Value {
+        assert!(!samples.is_empty());
+        let mut ordered = samples.to_vec();
+        ordered.sort_unstable();
+        let middle = ordered.len() / 2;
+        let median = (ordered[(ordered.len() - 1) / 2] as u128 + ordered[middle] as u128) / 2;
+        let p95 = (ordered.len() * 95).div_ceil(100) - 1;
+        serde_json::json!({"median_ns":median,"p95_ns":ordered[p95],
+            "first_ns":samples[0],"last_ns":samples[samples.len()-1],"samples_ns":samples})
+    }
+    fn stopped_store_disk(root: &Path) -> serde_json::Value {
+        let mut pending = vec![root.to_owned()];
+        let mut inodes = HashSet::new();
+        let mut apparent = 0u64;
+        let mut allocated = 0u64;
+        let mut files = 0u64;
+        while let Some(path) = pending.pop() {
+            let metadata = fs::symlink_metadata(&path).unwrap();
+            assert!(!metadata.file_type().is_symlink());
+            if !inodes.insert((metadata.dev(), metadata.ino())) {
+                continue;
+            }
+            allocated += metadata.blocks().checked_mul(512).unwrap();
+            if metadata.is_dir() {
+                for entry in fs::read_dir(path).unwrap() {
+                    pending.push(entry.unwrap().path());
+                }
+            } else {
+                assert!(metadata.is_file());
+                apparent += metadata.len();
+                files += 1;
+            }
+        }
+        serde_json::json!({"apparent_file_bytes":apparent,"allocated_bytes":allocated,
+            "regular_files":files,"owner_stopped":true})
+    }
+    fn revision_at(fixture: &mut Fixture, root: &Path, operation: Option<&str>) -> String {
+        let mut args = vec!["--ignore-working-copy"];
+        if let Some(operation) = operation {
+            args.extend(["--at-op", operation]);
+        }
+        args.extend(["log", "--no-graph", "-r", "@", "-T", "commit_id"]);
+        let revision = fixture.success(root, &args).trim().to_owned();
+        assert_eq!(revision.len(), 64);
+        assert!(revision.bytes().all(|byte| byte.is_ascii_hexdigit()));
+        revision
+    }
+    fn old_file(fixture: &mut Fixture, root: &Path, operation: &str) -> Vec<u8> {
+        fixture
+            .success(
+                root,
+                &[
+                    "--ignore-working-copy",
+                    "--at-op",
+                    operation,
+                    "file",
+                    "show",
+                    "working.txt",
+                ],
+            )
+            .into_bytes()
+    }
+    fn run_trial(iterations: usize, trial: usize, complete: bool) -> serde_json::Value {
+        let mut fixture = Fixture::new();
+        if complete {
+            // Policy is selected before ANY native storage exists and never
+            // changed for this cohort. Grace0 belongs only to the fixture.
+            fixture.enable_local_gc();
+        }
+        let started = Instant::now();
+        fixture.start();
+        let daemon_start_ns = nanos(started);
+        let base = fixture.base().to_owned();
+        let root = base.join("workspace");
+        let started = Instant::now();
+        fixture.initialize(&root);
+        let initialize_mount_ns = nanos(started);
+        let binding = fixture.binding(&root);
+        assert_eq!(
+            fs::read_to_string(binding.repo.join("index/type")).unwrap(),
+            jj_lib::default_index::DefaultIndexStore::NAME
+        );
+        let corpus: Vec<_> = (1..=iterations).map(file_version).collect();
+        let mut digest = blake3::Hasher::new();
+        for bytes in &corpus {
+            digest.update(bytes);
+        }
+        let before = fixture.control(Request::Status).unwrap()["native"]["commands"].clone();
+        assert_eq!(before["collection_enabled"], complete);
+        let mut samples = Vec::with_capacity(iterations);
+        let loop_started = Instant::now();
+        for bytes in &corpus {
+            fs::write(root.join("working.txt"), bytes).unwrap();
+            let command_started = Instant::now();
+            fixture.success(&root, &["status"]);
+            samples.push(nanos(command_started));
+        }
+        let iteration_wall_ns = nanos(loop_started);
+        let after = fixture.control(Request::Status).unwrap()["native"]["commands"].clone();
+        assert_eq!(after["active_commands"], 0);
+        let clean = number(&after["local_gc"], "clean_checkpoints")
+            - number(&before["local_gc"], "clean_checkpoints");
+        let blocked = number(&after["local_gc"], "blocked_checkpoints")
+            - number(&before["local_gc"], "blocked_checkpoints");
+        assert_eq!(clean, if complete { iterations as u64 } else { 0 });
+        assert_eq!(
+            blocked, 0,
+            "never measure a failed checkpoint as LocalComplete cost"
+        );
+
+        // Identical proof commands in both modes, entirely outside the timed
+        // snapshot loop. The oldest of N successive snapshot operations binds
+        // the first version; its expected contents are verified, not assumed.
+        let operations = fixture.success(
+            &root,
+            &[
+                "--ignore-working-copy",
+                "op",
+                "log",
+                "--no-graph",
+                "-n",
+                &iterations.to_string(),
+                "-T",
+                "id ++ \"\\n\"",
+            ],
+        );
+        let operations: Vec<_> = operations.lines().filter(|line| !line.is_empty()).collect();
+        assert_eq!(operations.len(), iterations);
+        assert!(
+            operations
+                .iter()
+                .all(|id| id.len() == 128 && id.bytes().all(|b| b.is_ascii_hexdigit()))
+        );
+        let oldest = operations[operations.len() - 1].to_owned();
+        let first_revision = revision_at(&mut fixture, &root, Some(&oldest));
+        let last_revision = revision_at(&mut fixture, &root, None);
+        assert_ne!(first_revision, last_revision);
+        let (preview_ns, preview, apply_ns, applied) = if complete {
+            let started = Instant::now();
+            let preview = native_gc_report(&mut fixture, false);
+            let preview_ns = nanos(started);
+            assert_eq!(preview["status"], "planned");
+            let started = Instant::now();
+            let applied = native_gc_report(&mut fixture, true);
+            let apply_ns = nanos(started);
+            assert_eq!(applied["status"], "collected");
+            (Some(preview_ns), preview, Some(apply_ns), applied)
+        } else {
+            (None, serde_json::Value::Null, None, serde_json::Value::Null)
+        };
+        assert_eq!(old_file(&mut fixture, &root, &oldest), corpus[0]);
+        assert_eq!(
+            fs::read(root.join("working.txt")).unwrap(),
+            corpus[iterations - 1]
+        );
+        fixture.success(&base, &["tinytree", "unmount", root.to_str().unwrap()]);
+        assert!(
+            !root.join("working.txt").exists(),
+            "no materialized fallback remains"
+        );
+        fixture.stop_daemon();
+        let store = fixture
+            .socket
+            .parent()
+            .unwrap()
+            .join("native/example/native-objects");
+        let stopped_disk = stopped_store_disk(&store);
+
+        let started = Instant::now();
+        fixture.start();
+        let restart_daemon_ns = nanos(started);
+        let started = Instant::now();
+        fixture.success(&base, &["tinytree", "resume", root.to_str().unwrap()]);
+        let resume_mount_ns = nanos(started);
+        assert_fuse_mounted(&root);
+        assert_eq!(fixture.binding(&root), binding);
+        assert_eq!(
+            fs::read(root.join("working.txt")).unwrap(),
+            corpus[iterations - 1]
+        );
+        assert_eq!(revision_at(&mut fixture, &root, None), last_revision);
+        assert_eq!(
+            revision_at(&mut fixture, &root, Some(&oldest)),
+            first_revision
+        );
+        assert_eq!(old_file(&mut fixture, &root, &oldest), corpus[0]);
+        fixture.success(&base, &["tinytree", "unmount", root.to_str().unwrap()]);
+        assert!(!root.join("working.txt").exists());
+        fixture.stop_daemon();
+        let restarted_disk = stopped_store_disk(&store);
+        serde_json::json!({
+            "schema":1,"benchmark":"native_mounted_local_gc_iterations","measurement":true,"status":"completed",
+            "policy":if complete {"local_complete"} else {"disabled"},"iterations":iterations,"trial":trial,"trials":TRIALS,
+            "file_bytes":FILE_BYTES,"payload_corpus_digest":digest.finalize().to_hex().to_string(),
+            "workspace_provider":"actual_linux_fuse","index_mode":"legacy","external_network":false,
+            "fresh_cohort_each_mode":true,"os_cache_uncontrolled":true,"fixture_grace_seconds":if complete {Some(0)} else {None},
+            "daemon_start_ns":daemon_start_ns,"initialize_mount_ns":initialize_mount_ns,
+            "iteration_wall_ns":iteration_wall_ns,"status_commands":command_statistics(&samples),
+            "clean_checkpoints_in_loop":clean,"blocked_checkpoints_in_loop":blocked,
+            "command_physical_drain_ns_in_loop":number(&after,"physical_drain_ns")-number(&before,"physical_drain_ns"),
+            "retention_encoded_write_bytes_in_loop":number(&after,"retention_encoded_write_bytes")-number(&before,"retention_encoded_write_bytes"),
+            "preview_cli_wall_ns":preview_ns,"preview":preview,"apply_cli_wall_ns":apply_ns,"apply":applied,
+            "preview_primes_apply_cache":complete,"restart_daemon_ns":restart_daemon_ns,"resume_mount_ns":resume_mount_ns,
+            "native_store_after_stop":stopped_disk,"native_store_after_restart_and_stop":restarted_disk,
+            "disk_scope":"authoritative_native_store_only_excludes_jj_admin_core_cas_and_registry",
+            "allocated_method":"namespace_st_blocks_times512_unique_inode_including_directories_not_df_or_rss",
+            "first_and_last_history_verified_after_restart":true,"full_history_retained":true,"synthetic_orphans_injected":false,
+            "cli_exit_poll_ms":10,"daemon_readiness_poll_ms":20,"no_disk_plateau_or_remote_bazel_claim":true
+        })
+    }
+
+    #[test]
+    #[ignore = "opt-in native GC iteration measurement"]
+    fn native_gc_iteration_benchmark() {
+        let profiles = match std::env::var("TINYTREE_MOUNTED_GC_BENCH_ITERATIONS") {
+            Err(std::env::VarError::NotPresent) => vec![16, 128],
+            Ok(value) if value == "16" => vec![16],
+            Ok(value) if value == "128" => vec![128],
+            Ok(value) if value == "1024" => vec![1024],
+            _ => panic!("native GC benchmark iterations must be 16, 128 or 1024"),
+        };
+        for iterations in profiles {
+            for trial in 1..=TRIALS {
+                for complete in [false, true] {
+                    // A success row is emitted only after this complete trial's
+                    // history/GC/restart proofs have all passed.
+                    eprintln!("{}", run_trial(iterations, trial, complete));
+                }
+            }
         }
     }
 }

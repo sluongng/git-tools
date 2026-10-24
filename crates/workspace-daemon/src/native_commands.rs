@@ -1,4 +1,4 @@
-//! Host-owned dirty command fences. No collector or Clean checkpoint is exposed.
+//! Host-owned command fences and optional complete-local root checkpoints.
 use anyhow::{Context, Result, ensure};
 use async_trait::async_trait;
 use fs2::FileExt;
@@ -27,6 +27,14 @@ const MAX_ACTIVE: usize = 64;
 struct Header {
     version: u32,
     id: RegistryId,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    collection: Option<CollectionIdentity>,
+}
+#[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct CollectionIdentity {
+    version: u32,
+    alias: String,
 }
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -70,6 +78,7 @@ struct Session {
 struct Inner {
     registry: Registry,
     capture: Arc<crate::native_capture::Coordinator>,
+    gc: Arc<crate::native_gc::Coordinator>,
     incarnation: [u8; 16],
     records: PrivateDir,
     workspaces: RwLock<HashMap<String, Arc<Workspace>>>,
@@ -215,8 +224,32 @@ impl NativeCommandHost {
         path: &Path,
         capture: crate::config::NativeCapture,
     ) -> Result<Self> {
+        Self::open_with_policy(
+            path,
+            capture,
+            crate::config::NativeGc::default(),
+            None,
+            None,
+        )
+        .await
+    }
+    pub(crate) async fn open_with_policy(
+        path: &Path,
+        capture: crate::config::NativeCapture,
+        gc: crate::config::NativeGc,
+        alias: Option<String>,
+        fresh_cohort: Option<crate::native_gc::FreshCohort>,
+    ) -> Result<Self> {
         let directory = PrivateDir::create(path)?;
         let fresh = !directory.path().join("identity.json").try_exists()?;
+        let collection = if gc.policy == crate::config::NativeGcPolicy::LocalComplete {
+            Some(CollectionIdentity {
+                version: 1,
+                alias: alias.context("local collection alias missing")?,
+            })
+        } else {
+            None
+        };
         let header = match directory.read("identity.json", MAX_RECORD) {
             Ok(bytes) => serde_json::from_slice::<Header>(&bytes)?,
             Err(error) if !directory.path().join("identity.json").try_exists()? => {
@@ -224,9 +257,14 @@ impl NativeCommandHost {
                     std::fs::read_dir(directory.path())?.next().is_none(),
                     "unknown native command state; preserve it"
                 );
+                ensure!(
+                    collection.is_none() || fresh_cohort.is_some(),
+                    "local collection requires a genuinely fresh native cohort"
+                );
                 let header = Header {
-                    version: 1,
+                    version: if collection.is_some() { 2 } else { 1 },
                     id: RegistryId::random(),
+                    collection: collection.clone(),
                 };
                 directory.replace("identity.json", &serde_json::to_vec(&header)?)?;
                 let _ = error;
@@ -235,8 +273,13 @@ impl NativeCommandHost {
             Err(error) => return Err(error.into()),
         };
         ensure!(
-            header.version == 1,
+            (header.version == 1 && header.collection.is_none())
+                || (header.version == 2 && header.collection.is_some()),
             "unsupported native command registry version"
+        );
+        ensure!(
+            header.collection == collection,
+            "native collection cohort policy differs; existing state is preserved"
         );
         let ledger = directory.path().join("ledger");
         let registry = if ledger.try_exists()? {
@@ -248,7 +291,17 @@ impl NativeCommandHost {
             );
             // Existing storage cannot be called ManagedFresh merely because
             // this ledger is new. Checkpoint A never enables collection.
-            Registry::init(&ledger, header.id, Tracking::Untracked, Default::default()).await?
+            Registry::init(
+                &ledger,
+                header.id,
+                if collection.is_some() {
+                    Tracking::ManagedFresh
+                } else {
+                    Tracking::Untracked
+                },
+                Default::default(),
+            )
+            .await?
         };
         let records = PrivateDir::create(directory.path().join("records"))?;
         let capture = crate::native_capture::Coordinator::open(
@@ -261,6 +314,7 @@ impl NativeCommandHost {
             inner: Arc::new(Inner {
                 registry,
                 capture,
+                gc: crate::native_gc::Coordinator::new(gc),
                 incarnation: *uuid::Uuid::new_v4().as_bytes(),
                 records,
                 workspaces: Default::default(),
@@ -283,8 +337,19 @@ impl NativeCommandHost {
         });
         Ok(host)
     }
+    /// Keep this scope through the entire accepted host operation and durable
+    /// Dirty enrollment, not merely one bootstrap RPC. It is not root proof.
+    pub(crate) fn host_access(
+        &self,
+    ) -> std::result::Result<Arc<native_retention::HostAccessGuard>, Status> {
+        self.inner
+            .registry
+            .try_host_access()
+            .map(Arc::new)
+            .map_err(status)
+    }
     pub async fn register(&self, binding: &Binding, identity: [u8; 32]) -> Result<()> {
-        self.register_inner(binding, identity, false)
+        self.register_inner(binding, identity, false, None)
             .await
             .map(|_| ())
     }
@@ -296,18 +361,67 @@ impl NativeCommandHost {
         binding: &Binding,
         identity: [u8; 32],
     ) -> Result<CommandStartupReservation> {
-        let workspace = self.register_inner(binding, identity, true).await?;
+        let workspace = self.register_inner(binding, identity, true, None).await?;
         Ok(CommandStartupReservation {
             inner: self.inner.clone(),
             workspace,
         })
+    }
+    pub(crate) async fn register_with_host_access(
+        &self,
+        binding: &Binding,
+        identity: [u8; 32],
+        access: Arc<native_retention::HostAccessGuard>,
+    ) -> Result<()> {
+        self.register_inner(binding, identity, false, Some(access))
+            .await
+            .map(|_| ())
+    }
+    pub(crate) async fn register_reserved_with_host_access(
+        &self,
+        binding: &Binding,
+        identity: [u8; 32],
+        access: Arc<native_retention::HostAccessGuard>,
+    ) -> Result<CommandStartupReservation> {
+        let workspace = self
+            .register_inner(binding, identity, true, Some(access))
+            .await?;
+        Ok(CommandStartupReservation {
+            inner: self.inner.clone(),
+            workspace,
+        })
+    }
+    /// Manager holds a stopped/gated frontend and the host fence before using
+    /// this explicit invalidation. Existing roots stay pinned until recaptured.
+    pub(crate) async fn invalidate_workspace_with_host_access(
+        &self,
+        binding: &Binding,
+        identity: [u8; 32],
+        access: Arc<native_retention::HostAccessGuard>,
+    ) -> Result<()> {
+        let workspace = self
+            .workspace(&binding.rpc_mount_id)
+            .map_err(|_| anyhow::anyhow!("native workspace unavailable"))?;
+        ensure!(
+            workspace.binding == *binding && workspace.mapping.identity == identity,
+            "native command startup binding differs"
+        );
+        self.inner
+            .registry
+            .mark_dirty_with_host_access(workspace.registration, access)
+            .await?;
+        Ok(())
     }
     async fn register_inner(
         &self,
         binding: &Binding,
         identity: [u8; 32],
         reserved: bool,
+        access: Option<Arc<native_retention::HostAccessGuard>>,
     ) -> Result<Arc<Workspace>> {
+        if let Some(access) = &access {
+            self.inner.registry.validate_host_access(access)?;
+        }
         let _start = self.inner.starts.lock().await;
         let mount = binding.rpc_mount_id.clone();
         ensure!(
@@ -349,11 +463,20 @@ impl NativeCommandHost {
             mapping.workspace.0 != [0; 16] && mapping.op_store.0 != [0; 16],
             "invalid native command registration identity"
         );
-        let registration = self
-            .inner
-            .registry
-            .register(mapping.workspace, mapping.op_store)
-            .await?;
+        let registration = match access {
+            Some(access) => {
+                self.inner
+                    .registry
+                    .register_with_host_access(mapping.workspace, mapping.op_store, access)
+                    .await?
+            }
+            None => {
+                self.inner
+                    .registry
+                    .register(mapping.workspace, mapping.op_store)
+                    .await?
+            }
+        };
         let lease = native_vfs_rpc::command_lock_path(&binding.admin, &mount)?;
         let parent = lease
             .parent()
@@ -729,22 +852,40 @@ impl NativeCommandHost {
             .lock()
             .ok()
             .and_then(|target| target.clone());
-        let plan = self.inner.capture.select(target);
+        let clean = if self.inner.gc.config.policy == crate::config::NativeGcPolicy::LocalComplete {
+            target
+                .clone()
+                .and_then(|target| self.inner.gc.select().map(|permit| (target, permit)))
+        } else {
+            None
+        };
+        let plan = if clean.is_none() {
+            self.inner.capture.select(target)
+        } else {
+            crate::native_capture::Plan::DrainOnly
+        };
+        let deadline = std::time::Instant::now()
+            + std::time::Duration::from_millis(self.inner.gc.config.timeout_ms);
         let host = self.clone();
         tokio::spawn(async move {
             let drain_started = std::time::Instant::now();
-            let result = match plan {
-                crate::native_capture::Plan::DrainOnly => host
-                    .inner
-                    .registry
-                    .drain_dirty(CommandToken::from_bytes(session.token))
+            let result = if let Some((target, permit)) = clean {
+                host.checkpoint_session(&session, target, permit, deadline)
                     .await
-                    .map_err(status),
-                crate::native_capture::Plan::Capture {
-                    target,
-                    permit,
-                    disk,
-                } => host.capture_session(&session, target, permit, disk).await,
+            } else {
+                match plan {
+                    crate::native_capture::Plan::DrainOnly => host
+                        .inner
+                        .registry
+                        .drain_dirty(CommandToken::from_bytes(session.token))
+                        .await
+                        .map_err(status),
+                    crate::native_capture::Plan::Capture {
+                        target,
+                        permit,
+                        disk,
+                    } => host.capture_session(&session, target, permit, disk).await,
+                }
             };
             match result {
                 Ok(()) => {
@@ -772,6 +913,96 @@ impl NativeCommandHost {
             }
             session.changed.notify_waiters();
         });
+    }
+    async fn checkpoint_session(
+        &self,
+        session: &Arc<Session>,
+        target: Arc<crate::native_capture::Target>,
+        permit: Arc<tokio::sync::OwnedSemaphorePermit>,
+        deadline: std::time::Instant,
+    ) -> std::result::Result<(), Status> {
+        let command = session
+            .owner
+            .lock()
+            .map_err(|_| Status::internal("native command owner unavailable"))?
+            .clone()
+            .ok_or_else(|| Status::failed_precondition("native command owner closed"))?;
+        let completion = Arc::new(crate::native_capture::Completion::default());
+        let done = completion.clone();
+        let coordinator = self.inner.gc.clone();
+        let lease = session.workspace.lease.clone();
+        let identity = session.workspace.lease_identity;
+        let _admission = permit.clone();
+        let callback = move || async move {
+            let kernel = loop {
+                if std::time::Instant::now() >= deadline {
+                    done.complete();
+                    return Err(native_retention::Error::Limit("checkpoint deadline"));
+                }
+                match existing_lease(&lease, Some(identity)) {
+                    Ok(file) => match file.try_lock_exclusive() {
+                        Ok(()) => break file,
+                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+                        Err(_) => {
+                            done.complete();
+                            return Err(native_retention::Error::Storage);
+                        }
+                    },
+                    Err(_) => {
+                        done.complete();
+                        return Err(native_retention::Error::Storage);
+                    }
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            };
+            crate::native_gc::checkpoint(
+                coordinator,
+                target,
+                command,
+                kernel,
+                permit,
+                done,
+                deadline,
+            )
+            .await
+            .map_err(|_| native_retention::Error::Storage)
+        };
+        let result = self
+            .inner
+            .registry
+            .capture_checkpoint_owned(CommandToken::from_bytes(session.token), callback)
+            .await;
+        if !completion.wait(std::time::Duration::from_secs(5)).await {
+            self.inner.gc.disposition("indeterminate", false);
+            return Err(Status::failed_precondition(
+                "local checkpoint physical ownership requires recovery",
+            ));
+        }
+        match result {
+            Ok(_) => {
+                self.inner.gc.disposition("clean", true);
+                Ok(())
+            }
+            Err(_) => {
+                let state = self
+                    .inner
+                    .registry
+                    .workspace(session.workspace.registration)
+                    .await
+                    .map_err(status)?;
+                if state.state != native_retention::WorkspaceState::Dirty
+                    || state.command_epoch != session.epoch
+                {
+                    return Err(Status::failed_precondition(
+                        "local checkpoint requires dirty recovery",
+                    ));
+                }
+                self.inner.gc.disposition("inventory_unavailable", false);
+                // An unavailable complete inventory leaves the durable Dirty
+                // claim in place; it does not roll back a successful jj edit.
+                Ok(())
+            }
+        }
     }
     async fn capture_session(
         &self,
@@ -900,6 +1131,19 @@ impl NativeCommandHost {
     pub(crate) fn capture_registry(&self) -> Registry {
         self.inner.registry.clone()
     }
+    pub(crate) async fn collect_native(
+        &self,
+        store: Arc<jj_native_backend::DirectObjectIo>,
+        apply: bool,
+    ) -> Result<serde_json::Value> {
+        crate::native_gc::collect(
+            self.inner.gc.clone(),
+            self.inner.registry.clone(),
+            store,
+            apply,
+        )
+        .await
+    }
     pub(crate) fn set_upload_status(
         &self,
         stats: Arc<crate::native_capture_upload::Stats>,
@@ -937,7 +1181,7 @@ impl NativeCommandHost {
     }
     pub fn status(&self) -> serde_json::Value {
         let stats = self.inner.registry.storage_stats();
-        serde_json::json!({"active_commands":self.inner.sessions.lock().map(|s|s.len()).unwrap_or(MAX_ACTIVE),"registered_workspaces":self.inner.workspaces.read().map(|w|w.len()).unwrap_or(4096),"collection_enabled":false,"local_capture":self.inner.capture.status(),"capture_upload":self.inner.upload_status.get().map(|stats|stats.status()),
+        serde_json::json!({"active_commands":self.inner.sessions.lock().map(|s|s.len()).unwrap_or(MAX_ACTIVE),"registered_workspaces":self.inner.workspaces.read().map(|w|w.len()).unwrap_or(4096),"collection_enabled":self.inner.gc.config.policy==crate::config::NativeGcPolicy::LocalComplete,"local_gc":self.inner.gc.status(),"local_capture":self.inner.capture.status(),"capture_upload":self.inner.upload_status.get().map(|stats|stats.status()),
             "dirty_transitions":self.inner.dirty_transitions.load(Ordering::Relaxed),"dirty_transition_ns":self.inner.dirty_transition_ns.load(Ordering::Relaxed),"physical_drains":self.inner.drains.load(Ordering::Relaxed),"physical_drain_ns":self.inner.physical_drain_ns.load(Ordering::Relaxed),"retention_transactions":stats.transactions,"retention_encoded_write_bytes":stats.encoded_write_bytes})
     }
     pub async fn workspace_state(&self, mount: &str) -> Result<native_retention::WorkspaceInfo> {
@@ -1041,6 +1285,11 @@ impl CommandHost for NativeCommandHost {
                 .resolve(CommandToken::from_bytes(token))
                 .map_err(status)?,
         ))
+    }
+}
+impl native_broker::HostAccessResolver for NativeCommandHost {
+    fn acquire_host_access(&self) -> std::result::Result<native_broker::CommandGuard, Status> {
+        Ok(self.host_access()?)
     }
 }
 impl native_broker::CommandResolver for NativeCommandHost {

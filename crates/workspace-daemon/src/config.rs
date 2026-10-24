@@ -83,6 +83,7 @@ pub struct NativeWorkspaces {
     pub index_mode: NativeIndexMode,
     pub capture: NativeCapture,
     pub upload: NativeCaptureUpload,
+    pub gc: NativeGc,
     /// None uses the per-user registry shared with the native jj client.
     pub registry_path: Option<PathBuf>,
     pub max_workspaces: usize,
@@ -97,6 +98,7 @@ impl Default for NativeWorkspaces {
             index_mode: NativeIndexMode::Legacy,
             capture: NativeCapture::default(),
             upload: NativeCaptureUpload::default(),
+            gc: NativeGc::default(),
             registry_path: None,
             max_workspaces: 128,
             max_entries: 100_000,
@@ -110,6 +112,18 @@ impl NativeWorkspaces {
     fn validate(&self) -> Result<()> {
         self.capture.validate()?;
         self.upload.validate()?;
+        self.gc.validate()?;
+        if self.gc.policy == NativeGcPolicy::LocalComplete {
+            ensure!(
+                self.index_mode == NativeIndexMode::Legacy,
+                "local-complete collection requires legacy local index mode"
+            );
+            ensure!(
+                self.capture.policy == NativeCapturePolicy::Disabled
+                    && self.upload.policy == NativeCaptureUploadPolicy::Disabled,
+                "local-complete collection cannot combine with capture or upload policy"
+            );
+        }
         ensure!(
             (1..=4096).contains(&self.max_workspaces)
                 && (1..=1_000_000).contains(&self.max_entries)
@@ -125,6 +139,85 @@ impl NativeWorkspaces {
                 "native workspace registry must be a bounded absolute path"
             );
         }
+        Ok(())
+    }
+}
+
+/// Explicit unreachable collection for a newly managed, fully local cohort.
+/// This never permits reachable offload or retirement of operation history.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum NativeGcPolicy {
+    #[default]
+    Disabled,
+    LocalComplete,
+}
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct NativeGc {
+    pub policy: NativeGcPolicy,
+    pub grace_seconds: u64,
+    pub timeout_ms: u64,
+    pub max_operations: usize,
+    pub max_checkpoint_bytes: usize,
+    pub max_roots: usize,
+    pub max_catalog_records: usize,
+    pub max_marked_objects: usize,
+    pub max_metadata_bytes: u64,
+    pub max_deleted_objects: usize,
+    pub max_deleted_bytes: u64,
+}
+impl Default for NativeGc {
+    fn default() -> Self {
+        let limits = tinytree_store::ClientGcLimits::default();
+        Self {
+            policy: NativeGcPolicy::Disabled,
+            grace_seconds: 3600,
+            timeout_ms: 30_000,
+            max_operations: 4096,
+            max_checkpoint_bytes: 1024 * 1024 * 1024,
+            max_roots: limits.max_roots,
+            max_catalog_records: limits.max_catalog_records,
+            max_marked_objects: limits.max_marked_objects,
+            max_metadata_bytes: limits.max_metadata_bytes,
+            max_deleted_objects: limits.max_deleted_objects,
+            max_deleted_bytes: limits.max_deleted_bytes,
+        }
+    }
+}
+impl NativeGc {
+    pub(crate) fn limits(&self) -> tinytree_store::ClientGcLimits {
+        tinytree_store::ClientGcLimits {
+            max_roots: self.max_roots,
+            max_catalog_records: self.max_catalog_records,
+            max_marked_objects: self.max_marked_objects,
+            max_metadata_bytes: self.max_metadata_bytes,
+            max_deleted_objects: self.max_deleted_objects,
+            max_deleted_bytes: self.max_deleted_bytes,
+            ..Default::default()
+        }
+    }
+    fn validate(&self) -> Result<()> {
+        let limits = self.limits();
+        let caps = tinytree_store::ClientGcLimits::default();
+        // OP/view decoding and the legacy reader reserve five decode windows,
+        // in addition to bounded operation, edge and root bookkeeping.
+        ensure!(
+            (512 * 1024 * 1024..=2 * 1024 * 1024 * 1024).contains(&self.max_checkpoint_bytes),
+            "native checkpoint byte budget must be between 512 MiB and 2 GiB"
+        );
+        ensure!(
+            self.grace_seconds <= 30 * 24 * 3600
+                && (1000..=120_000).contains(&self.timeout_ms)
+                && (1..=65_537).contains(&self.max_operations)
+                && (1..=caps.max_roots).contains(&limits.max_roots)
+                && (1..=caps.max_catalog_records).contains(&limits.max_catalog_records)
+                && (1..=caps.max_marked_objects).contains(&limits.max_marked_objects)
+                && (4096..=caps.max_metadata_bytes).contains(&limits.max_metadata_bytes)
+                && (1..=caps.max_deleted_objects).contains(&limits.max_deleted_objects)
+                && (1..=caps.max_deleted_bytes).contains(&limits.max_deleted_bytes),
+            "invalid native collection bounds"
+        );
         Ok(())
     }
 }
@@ -308,6 +401,16 @@ impl Native {
     }
     fn validate(&self, policy: &reapi::policy::Policy) -> Result<()> {
         self.workspaces.validate()?;
+        if self.workspaces.gc.policy == NativeGcPolicy::LocalComplete {
+            ensure!(
+                self.repositories.len() == 1
+                    && self
+                        .repositories
+                        .values()
+                        .all(|repository| repository.remote.is_none()),
+                "local-complete collection requires one fully local repository alias"
+            );
+        }
         ensure!(
             self.repositories.len() <= 1024,
             "too many native repository aliases"
@@ -852,6 +955,7 @@ mod tests {
         assert!(old.native.repositories.is_empty());
         assert_eq!(old.native.workspaces.max_workspaces, 128);
         assert_eq!(old.native.workspaces.index_mode, NativeIndexMode::Legacy);
+        assert_eq!(old.native.workspaces.gc.policy, NativeGcPolicy::Disabled);
         assert_eq!(
             old.native.workspaces.capture.policy,
             NativeCapturePolicy::Disabled
@@ -905,6 +1009,51 @@ mod tests {
         );
         let mut configured: Config = toml::from_str(&input).unwrap();
         configured.validate().unwrap();
+        let parsed_gc: Config =
+            toml::from_str("[native.workspaces.gc]\npolicy='local_complete'\ngrace_seconds=3600\n")
+                .unwrap();
+        let mut local_gc = configured.clone();
+        local_gc.native.workspaces.gc = parsed_gc.native.workspaces.gc;
+        local_gc.validate().unwrap();
+        let mut impossible_checkpoint = local_gc.clone();
+        impossible_checkpoint
+            .native
+            .workspaces
+            .gc
+            .max_checkpoint_bytes = 256 * 1024 * 1024;
+        assert!(
+            impossible_checkpoint
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("checkpoint byte budget")
+        );
+        let mut minimum_checkpoint = local_gc.clone();
+        minimum_checkpoint.native.workspaces.gc.max_checkpoint_bytes = 512 * 1024 * 1024;
+        minimum_checkpoint.validate().unwrap();
+        for (name, mutate) in [
+            ("zero root budget", 0),
+            ("above collector root cap", 10_001),
+        ] {
+            let mut invalid = local_gc.clone();
+            invalid.native.workspaces.gc.max_roots = mutate;
+            assert!(invalid.validate().is_err(), "{name}");
+        }
+        let mut combined = local_gc.clone();
+        combined.native.workspaces.index_mode = NativeIndexMode::Federated;
+        assert!(combined.validate().is_err());
+        let mut combined = local_gc.clone();
+        combined.native.workspaces.capture.policy = NativeCapturePolicy::AfterCommandBestEffort;
+        assert!(combined.validate().is_err());
+        let mut no_alias = local_gc.clone();
+        no_alias.native.repositories.clear();
+        assert!(no_alias.validate().is_err());
+        let mut extra_alias = local_gc;
+        extra_alias
+            .native
+            .repositories
+            .insert("other".into(), NativeRepository::default());
+        assert!(extra_alias.validate().is_err());
         assert_eq!(configured.native.max_inflight, 16);
         assert_eq!(configured.native.max_memory_bytes, 512 * 1024 * 1024);
         assert_eq!(configured.native.max_temporary_bytes, 1024 * 1024 * 1024);

@@ -14,6 +14,16 @@ pub const COMMAND_HEADER: &str = "native-command-bin";
 pub trait CommandResolver: Send + Sync + std::fmt::Debug {
     fn resolve(&self, store_alias: &str, token: [u8; 32]) -> Result<CommandGuard, Status>;
 }
+/// Trusted host access is separate from command attribution. The guard fences
+/// the host's whole repository cohort while bootstrap or source I/O runs; it
+/// does not attest that any workspace roots are complete or durably registered.
+/// Implementations must not queue behind a collector while holding another
+/// host scope: return Aborted for temporary collector contention before accepting
+/// physical work. The broker waits cancellation-safely under the original
+/// deadline; all other status codes fail immediately.
+pub trait HostAccessResolver: Send + Sync + std::fmt::Debug {
+    fn acquire_host_access(&self) -> Result<CommandGuard, Status>;
+}
 pub(crate) fn token(headers: &http::HeaderMap) -> Result<Option<[u8; 32]>, Status> {
     let metadata = tonic::metadata::MetadataMap::from_headers(headers.clone());
     let mut values = metadata.get_all_bin(COMMAND_HEADER).iter();

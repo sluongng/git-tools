@@ -755,6 +755,13 @@ impl p::query_io_server::QueryIo for BrokerService {
 
 /// In-process facade; persistent returned page owners never capture the call
 /// slot. The detached accepted job owns the slot until provider completion.
+// A cancelled waiter can discard a completed detached output. Destroy its page
+// payload/retention owners before releasing physical host and pool ownership.
+// Never attach these transport owners to the persistent QueryReply.owner.
+struct OwnedQueryResult<T> {
+    result: Result<QueryReply<T>, Status>,
+    _work: Arc<Work>,
+}
 pub(crate) struct GuardedQuery {
     service: BrokerService,
     provider: Arc<dyn NativeQueryIo>,
@@ -789,8 +796,8 @@ impl GuardedQuery {
     {
         let service = self.service.clone();
         let provider = self.provider.clone();
+        let deadline = service.operation_deadline();
         crate::client::run_control(async move {
-            let deadline = service.operation_deadline();
             let work = service
                 .admit_local("/native.broker.v1.QueryIo/Local", deadline)
                 .await
@@ -799,22 +806,29 @@ impl GuardedQuery {
             // Only spawn after admission: cancelled waiters cannot leave an
             // unbounded queue of detached jobs waiting for the shared pool.
             let accepted = tokio::spawn(async move {
-                let _work = work.clone();
-                let physical: QueryOwner = Arc::new((owner, work));
-                let reply = operation(provider, physical)
-                    .await
-                    .map_err(crate::query::status)?;
-                if reply.value.wire_size() > cap {
-                    return Err(Status::resource_exhausted(
-                        "native query reply exceeds limit",
-                    ));
+                let physical: QueryOwner = Arc::new((owner, work.clone()));
+                let result = async move {
+                    let reply = operation(provider, physical)
+                        .await
+                        .map_err(crate::query::status)?;
+                    if reply.value.wire_size() > cap {
+                        return Err(Status::resource_exhausted(
+                            "native query reply exceeds limit",
+                        ));
+                    }
+                    Ok(reply)
                 }
-                Ok(reply)
+                .await;
+                OwnedQueryResult {
+                    result,
+                    _work: work,
+                }
             });
-            tokio::time::timeout_at(deadline, accepted)
+            let result = tokio::time::timeout_at(deadline, accepted)
                 .await
                 .map_err(|_| Status::deadline_exceeded("native query operation deadline exceeded"))?
-                .map_err(|_| Status::internal("native query provider job failed"))?
+                .map_err(|_| Status::internal("native query provider job failed"))?;
+            result.result
         })
         .await
     }

@@ -81,6 +81,14 @@ buildbuddy = "https://github.com/buildbuddy-io/buildbuddy.git"
 # [native.workspaces]
 # index_mode = "legacy" # Experimental "federated" avoids eager jj history indexing.
 # Existing workspaces retain their recorded index type.
+# Explicit Linux-only collection; preview never deletes and no automatic GC runs.
+# "local_complete" requires a genuinely fresh native cohort under state_dir,
+# one fully local alias, legacy indexes, and disabled capture/upload policies.
+# Existing untracked stores cannot upgrade; retain policy and alias on reopen.
+# [native.workspaces.gc]
+# policy = "disabled" # Opt in only at initialization: "local_complete".
+# grace_seconds = 3600
+# timeout_ms = 30000
 # [native.workspaces.capture]
 # policy = "disabled" # Opt in: "after_command_best_effort" (Linux + federated).
 # max_bundle_bytes = 268435456

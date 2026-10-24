@@ -27,6 +27,7 @@ pub struct BrokerService {
 struct Inner {
     stores: HashMap<String, Arc<dyn NativeObjectIo>>,
     command_resolver: Option<Arc<dyn crate::CommandResolver>>,
+    host_access_resolver: Option<Arc<dyn crate::HostAccessResolver>>,
     controls: HashMap<String, Arc<dyn crate::NativeRepositoryControl>>,
     queries: HashMap<String, Arc<dyn crate::NativeQueryIo>>,
     descriptions: HashMap<String, crate::ProviderDescription>,
@@ -38,6 +39,40 @@ struct Inner {
     staging: Arc<Semaphore>,
 }
 impl Inner {
+    fn host_access(&self) -> Result<Option<crate::CommandGuard>, Status> {
+        self.host_access_resolver
+            .as_ref()
+            .map(|resolver| {
+                resolver
+                    .acquire_host_access()
+                    .map_err(|error| Status::new(error.code(), "native host access unavailable"))
+            })
+            .transpose()
+    }
+    async fn host_access_until(
+        &self,
+        deadline: Instant,
+    ) -> Result<Option<crate::CommandGuard>, Status> {
+        loop {
+            if Instant::now() >= deadline {
+                return Err(Status::deadline_exceeded(
+                    "native host admission deadline exceeded",
+                ));
+            }
+            match self.host_access() {
+                Err(error) if error.code() == tonic::Code::Aborted => {
+                    // No guard, provider job or pool permits exist while
+                    // collection owns the fence. The caller can cancel this
+                    // timer; never detach waiting admission or refresh budget.
+                    tokio::time::sleep_until(
+                        deadline.min(Instant::now() + std::time::Duration::from_millis(5)),
+                    )
+                    .await;
+                }
+                result => return result,
+            }
+        }
+    }
     async fn admit(&self, path: &str, deadline: Instant) -> Result<Arc<Work>, Status> {
         let is_control = path.starts_with("/native.broker.v1.RepositoryControl/");
         let is_query =
@@ -119,6 +154,7 @@ impl Inner {
             command_token: None,
             bootstrap: false,
             command: Mutex::new(None),
+            _host: None,
         }))
     }
 }
@@ -133,6 +169,18 @@ impl BrokerService {
         Arc::get_mut(&mut self.inner)
             .ok_or_else(|| Status::failed_precondition("broker registry already shared"))?
             .command_resolver = Some(resolver);
+        Ok(self)
+    }
+    /// Fence trusted in-process source/query jobs and tokenless bootstrap RPCs.
+    /// Register before sharing the broker. Standalone untracked brokers may omit
+    /// this hook; a managed collector host must provide it for the entire cohort.
+    pub fn with_host_access_resolver(
+        mut self,
+        resolver: Arc<dyn crate::HostAccessResolver>,
+    ) -> Result<Self, Status> {
+        Arc::get_mut(&mut self.inner)
+            .ok_or_else(|| Status::failed_precondition("broker registry already shared"))?
+            .host_access_resolver = Some(resolver);
         Ok(self)
     }
     pub(crate) fn authorize_command(&self, alias: &str, work: &Arc<Work>) -> Result<(), Status> {
@@ -215,6 +263,7 @@ impl BrokerService {
             inner: Arc::new(Inner {
                 stores,
                 command_resolver: None,
+                host_access_resolver: None,
                 metadata_work,
                 controls: HashMap::new(),
                 queries: HashMap::new(),
@@ -407,9 +456,18 @@ impl BrokerService {
         method: &str,
         deadline: Instant,
     ) -> Result<Arc<Work>, Status> {
-        tokio::time::timeout_at(deadline, self.inner.admit(method, deadline))
+        // Acquire the independent host fence BEFORE reserving any physical
+        // provider work. No permanent guard is attached to the source facade.
+        let host = self.inner.host_access_until(deadline).await?;
+        let mut work = tokio::time::timeout_at(deadline, self.inner.admit(method, deadline))
             .await
-            .map_err(|_| Status::deadline_exceeded("broker source admission deadline exceeded"))?
+            .map_err(|_| {
+                Status::deadline_exceeded("broker source admission deadline exceeded")
+            })??;
+        Arc::get_mut(&mut work)
+            .ok_or_else(|| Status::internal("broker source scope already shared"))?
+            ._host = host;
+        Ok(work)
     }
     fn store(&self, id: &str) -> Result<Arc<dyn NativeObjectIo>, Status> {
         wire::id(id)?;
@@ -572,17 +630,26 @@ where
         let mut inner = std::mem::replace(&mut self.inner, ready);
         Box::pin(async move {
             let result = tokio::time::timeout_at(deadline, async {
-                let mut work = shared.admit(&path, deadline).await?;
-                let context = Arc::get_mut(&mut work)
-                    .ok_or_else(|| Status::internal("broker request scope already shared"))?;
-                context.rpc = true;
-                context.command_token = command_token;
-                context.bootstrap = matches!(
+                // Bootstrap has no command job fence and its alias is still in
+                // the undecoded body. Fence the whole host cohort before pools.
+                let bootstrap = matches!(
                     path.as_str(),
                     "/native.broker.v1.QueryIo/DescribeProvider"
                         | "/native.broker.v1.RepositoryControl/ObserveReference"
                         | "/native.broker.v1.RepositoryControl/AdmitCommit"
                 );
+                let host = if bootstrap && command_token.is_none() {
+                    shared.host_access_until(deadline).await?
+                } else {
+                    None
+                };
+                let mut work = shared.admit(&path, deadline).await?;
+                let context = Arc::get_mut(&mut work)
+                    .ok_or_else(|| Status::internal("broker request scope already shared"))?;
+                context.rpc = true;
+                context.command_token = command_token;
+                context.bootstrap = bootstrap;
+                context._host = host;
                 let mut request = request.map(|body| {
                     Body::new(InboundBody::new(
                         body,
@@ -700,7 +767,7 @@ impl p::object_io_server::ObjectIo for BrokerService {
         if encoded.bytes != input.canonical {
             return Err(Status::invalid_argument("noncanonical broker metadata"));
         }
-        let descriptor = if work.has_command() {
+        let descriptor = if work.requires_owned_io() {
             provider
                 .write_metadata_with_owner(object, Arc::new((work.clone(), _staging)))
                 .await
@@ -844,7 +911,7 @@ impl p::object_io_server::ObjectIo for BrokerService {
         };
         let provider_copy = provider.clone();
         let write_owner = Arc::new((work.clone(), _staging));
-        let managed = work.has_command();
+        let managed = work.requires_owned_io();
         let write = async move {
             if managed {
                 provider_copy
@@ -1038,13 +1105,17 @@ pub(crate) struct Work {
     bootstrap: bool,
     // Resolved accepted-job guard outlives all handler/body/provider owners.
     command: Mutex<Option<(String, crate::CommandGuard)>>,
+    // Last owner: bootstrap/source physical jobs and returned bodies retain it.
+    _host: Option<crate::CommandGuard>,
 }
 impl Work {
-    fn has_command(&self) -> bool {
-        self.command
-            .lock()
-            .map(|binding| binding.is_some())
-            .unwrap_or(true)
+    fn requires_owned_io(&self) -> bool {
+        self._host.is_some()
+            || self
+                .command
+                .lock()
+                .map(|binding| binding.is_some())
+                .unwrap_or(true)
     }
 }
 struct InboundBody {
@@ -1122,7 +1193,7 @@ impl p::repository_control_server::RepositoryControl for BrokerService {
         self.authorize_command(&input.store_id, &work)?;
         crate::control::reference_name(&input.name)?;
         let control = self.control(&input.store_id)?;
-        let value = if work.has_command() {
+        let value = if work.requires_owned_io() {
             control
                 .observe_reference_with_owner(&input.name, work.clone())
                 .await
@@ -1166,7 +1237,7 @@ impl p::repository_control_server::RepositoryControl for BrokerService {
         self.authorize_command(&input.store_id, &work)?;
         let head = request_commit(&input.head)?;
         let control = self.control(&input.store_id)?;
-        let value = if work.has_command() {
+        let value = if work.requires_owned_io() {
             control.admit_commit_with_owner(head, work.clone()).await
         } else {
             control.admit_commit(head).await
@@ -1207,7 +1278,7 @@ impl p::repository_control_server::RepositoryControl for BrokerService {
             idempotency_key: input.idempotency_key,
         };
         let control = self.control(&input.store_id)?;
-        let value = if work.has_command() {
+        let value = if work.requires_owned_io() {
             control
                 .publish_with_owner(wanted.clone(), work.clone())
                 .await
@@ -1239,7 +1310,7 @@ impl p::repository_control_server::RepositoryControl for BrokerService {
         self.authorize_command(&input.store_id, &work)?;
         crate::control::key(&input.idempotency_key)?;
         let control = self.control(&input.store_id)?;
-        let value = if work.has_command() {
+        let value = if work.requires_owned_io() {
             control
                 .publication_with_owner(&input.idempotency_key, work.clone())
                 .await

@@ -440,14 +440,56 @@ async fn retained_tiny_readers_keep_their_buffer_memory_charged_until_drop() {
     c.max_catalog_bytes = 1024;
     c.max_catalog_objects = 1;
     c.max_memory_bytes = 1024 * 1024;
+    c.policy.operation_timeout_ms = 200;
+    let access = Arc::new(TestHostAccess::default());
     let service = BrokerService::new(
         HashMap::from([("example".into(), provider as Arc<dyn NativeObjectIo>)]),
         c.clone(),
     )
+    .unwrap()
+    .with_host_access_resolver(access.clone())
     .unwrap();
     let local = service.source_io("example").unwrap();
     let host = Running::start_service(&socket, service).await;
-    let local_reader = local.read_file(file).await.unwrap();
+    let exclusive = access.fence.clone().try_write_owned().unwrap();
+    assert!(
+        local
+            .write_file(&mut Cursor::new(b"blocked host write"), 64)
+            .await
+            .is_err()
+    );
+    assert!(
+        local
+            .write_metadata(tinytree_model::Object::Tree(tinytree_model::Tree {
+                entries: vec![]
+            }))
+            .await
+            .is_err()
+    );
+    let waiting_local = local.clone();
+    let before = access.calls.load(std::sync::atomic::Ordering::SeqCst);
+    let waiting = tokio::spawn(async move { waiting_local.read_file(file).await });
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while access.calls.load(std::sync::atomic::Ordering::SeqCst) == before {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    assert!(
+        !waiting.is_finished(),
+        "foreground file open waits for collection rather than returning EIO"
+    );
+    drop(exclusive);
+    let local_reader = tokio::time::timeout(Duration::from_secs(2), waiting)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert!(
+        access.fence.try_write().is_err(),
+        "returned local reader owns host access"
+    );
 
     c.max_file_bytes = 1;
     c.max_temporary_bytes = 1024 * 1024;
@@ -460,6 +502,15 @@ async fn retained_tiny_readers_keep_their_buffer_memory_charged_until_drop() {
         "local reader must retain shared host memory until drop"
     );
     drop(local_reader);
+    let exclusive =
+        tokio::time::timeout(Duration::from_secs(2), access.fence.clone().write_owned())
+            .await
+            .unwrap();
+    assert!(
+        local.read_file(file).await.is_err(),
+        "facade retries admission for each I/O"
+    );
+    drop(exclusive);
     let mut held = Vec::new();
     let mut exhausted = false;
     for _ in 0..600 {
@@ -668,19 +719,33 @@ async fn timed_out_provider_job_keeps_admission_until_its_blocking_work_finishes
     let socket = root.join("broker.sock");
     let mut server_config = config();
     server_config.max_inflight = 1;
-    let host = Running::start(&socket, provider, server_config).await;
+    server_config.policy.operation_timeout_ms = 100;
+    let access = Arc::new(TestHostAccess::default());
+    let service = BrokerService::new(
+        HashMap::from([("example".into(), provider as Arc<dyn NativeObjectIo>)]),
+        server_config,
+    )
+    .unwrap()
+    .with_host_access_resolver(access.clone())
+    .unwrap();
+    let local = service.source_io("example").unwrap();
+    let host = Running::start_service(&socket, service).await;
     let mut c = config();
     c.policy.operation_timeout_ms = 100;
     let client = BrokerObjectIo::connect(&socket, "example", &spool, c)
         .await
         .unwrap();
     assert!(
-        client
+        local
             .descriptor(tinytree_model::empty_tree().descriptor.key)
             .await
             .is_err()
     );
     assert_eq!(entered.load(Ordering::SeqCst), 1);
+    assert!(
+        access.fence.try_write().is_err(),
+        "expired local waiter retains host fence through blocking work"
+    );
     assert!(
         client
             .descriptor(tinytree_model::empty_tree().descriptor.key)
@@ -706,6 +771,10 @@ async fn timed_out_provider_job_keeps_admission_until_its_blocking_work_finishes
     );
     drop(client);
     host.stop().await;
+    let _exclusive =
+        tokio::time::timeout(Duration::from_secs(2), access.fence.clone().write_owned())
+            .await
+            .unwrap();
 }
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn cancelled_metadata_waiter_keeps_owners_until_local_and_provider_jobs_finish() {
@@ -760,7 +829,11 @@ async fn cancelled_metadata_waiter_keeps_owners_until_local_and_provider_jobs_fi
             BrokerService::new(stores.clone(), insufficient).is_err(),
             "provider workset must fit pools before control registration"
         );
-        let service = BrokerService::new(stores, server_config).unwrap();
+        let access = Arc::new(TestHostAccess::default());
+        let service = BrokerService::new(stores, server_config)
+            .unwrap()
+            .with_host_access_resolver(access.clone())
+            .unwrap();
         let host = Running::start_service(&socket, service.clone()).await;
         let mut client_config = config();
         client_config.policy.operation_timeout_ms = 1000;
@@ -807,6 +880,14 @@ async fn cancelled_metadata_waiter_keeps_owners_until_local_and_provider_jobs_fi
                 .is_err(),
             "local mount must share RPC admission"
         );
+        let exclusive = tokio::time::timeout(
+            Duration::from_millis(500),
+            access.fence.clone().write_owned(),
+        )
+        .await
+        .unwrap();
+        drop(exclusive); // cancelled pre-admission sources must not hold host fences
+
         assert!(probe.read_metadata(key).await.is_err());
         assert!(probe.descriptor(key).await.is_err());
         assert!(
@@ -1187,6 +1268,7 @@ async fn write_staging_is_global_across_aliases_and_survives_client_cancellation
 
 #[derive(Debug)]
 struct FakeControl {
+    supports_owned_calls: bool,
     state: std::sync::Mutex<FakeReferences>,
     observations: std::sync::atomic::AtomicUsize,
     resources: native_broker::ControlResources,
@@ -1206,8 +1288,15 @@ struct FakeReferences {
     requests: Vec<native_broker::PublishRequest>,
 }
 impl FakeControl {
+    fn unowned() -> Self {
+        Self {
+            supports_owned_calls: false,
+            ..Self::new()
+        }
+    }
     fn new() -> Self {
         Self {
+            supports_owned_calls: true,
             state: std::sync::Mutex::new(FakeReferences {
                 references: HashMap::from([
                     ("main".into(), (3, Some(native_broker::CommitId([1; 32])))),
@@ -1228,6 +1317,32 @@ impl FakeControl {
 }
 #[async_trait::async_trait]
 impl native_broker::NativeRepositoryControl for FakeControl {
+    async fn observe_reference_with_owner(
+        &self,
+        name: &str,
+        owner: native_broker::CommandGuard,
+    ) -> Result<native_broker::ReferenceSnapshot, tonic::Status> {
+        if !self.supports_owned_calls {
+            return Err(tonic::Status::unimplemented(
+                "owned reference observation unsupported",
+            ));
+        }
+        let _owner = owner;
+        self.observe_reference(name).await
+    }
+    async fn admit_commit_with_owner(
+        &self,
+        head: native_broker::CommitId,
+        owner: native_broker::CommandGuard,
+    ) -> Result<native_broker::AdmittedCommit, tonic::Status> {
+        if !self.supports_owned_calls {
+            return Err(tonic::Status::unimplemented(
+                "owned commit admission unsupported",
+            ));
+        }
+        let _owner = owner;
+        self.admit_commit(head).await
+    }
     fn resources(&self) -> native_broker::ControlResources {
         self.resources
     }
@@ -1326,11 +1441,15 @@ impl native_broker::NativeRepositoryControl for FakeControl {
             .map(|(_, receipt)| receipt.clone()))
     }
 }
-async fn control_fixture(root: &Path, control: Arc<FakeControl>) -> (Running, PathBuf) {
+async fn control_fixture(
+    root: &Path,
+    control: Arc<FakeControl>,
+) -> (Running, PathBuf, Arc<TestHostAccess>) {
     let backend = root.join("store");
     private(&backend);
     let provider: Arc<dyn NativeObjectIo> =
         Arc::new(DirectObjectIo::init(&backend, backend_config()).unwrap());
+    let access = Arc::new(TestHostAccess::default());
     let service = BrokerService::new(
         HashMap::from([
             ("example".into(), provider.clone()),
@@ -1343,9 +1462,15 @@ async fn control_fixture(root: &Path, control: Arc<FakeControl>) -> (Running, Pa
         "example".into(),
         control as Arc<dyn native_broker::NativeRepositoryControl>,
     )]))
+    .unwrap()
+    .with_host_access_resolver(access.clone())
     .unwrap();
     let socket = root.join("broker.sock");
-    (Running::start_service(&socket, service).await, socket)
+    (
+        Running::start_service(&socket, service).await,
+        socket,
+        access,
+    )
 }
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn control_preserves_observation_generation_and_caller_cas_across_independent_processes() {
@@ -1353,7 +1478,7 @@ async fn control_preserves_observation_generation_and_caller_cas_across_independ
     let root = directory.path().canonicalize().unwrap();
     private(&root);
     let control = Arc::new(FakeControl::new());
-    let (host, socket) = control_fixture(&root, control.clone()).await;
+    let (host, socket, _access) = control_fixture(&root, control.clone()).await;
     let a = OwnedChild::spawn(&socket, &root.join("a"), "control-observe", &["main"]);
     let b = OwnedChild::spawn(&socket, &root.join("b"), "control-observe", &["main"]);
     let (a, b) = tokio::join!(a.finish(), b.finish());
@@ -1473,7 +1598,7 @@ async fn control_registration_and_wire_requests_fail_before_adapter_work() {
             .is_err()
     );
     let control = Arc::new(FakeControl::new());
-    let (host, socket) = control_fixture(&root, control.clone()).await;
+    let (host, socket, _access) = control_fixture(&root, control.clone()).await;
     let path = socket.clone();
     let channel = Endpoint::from_static("http://[::]:50051")
         .connect_with_connector(tower::service_fn(move |_: http::Uri| {
@@ -1521,7 +1646,7 @@ async fn cancelled_control_drains_adapter_work_and_keeps_shared_object_pools_cha
     fake.admission_pause = Some(release.0.clone());
     let started = fake.admission_started.clone();
     let control = Arc::new(fake);
-    let (host, socket) = control_fixture(&root, control).await;
+    let (host, socket, access) = control_fixture(&root, control).await;
     let mut short = config();
     short.policy.operation_timeout_ms = 100;
     let client = native_broker::BrokerControlClient::connect(&socket, "example", short.clone())
@@ -1534,6 +1659,10 @@ async fn cancelled_control_drains_adapter_work_and_keeps_shared_object_pools_cha
             .is_err()
     );
     assert!(started.load(Ordering::SeqCst));
+    assert!(
+        access.fence.try_write().is_err(),
+        "timed-out bootstrap retains the host fence through physical adapter work"
+    );
     let io = BrokerObjectIo::connect(&socket, "example", &spool, short)
         .await
         .unwrap();
@@ -1552,6 +1681,10 @@ async fn cancelled_control_drains_adapter_work_and_keeps_shared_object_pools_cha
     );
     release.release();
     stopping.await.unwrap();
+    let _exclusive =
+        tokio::time::timeout(Duration::from_secs(2), access.fence.clone().write_owned())
+            .await
+            .unwrap();
 }
 
 #[derive(Debug)]
@@ -1571,6 +1704,20 @@ enum CloudQueryMode {
     WrongFork,
 }
 #[derive(Debug)]
+struct HostFenceDropProbe {
+    fence: Arc<tokio::sync::RwLock<()>>,
+    observed: Option<oneshot::Sender<bool>>,
+}
+impl Drop for HostFenceDropProbe {
+    fn drop(&mut self) {
+        let _ = self
+            .observed
+            .take()
+            .unwrap()
+            .send(self.fence.try_write().is_err());
+    }
+}
+#[derive(Debug)]
 struct FakeQuery {
     marker: u8,
     persistent: u64,
@@ -1579,6 +1726,7 @@ struct FakeQuery {
     cloud_replays: std::sync::Mutex<HashMap<[u8; 32], ([u8; 32], native_broker::QueryScope)>>,
     closed: std::sync::atomic::AtomicBool,
     page: std::sync::Mutex<Option<Arc<QueryPageProbe>>>,
+    response_drop_probe: std::sync::Mutex<Option<HostFenceDropProbe>>,
     dropped: Arc<std::sync::atomic::AtomicUsize>,
     scope_calls: std::sync::atomic::AtomicUsize,
     transient_pages: std::sync::atomic::AtomicUsize,
@@ -1598,6 +1746,7 @@ impl FakeQuery {
             cloud_replays: Default::default(),
             closed: Default::default(),
             page: Default::default(),
+            response_drop_probe: Default::default(),
             dropped: Default::default(),
             scope_calls: Default::default(),
             transient_pages: Default::default(),
@@ -1866,6 +2015,11 @@ impl native_broker::NativeQueryIo for FakeQuery {
             .unwrap()
             .get_or_insert_with(|| Arc::new(QueryPageProbe(self.dropped.clone())))
             .clone();
+        let owner: native_broker::QueryOwner = match self.response_drop_probe.lock().unwrap().take()
+        {
+            Some(probe) => Arc::new((owner, probe)),
+            None => owner,
+        };
         Ok(native_broker::QueryReply {
             value: native_broker::QueryPage {
                 sequence: s,
@@ -2504,7 +2658,13 @@ async fn local_query_deadline_returns_while_accepted_provider_job_and_drain_rema
     private(&root);
     let gate = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
     let release = Release(gate.clone());
+    let access = Arc::new(TestHostAccess::default());
+    let (observed, payload_dropped) = oneshot::channel();
     let mut slow = FakeQuery::new(1, 1024);
+    *slow.response_drop_probe.get_mut().unwrap() = Some(HostFenceDropProbe {
+        fence: access.fence.clone(),
+        observed: Some(observed),
+    });
     slow.page_pause = Some(gate);
     let entered = slow.page_entered.clone();
     let finished = slow.page_finished.clone();
@@ -2518,7 +2678,9 @@ async fn local_query_deadline_returns_while_accepted_provider_job_and_drain_rema
         Arc::new(slow),
         Arc::new(FakeQuery::new(2, 1024)),
         cfg,
-    );
+    )
+    .with_host_access_resolver(access.clone())
+    .unwrap();
     let local = service.query_io("first").unwrap();
     let dropped = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let physical: native_broker::QueryOwner = Arc::new(QueryPageProbe(dropped.clone()));
@@ -2537,6 +2699,10 @@ async fn local_query_deadline_returns_while_accepted_provider_job_and_drain_rema
         .err()
         .unwrap();
     assert_eq!(status.code(), tonic::Code::DeadlineExceeded);
+    assert!(
+        access.fence.try_write().is_err(),
+        "accepted local query owns the host fence"
+    );
     assert!(!finished.load(std::sync::atomic::Ordering::SeqCst));
     assert_eq!(dropped.load(std::sync::atomic::Ordering::SeqCst), 0);
     let drain = service.clone();
@@ -2552,6 +2718,17 @@ async fn local_query_deadline_returns_while_accepted_provider_job_and_drain_rema
         .unwrap()
         .unwrap()
         .unwrap();
+    assert!(
+        tokio::time::timeout(Duration::from_secs(2), payload_dropped)
+            .await
+            .unwrap()
+            .unwrap(),
+        "discarded detached query payload must drop before its host fence"
+    );
+    let _exclusive =
+        tokio::time::timeout(Duration::from_secs(2), access.fence.clone().write_owned())
+            .await
+            .unwrap();
     assert!(finished.load(std::sync::atomic::Ordering::SeqCst));
     assert_eq!(dropped.load(std::sync::atomic::Ordering::SeqCst), 1);
 }
@@ -2702,6 +2879,21 @@ async fn live_provider_description_binds_alias_identity_and_separate_creation_po
     host.stop().await;
 }
 
+#[derive(Debug, Default)]
+struct TestHostAccess {
+    fence: Arc<tokio::sync::RwLock<()>>,
+    calls: std::sync::atomic::AtomicUsize,
+}
+impl native_broker::HostAccessResolver for TestHostAccess {
+    fn acquire_host_access(&self) -> Result<native_broker::CommandGuard, tonic::Status> {
+        self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.fence
+            .clone()
+            .try_read_owned()
+            .map(|guard| Arc::new(guard) as native_broker::CommandGuard)
+            .map_err(|_| tonic::Status::aborted("host collection is active"))
+    }
+}
 #[derive(Debug)]
 struct TestCommands {
     tokens: HashMap<[u8; 32], String>,
@@ -2757,11 +2949,19 @@ async fn managed_commands_bind_all_client_routes_to_exact_registered_alias_and_f
         jobs: Default::default(),
     });
     let control = Arc::new(FakeControl::new());
+    let unowned_control = Arc::new(FakeControl::unowned());
+    let access = Arc::new(TestHostAccess::default());
     let service = query_service(&root, first.clone(), second.clone(), query_config())
-        .with_controls(HashMap::from([(
-            "first".into(),
-            control.clone() as Arc<dyn native_broker::NativeRepositoryControl>,
-        )]))
+        .with_controls(HashMap::from([
+            (
+                "first".into(),
+                control.clone() as Arc<dyn native_broker::NativeRepositoryControl>,
+            ),
+            (
+                "second".into(),
+                unowned_control.clone() as Arc<dyn native_broker::NativeRepositoryControl>,
+            ),
+        ]))
         .unwrap()
         .with_provider_descriptions(HashMap::from([
             (
@@ -2791,16 +2991,73 @@ async fn managed_commands_bind_all_client_routes_to_exact_registered_alias_and_f
         ]))
         .unwrap()
         .with_command_resolver(commands.clone())
+        .unwrap()
+        .with_host_access_resolver(access.clone())
         .unwrap();
     let socket = root.join("managed.sock");
     let host = Running::start_service(&socket, service).await;
     let query = native_broker::BrokerQueryClient::connect(&socket, "first", query_config())
         .await
         .unwrap();
+    let exclusive = access.fence.clone().try_write_owned().unwrap();
+    let mut short = query_config();
+    short.policy.operation_timeout_ms = 200;
+    let blocked_query = native_broker::BrokerQueryClient::connect(&socket, "first", short.clone())
+        .await
+        .unwrap();
     assert_eq!(
-        query.describe_provider().await.unwrap().identity,
+        blocked_query.describe_provider().await.unwrap_err().code(),
+        tonic::Code::DeadlineExceeded
+    );
+    let blocked_control = native_broker::BrokerControlClient::connect(&socket, "first", short)
+        .await
+        .unwrap();
+    assert_eq!(
+        blocked_control
+            .observe_reference("main")
+            .await
+            .unwrap_err()
+            .code(),
+        tonic::Code::DeadlineExceeded
+    );
+    assert_eq!(
+        blocked_control
+            .admit_commit(native_broker::CommitId([1; 32]))
+            .await
+            .unwrap_err()
+            .code(),
+        tonic::Code::DeadlineExceeded
+    );
+    assert_eq!(
+        control
+            .observations
+            .load(std::sync::atomic::Ordering::SeqCst),
+        0
+    );
+    let waiting_query = query.clone();
+    let before = access.calls.load(std::sync::atomic::Ordering::SeqCst);
+    let waiting = tokio::spawn(async move { waiting_query.describe_provider().await });
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while access.calls.load(std::sync::atomic::Ordering::SeqCst) == before {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    assert!(
+        !waiting.is_finished(),
+        "bootstrap waits without invoking the provider during collection"
+    );
+    drop(exclusive);
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(2), waiting)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap()
+            .identity,
         [1; 32],
-        "explicit bootstrap discovery needs no command"
+        "bootstrap discovery resumes without a command after collection"
     );
     let open = || native_broker::OpenQueryScope {
         roots: vec![native_broker::CommitId::ROOT],
@@ -2891,15 +3148,33 @@ async fn managed_commands_bind_all_client_routes_to_exact_registered_alias_and_f
             .load(std::sync::atomic::Ordering::SeqCst),
         observations
     );
+    let unsupported_client =
+        native_broker::BrokerControlClient::connect(&socket, "second", query_config())
+            .await
+            .unwrap()
+            .with_command_token([2; 32]);
     assert_eq!(
-        control_client
-            .with_command_token([1; 32])
+        unsupported_client
             .observe_reference("main")
             .await
             .unwrap_err()
             .code(),
         tonic::Code::Unimplemented,
         "managed control must not silently use a provider lacking owned opt-in"
+    );
+    assert_eq!(
+        unowned_control
+            .observations
+            .load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "unsupported owned observation must never fall back to unowned I/O"
+    );
+    assert_eq!(
+        control
+            .observations
+            .load(std::sync::atomic::Ordering::SeqCst),
+        observations,
+        "the unsupported alias must not be routed to the supported provider"
     );
     let spool = root.join("managed-spool");
     private(&spool);

@@ -4,6 +4,7 @@ use crate::remote_state::valid_hex;
 use crate::{Binding, Registry, remote_state};
 use anyhow::{Context, Result, bail, ensure};
 use jj_lib::{
+    default_index::{DefaultIndexGcLimits, DefaultIndexStore},
     object_id::ObjectId as _,
     op_store::{OpStore, OperationId, RootOperationData},
     operation::Operation,
@@ -55,7 +56,57 @@ impl Default for CaptureLimits {
     }
 }
 impl CaptureLimits {
+    fn validate_common(&self) -> Result<()> {
+        ensure!(
+            (1..=65_537).contains(&self.max_operations)
+                && (1..=1_000_000).contains(&self.max_parent_edges)
+                && (1..=1_000_000).contains(&self.max_roots)
+                && (1024..=64 * 1024 * 1024).contains(&self.max_file_bytes)
+                && self.max_decode_bytes >= self.max_file_bytes
+                && self.max_decode_bytes <= 1024 * 1024 * 1024
+                && (1..=86_400_000).contains(&self.max_elapsed_ms)
+                && self.max_working_bytes > 0,
+            "invalid local inventory bounds"
+        );
+        Ok(())
+    }
+    fn local_base(&self, native_index: bool) -> Result<usize> {
+        self.validate_common()?;
+        if native_index {
+            ensure!(
+                LocalIndexExportReader::required_read_bytes(&self.index)?
+                    <= self.export.max_working_bytes,
+                "local index read peak exceeds export pool"
+            );
+        }
+        let index_bytes = if native_index {
+            self.export.max_working_bytes
+        } else {
+            self.max_decode_bytes
+        };
+        let reserve = self
+            .max_operations
+            .checked_mul(1024)
+            .and_then(|n| n.checked_add(self.max_parent_edges.checked_mul(256)?))
+            .and_then(|n| n.checked_add(self.max_roots.checked_mul(128)?))
+            .and_then(|n| n.checked_add(self.max_decode_bytes.checked_mul(4)?))
+            .and_then(|n| n.checked_add(index_bytes))
+            .and_then(|n| {
+                if native_index {
+                    n.checked_add(self.export.artifacts.max_artifacts.checked_mul(512)?)
+                } else {
+                    Some(n)
+                }
+            })
+            .context("local inventory admission overflow")?;
+        ensure!(
+            reserve <= self.max_working_bytes,
+            "local inventory work exceeds its budget"
+        );
+        Ok(reserve)
+    }
     fn validate(&self) -> Result<()> {
+        self.validate_common()?;
         ensure!(
             LocalIndexExportReader::required_read_bytes(&self.index)?
                 <= self.export.max_working_bytes,
@@ -219,6 +270,75 @@ impl LocalCaptureCandidate {
         self.private_remote.as_deref()
     }
 }
+/// Complete local root claims plus their physical read/freeze owners. This is
+/// observational data, not permission to make a workspace Clean. A Tree-only
+/// candidate cannot be converted to host-quiescent checkpoint ownership.
+pub struct LocalRootInventory {
+    roots: Vec<m::ObjectKey>,
+    operation_heads: Vec<OperationId>,
+    working_copy_operation: OperationId,
+    retained_operations: Vec<OperationId>,
+    _indexes: Option<PortableIndexExport>,
+    _owner: Arc<CaptureOwner>,
+}
+impl LocalRootInventory {
+    pub fn roots(&self) -> &[m::ObjectKey] {
+        &self.roots
+    }
+    pub fn operation_heads(&self) -> &[OperationId] {
+        &self.operation_heads
+    }
+    pub fn working_copy_operation(&self) -> &OperationId {
+        &self.working_copy_operation
+    }
+    pub fn retained_operations(&self) -> &[OperationId] {
+        &self.retained_operations
+    }
+    pub fn seal_quiescent(self) -> Result<QuiescentRootInventory> {
+        ensure!(
+            matches!(self._owner.permit.source, CaptureFreeze::Host(_)),
+            "TreeOnly inventory is not frontend-quiescent checkpoint authority"
+        );
+        Ok(QuiescentRootInventory { inventory: self })
+    }
+}
+/// Hold this entire value through durable root-checkpoint publication. Its
+/// actual controller/frontend guard must not be replaced by copied root IDs.
+pub struct QuiescentRootInventory {
+    inventory: LocalRootInventory,
+}
+impl QuiescentRootInventory {
+    pub fn roots(&self) -> &[m::ObjectKey] {
+        self.inventory.roots()
+    }
+    pub fn operation_heads(&self) -> &[OperationId] {
+        self.inventory.operation_heads()
+    }
+    pub fn working_copy_operation(&self) -> &OperationId {
+        self.inventory.working_copy_operation()
+    }
+    pub fn retained_operations(&self) -> &[OperationId] {
+        self.inventory.retained_operations()
+    }
+}
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum InventoryMode {
+    Portable,
+    Local,
+}
+enum InventoryRead {
+    Portable(LocalCaptureCandidate),
+    Local(LocalRootInventory),
+}
+struct DiscardCaptureSink;
+#[async_trait::async_trait]
+impl LocalCaptureSink for DiscardCaptureSink {
+    async fn write(&mut self, blob: OwnedCaptureBlob) -> Result<()> {
+        drop(blob);
+        Ok(())
+    }
+}
+
 pub struct QuiescentCapture {
     candidate: LocalCaptureCandidate,
 }
@@ -420,13 +540,16 @@ fn op_id(text: &str) -> Result<OperationId> {
     ensure!(valid_hex(text, 128), "capture requires exact native OP64");
     OperationId::try_from_hex(text).context("invalid native operation")
 }
-fn read_type(path: &Path, expected: &str) -> Result<Vec<u8>> {
+fn read_type_bytes(path: &Path) -> Result<Vec<u8>> {
     let parent = path.parent().context("missing type parent")?;
     let repository =
         private_fs::PrivateDir::open_existing(parent.parent().context("missing type repository")?)?;
     let relative = Path::new(parent.file_name().context("missing type directory")?)
         .join(path.file_name().context("missing type name")?);
-    let bytes = repository.read_descendant(relative, 1024)?;
+    Ok(repository.read_descendant(relative, 1024)?)
+}
+fn read_type(path: &Path, expected: &str) -> Result<Vec<u8>> {
+    let bytes = read_type_bytes(path)?;
     ensure!(
         bytes == expected.as_bytes(),
         "unsupported native capture source type"
@@ -512,13 +635,82 @@ fn read_locator(binding: &Binding, input: &CaptureInput) -> Result<Vec<u8>> {
     Ok(bytes)
 }
 
+// DefaultIndexStore::load only records a path. The patched method performs
+// bounded observational reads, never its ordinary repair/rebuild loader.
+fn legacy_roots(
+    binding: &Binding,
+    operations: &BTreeMap<OperationId, OperationRecord>,
+    limits: &CaptureLimits,
+) -> Result<Vec<jj_lib::backend::CommitId>> {
+    let bounds = DefaultIndexGcLimits {
+        max_operations: limits.max_operations,
+        max_control_bytes: limits.max_file_bytes.min(64 * 1024),
+        max_total_control_bytes: limits.max_decode_bytes,
+        max_segment_bytes: limits.max_file_bytes,
+        max_total_segment_bytes: limits.max_decode_bytes,
+        max_segments: limits.index.max_segments,
+        max_chain_depth: limits.index.max_depth,
+        max_commits: limits.max_parent_edges,
+        max_parent_edges: limits.max_parent_edges,
+        max_validation_steps: limits.max_parent_edges.saturating_mul(64).min(8_000_000),
+        max_roots: limits.max_roots,
+        max_working_bytes: limits.max_decode_bytes,
+    };
+    DefaultIndexStore::load(&binding.repo.join("index"))
+        .gc_roots_readonly(
+            &operations.keys().cloned().collect::<Vec<_>>(),
+            &OperationId::from_bytes(&[0; 64]),
+            &jj_lib::backend::CommitId::from_bytes(&m::CommitId::ROOT.0),
+            16,
+            bounds,
+        )
+        .context("local default index root inventory unavailable")
+}
+
 pub async fn read_candidate(
     input: CaptureInput,
     permit: TreeFreezePermit,
     limits: CaptureLimits,
     sink: &mut dyn LocalCaptureSink,
 ) -> Result<LocalCaptureCandidate> {
-    limits.validate()?;
+    match read_inventory(input, permit, limits, sink, InventoryMode::Portable).await? {
+        InventoryRead::Portable(candidate) => Ok(candidate),
+        InventoryRead::Local(_) => unreachable!("portable inventory mode"),
+    }
+}
+/// Read all retained local operation/view/index roots without a pack, provider
+/// query, regular-file hydration, index repair or working-copy loader. The host
+/// must retain its writer lease and use a genuinely frozen controller source.
+/// Missing or corrupt state fails closed; pending remote intents stay roots.
+pub async fn read_local_root_inventory(
+    input: CaptureInput,
+    permit: TreeFreezePermit,
+    limits: CaptureLimits,
+) -> Result<LocalRootInventory> {
+    match read_inventory(
+        input,
+        permit,
+        limits,
+        &mut DiscardCaptureSink,
+        InventoryMode::Local,
+    )
+    .await?
+    {
+        InventoryRead::Local(inventory) => Ok(inventory),
+        InventoryRead::Portable(_) => unreachable!("local inventory mode"),
+    }
+}
+async fn read_inventory(
+    input: CaptureInput,
+    permit: TreeFreezePermit,
+    limits: CaptureLimits,
+    sink: &mut dyn LocalCaptureSink,
+    mode: InventoryMode,
+) -> Result<InventoryRead> {
+    limits.validate_common()?;
+    if mode == InventoryMode::Portable {
+        limits.validate()?;
+    }
     if let CaptureFreeze::Host(host) = &permit.source {
         let actual = host.binding();
         ensure!(
@@ -538,6 +730,12 @@ pub async fn read_candidate(
         );
     }
     verify_registration(&input.registry, &input.binding)?;
+    let index_type = read_type_bytes(&input.binding.repo.join("index/type"))?;
+    ensure!(
+        index_type == jj_native_index::NAME.as_bytes()
+            || (mode == InventoryMode::Local && index_type == DefaultIndexStore::NAME.as_bytes()),
+        "unsupported local inventory index type"
+    );
     let binding = &input.binding;
     let locator = read_locator(binding, &input)?;
     ensure!(
@@ -552,16 +750,20 @@ pub async fn read_candidate(
         used: Mutex::new(0),
         maximum: limits.max_working_bytes,
     });
-    let base = limits
-        .max_operations
-        .checked_mul(1024)
-        .and_then(|n| n.checked_add(limits.max_parent_edges.checked_mul(256)?))
-        .and_then(|n| n.checked_add(limits.max_roots.checked_mul(128)?))
-        .and_then(|n| n.checked_add(limits.max_decode_bytes.checked_mul(4)?))
-        .and_then(|n| n.checked_add(limits.max_capsule_bytes.checked_mul(2)?))
-        .and_then(|n| n.checked_add(limits.export.artifacts.max_artifacts.checked_mul(512)?))
-        .and_then(|n| n.checked_add(limits.export.max_working_bytes))
-        .context("capture base allocation overflow")?;
+    let base = if mode == InventoryMode::Local {
+        limits.local_base(index_type == jj_native_index::NAME.as_bytes())?
+    } else {
+        limits
+            .max_operations
+            .checked_mul(1024)
+            .and_then(|n| n.checked_add(limits.max_parent_edges.checked_mul(256)?))
+            .and_then(|n| n.checked_add(limits.max_roots.checked_mul(128)?))
+            .and_then(|n| n.checked_add(limits.max_decode_bytes.checked_mul(4)?))
+            .and_then(|n| n.checked_add(limits.max_capsule_bytes.checked_mul(2)?))
+            .and_then(|n| n.checked_add(limits.export.artifacts.max_artifacts.checked_mul(512)?))
+            .and_then(|n| n.checked_add(limits.export.max_working_bytes))
+            .context("capture base allocation overflow")?
+    };
     let owner = Arc::new(CaptureOwner {
         permit,
         _base: quota.reserve(base)?,
@@ -602,9 +804,10 @@ pub async fn read_candidate(
     );
     let remote = read_remote(binding, &input.remote_scope, state_cap)?;
     ensure!(
-        remote
-            .as_ref()
-            .is_none_or(|(state, _)| state.pending.is_none()),
+        mode == InventoryMode::Local
+            || remote
+                .as_ref()
+                .is_none_or(|(state, _)| state.pending.is_none()),
         "active remote intent lacks supported immutable capture policy"
     );
     let simple = Arc::new(SimpleOpStore::load(
@@ -699,7 +902,7 @@ pub async fn read_candidate(
         let mut codec = c::Limits::default();
         codec.max_payload_bytes = limits.max_file_bytes;
         codec.max_decode_bytes = limits.max_decode_bytes;
-        if id.as_bytes() != [0; 64] {
+        if mode == InventoryMode::Portable && id.as_bytes() != [0; 64] {
             let reservation = owner.quota.reserve(
                 limits
                     .max_decode_bytes
@@ -731,7 +934,8 @@ pub async fn read_candidate(
             })
             .await?;
         }
-        if operation.view_id().as_bytes() != [0; 64]
+        if mode == InventoryMode::Portable
+            && operation.view_id().as_bytes() != [0; 64]
             && seen_views.insert(operation.view_id().clone())
         {
             let reservation = owner.quota.reserve(
@@ -876,53 +1080,68 @@ pub async fn read_candidate(
         .keys()
         .map(|id| id.as_bytes().try_into().unwrap())
         .collect::<Vec<[u8; 64]>>();
-    let reader = LocalIndexExportReader::open_existing(
-        &binding.repo.join("index"),
-        &input.index_config,
-        limits.index.clone(),
-        limits.export.max_working_bytes,
-    )?;
-    let index_directory = private_fs::PrivateDir::open_existing(binding.repo.join("index"))?;
-    let index_manifest = index_directory.read("manifest", 16 * 1024)?;
-    let index_before = reader.association_fingerprint(
-        &operation_ids,
-        limits.export.max_source_reads,
-        limits.export.max_source_bytes,
-    )?;
-    let mut index_sink = IndexSink {
-        sink,
-        owner: owner.clone(),
-        records: vec![],
-        roots: BTreeSet::new(),
-        native_references: budget.references,
-        artifact_limits: {
-            let mut bounds = limits.export.artifacts;
-            bounds.max_decode_bytes = bounds.max_decode_bytes.min(limits.max_decode_bytes);
-            bounds
-        },
-        max_roots: limits.max_roots,
-        max_references: limits.max_parent_edges,
-    };
-    let exported = reader
-        .export_operation_indexes(
+    let (exported, native_recheck, legacy_before) = if index_type
+        == jj_native_index::NAME.as_bytes()
+    {
+        let reader = LocalIndexExportReader::open_existing(
+            &binding.repo.join("index"),
+            &input.index_config,
+            limits.index.clone(),
+            limits.export.max_working_bytes,
+        )?;
+        let index_directory = private_fs::PrivateDir::open_existing(binding.repo.join("index"))?;
+        let index_manifest = index_directory.read("manifest", 16 * 1024)?;
+        let index_before = reader.association_fingerprint(
             &operation_ids,
-            limits.export.clone(),
-            &mut index_sink,
-            owner.clone(),
+            limits.export.max_source_reads,
+            limits.export.max_source_bytes,
+        )?;
+        let mut index_sink = IndexSink {
+            sink,
+            owner: owner.clone(),
+            records: vec![],
+            roots: BTreeSet::new(),
+            native_references: budget.references,
+            artifact_limits: {
+                let mut bounds = limits.export.artifacts;
+                bounds.max_decode_bytes = bounds.max_decode_bytes.min(limits.max_decode_bytes);
+                bounds
+            },
+            max_roots: limits.max_roots,
+            max_references: limits.max_parent_edges,
+        };
+        let exported = reader
+            .export_operation_indexes(
+                &operation_ids,
+                limits.export.clone(),
+                &mut index_sink,
+                owner.clone(),
+            )
+            .await?;
+        // Root claims from portable snapshots are decoded without canonical object,
+        // query or FILE reads; exported descriptor roots alone are not native roots.
+        for root in &index_sink.roots {
+            ensure!(
+                roots.contains(root) || roots.len() < limits.max_roots,
+                "capture root union limit"
+            );
+            roots.insert(root.clone());
+        }
+        for record in index_sink.records {
+            blobs.insert((record.kind, record.id.clone()), record);
+        }
+        (
+            Some(exported),
+            Some((reader, index_directory, index_manifest, index_before)),
+            None,
         )
-        .await?;
-    // Root claims from portable snapshots are decoded without canonical object,
-    // query or FILE reads; exported descriptor roots alone are not native roots.
-    for root in &index_sink.roots {
-        ensure!(
-            roots.contains(root) || roots.len() < limits.max_roots,
-            "capture root union limit"
-        );
-        roots.insert(root.clone());
-    }
-    for record in index_sink.records {
-        blobs.insert((record.kind, record.id.clone()), record);
-    }
+    } else {
+        let indexed = legacy_roots(binding, &operations, &limits)?;
+        for commit in &indexed {
+            budget.root(&mut roots, m::Kind::Commit, commit.as_bytes())?;
+        }
+        (None, None, Some(indexed))
+    };
     let (after, after_projection) =
         jj_vfs::native::read_retained_state_for_capture(&wc_binding, state_cap)?;
     let mut after_heads = heads.get_op_heads_bounded(limits.max_operations)?;
@@ -954,18 +1173,51 @@ pub async fn read_candidate(
             )? == heads_type,
         "capture source type changed"
     );
-    let index_recheck = exported.reserve_local_read(&limits.index)?;
     ensure!(
-        index_directory.read("manifest", 16 * 1024)? == index_manifest
-            && reader.association_fingerprint(
-                &operation_ids,
-                limits.export.max_source_reads,
-                limits.export.max_source_bytes
-            )? == index_before,
-        "index associations changed during capture"
+        read_type_bytes(&binding.repo.join("index/type"))? == index_type,
+        "index type changed during inventory"
     );
-    drop(index_recheck);
+    if let Some((reader, index_directory, manifest, before)) = native_recheck {
+        let index_recheck = exported
+            .as_ref()
+            .unwrap()
+            .reserve_local_read(&limits.index)?;
+        ensure!(
+            index_directory.read("manifest", 16 * 1024)? == manifest
+                && reader.association_fingerprint(
+                    &operation_ids,
+                    limits.export.max_source_reads,
+                    limits.export.max_source_bytes
+                )? == before,
+            "index associations changed during capture"
+        );
+        drop(index_recheck);
+    } else {
+        ensure!(
+            Some(legacy_roots(binding, &operations, &limits)?) == legacy_before,
+            "legacy index roots changed during inventory"
+        );
+    }
     budget.check()?;
+    if mode == InventoryMode::Local {
+        return Ok(InventoryRead::Local(LocalRootInventory {
+            roots: roots
+                .into_iter()
+                .map(|root| {
+                    Ok(m::ObjectKey {
+                        kind: m::Kind::try_from(root.kind)?,
+                        id: m::ObjectId(root.id),
+                    })
+                })
+                .collect::<Result<_>>()?,
+            operation_heads,
+            working_copy_operation: wc.operation,
+            retained_operations: operations.into_keys().collect(),
+            _indexes: exported,
+            _owner: owner,
+        }));
+    }
+    let exported = exported.context("portable capture requires native index export")?;
     let data = CaptureData {
         version: 1,
         policy: if matches!(owner.permit.source, CaptureFreeze::Host(_)) {
@@ -1027,12 +1279,12 @@ pub async fn read_candidate(
         bytes.len() <= limits.max_capsule_bytes,
         "capture capsule byte budget exhausted"
     );
-    Ok(LocalCaptureCandidate {
+    Ok(InventoryRead::Portable(LocalCaptureCandidate {
         data,
         bytes,
         private_wc: wc.persisted_bytes,
         private_remote: remote.map(|(_, bytes)| bytes),
         _indexes: exported,
         _owner: owner,
-    })
+    }))
 }

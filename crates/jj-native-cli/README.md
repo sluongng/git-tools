@@ -72,5 +72,7 @@ persisted identity. Missing evidence requires manual inspection, not a reset.
 
 Linux FUSE is the current integrated provider. Native macOS/Windows mutation
 integration and acceptance remain incomplete; unsupported operations fail
-without creating a checkout. Client GC/offloading is not automatic. Protocol
+without creating a checkout. Client GC/offloading is not automatic; see the
+[daemon collection guide](../workspace-daemon#explicit-native-collection) for
+explicit unreachable-only collection of a fresh, fully local cohort. Protocol
 fixtures are separate test-only binaries, not proof of native mount acceptance.

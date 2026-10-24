@@ -258,6 +258,10 @@ async fn collector_serializes_registration_forget_and_no_implicit_untracking() {
         registry.acquire_collector().await,
         Err(Error::UntrackedAccess)
     ));
+    assert!(matches!(
+        registry.try_acquire_collector().await,
+        Err(Error::UntrackedAccess)
+    ));
 }
 #[test]
 fn quotas_reject_before_durable_clean_and_tombstones_keep_namespace_admission_bounded() {
@@ -1254,4 +1258,194 @@ fn reopen_rejects_missing_or_rebound_capture_inventory_and_old_readers_fail_clos
             );
         }
     });
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn host_access_scoped_registration_does_not_queue_behind_its_own_collector() {
+    let (directory, registry) = registry().await;
+    let host = Arc::new(registry.try_host_access().unwrap());
+    assert_eq!(host.registry_id(), registry.id());
+    assert!(matches!(
+        registry.try_acquire_collector().await,
+        Err(Error::Busy)
+    ));
+    // A failed try must not queue an exclusive writer ahead of nested host I/O.
+    drop(registry.try_host_access().unwrap());
+    drop(host);
+    let collector = registry.try_acquire_collector().await.unwrap();
+    assert!(
+        collector
+            .roots()
+            .contains(&tinytree_model::empty_tree().descriptor.key)
+    );
+    assert!(matches!(registry.try_host_access(), Err(Error::Busy)));
+    assert!(matches!(
+        registry.try_acquire_collector().await,
+        Err(Error::Busy)
+    ));
+    drop(collector);
+    let host = Arc::new(registry.try_host_access().unwrap());
+    let (_other_directory, other) = self::registry().await;
+    let before = other.storage_stats();
+    assert!(matches!(
+        other
+            .register_with_host_access(WorkspaceId([2; 16]), OpStoreId([3; 16]), host.clone())
+            .await,
+        Err(Error::IdentityMismatch)
+    ));
+    assert_eq!(other.storage_stats(), before);
+    let collecting = registry.clone();
+    let collection = tokio::spawn(async move { collecting.acquire_collector().await });
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while registry.try_host_access().is_ok() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    let registered = tokio::time::timeout(
+        Duration::from_secs(2),
+        registry.register_with_host_access(WorkspaceId([2; 16]), OpStoreId([3; 16]), host.clone()),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(
+        registry.workspace(registered).await.unwrap().state,
+        WorkspaceState::Dirty
+    );
+    assert!(!collection.is_finished());
+    drop(host);
+    assert!(matches!(
+        tokio::time::timeout(Duration::from_secs(2), collection)
+            .await
+            .unwrap()
+            .unwrap(),
+        Err(Error::DirtyWorkspace)
+    ));
+    assert!(matches!(
+        registry.try_acquire_collector().await,
+        Err(Error::DirtyWorkspace)
+    ));
+    let host = registry.try_host_access().unwrap();
+    drop(registry);
+    assert!(matches!(
+        Registry::open_existing(directory.path(), RegistryId([1; 16]), Limits::default()).await,
+        Err(Error::Busy)
+    ));
+    drop(host);
+    let reopened =
+        Registry::open_existing(directory.path(), RegistryId([1; 16]), Limits::default())
+            .await
+            .unwrap();
+    assert_eq!(
+        reopened.workspace(registered).await.unwrap().state,
+        WorkspaceState::Dirty
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn host_dirty_invalidation_preserves_claim_and_refuses_live_command_owners() {
+    let (_directory, registry) = registry().await;
+    let host = Arc::new(registry.try_host_access().unwrap());
+    let registration = registry
+        .register_with_host_access(WorkspaceId([2; 16]), OpStoreId([3; 16]), host.clone())
+        .await
+        .unwrap();
+    let command = registry.begin_command(registration).await.unwrap();
+    registry
+        .checkpoint(command.token(), checkpoint(4))
+        .await
+        .unwrap();
+    assert!(matches!(
+        registry
+            .mark_dirty_with_host_access(registration, host.clone())
+            .await,
+        Err(Error::Busy)
+    ));
+    drop(command);
+    let clean = registry.workspace(registration).await.unwrap();
+    let before = registry.storage_stats();
+    assert_eq!(
+        registry
+            .register_with_host_access(registration.workspace, registration.op_store, host.clone())
+            .await
+            .unwrap(),
+        registration
+    );
+    assert_eq!(
+        registry.storage_stats(),
+        before,
+        "idempotent registration must not silently invalidate a checkpoint"
+    );
+    registry
+        .mark_dirty_with_host_access(registration, host.clone())
+        .await
+        .unwrap();
+    let dirty = registry.workspace(registration).await.unwrap();
+    assert_eq!(dirty.state, WorkspaceState::Dirty);
+    assert_eq!(dirty.command_epoch, clean.command_epoch);
+    assert_eq!(
+        dirty.fingerprint, clean.fingerprint,
+        "host invalidation preserves the old root claim"
+    );
+    let before = registry.storage_stats();
+    registry
+        .mark_dirty_with_host_access(registration, host.clone())
+        .await
+        .unwrap();
+    assert_eq!(
+        registry.storage_stats(),
+        before,
+        "already Dirty remains an idempotent safe state"
+    );
+    drop(host);
+    assert!(matches!(
+        registry.acquire_collector().await,
+        Err(Error::DirtyWorkspace)
+    ));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cancelled_host_registration_retains_its_fence_until_the_durable_dirty_write() {
+    let (_directory, registry) = registry().await;
+    let access = Arc::new(registry.try_host_access().unwrap());
+    let inner = registry.inner.clone();
+    let (locked, arrived) = tokio::sync::oneshot::channel();
+    let (release, released) = std::sync::mpsc::channel();
+    let blocking = std::thread::spawn(move || {
+        let _data = inner.data.lock().unwrap();
+        locked.send(()).unwrap();
+        released.recv().unwrap();
+    });
+    arrived.await.unwrap();
+    let weak = Arc::downgrade(&access);
+    {
+        let mut registration = Box::pin(registry.register_with_host_access(
+            WorkspaceId([2; 16]),
+            OpStoreId([3; 16]),
+            access,
+        ));
+        // Poll through actual blocking-job acceptance. The held ledger mutex
+        // prevents completion, so dropping this Pending future cancels only its
+        // waiter, not an arbitrary task that might never have started.
+        assert!(futures::poll!(registration.as_mut()).is_pending());
+    }
+    assert!(
+        weak.upgrade().is_some(),
+        "cancelled registration keeps physical access ownership"
+    );
+    let collecting = registry.clone();
+    let collection = tokio::spawn(async move { collecting.acquire_collector().await });
+    tokio::task::yield_now().await;
+    assert!(!collection.is_finished());
+    release.send(()).unwrap();
+    blocking.join().unwrap();
+    assert!(matches!(
+        tokio::time::timeout(Duration::from_secs(2), collection)
+            .await
+            .unwrap()
+            .unwrap(),
+        Err(Error::DirtyWorkspace)
+    ));
 }

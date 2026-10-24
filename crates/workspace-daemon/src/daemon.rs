@@ -687,6 +687,8 @@ fn open_native_host(
             })?;
     let broker = if let Some(commands) = command_host {
         broker
+            .with_host_access_resolver(commands.clone())
+            .map_err(|_| anyhow::anyhow!("cannot configure native host admission"))?
             .with_command_resolver(commands)
             .map_err(|_| anyhow::anyhow!("cannot configure native command admission"))?
     } else {
@@ -832,13 +834,23 @@ pub async fn serve(mut config: Config) -> Result<()> {
     let native_cache = cache.clone();
     let native_ca = credentials.native_ca.clone();
     let native_credentials = credentials.native.clone();
+    let fresh_native_cohort = crate::native_gc::fresh_cohort(&config)?;
     let native_commands = if config.native.repositories.is_empty() {
         None
     } else {
         Some(Arc::new(
-            crate::native_commands::NativeCommandHost::open_with_capture(
+            crate::native_commands::NativeCommandHost::open_with_policy(
                 &config.state_dir.join("native-commands"),
                 config.native.workspaces.capture.clone(),
+                config.native.workspaces.gc.clone(),
+                if config.native.workspaces.gc.policy
+                    == crate::config::NativeGcPolicy::LocalComplete
+                {
+                    config.native.repositories.keys().next().cloned()
+                } else {
+                    None
+                },
+                fresh_native_cohort,
             )
             .await?,
         ))
@@ -1124,6 +1136,13 @@ pub async fn serve(mut config: Config) -> Result<()> {
                         Some(manager) => manager.create(root, store, commit, workspace_id).await.and_then(|value| serde_json::to_value(value).map_err(Into::into)),
                         None => Err(anyhow::anyhow!("native repositories are not configured")),
                     }
+                }
+                Ok(Request::NativeGc { store, apply }) => {
+                    if !configuration_scoped { Err(anyhow::anyhow!("native collection requires configuration-scoped control")) }
+                    else { match state_slot.as_ref().unwrap().native_workspaces.as_ref() {
+                        Some(manager) => manager.collect_native(&store, apply).await,
+                        None => Err(anyhow::anyhow!("native repositories are not configured")),
+                    }}
                 }
                 Ok(Request::NativeRestore {root,store,workspace_id,source}) => {
                     if !configuration_scoped {Err(anyhow::anyhow!("native restore requires matching scoped daemon configuration"))}
@@ -1616,6 +1635,90 @@ mod tests {
             assert!(git_cas_endpoint(upstream).is_err());
         }
     }
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn native_collection_policy_requires_fresh_cohort_and_cannot_upgrade_existing_state()
+    -> Result<()> {
+        use crate::config::{NativeCapture, NativeGc, NativeGcPolicy, NativeRepository};
+        let directory = tempfile::tempdir()?;
+        let mut config = Config::default();
+        config.state_dir = directory.path().join("fresh");
+        private_dir(&config.state_dir)?;
+        config
+            .native
+            .repositories
+            .insert("example".into(), NativeRepository::default());
+        config.native.workspaces.gc.policy = NativeGcPolicy::LocalComplete;
+        let proof =
+            crate::native_gc::fresh_cohort(&config)?.context("fresh cohort proof missing")?;
+        let path = config.state_dir.join("native-commands");
+        let host = crate::native_commands::NativeCommandHost::open_with_policy(
+            &path,
+            NativeCapture::default(),
+            config.native.workspaces.gc.clone(),
+            Some("example".into()),
+            Some(proof),
+        )
+        .await?;
+        assert_eq!(host.status()["collection_enabled"], true);
+        drop(host);
+        assert!(crate::native_gc::fresh_cohort(&config)?.is_none());
+        let header = std::fs::read(path.join("identity.json"))?;
+        let host = crate::native_commands::NativeCommandHost::open_with_policy(
+            &path,
+            NativeCapture::default(),
+            config.native.workspaces.gc.clone(),
+            Some("example".into()),
+            None,
+        )
+        .await?;
+        drop(host);
+        assert!(
+            crate::native_commands::NativeCommandHost::open_with_policy(
+                &path,
+                NativeCapture::default(),
+                NativeGc::default(),
+                None,
+                None
+            )
+            .await
+            .is_err()
+        );
+        assert!(
+            crate::native_commands::NativeCommandHost::open_with_policy(
+                &path,
+                NativeCapture::default(),
+                config.native.workspaces.gc.clone(),
+                Some("other".into()),
+                None
+            )
+            .await
+            .is_err()
+        );
+        assert_eq!(std::fs::read(path.join("identity.json"))?, header);
+        let old = directory.path().join("old");
+        let host = crate::native_commands::NativeCommandHost::open(&old).await?;
+        drop(host);
+        let old_header = std::fs::read(old.join("identity.json"))?;
+        assert!(
+            crate::native_commands::NativeCommandHost::open_with_policy(
+                &old,
+                NativeCapture::default(),
+                config.native.workspaces.gc.clone(),
+                Some("example".into()),
+                None
+            )
+            .await
+            .is_err()
+        );
+        assert_eq!(std::fs::read(old.join("identity.json"))?, old_header);
+        config.state_dir = directory.path().join("unknown");
+        private_dir(&config.state_dir)?;
+        private_dir(&config.state_dir.join("native"))?;
+        assert!(crate::native_gc::fresh_cohort(&config).is_err());
+        assert!(!config.state_dir.join("native-commands").exists());
+        Ok(())
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn native_command_dirty_fence_survives_client_timeout_and_kernel_lease_until_drain()
     -> Result<()> {

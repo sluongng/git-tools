@@ -1012,7 +1012,29 @@ impl Controller {
         &self,
         expected: &ProjectionState,
     ) -> Result<ControllerCapture> {
-        let admission = self.admission().await?;
+        self.capture_for_backup_inner(expected, None).await
+    }
+    /// Bound a host checkpoint by its original deadline, including controller
+    /// admission. Native physical ownership still survives caller cancellation.
+    pub async fn capture_for_backup_until(
+        &self,
+        expected: &ProjectionState,
+        deadline: tokio::time::Instant,
+    ) -> Result<ControllerCapture> {
+        self.capture_for_backup_inner(expected, Some(deadline))
+            .await
+    }
+    async fn capture_for_backup_inner(
+        &self,
+        expected: &ProjectionState,
+        original_deadline: Option<tokio::time::Instant>,
+    ) -> Result<ControllerCapture> {
+        let admission = match original_deadline {
+            Some(deadline) => tokio::time::timeout_at(deadline, self.admission())
+                .await
+                .context("native capture admission deadline elapsed")??,
+            None => self.admission().await?,
+        };
         // All projected-path health reads occur before the native frontend is
         // paused. Never call healthy()/inspect() while the returned guard lives.
         self.healthy()?;
@@ -1049,7 +1071,10 @@ impl Controller {
                 repository: ledger.binding.repository.clone(),
             }
         };
-        let deadline = tokio::time::Instant::now() + self.inner.config.operation_timeout;
+        let mut deadline = tokio::time::Instant::now() + self.inner.config.operation_timeout;
+        if let Some(original) = original_deadline {
+            deadline = deadline.min(original);
+        }
         let native = mount
             .capture_for_backup(&self.inner.config.source_limits, deadline)
             .await?;

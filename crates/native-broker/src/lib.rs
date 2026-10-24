@@ -3,7 +3,7 @@
 mod client;
 mod command;
 mod config;
-pub use command::{CommandGuard, CommandResolver};
+pub use command::{CommandGuard, CommandResolver, HostAccessResolver};
 mod control;
 mod control_client;
 mod local;

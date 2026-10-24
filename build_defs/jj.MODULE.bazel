@@ -4,14 +4,15 @@ crate = use_extension("@rules_rs//rs:extensions.bzl", "crate")
 # operations kept by the operation store's age policy.
 crate.annotation(
     crate = "jj-lib",
-    version = "0.46.0",
+    patch_args = ["-p1"],
     patches = [
         "//third_party/patches:jj-retained-operation-inventory.patch",
+        "//third_party/patches:jj-default-index-gc-inventory.patch",
         "//third_party/patches:jj-cloud-operation-codec.patch",
         "//third_party/patches:jj-cloud-restore-heads.patch",
         "//third_party/patches:jj-index-capabilities.patch",
         "//third_party/patches:jj-merge-prepared-index.patch",
         "//third_party/patches:jj-lazy-prefix-context.patch",
     ],
-    patch_args = ["-p1"],
+    version = "0.46.0",
 )

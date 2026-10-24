@@ -1,6 +1,6 @@
 //! In-process read admission for daemon-owned providers. Raw providers remain
 //! below the facade so dependency proofs never reacquire the same pool.
-use crate::{BrokerService, Config, client::run_owned, wire};
+use crate::{BrokerService, Config, client::run_control, wire};
 use futures::AsyncRead;
 use jj_lib::backend::BackendResult;
 use jj_native_backend::{
@@ -47,18 +47,37 @@ impl GuardedIo {
     {
         let service = self.service.clone();
         let provider = self.provider.clone();
-        run_owned(owner.clone(), async move {
-            let deadline = service.operation_deadline();
+        let deadline = service.operation_deadline();
+        run_control(async move {
             let work = service.admit_local(method, deadline).await?;
-            // Both guards follow physical provider jobs, not just this waiter.
+            // Admission is abortable. Only accepted physical jobs are detached,
+            // so cancelled callers cannot leave an orphan queue holding host
+            // fences while waiting for the shared pools.
             let owner: Owner = Arc::new((owner, work));
-            reapi::policy::timeout(deadline, async move {
-                job(provider, owner).await.map_err(wire::backend)
+            let accepted = tokio::spawn(async move {
+                let value = job(provider, owner.clone()).await;
+                OwnedResult {
+                    value,
+                    _owner: owner,
+                }
+            });
+            let result = reapi::policy::timeout(deadline, async move {
+                accepted
+                    .await
+                    .map_err(|_| tonic::Status::internal("native source worker failed"))
             })
-            .await
+            .await?;
+            result.value.map_err(wire::backend)
         })
         .await
+        .map_err(wire::other)
     }
+}
+// Keep returned physical payload teardown inside host/admission ownership when
+// cancellation discards a detached worker's output.
+struct OwnedResult<T> {
+    value: BackendResult<T>,
+    _owner: Owner,
 }
 struct OwnedReader {
     reader: Pin<Box<dyn AsyncRead + Send>>,
@@ -188,7 +207,7 @@ impl NativeObjectIo for GuardedIo {
     // Those retain existing provider staging admission and durable ACK semantics;
     // they do not perform remote dependency hydration.
     async fn write_metadata(&self, object: m::Object) -> BackendResult<m::Descriptor> {
-        self.provider.write_metadata(object).await
+        self.write_metadata_with_owner(object, Arc::new(())).await
     }
     async fn write_metadata_with_owner(
         &self,
@@ -206,9 +225,9 @@ impl NativeObjectIo for GuardedIo {
         max_bytes: u64,
         owner: Owner,
     ) -> BackendResult<m::FileId> {
-        let work = self
-            .service
-            .admit_local("/WriteFile", self.service.operation_deadline())
+        let service = self.service.clone();
+        let deadline = service.operation_deadline();
+        let work = run_control(async move { service.admit_local("/WriteFile", deadline).await })
             .await
             .map_err(wire::other)?;
         self.provider
@@ -220,6 +239,7 @@ impl NativeObjectIo for GuardedIo {
         input: &mut (dyn AsyncRead + Send + Unpin),
         max_bytes: u64,
     ) -> BackendResult<m::FileId> {
-        self.provider.write_file(input, max_bytes).await
+        self.write_file_with_owner(input, max_bytes, Arc::new(()))
+            .await
     }
 }

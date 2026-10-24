@@ -1002,6 +1002,39 @@ fn local_capture_reads_exact_existing_state_without_loaders_or_provider_queries(
             candidate.seal_quiescent().is_err(),
             "TreeOnly never manufactures frontend quiescence"
         );
+        let snapshot = tree
+            .freeze_lazy_source(
+                output_core::SourceFrontendFence::TreeOnly,
+                &Default::default(),
+            )
+            .unwrap();
+        let inventory = capture::read_local_root_inventory(
+            capture::CaptureInput {
+                registry: fixture.registry.clone(),
+                binding: fixture.binding.clone(),
+                index_config: index_config.clone(),
+                local_objects: objects.clone(),
+                remote_scope: scope.clone(),
+            },
+            capture::TreeFreezePermit::from_snapshot(snapshot, projection.clone(), Arc::new(()))
+                .unwrap(),
+            Default::default(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(inventory.working_copy_operation(), &exact_op);
+        assert!(inventory.retained_operations().contains(&exact_op));
+        assert!(
+            inventory
+                .roots()
+                .iter()
+                .any(|root| root.kind == tinytree_model::Kind::Tree)
+        );
+        assert!(
+            inventory.seal_quiescent().is_err(),
+            "TreeOnly inventory cannot make Clean"
+        );
+        assert_eq!(setup_queries.calls.load(Ordering::SeqCst), setup_calls);
         // Explicit private-state corruption boundary: canonical no-label state
         // must not accidentally match a nonempty projected label. This is still
         // a TreeOnly candidate, never a manufactured host capture proof.
@@ -1041,6 +1074,375 @@ fn local_capture_reads_exact_existing_state_without_loaders_or_provider_queries(
                 .contains("working-copy commit tree mismatch")
         );
         assert_eq!(setup_queries.calls.load(Ordering::SeqCst), setup_calls);
+    });
+}
+
+#[test]
+fn local_default_inventory_retains_hidden_indexes_and_pending_archived_intents_without_repair() {
+    futures::executor::block_on(async {
+        use crate::remote_state::{Kind, Pending, State};
+        fn index_files(path: &Path) -> std::collections::BTreeMap<PathBuf, Vec<u8>> {
+            fn walk(
+                base: &Path,
+                here: &Path,
+                out: &mut std::collections::BTreeMap<PathBuf, Vec<u8>>,
+            ) {
+                for entry in fs::read_dir(here).unwrap() {
+                    let path = entry.unwrap().path();
+                    if path.is_dir() {
+                        walk(base, &path, out);
+                    } else {
+                        out.insert(
+                            path.strip_prefix(base).unwrap().to_path_buf(),
+                            fs::read(path).unwrap(),
+                        );
+                    }
+                }
+            }
+            let mut files = Default::default();
+            walk(path, path, &mut files);
+            files
+        }
+        let fixture = Fixture::new();
+        let shared = std::cell::RefCell::new(None);
+        let initializer = |_: &UserSettings,
+                           path: &Path|
+         -> std::result::Result<Box<dyn Backend>, BackendInitError> {
+            let objects = Arc::new(
+                jj_native_backend::DirectObjectIo::init(path, Default::default())
+                    .map_err(|e| BackendInitError(Box::new(e)))?,
+            );
+            *shared.borrow_mut() = Some(objects.clone());
+            let backend = std::thread::spawn(move || {
+                futures::executor::block_on(NativeBackend::from_io(
+                    objects,
+                    BackendConfig::default(),
+                ))
+            })
+            .join()
+            .unwrap()
+            .map_err(|e| BackendInitError(Box::new(e)))?;
+            Ok(Box::new(backend))
+        };
+        let (workspace, repo) = initialize(
+            &fixture.registry,
+            &fixture.binding,
+            &fixture.settings,
+            &initializer,
+            Signer::new(None, vec![]),
+            fixture.connector.clone(),
+            &CommitId::from_bytes(&[0; 32]),
+            WorkspaceName::DEFAULT.to_owned(),
+        )
+        .await
+        .unwrap();
+        let wc_operation = workspace.working_copy().operation_id().clone();
+        let current = repo
+            .store()
+            .get_commit_async(
+                repo.view()
+                    .get_wc_commit_id(WorkspaceName::DEFAULT)
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let mut hidden_data = current.store_commit().as_ref().clone();
+        hidden_data.parents = vec![repo.store().root_commit_id().clone()];
+        hidden_data.change_id = jj_lib::backend::ChangeId::from_bytes(&[13; 16]);
+        hidden_data.description = "hidden indexed draft".into();
+        let hidden = repo
+            .store()
+            .write_commit(hidden_data.clone(), None)
+            .await
+            .unwrap();
+        let mut tx = repo.start_transaction();
+        tx.repo_mut()
+            .index_commits(std::slice::from_ref(&hidden))
+            .await
+            .unwrap();
+        let unpublished = tx.write("retain unpublished indexed draft").await.unwrap();
+        let hidden_operation = unpublished.operation().id().clone();
+        assert!(
+            !repo.view().heads().contains(hidden.id()),
+            "hidden object is not a view head"
+        );
+        hidden_data.description = "pending intent draft".into();
+        let pending_commit = repo
+            .store()
+            .write_commit(hidden_data.clone(), None)
+            .await
+            .unwrap();
+        hidden_data.description = "archived intent draft".into();
+        let archived_commit = repo.store().write_commit(hidden_data, None).await.unwrap();
+        let objects = shared.borrow().as_ref().unwrap().clone();
+        drop(unpublished);
+        drop(workspace);
+        drop(repo);
+        let scope = remote_state::RemoteScope::new(
+            fixture.binding.admin.join("broker.sock"),
+            "example".into(),
+        )
+        .unwrap();
+        fs::write(
+            fixture.binding.repo.join("store/native-broker.toml"),
+            format!("version=1\nsocket={:?}\nstore='example'\n", scope.socket),
+        )
+        .unwrap();
+        let mut remote = State::new(&scope);
+        remote.pending = Some(Pending {
+            kind: Kind::Fetch,
+            reference: "refs/heads/main".into(),
+            bookmark: "main".into(),
+            generation: 0,
+            head: Some(pending_commit.id().hex()),
+            request_id: "11".repeat(16),
+            base_operation: wc_operation.hex(),
+            confirmed_generation: None,
+        });
+        remote.archived_pushes.push(Pending {
+            kind: Kind::Push,
+            reference: "refs/heads/topic".into(),
+            bookmark: "topic".into(),
+            generation: 2,
+            head: Some(archived_commit.id().hex()),
+            request_id: "12".repeat(16),
+            base_operation: hidden_operation.hex(),
+            confirmed_generation: Some(3),
+        });
+        remote.validate(&scope).unwrap();
+        PrivateDir::open_existing(&fixture.binding.working_copy)
+            .unwrap()
+            .replace(
+                "native-remote.toml",
+                toml::to_string(&remote).unwrap().as_bytes(),
+            )
+            .unwrap();
+        let source = Arc::new(NoCaptureSource);
+        let tree = output_core::Tree::open(
+            fixture.binding.admin.join("inventory-source"),
+            "inventory",
+            source.clone(),
+            Default::default(),
+        )
+        .unwrap();
+        let projection = fixture.connector.projected.clone();
+        tree.install_lazy_source(
+            output_core::LazySourceRoot {
+                identity: tree.identity().into(),
+                root_tree: projection.tree.terms[0],
+                pin: output_core::SourcePin {
+                    root: projection.tree.terms[0],
+                    generation: projection.generation,
+                },
+                provider: source,
+                load_limits: Default::default(),
+            },
+            None,
+            "initial",
+            &Default::default(),
+        )
+        .unwrap();
+        let input = || capture::CaptureInput {
+            registry: fixture.registry.clone(),
+            binding: fixture.binding.clone(),
+            index_config: jj_native_index::Config {
+                endpoint: jj_native_index::Endpoint::UnixSocket(scope.socket.clone()),
+                store_alias: scope.store.clone(),
+                provider_fingerprint: [7; 32],
+            },
+            local_objects: objects.clone(),
+            remote_scope: scope.clone(),
+        };
+        let permit = || {
+            capture::TreeFreezePermit::from_snapshot(
+                tree.freeze_lazy_source(
+                    output_core::SourceFrontendFence::TreeOnly,
+                    &Default::default(),
+                )
+                .unwrap(),
+                projection.clone(),
+                Arc::new(()),
+            )
+            .unwrap()
+        };
+        let index = fixture.binding.repo.join("index");
+        // Many real retained operations can name one unchanged index snapshot.
+        // A per-call validated-segment memo must charge parsed rows/segments
+        // once, while still reading and bounding every operation association.
+        use jj_lib::op_store::OpStore as _;
+        let operation_store = jj_lib::simple_op_store::SimpleOpStore::load(
+            &fixture.binding.repo.join("op_store"),
+            jj_lib::op_store::RootOperationData {
+                root_commit_id: CommitId::from_bytes(&[0; 32]),
+            },
+        );
+        let original_operation = operation_store
+            .read_operation_bounded(&hidden_operation, 4 * 1024 * 1024, 64 * 1024 * 1024)
+            .unwrap();
+        let shared_control = fs::read(index.join("op_links").join(hidden_operation.hex())).unwrap();
+        let mut shared_operations = Vec::new();
+        for number in 0..64 {
+            let mut operation = original_operation.clone();
+            operation.metadata.description = format!("retained unchanged index {number}");
+            let operation = operation_store.write_operation(&operation).await.unwrap();
+            fs::write(
+                index.join("op_links").join(operation.hex()),
+                &shared_control,
+            )
+            .unwrap();
+            shared_operations.push(operation);
+        }
+        assert_eq!(
+            shared_operations
+                .iter()
+                .collect::<std::collections::BTreeSet<_>>()
+                .len(),
+            64
+        );
+        let before = index_files(&index);
+        assert_eq!(&shared_control[..2], &[0x0a, 64]);
+        let mut segment_name = hex(&shared_control[2..66]);
+        let mut unique_segments = std::collections::BTreeSet::new();
+        loop {
+            assert!(unique_segments.insert(segment_name.clone()));
+            let bytes = before
+                .get(&PathBuf::from("segments").join(&segment_name))
+                .unwrap();
+            let parent_length = u32::from_le_bytes(bytes[4..8].try_into().unwrap()) as usize;
+            if parent_length == 0 {
+                break;
+            }
+            segment_name = std::str::from_utf8(&bytes[8..8 + parent_length])
+                .unwrap()
+                .to_owned();
+        }
+        let expected_index_roots = [
+            CommitId::from_bytes(&[0; 32]),
+            current.id().clone(),
+            hidden.id().clone(),
+        ]
+        .into_iter()
+        .collect::<std::collections::BTreeSet<_>>();
+        let tight_index_limits = jj_lib::default_index::DefaultIndexGcLimits {
+            max_operations: shared_operations.len(),
+            max_segments: unique_segments.len(),
+            max_commits: expected_index_roots.len(),
+            max_roots: expected_index_roots.len(),
+            ..Default::default()
+        };
+        let readonly_index = jj_lib::default_index::DefaultIndexStore::load(&index);
+        let read_shared = || {
+            readonly_index.gc_roots_readonly(
+                &shared_operations,
+                &OperationId::from_bytes(&[0; 64]),
+                &CommitId::from_bytes(&[0; 32]),
+                16,
+                tight_index_limits,
+            )
+        };
+        assert_eq!(
+            read_shared()
+                .unwrap()
+                .into_iter()
+                .collect::<std::collections::BTreeSet<_>>(),
+            expected_index_roots
+        );
+        assert_eq!(index_files(&index), before);
+        let calls = fixture.connector.calls.load(Ordering::SeqCst);
+        let inventory = capture::read_local_root_inventory(input(), permit(), Default::default())
+            .await
+            .unwrap();
+        assert_eq!(inventory.working_copy_operation(), &wc_operation);
+        assert!(inventory.retained_operations().contains(&hidden_operation));
+        assert!(
+            shared_operations
+                .iter()
+                .all(|operation| inventory.retained_operations().contains(operation)),
+            "every actual retained operation must be inventoried even when its index is shared"
+        );
+        assert!(
+            !inventory.operation_heads().contains(&hidden_operation),
+            "unpublished operation is not a current head"
+        );
+        for commit in [&hidden, &pending_commit, &archived_commit] {
+            assert!(
+                inventory.roots().contains(&tinytree_model::ObjectKey {
+                    kind: tinytree_model::Kind::Commit,
+                    id: tinytree_model::ObjectId(commit.id().as_bytes().try_into().unwrap())
+                }),
+                "all indexed and intent objects remain roots"
+            );
+        }
+        assert!(inventory.seal_quiescent().is_err());
+        assert_eq!(index_files(&index), before);
+        assert_eq!(
+            fixture.connector.calls.load(Ordering::SeqCst),
+            calls,
+            "inventory never loads a working copy"
+        );
+        let mut limited = capture::CaptureLimits::default();
+        limited.max_operations = 1;
+        assert!(
+            capture::read_local_root_inventory(input(), permit(), limited)
+                .await
+                .is_err()
+        );
+        assert_eq!(index_files(&index), before);
+        let association = PathBuf::from("op_links").join(hidden_operation.hex());
+        let association_bytes = before.get(&association).unwrap();
+        fs::remove_file(index.join(&association)).unwrap();
+        let missing = index_files(&index);
+        assert!(
+            capture::read_local_root_inventory(input(), permit(), Default::default())
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            index_files(&index),
+            missing,
+            "missing association must not rebuild"
+        );
+        fs::write(index.join(&association), association_bytes).unwrap();
+        // Select the exact commit segment named by this retained operation,
+        // not an arbitrary orphan left behind by index compaction.
+        assert_eq!(&association_bytes[..2], &[0x0a, 64]);
+        let segment = PathBuf::from("segments").join(hex(&association_bytes[2..66]));
+        let segment_bytes = before.get(&segment).unwrap();
+        fs::write(index.join(&segment), b"corrupt retained segment").unwrap();
+        let corrupt = index_files(&index);
+        assert_eq!(
+            read_shared().unwrap_err().kind(),
+            std::io::ErrorKind::InvalidData,
+            "a new read must not reuse another call's validated segment memo"
+        );
+        assert_eq!(index_files(&index), corrupt);
+        assert!(
+            capture::read_local_root_inventory(input(), permit(), Default::default())
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            index_files(&index),
+            corrupt,
+            "corrupt index must not reinitialize"
+        );
+        fs::write(index.join(&segment), segment_bytes).unwrap();
+        assert_eq!(index_files(&index), before);
+        // Archived ancestry is required, not optional diagnostic metadata.
+        remote.archived_pushes[0].base_operation = "ff".repeat(64);
+        PrivateDir::open_existing(&fixture.binding.working_copy)
+            .unwrap()
+            .replace(
+                "native-remote.toml",
+                toml::to_string(&remote).unwrap().as_bytes(),
+            )
+            .unwrap();
+        assert!(
+            capture::read_local_root_inventory(input(), permit(), Default::default())
+                .await
+                .is_err()
+        );
+        assert_eq!(index_files(&index), before);
     });
 }
 

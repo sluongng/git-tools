@@ -38,6 +38,26 @@ also use `rbe.sock` for shared object I/O and native reference control. Configur
 [`tinytree-jj`](../jj-native-cli) for native clone/fetch/push through daemon-owned
 lazy Linux mounts. Native client GC/offloading is not automatic.
 
+## Explicit native collection
+
+On Linux, opt into `[native.workspaces.gc] policy = "local_complete"` only when
+initializing a genuinely fresh native cohort under `state_dir`, with exactly one
+fully local repository alias, legacy index mode and capture/upload policies
+disabled. Existing untracked stores cannot be upgraded this way. Reopening a managed cohort requires
+its recorded policy and alias; do not disable the policy or rename the alias.
+
+```sh
+workspace --config CONFIG native-gc --store example          # Preview only.
+workspace --config CONFIG native-gc --store example --apply  # Bounded sweep.
+```
+
+The preview is nonmutating, not deletion permission; apply revalidates the roots.
+Only unreachable objects past the grace period are eligible. Collection is never
+automatic: no reachable offloading, undo expiry or recovery-ticket retirement.
+See the [TOML example](../../examples/workspace.toml) for conservative defaults.
+
+## Retained captures
+
 With federated indexes on Linux, set `native.workspaces.capture.policy` to
 `"after_command_best_effort"` to queue a durable local capture after each command.
 To publish queued captures asynchronously, also set

@@ -236,6 +236,32 @@ impl Manager {
             .map(|commands| commands.status())
             .unwrap_or(serde_json::Value::Null)
     }
+    pub async fn collect_native(&self, alias: &str, apply: bool) -> Result<serde_json::Value> {
+        ensure!(
+            self.entries.values().all(|entry| {
+                matches!(entry.record.state, Lifecycle::Ready | Lifecycle::Stopped)
+                    && entry.provider_failure.is_none()
+                    && entry.startup.is_none()
+                    && entry.command_startup.is_none()
+                    && entry.restore_intent.is_none()
+                    && entry.restore_receipt.is_none()
+            }),
+            "native collection blocked: workspace recovery is incomplete"
+        );
+        let repository = self
+            .repositories
+            .get(alias)
+            .context("native repository alias is not configured")?;
+        ensure!(
+            !repository.remote,
+            "native collection requires complete local storage"
+        );
+        self.commands
+            .as_ref()
+            .context("native command host unavailable")?
+            .collect_native(repository.local_objects.clone(), apply)
+            .await
+    }
     pub fn status(&self) -> serde_json::Value {
         serde_json::json!(self.entries.iter().map(|(id,entry)| serde_json::json!({"workspace_id":id,"root":entry.record.root,"store":entry.record.store,"state":entry.record.state,"active":entry.mount.is_some(),"provider_recovery_owned":entry.provider_failure.is_some()})).collect::<Vec<_>>())
     }
@@ -278,6 +304,11 @@ impl Manager {
         commit: String,
         workspace_id: String,
     ) -> Result<Mounted> {
+        let access = self
+            .commands
+            .as_ref()
+            .map(|host| host.host_access())
+            .transpose()?;
         let id = unhex(&workspace_id)?;
         ensure!(id != [0; 32], "native workspace identity must be nonzero");
         let commit = unhex(&commit)?;
@@ -444,7 +475,20 @@ impl Manager {
         );
         let binding = self.binding(&record)?;
         if let Some(commands) = &self.commands {
-            commands.register(&binding, repository.identity).await?;
+            if let Some(access) = &access {
+                commands
+                    .register_with_host_access(&binding, repository.identity, access.clone())
+                    .await?;
+                commands
+                    .invalidate_workspace_with_host_access(
+                        &binding,
+                        repository.identity,
+                        access.clone(),
+                    )
+                    .await?;
+            } else {
+                commands.register(&binding, repository.identity).await?;
+            }
         }
         #[cfg(test)]
         if let Some(before) = self.before_provider_start.take() {
@@ -611,9 +655,14 @@ impl Manager {
         workspace_id: String,
         selection: crate::control::NativeRestoreSelection,
     ) -> Result<Mounted> {
+        let access = self
+            .commands
+            .as_ref()
+            .context("native restore requires managed command admission")?
+            .host_access()?;
         let mut started = false;
         let result = self
-            .restore_inner(root, store, &workspace_id, selection, &mut started)
+            .restore_inner(root, store, &workspace_id, selection, &mut started, access)
             .await;
         if result.is_err() && started && self.entries.contains_key(&workspace_id) {
             // Never let an error discard an acquired startup fence/controller.
@@ -629,6 +678,7 @@ impl Manager {
         workspace_id: &str,
         selection: crate::control::NativeRestoreSelection,
         started: &mut bool,
+        access: Arc<native_retention::HostAccessGuard>,
     ) -> Result<Mounted> {
         #[cfg(not(target_os = "linux"))]
         anyhow::bail!("startup-gated native restore requires Linux; no checkout was created");
@@ -857,10 +907,13 @@ impl Manager {
             .is_none()
         {
             let reservation = commands
-                .register_reserved(&binding, repository.identity)
+                .register_reserved_with_host_access(&binding, repository.identity, access.clone())
                 .await?;
             self.entries.get_mut(workspace_id).unwrap().command_startup = Some(reservation);
         }
+        commands
+            .invalidate_workspace_with_host_access(&binding, repository.identity, access.clone())
+            .await?;
         let mut compiler_limits = native_workspace::Limits::default();
         compiler_limits.max_entries = settings.max_entries;
         compiler_limits.max_metadata_bytes = settings.max_metadata_bytes as u64;
@@ -1127,6 +1180,11 @@ impl Manager {
         })
     }
     pub fn recover(&mut self, id: &str) -> Result<serde_json::Value> {
+        let _access = self
+            .commands
+            .as_ref()
+            .map(|host| host.host_access())
+            .transpose()?;
         let _ = unhex(id)?;
         let entry = self
             .entries
@@ -1142,6 +1200,11 @@ impl Manager {
         recover_entry(&self.config, entry)
     }
     pub async fn stop(&mut self, id: &str) -> Result<()> {
+        let _access = self
+            .commands
+            .as_ref()
+            .map(|host| host.host_access())
+            .transpose()?;
         let _ = unhex(id)?;
         if let Some(entry) = self.entries.get_mut(id) {
             if matches!(&entry.record.origin, Origin::Restore { .. })

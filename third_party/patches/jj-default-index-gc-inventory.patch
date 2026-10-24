@@ -1,0 +1,780 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: sluongng <26684313+sluongng@users.noreply.github.com>
+Date: Sat, 24 Oct 2026 09:20:00 +0000
+Subject: [PATCH] jj: Read default index roots without mutation
+
+Native-object collection needs every indexed commit at every retained
+operation, including hidden commits not present in a view. The ordinary
+index loader may build missing associations or reinitialize a corrupt
+index, so it cannot serve as an observational collection prerequisite.
+
+Expose an opt-in reader of explicit operation associations and their
+commit-segment chains. Return all indexed IDs rather than only graph
+heads: index parent relationships need not independently prove canonical
+object reachability. Verify content hashes, the pinned version-six
+layout, lookup coverage and topological references before returning
+any roots.  Only the actual intrinsic root operation may omit its
+association, in which case the caller-supplied intrinsic root commit
+is retained.
+
+Reuse compact, validated shared segments only within one observation.
+Retained operations otherwise rescan the same history quadratically.
+Read every association again and start a fresh memo for each independent
+observation; retain all indexed IDs rather than weakening root coverage.
+Bound live allocations separately from cumulative I/O and validation
+work.  Use non-owning parent links so custom deep chains also have
+shallow cleanup.
+
+Bound file reads, control decoding, chain depth, aggregate
+observations, returned roots and conservative working allocations before
+growth. Share validated compact segments only within one inventory call,
+while reading every operation control and giving each independent
+observation a fresh memo. Retain only local IDs and generations,
+never raw payloads or growing full-prefix sets; separately bound
+validation steps and current live bytes.  Never initialize, repair,
+delete or invoke a backend. Callers still own trusted path validation
+and mutation/collection fencing. Optional changed-path cache payloads
+do not contribute commit roots and are not loaded. Existing index
+loading behavior and all on-disk formats remain unchanged.
+
+---
+diff --git a/src/default_index/mod.rs b/src/default_index/mod.rs
+--- a/src/default_index/mod.rs
++++ b/src/default_index/mod.rs
+@@ -23,6 +23,7 @@
+ mod changed_path;
+ mod composite;
+ mod entry;
++mod gc;
+ mod mutable;
+ mod readonly;
+ mod rev_walk;
+@@ -31,6 +32,7 @@
+ mod revset_graph_iterator;
+ mod store;
+ 
++pub use self::gc::DefaultIndexGcLimits;
+ pub use self::mutable::DefaultMutableIndex;
+ pub use self::readonly::ChangedPathIndexLevelStats;
+ pub use self::readonly::CommitIndexLevelStats;
+diff --git a/src/default_index/store.rs b/src/default_index/store.rs
+--- a/src/default_index/store.rs
++++ b/src/default_index/store.rs
+@@ -124,6 +124,38 @@
+         }
+     }
+ 
++    /// Inventories every indexed commit at each explicit retained operation.
++    ///
++    /// This observation never builds, repairs, initializes, or removes index
++    /// state and never calls a backend. Hidden and non-head indexed commits are
++    /// included; callers must also inventory OP/VIEW, working-copy and sidecar
++    /// roots under their own mutation/collection fences. Trusted index-directory
++    /// ownership and concurrent-mutation exclusion are caller responsibilities.
++    ///
++    /// Supply the actual operation store's intrinsic root identities. Only a
++    /// missing association for that exact root operation yields its root commit;
++    /// missing nonroot associations and corrupt existing files are errors.
++    /// Changed-path caches cannot add commit roots and are not loaded. Limits
++    /// fail with `InvalidInput`, malformed data with `InvalidData`, and I/O errors
++    /// retain their kind. No partial result is returned on failure.
++    pub fn gc_roots_readonly(
++        &self,
++        operations: &[OperationId],
++        root_operation: &OperationId,
++        root_commit: &CommitId,
++        change_id_length: usize,
++        limits: super::gc::DefaultIndexGcLimits,
++    ) -> io::Result<Vec<CommitId>> {
++        super::gc::roots(
++            &self.dir,
++            operations,
++            root_operation,
++            root_commit,
++            change_id_length,
++            limits,
++        )
++    }
++
+     pub fn reinit(&self) -> Result<(), DefaultIndexStoreInitError> {
+         // Create base directories in case the store was initialized by old jj.
+         self.ensure_base_dirs()?;
+diff --git a/src/default_index/gc.rs b/src/default_index/gc.rs
+new file mode 100644
+--- /dev/null
++++ b/src/default_index/gc.rs
+@@ -0,0 +1,674 @@
++// Copyright 2026 The Jujutsu Authors
++//
++// Licensed under the Apache License, Version 2.0 (the "License");
++// you may not use this file except in compliance with the License.
++// You may obtain a copy of the License at
++//
++// https://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing, software
++// distributed under the License is distributed on an "AS IS" BASIS,
++// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++// See the License for the specific language governing permissions and
++// limitations under the License.
++
++//! Observational inventory of the pinned version-six commit index format.
++
++use std::collections::{BTreeMap, BTreeSet};
++use std::fs;
++use std::io;
++use std::io::Read as _;
++use std::path::Path;
++use std::sync::{Arc, Weak};
++
++use blake2::Blake2b512;
++use digest::Digest as _;
++use prost::Message as _;
++
++use super::composite::CommitIndexSegmentId;
++use crate::backend::CommitId;
++use crate::object_id::ObjectId as _;
++use crate::op_store::OperationId;
++
++/// Bounds for a complete, read-only default-index root inventory.
++///
++/// Control bytes count every operation association. Segment bytes, files,
++/// commits and parent edges count distinct validated segment observations within
++/// this call. A bounded compact memo is discarded between independent calls.
++/// The working-byte bound is a conservative admission charge, not an RSS limit.
++#[derive(Clone, Copy, Debug)]
++pub struct DefaultIndexGcLimits {
++    /// Maximum explicit operation IDs, including the intrinsic root if supplied.
++    pub max_operations: usize,
++    /// Maximum bytes in one operation-to-segment control file.
++    pub max_control_bytes: usize,
++    /// Maximum aggregate bytes read from control files.
++    pub max_total_control_bytes: usize,
++    /// Maximum bytes in one encoded commit segment.
++    pub max_segment_bytes: usize,
++    /// Maximum aggregate bytes read from commit segments.
++    pub max_total_segment_bytes: usize,
++    /// Maximum distinct segment-file observations in one call.
++    pub max_segments: usize,
++    /// Maximum number of segments in one parent chain.
++    pub max_chain_depth: usize,
++    /// Maximum rows across distinct parsed segments, including compacted copies.
++    pub max_commits: usize,
++    /// Maximum parent edges across distinct parsed segments.
++    pub max_parent_edges: usize,
++    /// Maximum graph-validation iterations, chain hops and binary-search comparisons.
++    pub max_validation_steps: usize,
++    /// Maximum distinct returned commit roots. No truncation is permitted.
++    pub max_roots: usize,
++    /// Conservative live allocation admission charge.
++    pub max_working_bytes: usize,
++}
++
++impl Default for DefaultIndexGcLimits {
++    fn default() -> Self {
++        Self {
++            max_operations: 4096,
++            max_control_bytes: 64 * 1024,
++            max_total_control_bytes: 4 * 1024 * 1024,
++            max_segment_bytes: 64 * 1024 * 1024,
++            max_total_segment_bytes: 256 * 1024 * 1024,
++            max_segments: 4096,
++            max_chain_depth: 256,
++            max_commits: 1_000_000,
++            max_parent_edges: 8_000_000,
++            max_validation_steps: 8_000_000,
++            max_roots: 1_000_000,
++            max_working_bytes: 512 * 1024 * 1024,
++        }
++    }
++}
++
++fn invalid(message: &'static str) -> io::Error {
++    io::Error::new(io::ErrorKind::InvalidData, message)
++}
++fn limit() -> io::Error {
++    io::Error::new(
++        io::ErrorKind::InvalidInput,
++        "default index inventory exceeds configured limits",
++    )
++}
++fn add(value: &mut usize, extra: usize, max: usize) -> io::Result<()> {
++    *value = value
++        .checked_add(extra)
++        .filter(|&n| n <= max)
++        .ok_or_else(limit)?;
++    Ok(())
++}
++fn word(bytes: &[u8], offset: usize) -> io::Result<u32> {
++    let end = offset.checked_add(4).ok_or_else(limit)?;
++    let value = bytes
++        .get(offset..end)
++        .ok_or_else(|| invalid("truncated index segment"))?;
++    Ok(u32::from_le_bytes(value.try_into().unwrap()))
++}
++
++struct Budget {
++    limits: DefaultIndexGcLimits,
++    controls: usize,
++    segments: usize,
++    bytes: usize,
++    commits: usize,
++    edges: usize,
++    steps: usize,
++    operations: usize,
++    id_length: usize,
++    // Actual per-call live phases, distinct from cumulative I/O/work counters.
++    raw_live: usize,
++    control_live: usize,
++    cached: usize,
++}
++impl Budget {
++    fn memory(&self, roots: usize, temporary: usize) -> io::Result<()> {
++        // Exact-length raw buffers and compact cache vectors are charged before
++        // allocation. 128x current control wire bytes covers Prost high-water
++        // byte/repeated-field allocations. The root charge covers BTree nodes,
++        // IDs and the final output Vec being live together. Per-segment fixed
++        // admission covers map/Arc records and pending-chain bookkeeping.
++        let charge = self
++            .raw_live
++            .checked_add(16 * 1024)
++            .and_then(|n| n.checked_add(self.cached))
++            .and_then(|n| self.control_live.checked_mul(128)?.checked_add(n))
++            .and_then(|n| roots.checked_mul(self.id_length + 256)?.checked_add(n))
++            .and_then(|n| self.operations.checked_mul(512)?.checked_add(n))
++            .and_then(|n| n.checked_add(temporary))
++            .ok_or_else(limit)?;
++        if charge > self.limits.max_working_bytes {
++            return Err(limit());
++        }
++        Ok(())
++    }
++    fn step(&mut self) -> io::Result<()> {
++        add(&mut self.steps, 1, self.limits.max_validation_steps)
++    }
++    fn begin_segment(&mut self, roots: usize) -> io::Result<()> {
++        add(&mut self.segments, 1, self.limits.max_segments)?;
++        self.cached = self.cached.checked_add(1024).ok_or_else(limit)?;
++        self.memory(roots, 0)
++    }
++    fn read(&mut self, path: &Path, control: bool, roots: usize) -> io::Result<Vec<u8>> {
++        // The caller must fence mutations and validate its trusted index path.
++        // Reject symlinks and nonregular files rather than adopting/rebuilding.
++        let metadata = fs::symlink_metadata(path)?;
++        if !metadata.file_type().is_file() {
++            return Err(invalid("index inventory requires a regular file"));
++        }
++        let length: usize = metadata.len().try_into().map_err(|_| limit())?;
++        let cap = if control {
++            self.limits.max_control_bytes
++        } else {
++            self.limits.max_segment_bytes
++        };
++        if length > cap {
++            return Err(limit());
++        }
++        if control {
++            add(
++                &mut self.controls,
++                length,
++                self.limits.max_total_control_bytes,
++            )?;
++            self.control_live = length;
++        } else {
++            add(&mut self.bytes, length, self.limits.max_total_segment_bytes)?;
++            self.raw_live = self.raw_live.checked_add(length).ok_or_else(limit)?;
++        }
++        self.memory(roots, 0)?;
++        let mut file = fs::File::open(path)?;
++        if !file.metadata()?.is_file() || file.metadata()?.len() != metadata.len() {
++            return Err(invalid("index file changed during inventory"));
++        }
++        let mut bytes = vec![0; length];
++        file.read_exact(&mut bytes)?;
++        if file.read(&mut [0])? != 0 {
++            return Err(invalid("index file grew during inventory"));
++        }
++        Ok(bytes)
++    }
++}
++
++// A record is inserted only after its hash, complete local layout and actual
++// parent chain have passed validation. No raw payload or full-prefix ID set is
++// cached. Record identity is the immutable content hash, not an operation ID.
++struct ValidatedSegment {
++    // The per-call map strongly owns every record. Weak edges prevent recursive
++    // Arc teardown for caller-configured deep chains, including error cleanup.
++    parent: Option<Weak<ValidatedSegment>>,
++    base: usize,
++    count: usize,
++    depth: usize,
++    generations: Vec<u32>,
++    sorted_ids: Vec<u8>,
++}
++impl ValidatedSegment {
++    fn contains_local(&self, id: &[u8], budget: &mut Budget) -> io::Result<bool> {
++        budget.step()?;
++        let mut low = 0;
++        let mut high = self.generations.len();
++        while low < high {
++            budget.step()?;
++            let middle = low + (high - low) / 2;
++            let key = &self.sorted_ids[middle * budget.id_length..(middle + 1) * budget.id_length];
++            match key.cmp(id) {
++                std::cmp::Ordering::Less => low = middle + 1,
++                std::cmp::Ordering::Greater => high = middle,
++                std::cmp::Ordering::Equal => return Ok(true),
++            }
++        }
++        Ok(false)
++    }
++    fn contains(&self, id: &[u8], budget: &mut Budget) -> io::Result<bool> {
++        if self.contains_local(id, budget)? {
++            return Ok(true);
++        }
++        let mut parent = self.parent.clone();
++        while let Some(weak) = parent {
++            let current = weak
++                .upgrade()
++                .ok_or_else(|| invalid("lost validated index parent"))?;
++            if current.contains_local(id, budget)? {
++                return Ok(true);
++            }
++            parent = current.parent.clone();
++        }
++        Ok(false)
++    }
++    fn generation_local(&self, position: usize, budget: &mut Budget) -> io::Result<Option<u32>> {
++        budget.step()?;
++        if position < self.base {
++            return Ok(None);
++        }
++        self.generations
++            .get(position - self.base)
++            .copied()
++            .map(Some)
++            .ok_or_else(|| invalid("index parent position out of range"))
++    }
++    fn generation(&self, position: usize, budget: &mut Budget) -> io::Result<u32> {
++        if let Some(value) = self.generation_local(position, budget)? {
++            return Ok(value);
++        }
++        let mut parent = self.parent.clone();
++        while let Some(weak) = parent {
++            let current = weak
++                .upgrade()
++                .ok_or_else(|| invalid("lost validated index parent"))?;
++            if let Some(value) = current.generation_local(position, budget)? {
++                return Ok(value);
++            }
++            parent = current.parent.clone();
++        }
++        Err(invalid("index parent position out of range"))
++    }
++}
++
++pub(super) fn roots(
++    directory: &Path,
++    operations: &[OperationId],
++    root_operation: &OperationId,
++    root_commit: &CommitId,
++    change_id_length: usize,
++    limits: DefaultIndexGcLimits,
++) -> io::Result<Vec<CommitId>> {
++    // Recognize an existing pinned store even for an intrinsic-only request;
++    // absence of the entire datastore is not an intrinsic-root association.
++    for path in [
++        directory.to_owned(),
++        directory.join("op_links"),
++        directory.join("segments"),
++    ] {
++        if !fs::symlink_metadata(path)?.file_type().is_dir() {
++            return Err(invalid(
++                "index inventory requires existing regular directories",
++            ));
++        }
++    }
++    let id_length = root_commit.as_bytes().len();
++    if operations.len() > limits.max_operations {
++        return Err(limit());
++    }
++    if root_operation.as_bytes().len() != 64
++        || !(1..=128).contains(&id_length)
++        || !(1..=128).contains(&change_id_length)
++    {
++        return Err(invalid("unsupported index identity lengths"));
++    }
++    let mut budget = Budget {
++        limits,
++        controls: 0,
++        segments: 0,
++        bytes: 0,
++        commits: 0,
++        edges: 0,
++        steps: 0,
++        raw_live: 0,
++        control_live: 0,
++        cached: 0,
++        operations: operations.len(),
++        id_length,
++    };
++    budget.memory(0, 0)?;
++    let mut roots = BTreeSet::new();
++    let mut seen_operations = BTreeSet::new();
++    let mut memo = BTreeMap::<CommitIndexSegmentId, Arc<ValidatedSegment>>::new();
++    for operation in operations {
++        budget.step()?;
++        if operation.as_bytes().len() != 64 || !seen_operations.insert(operation) {
++            return Err(invalid("invalid or duplicate operation identity"));
++        }
++        let control_bytes = match budget.read(
++            &directory.join("op_links").join(operation.hex()),
++            true,
++            roots.len(),
++        ) {
++            Ok(bytes) => bytes,
++            Err(error)
++                if error.kind() == io::ErrorKind::NotFound && operation == root_operation =>
++            {
++                if !roots.contains(root_commit) {
++                    if roots.len() >= limits.max_roots {
++                        return Err(limit());
++                    }
++                    budget.memory(roots.len() + 1, 0)?;
++                    roots.insert(root_commit.clone());
++                }
++                continue;
++            }
++            Err(error) => return Err(error),
++        };
++        // SegmentControl has only scalar and bytes fields; encoded control bytes
++        // bound Prost's repeated byte-vector growth. There are no nested messages.
++        let control =
++            crate::protos::default_index::SegmentControl::decode(control_bytes.as_slice())
++                .map_err(|_| invalid("invalid index segment control"))?;
++        if control.commit_segment_id.len() != 64
++            || control.changed_path_segment_ids.len() > limits.max_segments
++            || control
++                .changed_path_segment_ids
++                .iter()
++                .any(|id| id.len() != 64)
++        {
++            return Err(invalid("invalid index control segment identity"));
++        }
++        // Changed-path payloads contain no additional indexed commit IDs. GC
++        // roots come from the complete commit graph, not that optional cache.
++        let mut next = CommitIndexSegmentId::new(control.commit_segment_id.clone());
++        drop(control);
++        drop(control_bytes);
++        budget.control_live = 0;
++        let mut chain = Vec::new();
++        let mut seen_segments = BTreeSet::new();
++        let mut parent = loop {
++            budget.step()?;
++            if let Some(cached) = memo.get(&next) {
++                break Some(cached.clone());
++            }
++            if chain.len() >= limits.max_chain_depth {
++                return Err(limit());
++            }
++            budget.begin_segment(roots.len())?;
++            if !seen_segments.insert(next.as_bytes().to_vec()) {
++                return Err(invalid("cyclic index segment chain"));
++            }
++            let name = next.hex();
++            let bytes = budget.read(&directory.join("segments").join(name), false, roots.len())?;
++            if Blake2b512::digest(&bytes).as_slice() != next.as_bytes() {
++                return Err(invalid("index segment content digest mismatch"));
++            }
++            if word(&bytes, 0)? != 6 {
++                return Err(invalid("unsupported commit index segment version"));
++            }
++            let parent_length = word(&bytes, 4)? as usize;
++            if parent_length != 0 && parent_length != 128 {
++                return Err(invalid("invalid index parent segment name"));
++            }
++            let parent = bytes
++                .get(8..8 + parent_length)
++                .ok_or_else(|| invalid("truncated index parent name"))?;
++            let parent = if parent_length == 0 {
++                None
++            } else {
++                if !parent
++                    .iter()
++                    .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(b))
++                {
++                    return Err(invalid("invalid index parent segment name"));
++                }
++                Some(
++                    CommitIndexSegmentId::try_from_hex(parent)
++                        .ok_or_else(|| invalid("invalid index parent hex"))?,
++                )
++            };
++            chain.push((next, bytes, 8 + parent_length));
++            match parent {
++                Some(next_parent) => next = next_parent,
++                None => break None,
++            }
++        };
++        for (id, bytes, offset) in chain.into_iter().rev() {
++            let record = inventory_segment(
++                &bytes,
++                offset,
++                change_id_length,
++                &mut budget,
++                parent,
++                &mut roots,
++            )?;
++            // Drop the actual raw payload BEFORE releasing its live-byte charge.
++            let length = bytes.len();
++            drop(bytes);
++            budget.raw_live -= length;
++            let record = Arc::new(record);
++            parent = Some(record.clone());
++            memo.insert(id, record);
++        }
++    }
++    // Admission covers the set and output vector being live together.
++    Ok(roots.into_iter().collect())
++}
++
++fn inventory_segment(
++    bytes: &[u8],
++    offset: usize,
++    change_length: usize,
++    budget: &mut Budget,
++    parent: Option<Arc<ValidatedSegment>>,
++    roots: &mut BTreeSet<CommitId>,
++) -> io::Result<ValidatedSegment> {
++    let count = word(bytes, offset)? as usize;
++    let changes = word(bytes, offset + 4)? as usize;
++    let parent_overflow = word(bytes, offset + 8)? as usize;
++    let change_overflow = word(bytes, offset + 12)? as usize;
++    add(&mut budget.commits, count, budget.limits.max_commits)?;
++    budget.memory(roots.len(), 0)?;
++    if changes > count
++        || parent_overflow > budget.limits.max_parent_edges
++        || change_overflow > count
++    {
++        return Err(invalid("invalid index table counts"));
++    }
++    let graph = offset + 16;
++    let entry_size = 16 + budget.id_length;
++    let commit_lookup = graph
++        .checked_add(count.checked_mul(entry_size).ok_or_else(limit)?)
++        .ok_or_else(limit)?;
++    let change_ids = commit_lookup
++        .checked_add(count.checked_mul(4).ok_or_else(limit)?)
++        .ok_or_else(limit)?;
++    let change_positions = change_ids
++        .checked_add(changes.checked_mul(change_length).ok_or_else(limit)?)
++        .ok_or_else(limit)?;
++    let parents = change_positions
++        .checked_add(changes.checked_mul(4).ok_or_else(limit)?)
++        .ok_or_else(limit)?;
++    let overflow_changes = parents
++        .checked_add(parent_overflow.checked_mul(4).ok_or_else(limit)?)
++        .ok_or_else(limit)?;
++    let end = overflow_changes
++        .checked_add(change_overflow.checked_mul(4).ok_or_else(limit)?)
++        .ok_or_else(limit)?;
++    if end != bytes.len() {
++        return Err(invalid("invalid index table lengths"));
++    }
++    let base = parent.as_ref().map_or(0, |p| p.count);
++    let depth = parent.as_ref().map_or(1, |p| p.depth + 1);
++    if depth > budget.limits.max_chain_depth {
++        return Err(limit());
++    }
++    if base
++        .checked_add(count)
++        .filter(|&n| n <= u32::MAX as usize)
++        .is_none()
++    {
++        return Err(limit());
++    }
++    let ids_bytes = count.checked_mul(budget.id_length).ok_or_else(limit)?;
++    let generations_bytes = count
++        .checked_mul(std::mem::size_of::<u32>())
++        .ok_or_else(limit)?;
++    budget.cached = budget
++        .cached
++        .checked_add(ids_bytes)
++        .and_then(|n| n.checked_add(generations_bytes))
++        .ok_or_else(limit)?;
++    // Exact-capacity vectors retain only compact IDs/generations. The temporary
++    // change-range vector and one transient CommitId are admitted separately.
++    let temporary = changes
++        .checked_mul(std::mem::size_of::<(usize, usize)>())
++        .and_then(|n| n.checked_add(budget.id_length + 256))
++        .ok_or_else(limit)?;
++    budget.memory(roots.len(), temporary)?;
++    let mut sorted_ids = vec![0; ids_bytes];
++    let mut generations = vec![0u32; count];
++    let mut previous_id: Option<&[u8]> = None;
++    for lookup in 0..count {
++        budget.step()?;
++        let position = word(bytes, commit_lookup + lookup * 4)? as usize;
++        if position >= count {
++            return Err(invalid("index commit lookup position out of range"));
++        }
++        let id = &bytes[graph + position * entry_size + 16..graph + (position + 1) * entry_size];
++        if previous_id.is_some_and(|previous| previous >= id) {
++            return Err(invalid("index commit lookup is not strictly sorted"));
++        }
++        previous_id = Some(id);
++        sorted_ids[lookup * budget.id_length..(lookup + 1) * budget.id_length].copy_from_slice(id);
++        if let Some(parent) = &parent {
++            if parent.contains(id, budget)? {
++                return Err(invalid("duplicate indexed commit in segment chain"));
++            }
++        }
++    }
++    let mut previous_change: Option<&[u8]> = None;
++    let mut covered_changes = 0;
++    let mut overflow_ranges = Vec::with_capacity(changes);
++    for change in 0..changes {
++        budget.step()?;
++        let id =
++            &bytes[change_ids + change * change_length..change_ids + (change + 1) * change_length];
++        if previous_change.is_some_and(|previous| previous >= id) {
++            return Err(invalid("index change lookup is not strictly sorted"));
++        }
++        previous_change = Some(id);
++        let value = word(bytes, change_positions + change * 4)?;
++        if value & 0x8000_0000 == 0 {
++            if value as usize >= count
++                || word(bytes, graph + value as usize * entry_size + 12)? as usize != change
++            {
++                return Err(invalid("invalid inline change position"));
++            }
++            covered_changes += 1;
++        } else {
++            let start = (!value) as usize;
++            if start > change_overflow
++                || overflow_ranges
++                    .last()
++                    .is_some_and(|&(_, previous)| previous >= start)
++            {
++                return Err(invalid("invalid change overflow pointer"));
++            }
++            overflow_ranges.push((change, start));
++        }
++    }
++    if overflow_ranges
++        .first()
++        .map_or(change_overflow != 0, |&(_, start)| start != 0)
++    {
++        return Err(invalid("unclaimed change overflow prefix"));
++    }
++    for (range, &(change, start)) in overflow_ranges.iter().enumerate() {
++        budget.step()?;
++        let end = overflow_ranges
++            .get(range + 1)
++            .map_or(change_overflow, |&(_, next)| next);
++        if end - start < 2 {
++            return Err(invalid("noncanonical change overflow"));
++        }
++        let mut previous = None;
++        for position in start..end {
++            budget.step()?;
++            let local = word(bytes, overflow_changes + position * 4)? as usize;
++            if local >= count
++                || previous.is_some_and(|p| p >= local)
++                || word(bytes, graph + local * entry_size + 12)? as usize != change
++            {
++                return Err(invalid("invalid change overflow position"));
++            }
++            previous = Some(local);
++            covered_changes += 1;
++        }
++    }
++    if covered_changes != count {
++        return Err(invalid("incomplete change lookup"));
++    }
++    let mut used_parent_overflow = 0;
++    for local in 0..count {
++        budget.step()?;
++        let entry = graph + local * entry_size;
++        if word(bytes, entry + 12)? as usize >= changes {
++            return Err(invalid("invalid graph change position"));
++        }
++        let first = word(bytes, entry + 4)?;
++        let second = word(bytes, entry + 8)?;
++        let mut generation = 0;
++        let parent_record = &parent;
++        let mut visit = |parent: u32| -> io::Result<()> {
++            budget.step()?;
++            add(&mut budget.edges, 1, budget.limits.max_parent_edges)?;
++            if parent as usize >= base + local {
++                return Err(invalid("index parent is not topologically earlier"));
++            }
++            let value = if (parent as usize) >= base {
++                generations[parent as usize - base]
++            } else {
++                // Only the already validated ACTUAL parent chain is searched;
++                // an unrelated branch in the memo cannot supply this position.
++                parent_record
++                    .as_ref()
++                    .ok_or_else(|| invalid("missing parent segment"))?
++                    .generation(parent as usize, budget)?
++            };
++            generation = generation.max(value.checked_add(1).ok_or_else(limit)?);
++            Ok(())
++        };
++        if first & 0x8000_0000 == 0 {
++            visit(first)?;
++            if second & 0x8000_0000 == 0 {
++                visit(second)?;
++            } else if second != u32::MAX {
++                return Err(invalid("invalid inline index parent"));
++            }
++        } else {
++            if second & 0x8000_0000 == 0 {
++                return Err(invalid("invalid overflow parent count"));
++            }
++            let start = (!first) as usize;
++            let length = (!second) as usize;
++            let end = start
++                .checked_add(length)
++                .filter(|&end| end <= parent_overflow)
++                .ok_or_else(|| invalid("invalid parent overflow range"))?;
++            if length == 0 {
++                if start != 0 {
++                    return Err(invalid("invalid empty parent encoding"));
++                }
++            } else {
++                if length < 3 || start != used_parent_overflow {
++                    return Err(invalid("noncanonical parent overflow"));
++                }
++                used_parent_overflow = end;
++            }
++            for position in start..end {
++                visit(word(bytes, parents + position * 4)?)?;
++            }
++        }
++        if word(bytes, entry)? != generation {
++            return Err(invalid("invalid index generation"));
++        }
++        generations[local] = generation;
++        let id = CommitId::from_bytes(&bytes[entry + 16..entry + entry_size]);
++        if !roots.contains(&id) {
++            if roots.len() >= budget.limits.max_roots {
++                return Err(limit());
++            }
++            budget.memory(roots.len() + 1, temporary)?;
++            roots.insert(id);
++        }
++    }
++    if used_parent_overflow != parent_overflow {
++        return Err(invalid("unclaimed parent overflow entries"));
++    }
++    Ok(ValidatedSegment {
++        parent: parent.as_ref().map(Arc::downgrade),
++        base,
++        count: base + count,
++        depth,
++        generations,
++        sorted_ids,
++    })
++}

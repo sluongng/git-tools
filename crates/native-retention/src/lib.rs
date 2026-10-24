@@ -390,6 +390,25 @@ impl CommandJobGuard {
         self.lease.context.epoch
     }
 }
+/// A short-lived host operation fence, not a durable root claim or permission
+/// to collect. Keep this owner through physical work, returned readers, and any
+/// durable Dirty registration before releasing newly installed workspace roots.
+/// Acquisition is nonqueued so nested host operations cannot deadlock behind a
+/// collector that is already waiting for an outer host operation.
+pub struct HostAccessGuard {
+    _read: OwnedRwLockReadGuard<()>,
+    registry: Arc<storage::Inner>,
+}
+impl fmt::Debug for HostAccessGuard {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("HostAccessGuard").finish_non_exhaustive()
+    }
+}
+impl HostAccessGuard {
+    pub fn registry_id(&self) -> RegistryId {
+        self.registry.id
+    }
+}
 pub struct CollectorGuard {
     registry: Arc<storage::Inner>,
     _write: OwnedRwLockWriteGuard<()>,
@@ -465,6 +484,69 @@ impl Registry {
         storage::blocking(move || {
             let _read = read;
             inner.register(workspace, op_store)
+        })
+        .await
+    }
+    /// Validate physical host-scope provenance before any host-side mutation.
+    /// Matching a serialized registry identity alone is not sufficient.
+    pub fn validate_host_access(&self, access: &HostAccessGuard) -> Result<()> {
+        self.inner.check()?;
+        if !Arc::ptr_eq(&self.inner, &access.registry) {
+            return Err(Error::IdentityMismatch);
+        }
+        Ok(())
+    }
+    /// Register under an already held same-registry host fence. This avoids a
+    /// recursive read acquisition behind a waiting collector. Existing
+    /// registrations retain their current state; new registrations start Dirty.
+    pub async fn register_with_host_access(
+        &self,
+        workspace: WorkspaceId,
+        op_store: OpStoreId,
+        access: Arc<HostAccessGuard>,
+    ) -> Result<Registration> {
+        self.validate_host_access(&access)?;
+        let inner = self.inner.clone();
+        storage::blocking(move || {
+            let _access = access;
+            inner.register(workspace, op_store)
+        })
+        .await
+    }
+    /// Invalidate a saved Clean checkpoint before trusted host changes can
+    /// publish new workspace roots. Old roots remain retained. This is not a
+    /// command and cannot race an active or draining command context.
+    pub async fn mark_dirty_with_host_access(
+        &self,
+        registration: Registration,
+        access: Arc<HostAccessGuard>,
+    ) -> Result<()> {
+        self.validate_host_access(&access)?;
+        let inner = self.inner.clone();
+        storage::blocking(move || {
+            let _access = access;
+            inner.check()?;
+            let mut data = inner.data.lock().map_err(|_| Error::Poisoned)?;
+            let mut entry = data.get(registration)?.clone();
+            if entry.state == WorkspaceState::Forgotten {
+                return Err(Error::Forgotten);
+            }
+            if inner
+                .runtime
+                .lock()
+                .map_err(|_| Error::Poisoned)?
+                .sessions
+                .get(&registration.workspace)
+                .and_then(Weak::upgrade)
+                .is_some()
+            {
+                return Err(Error::Busy);
+            }
+            if entry.state != WorkspaceState::Dirty {
+                entry.state = WorkspaceState::Dirty;
+                inner.persist(&mut data, entry, None)?;
+            }
+            Ok(())
         })
         .await
     }
@@ -803,9 +885,46 @@ impl Registry {
         });
         worker.await.map_err(|_| Error::Poisoned)?
     }
+    /// Fence trusted host I/O without claiming that its roots are registered.
+    /// Busy admission must be retried before accepting physical work; this does
+    /// not wait behind an exclusive collector or change tracking/Dirty state.
+    pub fn try_host_access(&self) -> Result<HostAccessGuard> {
+        self.inner.check()?;
+        let read = self
+            .inner
+            .fence
+            .clone()
+            .try_read_owned()
+            .map_err(|_| Error::Busy)?;
+        self.inner.check()?;
+        Ok(HostAccessGuard {
+            _read: read,
+            registry: self.inner.clone(),
+        })
+    }
     pub async fn acquire_collector(&self) -> Result<CollectorGuard> {
         self.inner.check()?;
         let write = self.inner.fence.clone().write_owned().await;
+        self.collector_with_fence(write).await
+    }
+    /// Attempt exclusive collection without queuing a writer ahead of new host
+    /// work. Busy is returned before any physical ledger lookup is accepted.
+    /// Once admitted, the owned lookup and result retain the actual fence even
+    /// when this waiter is cancelled.
+    pub async fn try_acquire_collector(&self) -> Result<CollectorGuard> {
+        self.inner.check()?;
+        let write = self
+            .inner
+            .fence
+            .clone()
+            .try_write_owned()
+            .map_err(|_| Error::Busy)?;
+        self.collector_with_fence(write).await
+    }
+    async fn collector_with_fence(
+        &self,
+        write: OwnedRwLockWriteGuard<()>,
+    ) -> Result<CollectorGuard> {
         let inner = self.inner.clone();
         storage::blocking(move || {
             let roots = inner.collector_roots()?;

@@ -91,6 +91,46 @@ fixture_test(
 )
 
 rust_test(
+    name = "gc_benchmark_fixture",
+    srcs = ["tests/mounted.rs"],
+    aliases = aliases(),
+    crate_features = ["native-gc-benchmark"],
+    data = [
+        ":tinytree-jj",
+        "//crates/workspace-daemon:workspace",
+    ],
+    edition = "2024",
+    rustc_env = {
+        "CARGO_BIN_EXE_tinytree-jj": "$(rootpath :tinytree-jj)",
+        "CARGO_BIN_EXE_workspace": "$(rootpath //crates/workspace-daemon:workspace)",
+    },
+    tags = ["manual"],
+    deps = all_crate_deps(
+        normal = True,
+        normal_dev = True,
+    ),
+)
+
+# Real mount iteration, selected explicitly; ordinary mount acceptance does not
+# compile the benchmark case. Compilation remains remotely executable.
+fixture_test(
+    name = "gc_benchmarks",
+    size = "large",
+    timeout = "long",
+    args = [
+        "--ignored",
+        "native_gc_iteration_benchmark",
+        "--nocapture",
+        "--test-threads=1",
+    ],
+    binary = ":gc_benchmark_fixture",
+    tags = [
+        "local",
+        "manual",
+    ],
+)
+
+rust_test(
     name = "production_unit_tests",
     srcs = glob(["src/**/*.rs"]),
     aliases = aliases(),
