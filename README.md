@@ -76,6 +76,7 @@ entry points. Most also expose Rust libraries; `jj-native-cli` is executable-onl
 | [`workspace-projfs`](crates/workspace-projfs) | `git-projfs` | Windows source mounts using ProjFS. |
 | [`jj-vfs`](crates/jj-vfs) | `git-jj` | Jujutsu working-copy integration with the source VFS. |
 | [`tinytree-server`](crates/tinytree-server) | `tinytree` | Separate jj-native object, reference, graph and content-query server over compressed gRPC. |
+| [`tinytree-import`](crates/tinytree-import) | `tinytree-import` | Seed one verified Git revision into a native reference without reading a checkout; not a history adapter. |
 | [`jj-native-cli`](crates/jj-native-cli) | `tinytree-jj` | Native jj commands, publication, restore and scoped history/search through lazy workspaces. |
 | [`bazel-output-service`](crates/bazel-output-service) | `git-output-service` | Lazy Bazel output service backed by remote CAS. |
 

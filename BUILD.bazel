@@ -23,3 +23,5 @@ alias(name = "git-nfs", actual = ":workspace-nfs", visibility = ["//visibility:p
 alias(name = "git-projfs", actual = ":workspace-projfs", visibility = ["//visibility:public"])
 alias(name = "git-jj", actual = ":jj-vfs", visibility = ["//visibility:public"])
 alias(name = "git-output-service", actual = ":bazel-output-service", visibility = ["//visibility:public"])
+
+alias(name = "tinytree-import", actual = "//crates/tinytree-import:tinytree-import-bin", visibility = ["//visibility:public"])

@@ -26,6 +26,7 @@ members = [
     "crates/tinytree-index",
     "crates/tinytree-search",
     "crates/tinytree-fixture",
+    "crates/tinytree-import",
     "crates/tinytree-store",
     "crates/tinytree-server",
     "crates/tinytree-client",

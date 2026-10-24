@@ -5644,6 +5644,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "tinytree-import"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "blake3",
+ "clap",
+ "serde",
+ "serde_json",
+ "sha1",
+ "sha2 0.10.9",
+ "tempfile",
+ "tinytree-client",
+ "tinytree-model",
+ "tinytree-server",
+ "tinytree-store",
+ "tokio",
+ "toml",
+]
+
+[[package]]
 name = "tinytree-index"
 version = "0.1.0"
 dependencies = [

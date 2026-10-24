@@ -1,0 +1,46 @@
+load("@crates//:defs.bzl", "aliases", "all_crate_deps")
+load("@rules_rs//rs:rust_binary.bzl", "rust_binary")
+load("@rules_rs//rs:rust_library.bzl", "rust_library")
+load("@rules_rs//rs:rust_test.bzl", "rust_test")
+load("//build_defs:fixture_test.bzl", "fixture_test")
+
+package(default_visibility = ["//visibility:public"])
+
+rust_library(
+    name = "tinytree-import",
+    srcs = glob(["src/**/*.rs"], exclude = ["src/main.rs"]),
+    crate_name = "tinytree_import",
+    crate_root = "src/lib.rs",
+    edition = "2024",
+    version = "0.1.0",
+    aliases = aliases(),
+    deps = all_crate_deps(normal = True),
+)
+
+rust_binary(
+    name = "tinytree-import-bin",
+    srcs = ["src/main.rs"],
+    crate_name = "tinytree_import",
+    edition = "2024",
+    aliases = aliases(),
+    deps = [":tinytree-import"] + all_crate_deps(normal = True),
+)
+
+rust_test(
+    name = "integration_fixture",
+    srcs = ["tests/import.rs"],
+    edition = "2024",
+    aliases = aliases(),
+    data = [":tinytree-import-bin"],
+    rustc_env = {"CARGO_BIN_EXE_tinytree-import": "$(rootpath :tinytree-import-bin)"},
+    deps = [":tinytree-import"] + all_crate_deps(normal = True, normal_dev = True),
+    tags = ["manual"],
+)
+
+fixture_test(
+    name = "integration_tests",
+    binary = ":integration_fixture",
+    git = True,
+    script = "tests/run.sh",
+    binary_env = "TINYTREE_IMPORT_FIXTURE",
+)
