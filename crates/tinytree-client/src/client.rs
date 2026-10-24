@@ -34,6 +34,7 @@ pub struct NativeClient {
     guards: crate::verified::LifetimeGuards,
     rpc_guards: crate::verified::LifetimeGuards,
     operation_deadline: Option<Instant>,
+    cleanup_deadline: Option<Instant>,
 }
 struct Inner {
     config: Config,
@@ -71,6 +72,21 @@ impl NativeClient {
         );
         self
     }
+    /// Bound explicit query/scope release attempts independently of the data
+    /// operation deadline. Rebinding only shortens this clone's cleanup budget;
+    /// queued Drop cleanup keeps its separate configured grace period.
+    pub fn with_cleanup_deadline(mut self, deadline: Instant) -> Self {
+        self.cleanup_deadline = Some(
+            self.cleanup_deadline
+                .map_or(deadline, |old| old.min(deadline)),
+        );
+        self
+    }
+    fn cleanup_deadline(&self, timeout: Duration) -> Instant {
+        let configured = Instant::now() + timeout;
+        self.cleanup_deadline
+            .map_or(configured, |bound| bound.min(configured))
+    }
     /// Pin external resource owners through temporary creation, readers,
     /// snapshots and cancelled blocking work produced by this client. Existing
     /// client clones are unchanged; the guard does not authorize remote access.
@@ -82,6 +98,7 @@ impl NativeClient {
             guards: Arc::new(guards),
             rpc_guards: self.rpc_guards,
             operation_deadline: self.operation_deadline,
+            cleanup_deadline: self.cleanup_deadline,
         }
     }
     /// Pin a physical request/job owner through actual codec and blocking work.
@@ -96,6 +113,7 @@ impl NativeClient {
             guards: self.guards,
             rpc_guards: Arc::new(guards),
             operation_deadline: self.operation_deadline,
+            cleanup_deadline: self.cleanup_deadline,
         }
     }
     fn without_rpc_guards(&self) -> Self {
@@ -107,6 +125,7 @@ impl NativeClient {
             // caller's transient request bound. The query's explicit execution
             // deadline remains captured separately by Begin.
             operation_deadline: None,
+            cleanup_deadline: None,
         }
     }
     fn rpc_lifetime_guards(&self) -> crate::verified::LifetimeGuards {
@@ -252,6 +271,7 @@ impl NativeClient {
             tokio::sync::mpsc::channel(config.limits.query_cleanup_capacity);
         let client = Self {
             operation_deadline: None,
+            cleanup_deadline: None,
             guards: Default::default(),
             rpc_guards: Default::default(),
             inner: Arc::new(Inner {

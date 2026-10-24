@@ -501,7 +501,7 @@ impl NativeClient {
     }
     pub async fn close_query_scope(&self, scope: &CheckedScopeHandle) -> Result<(), Status> {
         self.checked_scope(scope, true)?;
-        let deadline = self.deadline();
+        let deadline = self.cleanup_deadline(self.inner.config.rpc.operation_timeout());
         let budget = self.admit(deadline, self.unary_memory()).await?;
         let request = q::CloseScopeRequest {
             scope: Some(scope.key()),
@@ -2016,8 +2016,9 @@ impl NativeClient {
         let item = QueryCleanup {
             scope: query.scope.key(),
             query_id: query.query_id,
-            deadline: Instant::now()
-                + Duration::from_millis(self.inner.config.query_cleanup_timeout_ms),
+            deadline: self.cleanup_deadline(Duration::from_millis(
+                self.inner.config.query_cleanup_timeout_ms,
+            )),
             guards: CleanupGuards {
                 _begin: query.begin_guards.clone(),
                 _attempt: query.cleanup_guards.clone(),

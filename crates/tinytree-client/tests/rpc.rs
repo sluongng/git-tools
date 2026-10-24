@@ -4253,6 +4253,7 @@ async fn drop_query_cleanup_is_bounded_and_drains_after_last_client_drop() {
     ] {
         let guarded = client
             .clone()
+            .with_cleanup_deadline(tokio::time::Instant::now() - Duration::from_millis(1))
             .with_lifetime_guard(Arc::new(LifetimeProbe(probe.clone())));
         let mut query = guarded
             .begin_query(&scope, &ids_ancestors(fixture.root), 1)
@@ -4288,6 +4289,64 @@ async fn drop_query_cleanup_is_bounded_and_drains_after_last_client_drop() {
     running.counts.close_query_release.notify_one();
     assert_released(&first_dropped).await;
     assert_released(&queued_dropped).await;
+    running.stop().await;
+}
+
+#[tokio::test]
+async fn explicit_cleanup_deadline_is_independent_and_not_renewed_by_guard_clones() {
+    let fixture = setup_query_retained();
+    let running = QueryRunning::start(fixture.service.clone(), QueryMode::CloseQueryPause).await;
+    let mut config = running.config.clone();
+    config.query_cleanup_timeout_ms = 2000;
+    config.rpc.retry.max_attempts = 1;
+    let client = NativeClient::connect(config).await.unwrap();
+    let scope = client.open_query_scope(vec![fixture.root]).await.unwrap();
+    let mut query = client
+        .begin_query(&scope, &ids_ancestors(fixture.root), 1)
+        .await
+        .unwrap();
+    drop(client.evaluate_page(&mut query).await.unwrap());
+    let deadline = tokio::time::Instant::now() + Duration::from_millis(100);
+    let cleanup = client
+        .clone()
+        .with_operation_deadline(tokio::time::Instant::now() - Duration::from_millis(1))
+        .with_cleanup_deadline(deadline)
+        .with_lifetime_guard(Arc::new(()))
+        .with_rpc_lifetime_guard(Arc::new(()))
+        .with_cleanup_deadline(deadline + Duration::from_secs(5));
+    let error = tokio::time::timeout(
+        Duration::from_millis(500),
+        cleanup.close_ids_query(&mut query),
+    )
+    .await
+    .expect("explicit cleanup must respect original fresh bound, not configured two-second grace")
+    .unwrap_err();
+    assert_eq!(error.code(), Code::DeadlineExceeded);
+    assert!(
+        running.counts.query_closes.load(Ordering::SeqCst) > 0,
+        "expired data deadline must not suppress independently admitted cleanup RPC"
+    );
+    let scope_closes = running.counts.closes.load(Ordering::SeqCst);
+    assert_eq!(
+        cleanup.close_query_scope(&scope).await.unwrap_err().code(),
+        Code::DeadlineExceeded
+    );
+    assert_eq!(
+        running.counts.closes.load(Ordering::SeqCst),
+        scope_closes,
+        "expired cleanup bound must reject Scope close before RPC"
+    );
+    // Release any server-side request that outlived the timed-out waiter, then
+    // permit an independent exact retry. No new grace is hidden in the clone.
+    running.counts.close_query_release.notify_waiters();
+    running.counts.close_query_release.notify_one();
+    client.close_ids_query(&mut query).await.unwrap();
+    client
+        .clone()
+        .with_operation_deadline(tokio::time::Instant::now() - Duration::from_millis(1))
+        .close_query_scope(&scope)
+        .await
+        .unwrap();
     running.stop().await;
 }
 
