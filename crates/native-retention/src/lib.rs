@@ -218,6 +218,18 @@ pub struct CaptureBundle {
     pub checkpoint: RootCheckpoint,
     pub bundle: BundleDescriptor,
 }
+/// Physical capture ownership retained through the actual durable transaction,
+/// including after callback completion or caller cancellation. The owner can
+/// contain frontend fences, staging leases and admitted resource reservations.
+pub struct OwnedCaptureBundle {
+    bundle: CaptureBundle,
+    owner: Arc<dyn std::any::Any + Send + Sync>,
+}
+impl OwnedCaptureBundle {
+    pub fn new(bundle: CaptureBundle, owner: Arc<dyn std::any::Any + Send + Sync>) -> Self {
+        Self { bundle, owner }
+    }
+}
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PendingCapture {
     pub id: CaptureId,
@@ -586,6 +598,22 @@ impl Registry {
         C: FnOnce() -> F + Send + 'static,
         F: std::future::Future<Output = Result<CaptureBundle>> + Send + 'static,
     {
+        self.capture_dirty_owned(token, move || async move {
+            Ok(OwnedCaptureBundle::new(capture().await?, Arc::new(())))
+        })
+        .await
+    }
+    /// Like `capture_dirty`, but carry physical capture owners into the blocking
+    /// SyncAll job. Callback-local guards alone do not fence durable publication.
+    pub async fn capture_dirty_owned<C, F>(
+        &self,
+        token: CommandToken,
+        capture: C,
+    ) -> Result<PendingCapture>
+    where
+        C: FnOnce() -> F + Send + 'static,
+        F: std::future::Future<Output = Result<OwnedCaptureBundle>> + Send + 'static,
+    {
         self.inner.check()?;
         let context = self.lookup(token)?;
         let runtime = storage::runtime()?;
@@ -605,14 +633,21 @@ impl Registry {
                 let captured = capture().await?;
                 let commit = context.clone();
                 storage::blocking(move || {
-                    let checkpoint =
-                        storage::canonical(captured.checkpoint, &commit.registry.limits)?;
-                    commit.registry.capture_dirty(
-                        commit.registration,
-                        commit.epoch,
-                        checkpoint,
-                        captured.bundle,
-                    )
+                    let OwnedCaptureBundle { bundle, owner } = captured;
+                    let result = (|| {
+                        let checkpoint =
+                            storage::canonical(bundle.checkpoint, &commit.registry.limits)?;
+                        commit.registry.capture_dirty(
+                            commit.registration,
+                            commit.epoch,
+                            checkpoint,
+                            bundle.bundle,
+                        )
+                    })();
+                    // Explicitly after the transaction, on success AND error.
+                    // Never let a callback/await boundary release this owner.
+                    drop(owner);
+                    result
                 })
                 .await
             }

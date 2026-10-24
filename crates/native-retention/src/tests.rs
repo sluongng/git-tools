@@ -864,6 +864,19 @@ fn dirty_captures_are_atomic_and_keep_independent_roots_through_newer_checkpoint
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn dirty_capture_drains_physical_jobs_and_commits_after_the_caller_is_cancelled() {
+    struct CommitOwner {
+        registry: Registry,
+        dropped: Option<tokio::sync::oneshot::Sender<u64>>,
+    }
+    impl Drop for CommitOwner {
+        fn drop(&mut self) {
+            let _ = self
+                .dropped
+                .take()
+                .unwrap()
+                .send(self.registry.storage_stats().transactions);
+        }
+    }
     let (directory, registry) = registry().await;
     let registration = registry
         .register(WorkspaceId([2; 16]), OpStoreId([3; 16]))
@@ -874,15 +887,21 @@ async fn dirty_capture_drains_physical_jobs_and_commits_after_the_caller_is_canc
     let job = registry.resolve(token).unwrap();
     let (entered, arrival) = tokio::sync::oneshot::channel();
     let (release, released) = tokio::sync::oneshot::channel();
+    let (dropped, owner_dropped) = tokio::sync::oneshot::channel();
+    let before_commit = registry.storage_stats().transactions;
+    let physical_owner = Arc::new(CommitOwner {
+        registry: registry.clone(),
+        dropped: Some(dropped),
+    });
     let path = directory.path().to_owned();
     let captured_registry = registry.clone();
     let waiter = tokio::spawn(async move {
         captured_registry
-            .capture_dirty(token, move || async move {
+            .capture_dirty_owned(token, move || async move {
                 let bundle = staged_capture(&path, 7);
                 entered.send(()).unwrap();
                 released.await.unwrap();
-                Ok(bundle)
+                Ok(OwnedCaptureBundle::new(bundle, physical_owner))
             })
             .await
     });
@@ -919,6 +938,14 @@ async fn dirty_capture_drains_physical_jobs_and_commits_after_the_caller_is_canc
         "accepted capture owns collector fence"
     );
     release.send(()).unwrap();
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(3), owner_dropped)
+            .await
+            .unwrap()
+            .unwrap(),
+        before_commit + 1,
+        "physical capture ownership survives cancellation and callback return through SyncAll"
+    );
     assert!(matches!(
         tokio::time::timeout(Duration::from_secs(3), collection)
             .await
