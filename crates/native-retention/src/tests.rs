@@ -761,3 +761,364 @@ async fn dirty_drain_seals_physical_jobs_without_cleaning_or_losing_fence_on_can
     let next = registry.begin_command(registration).await.unwrap();
     assert_eq!(next.epoch(), 2);
 }
+
+fn staged_capture(directory: &std::path::Path, seed: u8) -> CaptureBundle {
+    use std::io::Write;
+    let bytes = vec![seed; 64];
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(directory.join(format!("bundle-{seed}")))
+        .unwrap();
+    file.write_all(&bytes).unwrap();
+    file.sync_all().unwrap();
+    std::fs::File::open(directory).unwrap().sync_all().unwrap();
+    CaptureBundle {
+        checkpoint: checkpoint(seed),
+        bundle: BundleDescriptor {
+            blake3: *blake3::hash(&bytes).as_bytes(),
+            size_bytes: bytes.len() as u64,
+        },
+    }
+}
+
+#[test]
+fn dirty_captures_are_atomic_and_keep_independent_roots_through_newer_checkpoints_forget_and_reopen()
+ {
+    block_on(async {
+        let (directory, registry) = registry().await;
+        let registration = registry
+            .register(WorkspaceId([2; 16]), OpStoreId([3; 16]))
+            .await
+            .unwrap();
+        let mut expected = Vec::new();
+        for seed in [4, 5] {
+            let owner = registry.begin_command(registration).await.unwrap();
+            let path = directory.path().to_owned();
+            let before = registry.storage_stats().transactions;
+            let receipt = registry
+                .capture_dirty(owner.token(), move || async move {
+                    Ok(staged_capture(&path, seed))
+                })
+                .await
+                .unwrap();
+            assert_eq!(
+                registry.storage_stats().transactions,
+                before + 1,
+                "root claims and ticket share one durable transaction"
+            );
+            assert_eq!(
+                registry.workspace(registration).await.unwrap().state,
+                WorkspaceState::Dirty
+            );
+            assert_eq!(
+                registry
+                    .capture_dirty(owner.token(), || async { Err(Error::Storage) })
+                    .await
+                    .unwrap_err(),
+                Error::CheckpointConflict
+            );
+            assert!(matches!(
+                registry.resolve(owner.token()),
+                Err(Error::ClosedCommand)
+            ));
+            expected.push(receipt);
+            drop(owner);
+            assert!(matches!(
+                registry.acquire_collector().await,
+                Err(Error::DirtyWorkspace)
+            ));
+        }
+        let owner = registry.begin_command(registration).await.unwrap();
+        registry
+            .checkpoint(owner.token(), checkpoint(9))
+            .await
+            .unwrap();
+        drop(owner);
+        let collector = registry.acquire_collector().await.unwrap();
+        for seed in [4, 5, 9] {
+            assert!(collector.roots().contains(&checkpoint(seed).roots[0]));
+        }
+        drop(collector);
+        registry.forget(registration).await.unwrap();
+        let collector = registry.acquire_collector().await.unwrap();
+        for seed in [4, 5] {
+            assert!(collector.roots().contains(&checkpoint(seed).roots[0]));
+        }
+        assert!(!collector.roots().contains(&checkpoint(9).roots[0]));
+        drop(collector);
+        expected.sort_by_key(|ticket| ticket.id);
+        assert_eq!(registry.pending_captures().await.unwrap(), expected);
+        drop(registry);
+        let reopened =
+            Registry::open_existing(directory.path(), RegistryId([1; 16]), Limits::default())
+                .await
+                .unwrap();
+        assert_eq!(reopened.pending_captures().await.unwrap(), expected);
+        let collector = reopened.acquire_collector().await.unwrap();
+        for seed in [4, 5] {
+            assert!(collector.roots().contains(&checkpoint(seed).roots[0]));
+        }
+    });
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn dirty_capture_drains_physical_jobs_and_commits_after_the_caller_is_cancelled() {
+    let (directory, registry) = registry().await;
+    let registration = registry
+        .register(WorkspaceId([2; 16]), OpStoreId([3; 16]))
+        .await
+        .unwrap();
+    let owner = registry.begin_command(registration).await.unwrap();
+    let token = owner.token();
+    let job = registry.resolve(token).unwrap();
+    let (entered, arrival) = tokio::sync::oneshot::channel();
+    let (release, released) = tokio::sync::oneshot::channel();
+    let path = directory.path().to_owned();
+    let captured_registry = registry.clone();
+    let waiter = tokio::spawn(async move {
+        captured_registry
+            .capture_dirty(token, move || async move {
+                let bundle = staged_capture(&path, 7);
+                entered.send(()).unwrap();
+                released.await.unwrap();
+                Ok(bundle)
+            })
+            .await
+    });
+    tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            match registry.resolve(token) {
+                Err(Error::ClosedCommand) => break,
+                Ok(lease) => drop(lease),
+                Err(error) => panic!("{error}"),
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    assert!(!waiter.is_finished());
+    waiter.abort();
+    let _ = waiter.await;
+    drop(owner);
+    assert!(
+        registry.pending_captures().await.unwrap().is_empty(),
+        "capture waits for accepted jobs"
+    );
+    drop(job);
+    tokio::time::timeout(Duration::from_secs(3), arrival)
+        .await
+        .unwrap()
+        .unwrap();
+    let collecting_registry = registry.clone();
+    let collection = tokio::spawn(async move { collecting_registry.acquire_collector().await });
+    tokio::task::yield_now().await;
+    assert!(
+        !collection.is_finished(),
+        "accepted capture owns collector fence"
+    );
+    release.send(()).unwrap();
+    assert!(matches!(
+        tokio::time::timeout(Duration::from_secs(3), collection)
+            .await
+            .unwrap()
+            .unwrap(),
+        Err(Error::DirtyWorkspace)
+    ));
+    let tickets = registry.pending_captures().await.unwrap();
+    assert_eq!(tickets.len(), 1);
+    let mut expected = checkpoint(7);
+    expected.roots.reverse(); // Canonical intrinsic ROOT precedes nonzero IDs.
+    assert_eq!(tickets[0].checkpoint, expected);
+    assert_eq!(
+        registry.workspace(registration).await.unwrap().state,
+        WorkspaceState::Dirty
+    );
+    drop(registry);
+    let reopened =
+        Registry::open_existing(directory.path(), RegistryId([1; 16]), Limits::default())
+            .await
+            .unwrap();
+    assert_eq!(reopened.pending_captures().await.unwrap(), tickets);
+}
+
+#[test]
+fn dirty_capture_errors_and_aggregate_limits_never_clean_or_erase_queued_tickets() {
+    block_on(async {
+        for limits in [
+            Limits {
+                max_pending_captures: 1,
+                ..Limits::default()
+            },
+            Limits {
+                max_capture_roots: 2,
+                ..Limits::default()
+            },
+            Limits {
+                // Two typed roots and two 64-byte operation identities.
+                max_capture_root_bytes: 2 * 33 + 2 * (4 + 64),
+                ..Limits::default()
+            },
+            Limits {
+                max_capture_bundle_bytes: 64,
+                ..Limits::default()
+            },
+        ] {
+            let directory = tempfile::tempdir().unwrap();
+            let registry = Registry::init(
+                directory.path(),
+                RegistryId([1; 16]),
+                Tracking::ManagedFresh,
+                limits,
+            )
+            .await
+            .unwrap();
+            let registration = registry
+                .register(WorkspaceId([2; 16]), OpStoreId([3; 16]))
+                .await
+                .unwrap();
+            let first = registry.begin_command(registration).await.unwrap();
+            let path = directory.path().to_owned();
+            let ticket = registry
+                .capture_dirty(first.token(), move || async move {
+                    Ok(staged_capture(&path, 4))
+                })
+                .await
+                .unwrap();
+            drop(first);
+            let second = registry.begin_command(registration).await.unwrap();
+            let path = directory.path().to_owned();
+            assert!(matches!(
+                registry
+                    .capture_dirty(second.token(), move || async move {
+                        Ok(staged_capture(&path, 5))
+                    })
+                    .await,
+                Err(Error::Limit(_))
+            ));
+            assert_eq!(
+                registry.workspace(registration).await.unwrap().state,
+                WorkspaceState::Dirty
+            );
+            drop(second);
+            assert_eq!(
+                registry.pending_captures().await.unwrap(),
+                vec![ticket.clone()]
+            );
+            let failed = registry.begin_command(registration).await.unwrap();
+            assert_eq!(
+                registry
+                    .capture_dirty(failed.token(), || async { Err(Error::Storage) })
+                    .await
+                    .unwrap_err(),
+                Error::Storage
+            );
+            drop(failed);
+            let next = registry.begin_command(registration).await.unwrap();
+            drop(next);
+            assert_eq!(registry.pending_captures().await.unwrap(), vec![ticket]);
+            assert!(matches!(
+                registry.acquire_collector().await,
+                Err(Error::DirtyWorkspace)
+            ));
+        }
+    });
+}
+
+#[test]
+fn reopen_rejects_missing_or_rebound_capture_inventory_and_old_readers_fail_closed() {
+    use fjall::Readable;
+    #[derive(Clone, Copy, Debug)]
+    enum Corruption {
+        MissingRow,
+        ReboundBundle,
+        MissingInventory,
+    }
+    block_on(async {
+        for corrupt in [
+            Corruption::MissingRow,
+            Corruption::ReboundBundle,
+            Corruption::MissingInventory,
+        ] {
+            let (directory, registry) = registry().await;
+            let registration = registry
+                .register(WorkspaceId([2; 16]), OpStoreId([3; 16]))
+                .await
+                .unwrap();
+            let owner = registry.begin_command(registration).await.unwrap();
+            let path = directory.path().to_owned();
+            let ticket = registry
+                .capture_dirty(owner.token(), move || async move {
+                    Ok(staged_capture(&path, 4))
+                })
+                .await
+                .unwrap();
+            drop(owner);
+            drop(registry);
+            {
+                let db = fjall::SingleWriterTxDatabase::builder(directory.path().join("metadata"))
+                    .manual_journal_persist(true)
+                    .open()
+                    .unwrap();
+                let captures = db
+                    .keyspace("captures", fjall::KeyspaceCreateOptions::default)
+                    .unwrap();
+                let meta = db
+                    .keyspace("meta", fjall::KeyspaceCreateOptions::default)
+                    .unwrap();
+                let manifest = db.read_tx().get(&meta, b"manifest").unwrap().unwrap();
+                let manifest: serde_json::Value = serde_json::from_slice(&manifest).unwrap();
+                assert!(manifest.get("captures").is_some());
+                #[derive(serde::Deserialize)]
+                #[serde(deny_unknown_fields)]
+                struct OldManifest {
+                    #[serde(rename = "version")]
+                    _version: u32,
+                    #[serde(rename = "id")]
+                    _id: RegistryId,
+                    #[serde(rename = "epoch")]
+                    _epoch: u64,
+                    #[serde(rename = "untracked")]
+                    _untracked: bool,
+                    #[serde(rename = "workspace_count")]
+                    _workspace_count: u64,
+                    #[serde(rename = "workspace_commitment")]
+                    _workspace_commitment: [u8; 32],
+                }
+                assert!(
+                    serde_json::from_value::<OldManifest>(manifest.clone()).is_err(),
+                    "old readers cannot silently omit ticket roots"
+                );
+                let mut tx = db.write_tx().durability(Some(fjall::PersistMode::SyncAll));
+                match corrupt {
+                    Corruption::MissingRow => tx.remove(&captures, ticket.id.0),
+                    Corruption::ReboundBundle => {
+                        let bytes = db.read_tx().get(&captures, ticket.id.0).unwrap().unwrap();
+                        let mut value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+                        value["bundle"]["size_bytes"] = 63.into();
+                        tx.insert(&captures, ticket.id.0, serde_json::to_vec(&value).unwrap());
+                    }
+                    Corruption::MissingInventory => {
+                        let mut value = manifest;
+                        value.as_object_mut().unwrap().remove("captures");
+                        tx.insert(&meta, b"manifest", serde_json::to_vec(&value).unwrap());
+                    }
+                }
+                tx.commit().unwrap();
+            }
+            assert!(
+                matches!(
+                    Registry::open_existing(
+                        directory.path(),
+                        RegistryId([1; 16]),
+                        Limits::default()
+                    )
+                    .await,
+                    Err(Error::Corrupt(_))
+                ),
+                "{corrupt:?}"
+            );
+        }
+    });
+}

@@ -12,6 +12,10 @@ remote services.
 - Checkpoint typed object roots plus opaque operation IDs after workspace writes
   finish. It freezes new job admission, drains accepted jobs, then atomically
   persists the complete root claim and clean state with `SyncAll`.
+- `capture_dirty` seals/drains a command and atomically records its roots plus
+  an independent immutable-bundle ticket, leaving the workspace dirty. The host
+  must sync the bundle before callback success. Pending tickets survive newer
+  checkpoints and explicit forget; no upload or acknowledgement is implied.
 - Collector admission requires no active/draining commands, no dirty workspace,
   and no untracked access. Its exclusive guard pins a coherent bounded union of
   roots, including the real empty tree. The intrinsic zero commit is a root marker,
@@ -24,12 +28,16 @@ pin) permanently blocks collection. Persist the registry identity alongside the
 configured store; reopening requires exact identity and format agreement.
 
 Limits cover workspace records (including tombstones), root counts/bytes,
-operation IDs, command jobs, and logical encoded ledger bytes. They are **not** a
-physical disk quota for Fjall files or its journal. Filesystem work runs on an
+operation IDs, command jobs, pending capture roots/bundle descriptors, and logical
+encoded ledger bytes. They are **not** a physical disk quota for Fjall files or
+its journal. Filesystem work runs on an
 owned runtime and survives requester cancellation; callers need no Tokio runtime.
 
 `storage_stats()` reports successful transaction count and encoded write bytes
-since open (not physical I/O). `:checkpoint_benchmarks` measures stable commands
-with 100, 1,000 and 10,000 roots. The current format rewrites the full retained
-root record at both dirty admission and clean checkpoint; this baseline is not
-an optimized immutable-root-set format.
+since open (not physical I/O). `:checkpoint_benchmarks` compares ordinary
+checkpoints with queued captures at 100, 1,000 and 10,000 roots, excluding bundle
+export, staging and networking. Both rewrite workspace roots; captures also
+retain independent ticket roots. This is not an immutable-root-set optimization.
+
+Registries with pending captures require a capture-aware reader. Older readers
+fail closed on the versioned inventory rather than omitting its root claims.

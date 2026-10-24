@@ -113,6 +113,11 @@ pub struct Limits {
     pub max_total_root_bytes: usize,
     pub max_ledger_bytes: usize,
     pub max_jobs_per_command: usize,
+    pub max_pending_captures: usize,
+    pub max_capture_roots: usize,
+    pub max_capture_root_bytes: usize,
+    /// Aggregate referenced immutable bundle bytes, not owned disk allocation.
+    pub max_capture_bundle_bytes: u64,
 }
 impl Default for Limits {
     fn default() -> Self {
@@ -126,6 +131,10 @@ impl Default for Limits {
             max_total_root_bytes: 64 * 1024 * 1024,
             max_ledger_bytes: 256 * 1024 * 1024,
             max_jobs_per_command: 256,
+            max_pending_captures: 1024,
+            max_capture_roots: 1_000_000,
+            max_capture_root_bytes: 64 * 1024 * 1024,
+            max_capture_bundle_bytes: 16 * 1024 * 1024 * 1024,
         }
     }
 }
@@ -147,13 +156,21 @@ impl Limits {
             || self.max_ledger_bytes > 1024 * 1024 * 1024
             || self.max_jobs_per_command == 0
             || self.max_jobs_per_command > 100_000
+            || self.max_pending_captures == 0
+            || self.max_pending_captures > 100_000
+            || self.max_capture_roots == 0
+            || self.max_capture_roots > 4_000_000
+            || self.max_capture_root_bytes == 0
+            || self.max_capture_root_bytes > 1024 * 1024 * 1024
+            || self.max_capture_bundle_bytes == 0
         {
             return Err(Error::Invalid("registry limits"));
         }
         Ok(())
     }
 }
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Registration {
     pub workspace: WorkspaceId,
     pub op_store: OpStoreId,
@@ -186,6 +203,31 @@ pub struct CheckpointReceipt {
     pub command_epoch: u64,
     pub registry_epoch: u64,
     pub fingerprint: [u8; 32],
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub struct CaptureId(pub [u8; 32]);
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BundleDescriptor {
+    pub blake3: [u8; 32],
+    pub size_bytes: u64,
+}
+/// The caller has staged and synced this immutable bundle before returning it.
+/// This descriptor does not carry a path or prove remote publication.
+pub struct CaptureBundle {
+    pub checkpoint: RootCheckpoint,
+    pub bundle: BundleDescriptor,
+}
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PendingCapture {
+    pub id: CaptureId,
+    pub registry: RegistryId,
+    pub registration: Registration,
+    pub command_epoch: u64,
+    pub registry_epoch: u64,
+    pub fingerprint: [u8; 32],
+    pub bundle: BundleDescriptor,
+    pub checkpoint: RootCheckpoint,
 }
 /// Process-local counters since opening, excluding initialization. Encoded bytes
 /// count successful transaction keys/values, not physical Fjall/WAL disk writes.
@@ -226,6 +268,8 @@ struct CommandState {
 enum Phase {
     Open,
     Capturing,
+    CapturingDirty,
+    CapturedDirty,
     SealingDirty,
     DrainedDirty,
     Frozen([u8; 32]),
@@ -527,6 +571,67 @@ impl Registry {
             result
         });
         worker.await.map_err(|_| Error::Poisoned)?
+    }
+    /// Seal and drain, then capture an immutable staged bundle and root claims
+    /// in one SyncAll transaction WITHOUT making the workspace Clean. The host
+    /// must sync its bundle before callback success. Accepted work survives
+    /// caller cancellation; the callback cannot enqueue jobs on this token.
+    /// Pending roots survive later checkpoints and explicit workspace forget.
+    pub async fn capture_dirty<C, F>(
+        &self,
+        token: CommandToken,
+        capture: C,
+    ) -> Result<PendingCapture>
+    where
+        C: FnOnce() -> F + Send + 'static,
+        F: std::future::Future<Output = Result<CaptureBundle>> + Send + 'static,
+    {
+        self.inner.check()?;
+        let context = self.lookup(token)?;
+        let runtime = storage::runtime()?;
+        {
+            let mut state = context.state.lock().map_err(|_| Error::Poisoned)?;
+            if !state.owner_alive {
+                return Err(Error::ClosedCommand);
+            }
+            if !matches!(state.phase, Phase::Open) {
+                return Err(Error::CheckpointConflict);
+            }
+            state.phase = Phase::CapturingDirty;
+        }
+        let worker = runtime.spawn(async move {
+            let result = async {
+                drain_jobs(&context).await?;
+                let captured = capture().await?;
+                let commit = context.clone();
+                storage::blocking(move || {
+                    let checkpoint =
+                        storage::canonical(captured.checkpoint, &commit.registry.limits)?;
+                    commit.registry.capture_dirty(
+                        commit.registration,
+                        commit.epoch,
+                        checkpoint,
+                        captured.bundle,
+                    )
+                })
+                .await
+            }
+            .await;
+            context.state.lock().map_err(|_| Error::Poisoned)?.phase = if result.is_ok() {
+                Phase::CapturedDirty
+            } else {
+                Phase::Failed
+            };
+            context.changed.notify_waiters();
+            result
+        });
+        worker.await.map_err(|_| Error::Poisoned)?
+    }
+    /// Bounded immutable local outbox inventory. No upload or acknowledgement is
+    /// implied, and this API intentionally cannot remove pending root claims.
+    pub async fn pending_captures(&self) -> Result<Vec<PendingCapture>> {
+        let inner = self.inner.clone();
+        storage::blocking(move || inner.pending_captures()).await
     }
     /// Stop ordinary admission and drain accepted physical work WITHOUT
     /// checkpointing or making a dirty workspace collectable. The worker owns

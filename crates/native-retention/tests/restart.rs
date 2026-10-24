@@ -41,12 +41,13 @@ fn driver() -> PathBuf {
 }
 #[test]
 fn killed_owner_preserves_only_syncall_acknowledged_checkpoints_and_invalidates_tokens() {
-    for clean in [false, true] {
+    for mode in ["dirty", "clean", "capture"] {
+        let clean = mode == "clean";
         let directory = tempfile::tempdir().unwrap();
         let mut child = OwnedChild(
             Command::new(driver())
                 .arg(directory.path())
-                .arg(if clean { "clean" } else { "dirty" })
+                .arg(mode)
                 .stdin(Stdio::null())
                 .stdout(Stdio::piped())
                 .stderr(Stdio::inherit())
@@ -99,6 +100,20 @@ fn killed_owner_preserves_only_syncall_acknowledged_checkpoints_and_invalidates_
                 registry.resolve(CommandToken::from_bytes(token)),
                 Err(Error::ClosedCommand)
             ));
+            let pending = registry.pending_captures().await.unwrap();
+            if mode == "capture" {
+                assert_eq!(pending.len(), 1);
+                assert_eq!(pending[0].fingerprint, expected_fingerprint.unwrap());
+                assert_eq!(
+                    pending[0].checkpoint.roots,
+                    vec![ObjectKey {
+                        kind: Kind::Commit,
+                        id: ObjectId([4; 32])
+                    }]
+                );
+            } else {
+                assert!(pending.is_empty());
+            }
             if clean {
                 assert_eq!(info.state, WorkspaceState::Clean);
                 let collector = registry.acquire_collector().await.unwrap();

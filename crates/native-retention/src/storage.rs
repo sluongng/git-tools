@@ -46,6 +46,42 @@ pub(crate) struct Manifest {
     untracked: bool,
     workspace_count: u64,
     workspace_commitment: [u8; 32],
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    captures: Option<CaptureInventory>,
+}
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CaptureInventory {
+    version: u32,
+    count: u64,
+    commitment: [u8; 32],
+}
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StoredCapture {
+    version: u32,
+    id: CaptureId,
+    registry: RegistryId,
+    registry_epoch: u64,
+    bundle: BundleDescriptor,
+    checkpoint: Entry,
+}
+impl StoredCapture {
+    fn pending(&self) -> Result<PendingCapture> {
+        Ok(PendingCapture {
+            id: self.id,
+            registry: self.registry,
+            registration: self.checkpoint.registration(),
+            command_epoch: self.checkpoint.command_epoch,
+            registry_epoch: self.registry_epoch,
+            fingerprint: self
+                .checkpoint
+                .fingerprint
+                .ok_or(Error::Corrupt("capture fingerprint"))?,
+            bundle: self.bundle,
+            checkpoint: self.checkpoint.checkpoint()?,
+        })
+    }
 }
 #[derive(Clone, Copy, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -106,6 +142,8 @@ pub(crate) struct Data {
     entries: HashMap<WorkspaceId, Entry>,
     logical_bytes: usize,
     row_digests: BTreeMap<WorkspaceId, [u8; 32]>,
+    captures: BTreeMap<CaptureId, StoredCapture>,
+    capture_digests: BTreeMap<CaptureId, [u8; 32]>,
 }
 impl Data {
     pub fn get(&self, registration: Registration) -> Result<&Entry> {
@@ -140,6 +178,7 @@ pub(crate) struct Inner {
     db: SingleWriterTxDatabase,
     meta: SingleWriterTxKeyspace,
     workspaces: SingleWriterTxKeyspace,
+    captures: SingleWriterTxKeyspace,
     _owner: File,
 }
 impl Inner {
@@ -214,6 +253,7 @@ impl Inner {
                 untracked: tracking == Some(Tracking::Untracked),
                 workspace_count: 0,
                 workspace_commitment: inventory_commitment(&BTreeMap::new()),
+                captures: None,
             };
             let bytes = encode(&manifest)?;
             if bytes.len() + MANIFEST.len() > limits.max_ledger_bytes {
@@ -254,6 +294,46 @@ impl Inner {
         if manifest.id != id {
             return Err(Error::IdentityMismatch);
         }
+        if manifest.captures.is_some() && !db.keyspace_exists("captures") {
+            return Err(Error::Corrupt("capture inventory missing"));
+        }
+        let captures_space = db
+            .keyspace("captures", KeyspaceCreateOptions::default)
+            .map_err(|_| Error::Storage)?;
+        let mut captures = BTreeMap::new();
+        let mut capture_digests = BTreeMap::new();
+        for item in view.iter(&captures_space) {
+            if captures.len() >= limits.max_pending_captures {
+                return Err(Error::Limit("pending captures"));
+            }
+            let (key, value) = item.into_inner().map_err(|_| Error::Storage)?;
+            charge(
+                &mut logical,
+                key.len().saturating_add(value.len()),
+                limits.max_ledger_bytes,
+            )?;
+            if value.len() > record_cap(&limits) {
+                return Err(Error::Limit("capture record bytes"));
+            }
+            let capture = decode::<StoredCapture>(&value)?;
+            validate_capture(&capture, id, manifest.epoch, &limits)?;
+            if &*key != capture.id.0 {
+                return Err(Error::Corrupt("capture key identity"));
+            }
+            capture_digests.insert(capture.id, *blake3::hash(&value).as_bytes());
+            if captures.insert(capture.id, capture).is_some() {
+                return Err(Error::Corrupt("duplicate capture"));
+            }
+        }
+        match &manifest.captures {
+            None if captures.is_empty() => {}
+            Some(inventory)
+                if inventory.version == 1
+                    && inventory.count == captures.len() as u64
+                    && inventory.commitment == capture_commitment(&capture_digests) => {}
+            _ => return Err(Error::Corrupt("capture inventory commitment")),
+        }
+        capture_limits(captures.values(), &limits)?;
         let mut entries = HashMap::new();
         let mut row_digests = BTreeMap::new();
         let mut generations = HashSet::new();
@@ -333,6 +413,8 @@ impl Inner {
                 entries,
                 logical_bytes: logical,
                 row_digests,
+                captures,
+                capture_digests,
             }),
             poisoned: AtomicBool::new(false),
             transactions: AtomicU64::new(0),
@@ -340,6 +422,7 @@ impl Inner {
             db,
             meta,
             workspaces,
+            captures: captures_space,
             _owner: owner,
         })
     }
@@ -385,6 +468,15 @@ impl Inner {
             .info())
     }
     pub fn persist(&self, data: &mut Data, entry: Entry, untracked: Option<bool>) -> Result<u64> {
+        self.persist_with_capture(data, entry, untracked, None)
+    }
+    fn persist_with_capture(
+        &self,
+        data: &mut Data,
+        entry: Entry,
+        untracked: Option<bool>,
+        capture: Option<StoredCapture>,
+    ) -> Result<u64> {
         self.check()?;
         validate_entry(&entry, &self.limits)?;
         let mut manifest = data.manifest.clone();
@@ -399,6 +491,27 @@ impl Inner {
         row_digests.insert(entry.workspace, *blake3::hash(&bytes).as_bytes());
         manifest.workspace_count = row_digests.len() as u64;
         manifest.workspace_commitment = inventory_commitment(&row_digests);
+        let mut capture_digests = data.capture_digests.clone();
+        let capture_bytes = if let Some(capture) = &capture {
+            if data.captures.contains_key(&capture.id) {
+                return Err(Error::CheckpointConflict);
+            }
+            validate_capture(capture, self.id, manifest.epoch, &self.limits)?;
+            capture_limits(
+                data.captures.values().chain(std::iter::once(capture)),
+                &self.limits,
+            )?;
+            let bytes = encode(capture)?;
+            capture_digests.insert(capture.id, *blake3::hash(&bytes).as_bytes());
+            manifest.captures = Some(CaptureInventory {
+                version: 1,
+                count: capture_digests.len() as u64,
+                commitment: capture_commitment(&capture_digests),
+            });
+            Some(bytes)
+        } else {
+            None
+        };
         let manifest_bytes = encode(&manifest)?;
         let old_manifest = encode(&data.manifest)?.len() + MANIFEST.len();
         let old_entry = data
@@ -411,6 +524,13 @@ impl Inner {
             .logical_bytes
             .checked_sub(old_manifest + old_entry)
             .and_then(|n| n.checked_add(manifest_bytes.len() + MANIFEST.len() + bytes.len() + 16))
+            .ok_or(Error::Limit("ledger bytes"))?;
+        let logical = logical
+            .checked_add(
+                capture_bytes
+                    .as_ref()
+                    .map_or(0, |bytes| bytes.len().saturating_add(32)),
+            )
             .ok_or(Error::Limit("ledger bytes"))?;
         if logical > self.limits.max_ledger_bytes {
             return Err(Error::Limit("ledger bytes"));
@@ -435,10 +555,17 @@ impl Inner {
         {
             return Err(Error::Limit("total roots"));
         }
-        let written = manifest_bytes.len() + MANIFEST.len() + bytes.len() + 16;
+        let written = manifest_bytes.len()
+            + MANIFEST.len()
+            + bytes.len()
+            + 16
+            + capture_bytes.as_ref().map_or(0, |bytes| bytes.len() + 32);
         let mut tx = self.db.write_tx().durability(Some(PersistMode::SyncAll));
         tx.insert(&self.meta, MANIFEST, manifest_bytes);
         tx.insert(&self.workspaces, entry.workspace.0, bytes);
+        if let (Some(capture), Some(bytes)) = (&capture, capture_bytes) {
+            tx.insert(&self.captures, capture.id.0, bytes);
+        }
         if tx.commit().is_err() {
             self.poisoned.store(true, Ordering::Release);
             return Err(Error::Storage);
@@ -450,6 +577,10 @@ impl Inner {
         data.manifest = manifest;
         data.entries.insert(entry.workspace, entry);
         data.row_digests = row_digests;
+        data.capture_digests = capture_digests;
+        if let Some(capture) = capture {
+            data.captures.insert(capture.id, capture);
+        }
         Ok(data.manifest.epoch)
     }
     pub fn checkpoint(
@@ -485,6 +616,61 @@ impl Inner {
             registry_epoch,
             fingerprint,
         })
+    }
+    pub fn capture_dirty(
+        &self,
+        registration: Registration,
+        epoch: u64,
+        checkpoint: RootCheckpoint,
+        bundle: BundleDescriptor,
+    ) -> Result<PendingCapture> {
+        if bundle.size_bytes == 0 {
+            return Err(Error::Invalid("capture bundle size"));
+        }
+        if bundle.size_bytes > self.limits.max_capture_bundle_bytes {
+            return Err(Error::Limit("capture bundle bytes"));
+        }
+        self.check()?;
+        let mut data = self.data.lock().map_err(|_| Error::Poisoned)?;
+        let mut entry = data.get(registration)?.clone();
+        if entry.command_epoch != epoch || entry.state != WorkspaceState::Dirty {
+            return Err(Error::ClosedCommand);
+        }
+        entry.checkpoint_epoch = Some(epoch);
+        entry.fingerprint = Some(fingerprint(&registration, epoch, &checkpoint));
+        entry.roots = checkpoint
+            .roots
+            .iter()
+            .map(|root| StoredRoot {
+                kind: root.kind as u8,
+                id: root.id.0,
+            })
+            .collect();
+        entry.op_heads = checkpoint.op_heads;
+        entry.working_copy_operation = checkpoint.working_copy_operation;
+        let id = capture_id(
+            self.id,
+            registration,
+            epoch,
+            entry.fingerprint.unwrap(),
+            bundle,
+        );
+        let capture = StoredCapture {
+            version: 1,
+            id,
+            registry: self.id,
+            registry_epoch: data.next()?,
+            bundle,
+            checkpoint: entry.clone(),
+        };
+        let pending = capture.pending()?;
+        self.persist_with_capture(&mut data, entry, None, Some(capture))?;
+        Ok(pending)
+    }
+    pub fn pending_captures(&self) -> Result<Vec<PendingCapture>> {
+        self.check()?;
+        let data = self.data.lock().map_err(|_| Error::Poisoned)?;
+        data.captures.values().map(StoredCapture::pending).collect()
     }
     pub fn forget(&self, registration: Registration) -> Result<Registration> {
         self.check()?;
@@ -569,6 +755,20 @@ impl Inner {
                 }
             }
         }
+        for capture in data.captures.values() {
+            for root in capture.checkpoint.checkpoint()?.roots {
+                roots.insert(root);
+            }
+            if roots.len()
+                > self
+                    .limits
+                    .max_total_roots
+                    .saturating_add(self.limits.max_capture_roots)
+                    .saturating_add(1)
+            {
+                return Err(Error::Limit("collector roots"));
+            }
+        }
         let mut roots: Vec<_> = roots.into_iter().collect();
         roots.sort_by_key(|root| (root.kind as u8, root.id.0));
         Ok(roots)
@@ -626,6 +826,115 @@ fn validate_entry(entry: &Entry, limits: &Limits) -> Result<()> {
         }
     }
     Ok(())
+}
+fn record_cap(limits: &Limits) -> usize {
+    limits
+        .max_roots_per_workspace
+        .saturating_mul(192)
+        .saturating_add(
+            limits
+                .max_op_heads_per_workspace
+                .saturating_add(1)
+                .saturating_mul(
+                    limits
+                        .max_operation_id_bytes
+                        .saturating_mul(4)
+                        .saturating_add(8),
+                ),
+        )
+        .saturating_add(8192)
+        .min(limits.max_ledger_bytes)
+}
+fn capture_id(
+    registry: RegistryId,
+    registration: Registration,
+    epoch: u64,
+    fingerprint: [u8; 32],
+    bundle: BundleDescriptor,
+) -> CaptureId {
+    let mut hash = blake3::Hasher::new();
+    hash.update(b"native-retention-capture-v1\0");
+    hash.update(&registry.0);
+    hash.update(&registration.workspace.0);
+    hash.update(&registration.op_store.0);
+    hash.update(&registration.generation.to_be_bytes());
+    hash.update(&epoch.to_be_bytes());
+    hash.update(&fingerprint);
+    hash.update(&bundle.blake3);
+    hash.update(&bundle.size_bytes.to_be_bytes());
+    CaptureId(*hash.finalize().as_bytes())
+}
+fn validate_capture(
+    capture: &StoredCapture,
+    registry: RegistryId,
+    epoch: u64,
+    limits: &Limits,
+) -> Result<()> {
+    let entry = &capture.checkpoint;
+    validate_entry(entry, limits)?;
+    if capture.version != 1
+        || capture.registry != registry
+        || capture.registry_epoch == 0
+        || capture.registry_epoch > epoch
+        || entry.state != WorkspaceState::Dirty
+        || entry.command_epoch == 0
+        || entry.command_epoch > capture.registry_epoch
+        || entry.generation == 0
+        || entry.generation > capture.registry_epoch
+        || entry.checkpoint_epoch != Some(entry.command_epoch)
+        || capture.bundle.size_bytes == 0
+        || capture.id
+            != capture_id(
+                registry,
+                entry.registration(),
+                entry.command_epoch,
+                entry
+                    .fingerprint
+                    .ok_or(Error::Corrupt("capture fingerprint"))?,
+                capture.bundle,
+            )
+    {
+        return Err(Error::Corrupt("capture identity"));
+    }
+    Ok(())
+}
+fn capture_limits<'a>(
+    captures: impl Iterator<Item = &'a StoredCapture>,
+    limits: &Limits,
+) -> Result<()> {
+    let (mut count, mut roots, mut bytes, mut bundles) = (0usize, 0usize, 0usize, 0u64);
+    for capture in captures {
+        count = count
+            .checked_add(1)
+            .ok_or(Error::Limit("pending captures"))?;
+        roots = roots
+            .checked_add(capture.checkpoint.roots.len())
+            .ok_or(Error::Limit("capture roots"))?;
+        bytes = bytes
+            .checked_add(root_bytes(&capture.checkpoint.checkpoint()?)?)
+            .ok_or(Error::Limit("capture root bytes"))?;
+        bundles = bundles
+            .checked_add(capture.bundle.size_bytes)
+            .ok_or(Error::Limit("capture bundle bytes"))?;
+        if count > limits.max_pending_captures
+            || roots > limits.max_capture_roots
+            || bytes > limits.max_capture_root_bytes
+            || bundles > limits.max_capture_bundle_bytes
+        {
+            return Err(Error::Limit("capture inventory"));
+        }
+    }
+    Ok(())
+}
+fn capture_commitment(rows: &BTreeMap<CaptureId, [u8; 32]>) -> [u8; 32] {
+    let mut hash = blake3::Hasher::new();
+    hash.update(b"native-retention-capture-inventory-v1\0");
+    hash.update(&(rows.len() as u64).to_be_bytes());
+    for (id, digest) in rows {
+        hash.update(&id.0);
+        hash.update(digest);
+    }
+    *hash.finalize().as_bytes()
 }
 pub(crate) fn canonical(mut checkpoint: RootCheckpoint, limits: &Limits) -> Result<RootCheckpoint> {
     if checkpoint.roots.len() > limits.max_roots_per_workspace {
