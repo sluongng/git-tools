@@ -37,6 +37,7 @@ use tonic::{
 #[derive(Clone)]
 pub struct NativeClient {
     inner: Arc<Inner>,
+    landing_budget: Option<Arc<landing::LandingBudget>>,
     guards: crate::verified::LifetimeGuards,
     rpc_guards: crate::verified::LifetimeGuards,
     operation_deadline: Option<Instant>,
@@ -101,6 +102,7 @@ impl NativeClient {
         guards.push(guard);
         Self {
             inner: self.inner,
+            landing_budget: self.landing_budget,
             guards: Arc::new(guards),
             rpc_guards: self.rpc_guards,
             operation_deadline: self.operation_deadline,
@@ -116,6 +118,7 @@ impl NativeClient {
         guards.push(guard);
         Self {
             inner: self.inner,
+            landing_budget: self.landing_budget,
             guards: self.guards,
             rpc_guards: Arc::new(guards),
             operation_deadline: self.operation_deadline,
@@ -125,6 +128,7 @@ impl NativeClient {
     fn without_rpc_guards(&self) -> Self {
         Self {
             inner: self.inner.clone(),
+            landing_budget: self.landing_budget.clone(),
             guards: self.guards.clone(),
             rpc_guards: Default::default(),
             // Stored query clients / deferred Drop cleanup must not inherit a
@@ -278,6 +282,7 @@ impl NativeClient {
         let client = Self {
             operation_deadline: None,
             cleanup_deadline: None,
+            landing_budget: None,
             guards: Default::default(),
             rpc_guards: Default::default(),
             inner: Arc::new(Inner {

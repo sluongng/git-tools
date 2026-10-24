@@ -32,6 +32,7 @@ service RepositoryControl {
   rpc AdmitCommit(AdmitCommitRequest) returns (AdmittedCommit);
   rpc Publish(PublishRequest) returns (ConfirmedPublication);
   rpc Publication(PublicationRequest) returns (PublicationReply);
+  rpc Landing(LandingRequest) returns (LandingReply);
 }
 message ObserveReferenceRequest { string store_id = 1; string name = 2; }
 message AdmitCommitRequest { string store_id = 1; bytes head = 2; }
@@ -162,3 +163,15 @@ message ProviderDescription {
   optional bool query_capable = 3;
   ProviderIndexMode index_mode = 4;
 }
+
+// Compact bounded envelopes keep repeated upstream fields out of the local
+// transport decoder. The adapter validates the original intent and job before
+// exposing them; no verdict or finalization is accepted here.
+message LandingRequest {
+  string store_id = 1;
+  bytes original_intent = 2;
+  bytes source_stack = 3; // Oldest first, concatenated 32-byte commit IDs.
+  optional bytes observed_job = 4;
+  bool submit = 5;
+}
+message LandingReply { bytes job = 1; }

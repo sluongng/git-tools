@@ -17,7 +17,7 @@ use std::{
     process::{Child, Command, Output, Stdio},
     sync::{
         Arc, Mutex,
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
     },
     task::{Context, Poll},
     time::{Duration, Instant},
@@ -876,6 +876,13 @@ where
         {
             self.metadata.query_calls.fetch_add(1, Ordering::SeqCst);
         }
+        if request
+            .uri()
+            .path()
+            .starts_with("/tinytree.landing.v1.Landing/")
+        {
+            self.metadata.landing_calls.fetch_add(1, Ordering::SeqCst);
+        }
         self.inner.call(request)
     }
 }
@@ -895,6 +902,10 @@ struct MetadataReads {
     graph_commit_bytes: AtomicUsize,
     query_calls: AtomicUsize,
     query_commit_bytes: AtomicUsize,
+    landing_calls: AtomicUsize,
+    public_paused: AtomicBool,
+    public_started: AtomicBool,
+    public_release: tokio::sync::Notify,
 }
 
 /// Observe decoded metadata without replacing any repository implementation.
@@ -1019,6 +1030,18 @@ impl Repository for CountMetadata {
         &self,
         request: RpcRequest<p::PublishReferenceRequest>,
     ) -> Result<RpcResponse<p::Publication>, Status> {
+        if request.get_ref().reference_name == "main"
+            && self.reads.public_paused.load(Ordering::SeqCst)
+        {
+            self.reads.public_started.store(true, Ordering::SeqCst);
+            loop {
+                let released = self.reads.public_release.notified();
+                if !self.reads.public_paused.load(Ordering::SeqCst) {
+                    break;
+                }
+                released.await;
+            }
+        }
         self.inner.publish_reference(request).await
     }
 
@@ -1176,11 +1199,23 @@ impl RemoteServer {
         blame_bytes: Option<usize>,
         search_seed: bool,
     ) -> Self {
+        Self::start_landing_configured(history, cloud_enabled, blame_bytes, search_seed, false)
+    }
+    fn start_with_landing() -> Self {
+        Self::start_landing_configured(8, false, None, false, true)
+    }
+    fn start_landing_configured(
+        history: usize,
+        cloud_enabled: bool,
+        blame_bytes: Option<usize>,
+        search_seed: bool,
+        landing_enabled: bool,
+    ) -> Self {
         assert!((1..=1024).contains(&history));
         let setup_started = Instant::now();
         let directory = tempfile::tempdir().unwrap();
-        let (mut configuration, store_configuration) = if cloud_enabled {
-            let profile: tinytree_server::Config = toml::from_str(
+        let (mut configuration, store_configuration) = if cloud_enabled || landing_enabled {
+            let mut profile: tinytree_server::Config = toml::from_str(
                 r#"
 [service]
 max_metadata_bytes=4194304
@@ -1209,6 +1244,15 @@ max_manifest_members=1024
 "#,
             )
             .unwrap();
+            if landing_enabled {
+                profile.store.max_retention_validation_records = 1024;
+                profile.store.max_retention_validation_bytes = 2 * 1024 * 1024;
+                profile.store.max_closure_objects = 4096;
+                profile.store.max_closure_edges = 16384;
+                profile.store.max_path_contexts = 4096;
+                profile.store.max_path_context_bytes = 4 * 1024 * 1024;
+                profile.store.cloud.max_version_decode_bytes = 128 * 1024 * 1024;
+            }
             profile.validate().unwrap();
             let store = profile
                 .store
@@ -1220,6 +1264,20 @@ max_manifest_members=1024
                 tinytree_store::Config::default(),
             )
         };
+        if landing_enabled {
+            configuration.landing = toml::from_str(
+                r#"
+enabled=true
+max_buffered_bytes=3221225472
+poll_interval_ms=10
+[[profiles]]
+name="checks"
+version="v1"
+repositories=["example"]
+"#,
+            )
+            .unwrap();
+        }
         if let Some(bytes) = blame_bytes {
             configuration.query.max_blame_file_bytes = bytes;
         }
@@ -1422,12 +1480,20 @@ max_manifest_members=1024
                     )
                     .unwrap()
                     .with_retention(true)
-                    .with_cloud(cloud_enabled),
+                    .with_cloud(cloud_enabled)
+                    .with_landing_profiles(if landing_enabled {
+                        vec!["checks".into()]
+                    } else {
+                        vec![]
+                    }),
                 ],
             )
             .unwrap()
             .with_query_index(index)
             .unwrap()
+        });
+        runtime.block_on(async {
+            service.start_landing_worker().unwrap();
         });
         let reads = Arc::new(AtomicUsize::new(0));
         let counter = reads.clone();
@@ -1447,6 +1513,7 @@ max_manifest_members=1024
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
             let endpoint = format!("http://{}", listener.local_addr().unwrap());
             let task = tokio::spawn(async move {
+                let drain = service.clone();
                 tonic::transport::Server::builder()
                     .layer(service.deadline_layer())
                     .layer(tower::layer::layer_fn(move |inner| CountFileReads {
@@ -1464,6 +1531,7 @@ max_manifest_members=1024
                     )
                     .add_service(service.query_grpc_service_with_adapter(query))
                     .add_service(cloud)
+                    .add_service(service.landing_grpc_service())
                     .serve_with_incoming_shutdown(
                         tokio_stream::wrappers::TcpListenerStream::new(listener).map(|accepted| {
                             accepted.and_then(|stream| {
@@ -1477,6 +1545,7 @@ max_manifest_members=1024
                     )
                     .await
                     .unwrap();
+                drain.drain_landing().await;
             });
             (endpoint, task)
         });
@@ -4676,5 +4745,969 @@ fn stopped_immutable_candidates_retire_locally_and_release_workspace_quota() {
             .join(rw_id)
             .exists()
     );
+    fixture.stop_daemon();
+}
+
+impl RemoteServer {
+    fn landing_owner() -> tinytree_store::LandingOwner {
+        // Trusted fixture authority only. Actual Start/Get authenticate through
+        // the real service; no client verdict/finalize RPC exists.
+        let name = b"mounted-writer";
+        let mut retention = blake3::Hasher::new();
+        retention.update(b"tinytree-retention-owner-v1\0");
+        retention.update(&(name.len() as u64).to_be_bytes());
+        retention.update(name);
+        let mut owner = blake3::Hasher::new();
+        owner.update(b"tinytree-landing-owner-v1\0");
+        owner.update(&[1]);
+        owner.update(retention.finalize().as_bytes());
+        tinytree_store::LandingOwner(*owner.finalize().as_bytes())
+    }
+    fn finish_fixture_landing(&self, key: &str, passed: bool) -> tinytree_store::LandingJob {
+        let owner = Self::landing_owner();
+        let job = self
+            .store
+            .landing_job("example", owner, key)
+            .unwrap()
+            .unwrap();
+        let candidate = job.candidate.unwrap();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        self.store
+            .record_landing_check(
+                "example",
+                owner,
+                key,
+                &tinytree_store::LandingCheckIdentity {
+                    candidate: candidate.head,
+                    root_tree: candidate.root_tree,
+                    profile: job.profile,
+                },
+                tinytree_store::LandingVerdict {
+                    passed,
+                    evidence: [61; 32],
+                },
+                now,
+            )
+            .unwrap();
+        self.store
+            .finalize_landing("example", owner, key, now)
+            .unwrap()
+    }
+}
+fn landing_report(fixture: &mut Fixture, root: &Path, args: &[&str]) -> serde_json::Value {
+    serde_json::from_str(&fixture.success(root, args)).unwrap()
+}
+fn kill_landing_at(fixture: &Fixture, root: &Path, args: &[&str], point: &str) -> String {
+    let marker = fixture.base().join(format!(
+        "landing-{}-{point}.marker",
+        root.file_name().unwrap().to_str().unwrap()
+    ));
+    let stdout = fixture.base().join(format!("landing-{point}.out"));
+    let stderr = fixture.base().join(format!("landing-{point}.err"));
+    let binary = Path::new(env!("CARGO_BIN_EXE_landing_fault_driver"))
+        .canonicalize()
+        .unwrap();
+    let mut command = Command::new(binary);
+    fixture.environment(&mut command);
+    command
+        .current_dir(root)
+        .args(args)
+        .env("PATH", &fixture.empty_path)
+        .env("TINYTREE_LANDING_TEST_POINT", point)
+        .env("TINYTREE_LANDING_TEST_MARKER", &marker)
+        .stdout(fs::File::create(&stdout).unwrap())
+        .stderr(fs::File::create(&stderr).unwrap());
+    let mut child = command.spawn().unwrap();
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while !marker.exists() {
+        assert!(
+            child.try_wait().unwrap().is_none(),
+            "fault driver exited before {point}: {}",
+            fs::read_to_string(&stderr).unwrap()
+        );
+        assert!(
+            Instant::now() < deadline,
+            "fault driver did not reach {point}: {}",
+            fs::read_to_string(&stderr).unwrap()
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    child.kill().unwrap();
+    assert!(!child.wait().unwrap().success());
+    // Kernel lease release is not physical completion. Wait for the daemon's
+    // existing lease poller to drain the killed command before starting another.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let status = fixture.control(Request::Status).unwrap();
+        if status["native"]["commands"]["active_commands"] == 0 {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "killed native command did not physically drain: {status}"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    fs::read_to_string(marker).unwrap()
+}
+#[test]
+#[ignore = "requires usable /dev/fuse and fusermount3; trusted fixture verdict is not RBE evidence"]
+fn native_landing_preserves_iteration_and_replays_exact_unpublished_evolution_after_client_death() {
+    let upstream = RemoteServer::start_with_landing();
+    let mut fixture = Fixture::new();
+    fixture.configure_remote(&upstream.endpoint);
+    fixture.index_mode("federated");
+    fixture.start();
+    let base = fixture.base().to_owned();
+    let root = base.join("landing");
+    fixture.clone_remote(&root);
+    let binding = fixture.binding(&root);
+    fs::write(root.join("authored.txt"), b"submitted source\n").unwrap();
+    fixture.success(&root, &["describe", "-m", "submitted source"]);
+    let submitted = fixture.revision(&root, "@");
+    let submit = [
+        "tinytree",
+        "land",
+        "--base",
+        upstream.head.as_str(),
+        "--reference",
+        "main",
+        "--bookmark",
+        "main",
+        "--profile",
+        "checks",
+        "--profile-version",
+        "v1",
+    ];
+    // Actual lost response: Start was accepted, but the CLI is killed before
+    // persisting its returned job ID. The original intent/key stays durable.
+    kill_landing_at(&fixture, &root, &submit, "response_received");
+    let (_, state) = remote_observation(&binding);
+    assert!(state["landing"].get("job_id").is_none());
+    let key = state["landing"]["request_id"].as_str().unwrap().to_owned();
+    assert_ne!(fixture.revision(&root, "@"), submitted);
+    assert_eq!(
+        fixture.revision(&root, "@-"),
+        submitted,
+        "submission leaves a fresh working-copy child"
+    );
+    fs::write(
+        root.join("after.txt"),
+        b"edits made while server checks run\n",
+    )
+    .unwrap();
+    fixture.success(&root, &["status"]);
+    assert_eq!(
+        upstream.public().commit.unwrap().key.id.0,
+        *blake3::Hash::from_hex(&upstream.head).unwrap().as_bytes()
+    );
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let prepared = loop {
+        let report = landing_report(&mut fixture, &root, &["tinytree", "land", "--status"]);
+        if report["phase"] == "prepared_pending_checks" {
+            break report;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "candidate was not prepared: {report}"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    let candidate = prepared["candidate"].as_str().unwrap().to_owned();
+    assert_ne!(candidate, submitted);
+    assert_eq!(
+        upstream.file_reads(),
+        0,
+        "submit/status must not read any unchanged source FILE"
+    );
+    assert_eq!(
+        upstream.historical_tree_reads(),
+        0,
+        "thin staging must not walk unrelated historical trees"
+    );
+    assert_eq!(
+        upstream
+            .store
+            .scan_pending_landings("example", None, Default::default())
+            .unwrap()
+            .jobs
+            .len(),
+        1,
+        "lost response must not allocate another job"
+    );
+    let committed = upstream.finish_fixture_landing(&key, true);
+    assert_eq!(committed.state, tinytree_store::LandingState::Committed);
+    assert_eq!(
+        committed
+            .receipt
+            .as_ref()
+            .unwrap()
+            .reference
+            .commit
+            .unwrap()
+            .key
+            .id
+            .0,
+        *blake3::Hash::from_hex(&candidate).unwrap().as_bytes()
+    );
+    kill_landing_at(
+        &fixture,
+        &root,
+        &["tinytree", "land", "--resume"],
+        "apply_saved",
+    );
+    let (_, saved) = remote_observation(&binding);
+    let exact_op = saved["landing"]["apply_operation"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    assert!(!saved["landing"]["acknowledged"].as_bool().unwrap());
+    fixture.success(&base, &["tinytree", "unmount", root.to_str().unwrap()]);
+    fixture.stop_daemon();
+    fixture.start();
+    fixture.success(&base, &["tinytree", "resume", root.to_str().unwrap()]);
+    let applied = landing_report(&mut fixture, &root, &["tinytree", "land", "--resume"]);
+    assert_eq!(applied["phase"], "applied");
+    assert_eq!(applied["applied_operation"], exact_op);
+    assert_eq!(applied["acknowledged"], true);
+    assert_eq!(fixture.revision(&root, "@-"), candidate);
+    assert_eq!(
+        fs::read(root.join("after.txt")).unwrap(),
+        b"edits made while server checks run\n"
+    );
+    assert_eq!(
+        fs::read(root.join("authored.txt")).unwrap(),
+        b"submitted source\n"
+    );
+    let evolution = fixture.success(
+        &root,
+        &[
+            "evolog",
+            "--no-graph",
+            "-r",
+            &candidate,
+            "-T",
+            "commit.commit_id() ++ \"\\n\"",
+        ],
+    );
+    assert_eq!(evolution.lines().filter(|id| *id == candidate).count(), 1);
+    assert_eq!(evolution.lines().filter(|id| *id == submitted).count(), 1);
+    let replay = landing_report(&mut fixture, &root, &["tinytree", "land", "--resume"]);
+    assert_eq!(replay["applied_operation"], exact_op);
+    let replay_evolution = fixture.success(
+        &root,
+        &[
+            "evolog",
+            "--no-graph",
+            "-r",
+            &candidate,
+            "-T",
+            "commit.commit_id() ++ \"\\n\"",
+        ],
+    );
+    assert_eq!(
+        replay_evolution, evolution,
+        "receipt replay cannot duplicate evolution"
+    );
+    assert_eq!(upstream.file_reads(), 0);
+    if let Some(binary) = std::env::var_os("TINYTREE_PRE_LANDING_CLI") {
+        // Native-only optional compatibility proof against an independently
+        // pinned historical executable, never the current mutable bazel-bin.
+        let expected = std::env::var("TINYTREE_PRE_LANDING_CLI_BLAKE3").unwrap();
+        let binary = PathBuf::from(binary);
+        let mut file = fs::File::open(&binary).unwrap();
+        assert!(file.metadata().unwrap().len() <= 512 * 1024 * 1024);
+        let mut hash = blake3::Hasher::new();
+        hash.update_reader(&mut file).unwrap();
+        assert_eq!(hash.finalize().to_hex().as_str(), expected);
+        let before_heads = native_operation_heads(&binding);
+        let before_wc = jj_vfs::native::read_retained_state(
+            &binding.root,
+            &binding.working_copy,
+            &binding.repository,
+        )
+        .unwrap()
+        .persisted_bytes;
+        let rejected = fixture.run_binary(&root, &binary, &["status"], false);
+        assert!(!rejected.status.success());
+        assert!(String::from_utf8_lossy(&rejected.stderr).contains("native broker locator"));
+        assert_eq!(native_operation_heads(&binding), before_heads);
+        let after_wc = jj_vfs::native::read_retained_state(
+            &binding.root,
+            &binding.working_copy,
+            &binding.repository,
+        )
+        .unwrap()
+        .persisted_bytes;
+        assert_eq!(
+            after_wc, before_wc,
+            "legacy reader must reject before working-copy mutation"
+        );
+        assert_eq!(
+            fs::read(root.join("after.txt")).unwrap(),
+            b"edits made while server checks run\n"
+        );
+        eprintln!(
+            "native landing historical reader rejected before repository/working-copy mutation"
+        );
+    }
+    fixture.success(&base, &["tinytree", "unmount", root.to_str().unwrap()]);
+    fixture.stop_daemon();
+}
+
+fn prepare_native_landing(
+    fixture: &mut Fixture,
+    upstream: &RemoteServer,
+    name: &str,
+) -> (PathBuf, String, String, String) {
+    let root = fixture.base().join(name);
+    fixture.clone_remote(&root);
+    let base = fixture.revision(&root, "main");
+    fs::write(root.join(format!("{name}.txt")), format!("source {name}\n")).unwrap();
+    fixture.success(&root, &["describe", "-m", name]);
+    let source = fixture.revision(&root, "@");
+    landing_report(
+        fixture,
+        &root,
+        &[
+            "tinytree",
+            "land",
+            "--base",
+            &base,
+            "--reference",
+            "main",
+            "--bookmark",
+            "main",
+            "--profile",
+            "checks",
+            "--profile-version",
+            "v1",
+        ],
+    );
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let report = landing_report(fixture, &root, &["tinytree", "land", "--status"]);
+        if report["phase"] == "prepared_pending_checks" {
+            let key = report["request_id"].as_str().unwrap().to_owned();
+            let candidate = report["candidate"].as_str().unwrap().to_owned();
+            assert_eq!(fixture.revision(&root, "@-"), source);
+            assert_eq!(
+                upstream.file_reads(),
+                0,
+                "private edits must not hydrate unrelated FILEs"
+            );
+            return (root, source, key, candidate);
+        }
+        assert!(Instant::now() < deadline, "not prepared: {report}");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+fn new_landing_fixture() -> (RemoteServer, Fixture, PathBuf) {
+    let upstream = RemoteServer::start_with_landing();
+    let mut fixture = Fixture::new();
+    fixture.configure_remote(&upstream.endpoint);
+    fixture.index_mode("federated");
+    fixture.start();
+    let base = fixture.base().to_owned();
+    (upstream, fixture, base)
+}
+fn seed_landing_conflict_target(upstream: &RemoteServer) {
+    let original = m::CommitId(*blake3::Hash::from_hex(&upstream.head).unwrap().as_bytes());
+    let (_, bytes) = upstream
+        .store
+        .read_metadata(
+            "example",
+            m::ObjectKey {
+                kind: m::Kind::Commit,
+                id: m::ObjectId(original.0),
+            },
+        )
+        .unwrap();
+    let m::Object::Commit(mut commit) = m::decode(&bytes, Default::default()).unwrap() else {
+        unreachable!()
+    };
+    let (_, bytes) = upstream
+        .store
+        .read_metadata(
+            "example",
+            m::ObjectKey {
+                kind: m::Kind::Tree,
+                id: m::ObjectId(commit.root_tree.terms[0].0),
+            },
+        )
+        .unwrap();
+    let m::Object::Tree(mut tree) = m::decode(&bytes, Default::default()).unwrap() else {
+        unreachable!()
+    };
+    let content = b"destination addition\n";
+    let file = m::describe_file(content);
+    upstream.store.put("example", file, content, 0).unwrap();
+    tree.entries.push(m::TreeEntry {
+        name: "authored.txt".into(),
+        value: m::TreeValue::File {
+            id: m::FileId(file.key.id.0),
+            executable: false,
+            size_bytes: file.size_bytes,
+            copy_id: None,
+        },
+    });
+    tree.entries.sort_by(|a, b| a.name.cmp(&b.name));
+    let tree = m::encode(&m::Object::Tree(tree), Default::default()).unwrap();
+    upstream
+        .store
+        .put("example", tree.descriptor, &tree.bytes, 0)
+        .unwrap();
+    commit.parents = vec![original];
+    commit.predecessors.clear();
+    commit.change_id = m::ChangeId([77; 16]);
+    commit.root_tree.terms = vec![m::TreeId(tree.descriptor.key.id.0)];
+    let commit = m::encode(&m::Object::Commit(commit), Default::default()).unwrap();
+    upstream
+        .store
+        .put("example", commit.descriptor, &commit.bytes, 0)
+        .unwrap();
+    upstream
+        .store
+        .publish(
+            "example",
+            &tinytree_store::PublishRequest {
+                idempotency_key: "conflict-destination".into(),
+                reference_name: "main".into(),
+                expected_generation: 1,
+                new_commit: Some(m::CommitId(commit.descriptor.key.id.0)),
+                staging_leases: vec![],
+            },
+            0,
+        )
+        .unwrap();
+}
+#[test]
+#[ignore = "requires usable /dev/fuse and fusermount3; trusted fixture verdict is not RBE evidence"]
+fn native_landing_recovery_edges_preserve_divergence_and_terminal_states() {
+    for point in ["apply_written", "checkout_applied"] {
+        let (upstream, mut owner, base) = new_landing_fixture();
+        let fixture = &mut owner;
+        let upstream = &upstream;
+
+        let (root, source, key, candidate) = prepare_native_landing(fixture, upstream, point);
+        fs::write(
+            root.join("later.txt"),
+            b"working-copy changes after submission\n",
+        )
+        .unwrap();
+        fixture.success(&root, &["status"]);
+        upstream.finish_fixture_landing(&key, true);
+        let marker = kill_landing_at(fixture, &root, &["tinytree", "land", "--resume"], point);
+        let binding = fixture.binding(&root);
+        let (_, saved) = remote_observation(&binding);
+        let exact = if point == "apply_written" {
+            assert_eq!(
+                saved["landing"]["operation_writing"].as_str(),
+                Some("apply")
+            );
+            assert!(saved["landing"].get("apply_operation").is_none());
+            marker.lines().nth(1).unwrap().to_owned()
+        } else {
+            saved["landing"]["apply_operation"]
+                .as_str()
+                .unwrap()
+                .to_owned()
+        };
+        let applied = landing_report(fixture, &root, &["tinytree", "land", "--resume"]);
+        assert_eq!(applied["applied_operation"], exact);
+        assert_eq!(applied["acknowledged"], true);
+        assert_eq!(fixture.revision(&root, "@-"), candidate);
+        assert_eq!(
+            fs::read(root.join("later.txt")).unwrap(),
+            b"working-copy changes after submission\n"
+        );
+        let evolution = fixture.success(
+            &root,
+            &[
+                "evolog",
+                "--no-graph",
+                "-r",
+                &candidate,
+                "-T",
+                "commit.commit_id() ++ \"\\n\"",
+            ],
+        );
+        assert_eq!(evolution.lines().filter(|id| *id == candidate).count(), 1);
+        assert_eq!(evolution.lines().filter(|id| *id == source).count(), 1);
+        let replay = landing_report(fixture, &root, &["tinytree", "land", "--resume"]);
+        assert_eq!(replay["applied_operation"], exact);
+        fixture.success(&base, &["tinytree", "unmount", root.to_str().unwrap()]);
+        fixture.stop_daemon();
+    }
+    {
+        let (upstream, mut owner, base) = new_landing_fixture();
+        let fixture = &mut owner;
+        let upstream = &upstream;
+
+        // Explicit amendment of a submitted source is not the same tested commit.
+        let (root, source, key, _candidate) = prepare_native_landing(fixture, upstream, "amended");
+        fixture.success(
+            &root,
+            &["describe", "-r", &source, "-m", "amended while checks run"],
+        );
+        let amended = fixture.revision(&root, "@-");
+        assert_ne!(amended, source);
+        fs::write(root.join("keep.txt"), b"keep private divergence\n").unwrap();
+        fixture.success(&root, &["status"]);
+        upstream.finish_fixture_landing(&key, true);
+        let failed = fixture.run(&root, &["tinytree", "land", "--resume"]);
+        assert!(!failed.status.success());
+        assert!(String::from_utf8_lossy(&failed.stderr).contains("reconciliation_required"));
+        assert_eq!(fixture.revision(&root, "@-"), amended);
+        assert_eq!(
+            fs::read(root.join("keep.txt")).unwrap(),
+            b"keep private divergence\n"
+        );
+        fixture.success(&base, &["tinytree", "unmount", root.to_str().unwrap()]);
+        fixture.stop_daemon();
+    }
+    {
+        let (upstream, mut owner, base) = new_landing_fixture();
+        let fixture = &mut owner;
+        let upstream = &upstream;
+
+        // A detached saved operation cannot overwrite edits made after client death.
+        let (root, _source, key, _candidate) =
+            prepare_native_landing(fixture, upstream, "advanced");
+        upstream.finish_fixture_landing(&key, true);
+        kill_landing_at(
+            fixture,
+            &root,
+            &["tinytree", "land", "--resume"],
+            "apply_saved",
+        );
+        fs::write(root.join("keep.txt"), b"new operation after saved plan\n").unwrap();
+        fixture.success(&root, &["status"]);
+        let current = fixture.revision(&root, "@");
+        let failed = fixture.run(&root, &["tinytree", "land", "--resume"]);
+        assert!(!failed.status.success());
+        assert!(String::from_utf8_lossy(&failed.stderr).contains("reconciliation_required"));
+        assert_eq!(fixture.revision(&root, "@"), current);
+        assert_eq!(
+            fs::read(root.join("keep.txt")).unwrap(),
+            b"new operation after saved plan\n"
+        );
+        fixture.success(&base, &["tinytree", "unmount", root.to_str().unwrap()]);
+        fixture.stop_daemon();
+    }
+    {
+        let (upstream, mut owner, base) = new_landing_fixture();
+        let fixture = &mut owner;
+        let upstream = &upstream;
+
+        // A conflicting rebase remains a server conflict, not a local reset.
+        seed_landing_conflict_target(upstream);
+        let conflict = fixture.base().join("conflict");
+        fixture.clone_remote(&conflict);
+        fixture.success(&conflict, &["new", &upstream.head]);
+        fs::write(
+            conflict.join("authored.txt"),
+            b"conflicting source addition\n",
+        )
+        .unwrap();
+        fixture.success(&conflict, &["describe", "-m", "conflicting draft"]);
+        let before = upstream.public();
+        landing_report(
+            fixture,
+            &conflict,
+            &[
+                "tinytree",
+                "land",
+                "--base",
+                &upstream.head,
+                "--reference",
+                "main",
+                "--bookmark",
+                "main",
+                "--profile",
+                "checks",
+                "--profile-version",
+                "v1",
+            ],
+        );
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let report = landing_report(fixture, &conflict, &["tinytree", "land", "--resume"]);
+            if report["phase"] == "conflict" {
+                assert!(report["applied_operation"].is_null());
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "conflict was not terminal: {report}"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(upstream.public(), before);
+        assert_eq!(
+            fs::read(conflict.join("authored.txt")).unwrap(),
+            b"conflicting source addition\n"
+        );
+        fixture.success(&base, &["tinytree", "unmount", conflict.to_str().unwrap()]);
+        fixture.stop_daemon();
+    }
+    // Failed and stale server checks never create a local apply operation.
+    for stale in [false, true] {
+        let (upstream, mut owner, base) = new_landing_fixture();
+        let fixture = &mut owner;
+        let upstream = &upstream;
+
+        let name = if stale { "stale" } else { "failed" };
+        let (root, _source, key, _candidate) = prepare_native_landing(fixture, upstream, name);
+        let before = upstream.public();
+        if stale {
+            upstream
+                .store
+                .publish(
+                    "example",
+                    &tinytree_store::PublishRequest {
+                        idempotency_key: "fixture-stale-target".into(),
+                        reference_name: "main".into(),
+                        expected_generation: before.generation,
+                        new_commit: before.commit.map(|d| m::CommitId(d.key.id.0)),
+                        staging_leases: vec![],
+                    },
+                    std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap()
+                        .as_secs() as i64,
+                )
+                .unwrap();
+        }
+        let job = upstream.finish_fixture_landing(&key, stale);
+        assert_eq!(
+            job.state,
+            if stale {
+                tinytree_store::LandingState::StaleTarget
+            } else {
+                tinytree_store::LandingState::CheckFailed
+            }
+        );
+        let head = fixture.revision(&root, "@");
+        let report = landing_report(fixture, &root, &["tinytree", "land", "--resume"]);
+        assert_eq!(
+            report["phase"],
+            if stale {
+                "stale_target"
+            } else {
+                "check_failed"
+            }
+        );
+        assert!(report["applied_operation"].is_null());
+        assert_eq!(fixture.revision(&root, "@"), head);
+        assert_eq!(upstream.public().commit, before.commit);
+        fixture.success(&base, &["tinytree", "unmount", root.to_str().unwrap()]);
+        fixture.stop_daemon();
+    }
+}
+
+#[test]
+#[ignore = "requires usable /dev/fuse and fusermount3; trusted fixture verdict is not RBE evidence"]
+fn native_landing_successful_iteration_reuses_default_quota_without_crashes() {
+    let (upstream, mut fixture, base) = new_landing_fixture();
+    let root = base.join("clean-iteration");
+    fixture.clone_remote(&root);
+    let mut canonical = HashSet::new();
+    for iteration in 0..4 {
+        fs::write(
+            root.join(format!("iteration-{iteration}.txt")),
+            format!("draft {iteration}\n"),
+        )
+        .unwrap();
+        fixture.success(
+            &root,
+            &["describe", "-m", &format!("iteration {iteration}")],
+        );
+        let observed = fixture.revision(&root, "main");
+        let source = fixture.revision(&root, "@");
+        landing_report(
+            &mut fixture,
+            &root,
+            &[
+                "tinytree",
+                "land",
+                "--base",
+                &observed,
+                "--reference",
+                "main",
+                "--bookmark",
+                "main",
+                "--profile",
+                "checks",
+                "--profile-version",
+                "v1",
+            ],
+        );
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let prepared = loop {
+            let report = landing_report(&mut fixture, &root, &["tinytree", "land", "--status"]);
+            if report["phase"] == "prepared_pending_checks" {
+                break report;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "iteration {iteration} did not prepare: {report}"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        let candidate = prepared["candidate"].as_str().unwrap().to_owned();
+        assert!(canonical.insert(candidate.clone()));
+        upstream.finish_fixture_landing(prepared["request_id"].as_str().unwrap(), true);
+        let applied = landing_report(&mut fixture, &root, &["tinytree", "land", "--resume"]);
+        assert_eq!(applied["acknowledged"], true);
+        assert_eq!(fixture.revision(&root, "main"), candidate);
+        assert_eq!(fixture.revision(&root, "@-"), candidate);
+        let evolution = fixture.success(
+            &root,
+            &[
+                "evolog",
+                "--no-graph",
+                "-r",
+                &candidate,
+                "-T",
+                "commit.commit_id() ++ \"\\n\"",
+            ],
+        );
+        assert_eq!(evolution.lines().filter(|id| *id == source).count(), 1);
+        assert_eq!(upstream.file_reads(), 0);
+        assert_eq!(upstream.historical_tree_reads(), 0);
+    }
+    fixture.success(&base, &["tinytree", "unmount", root.to_str().unwrap()]);
+    fixture.stop_daemon();
+}
+
+#[test]
+#[ignore = "requires usable /dev/fuse and fusermount3; trusted fixture verdict is not RBE evidence"]
+fn native_landing_selected_ancestor_working_copy_forks_and_rebases_at_that_ancestor() {
+    let (upstream, mut fixture, base) = new_landing_fixture();
+    let root = base.join("ancestor");
+    fixture.clone_remote(&root);
+    let observed = fixture.revision(&root, "main");
+    fs::write(root.join("first.txt"), b"first stack commit\n").unwrap();
+    fixture.success(&root, &["describe", "-m", "first stack commit"]);
+    let first = fixture.revision(&root, "@");
+    fixture.success(&root, &["new"]);
+    fs::write(root.join("second.txt"), b"second stack commit\n").unwrap();
+    fixture.success(&root, &["describe", "-m", "second stack commit"]);
+    let tip = fixture.revision(&root, "@");
+    fixture.success(&root, &["bookmark", "set", "draft-tip", "-r", &tip]);
+    fixture.success(&root, &["edit", &first]);
+    landing_report(
+        &mut fixture,
+        &root,
+        &[
+            "tinytree",
+            "land",
+            "--base",
+            &observed,
+            "--revision",
+            &tip,
+            "--reference",
+            "main",
+            "--bookmark",
+            "main",
+            "--profile",
+            "checks",
+            "--profile-version",
+            "v1",
+        ],
+    );
+    assert_ne!(fixture.revision(&root, "@"), first);
+    assert_eq!(
+        fixture.revision(&root, "@-"),
+        first,
+        "freeze the actual selected working copy, not just the stack tip"
+    );
+    fs::write(
+        root.join("continued.txt"),
+        b"continued from the selected ancestor\n",
+    )
+    .unwrap();
+    fixture.success(&root, &["status"]);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let prepared = loop {
+        let report = landing_report(&mut fixture, &root, &["tinytree", "land", "--status"]);
+        if report["phase"] == "prepared_pending_checks" {
+            break report;
+        }
+        assert!(Instant::now() < deadline, "not prepared: {report}");
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    let committed = upstream.finish_fixture_landing(prepared["request_id"].as_str().unwrap(), true);
+    let candidate = committed.candidate.unwrap();
+    let rewritten_first = candidate
+        .rewrites
+        .iter()
+        .find(|r| r.old.0 == *blake3::Hash::from_hex(&first).unwrap().as_bytes())
+        .unwrap()
+        .new;
+    let applied = landing_report(&mut fixture, &root, &["tinytree", "land", "--resume"]);
+    assert_eq!(applied["acknowledged"], true);
+    assert_eq!(
+        fixture.revision(&root, "@-"),
+        rewritten_first
+            .0
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect::<String>()
+    );
+    assert_ne!(
+        fixture.revision(&root, "@-"),
+        prepared["candidate"].as_str().unwrap()
+    );
+    assert_eq!(
+        fixture.revision(&root, "draft-tip"),
+        prepared["candidate"].as_str().unwrap()
+    );
+    assert_eq!(
+        fs::read(root.join("continued.txt")).unwrap(),
+        b"continued from the selected ancestor\n"
+    );
+    assert!(
+        !root.join("second.txt").exists(),
+        "do not jump the workspace to the selected stack tip"
+    );
+    assert_eq!(upstream.file_reads(), 0);
+    assert_eq!(upstream.historical_tree_reads(), 0);
+    fixture.success(&base, &["tinytree", "unmount", root.to_str().unwrap()]);
+    fixture.stop_daemon();
+}
+
+#[test]
+#[ignore = "requires usable /dev/fuse and fusermount3; trusted fixture verdict is not RBE evidence"]
+fn native_landing_waits_for_an_interrupted_publication_without_mutating_either_intent() {
+    let (upstream, mut fixture, base) = new_landing_fixture();
+    let (root, _source, key, candidate) =
+        prepare_native_landing(&mut fixture, &upstream, "interrupted-push");
+    upstream.finish_fixture_landing(&key, true);
+    // A real ordinary push has durably recorded its old-generation intent, but
+    // its upstream CAS has not yet answered when that CLI process is killed.
+    struct Release(Arc<MetadataReads>);
+    impl Drop for Release {
+        fn drop(&mut self) {
+            self.0.public_paused.store(false, Ordering::SeqCst);
+            self.0.public_release.notify_waiters();
+        }
+    }
+    upstream
+        .metadata
+        .public_paused
+        .store(true, Ordering::SeqCst);
+    let release = Release(upstream.metadata.clone());
+    let mut command = Command::new(&fixture.cli);
+    fixture.environment(&mut command);
+    command
+        .current_dir(&root)
+        .args([
+            "tinytree",
+            "push",
+            "--reference",
+            "main",
+            "--bookmark",
+            "main",
+        ])
+        .env("PATH", &fixture.empty_path)
+        .stdout(fs::File::create(base.join("interrupted-push.out")).unwrap())
+        .stderr(fs::File::create(base.join("interrupted-push.err")).unwrap());
+    let mut child = command.spawn().unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !upstream.metadata.public_started.load(Ordering::SeqCst) {
+        assert!(
+            child.try_wait().unwrap().is_none(),
+            "ordinary push exited before upstream CAS pause: {}",
+            fs::read_to_string(base.join("interrupted-push.err")).unwrap()
+        );
+        assert!(
+            Instant::now() < deadline,
+            "ordinary push did not reach upstream CAS"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    child.kill().unwrap();
+    assert!(!child.wait().unwrap().success());
+    drop(release);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let status = fixture.control(Request::Status).unwrap();
+        if status["native"]["commands"]["active_commands"] == 0 {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "interrupted publication did not physically drain: {status}"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let binding = fixture.binding(&root);
+    let (before, state) = remote_observation(&binding);
+    assert_eq!(state["pending"]["kind"].as_str(), Some("push"));
+    assert_eq!(state["pending"]["generation"].as_integer(), Some(1));
+    assert_eq!(state["landing"]["request_id"].as_str(), Some(key.as_str()));
+    let before_heads = native_operation_heads(&binding);
+    let before_wc = jj_vfs::native::read_retained_state(
+        &binding.root,
+        &binding.working_copy,
+        &binding.repository,
+    )
+    .unwrap()
+    .persisted_bytes;
+    let landing_calls = upstream.metadata.landing_calls.load(Ordering::SeqCst);
+    for flag in ["--status", "--resume"] {
+        let output = fixture.run(&root, &["tinytree", "land", flag]);
+        assert!(!output.status.success());
+        assert!(
+            String::from_utf8_lossy(&output.stderr)
+                .contains("resolve the original pending native fetch/publication")
+        );
+        assert_eq!(
+            remote_observation(&binding).0,
+            before,
+            "both exact original journals must remain byte-identical"
+        );
+        assert_eq!(native_operation_heads(&binding), before_heads);
+        assert_eq!(
+            jj_vfs::native::read_retained_state(
+                &binding.root,
+                &binding.working_copy,
+                &binding.repository
+            )
+            .unwrap()
+            .persisted_bytes,
+            before_wc
+        );
+        assert_eq!(
+            upstream.metadata.landing_calls.load(Ordering::SeqCst),
+            landing_calls,
+            "guard must run before status/control dispatch"
+        );
+    }
+    // Retry the ordinary original intent to obtain its authoritative stale-CAS
+    // result. Only that workflow clears it; landing never replaces the journal.
+    let stale = fixture.run(
+        &root,
+        &[
+            "tinytree",
+            "push",
+            "--reference",
+            "main",
+            "--bookmark",
+            "main",
+        ],
+    );
+    assert!(!stale.status.success());
+    assert!(String::from_utf8_lossy(&stale.stderr).contains("native reference changed"));
+    assert!(remote_observation(&binding).1.get("pending").is_none());
+    let applied = landing_report(&mut fixture, &root, &["tinytree", "land", "--resume"]);
+    assert_eq!(applied["acknowledged"], true);
+    assert_eq!(fixture.revision(&root, "@-"), candidate);
+    fixture.success(&base, &["tinytree", "unmount", root.to_str().unwrap()]);
     fixture.stop_daemon();
 }

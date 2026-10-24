@@ -1913,7 +1913,9 @@ fn restore_locator(
         let bytes = directory.read_descendant("store/native-broker.toml", 16 * 1024)?;
         let actual: RestoreLocator = toml::from_str(std::str::from_utf8(&bytes)?)?;
         ensure!(
-            actual == expected,
+            matches!(actual.version, 1 | 2)
+                && actual.socket == expected.socket
+                && actual.store == expected.store,
             "restored backend locator differs from current configuration"
         );
         let _spool = PrivateDir::open_existing(path.join("native-broker-spool"))?;
@@ -2243,6 +2245,24 @@ mod tests {
         let original = fs::read(store.join("native-broker.toml"))?;
         assert!(write(&store).is_err());
         assert_eq!(fs::read(store.join("native-broker.toml"))?, original);
+        let mut upgraded: RestoreLocator = toml::from_str(std::str::from_utf8(&original)?)?;
+        upgraded.version = 2;
+        fs::write(
+            store.join("native-broker.toml"),
+            toml::to_string(&upgraded)?,
+        )?;
+        check(&store)?;
+        upgraded.version = 3;
+        fs::write(
+            store.join("native-broker.toml"),
+            toml::to_string(&upgraded)?,
+        )?;
+        assert!(check(&store).is_err());
+        upgraded.version = 2;
+        fs::write(
+            store.join("native-broker.toml"),
+            toml::to_string(&upgraded)?,
+        )?;
         let (_, foreign) = restore_locator(directory.path().join("other.sock"), "example".into());
         assert!(foreign(&store).is_err());
         let alias = repository.path().join("alias");

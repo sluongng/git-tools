@@ -115,6 +115,61 @@ impl BrokerControlClient {
         })
         .await
     }
+    /// Submit once or recover by the original persisted intent. Status is a
+    /// short RPC, never a wait for checks, and there is no verdict operation.
+    pub async fn landing(
+        &self,
+        intent: crate::LandingIntent,
+        submit: bool,
+    ) -> Result<crate::LandingReport, Status> {
+        intent.validate()?;
+        let inner = self.inner.clone();
+        crate::client::run_control(async move {
+            let deadline = Instant::now() + inner.config.policy.operation_timeout();
+            let memory = 194 * 1024 * 1024;
+            let retained = 2 * 1024 * 1024;
+            if memory + retained > inner.config.max_memory_bytes {
+                return Err(Status::resource_exhausted(
+                    "native landing decode budget unavailable",
+                ));
+            }
+            reapi::policy::timeout(deadline, async {
+                let call = inner
+                    .calls
+                    .clone()
+                    .acquire_owned()
+                    .await
+                    .map_err(|_| Status::unavailable("broker client closed"))?;
+                let bytes = inner
+                    .memory
+                    .clone()
+                    .acquire_many_owned(memory as u32)
+                    .await
+                    .map_err(|_| Status::unavailable("broker client closed"))?;
+                let result_bytes = inner
+                    .memory
+                    .clone()
+                    .acquire_many_owned(retained as u32)
+                    .await
+                    .map_err(|_| Status::unavailable("broker client closed"))?;
+                let physical = Arc::new((call, bytes));
+                let channel = inner.channel.clone().with_owner(physical);
+                let mut client =
+                    p::repository_control_client::RepositoryControlClient::new(channel)
+                        .send_compressed(CompressionEncoding::Zstd)
+                        .accept_compressed(CompressionEncoding::Zstd)
+                        .max_decoding_message_size(128 * 1024 + 4096)
+                        .max_encoding_message_size(16 * 1024);
+                let reply = client
+                    .landing(request(intent.wire(inner.store.clone(), submit), deadline)?)
+                    .await?
+                    .into_inner();
+                crate::LandingReport::decode(&reply.job, &intent, Arc::new(result_bytes))
+            })
+            .await
+        })
+        .await
+    }
     pub async fn observe_reference(&self, name: &str) -> Result<ReferenceSnapshot, Status> {
         control::reference_name(name)?;
         let name = name.to_owned();

@@ -16,6 +16,20 @@ rust_binary(
     deps = all_crate_deps(normal = True),
 )
 
+# Actual native implementation with process-kill gates, never a materialized fixture.
+rust_binary(
+    name = "landing_fault_driver",
+    testonly = True,
+    srcs = glob(["src/**/*.rs"]),
+    aliases = aliases(),
+    crate_features = ["native-landing-fault-injection"],
+    crate_name = "tinytree_landing_fault_driver",
+    crate_root = "src/main.rs",
+    edition = "2024",
+    version = "0.1.0",
+    deps = all_crate_deps(normal = True),
+)
+
 # Lower-level repository/publication scenarios. Never the shipped CLI.
 rust_binary(
     name = "protocol_fixture",
@@ -66,11 +80,13 @@ rust_test(
     aliases = aliases(),
     data = [
         ":tinytree-jj",
+        ":landing_fault_driver",
         "//crates/workspace-daemon:workspace",
     ],
     edition = "2024",
     rustc_env = {
         "CARGO_BIN_EXE_tinytree-jj": "$(rootpath :tinytree-jj)",
+        "CARGO_BIN_EXE_landing_fault_driver": "$(rootpath :landing_fault_driver)",
         "CARGO_BIN_EXE_workspace": "$(rootpath //crates/workspace-daemon:workspace)",
     },
     tags = ["manual"],
@@ -97,11 +113,13 @@ rust_test(
     crate_features = ["native-gc-benchmark"],
     data = [
         ":tinytree-jj",
+        ":landing_fault_driver",
         "//crates/workspace-daemon:workspace",
     ],
     edition = "2024",
     rustc_env = {
         "CARGO_BIN_EXE_tinytree-jj": "$(rootpath :tinytree-jj)",
+        "CARGO_BIN_EXE_landing_fault_driver": "$(rootpath :landing_fault_driver)",
         "CARGO_BIN_EXE_workspace": "$(rootpath //crates/workspace-daemon:workspace)",
     },
     tags = ["manual"],

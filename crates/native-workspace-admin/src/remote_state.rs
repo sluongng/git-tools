@@ -58,6 +58,119 @@ pub struct Pending {
     pub base_operation: String,
     pub confirmed_generation: Option<u64>,
 }
+/// Durable original intent. This is a local recovery journal, never a client
+/// verdict or permission to finalize the server job. IDs remain protected until
+/// exact operation publication and native checkout acknowledgement are durable.
+#[derive(Clone, Serialize, Deserialize, Debug, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct LandingPending {
+    pub request_id: String,
+    pub source_base: String,
+    pub source_head: String,
+    pub reference: String,
+    pub bookmark: String,
+    pub generation: u64,
+    pub expected_head: String,
+    pub profile_name: String,
+    pub profile_version: String,
+    pub source_operation: String,
+    /// Oldest first; source_head is last. Never reconstructed from a moving @.
+    pub source_stack: Vec<String>,
+    pub fork_operation: Option<String>,
+    pub fork_acknowledged: bool,
+    pub job_id: Option<String>,
+    /// Canonical admitted candidate/evolution roots, populated after Get.
+    #[serde(default)]
+    pub result_roots: Vec<String>,
+    pub candidate_head: Option<String>,
+    pub apply_operation: Option<String>,
+    pub operation_writing: Option<String>,
+    pub acknowledged: bool,
+    pub terminal: Option<String>,
+}
+impl LandingPending {
+    fn validate(&self) -> io::Result<()> {
+        validate_names(&self.reference, &self.bookmark)?;
+        let nonroot = |id: &str| valid_hex(id, 64) && id.bytes().any(|b| b != b'0');
+        let operation = |id: &str| valid_hex(id, 128);
+        let mut stack = std::collections::HashSet::new();
+        if !valid_hex(&self.request_id, 32)
+            || !valid_hex(&self.source_base, 64)
+            || !nonroot(&self.source_head)
+            || !nonroot(&self.expected_head)
+            || self.generation == 0
+            || self.generation == u64::MAX
+            || self.profile_name.is_empty()
+            || self.profile_name.len() > 64
+            || !self
+                .profile_name
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b"-_".contains(&b))
+            || self.profile_version.is_empty()
+            || self.profile_version.len() > 128
+            || self.profile_version.contains('\0')
+            || !operation(&self.source_operation)
+            || self.source_stack.is_empty()
+            || self.source_stack.len() > 128
+            || self.source_stack.last() != Some(&self.source_head)
+            || self
+                .source_stack
+                .iter()
+                .any(|id| !nonroot(id) || !stack.insert(id))
+            || stack.contains(&self.source_base)
+            || (self.fork_acknowledged && self.fork_operation.is_none())
+            || self
+                .fork_operation
+                .as_deref()
+                .is_some_and(|id| !operation(id))
+            || self
+                .apply_operation
+                .as_deref()
+                .is_some_and(|id| !operation(id))
+            || self.job_id.as_deref().is_some_and(|id| !nonroot(id))
+            || self
+                .candidate_head
+                .as_deref()
+                .is_some_and(|id| !nonroot(id))
+            || self.result_roots.len() > 256
+            || self.result_roots.iter().any(|id| !nonroot(id))
+            || (self.job_id.is_some() && !self.fork_acknowledged)
+            || (self.candidate_head.is_some()
+                && (self.job_id.is_none()
+                    || !self
+                        .result_roots
+                        .iter()
+                        .any(|id| Some(id) == self.candidate_head.as_ref())))
+            || (!self.result_roots.is_empty() && self.candidate_head.is_none())
+            || (self.apply_operation.is_some()
+                && (self.job_id.is_none() || self.candidate_head.is_none()))
+            || (self.terminal.is_some() && (self.job_id.is_none() || self.acknowledged))
+            || self
+                .operation_writing
+                .as_deref()
+                .is_some_and(|phase| match phase {
+                    "freeze" => self.fork_operation.is_some(),
+                    "apply" => {
+                        self.apply_operation.is_some()
+                            || self.job_id.is_none()
+                            || self.candidate_head.is_none()
+                    }
+                    _ => true,
+                })
+            || (self.acknowledged && self.apply_operation.is_none())
+            || self.terminal.as_deref().is_some_and(|s| {
+                !matches!(
+                    s,
+                    "conflict" | "unsupported" | "check_failed" | "stale_target" | "expired"
+                )
+            })
+        {
+            return Err(io::Error::other("invalid native landing recovery intent"));
+        }
+        Ok(())
+    }
+}
+
 #[derive(Serialize, Deserialize, Debug, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct State {
@@ -68,6 +181,8 @@ pub struct State {
     pub pending: Option<Pending>,
     #[serde(default)]
     pub archived_pushes: Vec<Pending>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub landing: Option<LandingPending>,
 }
 impl State {
     pub fn new(locator: &RemoteScope) -> Self {
@@ -78,10 +193,12 @@ impl State {
             observations: vec![],
             pending: None,
             archived_pushes: vec![],
+            landing: None,
         }
     }
     pub fn validate(&self, locator: &RemoteScope) -> io::Result<()> {
-        if self.version != VERSION
+        if !matches!(self.version, VERSION | 2)
+            || (self.landing.is_some() && self.version != 2)
             || self.socket != locator.socket
             || self.store != locator.store
             || self.observations.len() > MAX_REFERENCES
@@ -90,6 +207,9 @@ impl State {
             return Err(io::Error::other(
                 "native remote state scope/version mismatch",
             ));
+        }
+        if let Some(landing) = &self.landing {
+            landing.validate()?;
         }
         let mut names = std::collections::HashSet::new();
         let mut bookmarks = std::collections::HashSet::new();
@@ -144,6 +264,19 @@ impl State {
         {
             return Err(io::Error::other("invalid archived native replay intent"));
         }
+        Ok(())
+    }
+    /// Activate the fail-closed version fence before any landing dispatch. Once
+    /// upgraded, removing a journal never silently restores legacy mutation.
+    pub fn begin_landing(&mut self, intent: LandingPending) -> io::Result<()> {
+        intent.validate()?;
+        if self.landing.is_some() || self.pending.is_some() {
+            return Err(io::Error::other(
+                "another native intent requires reconciliation",
+            ));
+        }
+        self.version = 2;
+        self.landing = Some(intent);
         Ok(())
     }
     pub fn prepare(&self, reference: &str, bookmark: &str) -> io::Result<()> {
@@ -249,6 +382,11 @@ impl State {
             .iter()
             .chain(&self.archived_pushes)
             .map(|intent| intent.base_operation.as_str())
+            .chain(self.landing.iter().flat_map(|intent| {
+                std::iter::once(intent.source_operation.as_str())
+                    .chain(intent.fork_operation.as_deref())
+                    .chain(intent.apply_operation.as_deref())
+            }))
     }
     pub fn retained_commit_heads(&self) -> impl Iterator<Item = &str> {
         self.observations
@@ -260,5 +398,15 @@ impl State {
                     .chain(&self.archived_pushes)
                     .filter_map(|entry| entry.head.as_deref()),
             )
+            .chain(self.landing.iter().flat_map(|intent| {
+                std::iter::once(intent.source_head.as_str())
+                    .chain(std::iter::once(intent.expected_head.as_str()))
+                    .chain(
+                        (intent.source_base.bytes().any(|b| b != b'0'))
+                            .then_some(intent.source_base.as_str()),
+                    )
+                    .chain(intent.source_stack.iter().map(String::as_str))
+                    .chain(intent.result_roots.iter().map(String::as_str))
+            }))
     }
 }

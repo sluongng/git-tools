@@ -2,6 +2,7 @@
 mod broker;
 mod commands;
 mod history;
+mod landing;
 mod remote;
 mod remote_state;
 mod roots;
@@ -26,6 +27,8 @@ enum NativeCommand {
 
 #[derive(clap::Subcommand, Clone, Debug)]
 enum TinytreeCommand {
+    /// Submit a frozen native stack to server-owned checks, or reconcile its result.
+    Land(landing::LandArgs),
     /// Search an immutable revision, including local draft and dirty-file overlays.
     Search(search::SearchArgs),
     /// Inspect exact-path history without downloading historical file bodies.
@@ -128,6 +131,9 @@ async fn run_native_command(
     args: NativeCommand,
 ) -> Result<(), CommandError> {
     match args {
+        NativeCommand::Tinytree {
+            command: TinytreeCommand::Land(args),
+        } => landing::run(ui, command, args).await,
         NativeCommand::Tinytree {
             command: TinytreeCommand::Search(args),
         } => search::run(ui, command, args).await,

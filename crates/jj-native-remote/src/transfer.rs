@@ -205,6 +205,116 @@ impl RemoteRepositoryControl {
         completed.result
     }
 
+    /// Stage only an explicit linear source stack and its Merkle changed-path
+    /// frontier. The base is protected by a complete server-side private hold,
+    /// never inferred from descriptor presence. Equal subtrees need no walk or
+    /// FILE reads. Legacy ancestry uses a separately bounded auxiliary frontier;
+    /// unsupported/over-limit graphs fail closed without a full-history fallback. This creates no public destination reference.
+    pub async fn transfer_native_stack(
+        &self,
+        source: Arc<dyn NativeObjectIo>,
+        base: m::CommitId,
+        stack: Vec<m::CommitId>,
+        owner: Owner,
+        limits: NativeTransferLimits,
+        deadline: tokio::time::Instant,
+    ) -> Result<NativeTransferReceipt> {
+        self.transfer_stack_owned(source, base, stack, owner, limits, deadline, false)
+            .await
+    }
+    /// Same configured repository only. Exact-key metadata fetch follows the
+    /// held base/frozen canonical references; it does not create generic provider
+    /// grants or invoke another provider's whole-closure hydration machinery.
+    pub async fn stage_landing_stack(
+        &self,
+        base: m::CommitId,
+        stack: Vec<m::CommitId>,
+        owner: Owner,
+        limits: NativeTransferLimits,
+        deadline: tokio::time::Instant,
+    ) -> Result<NativeTransferReceipt> {
+        self.transfer_stack_owned(
+            self.inner.local.clone(),
+            base,
+            stack,
+            owner,
+            limits,
+            deadline,
+            true,
+        )
+        .await
+    }
+    async fn transfer_stack_owned(
+        &self,
+        source: Arc<dyn NativeObjectIo>,
+        base: m::CommitId,
+        stack: Vec<m::CommitId>,
+        owner: Owner,
+        limits: NativeTransferLimits,
+        deadline: tokio::time::Instant,
+        remote_metadata: bool,
+    ) -> Result<NativeTransferReceipt> {
+        self.native_transfer_resources(source.as_ref(), &limits)?;
+        if stack.is_empty()
+            || stack.len() > 128
+            || stack.len() > limits.max_roots
+            || stack.contains(&base)
+            || stack.iter().any(|id| *id == m::CommitId::ROOT)
+            || stack.iter().collect::<HashSet<_>>().len() != stack.len()
+        {
+            return Err(Status::invalid_argument("invalid native landing stack").into());
+        }
+        if io::in_control() {
+            return Err(Status::failed_precondition(
+                "native stack transfer requires independent host admission",
+            )
+            .into());
+        }
+        // Admission and proof refresh are bounded by the SAME original deadline.
+        if base != m::CommitId::ROOT {
+            self.run_owned(deadline, owner.clone(), self.admit_commit(base))
+                .await?;
+        }
+        let permit = tokio::time::timeout_at(deadline, self.inner.control.clone().acquire_owned())
+            .await
+            .map_err(|_| Status::deadline_exceeded("native stack admission deadline exceeded"))??;
+        let scope = Arc::new(io::ControlScope::new(permit, deadline, owner.clone()));
+        let control = self.clone();
+        struct Completed {
+            result: Result<NativeTransferReceipt>,
+            _scope: Arc<io::ControlScope>,
+        }
+        let completed = io::owned(async move {
+            let result = io::control_scope(scope.clone(), async {
+                tokio::time::timeout_at(deadline, async {
+                    let physical: Owner = scope.clone();
+                    let closure = collect_stack(
+                        &control,
+                        &source,
+                        base,
+                        stack,
+                        &limits,
+                        physical,
+                        remote_metadata,
+                    )
+                    .await?;
+                    control
+                        .upload_collected(source, closure, owner, limits, deadline)
+                        .await
+                })
+                .await
+                .map_err(|_| Status::deadline_exceeded("native stack transfer deadline exceeded"))?
+            })
+            .await;
+            Ok(Completed {
+                result,
+                _scope: scope,
+            })
+        })
+        .await?;
+        completed.result
+    }
+
     async fn transfer_inner(
         &self,
         source: Arc<dyn NativeObjectIo>,
@@ -222,6 +332,19 @@ impl RemoteRepositoryControl {
             physical.clone(),
         )
         .await?;
+        self.upload_collected(source, closure, owner, limits, deadline)
+            .await
+    }
+
+    async fn upload_collected(
+        &self,
+        source: Arc<dyn NativeObjectIo>,
+        closure: closure::Closure,
+        owner: Owner,
+        _limits: NativeTransferLimits,
+        deadline: tokio::time::Instant,
+    ) -> Result<NativeTransferReceipt> {
+        let physical: Owner = io::scope().context("native transfer admission missing")?;
         let client = self.physical_client().await?;
         let mut descriptors = closure.descriptors();
         descriptors.extend(closure.files.iter().map(|(id, size, _)| m::Descriptor {
@@ -504,6 +627,455 @@ async fn collect(
         nodes,
         order,
         files: files
+            .into_iter()
+            .map(|(id, (size, tree))| (id, size, tree))
+            .collect(),
+    })
+}
+
+// Old-tree nodes are retained and charged too: comparing a huge base directory
+// is not free just because none of its FILE bodies are downloaded.
+struct StackFrontier<'a> {
+    source: &'a Arc<dyn NativeObjectIo>,
+    remote: Option<&'a RemoteRepositoryControl>,
+    owner: Owner,
+    limits: &'a NativeTransferLimits,
+    config: &'a crate::Config,
+    cache: HashMap<m::ObjectKey, closure::Node>,
+    selected: HashSet<m::ObjectKey>,
+    files: HashMap<m::ObjectId, (u64, m::ObjectId)>,
+    total_files: u64,
+    bytes: usize,
+    edges: usize,
+    contexts: usize,
+    context_bytes: usize,
+}
+impl StackFrontier<'_> {
+    async fn read(&mut self, key: m::ObjectKey) -> Result<m::Object> {
+        io::check_deadline()?;
+        if let Some(node) = self.cache.get(&key) {
+            return Ok(node.object.clone());
+        }
+        if self.cache.len() + self.files.len() >= self.limits.closure.max_objects {
+            return Err(limit());
+        }
+        let resident = self
+            .source
+            .descriptor_with_owner(key, self.owner.clone())
+            .await
+            .map_err(backend)?;
+        let (descriptor, bytes, object) = if let Some(descriptor) = resident {
+            // Direct canonical stores may allow larger metadata than this
+            // transfer. Reject before source decode or retained copies, not
+            // after allocating an object outside the frontier reservation.
+            self.charge_metadata(key, descriptor)?;
+            let value = self
+                .source
+                .read_metadata_with_owner(key, self.owner.clone())
+                .await
+                .map_err(backend)?;
+            ensure!(
+                value.descriptor() == descriptor,
+                "native stack source descriptor changed"
+            );
+            (descriptor, value.bytes().to_vec(), value.into_object())
+        } else if let Some(control) = self.remote {
+            let client = control.physical_client().await?;
+            let mut outcomes = io::network(client.read_objects(vec![key])).await?;
+            let Some(tinytree_client::MetadataOutcome::Object(value)) = outcomes.pop() else {
+                return Err(Status::not_found("native landing metadata unavailable").into());
+            };
+            ensure!(
+                outcomes.is_empty(),
+                "native landing metadata count mismatch"
+            );
+            let descriptor = value.descriptor();
+            // SDK decoding owns its separate bounded pool; reserve our retained
+            // frontier BEFORE copying its verified bytes/model out of that pool.
+            self.charge_metadata(key, descriptor)?;
+            (
+                descriptor,
+                value.canonical_bytes().to_vec(),
+                value.object().clone(),
+            )
+        } else {
+            return Err(Status::not_found("native stack metadata unavailable").into());
+        };
+        add(
+            &mut self.edges,
+            object.references().len(),
+            self.limits.closure.max_edges,
+        )?;
+        self.cache.insert(
+            key,
+            closure::Node {
+                descriptor,
+                bytes,
+                object: object.clone(),
+            },
+        );
+        Ok(object)
+    }
+    fn charge_metadata(&mut self, key: m::ObjectKey, descriptor: m::Descriptor) -> Result<()> {
+        ensure!(
+            descriptor.key == key && descriptor.format_version == m::FORMAT_VERSION,
+            "native stack metadata descriptor mismatch"
+        );
+        let size = usize::try_from(descriptor.size_bytes).map_err(|_| limit())?;
+        if size > self.config.remote.limits.max_metadata_bytes {
+            return Err(limit());
+        }
+        add(
+            &mut self.bytes,
+            size,
+            self.limits.closure.max_metadata_bytes,
+        )
+    }
+    async fn tree(&mut self, id: m::TreeId) -> Result<m::Tree> {
+        match self
+            .read(m::ObjectKey {
+                kind: m::Kind::Tree,
+                id: m::ObjectId(id.0),
+            })
+            .await?
+        {
+            m::Object::Tree(tree) => Ok(tree),
+            _ => anyhow::bail!("native stack tree kind mismatch"),
+        }
+    }
+    // Copy history contains only copy-parent edges, not arbitrary commit history.
+    // This auxiliary frontier is independently bounded by the shared object/edge
+    // allowance; malformed cycles are rejected by canonical graph validation on
+    // server retention admission (and cannot bypass the upload budget here).
+    async fn auxiliary(&mut self, root: m::ObjectKey) -> Result<()> {
+        let mut pending = vec![root];
+        while let Some(key) = pending.pop() {
+            if !self.selected.insert(key) {
+                continue;
+            }
+            let object = self.read(key).await?;
+            match object {
+                m::Object::Symlink(_) => {}
+                m::Object::CopyHistory(copy) => {
+                    pending.extend(copy.parents.into_iter().map(|id| m::ObjectKey {
+                        kind: m::Kind::CopyHistory,
+                        id: m::ObjectId(id.0),
+                    }))
+                }
+                _ => {
+                    return Err(Status::unimplemented(
+                        "unsupported native landing auxiliary history",
+                    )
+                    .into());
+                }
+            }
+            if pending.len() > self.limits.closure.max_edges {
+                return Err(limit());
+            }
+        }
+        Ok(())
+    }
+    async fn legacy_commits(
+        &mut self,
+        control: &RemoteRepositoryControl,
+        root: m::CommitId,
+        protected: &mut HashSet<m::CommitId>,
+        used: &mut usize,
+    ) -> Result<()> {
+        let key = |id: m::CommitId| m::ObjectKey {
+            kind: m::Kind::Commit,
+            id: m::ObjectId(id.0),
+        };
+        let mut pending = vec![(root, false)];
+        let mut visiting = HashSet::new();
+        while let Some((id, exit)) = pending.pop() {
+            if id == m::CommitId::ROOT || protected.contains(&id) {
+                continue;
+            }
+            if !exit {
+                if !visiting.insert(id) {
+                    return Err(Status::invalid_argument(
+                        "cyclic native landing auxiliary history",
+                    )
+                    .into());
+                }
+                add(used, 1, 128)?;
+                // A complete remote hold is a safe boundary, never descriptor
+                // presence. Failure to admit a LOCAL node does not authorize an
+                // unbounded history walk: the explicit auxiliary limit applies.
+                let client = control.physical_client().await?;
+                // Presence is only a reason to ATTEMPT complete admission. Do
+                // not create durable failed hold intents for missing local-only
+                // predecessors; those would exhaust the shared replay ledger.
+                let missing = io::network(client.find_missing(vec![key(id)])).await?;
+                if missing.is_empty() {
+                    match control.admit_commit(id).await {
+                        Ok(_) => {
+                            protected.insert(id);
+                            visiting.remove(&id);
+                            continue;
+                        }
+                        Err(error)
+                            if error.downcast_ref::<Status>().is_some_and(|s| {
+                                matches!(
+                                    s.code(),
+                                    tonic::Code::NotFound | tonic::Code::FailedPrecondition
+                                )
+                            }) => {}
+                        Err(error) => return Err(error),
+                    }
+                }
+                if self
+                    .source
+                    .descriptor_with_owner(key(id), self.owner.clone())
+                    .await
+                    .map_err(backend)?
+                    .is_none()
+                {
+                    return Err(Status::unimplemented(
+                        "unprotected native auxiliary commit is not locally available",
+                    )
+                    .into());
+                }
+            }
+            let m::Object::Commit(commit) = self.read(key(id)).await? else {
+                anyhow::bail!("native auxiliary commit kind mismatch")
+            };
+            if commit.parents.len() != 1 || commit.root_tree.terms.len() != 1 {
+                return Err(Status::unimplemented(
+                    "native landing auxiliary history must be resolved and linear",
+                )
+                .into());
+            }
+            if exit {
+                let parent = commit.parents[0];
+                let old = if parent == m::CommitId::ROOT {
+                    None
+                } else {
+                    let m::Object::Commit(parent) = self.read(key(parent)).await? else {
+                        anyhow::bail!("native auxiliary parent kind mismatch")
+                    };
+                    if parent.root_tree.terms.len() != 1 {
+                        return Err(Status::unimplemented(
+                            "conflicted native auxiliary parent unsupported",
+                        )
+                        .into());
+                    }
+                    Some(parent.root_tree.terms[0])
+                };
+                self.trees(old, commit.root_tree.terms[0]).await?;
+                self.selected.insert(key(id));
+                visiting.remove(&id);
+                protected.insert(id);
+            } else {
+                pending.push((id, true));
+                for next in commit.parents.into_iter().chain(commit.predecessors).rev() {
+                    if next != m::CommitId::ROOT && !protected.contains(&next) {
+                        pending.push((next, false));
+                    }
+                }
+                if pending.len() > self.limits.closure.max_edges {
+                    return Err(limit());
+                }
+            }
+        }
+        Ok(())
+    }
+    async fn trees(&mut self, old: Option<m::TreeId>, new: m::TreeId) -> Result<()> {
+        if old == Some(new) {
+            return Ok(());
+        }
+        add(&mut self.contexts, 1, self.limits.closure.max_path_contexts)?;
+        let mut pending = vec![(old, new, String::new())];
+        while let Some((old, new, path)) = pending.pop() {
+            let old_tree = match old {
+                Some(id) => self.tree(id).await?,
+                None => m::Tree::default(),
+            };
+            let new_tree = self.tree(new).await?;
+            self.selected.insert(m::ObjectKey {
+                kind: m::Kind::Tree,
+                id: m::ObjectId(new.0),
+            });
+            for entry in new_tree.entries {
+                let old_value = old_tree
+                    .entries
+                    .binary_search_by(|e| e.name.as_bytes().cmp(entry.name.as_bytes()))
+                    .ok()
+                    .map(|n| &old_tree.entries[n].value);
+                if old_value == Some(&entry.value) {
+                    continue;
+                }
+                let child_len = path
+                    .len()
+                    .checked_add(usize::from(!path.is_empty()))
+                    .and_then(|n| n.checked_add(entry.name.len()))
+                    .ok_or_else(limit)?;
+                if child_len > self.limits.closure.max_path_bytes {
+                    return Err(limit());
+                }
+                match entry.value {
+                    m::TreeValue::Tree(id) => {
+                        let old = match old_value {
+                            Some(m::TreeValue::Tree(id)) => Some(*id),
+                            _ => None,
+                        };
+                        // Charge both processed and queued contexts BEFORE
+                        // copying a prefix into another pending String. Limits
+                        // are shared by the entire stack/auxiliary frontier.
+                        add(&mut self.contexts, 1, self.limits.closure.max_path_contexts)?;
+                        add(
+                            &mut self.context_bytes,
+                            child_len,
+                            self.limits.closure.max_path_context_bytes,
+                        )?;
+                        let child_path = if path.is_empty() {
+                            entry.name
+                        } else {
+                            format!("{path}/{}", entry.name)
+                        };
+                        pending.push((old, id, child_path));
+                    }
+                    m::TreeValue::File {
+                        id,
+                        size_bytes,
+                        copy_id,
+                        ..
+                    } => {
+                        // Mode/copy-only changes don't require reading the body.
+                        let same_file = matches!(old_value, Some(m::TreeValue::File { id: old, size_bytes: size, .. }) if *old == id && *size == size_bytes);
+                        if !same_file {
+                            insert_file(
+                                &mut self.files,
+                                &mut self.total_files,
+                                m::ObjectId(id.0),
+                                size_bytes,
+                                m::ObjectId(new.0),
+                                self.cache.len(),
+                                self.limits,
+                            )?;
+                        }
+                        if let Some(copy) = copy_id {
+                            let same_copy = matches!(old_value, Some(m::TreeValue::File { copy_id: Some(old), .. }) if *old == copy);
+                            if !same_copy {
+                                self.auxiliary(m::ObjectKey {
+                                    kind: m::Kind::CopyHistory,
+                                    id: m::ObjectId(copy.0),
+                                })
+                                .await?;
+                            }
+                        }
+                    }
+                    m::TreeValue::Symlink { id, target_bytes } => {
+                        let key = m::ObjectKey {
+                            kind: m::Kind::Symlink,
+                            id: m::ObjectId(id.0),
+                        };
+                        self.auxiliary(key).await?;
+                        let m::Object::Symlink(target) = &self.cache[&key].object else {
+                            unreachable!()
+                        };
+                        ensure!(
+                            target.len() as u64 == target_bytes,
+                            "native stack symlink length mismatch"
+                        );
+                    }
+                }
+            }
+            if pending.len() > self.limits.closure.max_path_contexts {
+                return Err(limit());
+            }
+        }
+        Ok(())
+    }
+}
+async fn collect_stack(
+    control: &RemoteRepositoryControl,
+    source: &Arc<dyn NativeObjectIo>,
+    base: m::CommitId,
+    stack: Vec<m::CommitId>,
+    limits: &NativeTransferLimits,
+    owner: Owner,
+    remote_metadata: bool,
+) -> Result<closure::Closure> {
+    let mut walker = StackFrontier {
+        source,
+        remote: remote_metadata.then_some(control),
+        owner,
+        limits,
+        config: &control.inner.config,
+        cache: HashMap::new(),
+        selected: HashSet::new(),
+        files: HashMap::new(),
+        total_files: 0,
+        bytes: 0,
+        edges: 0,
+        contexts: 0,
+        context_bytes: 0,
+    };
+    let key = |id: m::CommitId| m::ObjectKey {
+        kind: m::Kind::Commit,
+        id: m::ObjectId(id.0),
+    };
+    let mut old_tree = if base == m::CommitId::ROOT {
+        None
+    } else {
+        let m::Object::Commit(commit) = walker.read(key(base)).await? else {
+            anyhow::bail!("native stack base kind mismatch")
+        };
+        if commit.root_tree.terms.len() != 1 {
+            return Err(Status::unimplemented("conflicted native landing base unsupported").into());
+        }
+        Some(commit.root_tree.terms[0])
+    };
+    let mut previous = base;
+    let mut protected = HashSet::from([base]);
+    let mut auxiliary_commits = 0;
+    for id in stack {
+        let m::Object::Commit(commit) = walker.read(key(id)).await? else {
+            anyhow::bail!("native stack commit kind mismatch")
+        };
+        if commit.parents != [previous]
+            || commit.root_tree.terms.len() != 1
+            || commit.secure_signature.is_some()
+        {
+            return Err(Status::unimplemented(
+                "native landing requires an unsigned resolved linear stack",
+            )
+            .into());
+        }
+        for predecessor in &commit.predecessors {
+            if protected.contains(predecessor) {
+                continue;
+            }
+            walker
+                .legacy_commits(
+                    control,
+                    *predecessor,
+                    &mut protected,
+                    &mut auxiliary_commits,
+                )
+                .await?;
+        }
+        walker.selected.insert(key(id));
+        walker.trees(old_tree, commit.root_tree.terms[0]).await?;
+        old_tree = Some(commit.root_tree.terms[0]);
+        protected.insert(id);
+        previous = id;
+    }
+    let nodes = walker
+        .cache
+        .into_iter()
+        .filter(|(key, _)| walker.selected.contains(key))
+        .collect::<HashMap<_, _>>();
+    // Upload order is not closure authority: native staging accepts individual
+    // canonical objects; Start atomically acquires and verifies complete roots.
+    let order = nodes.keys().copied().collect();
+    Ok(closure::Closure {
+        nodes,
+        order,
+        files: walker
+            .files
             .into_iter()
             .map(|(id, (size, tree))| (id, size, tree))
             .collect(),

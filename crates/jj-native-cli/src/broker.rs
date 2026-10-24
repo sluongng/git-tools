@@ -36,7 +36,7 @@ impl Locator {
         Ok(locator)
     }
     fn validate(&self) -> Result<(), io::Error> {
-        if self.version != 1
+        if !matches!(self.version, 1 | 2)
             || !self.socket.is_absolute()
             || self.socket.as_os_str().len() > 4096
             || self
@@ -136,6 +136,45 @@ pub(crate) fn locator(path: &Path) -> Result<Locator, Failure> {
     .map_err(|_| io::Error::other("invalid native broker locator configuration"))?;
     locator.validate()?;
     Ok(locator)
+}
+
+/// A landing-aware workspace must not be mutated by an older CLI that does not
+/// retain its recovery roots. Persist this loader fence before external work;
+/// it deliberately remains after the last landing journal has been acknowledged.
+pub(crate) fn require_landing_reader(path: &Path) -> Result<(), Failure> {
+    let mut locator = locator(path)?;
+    if locator.version == 2 {
+        return Ok(());
+    }
+    locator.version = 2;
+    let bytes = toml::to_string(&locator)
+        .map_err(|_| io::Error::other("cannot encode native broker locator"))?;
+    // jj creates this known backend child under its private repository using
+    // the caller's umask. Tighten that one registered directory via its verified
+    // file handle before using the no-follow private atomic writer. Do not
+    // chmod an arbitrary ancestor or follow a substituted/symlink directory.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let parent = private_fs::PrivateDir::open_existing(
+            path.parent()
+                .ok_or_else(|| io::Error::other("backend has no repository"))?,
+        )?;
+        let before = fs::symlink_metadata(path)?;
+        if !before.is_dir() || before.uid() != fs::metadata(parent.path())?.uid() {
+            return Err(io::Error::other("landing backend directory identity mismatch").into());
+        }
+        let handle = File::open(path)?;
+        let actual = handle.metadata()?;
+        if before.dev() != actual.dev() || before.ino() != actual.ino() {
+            return Err(io::Error::other("landing backend directory changed").into());
+        }
+        handle.set_permissions(fs::Permissions::from_mode(0o700))?;
+        handle.sync_all()?;
+    }
+    let directory = private_fs::PrivateDir::open_existing(path)?;
+    directory.replace(LOCATOR, bytes.as_bytes())?;
+    Ok(())
 }
 
 fn load(path: &Path) -> Result<Box<dyn Backend>, BackendLoadError> {

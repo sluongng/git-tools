@@ -132,18 +132,19 @@ pub(crate) fn retained_roots(
     let locator = crate::broker::locator(&repo_path.join("store"))
         .map_err(|_| io::Error::other("native remote retention locator is unavailable"))?;
     state.validate(&scope(&locator)?)?;
-    let mut heads = state
-        .observations
-        .iter()
-        .filter_map(|observation| observation.head.clone())
+    if state
+        .landing
+        .as_ref()
+        .is_some_and(|p| p.operation_writing.is_some())
+    {
+        return Err(io::Error::other(
+            "landing operation receipt requires reconciliation before collection",
+        ));
+    }
+    let heads = state
+        .retained_commit_heads()
+        .map(str::to_owned)
         .collect::<Vec<_>>();
-    heads.extend(
-        state
-            .pending
-            .iter()
-            .chain(&state.archived_pushes)
-            .filter_map(|intent| intent.head.clone()),
-    );
     if heads
         .iter()
         .any(|head| head.bytes().all(|byte| byte == b'0'))
@@ -152,12 +153,20 @@ pub(crate) fn retained_roots(
             "native sidecar cannot retain an intrinsic commit as a publication target",
         ));
     }
-    // Only active replay requires its saved operation. Archived publication
-    // heads stay retained even after operation GC expires their base.
+    // Archived publication replay heads remain protected, but their abandoned
+    // operation files are not active authority after local replay abandonment.
+    // A landing is different: exact source/fork/apply operations are required
+    // until reconciliation, and its saved journal remains a retention input.
     let active_operations = state
         .pending
         .iter()
-        .map(|intent| intent.base_operation.clone())
+        .map(|p| p.base_operation.as_str())
+        .chain(state.landing.iter().flat_map(|p| {
+            std::iter::once(p.source_operation.as_str())
+                .chain(p.fork_operation.as_deref())
+                .chain(p.apply_operation.as_deref())
+        }))
+        .map(str::to_owned)
         .collect();
     Ok(Some(RetentionInput {
         commit_heads: heads,

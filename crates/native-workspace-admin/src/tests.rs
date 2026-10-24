@@ -2514,3 +2514,75 @@ fn candidate_retirement_removes_only_uninitialized_administration() {
         );
     });
 }
+
+#[test]
+fn landing_intent_fences_legacy_readers_and_retains_frozen_and_unpublished_roots() {
+    use crate::remote_state::{LandingPending, RemoteScope, State};
+    let scope = RemoteScope::new(PathBuf::from("/private/broker.sock"), "example".into()).unwrap();
+    let mut state = State::new(&scope);
+    let ordinary = toml::to_string(&state).unwrap();
+    assert!(ordinary.contains("version = 1"));
+    assert!(!ordinary.contains("landing"));
+    let intent = LandingPending {
+        request_id: "12".repeat(16),
+        source_base: "00".repeat(32),
+        source_head: "13".repeat(32),
+        reference: "main".into(),
+        bookmark: "main".into(),
+        generation: 1,
+        expected_head: "14".repeat(32),
+        profile_name: "checks".into(),
+        profile_version: "v1".into(),
+        source_operation: "15".repeat(64),
+        source_stack: vec!["13".repeat(32)],
+        fork_operation: Some("16".repeat(64)),
+        fork_acknowledged: true,
+        job_id: Some("17".repeat(32)),
+        result_roots: vec!["18".repeat(32)],
+        candidate_head: Some("18".repeat(32)),
+        apply_operation: Some("19".repeat(64)),
+        operation_writing: None,
+        acknowledged: false,
+        terminal: None,
+    };
+    state.begin_landing(intent.clone()).unwrap();
+    let encoded = toml::to_string(&state).unwrap();
+    assert!(encoded.contains("version = 2"));
+    let decoded = remote_state::decode(encoded.as_bytes(), &scope).unwrap();
+    assert_eq!(
+        decoded.retained_operations().collect::<Vec<_>>(),
+        vec!["15".repeat(64), "16".repeat(64), "19".repeat(64)]
+    );
+    assert!(
+        decoded
+            .retained_commit_heads()
+            .any(|id| id == "13".repeat(32))
+    );
+    assert!(
+        decoded
+            .retained_commit_heads()
+            .any(|id| id == "18".repeat(32))
+    );
+    assert!(
+        !decoded
+            .retained_commit_heads()
+            .any(|id| id == "00".repeat(32))
+    );
+    assert!(
+        remote_state::decode(
+            encoded.replace("version = 2", "version = 1").as_bytes(),
+            &scope
+        )
+        .is_err()
+    );
+    assert!(
+        state.begin_landing(intent.clone()).is_err(),
+        "uncertain intent cannot be replaced"
+    );
+    let mut duplicate = intent.clone();
+    duplicate.source_stack.push(duplicate.source_head.clone());
+    assert!(State::new(&scope).begin_landing(duplicate).is_err());
+    let mut bad = intent;
+    bad.profile_name = "not.allowed".into();
+    assert!(State::new(&scope).begin_landing(bad).is_err());
+}

@@ -1320,6 +1320,7 @@ async fn cancelled_admission_reconciles_current_durable_hold_after_restart() {
 struct TransferSource {
     inner: Arc<dyn NativeObjectIo>,
     files: AtomicUsize,
+    metadata_reads: AtomicUsize,
 }
 #[async_trait]
 impl NativeObjectIo for TransferSource {
@@ -1350,6 +1351,7 @@ impl NativeObjectIo for TransferSource {
         key: m::ObjectKey,
         owner: Arc<dyn std::any::Any + Send + Sync>,
     ) -> jj_lib::backend::BackendResult<jj_native_backend::VerifiedMetadata> {
+        self.metadata_reads.fetch_add(1, Ordering::SeqCst);
         self.inner.read_metadata_with_owner(key, owner).await
     }
     async fn read_file(
@@ -1453,6 +1455,7 @@ async fn unrelated_tree_write_and_publication_upload_only_new_local_content() {
     let source = Arc::new(TransferSource {
         inner: repo.io.clone(),
         files: AtomicUsize::new(0),
+        metadata_reads: AtomicUsize::new(0),
     });
     let fence: Arc<dyn std::any::Any + Send + Sync> = Arc::new(());
     let transfer_limits = jj_native_remote::NativeTransferLimits::default();
@@ -1575,6 +1578,161 @@ async fn unrelated_tree_write_and_publication_upload_only_new_local_content() {
         references_before
     );
     let head = m::CommitId(commit.key.id.0);
+    let before_files = counts.files.load(Ordering::SeqCst);
+    let before_graph = counts.graph_rpcs.load(Ordering::SeqCst);
+    let thin = repo
+        .control
+        .stage_landing_stack(
+            old,
+            vec![head],
+            Arc::new(()),
+            jj_native_remote::NativeTransferLimits::default(),
+            tokio::time::Instant::now() + Duration::from_secs(10),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        thin.metadata_objects(),
+        2,
+        "only selected commit and changed root TREE; no unchanged subtrees/history"
+    );
+    assert_eq!(
+        thin.file_objects(),
+        1,
+        "only the authored FILE is in the frontier"
+    );
+    assert_eq!(
+        thin.stages().len(),
+        1,
+        "the selected commit alone was not already staged"
+    );
+    assert_eq!(
+        counts.files.load(Ordering::SeqCst),
+        before_files,
+        "unchanged/present FILE bodies never hydrate"
+    );
+    assert_eq!(
+        counts.graph_rpcs.load(Ordering::SeqCst),
+        before_graph,
+        "stack upload must not walk repository history"
+    );
+    assert_eq!(
+        store.references("example", &["main".into()]).unwrap(),
+        references_before
+    );
+    let mut tiny = jj_native_remote::NativeTransferLimits::default();
+    tiny.max_memory_bytes = 1;
+    assert_eq!(
+        repo.control
+            .stage_landing_stack(
+                old,
+                vec![head],
+                Arc::new(()),
+                tiny,
+                tokio::time::Instant::now() + Duration::from_secs(10)
+            )
+            .await
+            .unwrap_err()
+            .downcast_ref::<Status>()
+            .unwrap()
+            .code(),
+        tonic::Code::ResourceExhausted
+    );
+    let metadata_before = source.metadata_reads.load(Ordering::SeqCst);
+    let mut tiny_metadata = jj_native_remote::NativeTransferLimits::default();
+    tiny_metadata.closure.max_metadata_bytes = 1;
+    let error = repo
+        .control
+        .transfer_native_stack(
+            source.clone(),
+            old,
+            vec![head],
+            Arc::new(()),
+            tiny_metadata,
+            tokio::time::Instant::now() + Duration::from_secs(10),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(
+        error.downcast_ref::<Status>().unwrap().code(),
+        tonic::Code::ResourceExhausted
+    );
+    assert_eq!(
+        source.metadata_reads.load(Ordering::SeqCst),
+        metadata_before,
+        "descriptor/frontier allowance must reject before source metadata hydration/decode"
+    );
+    // Long prefix + wide siblings must exhaust the shared context-byte bound
+    // before allocating/enqueuing all copied prefixes or uploading any object.
+    let empty = repo
+        .io
+        .write_metadata(m::Object::Tree(m::Tree::default()))
+        .await
+        .unwrap();
+    let wide = repo
+        .io
+        .write_metadata(m::Object::Tree(m::Tree {
+            entries: (0..16)
+                .map(|n| m::TreeEntry {
+                    name: format!("branch-{n:02}"),
+                    value: m::TreeValue::Tree(m::TreeId(empty.key.id.0)),
+                })
+                .collect(),
+        }))
+        .await
+        .unwrap();
+    let root = repo
+        .io
+        .write_metadata(m::Object::Tree(m::Tree {
+            entries: vec![m::TreeEntry {
+                name: "prefix".repeat(12),
+                value: m::TreeValue::Tree(m::TreeId(wide.key.id.0)),
+            }],
+        }))
+        .await
+        .unwrap();
+    let m::Object::Commit(mut wide_commit) = repo
+        .io
+        .read_metadata(commit.key)
+        .await
+        .unwrap()
+        .into_object()
+    else {
+        unreachable!()
+    };
+    wide_commit.root_tree.terms = vec![m::TreeId(root.key.id.0)];
+    wide_commit.description = "bounded long-prefix frontier".into();
+    let wide_commit = repo
+        .io
+        .write_metadata(m::Object::Commit(wide_commit))
+        .await
+        .unwrap();
+    let mut bounded = jj_native_remote::NativeTransferLimits::default();
+    bounded.closure.max_path_contexts = 16;
+    bounded.closure.max_path_context_bytes = 96;
+    let error = repo
+        .control
+        .stage_landing_stack(
+            old,
+            vec![m::CommitId(wide_commit.key.id.0)],
+            Arc::new(()),
+            bounded,
+            tokio::time::Instant::now() + Duration::from_secs(10),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(
+        error.downcast_ref::<Status>().unwrap().code(),
+        tonic::Code::ResourceExhausted
+    );
+    assert!(
+        store
+            .descriptor("example", wide_commit.key)
+            .unwrap()
+            .is_none(),
+        "over-budget queue must fail before upload"
+    );
+    assert_eq!(counts.files.load(Ordering::SeqCst), before_files);
     let published = repo
         .control
         .publish(PublishRequest {

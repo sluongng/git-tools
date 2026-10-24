@@ -563,7 +563,14 @@ fn read_remote(
 ) -> Result<Option<(remote_state::State, Vec<u8>)>> {
     let directory = private_fs::PrivateDir::open_existing(&binding.working_copy)?;
     match directory.read("native-remote.toml", cap.min(1024 * 1024)) {
-        Ok(bytes) => Ok(Some((remote_state::decode(&bytes, scope)?, bytes))),
+        Ok(bytes) => {
+            let state = remote_state::decode(&bytes, scope)?;
+            ensure!(
+                state.landing.as_ref().is_none_or(|p| p.acknowledged),
+                "capture of an unresolved native landing requires reconciliation first"
+            );
+            Ok(Some((state, bytes)))
+        }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(error) => Err(error.into()),
     }
@@ -624,7 +631,7 @@ fn read_locator(binding: &Binding, input: &CaptureInput) -> Result<Vec<u8>> {
     let locator: Locator = toml::from_str(std::str::from_utf8(&bytes)?)?;
     let checked = remote_state::RemoteScope::new(locator.socket, locator.store)?;
     ensure!(
-        locator.version == 1 && checked == input.remote_scope,
+        matches!(locator.version, 1 | 2) && checked == input.remote_scope,
         "capture backend locator changed"
     );
     ensure!(

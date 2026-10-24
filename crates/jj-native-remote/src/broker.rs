@@ -34,6 +34,29 @@ impl NativeRepositoryControl for RemoteRepositoryControl {
     fn resources(&self) -> ControlResources {
         self.inner.config.control_work_budget()
     }
+    fn landing_resources(&self) -> Option<ControlResources> {
+        let mut r = self.inner.config.control_work_budget();
+        // Local unary request decoding completes before handler dispatch; thin
+        // staging then upstream status run sequentially. Response encoding owns
+        // only the compact retained result, not the completed staging frontier
+        // or upstream RPC decoder. Keep all three peaks under one host owner.
+        r.memory_bytes = r
+            .memory_bytes
+            .max(256 * 1024 * 1024)
+            .saturating_add(2 * 1024 * 1024);
+        Some(r)
+    }
+    async fn landing_with_owner(
+        &self,
+        intent: native_broker::LandingIntent,
+        submit: bool,
+        owner: native_broker::CommandGuard,
+    ) -> Result<native_broker::LandingReport, Status> {
+        self.landing_owned(intent, submit, owner)
+            .await
+            .map_err(status)
+    }
+
     async fn observe_reference_with_owner(
         &self,
         name: &str,

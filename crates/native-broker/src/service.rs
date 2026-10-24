@@ -94,7 +94,28 @@ impl Inner {
         ]
         .iter()
         .any(|suffix| path.ends_with(suffix));
-        let memory = if is_query {
+        let landing = path.ends_with("/RepositoryControl/Landing")
+            || path == "/native.broker.v1.RepositoryControl/Landing";
+        let landing_work = self
+            .controls
+            .values()
+            .filter_map(|c| c.landing_resources())
+            .fold(
+                crate::ControlResources {
+                    memory_bytes: 0,
+                    temporary_bytes: 0,
+                },
+                |a, b| crate::ControlResources {
+                    memory_bytes: a.memory_bytes.max(b.memory_bytes),
+                    temporary_bytes: a.temporary_bytes.max(b.temporary_bytes),
+                },
+            );
+        if landing && landing_work.memory_bytes == 0 {
+            return Err(Status::unimplemented("native landing is not configured"));
+        }
+        let memory = if landing {
+            landing_work.memory_bytes as usize
+        } else if is_query {
             self.config
                 .query_memory()
                 .saturating_add(self.query_work.memory_bytes as usize)
@@ -113,7 +134,9 @@ impl Inner {
         } else {
             memory
         };
-        let temporary = if is_query {
+        let temporary = if landing {
+            landing_work.temporary_bytes
+        } else if is_query {
             self.query_work.temporary_bytes
         } else if is_control {
             self.config.max_temporary_bytes
@@ -290,6 +313,15 @@ impl BrokerService {
                 ));
             }
             let required = control.resources();
+            if control.landing_resources().is_some_and(|r| {
+                r.memory_bytes == 0
+                    || r.memory_bytes > self.inner.config.max_memory_bytes as u64
+                    || r.temporary_bytes > self.inner.config.max_temporary_bytes
+            }) {
+                return Err(Status::invalid_argument(
+                    "native landing resource bounds exceed broker pools",
+                ));
+            }
             if required.memory_bytes == 0
                 || required.memory_bytes > self.inner.config.max_memory_bytes as u64
                 || required.temporary_bytes > self.inner.config.max_temporary_bytes
@@ -524,8 +556,8 @@ impl BrokerService {
         let raw = p::repository_control_server::RepositoryControlServer::new(self.clone())
             .accept_compressed(CompressionEncoding::Zstd)
             .send_compressed(CompressionEncoding::Zstd)
-            .max_decoding_message_size(4096)
-            .max_encoding_message_size(4096);
+            .max_decoding_message_size(16 * 1024)
+            .max_encoding_message_size(128 * 1024 + 4096);
         ControlRpcService {
             inner: self.wrap(raw),
         }
@@ -1180,6 +1212,35 @@ async fn send_read(
 
 #[tonic::async_trait]
 impl p::repository_control_server::RepositoryControl for BrokerService {
+    async fn landing(
+        &self,
+        request: Request<p::LandingRequest>,
+    ) -> Result<Response<p::LandingReply>, Status> {
+        use prost::Message;
+        let work = request
+            .extensions()
+            .get::<Arc<Work>>()
+            .cloned()
+            .ok_or_else(|| Status::internal("broker request missing resource scope"))?;
+        let input = request.into_inner();
+        self.authorize_command(&input.store_id, &work)?;
+        let intent = crate::LandingIntent::decode(&input)?;
+        let control = self.control(&input.store_id)?;
+        if control.landing_resources().is_none() {
+            return Err(Status::unimplemented("native landing is not configured"));
+        }
+        let value = control
+            .landing_with_owner(intent, input.submit, work.clone())
+            .await
+            .map_err(crate::control::status)?;
+        let mut response = Response::new(p::LandingReply {
+            job: value.job().encode_to_vec(),
+        });
+        response
+            .extensions_mut()
+            .insert(grpc_transport::ResponseBudget::new(value));
+        Ok(response)
+    }
     async fn observe_reference(
         &self,
         request: Request<p::ObserveReferenceRequest>,

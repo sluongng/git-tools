@@ -7,6 +7,7 @@ pub use cloud::AdmittedCloudVersion;
 mod config;
 mod control;
 mod io;
+mod landing;
 mod ledger;
 mod metadata;
 mod provider;
@@ -49,6 +50,7 @@ pub(crate) struct Inner {
     pub config: Config,
     pub control: Arc<tokio::sync::Semaphore>,
     pub metadata: Arc<tokio::sync::Mutex<()>>,
+    pub landing_client: tokio::sync::OnceCell<NativeClient>,
     pub metadata_work: Arc<io::OwnedWork>,
     #[cfg(test)]
     pub catalog_boundary: std::sync::Mutex<Option<Arc<metadata::CatalogBoundary>>>,
@@ -176,6 +178,7 @@ impl RemoteRepository {
             staging_owner,
             control: Arc::new(tokio::sync::Semaphore::new(1)),
             metadata: Arc::new(tokio::sync::Mutex::new(())),
+            landing_client: tokio::sync::OnceCell::new(),
             metadata_work: Arc::new(io::OwnedWork::default()),
             #[cfg(test)]
             catalog_boundary: std::sync::Mutex::new(None),

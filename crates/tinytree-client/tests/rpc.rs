@@ -8995,3 +8995,74 @@ async fn landing_start_response_loss_retries_one_stable_intent_under_original_de
         server.await.unwrap();
     }
 }
+
+#[tokio::test]
+async fn landing_independent_pool_reuses_authenticated_transport_and_preserves_ordinary_limits() {
+    let (_directory, store, service, start) = landing_fixture();
+    let running = LandingRunning::start(store, service, true, None).await;
+    let mut config = running.config();
+    config.limits.max_buffered_bytes = 32 * 1024 * 1024;
+    config.limits.max_batch_bytes = 4 * 1024 * 1024;
+    config.limits.max_metadata_bytes = 4 * 1024 * 1024;
+    config.limits.max_graph_bytes = 8 * 1024 * 1024;
+    let original = NativeClient::connect(config).await.unwrap();
+    assert_eq!(
+        original.start_landing(&start).await.unwrap_err().code(),
+        Code::ResourceExhausted
+    );
+    assert_eq!(
+        original
+            .clone()
+            .with_landing_budget(32 * 1024 * 1024)
+            .err()
+            .unwrap()
+            .code(),
+        Code::InvalidArgument
+    );
+    assert_eq!(
+        original
+            .clone()
+            .with_landing_budget(257 * 1024 * 1024)
+            .err()
+            .unwrap()
+            .code(),
+        Code::InvalidArgument
+    );
+    let budgeted = original
+        .clone()
+        .with_landing_budget(256 * 1024 * 1024)
+        .unwrap();
+    let accepted = budgeted.start_landing(&start).await.unwrap();
+    let handle = accepted.handle();
+    let id = handle.id();
+    drop(accepted);
+    assert_eq!(
+        budgeted.get_landing(&handle).await.unwrap().handle().id(),
+        id
+    );
+    assert_eq!(
+        budgeted
+            .lookup_landing(&start, Some(id))
+            .await
+            .unwrap()
+            .handle()
+            .id(),
+        id
+    );
+    // Same Inner accepts the handle, but the original's small pool remains
+    // unchanged. A reconnect has different authenticated handle scope entirely.
+    assert_eq!(
+        original.get_landing(&handle).await.unwrap_err().code(),
+        Code::ResourceExhausted
+    );
+    let foreign = NativeClient::connect(running.config())
+        .await
+        .unwrap()
+        .with_landing_budget(256 * 1024 * 1024)
+        .unwrap();
+    assert_eq!(
+        foreign.get_landing(&handle).await.unwrap_err().code(),
+        Code::InvalidArgument
+    );
+    running.stop().await;
+}

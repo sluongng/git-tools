@@ -395,7 +395,47 @@ fn checked(
         _memory: memory,
     })))
 }
+pub(crate) struct LandingBudget {
+    bytes: Arc<Semaphore>,
+    state: Arc<Semaphore>,
+}
 impl NativeClient {
+    /// Give landing RPCs an independent, bounded pool without reconnecting or
+    /// changing the authenticated channel, token, repository, or ordinary pools.
+    /// Cache this clone per provider: creating pools per request would bypass the
+    /// bound. Hosts must reserve aggregate physical codec/result work externally
+    /// before using it; this method does not provide process-wide admission.
+    pub fn with_landing_budget(mut self, memory_bytes: usize) -> Result<Self, Status> {
+        let cap = self.inner.config.landing.max_response_bytes;
+        let call = cap
+            .checked_mul(8)
+            .and_then(|n| n.checked_add(256 * 1024))
+            .and_then(|n| {
+                n.checked_add(if self.inner.config.compression {
+                    ZSTD_WORKSPACE_BYTES
+                } else {
+                    0
+                })
+            })
+            .ok_or_else(exhausted)?;
+        let retained = cap
+            .checked_mul(2)
+            .and_then(|n| n.checked_add(16384))
+            .ok_or_else(exhausted)?;
+        let minimum = call
+            .checked_add(retained.checked_mul(2).ok_or_else(exhausted)?)
+            .ok_or_else(exhausted)?;
+        if memory_bytes < minimum || memory_bytes > 256 * 1024 * 1024 {
+            return Err(Status::invalid_argument(
+                "landing pool is outside bounded codec/result allowance",
+            ));
+        }
+        self.landing_budget = Some(Arc::new(LandingBudget {
+            bytes: Arc::new(Semaphore::new(memory_bytes)),
+            state: Arc::new(Semaphore::new(memory_bytes - call)),
+        }));
+        Ok(self)
+    }
     fn landing_retained(&self) -> Result<Arc<RetainedLanding>, Status> {
         let n = self
             .inner
@@ -407,15 +447,17 @@ impl NativeClient {
             .and_then(|n| u32::try_from(n).ok())
             .ok_or_else(exhausted)?;
         let state = self
-            .inner
-            .query_state
-            .clone()
+            .landing_budget
+            .as_ref()
+            .map(|b| b.state.clone())
+            .unwrap_or_else(|| self.inner.query_state.clone())
             .try_acquire_many_owned(n)
             .map_err(|_| exhausted())?;
         let bytes = self
-            .inner
-            .bytes
-            .clone()
+            .landing_budget
+            .as_ref()
+            .map(|b| b.bytes.clone())
+            .unwrap_or_else(|| self.inner.bytes.clone())
             .try_acquire_many_owned(n)
             .map_err(|_| exhausted())?;
         Ok(Arc::new(RetainedLanding {
@@ -455,9 +497,10 @@ impl NativeClient {
                 })
                 .await?;
                 let bytes = self
-                    .inner
-                    .bytes
-                    .clone()
+                    .landing_budget
+                    .as_ref()
+                    .map(|b| b.bytes.clone())
+                    .unwrap_or_else(|| self.inner.bytes.clone())
                     .try_acquire_many_owned(u32::try_from(memory).map_err(|_| exhausted())?)
                     .map_err(|_| exhausted())?;
                 let budget = Arc::new(Budget {

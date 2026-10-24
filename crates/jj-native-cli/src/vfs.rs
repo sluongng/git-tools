@@ -798,7 +798,7 @@ pub(crate) fn prepare_destination(destination: &Path) -> anyhow::Result<()> {
 }
 
 #[cfg(all(unix, not(feature = "protocol-fixture")))]
-fn load_recovery_operation(
+pub(crate) fn load_recovery_operation(
     store: Arc<dyn jj_lib::op_store::OpStore>,
     id: &jj_lib::op_store::OperationId,
     max_file_bytes: usize,

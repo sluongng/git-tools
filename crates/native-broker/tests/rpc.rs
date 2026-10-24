@@ -4348,3 +4348,100 @@ async fn retained_query_facade_enforces_managed_tokens_provider_identity_and_bou
     drop((held, raw, client, local));
     host.stop().await;
 }
+
+#[test]
+fn landing_reports_are_bound_to_original_intent_and_check_state() {
+    use native_broker::{LandingIntent, LandingReport, landing_protocol as l};
+    let intent = LandingIntent {
+        request: l::StartLandingRequest {
+            repository_id: String::new(),
+            idempotency_key: "original".into(),
+            source_base: vec![1; 32],
+            source_head: vec![2; 32],
+            destination: "main".into(),
+            expected_generation: 1,
+            expected_head: vec![1; 32],
+            profile_name: "checks".into(),
+            expected_profile_version: "v1".into(),
+        },
+        source_stack: vec![native_broker::CommitId([2; 32])],
+        observed_job: None,
+    };
+    intent.validate().unwrap();
+    let job = l::LandingJob {
+        id: vec![3; 32],
+        phase: l::Phase::Intent as i32,
+        roots_retained: true,
+        expires_at_seconds: 1,
+        profile_name: "checks".into(),
+        profile_version: "v1".into(),
+        candidate: None,
+        receipt: None,
+        conflict_path: None,
+        preparation: l::PreparationAvailability::ProfileConfigured as i32,
+    };
+    assert_eq!(
+        LandingReport::checked(job.clone(), &intent, Arc::new(()))
+            .unwrap()
+            .job(),
+        &job
+    );
+    let mut prepared = job.clone();
+    prepared.phase = l::Phase::PreparedPendingChecks as i32;
+    prepared.candidate = Some(l::Candidate {
+        head: vec![2; 32],
+        root_tree: vec![4; 32],
+        rewrites: vec![],
+    });
+    LandingReport::checked(prepared.clone(), &intent, Arc::new(())).unwrap();
+    let mut no_hold = job.clone();
+    no_hold.roots_retained = false;
+    let mut wrong_profile = job.clone();
+    wrong_profile.profile_version = "v2".into();
+    let mut premature_candidate = prepared.clone();
+    premature_candidate.phase = l::Phase::Intent as i32;
+    let mut unknown_phase = job.clone();
+    unknown_phase.phase = 99;
+    let mut conflict_with_candidate = prepared.clone();
+    conflict_with_candidate.phase = l::Phase::Conflict as i32;
+    conflict_with_candidate.roots_retained = false;
+    conflict_with_candidate.conflict_path = Some("file.rs".into());
+    for (name, invalid) in [
+        ("unretained_intent", no_hold),
+        ("changed_profile", wrong_profile),
+        ("candidate_before_preparation", premature_candidate),
+        ("unknown_phase", unknown_phase),
+        ("conflict_with_candidate", conflict_with_candidate),
+    ] {
+        assert_eq!(
+            LandingReport::checked(invalid, &intent, Arc::new(()))
+                .unwrap_err()
+                .code(),
+            tonic::Code::DataLoss,
+            "{name}"
+        );
+    }
+    let mut other_job = intent.clone();
+    other_job.observed_job = Some([5; 32]);
+    assert_eq!(
+        LandingReport::checked(job, &other_job, Arc::new(()))
+            .unwrap_err()
+            .code(),
+        tonic::Code::DataLoss
+    );
+    let mut many = prepared;
+    many.candidate.as_mut().unwrap().rewrites = vec![
+        l::Rewrite {
+            old_commit: vec![2; 32],
+            new_commit: vec![6; 32],
+            change_id: vec![7; 16]
+        };
+        129
+    ];
+    assert_eq!(
+        LandingReport::checked(many, &intent, Arc::new(()))
+            .unwrap_err()
+            .code(),
+        tonic::Code::DataLoss
+    );
+}

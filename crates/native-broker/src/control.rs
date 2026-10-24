@@ -42,6 +42,20 @@ pub trait NativeRepositoryControl: Send + Sync + std::fmt::Debug {
     /// Conservative adapter work limits, checked before registering the alias.
     /// Implementations must not recursively call this broker from an operation.
     fn resources(&self) -> ControlResources;
+    /// Independently budgeted, short landing preparation/status work. Returning
+    /// None disables the operation; ordinary publication remains unchanged.
+    fn landing_resources(&self) -> Option<ControlResources> {
+        None
+    }
+    async fn landing_with_owner(
+        &self,
+        _intent: crate::LandingIntent,
+        _submit: bool,
+        _owner: crate::CommandGuard,
+    ) -> Result<crate::LandingReport, Status> {
+        Err(Status::unimplemented("native landing is not configured"))
+    }
+
     /// Opt-in physical owner contract: accepted transport, verification and
     /// blocking work retain this guard after caller cancellation or timeout.
     async fn observe_reference_with_owner(

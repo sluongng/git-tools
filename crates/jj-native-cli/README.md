@@ -34,6 +34,23 @@ For new remote workspaces, experimental `[native.workspaces] index_mode =
 than building a full local history index. The default remains `"legacy"`. Existing
 workspaces keep their recorded index type; missing native state fails closed.
 
+With a federated workspace and an operator-configured landing profile:
+
+```sh
+"$JJ" tinytree land --base main@tinytree --reference main --bookmark main \
+  --profile checks --profile-version v1
+"$JJ" tinytree land --status
+"$JJ" tinytree land --resume
+```
+
+Submission freezes the selected linear stack (default `@`) and leaves a fresh
+working-copy child for continued edits. Checks and native publication are owned
+by the server; the client never supplies a verdict. Resume imports exact checked
+IDs and rebases local descendants. Amending submitted commits requires explicit
+reconciliation; it never overwrites newer work. Interrupted operations retain
+recovery roots. First submission upgrades local state; use a matching
+landing-aware CLI afterward. There is no Git publication or materialized fallback.
+
 `history` and `blame` pin the selected revision (`-r REV`, default `@`) and
 compose local drafts and dirty edits over this workspace's observed remote
 baseline, without uploading them. They use fixed-path, linear-history semantics;

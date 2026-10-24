@@ -8,6 +8,7 @@ description = "Jujutsu command-line entry point for native Tinytree repositories
 [features]
 default = []
 protocol-fixture = []
+native-landing-fault-injection = []
 
 [dependencies]
 anyhow = "1"
