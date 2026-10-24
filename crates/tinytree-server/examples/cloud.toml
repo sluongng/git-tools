@@ -13,6 +13,8 @@ cloud = true
 
 [service.cloud]
 enabled = true
+# Opt in to portable logical indexes and indexed recovery manifests.
+indexed_versions = false
 max_manifest_bytes = 524288
 max_staging_leases = 256
 max_inflight = 2

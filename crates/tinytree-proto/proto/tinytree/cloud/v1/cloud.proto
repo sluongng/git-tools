@@ -5,6 +5,9 @@ package tinytree.cloud.v1;
 // OP/VIEW semantic IDs and selected raw encodings are separate hash domains.
 service WorkspaceCloud {
   rpc PutObject(PutObjectRequest) returns (WriteReceipt);
+  rpc PutIndexArtifact(PutIndexArtifactRequest) returns (IndexArtifactWriteReceipt);
+  rpc LookupIndexArtifacts(LookupIndexArtifactsRequest) returns (LookupIndexArtifactsResponse);
+  rpc ReadIndexArtifact(ReadIndexArtifactRequest) returns (stream IndexArtifactChunk);
   rpc LookupObjects(LookupObjectsRequest) returns (LookupObjectsResponse);
   rpc ReadObject(ReadObjectRequest) returns (stream ObjectChunk);
   rpc PublishVersion(PublishVersionRequest) returns (Publication);
@@ -94,3 +97,48 @@ message GetPublicationRequest {
   string idempotency_key = 2;
 }
 message GetPublicationResponse { optional Publication publication = 1; }
+
+// Portable logical-index artifacts are not OP/VIEW64 or native object IDs.
+enum IndexArtifactKind {
+  INDEX_ARTIFACT_KIND_UNSPECIFIED = 0;
+  ROOT = 1;
+  NODE = 2;
+}
+message IndexArtifactId {
+  IndexArtifactKind kind = 1;
+  bytes semantic_id = 2; // Exactly 32 bytes in the root/node identity domain.
+}
+message IndexArtifactDescriptor {
+  IndexArtifactId id = 1;
+  RawDigest selected = 2;
+}
+message PutIndexArtifactRequest {
+  string repository_id = 1;
+  IndexArtifactDescriptor descriptor = 2;
+  bytes payload = 3;
+}
+message IndexArtifactWriteReceipt {
+  IndexArtifactDescriptor descriptor = 1;
+  string staging_lease = 2;
+  int64 expires_at_unix_seconds = 3;
+}
+message LookupIndexArtifactsRequest {
+  string repository_id = 1;
+  repeated IndexArtifactId ids = 2;
+}
+message IndexArtifactSelection {
+  optional IndexArtifactDescriptor descriptor = 1;
+}
+message LookupIndexArtifactsResponse {
+  repeated IndexArtifactSelection selections = 1;
+}
+message ReadIndexArtifactRequest {
+  string repository_id = 1;
+  IndexArtifactId id = 2;
+}
+message IndexArtifactChunk {
+  IndexArtifactDescriptor descriptor = 1;
+  uint64 offset = 2;
+  bytes data = 3;
+  bool eof = 4;
+}

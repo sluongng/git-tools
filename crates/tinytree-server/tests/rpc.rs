@@ -4692,8 +4692,10 @@ fn cloud_object_descriptor(
 async fn cloud_rpc_private_compressed_history_replay_gc_and_restart() {
     use tinytree_proto::cloud_v1::{self as c, workspace_cloud_client::WorkspaceCloudClient};
     let directory = tempfile::tempdir().unwrap();
-    let profile: tinytree_server::Config =
+    let mut profile: tinytree_server::Config =
         toml::from_str(include_str!("../examples/cloud.toml")).unwrap();
+    profile.service.cloud.indexed_versions = true;
+    profile.validate().unwrap();
     let store_config = profile
         .store
         .materialize(profile.service.max_metadata_bytes);
@@ -4833,13 +4835,139 @@ async fn cloud_rpc_private_compressed_history_replay_gc_and_restart() {
     );
     manifest.sequence = 2;
     manifest.parents = vec![tinytree_cloud::ManifestId::of(&bytes)];
-    let next = tinytree_cloud::encode_manifest(&manifest, Default::default()).unwrap();
+    // Transition the same workspace from legacy history to an exact indexed
+    // recovery version. Typed artifacts remain separate from OP/VIEW64.
+    let intrinsic = tinytree_cloud::build_index_artifacts(
+        &tinytree_cloud::PortableIndexSnapshot {
+            roots: vec![tinytree_model::CommitId::ROOT],
+            drafts: vec![],
+        },
+        Default::default(),
+    )
+    .unwrap();
+    let selected_index = tinytree_cloud::build_index_artifacts(
+        &tinytree_cloud::PortableIndexSnapshot {
+            roots: vec![tinytree_model::CommitId(
+                manifest.working_copy.snapshot_commit,
+            )],
+            drafts: vec![],
+        },
+        Default::default(),
+    )
+    .unwrap();
+    let mut artifacts = intrinsic.artifacts;
+    artifacts.extend(selected_index.artifacts);
+    artifacts.sort_by_key(|artifact| artifact.descriptor.id);
+    artifacts.dedup_by_key(|artifact| artifact.descriptor.id);
+    let mut index_leases = Vec::new();
+    for artifact in &artifacts {
+        let (kind, semantic_id) = match artifact.descriptor.id {
+            tinytree_cloud::IndexArtifactId::Root(id) => (1, id.0),
+            tinytree_cloud::IndexArtifactId::Node(id) => (2, id.0),
+        };
+        let descriptor = c::IndexArtifactDescriptor {
+            id: Some(c::IndexArtifactId {
+                kind,
+                semantic_id: semantic_id.to_vec(),
+            }),
+            selected: Some(c::RawDigest {
+                blake3: artifact.descriptor.selected.blake3.to_vec(),
+                size_bytes: artifact.descriptor.selected.size_bytes,
+            }),
+        };
+        let put = c::PutIndexArtifactRequest {
+            repository_id: "alpha".into(),
+            descriptor: Some(descriptor.clone()),
+            payload: artifact.bytes.clone(),
+        };
+        assert_eq!(
+            client
+                .put_index_artifact(request(put.clone(), READER))
+                .await
+                .unwrap_err()
+                .code(),
+            Code::PermissionDenied
+        );
+        let response = client
+            .put_index_artifact(request(put, ALPHA))
+            .await
+            .unwrap();
+        assert_eq!(response.metadata().get("grpc-encoding").unwrap(), "zstd");
+        let receipt = response.into_inner();
+        assert_eq!(receipt.descriptor, Some(descriptor.clone()));
+        index_leases.push(receipt.staging_lease);
+        let lookup = c::LookupIndexArtifactsRequest {
+            repository_id: "alpha".into(),
+            ids: vec![descriptor.id.clone().unwrap()],
+        };
+        assert!(
+            client
+                .lookup_index_artifacts(request(lookup.clone(), PEER))
+                .await
+                .unwrap()
+                .into_inner()
+                .selections[0]
+                .descriptor
+                .is_none()
+        );
+        assert_eq!(
+            client
+                .lookup_index_artifacts(request(lookup, ALPHA))
+                .await
+                .unwrap()
+                .into_inner()
+                .selections[0]
+                .descriptor,
+            Some(descriptor.clone())
+        );
+        let response = client
+            .read_index_artifact(request(
+                c::ReadIndexArtifactRequest {
+                    repository_id: "alpha".into(),
+                    id: descriptor.id.clone(),
+                },
+                ALPHA,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.metadata().get("grpc-encoding").unwrap(), "zstd");
+        let mut stream = response.into_inner();
+        let mut bytes = Vec::new();
+        let mut eof = false;
+        while let Some(chunk) = stream.message().await.unwrap() {
+            assert_eq!(chunk.descriptor, Some(descriptor.clone()));
+            assert_eq!(chunk.offset, bytes.len() as u64);
+            bytes.extend(chunk.data);
+            eof = chunk.eof;
+        }
+        assert!(eof);
+        assert_eq!(bytes, artifact.bytes);
+    }
+    let mut roots = vec![intrinsic.root, selected_index.root];
+    roots.sort_by_key(|root| root.id);
+    roots.dedup_by_key(|root| root.id);
+    let indexed_manifest = tinytree_cloud::ManifestV2 {
+        operation_indexes: vec![
+            tinytree_cloud::OperationIndex {
+                operation: [0; 64],
+                root: intrinsic.root.id,
+            },
+            tinytree_cloud::OperationIndex {
+                operation: manifest.working_copy.snapshot_operation,
+                root: selected_index.root.id,
+            },
+        ],
+        index_roots: roots,
+        recovery: manifest.clone(),
+    };
+    let next = tinytree_cloud::encode_manifest_v2(&indexed_manifest, Default::default()).unwrap();
+    let indexed_bytes = next.clone();
     let second = c::PublishVersionRequest {
         expected_generation: 1,
         idempotency_key: "second-cloud-capture".into(),
         manifest_id: tinytree_cloud::ManifestId::of(&next).0.to_vec(),
         manifest: next,
-        staging_leases: vec![],
+        staging_leases: index_leases,
         ..first.clone()
     };
     client
@@ -4890,6 +5018,21 @@ async fn cloud_rpc_private_compressed_history_replay_gc_and_restart() {
             .await
             .is_err()
     );
+    assert_eq!(
+        client
+            .get_version(request(
+                c::GetVersionRequest {
+                    generation: 2,
+                    ..version.clone()
+                },
+                ALPHA
+            ))
+            .await
+            .unwrap()
+            .into_inner()
+            .manifest,
+        indexed_bytes
+    );
     drop(client);
     server.stop().await;
     drop(store);
@@ -4903,6 +5046,21 @@ async fn cloud_rpc_private_compressed_history_replay_gc_and_restart() {
     let mut client = WorkspaceCloudClient::new(channel)
         .send_compressed(CompressionEncoding::Zstd)
         .accept_compressed(CompressionEncoding::Zstd);
+    assert_eq!(
+        client
+            .get_version(request(
+                c::GetVersionRequest {
+                    generation: 2,
+                    ..version.clone()
+                },
+                ALPHA
+            ))
+            .await
+            .unwrap()
+            .into_inner()
+            .manifest,
+        indexed_bytes
+    );
     assert_eq!(
         client
             .get_version(request(version, ALPHA))

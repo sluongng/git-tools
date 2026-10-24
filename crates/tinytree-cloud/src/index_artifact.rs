@@ -20,17 +20,11 @@ pub enum IndexArtifactId {
 }
 impl IndexArtifactId {
     pub fn of_root(bytes: &[u8]) -> Self {
-        Self::Root(IndexRootId(domain(b"tinytree-index-root-v1\0", bytes)))
+        Self::Root(IndexRootId(m::cloud_index_root_id(bytes)))
     }
     pub fn of_node(bytes: &[u8]) -> Self {
-        Self::Node(IndexNodeId(domain(b"tinytree-index-node-v1\0", bytes)))
+        Self::Node(IndexNodeId(m::cloud_index_node_id(bytes)))
     }
-}
-fn domain(tag: &[u8], bytes: &[u8]) -> [u8; 32] {
-    let mut h = blake3::Hasher::new();
-    h.update(tag);
-    h.update(bytes);
-    *h.finalize().as_bytes()
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct IndexRootDescriptor {

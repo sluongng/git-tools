@@ -15,6 +15,22 @@ pub fn cloud_manifest_id(bytes: &[u8]) -> [u8; 32] {
     *hash.finalize().as_bytes()
 }
 
+/// Hash canonical portable-index root bytes in their separate identity domain.
+/// This does not decode the artifact, validate graph coverage or grant access.
+pub fn cloud_index_root_id(bytes: &[u8]) -> [u8; 32] {
+    let mut hash = blake3::Hasher::new();
+    hash.update(b"tinytree-index-root-v1\0");
+    hash.update(bytes);
+    *hash.finalize().as_bytes()
+}
+/// Hash canonical portable-index node bytes; not a native commit/tree identity.
+pub fn cloud_index_node_id(bytes: &[u8]) -> [u8; 32] {
+    let mut hash = blake3::Hasher::new();
+    hash.update(b"tinytree-index-node-v1\0");
+    hash.update(bytes);
+    *hash.finalize().as_bytes()
+}
+
 /// Hash canonical known-field query-expression bytes for prefix selection.
 ///
 /// This binds a response to the requested structural selection. It is not

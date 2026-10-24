@@ -414,8 +414,21 @@ mod tests {
         assert!(config.validate().is_err());
         config.service.cloud.max_buffered_bytes = low + 1;
         assert!(config.validate().is_ok());
+        // Opting into indexed versions must fit their larger Store-derived
+        // profile, rather than silently increasing the shared pool.
+        config.service.cloud.max_buffered_bytes = low + 1;
+        config.service.cloud.indexed_versions = true;
+        assert!(config.validate().is_err());
+        config.service.cloud.max_buffered_bytes = 1024 * 1024 * 1024;
+        assert!(config.validate().is_ok());
+        let absent = tempfile::tempdir().unwrap().path().join("not-created");
+        config.storage = absent.clone();
         config.service.cloud.max_buffered_bytes = 1024 * 1024;
         assert!(config.validate().is_err());
+        assert!(
+            !absent.exists(),
+            "profile preflight does not create storage"
+        );
         config.service.cloud.enabled = false;
         assert!(
             config.validate().is_ok(),

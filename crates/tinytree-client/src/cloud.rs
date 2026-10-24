@@ -1,8 +1,13 @@
 //! Portable workspace-cloud transport. Raw digests and manifest IDs are checked;
 //! native OP/VIEW semantic verification and manifest graph coverage remain the
 //! caller's responsibility. Neither a receipt nor lookup establishes retention.
+#[path = "cloud_index.rs"]
+mod index;
 use super::*;
 use crate::transport::Shape;
+pub use index::{
+    CloudIndexArtifact, CloudIndexArtifactDescriptor, CloudIndexArtifactId, CloudIndexWriteReceipt,
+};
 use serde::{Deserialize, Serialize};
 use tinytree_proto::cloud_v1 as c;
 

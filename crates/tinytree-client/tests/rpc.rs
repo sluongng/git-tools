@@ -4714,11 +4714,13 @@ async fn rpc_only_guards_do_not_enter_query_state_pages_or_uncertain_drop_cleanu
     running.stop().await;
 }
 
-#[derive(Clone)]
+#[derive(Clone, Default)]
 struct CloudFaults {
     mode: Arc<AtomicUsize>,
     calls: Arc<AtomicUsize>,
     publication: Arc<std::sync::Mutex<Option<tinytree_client::cloud_protocol::Publication>>>,
+    index_entered: Arc<tokio::sync::Notify>,
+    index_release: Arc<tokio::sync::Notify>,
 }
 #[tonic::async_trait]
 impl tinytree_client::cloud_protocol::workspace_cloud_server::WorkspaceCloud for CloudFaults {
@@ -4825,6 +4827,132 @@ impl tinytree_client::cloud_protocol::workspace_cloud_server::WorkspaceCloud for
         }
         Ok(Response::new(Box::pin(futures_util::stream::iter(frames))))
     }
+    async fn put_index_artifact(
+        &self,
+        request: Request<tinytree_client::cloud_protocol::PutIndexArtifactRequest>,
+    ) -> Result<Response<tinytree_client::cloud_protocol::IndexArtifactWriteReceipt>, Status> {
+        use tinytree_client::cloud_protocol as c;
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        let request = request.into_inner();
+        let mut descriptor = request.descriptor.unwrap();
+        assert_eq!(
+            descriptor.selected.as_ref().unwrap().blake3,
+            blake3::hash(&request.payload).as_bytes().to_vec()
+        );
+        if self.mode.load(Ordering::SeqCst) == 7 {
+            descriptor.selected.as_mut().unwrap().blake3 = vec![0; 32];
+        }
+        Ok(Response::new(c::IndexArtifactWriteReceipt {
+            descriptor: Some(descriptor),
+            staging_lease: "b".repeat(64),
+            expires_at_unix_seconds: 2_000_000_000,
+        }))
+    }
+    async fn lookup_index_artifacts(
+        &self,
+        request: Request<tinytree_client::cloud_protocol::LookupIndexArtifactsRequest>,
+    ) -> Result<Response<tinytree_client::cloud_protocol::LookupIndexArtifactsResponse>, Status>
+    {
+        use tinytree_client::cloud_protocol as c;
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        let mode = self.mode.load(Ordering::SeqCst);
+        let mut selections: Vec<_> = request
+            .into_inner()
+            .ids
+            .into_iter()
+            .map(|mut id| {
+                if id.semantic_id.iter().all(|b| *b == 0) {
+                    return c::IndexArtifactSelection { descriptor: None };
+                }
+                if mode == 10 {
+                    id.kind = if id.kind == c::IndexArtifactKind::Root as i32 {
+                        c::IndexArtifactKind::Node as i32
+                    } else {
+                        c::IndexArtifactKind::Root as i32
+                    };
+                }
+                c::IndexArtifactSelection {
+                    descriptor: Some(c::IndexArtifactDescriptor {
+                        id: Some(id),
+                        selected: Some(c::RawDigest {
+                            blake3: blake3::hash(b"portable index transport payload")
+                                .as_bytes()
+                                .to_vec(),
+                            size_bytes: b"portable index transport payload".len() as u64,
+                        }),
+                    }),
+                }
+            })
+            .collect();
+        if mode == 4 {
+            selections.push(selections[0].clone());
+        }
+        Ok(Response::new(c::LookupIndexArtifactsResponse {
+            selections,
+        }))
+    }
+    type ReadIndexArtifactStream = std::pin::Pin<
+        Box<
+            dyn futures_util::Stream<
+                    Item = Result<tinytree_client::cloud_protocol::IndexArtifactChunk, Status>,
+                > + Send,
+        >,
+    >;
+    async fn read_index_artifact(
+        &self,
+        request: Request<tinytree_client::cloud_protocol::ReadIndexArtifactRequest>,
+    ) -> Result<Response<Self::ReadIndexArtifactStream>, Status> {
+        use tinytree_client::cloud_protocol as c;
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        let mode = self.mode.load(Ordering::SeqCst);
+        let mut id = request.into_inner().id.unwrap();
+        if mode == 10 {
+            id.kind = if id.kind == c::IndexArtifactKind::Root as i32 {
+                c::IndexArtifactKind::Node as i32
+            } else {
+                c::IndexArtifactKind::Root as i32
+            };
+        }
+        if mode == 11 {
+            id.semantic_id.pop();
+        }
+        if mode == 12 {
+            id.semantic_id.push(1);
+        }
+        let mut bytes = b"portable index transport payload".to_vec();
+        let digest = blake3::hash(&bytes).as_bytes().to_vec();
+        if mode == 6 {
+            bytes[0] ^= 1;
+        }
+        let descriptor = Some(c::IndexArtifactDescriptor {
+            id: Some(id),
+            selected: Some(c::RawDigest {
+                blake3: digest,
+                size_bytes: bytes.len() as u64,
+            }),
+        });
+        if mode == 9 {
+            let entered = self.index_entered.clone();
+            let release = self.index_release.clone();
+            return Ok(Response::new(Box::pin(async_stream::stream! {
+                let split=bytes.len()/2;
+                yield Ok(c::IndexArtifactChunk{descriptor:descriptor.clone(),offset:0,data:bytes[..split].to_vec(),eof:false});
+                entered.notify_one();release.notified().await;
+                yield Ok(c::IndexArtifactChunk{descriptor,offset:split as u64,data:bytes[split..].to_vec(),eof:true});
+            })));
+        }
+        let frame = c::IndexArtifactChunk {
+            descriptor,
+            offset: 0,
+            data: bytes,
+            eof: mode != 1,
+        };
+        let mut frames = vec![Ok(frame.clone())];
+        if mode == 3 {
+            frames.push(Ok(frame))
+        }
+        Ok(Response::new(Box::pin(futures_util::stream::iter(frames))))
+    }
     async fn publish_version(
         &self,
         request: Request<tinytree_client::cloud_protocol::PublishVersionRequest>,
@@ -4896,6 +5024,7 @@ async fn workspace_cloud_checks_stream_selection_reconciles_intent_and_releases_
         mode: Arc::new(AtomicUsize::new(0)),
         calls: Arc::new(AtomicUsize::new(0)),
         publication: Arc::new(std::sync::Mutex::new(None)),
+        ..Default::default()
     };
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
@@ -5939,4 +6068,180 @@ async fn selected_prefixes_validate_original_ast_and_propagate_work_exhaustion()
     );
     client.close_query_scope(&scope).await.unwrap();
     running.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn typed_index_artifact_rpc_checks_domains_bounds_retained_results_and_cancelled_reads() {
+    use tinytree_client::cloud_protocol::workspace_cloud_server::WorkspaceCloudServer;
+    use tinytree_client::{
+        CloudIndexArtifactDescriptor as Descriptor, CloudIndexArtifactId as Id, CloudRawDigest,
+    };
+    let faults = CloudFaults::default();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let incoming = async_stream::stream! {loop{match listener.accept().await{Ok((stream,_))=>yield Ok::<_,std::io::Error>(stream),Err(error)=>{yield Err(error);break}}}};
+    let service = WorkspaceCloudServer::new(faults.clone())
+        .accept_compressed(tonic::codec::CompressionEncoding::Zstd)
+        .send_compressed(tonic::codec::CompressionEncoding::Zstd);
+    let server = tokio::spawn(async move {
+        tonic::transport::Server::builder()
+            .add_service(service)
+            .serve_with_incoming(incoming)
+            .await
+            .unwrap()
+    });
+    let mut config = Config::default();
+    config.endpoint = format!("http://{address}");
+    config.limits.max_inflight = 1;
+    config.rpc.retry.max_attempts = 1;
+    let client = NativeClient::connect(config.clone()).await.unwrap();
+    let payload = b"portable index transport payload";
+    let root = Id::of_root(payload);
+    let node = Id::of_node(payload);
+    assert_ne!(root, node);
+    for (id, tag) in [
+        (root, b"tinytree-index-root-v1\0".as_slice()),
+        (node, b"tinytree-index-node-v1\0".as_slice()),
+    ] {
+        let mut hash = blake3::Hasher::new();
+        hash.update(tag);
+        hash.update(payload);
+        let expected = *hash.finalize().as_bytes();
+        assert!(matches!(id,Id::Root(value)|Id::Node(value)if value==expected));
+        let descriptor = Descriptor {
+            id,
+            selected: CloudRawDigest::of(payload),
+        };
+        assert_eq!(
+            client
+                .cloud_put_index_artifact(id, payload)
+                .await
+                .unwrap()
+                .descriptor,
+            descriptor
+        );
+        assert_eq!(
+            client
+                .cloud_lookup_index_artifacts(&[id, Id::Root([0; 32])])
+                .await
+                .unwrap(),
+            vec![Some(descriptor), None]
+        );
+        let physical = Arc::new(AtomicUsize::new(0));
+        let persistent = Arc::new(AtomicUsize::new(0));
+        let guarded = client
+            .clone()
+            .with_lifetime_guard(Arc::new(LifetimeProbe(persistent.clone())))
+            .with_rpc_lifetime_guard(Arc::new(LifetimeProbe(physical.clone())));
+        let object = guarded.cloud_read_index_artifact(descriptor).await.unwrap();
+        assert_eq!(object.payload(), payload);
+        assert_eq!(object.descriptor(), descriptor);
+        drop(guarded);
+        assert_released(&physical).await;
+        assert_eq!(persistent.load(Ordering::SeqCst), 0);
+        client.cloud_workspace([1; 32]).await.unwrap();
+        drop(object);
+        assert_released(&persistent).await;
+    }
+    let descriptor = Descriptor {
+        id: root,
+        selected: CloudRawDigest::of(payload),
+    };
+    for mode in [1, 3, 6, 10, 11, 12] {
+        faults.mode.store(mode, Ordering::SeqCst);
+        let error = client
+            .cloud_read_index_artifact(descriptor)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(error.code(), Code::DataLoss | Code::ResourceExhausted),
+            "mode{mode}: {error}"
+        );
+    }
+    let Id::Root(raw) = root else { unreachable!() };
+    faults.mode.store(0, Ordering::SeqCst);
+    assert_eq!(
+        client
+            .cloud_read_index_artifact(Descriptor {
+                id: Id::Node(raw),
+                ..descriptor
+            })
+            .await
+            .unwrap_err()
+            .code(),
+        Code::DataLoss,
+        "matching raw hash is insufficient in the wrong semantic domain"
+    );
+    let before = faults.calls.load(Ordering::SeqCst);
+    assert_eq!(
+        client
+            .cloud_put_index_artifact(Id::Node(raw), payload)
+            .await
+            .unwrap_err()
+            .code(),
+        Code::InvalidArgument
+    );
+    assert_eq!(
+        client
+            .cloud_put_index_artifact(root, &vec![0; config.cloud.max_object_bytes + 1])
+            .await
+            .unwrap_err()
+            .code(),
+        Code::ResourceExhausted
+    );
+    assert_eq!(
+        client
+            .cloud_lookup_index_artifacts(&vec![root; config.cloud.max_lookup_items + 1])
+            .await
+            .unwrap_err()
+            .code(),
+        Code::ResourceExhausted
+    );
+    assert_eq!(faults.calls.load(Ordering::SeqCst), before);
+    faults.mode.store(7, Ordering::SeqCst);
+    assert_eq!(
+        client
+            .cloud_put_index_artifact(root, payload)
+            .await
+            .unwrap_err()
+            .code(),
+        Code::DataLoss,
+        "canonical index artifacts cannot select alternate raw bytes for one ID"
+    );
+    for mode in [4, 10] {
+        faults.mode.store(mode, Ordering::SeqCst);
+        assert_eq!(
+            client
+                .cloud_lookup_index_artifacts(&[root])
+                .await
+                .unwrap_err()
+                .code(),
+            Code::DataLoss
+        );
+    }
+    faults.mode.store(9, Ordering::SeqCst);
+    let dropped = Arc::new(AtomicUsize::new(0));
+    let guarded = client
+        .clone()
+        .with_rpc_lifetime_guard(Arc::new(LifetimeProbe(dropped.clone())));
+    let task = tokio::spawn(async move { guarded.cloud_read_index_artifact(descriptor).await });
+    tokio::time::timeout(Duration::from_secs(2), faults.index_entered.notified())
+        .await
+        .unwrap();
+    task.abort();
+    let _ = task.await;
+    assert_released(&dropped).await;
+    faults.mode.store(0, Ordering::SeqCst);
+    faults.index_release.notify_one();
+    assert_eq!(
+        client
+            .cloud_read_index_artifact(descriptor)
+            .await
+            .unwrap()
+            .payload(),
+        payload,
+        "cancelled physical read must release the sole call slot"
+    );
+    server.abort();
+    let _ = server.await;
 }

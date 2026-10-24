@@ -4814,3 +4814,19 @@ fn packing_native_metadata_preserves_retained_indexed_version_memory_contract() 
         request.manifest_bytes
     );
 }
+
+#[test]
+fn cloud_resource_profile_matches_open_store_and_rejects_overflow() {
+    let directory = tempfile::tempdir().unwrap();
+    let policy = config();
+    let declared = policy.cloud_resource_profile().unwrap();
+    assert!(declared.version_v2_bytes >= declared.version_v1_bytes);
+    let store = Store::open(directory.path(), policy.clone()).unwrap();
+    assert_eq!(declared, store.cloud_resource_profile().unwrap());
+    let mut impossible = policy;
+    impossible.max_retention_validation_bytes = u64::MAX;
+    assert!(matches!(
+        impossible.cloud_resource_profile(),
+        Err(Error::Limit(_))
+    ));
+}

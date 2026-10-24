@@ -55,6 +55,9 @@ impl Service<http::Request<Body>> for CloudGrpcService {
                 if !matches!(
                     method.as_str(),
                     "PutObject"
+                        | "PutIndexArtifact"
+                        | "LookupIndexArtifacts"
+                        | "ReadIndexArtifact"
                         | "LookupObjects"
                         | "ReadObject"
                         | "PublishVersion"
@@ -64,10 +67,16 @@ impl Service<http::Request<Body>> for CloudGrpcService {
                 ) {
                     return Err(Status::unimplemented("unknown private workspace method"));
                 }
-                if matches!(method.as_str(), "PutObject" | "PublishVersion") {
+                if matches!(
+                    method.as_str(),
+                    "PutObject" | "PutIndexArtifact" | "PublishVersion"
+                ) {
                     identity.cloud_write_capability()?;
                 }
-                let deadline = repository.query_deadline(&metadata, method == "ReadObject")?;
+                let deadline = repository.query_deadline(
+                    &metadata,
+                    matches!(method.as_str(), "ReadObject" | "ReadIndexArtifact"),
+                )?;
                 let work: Arc<Work> = host.admit(&method, deadline)?;
                 let cap = host.config.wire_limit(&method);
                 let (mut parts, body) = request.into_parts();

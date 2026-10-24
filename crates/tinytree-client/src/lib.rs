@@ -6,8 +6,10 @@ mod transport;
 mod verified;
 pub use client::NativeClient;
 pub use client::cloud::{
-    CloudDescriptor, CloudLimits, CloudManifestId, CloudObject, CloudObjectId, CloudPublication,
-    CloudPublishIntent, CloudRawDigest, CloudVersion, CloudWorkspace, CloudWriteReceipt,
+    CloudDescriptor, CloudIndexArtifact, CloudIndexArtifactDescriptor, CloudIndexArtifactId,
+    CloudIndexWriteReceipt, CloudLimits, CloudManifestId, CloudObject, CloudObjectId,
+    CloudPublication, CloudPublishIntent, CloudRawDigest, CloudVersion, CloudWorkspace,
+    CloudWriteReceipt,
 };
 pub use client::query::{
     ChangeMatch, ChangePrefix, ChangeTarget, CheckedGraphPage, CheckedGraphQuery, CheckedGraphRows,

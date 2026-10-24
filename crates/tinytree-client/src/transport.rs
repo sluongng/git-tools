@@ -122,6 +122,36 @@ impl Client {
             )
             .await
     }
+    pub(crate) async fn cloud_index_read(
+        &mut self,
+        request: Request<tinytree_proto::cloud_v1::ReadIndexArtifactRequest>,
+        limits: &crate::CloudLimits,
+    ) -> Result<Response<Streaming<tinytree_proto::cloud_v1::IndexArtifactChunk>>, Status> {
+        let cap = limits.max_chunk_bytes + 1024;
+        self.inner = self
+            .inner
+            .clone()
+            .max_decoding_message_size(cap)
+            .max_encoding_message_size(4096);
+        self.limits.max_frame_bytes = limits.max_chunk_bytes;
+        self.inner
+            .ready()
+            .await
+            .map_err(|_| Status::unavailable("native gRPC transport not ready"))?;
+        self.inner
+            .server_streaming(
+                request,
+                http::uri::PathAndQuery::from_static(
+                    "/tinytree.cloud.v1.WorkspaceCloud/ReadIndexArtifact",
+                ),
+                BoundedCodec::<
+                    tinytree_proto::cloud_v1::ReadIndexArtifactRequest,
+                    tinytree_proto::cloud_v1::IndexArtifactChunk,
+                >::new(Shape::CloudIndexChunk, self.limits.clone(), cap)
+                .with_optional_owner(self.owner.clone()),
+            )
+            .await
+    }
     pub async fn open_scope(
         &mut self,
         request: impl tonic::IntoStreamingRequest<Message = q::OpenScopeFrame>,
@@ -421,6 +451,12 @@ pub(crate) enum Shape {
     CloudPublication,
     CloudPublicationResult,
     CloudVersion,
+    CloudIndexId,
+    CloudIndexDescriptor,
+    CloudIndexReceipt,
+    CloudIndexSelections,
+    CloudIndexSelection,
+    CloudIndexChunk,
     IdsPage,
     IdsRow,
     GraphPage,
@@ -647,7 +683,7 @@ fn scan(
                     (Shape::FactAnswer, 1 | 2 | 5)
                         | (Shape::ChangeTarget, 2)
                         | (Shape::IdsPage | Shape::GraphPage | Shape::CanonicalPage, 6)
-                        | (Shape::CloudChunk, 4)
+                        | (Shape::CloudChunk | Shape::CloudIndexChunk, 4)
                         | (Shape::ShortestPrefix, 3)
                 )
             {
@@ -695,12 +731,14 @@ fn scan(
         }
     }
     let required = match shape {
-        Shape::CloudId => (1 << 1) | (1 << 2),
+        Shape::CloudId | Shape::CloudIndexId => (1 << 1) | (1 << 2),
         Shape::CloudDigest => 1 << 1,
-        Shape::CloudDescriptor | Shape::CloudReceipt | Shape::CloudPublication => {
-            (1 << 1) | (1 << 2)
-        }
-        Shape::CloudChunk | Shape::CloudWorkspace => 1 << 1,
+        Shape::CloudDescriptor
+        | Shape::CloudReceipt
+        | Shape::CloudPublication
+        | Shape::CloudIndexDescriptor
+        | Shape::CloudIndexReceipt => (1 << 1) | (1 << 2),
+        Shape::CloudChunk | Shape::CloudWorkspace | Shape::CloudIndexChunk => 1 << 1,
         Shape::CloudVersion => (1 << 1) | (1 << 3),
         Shape::IdsPage | Shape::GraphPage | Shape::CanonicalPage => (1 << 1) | (1 << 2) | (1 << 6),
         Shape::IdsRow | Shape::GraphRow | Shape::CanonicalRow => (1 << 1) | (1 << 2),
@@ -753,6 +791,22 @@ fn rule(shape: Shape, n: u32, l: &Limits) -> Option<(u8, Option<Shape>, usize, u
     let nested = |child| Some((2, Some(child), 1, 0));
     let repeated = |child, count, allocation| Some((2, Some(child), count, allocation));
     match (shape, n) {
+        (Shape::CloudIndexId, 1)
+        | (Shape::CloudIndexReceipt, 3)
+        | (Shape::CloudIndexChunk, 2 | 4) => scalar(),
+        (Shape::CloudIndexId, 2) => text(32),
+        (Shape::CloudIndexDescriptor, 1) => nested(Shape::CloudIndexId),
+        (Shape::CloudIndexDescriptor, 2) => nested(Shape::CloudDigest),
+        (Shape::CloudIndexReceipt | Shape::CloudIndexSelection | Shape::CloudIndexChunk, 1) => {
+            nested(Shape::CloudIndexDescriptor)
+        }
+        (Shape::CloudIndexReceipt, 2) => text(64),
+        (Shape::CloudIndexSelections, 1) => repeated(
+            Shape::CloudIndexSelection,
+            l.max_batch_items,
+            4 * std::mem::size_of::<tinytree_proto::cloud_v1::IndexArtifactSelection>(),
+        ),
+        (Shape::CloudIndexChunk, 3) => text(l.max_frame_bytes),
         (Shape::CloudId, 1)
         | (Shape::CloudDigest, 2)
         | (Shape::CloudReceipt, 3)

@@ -26,8 +26,8 @@ use tinytree_model::{CommitId, Descriptor, Kind, Limits, ObjectId, ObjectKey};
 mod cloud;
 pub use cloud::{
     CloudConfig, CloudIndexReadLease, CloudIndexWriteReceipt, CloudObjectDescriptor, CloudOwner,
-    CloudPublication, CloudPublicationLimits, CloudReadLease, CloudVersion, CloudVersionReadGuard,
-    CloudWorkspace, CloudWriteReceipt, PublishCloudRequest,
+    CloudPublication, CloudPublicationLimits, CloudReadLease, CloudResourceProfile, CloudVersion,
+    CloudVersionReadGuard, CloudWorkspace, CloudWriteReceipt, PublishCloudRequest,
 };
 mod client_gc;
 mod closure;

@@ -92,6 +92,8 @@ impl CloudConfig {
 // Keep read and precommit bounds identical; a durable ACK must remain readable.
 const CLOUD_JSON_ROW_BYTES: usize = 1024 * 1024;
 const CLOUD_BINARY_ROW_BYTES: usize = 64 * 1024 * 1024 + 4096;
+mod resources;
+pub use resources::CloudResourceProfile;
 mod artifacts;
 pub use artifacts::{CloudIndexReadLease, CloudIndexWriteReceipt};
 mod versions;
