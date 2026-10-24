@@ -58,7 +58,7 @@ pub struct ConfirmedPublication {
     pub head: m::CommitId,
 }
 impl RemoteRepositoryControl {
-    async fn physical_client(&self) -> Result<NativeClient> {
+    pub(crate) async fn physical_client(&self) -> Result<NativeClient> {
         let client = self.inner.connector.get().await?;
         Ok(match io::scope() {
             Some(scope) => client.with_rpc_lifetime_guard(scope),
@@ -454,7 +454,7 @@ impl RemoteRepositoryControl {
             head: request.head,
         })
     }
-    async fn upload_snapshot(
+    pub(crate) async fn upload_snapshot(
         &self,
         read: jj_native_backend::FileRead,
         descriptor: m::Descriptor,

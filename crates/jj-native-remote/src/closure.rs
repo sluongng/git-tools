@@ -313,7 +313,7 @@ async fn prefetch(
     Ok(())
 }
 
-fn validate_contexts(
+pub(crate) fn validate_contexts(
     nodes: &HashMap<m::ObjectKey, Node>,
     roots: HashSet<m::TreeId>,
     config: &Config,
@@ -333,6 +333,7 @@ fn validate_contexts(
         )?;
     }
     while let Some((tree, prefix)) = pending.pop() {
+        crate::io::check_deadline()?;
         let key = m::ObjectKey {
             kind: m::Kind::Tree,
             id: m::ObjectId(tree.0),
@@ -344,6 +345,7 @@ fn validate_contexts(
             bail!("native tree context kind mismatch")
         };
         for entry in &tree.entries {
+            crate::io::check_deadline()?;
             *edges = edges.checked_add(1).context("native path edge overflow")?;
             ensure!(
                 *edges <= config.closure.max_edges,

@@ -13,6 +13,7 @@ mod provider;
 mod query;
 mod snapshot;
 mod staging;
+mod transfer;
 use anyhow::{Context, Result, ensure};
 pub use config::{ClosureLimits, Config, QueryLimits};
 pub use control::{
@@ -29,6 +30,7 @@ use std::{
     time::Duration,
 };
 use tinytree_client::NativeClient;
+pub use transfer::{NativeTransferLimits, NativeTransferReceipt, NativeTransferStage};
 
 pub struct RemoteRepository {
     pub io: Arc<RemoteObjectIo>,

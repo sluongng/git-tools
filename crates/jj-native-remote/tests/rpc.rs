@@ -1289,6 +1289,74 @@ async fn cancelled_admission_reconciles_current_durable_hold_after_restart() {
     server.stop().await;
 }
 
+#[derive(Debug)]
+struct TransferSource {
+    inner: Arc<dyn NativeObjectIo>,
+    files: AtomicUsize,
+}
+#[async_trait]
+impl NativeObjectIo for TransferSource {
+    fn metadata_work_budget(&self) -> Option<jj_native_backend::ObjectIoResources> {
+        self.inner.metadata_work_budget()
+    }
+    async fn descriptor(
+        &self,
+        key: m::ObjectKey,
+    ) -> jj_lib::backend::BackendResult<Option<m::Descriptor>> {
+        self.inner.descriptor(key).await
+    }
+    async fn descriptor_with_owner(
+        &self,
+        key: m::ObjectKey,
+        owner: Arc<dyn std::any::Any + Send + Sync>,
+    ) -> jj_lib::backend::BackendResult<Option<m::Descriptor>> {
+        self.inner.descriptor_with_owner(key, owner).await
+    }
+    async fn read_metadata(
+        &self,
+        key: m::ObjectKey,
+    ) -> jj_lib::backend::BackendResult<jj_native_backend::VerifiedMetadata> {
+        self.inner.read_metadata(key).await
+    }
+    async fn read_metadata_with_owner(
+        &self,
+        key: m::ObjectKey,
+        owner: Arc<dyn std::any::Any + Send + Sync>,
+    ) -> jj_lib::backend::BackendResult<jj_native_backend::VerifiedMetadata> {
+        self.inner.read_metadata_with_owner(key, owner).await
+    }
+    async fn read_file(
+        &self,
+        _: m::FileId,
+    ) -> jj_lib::backend::BackendResult<jj_native_backend::FileRead> {
+        panic!("transfer must use physically owned source reads")
+    }
+    async fn read_file_with_owner(
+        &self,
+        id: m::FileId,
+        owner: Arc<dyn std::any::Any + Send + Sync>,
+    ) -> jj_lib::backend::BackendResult<jj_native_backend::FileRead> {
+        self.files.fetch_add(1, Ordering::SeqCst);
+        self.inner.read_file_with_owner(id, owner).await
+    }
+    async fn write_metadata(&self, _: m::Object) -> jj_lib::backend::BackendResult<m::Descriptor> {
+        panic!("transfer cannot write its source")
+    }
+    async fn write_file(
+        &self,
+        _: &mut (dyn futures::io::AsyncRead + Send + Unpin),
+        _: u64,
+    ) -> jj_lib::backend::BackendResult<m::FileId> {
+        panic!("transfer cannot write its source")
+    }
+    async fn copy_catalog_snapshot(
+        &self,
+        _: jj_native_backend::CopyCatalogLimits,
+    ) -> jj_lib::backend::BackendResult<jj_native_backend::CopyCatalogSnapshot> {
+        panic!("transfer cannot query unrelated source catalog")
+    }
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn unrelated_tree_write_and_publication_upload_only_new_local_content() {
     let (_serverdir, store, fixture, old) = seed();
@@ -1352,6 +1420,132 @@ async fn unrelated_tree_write_and_publication_upload_only_new_local_content() {
         counts.files.load(Ordering::SeqCst),
         0,
         "tree edits must not fetch unchanged source payloads"
+    );
+    // Backup staging must not reuse publication: it accepts a TREE without a
+    // COMMIT and never creates a hold, moves a reference or acquires read grants.
+    let source = Arc::new(TransferSource {
+        inner: repo.io.clone(),
+        files: AtomicUsize::new(0),
+    });
+    let fence: Arc<dyn std::any::Any + Send + Sync> = Arc::new(());
+    let transfer_limits = jj_native_remote::NativeTransferLimits::default();
+    let work = repo
+        .control
+        .native_transfer_resources(source.as_ref(), &transfer_limits)
+        .unwrap();
+    assert!(
+        work.memory_bytes > config(&server).control_work_budget().memory_bytes,
+        "lazy source hydration is additional to retained transfer/target work"
+    );
+    let holds_before = counts.holds.load(Ordering::SeqCst);
+    let references_before = store.references("example", &["main".into()]).unwrap();
+    let staged = repo
+        .control
+        .transfer_native_closure(
+            source.clone(),
+            vec![tree.key],
+            fence.clone(),
+            transfer_limits.clone(),
+            tokio::time::Instant::now() + Duration::from_secs(10),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        source.files.load(Ordering::SeqCst),
+        1,
+        "only missing authored FILE is read"
+    );
+    assert!(
+        staged
+            .stages()
+            .iter()
+            .any(|stage| stage.descriptor.key.kind == m::Kind::File
+                && stage.descriptor.key.id.0 == file.0)
+    );
+    assert!(
+        staged
+            .stages()
+            .iter()
+            .all(|stage| !stage.staging_lease.is_empty() && stage.expires_at_unix_seconds > 0)
+    );
+    let symlink = repo
+        .io
+        .write_metadata(m::Object::Symlink("new-local.txt".into()))
+        .await
+        .unwrap();
+    let warm = repo
+        .control
+        .transfer_native_closure(
+            source.clone(),
+            vec![tree.key, symlink.key],
+            fence.clone(),
+            transfer_limits.clone(),
+            tokio::time::Instant::now() + Duration::from_secs(10),
+        )
+        .await
+        .unwrap();
+    assert_eq!(warm.stages().len(), 1);
+    assert_eq!(warm.stages()[0].descriptor, symlink);
+    assert!(warm.present_objects() > 0);
+    assert_eq!(
+        source.files.load(Ordering::SeqCst),
+        1,
+        "present FILEs must not be read even locally"
+    );
+    assert_eq!(counts.holds.load(Ordering::SeqCst), holds_before);
+    assert_eq!(
+        store.references("example", &["main".into()]).unwrap(),
+        references_before
+    );
+    let mut tiny = transfer_limits.clone();
+    tiny.max_memory_bytes = 1;
+    let error = repo
+        .control
+        .transfer_native_closure(
+            source.clone(),
+            vec![tree.key],
+            fence.clone(),
+            tiny,
+            tokio::time::Instant::now() + Duration::from_secs(10),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(
+        error.downcast_ref::<Status>().unwrap().code(),
+        tonic::Code::ResourceExhausted
+    );
+    let missing_tree = repo
+        .io
+        .write_metadata(m::Object::Tree(m::Tree {
+            entries: vec![m::TreeEntry {
+                name: "absent.txt".into(),
+                value: m::TreeValue::File {
+                    id: m::FileId([217; 32]),
+                    executable: false,
+                    size_bytes: 7,
+                    copy_id: None,
+                },
+            }],
+        }))
+        .await
+        .unwrap();
+    assert!(
+        repo.control
+            .transfer_native_closure(
+                source.clone(),
+                vec![missing_tree.key],
+                fence,
+                transfer_limits,
+                tokio::time::Instant::now() + Duration::from_secs(10),
+            )
+            .await
+            .is_err(),
+        "FILE missing both upstream and at actual source cannot succeed"
+    );
+    assert_eq!(counts.holds.load(Ordering::SeqCst), holds_before);
+    assert_eq!(
+        store.references("example", &["main".into()]).unwrap(),
+        references_before
     );
     let head = m::CommitId(commit.key.id.0);
     let published = repo
