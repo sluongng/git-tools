@@ -2,6 +2,8 @@
 pub(crate) mod cloud;
 #[path = "history.rs"]
 pub(crate) mod history;
+#[path = "landing.rs"]
+pub(crate) mod landing;
 #[path = "query.rs"]
 pub(crate) mod query;
 #[path = "search.rs"]

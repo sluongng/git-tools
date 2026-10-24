@@ -27,3 +27,8 @@ pub use verified::{
     CanonicalCommitSummaries, MetadataOutcome, UploadSource, VerifiedFile, VerifiedMetadata,
     VerifiedReader,
 };
+
+pub use client::landing::{
+    CheckedLandingJob, LandingCandidate, LandingHandle, LandingLimits, LandingPhase,
+    LandingPreparation, LandingReceipt, LandingRewrite, LandingStart,
+};

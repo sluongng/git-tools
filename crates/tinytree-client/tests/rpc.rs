@@ -8085,3 +8085,913 @@ async fn immutable_search_inputs_sessions_and_deadlines_fail_before_remote_work(
     );
     running.stop().await;
 }
+
+// Real server/Store fixture for landing workflows. Deliberately separate from
+// malformed-protocol fixtures: success is never supplied by a mock job service.
+fn landing_fixture_principal(grant: bool) -> Principal {
+    Principal::new("test", TOKEN, vec!["example".into()], grant)
+        .unwrap()
+        .with_landing_profiles(if grant { vec!["checks".into()] } else { vec![] })
+}
+fn landing_fixture_owner() -> tinytree_store::LandingOwner {
+    // Controlled in-process fixture authority, not SDK-side authentication.
+    // Match the real service's authenticated principal namespace for seeding a
+    // fixed committer; actual Get still authenticates its normal bearer token.
+    let principal = landing_fixture_principal(true);
+    let mut retention = blake3::Hasher::new();
+    retention.update(b"tinytree-retention-owner-v1\0");
+    retention.update(&(principal.id.len() as u64).to_be_bytes());
+    retention.update(principal.id.as_bytes());
+    let mut owner = blake3::Hasher::new();
+    owner.update(b"tinytree-landing-owner-v1\0");
+    owner.update(&[1]);
+    owner.update(retention.finalize().as_bytes());
+    tinytree_store::LandingOwner(*owner.finalize().as_bytes())
+}
+struct LandingRunning {
+    address: std::net::SocketAddr,
+    stop: tokio::sync::oneshot::Sender<()>,
+    task: tokio::task::JoinHandle<()>,
+}
+impl LandingRunning {
+    async fn start(
+        store: Store,
+        config: ServiceConfig,
+        grant: bool,
+        address: Option<std::net::SocketAddr>,
+    ) -> Self {
+        let service = RepositoryService::new(
+            store,
+            config,
+            vec!["example".into()],
+            vec![
+                Principal::new("test", TOKEN, vec!["example".into()], grant)
+                    .unwrap()
+                    .with_landing_profiles(if grant { vec!["checks".into()] } else { vec![] }),
+            ],
+        )
+        .unwrap();
+        let listener = tokio::net::TcpListener::bind(
+            address.unwrap_or_else(|| "127.0.0.1:0".parse().unwrap()),
+        )
+        .await
+        .unwrap();
+        let address = listener.local_addr().unwrap();
+        let (stop, stopped) = tokio::sync::oneshot::channel();
+        let task = tokio::spawn(async move {
+            tinytree_server::serve_tcp(listener, service, None, async {
+                let _ = stopped.await;
+            })
+            .await
+            .unwrap();
+        });
+        Self {
+            address,
+            stop,
+            task,
+        }
+    }
+    fn config(&self) -> Config {
+        Config {
+            endpoint: format!("http://{}", self.address),
+            repository_id: "example".into(),
+            token_env: Some("TINYTREE_CLIENT_TEST_TOKEN".into()),
+            ..Default::default()
+        }
+    }
+    async fn stop(self) {
+        let _ = self.stop.send(());
+        tokio::time::timeout(Duration::from_secs(5), self.task)
+            .await
+            .unwrap()
+            .unwrap();
+    }
+}
+fn landing_fixture() -> (
+    tempfile::TempDir,
+    Store,
+    ServiceConfig,
+    tinytree_client::LandingStart,
+) {
+    use tinytree_model::{ChangeId, CommitId, Object};
+    let mut config: tinytree_server::Config =
+        toml::from_str(include_str!("../../tinytree-server/examples/landing.toml")).unwrap();
+    config.service.landing.poll_interval_ms = 10;
+    let directory = private_tempdir();
+    let store = Store::open(
+        directory.path(),
+        config.store.materialize(config.service.max_metadata_bytes),
+    )
+    .unwrap();
+    store.create_repository("example").unwrap();
+    let fixture = fixture();
+    for object in fixture.objects() {
+        store
+            .put("example", object.descriptor, &object.bytes, 0)
+            .unwrap();
+    }
+    let base = CommitId(
+        *blake3::Hash::from_hex(&fixture.manifest.root_commit)
+            .unwrap()
+            .as_bytes(),
+    );
+    let (_, bytes) = store
+        .read_metadata(
+            "example",
+            ObjectKey {
+                kind: Kind::Commit,
+                id: ObjectId(base.0),
+            },
+        )
+        .unwrap();
+    let Object::Commit(mut draft) = tinytree_model::decode(&bytes, Default::default()).unwrap()
+    else {
+        unreachable!()
+    };
+    draft.parents = vec![base];
+    draft.change_id = ChangeId([19; 16]);
+    draft.description = "landing SDK private draft".into();
+    let source = tinytree_model::encode(&Object::Commit(draft), Default::default()).unwrap();
+    store
+        .put("example", source.descriptor, &source.bytes, 0)
+        .unwrap();
+    store
+        .publish(
+            "example",
+            &tinytree_store::PublishRequest {
+                idempotency_key: "landing-baseline".into(),
+                reference_name: "main".into(),
+                expected_generation: 0,
+                new_commit: Some(base),
+                staging_leases: vec![],
+            },
+            0,
+        )
+        .unwrap();
+    let request = tinytree_client::LandingStart {
+        idempotency_key: "sdk-landing".into(),
+        source_base: base,
+        source_head: CommitId(source.descriptor.key.id.0),
+        destination: "main".into(),
+        expected_generation: 1,
+        expected_head: base,
+        profile_name: "checks".into(),
+        expected_profile_version: "v1".into(),
+    };
+    (directory, store, config.service, request)
+}
+#[tokio::test]
+async fn landing_compressed_preparation_replay_and_retained_results_are_checked() {
+    use tinytree_client::{LandingPhase, LandingPreparation};
+    let (_directory, store, config, start) = landing_fixture();
+    let running = LandingRunning::start(store.clone(), config, true, None).await;
+    let mut client_config = running.config();
+    client_config.landing.max_response_bytes = 1024 * 1024;
+    client_config.limits.max_buffered_bytes = 203 * 1024 * 1024;
+    client_config.limits.max_graph_bytes = 32 * 1024 * 1024;
+    let client = NativeClient::connect(client_config).await.unwrap();
+    let lifetime = Arc::new(AtomicUsize::new(0));
+    let rpc_lifetime = Arc::new(AtomicUsize::new(0));
+    let selected = client
+        .clone()
+        .with_lifetime_guard(Arc::new(LifetimeProbe(lifetime.clone())))
+        .with_rpc_lifetime_guard(Arc::new(LifetimeProbe(rpc_lifetime.clone())));
+    let job = selected.start_landing(&start).await.unwrap();
+    assert!(matches!(
+        job.phase(),
+        LandingPhase::Intent | LandingPhase::PreparedPendingChecks
+    ));
+    assert_eq!(job.preparation(), LandingPreparation::ProfileConfigured);
+    let handle = job.handle();
+    let id = handle.id();
+    assert_eq!(
+        client.get_landing(&handle).await.unwrap_err().code(),
+        Code::ResourceExhausted,
+        "retained result must remain charged after RPC"
+    );
+    drop(selected);
+    assert_released(&rpc_lifetime).await;
+    assert_eq!(lifetime.load(Ordering::SeqCst), 0);
+    drop(job);
+    assert_eq!(
+        lifetime.load(Ordering::SeqCst),
+        0,
+        "the handle still owns its intent"
+    );
+    drop(handle);
+    assert_released(&lifetime).await;
+    // Preparation shares the server's bounded heavy pool with Start. Status
+    // remains light; wait for that physical work before replaying acceptance.
+    let ready_deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let status = client.lookup_landing(&start, Some(id)).await.unwrap();
+        let ready = status.phase() != LandingPhase::Intent;
+        drop(status);
+        if ready {
+            break;
+        }
+        assert!(tokio::time::Instant::now() < ready_deadline);
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let replay = client.start_landing(&start).await.unwrap();
+    assert_eq!(replay.handle().id(), id);
+    drop(replay);
+    let status = client.lookup_landing(&start, Some(id)).await.unwrap();
+    let handle = status.handle();
+    drop(status);
+    // The independent next result has headroom with the ordinary default pool.
+    let ordinary = NativeClient::connect(running.config()).await.unwrap();
+    assert_eq!(
+        ordinary.get_landing(&handle).await.unwrap_err().code(),
+        Code::InvalidArgument,
+        "handles cannot change authenticated client transport"
+    );
+    drop(handle);
+    let mut job = ordinary.lookup_landing(&start, Some(id)).await.unwrap();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while job.phase() == LandingPhase::Intent {
+        let h = job.handle();
+        drop(job);
+        job = ordinary.get_landing(&h).await.unwrap();
+        assert!(tokio::time::Instant::now() < deadline);
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(job.phase(), LandingPhase::PreparedPendingChecks);
+    assert!(job.roots_retained());
+    assert!(job.receipt().is_none());
+    assert!(job.candidate().is_some());
+    assert_eq!(
+        store.references("example", &["main".into()]).unwrap()[0].generation,
+        1,
+        "preparation/status is not publication or a check verdict"
+    );
+    drop(job);
+    let mut intrinsic = start.clone();
+    intrinsic.idempotency_key = "intrinsic-base".into();
+    intrinsic.source_base = tinytree_model::CommitId::ROOT;
+    client.start_landing(&intrinsic).await.unwrap();
+    // Only the trusted embedding Store API supplies a verdict in this fixture;
+    // the SDK exposes preparation/status only, including historical receipts.
+    let pending = store
+        .scan_pending_landings("example", None, Default::default())
+        .unwrap()
+        .jobs
+        .into_iter()
+        .find(|job| job.id == id)
+        .unwrap();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+    let lease = pending.handle.pin_candidate(&store, now).unwrap();
+    pending
+        .handle
+        .record_check(
+            &store,
+            lease.identity(),
+            tinytree_store::LandingVerdict {
+                passed: true,
+                evidence: [44; 32],
+            },
+            now,
+        )
+        .unwrap();
+    let checked = ordinary.lookup_landing(&start, Some(id)).await.unwrap();
+    assert_eq!(checked.phase(), LandingPhase::Checked);
+    assert!(checked.receipt().is_none());
+    drop(lease);
+    pending.handle.finalize(&store, now).unwrap();
+    let committed = ordinary.get_landing(&checked.handle()).await.unwrap();
+    assert_eq!(committed.phase(), LandingPhase::Committed);
+    let receipt = committed.receipt().unwrap();
+    assert_eq!(receipt.generation, 2);
+    assert_eq!(receipt.destination, "main");
+    assert_eq!(receipt.evidence, [44; 32]);
+
+    // Deterministic identity fast-forward: freeze the original canonical
+    // committer directly through the trusted Store fixture. Server wall-clock
+    // metadata is deliberately not synchronized or overridden in production.
+    let owner = landing_fixture_owner();
+    let mut unchanged = start.clone();
+    unchanged.idempotency_key = "unchanged-sdk".into();
+    unchanged.destination = "unchanged".into();
+    store
+        .publish(
+            "example",
+            &tinytree_store::PublishRequest {
+                idempotency_key: "unchanged-baseline".into(),
+                reference_name: unchanged.destination.clone(),
+                expected_generation: 0,
+                new_commit: Some(unchanged.expected_head),
+                staging_leases: vec![],
+            },
+            now,
+        )
+        .unwrap();
+    let (_, bytes) = store
+        .read_metadata(
+            "example",
+            ObjectKey {
+                kind: Kind::Commit,
+                id: ObjectId(unchanged.source_head.0),
+            },
+        )
+        .unwrap();
+    let tinytree_model::Object::Commit(source) =
+        tinytree_model::decode(&bytes, Default::default()).unwrap()
+    else {
+        unreachable!()
+    };
+    let begun = store
+        .begin_landing(
+            "example",
+            owner,
+            &tinytree_store::LandingRequest {
+                idempotency_key: unchanged.idempotency_key.clone(),
+                source_base: unchanged.source_base,
+                source_head: unchanged.source_head,
+                reference_name: unchanged.destination.clone(),
+                expected_generation: unchanged.expected_generation,
+                expected_head: unchanged.expected_head,
+                committer: source.committer,
+                check_profile: tinytree_store::LandingCheckProfile {
+                    name: unchanged.profile_name.clone(),
+                    version: unchanged.expected_profile_version.clone(),
+                },
+                expires_at: now + 60,
+            },
+            now,
+        )
+        .unwrap();
+    let prepared = store
+        .prepare_landing("example", owner, &unchanged.idempotency_key, now)
+        .unwrap();
+    let candidate = prepared.candidate.as_ref().unwrap();
+    assert_eq!(candidate.head, unchanged.source_head);
+    assert_eq!(candidate.rewrites.len(), 1);
+    assert_eq!(candidate.rewrites[0].old, candidate.rewrites[0].new);
+    let observed = ordinary
+        .lookup_landing(&unchanged, Some(begun.id))
+        .await
+        .unwrap();
+    assert_eq!(observed.phase(), LandingPhase::PreparedPendingChecks);
+    assert_eq!(observed.candidate().unwrap().head, unchanged.source_head);
+    assert!(
+        observed.candidate().unwrap().rewrites.is_empty(),
+        "identity constructor pairs are not wire evolution relations"
+    );
+    store
+        .record_landing_check(
+            "example",
+            owner,
+            &unchanged.idempotency_key,
+            &tinytree_store::LandingCheckIdentity {
+                candidate: candidate.head,
+                root_tree: candidate.root_tree,
+                profile: prepared.profile,
+            },
+            tinytree_store::LandingVerdict {
+                passed: true,
+                evidence: [45; 32],
+            },
+            now,
+        )
+        .unwrap();
+    store
+        .finalize_landing("example", owner, &unchanged.idempotency_key, now)
+        .unwrap();
+    let committed = ordinary.get_landing(&observed.handle()).await.unwrap();
+    assert_eq!(committed.phase(), LandingPhase::Committed);
+    assert!(committed.candidate().unwrap().rewrites.is_empty());
+    assert!(committed.receipt().unwrap().rewrites.is_empty());
+    assert_eq!(
+        committed.receipt().unwrap().commit.key.id.0,
+        unchanged.source_head.0
+    );
+    running.stop().await;
+}
+#[tokio::test]
+async fn landing_lost_start_response_recovers_read_only_after_launch_grant_and_profile_removal() {
+    use tinytree_client::LandingPreparation;
+    use tinytree_proto::landing_v1 as l;
+    let (_directory, store, mut config, start) = landing_fixture();
+    let running = LandingRunning::start(store.clone(), config.clone(), true, None).await;
+    // Accept through the real compressed RPC but lose its response at the SDK's
+    // crash boundary. Recovery has the persisted original intent, not a handle.
+    let channel = tonic::transport::Endpoint::from_shared(format!("http://{}", running.address))
+        .unwrap()
+        .connect()
+        .await
+        .unwrap();
+    let mut raw = l::landing_client::LandingClient::new(channel)
+        .send_compressed(tonic::codec::CompressionEncoding::Zstd)
+        .accept_compressed(tonic::codec::CompressionEncoding::Zstd);
+    let mut request = Request::new(l::StartLandingRequest {
+        repository_id: "example".into(),
+        idempotency_key: start.idempotency_key.clone(),
+        source_base: start.source_base.0.to_vec(),
+        source_head: start.source_head.0.to_vec(),
+        destination: start.destination.clone(),
+        expected_generation: start.expected_generation,
+        expected_head: start.expected_head.0.to_vec(),
+        profile_name: start.profile_name.clone(),
+        expected_profile_version: start.expected_profile_version.clone(),
+    });
+    request
+        .metadata_mut()
+        .insert("authorization", format!("Bearer {TOKEN}").parse().unwrap());
+    drop(raw.start_landing(request).await.unwrap());
+    drop(raw);
+    running.stop().await;
+    config.landing.profiles[0].version = "v2".into();
+    let running = LandingRunning::start(store, config, false, None).await;
+    let client = NativeClient::connect(running.config()).await.unwrap();
+    assert_eq!(
+        client.start_landing(&start).await.unwrap_err().code(),
+        Code::PermissionDenied
+    );
+    let recovered = client.lookup_landing(&start, None).await.unwrap();
+    assert_eq!(
+        recovered.preparation(),
+        LandingPreparation::ProfileUnavailable
+    );
+    let id = recovered.handle().id();
+    assert_eq!(
+        client
+            .lookup_landing(&start, Some([99; 32]))
+            .await
+            .unwrap_err()
+            .code(),
+        Code::DataLoss
+    );
+    let mut wrong = start.clone();
+    wrong.expected_profile_version = "v2".into();
+    assert_eq!(
+        client
+            .lookup_landing(&wrong, Some(id))
+            .await
+            .unwrap_err()
+            .code(),
+        Code::DataLoss
+    );
+    assert_eq!(
+        client
+            .get_landing(&recovered.handle())
+            .await
+            .unwrap()
+            .handle()
+            .id(),
+        id
+    );
+    running.stop().await;
+}
+
+// Explicit negative wire boundary. Successful preparation is tested above using
+// the real service and Store, never this fabricated assertion producer.
+#[derive(Clone)]
+struct LandingProtocolBoundary {
+    response: Arc<std::sync::Mutex<tinytree_proto::landing_v1::LandingResponse>>,
+    delay: Arc<AtomicUsize>,
+    entered: Arc<tokio::sync::Notify>,
+}
+#[tonic::async_trait]
+impl tinytree_proto::landing_v1::landing_server::Landing for LandingProtocolBoundary {
+    async fn start_landing(
+        &self,
+        request: Request<tinytree_proto::landing_v1::StartLandingRequest>,
+    ) -> Result<Response<tinytree_proto::landing_v1::LandingResponse>, Status> {
+        assert_eq!(
+            request.metadata().get("authorization").unwrap(),
+            format!("Bearer {TOKEN}").as_str()
+        );
+        assert_eq!(request.get_ref().repository_id, "example");
+        self.entered.notify_one();
+        tokio::time::sleep(Duration::from_millis(
+            self.delay.load(Ordering::SeqCst) as u64
+        ))
+        .await;
+        Ok(Response::new(self.response.lock().unwrap().clone()))
+    }
+    async fn get_landing(
+        &self,
+        request: Request<tinytree_proto::landing_v1::GetLandingRequest>,
+    ) -> Result<Response<tinytree_proto::landing_v1::LandingResponse>, Status> {
+        assert_eq!(
+            request.metadata().get("authorization").unwrap(),
+            format!("Bearer {TOKEN}").as_str()
+        );
+        assert_eq!(request.get_ref().repository_id, "example");
+        self.entered.notify_one();
+        tokio::time::sleep(Duration::from_millis(
+            self.delay.load(Ordering::SeqCst) as u64
+        ))
+        .await;
+        Ok(Response::new(self.response.lock().unwrap().clone()))
+    }
+}
+#[tokio::test]
+async fn landing_rejects_malformed_and_overbudget_assertions_and_cancellation_releases_owners() {
+    use tinytree_model::CommitId;
+    use tinytree_proto::landing_v1 as l;
+    let input = tinytree_client::LandingStart {
+        idempotency_key: "boundary".into(),
+        source_base: CommitId([5; 32]),
+        source_head: CommitId([1; 32]),
+        expected_head: CommitId([6; 32]),
+        destination: "main".into(),
+        expected_generation: 1,
+        profile_name: "checks".into(),
+        expected_profile_version: "v1".into(),
+    };
+    let prepared = l::LandingResponse {
+        repository_id: "example".into(),
+        idempotency_key: "boundary".into(),
+        job: Some(l::LandingJob {
+            id: vec![7; 32],
+            phase: l::Phase::PreparedPendingChecks as i32,
+            roots_retained: true,
+            expires_at_seconds: 1,
+            profile_name: "checks".into(),
+            profile_version: "v1".into(),
+            preparation: l::PreparationAvailability::ProfileConfigured as i32,
+            candidate: Some(l::Candidate {
+                head: vec![2; 32],
+                root_tree: vec![4; 32],
+                rewrites: vec![l::Rewrite {
+                    old_commit: vec![1; 32],
+                    new_commit: vec![2; 32],
+                    change_id: vec![3; 16],
+                }],
+            }),
+            ..Default::default()
+        }),
+    };
+    let reply = Arc::new(std::sync::Mutex::new(prepared.clone()));
+    let delay = Arc::new(AtomicUsize::new(0));
+    let entered = Arc::new(tokio::sync::Notify::new());
+    let service = LandingProtocolBoundary {
+        response: reply.clone(),
+        delay: delay.clone(),
+        entered: entered.clone(),
+    };
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let (stop, stopped) = tokio::sync::oneshot::channel();
+    let server = tokio::spawn(async move {
+        tonic::transport::Server::builder()
+            .add_service(
+                l::landing_server::LandingServer::new(service)
+                    .send_compressed(tonic::codec::CompressionEncoding::Zstd)
+                    .accept_compressed(tonic::codec::CompressionEncoding::Zstd),
+            )
+            .serve_with_incoming_shutdown(
+                tokio_stream::wrappers::TcpListenerStream::new(listener),
+                async {
+                    let _ = stopped.await;
+                },
+            )
+            .await
+            .unwrap();
+    });
+    let config = Config {
+        endpoint: format!("http://{address}"),
+        repository_id: "example".into(),
+        token_env: Some("TINYTREE_CLIENT_TEST_TOKEN".into()),
+        ..Default::default()
+    };
+    let client = NativeClient::connect(config).await.unwrap();
+    let cases: [(&str, Box<dyn Fn(&mut l::LandingResponse)>); 16] = [
+        (
+            "unknown phase",
+            Box::new(|r| r.job.as_mut().unwrap().phase = 999),
+        ),
+        (
+            "unknown readiness",
+            Box::new(|r| r.job.as_mut().unwrap().preparation = 999),
+        ),
+        (
+            "wrong job width",
+            Box::new(|r| r.job.as_mut().unwrap().id.pop().map(|_| ()).unwrap()),
+        ),
+        (
+            "wrong profile",
+            Box::new(|r| r.job.as_mut().unwrap().profile_version = "other".into()),
+        ),
+        (
+            "wrong repository",
+            Box::new(|r| r.repository_id = "other".into()),
+        ),
+        (
+            "wrong replay key",
+            Box::new(|r| r.idempotency_key = "other".into()),
+        ),
+        (
+            "intent with candidate",
+            Box::new(|r| r.job.as_mut().unwrap().phase = l::Phase::Intent as i32),
+        ),
+        (
+            "prepared without retained roots",
+            Box::new(|r| r.job.as_mut().unwrap().roots_retained = false),
+        ),
+        (
+            "prepared without candidate",
+            Box::new(|r| r.job.as_mut().unwrap().candidate = None),
+        ),
+        (
+            "committed without receipt",
+            Box::new(|r| r.job.as_mut().unwrap().phase = l::Phase::Committed as i32),
+        ),
+        (
+            "duplicate relation",
+            Box::new(|r| {
+                let c = r.job.as_mut().unwrap().candidate.as_mut().unwrap();
+                c.rewrites.push(c.rewrites[0].clone());
+            }),
+        ),
+        (
+            "self relation",
+            Box::new(|r| {
+                let c = r.job.as_mut().unwrap().candidate.as_mut().unwrap();
+                c.rewrites[0].new_commit = c.rewrites[0].old_commit.clone();
+            }),
+        ),
+        (
+            "head contradicts relation",
+            Box::new(|r| r.job.as_mut().unwrap().candidate.as_mut().unwrap().head = vec![9; 32]),
+        ),
+        (
+            "conflicting source relation",
+            Box::new(|r| {
+                r.job
+                    .as_mut()
+                    .unwrap()
+                    .candidate
+                    .as_mut()
+                    .unwrap()
+                    .rewrites
+                    .push(l::Rewrite {
+                        old_commit: vec![1; 32],
+                        new_commit: vec![8; 32],
+                        change_id: vec![9; 16],
+                    })
+            }),
+        ),
+        (
+            "conflicting target relation",
+            Box::new(|r| {
+                r.job
+                    .as_mut()
+                    .unwrap()
+                    .candidate
+                    .as_mut()
+                    .unwrap()
+                    .rewrites
+                    .push(l::Rewrite {
+                        old_commit: vec![8; 32],
+                        new_commit: vec![2; 32],
+                        change_id: vec![9; 16],
+                    })
+            }),
+        ),
+        (
+            "conflicting change relation",
+            Box::new(|r| {
+                r.job
+                    .as_mut()
+                    .unwrap()
+                    .candidate
+                    .as_mut()
+                    .unwrap()
+                    .rewrites
+                    .push(l::Rewrite {
+                        old_commit: vec![8; 32],
+                        new_commit: vec![9; 32],
+                        change_id: vec![3; 16],
+                    })
+            }),
+        ),
+    ];
+    for (name, change) in cases {
+        let mut invalid = prepared.clone();
+        change(&mut invalid);
+        *reply.lock().unwrap() = invalid;
+        assert!(
+            matches!(
+                client.start_landing(&input).await.unwrap_err().code(),
+                Code::DataLoss | Code::ResourceExhausted
+            ),
+            "{name}"
+        );
+    }
+    let mut oversized = prepared.clone();
+    oversized
+        .job
+        .as_mut()
+        .unwrap()
+        .candidate
+        .as_mut()
+        .unwrap()
+        .rewrites = vec![
+        prepared
+            .job
+            .as_ref()
+            .unwrap()
+            .candidate
+            .as_ref()
+            .unwrap()
+            .rewrites[0]
+            .clone();
+        129
+    ];
+    *reply.lock().unwrap() = oversized;
+    assert_eq!(
+        client.start_landing(&input).await.unwrap_err().code(),
+        Code::ResourceExhausted
+    );
+    let mut unchanged = prepared.clone();
+    unchanged.job.as_mut().unwrap().candidate = Some(l::Candidate {
+        head: input.source_head.0.to_vec(),
+        root_tree: vec![4; 32],
+        rewrites: vec![],
+    });
+    *reply.lock().unwrap() = unchanged;
+    assert!(
+        client
+            .start_landing(&input)
+            .await
+            .unwrap()
+            .candidate()
+            .unwrap()
+            .rewrites
+            .is_empty(),
+        "wire filtering preserves an unchanged candidate without self evolution edges"
+    );
+    *reply.lock().unwrap() = prepared;
+    delay.store(100, Ordering::SeqCst);
+    let dropped = Arc::new(AtomicUsize::new(0));
+    let transient = client
+        .clone()
+        .with_rpc_lifetime_guard(Arc::new(LifetimeProbe(dropped.clone())));
+    let _ = futures_util::FutureExt::now_or_never(entered.notified());
+    let input_copy = input.clone();
+    let task = tokio::spawn(async move { transient.lookup_landing(&input_copy, None).await });
+    entered.notified().await;
+    assert_eq!(dropped.load(Ordering::SeqCst), 0);
+    task.abort();
+    let _ = task.await;
+    assert_released(&dropped).await;
+    let bounded = client
+        .clone()
+        .with_operation_deadline(tokio::time::Instant::now() + Duration::from_millis(30));
+    let began = std::time::Instant::now();
+    assert_eq!(
+        bounded
+            .lookup_landing(&input, None)
+            .await
+            .unwrap_err()
+            .code(),
+        Code::DeadlineExceeded
+    );
+    assert!(began.elapsed() < Duration::from_millis(250));
+    delay.store(0, Ordering::SeqCst);
+    // A following call proves the cancelled operation did not strand shared
+    // physical memory or inflight admission, independently of result ownership.
+    assert!(client.lookup_landing(&input, None).await.is_ok());
+    let _ = stop.send(());
+    server.await.unwrap();
+}
+
+// Transport-only response loss wraps the real authenticated service; it does
+// not manufacture accepted intents, candidate data or successful job responses.
+#[derive(Clone)]
+struct LandingLostReplies {
+    inner: tinytree_server::LandingGrpcService,
+    calls: Arc<AtomicUsize>,
+    losses: usize,
+}
+impl tonic::server::NamedService for LandingLostReplies {
+    const NAME: &'static str = "tinytree.landing.v1.Landing";
+}
+impl tower::Service<http::Request<tonic::body::Body>> for LandingLostReplies {
+    type Response = http::Response<tonic::body::Body>;
+    type Error = std::convert::Infallible;
+    type Future = std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<Self::Response, Self::Error>> + Send>,
+    >;
+    fn poll_ready(
+        &mut self,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<(), Self::Error>> {
+        self.inner.poll_ready(cx)
+    }
+    fn call(&mut self, request: http::Request<tonic::body::Body>) -> Self::Future {
+        let start = request.uri().path().ends_with("/StartLanding");
+        let attempt = if start {
+            self.calls.fetch_add(1, Ordering::SeqCst)
+        } else {
+            usize::MAX
+        };
+        let lose = attempt < self.losses;
+        let future = self.inner.call(request);
+        Box::pin(async move {
+            let response = future.await?;
+            if lose {
+                drop(response);
+                Ok(http::Response::builder()
+                    .header("content-type", "application/grpc")
+                    .header("grpc-status", "14")
+                    .header("grpc-message", "accepted%20response%20lost")
+                    .body(tonic::body::Body::empty())
+                    .unwrap())
+            } else {
+                Ok(response)
+            }
+        })
+    }
+}
+#[tokio::test]
+async fn landing_start_response_loss_retries_one_stable_intent_under_original_deadline() {
+    for (name, losses, deadline_ms) in [
+        ("replay accepted intent", 1, 1000),
+        ("whole retry deadline", usize::MAX, 70),
+    ] {
+        let (_directory, store, config, start) = landing_fixture();
+        let service = RepositoryService::new(
+            store.clone(),
+            config,
+            vec!["example".into()],
+            vec![
+                Principal::new("test", TOKEN, vec!["example".into()], true)
+                    .unwrap()
+                    .with_landing_profiles(vec!["checks".into()]),
+            ],
+        )
+        .unwrap();
+        service.start_landing_worker().unwrap();
+        let draining = service.clone();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let wrapper = LandingLostReplies {
+            inner: service.landing_grpc_service(),
+            calls: calls.clone(),
+            losses,
+        };
+        let (stop, stopped) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            tonic::transport::Server::builder()
+                .add_service(wrapper)
+                .serve_with_incoming_shutdown(
+                    tokio_stream::wrappers::TcpListenerStream::new(listener),
+                    async {
+                        let _ = stopped.await;
+                    },
+                )
+                .await
+                .unwrap();
+            draining.drain_landing().await;
+        });
+        let mut config = Config {
+            endpoint: format!("http://{address}"),
+            repository_id: "example".into(),
+            token_env: Some("TINYTREE_CLIENT_TEST_TOKEN".into()),
+            ..Default::default()
+        };
+        config.rpc.operation_timeout_ms = deadline_ms;
+        config.rpc.rpc_timeout_ms = 20;
+        config.rpc.retry.max_attempts = 16;
+        config.rpc.retry.initial_backoff_ms = 30;
+        config.rpc.retry.max_backoff_ms = 30;
+        let client = NativeClient::connect(config).await.unwrap();
+        let began = std::time::Instant::now();
+        let result = client.start_landing(&start).await;
+        if losses == 1 {
+            let job = result.unwrap();
+            assert!(calls.load(Ordering::SeqCst) >= 2, "{name}");
+            let replay = client.start_landing(&start).await.unwrap();
+            assert_eq!(replay.handle().id(), job.handle().id());
+            let mut conflict = start.clone();
+            conflict.expected_profile_version = "different".into();
+            assert_eq!(
+                client.start_landing(&conflict).await.unwrap_err().code(),
+                Code::AlreadyExists
+            );
+        } else {
+            assert_eq!(result.unwrap_err().code(), Code::DeadlineExceeded);
+            assert!(began.elapsed() < Duration::from_millis(250), "{name}");
+            assert!(
+                calls.load(Ordering::SeqCst) < 16,
+                "retry must not obtain a fresh operation deadline"
+            );
+        }
+        let jobs = store
+            .scan_pending_landings("example", None, Default::default())
+            .unwrap();
+        assert_eq!(
+            jobs.scanned_records, 1,
+            "{name}: retries created more than one durable intent"
+        );
+        let _ = stop.send(());
+        server.await.unwrap();
+    }
+}

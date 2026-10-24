@@ -68,6 +68,22 @@ impl Client {
             )
             .await
     }
+    pub(crate) async fn landing_unary<T: Message + Send + 'static>(
+        &mut self,
+        request: Request<T>,
+        path: &'static str,
+        limits: &crate::LandingLimits,
+    ) -> Result<Response<tinytree_proto::landing_v1::LandingResponse>, Status> {
+        self.limits.max_batch_items = limits.max_rewrites;
+        self.limits.max_metadata_bytes = limits.max_conflict_path_bytes;
+        self.decode = limits.max_response_bytes;
+        self.inner = self
+            .inner
+            .clone()
+            .max_decoding_message_size(self.decode)
+            .max_encoding_message_size(16 * 1024);
+        self.unary(request, path, Shape::LandingResponse).await
+    }
     pub(crate) async fn cloud_unary<
         T: Message + Send + 'static,
         U: Message + Default + Send + 'static,
@@ -540,6 +556,12 @@ impl Client {
 }
 #[derive(Clone, Copy)]
 pub(crate) enum Shape {
+    LandingResponse,
+    LandingJob,
+    LandingCandidate,
+    LandingRewrite,
+    LandingReceipt,
+    LandingReference,
     Search,
     SearchHit,
     PathHistory,
@@ -805,7 +827,8 @@ fn scan(
             if wire == 0
                 && matches!(
                     (shape, number),
-                    (Shape::FactAnswer, 1 | 2 | 5)
+                    (Shape::LandingJob, 3)
+                        | (Shape::FactAnswer, 1 | 2 | 5)
                         | (Shape::ChangeTarget, 2)
                         | (Shape::IdsPage | Shape::GraphPage | Shape::CanonicalPage, 6)
                         | (
@@ -833,14 +856,19 @@ fn scan(
                     }
                     charge(budget, data.len().saturating_mul(2))?;
                     let exact = match (shape, number) {
-                        (Shape::QueryScope, 2 | 8)
+                        (Shape::LandingJob, 1)
+                        | (Shape::LandingCandidate, 1 | 2)
+                        | (Shape::LandingRewrite, 1 | 2)
+                        | (Shape::LandingReceipt, 3)
+                        | (Shape::QueryScope, 2 | 8)
                         | (Shape::IdsPage | Shape::GraphPage | Shape::CanonicalPage, 1)
                         | (Shape::ScopeKey, 2)
                         | (Shape::CommitId, 1)
                         | (Shape::QueryFacts, 2)
                         | (Shape::PathHistory | Shape::Blame | Shape::Search, 1)
                         | (Shape::SearchHit, 2) => Some(32),
-                        (Shape::QueryScope, 3)
+                        (Shape::LandingRewrite, 3)
+                        | (Shape::QueryScope, 3)
                         | (Shape::IdsPage | Shape::GraphPage | Shape::CanonicalPage, 2)
                         | (Shape::ChangeId, 1)
                         | (Shape::QueryFacts, 3)
@@ -864,6 +892,12 @@ fn scan(
         }
     }
     let required = match shape {
+        Shape::LandingResponse => (1 << 1) | (1 << 2) | (1 << 3),
+        Shape::LandingJob => (1 << 1) | (1 << 2) | (1 << 4) | (1 << 5) | (1 << 6) | (1 << 10),
+        Shape::LandingCandidate => (1 << 1) | (1 << 2),
+        Shape::LandingRewrite => (1 << 1) | (1 << 2) | (1 << 3),
+        Shape::LandingReceipt => (1 << 1) | (1 << 3),
+        Shape::LandingReference => (1 << 1) | (1 << 2) | (1 << 3),
         Shape::Search => {
             (1 << 1) | (1 << 2) | (1 << 3) | (1 << 6) | (1 << 8) | (1 << 9) | (1 << 14)
         }
@@ -936,6 +970,28 @@ fn rule(shape: Shape, n: u32, l: &Limits) -> Option<(u8, Option<Shape>, usize, u
     let nested = |child| Some((2, Some(child), 1, 0));
     let repeated = |child, count, allocation| Some((2, Some(child), count, allocation));
     match (shape, n) {
+        (Shape::LandingResponse, 1) => nested(Shape::LandingJob),
+        (Shape::LandingResponse, 2 | 3) => text(128),
+        (Shape::LandingJob, 1) => text(32),
+        (Shape::LandingJob, 2 | 3 | 4 | 10) => scalar(),
+        (Shape::LandingJob, 5) => text(64),
+        (Shape::LandingJob, 6) => text(128),
+        (Shape::LandingJob, 7) => nested(Shape::LandingCandidate),
+        (Shape::LandingJob, 8) => nested(Shape::LandingReceipt),
+        (Shape::LandingJob, 9) => text(l.max_metadata_bytes),
+        (Shape::LandingCandidate, 1 | 2) => text(32),
+        (Shape::LandingCandidate, 3) | (Shape::LandingReceipt, 2) => repeated(
+            Shape::LandingRewrite,
+            l.max_batch_items,
+            std::mem::size_of::<tinytree_proto::landing_v1::Rewrite>(),
+        ),
+        (Shape::LandingRewrite, 1 | 2) => text(32),
+        (Shape::LandingRewrite, 3) => text(16),
+        (Shape::LandingReceipt, 1) => nested(Shape::LandingReference),
+        (Shape::LandingReceipt, 3) => text(32),
+        (Shape::LandingReference, 1) => text(512),
+        (Shape::LandingReference, 2) => scalar(),
+        (Shape::LandingReference, 3) => nested(Shape::Descriptor),
         (Shape::Search, 1 | 4 | 5) => text(32),
         (Shape::Search, 2) => text(16),
         (Shape::Search, 3) => nested(Shape::CommitId),
@@ -1228,5 +1284,177 @@ mod tests {
         drop(body);
         assert_eq!(drops.load(Ordering::SeqCst), 1);
         assert!(slots.try_acquire_owned().is_ok());
+    }
+}
+
+#[cfg(test)]
+mod landing_wire_tests {
+    use super::*;
+    use http_body::{Body, Frame};
+    use std::{
+        convert::Infallible,
+        pin::Pin,
+        sync::atomic::{AtomicUsize, Ordering},
+        task::{Context, Poll},
+    };
+    struct Once(Option<bytes::Bytes>);
+    impl Body for Once {
+        type Data = bytes::Bytes;
+        type Error = Infallible;
+        fn poll_frame(
+            mut self: Pin<&mut Self>,
+            _: &mut Context<'_>,
+        ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
+            Poll::Ready(self.0.take().map(|bytes| Ok(Frame::data(bytes))))
+        }
+    }
+    struct Physical {
+        drops: Arc<AtomicUsize>,
+        _permit: tokio::sync::OwnedSemaphorePermit,
+    }
+    impl Drop for Physical {
+        fn drop(&mut self) {
+            self.drops.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+    fn grpc_zstd(window_log: u8, payload: &[u8], rle: Option<usize>) -> bytes::Bytes {
+        let mut frame = vec![0x28, 0xb5, 0x2f, 0xfd, 0, (window_log - 10) << 3];
+        let size = rle.unwrap_or(payload.len());
+        let block = ((size as u32) << 3) | if rle.is_some() { 3 } else { 1 };
+        frame.extend_from_slice(&block.to_le_bytes()[..3]);
+        frame.extend_from_slice(if rle.is_some() {
+            &payload[..1]
+        } else {
+            payload
+        });
+        let mut grpc = vec![1];
+        grpc.extend_from_slice(&(frame.len() as u32).to_be_bytes());
+        grpc.extend(frame);
+        grpc.into()
+    }
+    #[tokio::test]
+    async fn landing_zstd_advertised_windows_and_ratio_keep_physical_reservation() {
+        use tinytree_proto::landing_v1 as l;
+        let valid = l::LandingResponse {
+            repository_id: "example".into(),
+            idempotency_key: "wire-shape".into(),
+            job: Some(l::LandingJob {
+                id: vec![1; 32],
+                phase: l::Phase::Intent as i32,
+                roots_retained: true,
+                expires_at_seconds: 1,
+                profile_name: "checks".into(),
+                profile_version: "v1".into(),
+                preparation: l::PreparationAvailability::ProfileConfigured as i32,
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+        .encode_to_vec();
+        for (name, log, payload, rle, accepted) in [
+            ("maximum decoder window", 27, valid.as_slice(), None, true),
+            ("over decoder window", 28, valid.as_slice(), None, false),
+            (
+                "high ratio decoded byte cap",
+                27,
+                &b"x"[..],
+                Some(128 * 1024),
+                false,
+            ),
+        ] {
+            let slots = Arc::new(tokio::sync::Semaphore::new(
+                crate::client::landing::ZSTD_WORKSPACE_BYTES,
+            ));
+            let drops = Arc::new(AtomicUsize::new(0));
+            let owner = Arc::new(Physical {
+                drops: drops.clone(),
+                _permit: slots
+                    .clone()
+                    .acquire_many_owned(crate::client::landing::ZSTD_WORKSPACE_BYTES as u32)
+                    .await
+                    .unwrap(),
+            });
+            let mut codec = BoundedCodec::<l::GetLandingRequest, l::LandingResponse>::new(
+                Shape::LandingResponse,
+                Limits::default(),
+                4096,
+            )
+            .with_owner(owner.clone());
+            let decoder = codec.decoder();
+            drop(codec);
+            drop(owner);
+            let mut stream = Streaming::new_response(
+                decoder,
+                Once(Some(grpc_zstd(log, payload, rle))),
+                http::StatusCode::OK,
+                Some(CompressionEncoding::Zstd),
+                Some(4096),
+            );
+            let result = stream.message().await;
+            assert_eq!(result.is_ok(), accepted, "{name}: {result:?}");
+            assert_eq!(
+                drops.load(Ordering::SeqCst),
+                0,
+                "{name}: decoder released owner early"
+            );
+            assert_eq!(
+                slots.available_permits(),
+                0,
+                "{name}: physical work escaped accounting"
+            );
+            drop(stream);
+            assert_eq!(drops.load(Ordering::SeqCst), 1);
+            assert_eq!(
+                slots.available_permits(),
+                crate::client::landing::ZSTD_WORKSPACE_BYTES
+            );
+        }
+    }
+    #[test]
+    fn landing_nested_rewrites_are_bounded_before_prost() {
+        use tinytree_proto::landing_v1 as l;
+        let rewrite = l::Rewrite {
+            old_commit: vec![1; 32],
+            new_commit: vec![2; 32],
+            change_id: vec![3; 16],
+        };
+        let wire = l::LandingResponse {
+            repository_id: "example".into(),
+            idempotency_key: "wire-shape".into(),
+            job: Some(l::LandingJob {
+                id: vec![1; 32],
+                phase: 2,
+                roots_retained: true,
+                expires_at_seconds: 1,
+                profile_name: "checks".into(),
+                profile_version: "v1".into(),
+                preparation: 1,
+                candidate: Some(l::Candidate {
+                    head: vec![2; 32],
+                    root_tree: vec![4; 32],
+                    rewrites: vec![rewrite; 129],
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+        .encode_to_vec();
+        let mut limits = Limits::default();
+        limits.max_batch_items = 128;
+        let mut budget = 256 * 1024;
+        let mut edges = 0;
+        assert_eq!(
+            scan(
+                &wire,
+                Shape::LandingResponse,
+                &limits,
+                &mut budget,
+                &mut edges,
+                0
+            )
+            .unwrap_err()
+            .code(),
+            tonic::Code::ResourceExhausted
+        );
     }
 }

@@ -20,11 +20,12 @@ rust_test(
     aliases = aliases(),
     crate = ":tinytree-client",
     edition = "2024",
-    deps = all_crate_deps(normal_dev = True),
+    deps = ["@crates//:http-body"] + all_crate_deps(normal_dev = True),
 )
 
 rust_test(
     name = "rpc_tests",
+    compile_data = ["//crates/tinytree-server:examples/landing.toml"],
     srcs = ["tests/rpc.rs"],
     aliases = aliases(),
     data = [
