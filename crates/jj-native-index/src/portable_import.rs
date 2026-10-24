@@ -178,12 +178,32 @@ impl NativeIndexStore {
             .snapshot
             .max_metadata_bytes
             .min(limits.max_metadata_bytes as u64);
-        let manifest = cloud::decode_manifest_v2(
-            manifest_bytes,
-            cloud::ManifestId(version.manifest_id),
-            codec,
-        )
-        .map_err(cloud_error)?;
+        // V3 adds a bounded attachment descriptor; index staging validates its
+        // framing/identity, not capture DATA or physical frontend quiescence.
+        // Only the configured provider can authorize the selected history below.
+        let manifest = match manifest_bytes.get(..10) {
+            Some(header) if &header[..8] == b"TTCLOUD\0" && header[8..] == 2u16.to_le_bytes() => {
+                cloud::decode_manifest_v2(
+                    manifest_bytes,
+                    cloud::ManifestId(version.manifest_id),
+                    codec,
+                )
+                .map_err(cloud_error)?
+            }
+            Some(header) if &header[..8] == b"TTCLOUD\0" && header[8..] == 3u16.to_le_bytes() => {
+                cloud::decode_manifest_v3(
+                    manifest_bytes,
+                    cloud::ManifestId(version.manifest_id),
+                    cloud::ManifestV3Limits {
+                        history: codec,
+                        ..Default::default()
+                    },
+                )
+                .map_err(cloud_error)?
+                .history
+            }
+            _ => return Err(Error::Corrupt),
+        };
         if manifest.recovery.workspace != version.workspace_id
             || manifest.index_roots.as_slice() != graph.roots()
         {

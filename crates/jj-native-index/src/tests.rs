@@ -3413,6 +3413,95 @@ fn portable_import_preserves_exact_cloud_baselines_without_canonical_hydration_o
             Err(Error::Corrupt)
         ));
         assert!(!malformed.exists());
+        // V3 history uses the same exact selected provider authority. This
+        // index-only fixture does not assert capture DATA validation or restore.
+        let captured = cloud::ManifestV3 {
+            history: manifest.clone(),
+            capture: cloud::CaptureDescriptor::of(b"index transport attachment"),
+        };
+        let captured_bytes = cloud::encode_manifest_v3(&captured, Default::default()).unwrap();
+        let captured_version = PortableImportVersion {
+            manifest_id: cloud::ManifestId::of(&captured_bytes).0,
+            manifest_blake3: *blake3::hash(&captured_bytes).as_bytes(),
+            manifest_size_bytes: captured_bytes.len() as u64,
+            ..version.clone()
+        };
+        for (source, _) in io.cloud_snapshots.lock().unwrap().values_mut() {
+            source.manifest_id = captured_version.manifest_id;
+            source.manifest_blake3 = captured_version.manifest_blake3;
+            source.manifest_size_bytes = captured_version.manifest_size_bytes;
+        }
+        let captured_path = directory.path().join("captured-index");
+        let captured_receipt = NativeIndexStore::import_fresh_operation_indexes(
+            &captured_path,
+            config.clone(),
+            Default::default(),
+            io.clone(),
+            observed.clone(),
+            captured_version.clone(),
+            &captured_bytes,
+            &graph,
+            Default::default(),
+            Arc::new(()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            captured_receipt.operation_indexes,
+            manifest.operation_indexes
+        );
+        let captured_source = captured_receipt
+            .store
+            .index_at_operation(&[1; 64])
+            .unwrap()
+            .checkpoint
+            .source
+            .clone();
+        let source::CheckpointSource::CloudSnapshot { pins, .. } = captured_source else {
+            panic!("captured import lost its exact source");
+        };
+        assert_eq!(pins.manifest_id, captured_version.manifest_id);
+        assert_eq!(pins.manifest_blake3, captured_version.manifest_blake3);
+        let before_rejected = io.cloud_opens.load(Ordering::SeqCst);
+        for (name, bytes, selector) in [
+            {
+                let mut bytes = captured_bytes.clone();
+                let end = bytes.len();
+                bytes[end - 8..].fill(0); // Invalid empty attachment, valid outer identity.
+                let selector = PortableImportVersion {
+                    manifest_id: cloud::ManifestId::of(&bytes).0,
+                    manifest_blake3: *blake3::hash(&bytes).as_bytes(),
+                    ..captured_version.clone()
+                };
+                ("malformed-capture-footer", bytes, selector)
+            },
+            {
+                let mut selector = captured_version.clone();
+                selector.manifest_id = version.manifest_id;
+                ("foreign-capture-manifest", captured_bytes.clone(), selector)
+            },
+        ] {
+            let rejected = directory.path().join(name);
+            assert!(matches!(
+                NativeIndexStore::import_fresh_operation_indexes(
+                    &rejected,
+                    config.clone(),
+                    Default::default(),
+                    io.clone(),
+                    observed.clone(),
+                    selector,
+                    &bytes,
+                    &graph,
+                    Default::default(),
+                    Arc::new(()),
+                )
+                .await,
+                Err(Error::Corrupt)
+            ));
+            assert!(!rejected.exists());
+        }
+        assert_eq!(io.cloud_opens.load(Ordering::SeqCst), before_rejected);
+        assert_eq!(observed.files.load(Ordering::SeqCst), 0);
         let policy = PortableImportLimits {
             max_operations: 1,
             ..Default::default()

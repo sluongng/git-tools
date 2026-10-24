@@ -52,6 +52,7 @@ struct Counters {
     metadata_rpcs: Arc<AtomicUsize>,
     graph_rpcs: Arc<AtomicUsize>,
     query_rpcs: Arc<AtomicUsize>,
+    cloud_rpcs: Arc<AtomicUsize>,
     metadata_keys: Arc<AtomicUsize>,
     metadata_requests: Arc<std::sync::Mutex<Vec<p::ObjectKey>>>,
     metadata_bytes: Arc<AtomicUsize>,
@@ -71,6 +72,7 @@ impl Counters {
             metadata_rpcs: Arc::new(AtomicUsize::new(0)),
             graph_rpcs: Arc::new(AtomicUsize::new(0)),
             query_rpcs: Arc::new(AtomicUsize::new(0)),
+            cloud_rpcs: Arc::new(AtomicUsize::new(0)),
             metadata_keys: Arc::new(AtomicUsize::new(0)),
             metadata_requests: Arc::new(std::sync::Mutex::new(Vec::new())),
             metadata_bytes: Arc::new(AtomicUsize::new(0)),
@@ -250,7 +252,14 @@ impl Server {
                 Ok(request)
             },
         );
-        let cloud = service.cloud_grpc_service();
+        let cloud_requests = counts.cloud_rpcs.clone();
+        let cloud = tonic::service::interceptor::InterceptedService::new(
+            service.cloud_grpc_service(),
+            move |request: Request<()>| {
+                cloud_requests.fetch_add(1, Ordering::SeqCst);
+                Ok(request)
+            },
+        );
         let listener = tokio::net::TcpListener::bind(bind).await.unwrap();
         let address = listener.local_addr().unwrap();
         let (stop, stopped) = tokio::sync::oneshot::channel();
@@ -5466,6 +5475,8 @@ max_metadata_bytes=4194304
 [service.cloud]
 enabled=true
 indexed_versions=true
+captured_versions=true
+max_capture_bytes=131072
 max_manifest_bytes=524288
 max_staging_leases=256
 max_inflight=2
@@ -5732,6 +5743,7 @@ max_manifest_members=1024
         &store,
         &client,
         &manifest,
+        &objects,
         head_object,
         &data,
         configuration.clone(),
@@ -6097,16 +6109,19 @@ struct QueryRotationFixture {
     bytes: Vec<u8>,
 }
 // Extend the retained-version fixture with an independent local provider. This
-// keeps its V1 residency assertions intact while exercising the V2 full chain.
+// keeps its V1 residency assertions intact while exercising V2 import and the
+// V3 retained-provider/query chain. Neither asserts a physically sealed restore.
 async fn exercise_retained_query_facade(
     store: &Store,
     publisher: &tinytree_client::NativeClient,
     recovery: &tinytree_cloud::Manifest,
+    objects: &[tinytree_cloud::VerifiedObject],
     base: &m::EncodedObject,
     fixture: &tinytree_fixture::Fixture,
     configuration: Config,
     counts: &Counters,
 ) -> QueryRotationFixture {
+    use jj_lib::object_id::ObjectId as _;
     use native_broker::{NativeQueryIo as _, query_protocol as q};
     let m::Object::Commit(mut model) = m::decode(&base.bytes, Default::default()).unwrap() else {
         panic!()
@@ -6201,10 +6216,199 @@ async fn exercise_retained_query_facade(
         })
         .await
         .unwrap();
+    // The V2 compatibility check uses a separate provider so its terminal
+    // grants cannot mask any V3 snapshot/FILE authority in the full chain.
+    {
+        let compatibility_dir = private_dir();
+        let compatibility_cache = cache(compatibility_dir.path());
+        let (direct, compatibility) = local(
+            compatibility_dir.path(),
+            compatibility_cache,
+            configuration.clone(),
+            true,
+        );
+        let v2_selector = tinytree_client::RetainedVersionSelector {
+            workspace_id: recovery.workspace,
+            generation: 2,
+            manifest_id: tinytree_client::CloudManifestId::of(&manifest_bytes),
+        };
+        assert_eq!(
+            compatibility
+                .control
+                .admit_retained_version(
+                    v2_selector,
+                    tinytree_client::CloudRawDigest::of(&manifest_bytes),
+                    Arc::new(())
+                )
+                .await
+                .unwrap()
+                .native_root_count(),
+            manifest.recovery.native_roots.len()
+        );
+        compatibility.wait_for_idle().await;
+        drop(compatibility);
+        drop(direct);
+    }
+    // Owner-declared portable capture DATA; no physically sealed restore is
+    // inferred. Every native root is independently derivable by the server.
+    let mut history = manifest.clone();
+    history.recovery.sequence = 3;
+    history.recovery.parents = vec![tinytree_cloud::ManifestId::of(&manifest_bytes)];
+    history.recovery.intent_roots.clear();
+    let mut roots = std::collections::BTreeSet::new();
+    for object in objects {
+        for id in &object.dependencies().native_commits {
+            if *id != [0; 32] {
+                roots.insert((m::Kind::Commit as u8, *id));
+            }
+        }
+    }
+    roots.insert((
+        m::Kind::Commit as u8,
+        history.recovery.working_copy.snapshot_commit,
+    ));
+    for id in &history.recovery.working_copy.tree.terms {
+        roots.insert((m::Kind::Tree as u8, id.0));
+    }
+    roots.insert((m::Kind::Commit as u8, base.descriptor.key.id.0));
+    roots.insert((m::Kind::Commit as u8, frozen.descriptor.key.id.0));
+    roots.remove(&(m::Kind::Commit as u8, [0; 32]));
+    history.recovery.native_roots = roots
+        .iter()
+        .map(|(kind, id)| m::ObjectKey {
+            kind: m::Kind::try_from(*kind).unwrap(),
+            id: m::ObjectId(*id),
+        })
+        .collect();
+    let text = |bytes: &[u8]| bytes.iter().map(|b| format!("{b:02x}")).collect::<String>();
+    let zero = text(&[0; 64]);
+    let mut operations = vec![tinytree_cloud::OperationRecord {
+        operation: zero.clone(),
+        view: zero,
+        parents: vec![],
+    }];
+    let mut blobs = Vec::new();
+    for object in objects {
+        let (kind, id) = match object.id() {
+            tinytree_cloud::ObjectId::Operation(id) => (1, id),
+            tinytree_cloud::ObjectId::View(id) => (2, id),
+        };
+        let selected = object.digest().unwrap();
+        blobs.push(tinytree_cloud::BlobRecord {
+            kind,
+            id: text(&id),
+            blake3: selected.blake3,
+            size: selected.size_bytes,
+        });
+        if let Some(op) = object.operation() {
+            operations.push(tinytree_cloud::OperationRecord {
+                operation: text(&id),
+                view: text(op.view_id.as_bytes()),
+                parents: op.parents.iter().map(|id| text(id.as_bytes())).collect(),
+            });
+        }
+    }
+    operations.sort_by(|a, b| a.operation.cmp(&b.operation));
+    let mut selected_artifacts = std::collections::BTreeMap::new();
+    for artifact in selected_index.artifacts.iter().chain(&intrinsic.artifacts) {
+        selected_artifacts.insert(artifact.descriptor.id, artifact);
+    }
+    for artifact in selected_artifacts.values() {
+        let (kind, id) = match artifact.descriptor.id {
+            tinytree_cloud::IndexArtifactId::Root(id) => (3, id.0),
+            tinytree_cloud::IndexArtifactId::Node(id) => (4, id.0),
+        };
+        blobs.push(tinytree_cloud::BlobRecord {
+            kind,
+            id: text(&id),
+            blake3: artifact.descriptor.selected.blake3,
+            size: artifact.descriptor.selected.size_bytes,
+        });
+    }
+    blobs.sort_by(|a, b| (a.kind, &a.id).cmp(&(b.kind, &b.id)));
+    let wc = &history.recovery.working_copy;
+    let capture = tinytree_cloud::CaptureData {
+        version: 1,
+        policy: tinytree_cloud::CapturePolicy::HostQuiescentV1,
+        codec: tinytree_cloud::CODEC.into(),
+        operation_heads: history
+            .recovery
+            .operation_heads
+            .iter()
+            .map(|id| text(id))
+            .collect(),
+        working_copy: tinytree_cloud::PortableWorkingCopy {
+            workspace: wc.workspace_name.clone(),
+            wc_operation: text(&wc.wc_operation),
+            snapshot_operation: text(&wc.snapshot_operation),
+            snapshot_commit: wc.snapshot_commit,
+            tree: tinytree_cloud::CaptureTree {
+                terms: wc.tree.terms.iter().map(|id| id.0).collect(),
+                labels: if wc.tree.labels.iter().all(String::is_empty) {
+                    vec![]
+                } else {
+                    wc.tree.labels.clone()
+                },
+            },
+        },
+        operations,
+        indexes: history
+            .operation_indexes
+            .iter()
+            .map(|a| tinytree_cloud::IndexRecord {
+                operation: text(&a.operation),
+                root: a.root.0,
+            })
+            .collect(),
+        blobs,
+        roots: roots
+            .into_iter()
+            .map(|(kind, id)| tinytree_cloud::CapturedRoot { kind, id })
+            .collect(),
+        remote: None,
+    };
+    let capture_bytes = tinytree_cloud::encode_capture_data(&capture, Default::default()).unwrap();
+    let captured = tinytree_cloud::ManifestV3 {
+        history,
+        capture: tinytree_cloud::CaptureDescriptor::of(&capture_bytes),
+    };
+    let captured_bytes = tinytree_cloud::encode_manifest_v3(&captured, Default::default()).unwrap();
+    let intent = tinytree_client::CloudCapturedPublishIntent::new(
+        tinytree_client::CloudPublishIntent {
+            workspace_id: recovery.workspace,
+            expected_generation: 2,
+            idempotency_key: "selected-captured-query-version".into(),
+            manifest: captured_bytes.clone(),
+            staging_leases: vec![],
+        },
+        capture_bytes,
+    )
+    .unwrap();
+    let publication = publisher
+        .cloud_publish_captured_version(&intent)
+        .await
+        .unwrap();
+    assert_eq!(publication.workspace.generation, 3);
+    // Reconcile the immutable intent without selecting a different generation.
+    assert_eq!(
+        publisher
+            .cloud_publish_captured_version(&intent)
+            .await
+            .unwrap(),
+        publication
+    );
+    let selector = tinytree_client::RetainedVersionSelector {
+        workspace_id: recovery.workspace,
+        generation: 3,
+        manifest_id: tinytree_client::CloudManifestId::of(&captured_bytes),
+    };
+    let selected = tinytree_client::CloudRawDigest::of(&captured_bytes);
+    let manifest = captured.history;
+    let manifest_bytes = captured_bytes;
     let source = native_broker::CloudQuerySource {
         provider_identity: [41; 32],
         workspace_id: recovery.workspace,
-        generation: 2,
+        generation: 3,
         manifest_id: tinytree_client::CloudManifestId::of(&manifest_bytes).0,
         manifest_blake3: *blake3::hash(&manifest_bytes).as_bytes(),
         manifest_size_bytes: manifest_bytes.len() as u64,
@@ -6218,6 +6422,24 @@ async fn exercise_retained_query_facade(
         shared.clone(),
         configuration.clone(),
         true,
+    );
+    let mut wrong = selected;
+    wrong.blake3[0] ^= 1;
+    assert!(
+        remote
+            .control
+            .admit_retained_version(selector, wrong, Arc::new(()))
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        remote
+            .control
+            .admit_retained_version(selector, selected, Arc::new(()))
+            .await
+            .unwrap()
+            .native_root_count(),
+        manifest.recovery.native_roots.len()
     );
     assert_eq!(
         std::fs::read(directory.path().join("ledger/admission.format")).unwrap(),
@@ -6830,6 +7052,45 @@ async fn exercise_retained_query_facade(
     remote.wait_for_idle().await;
     drop(remote);
     drop(direct);
+    // Move live references independently and collect expired staging leases.
+    // Refetch must reauthorize through the exact V3 selector, not the current
+    // ref. Older retained history also pins this shared closure, so this is an
+    // authority/refetch check, not an exclusive V3 retention-availability oracle.
+    store
+        .publish(
+            "example",
+            &tinytree_store::PublishRequest {
+                idempotency_key: "captured-ref-initial".into(),
+                reference_name: "main".into(),
+                expected_generation: 0,
+                new_commit: Some(m::CommitId(base.descriptor.key.id.0)),
+                staging_leases: vec![],
+            },
+            1,
+        )
+        .unwrap();
+    store
+        .publish(
+            "example",
+            &tinytree_store::PublishRequest {
+                idempotency_key: "captured-ref-advanced".into(),
+                reference_name: "main".into(),
+                expected_generation: 1,
+                new_commit: Some(m::CommitId(unselected.descriptor.key.id.0)),
+                staging_leases: vec![],
+            },
+            2,
+        )
+        .unwrap();
+    store.gc("example", i64::MAX / 4).unwrap();
+    assert_eq!(
+        store.references("example", &["main".into()]).unwrap()[0].commit,
+        Some(unselected.descriptor)
+    );
+    assert_eq!(
+        store.descriptor("example", frozen.descriptor.key).unwrap(),
+        Some(frozen.descriptor)
+    );
     // Use the supported local store collector to evict fetched payloads while
     // keeping the separate provenance ledger. No fabricated body/path edits.
     {
@@ -6874,6 +7135,7 @@ async fn exercise_retained_query_facade(
             .unwrap()
             .is_none()
     );
+    let cloud_before_metadata = counts.cloud_rpcs.load(Ordering::SeqCst);
     assert_eq!(
         reopened
             .io
@@ -6883,6 +7145,10 @@ async fn exercise_retained_query_facade(
             .descriptor(),
         frozen.descriptor,
         "deep commit refetch uses retained snapshot membership after all query scopes close"
+    );
+    assert!(
+        counts.cloud_rpcs.load(Ordering::SeqCst) > cloud_before_metadata,
+        "evicted canonical metadata must reauthorize the retained V3 source"
     );
     assert_eq!(
         reopened
@@ -6894,7 +7160,12 @@ async fn exercise_retained_query_facade(
             .key,
         tree_key
     );
+    let cloud_before_file = counts.cloud_rpcs.load(Ordering::SeqCst);
     assert_eq!(bytes(reopened.io.as_ref(), file).await, expected_file);
+    assert!(
+        counts.cloud_rpcs.load(Ordering::SeqCst) > cloud_before_file,
+        "empty CAS must trigger fresh V3 selected-version FILE delivery"
+    );
     assert_eq!(counts.holds.load(Ordering::SeqCst), 0);
     assert_eq!(counts.metadata_rpcs.load(Ordering::SeqCst), 0);
     assert_eq!(counts.graph_rpcs.load(Ordering::SeqCst), 0);
@@ -6923,6 +7194,14 @@ async fn exercise_retained_query_facade(
         counts.query_rpcs.load(Ordering::SeqCst),
         before,
         "stale local provenance must fail before upstream query attempts"
+    );
+    assert!(
+        other
+            .control
+            .admit_retained_version(selector, selected, Arc::new(()))
+            .await
+            .is_err(),
+        "V3 selectors do not transfer private owner authority"
     );
     assert!(
         other

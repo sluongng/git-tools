@@ -113,6 +113,26 @@ impl RemoteRepositoryControl {
                             );
                             value.recovery.native_roots
                         }
+                        3 => {
+                            let mut captured = tinytree_cloud::ManifestV3Limits {
+                                history: limits,
+                                ..Default::default()
+                            };
+                            captured.capture.max_bytes =
+                                inner.config.remote.cloud.max_capture_bytes;
+                            let value = tinytree_cloud::decode_manifest_v3(
+                                bytes,
+                                tinytree_cloud::ManifestId(selector.manifest_id.0),
+                                captured,
+                            )?;
+                            ensure!(
+                                tinytree_cloud::encode_manifest_v3(&value, captured)? == bytes,
+                                "cloud manifest is not canonical"
+                            );
+                            // Declared capture policy does not prove a live
+                            // mount, restore completeness or index installation.
+                            value.history.recovery.native_roots
+                        }
                         _ => anyhow::bail!("unsupported canonical cloud manifest version"),
                     };
                     inner.ledger.install_cloud_authority(&held, &roots)
