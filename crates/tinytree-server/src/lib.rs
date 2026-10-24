@@ -3,6 +3,11 @@
 //! Authorization, bounded streaming and durable store publication are distinct
 //! layers. The listener helpers enforce safe-local or authenticated TLS access;
 //! callers assembling their own tonic transport must preserve that boundary.
+// Logical per-request allowance for the pinned server Zstd decoder: its
+// default 128 MiB window plus decoder workspace and allocation headroom.
+// This is admission accounting, not an eager allocation or an RSS guarantee.
+pub(crate) const SERVER_CODEC_MEMORY_BYTES: usize = 256 * 1024 * 1024;
+
 mod auth;
 mod body_deadline;
 pub use body_deadline::DeadlineLayer;
@@ -396,6 +401,19 @@ impl Drop for UnixSocketGuard {
 #[cfg(test)]
 mod tests {
     use super::*;
+    // Unknown content size is essential: known-size frames can avoid the
+    // streaming decoder window allocation. One final raw block carries payload.
+    pub(crate) fn zstd_window_frame(payload: &[u8], window_log: u8) -> Vec<u8> {
+        let mut zstd = vec![0x28, 0xb5, 0x2f, 0xfd, 0, (window_log - 10) << 3];
+        let block = ((payload.len() as u32) << 3) | 1;
+        zstd.extend_from_slice(&block.to_le_bytes()[..3]);
+        zstd.extend_from_slice(payload);
+        let mut grpc = vec![1];
+        grpc.extend_from_slice(&(zstd.len() as u32).to_be_bytes());
+        grpc.extend(zstd);
+        grpc
+    }
+
     #[test]
     fn config_rejects_unsafe_transport_and_unbounded_limits() {
         let mut config = Config::default();
@@ -417,6 +435,26 @@ mod tests {
             private_key: "key.pem".into(),
         });
         assert!(config.validate().is_ok());
+        // Even tiny protobuf requests need the codec workspace. Discover the
+        // public admission boundary and reject a pool one byte below it.
+        let default_query_pool = config.service.query.max_request_memory_bytes;
+        let (mut low, mut high) = (256 * 1024 * 1024, default_query_pool);
+        config.service.query.max_request_memory_bytes = low;
+        assert!(config.validate().is_err());
+        while low < high {
+            let midpoint = low + (high - low) / 2;
+            config.service.query.max_request_memory_bytes = midpoint;
+            if config.validate().is_ok() {
+                high = midpoint;
+            } else {
+                low = midpoint + 1;
+            }
+        }
+        config.service.query.max_request_memory_bytes = low - 1;
+        assert!(config.validate().is_err());
+        config.service.query.max_request_memory_bytes = low;
+        assert!(config.validate().is_ok());
+        config.service.query.max_request_memory_bytes = default_query_pool;
         config.service.query.index_rebuild_generation = 1_000_000_001;
         assert!(config.validate().is_err());
         config.service.query.index_rebuild_generation = 0;
@@ -450,7 +488,7 @@ mod tests {
         config.service.cloud.max_buffered_bytes = low + 1;
         config.service.cloud.indexed_versions = true;
         assert!(config.validate().is_err());
-        config.service.cloud.max_buffered_bytes = 1024 * 1024 * 1024;
+        config.service.cloud.max_buffered_bytes = 1280 * 1024 * 1024;
         assert!(config.validate().is_ok());
         // Cloud OP/VIEW limits do not bound native canonical metadata. A wider
         // native model requires its own proof/read reservation under this pool.

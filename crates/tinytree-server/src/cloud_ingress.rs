@@ -284,6 +284,54 @@ mod tests {
             assert_eq!(polls.load(Ordering::SeqCst), 0);
         }
     }
+    async fn response_status(mut response: http::Response<Body>) -> String {
+        if let Some(status) = response.headers().get("grpc-status") {
+            return status.to_str().unwrap().to_owned();
+        }
+        loop {
+            let frame = poll_fn(|cx| Pin::new(response.body_mut()).poll_frame(cx))
+                .await
+                .expect("missing grpc status")
+                .unwrap();
+            if let Ok(trailers) = frame.into_trailers() {
+                if let Some(status) = trailers.get("grpc-status") {
+                    return status.to_str().unwrap().to_owned();
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn unknown_size_zstd_window_is_bounded_by_generated_cloud_decoder() {
+        let directory = tempfile::tempdir().unwrap();
+        let service = service(directory.path());
+        let payload = p::GetWorkspaceRequest {
+            repository_id: "example".into(),
+            workspace_id: vec![1; 32],
+        }
+        .encode_to_vec();
+        for (window, accepted) in [(27, true), (28, false)] {
+            let (mut request, _) = request(
+                "GetWorkspace",
+                Some(WRITER),
+                crate::tests::zstd_window_frame(&payload, window),
+            );
+            request
+                .headers_mut()
+                .insert("grpc-encoding", "zstd".parse().unwrap());
+            let response = service.cloud_grpc_service().oneshot(request).await.unwrap();
+            let status = response_status(response).await;
+            if accepted {
+                assert_eq!(
+                    status, "0",
+                    "accepted decoder reaches the empty-workspace lookup"
+                );
+            } else {
+                assert_ne!(status, "0");
+            }
+        }
+    }
+
     #[tokio::test]
     async fn cloud_compressed_frame_declaration_is_bounded_before_protobuf_decode() {
         let directory = tempfile::tempdir().unwrap();

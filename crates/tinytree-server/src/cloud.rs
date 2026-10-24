@@ -139,6 +139,7 @@ impl CloudConfig {
         .try_fold(0u64, |maximum, (method, store)| {
             let bytes = (self.wire_limit(method) as u64)
                 .checked_mul(128)
+                .and_then(|n| n.checked_add(crate::SERVER_CODEC_MEMORY_BYTES as u64))
                 .and_then(|n| n.checked_add(store))
                 .ok_or(ConfigError("private workspace memory bound"))?;
             Ok::<_, ConfigError>(maximum.max(bytes))
@@ -283,6 +284,7 @@ impl CloudHost {
         };
         let bytes = wire
             .checked_mul(128)
+            .and_then(|n| n.checked_add(crate::SERVER_CODEC_MEMORY_BYTES as u64))
             .and_then(|n| n.checked_add(store))
             .ok_or_else(|| Status::resource_exhausted("private workspace memory bound"))?;
         let permits =

@@ -26,7 +26,8 @@ max_manifest_bytes = 524288
 max_staging_leases = 256
 max_inflight = 2
 max_inflight_per_repository = 1
-max_buffered_bytes = 1073741824
+# Includes decoder workspace and the optional indexed-version read profile.
+max_buffered_bytes = 1342177280
 
 # Cloud validation scans are bounded and retain all published versions.
 # New promises are rejected when this profile fills; history is not evicted.

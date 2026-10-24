@@ -156,7 +156,7 @@ impl Default for QueryConfig {
             max_roots: 64,
             max_request_bytes: 256 * 1024,
             max_inflight: 2,
-            max_request_memory_bytes: 256 * 1024 * 1024,
+            max_request_memory_bytes: 1024 * 1024 * 1024,
             max_facts: 64,
             max_input_ids: 1024,
             max_result_ids: 16_384,
@@ -218,6 +218,7 @@ impl QueryConfig {
         request_bytes
             .min(self.max_request_bytes)
             .saturating_mul(128)
+            .saturating_add(crate::SERVER_CODEC_MEMORY_BYTES)
             .saturating_add(self.max_frontier.saturating_mul(256))
             .saturating_add(self.max_response_bytes.saturating_mul(4))
             .saturating_add(self.max_index_record_bytes.saturating_mul(4))

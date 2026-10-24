@@ -274,6 +274,47 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn unknown_size_zstd_window_is_bounded_by_generated_query_decoder() {
+        let temporary = tempfile::tempdir().unwrap();
+        let index =
+            tinytree_index::Index::open(temporary.path().join("index"), &Default::default())
+                .unwrap();
+        let repository = repository(&temporary.path().join("objects"))
+            .with_query_index(index)
+            .unwrap();
+        for (window, accepted) in [(27, true), (28, false)] {
+            let (mut request, polls) = request(true);
+            let payload = q::QueryFactsRequest {
+                scope: Some(q::ScopeKey {
+                    repository_id: "example".into(),
+                    handle: vec![0; 32],
+                }),
+                facts: vec![],
+            }
+            .encode_to_vec();
+            *request.body_mut() = Body::new(CountedBody {
+                bytes: Some(crate::tests::zstd_window_frame(&payload, window).into()),
+                polls,
+            });
+            request
+                .headers_mut()
+                .insert("grpc-encoding", "zstd".parse().unwrap());
+            let response = repository
+                .query_grpc_service()
+                .oneshot(request)
+                .await
+                .unwrap();
+            let status = response.headers().get("grpc-status").unwrap();
+            if accepted {
+                assert_eq!(status, "9", "accepted decoder reaches missing-scope lookup");
+            } else {
+                assert_ne!(status, "9");
+                assert_ne!(status, "0");
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn shared_admission_precedes_decoding_and_is_reused_by_handler() {
         let temporary = tempfile::tempdir().unwrap();
         let index =
@@ -308,6 +349,49 @@ mod tests {
                 .is_ok()
         );
     }
+    #[tokio::test]
+    async fn default_pool_preserves_two_complete_history_reservations() {
+        let temporary = tempfile::tempdir().unwrap();
+        let index =
+            tinytree_index::Index::open(temporary.path().join("index"), &Default::default())
+                .unwrap();
+        let store =
+            tinytree_store::Store::open(temporary.path().join("objects"), Default::default())
+                .unwrap();
+        store.create_repository("example").unwrap();
+        let repository = RepositoryService::new(
+            store,
+            ServiceConfig::default(),
+            vec!["example".into()],
+            vec![],
+        )
+        .unwrap()
+        .with_query_index(index)
+        .unwrap();
+        let host = repository.query_host().unwrap();
+        let first = host
+            .admit_history(tokio::time::Instant::now() + Duration::from_secs(1))
+            .await
+            .unwrap();
+        let second = host
+            .admit_history(tokio::time::Instant::now() + Duration::from_secs(1))
+            .await
+            .unwrap();
+        assert!(first.has_history_memory() && second.has_history_memory());
+        let blocked = host
+            .admit_history(tokio::time::Instant::now() + Duration::from_millis(10))
+            .await
+            .err()
+            .unwrap();
+        assert_eq!(blocked.code(), tonic::Code::DeadlineExceeded);
+        drop(first);
+        assert!(
+            host.admit_history(tokio::time::Instant::now() + Duration::from_secs(1),)
+                .await
+                .is_ok()
+        );
+    }
+
     #[tokio::test]
     async fn history_buffers_are_admitted_before_decoding_without_taxing_graph_calls() {
         let temporary = tempfile::tempdir().unwrap();
