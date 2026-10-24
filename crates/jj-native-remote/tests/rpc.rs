@@ -5702,7 +5702,7 @@ max_manifest_bytes=524288
 max_staging_leases=256
 max_inflight=2
 max_inflight_per_repository=1
-max_buffered_bytes=1073741824
+max_buffered_bytes=1342177280
 [store]
 max_retention_validation_records=1024
 max_retention_validation_bytes=2097152
