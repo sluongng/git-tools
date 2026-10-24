@@ -19,6 +19,42 @@ pub(crate) fn handle(bytes: &[u8]) -> Result<[u8; 32], Status> {
         .try_into()
         .map_err(|_| Status::invalid_argument("native query handle must be 32 bytes"))
 }
+pub(crate) fn validate_scope_source(
+    scope: &QueryScope,
+    expected: Option<[u8; 32]>,
+) -> Result<(), Status> {
+    if scope.cloud_source_digest != expected
+        || (expected.is_some() && scope.query_identity_version != 2)
+    {
+        return Err(Status::data_loss(
+            "native cloud query source negotiation failed",
+        ));
+    }
+    Ok(())
+}
+fn cloud_source(value: p::NativeCloudQuerySource, cap: usize) -> Result<CloudQuerySource, Status> {
+    if value.index_root_ids.len() > 4096 || value.expected_anchors.len() > 4096 {
+        return Err(Status::resource_exhausted(
+            "native cloud query source count exceeded",
+        ));
+    }
+    let source = CloudQuerySource {
+        provider_identity: handle(&value.provider_identity)?,
+        workspace_id: handle(&value.workspace_id)?,
+        generation: value.generation,
+        manifest_id: handle(&value.manifest_id)?,
+        manifest_blake3: handle(&value.manifest_blake3)?,
+        manifest_size_bytes: value.manifest_size_bytes,
+        index_root_ids: value
+            .index_root_ids
+            .into_iter()
+            .map(|id| handle(&id))
+            .collect::<Result<_, _>>()?,
+        expected_anchors: commits(value.expected_anchors)?,
+    };
+    source.validate(cap)?;
+    Ok(source)
+}
 fn commits(values: Vec<Vec<u8>>) -> Result<Vec<tinytree_model::CommitId>, Status> {
     values
         .into_iter()
@@ -305,6 +341,54 @@ impl p::query_io_server::QueryIo for BrokerService {
             1024,
         )
     }
+    async fn open_cloud_scope(
+        &self,
+        request: Request<p::QueryOpenCloudScopeRequest>,
+    ) -> Result<Response<p::QueryScopeReply>, Status> {
+        let (i, w) = input(request, self.query_limit())?;
+        self.authorize_command(&i.store_id, &w)?;
+        let source = cloud_source(
+            i.source
+                .ok_or_else(|| Status::invalid_argument("missing native cloud query source"))?,
+            self.query_limit(),
+        )?;
+        if self.describe_provider(&i.store_id)?.identity != source.provider_identity {
+            return Err(Status::failed_precondition(
+                "native cloud query provider identity changed",
+            ));
+        }
+        overlay_bytes(&i.overlay, self.query_limit())?;
+        let expected = source.digest();
+        let value = self
+            .query_provider(&i.store_id)?
+            .open_cloud_scope(
+                OpenCloudQueryScope {
+                    source,
+                    overlay: i.overlay,
+                    replay_key: handle(&i.replay_key)?,
+                },
+                w.clone(),
+            )
+            .await
+            .map_err(crate::query::status)?;
+        validate_scope_source(&value.value, Some(expected))?;
+        reply(
+            QueryReply {
+                value: p::QueryScopeReply {
+                    handle: value.value.handle.to_vec(),
+                    expires_at_unix_seconds: value.value.expires_at_unix_seconds,
+                    query_identity_version: value.value.query_identity_version,
+                    cloud_source_digest: value
+                        .value
+                        .cloud_source_digest
+                        .map(|digest| digest.to_vec()),
+                },
+                owner: value.owner,
+            },
+            w,
+            self.query_limit(),
+        )
+    }
     async fn open_scope(
         &self,
         request: Request<p::QueryOpenScopeRequest>,
@@ -326,12 +410,14 @@ impl p::query_io_server::QueryIo for BrokerService {
             )
             .await
             .map_err(crate::query::status)?;
+        validate_scope_source(&v.value, None)?;
         reply(
             QueryReply {
                 value: p::QueryScopeReply {
                     handle: v.value.handle.to_vec(),
                     expires_at_unix_seconds: v.value.expires_at_unix_seconds,
                     query_identity_version: v.value.query_identity_version,
+                    cloud_source_digest: v.value.cloud_source_digest.map(|digest| digest.to_vec()),
                 },
                 owner: v.owner,
             },
@@ -345,11 +431,17 @@ impl p::query_io_server::QueryIo for BrokerService {
     ) -> Result<Response<p::QueryScopeReply>, Status> {
         let (i, w) = input(request, self.query_limit())?;
         self.authorize_command(&i.store_id, &w)?;
+        let expected = i
+            .expected_cloud_source_digest
+            .as_deref()
+            .map(handle)
+            .transpose()?;
         let v = self
             .query_provider(&i.store_id)?
             .fork_scope(
                 ForkQueryScope {
                     parent: handle(&i.parent)?,
+                    expected_cloud_source_digest: expected,
                     overlay: i.overlay,
                     replay_key: handle(&i.replay_key)?,
                 },
@@ -357,12 +449,14 @@ impl p::query_io_server::QueryIo for BrokerService {
             )
             .await
             .map_err(crate::query::status)?;
+        validate_scope_source(&v.value, expected)?;
         reply(
             QueryReply {
                 value: p::QueryScopeReply {
                     handle: v.value.handle.to_vec(),
                     expires_at_unix_seconds: v.value.expires_at_unix_seconds,
                     query_identity_version: v.value.query_identity_version,
+                    cloud_source_digest: v.value.cloud_source_digest.map(|digest| digest.to_vec()),
                 },
                 owner: v.owner,
             },
@@ -664,6 +758,7 @@ impl p::query_io_server::QueryIo for BrokerService {
 pub(crate) struct GuardedQuery {
     service: BrokerService,
     provider: Arc<dyn NativeQueryIo>,
+    alias: String,
 }
 impl std::fmt::Debug for GuardedQuery {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -671,8 +766,16 @@ impl std::fmt::Debug for GuardedQuery {
     }
 }
 impl GuardedQuery {
-    pub(crate) fn new(service: BrokerService, provider: Arc<dyn NativeQueryIo>) -> Self {
-        Self { service, provider }
+    pub(crate) fn new(
+        service: BrokerService,
+        provider: Arc<dyn NativeQueryIo>,
+        alias: String,
+    ) -> Self {
+        Self {
+            service,
+            provider,
+            alias,
+        }
     }
     async fn run<T: Send + 'static, F, Fut>(
         &self,
@@ -728,7 +831,7 @@ message_size!(
 );
 impl WireSize for QueryScope {
     fn wire_size(&self) -> usize {
-        64
+        128
     }
 }
 impl WireSize for QueryHandle {
@@ -758,6 +861,33 @@ impl NativeQueryIo for GuardedQuery {
     fn resources(&self) -> QueryResources {
         self.provider.resources()
     }
+    async fn open_cloud_scope(
+        &self,
+        i: OpenCloudQueryScope,
+        o: QueryOwner,
+    ) -> Result<QueryReply<QueryScope>, Status> {
+        let cap = self.service.query_limit();
+        bounded_input(
+            i.source
+                .validate(cap)?
+                .saturating_add(overlay_bytes(&i.overlay, cap)?)
+                .saturating_add(128),
+            cap,
+        )?;
+        if self.service.describe_provider(&self.alias)?.identity != i.source.provider_identity {
+            return Err(Status::failed_precondition(
+                "native cloud query provider identity changed",
+            ));
+        }
+        let expected = i.source.digest();
+        let reply = self
+            .run(o, move |provider, owner| async move {
+                provider.open_cloud_scope(i, owner).await
+            })
+            .await?;
+        validate_scope_source(&reply.value, Some(expected))?;
+        Ok(reply)
+    }
     async fn open_scope(
         &self,
         i: OpenQueryScope,
@@ -769,8 +899,11 @@ impl NativeQueryIo for GuardedQuery {
                 .saturating_add(128),
             self.service.query_limit(),
         )?;
-        self.run(o, move |p, o| async move { p.open_scope(i, o).await })
-            .await
+        let reply = self
+            .run(o, move |p, o| async move { p.open_scope(i, o).await })
+            .await?;
+        validate_scope_source(&reply.value, None)?;
+        Ok(reply)
     }
     async fn fork_scope(
         &self,
@@ -781,8 +914,12 @@ impl NativeQueryIo for GuardedQuery {
             overlay_bytes(&i.overlay, self.service.query_limit())?.saturating_add(128),
             self.service.query_limit(),
         )?;
-        self.run(o, move |p, o| async move { p.fork_scope(i, o).await })
-            .await
+        let expected = i.expected_cloud_source_digest;
+        let reply = self
+            .run(o, move |p, o| async move { p.fork_scope(i, o).await })
+            .await?;
+        validate_scope_source(&reply.value, expected)?;
+        Ok(reply)
     }
     async fn facts(
         &self,

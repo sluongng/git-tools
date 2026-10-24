@@ -194,6 +194,7 @@ impl Registry {
             .get(&handle)
             .context("native query scope unavailable")?;
         let value = QueryScope {
+            cloud_source_digest: None,
             handle,
             expires_at_unix_seconds: scope.expires,
             query_identity_version: scope.query_identity_version,
@@ -712,6 +713,7 @@ impl NativeQueryIo for RemoteQueryIo {
                 let scope = registry.scope(handle)?;
                 return Ok(QueryReply {
                     value: QueryScope {
+                        cloud_source_digest: None,
                         handle,
                         expires_at_unix_seconds: scope.checked.expires_at_unix_seconds(),
                         query_identity_version: scope.checked.query_identity_version(),
@@ -789,6 +791,7 @@ impl NativeQueryIo for RemoteQueryIo {
                     );
                     Ok(QueryReply {
                         value: QueryScope {
+                            cloud_source_digest: None,
                             handle,
                             expires_at_unix_seconds: expires,
                             query_identity_version: scope.checked.query_identity_version(),
@@ -817,6 +820,11 @@ impl NativeQueryIo for RemoteQueryIo {
         input: ForkQueryScope,
         owner: QueryOwner,
     ) -> std::result::Result<QueryReply<QueryScope>, tonic::Status> {
+        if input.expected_cloud_source_digest.is_some() {
+            return Err(tonic::Status::unimplemented(
+                "native retained query forks unsupported",
+            ));
+        }
         self.run(owner, move |this, operation| async move {
             this.input_bounds(&[], &input.overlay)?;
             let overlay_hash = scope_fingerprint(&[], &input.overlay);
@@ -827,6 +835,7 @@ impl NativeQueryIo for RemoteQueryIo {
                 let scope = registry.scope(handle)?;
                 return Ok(QueryReply {
                     value: QueryScope {
+                        cloud_source_digest: None,
                         handle,
                         expires_at_unix_seconds: scope.checked.expires_at_unix_seconds(),
                         query_identity_version: scope.checked.query_identity_version(),
@@ -906,6 +915,7 @@ impl NativeQueryIo for RemoteQueryIo {
                     );
                     Ok(QueryReply {
                         value: QueryScope {
+                            cloud_source_digest: None,
                             handle,
                             expires_at_unix_seconds: expires,
                             query_identity_version: scope.checked.query_identity_version(),

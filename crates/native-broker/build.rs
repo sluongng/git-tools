@@ -15,6 +15,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .build_server(true)
         .extern_path(".tinytree.query.v1", "::tinytree_proto::query_v1")
         .extern_path(".tinytree.v1", "::tinytree_proto::v1")
+        .extern_path(".tinytree.cloud.v1", "::tinytree_proto::cloud_v1")
         .compile_with_config(
             prost,
             &[std::path::Path::new(

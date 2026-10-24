@@ -379,6 +379,7 @@ impl BrokerService {
         Ok(Arc::new(crate::query_service::GuardedQuery::new(
             self.clone(),
             self.query_provider(id)?,
+            id.to_owned(),
         )))
     }
     fn control(&self, id: &str) -> Result<Arc<dyn crate::NativeRepositoryControl>, Status> {

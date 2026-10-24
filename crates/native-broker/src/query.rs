@@ -51,6 +51,8 @@ pub struct QueryScope {
     pub expires_at_unix_seconds: i64,
     /// 1 keeps legacy replay history; 2 binds query identities to this handle.
     pub query_identity_version: u32,
+    /// Exact local retained-source echo. Absent for ordinary scopes.
+    pub cloud_source_digest: Option<[u8; 32]>,
 }
 impl QueryScope {
     pub fn bound_query_id(&self, nonce: [u8; 16]) -> Result<[u8; 32], Status> {
@@ -95,6 +97,74 @@ pub struct QueryHandle {
     pub handle: [u8; 32],
     pub expires_at_unix_seconds: i64,
 }
+/// Immutable selection pins, not an upstream authorization credential. Index
+/// roots and expected anchors must be nonempty, strictly sorted and unique.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CloudQuerySource {
+    pub provider_identity: [u8; 32],
+    pub workspace_id: [u8; 32],
+    pub generation: u64,
+    pub manifest_id: [u8; 32],
+    pub manifest_blake3: [u8; 32],
+    pub manifest_size_bytes: u64,
+    pub index_root_ids: Vec<[u8; 32]>,
+    pub expected_anchors: Vec<CommitId>,
+}
+impl CloudQuerySource {
+    /// Public selection provenance, never an authorization or completeness proof.
+    pub fn digest(&self) -> [u8; 32] {
+        let mut hash = blake3::Hasher::new();
+        hash.update(b"native-broker-cloud-query-source-v1\0");
+        hash.update(&self.provider_identity);
+        hash.update(&self.workspace_id);
+        hash.update(&self.generation.to_be_bytes());
+        hash.update(&self.manifest_id);
+        hash.update(&self.manifest_blake3);
+        hash.update(&self.manifest_size_bytes.to_be_bytes());
+        hash.update(&(self.index_root_ids.len() as u64).to_be_bytes());
+        for id in &self.index_root_ids {
+            hash.update(id);
+        }
+        hash.update(&(self.expected_anchors.len() as u64).to_be_bytes());
+        for id in &self.expected_anchors {
+            hash.update(&id.0);
+        }
+        *hash.finalize().as_bytes()
+    }
+    pub(crate) fn validate(&self, cap: usize) -> Result<usize, Status> {
+        if self.index_root_ids.len() > 4096 || self.expected_anchors.len() > 4096 {
+            return Err(Status::resource_exhausted(
+                "native cloud query source count exceeded",
+            ));
+        }
+        if self.provider_identity == [0; 32]
+            || self.generation == 0
+            || self.manifest_size_bytes == 0
+            || self.index_root_ids.is_empty()
+            || self.expected_anchors.is_empty()
+            || !self.index_root_ids.windows(2).all(|ids| ids[0] < ids[1])
+            || !self.expected_anchors.windows(2).all(|ids| ids[0] < ids[1])
+        {
+            return Err(Status::invalid_argument(
+                "invalid native cloud query source",
+            ));
+        }
+        let bytes = self
+            .index_root_ids
+            .len()
+            .saturating_add(self.expected_anchors.len())
+            .saturating_mul(34)
+            .saturating_add(256);
+        crate::query_service::bounded_input(bytes, cap)?;
+        Ok(bytes)
+    }
+}
+#[derive(Clone, Debug)]
+pub struct OpenCloudQueryScope {
+    pub source: CloudQuerySource,
+    pub overlay: Vec<Vec<u8>>,
+    pub replay_key: [u8; 32],
+}
 #[derive(Clone, Debug)]
 pub struct OpenQueryScope {
     pub roots: Vec<CommitId>,
@@ -105,6 +175,8 @@ pub struct OpenQueryScope {
 #[derive(Clone, Debug)]
 pub struct ForkQueryScope {
     pub parent: [u8; 32],
+    /// Must match the parent's immutable source, including on replay.
+    pub expected_cloud_source_digest: Option<[u8; 32]>,
     pub overlay: Vec<Vec<u8>>,
     pub replay_key: [u8; 32],
 }
@@ -134,9 +206,23 @@ pub struct QueryPage {
 /// `begin` prepares a local session; only its first page establishes the upstream
 /// evaluator. Closing its scope before that first page may reject evaluation.
 /// Established unclosed queries retain their page replay until close/expiry.
+/// Cloud scopes require their exact source digest and v2 identities. Forks must
+/// validate the parent's expected source even on replay; no source replacement
+/// or ordinary-root fallback is permitted.
 #[async_trait]
 pub trait NativeQueryIo: Send + Sync + std::fmt::Debug {
     fn resources(&self) -> QueryResources;
+    /// Explicit retained snapshot support; unsupported providers must not
+    /// reinterpret this request as ordinary root/reference admission.
+    async fn open_cloud_scope(
+        &self,
+        _input: OpenCloudQueryScope,
+        _owner: QueryOwner,
+    ) -> Result<QueryReply<QueryScope>, Status> {
+        Err(Status::unimplemented(
+            "native cloud query scopes unsupported",
+        ))
+    }
     async fn open_scope(
         &self,
         input: OpenQueryScope,

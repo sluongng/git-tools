@@ -281,6 +281,7 @@ impl NativeReadonlyIndex {
                 .query
                 .fork_scope(
                     native_broker::ForkQueryScope {
+                        expected_cloud_source_digest: None,
                         parent: base.value.handle,
                         overlay,
                         replay_key: state.replay,

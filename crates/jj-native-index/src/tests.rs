@@ -150,6 +150,7 @@ impl FixtureIo {
         self.opens.fetch_add(1, Ordering::SeqCst);
         reply(
             QueryScope {
+                cloud_source_digest: None,
                 handle,
                 expires_at_unix_seconds: now().unwrap() + 300,
                 query_identity_version: 2,
@@ -440,6 +441,7 @@ impl NativeQueryIo for FixtureIo {
     ) -> Result<QueryReply<QueryHandle>, tonic::Status> {
         self.begins.fetch_add(1, Ordering::SeqCst);
         QueryScope {
+            cloud_source_digest: None,
             handle: i.scope,
             expires_at_unix_seconds: now().unwrap() + 300,
             query_identity_version: 2,

@@ -51,6 +51,7 @@ struct Counters {
     holds: Arc<AtomicUsize>,
     metadata_rpcs: Arc<AtomicUsize>,
     graph_rpcs: Arc<AtomicUsize>,
+    query_rpcs: Arc<AtomicUsize>,
     metadata_keys: Arc<AtomicUsize>,
     metadata_requests: Arc<std::sync::Mutex<Vec<p::ObjectKey>>>,
     metadata_bytes: Arc<AtomicUsize>,
@@ -69,6 +70,7 @@ impl Counters {
             holds: Arc::new(AtomicUsize::new(0)),
             metadata_rpcs: Arc::new(AtomicUsize::new(0)),
             graph_rpcs: Arc::new(AtomicUsize::new(0)),
+            query_rpcs: Arc::new(AtomicUsize::new(0)),
             metadata_keys: Arc::new(AtomicUsize::new(0)),
             metadata_requests: Arc::new(std::sync::Mutex::new(Vec::new())),
             metadata_bytes: Arc::new(AtomicUsize::new(0)),
@@ -240,7 +242,14 @@ impl Server {
         tls: Option<tonic::transport::Identity>,
         bind: std::net::SocketAddr,
     ) -> Self {
-        let query = service.query_grpc_service();
+        let query_requests = counts.query_rpcs.clone();
+        let query = tonic::service::interceptor::InterceptedService::new(
+            service.query_grpc_service(),
+            move |request: Request<()>| {
+                query_requests.fetch_add(1, Ordering::SeqCst);
+                Ok(request)
+            },
+        );
         let cloud = service.cloud_grpc_service();
         let listener = tokio::net::TcpListener::bind(bind).await.unwrap();
         let address = listener.local_addr().unwrap();
@@ -4403,7 +4412,8 @@ async fn native_v2_retires_only_acknowledged_queries_after_scope_close_and_keeps
     .unwrap()
     .with_query_index(index)
     .unwrap();
-    let server = Server::start_service(service, Counters::new(), None).await;
+    let counts = Counters::new();
+    let server = Server::start_service(service, counts.clone(), None).await;
     let directory = private_dir();
     let mut configuration = config(&server);
     configuration.query.max_queries = 4;
@@ -4431,10 +4441,29 @@ async fn native_v2_retires_only_acknowledged_queries_after_scope_close_and_keeps
     assert_eq!(opened.value.query_identity_version, 2);
     let scope = opened.value.clone();
     let fork = ForkQueryScope {
+        expected_cloud_source_digest: None,
         parent: scope.handle,
         overlay: vec![],
         replay_key: [92; 32],
     };
+    let query_calls = counts.query_rpcs.load(Ordering::SeqCst);
+    let mut unsupported = fork.clone();
+    unsupported.expected_cloud_source_digest = Some([77; 32]);
+    assert_eq!(
+        repo.query
+            .fork_scope(unsupported, Arc::new(()))
+            .await
+            .unwrap_err()
+            .code(),
+        tonic::Code::Unimplemented
+    );
+    assert_eq!(
+        counts.query_rpcs.load(Ordering::SeqCst),
+        query_calls,
+        "unsupported cloud fork must reject before any upstream RPC"
+    );
+    // The same replay key must still accept its ordinary intent; no reservation
+    // or failed cloud replay may be inserted before the explicit support gate.
     let child = repo
         .query
         .fork_scope(fork.clone(), Arc::new(()))

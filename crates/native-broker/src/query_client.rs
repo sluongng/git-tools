@@ -372,6 +372,12 @@ fn scope(v: p::QueryScopeReply) -> Result<QueryScope, Status> {
         handle: handle(&v.handle)?,
         expires_at_unix_seconds: v.expires_at_unix_seconds,
         query_identity_version: crate::normalize_query_identity_version(v.query_identity_version)?,
+        cloud_source_digest: v
+            .cloud_source_digest
+            .as_deref()
+            .map(handle)
+            .transpose()
+            .map_err(|_| integrity())?,
     })
 }
 #[async_trait::async_trait]
@@ -382,6 +388,60 @@ impl NativeQueryIo for BrokerQueryClient {
             temporary_bytes: 0,
             persistent_memory_bytes: self.inner.config.max_memory_bytes as u64,
         }
+    }
+    async fn open_cloud_scope(
+        &self,
+        i: OpenCloudQueryScope,
+        o: QueryOwner,
+    ) -> Result<QueryReply<QueryScope>, Status> {
+        let cap = self.inner.config.max_query_bytes;
+        self.preflight(
+            i.source
+                .validate(cap)?
+                .saturating_add(crate::query_service::overlay_bytes(&i.overlay, cap)?)
+                .saturating_add(128),
+        )?;
+        let expected = i.source.digest();
+        let reply = self
+            .execute(o, move |mut client, deadline, store, cap| {
+                let i = i.clone();
+                async move {
+                    let source = i.source;
+                    Ok(client
+                        .open_cloud_scope(request(
+                            p::QueryOpenCloudScopeRequest {
+                                store_id: store,
+                                source: Some(p::NativeCloudQuerySource {
+                                    provider_identity: source.provider_identity.to_vec(),
+                                    workspace_id: source.workspace_id.to_vec(),
+                                    generation: source.generation,
+                                    manifest_id: source.manifest_id.to_vec(),
+                                    manifest_blake3: source.manifest_blake3.to_vec(),
+                                    manifest_size_bytes: source.manifest_size_bytes,
+                                    index_root_ids: source
+                                        .index_root_ids
+                                        .into_iter()
+                                        .map(|id| id.to_vec())
+                                        .collect(),
+                                    expected_anchors: ids(source.expected_anchors),
+                                }),
+                                overlay: i.overlay,
+                                replay_key: i.replay_key.to_vec(),
+                            },
+                            deadline,
+                            cap,
+                        )?)
+                        .await?
+                        .into_inner())
+                }
+            })
+            .await?;
+        let value = scope(reply.value)?;
+        crate::query_service::validate_scope_source(&value, Some(expected))?;
+        Ok(QueryReply {
+            value,
+            owner: reply.owner,
+        })
     }
     async fn open_scope(
         &self,
@@ -416,6 +476,7 @@ impl NativeQueryIo for BrokerQueryClient {
             })
             .await?;
         let value = scope(r.value)?;
+        crate::query_service::validate_scope_source(&value, None)?;
         if value.query_identity_version != expected {
             return Err(Status::unimplemented(
                 "native query identity negotiation failed",
@@ -431,8 +492,13 @@ impl NativeQueryIo for BrokerQueryClient {
         i: ForkQueryScope,
         o: QueryOwner,
     ) -> Result<QueryReply<QueryScope>, Status> {
+        let expected = i.expected_cloud_source_digest;
         let cap = self.inner.config.max_query_bytes;
-        self.preflight(crate::query_service::overlay_bytes(&i.overlay, cap)?.saturating_add(68))?;
+        self.preflight(
+            crate::query_service::overlay_bytes(&i.overlay, cap)?
+                .saturating_add(68)
+                .saturating_add(if expected.is_some() { 34 } else { 0 }),
+        )?;
         let r = self
             .execute(o, move |mut c, d, s, cap| {
                 let i = i.clone();
@@ -441,6 +507,9 @@ impl NativeQueryIo for BrokerQueryClient {
                         p::QueryForkScopeRequest {
                             store_id: s,
                             parent: i.parent.to_vec(),
+                            expected_cloud_source_digest: i
+                                .expected_cloud_source_digest
+                                .map(|digest| digest.to_vec()),
                             overlay: i.overlay,
                             replay_key: i.replay_key.to_vec(),
                         },
@@ -452,8 +521,10 @@ impl NativeQueryIo for BrokerQueryClient {
                 }
             })
             .await?;
+        let value = scope(r.value)?;
+        crate::query_service::validate_scope_source(&value, expected)?;
         Ok(QueryReply {
-            value: scope(r.value)?,
+            value,
             owner: r.owner,
         })
     }

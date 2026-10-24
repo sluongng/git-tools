@@ -1561,10 +1561,22 @@ impl Drop for QueryPageProbe {
         self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     }
 }
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CloudQueryMode {
+    Valid,
+    MissingEcho,
+    WrongEcho,
+    Legacy,
+    Retry,
+    WrongFork,
+}
 #[derive(Debug)]
 struct FakeQuery {
     marker: u8,
     persistent: u64,
+    cloud_mode: Option<CloudQueryMode>,
+    cloud_calls: std::sync::atomic::AtomicUsize,
+    cloud_replays: std::sync::Mutex<HashMap<[u8; 32], ([u8; 32], native_broker::QueryScope)>>,
     closed: std::sync::atomic::AtomicBool,
     page: std::sync::Mutex<Option<Arc<QueryPageProbe>>>,
     dropped: Arc<std::sync::atomic::AtomicUsize>,
@@ -1581,6 +1593,9 @@ impl FakeQuery {
         Self {
             marker,
             persistent,
+            cloud_mode: None,
+            cloud_calls: Default::default(),
+            cloud_replays: Default::default(),
             closed: Default::default(),
             page: Default::default(),
             dropped: Default::default(),
@@ -1617,6 +1632,52 @@ impl native_broker::NativeQueryIo for FakeQuery {
             persistent_memory_bytes: self.persistent,
         }
     }
+    async fn open_cloud_scope(
+        &self,
+        input: native_broker::OpenCloudQueryScope,
+        _: native_broker::QueryOwner,
+    ) -> Result<native_broker::QueryReply<native_broker::QueryScope>, tonic::Status> {
+        let Some(mode) = self.cloud_mode else {
+            return Err(tonic::Status::unimplemented("fixture old query provider"));
+        };
+        let attempt = self
+            .cloud_calls
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let digest = input.source.digest();
+        let mut hash = blake3::Hasher::new();
+        hash.update(&digest);
+        for bytes in &input.overlay {
+            hash.update(&(bytes.len() as u64).to_be_bytes());
+            hash.update(bytes);
+        }
+        let fingerprint = *hash.finalize().as_bytes();
+        let mut replays = self.cloud_replays.lock().unwrap();
+        let scope = if let Some((old, scope)) = replays.get(&input.replay_key) {
+            if old != &fingerprint {
+                return Err(tonic::Status::already_exists(
+                    "fixture changed cloud intent",
+                ));
+            }
+            scope.clone()
+        } else {
+            let scope = native_broker::QueryScope {
+                handle: [self.marker; 32],
+                expires_at_unix_seconds: i64::MAX / 2,
+                query_identity_version: if mode == CloudQueryMode::Legacy { 1 } else { 2 },
+                cloud_source_digest: match mode {
+                    CloudQueryMode::MissingEcho => None,
+                    CloudQueryMode::WrongEcho => Some([88; 32]),
+                    _ => Some(digest),
+                },
+            };
+            replays.insert(input.replay_key, (fingerprint, scope.clone()));
+            scope
+        };
+        if mode == CloudQueryMode::Retry && attempt == 0 {
+            return Err(tonic::Status::unavailable("fixture withheld cloud ACK"));
+        }
+        Ok(self.reply(scope))
+    }
     async fn open_scope(
         &self,
         _: native_broker::OpenQueryScope,
@@ -1625,6 +1686,7 @@ impl native_broker::NativeQueryIo for FakeQuery {
         self.scope_calls
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         Ok(self.reply(native_broker::QueryScope {
+            cloud_source_digest: None,
             handle: [self.marker; 32],
             expires_at_unix_seconds: i64::MAX / 2,
             query_identity_version: 1,
@@ -1636,7 +1698,27 @@ impl native_broker::NativeQueryIo for FakeQuery {
         _: native_broker::QueryOwner,
     ) -> Result<native_broker::QueryReply<native_broker::QueryScope>, tonic::Status> {
         self.scope(i.parent)?;
+        if self.cloud_mode.is_some() {
+            let replays = self.cloud_replays.lock().unwrap();
+            let scope = replays
+                .values()
+                .map(|(_, scope)| scope)
+                .find(|scope| scope.handle == i.parent)
+                .ok_or_else(|| tonic::Status::not_found("fixture cloud parent missing"))?;
+            if scope.cloud_source_digest != i.expected_cloud_source_digest {
+                return Err(tonic::Status::permission_denied(
+                    "fixture cloud fork source mismatch",
+                ));
+            }
+            let mut scope = scope.clone();
+            scope.handle = [self.marker.wrapping_add(1); 32];
+            if self.cloud_mode == Some(CloudQueryMode::WrongFork) {
+                scope.cloud_source_digest = Some([91; 32]);
+            }
+            return Ok(self.reply(scope));
+        }
         Ok(self.reply(native_broker::QueryScope {
+            cloud_source_digest: None,
             handle: [self.marker; 32],
             expires_at_unix_seconds: i64::MAX / 2,
             query_identity_version: 1,
@@ -2035,6 +2117,7 @@ async fn query_aliases_preserve_scopes_replay_pages_and_cancellation_without_hol
         first
             .fork_scope(
                 native_broker::ForkQueryScope {
+                    expected_cloud_source_digest: None,
                     parent: sa.value.handle,
                     overlay: vec![
                         vec![0; cfg.max_query_bytes / 2],
@@ -2995,5 +3078,398 @@ async fn cancelled_managed_metadata_write_keeps_command_job_until_actual_owned_p
         local.descriptor(expected.key).await.unwrap(),
         Some(expected)
     );
+    host.stop().await;
+}
+
+fn retained_query_source() -> native_broker::CloudQuerySource {
+    native_broker::CloudQuerySource {
+        provider_identity: [1; 32],
+        workspace_id: [4; 32],
+        generation: 1,
+        manifest_id: [5; 32],
+        manifest_blake3: [6; 32],
+        manifest_size_bytes: 1024,
+        index_root_ids: vec![[7; 32]],
+        expected_anchors: vec![native_broker::CommitId::ROOT],
+    }
+}
+fn cloud_query_service(root: &Path, query: Arc<FakeQuery>, cfg: Config) -> BrokerService {
+    query_service(root, query, Arc::new(FakeQuery::new(2, 1024)), cfg)
+        .with_provider_descriptions(HashMap::from([
+            (
+                "first".into(),
+                native_broker::ProviderDescription {
+                    identity: [1; 32],
+                    query_capable: true,
+                    index_mode: native_broker::ProviderIndexMode::Legacy,
+                },
+            ),
+            (
+                "second".into(),
+                native_broker::ProviderDescription {
+                    identity: [2; 32],
+                    query_capable: true,
+                    index_mode: native_broker::ProviderIndexMode::Legacy,
+                },
+            ),
+            (
+                "local-only".into(),
+                native_broker::ProviderDescription {
+                    identity: [3; 32],
+                    query_capable: false,
+                    index_mode: native_broker::ProviderIndexMode::Legacy,
+                },
+            ),
+        ]))
+        .unwrap()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn retained_query_facade_checks_exact_source_replay_and_fork_without_slot_retention() {
+    use native_broker::NativeQueryIo as _;
+    use std::sync::atomic::Ordering;
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path().canonicalize().unwrap();
+    private(&root);
+    let cfg = Config {
+        max_inflight: 1,
+        ..query_config()
+    };
+    let mut fake = FakeQuery::new(1, 1024);
+    fake.cloud_mode = Some(CloudQueryMode::Retry);
+    let fake = Arc::new(fake);
+    let service = cloud_query_service(&root, fake.clone(), cfg.clone());
+    let local = service.query_io("first").unwrap();
+    let socket = root.join("cloud-query.sock");
+    let host = Running::start_service(&socket, service).await;
+    let client = native_broker::BrokerQueryClient::connect(&socket, "first", cfg)
+        .await
+        .unwrap();
+    let input = native_broker::OpenCloudQueryScope {
+        source: retained_query_source(),
+        overlay: vec![b"bounded opaque overlay fixture".to_vec()],
+        replay_key: [9; 32],
+    };
+    let expected = input.source.digest();
+    let held = client
+        .open_cloud_scope(input.clone(), Arc::new(()))
+        .await
+        .unwrap();
+    assert_eq!(
+        fake.cloud_calls.load(Ordering::SeqCst),
+        2,
+        "lost ACK retains exact immutable cloud intent"
+    );
+    assert_eq!(held.value.cloud_source_digest, Some(expected));
+    assert_eq!(held.value.query_identity_version, 2);
+    let replay = local
+        .open_cloud_scope(input.clone(), Arc::new(()))
+        .await
+        .unwrap();
+    assert_eq!(held.value, replay.value);
+    let fork = native_broker::ForkQueryScope {
+        parent: held.value.handle,
+        expected_cloud_source_digest: Some(expected),
+        overlay: vec![],
+        replay_key: [10; 32],
+    };
+    let first = client.fork_scope(fork.clone(), Arc::new(())).await.unwrap();
+    let second = local.fork_scope(fork, Arc::new(())).await.unwrap();
+    assert_eq!(first.value, second.value);
+    assert_eq!(first.value.cloud_source_digest, Some(expected));
+    let wrong = native_broker::ForkQueryScope {
+        parent: held.value.handle,
+        expected_cloud_source_digest: Some([77; 32]),
+        overlay: vec![],
+        replay_key: [11; 32],
+    };
+    assert_eq!(
+        client
+            .fork_scope(wrong, Arc::new(()))
+            .await
+            .unwrap_err()
+            .code(),
+        tonic::Code::PermissionDenied
+    );
+    let mut changed = input;
+    changed.source.manifest_blake3 = [99; 32];
+    assert_eq!(
+        client
+            .open_cloud_scope(changed, Arc::new(()))
+            .await
+            .unwrap_err()
+            .code(),
+        tonic::Code::AlreadyExists
+    );
+    assert_eq!(
+        fake.scope_calls.load(Ordering::SeqCst),
+        0,
+        "cloud requests never become ordinary roots"
+    );
+    drop((held, replay, first, second, client, local));
+    host.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn retained_query_facade_rejects_unsupported_missing_wrong_and_substituted_source_echoes() {
+    use native_broker::NativeQueryIo as _;
+    use std::sync::atomic::Ordering;
+    for (mode, expected) in [
+        (None, tonic::Code::Unimplemented),
+        (Some(CloudQueryMode::MissingEcho), tonic::Code::DataLoss),
+        (Some(CloudQueryMode::WrongEcho), tonic::Code::DataLoss),
+        (Some(CloudQueryMode::Legacy), tonic::Code::DataLoss),
+        (Some(CloudQueryMode::WrongFork), tonic::Code::DataLoss),
+    ] {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        private(&root);
+        let mut query = FakeQuery::new(1, 1024);
+        query.cloud_mode = mode;
+        let query = Arc::new(query);
+        let service = cloud_query_service(&root, query.clone(), query_config());
+        let local = service.query_io("first").unwrap();
+        let socket = root.join("cloud-query.sock");
+        let host = Running::start_service(&socket, service).await;
+        let client = native_broker::BrokerQueryClient::connect(&socket, "first", query_config())
+            .await
+            .unwrap();
+        let input = || native_broker::OpenCloudQueryScope {
+            source: retained_query_source(),
+            overlay: vec![],
+            replay_key: [9; 32],
+        };
+        if mode == Some(CloudQueryMode::WrongFork) {
+            let scope = client
+                .open_cloud_scope(input(), Arc::new(()))
+                .await
+                .unwrap();
+            let fork = native_broker::ForkQueryScope {
+                parent: scope.value.handle,
+                expected_cloud_source_digest: scope.value.cloud_source_digest,
+                overlay: vec![],
+                replay_key: [10; 32],
+            };
+            assert_eq!(
+                client
+                    .fork_scope(fork.clone(), Arc::new(()))
+                    .await
+                    .unwrap_err()
+                    .code(),
+                expected
+            );
+            assert_eq!(
+                local
+                    .fork_scope(fork, Arc::new(()))
+                    .await
+                    .unwrap_err()
+                    .code(),
+                expected
+            );
+        } else {
+            assert_eq!(
+                client
+                    .open_cloud_scope(input(), Arc::new(()))
+                    .await
+                    .unwrap_err()
+                    .code(),
+                expected,
+                "{mode:?}"
+            );
+            assert_eq!(
+                local
+                    .open_cloud_scope(input(), Arc::new(()))
+                    .await
+                    .unwrap_err()
+                    .code(),
+                expected,
+                "{mode:?}"
+            );
+        }
+        assert_eq!(query.scope_calls.load(Ordering::SeqCst), 0);
+        drop((client, local));
+        host.stop().await;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn retained_query_facade_enforces_managed_tokens_provider_identity_and_bounded_sources_before_io()
+ {
+    use native_broker::NativeQueryIo as _;
+    use std::sync::atomic::Ordering;
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path().canonicalize().unwrap();
+    private(&root);
+    let cfg = query_config();
+    let mut fake = FakeQuery::new(1, 1024);
+    fake.cloud_mode = Some(CloudQueryMode::Valid);
+    let fake = Arc::new(fake);
+    let commands = Arc::new(TestCommands {
+        tokens: HashMap::from([([1; 32], "first".into()), ([2; 32], "second".into())]),
+        active: true.into(),
+        jobs: Default::default(),
+    });
+    let service = cloud_query_service(&root, fake.clone(), cfg.clone())
+        .with_command_resolver(commands.clone())
+        .unwrap();
+    let local = service.query_io("first").unwrap();
+    let socket = root.join("cloud-query.sock");
+    let host = Running::start_service(&socket, service).await;
+    let client = native_broker::BrokerQueryClient::connect(&socket, "first", cfg.clone())
+        .await
+        .unwrap();
+    let input = || native_broker::OpenCloudQueryScope {
+        source: retained_query_source(),
+        overlay: vec![],
+        replay_key: [9; 32],
+    };
+    assert_eq!(
+        client
+            .open_cloud_scope(input(), Arc::new(()))
+            .await
+            .unwrap_err()
+            .code(),
+        tonic::Code::Unauthenticated
+    );
+    assert_eq!(
+        client
+            .clone()
+            .with_command_token([2; 32])
+            .open_cloud_scope(input(), Arc::new(()))
+            .await
+            .unwrap_err()
+            .code(),
+        tonic::Code::PermissionDenied
+    );
+    let client = client.with_command_token([1; 32]);
+    let mut changed = input();
+    changed.source.provider_identity = [2; 32];
+    assert_eq!(
+        client
+            .open_cloud_scope(changed.clone(), Arc::new(()))
+            .await
+            .unwrap_err()
+            .code(),
+        tonic::Code::FailedPrecondition
+    );
+    assert_eq!(
+        local
+            .open_cloud_scope(changed, Arc::new(()))
+            .await
+            .unwrap_err()
+            .code(),
+        tonic::Code::FailedPrecondition
+    );
+    let mut duplicate = input();
+    duplicate.source.index_root_ids.push([7; 32]);
+    assert_eq!(
+        client
+            .open_cloud_scope(duplicate, Arc::new(()))
+            .await
+            .unwrap_err()
+            .code(),
+        tonic::Code::InvalidArgument
+    );
+    let mut oversized = input();
+    oversized.overlay.push(vec![0; cfg.max_query_bytes + 1]);
+    assert_eq!(
+        client
+            .open_cloud_scope(oversized.clone(), Arc::new(()))
+            .await
+            .unwrap_err()
+            .code(),
+        tonic::Code::ResourceExhausted
+    );
+    assert_eq!(
+        local
+            .open_cloud_scope(oversized, Arc::new(()))
+            .await
+            .unwrap_err()
+            .code(),
+        tonic::Code::ResourceExhausted
+    );
+    let mut roots = input();
+    roots.source.index_root_ids = (0..4097u32)
+        .map(|i| {
+            let mut id = [0; 32];
+            id[..4].copy_from_slice(&i.to_be_bytes());
+            id
+        })
+        .collect();
+    assert_eq!(
+        client
+            .open_cloud_scope(roots, Arc::new(()))
+            .await
+            .unwrap_err()
+            .code(),
+        tonic::Code::ResourceExhausted
+    );
+    assert_eq!(
+        fake.cloud_calls.load(Ordering::SeqCst),
+        0,
+        "all invalid paths reject before provider execution"
+    );
+    // Raw generated-client malformed ID widths must also fail at the service,
+    // independently of the typed client's preflight.
+    let channel = native_broker::connect_local_channel(
+        native_broker::LocalEndpoint::UnixSocket(socket),
+        &cfg,
+    )
+    .await
+    .unwrap();
+    let mut raw = native_broker::proto::query_io_client::QueryIoClient::new(channel)
+        .send_compressed(tonic::codec::CompressionEncoding::Zstd)
+        .accept_compressed(tonic::codec::CompressionEncoding::Zstd);
+    let source = retained_query_source();
+    let mut request = tonic::Request::new(native_broker::proto::QueryOpenCloudScopeRequest {
+        store_id: "first".into(),
+        source: Some(native_broker::proto::NativeCloudQuerySource {
+            provider_identity: source.provider_identity.to_vec(),
+            workspace_id: source.workspace_id.to_vec(),
+            generation: source.generation,
+            manifest_id: source.manifest_id.to_vec(),
+            manifest_blake3: source.manifest_blake3.to_vec(),
+            manifest_size_bytes: source.manifest_size_bytes,
+            index_root_ids: vec![vec![7; 31]],
+            expected_anchors: vec![vec![0; 32]],
+        }),
+        overlay: vec![],
+        replay_key: vec![9; 32],
+    });
+    request.metadata_mut().insert_bin(
+        "native-command-bin",
+        tonic::metadata::MetadataValue::from_bytes(&[1; 32]),
+    );
+    let mut oversized_wire = request.get_ref().clone();
+    oversized_wire.source.as_mut().unwrap().index_root_ids = vec![vec![7; 32]];
+    oversized_wire.overlay = vec![vec![0; cfg.max_query_bytes + 1]];
+    assert_eq!(
+        raw.open_cloud_scope(request).await.unwrap_err().code(),
+        tonic::Code::InvalidArgument
+    );
+    let mut oversized_request = tonic::Request::new(oversized_wire);
+    oversized_request.metadata_mut().insert_bin(
+        "native-command-bin",
+        tonic::metadata::MetadataValue::from_bytes(&[1; 32]),
+    );
+    assert_eq!(
+        raw.open_cloud_scope(oversized_request)
+            .await
+            .unwrap_err()
+            .code(),
+        tonic::Code::ResourceExhausted,
+        "compressed wire bytes do not bypass decompressed request admission"
+    );
+    assert_eq!(fake.cloud_calls.load(Ordering::SeqCst), 0);
+    let held = client
+        .open_cloud_scope(input(), Arc::new(()))
+        .await
+        .unwrap();
+    assert_eq!(
+        held.value.cloud_source_digest,
+        Some(retained_query_source().digest())
+    );
+    command_jobs_idle(&commands).await;
+    drop((held, raw, client, local));
     host.stop().await;
 }

@@ -22,6 +22,7 @@ cargo_build_script(
     data = [
         ":proto_files",
         "//crates/tinytree-proto:proto/tinytree/query/v1/query.proto",
+        "//crates/tinytree-proto:proto/tinytree/cloud/v1/cloud.proto",
         "//crates/tinytree-proto:proto/tinytree/v1/repository.proto",
     ],
     edition = "2024",

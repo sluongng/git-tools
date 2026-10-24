@@ -52,6 +52,7 @@ message PublicationReply {
 // broker-local and never carry upstream connection settings or cursor tokens.
 service QueryIo {
   rpc DescribeProvider(DescribeProviderRequest) returns (ProviderDescription);
+  rpc OpenCloudScope(QueryOpenCloudScopeRequest) returns (QueryScopeReply);
   rpc OpenScope(QueryOpenScopeRequest) returns (QueryScopeReply);
   rpc ForkScope(QueryForkScopeRequest) returns (QueryScopeReply);
   rpc Facts(QueryFactsRequest) returns (tinytree.query.v1.GraphFacts);
@@ -64,6 +65,22 @@ service QueryIo {
   rpc CloseQuery(QueryCloseRequest) returns (QueryCloseReply);
   rpc CloseScope(QueryCloseRequest) returns (QueryCloseReply);
 }
+message NativeCloudQuerySource {
+  bytes provider_identity = 1;
+  bytes workspace_id = 2;
+  uint64 generation = 3;
+  bytes manifest_id = 4;
+  bytes manifest_blake3 = 5;
+  uint64 manifest_size_bytes = 6;
+  repeated bytes index_root_ids = 7;
+  repeated bytes expected_anchors = 8; // Assertions, never upstream root grants.
+}
+message QueryOpenCloudScopeRequest {
+  string store_id = 1;
+  NativeCloudQuerySource source = 2;
+  repeated bytes overlay = 3;
+  bytes replay_key = 4;
+}
 message QueryOpenScopeRequest {
   string store_id = 1; repeated bytes roots = 2;
   repeated bytes overlay = 3; bytes replay_key = 4;
@@ -72,10 +89,12 @@ message QueryOpenScopeRequest {
 message QueryForkScopeRequest {
   string store_id = 1; bytes parent = 2;
   repeated bytes overlay = 3; bytes replay_key = 4;
+  optional bytes expected_cloud_source_digest = 5;
 }
 message QueryScopeReply {
   bytes handle = 1; int64 expires_at_unix_seconds = 2;
   uint32 query_identity_version = 3;
+  optional bytes cloud_source_digest = 4;
 }
 message QueryFactsRequest {
   string store_id = 1; bytes scope = 2;
