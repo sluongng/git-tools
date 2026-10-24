@@ -23,6 +23,8 @@ use tonic::{Request, Response, Status, codec::CompressionEncoding};
 pub struct CloudConfig {
     pub enabled: bool,
     pub indexed_versions: bool,
+    pub captured_versions: bool,
+    pub max_capture_bytes: usize,
     pub max_native_proof_steps: usize,
     pub max_native_proof_bytes: u64,
     pub max_native_proof_edges: usize,
@@ -41,6 +43,8 @@ impl Default for CloudConfig {
         Self {
             enabled: false,
             indexed_versions: false,
+            captured_versions: false,
+            max_capture_bytes: 8 * 1024 * 1024,
             max_native_proof_steps: 256,
             max_native_proof_bytes: 64 * 1024 * 1024,
             max_native_proof_edges: 1_000_000,
@@ -58,7 +62,9 @@ impl Default for CloudConfig {
 }
 impl CloudConfig {
     pub(crate) fn validate(&self) -> Result<(), ConfigError> {
-        if !(1..=4096).contains(&self.max_native_proof_steps)
+        if (self.captured_versions && !self.indexed_versions)
+            || !(1024..=8 * 1024 * 1024).contains(&self.max_capture_bytes)
+            || !(1..=4096).contains(&self.max_native_proof_steps)
             || !(1024..=16 * 1024 * 1024 * 1024).contains(&self.max_native_proof_bytes)
             || !(1..=10_000_000).contains(&self.max_native_proof_edges)
             || !(1024..=64 * 1024 * 1024).contains(&self.max_object_bytes)
@@ -81,7 +87,12 @@ impl CloudConfig {
             .cloud_resource_profile()
             .map_err(|_| ConfigError("private workspace resource bounds overflow"))?;
         let store_work = if self.indexed_versions {
-            profile.version_v1_bytes.max(profile.version_v2_bytes)
+            // Indexed reads can select an existing captured version even when
+            // accepting new captured publications is disabled.
+            profile
+                .version_v1_bytes
+                .max(profile.version_v2_bytes)
+                .max(profile.version_v3_bytes)
         } else {
             profile.version_v1_bytes
         };
@@ -89,6 +100,14 @@ impl CloudConfig {
         let maximum = [
             ("PublishVersion", store_work),
             ("GetVersion", store_work),
+            (
+                "ReadCapture",
+                if self.captured_versions {
+                    profile.capture_read_bytes
+                } else {
+                    0
+                },
+            ),
             ("PutObject", ordinary_work),
             ("LookupObjects", ordinary_work),
             (
@@ -136,6 +155,11 @@ impl CloudConfig {
             "PutObject" | "PutIndexArtifact" => self.max_object_bytes.saturating_add(4096),
             "PublishVersion" => self
                 .max_manifest_bytes
+                .saturating_add(if self.captured_versions {
+                    self.max_capture_bytes
+                } else {
+                    0
+                })
                 .saturating_add(self.max_staging_leases.saturating_mul(128))
                 .saturating_add(4096),
             _ => self.max_request_bytes,
@@ -227,12 +251,18 @@ impl CloudHost {
                 Status::resource_exhausted("private workspace call budget exhausted")
             })?;
         let wire = self.config.wire_limit(method) as u64;
+        if method == "ReadCapture" && !self.config.captured_versions {
+            return Err(Status::unimplemented(
+                "captured cloud versions are disabled",
+            ));
+        }
         if matches!(
             method,
             "PutIndexArtifact"
                 | "LookupIndexArtifacts"
                 | "ReadIndexArtifact"
                 | "ReadNativeClosure"
+                | "ReadCapture"
                 | "OpenCloudScope"
         ) && !self.config.indexed_versions
         {
@@ -244,7 +274,11 @@ impl CloudHost {
             "PublishVersion" | "GetVersion" => self.store_work,
             "PutIndexArtifact" | "ReadIndexArtifact" => self.profile.index_artifact_bytes,
             "ReadNativeClosure" => self.profile.native_read_bytes,
-            "OpenCloudScope" => self.profile.version_v2_bytes,
+            "ReadCapture" => self.profile.capture_read_bytes,
+            "OpenCloudScope" => self
+                .profile
+                .version_v2_bytes
+                .max(self.profile.version_v3_bytes),
             _ => self.profile.object_bytes,
         };
         let bytes = wire
@@ -870,6 +904,102 @@ impl p::workspace_cloud_server::WorkspaceCloud for CloudService {
             held,
         ))
     }
+    type ReadCaptureStream = RpcStream<p::CaptureChunk>;
+    async fn read_capture(
+        &self,
+        request: Request<p::ReadCaptureRequest>,
+    ) -> Result<Response<Self::ReadCaptureStream>, Status> {
+        let (host, work, owner) =
+            self.context(&request, &request.get_ref().repository_id, false)?;
+        let input = request.into_inner();
+        let selector = input
+            .selector
+            .ok_or_else(|| Status::invalid_argument("missing retained version selector"))?;
+        let selected = input
+            .manifest_selected
+            .ok_or_else(|| Status::invalid_argument("missing retained manifest selection"))?;
+        if selector.generation == 0 || selected.size_bytes == 0 {
+            return Err(Status::invalid_argument(
+                "invalid retained version selection",
+            ));
+        }
+        if selected.size_bytes > host.config.max_manifest_bytes as u64 {
+            return Err(Status::resource_exhausted(
+                "retained manifest exceeds budget",
+            ));
+        }
+        let expected = tinytree_cloud::CaptureDataId(array(&input.expected_capture_id)?);
+        let selection = s::CloudVersionSelector {
+            workspace: array(&selector.workspace_id)?,
+            generation: selector.generation,
+            manifest: tinytree_cloud::ManifestId(array(&selector.manifest_id)?),
+            selected: tinytree_cloud::BlobDigest {
+                blake3: array(&selected.blake3)?,
+                size_bytes: selected.size_bytes,
+            },
+        };
+        let manifest_id = selection.manifest.0;
+        let store = host.store.clone();
+        let lease = execute(work.clone(), move || {
+            store
+                .read_cloud_capture(&input.repository_id, owner, selection, expected)
+                .map_err(status)
+        })
+        .await?;
+        let capture = lease.descriptor();
+        if capture.selected.size_bytes > host.config.max_capture_bytes as u64 {
+            return Err(Status::resource_exhausted(
+                "capture attachment exceeds budget",
+            ));
+        }
+        let descriptor = p::CaptureDescriptor {
+            capture_id: capture.id.0.to_vec(),
+            selected: Some(p::RawDigest {
+                blake3: capture.selected.blake3.to_vec(),
+                size_bytes: capture.selected.size_bytes,
+            }),
+        };
+        let lease = Arc::new(Mutex::new(lease));
+        let held = lease.clone();
+        let stream_work = work.clone();
+        let frame = host.config.max_frame_bytes;
+        let stream = async_stream::try_stream! {
+            let mut offset = 0u64;
+            loop {
+                let lease = lease.clone();
+                let bytes = execute(stream_work.clone(), move || {
+                    let mut bytes = vec![0; frame];
+                    let n = lease.lock()
+                        .map_err(|_| Status::internal("capture read unavailable"))?
+                        .read(&mut bytes)
+                        .map_err(|_| Status::data_loss("capture payload unavailable"))?;
+                    bytes.truncate(n);
+                    Ok(bytes)
+                }).await?;
+                let end = offset.checked_add(bytes.len() as u64)
+                    .ok_or_else(|| Status::data_loss("capture stream offset overflow"))?;
+                let size = capture.selected.size_bytes;
+                let eof = end == size;
+                if end > size || (bytes.is_empty() && !eof) {
+                    Err(Status::data_loss("capture payload length mismatch"))?;
+                }
+                yield p::CaptureChunk {
+                    descriptor: Some(descriptor.clone()),
+                    offset,
+                    data: bytes,
+                    eof,
+                    manifest_id: manifest_id.to_vec(),
+                };
+                offset = end;
+                if eof { break; }
+            }
+        };
+        Ok(response(
+            Box::pin(stream) as Self::ReadCaptureStream,
+            work,
+            held,
+        ))
+    }
     async fn publish_version(
         &self,
         request: Request<p::PublishVersionRequest>,
@@ -877,6 +1007,7 @@ impl p::workspace_cloud_server::WorkspaceCloud for CloudService {
         let (host, work, owner) = self.context(&request, &request.get_ref().repository_id, true)?;
         let input = request.into_inner();
         if input.manifest.len() > host.config.max_manifest_bytes
+            || input.capture_data.len() > host.config.max_capture_bytes
             || input.staging_leases.len() > host.config.max_staging_leases
         {
             return Err(Status::resource_exhausted(
@@ -884,12 +1015,19 @@ impl p::workspace_cloud_server::WorkspaceCloud for CloudService {
             ));
         }
         // The opt-in reserves the complete indexed Store profile before decode.
-        if !host.config.indexed_versions
-            && input.manifest.get(..8) == Some(b"TTCLOUD\0".as_slice())
-            && input.manifest.get(8..10) == Some([2u8, 0].as_slice())
-        {
+        let indexed_format = input.manifest.get(..8) == Some(b"TTCLOUD\0".as_slice())
+            && matches!(input.manifest.get(8..10), Some([2, 0] | [3, 0]));
+        let captured_format = input.manifest.get(..8) == Some(b"TTCLOUD\0".as_slice())
+            && input.manifest.get(8..10) == Some([3u8, 0].as_slice());
+        if !host.config.indexed_versions && indexed_format {
             return Err(Status::unimplemented(
                 "indexed cloud manifests are not enabled by this RPC adapter",
+            ));
+        }
+        let captured = captured_format || !input.capture_data.is_empty();
+        if captured && !host.config.captured_versions {
+            return Err(Status::unimplemented(
+                "captured cloud versions are disabled",
             ));
         }
         let publish = s::PublishCloudRequest {
@@ -907,9 +1045,21 @@ impl p::workspace_cloud_server::WorkspaceCloud for CloudService {
             ..Default::default()
         };
         let value = execute(work.clone(), move || {
-            store
-                .publish_cloud_version(&input.repository_id, owner, &publish, now()?, &limits)
-                .map_err(status)
+            if captured {
+                store.publish_captured_cloud_version(
+                    &input.repository_id,
+                    owner,
+                    &s::PublishCapturedCloudRequest {
+                        publication: publish,
+                        capture_data: input.capture_data,
+                    },
+                    now()?,
+                    &limits,
+                )
+            } else {
+                store.publish_cloud_version(&input.repository_id, owner, &publish, now()?, &limits)
+            }
+            .map_err(status)
         })
         .await?;
         Ok(response(publication(value), work, ()))
@@ -1271,6 +1421,7 @@ mod indexed_adapter_tests {
             manifest_id: id.0.to_vec(),
             manifest: manifest.clone(),
             staging_leases: vec![],
+            capture_data: vec![],
         });
         request.extensions_mut().insert(
             host.admit(

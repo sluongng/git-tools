@@ -4839,6 +4839,24 @@ async fn rpc_only_guards_do_not_enter_query_state_pages_or_uncertain_drop_cleanu
     running.stop().await;
 }
 
+// Opaque raw transport fixture, intentionally not a native manifest/body claim.
+fn capture_transport_fixture(mode: usize) -> (Vec<u8>, Vec<u8>) {
+    let data = b"portable capture transport DATA".to_vec();
+    let mut manifest = b"TTCLOUD\0".to_vec();
+    manifest.extend_from_slice(&if mode == 53 { 2u16 } else { 3u16 }.to_le_bytes());
+    if mode == 54 {
+        return (data, manifest);
+    }
+    manifest.extend_from_slice(b"opaque native body is verified by native callers");
+    let mut id = tinytree_model::cloud_capture_data_id(&data);
+    if mode == 58 {
+        id[0] ^= 1;
+    }
+    manifest.extend_from_slice(&id);
+    manifest.extend_from_slice(blake3::hash(&data).as_bytes());
+    manifest.extend_from_slice(&(data.len() as u64).to_le_bytes());
+    (data, manifest)
+}
 #[derive(Clone, Default)]
 struct CloudFaults {
     mode: Arc<AtomicUsize>,
@@ -5086,6 +5104,14 @@ impl tinytree_client::cloud_protocol::workspace_cloud_server::WorkspaceCloud for
         use tinytree_client::cloud_protocol as c;
         self.calls.fetch_add(1, Ordering::SeqCst);
         let request = request.into_inner();
+        if request.manifest.get(8..10) == Some(3u16.to_le_bytes().as_slice()) {
+            assert_eq!(request.capture_data, capture_transport_fixture(40).0);
+        } else {
+            assert!(
+                request.capture_data.is_empty(),
+                "legacy publication sends no capture DATA"
+            );
+        }
         let value = c::Publication {
             idempotency_key: request.idempotency_key,
             workspace: Some(c::Workspace {
@@ -5095,7 +5121,7 @@ impl tinytree_client::cloud_protocol::workspace_cloud_server::WorkspaceCloud for
             }),
         };
         *self.publication.lock().unwrap() = Some(value.clone());
-        if self.mode.load(Ordering::SeqCst) == 5 {
+        if matches!(self.mode.load(Ordering::SeqCst), 5 | 55) {
             return Err(Status::unavailable("publication reply lost"));
         }
         Ok(Response::new(value))
@@ -5117,7 +5143,11 @@ impl tinytree_client::cloud_protocol::workspace_cloud_server::WorkspaceCloud for
     ) -> Result<Response<tinytree_client::cloud_protocol::Version>, Status> {
         self.calls.fetch_add(1, Ordering::SeqCst);
         let request = request.into_inner();
-        let manifest = b"raw manifest transport fixture".to_vec();
+        let manifest = if self.mode.load(Ordering::SeqCst) >= 40 {
+            capture_transport_fixture(self.mode.load(Ordering::SeqCst)).1
+        } else {
+            b"raw manifest transport fixture".to_vec()
+        };
         let native_authority =
             if self.mode.load(Ordering::SeqCst) >= 30 && self.mode.load(Ordering::SeqCst) != 35 {
                 let raw = tinytree_client::CloudRawDigest::of(&manifest);
@@ -5221,6 +5251,93 @@ impl tinytree_client::cloud_protocol::workspace_cloud_server::WorkspaceCloud for
             if mode!=33 {yield Ok(c::NativeClosureChunk{descriptor:Some(wire),offset:bytes.len() as u64,data:vec![],eof:true,source_binding_digest:binding});}
         };
         Ok(Response::new(Box::pin(stream)))
+    }
+    type ReadCaptureStream = std::pin::Pin<
+        Box<
+            dyn futures_util::Stream<
+                    Item = Result<tinytree_client::cloud_protocol::CaptureChunk, Status>,
+                > + Send,
+        >,
+    >;
+    async fn read_capture(
+        &self,
+        request: Request<tinytree_client::cloud_protocol::ReadCaptureRequest>,
+    ) -> Result<Response<Self::ReadCaptureStream>, Status> {
+        use tinytree_client::cloud_protocol as c;
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        let request = request.into_inner();
+        let mode = self.mode.load(Ordering::SeqCst);
+        let (mut data, manifest) = capture_transport_fixture(mode);
+        let selector = request.selector.unwrap();
+        let manifest_id = tinytree_client::CloudManifestId::of(&manifest).0;
+        assert_eq!(selector.manifest_id, manifest_id);
+        let raw = request.manifest_selected.unwrap();
+        assert_eq!(raw.blake3, blake3::hash(&manifest).as_bytes());
+        assert_eq!(raw.size_bytes, manifest.len() as u64);
+        let selected = tinytree_client::CloudRawDigest::of(&data);
+        let mut descriptor = c::CaptureDescriptor {
+            capture_id: request.expected_capture_id,
+            selected: Some(c::RawDigest {
+                blake3: selected.blake3.to_vec(),
+                size_bytes: selected.size_bytes,
+            }),
+        };
+        if mode == 42 {
+            descriptor.capture_id[0] ^= 1;
+        }
+        if mode == 60 {
+            descriptor.capture_id.pop();
+        }
+        if mode == 44 {
+            data[0] ^= 1;
+        }
+        let mut echo = manifest_id.to_vec();
+        if mode == 43 {
+            echo[0] ^= 1;
+        }
+        if mode == 59 {
+            echo.clear();
+        }
+        let chunk = |offset, data, eof| c::CaptureChunk {
+            descriptor: Some(descriptor.clone()),
+            offset,
+            data,
+            eof,
+            manifest_id: echo.clone(),
+        };
+        let mut frames = Vec::new();
+        if matches!(mode, 49 | 51) {
+            frames.push(Ok(chunk(0, vec![], false)));
+        }
+        if mode == 49 {
+            frames.push(Ok(chunk(0, vec![], false)));
+        }
+        if mode == 50 {
+            frames.push(Ok(chunk(0, vec![0; 64 * 1024 + 1], true)));
+        } else {
+            frames.push(Ok(chunk(
+                if mode == 45 { 1 } else { 0 },
+                data.clone(),
+                !matches!(mode, 41 | 48),
+            )));
+            if mode == 46 {
+                frames.push(Ok(chunk(data.len() as u64, vec![], true)));
+            }
+        }
+        if mode == 47 {
+            let first = chunk(0, data[..data.len() / 2].to_vec(), false);
+            let last = chunk(
+                (data.len() / 2) as u64,
+                data[data.len() / 2..].to_vec(),
+                true,
+            );
+            let entered = self.index_entered.clone();
+            let release = self.index_release.clone();
+            return Ok(Response::new(Box::pin(async_stream::stream! {
+                yield Ok(first);entered.notify_one();release.notified().await;yield Ok(last);
+            })));
+        }
+        Ok(Response::new(Box::pin(futures_util::stream::iter(frames))))
     }
     async fn get_publication(
         &self,
@@ -6957,4 +7074,215 @@ async fn cancelled_cloud_scope_releases_transport_admission_after_physical_respo
     tokio::time::timeout(Duration::from_secs(5), running.stop())
         .await
         .expect("cloud scope fixture did not shut down");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn captured_version_transport_checks_client_footer_stream_and_original_publish_intent() {
+    use tinytree_client::cloud_protocol::workspace_cloud_server::WorkspaceCloudServer;
+    use tinytree_client::{
+        CloudCapturedPublishIntent, CloudManifestId, CloudPublishIntent, CloudRawDigest,
+        RetainedVersionSelector,
+    };
+    let faults = CloudFaults::default();
+    faults.mode.store(40, Ordering::SeqCst);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let incoming = async_stream::stream! {loop{match listener.accept().await{Ok((stream,_))=>yield Ok::<_,std::io::Error>(stream),Err(error)=>{yield Err(error);break}}}};
+    let service = WorkspaceCloudServer::new(faults.clone())
+        .accept_compressed(tonic::codec::CompressionEncoding::Zstd)
+        .send_compressed(tonic::codec::CompressionEncoding::Zstd);
+    let server = tokio::spawn(async move {
+        tonic::transport::Server::builder()
+            .add_service(service)
+            .serve_with_incoming(incoming)
+            .await
+            .unwrap()
+    });
+    let mut config = Config::default();
+    config.endpoint = format!("http://{address}");
+    config.limits.max_inflight = 1;
+    config.rpc.retry.max_attempts = 1;
+    assert!(!toml::to_string(&config).unwrap().contains("[cloud]"));
+    let mut existing_custom = config.clone();
+    existing_custom.cloud.max_object_bytes /= 2;
+    assert!(
+        !toml::to_string(&existing_custom)
+            .unwrap()
+            .contains("max_capture_bytes"),
+        "adding the default capture bound does not rotate existing custom cloud configuration identity"
+    );
+    let client = NativeClient::connect(config.clone()).await.unwrap();
+    let (data, manifest) = capture_transport_fixture(40);
+    let selector = RetainedVersionSelector {
+        workspace_id: [1; 32],
+        generation: 1,
+        manifest_id: CloudManifestId::of(&manifest),
+    };
+    let selected = CloudRawDigest::of(&manifest);
+    let retained = client
+        .cloud_retained_version_selected(selector, selected)
+        .await
+        .unwrap();
+    let proof = client.cloud_captured_version(retained).unwrap();
+    let capture = client.cloud_read_capture(&proof).await.unwrap();
+    assert_eq!(capture.payload(), data);
+    assert_eq!(capture.descriptor(), proof.descriptor());
+    client.cloud_workspace([1; 32]).await.unwrap(); // Retained bytes never pin max_inflight=1.
+    drop(capture);
+    let foreign = NativeClient::connect(config.clone()).await.unwrap();
+    let before = faults.calls.load(Ordering::SeqCst);
+    assert_eq!(
+        foreign.cloud_read_capture(&proof).await.unwrap_err().code(),
+        Code::FailedPrecondition
+    );
+    assert_eq!(
+        faults.calls.load(Ordering::SeqCst),
+        before,
+        "foreign client proof rejected before RPC"
+    );
+    for (mode, code) in [
+        (41, Code::DataLoss),
+        (42, Code::DataLoss),
+        (43, Code::DataLoss),
+        (44, Code::DataLoss),
+        (45, Code::DataLoss),
+        (46, Code::DataLoss),
+        (48, Code::DataLoss),
+        (49, Code::DataLoss),
+        (50, Code::ResourceExhausted),
+        (59, Code::DataLoss),
+        (60, Code::DataLoss),
+    ] {
+        faults.mode.store(mode, Ordering::SeqCst);
+        assert_eq!(
+            client.cloud_read_capture(&proof).await.unwrap_err().code(),
+            code,
+            "capture stream mode {mode}"
+        );
+    }
+    faults.mode.store(51, Ordering::SeqCst);
+    assert_eq!(
+        client.cloud_read_capture(&proof).await.unwrap().payload(),
+        data
+    );
+    drop(proof);
+    for (mode, code) in [(53, Code::Unimplemented), (54, Code::DataLoss)] {
+        faults.mode.store(mode, Ordering::SeqCst);
+        let manifest = capture_transport_fixture(mode).1;
+        let selector = RetainedVersionSelector {
+            manifest_id: CloudManifestId::of(&manifest),
+            ..selector
+        };
+        let retained = client
+            .cloud_retained_version_selected(selector, CloudRawDigest::of(&manifest))
+            .await
+            .unwrap();
+        assert_eq!(
+            client.cloud_captured_version(retained).unwrap_err().code(),
+            code
+        );
+    }
+    faults.mode.store(58, Ordering::SeqCst);
+    let wrong_domain = capture_transport_fixture(58).1;
+    let retained = client
+        .cloud_retained_version_selected(
+            RetainedVersionSelector {
+                manifest_id: CloudManifestId::of(&wrong_domain),
+                ..selector
+            },
+            CloudRawDigest::of(&wrong_domain),
+        )
+        .await
+        .unwrap();
+    let proof = client.cloud_captured_version(retained).unwrap();
+    assert_eq!(
+        client.cloud_read_capture(&proof).await.unwrap_err().code(),
+        Code::DataLoss,
+        "raw digest alone cannot substitute for capture domain ID"
+    );
+    drop(proof);
+    faults.mode.store(40, Ordering::SeqCst);
+    let physical = Arc::new(AtomicUsize::new(0));
+    let persistent = Arc::new(AtomicUsize::new(0));
+    let guarded = client
+        .clone()
+        .with_lifetime_guard(Arc::new(LifetimeProbe(persistent.clone())))
+        .with_rpc_lifetime_guard(Arc::new(LifetimeProbe(physical.clone())));
+    let retained = guarded
+        .cloud_retained_version_selected(selector, selected)
+        .await
+        .unwrap();
+    let proof = guarded.cloud_captured_version(retained).unwrap();
+    let capture = guarded.cloud_read_capture(&proof).await.unwrap();
+    drop(guarded);
+    assert_released(&physical).await;
+    assert_eq!(persistent.load(Ordering::SeqCst), 0);
+    client.cloud_workspace([1; 32]).await.unwrap();
+    drop(capture);
+    drop(proof);
+    assert_released(&persistent).await;
+    // A canceled partial transfer must release physical admission, while an
+    // independent retained-version proof never owns max_inflight's call slot.
+    let retained = client
+        .cloud_retained_version_selected(selector, selected)
+        .await
+        .unwrap();
+    let proof = Arc::new(client.cloud_captured_version(retained).unwrap());
+    faults.mode.store(47, Ordering::SeqCst);
+    let canceled_physical = Arc::new(AtomicUsize::new(0));
+    let guarded = client
+        .clone()
+        .with_rpc_lifetime_guard(Arc::new(LifetimeProbe(canceled_physical.clone())));
+    let read = tokio::spawn(async move { guarded.cloud_read_capture(&proof).await });
+    tokio::time::timeout(Duration::from_secs(1), faults.index_entered.notified())
+        .await
+        .unwrap();
+    read.abort();
+    assert!(read.await.unwrap_err().is_cancelled());
+    faults.index_release.notify_one();
+    assert_released(&canceled_physical).await;
+    client.cloud_workspace([1; 32]).await.unwrap();
+    let intent = CloudPublishIntent {
+        workspace_id: [1; 32],
+        expected_generation: 0,
+        idempotency_key: "captured-original".into(),
+        manifest: manifest.clone(),
+        staging_leases: vec![],
+    };
+    let before = faults.calls.load(Ordering::SeqCst);
+    assert_eq!(
+        client
+            .cloud_publish_version(&intent)
+            .await
+            .unwrap_err()
+            .code(),
+        Code::InvalidArgument
+    );
+    assert_eq!(faults.calls.load(Ordering::SeqCst), before);
+    let intent = CloudCapturedPublishIntent::new(intent, data.clone()).unwrap();
+    faults.mode.store(55, Ordering::SeqCst);
+    let publication = client
+        .cloud_publish_captured_version(&intent)
+        .await
+        .unwrap();
+    assert_eq!(publication.idempotency_key, "captured-original");
+    assert_eq!(
+        publication.workspace.manifest_id,
+        Some(selector.manifest_id)
+    );
+    assert_eq!(intent.capture_data(), data);
+    config.cloud.max_capture_bytes = 1;
+    let small = NativeClient::connect(config).await.unwrap();
+    let before = faults.calls.load(Ordering::SeqCst);
+    assert_eq!(
+        small
+            .cloud_publish_captured_version(&intent)
+            .await
+            .unwrap_err()
+            .code(),
+        Code::ResourceExhausted
+    );
+    assert_eq!(faults.calls.load(Ordering::SeqCst), before);
+    server.abort();
+    let _ = server.await;
 }

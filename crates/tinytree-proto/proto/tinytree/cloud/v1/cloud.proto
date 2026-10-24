@@ -15,6 +15,7 @@ service WorkspaceCloud {
   rpc PublishVersion(PublishVersionRequest) returns (Publication);
   rpc GetWorkspace(GetWorkspaceRequest) returns (Workspace);
   rpc GetVersion(GetVersionRequest) returns (Version);
+  rpc ReadCapture(ReadCaptureRequest) returns (stream CaptureChunk);
   rpc ReadNativeClosure(ReadNativeClosureRequest) returns (stream NativeClosureChunk);
   rpc GetPublication(GetPublicationRequest) returns (GetPublicationResponse);
 }
@@ -78,6 +79,7 @@ message PublishVersionRequest {
   bytes manifest_id = 5; // Domain-separated manifest ID, not raw BLAKE3.
   bytes manifest = 6; // Canonical tinytree-cloud manifest encoding.
   repeated string staging_leases = 7;
+  bytes capture_data = 8; // Canonical capture DATA, required by manifest v3.
 }
 message GetWorkspaceRequest {
   string repository_id = 1;
@@ -186,4 +188,22 @@ message NativeClosureChunk {
   bytes data = 3;
   bool eof = 4;
   bytes source_binding_digest = 5;
+}
+
+message CaptureDescriptor {
+  bytes capture_id = 1; // Domain-separated capture DATA ID, exactly 32 bytes.
+  RawDigest selected = 2;
+}
+message ReadCaptureRequest {
+  string repository_id = 1;
+  RetainedVersionSelector selector = 2;
+  bytes expected_capture_id = 3;
+  RawDigest manifest_selected = 4; // Exact selected manifest; not an auth grant.
+}
+message CaptureChunk {
+  CaptureDescriptor descriptor = 1;
+  uint64 offset = 2;
+  bytes data = 3;
+  bool eof = 4;
+  bytes manifest_id = 5; // Mandatory echo of the exact retained selector.
 }

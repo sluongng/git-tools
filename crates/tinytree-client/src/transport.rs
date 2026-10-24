@@ -78,6 +78,7 @@ impl Client {
         shape: Shape,
         limits: &crate::CloudLimits,
         cap: usize,
+        request_bound: usize,
     ) -> Result<Response<U>, Status> {
         self.limits.max_batch_items = limits.max_lookup_items;
         self.limits.max_metadata_bytes = limits.max_manifest_bytes;
@@ -87,9 +88,7 @@ impl Client {
             .inner
             .clone()
             .max_decoding_message_size(cap)
-            .max_encoding_message_size(
-                limits.max_manifest_bytes.max(limits.max_object_bytes) + 128 * 1024,
-            );
+            .max_encoding_message_size(request_bound);
         self.unary(request, path, shape).await
     }
     pub(crate) async fn cloud_read(
@@ -148,6 +147,36 @@ impl Client {
                     tinytree_proto::cloud_v1::ReadIndexArtifactRequest,
                     tinytree_proto::cloud_v1::IndexArtifactChunk,
                 >::new(Shape::CloudIndexChunk, self.limits.clone(), cap)
+                .with_optional_owner(self.owner.clone()),
+            )
+            .await
+    }
+    pub(crate) async fn cloud_capture_read(
+        &mut self,
+        request: Request<tinytree_proto::cloud_v1::ReadCaptureRequest>,
+        limits: &crate::CloudLimits,
+    ) -> Result<Response<Streaming<tinytree_proto::cloud_v1::CaptureChunk>>, Status> {
+        let cap = limits.max_chunk_bytes + 1024;
+        self.inner = self
+            .inner
+            .clone()
+            .max_decoding_message_size(cap)
+            .max_encoding_message_size(4096);
+        self.limits.max_frame_bytes = limits.max_chunk_bytes;
+        self.inner
+            .ready()
+            .await
+            .map_err(|_| Status::unavailable("native gRPC transport not ready"))?;
+        self.inner
+            .server_streaming(
+                request,
+                http::uri::PathAndQuery::from_static(
+                    "/tinytree.cloud.v1.WorkspaceCloud/ReadCapture",
+                ),
+                BoundedCodec::<
+                    tinytree_proto::cloud_v1::ReadCaptureRequest,
+                    tinytree_proto::cloud_v1::CaptureChunk,
+                >::new(Shape::CloudCaptureChunk, self.limits.clone(), cap)
                 .with_optional_owner(self.owner.clone()),
             )
             .await
@@ -511,6 +540,8 @@ pub(crate) enum Shape {
     CloudIndexSelections,
     CloudIndexSelection,
     CloudIndexChunk,
+    CloudCaptureDescriptor,
+    CloudCaptureChunk,
     IdsPage,
     IdsRow,
     GraphPage,
@@ -737,7 +768,10 @@ fn scan(
                     (Shape::FactAnswer, 1 | 2 | 5)
                         | (Shape::ChangeTarget, 2)
                         | (Shape::IdsPage | Shape::GraphPage | Shape::CanonicalPage, 6)
-                        | (Shape::CloudChunk | Shape::CloudIndexChunk, 4)
+                        | (
+                            Shape::CloudChunk | Shape::CloudIndexChunk | Shape::CloudCaptureChunk,
+                            4
+                        )
                         | (Shape::ShortestPrefix, 3)
                         | (Shape::CloudNativeChunk, 4)
                 )
@@ -792,11 +826,12 @@ fn scan(
         | Shape::CloudReceipt
         | Shape::CloudPublication
         | Shape::CloudIndexDescriptor
-        | Shape::CloudIndexReceipt => (1 << 1) | (1 << 2),
+        | Shape::CloudIndexReceipt
+        | Shape::CloudCaptureDescriptor => (1 << 1) | (1 << 2),
         Shape::CloudChunk | Shape::CloudWorkspace | Shape::CloudIndexChunk => 1 << 1,
         Shape::CloudVersion => (1 << 1) | (1 << 3),
         Shape::CloudNativeAuthority => (1 << 2) | (1 << 3) | (1 << 4),
-        Shape::CloudNativeChunk => (1 << 1) | (1 << 5),
+        Shape::CloudNativeChunk | Shape::CloudCaptureChunk => (1 << 1) | (1 << 5),
         Shape::IdsPage | Shape::GraphPage | Shape::CanonicalPage => (1 << 1) | (1 << 2) | (1 << 6),
         Shape::IdsRow | Shape::GraphRow | Shape::CanonicalRow => (1 << 1) | (1 << 2),
         Shape::QueryScope => (1 << 1) | (1 << 2) | (1 << 3) | (1 << 5),
@@ -848,6 +883,11 @@ fn rule(shape: Shape, n: u32, l: &Limits) -> Option<(u8, Option<Shape>, usize, u
     let nested = |child| Some((2, Some(child), 1, 0));
     let repeated = |child, count, allocation| Some((2, Some(child), count, allocation));
     match (shape, n) {
+        (Shape::CloudCaptureDescriptor, 1) | (Shape::CloudCaptureChunk, 5) => text(32),
+        (Shape::CloudCaptureDescriptor, 2) => nested(Shape::CloudDigest),
+        (Shape::CloudCaptureChunk, 1) => nested(Shape::CloudCaptureDescriptor),
+        (Shape::CloudCaptureChunk, 2 | 4) => scalar(),
+        (Shape::CloudCaptureChunk, 3) => text(l.max_frame_bytes),
         (Shape::CloudIndexId, 1)
         | (Shape::CloudIndexReceipt, 3)
         | (Shape::CloudIndexChunk, 2 | 4) => scalar(),

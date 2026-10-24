@@ -29,6 +29,12 @@ All published versions are retained. Quotas reject new promises rather than
 expiring history. The profile explicitly bounds Store validation work and its
 separate RPC memory pool; it does not silently shrink existing native limits.
 
+Set `indexed_versions = true` for portable indexes, then `captured_versions = true`
+to accept bound capture capsules. Configure `max_capture_bytes` and the RPC pool
+together; the cloud profile includes bounded opt-in settings. The first captured
+publication upgrades Store format to 5. The daemon does not yet upload its local
+capture queue automatically.
+
 The separate query service supports retained root scopes, exact graph facts and
 prefix resolution. Its rebuildable index warms asynchronously; unavailable
 coverage is an error, not an empty result. Warming caches raw canonical payloads

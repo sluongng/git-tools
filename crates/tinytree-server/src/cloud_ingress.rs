@@ -59,6 +59,7 @@ impl Service<http::Request<Body>> for CloudGrpcService {
                         | "LookupIndexArtifacts"
                         | "ReadIndexArtifact"
                         | "ReadNativeClosure"
+                        | "ReadCapture"
                         | "LookupObjects"
                         | "ReadObject"
                         | "PublishVersion"
@@ -78,7 +79,7 @@ impl Service<http::Request<Body>> for CloudGrpcService {
                     &metadata,
                     matches!(
                         method.as_str(),
-                        "ReadObject" | "ReadIndexArtifact" | "ReadNativeClosure"
+                        "ReadObject" | "ReadIndexArtifact" | "ReadNativeClosure" | "ReadCapture"
                     ),
                 )?;
                 let work: Arc<Work> = host.admit(&method, deadline)?;

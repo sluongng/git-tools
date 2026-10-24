@@ -4691,11 +4691,14 @@ fn cloud_object_descriptor(
 }
 #[tokio::test]
 async fn cloud_rpc_private_compressed_history_replay_gc_and_restart() {
+    use jj_lib::object_id::ObjectId as _;
     use tinytree_proto::cloud_v1::{self as c, workspace_cloud_client::WorkspaceCloudClient};
     let directory = tempfile::tempdir().unwrap();
     let mut profile: tinytree_server::Config =
         toml::from_str(include_str!("../examples/cloud.toml")).unwrap();
     profile.service.cloud.indexed_versions = true;
+    profile.service.cloud.captured_versions = true;
+    profile.service.cloud.max_capture_bytes = 128 * 1024;
     profile.service.cloud.max_inflight = 1;
     profile.service.query.max_scope_memory_bytes = 40 * 1024;
     profile.validate().unwrap();
@@ -4827,6 +4830,7 @@ async fn cloud_rpc_private_compressed_history_replay_gc_and_restart() {
         manifest_id: tinytree_cloud::ManifestId::of(&bytes).0.to_vec(),
         manifest: bytes.clone(),
         staging_leases: leases,
+        capture_data: vec![],
     };
     let published = client
         .publish_version(request(first.clone(), ALPHA))
@@ -5007,7 +5011,105 @@ async fn cloud_rpc_private_compressed_history_replay_gc_and_restart() {
         index_roots: roots,
         recovery: manifest.clone(),
     };
+    // Protocol fixture: the policy is a publisher declaration, not a live
+    // frontend proof. Actual native capture acceptance is tested by the host.
+    let text = |bytes: &[u8]| bytes.iter().map(|b| format!("{b:02x}")).collect::<String>();
+    let mut operations = vec![tinytree_cloud::OperationRecord {
+        operation: "00".repeat(64),
+        view: "00".repeat(64),
+        parents: vec![],
+    }];
+    let mut blobs = Vec::new();
+    for object in &objects {
+        let (kind, id) = match object.id() {
+            tinytree_cloud::ObjectId::Operation(id) => (1, id),
+            tinytree_cloud::ObjectId::View(id) => (2, id),
+        };
+        let digest = object.digest().unwrap();
+        blobs.push(tinytree_cloud::BlobRecord {
+            kind,
+            id: text(&id),
+            blake3: digest.blake3,
+            size: digest.size_bytes,
+        });
+        if let Some(operation) = object.operation() {
+            operations.push(tinytree_cloud::OperationRecord {
+                operation: text(&id),
+                view: operation.view_id.hex(),
+                parents: operation.parents.iter().map(|id| id.hex()).collect(),
+            });
+        }
+    }
+    operations.sort_by(|a, b| a.operation.cmp(&b.operation));
+    for artifact in &artifacts {
+        let (kind, id) = match artifact.descriptor.id {
+            tinytree_cloud::IndexArtifactId::Root(id) => (3, id.0),
+            tinytree_cloud::IndexArtifactId::Node(id) => (4, id.0),
+        };
+        blobs.push(tinytree_cloud::BlobRecord {
+            kind,
+            id: text(&id),
+            blake3: artifact.descriptor.selected.blake3,
+            size: artifact.descriptor.selected.size_bytes,
+        });
+    }
+    blobs.sort_by(|a, b| (a.kind, &a.id).cmp(&(b.kind, &b.id)));
+    let wc = &manifest.working_copy;
+    let capture_data = tinytree_cloud::CaptureData {
+        version: 1,
+        policy: tinytree_cloud::CapturePolicy::HostQuiescentV1,
+        codec: tinytree_cloud::CODEC.into(),
+        operation_heads: manifest.operation_heads.iter().map(|id| text(id)).collect(),
+        working_copy: tinytree_cloud::PortableWorkingCopy {
+            workspace: wc.workspace_name.clone(),
+            wc_operation: text(&wc.wc_operation),
+            snapshot_operation: text(&wc.snapshot_operation),
+            snapshot_commit: wc.snapshot_commit,
+            tree: tinytree_cloud::CaptureTree {
+                terms: wc.tree.terms.iter().map(|id| id.0).collect(),
+                labels: if wc.tree.labels.iter().all(String::is_empty) {
+                    vec![]
+                } else {
+                    wc.tree.labels.clone()
+                },
+            },
+        },
+        indexes: indexed_manifest
+            .operation_indexes
+            .iter()
+            .map(|index| tinytree_cloud::IndexRecord {
+                operation: text(&index.operation),
+                root: index.root.0,
+            })
+            .collect(),
+        operations,
+        blobs,
+        roots: manifest
+            .native_roots
+            .iter()
+            .map(|key| tinytree_cloud::CapturedRoot {
+                kind: key.kind as u8,
+                id: key.id.0,
+            })
+            .collect(),
+        remote: None,
+    };
+    let capture_bytes =
+        tinytree_cloud::encode_capture_data(&capture_data, Default::default()).unwrap();
+    let capture_descriptor = tinytree_cloud::CaptureDescriptor::of(&capture_bytes);
+    let mut captured_history = indexed_manifest.clone();
+    captured_history.recovery.sequence = 3;
+    // Its parent is filled after the exact V2 encoding below.
     let next = tinytree_cloud::encode_manifest_v2(&indexed_manifest, Default::default()).unwrap();
+    captured_history.recovery.parents = vec![tinytree_cloud::ManifestId::of(&next)];
+    let captured_manifest = tinytree_cloud::encode_manifest_v3(
+        &tinytree_cloud::ManifestV3 {
+            history: captured_history,
+            capture: capture_descriptor,
+        },
+        Default::default(),
+    )
+    .unwrap();
     let indexed_bytes = next.clone();
     let second = c::PublishVersionRequest {
         expected_generation: 1,
@@ -5730,6 +5832,99 @@ async fn cloud_rpc_private_compressed_history_replay_gc_and_restart() {
             .manifest,
         indexed_bytes
     );
+    let captured_request = c::PublishVersionRequest {
+        repository_id: "alpha".into(),
+        workspace_id: manifest.workspace.to_vec(),
+        expected_generation: 2,
+        idempotency_key: "captured-native-state".into(),
+        manifest_id: tinytree_cloud::ManifestId::of(&captured_manifest)
+            .0
+            .to_vec(),
+        manifest: captured_manifest.clone(),
+        staging_leases: vec![],
+        capture_data: capture_bytes.clone(),
+    };
+    assert_eq!(
+        client
+            .publish_version(request(captured_request.clone(), READER))
+            .await
+            .unwrap_err()
+            .code(),
+        Code::PermissionDenied
+    );
+    let captured_publication = client
+        .publish_version(request(captured_request.clone(), ALPHA))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(
+        captured_publication.workspace.as_ref().unwrap().generation,
+        3
+    );
+    assert_eq!(
+        client
+            .publish_version(request(captured_request.clone(), ALPHA))
+            .await
+            .unwrap()
+            .into_inner(),
+        captured_publication
+    );
+    let mut changed_capture = captured_request.clone();
+    changed_capture.capture_data[0] ^= 1;
+    assert_eq!(
+        client
+            .publish_version(request(changed_capture, ALPHA))
+            .await
+            .unwrap_err()
+            .code(),
+        Code::AlreadyExists
+    );
+    let captured_read = c::ReadCaptureRequest {
+        repository_id: "alpha".into(),
+        selector: Some(c::RetainedVersionSelector {
+            workspace_id: manifest.workspace.to_vec(),
+            generation: 3,
+            manifest_id: captured_request.manifest_id.clone(),
+        }),
+        expected_capture_id: capture_descriptor.id.0.to_vec(),
+        manifest_selected: Some(c::RawDigest {
+            blake3: blake3::hash(&captured_manifest).as_bytes().to_vec(),
+            size_bytes: captured_manifest.len() as u64,
+        }),
+    };
+    assert!(
+        client
+            .read_capture(request(captured_read.clone(), PEER))
+            .await
+            .is_err()
+    );
+    let held = store.clone();
+    tokio::task::spawn_blocking(move || held.gc("alpha", i64::MAX).unwrap())
+        .await
+        .unwrap();
+    let response = client
+        .read_capture(request(captured_read.clone(), ALPHA))
+        .await
+        .unwrap();
+    assert_eq!(response.metadata().get("grpc-encoding").unwrap(), "zstd");
+    let mut capture_stream = response.into_inner();
+    let mut transferred_capture = Vec::new();
+    let mut capture_eof = false;
+    while let Some(chunk) = capture_stream.message().await.unwrap() {
+        assert!(!capture_eof);
+        assert_eq!(chunk.offset, transferred_capture.len() as u64);
+        assert_eq!(chunk.manifest_id, captured_request.manifest_id);
+        let descriptor = chunk.descriptor.unwrap();
+        assert_eq!(descriptor.capture_id, capture_descriptor.id.0);
+        assert_eq!(
+            descriptor.selected.unwrap().blake3,
+            capture_descriptor.selected.blake3
+        );
+        transferred_capture.extend(chunk.data);
+        capture_eof = chunk.eof;
+    }
+    assert!(capture_eof);
+    assert_eq!(transferred_capture, capture_bytes);
     drop(client);
     server.stop().await;
     drop(store);
@@ -5743,6 +5938,20 @@ async fn cloud_rpc_private_compressed_history_replay_gc_and_restart() {
     let mut client = WorkspaceCloudClient::new(channel)
         .send_compressed(CompressionEncoding::Zstd)
         .accept_compressed(CompressionEncoding::Zstd);
+    let mut capture_stream = client
+        .read_capture(request(captured_read, ALPHA))
+        .await
+        .unwrap()
+        .into_inner();
+    let mut reopened_capture = Vec::new();
+    while let Some(chunk) = capture_stream.message().await.unwrap() {
+        assert_eq!(chunk.offset, reopened_capture.len() as u64);
+        reopened_capture.extend(chunk.data);
+    }
+    assert_eq!(
+        reopened_capture, capture_bytes,
+        "capture and version survive reopening together"
+    );
     assert_eq!(
         client
             .get_version(request(
@@ -5878,6 +6087,7 @@ async fn cloud_rpc_decompressed_and_semantic_request_bounds_reject_before_store_
                 manifest_id: vec![2; 32],
                 manifest: vec![0; 1025],
                 staging_leases: vec![],
+                capture_data: vec![],
             },
             ALPHA,
         ))

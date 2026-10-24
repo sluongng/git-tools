@@ -19,6 +19,9 @@ max_metadata_bytes = 4194304
 enabled = true
 # Opt in to portable logical indexes and indexed recovery manifests.
 indexed_versions = false
+# Optional bound capsules; enable only with indexed_versions and a sized pool.
+# captured_versions = true
+# max_capture_bytes = 131072
 max_manifest_bytes = 524288
 max_staging_leases = 256
 max_inflight = 2

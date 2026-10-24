@@ -1,12 +1,18 @@
 //! Portable workspace-cloud transport. Raw digests and manifest IDs are checked;
 //! native OP/VIEW semantic verification and manifest graph coverage remain the
 //! caller's responsibility. Neither a receipt nor lookup establishes retention.
+#[path = "cloud_capture.rs"]
+mod capture;
 #[path = "cloud_index.rs"]
 mod index;
 #[path = "cloud_native.rs"]
 mod native;
 use super::*;
 use crate::transport::Shape;
+pub use capture::{
+    CloudCapture, CloudCaptureDescriptor, CloudCaptureId, CloudCapturedPublishIntent,
+    VerifiedCapturedVersion,
+};
 pub use index::{
     CloudIndexArtifact, CloudIndexArtifactDescriptor, CloudIndexArtifactId, CloudIndexWriteReceipt,
 };
@@ -19,15 +25,21 @@ use tinytree_proto::cloud_v1 as c;
 pub struct CloudLimits {
     pub max_object_bytes: usize,
     pub max_manifest_bytes: usize,
+    #[serde(skip_serializing_if = "default_capture_limit")]
+    pub max_capture_bytes: usize,
     pub max_lookup_items: usize,
     pub max_staging_leases: usize,
     pub max_chunk_bytes: usize,
+}
+fn default_capture_limit(value: &usize) -> bool {
+    *value == 8 * 1024 * 1024
 }
 impl Default for CloudLimits {
     fn default() -> Self {
         Self {
             max_object_bytes: 4 * 1024 * 1024,
             max_manifest_bytes: 8 * 1024 * 1024,
+            max_capture_bytes: 8 * 1024 * 1024,
             max_lookup_items: 256,
             max_staging_leases: 1024,
             max_chunk_bytes: 64 * 1024,
@@ -41,6 +53,7 @@ impl CloudLimits {
     pub(crate) fn validate(&self) -> Result<(), &'static str> {
         if !(1..=4 * 1024 * 1024).contains(&self.max_object_bytes)
             || !(1..=8 * 1024 * 1024).contains(&self.max_manifest_bytes)
+            || !(1..=8 * 1024 * 1024).contains(&self.max_capture_bytes)
             || !(1..=256).contains(&self.max_lookup_items)
             || !(1..=1024).contains(&self.max_staging_leases)
             || !(1024..=64 * 1024).contains(&self.max_chunk_bytes)
@@ -360,6 +373,7 @@ impl NativeClient {
                         shape,
                         &self.inner.config.cloud,
                         cap,
+                        request_bound,
                     )
                     .await?
                     .into_inner();
@@ -613,9 +627,23 @@ impl NativeClient {
         &self,
         intent: &CloudPublishIntent,
     ) -> Result<CloudPublication, Status> {
+        if capture::is_v3(&intent.manifest) {
+            return Err(Status::invalid_argument(
+                "captured manifest requires capture data",
+            ));
+        }
+        self.cloud_publish_at(intent, &[], false).await
+    }
+    async fn cloud_publish_at(
+        &self,
+        intent: &CloudPublishIntent,
+        capture_data: &[u8],
+        same_deadline_reconcile: bool,
+    ) -> Result<CloudPublication, Status> {
         key(&intent.idempotency_key)?;
         let l = &self.inner.config.cloud;
         if intent.manifest.len() > l.max_manifest_bytes
+            || capture_data.len() > l.max_capture_bytes
             || intent.staging_leases.len() > l.max_staging_leases
             || intent.staging_leases.iter().any(|s| !lease(s))
         {
@@ -628,7 +656,8 @@ impl NativeClient {
         let bound = intent
             .manifest
             .len()
-            .checked_add(intent.staging_leases.len() * 68)
+            .checked_add(capture_data.len())
+            .and_then(|n| n.checked_add(intent.staging_leases.len() * 68))
             .and_then(|n| n.checked_add(4096))
             .ok_or_else(limit)?;
         let deadline = self.deadline();
@@ -655,6 +684,7 @@ impl NativeClient {
                     manifest_id: expected.0.to_vec(),
                     manifest: intent.manifest.clone(),
                     staging_leases: intent.staging_leases.clone(),
+                    capture_data: capture_data.to_vec(),
                 },
             )
             .await;
@@ -676,10 +706,18 @@ impl NativeClient {
                 if reapi::policy::retryable(&error)
                     || error.code() == tonic::Code::DeadlineExceeded =>
             {
-                // Unknown outcome: reconcile the original key under a fresh
-                // bounded operation deadline. Never manufacture a new intent.
+                // Reconcile only the original key. Captured publication stays
+                // within its original absolute deadline; legacy policy retains
+                // its existing fresh, bounded reconciliation deadline.
                 match self
-                    .cloud_publication_at(&intent.idempotency_key, self.deadline())
+                    .cloud_publication_at(
+                        &intent.idempotency_key,
+                        if same_deadline_reconcile {
+                            deadline
+                        } else {
+                            self.deadline()
+                        },
+                    )
                     .await?
                 {
                     Some(value) => value,
