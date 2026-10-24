@@ -2447,3 +2447,311 @@ fn immutable_fact_memo_is_optional_bounded_and_never_remembers_errors() {
         }
     });
 }
+
+#[derive(Default)]
+struct PortableArtifactSink {
+    values: Vec<tinytree_cloud::VerifiedIndexArtifact>,
+    emitted: BTreeSet<tinytree_cloud::IndexArtifactId>,
+}
+#[async_trait]
+impl IndexArtifactSink for PortableArtifactSink {
+    async fn write(&mut self, artifact: ExportArtifact) -> Result<(), Error> {
+        assert!(
+            self.emitted.insert(artifact.descriptor().id),
+            "shared artifacts are emitted once"
+        );
+        self.values.push(
+            tinytree_cloud::decode_index_artifact(
+                artifact.bytes(),
+                artifact.descriptor(),
+                Default::default(),
+            )
+            .unwrap(),
+        );
+        Ok(())
+    }
+}
+#[test]
+fn portable_export_preserves_exact_historical_indexes_and_never_invents_root_operation() {
+    block_on(async {
+        let (_directory, _objects_directory, store, io, objects, _config) = fixture();
+        let mut sink = PortableArtifactSink::default();
+        assert!(matches!(
+            store
+                .export_operation_indexes(&[[0; 64]], Default::default(), &mut sink, Arc::new(()))
+                .await,
+            Err(Error::MissingOperation)
+        ));
+        assert!(sink.values.is_empty());
+        let seed = store.seed_index().unwrap();
+        store.associate_operation(&[0; 64], &seed).unwrap();
+        let backend =
+            jj_native_backend::NativeBackend::from_io(objects.clone(), Default::default())
+                .await
+                .unwrap();
+        let jj_store = Store::new(
+            Box::new(backend),
+            jj_lib::signing::Signer::new(None, vec![]),
+            jj_lib::tree_merge::MergeOptions {
+                hunk_level: jj_lib::files::FileMergeHunkLevel::Line,
+                same_change: jj_lib::merge::SameChange::Accept,
+            },
+        );
+        let root = jj_store.root_commit();
+        let mut branches = Vec::new();
+        let mut commits = Vec::new();
+        for description in ["initial working-copy draft", "hidden divergent draft"] {
+            let mut value = root.store_commit().as_ref().clone();
+            value.parents = vec![root.id().clone()];
+            value.change_id = ChangeId::from_bytes(&[19; 16]);
+            value.description = description.into();
+            let commit = jj_store.write_commit(value, None).await.unwrap();
+            let mut mutable = seed.start_modification();
+            mutable.add_commit(&commit).await.unwrap();
+            branches.push(store.persist_index(mutable).unwrap());
+            commits.push(commit);
+        }
+        store.associate_operation(&[1; 64], &branches[0]).unwrap();
+        let mut merged = branches[0].start_modification();
+        merged.merge_in(&branches[1]).unwrap();
+        let merged = store.persist_index(merged).unwrap();
+        store.associate_operation(&[2; 64], &merged).unwrap();
+        store.associate_operation(&[3; 64], &merged).unwrap();
+        // Promotion changes only anchors/overlay classification, not preserved
+        // local records. It must not discard a published draft during export.
+        let verified = objects
+            .read_metadata(m::ObjectKey {
+                kind: m::Kind::Commit,
+                id: m::ObjectId(model_id(commits[0].id()).unwrap().0),
+            })
+            .await
+            .unwrap();
+        let m::Object::Commit(published) = verified.into_object() else {
+            panic!()
+        };
+        let published_id = model_commit_id(&published);
+        io.remote.lock().unwrap().push(published);
+        io.admitted.lock().unwrap().insert(published_id);
+        let promoted = merged.with_remote_roots(vec![published_id]).await.unwrap();
+        store.associate_operation(&[4; 64], &promoted).unwrap();
+        let before_opens = io.opens.load(Ordering::SeqCst);
+        let before_facts = io.facts_count.load(Ordering::SeqCst);
+        let result = store
+            .export_operation_indexes(
+                &[[0; 64], [1; 64], [2; 64], [3; 64], [4; 64]],
+                Default::default(),
+                &mut sink,
+                Arc::new(()),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            io.opens.load(Ordering::SeqCst),
+            before_opens,
+            "export does not create remote scopes"
+        );
+        assert_eq!(io.facts_count.load(Ordering::SeqCst), before_facts);
+        assert_eq!(result.operation_indexes().len(), 5);
+        assert_eq!(
+            result.operation_indexes()[2].root,
+            result.operation_indexes()[3].root
+        );
+        assert_eq!(result.work().unique_artifacts, sink.values.len());
+        assert!(result.work().source_reads >= 10);
+        let graph = tinytree_cloud::verify_index_artifact_graph(
+            result.index_roots(),
+            &sink.values,
+            Default::default(),
+        )
+        .unwrap();
+        let snapshot = |n: usize| graph.snapshot(result.operation_indexes()[n].root).unwrap();
+        assert_eq!(snapshot(0).roots, vec![m::CommitId::ROOT]);
+        assert!(snapshot(0).drafts.is_empty());
+        assert_eq!(snapshot(1).drafts.len(), 1);
+        let all = snapshot(2);
+        assert_eq!(all.drafts.len(), 2);
+        assert!(
+            all.drafts.iter().all(|d| d.order == 1),
+            "independent branches preserve repeated original ordinals"
+        );
+        for commit in &commits {
+            let record = all
+                .drafts
+                .iter()
+                .find(|d| d.commit() == model_id(commit.id()).unwrap())
+                .unwrap();
+            assert_eq!(record.change, m::ChangeId([19; 16]));
+            assert_eq!(record.parents, vec![m::CommitId::ROOT]);
+        }
+        let after = snapshot(4);
+        assert!(after.roots.contains(&published_id));
+        assert_eq!(
+            after.drafts, all.drafts,
+            "hidden/promoted records survive exactly"
+        );
+        assert_eq!(result.artifacts().len(), sink.emitted.len());
+        drop(graph);
+        drop(result);
+        drop(sink);
+        struct HoldSink(Vec<ExportArtifact>);
+        #[async_trait]
+        impl IndexArtifactSink for HoldSink {
+            async fn write(&mut self, value: ExportArtifact) -> Result<(), Error> {
+                self.0.push(value);
+                Ok(())
+            }
+        }
+        let mut held = HoldSink(vec![]);
+        let artifact_owner: QueryOwner = Arc::new(CanonicalReplyOwner);
+        let owner_probe = Arc::downgrade(&artifact_owner);
+        assert!(
+            matches!(
+                store
+                    .export_operation_indexes(
+                        &[[0; 64], [1; 64]],
+                        Default::default(),
+                        &mut held,
+                        artifact_owner
+                    )
+                    .await,
+                Err(Error::Limit)
+            ),
+            "retained artifacts consume the same peak quota; never wait for self-release"
+        );
+        assert!(!held.0.is_empty());
+        assert!(
+            owner_probe.upgrade().is_some(),
+            "escaped artifact retains caller guard after export error"
+        );
+        drop(held);
+        assert!(owner_probe.upgrade().is_none());
+        for limits in [
+            PortableExportLimits {
+                max_source_reads: 1,
+                ..Default::default()
+            },
+            PortableExportLimits {
+                max_source_bytes: 1,
+                ..Default::default()
+            },
+            PortableExportLimits {
+                max_work_units: 1,
+                ..Default::default()
+            },
+            PortableExportLimits {
+                max_working_bytes: 1024,
+                ..Default::default()
+            },
+        ] {
+            let mut sink = PortableArtifactSink::default();
+            assert!(matches!(
+                store
+                    .export_operation_indexes(&[[0; 64]], limits, &mut sink, Arc::new(()))
+                    .await,
+                Err(Error::Limit)
+            ));
+            assert!(sink.values.is_empty());
+        }
+        let mut sink = PortableArtifactSink::default();
+        assert!(matches!(
+            store
+                .export_operation_indexes(
+                    &[[0; 64], [0; 64]],
+                    Default::default(),
+                    &mut sink,
+                    Arc::new(())
+                )
+                .await,
+            Err(Error::Invalid)
+        ));
+        assert!(sink.values.is_empty());
+        let retried = store
+            .export_operation_indexes(
+                &[[0; 64], [1; 64]],
+                Default::default(),
+                &mut sink,
+                Arc::new(()),
+            )
+            .await
+            .unwrap();
+        assert_eq!(retried.operation_indexes().len(), 2);
+    });
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cancelled_portable_export_keeps_accepted_sink_artifact_owned_until_physical_teardown() {
+    struct PhysicalSink {
+        entered: Option<tokio::sync::oneshot::Sender<()>>,
+        release: Option<tokio::sync::oneshot::Receiver<()>>,
+        completed: Option<tokio::sync::oneshot::Sender<usize>>,
+    }
+    #[async_trait]
+    impl IndexArtifactSink for PhysicalSink {
+        async fn write(&mut self, artifact: ExportArtifact) -> Result<(), Error> {
+            let entered = self.entered.take().unwrap();
+            let release = self.release.take().unwrap();
+            let completed = self.completed.take().unwrap();
+            // Model an admitted physical sink whose lifetime is independent of
+            // the caller's export future. The ENTIRE opaque artifact is moved,
+            // not just the source guard or a borrowed/copied payload.
+            tokio::spawn(async move {
+                let _ = entered.send(());
+                let _ = release.await;
+                let bytes = artifact.bytes().len();
+                assert!(bytes > 0);
+                drop(artifact);
+                let _ = completed.send(bytes);
+            });
+            futures::future::pending::<Result<(), Error>>().await
+        }
+    }
+    let (_directory, _objects_directory, store, _io, _objects, _config) = fixture();
+    let seed = store.seed_index().unwrap();
+    store.associate_operation(&[0; 64], &seed).unwrap();
+    let owner: QueryOwner = Arc::new(CanonicalReplyOwner);
+    let probe = Arc::downgrade(&owner);
+    let (entered, accepted) = tokio::sync::oneshot::channel();
+    let (release, blocked) = tokio::sync::oneshot::channel();
+    let (completed, physical_done) = tokio::sync::oneshot::channel();
+    let exporting = store.clone();
+    let caller = tokio::spawn(async move {
+        let mut sink = PhysicalSink {
+            entered: Some(entered),
+            release: Some(blocked),
+            completed: Some(completed),
+        };
+        exporting
+            .export_operation_indexes(&[[0; 64]], Default::default(), &mut sink, owner)
+            .await
+            .map(|_| ())
+    });
+    tokio::time::timeout(Duration::from_secs(5), accepted)
+        .await
+        .unwrap()
+        .unwrap();
+    caller.abort();
+    assert!(caller.await.unwrap_err().is_cancelled());
+    assert!(
+        probe.upgrade().is_some(),
+        "accepted physical artifact must retain source ownership after caller cancellation"
+    );
+    release.send(()).unwrap();
+    assert!(
+        tokio::time::timeout(Duration::from_secs(5), physical_done)
+            .await
+            .unwrap()
+            .unwrap()
+            > 0
+    );
+    assert!(
+        probe.upgrade().is_none(),
+        "physical payload teardown releases its last source/quota owner"
+    );
+    let mut sink = PortableArtifactSink::default();
+    let retry = store
+        .export_operation_indexes(&[[0; 64]], Default::default(), &mut sink, Arc::new(()))
+        .await
+        .unwrap();
+    assert_eq!(retry.operation_indexes().len(), 1);
+    assert_eq!(retry.artifacts().len(), sink.values.len());
+}

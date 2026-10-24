@@ -3153,6 +3153,7 @@ dependencies = [
  "serde",
  "tempfile",
  "thiserror 2.0.21",
+ "tinytree-cloud",
  "tinytree-model",
  "tinytree-proto",
  "tokio",

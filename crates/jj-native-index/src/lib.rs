@@ -4,6 +4,11 @@ mod cleanup;
 pub use cleanup::CleanupHandle;
 mod memo;
 mod persistence;
+mod portable;
+pub use portable::{
+    ExportArtifact, IndexArtifactSink, PortableExportLimits, PortableExportWork,
+    PortableIndexExport,
+};
 mod prefix;
 mod query;
 mod revsets;

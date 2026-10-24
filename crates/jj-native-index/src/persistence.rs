@@ -9,6 +9,30 @@ struct Layout {
     linked_segments: usize,
     linked_bytes: usize,
 }
+/// Export-only shared source-read accounting, checked before every read.
+pub(super) struct ExportReadBudget {
+    pub bytes: usize,
+    pub reads: usize,
+    pub max_bytes: usize,
+    pub max_reads: usize,
+}
+impl ExportReadBudget {
+    fn cap(&mut self, maximum: usize) -> Result<usize, Error> {
+        if self.reads >= self.max_reads || self.bytes >= self.max_bytes {
+            return Err(Error::Limit);
+        }
+        self.reads += 1;
+        Ok(maximum.min(self.max_bytes - self.bytes))
+    }
+    fn charge(&mut self, bytes: usize) -> Result<(), Error> {
+        self.bytes = self
+            .bytes
+            .checked_add(bytes)
+            .filter(|n| *n <= self.max_bytes)
+            .ok_or(Error::Limit)?;
+        Ok(())
+    }
+}
 fn encoded_size(parents: usize, roots: usize, drafts: &[Arc<Draft>]) -> Result<usize, Error> {
     let mut size = 57usize
         .checked_add(parents.checked_mul(32).ok_or(Error::Limit)?)
@@ -297,13 +321,37 @@ impl Storage {
         id: &[u8; 64],
         limits: &Limits,
     ) -> Result<Vec<SegmentId>, Error> {
-        let bytes = match self.operations.read(hex(id), limits.max_segment_bytes) {
+        self.operation_export(id, limits, None)
+    }
+    fn operation_export(
+        &self,
+        id: &[u8; 64],
+        limits: &Limits,
+        mut budget: Option<&mut ExportReadBudget>,
+    ) -> Result<Vec<SegmentId>, Error> {
+        let cap = match budget.as_deref_mut() {
+            Some(b) => b.cap(limits.max_segment_bytes)?,
+            None => limits.max_segment_bytes,
+        };
+        let bytes = match self.operations.read(hex(id), cap) {
             Ok(v) => v,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                 return Err(Error::MissingOperation);
             }
+            Err(e)
+                if cap < limits.max_segment_bytes
+                    && matches!(
+                        e.kind(),
+                        std::io::ErrorKind::InvalidData | std::io::ErrorKind::InvalidInput
+                    ) =>
+            {
+                return Err(Error::Limit);
+            }
             Err(e) => return Err(e.into()),
         };
+        if let Some(b) = budget {
+            b.charge(bytes.len())?;
+        }
         let mut reader = Reader(payload(3, id, &bytes)?);
         let n = reader.count_width(limits.max_segments, 32)?;
         let mut tips = Vec::with_capacity(n);
@@ -360,6 +408,24 @@ impl Storage {
         tips: &[SegmentId],
         limits: &Limits,
     ) -> Result<(Vec<m::CommitId>, Vec<Arc<Draft>>, Layout), Error> {
+        self.load_layout_export(tips, limits, None)
+    }
+    pub(super) fn export_operation(
+        &self,
+        id: &[u8; 64],
+        limits: &Limits,
+        budget: &mut ExportReadBudget,
+    ) -> Result<(Vec<m::CommitId>, Vec<Arc<Draft>>), Error> {
+        let tips = self.operation_export(id, limits, Some(&mut *budget))?;
+        let (roots, drafts, _) = self.load_layout_export(&tips, limits, Some(&mut *budget))?;
+        Ok((roots, drafts))
+    }
+    fn load_layout_export(
+        &self,
+        tips: &[SegmentId],
+        limits: &Limits,
+        mut budget: Option<&mut ExportReadBudget>,
+    ) -> Result<(Vec<m::CommitId>, Vec<Arc<Draft>>, Layout), Error> {
         let mut layout = Layout::default();
         if tips.is_empty() || tips.len() > limits.max_segments {
             return Err(Error::Limit);
@@ -377,7 +443,26 @@ impl Storage {
                 return Err(Error::Limit);
             }
             visited.insert(id);
-            let bytes = self.segments.read(hex(&id), limits.max_segment_bytes)?;
+            let cap = match budget.as_deref_mut() {
+                Some(b) => b.cap(limits.max_segment_bytes)?,
+                None => limits.max_segment_bytes,
+            };
+            let bytes = self.segments.read(hex(&id), cap).map_err(|e| {
+                if cap < limits.max_segment_bytes
+                    && matches!(
+                        e.kind(),
+                        std::io::ErrorKind::InvalidData | std::io::ErrorKind::InvalidInput
+                    )
+                {
+                    Error::Limit
+                } else {
+                    Error::Io(e)
+                }
+            })?;
+            if let Some(b) = budget.as_deref_mut() {
+                b.charge(bytes.len())?;
+            }
+
             total = total.checked_add(bytes.len()).ok_or(Error::Limit)?;
             if total > limits.max_checkpoint_bytes {
                 return Err(Error::Limit);

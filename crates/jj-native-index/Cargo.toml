@@ -21,6 +21,7 @@ tempfile = "3"
 thiserror = "2"
 tinytree-proto = { path = "../tinytree-proto" }
 tinytree-model = { path = "../tinytree-model" }
+tinytree-cloud = { path = "../tinytree-cloud" }
 tokio = { version = "1", features = ["full"] }
 toml = "1.1"
 tonic = "0.14"
