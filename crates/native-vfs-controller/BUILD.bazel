@@ -1,6 +1,7 @@
 load("@crates//:defs.bzl", "aliases", "all_crate_deps")
 load("@rules_rs//rs:rust_library.bzl", "rust_library")
 load("@rules_rs//rs:rust_test.bzl", "rust_test")
+load("//build_defs:fixture_test.bzl", "fixture_test")
 
 package(default_visibility = ["//visibility:public"])
 
@@ -38,4 +39,12 @@ rust_library(
     edition = "2024",
     version = "0.1.0",
     deps = all_crate_deps(normal = True),
+)
+
+# Compilation remains remotely executable; only this actual kernel case runs local.
+fixture_test(
+    name = "mounted_tests",
+    binary = ":unit_tests",
+    args = ["--ignored", "controller_backup_capture_owns_the_actual_frontend_pause_and_resumes_on_drop"],
+    tags = ["local", "manual"],
 )

@@ -18,7 +18,7 @@ use std::{
 };
 use tokio::{
     runtime::Handle,
-    sync::{Mutex as AsyncMutex, Notify, Semaphore},
+    sync::{Mutex as AsyncMutex, Notify, OwnedMutexGuard, Semaphore},
 };
 
 const TTL: Duration = Duration::ZERO;
@@ -127,15 +127,28 @@ impl Pending {
 }
 struct RequestTicket {
     pending: Arc<Pending>,
-    _generation: GenerationLease,
+    _generation: Option<GenerationLease>,
 }
 impl Drop for RequestTicket {
     fn drop(&mut self) {
+        drop(self._generation.take());
         self.pending.count.fetch_sub(1, Ordering::SeqCst);
         self.pending.changed.notify_waiters();
     }
 }
 
+#[derive(Default)]
+struct Admission {
+    source_capture: bool,
+}
+struct SourceAdmissionPause {
+    admission: Arc<Mutex<Admission>>,
+}
+impl Drop for SourceAdmissionPause {
+    fn drop(&mut self) {
+        self.admission.lock().unwrap().source_capture = false;
+    }
+}
 #[derive(Default)]
 struct Maintenance {
     running: bool,
@@ -145,11 +158,17 @@ struct Maintenance {
 #[derive(Default)]
 struct References {
     lookups: HashMap<u64, u64>,
-    opens: HashMap<u64, Vec<NodeLease>>,
+    opens: HashMap<u64, Vec<OpenReference>>,
+    regular_opens: usize,
+}
+struct OpenReference {
+    regular: bool,
+    _pin: NodeLease,
 }
 struct KernelReferences {
     tree: Arc<Tree>,
     references: Mutex<References>,
+    changed: Notify,
 }
 impl KernelReferences {
     fn entry(&self, node: &Node, already_retained: bool) -> Result<()> {
@@ -161,14 +180,21 @@ impl KernelReferences {
         Ok(())
     }
     fn open(&self, id: u64) -> Result<()> {
+        let regular = self.tree.get(id)?.kind == NodeKind::File;
         let pin = self.tree.pin(id)?;
-        self.references
-            .lock()
-            .unwrap()
-            .opens
+        let mut refs = self.references.lock().unwrap();
+        let count = if regular {
+            refs.regular_opens
+                .checked_add(1)
+                .context("FUSE open count overflow")?
+        } else {
+            refs.regular_opens
+        };
+        refs.opens
             .entry(id)
             .or_default()
-            .push(pin);
+            .push(OpenReference { regular, _pin: pin });
+        refs.regular_opens = count;
         Ok(())
     }
     fn forget(&self, id: u64, count: u64) {
@@ -185,10 +211,31 @@ impl KernelReferences {
     fn release(&self, id: u64) {
         let mut refs = self.references.lock().unwrap();
         if let Some(pins) = refs.opens.get_mut(&id) {
-            pins.pop();
+            let regular = pins.pop().is_some_and(|pin| pin.regular);
             if pins.is_empty() {
                 refs.opens.remove(&id);
             }
+            if regular {
+                refs.regular_opens = refs.regular_opens.checked_sub(1).expect("FUSE open count");
+            }
+        }
+        drop(refs);
+        self.changed.notify_waiters();
+    }
+    fn has_regular_opens(&self) -> bool {
+        self.references.lock().unwrap().regular_opens != 0
+    }
+    async fn wait_regular_closed(&self, deadline: tokio::time::Instant) -> Result<()> {
+        loop {
+            let changed = self.changed.notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
+            if !self.has_regular_opens() {
+                return Ok(());
+            }
+            tokio::time::timeout_at(deadline, changed)
+                .await
+                .map_err(|_| std::io::Error::from_raw_os_error(libc::EBUSY))?;
         }
     }
     fn clear(&self) {
@@ -197,6 +244,9 @@ impl KernelReferences {
             self.tree.forget(id, count);
         }
         refs.opens.clear();
+        refs.regular_opens = 0;
+        drop(refs);
+        self.changed.notify_waiters();
     }
 }
 impl Drop for KernelReferences {
@@ -217,6 +267,7 @@ struct Adapter {
     runtime: Handle,
     payload: Arc<Semaphore>,
     pending: Arc<Pending>,
+    admission: Arc<Mutex<Admission>>,
     stopped: Arc<AtomicBool>,
     references: Arc<KernelReferences>,
     maintenance: Arc<Mutex<Maintenance>>,
@@ -274,10 +325,14 @@ impl Adapter {
         // Count before testing stopped. Sequential consistency across these
         // two atomics excludes store-buffering: shutdown cannot observe zero
         // while this callback observes the pre-shutdown admission flag.
+        let admission = self.admission.lock().unwrap();
+        if admission.source_capture {
+            return Err(libc::EAGAIN);
+        }
         self.pending.count.fetch_add(1, Ordering::SeqCst);
         let ticket = RequestTicket {
             pending: self.pending.clone(),
-            _generation: self.tree.pin_generation(),
+            _generation: Some(self.tree.pin_generation()),
         };
         if self.stopped.load(Ordering::SeqCst) {
             return Err(libc::EIO);
@@ -322,6 +377,10 @@ impl Filesystem for Adapter {
         Ok(())
     }
     fn lookup(&mut self, _: &Request<'_>, parent: u64, name_: &OsStr, reply: ReplyEntry) {
+        let ticket = match self.enter() {
+            Ok(ticket) => ticket,
+            Err(error) => return reply.error(error),
+        };
         let owned_name = match name(name_) {
             Ok(name) => name,
             Err(error) => return reply.error(errno(error)),
@@ -331,10 +390,6 @@ impl Filesystem for Adapter {
             .as_ref()
             .is_err_and(|e| e.is::<output_core::SourceNotLoaded>())
         {
-            let ticket = match self.enter() {
-                Ok(ticket) => ticket,
-                Err(error) => return reply.error(error),
-            };
             let tree = self.tree.clone();
             let references = self.references.clone();
             self.dispatch(async move {
@@ -366,6 +421,10 @@ impl Filesystem for Adapter {
         self.collect();
     }
     fn opendir(&mut self, _: &Request<'_>, ino: u64, _: i32, reply: ReplyOpen) {
+        let _ticket = match self.enter() {
+            Ok(ticket) => ticket,
+            Err(error) => return reply.error(error),
+        };
         match self.references.open(ino) {
             Ok(()) => reply.opened(ino, 0),
             Err(e) => reply.error(errno(e)),
@@ -391,19 +450,23 @@ impl Filesystem for Adapter {
         reply.ok();
     }
     fn getattr(&mut self, _: &Request<'_>, ino: u64, _: Option<u64>, reply: ReplyAttr) {
+        let _ticket = match self.enter() {
+            Ok(ticket) => ticket,
+            Err(error) => return reply.error(error),
+        };
         match self.tree.get(ino) {
             Ok(n) => reply.attr(&TTL, &attrs(&n)),
             Err(e) => reply.error(errno(e)),
         }
     }
     fn readlink(&mut self, _: &Request<'_>, ino: u64, reply: ReplyData) {
+        let ticket = match self.enter() {
+            Ok(ticket) => ticket,
+            Err(error) => return reply.error(error),
+        };
         match self.tree.readlink(ino) {
             Ok(target) => reply.data(target.as_bytes()),
             Err(e) if e.is::<output_core::SourceNotLoaded>() => {
-                let ticket = match self.enter() {
-                    Ok(ticket) => ticket,
-                    Err(error) => return reply.error(error),
-                };
                 let tree = self.tree.clone();
                 self.dispatch(async move {
                     let _ticket = ticket;
@@ -417,6 +480,10 @@ impl Filesystem for Adapter {
         }
     }
     fn readdir(&mut self, _: &Request<'_>, ino: u64, _: u64, offset: i64, reply: ReplyDirectory) {
+        let ticket = match self.enter() {
+            Ok(ticket) => ticket,
+            Err(error) => return reply.error(error),
+        };
         if offset < 0 {
             reply.error(libc::EINVAL);
             return;
@@ -424,10 +491,6 @@ impl Filesystem for Adapter {
         match self.tree.list(ino, 0, 0) {
             Ok(_) => reply_directory(&self.tree, ino, offset, reply),
             Err(error) if error.is::<output_core::SourceNotLoaded>() => {
-                let ticket = match self.enter() {
-                    Ok(ticket) => ticket,
-                    Err(error) => return reply.error(error),
-                };
                 let tree = self.tree.clone();
                 self.dispatch(async move {
                     let _ticket = ticket;
@@ -441,6 +504,10 @@ impl Filesystem for Adapter {
         }
     }
     fn open(&mut self, _: &Request<'_>, ino: u64, flags: i32, reply: ReplyOpen) {
+        let permit = match self.enter() {
+            Ok(ticket) => ticket,
+            Err(error) => return reply.error(error),
+        };
         let node = match self.tree.get(ino) {
             Ok(n) => n,
             Err(e) => {
@@ -479,13 +546,6 @@ impl Filesystem for Adapter {
             }
             return;
         }
-        let permit = match self.enter() {
-            Ok(p) => p,
-            Err(e) => {
-                reply.error(e);
-                return;
-            }
-        };
         let tree = self.tree.clone();
         let references = self.references.clone();
         self.dispatch(async move {
@@ -880,6 +940,10 @@ impl Filesystem for Adapter {
         reply.ok();
     }
     fn statfs(&mut self, _: &Request<'_>, _: u64, reply: ReplyStatfs) {
+        let _ticket = match self.enter() {
+            Ok(ticket) => ticket,
+            Err(error) => return reply.error(error),
+        };
         use std::os::unix::ffi::OsStrExt;
         let path = match std::ffi::CString::new(self.tree.state_dir().as_os_str().as_bytes()) {
             Ok(path) => path,
@@ -909,6 +973,10 @@ impl Filesystem for Adapter {
         );
     }
     fn getxattr(&mut self, _: &Request<'_>, ino: u64, attr: &OsStr, size: u32, reply: ReplyXattr) {
+        let _ticket = match self.enter() {
+            Ok(ticket) => ticket,
+            Err(error) => return reply.error(error),
+        };
         let function = match attr.to_str() {
             Some("user.blake3") => 9,
             Some("user.sha256") => 1,
@@ -1110,6 +1178,7 @@ async fn start_named(
         let references = Arc::new(KernelReferences {
             tree: tree.clone(),
             references: Mutex::new(References::default()),
+            changed: Notify::new(),
         });
         let adapter = Adapter {
             tree,
@@ -1120,6 +1189,7 @@ async fn start_named(
             runtime,
             payload: Arc::new(Semaphore::new(PAYLOAD_SLOTS)),
             pending: Arc::new(Pending::default()),
+            admission: Arc::new(Mutex::new(Admission::default())),
             stopped: Arc::new(AtomicBool::new(false)),
         };
         let mut session = Session::new(
@@ -1163,7 +1233,106 @@ async fn start_named(
     .await
     .context("mount worker failed")?
 }
+/// Genuine frontend-owned capture. The Tree fence drops before admission and
+/// control resume; callers can only borrow the frozen delta, not forge a fence.
+pub struct FuseSourceCapture {
+    snapshot: output_core::SourceDeltaSnapshot,
+    _pause: SourceAdmissionPause,
+    _control: OwnedMutexGuard<()>,
+    _mount: Arc<FuseMount>,
+}
+impl FuseSourceCapture {
+    pub fn snapshot(&self) -> &output_core::SourceDeltaSnapshot {
+        &self.snapshot
+    }
+}
 impl FuseMount {
+    /// Fence native kernel writers before freezing a lazy source delta. Existing
+    /// file handles (including the last mmap reference) must close first.
+    pub async fn capture_lazy_source(
+        self: &Arc<Self>,
+        limits: &output_core::SourceLimits,
+        deadline: tokio::time::Instant,
+    ) -> Result<FuseSourceCapture> {
+        if tokio::time::Instant::now() >= deadline {
+            return Err(std::io::Error::from_raw_os_error(libc::ETIMEDOUT).into());
+        }
+        let control = tokio::time::timeout_at(deadline, self.control.clone().lock_owned())
+            .await
+            .map_err(|_| std::io::Error::from_raw_os_error(libc::ETIMEDOUT))?;
+        ensure!(
+            !self.adapter.stopped.load(Ordering::SeqCst),
+            "source projection stopped"
+        );
+        ensure!(
+            self.session.lock().unwrap().is_some(),
+            "source mount is not live"
+        );
+        // Do not pause writes while waiting for a dirty mapping's last close:
+        // its kernel flush/writeback must be allowed to finish normally.
+        self.adapter
+            .references
+            .wait_regular_closed(deadline)
+            .await?;
+        {
+            let mut admission = self.adapter.admission.lock().unwrap();
+            ensure!(!admission.source_capture, "source capture already active");
+            admission.source_capture = true;
+        }
+        let pause = SourceAdmissionPause {
+            admission: self.adapter.admission.clone(),
+        };
+        tokio::time::timeout_at(deadline, self.adapter.pending.drain())
+            .await
+            .map_err(|_| std::io::Error::from_raw_os_error(libc::ETIMEDOUT))?;
+        // A pre-pause accepted open/create can register a handle while draining.
+        // Fail and resume immediately; do not suppress that handle's writeback.
+        if self.adapter.references.has_regular_opens() {
+            return Err(std::io::Error::from_raw_os_error(libc::EBUSY).into());
+        }
+        let mount = self.clone();
+        tokio::time::timeout_at(
+            deadline,
+            tokio::task::spawn_blocking(move || -> Result<()> {
+                let session = mount.session.lock().unwrap();
+                let session = session.as_ref().context("source mount is not live")?;
+                ensure!(
+                    !session.stop.load(Ordering::Acquire)
+                        && session
+                            .worker
+                            .as_ref()
+                            .is_some_and(|worker| !worker.is_finished()),
+                    "source mount receiver is not live"
+                );
+                ensure!(
+                    mounted_ids(&mount.root)? == [session.mount_id],
+                    "source mount was replaced"
+                );
+                Ok(())
+            }),
+        )
+        .await
+        .map_err(|_| std::io::Error::from_raw_os_error(libc::ETIMEDOUT))??
+        .context("source mount verification failed")?;
+        if tokio::time::Instant::now() >= deadline {
+            return Err(std::io::Error::from_raw_os_error(libc::ETIMEDOUT).into());
+        }
+        let snapshot = self
+            .adapter
+            .tree
+            .freeze_lazy_source_wait(
+                output_core::SourceFrontendFence::AuthoritativelyQuiesced,
+                limits,
+                deadline,
+            )
+            .await?;
+        Ok(FuseSourceCapture {
+            snapshot,
+            _pause: pause,
+            _control: control,
+            _mount: self.clone(),
+        })
+    }
     async fn complete<T: Send + 'static>(
         &self,
         operation: impl FnOnce(

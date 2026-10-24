@@ -534,3 +534,290 @@ async fn replacement_survives_independent_fuser_receiver_exit() {
     drop(held);
     replacement.shutdown().await.unwrap();
 }
+
+struct CaptureDirectories {
+    artifact: Artifact,
+    entered: Notify,
+    release: Semaphore,
+}
+#[async_trait]
+impl output_core::SourceDirectoryProvider for CaptureDirectories {
+    async fn read_directory(
+        &self,
+        _: output_core::SourcePin,
+        tree_id: [u8; 32],
+        _: String,
+        _: output_core::SourceLoadLimits,
+        _: Arc<dyn std::any::Any + Send + Sync>,
+    ) -> Result<output_core::VerifiedSourceDirectory> {
+        use output_core::{SourceDirectoryEntry as Entry, SourceDirectoryEntryKind as Kind};
+        let file = |name: &str| Entry {
+            name: name.into(),
+            mode: 0o644,
+            kind: Kind::File {
+                artifact: self.artifact.clone(),
+                copy_id: None,
+            },
+        };
+        let entries = if tree_id == [1; 32] {
+            vec![
+                Entry {
+                    name: "blocked".into(),
+                    mode: 0o755,
+                    kind: Kind::Directory { tree_id: [2; 32] },
+                },
+                file("mapped"),
+                Entry {
+                    name: "raced".into(),
+                    mode: 0o755,
+                    kind: Kind::Directory { tree_id: [3; 32] },
+                },
+            ]
+        } else {
+            self.entered.notify_one();
+            self.release.acquire().await?.forget();
+            vec![file("child")]
+        };
+        Ok(output_core::VerifiedSourceDirectory { tree_id, entries })
+    }
+    async fn read_symlink(
+        &self,
+        _: output_core::SourcePin,
+        _: [u8; 32],
+        _: u64,
+        _: Arc<dyn std::any::Any + Send + Sync>,
+    ) -> Result<String> {
+        bail!("no symlink in capture fixture")
+    }
+}
+struct WritableMapping {
+    address: usize,
+    len: usize,
+}
+impl Drop for WritableMapping {
+    fn drop(&mut self) {
+        unsafe {
+            libc::munmap(self.address as *mut libc::c_void, self.len);
+        }
+    }
+}
+async fn wait_for_capture_pause(path: std::path::PathBuf) {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let path = path.clone();
+            let error = io(move || fs::metadata(path).map(drop).err()).await;
+            if error.is_some_and(|error| error.raw_os_error() == Some(libc::EAGAIN)) {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("frontend did not enter capture admission pause");
+}
+
+/// A closed userspace fd is not enough: a writable mmap retains a kernel file
+/// reference and can dirty cached pages without a new userspace write syscall.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires usable /dev/fuse and fusermount3"]
+async fn mounted_lazy_source_capture_fences_open_mmap_deferred_work_and_cancellation() {
+    let directory = tempfile::tempdir().unwrap();
+    let source = Arc::new(Source::new());
+    let artifact = source.artifact(&vec![b'a'; 4096]);
+    let provider = Arc::new(CaptureDirectories {
+        artifact,
+        entered: Notify::new(),
+        release: Semaphore::new(0),
+    });
+    let tree = Tree::open(
+        directory.path().join("state"),
+        "test",
+        source,
+        CacheConfig::default(),
+    )
+    .unwrap();
+    let limits = output_core::SourceLimits::default();
+    tree.install_lazy_source(
+        output_core::LazySourceRoot {
+            identity: tree.identity().into(),
+            root_tree: [1; 32],
+            pin: output_core::SourcePin {
+                root: [1; 32],
+                generation: 1,
+            },
+            provider: provider.clone(),
+            load_limits: Default::default(),
+        },
+        None,
+        "capture-fixture",
+        &limits,
+    )
+    .unwrap();
+    let root = directory.path().join("source");
+    let mount = output_fuse::start_native_source(tree, &root, [4; 32])
+        .await
+        .unwrap();
+    let path = root.join("mapped");
+    let read_path = path.clone();
+    assert_eq!(
+        io(move || fs::read(read_path).unwrap()).await,
+        vec![b'a'; 4096]
+    );
+    let clean = mount
+        .capture_lazy_source(
+            &limits,
+            tokio::time::Instant::now() + Duration::from_secs(5),
+        )
+        .await
+        .unwrap();
+    assert!(clean.snapshot().entries().is_empty());
+    let denied = path.clone();
+    assert_eq!(
+        io(move || File::open(denied).err().unwrap().raw_os_error()).await,
+        Some(libc::EAGAIN),
+        "ordinary open must not bypass the capture gate"
+    );
+    let denied_create = root.join("new-file");
+    assert_eq!(
+        io(move || OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(denied_create)
+            .err()
+            .unwrap()
+            .raw_os_error())
+        .await,
+        Some(libc::EAGAIN)
+    );
+    drop(clean);
+
+    let opened = path.clone();
+    let handle = io(move || File::open(opened).unwrap()).await;
+    assert!(
+        mount
+            .capture_lazy_source(
+                &limits,
+                tokio::time::Instant::now() + Duration::from_millis(100)
+            )
+            .await
+            .is_err(),
+        "even readonly open handles must conservatively block capture"
+    );
+    io(move || drop(handle)).await;
+    let mapped_path = path.clone();
+    let mapping = io(move || {
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(mapped_path)
+            .unwrap();
+        let address = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                4096,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_SHARED,
+                file.as_raw_fd(),
+                0,
+            )
+        };
+        assert_ne!(address, libc::MAP_FAILED);
+        unsafe {
+            *address.cast::<u8>() = b'Z';
+        }
+        drop(file);
+        WritableMapping {
+            address: address as usize,
+            len: 4096,
+        }
+    })
+    .await;
+    assert!(
+        mount
+            .capture_lazy_source(
+                &limits,
+                tokio::time::Instant::now() + Duration::from_millis(100)
+            )
+            .await
+            .is_err(),
+        "closed fd with live writable mapping is still a kernel writer"
+    );
+    // No explicit msync: last VMA close/release must flush dirty pages before
+    // the frontend can attest that no regular kernel file reference remains.
+    io(move || drop(mapping)).await;
+    let captured = mount
+        .capture_lazy_source(
+            &limits,
+            tokio::time::Instant::now() + Duration::from_secs(5),
+        )
+        .await
+        .unwrap();
+    let changed = captured
+        .snapshot()
+        .entries()
+        .iter()
+        .find(|entry| entry.path == "mapped")
+        .unwrap();
+    assert_eq!(
+        captured
+            .snapshot()
+            .read_local(changed.node.id, 0, 1)
+            .unwrap(),
+        b"Z"
+    );
+    drop(captured);
+
+    // Deferred lazy metadata work has no open file handle, but must drain before
+    // capture can freeze. Cancelling that waiter must reopen frontend admission.
+    let blocked = root.join("blocked/child");
+    let lookup = tokio::task::spawn_blocking(move || fs::metadata(blocked));
+    tokio::time::timeout(Duration::from_secs(5), provider.entered.notified())
+        .await
+        .unwrap();
+    let owner = mount.clone();
+    let capture_limits = limits.clone();
+    let waiting = tokio::spawn(async move {
+        owner
+            .capture_lazy_source(
+                &capture_limits,
+                tokio::time::Instant::now() + Duration::from_secs(5),
+            )
+            .await
+    });
+    wait_for_capture_pause(path.clone()).await;
+    waiting.abort();
+    let _ = waiting.await;
+    let resumed = path.clone();
+    assert_eq!(io(move || fs::read(resumed).unwrap()[0]).await, b'Z');
+    provider.release.add_permits(1);
+    lookup.await.unwrap().unwrap();
+
+    // An OPEN whose lookup began before the pause must still pass admission
+    // after the deferred lookup replies, rather than resurrecting a handle.
+    let raced = root.join("raced/child");
+    let opening = tokio::task::spawn_blocking(move || File::open(raced));
+    tokio::time::timeout(Duration::from_secs(5), provider.entered.notified())
+        .await
+        .unwrap();
+    let owner = mount.clone();
+    let capture_limits = limits.clone();
+    let waiting = tokio::spawn(async move {
+        owner
+            .capture_lazy_source(
+                &capture_limits,
+                tokio::time::Instant::now() + Duration::from_secs(5),
+            )
+            .await
+    });
+    wait_for_capture_pause(path.clone()).await;
+    provider.release.add_permits(1);
+    let captured = waiting.await.unwrap().unwrap();
+    assert_eq!(
+        opening.await.unwrap().err().unwrap().raw_os_error(),
+        Some(libc::EAGAIN)
+    );
+    drop(captured);
+    let raced = root.join("raced/child");
+    assert_eq!(io(move || fs::read(raced).unwrap()).await.len(), 4096);
+    mount.shutdown().await.unwrap();
+}

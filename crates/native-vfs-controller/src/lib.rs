@@ -14,7 +14,7 @@ use jj_vfs::native::{
     NativeProjectionController, NativeProjectionMutation, NativeTree, ProjectionBinding,
     ProjectionConnector, ProjectionFailure, ProjectionOutcome, ProjectionReceipt, ProjectionState,
 };
-use native_vfs::NativeMount;
+use native_vfs::{NativeMount, SealedNativeCapture};
 use native_workspace::Compiler;
 use output_core::{
     SourceDeltaSnapshot, SourceLimits, SourceOperation, SourceReceipt, SourceSnapshot,
@@ -495,6 +495,60 @@ pub struct Controller {
     inner: Arc<Inner>,
 }
 
+/// Immutable actual mount/controller identity captured before frontend pausing.
+/// These are binding facts, not caller-supplied backup attestation fields.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CaptureBinding {
+    root: PathBuf,
+    workspace_identity: [u8; 32],
+    working_copy_state: PathBuf,
+    backend_identity: String,
+    repository: String,
+}
+impl CaptureBinding {
+    pub fn root(&self) -> &Path {
+        &self.root
+    }
+    pub fn workspace_identity(&self) -> [u8; 32] {
+        self.workspace_identity
+    }
+    pub fn working_copy_state(&self) -> &Path {
+        &self.working_copy_state
+    }
+    /// NativeWorkspace Scope backend, not a raw repository or broker fingerprint.
+    pub fn backend_identity(&self) -> &str {
+        &self.backend_identity
+    }
+    pub fn repository(&self) -> &str {
+        &self.repository
+    }
+}
+/// Actual native frontend pause, frozen delta, controller admission and private
+/// state ownership. A backup sink must retain this whole value through commit;
+/// neither the snapshot nor a boolean quiescence attestation can replace it.
+pub struct ControllerCapture {
+    native: SealedNativeCapture,
+    projection: ProjectionState,
+    binding: CaptureBinding,
+    _controller: Controller,
+    _admission: OwnedMutexGuard<()>,
+}
+impl std::fmt::Debug for ControllerCapture {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ControllerCapture").finish_non_exhaustive()
+    }
+}
+impl ControllerCapture {
+    pub fn snapshot(&self) -> &SourceDeltaSnapshot {
+        self.native.snapshot()
+    }
+    pub fn projection_state(&self) -> &ProjectionState {
+        &self.projection
+    }
+    pub fn binding(&self) -> &CaptureBinding {
+        &self.binding
+    }
+}
 /// Explicit unmounted fixture configuration. Available only in the test-support
 /// build; it is not native-provider acceptance or a user workspace fallback.
 #[cfg(feature = "protocol-test-support")]
@@ -951,6 +1005,68 @@ impl Controller {
     }
 }
 impl Controller {
+    /// Separate backup capture, not an ordinary working-copy snapshot/ACK.
+    /// Unsupported frontends and unmounted protocol fixtures never become a
+    /// portable capture through TreeOnly or a materialized fallback.
+    pub async fn capture_for_backup(
+        &self,
+        expected: &ProjectionState,
+    ) -> Result<ControllerCapture> {
+        let admission = self.admission().await?;
+        // All projected-path health reads occur before the native frontend is
+        // paused. Never call healthy()/inspect() while the returned guard lives.
+        self.healthy()?;
+        ensure!(
+            !self.requires_reconciliation(),
+            "native publication outcome requires recovery before backup capture"
+        );
+        ensure!(
+            self.inspect()? == *expected,
+            "native working-copy baseline is stale"
+        );
+        let mount = match &self.inner.host {
+            Host::Mounted(mount) => mount.clone(),
+            #[cfg(any(test, feature = "protocol-test-support"))]
+            Host::Protocol { .. } => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::Unsupported,
+                    "unmounted protocol state is not native backup quiescence proof",
+                )
+                .into());
+            }
+        };
+        let binding = {
+            let ledger = self
+                .inner
+                .ledger
+                .lock()
+                .map_err(|_| anyhow::anyhow!("native controller requires recovery"))?;
+            CaptureBinding {
+                root: ledger.binding.root.clone(),
+                workspace_identity: ledger.binding.workspace,
+                working_copy_state: ledger.binding.working_copy_state.clone(),
+                backend_identity: ledger.binding.backend.clone(),
+                repository: ledger.binding.repository.clone(),
+            }
+        };
+        let deadline = tokio::time::Instant::now() + self.inner.config.operation_timeout;
+        let native = mount
+            .capture_for_backup(&self.inner.config.source_limits, deadline)
+            .await?;
+        ensure!(
+            native.snapshot().version().generation == expected.generation
+                && expected.tree.terms.as_slice() == [native.snapshot().baseline_tree()]
+                && expected.repository == self.inner.config.repository,
+            "native capture baseline changed during frontend fencing"
+        );
+        Ok(ControllerCapture {
+            native,
+            projection: expected.clone(),
+            binding,
+            _controller: self.clone(),
+            _admission: admission,
+        })
+    }
     pub async fn begin_session(&self, expected: &ProjectionState) -> Result<Mutation> {
         let guard = self.admission().await?;
         self.healthy()?;

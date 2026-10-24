@@ -1228,3 +1228,307 @@ async fn lazy_excluded_nested_local_directory_can_be_tracked_on_a_later_snapshot
         node.id
     );
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn backup_capture_protocol_state_cannot_attest_native_frontend_quiescence() {
+    let fixture = Fixture::new(true).await;
+    let controller = fixture.open(None).await;
+    let before = controller.inspect().unwrap();
+    let reads = fixture.provider.reads.load(Ordering::SeqCst);
+    let uploads = fixture.provider.uploads.load(Ordering::SeqCst);
+    let error = controller.capture_for_backup(&before).await.unwrap_err();
+    assert_eq!(
+        error.downcast_ref::<std::io::Error>().unwrap().kind(),
+        std::io::ErrorKind::Unsupported
+    );
+    assert_eq!(controller.inspect().unwrap(), before);
+    assert_eq!(fixture.provider.reads.load(Ordering::SeqCst), reads);
+    assert_eq!(fixture.provider.uploads.load(Ordering::SeqCst), uploads);
+    // Rejection must release exclusive controller admission. This is a protocol
+    // fixture, not evidence of a native FUSE capture or a portable capsule.
+    let session = controller.begin_session(&before).await.unwrap();
+    drop(session);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn backup_capture_cancelled_or_busy_admission_does_not_leak_the_controller_session() {
+    let fixture = Fixture::new(true).await;
+    let mut config = Config::new("fixture".into(), fixture.working_copy.clone());
+    config.admission_timeout = Duration::from_millis(100);
+    let controller = fixture.open(Some(config)).await;
+    let before = controller.inspect().unwrap();
+    let session = controller.begin_session(&before).await.unwrap();
+    assert!(
+        tokio::time::timeout(
+            Duration::from_millis(20),
+            controller.capture_for_backup(&before)
+        )
+        .await
+        .is_err(),
+        "cancel while still waiting for admission"
+    );
+    let error = controller.capture_for_backup(&before).await.unwrap_err();
+    assert!(error.to_string().contains("admission timed out"));
+    drop(session);
+    let error = controller.capture_for_backup(&before).await.unwrap_err();
+    assert_eq!(
+        error.downcast_ref::<std::io::Error>().unwrap().kind(),
+        std::io::ErrorKind::Unsupported
+    );
+    let next = controller.begin_session(&before).await.unwrap();
+    drop(next);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn backup_capture_rejects_stale_unhealthy_and_pending_state_before_frontend_capture() {
+    let fixture = Fixture::lazy(true).await;
+    let controller = fixture.open(None).await;
+    let before = controller.inspect().unwrap();
+    let mut stale = before.clone();
+    stale.generation += 1;
+    assert!(
+        controller
+            .capture_for_backup(&stale)
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("baseline is stale")
+    );
+    controller.inner.poisoned.store(true, Ordering::Release);
+    assert!(
+        controller
+            .capture_for_backup(&before)
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("durable state is uncertain")
+    );
+    // Explicit protocol corruption/recovery-boundary fixture only. Production
+    // never clears poison; it reopens the controller to reconcile durable state.
+    controller.inner.poisoned.store(false, Ordering::Release);
+    let frozen = fixture
+        .tree
+        .freeze_lazy_source(SourceFrontendFence::TreeOnly, &SourceLimits::default())
+        .unwrap();
+    let expected = frozen.version().clone();
+    drop(frozen);
+    // Reuse the durable intent boundary exercised by recovery tests. No frontend
+    // capture guard or successful portable proof is constructed by this fixture.
+    controller
+        .prepare(
+            "backup-pending",
+            &before,
+            Action::Snapshot { policy: [1; 32] },
+            expected,
+        )
+        .unwrap();
+    assert!(
+        controller
+            .capture_for_backup(&before)
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("requires recovery before backup capture")
+    );
+    assert!(controller.requires_reconciliation());
+}
+
+#[cfg(target_os = "linux")]
+/// Actual Controller -> NativeMount -> FUSE capture acceptance. No protocol
+/// fixture, serialized attestation or manually supplied frontend fence is used.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires usable /dev/fuse and fusermount3"]
+async fn controller_backup_capture_owns_the_actual_frontend_pause_and_resumes_on_drop() {
+    use std::{sync::Arc, time::Duration};
+    let fixture = Fixture::new(false).await;
+    let provider = fixture.provider.clone();
+    let config = native_vfs::Config {
+        root: fixture._directory.path().join("native-root"),
+        state: fixture._directory.path().join("native-state"),
+        workspace_identity: [88; 32],
+        scope: fixture.scope.clone(),
+        root_merge: m::TreeMerge {
+            terms: vec![fixture.base],
+            labels: vec![String::new()],
+        },
+        compiler_limits: Limits::default(),
+        source_limits: SourceLimits::default(),
+    };
+    let cache = fixture._cache.clone();
+    let mount = Arc::new(
+        native_vfs::start(config.clone(), provider.clone(), cache)
+            .await
+            .unwrap(),
+    );
+    let working_copy = private_fs::PrivateDir::create(config.state.join("working-copy")).unwrap();
+    let mut controller_config = Config::new(
+        "native-mount-fixture".into(),
+        working_copy.path().to_owned(),
+    );
+    controller_config.source_limits = config.source_limits.clone();
+    let controller = Controller::open(mount.clone(), provider.clone(), controller_config)
+        .await
+        .unwrap();
+    let expected = controller.inspect().unwrap();
+    assert_eq!(
+        expected.generation,
+        mount.tree().source_baseline().unwrap().1
+    );
+    assert_eq!(provider.reads.load(Ordering::SeqCst), 0);
+    let actual_root = config.root.canonicalize().unwrap();
+    let actual_working_copy = working_copy.path().to_owned();
+    let capture = controller.capture_for_backup(&expected).await.unwrap();
+    assert_eq!(capture.projection_state(), &expected);
+    assert_eq!(capture.binding().root(), actual_root);
+    assert_eq!(
+        capture.binding().workspace_identity(),
+        config.workspace_identity
+    );
+    assert_eq!(capture.binding().working_copy_state(), actual_working_copy);
+    assert_eq!(
+        capture.binding().backend_identity(),
+        mount.backend_identity()
+    );
+    assert_eq!(capture.binding().repository(), expected.repository);
+    // A second actual mount deliberately shares the tree/generation/repository.
+    // Its different native workspace and WC-state identities must stay visible;
+    // neither a matching projection nor capture of A can attest to B.
+    let mut other_config = config.clone();
+    other_config.root = fixture._directory.path().join("other-native-root");
+    other_config.state = fixture._directory.path().join("other-native-state");
+    other_config.workspace_identity = [89; 32];
+    let other_mount = Arc::new(
+        native_vfs::start(
+            other_config.clone(),
+            provider.clone(),
+            fixture._cache.clone(),
+        )
+        .await
+        .unwrap(),
+    );
+    let other_working_copy = PrivateDir::create(other_config.state.join("working-copy")).unwrap();
+    let other = Controller::open(
+        other_mount.clone(),
+        provider.clone(),
+        Config::new(
+            expected.repository.clone(),
+            other_working_copy.path().to_owned(),
+        ),
+    )
+    .await
+    .unwrap();
+    let other_expected = other.inspect().unwrap();
+    assert_eq!(other_expected, expected);
+    // Pausing A must not globally stop B's independent native source writers.
+    fs::write(other_config.root.join("other-local"), b"independent mount").unwrap();
+    let other_capture = other.capture_for_backup(&other_expected).await.unwrap();
+    assert_eq!(other_capture.projection_state(), capture.projection_state());
+    assert_ne!(other_capture.binding().root(), capture.binding().root());
+    assert_ne!(
+        other_capture.binding().workspace_identity(),
+        capture.binding().workspace_identity()
+    );
+    assert_ne!(
+        other_capture.binding().working_copy_state(),
+        capture.binding().working_copy_state()
+    );
+    assert_eq!(
+        other_capture.binding().backend_identity(),
+        capture.binding().backend_identity()
+    );
+    assert_eq!(
+        other_capture.binding().workspace_identity(),
+        other_config.workspace_identity
+    );
+    drop(other_capture);
+    drop(other);
+    other_mount.shutdown().await.unwrap();
+
+    assert_eq!(
+        capture.snapshot().baseline_tree(),
+        config.root_merge.terms[0].0
+    );
+    assert_eq!(capture.snapshot().version().generation, expected.generation);
+    assert_eq!(
+        provider.reads.load(Ordering::SeqCst),
+        0,
+        "fresh capture without a prior ACK must not hydrate source FILEs"
+    );
+    assert_eq!(
+        fs::File::open(config.root.join("tracked"))
+            .unwrap_err()
+            .kind(),
+        std::io::ErrorKind::WouldBlock,
+        "an actual held capture rejects new kernel opens"
+    );
+    assert!(
+        tokio::time::timeout(
+            Duration::from_millis(20),
+            controller.capture_for_backup(&expected)
+        )
+        .await
+        .is_err(),
+        "controller admission remains owned for the complete capture lifetime"
+    );
+    drop(capture);
+    drop(fs::File::open(config.root.join("tracked")).unwrap());
+    assert_eq!(
+        provider.reads.load(Ordering::SeqCst),
+        0,
+        "reopening alone does not read payloads"
+    );
+    fs::write(config.root.join("local"), b"captured local bytes").unwrap();
+    let dirty = controller.capture_for_backup(&expected).await.unwrap();
+    let local = dirty
+        .snapshot()
+        .entries()
+        .iter()
+        .find(|entry| entry.path == "local")
+        .unwrap();
+    assert_eq!(
+        dirty.snapshot().read_local(local.node.id, 0, 64).unwrap(),
+        b"captured local bytes"
+    );
+    assert_eq!(provider.reads.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(config.root.join("blocked"))
+            .unwrap_err()
+            .kind(),
+        std::io::ErrorKind::WouldBlock
+    );
+    drop(dirty);
+    let mut stale = expected.clone();
+    stale.generation += 1;
+    assert!(
+        controller
+            .capture_for_backup(&stale)
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("baseline is stale")
+    );
+    fs::write(config.root.join("after"), b"writer admission resumed").unwrap();
+    // The cancelled waiter did not steal admission or leave the frontend paused.
+    let final_capture = controller.capture_for_backup(&expected).await.unwrap();
+    assert!(
+        final_capture
+            .snapshot()
+            .entries()
+            .iter()
+            .any(|entry| entry.path == "after")
+    );
+    drop(final_capture);
+    assert_eq!(
+        controller.inspect().unwrap(),
+        expected,
+        "backup capture does not ACK or rebaseline dirty state"
+    );
+    mount.shutdown().await.unwrap();
+    assert!(
+        controller.capture_for_backup(&expected).await.is_err(),
+        "an actual stopped mount cannot produce another sealed capture"
+    );
+}

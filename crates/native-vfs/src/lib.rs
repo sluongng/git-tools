@@ -238,6 +238,29 @@ pub async fn prepare(
 pub struct NativeMount {
     prepared: PreparedWorkspace,
     projection: Arc<dyn Projection>,
+    #[cfg(target_os = "linux")]
+    source_frontend: Arc<output_fuse::FuseMount>,
+}
+/// An actual frontend-owned lazy capture. Its snapshot cannot be detached from
+/// the native pause/control guard or the mounted private-state owner.
+pub struct SealedNativeCapture {
+    #[cfg(target_os = "linux")]
+    capture: output_fuse::FuseSourceCapture,
+    #[cfg(not(target_os = "linux"))]
+    unavailable: std::convert::Infallible,
+    _mount: Arc<NativeMount>,
+}
+impl SealedNativeCapture {
+    pub fn snapshot(&self) -> &SourceDeltaSnapshot {
+        #[cfg(target_os = "linux")]
+        {
+            self.capture.snapshot()
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            match self.unavailable {}
+        }
+    }
 }
 impl std::fmt::Debug for NativeMount {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -265,6 +288,64 @@ impl NativeMount {
     }
     pub fn backend_identity(&self) -> &str {
         self.prepared.config.scope.backend()
+    }
+    /// Capture only through a genuine native writer fence. No TreeOnly or
+    /// materialized fallback is accepted as portable backup quiescence proof.
+    pub async fn capture_for_backup(
+        self: &Arc<Self>,
+        limits: &SourceLimits,
+        deadline: tokio::time::Instant,
+    ) -> Result<SealedNativeCapture> {
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = (limits, deadline);
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "native backup capture requires a proven frontend fence",
+            )
+            .into());
+        }
+        #[cfg(target_os = "linux")]
+        {
+            ensure!(
+                self.tree().lazy_source_pin().is_some(),
+                std::io::Error::new(
+                    std::io::ErrorKind::Unsupported,
+                    "native backup capture requires a lazy source namespace"
+                )
+            );
+            // Open and CLOSE the actual projected marker before pausing FUSE.
+            // Its asynchronous RELEASE is drained by the frontend fence.
+            let root = self.root().to_owned();
+            let expected = hex(&self.workspace_identity()).into_bytes();
+            let owner = self.clone();
+            tokio::time::timeout_at(
+                deadline,
+                tokio::task::spawn_blocking(move || -> Result<()> {
+                    use std::io::Read;
+                    let _owner = owner;
+                    let mut bytes = Vec::new();
+                    File::open(root.join(".jj/native-workspace"))?
+                        .take(65)
+                        .read_to_end(&mut bytes)?;
+                    ensure!(
+                        bytes == expected,
+                        "native provider marker is unavailable or changed"
+                    );
+                    Ok(())
+                }),
+            )
+            .await
+            .context("native backup marker validation timed out")???;
+            let capture = self
+                .source_frontend
+                .capture_lazy_source(limits, deadline)
+                .await?;
+            Ok(SealedNativeCapture {
+                capture,
+                _mount: self.clone(),
+            })
+        }
     }
     /// Caller must quiesce and flush native users first. Windows native writers
     /// are not Tree-authoritative: reject rather than omit dirty NTFS bytes.
@@ -387,12 +468,14 @@ pub async fn mount_prepared(prepared: PreparedWorkspace) -> Result<NativeMount> 
     #[cfg(any(target_os = "linux", target_os = "macos", windows))]
     {
         #[cfg(target_os = "linux")]
-        let projection: Arc<dyn Projection> = output_fuse::start_native_source(
+        let source_frontend = output_fuse::start_native_source(
             prepared.tree(),
             prepared.root(),
             prepared.workspace_identity(),
         )
         .await?;
+        #[cfg(target_os = "linux")]
+        let projection: Arc<dyn Projection> = source_frontend.clone();
         #[cfg(target_os = "macos")]
         let projection: Arc<dyn Projection> =
             Arc::new(output_nfs::NfsMount::start(prepared.tree(), prepared.root()).await?);
@@ -413,6 +496,8 @@ pub async fn mount_prepared(prepared: PreparedWorkspace) -> Result<NativeMount> 
         Ok(NativeMount {
             prepared,
             projection,
+            #[cfg(target_os = "linux")]
+            source_frontend,
         })
     }
 }
