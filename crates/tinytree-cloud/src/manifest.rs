@@ -868,7 +868,7 @@ impl ManifestV2Limits {
         Ok(())
     }
 }
-fn shape_v2(value: &ManifestV2, limits: ManifestV2Limits) -> Result<()> {
+pub(crate) fn shape_v2(value: &ManifestV2, limits: ManifestV2Limits) -> Result<()> {
     limits.validate()?;
     shape(&value.recovery, limits.recovery)?;
     if value.operation_indexes.len() > limits.max_operation_indexes

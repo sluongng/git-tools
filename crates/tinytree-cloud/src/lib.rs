@@ -6,6 +6,8 @@
 //! not publish a workspace or authorize deleting a sole local copy.
 mod capture;
 pub use capture::*;
+mod capture_manifest;
+pub use capture_manifest::*;
 mod index_artifact;
 pub use index_artifact::*;
 mod index_snapshot;
