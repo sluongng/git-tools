@@ -168,6 +168,17 @@ impl NativeObjectIo for RemoteObjectIo {
     async fn write_metadata(&self, object: m::Object) -> BackendResult<m::Descriptor> {
         self.inner.local.write_metadata(object).await
     }
+    async fn write_metadata_with_owner(
+        &self,
+        object: m::Object,
+        owner: Arc<dyn std::any::Any + Send + Sync>,
+    ) -> BackendResult<m::Descriptor> {
+        self.inner
+            .local
+            .write_metadata_with_owner(object, owner)
+            .await
+    }
+
     async fn read_file(&self, id: m::FileId) -> BackendResult<FileRead> {
         let key = m::ObjectKey {
             kind: m::Kind::File,
@@ -266,6 +277,18 @@ impl NativeObjectIo for RemoteObjectIo {
     ) -> BackendResult<m::FileId> {
         self.inner.local.write_file(input, max_bytes).await
     }
+    async fn write_file_with_owner(
+        &self,
+        input: &mut (dyn AsyncRead + Send + Unpin),
+        max_bytes: u64,
+        owner: Arc<dyn std::any::Any + Send + Sync>,
+    ) -> BackendResult<m::FileId> {
+        self.inner
+            .local
+            .write_file_with_owner(input, max_bytes, owner)
+            .await
+    }
+
     async fn copy_catalog_snapshot(
         &self,
         limits: CopyCatalogLimits,

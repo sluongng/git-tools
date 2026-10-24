@@ -58,12 +58,19 @@ pub struct ConfirmedPublication {
     pub head: m::CommitId,
 }
 impl RemoteRepositoryControl {
+    async fn physical_client(&self) -> Result<NativeClient> {
+        let client = self.inner.connector.get().await?;
+        Ok(match io::scope() {
+            Some(scope) => client.with_rpc_lifetime_guard(scope),
+            None => client,
+        })
+    }
     pub fn client_id(&self) -> [u8; 16] {
         self.inner.ledger.client
     }
     pub(crate) async fn refresh_scope_hold(&self, head: m::CommitId) -> Result<()> {
         let operation = async {
-            let client = self.inner.connector.get().await?;
+            let client = self.physical_client().await?;
             let root = self.hold(&client, head).await?;
             self.current_hold(&client, root).await?;
             Ok(())
@@ -90,7 +97,7 @@ impl RemoteRepositoryControl {
         );
         let deadline = self.inner.deadline();
         self.run(deadline, async {
-            let client = self.inner.connector.get().await?;
+            let client = self.physical_client().await?;
             let view = io::network(client.open(vec![name.to_owned()])).await?;
             let reference = view
                 .references
@@ -141,7 +148,12 @@ impl RemoteRepositoryControl {
         deadline: tokio::time::Instant,
         operation: impl std::future::Future<Output = Result<T>>,
     ) -> Result<T> {
-        self.run_owned(deadline, Arc::new(()), operation).await
+        if io::in_control() {
+            io::check_deadline()?;
+            operation.await
+        } else {
+            self.run_owned(deadline, Arc::new(()), operation).await
+        }
     }
     pub(crate) async fn run_owned<T>(
         &self,
@@ -149,6 +161,10 @@ impl RemoteRepositoryControl {
         owner: Arc<dyn std::any::Any + Send + Sync>,
         operation: impl std::future::Future<Output = Result<T>>,
     ) -> Result<T> {
+        if let Some(parent) = io::scope() {
+            io::check_deadline()?;
+            return io::control_scope(io::ControlScope::with_owner(parent, owner), operation).await;
+        }
         // Only admission is cancellable here. Once DirectObjectIo owns a job,
         // await its physical completion; the broker's owned request task keeps
         // this future alive even when the incoming RPC times out/disconnects.
@@ -179,7 +195,7 @@ impl RemoteRepositoryControl {
             head != m::CommitId::ROOT,
             "intrinsic root does not need remote admission"
         );
-        let client = self.inner.connector.get().await?;
+        let client = self.physical_client().await?;
         let mut root = self.hold(&client, head).await?;
         root.pinned = true;
         let ledger = self.inner.ledger.clone();
@@ -344,7 +360,7 @@ impl RemoteRepositoryControl {
         let ledger = self.inner.ledger.clone();
         let saved = pending.clone();
         io::blocking(move || ledger.save_pending(&saved)).await?;
-        let client = self.inner.connector.get().await?;
+        let client = self.physical_client().await?;
         let closure = self.hydrate_closure(request.head).await?;
         let mut descriptors = closure.descriptors();
         for (id, size, _) in &closure.files {
@@ -616,7 +632,7 @@ impl RemoteRepositoryControl {
                 .filter(|root| root.retained() && !root.complete)
             {
                 let head = m::CommitId(unhex(&root.head)?);
-                let client = self.inner.connector.get().await?;
+                let client = self.physical_client().await?;
                 let root = self.hold(&client, head).await?;
                 let closure = self.hydrate_closure(head).await?;
                 let root = self.current_hold(&client, root).await?;
@@ -650,7 +666,12 @@ impl RemoteRepositoryControl {
                 let descriptor = self
                     .inner
                     .local
-                    .write_metadata(node.object.clone())
+                    .write_metadata_with_owner(
+                        node.object.clone(),
+                        io::scope()
+                            .map(|v| v as Arc<dyn std::any::Any + Send + Sync>)
+                            .unwrap_or_else(|| Arc::new(())),
+                    )
                     .await
                     .map_err(backend)?;
                 ensure!(

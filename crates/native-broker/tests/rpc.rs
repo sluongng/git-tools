@@ -2618,3 +2618,382 @@ async fn live_provider_description_binds_alias_identity_and_separate_creation_po
     drop((first, second_client, unknown));
     host.stop().await;
 }
+
+#[derive(Debug)]
+struct TestCommands {
+    tokens: HashMap<[u8; 32], String>,
+    active: std::sync::atomic::AtomicBool,
+    jobs: Arc<std::sync::atomic::AtomicUsize>,
+}
+struct CommandJob(Arc<std::sync::atomic::AtomicUsize>);
+impl Drop for CommandJob {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+impl native_broker::CommandResolver for TestCommands {
+    fn resolve(
+        &self,
+        alias: &str,
+        token: [u8; 32],
+    ) -> Result<native_broker::CommandGuard, tonic::Status> {
+        if !self.active.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err(tonic::Status::failed_precondition("command is closing"));
+        }
+        if self
+            .tokens
+            .get(&token)
+            .is_none_or(|expected| expected != alias)
+        {
+            return Err(tonic::Status::permission_denied("command alias mismatch"));
+        }
+        self.jobs.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Ok(Arc::new(CommandJob(self.jobs.clone())))
+    }
+}
+async fn command_jobs_idle(commands: &TestCommands) {
+    tokio::time::timeout(Duration::from_secs(3), async {
+        while commands.jobs.load(std::sync::atomic::Ordering::SeqCst) != 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+}
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn managed_commands_bind_all_client_routes_to_exact_registered_alias_and_fail_before_io() {
+    use native_broker::NativeQueryIo as _;
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path().canonicalize().unwrap();
+    private(&root);
+    let first = Arc::new(FakeQuery::new(11, 1024));
+    let second = Arc::new(FakeQuery::new(12, 1024));
+    let commands = Arc::new(TestCommands {
+        tokens: HashMap::from([([1; 32], "first".into()), ([2; 32], "second".into())]),
+        active: true.into(),
+        jobs: Default::default(),
+    });
+    let control = Arc::new(FakeControl::new());
+    let service = query_service(&root, first.clone(), second.clone(), query_config())
+        .with_controls(HashMap::from([(
+            "first".into(),
+            control.clone() as Arc<dyn native_broker::NativeRepositoryControl>,
+        )]))
+        .unwrap()
+        .with_provider_descriptions(HashMap::from([
+            (
+                "first".into(),
+                native_broker::ProviderDescription {
+                    identity: [1; 32],
+                    query_capable: true,
+                    index_mode: native_broker::ProviderIndexMode::Legacy,
+                },
+            ),
+            (
+                "second".into(),
+                native_broker::ProviderDescription {
+                    identity: [2; 32],
+                    query_capable: true,
+                    index_mode: native_broker::ProviderIndexMode::Legacy,
+                },
+            ),
+            (
+                "local-only".into(),
+                native_broker::ProviderDescription {
+                    identity: [3; 32],
+                    query_capable: false,
+                    index_mode: native_broker::ProviderIndexMode::Legacy,
+                },
+            ),
+        ]))
+        .unwrap()
+        .with_command_resolver(commands.clone())
+        .unwrap();
+    let socket = root.join("managed.sock");
+    let host = Running::start_service(&socket, service).await;
+    let query = native_broker::BrokerQueryClient::connect(&socket, "first", query_config())
+        .await
+        .unwrap();
+    assert_eq!(
+        query.describe_provider().await.unwrap().identity,
+        [1; 32],
+        "explicit bootstrap discovery needs no command"
+    );
+    let open = || native_broker::OpenQueryScope {
+        roots: vec![native_broker::CommitId::ROOT],
+        overlay: vec![],
+        replay_key: [7; 32],
+        query_identity_version: 1,
+    };
+    assert_eq!(
+        query
+            .open_scope(open(), Arc::new(()))
+            .await
+            .unwrap_err()
+            .code(),
+        tonic::Code::Unauthenticated
+    );
+    assert!(
+        query
+            .clone()
+            .with_command_token([9; 32])
+            .describe_provider()
+            .await
+            .is_err(),
+        "a present token is validated even on bootstrap routes"
+    );
+    let foreign = native_broker::BrokerQueryClient::connect(&socket, "second", query_config())
+        .await
+        .unwrap()
+        .with_command_token([1; 32]);
+    assert_eq!(
+        foreign
+            .open_scope(open(), Arc::new(()))
+            .await
+            .unwrap_err()
+            .code(),
+        tonic::Code::PermissionDenied
+    );
+    assert_eq!(
+        first.scope_calls.load(std::sync::atomic::Ordering::SeqCst),
+        0
+    );
+    assert_eq!(
+        second.scope_calls.load(std::sync::atomic::Ordering::SeqCst),
+        0
+    );
+    let first_scope = query
+        .with_command_token([1; 32])
+        .open_scope(open(), Arc::new(()))
+        .await
+        .unwrap();
+    assert_eq!(first_scope.value.handle, [11; 32]);
+    let second_client =
+        native_broker::BrokerQueryClient::connect(&socket, "second", query_config())
+            .await
+            .unwrap()
+            .with_command_token([2; 32]);
+    let second_scope = second_client
+        .open_scope(open(), Arc::new(()))
+        .await
+        .unwrap();
+    assert_eq!(second_scope.value.handle, [12; 32]);
+    let control_client =
+        native_broker::BrokerControlClient::connect(&socket, "first", query_config())
+            .await
+            .unwrap();
+    control_client.observe_reference("main").await.unwrap();
+    let observations = control
+        .observations
+        .load(std::sync::atomic::Ordering::SeqCst);
+    assert_eq!(
+        control_client
+            .publication("intent")
+            .await
+            .unwrap_err()
+            .code(),
+        tonic::Code::Unauthenticated
+    );
+    assert!(
+        control_client
+            .clone()
+            .with_command_token([9; 32])
+            .observe_reference("main")
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        control
+            .observations
+            .load(std::sync::atomic::Ordering::SeqCst),
+        observations
+    );
+    assert_eq!(
+        control_client
+            .with_command_token([1; 32])
+            .observe_reference("main")
+            .await
+            .unwrap_err()
+            .code(),
+        tonic::Code::Unimplemented,
+        "managed control must not silently use a provider lacking owned opt-in"
+    );
+    let spool = root.join("managed-spool");
+    private(&spool);
+    let object = BrokerObjectIo::connect(&socket, "first", &spool, query_config())
+        .await
+        .unwrap();
+    let value = tinytree_model::Object::Symlink("managed snapshot".into());
+    assert!(object.write_metadata(value.clone()).await.is_err());
+    assert!(
+        object
+            .clone()
+            .with_command_token([2; 32])
+            .write_metadata(value.clone())
+            .await
+            .is_err()
+    );
+    let descriptor = object
+        .clone()
+        .with_command_token([1; 32])
+        .write_metadata(value)
+        .await
+        .unwrap();
+    assert!(object.read_metadata(descriptor.key).await.is_err());
+    assert_eq!(
+        object
+            .with_command_token([1; 32])
+            .read_metadata(descriptor.key)
+            .await
+            .unwrap()
+            .descriptor(),
+        descriptor
+    );
+    let channel = native_broker::connect_local_channel(
+        native_broker::LocalEndpoint::UnixSocket(socket.clone()),
+        &query_config(),
+    )
+    .await
+    .unwrap();
+    let mut raw = native_broker::proto::object_io_client::ObjectIoClient::new(channel);
+    let mut request = tonic::Request::new(native_broker::proto::ObjectRequest {
+        store_id: "first".into(),
+        kind: descriptor.key.kind as u32,
+        id: descriptor.key.id.0.to_vec(),
+    });
+    request.metadata_mut().insert_bin(
+        "native-command-bin",
+        tonic::metadata::MetadataValue::from_bytes(&[1; 31]),
+    );
+    assert_eq!(
+        raw.descriptor(request).await.unwrap_err().code(),
+        tonic::Code::InvalidArgument
+    );
+    command_jobs_idle(&commands).await;
+    drop(first_scope);
+    drop(second_scope);
+    host.stop().await;
+}
+
+#[derive(Debug)]
+struct PendingCommandWrite {
+    inner: Arc<DirectObjectIo>,
+    entered: Arc<tokio::sync::Notify>,
+    release: Arc<tokio::sync::Notify>,
+}
+#[async_trait::async_trait]
+impl NativeObjectIo for PendingCommandWrite {
+    async fn descriptor(
+        &self,
+        key: tinytree_model::ObjectKey,
+    ) -> jj_lib::backend::BackendResult<Option<tinytree_model::Descriptor>> {
+        self.inner.descriptor(key).await
+    }
+    async fn read_metadata(
+        &self,
+        key: tinytree_model::ObjectKey,
+    ) -> jj_lib::backend::BackendResult<jj_native_backend::VerifiedMetadata> {
+        self.inner.read_metadata(key).await
+    }
+    async fn write_metadata(
+        &self,
+        object: tinytree_model::Object,
+    ) -> jj_lib::backend::BackendResult<tinytree_model::Descriptor> {
+        self.inner.write_metadata(object).await
+    }
+    async fn write_metadata_with_owner(
+        &self,
+        object: tinytree_model::Object,
+        owner: native_broker::CommandGuard,
+    ) -> jj_lib::backend::BackendResult<tinytree_model::Descriptor> {
+        let local = self.inner.clone();
+        let entered = self.entered.clone();
+        let release = self.release.clone();
+        tokio::spawn(async move {
+            entered.notify_one();
+            release.notified().await;
+            local.write_metadata_with_owner(object, owner).await
+        })
+        .await
+        .map_err(|error| jj_lib::backend::BackendError::Other(Box::new(error)))?
+    }
+    async fn read_file(
+        &self,
+        id: tinytree_model::FileId,
+    ) -> jj_lib::backend::BackendResult<jj_native_backend::FileRead> {
+        self.inner.read_file(id).await
+    }
+    async fn write_file(
+        &self,
+        input: &mut (dyn futures::AsyncRead + Send + Unpin),
+        max: u64,
+    ) -> jj_lib::backend::BackendResult<tinytree_model::FileId> {
+        self.inner.write_file(input, max).await
+    }
+    async fn copy_catalog_snapshot(
+        &self,
+        limits: CopyCatalogLimits,
+    ) -> jj_lib::backend::BackendResult<jj_native_backend::CopyCatalogSnapshot> {
+        self.inner.copy_catalog_snapshot(limits).await
+    }
+}
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cancelled_managed_metadata_write_keeps_command_job_until_actual_owned_put_finishes() {
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path().canonicalize().unwrap();
+    private(&root);
+    private(&root.join("objects"));
+    private(&root.join("spool"));
+    let local = Arc::new(DirectObjectIo::init(&root.join("objects"), backend_config()).unwrap());
+    let provider = Arc::new(PendingCommandWrite {
+        inner: local.clone(),
+        entered: Default::default(),
+        release: Default::default(),
+    });
+    let commands = Arc::new(TestCommands {
+        tokens: HashMap::from([([1; 32], "example".into())]),
+        active: true.into(),
+        jobs: Default::default(),
+    });
+    let service = BrokerService::new(
+        HashMap::from([(
+            "example".into(),
+            provider.clone() as Arc<dyn NativeObjectIo>,
+        )]),
+        config(),
+    )
+    .unwrap()
+    .with_command_resolver(commands.clone())
+    .unwrap();
+    let socket = root.join("managed-write.sock");
+    let host = Running::start_service(&socket, service).await;
+    let client = BrokerObjectIo::connect(&socket, "example", root.join("spool"), config())
+        .await
+        .unwrap()
+        .with_command_token([1; 32]);
+    let object = tinytree_model::Object::Symlink("accepted immutable snapshot".into());
+    let expected = tinytree_model::encode(&object, Default::default())
+        .unwrap()
+        .descriptor;
+    let task = tokio::spawn(async move { client.write_metadata(object).await });
+    tokio::time::timeout(Duration::from_secs(2), provider.entered.notified())
+        .await
+        .unwrap();
+    task.abort();
+    let _ = task.await;
+    commands
+        .active
+        .store(false, std::sync::atomic::Ordering::SeqCst);
+    assert_eq!(
+        commands.jobs.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "caller cancellation cannot release an accepted physical command job"
+    );
+    provider.release.notify_one();
+    command_jobs_idle(&commands).await;
+    assert_eq!(
+        local.descriptor(expected.key).await.unwrap(),
+        Some(expected)
+    );
+    host.stop().await;
+}

@@ -42,6 +42,45 @@ pub trait NativeRepositoryControl: Send + Sync + std::fmt::Debug {
     /// Conservative adapter work limits, checked before registering the alias.
     /// Implementations must not recursively call this broker from an operation.
     fn resources(&self) -> ControlResources;
+    /// Opt-in physical owner contract: accepted transport, verification and
+    /// blocking work retain this guard after caller cancellation or timeout.
+    async fn observe_reference_with_owner(
+        &self,
+        _name: &str,
+        _owner: crate::CommandGuard,
+    ) -> Result<ReferenceSnapshot, Status> {
+        Err(Status::unimplemented(
+            "owned native reference observation unsupported",
+        ))
+    }
+    async fn admit_commit_with_owner(
+        &self,
+        _head: CommitId,
+        _owner: crate::CommandGuard,
+    ) -> Result<AdmittedCommit, Status> {
+        Err(Status::unimplemented(
+            "owned native commit admission unsupported",
+        ))
+    }
+    async fn publish_with_owner(
+        &self,
+        _request: PublishRequest,
+        _owner: crate::CommandGuard,
+    ) -> Result<ConfirmedPublication, Status> {
+        Err(Status::unimplemented(
+            "owned native publication unsupported",
+        ))
+    }
+    async fn publication_with_owner(
+        &self,
+        _key: &str,
+        _owner: crate::CommandGuard,
+    ) -> Result<Option<ConfirmedPublication>, Status> {
+        Err(Status::unimplemented(
+            "owned native publication lookup unsupported",
+        ))
+    }
+
     /// Return name, generation and optional head from ONE initial observation.
     /// A present head is returned only after retained-root admission. This does
     /// not imply that its full metadata closure has been fetched locally.

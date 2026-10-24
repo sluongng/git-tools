@@ -286,6 +286,7 @@ impl p::query_io_server::QueryIo for BrokerService {
         request: Request<p::DescribeProviderRequest>,
     ) -> Result<Response<p::ProviderDescription>, Status> {
         let (input, work) = input(request, 1024)?;
+        self.authorize_command(&input.store_id, &work)?;
         let description = self.describe_provider(&input.store_id)?;
         reply(
             QueryReply {
@@ -309,6 +310,7 @@ impl p::query_io_server::QueryIo for BrokerService {
         request: Request<p::QueryOpenScopeRequest>,
     ) -> Result<Response<p::QueryScopeReply>, Status> {
         let (i, w) = input(request, self.query_limit())?;
+        self.authorize_command(&i.store_id, &w)?;
         let v = self
             .query_provider(&i.store_id)?
             .open_scope(
@@ -342,6 +344,7 @@ impl p::query_io_server::QueryIo for BrokerService {
         request: Request<p::QueryForkScopeRequest>,
     ) -> Result<Response<p::QueryScopeReply>, Status> {
         let (i, w) = input(request, self.query_limit())?;
+        self.authorize_command(&i.store_id, &w)?;
         let v = self
             .query_provider(&i.store_id)?
             .fork_scope(
@@ -372,6 +375,7 @@ impl p::query_io_server::QueryIo for BrokerService {
         request: Request<p::QueryFactsRequest>,
     ) -> Result<Response<q::GraphFacts>, Status> {
         let (i, w) = input(request, self.query_limit())?;
+        self.authorize_command(&i.store_id, &w)?;
         fact_shapes(&i.facts, self.query_limit())?;
         let v = self
             .query_provider(&i.store_id)?
@@ -385,6 +389,7 @@ impl p::query_io_server::QueryIo for BrokerService {
         request: Request<p::QueryCommitPrefixRequest>,
     ) -> Result<Response<q::CommitPrefixResult>, Status> {
         let (i, w) = input(request, self.query_limit())?;
+        self.authorize_command(&i.store_id, &w)?;
         prefix(&i.hex_prefix, 64)?;
         let provider = self.query_provider(&i.store_id)?;
         let v = match i.selection {
@@ -416,6 +421,7 @@ impl p::query_io_server::QueryIo for BrokerService {
         request: Request<p::QueryChangePrefixRequest>,
     ) -> Result<Response<q::ChangePrefixResult>, Status> {
         let (i, w) = input(request, self.query_limit())?;
+        self.authorize_command(&i.store_id, &w)?;
         prefix(&i.hex_prefix, 32)?;
         let provider = self.query_provider(&i.store_id)?;
         let v = match i.selection {
@@ -453,6 +459,7 @@ impl p::query_io_server::QueryIo for BrokerService {
         request: Request<p::QueryShortestPrefixRequest>,
     ) -> Result<Response<q::ShortestPrefixResult>, Status> {
         let (i, w) = input(request, self.query_limit())?;
+        self.authorize_command(&i.store_id, &w)?;
         let target = match i
             .target
             .ok_or_else(|| Status::invalid_argument("missing native query prefix target"))?
@@ -509,6 +516,7 @@ impl p::query_io_server::QueryIo for BrokerService {
         request: Request<p::QueryBeginRequest>,
     ) -> Result<Response<p::QueryHandleReply>, Status> {
         let (i, w) = input(request, self.query_limit())?;
+        self.authorize_command(&i.store_id, &w)?;
         expression_shape(
             i.expression
                 .as_ref()
@@ -555,6 +563,7 @@ impl p::query_io_server::QueryIo for BrokerService {
         request: Request<p::QueryPageRequest>,
     ) -> Result<Response<p::QueryPageReply>, Status> {
         let (i, w) = input(request, self.query_limit())?;
+        self.authorize_command(&i.store_id, &w)?;
         let v = self
             .query_provider(&i.store_id)?
             .page(handle(&i.query)?, i.expected_sequence, w.clone())
@@ -581,6 +590,7 @@ impl p::query_io_server::QueryIo for BrokerService {
         request: Request<p::QueryReadCommitRequest>,
     ) -> Result<Response<p::Metadata>, Status> {
         let (i, w) = input(request, self.query_limit())?;
+        self.authorize_command(&i.store_id, &w)?;
         let id = handle(&i.commit)?;
         let v = self
             .query_provider(&i.store_id)?
@@ -614,6 +624,7 @@ impl p::query_io_server::QueryIo for BrokerService {
         request: Request<p::QueryCloseRequest>,
     ) -> Result<Response<p::QueryCloseReply>, Status> {
         let (i, w) = input(request, self.query_limit())?;
+        self.authorize_command(&i.store_id, &w)?;
         self.query_provider(&i.store_id)?
             .close_query(handle(&i.handle)?, w.clone())
             .await
@@ -632,6 +643,7 @@ impl p::query_io_server::QueryIo for BrokerService {
         request: Request<p::QueryCloseRequest>,
     ) -> Result<Response<p::QueryCloseReply>, Status> {
         let (i, w) = input(request, self.query_limit())?;
+        self.authorize_command(&i.store_id, &w)?;
         self.query_provider(&i.store_id)?
             .close_scope(handle(&i.handle)?, w.clone())
             .await

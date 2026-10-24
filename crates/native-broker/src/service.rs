@@ -7,7 +7,7 @@ use std::{
     convert::Infallible,
     future::Future,
     pin::Pin,
-    sync::Arc,
+    sync::{Arc, Mutex},
     task::{Context, Poll},
 };
 use tokio::{
@@ -26,6 +26,7 @@ pub struct BrokerService {
 }
 struct Inner {
     stores: HashMap<String, Arc<dyn NativeObjectIo>>,
+    command_resolver: Option<Arc<dyn crate::CommandResolver>>,
     controls: HashMap<String, Arc<dyn crate::NativeRepositoryControl>>,
     queries: HashMap<String, Arc<dyn crate::NativeQueryIo>>,
     descriptions: HashMap<String, crate::ProviderDescription>,
@@ -48,9 +49,16 @@ impl Inner {
         }
         // The alias is inside the protobuf body, which has not been decoded at
         // this boundary. Reserve the largest registered provider workset.
-        let is_metadata = ["/Descriptor", "/ReadMetadata", "/CopyCatalog", "/ReadFile"]
-            .iter()
-            .any(|suffix| path.ends_with(suffix));
+        let is_metadata = [
+            "/Descriptor",
+            "/ReadMetadata",
+            "/CopyCatalog",
+            "/ReadFile",
+            "/WriteMetadata",
+            "/WriteFile",
+        ]
+        .iter()
+        .any(|suffix| path.ends_with(suffix));
         let memory = if is_query {
             self.config
                 .query_memory()
@@ -107,10 +115,64 @@ impl Inner {
             _memory: bytes,
             _staging: staging,
             deadline,
+            rpc: false,
+            command_token: None,
+            bootstrap: false,
+            command: Mutex::new(None),
         }))
     }
 }
 impl BrokerService {
+    /// Enable command attribution for all configured RPC aliases. Register
+    /// before exposing/cloning this service. Trusted in-process source reads
+    /// remain a distinct host capability, not a tokenless RPC fallback.
+    pub fn with_command_resolver(
+        mut self,
+        resolver: Arc<dyn crate::CommandResolver>,
+    ) -> Result<Self, Status> {
+        Arc::get_mut(&mut self.inner)
+            .ok_or_else(|| Status::failed_precondition("broker registry already shared"))?
+            .command_resolver = Some(resolver);
+        Ok(self)
+    }
+    pub(crate) fn authorize_command(&self, alias: &str, work: &Arc<Work>) -> Result<(), Status> {
+        self.store(alias)?;
+        if !work.rpc {
+            return Ok(());
+        }
+        let Some(resolver) = &self.inner.command_resolver else {
+            return if work.command_token.is_some() {
+                Err(Status::failed_precondition(
+                    "native command attribution unavailable",
+                ))
+            } else {
+                Ok(())
+            };
+        };
+        let Some(token) = work.command_token else {
+            return if work.bootstrap {
+                Ok(())
+            } else {
+                Err(Status::unauthenticated("native command token required"))
+            };
+        };
+        let mut binding = work
+            .command
+            .lock()
+            .map_err(|_| Status::internal("native command scope unavailable"))?;
+        if let Some((bound, _)) = &*binding {
+            return if bound == alias {
+                Ok(())
+            } else {
+                Err(Status::permission_denied("native command alias mismatch"))
+            };
+        }
+        let guard = resolver
+            .resolve(alias, token)
+            .map_err(|error| Status::new(error.code(), "native command access denied"))?;
+        *binding = Some((alias.to_owned(), guard));
+        Ok(())
+    }
     /// Call after stopping incoming requests. Waits for transport-held guards
     /// AND detached draining provider jobs; it never force-closes their I/O.
     pub async fn drain(&self) -> Result<(), Status> {
@@ -152,6 +214,7 @@ impl BrokerService {
         Ok(Self {
             inner: Arc::new(Inner {
                 stores,
+                command_resolver: None,
                 metadata_work,
                 controls: HashMap::new(),
                 queries: HashMap::new(),
@@ -494,6 +557,10 @@ where
     fn call(&mut self, request: HttpRequest<Body>) -> Self::Future {
         let shared = self.shared.clone();
         let path = request.uri().path().to_owned();
+        let command_token = match crate::command::token(request.headers()) {
+            Ok(token) => token,
+            Err(status) => return Box::pin(async move { Ok(status.into_http()) }),
+        };
         let budget = match grpc_budget(request.headers(), shared.config.policy.operation_timeout())
         {
             Ok(value) => value,
@@ -504,7 +571,17 @@ where
         let mut inner = std::mem::replace(&mut self.inner, ready);
         Box::pin(async move {
             let result = tokio::time::timeout_at(deadline, async {
-                let work = shared.admit(&path, deadline).await?;
+                let mut work = shared.admit(&path, deadline).await?;
+                let context = Arc::get_mut(&mut work)
+                    .ok_or_else(|| Status::internal("broker request scope already shared"))?;
+                context.rpc = true;
+                context.command_token = command_token;
+                context.bootstrap = matches!(
+                    path.as_str(),
+                    "/native.broker.v1.QueryIo/DescribeProvider"
+                        | "/native.broker.v1.RepositoryControl/ObserveReference"
+                        | "/native.broker.v1.RepositoryControl/AdmitCommit"
+                );
                 let mut request = request.map(|body| {
                     Body::new(InboundBody::new(
                         body,
@@ -556,6 +633,7 @@ impl p::object_io_server::ObjectIo for BrokerService {
             .cloned()
             .ok_or_else(|| Status::internal("broker request missing resource scope"))?;
         let input = request.into_inner();
+        self.authorize_command(&input.store_id, &owner)?;
         let provider = self.store(&input.store_id)?;
         let value = provider
             .descriptor_with_owner(wire::key(input.kind, &input.id)?, owner)
@@ -575,6 +653,7 @@ impl p::object_io_server::ObjectIo for BrokerService {
             .cloned()
             .ok_or_else(|| Status::internal("broker request missing resource scope"))?;
         let input = request.into_inner();
+        self.authorize_command(&input.store_id, &owner)?;
         let provider = self.store(&input.store_id)?;
         let key = wire::key(input.kind, &input.id)?;
         if key.kind == tinytree_model::Kind::File {
@@ -598,12 +677,14 @@ impl p::object_io_server::ObjectIo for BrokerService {
         &self,
         request: Request<p::MetadataWrite>,
     ) -> Result<Response<p::ObjectDescriptor>, Status> {
-        let deadline = request
+        let work = request
             .extensions()
             .get::<Arc<Work>>()
-            .ok_or_else(|| Status::internal("broker request missing resource scope"))?
-            .deadline;
+            .cloned()
+            .ok_or_else(|| Status::internal("broker request missing resource scope"))?;
+        let deadline = work.deadline;
         let input = request.into_inner();
+        self.authorize_command(&input.store_id, &work)?;
         let provider = self.store(&input.store_id)?;
         if input.canonical.len() > self.inner.config.max_metadata_bytes {
             return Err(Status::resource_exhausted("broker metadata exceeds limit"));
@@ -618,10 +699,14 @@ impl p::object_io_server::ObjectIo for BrokerService {
         if encoded.bytes != input.canonical {
             return Err(Status::invalid_argument("noncanonical broker metadata"));
         }
-        let descriptor = provider
-            .write_metadata(object)
-            .await
-            .map_err(wire::backend)?;
+        let descriptor = if work.has_command() {
+            provider
+                .write_metadata_with_owner(object, Arc::new((work.clone(), _staging)))
+                .await
+        } else {
+            provider.write_metadata(object).await
+        }
+        .map_err(wire::backend)?;
         if descriptor != encoded.descriptor {
             return Err(Status::data_loss("broker provider metadata mismatch"));
         }
@@ -638,6 +723,7 @@ impl p::object_io_server::ObjectIo for BrokerService {
             .cloned()
             .ok_or_else(|| Status::internal("broker request missing resource scope"))?;
         let input = request.into_inner();
+        self.authorize_command(&input.store_id, &work)?;
         let provider = self.store(&input.store_id)?;
         let key = wire::key(input.kind, &input.id)?;
         if key.kind != tinytree_model::Kind::File {
@@ -725,11 +811,12 @@ impl p::object_io_server::ObjectIo for BrokerService {
         &self,
         request: Request<Streaming<p::WriteFrame>>,
     ) -> Result<Response<p::ObjectDescriptor>, Status> {
-        let deadline = request
+        let work = request
             .extensions()
             .get::<Arc<Work>>()
-            .ok_or_else(|| Status::internal("broker request missing resource scope"))?
-            .deadline;
+            .cloned()
+            .ok_or_else(|| Status::internal("broker request missing resource scope"))?;
+        let deadline = work.deadline;
         let mut body = request.into_inner();
         let first = body
             .message()
@@ -738,6 +825,7 @@ impl p::object_io_server::ObjectIo for BrokerService {
         let Some(p::write_frame::Frame::Header(header)) = first.frame else {
             return Err(Status::invalid_argument("missing broker upload header"));
         };
+        self.authorize_command(&header.store_id, &work)?;
         let provider = self.store(&header.store_id)?;
         if header.max_bytes > self.inner.config.max_file_bytes {
             return Err(Status::resource_exhausted("broker upload exceeds limit"));
@@ -754,11 +842,19 @@ impl p::object_io_server::ObjectIo for BrokerService {
             done: false,
         };
         let provider_copy = provider.clone();
+        let write_owner = Arc::new((work.clone(), _staging));
+        let managed = work.has_command();
         let write = async move {
-            provider_copy
-                .write_file(&mut reader, header.max_bytes)
-                .await
-                .map_err(wire::backend)
+            if managed {
+                provider_copy
+                    .write_file_with_owner(&mut reader, header.max_bytes, write_owner)
+                    .await
+            } else {
+                provider_copy
+                    .write_file(&mut reader, header.max_bytes)
+                    .await
+            }
+            .map_err(wire::backend)
         };
         let frame = self.inner.config.max_frame_bytes;
         let ingestion = async move {
@@ -804,14 +900,17 @@ impl p::object_io_server::ObjectIo for BrokerService {
         let (written, ingested) = tokio::join!(write, ingestion);
         ingested?;
         let id = written?;
-        let descriptor = provider
-            .descriptor(tinytree_model::ObjectKey {
-                kind: tinytree_model::Kind::File,
-                id: tinytree_model::ObjectId(id.0),
-            })
-            .await
-            .map_err(wire::backend)?
-            .ok_or_else(|| Status::internal("durable broker upload descriptor missing"))?;
+        let key = tinytree_model::ObjectKey {
+            kind: tinytree_model::Kind::File,
+            id: tinytree_model::ObjectId(id.0),
+        };
+        let descriptor = if managed {
+            provider.descriptor_with_owner(key, work.clone()).await
+        } else {
+            provider.descriptor(key).await
+        }
+        .map_err(wire::backend)?
+        .ok_or_else(|| Status::internal("durable broker upload descriptor missing"))?;
         Ok(Response::new(wire::describe(descriptor)))
     }
     type CopyCatalogStream = Stream<p::CatalogFrame>;
@@ -825,6 +924,7 @@ impl p::object_io_server::ObjectIo for BrokerService {
             .cloned()
             .ok_or_else(|| Status::internal("broker request missing resource scope"))?;
         let input = request.into_inner();
+        self.authorize_command(&input.store_id, &owner)?;
         let provider = self.store(&input.store_id)?;
         let cfg = &self.inner.config;
         if input.max_objects == 0
@@ -932,6 +1032,19 @@ pub(crate) struct Work {
     _memory: OwnedSemaphorePermit,
     _staging: Option<OwnedSemaphorePermit>,
     pub(crate) deadline: Instant,
+    rpc: bool,
+    command_token: Option<[u8; 32]>,
+    bootstrap: bool,
+    // Resolved accepted-job guard outlives all handler/body/provider owners.
+    command: Mutex<Option<(String, crate::CommandGuard)>>,
+}
+impl Work {
+    fn has_command(&self) -> bool {
+        self.command
+            .lock()
+            .map(|binding| binding.is_some())
+            .unwrap_or(true)
+    }
 }
 struct InboundBody {
     body: Body,
@@ -999,13 +1112,23 @@ impl p::repository_control_server::RepositoryControl for BrokerService {
         &self,
         request: Request<p::ObserveReferenceRequest>,
     ) -> Result<Response<p::ReferenceSnapshot>, Status> {
+        let work = request
+            .extensions()
+            .get::<Arc<Work>>()
+            .cloned()
+            .ok_or_else(|| Status::internal("broker request missing resource scope"))?;
         let input = request.into_inner();
+        self.authorize_command(&input.store_id, &work)?;
         crate::control::reference_name(&input.name)?;
         let control = self.control(&input.store_id)?;
-        let value = control
-            .observe_reference(&input.name)
-            .await
-            .map_err(crate::control::status)?;
+        let value = if work.has_command() {
+            control
+                .observe_reference_with_owner(&input.name, work.clone())
+                .await
+        } else {
+            control.observe_reference(&input.name).await
+        }
+        .map_err(crate::control::status)?;
         if value.name != input.name || value.generation == 0 && value.head.is_some() {
             return Err(Status::data_loss(
                 "native control returned an invalid reference observation",
@@ -1033,13 +1156,21 @@ impl p::repository_control_server::RepositoryControl for BrokerService {
         &self,
         request: Request<p::AdmitCommitRequest>,
     ) -> Result<Response<p::AdmittedCommit>, Status> {
+        let work = request
+            .extensions()
+            .get::<Arc<Work>>()
+            .cloned()
+            .ok_or_else(|| Status::internal("broker request missing resource scope"))?;
         let input = request.into_inner();
+        self.authorize_command(&input.store_id, &work)?;
         let head = request_commit(&input.head)?;
-        let value = self
-            .control(&input.store_id)?
-            .admit_commit(head)
-            .await
-            .map_err(crate::control::status)?;
+        let control = self.control(&input.store_id)?;
+        let value = if work.has_command() {
+            control.admit_commit_with_owner(head, work.clone()).await
+        } else {
+            control.admit_commit(head).await
+        }
+        .map_err(crate::control::status)?;
         if value.head != head {
             return Err(Status::data_loss("native control admitted another head"));
         }
@@ -1052,7 +1183,13 @@ impl p::repository_control_server::RepositoryControl for BrokerService {
         &self,
         request: Request<p::PublishRequest>,
     ) -> Result<Response<p::ConfirmedPublication>, Status> {
+        let work = request
+            .extensions()
+            .get::<Arc<Work>>()
+            .cloned()
+            .ok_or_else(|| Status::internal("broker request missing resource scope"))?;
         let input = request.into_inner();
+        self.authorize_command(&input.store_id, &work)?;
         crate::control::reference_name(&input.name)?;
         crate::control::key(&input.idempotency_key)?;
         let head = request_commit(&input.head)?;
@@ -1068,11 +1205,15 @@ impl p::repository_control_server::RepositoryControl for BrokerService {
             expected_generation: expected,
             idempotency_key: input.idempotency_key,
         };
-        let value = self
-            .control(&input.store_id)?
-            .publish(wanted.clone())
-            .await
-            .map_err(crate::control::status)?;
+        let control = self.control(&input.store_id)?;
+        let value = if work.has_command() {
+            control
+                .publish_with_owner(wanted.clone(), work.clone())
+                .await
+        } else {
+            control.publish(wanted.clone()).await
+        }
+        .map_err(crate::control::status)?;
         if value.idempotency_key != wanted.idempotency_key
             || value.name != wanted.name
             || value.head != wanted.head
@@ -1088,13 +1229,23 @@ impl p::repository_control_server::RepositoryControl for BrokerService {
         &self,
         request: Request<p::PublicationRequest>,
     ) -> Result<Response<p::PublicationReply>, Status> {
+        let work = request
+            .extensions()
+            .get::<Arc<Work>>()
+            .cloned()
+            .ok_or_else(|| Status::internal("broker request missing resource scope"))?;
         let input = request.into_inner();
+        self.authorize_command(&input.store_id, &work)?;
         crate::control::key(&input.idempotency_key)?;
-        let value = self
-            .control(&input.store_id)?
-            .publication(&input.idempotency_key)
-            .await
-            .map_err(crate::control::status)?;
+        let control = self.control(&input.store_id)?;
+        let value = if work.has_command() {
+            control
+                .publication_with_owner(&input.idempotency_key, work.clone())
+                .await
+        } else {
+            control.publication(&input.idempotency_key).await
+        }
+        .map_err(crate::control::status)?;
         if value
             .as_ref()
             .is_some_and(|v| v.idempotency_key != input.idempotency_key)

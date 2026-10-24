@@ -59,6 +59,8 @@ struct Counters {
     metadata_started: Arc<tokio::sync::Notify>,
     public_paused: Arc<AtomicBool>,
     public_started: Arc<tokio::sync::Notify>,
+    missing_paused: Arc<AtomicBool>,
+    missing_started: Arc<tokio::sync::Notify>,
 }
 impl Counters {
     fn new() -> Self {
@@ -75,6 +77,8 @@ impl Counters {
             metadata_started: Arc::new(tokio::sync::Notify::new()),
             public_paused: Arc::new(AtomicBool::new(false)),
             public_started: Arc::new(tokio::sync::Notify::new()),
+            missing_paused: Arc::new(AtomicBool::new(false)),
+            missing_started: Arc::new(tokio::sync::Notify::new()),
         }
     }
 }
@@ -139,7 +143,12 @@ impl Repository for Counting {
         &self,
         r: Request<p::FindMissingObjectsRequest>,
     ) -> Result<Response<p::MissingObjects>, Status> {
-        self.service.find_missing_objects(r).await
+        let response = self.service.find_missing_objects(r).await?;
+        self.counts.missing_started.notify_one();
+        while self.counts.missing_paused.load(Ordering::SeqCst) {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        Ok(response)
     }
     type ReadFileStream = <RepositoryService as Repository>::ReadFileStream;
     async fn read_file(
@@ -5282,4 +5291,120 @@ async fn native_prefix_context_matches_pinned_default_through_broker_on_current_
     let _ = stop.send(());
     task.await.unwrap().unwrap();
     server.stop().await;
+}
+
+#[test]
+fn owned_remote_publication_keeps_command_guard_after_deadline_and_cancelled_sdk_verification() {
+    use native_broker::NativeRepositoryControl as _;
+    use std::sync::{Condvar, Mutex};
+    struct ReleaseOnDrop(Arc<(Mutex<bool>, Condvar)>);
+    impl Drop for ReleaseOnDrop {
+        fn drop(&mut self) {
+            let (lock, changed) = &*self.0;
+            *lock.lock().unwrap_or_else(|error| error.into_inner()) = true;
+            changed.notify_all();
+        }
+    }
+    // Queue the real SDK verification worker, not a mock trait operation. The
+    // upstream missing-object job has finished before occupying this one slot.
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .max_blocking_threads(1)
+        .enable_all()
+        .build()
+        .unwrap();
+    runtime.block_on(async {
+        let server_directory = private_dir();
+        let store = Store::open(server_directory.path(), Default::default()).unwrap();
+        store.create_repository("example").unwrap();
+        let counts = Counters::new();
+        counts.missing_paused.store(true, Ordering::SeqCst);
+        let server = Server::start(store, counts.clone()).await;
+        let directory = private_dir();
+        let mut cfg = config(&server);
+        cfg.remote.rpc.operation_timeout_ms = 1000;
+        cfg.remote.rpc.rpc_timeout_ms = 1000;
+        cfg.remote.rpc.retry.max_attempts = 1;
+        let (_direct, repo) = local(directory.path(), cache(directory.path()), cfg, true);
+        let mut commit = m::synthetic_root();
+        commit.parents = vec![m::CommitId::ROOT];
+        commit.change_id = m::ChangeId([77; 16]);
+        commit.description = "queued SDK canonical verification".into();
+        let descriptor = repo
+            .io
+            .write_metadata(m::Object::Commit(commit))
+            .await
+            .unwrap();
+        let head = m::CommitId(descriptor.key.id.0);
+        let permits = Arc::new(tokio::sync::Semaphore::new(1));
+        let owner = Arc::new(permits.clone().acquire_owned().await.unwrap());
+        let weak = Arc::downgrade(&owner);
+        let control = repo.control.clone();
+        let started = tokio::time::Instant::now();
+        let task = tokio::spawn(async move {
+            control
+                .publish_with_owner(
+                    native_broker::PublishRequest {
+                        name: "main".into(),
+                        head,
+                        expected_generation: 0,
+                        idempotency_key: "owned-publication".into(),
+                    },
+                    owner,
+                )
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(2), counts.missing_started.notified())
+            .await
+            .unwrap();
+        let gate = Arc::new((Mutex::new(false), Condvar::new()));
+        let release = ReleaseOnDrop(gate.clone());
+        let worker_gate = gate.clone();
+        let (entered, accepted) = tokio::sync::oneshot::channel();
+        let blocker = tokio::task::spawn_blocking(move || {
+            let _ = entered.send(());
+            let (lock, changed) = &*worker_gate;
+            let mut done = lock.lock().unwrap();
+            while !*done {
+                done = changed.wait(done).unwrap();
+            }
+        });
+        accepted.await.unwrap();
+        counts.missing_paused.store(false, Ordering::SeqCst);
+        // The operation deadline has now passed while verification remains
+        // physically queued. Draining must not return or release its owner.
+        tokio::time::sleep_until(started + Duration::from_millis(1100)).await;
+        assert!(
+            !task.is_finished(),
+            "owned control must drain the accepted SDK worker after timeout"
+        );
+        assert!(weak.upgrade().is_some());
+        assert!(permits.clone().try_acquire_owned().is_err());
+        task.abort();
+        let _ = task.await;
+        assert!(
+            weak.upgrade().is_some(),
+            "cancelling the drain waiter cannot drop the queued worker's guard"
+        );
+        drop(release);
+        blocker.await.unwrap();
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while weak.upgrade().is_some() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(permits.clone().try_acquire_owned().is_ok());
+        let next = repo
+            .control
+            .observe_reference_with_owner("absent", Arc::new(()))
+            .await
+            .unwrap();
+        assert!(
+            next.head.is_none(),
+            "actual codec/worker teardown must release control admission for the next command"
+        );
+        server.stop().await;
+    });
 }

@@ -1,3 +1,4 @@
+use crate::command::CommandChannel;
 use crate::{Config, proto as p, wire};
 use async_trait::async_trait;
 use futures::{AsyncRead, AsyncReadExt};
@@ -10,7 +11,7 @@ use std::{
     io::{Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
     pin::Pin,
-    sync::{Arc, OnceLock},
+    sync::{Arc, Mutex, OnceLock},
     task::{Context, Poll},
 };
 use tokio::{
@@ -19,7 +20,7 @@ use tokio::{
     task::JoinHandle,
     time::Instant,
 };
-use tonic::{Request, Status, codec::CompressionEncoding, transport::Channel};
+use tonic::{Request, Status, codec::CompressionEncoding};
 fn runtime() -> BackendResult<&'static Runtime> {
     static RUNTIME: OnceLock<std::io::Result<Runtime>> = OnceLock::new();
     RUNTIME
@@ -72,7 +73,7 @@ async fn read_metadata_request(
     reapi::policy::timeout(deadline, async {
         let _budget = inner.budget(inner.config.metadata_memory()).await?;
         let value = inner
-            .client(inner.config.max_metadata_bytes + 4096)
+            .client(inner.config.max_metadata_bytes + 4096, _budget.clone())
             .read_metadata(inner.request(inner.object(key), deadline)?)
             .await?
             .into_inner();
@@ -91,10 +92,13 @@ async fn read_metadata_request(
 }
 struct Budget {
     _calls: OwnedSemaphorePermit,
-    _memory: OwnedSemaphorePermit,
+    _memory: Mutex<OwnedSemaphorePermit>,
+    _external: Option<crate::CommandGuard>,
 }
+#[derive(Clone)]
 struct Inner {
-    channel: Channel,
+    channel: CommandChannel,
+    physical_owner: Option<crate::CommandGuard>,
     store: String,
     spool: PathBuf,
     config: Config,
@@ -114,6 +118,21 @@ impl std::fmt::Debug for BrokerObjectIo {
     }
 }
 impl BrokerObjectIo {
+    /// Bind subsequent local RPCs to a live host command. Runtime only: shared
+    /// channel/pools and configured provider identity remain unchanged.
+    pub fn with_command_token(mut self, token: [u8; 32]) -> Self {
+        let mut inner = (*self.inner).clone();
+        inner.channel = inner.channel.with_command_token(token);
+        self.inner = Arc::new(inner);
+        self
+    }
+
+    fn with_physical_owner(mut self, owner: crate::CommandGuard) -> Self {
+        let mut inner = (*self.inner).clone();
+        inner.physical_owner = Some(owner);
+        self.inner = Arc::new(inner);
+        self
+    }
     /// Connect to a private owner-controlled Unix socket. The spool directory
     /// must already be private/trusted; it never becomes a broker store path.
     pub async fn connect(
@@ -150,9 +169,11 @@ impl BrokerObjectIo {
                     .map_err(|_| Status::permission_denied("broker spool is not private"))?,
             );
             let channel = crate::transport::connect_local_channel(endpoint, &config).await?;
+            let channel = CommandChannel::new(channel);
             Ok(Self {
                 inner: Arc::new(Inner {
                     channel,
+                    physical_owner: None,
                     store,
                     spool,
                     calls: Arc::new(Semaphore::new(config.max_inflight)),
@@ -168,8 +189,12 @@ impl BrokerObjectIo {
     }
 }
 impl Inner {
-    fn client(&self, limit: usize) -> p::object_io_client::ObjectIoClient<Channel> {
-        p::object_io_client::ObjectIoClient::new(self.channel.clone())
+    fn client(
+        &self,
+        limit: usize,
+        budget: Arc<Budget>,
+    ) -> p::object_io_client::ObjectIoClient<CommandChannel> {
+        p::object_io_client::ObjectIoClient::new(self.channel.clone().with_owner(budget))
             .send_compressed(CompressionEncoding::Zstd)
             .accept_compressed(CompressionEncoding::Zstd)
             .max_decoding_message_size(limit)
@@ -190,7 +215,8 @@ impl Inner {
             .map_err(|_| Status::unavailable("broker client closed"))?;
         Ok(Arc::new(Budget {
             _calls: calls,
-            _memory: memory,
+            _memory: Mutex::new(memory),
+            _external: self.physical_owner.clone(),
         }))
     }
     fn request<T>(&self, body: T, deadline: Instant) -> Result<Request<T>, Status> {
@@ -222,7 +248,7 @@ impl NativeObjectIo for BrokerObjectIo {
             reapi::policy::timeout(deadline, async {
                 let _budget = inner.budget(4096).await?;
                 let value = inner
-                    .client(1024)
+                    .client(1024, _budget.clone())
                     .descriptor(inner.request(inner.object(key), deadline)?)
                     .await?
                     .into_inner()
@@ -243,7 +269,7 @@ impl NativeObjectIo for BrokerObjectIo {
         key: tinytree_model::ObjectKey,
         owner: Arc<dyn std::any::Any + Send + Sync>,
     ) -> BackendResult<Option<tinytree_model::Descriptor>> {
-        let provider = self.clone();
+        let provider = self.clone().with_physical_owner(owner.clone());
         run_owned(owner, async move {
             provider.descriptor(key).await.map_err(wire::backend)
         })
@@ -254,7 +280,7 @@ impl NativeObjectIo for BrokerObjectIo {
         limits: CopyCatalogLimits,
         owner: Arc<dyn std::any::Any + Send + Sync>,
     ) -> BackendResult<CopyCatalogSnapshot> {
-        let provider = self.clone();
+        let provider = self.clone().with_physical_owner(owner.clone());
         run_owned(owner, async move {
             provider
                 .copy_catalog_snapshot(limits)
@@ -274,7 +300,8 @@ impl NativeObjectIo for BrokerObjectIo {
         key: tinytree_model::ObjectKey,
         owner: Arc<dyn std::any::Any + Send + Sync>,
     ) -> BackendResult<VerifiedMetadata> {
-        run_owned(owner, read_metadata_request(self.inner.clone(), key)).await
+        let provider = self.clone().with_physical_owner(owner.clone());
+        run_owned(owner, read_metadata_request(provider.inner.clone(), key)).await
     }
     async fn write_metadata(
         &self,
@@ -288,7 +315,7 @@ impl NativeObjectIo for BrokerObjectIo {
                 let encoded = tinytree_model::encode(&object, inner.config.model_limits())
                     .map_err(|_| Status::invalid_argument("invalid native metadata"))?;
                 let value = inner
-                    .client(1024)
+                    .client(1024, _budget.clone())
                     .write_metadata(inner.request(
                         p::MetadataWrite {
                             store_id: inner.store.clone(),
@@ -310,6 +337,16 @@ impl NativeObjectIo for BrokerObjectIo {
         })
         .await
     }
+    async fn write_metadata_with_owner(
+        &self,
+        object: tinytree_model::Object,
+        owner: crate::CommandGuard,
+    ) -> BackendResult<tinytree_model::Descriptor> {
+        self.clone()
+            .with_physical_owner(owner)
+            .write_metadata(object)
+            .await
+    }
     async fn read_file(&self, id: tinytree_model::FileId) -> BackendResult<FileRead> {
         self.read_file_with_owner(id, Arc::new(())).await
     }
@@ -318,7 +355,7 @@ impl NativeObjectIo for BrokerObjectIo {
         id: tinytree_model::FileId,
         owner: Arc<dyn std::any::Any + Send + Sync>,
     ) -> BackendResult<FileRead> {
-        let inner = self.inner.clone();
+        let inner = self.clone().with_physical_owner(owner.clone()).inner;
         run_owned(owner.clone(), async move {
             let deadline = Instant::now() + inner.config.policy.operation_timeout();
             reapi::policy::timeout(deadline, async {
@@ -341,6 +378,7 @@ impl NativeObjectIo for BrokerObjectIo {
                 let create_budget = budget.clone();
                 let create_owner = owner.clone();
                 let mut spool = tokio::task::spawn_blocking(move || {
+                    let held_budget = create_budget.clone();
                     let _budget = create_budget;
                     crate::transport::private_directory(&create_spool)?;
                     let file = tempfile::tempfile_in(create_spool)
@@ -350,6 +388,7 @@ impl NativeObjectIo for BrokerObjectIo {
                         _disk: create_disk,
                         _reader_memory: None,
                         _owner: create_owner,
+                        _pending_budget: Some(held_budget),
                         #[cfg(windows)]
                         _directory: create_directory,
                     })
@@ -361,7 +400,7 @@ impl NativeObjectIo for BrokerObjectIo {
                     id: tinytree_model::ObjectId(id.0),
                 };
                 let mut stream = inner
-                    .client(inner.config.max_frame_bytes + 4096)
+                    .client(inner.config.max_frame_bytes + 4096, budget.clone())
                     .read_file(inner.request(inner.object(key), deadline)?)
                     .await?
                     .into_inner();
@@ -435,16 +474,16 @@ impl NativeObjectIo for BrokerObjectIo {
                     .max_frame_bytes
                     .min(64 * 1024)
                     .min(descriptor.size_bytes.max(1) as usize);
-                let mut owned = Arc::try_unwrap(budget).map_err(|_| {
-                    Status::internal("broker file work still owns memory admission")
-                })?;
+                drop(stream);
                 spool._reader_memory = Some(
-                    owned
+                    budget
                         ._memory
+                        .lock()
+                        .map_err(|_| Status::internal("broker reader reservation unavailable"))?
                         .split(buffer_bytes.saturating_mul(2).saturating_add(1024))
                         .ok_or_else(|| Status::internal("broker reader reservation missing"))?,
                 );
-                drop(owned);
+                spool._pending_budget.take();
                 FileRead::from_preverified_pinned_source(
                     descriptor,
                     Box::pin(SpoolReader::new(spool, buffer_bytes)),
@@ -483,7 +522,7 @@ impl NativeObjectIo for BrokerObjectIo {
                 let _budget = rpc_budget;
                 let stream = tokio_stream::wrappers::ReceiverStream::new(rx);
                 let raw = inner
-                    .client(1024)
+                    .client(1024, _budget.clone())
                     .max_encoding_message_size(inner.config.max_frame_bytes + 4096)
                     .write_file(inner.request(stream, deadline)?)
                     .await?
@@ -558,6 +597,17 @@ impl NativeObjectIo for BrokerObjectIo {
         }
         Ok(tinytree_model::FileId(id))
     }
+    async fn write_file_with_owner(
+        &self,
+        input: &mut (dyn AsyncRead + Send + Unpin),
+        max_bytes: u64,
+        owner: crate::CommandGuard,
+    ) -> BackendResult<tinytree_model::FileId> {
+        self.clone()
+            .with_physical_owner(owner)
+            .write_file(input, max_bytes)
+            .await
+    }
     async fn copy_catalog_snapshot(
         &self,
         limits: CopyCatalogLimits,
@@ -577,7 +627,7 @@ impl NativeObjectIo for BrokerObjectIo {
                 }
                 let _budget = inner.budget(inner.config.catalog_memory()).await?;
                 let mut stream = inner
-                    .client(inner.config.max_metadata_bytes + 4096)
+                    .client(inner.config.max_metadata_bytes + 4096, _budget.clone())
                     .copy_catalog(inner.request(
                         p::CatalogRequest {
                             store_id: inner.store.clone(),
@@ -687,6 +737,9 @@ struct Spool {
     _disk: Arc<OwnedSemaphorePermit>,
     _reader_memory: Option<OwnedSemaphorePermit>,
     _owner: Arc<dyn std::any::Any + Send + Sync>,
+    // Pending/unreceived physical job results keep full admission until the
+    // caller transfers only the bounded reader window at successful delivery.
+    _pending_budget: Option<Arc<Budget>>,
 }
 struct SpoolWrite {
     data: Vec<u8>,

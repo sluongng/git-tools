@@ -878,7 +878,7 @@ fn cancelled_metadata_install_keeps_the_physical_put_owner_and_admission() {
     commit.parents = vec![m::CommitId::ROOT];
     let object = m::Object::Commit(commit);
     let expected = m::encode(&object, m::Limits::default()).unwrap().descriptor;
-    let worker = provider.clone();
+    let worker: Arc<dyn NativeObjectIo> = provider.clone();
     let runtime = tokio::runtime::Runtime::new().unwrap();
     let task = runtime.spawn(async move { worker.write_metadata_with_owner(object, owner).await });
     started.recv_timeout(Duration::from_secs(5)).unwrap();

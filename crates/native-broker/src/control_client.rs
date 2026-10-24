@@ -1,16 +1,18 @@
+use crate::command::CommandChannel;
 use crate::{
     AdmittedCommit, CommitId, Config, ConfirmedPublication, PublishRequest, ReferenceSnapshot,
     control, proto as p,
 };
 use std::{future::Future, path::Path, sync::Arc};
 use tokio::{sync::Semaphore, time::Instant};
-use tonic::{Request, Status, codec::CompressionEncoding, transport::Channel};
+use tonic::{Request, Status, codec::CompressionEncoding};
 #[derive(Clone)]
 pub struct BrokerControlClient {
     inner: Arc<Inner>,
 }
+#[derive(Clone)]
 struct Inner {
-    channel: Channel,
+    channel: CommandChannel,
     store: String,
     config: Config,
     calls: Arc<Semaphore>,
@@ -23,6 +25,15 @@ impl std::fmt::Debug for BrokerControlClient {
     }
 }
 impl BrokerControlClient {
+    /// Bind subsequent local RPCs to a live host command. Runtime only: shared
+    /// channel/pools and configured provider identity remain unchanged.
+    pub fn with_command_token(mut self, token: [u8; 32]) -> Self {
+        let mut inner = (*self.inner).clone();
+        inner.channel = inner.channel.with_command_token(token);
+        self.inner = Arc::new(inner);
+        self
+    }
+
     /// Connect without requiring a caller Tokio runtime. No remote endpoint,
     /// credentials, object-store path or per-workspace generation is inferred.
     pub async fn connect(
@@ -48,6 +59,7 @@ impl BrokerControlClient {
             config.validate()?;
             crate::wire::id(&store)?;
             let channel = crate::transport::connect_local_channel(endpoint, &config).await?;
+            let channel = CommandChannel::new(channel);
             Ok(Self {
                 inner: Arc::new(Inner {
                     channel,
@@ -64,7 +76,7 @@ impl BrokerControlClient {
     where
         T: Send + 'static,
         F: FnOnce(
-                p::repository_control_client::RepositoryControlClient<Channel>,
+                p::repository_control_client::RepositoryControlClient<CommandChannel>,
                 Instant,
                 String,
             ) -> Fut

@@ -200,6 +200,18 @@ pub trait NativeObjectIo: Send + Sync + fmt::Debug {
         )))
     }
     async fn write_metadata(&self, object: m::Object) -> BackendResult<m::Descriptor>;
+    /// The owner follows accepted encoding, durable put and cleanup even when
+    /// the caller stops waiting. Implementations explicitly opt in.
+    async fn write_metadata_with_owner(
+        &self,
+        _object: m::Object,
+        _owner: Arc<dyn std::any::Any + Send + Sync>,
+    ) -> BackendResult<m::Descriptor> {
+        Err(other(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "native provider does not support owned metadata writes",
+        )))
+    }
     async fn read_file(&self, id: m::FileId) -> BackendResult<FileRead>;
     /// Ordinary file delivery whose owner follows all physical hydration,
     /// verification, spool work and returned readers after waiter cancellation.
@@ -234,6 +246,19 @@ pub trait NativeObjectIo: Send + Sync + fmt::Debug {
         input: &mut (dyn AsyncRead + Send + Unpin),
         max_bytes: u64,
     ) -> BackendResult<m::FileId>;
+    /// Retain physical ownership through input delivery, blocking staging/put,
+    /// and temporary cleanup. No fallback to an unowned write is safe.
+    async fn write_file_with_owner(
+        &self,
+        _input: &mut (dyn AsyncRead + Send + Unpin),
+        _max_bytes: u64,
+        _owner: Arc<dyn std::any::Any + Send + Sync>,
+    ) -> BackendResult<m::FileId> {
+        Err(other(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "native provider does not support owned file writes",
+        )))
+    }
     async fn copy_catalog_snapshot(
         &self,
         limits: CopyCatalogLimits,
@@ -279,6 +304,18 @@ struct MetadataPutJob {
     #[cfg(test)]
     hook: Option<Arc<dyn Fn() + Send + Sync>>,
     _owner: MetadataOwner,
+}
+struct OwnedFileStaging {
+    file: tempfile::NamedTempFile,
+    _reservation: (
+        tokio::sync::OwnedSemaphorePermit,
+        tokio::sync::OwnedSemaphorePermit,
+    ),
+    _owner: Arc<dyn std::any::Any + Send + Sync>,
+}
+struct OwnedFileChunk {
+    bytes: Vec<u8>,
+    staged: OwnedFileStaging,
 }
 impl fmt::Debug for DirectObjectIo {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -504,6 +541,14 @@ impl NativeObjectIo for DirectObjectIo {
     async fn write_metadata(&self, object: m::Object) -> BackendResult<m::Descriptor> {
         self.write_metadata_with_owner(object, Arc::new(())).await
     }
+    async fn write_metadata_with_owner(
+        &self,
+        object: m::Object,
+        owner: Arc<dyn std::any::Any + Send + Sync>,
+    ) -> BackendResult<m::Descriptor> {
+        DirectObjectIo::write_metadata_with_owner(self, object, owner).await
+    }
+
     async fn read_file(&self, id: m::FileId) -> BackendResult<FileRead> {
         let store = self.store.clone();
         let key = m::ObjectKey {
@@ -553,6 +598,15 @@ impl NativeObjectIo for DirectObjectIo {
         input: &mut (dyn AsyncRead + Send + Unpin),
         max_bytes: u64,
     ) -> BackendResult<m::FileId> {
+        self.write_file_with_owner(input, max_bytes, Arc::new(()))
+            .await
+    }
+    async fn write_file_with_owner(
+        &self,
+        input: &mut (dyn AsyncRead + Send + Unpin),
+        max_bytes: u64,
+        owner: Arc<dyn std::any::Any + Send + Sync>,
+    ) -> BackendResult<m::FileId> {
         let max_bytes = max_bytes.min(self.config.store.max_file_bytes);
         let reservation = self
             .reserve_staging(
@@ -563,10 +617,11 @@ impl NativeObjectIo for DirectObjectIo {
             .await?;
         let path = self.path.clone();
         let mut temporary = io::blocking(move || {
-            Ok((
-                tempfile::NamedTempFile::new_in(path).map_err(other)?,
-                reservation,
-            ))
+            Ok(OwnedFileStaging {
+                file: tempfile::NamedTempFile::new_in(path).map_err(other)?,
+                _reservation: reservation,
+                _owner: owner,
+            })
         })
         .await?;
         let mut hash = blake3::Hasher::new();
@@ -584,10 +639,14 @@ impl NativeObjectIo for DirectObjectIo {
                 return Err(invalid("native file exceeds configured limit"));
             }
             hash.update(&buffer[..count]);
-            let chunk = buffer[..count].to_vec();
+            let chunk = OwnedFileChunk {
+                bytes: buffer[..count].to_vec(),
+                staged: temporary,
+            };
             temporary = io::blocking(move || {
-                temporary.0.write_all(&chunk).map_err(other)?;
-                Ok(temporary)
+                let mut chunk = chunk;
+                chunk.staged.file.write_all(&chunk.bytes).map_err(other)?;
+                Ok(chunk.staged)
             })
             .await?;
         }
@@ -596,7 +655,7 @@ impl NativeObjectIo for DirectObjectIo {
         io::blocking(move || {
             let mut staged = temporary;
             staged
-                .0
+                .file
                 .as_file_mut()
                 .seek(SeekFrom::Start(0))
                 .map_err(other)?;
@@ -609,7 +668,7 @@ impl NativeObjectIo for DirectObjectIo {
                 format_version: m::FORMAT_VERSION,
             };
             store
-                .put_stream(REPOSITORY, descriptor, staged.0.as_file_mut(), now()?)
+                .put_stream(REPOSITORY, descriptor, staged.file.as_file_mut(), now()?)
                 .map_err(other)?;
             Ok(())
         })

@@ -190,6 +190,31 @@ impl NativeObjectIo for GuardedIo {
     async fn write_metadata(&self, object: m::Object) -> BackendResult<m::Descriptor> {
         self.provider.write_metadata(object).await
     }
+    async fn write_metadata_with_owner(
+        &self,
+        object: m::Object,
+        owner: Owner,
+    ) -> BackendResult<m::Descriptor> {
+        self.read("/WriteMetadata", owner, move |provider, owner| async move {
+            provider.write_metadata_with_owner(object, owner).await
+        })
+        .await
+    }
+    async fn write_file_with_owner(
+        &self,
+        input: &mut (dyn AsyncRead + Send + Unpin),
+        max_bytes: u64,
+        owner: Owner,
+    ) -> BackendResult<m::FileId> {
+        let work = self
+            .service
+            .admit_local("/WriteFile", self.service.operation_deadline())
+            .await
+            .map_err(wire::other)?;
+        self.provider
+            .write_file_with_owner(input, max_bytes, Arc::new((owner, work)))
+            .await
+    }
     async fn write_file(
         &self,
         input: &mut (dyn AsyncRead + Send + Unpin),

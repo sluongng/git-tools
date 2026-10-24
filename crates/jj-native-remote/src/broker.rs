@@ -34,6 +34,90 @@ impl NativeRepositoryControl for RemoteRepositoryControl {
     fn resources(&self) -> ControlResources {
         self.inner.config.control_work_budget()
     }
+    async fn observe_reference_with_owner(
+        &self,
+        name: &str,
+        owner: native_broker::CommandGuard,
+    ) -> Result<ReferenceSnapshot, Status> {
+        let result = self
+            .run_owned(
+                self.inner.deadline(),
+                owner,
+                RemoteRepositoryControl::observe_reference(self, name),
+            )
+            .await;
+        let observed = drained(self, result).await?;
+        Ok(ReferenceSnapshot {
+            name: observed.name,
+            generation: observed.generation,
+            head: observed.head.map(|head| AdmittedCommit {
+                head: head.head,
+                metadata_objects: head.metadata_objects as u64,
+            }),
+        })
+    }
+    async fn admit_commit_with_owner(
+        &self,
+        head: CommitId,
+        owner: native_broker::CommandGuard,
+    ) -> Result<AdmittedCommit, Status> {
+        if head == CommitId::ROOT {
+            return Err(Status::invalid_argument(
+                "intrinsic root requires no native remote admission",
+            ));
+        }
+        let result = self
+            .run_owned(
+                self.inner.deadline(),
+                owner,
+                RemoteRepositoryControl::admit_commit(self, head),
+            )
+            .await;
+        let admitted = drained(self, result).await?;
+        Ok(AdmittedCommit {
+            head: admitted.head,
+            metadata_objects: admitted.metadata_objects as u64,
+        })
+    }
+    async fn publish_with_owner(
+        &self,
+        request: native_broker::PublishRequest,
+        owner: native_broker::CommandGuard,
+    ) -> Result<ConfirmedPublication, Status> {
+        let result = self
+            .run_owned(
+                self.inner.deadline(),
+                owner,
+                RemoteRepositoryControl::publish(
+                    self,
+                    PublishRequest {
+                        head: request.head,
+                        reference_name: request.name,
+                        expected_generation: request.expected_generation,
+                        idempotency_key: request.idempotency_key,
+                    },
+                ),
+            )
+            .await;
+        drained(self, result).await.map(publication)
+    }
+    async fn publication_with_owner(
+        &self,
+        key: &str,
+        owner: native_broker::CommandGuard,
+    ) -> Result<Option<ConfirmedPublication>, Status> {
+        let result = self
+            .run_owned(
+                self.inner.deadline(),
+                owner,
+                RemoteRepositoryControl::publication(self, key),
+            )
+            .await;
+        drained(self, result)
+            .await
+            .map(|value| value.map(publication))
+    }
+
     async fn observe_reference(&self, name: &str) -> Result<ReferenceSnapshot, Status> {
         let result = RemoteRepositoryControl::observe_reference(self, name).await;
         let observed = drained(self, result).await?;

@@ -1,3 +1,4 @@
+use crate::command::CommandChannel;
 use crate::{
     Config, NativeQueryIo, QueryOwner, QueryReply, proto as p, query::*, query_protocol as q,
     query_service::handle, wire,
@@ -16,7 +17,7 @@ use tokio::{
     sync::{OwnedSemaphorePermit, Semaphore},
     time::Instant,
 };
-use tonic::{Request, Status, codec::CompressionEncoding, transport::Channel};
+use tonic::{Request, Status, codec::CompressionEncoding};
 fn integrity() -> Status {
     Status::data_loss("invalid native query response")
 }
@@ -112,7 +113,7 @@ impl http_body::Body for OwnedQueryBody {
 }
 #[derive(Clone)]
 struct OwnedQueryChannel {
-    channel: Channel,
+    channel: CommandChannel,
     owner: Arc<QueryRpcBudget>,
 }
 impl tower::Service<http::Request<tonic::body::Body>> for OwnedQueryChannel {
@@ -145,8 +146,9 @@ impl tower::Service<http::Request<tonic::body::Body>> for OwnedQueryChannel {
 pub struct BrokerQueryClient {
     inner: Arc<Inner>,
 }
+#[derive(Clone)]
 struct Inner {
-    channel: Channel,
+    channel: CommandChannel,
     store: String,
     config: Config,
     calls: Arc<Semaphore>,
@@ -159,6 +161,15 @@ impl std::fmt::Debug for BrokerQueryClient {
     }
 }
 impl BrokerQueryClient {
+    /// Bind subsequent local RPCs to a live host command. Runtime only: shared
+    /// channel/pools and configured provider identity remain unchanged.
+    pub fn with_command_token(mut self, token: [u8; 32]) -> Self {
+        let mut inner = (*self.inner).clone();
+        inner.channel = inner.channel.with_command_token(token);
+        self.inner = Arc::new(inner);
+        self
+    }
+
     pub async fn connect(
         socket: impl AsRef<Path>,
         store: impl Into<String>,
@@ -188,6 +199,7 @@ impl BrokerQueryClient {
                 ));
             }
             let channel = crate::transport::connect_local_channel(endpoint, &config).await?;
+            let channel = CommandChannel::new(channel);
             Ok(Self {
                 inner: Arc::new(Inner {
                     channel,

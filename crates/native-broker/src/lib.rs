@@ -1,7 +1,9 @@
 //! Private daemon-owned native object I/O. Native references and remote storage
 //! remain in Tinytree; per-workspace jj operation/index/working-copy state stays local.
 mod client;
+mod command;
 mod config;
+pub use command::{CommandGuard, CommandResolver};
 mod control;
 mod control_client;
 mod local;
