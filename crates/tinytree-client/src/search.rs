@@ -112,17 +112,22 @@ fn checked_input(
     cursor: &[u8],
     limits: &crate::Limits,
 ) -> Result<(), Status> {
-    if policy != q::SearchPolicy::LiteralBytesV1
-        || pattern.is_empty()
-        || pattern.len() > 1024
-        || pattern.contains(&b'\n')
-        || (!prefix.is_empty() && !valid_path(prefix))
+    let mode = match policy {
+        q::SearchPolicy::LiteralBytesV1 => tinytree_search::SearchMode::Literal,
+        q::SearchPolicy::RegexBytesV1 => tinytree_search::SearchMode::Regex,
+        _ => {
+            return Err(Status::invalid_argument(
+                "unsupported immutable search policy",
+            ));
+        }
+    };
+    tinytree_search::validate_input(pattern, mode)
+        .map_err(|_| Status::invalid_argument("invalid immutable search pattern"))?;
+    if (!prefix.is_empty() && !valid_path(prefix))
         || page_size as usize > limits.max_batch_items
         || cursor.len() > MAX_CURSOR_BYTES
     {
-        return Err(Status::invalid_argument(
-            "invalid immutable literal search request",
-        ));
+        return Err(Status::invalid_argument("invalid immutable search request"));
     }
     Ok(())
 }
@@ -207,16 +212,20 @@ fn validate(
         if !valid_path(&hit.path)
             || !selected(prefix, &hit.path)
             || hit.file_id.len() != 32
-            || hit.match_bytes as usize != pattern.len()
+            || hit.match_bytes == 0
+            || hit.match_bytes as usize > tinytree_search::MAX_PATTERN_BYTES
+            || (policy == q::SearchPolicy::LiteralBytesV1
+                && hit.match_bytes as usize != pattern.len())
             || hit.line == 0
             || hit.byte_column > hit.byte_offset
             || hit
                 .byte_offset
-                .checked_add(pattern.len() as u64)
+                .checked_add(hit.match_bytes as u64)
                 .is_none_or(|end| end > hit.file_size)
             || hit.snippet_offset > hit.byte_offset
             || hit.byte_offset - hit.snippet_offset > 128
-            || hit.snippet.len() > pattern.len() + 256
+            || hit.snippet.len() > tinytree_search::MAX_SNIPPET_BYTES
+            || hit.snippet.len() > hit.match_bytes as usize + 256
             || hit
                 .snippet_offset
                 .checked_add(hit.snippet.len() as u64)
@@ -228,8 +237,17 @@ fn validate(
             return Err(integrity());
         }
         let at = usize::try_from(hit.byte_offset - hit.snippet_offset).map_err(|_| integrity())?;
-        let end = at.checked_add(pattern.len()).ok_or_else(integrity)?;
-        if hit.snippet.get(at..end) != Some(pattern) || hit.snippet.len() - end > 128 {
+        let end = at
+            .checked_add(hit.match_bytes as usize)
+            .ok_or_else(integrity)?;
+        let matched = hit.snippet.get(at..end).ok_or_else(integrity)?;
+        // Snippets are authenticated assertions, not complete FILE proofs.
+        // Re-running anchors or boundaries against truncated context can reject
+        // genuine regex hits; validate their span, not an invented file context.
+        if (policy == q::SearchPolicy::LiteralBytesV1 && matched != pattern)
+            || matched.contains(&b'\n')
+            || hit.snippet.len() - end > 128
+        {
             return Err(integrity());
         }
         let left = &hit.snippet[..at];
@@ -244,7 +262,7 @@ fn validate(
                 || (previous.path == hit.path
                     && (previous
                         .byte_offset
-                        .checked_add(pattern.len() as u64)
+                        .checked_add(previous.match_bytes as u64)
                         .is_none_or(|end| hit.byte_offset < end)
                         || previous.file_id != hit.file_id
                         || previous.file_size != hit.file_size

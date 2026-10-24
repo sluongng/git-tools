@@ -19,6 +19,7 @@ serde = { version = "1", features = ["derive"] }
 tempfile = "3"
 tinytree-model = { path = "../tinytree-model" }
 tinytree-proto = { path = "../tinytree-proto" }
+tinytree-search = { path = "../tinytree-search" }
 tokio = { version = "1", features = ["full"] }
 toml = "1.1"
 tonic = { version = "0.14", features = ["zstd", "tls-ring"] }

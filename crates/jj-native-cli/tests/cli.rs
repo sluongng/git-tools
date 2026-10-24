@@ -145,6 +145,27 @@ impl Client {
 }
 
 #[test]
+fn search_validates_regex_before_repository_access_and_accepts_fixed_strings() {
+    let client = Client::new(); // Deliberately not a repository.
+    let malformed = client.run(&["tinytree", "search", "["]);
+    assert!(!malformed.status.success());
+    assert!(
+        String::from_utf8_lossy(&malformed.stderr).contains("Native search failed:"),
+        "malformed regex must be rejected before workspace discovery: {}",
+        String::from_utf8_lossy(&malformed.stderr)
+    );
+    for flag in ["-F", "--fixed-strings"] {
+        let literal = client.run(&["tinytree", "search", flag, "["]);
+        assert!(!literal.status.success());
+        let stderr = String::from_utf8_lossy(&literal.stderr);
+        assert!(
+            !stderr.contains("Native search failed:") && stderr.contains("repo"),
+            "fixed strings must accept regex metacharacters and reach workspace discovery: {stderr}"
+        );
+    }
+}
+
+#[test]
 fn local_native_commands_snapshot_edit_restore_and_undo_without_git() {
     let client = Client::new();
     client.success(&["tinytree", "init"]);

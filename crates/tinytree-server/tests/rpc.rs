@@ -7273,6 +7273,117 @@ async fn indexed_search_pins_revision_and_pages_exact_matches_with_bound_cursors
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn indexed_regex_search_verifies_candidates_and_pages_actual_spans() {
+    let (temporary, store) = setup();
+    let index =
+        tinytree_index::Index::open(temporary.path().join("derived"), &Default::default()).unwrap();
+    let bytes = b"foo12 foo1234\nbar!\nfoo\nbar\nfoozzzbar\n\xffFOO7\n";
+    let head = history_commit(
+        &store,
+        &index,
+        &[],
+        Some(history_file(&store, bytes, false)),
+        100,
+    )
+    .descriptor
+    .key;
+    let server = Running::start_query(store, ServiceConfig::default(), index).await;
+    let mut client = server.query_client().await;
+    let scope = query_ready(&mut client, &[head], 100).await;
+    for (pattern, expected) in [
+        (
+            r"foo[0-9]+|bar!",
+            vec![&b"foo12"[..], &b"foo1234"[..], &b"bar!"[..]],
+        ),
+        (r"^foo[0-9]+", vec![&b"foo12"[..]]),
+        (r"\bfoo[0-9]+\b", vec![&b"foo12"[..], &b"foo1234"[..]]),
+        (r"^|foo[0-9]+", vec![&b"foo1234"[..]]),
+        (
+            r"(?i)foo[0-9]+",
+            vec![&b"foo12"[..], &b"foo1234"[..], &b"FOO7"[..]],
+        ),
+        (r"foo.*bar", vec![&b"foozzzbar"[..]]),
+        (r"foo\nbar", vec![]),
+        (r"absent|missing", vec![]),
+    ] {
+        let mut input = search_input(&scope, head, pattern.as_bytes(), 1);
+        input.policy = q::SearchPolicy::RegexBytesV1 as i32;
+        let mut hits = Vec::new();
+        for _ in 0..32 {
+            let page = search_ready(&mut client, &input).await;
+            assert_eq!(page.policy, q::SearchPolicy::RegexBytesV1 as i32);
+            hits.extend(page.hits.clone());
+            if page.coverage == q::SearchCoverage::SearchComplete as i32 {
+                assert!(page.cursor.is_empty());
+                break;
+            }
+            assert_eq!(
+                page.coverage,
+                q::SearchCoverage::SearchMore as i32,
+                "{pattern}"
+            );
+            assert_ne!(input.cursor, page.cursor);
+            let replay = search_ready(&mut client, &input).await;
+            assert_eq!(page, replay);
+            // A continuation cannot change from regex interpretation to literal.
+            let mut wrong_policy = input.clone();
+            wrong_policy.cursor = page.cursor.clone();
+            wrong_policy.policy = q::SearchPolicy::LiteralBytesV1 as i32;
+            assert_eq!(
+                client
+                    .search(request(wrong_policy, ALPHA))
+                    .await
+                    .unwrap_err()
+                    .code(),
+                Code::InvalidArgument
+            );
+            input.cursor = page.cursor;
+        }
+        let actual = hits
+            .iter()
+            .map(|hit| {
+                let start = hit.byte_offset as usize;
+                let end = start + hit.match_bytes as usize;
+                let line_start = bytes[..start]
+                    .iter()
+                    .rposition(|&byte| byte == b'\n')
+                    .map_or(0, |i| i + 1);
+                assert_eq!(
+                    hit.line,
+                    1 + bytes[..start].iter().filter(|&&byte| byte == b'\n').count() as u64
+                );
+                assert_eq!(hit.byte_column, (start - line_start) as u64);
+                let relative = (hit.byte_offset - hit.snippet_offset) as usize;
+                assert_eq!(
+                    &hit.snippet[relative..relative + hit.match_bytes as usize],
+                    &bytes[start..end]
+                );
+                &bytes[start..end]
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(actual, expected, "{pattern}");
+    }
+    for pattern in [b"[".as_slice(), b"(?=foo)".as_slice(), b"\xff".as_slice()] {
+        let mut input = search_input(&scope, head, pattern, 1);
+        input.policy = q::SearchPolicy::RegexBytesV1 as i32;
+        assert_eq!(
+            client
+                .search(request(input, ALPHA))
+                .await
+                .unwrap_err()
+                .code(),
+            Code::InvalidArgument
+        );
+    }
+    client
+        .close_scope(request(q::CloseScopeRequest { scope: scope.key }, ALPHA))
+        .await
+        .unwrap();
+    drop(client);
+    server.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn indexed_search_limits_do_not_turn_unread_or_unscanned_files_into_empty_success() {
     let (temporary, store) = setup();
     let index =
@@ -7307,6 +7418,17 @@ async fn indexed_search_limits_do_not_turn_unread_or_unscanned_files_into_empty_
     let negative = search_ready(&mut client, &search_input(&scope, head, b"zzzzzzzzzz", 128)).await;
     assert_eq!(negative.coverage, q::SearchCoverage::SearchComplete as i32);
     assert!(negative.hits.is_empty());
+    for (pattern, coverage) in [
+        (r"absent|missing", q::SearchCoverage::SearchComplete),
+        (r"needle.*cap", q::SearchCoverage::SearchReadLimit),
+        (r".*", q::SearchCoverage::SearchReadLimit),
+    ] {
+        let mut input = search_input(&scope, head, pattern.as_bytes(), 128);
+        input.policy = q::SearchPolicy::RegexBytesV1 as i32;
+        let result = search_ready(&mut client, &input).await;
+        assert_eq!(result.coverage, coverage as i32, "{pattern}");
+        assert!(result.hits.is_empty());
+    }
     drop(client);
     server.stop().await;
 }

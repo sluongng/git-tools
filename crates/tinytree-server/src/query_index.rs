@@ -241,6 +241,7 @@ impl QueryConfig {
             .saturating_mul(3)
             .saturating_add(self.max_search_file_bytes.saturating_mul(4))
             .saturating_add(self.max_response_bytes.saturating_mul(2))
+            .saturating_add(tinytree_search::MAX_REGEX_MEMORY_BYTES)
     }
     pub(crate) fn search_warm_memory(&self) -> usize {
         // Packed FILE reconstruction plus the caller's verified bytes; manifest

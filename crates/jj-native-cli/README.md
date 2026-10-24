@@ -15,7 +15,7 @@ cd project
 "$JJ" status
 "$JJ" tinytree history path/to/file.rs
 "$JJ" tinytree blame path/to/file.rs --json
-"$JJ" tinytree search 'literal text' --path-prefix src --json
+"$JJ" tinytree search 'fn (open|close)_[a-z_]+' --path-prefix src --json
 "$JJ" tinytree fetch --reference main --bookmark main
 # Make changes, then select the bookmark to publish.
 "$JJ" bookmark set main -r @
@@ -59,9 +59,18 @@ These commands currently require a clone/fetch observation; restored cloud-only
 workspaces are not yet supported. Ordinary `jj file annotate` is not wired to
 this service and remains unsupported with the Federated index.
 
-`search` matches case-sensitive literals in regular files at the selected
-revision, merging remote results with local additions, edits, deletions and
-renames. It does not follow symlinks or interpret regular expressions. Index
+`search` interprets its pattern as a case-sensitive regular expression in regular
+files at the selected revision, merging remote results with local additions,
+edits, deletions and renames. Quote patterns to preserve shell metacharacters;
+use inline flags such as `(?i)` for case-insensitive matching, or `-F` /
+`--fixed-strings` to search literally (for example, `search -F 'object.method('`).
+Character classes and word boundaries use ASCII byte semantics by default;
+`(?u:...)` enables Unicode classes, but Unicode word boundaries are unsupported.
+Matches are nonoverlapping and line-oriented: they never cross a newline, and
+zero-width matches are skipped. Patterns must be nonempty, at most 1024 bytes,
+and contain no literal newline. Results use byte offsets and byte columns, with
+bounded line snippets; a match longer than 1024 bytes exceeds search limits
+instead of yielding a truncated match. Search does not follow symlinks. Index
 warming is asynchronous; output reports incomplete coverage when limits apply.
 The same observed-baseline requirement applies.
 Private baseline discovery is currently linear-only; the server can search

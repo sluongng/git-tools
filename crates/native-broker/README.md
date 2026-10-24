@@ -40,7 +40,7 @@ instance refusal, and insecure-server rejection. Cross-compilation alone is not
 native transport acceptance.
 
 Optional `NativeQueryIo` adapters and `BrokerQueryClient` provide bounded graph
-queries, path history and literal search through the same local endpoint.
+queries, path history and regex/literal search through the same local endpoint.
 Handles are broker-local; upstream
 credentials and cursors stay in the configured adapter. Distinct repository or
 trust scopes require distinct adapters; aliases explicitly sharing one adapter

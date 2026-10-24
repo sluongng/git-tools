@@ -16,7 +16,7 @@ use std::{
 use tinytree_index::{Index, WorkBudget, content::ContentEntry};
 use tinytree_model as m;
 use tinytree_proto::query_v1 as q;
-use tinytree_search::{FilterBuilder, MatchBudget, MatchLimits};
+use tinytree_search::{FilterBuilder, MatchBudget, MatchLimits, Pattern, SearchMode};
 use tokio::{sync::Semaphore, time::Instant};
 use tonic::{Code, Status};
 
@@ -555,11 +555,13 @@ impl SearchHost {
         budget: &mut WorkBudget,
         deadline: Instant,
     ) -> Result<q::SearchResult, Status> {
-        tinytree_search::validate_pattern(&input.pattern)
-            .map_err(|_| Status::invalid_argument("invalid literal search pattern"))?;
-        if input.policy != q::SearchPolicy::LiteralBytesV1 as i32 {
-            return Err(Status::unimplemented("search policy unsupported"));
-        }
+        let mode = match q::SearchPolicy::try_from(input.policy) {
+            Ok(q::SearchPolicy::LiteralBytesV1) => SearchMode::Literal,
+            Ok(q::SearchPolicy::RegexBytesV1) => SearchMode::Regex,
+            _ => return Err(Status::unimplemented("search policy unsupported")),
+        };
+        let pattern = Pattern::new(&input.pattern, mode)
+            .map_err(|_| Status::invalid_argument("invalid or over-budget search pattern"))?;
         if !valid_prefix(&input.path_prefix) {
             return Err(Status::invalid_argument("invalid search path prefix"));
         }
@@ -743,7 +745,7 @@ impl SearchHost {
                     !input.cursor.is_empty(),
                 );
             };
-            if !filter.filter.may_match(&input.pattern) {
+            if !pattern.may_match(&filter.filter) {
                 position.entries += 1;
                 page_entries += 1;
                 position.index += 1;
@@ -788,9 +790,8 @@ impl SearchHost {
                     as usize,
                 max_output_bytes: output_remaining,
             });
-            let scanned = tinytree_search::scan(
+            let scanned = pattern.scan(
                 &bytes,
-                &input.pattern,
                 position.offset,
                 page_size as usize - result.hits.len(),
                 &mut matches,

@@ -1484,6 +1484,9 @@ enum QueryMode {
     SearchWrongPolicy,
     SearchFalseComplete,
     SearchCorruptSnippet,
+    SearchZeroWidth,
+    SearchMissingMatchSpan,
+    SearchLongMatch,
     SearchDuplicateHit,
     SearchOutsidePrefix,
     SearchInvalidLine,
@@ -1621,6 +1624,18 @@ impl RepositoryQuery for QueryFaults {
                 result.cursor = vec![1];
             }
             QueryMode::SearchCorruptSnippet => result.hits[0].snippet.fill(b'!'),
+            QueryMode::SearchZeroWidth => result.hits[0].match_bytes = 0,
+            QueryMode::SearchMissingMatchSpan => result.hits[0].snippet.clear(),
+            QueryMode::SearchLongMatch => {
+                let hit = &mut result.hits[0];
+                hit.file_size = 2048;
+                hit.byte_offset = 0;
+                hit.match_bytes = 1025;
+                hit.line = 1;
+                hit.byte_column = 0;
+                hit.snippet_offset = 0;
+                hit.snippet = vec![b'x'; 1025];
+            }
             QueryMode::SearchDuplicateHit => {
                 result.hits[1] = result.hits[0].clone();
             }
@@ -8008,6 +8023,14 @@ async fn immutable_search_inputs_sessions_and_deadlines_fail_before_remote_work(
     let before = running.counts.searches.load(Ordering::SeqCst);
     for (pattern, prefix, policy, size, cursor) in [
         (&b""[..], "", q::SearchPolicy::LiteralBytesV1, 1, Vec::new()),
+        (&b"("[..], "", q::SearchPolicy::RegexBytesV1, 1, Vec::new()),
+        (
+            &b"\xff"[..],
+            "",
+            q::SearchPolicy::RegexBytesV1,
+            1,
+            Vec::new(),
+        ),
         (
             &b"a\nb"[..],
             "",
@@ -9065,4 +9088,81 @@ async fn landing_independent_pool_reuses_authenticated_transport_and_preserves_o
         Code::InvalidArgument
     );
     running.stop().await;
+}
+
+#[tokio::test]
+async fn checked_regex_search_pages_preserve_variable_width_spans_and_reject_malformed_hits() {
+    for mode in [
+        QueryMode::Normal,
+        QueryMode::SearchZeroWidth,
+        QueryMode::SearchMissingMatchSpan,
+        QueryMode::SearchLongMatch,
+        QueryMode::SearchDuplicateHit,
+        QueryMode::SearchOverflow,
+        QueryMode::SearchRegressedHit,
+    ] {
+        let fixture = setup_query_retained();
+        let running = QueryRunning::start(fixture.service.clone(), mode).await;
+        let client = running.client().await;
+        let scope = client.open_query_scope(vec![fixture.root]).await.unwrap();
+        let mut query = client
+            .begin_search(
+                &scope,
+                fixture.root,
+                b"cc_binary|rules_cc",
+                "BUILD.bazel",
+                q::SearchPolicy::RegexBytesV1,
+                if mode == QueryMode::SearchDuplicateHit {
+                    2
+                } else {
+                    1
+                },
+            )
+            .await
+            .unwrap();
+        let result = tokio::time::timeout(Duration::from_secs(2), async {
+            let mut hits = Vec::new();
+            while !query.is_terminal() {
+                let page = client.search_page(&mut query).await?;
+                hits.extend(page.result().hits.clone());
+                if query.is_warming() {
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            }
+            Ok::<_, Status>(hits)
+        })
+        .await
+        .expect("bounded regex index warming");
+        if mode == QueryMode::Normal {
+            let hits = result.unwrap();
+            assert!(query.is_complete());
+            let seed = crate::fixture();
+            let source = seed
+                .objects()
+                .iter()
+                .find(|object| {
+                    object.descriptor.key.kind == Kind::File && object.bytes.starts_with(b"load(")
+                })
+                .unwrap();
+            let mut expected = Vec::new();
+            for literal in [&b"cc_binary"[..], &b"rules_cc"[..]] {
+                expected.extend(source.bytes.windows(literal.len()).enumerate().filter_map(
+                    |(at, bytes)| (bytes == literal).then_some((at as u64, literal.len() as u32)),
+                ));
+            }
+            expected.sort();
+            assert_eq!(
+                hits.iter()
+                    .map(|hit| (hit.byte_offset, hit.match_bytes))
+                    .collect::<Vec<_>>(),
+                expected
+            );
+            assert!(hits.iter().any(|hit| hit.match_bytes == 8));
+            assert!(hits.iter().any(|hit| hit.match_bytes == 9));
+        } else {
+            assert_eq!(result.unwrap_err().code(), Code::DataLoss, "{mode:?}");
+        }
+        client.close_query_scope(&scope).await.unwrap();
+        running.stop().await;
+    }
 }

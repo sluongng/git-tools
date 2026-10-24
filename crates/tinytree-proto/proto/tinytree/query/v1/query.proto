@@ -445,12 +445,19 @@ message BlameResult {
   repeated BlameRange ranges = 11; // Exact partition of selected file lines.
 }
 
-// Case-sensitive non-overlapping literal byte matches in regular FILE entries.
-// Patterns are nonempty, at most 1024 bytes and contain no LF. Symlinks are not
-// followed; a resolved tree may be searched regardless of commit parent count.
+// Non-overlapping, nonempty matches in regular FILE entries. Patterns are
+// nonempty, at most 1024 bytes and contain no LF. Symlinks are not followed;
+// a resolved tree may be searched regardless of commit parent count.
 enum SearchPolicy {
   SEARCH_POLICY_UNSPECIFIED = 0;
+  // Case-sensitive arbitrary byte literals (legacy clients).
   LITERAL_BYTES_V1 = 1;
+  // UTF-8 regular-expression syntax with ASCII byte semantics by default;
+  // inline flags select case folding or Unicode classes. Each LF-delimited line
+  // is searched separately; zero-width matches are skipped. Look-around,
+  // backreferences and Unicode word boundaries are unsupported.
+  // Compilation and matching are bounded; exhaustion is not complete coverage.
+  REGEX_BYTES_V1 = 2;
 }
 enum SearchCoverage {
   SEARCH_COVERAGE_UNSPECIFIED = 0;
@@ -479,11 +486,11 @@ message SearchHit {
   bytes file_id = 2; // Exact canonical32; metadata, not a file-read capability.
   uint64 file_size = 3;
   uint64 byte_offset = 4;
-  uint32 match_bytes = 5;
+  uint32 match_bytes = 5; // Actual width, 1..1024 bytes, not regex source length.
   uint64 line = 6; // One-based; LF delimits lines, arbitrary body bytes allowed.
   uint64 byte_column = 7; // Zero-based byte offset from this line's start.
   uint64 snippet_offset = 8; // Absolute FILE offset of bounded snippet bytes.
-  bytes snippet = 9; // Includes entire match and at most128 context bytes/side.
+  bytes snippet = 9; // At most1280 bytes; entire match and <=128 context bytes/side.
 }
 message SearchResult {
   bytes scope_digest = 1; // Exact32 from selected scope.

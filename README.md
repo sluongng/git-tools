@@ -92,7 +92,7 @@ entry points. Most also expose Rust libraries; `jj-native-cli` is executable-onl
 | [`tinytree-landing`](crates/tinytree-landing) | Bounded linear-stack candidate construction; no publication or check orchestration. |
 | [`tinytree-model`](crates/tinytree-model) | Canonical jj-native objects, typed IDs and bounded verification. |
 | [`tinytree-index`](crates/tinytree-index) | Rebuildable commit DAG, scoped graph facts and bounded content-search records. |
-| [`tinytree-search`](crates/tinytree-search) | Shared bounded literal matching and trigram candidate filters for server search and local overlays. |
+| [`tinytree-search`](crates/tinytree-search) | Shared bounded regex/literal matching and trigram candidate filters for server search and local overlays. |
 | [`tinytree-cloud`](crates/tinytree-cloud) | Verified jj operation/view recovery codecs; not an automatic backup service. |
 | [`tinytree-proto`](crates/tinytree-proto) | Native repository gRPC bindings; not a server implementation. |
 | [`tinytree-client`](crates/tinytree-client) | Bounded, verifying native RPCs and immutable transfer snapshots. |

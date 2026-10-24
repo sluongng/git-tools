@@ -2055,10 +2055,11 @@ fn shipped_indexed_search_reconciles_selected_private_and_dirty_trees() {
     let initial: serde_json::Value = serde_json::from_str(&fixture.success(
         &root,
         &[
-            "tinytree", "search", "needle", "-r", "main", "--limit", "10000", "--json",
+            "tinytree", "search", "(need)le", "-r", "main", "--limit", "10000", "--json",
         ],
     ))
     .unwrap();
+    assert_eq!(initial["policy"], "regex_bytes_v1");
     assert_eq!(initial["coverage"], "complete");
     assert_eq!(initial["revision"], upstream.head);
     assert_eq!(
@@ -2124,12 +2125,24 @@ fn shipped_indexed_search_reconciles_selected_private_and_dirty_trees() {
     );
     let dirty: serde_json::Value = serde_json::from_str(&fixture.success(
         &root,
-        &["tinytree", "search", "needle", "--limit", "10000", "--json"],
+        &[
+            "tinytree", "search", "nee[d]le", "--limit", "10000", "--json",
+        ],
     ))
     .unwrap();
     assert_eq!(dirty["coverage"], "complete");
     assert_eq!(dirty["revision"], fixture.revision(&root, "@"));
     assert_eq!(search_rows(&dirty), naive_search(&dirty_files, b"needle"));
+    let literal: serde_json::Value = serde_json::from_str(&fixture.success(
+        &root,
+        &[
+            "tinytree", "search", "-F", "needle", "--limit", "10000", "--json",
+        ],
+    ))
+    .unwrap();
+    assert_eq!(literal["policy"], "literal_bytes_v1");
+    assert_eq!(literal["coverage"], "complete");
+    assert_eq!(search_rows(&literal), naive_search(&dirty_files, b"needle"));
     let selected: serde_json::Value = serde_json::from_str(&fixture.success(
         &root,
         &[

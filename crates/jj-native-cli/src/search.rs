@@ -21,7 +21,7 @@ use std::{
     time::Duration,
 };
 use tinytree_model as m;
-use tinytree_search::{MatchBudget, MatchLimits};
+use tinytree_search::{MatchBudget, MatchLimits, Pattern, SearchMode};
 use tokio::time::Instant;
 
 const TIMEOUT: Duration = Duration::from_secs(30);
@@ -37,8 +37,11 @@ const MAX_OUTPUT: usize = 16 * 1024 * 1024;
 
 #[derive(clap::Args, Clone, Debug)]
 pub(crate) struct SearchArgs {
-    /// Case-sensitive literal bytes (UTF-8 input); newline patterns are unsupported.
+    /// Case-sensitive, line-oriented regular expression; inline flags are supported.
     pub pattern: String,
+    /// Match the pattern literally instead of interpreting regular expression syntax.
+    #[arg(short = 'F', long)]
+    pub fixed_strings: bool,
     /// Exact repository directory prefix or complete file path.
     #[arg(long, default_value = "")]
     pub path_prefix: String,
@@ -483,6 +486,8 @@ async fn collect(
     selected: m::CommitId,
     selected_tree: m::TreeId,
     pattern: &[u8],
+    compiled: &Pattern,
+    policy: q::SearchPolicy,
     prefix: &str,
     limit: usize,
 ) -> Result<Output, CommandError> {
@@ -501,10 +506,11 @@ async fn collect(
             continue;
         }
         let bytes = source.file(*id, *size).await?;
-        let page = tinytree_search::scan(&bytes, pattern, 0, limit + 1, &mut match_budget, || {
-            Instant::now() < source.deadline
-        })
-        .map_err(failure)?;
+        let page = compiled
+            .scan(&bytes, 0, limit + 1, &mut match_budget, || {
+                Instant::now() < source.deadline
+            })
+            .map_err(failure)?;
         for hit in page.hits {
             charge_output(&mut output_bytes, path.len(), hit.snippet.len())?;
             local_hits.push(Hit {
@@ -542,7 +548,7 @@ async fn collect(
                     revision: base,
                     pattern: pattern.to_vec(),
                     path_prefix: prefix.to_owned(),
-                    policy: q::SearchPolicy::LiteralBytesV1,
+                    policy,
                     page_size: 128,
                     cursor: cursor.clone(),
                 },
@@ -627,7 +633,11 @@ async fn collect(
         root_tree: hex(&selected_tree.0),
         pattern: String::from_utf8_lossy(pattern).into_owned(),
         path_prefix: prefix.to_owned(),
-        policy: "literal_bytes_v1",
+        policy: match policy {
+            q::SearchPolicy::LiteralBytesV1 => "literal_bytes_v1",
+            q::SearchPolicy::RegexBytesV1 => "regex_bytes_v1",
+            _ => unreachable!("CLI selects a supported search policy"),
+        },
         coverage,
         changed_paths: local.suppressed.len(),
         remote_pages: pages,
@@ -653,7 +663,12 @@ async fn run_query(
     command: &CommandHelper,
     args: SearchArgs,
 ) -> Result<(), CommandError> {
-    tinytree_search::validate_pattern(args.pattern.as_bytes()).map_err(failure)?;
+    let (mode, policy) = if args.fixed_strings {
+        (SearchMode::Literal, q::SearchPolicy::LiteralBytesV1)
+    } else {
+        (SearchMode::Regex, q::SearchPolicy::RegexBytesV1)
+    };
+    let compiled = Pattern::new(args.pattern.as_bytes(), mode).map_err(failure)?;
     if !(1..=10_000).contains(&args.limit) {
         return Err(cli_error("--limit must be between 1 and 10000"));
     }
@@ -773,6 +788,8 @@ async fn run_query(
             selected_id,
             selected_tree,
             args.pattern.as_bytes(),
+            &compiled,
+            policy,
             &prefix,
             args.limit,
         ),

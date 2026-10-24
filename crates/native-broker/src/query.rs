@@ -362,7 +362,7 @@ fn path_state(value: &q::HistoryPathState) -> Result<(), Status> {
         _ => Err(history_integrity()),
     }
 }
-/// Indexed literal search against one captured immutable source. The cursor is
+/// Indexed content search against one captured immutable source. The cursor is
 /// opaque and local to the configured provider; it is not an object capability.
 #[derive(Clone, Debug)]
 pub struct ScopedSearchQuery {
@@ -384,13 +384,14 @@ impl ScopedSearchQuery {
                 .saturating_add(256),
             cap,
         )?;
-        if self.policy != q::SearchPolicy::LiteralBytesV1 {
-            return Err(Status::unimplemented("native search policy unsupported"));
-        }
-        if self.pattern.is_empty()
-            || self.pattern.len() > 1024
-            || self.pattern.contains(&b'\n')
-            || self.page_size > 4096
+        let mode = match self.policy {
+            q::SearchPolicy::LiteralBytesV1 => tinytree_search::SearchMode::Literal,
+            q::SearchPolicy::RegexBytesV1 => tinytree_search::SearchMode::Regex,
+            _ => return Err(Status::unimplemented("native search policy unsupported")),
+        };
+        tinytree_search::validate_input(&self.pattern, mode)
+            .map_err(|_| Status::invalid_argument("invalid native search pattern"))?;
+        if self.page_size > 4096
             || self.cursor.len() > 8192
             || !search_path(&self.path_prefix, true)
         {
@@ -433,7 +434,7 @@ impl ScopedSearchQuery {
         for hit in &value.hits {
             let end = hit
                 .byte_offset
-                .checked_add(self.pattern.len() as u64)
+                .checked_add(hit.match_bytes as u64)
                 .ok_or_else(search_integrity)?;
             let snippet_end = hit
                 .snippet_offset
@@ -442,7 +443,10 @@ impl ScopedSearchQuery {
             if !search_path(&hit.path, false)
                 || !search_prefix(&hit.path, &self.path_prefix)
                 || hit.file_id.len() != 32
-                || hit.match_bytes as usize != self.pattern.len()
+                || hit.match_bytes == 0
+                || hit.match_bytes as usize > tinytree_search::MAX_PATTERN_BYTES
+                || (self.policy == q::SearchPolicy::LiteralBytesV1
+                    && hit.match_bytes as usize != self.pattern.len())
                 || end > hit.file_size
                 || hit.line == 0
                 || hit.line > hit.byte_offset.saturating_add(1)
@@ -452,14 +456,22 @@ impl ScopedSearchQuery {
                 || snippet_end > hit.file_size
                 || hit.byte_offset - hit.snippet_offset > 128
                 || snippet_end - end > 128
-                || hit.snippet.len() > self.pattern.len() + 256
+                || hit.snippet.len() > tinytree_search::MAX_SNIPPET_BYTES
+                || hit.snippet.len() > hit.match_bytes as usize + 256
             {
                 return Err(search_integrity());
             }
             let relative = usize::try_from(hit.byte_offset - hit.snippet_offset)
                 .map_err(|_| search_integrity())?;
-            if hit.snippet.get(relative..relative + self.pattern.len())
-                != Some(self.pattern.as_slice())
+            let matched = hit
+                .snippet
+                .get(relative..relative + hit.match_bytes as usize)
+                .ok_or_else(search_integrity)?;
+            // Partial snippets do not supply the complete context required by
+            // regex anchors and boundaries. They remain provider assertions.
+            if (self.policy == q::SearchPolicy::LiteralBytesV1
+                && matched != self.pattern.as_slice())
+                || matched.contains(&b'\n')
             {
                 return Err(search_integrity());
             }

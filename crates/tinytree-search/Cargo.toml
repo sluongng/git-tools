@@ -3,6 +3,8 @@ name = "tinytree-search"
 version = "0.1.0"
 edition = "2024"
 license = "MIT"
-description = "Bounded byte-literal matching and rebuildable trigram filters"
+description = "Bounded byte regex matching and rebuildable trigram filters"
 
 [dependencies]
+regex-automata = "0.4"
+regex-syntax = "0.8"

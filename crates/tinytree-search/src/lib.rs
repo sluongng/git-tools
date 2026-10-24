@@ -1,9 +1,13 @@
-//! Bounded literal matching and versioned candidate filters. A filter is not a
+//! Bounded byte-regex and literal matching and versioned candidate filters. A filter is not a
 //! content-integrity or repository-coverage proof; callers verify those sources.
 pub const ALGORITHM_VERSION: u32 = 1;
 pub const FILTER_BYTES: usize = 512;
 pub const MAX_PATTERN_BYTES: usize = 1024;
 pub const MAX_SNIPPET_BYTES: usize = MAX_PATTERN_BYTES + 256;
+/// Conservative admission reservation for regex compilation and a retained
+/// plan, including both 1 MiB DFAs, NFA/determinization scratch and syntax.
+/// This is an accounting envelope, not an exact allocator measurement.
+pub const MAX_REGEX_MEMORY_BYTES: usize = 8 * 1024 * 1024;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Error {
@@ -14,9 +18,9 @@ pub enum Error {
 impl std::fmt::Display for Error {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(match self {
-            Self::Invalid => "invalid literal-search input",
-            Self::Limit => "literal-search budget exceeded",
-            Self::Cancelled => "literal search cancelled",
+            Self::Invalid => "invalid search input",
+            Self::Limit => "search budget exceeded",
+            Self::Cancelled => "search cancelled",
         })
     }
 }
@@ -28,6 +32,302 @@ pub fn validate_pattern(pattern: &[u8]) -> Result<(), Error> {
     } else {
         Ok(())
     }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SearchMode {
+    Literal,
+    Regex,
+}
+
+/// Cheap request preflight before memory admission. Parsing an AST validates
+/// syntax without expanding Unicode classes, repetitions, or compiling DFAs.
+/// Semantic/compiler limits are checked by Pattern::new after admission.
+pub fn validate_input(pattern: &[u8], mode: SearchMode) -> Result<(), Error> {
+    validate_pattern(pattern)?;
+    if mode == SearchMode::Regex {
+        let text = std::str::from_utf8(pattern).map_err(|_| Error::Invalid)?;
+        regex_syntax::ast::parse::ParserBuilder::new()
+            .nest_limit(64)
+            .build()
+            .parse(text)
+            .map_err(|_| Error::Invalid)?;
+    }
+    Ok(())
+}
+
+/// Compiled, bounded search plan. Regex syntax is UTF-8, with ASCII byte
+/// semantics by default; inline flags can enable Unicode character classes.
+/// Backreferences, lookaround and Unicode word boundaries are unsupported.
+pub struct Pattern {
+    matcher: Matcher,
+    filter: FilterQuery,
+}
+enum Matcher {
+    Literal(Vec<u8>),
+    Regex(regex_automata::dfa::regex::Regex),
+}
+enum FilterQuery {
+    All,
+    Literal(Vec<u8>),
+    And(Vec<Self>),
+    Or(Vec<Self>),
+}
+impl FilterQuery {
+    fn from_hir(hir: &regex_syntax::hir::Hir) -> Self {
+        use regex_syntax::hir::HirKind;
+        match hir.kind() {
+            HirKind::Literal(value) => Self::Literal(value.0.to_vec()),
+            HirKind::Capture(value) => Self::from_hir(&value.sub),
+            HirKind::Repetition(value) if value.min > 0 => Self::from_hir(&value.sub),
+            HirKind::Concat(parts) => Self::And(parts.iter().map(Self::from_hir).collect()),
+            HirKind::Alternation(parts) => Self::Or(parts.iter().map(Self::from_hir).collect()),
+            // Assertions and classes prove no required trigram. Optional
+            // repetitions must not exclude a file missing the optional text.
+            _ => Self::All,
+        }
+    }
+    fn may_match(&self, filter: &FileFilter) -> bool {
+        match self {
+            Self::All => true,
+            Self::Literal(value) => filter.may_match(value),
+            Self::And(parts) => parts.iter().all(|part| part.may_match(filter)),
+            Self::Or(parts) => parts.iter().any(|part| part.may_match(filter)),
+        }
+    }
+}
+impl Pattern {
+    pub fn new(pattern: &[u8], mode: SearchMode) -> Result<Self, Error> {
+        validate_input(pattern, mode)?;
+        if mode == SearchMode::Literal {
+            return Ok(Self {
+                matcher: Matcher::Literal(pattern.to_vec()),
+                filter: FilterQuery::Literal(pattern.to_vec()),
+            });
+        }
+        let text = std::str::from_utf8(pattern).map_err(|_| Error::Invalid)?;
+        let hir = regex_syntax::ParserBuilder::new()
+            .unicode(false)
+            .utf8(false)
+            .nest_limit(64)
+            .build()
+            .parse(text)
+            .map_err(|_| Error::Invalid)?;
+        // Bound both the final programs and temporary determinization/NFA
+        // allocations. Unsupported or over-complex expressions fail closed.
+        const PROGRAM_BYTES: usize = 1024 * 1024;
+        let regex = regex_automata::dfa::regex::Regex::builder()
+            .syntax(
+                regex_automata::util::syntax::Config::new()
+                    .unicode(false)
+                    .utf8(false)
+                    .nest_limit(64),
+            )
+            .thompson(
+                regex_automata::nfa::thompson::Config::new()
+                    .utf8(false)
+                    .nfa_size_limit(Some(PROGRAM_BYTES)),
+            )
+            .dense(
+                regex_automata::dfa::dense::Config::new()
+                    .dfa_size_limit(Some(PROGRAM_BYTES))
+                    .determinize_size_limit(Some(PROGRAM_BYTES)),
+            )
+            .build(text)
+            .map_err(|_| Error::Invalid)?;
+        Ok(Self {
+            matcher: Matcher::Regex(regex),
+            filter: FilterQuery::from_hir(&hir),
+        })
+    }
+
+    /// A negative answer is exclusion proof only. Positive candidates must be
+    /// matched against verified FILE bytes, including saturated Bloom filters.
+    pub fn may_match(&self, filter: &FileFilter) -> bool {
+        self.filter.may_match(filter)
+    }
+
+    /// Find nonoverlapping nonempty matches on individual LF-delimited lines.
+    /// Empty matches are skipped; matches wider than MAX_PATTERN_BYTES exhaust
+    /// the budget so every returned snippet contains the entire match.
+    pub fn scan(
+        &self,
+        bytes: &[u8],
+        start_offset: u64,
+        max_hits: usize,
+        budget: &mut MatchBudget,
+        mut check: impl FnMut() -> bool,
+    ) -> Result<MatchPage, Error> {
+        let Matcher::Regex(regex) = &self.matcher else {
+            let Matcher::Literal(pattern) = &self.matcher else {
+                unreachable!()
+            };
+            return scan(bytes, pattern, start_offset, max_hits, budget, check);
+        };
+        let start = usize::try_from(start_offset).map_err(|_| Error::Invalid)?;
+        if start > bytes.len() || max_hits == 0 || max_hits > 65_536 {
+            return Err(Error::Invalid);
+        }
+        budget.work(1, &mut check)?;
+        MatchBudget::add(
+            &mut budget.usage.input_bytes,
+            bytes.len(),
+            budget.limits.max_input_bytes,
+        )?;
+        let (mut line, mut line_start) = (1u64, 0usize);
+        for (index, &byte) in bytes[..start].iter().enumerate() {
+            budget.work(1, &mut check)?;
+            if byte == b'\n' {
+                line += 1;
+                line_start = index + 1;
+            }
+        }
+        let mut hits = Vec::new();
+        let mut search = start;
+        while search < bytes.len() {
+            let mut line_end = search;
+            while line_end < bytes.len() && bytes[line_end] != b'\n' {
+                budget.work(1, &mut check)?;
+                line_end += 1;
+            }
+            let text = &bytes[line_start..line_end];
+            let mut at = search - line_start;
+            while at < text.len() {
+                let Some((left, right)) = regex_find(regex, text, at, budget, &mut check)? else {
+                    break;
+                };
+                if left == right {
+                    at = right + 1;
+                    continue;
+                }
+                if right - left > MAX_PATTERN_BYTES {
+                    return Err(Error::Limit);
+                }
+                let snippet_start = left.saturating_sub(128);
+                let snippet_end = text.len().min(right.saturating_add(128));
+                budget.work(snippet_end - snippet_start, &mut check)?;
+                let charge = std::mem::size_of::<Hit>()
+                    .saturating_add(snippet_end - snippet_start)
+                    .saturating_mul(2);
+                MatchBudget::add(
+                    &mut budget.usage.output_bytes,
+                    charge,
+                    budget.limits.max_output_bytes,
+                )?;
+                if hits.capacity() == 0 {
+                    hits.reserve_exact(1);
+                }
+                hits.push(Hit {
+                    offset: (line_start + left) as u64,
+                    length: (right - left) as u32,
+                    line,
+                    column: left as u64 + 1,
+                    snippet_offset: (line_start + snippet_start) as u64,
+                    snippet: text[snippet_start..snippet_end].to_vec(),
+                    truncated_prefix: snippet_start > 0,
+                    truncated_suffix: snippet_end < text.len(),
+                });
+                at = right;
+                if hits.len() == max_hits {
+                    let next = line_start + right;
+                    return Ok(MatchPage {
+                        hits,
+                        next_offset: (next < bytes.len()).then_some(next as u64),
+                    });
+                }
+            }
+            if line_end == bytes.len() {
+                break;
+            }
+            budget.work(1, &mut check)?;
+            line += 1;
+            line_start = line_end + 1;
+            search = line_start;
+        }
+        Ok(MatchPage {
+            hits,
+            next_offset: None,
+        })
+    }
+}
+
+/// Execute the forward/reverse DFA pair explicitly rather than calling an
+/// opaque find loop. Every transition is charged and cancellable, including
+/// pathological leftmost searches that repeatedly inspect a long suffix.
+fn regex_find(
+    regex: &regex_automata::dfa::regex::Regex,
+    bytes: &[u8],
+    start: usize,
+    budget: &mut MatchBudget,
+    check: &mut impl FnMut() -> bool,
+) -> Result<Option<(usize, usize)>, Error> {
+    use regex_automata::{Anchored, Input, dfa::Automaton};
+    let input = Input::new(bytes).span(start..bytes.len());
+    let forward = regex.forward();
+    let mut state = forward
+        .start_state_forward(&input)
+        .map_err(|_| Error::Invalid)?;
+    let mut end = None;
+    for at in start..bytes.len() {
+        budget.work(1, check)?;
+        state = forward.next_state(state, bytes[at]);
+        if forward.is_match_state(state) {
+            end = Some(at);
+        }
+        if forward.is_dead_state(state) {
+            break;
+        }
+        if forward.is_quit_state(state) {
+            return Err(Error::Invalid);
+        }
+    }
+    if !forward.is_dead_state(state) {
+        budget.work(1, check)?;
+        state = forward.next_eoi_state(state);
+        if forward.is_match_state(state) {
+            end = Some(bytes.len());
+        }
+    }
+    let Some(end) = end else {
+        return Ok(None);
+    };
+    if end == start {
+        return Ok(Some((start, end)));
+    }
+    let input = Input::new(bytes).span(start..end).anchored(Anchored::Yes);
+    let reverse = regex.reverse();
+    let mut state = reverse
+        .start_state_reverse(&input)
+        .map_err(|_| Error::Invalid)?;
+    let mut left = None;
+    for at in (start..end).rev() {
+        budget.work(1, check)?;
+        state = reverse.next_state(state, bytes[at]);
+        if reverse.is_match_state(state) {
+            left = Some(at + 1);
+        }
+        if reverse.is_dead_state(state) {
+            break;
+        }
+        if reverse.is_quit_state(state) {
+            return Err(Error::Invalid);
+        }
+    }
+    if !reverse.is_dead_state(state) {
+        budget.work(1, check)?;
+        state = if start > 0 {
+            reverse.next_state(state, bytes[start - 1])
+        } else {
+            reverse.next_eoi_state(state)
+        };
+        if reverse.is_match_state(state) {
+            left = Some(start);
+        }
+        if reverse.is_quit_state(state) {
+            return Err(Error::Invalid);
+        }
+    }
+    Ok(Some((left.ok_or(Error::Invalid)?, end)))
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

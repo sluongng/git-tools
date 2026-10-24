@@ -2231,11 +2231,12 @@ impl native_broker::NativeQueryIo for FakeQuery {
                 "fixture cursor belongs to another provider",
             ));
         }
-        let offset = if first {
-            0
+        let matched = if input.policy == q::SearchPolicy::RegexBytesV1 {
+            b"needle".to_vec()
         } else {
-            input.pattern.len() as u64 + 1
+            input.pattern.clone()
         };
+        let offset = if first { 0 } else { matched.len() as u64 + 1 };
         let mut value = q::SearchResult {
             scope_digest: vec![self.marker; 32],
             index_epoch: vec![self.marker; 16],
@@ -2255,13 +2256,13 @@ impl native_broker::NativeQueryIo for FakeQuery {
             hits: vec![q::SearchHit {
                 path: "src/main.rs".into(),
                 file_id: vec![self.marker; 32],
-                file_size: input.pattern.len() as u64 * 2 + 1,
+                file_size: matched.len() as u64 * 2 + 1,
                 byte_offset: offset,
-                match_bytes: input.pattern.len() as u32,
+                match_bytes: matched.len() as u32,
                 line: 1,
                 byte_column: offset,
                 snippet_offset: offset,
-                snippet: input.pattern,
+                snippet: matched,
             }],
             cursor: if first { vec![self.marker] } else { vec![] },
             entries_examined: if first { 1 } else { 2 },
@@ -2273,6 +2274,20 @@ impl native_broker::NativeQueryIo for FakeQuery {
             2 => value.hits[0].snippet[0] ^= 1,
             3 => value.hits.push(value.hits[0].clone()),
             4 => value.cursor.clear(),
+            5 => value.hits[0].match_bytes = 0,
+            6 => value.hits[0].match_bytes = u32::MAX,
+            7 => value.hits[0].snippet.clear(),
+            8 => value.hits[0].snippet[0] = b'\n',
+            9 => {
+                let hit = &mut value.hits[0];
+                hit.file_size = 2048;
+                hit.byte_offset = 0;
+                hit.match_bytes = 1025;
+                hit.line = 1;
+                hit.byte_column = 0;
+                hit.snippet_offset = 0;
+                hit.snippet = vec![b'x'; 1025];
+            }
             _ => {}
         }
         Ok(self.reply(value))
@@ -2589,6 +2604,84 @@ async fn indexed_search_routes_aliases_and_checks_paged_hit_provenance() {
             "{behavior}"
         );
     }
+    first_provider
+        .search_fault
+        .store(0, std::sync::atomic::Ordering::SeqCst);
+    let regex = ScopedSearchQuery {
+        pattern: b"nee+dle|hay".to_vec(),
+        policy: q::SearchPolicy::RegexBytesV1,
+        ..input.clone()
+    };
+    let regex_page = first.search(regex.clone(), Arc::new(())).await.unwrap();
+    assert_eq!(regex_page.value.hits[0].match_bytes, 6);
+    assert_eq!(regex_page.value.hits[0].snippet, b"needle");
+    let regex_next = local
+        .search(
+            ScopedSearchQuery {
+                cursor: regex_page.value.cursor.clone(),
+                ..regex.clone()
+            },
+            Arc::new(()),
+        )
+        .await
+        .unwrap();
+    assert_eq!(regex_next.value.hits[0].byte_offset, 7);
+    for fault in [3, 5, 6, 7, 8, 9] {
+        first_provider
+            .search_fault
+            .store(fault, std::sync::atomic::Ordering::SeqCst);
+        let invalid = ScopedSearchQuery {
+            page_size: 2,
+            ..regex.clone()
+        };
+        assert_eq!(
+            first
+                .search(invalid.clone(), Arc::new(()))
+                .await
+                .unwrap_err()
+                .code(),
+            tonic::Code::DataLoss,
+            "regex fault {fault}"
+        );
+        assert_eq!(
+            local
+                .search(invalid, Arc::new(()))
+                .await
+                .unwrap_err()
+                .code(),
+            tonic::Code::DataLoss,
+            "regex fault {fault}"
+        );
+    }
+    let calls = first_provider
+        .search_calls
+        .load(std::sync::atomic::Ordering::SeqCst);
+    let invalid_regex = ScopedSearchQuery {
+        pattern: b"(".to_vec(),
+        ..regex
+    };
+    assert_eq!(
+        first
+            .search(invalid_regex.clone(), Arc::new(()))
+            .await
+            .unwrap_err()
+            .code(),
+        tonic::Code::InvalidArgument
+    );
+    assert_eq!(
+        local
+            .search(invalid_regex, Arc::new(()))
+            .await
+            .unwrap_err()
+            .code(),
+        tonic::Code::InvalidArgument
+    );
+    assert_eq!(
+        first_provider
+            .search_calls
+            .load(std::sync::atomic::Ordering::SeqCst),
+        calls
+    );
     drop((page, next, other, first, second, local));
     host.stop().await;
 }

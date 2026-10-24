@@ -3585,6 +3585,7 @@ dependencies = [
  "tempfile",
  "tinytree-model",
  "tinytree-proto",
+ "tinytree-search",
  "tokio",
  "tokio-stream",
  "tonic",
@@ -5625,6 +5626,7 @@ dependencies = [
  "tinytree-index",
  "tinytree-model",
  "tinytree-proto",
+ "tinytree-search",
  "tinytree-server",
  "tinytree-store",
  "tokio",
@@ -5727,6 +5729,10 @@ dependencies = [
 [[package]]
 name = "tinytree-search"
 version = "0.1.0"
+dependencies = [
+ "regex-automata",
+ "regex-syntax",
+]
 
 [[package]]
 name = "tinytree-server"
