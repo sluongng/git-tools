@@ -1,9 +1,12 @@
-//! Local-only native jj Backend prework. No Git dependency at runtime, remote
-//! upload, eviction or GC. Store ownership is currently exclusive across
-//! processes; final multi-process use requires a local authoritative I/O broker.
+//! Native jj backend with no runtime Git dependency or automatic collection.
+//! Explicit host-owned GC only reclaims unreachable local objects; no reachable
+//! bytes are offloaded. Direct Store ownership is exclusive across processes;
+//! shared clients require an authoritative I/O broker.
 mod convert;
 mod copies;
 mod io;
+mod maintenance;
+pub use maintenance::{NativeClientGcError, NativeClientGcOptions};
 mod provider;
 pub use provider::{
     CopyCatalogLimits, CopyCatalogSnapshot, DirectObjectIo, FileRead, NativeObjectIo,

@@ -276,6 +276,8 @@ pub struct DirectObjectIo {
     #[cfg(test)]
     metadata_put_hook: Option<Arc<dyn Fn() + Send + Sync>>,
     #[cfg(test)]
+    client_gc_hook: Option<Arc<dyn Fn() + Send + Sync>>,
+    #[cfg(test)]
     file_read_hook: Option<Arc<dyn Fn() + Send + Sync>>,
 }
 // Field order is part of the admission contract: destroy payloads and their
@@ -323,6 +325,50 @@ impl fmt::Debug for DirectObjectIo {
     }
 }
 impl DirectObjectIo {
+    /// Reclaim unreachable resident objects in this exact live Store. The host
+    /// must supply a complete fenced root set and an owner retaining its
+    /// exclusive collector guard. The opaque Arc is retained, not validated as
+    /// proof of a guard or root completeness. This does not enable collection
+    /// for untracked workspaces. It never fetches or offloads.
+    /// A cancelled/expired waiter does not release the physical worker's owner.
+    pub async fn client_gc_with_owner(
+        &self,
+        options: NativeClientGcOptions,
+        owner: Arc<dyn std::any::Any + Send + Sync>,
+    ) -> Result<tinytree_store::ClientGcReport, NativeClientGcError> {
+        crate::maintenance::collect(
+            self.store.clone(),
+            options,
+            owner,
+            Store::client_gc,
+            #[cfg(test)]
+            self.client_gc_hook.clone(),
+        )
+        .await
+    }
+    /// Nonmutating selection summary under the same complete-root fencing and
+    /// physical ownership contract as `client_gc_with_owner`. This is not an
+    /// executable plan: apply revalidates a fresh epoch and all Store conditions.
+    pub async fn plan_client_gc_with_owner(
+        &self,
+        options: NativeClientGcOptions,
+        owner: Arc<dyn std::any::Any + Send + Sync>,
+    ) -> Result<tinytree_store::ClientGcPlanReport, NativeClientGcError> {
+        crate::maintenance::collect(
+            self.store.clone(),
+            options,
+            owner,
+            Store::plan_client_gc,
+            #[cfg(test)]
+            self.client_gc_hook.clone(),
+        )
+        .await
+    }
+    #[cfg(test)]
+    pub(crate) fn set_client_gc_hook(&mut self, hook: Arc<dyn Fn() + Send + Sync>) {
+        self.client_gc_hook = Some(hook);
+    }
+
     #[cfg(test)]
     pub(crate) fn set_metadata_put_hook(&mut self, hook: Arc<dyn Fn() + Send + Sync>) {
         self.metadata_put_hook = Some(hook);
@@ -475,6 +521,8 @@ impl DirectObjectIo {
             copy_gate: Arc::new(tokio::sync::Mutex::new(())),
             #[cfg(test)]
             metadata_put_hook: None,
+            #[cfg(test)]
+            client_gc_hook: None,
             #[cfg(test)]
             file_read_hook: None,
         })

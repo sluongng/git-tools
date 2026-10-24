@@ -1465,6 +1465,7 @@ fn client_gc_invalid_complete_graphs_fail_before_any_deletion() {
             }
         }
         request.epoch = store.client_gc_epoch("demo").unwrap();
+        assert!(store.plan_client_gc("demo", &request).is_err());
         assert!(store.client_gc("demo", &request).is_err());
         assert_eq!(store.descriptor("demo", spare.key).unwrap(), Some(spare));
         assert!(store.inner.path("demo", spare.key).exists());
@@ -1489,6 +1490,10 @@ fn client_gc_epoch_is_instance_repository_and_duplicate_write_sensitive() {
     let request = client_collection(&store, 100);
     store.put("demo", file, bytes, 90).unwrap();
     assert!(matches!(
+        store.plan_client_gc("demo", &request),
+        Err(Error::Invalid("stale client GC epoch"))
+    ));
+    assert!(matches!(
         store.client_gc("demo", &request),
         Err(Error::Invalid("stale client GC epoch"))
     ));
@@ -1499,10 +1504,18 @@ fn client_gc_epoch_is_instance_repository_and_duplicate_write_sensitive() {
     drop(store);
     let store = Store::open_existing(directory.path(), config()).unwrap();
     assert!(matches!(
+        store.plan_client_gc("demo", &old_instance),
+        Err(Error::Invalid("stale client GC epoch"))
+    ));
+    assert!(matches!(
         store.client_gc("demo", &old_instance),
         Err(Error::Invalid("stale client GC epoch"))
     ));
     store.create_repository("other").unwrap();
+    assert!(matches!(
+        store.plan_client_gc("other", &client_collection(&store, 200)),
+        Err(Error::Invalid("stale client GC epoch"))
+    ));
     assert!(matches!(
         store.client_gc("other", &client_collection(&store, 200)),
         Err(Error::Invalid("stale client GC epoch"))
@@ -1669,6 +1682,10 @@ fn client_gc_budget_failure_has_zero_deletions() {
             Bound::DeleteBytes => request.limits.max_deleted_bytes = 1,
         }
         assert!(matches!(
+            store.plan_client_gc("demo", &request),
+            Err(Error::Limit(_))
+        ));
+        assert!(matches!(
             store.client_gc("demo", &request),
             Err(Error::Limit(_))
         ));
@@ -1714,6 +1731,150 @@ fn client_gc_pending_unlink(store: &Store, d: Descriptor, remove_index: bool) {
         .unwrap(),
     );
     store.inner.commit(tx).unwrap();
+}
+
+#[test]
+fn client_gc_plan_preserves_payloads_catalog_and_recovery_work() {
+    let (_directory, store) = open();
+    let (file, tree, head) = fixture(&store, "retained history");
+    let spare_bytes = b"unreachable resident";
+    let spare = tinytree_model::describe_file(spare_bytes);
+    store.put("demo", spare, spare_bytes, 0).unwrap();
+    let legacy_bytes = b"unknown age must not be stamped by a plan";
+    let legacy = tinytree_model::describe_file(legacy_bytes);
+    store.put("demo", legacy, legacy_bytes, 0).unwrap();
+    let pending_bytes = b"pending physical deletion";
+    let pending = tinytree_model::describe_file(pending_bytes);
+    store.put("demo", pending, pending_bytes, 0).unwrap();
+    client_gc_pending_unlink(&store, pending, true);
+    let mut tx = store
+        .inner
+        .db
+        .write_tx()
+        .durability(Some(PersistMode::SyncAll));
+    tx.remove(
+        &store.inner.spaces.client_ages,
+        object_key("demo", legacy.key),
+    );
+    store.inner.commit(tx).unwrap();
+
+    // Observe every durable namespace that selection or application can touch.
+    // Raw rows also catch a stamp/lease update that leaves descriptors unchanged.
+    let catalog = || {
+        let view = store.inner.db.read_tx();
+        [
+            &store.inner.spaces.repos,
+            &store.inner.spaces.objects,
+            &store.inner.spaces.refs,
+            &store.inner.spaces.staging,
+            &store.inner.spaces.client_ages,
+            &store.inner.spaces.client_revisions,
+            &store.inner.spaces.client_deletions,
+            &store.inner.spaces.locations,
+            &store.inner.spaces.packs,
+        ]
+        .map(|space| {
+            view.prefix(space, b"")
+                .map(|row| {
+                    let (key, value) = row.into_inner().unwrap();
+                    (key.to_vec(), value.to_vec())
+                })
+                .collect::<Vec<_>>()
+        })
+    };
+    let before = catalog();
+    let mut request = client_collection(&store, 100);
+    request.complete_roots.push(head.key);
+    let plan = store.plan_client_gc("demo", &request).unwrap();
+    assert_eq!(plan.would_delete_objects, 1);
+    assert_eq!(plan.would_delete_bytes, spare.size_bytes);
+    assert_eq!(plan.pending_deletion_objects, 1);
+    assert_eq!(plan.pending_deletion_bytes, pending.size_bytes);
+    // Repository creation predates age rows for the intrinsic empty tree.
+    assert_eq!(plan.would_stamp_unknown_objects, 2);
+    assert_eq!(plan.would_expire_leases, before[3].len() as u64);
+    assert!(plan.would_expire_leases > 0);
+    assert_eq!(catalog(), before);
+    assert_eq!(store.plan_client_gc("demo", &request).unwrap(), plan);
+    assert_eq!(catalog(), before);
+    for (descriptor, bytes) in [
+        (spare, spare_bytes.as_slice()),
+        (legacy, legacy_bytes.as_slice()),
+        (pending, pending_bytes.as_slice()),
+    ] {
+        assert_eq!(
+            fs::read(store.inner.path("demo", descriptor.key)).unwrap(),
+            bytes
+        );
+    }
+    for descriptor in [file, tree, head, spare, legacy] {
+        assert_eq!(
+            store.descriptor("demo", descriptor.key).unwrap(),
+            Some(descriptor)
+        );
+    }
+    assert_eq!(store.descriptor("demo", pending.key).unwrap(), None);
+
+    // Reusing the same epoch proves planning neither advances the catalog nor
+    // pre-applies recovery work. Application performs a new gated selection.
+    let applied = store.client_gc("demo", &request).unwrap();
+    assert_eq!(applied.deleted_objects, plan.would_delete_objects);
+    assert_eq!(applied.deleted_bytes, plan.would_delete_bytes);
+    assert_eq!(
+        applied.stamped_unknown_objects,
+        plan.would_stamp_unknown_objects
+    );
+    assert_eq!(applied.expired_leases, plan.would_expire_leases);
+    assert_eq!(applied.unlinked_payloads, 2);
+    assert!(!store.inner.path("demo", spare.key).exists());
+    assert!(!store.inner.path("demo", pending.key).exists());
+    assert_eq!(store.descriptor("demo", legacy.key).unwrap(), Some(legacy));
+
+    // A plan must reject prospective accounting underflow just as apply does,
+    // without consuming its epoch or making partial stamps/recovery changes.
+    let repository = store.inner.repository("demo").unwrap();
+    for (corrupt, expected) in [
+        (
+            RepositoryRecord {
+                bytes: 0,
+                ..repository.clone()
+            },
+            "repository byte count",
+        ),
+        (
+            RepositoryRecord {
+                objects: 0,
+                ..repository.clone()
+            },
+            "repository object count",
+        ),
+    ] {
+        let mut tx = store
+            .inner
+            .db
+            .write_tx()
+            .durability(Some(PersistMode::SyncAll));
+        tx.insert(&store.inner.spaces.repos, "demo", encode(&corrupt).unwrap());
+        store.inner.commit(tx).unwrap();
+        let mut request = client_collection(&store, 200);
+        request.complete_roots.push(head.key);
+        let before = catalog();
+        assert!(matches!(
+            store.plan_client_gc("demo", &request),
+            Err(Error::Corrupt(actual)) if actual == expected
+        ));
+        assert_eq!(catalog(), before);
+        assert!(matches!(
+            store.client_gc("demo", &request),
+            Err(Error::Corrupt(actual)) if actual == expected
+        ));
+        assert_eq!(catalog(), before);
+        assert_eq!(store.descriptor("demo", legacy.key).unwrap(), Some(legacy));
+        assert_eq!(
+            fs::read(store.inner.path("demo", legacy.key)).unwrap(),
+            legacy_bytes
+        );
+    }
 }
 
 #[test]
@@ -1966,9 +2127,15 @@ fn packed_client_gc_reclaims_only_after_the_last_retained_member() {
     assert_eq!(contents, bytes);
     assert!(pack_path.exists());
     let request = client_collection(&store, 100);
+    let pack_before = fs::read(&pack_path).unwrap();
+    let plan = store.plan_client_gc("demo", &request).unwrap();
+    assert_eq!(plan.would_delete_objects, 1);
+    assert_eq!(plan.would_delete_bytes, target.size_bytes);
+    assert_eq!(fs::read(&pack_path).unwrap(), pack_before);
+    assert_eq!(store.descriptor("demo", target.key).unwrap(), Some(target));
     assert_eq!(
         store.client_gc("demo", &request).unwrap().deleted_objects,
-        1
+        plan.would_delete_objects
     );
     assert!(!pack_path.exists());
 }

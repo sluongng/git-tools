@@ -76,6 +76,27 @@ pub struct ClientGcReport {
     pub stamped_unknown_objects: u64,
     pub expired_leases: u64,
 }
+/// Nonmutating selection summary, not an executable deletion plan or remote
+/// retention proof. Byte counts describe logical objects, not disk blocks that
+/// would be reclaimed; readers and other packed members may retain payloads.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ClientGcPlanReport {
+    pub would_delete_objects: u64,
+    pub would_delete_bytes: u64,
+    /// Existing journal records to revisit, which may be deferred or superseded.
+    pub pending_deletion_objects: u64,
+    pub pending_deletion_bytes: u64,
+    pub would_stamp_unknown_objects: u64,
+    pub would_expire_leases: u64,
+}
+struct ClientGcPlan {
+    repository: RepositoryRecord,
+    victims: Vec<Descriptor>,
+    pending: Vec<Descriptor>,
+    unknown: Vec<ObjectKey>,
+    expired_staging: Vec<Vec<u8>>,
+    summary: ClientGcPlanReport,
+}
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Age {
@@ -161,14 +182,27 @@ impl Store {
         })
     }
 
-    /// Unreachable resident sweep only. Caller must hold its complete root
-    /// registry/collector guard until this returns, including error cleanup.
-    /// This synchronous operation must be drained, not timeout-detached while
-    /// releasing the caller's root fence. No network I/O occurs under the gate.
-    /// Limits bound logical records/graph work, not Fjall's physical disk usage.
-    pub fn client_gc(&self, repo: &str, request: &ClientGcRequest) -> Result<ClientGcReport> {
+    /// Validate and summarize the same bounded selection used by `client_gc`,
+    /// without stamps, lease expiry, journal recovery, catalog writes or unlink.
+    /// Caller must hold its complete root registry/collector guard until return.
+    /// The summary grants no permission to delete: apply always recomputes under
+    /// a fresh gate and validates the supplied epoch again.
+    pub fn plan_client_gc(
+        &self,
+        repo: &str,
+        request: &ClientGcRequest,
+    ) -> Result<ClientGcPlanReport> {
         let gate = self.inner.lock()?;
-        let mut repository = self.inner.repository(repo)?;
+        Ok(self.prepare_client_gc(repo, request, &gate)?.summary)
+    }
+
+    fn prepare_client_gc(
+        &self,
+        repo: &str,
+        request: &ClientGcRequest,
+        gate: &Runtime,
+    ) -> Result<ClientGcPlan> {
+        let repository = self.inner.repository(repo)?;
         if self.inner.has_cloud_state(repo)? {
             return Err(Error::Invalid(
                 "cloud state requires authoritative server GC",
@@ -257,7 +291,7 @@ impl Store {
                 self.inner.require_descriptor(repo, d)?;
                 transient.push(d.key);
             } else {
-                expired_staging.push(stage_key);
+                expired_staging.push(stage_key.to_vec());
             }
             if transient.len() > l.max_marked_objects {
                 return Err(Error::Limit("client GC transient roots"));
@@ -350,6 +384,7 @@ impl Store {
                 .ok_or(Error::Limit("client GC deletion bytes"))?;
             pending.push(d);
         }
+        let pending_bytes = delete_bytes;
         for d in &victims {
             delete_bytes = delete_bytes
                 .checked_add(d.size_bytes)
@@ -363,6 +398,48 @@ impl Store {
         {
             return Err(Error::Limit("client GC deletions"));
         }
+        let victim_bytes = delete_bytes - pending_bytes;
+        repository
+            .bytes
+            .checked_sub(victim_bytes)
+            .ok_or(Error::Corrupt("repository byte count"))?;
+        repository
+            .objects
+            .checked_sub(victims.len() as u64)
+            .ok_or(Error::Corrupt("repository object count"))?;
+        let summary = ClientGcPlanReport {
+            would_delete_objects: victims.len() as u64,
+            would_delete_bytes: victim_bytes,
+            pending_deletion_objects: pending.len() as u64,
+            pending_deletion_bytes: pending_bytes,
+            would_stamp_unknown_objects: unknown.len() as u64,
+            would_expire_leases: expired_staging.len() as u64,
+        };
+        Ok(ClientGcPlan {
+            repository,
+            victims,
+            pending,
+            unknown,
+            expired_staging,
+            summary,
+        })
+    }
+
+    /// Unreachable resident sweep only. Caller must hold its complete root
+    /// registry/collector guard until this returns, including error cleanup.
+    /// This synchronous operation must be drained, not timeout-detached while
+    /// releasing the caller's root fence. No network I/O occurs under the gate.
+    /// Limits bound logical records/graph work, not Fjall's physical disk usage.
+    pub fn client_gc(&self, repo: &str, request: &ClientGcRequest) -> Result<ClientGcReport> {
+        let gate = self.inner.lock()?;
+        let ClientGcPlan {
+            mut repository,
+            victims,
+            mut pending,
+            unknown,
+            expired_staging,
+            summary: _,
+        } = self.prepare_client_gc(repo, request, &gate)?;
         let mut report = ClientGcReport {
             stamped_unknown_objects: unknown.len() as u64,
             expired_leases: expired_staging.len() as u64,

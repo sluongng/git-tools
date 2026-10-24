@@ -603,6 +603,20 @@ fn reopen_rejects_valid_old_clean_row_under_newer_manifest_without_repair() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn capture_reads_after_physical_jobs_and_survives_caller_cancellation() {
+    struct CheckpointOwner {
+        registry: Registry,
+        dropped: Option<tokio::sync::oneshot::Sender<u64>>,
+    }
+    impl Drop for CheckpointOwner {
+        fn drop(&mut self) {
+            let _ = self
+                .dropped
+                .take()
+                .unwrap()
+                .send(self.registry.storage_stats().transactions);
+        }
+    }
+
     let (_directory, registry) = registry().await;
     let registration = registry
         .register(WorkspaceId([2; 16]), OpStoreId([3; 16]))
@@ -615,11 +629,17 @@ async fn capture_reads_after_physical_jobs_and_survives_caller_cancellation() {
     let final_state = state.clone();
     let (entered, entered_rx) = tokio::sync::oneshot::channel();
     let (release, release_rx) = tokio::sync::oneshot::channel();
+    let before_commit = registry.storage_stats().transactions;
+    let (dropped, owner_dropped) = tokio::sync::oneshot::channel();
+    let physical_owner = Arc::new(CheckpointOwner {
+        registry: registry.clone(),
+        dropped: Some(dropped),
+    });
     let capture_registry = registry.clone();
     let callback_registry = registry.clone();
     let pending = tokio::spawn(async move {
         capture_registry
-            .capture_checkpoint(token, move || async move {
+            .capture_checkpoint_owned(token, move || async move {
                 assert!(matches!(
                     callback_registry.resolve(token),
                     Err(Error::ClosedCommand)
@@ -627,7 +647,7 @@ async fn capture_reads_after_physical_jobs_and_survives_caller_cancellation() {
                 let value = final_state.load(Ordering::Acquire);
                 entered.send(value).unwrap();
                 release_rx.await.unwrap();
-                Ok(checkpoint(value))
+                Ok(OwnedRootCheckpoint::new(checkpoint(value), physical_owner))
             })
             .await
     });
@@ -672,6 +692,14 @@ async fn capture_reads_after_physical_jobs_and_survives_caller_cancellation() {
     );
     assert!(!collection.is_finished(), "capture still owns the fence");
     release.send(()).unwrap();
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(2), owner_dropped)
+            .await
+            .unwrap()
+            .unwrap(),
+        before_commit + 1,
+        "external capture ownership must survive callback return and SyncAll after cancellation"
+    );
     let collector = tokio::time::timeout(Duration::from_secs(2), collection)
         .await
         .unwrap()

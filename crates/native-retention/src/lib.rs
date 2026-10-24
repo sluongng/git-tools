@@ -220,6 +220,24 @@ pub struct CaptureBundle {
     pub checkpoint: RootCheckpoint,
     pub bundle: BundleDescriptor,
 }
+/// Root claims together with physical capture ownership. The owner may contain
+/// frontend fences and admitted resources and survives the actual SyncAll job.
+/// Keep the whole wrapper when handing it to physical work.
+pub struct OwnedRootCheckpoint {
+    checkpoint: RootCheckpoint,
+    owner: Arc<dyn std::any::Any + Send + Sync>,
+}
+impl OwnedRootCheckpoint {
+    pub fn new(checkpoint: RootCheckpoint, owner: Arc<dyn std::any::Any + Send + Sync>) -> Self {
+        Self { checkpoint, owner }
+    }
+}
+// Payload first, owner last: a discarded blocking or async worker result must
+// destroy the payload before releasing the external capture fence/resources.
+struct OwnedCheckpointResult {
+    result: Result<CheckpointReceipt>,
+    _owner: Arc<dyn std::any::Any + Send + Sync>,
+}
 /// Physical capture ownership retained through the actual durable transaction,
 /// including after callback completion or caller cancellation. The owner can
 /// contain frontend fences, staging leases and admitted resource reservations.
@@ -570,6 +588,23 @@ impl Registry {
         C: FnOnce() -> F + Send + 'static,
         F: std::future::Future<Output = Result<RootCheckpoint>> + Send + 'static,
     {
+        self.capture_checkpoint_owned(token, move || async move {
+            Ok(OwnedRootCheckpoint::new(capture().await?, Arc::new(())))
+        })
+        .await
+    }
+    /// Like `capture_checkpoint`, but retain the callback's physical capture
+    /// ownership through SyncAll, final command state publication, and discarded
+    /// worker results when the caller is cancelled.
+    pub async fn capture_checkpoint_owned<C, F>(
+        &self,
+        token: CommandToken,
+        capture: C,
+    ) -> Result<CheckpointReceipt>
+    where
+        C: FnOnce() -> F + Send + 'static,
+        F: std::future::Future<Output = Result<OwnedRootCheckpoint>> + Send + 'static,
+    {
         self.inner.check()?;
         let context = self.lookup(token)?;
         // Obtain the runtime before sealing: failure must not leave an accepted
@@ -588,26 +623,39 @@ impl Registry {
         let worker = runtime.spawn(async move {
             drain_jobs(&context).await?;
             let result = async {
-                let checkpoint = capture().await?;
+                let captured = capture().await?;
                 let commit = context.clone();
                 storage::blocking(move || {
-                    let checkpoint = storage::canonical(checkpoint, &commit.registry.limits)?;
-                    let fingerprint =
-                        storage::fingerprint(&commit.registration, commit.epoch, &checkpoint);
-                    commit.registry.checkpoint(
-                        commit.registration,
-                        commit.epoch,
-                        checkpoint,
-                        fingerprint,
-                    )
+                    let OwnedRootCheckpoint { checkpoint, owner } = captured;
+                    let result = (|| {
+                        let checkpoint = storage::canonical(checkpoint, &commit.registry.limits)?;
+                        let fingerprint =
+                            storage::fingerprint(&commit.registration, commit.epoch, &checkpoint);
+                        commit.registry.checkpoint(
+                            commit.registration,
+                            commit.epoch,
+                            checkpoint,
+                            fingerprint,
+                        )
+                    })();
+                    Ok(OwnedCheckpointResult {
+                        result,
+                        _owner: owner,
+                    })
                 })
                 .await
             }
-            .await;
-            finish_checkpoint(&context, &result)?;
-            result
+            .await
+            .unwrap_or_else(|error| OwnedCheckpointResult {
+                result: Err(error),
+                _owner: Arc::new(()),
+            });
+            finish_checkpoint(&context, &result.result)?;
+            Ok::<_, Error>(result)
         });
-        worker.await.map_err(|_| Error::Poisoned)?
+        // Only a live logical waiter takes the receipt out of its owner. A
+        // detached worker's output instead drops payload before capture owner.
+        worker.await.map_err(|_| Error::Poisoned)??.result
     }
     /// Seal and drain, then capture an immutable staged bundle and root claims
     /// in one SyncAll transaction WITHOUT making the workspace Clean. The host

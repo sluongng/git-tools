@@ -34,7 +34,9 @@ pub use cloud::{
 };
 mod client_gc;
 mod closure;
-pub use client_gc::{ClientGcEpoch, ClientGcLimits, ClientGcReport, ClientGcRequest};
+pub use client_gc::{
+    ClientGcEpoch, ClientGcLimits, ClientGcPlanReport, ClientGcReport, ClientGcRequest,
+};
 mod pack;
 mod retention;
 pub use pack::{PackOptions, PackReport};

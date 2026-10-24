@@ -11,7 +11,9 @@ remote services.
   retain a resolved job guard, including background and non-cancellable work.
 - Checkpoint typed object roots plus opaque operation IDs after workspace writes
   finish. It freezes new job admission, drains accepted jobs, then atomically
-  persists the complete root claim and clean state with `SyncAll`.
+  persists the complete root claim and clean state with `SyncAll`. Owned
+  checkpoint callbacks keep physical capture guards through durable publication,
+  even when the requester is cancelled.
 - `capture_dirty` seals/drains a command and atomically records its roots plus
   an independent immutable-bundle ticket, leaving the workspace dirty. The host
   must sync the bundle before callback success. Pending tickets survive newer
@@ -19,8 +21,8 @@ remote services.
 - Collector admission requires no active/draining commands, no dirty workspace,
   and no untracked access. Its exclusive guard pins a coherent bounded union of
   roots, including the real empty tree. The intrinsic zero commit is a root marker,
-  not a stored blob. A future collector must validate canonical closure before
-  deleting anything.
+  not a stored blob. Collectors must validate canonical closure before deleting
+  anything.
 
 `ManagedFresh` is a host attestation that all accesses are managed, never an
 automatic migration of an existing store. `Untracked` (or the monotonic untracked

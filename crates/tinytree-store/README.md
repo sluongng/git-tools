@@ -50,3 +50,5 @@ remote FILE promises permit absent indexes, never corrupt indexed payloads or
 reachable offload. Durable ages protect recent/legacy objects; deletion records
 make interrupted unlink recoverable on a later successful collection. Its
 logical scan/deletion limits do not cap database or crash-orphan disk overhead.
+`plan_client_gc` is nonmutating and grants no deletion permission; apply recomputes
+the selection under its gate and revalidates the supplied epoch.

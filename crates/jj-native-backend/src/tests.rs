@@ -975,3 +975,272 @@ fn owned_file_read_keeps_admission_through_cancelled_physical_chunk_output() {
     assert!(eof_owner.upgrade().is_none());
     assert!(pool.clone().try_acquire_owned().is_ok());
 }
+
+// The maintenance adapter intentionally has one process-wide, nonqueued slot.
+static CLIENT_GC_TEST: std::sync::Mutex<()> = std::sync::Mutex::new(());
+fn client_gc_options(roots: Vec<m::ObjectKey>) -> NativeClientGcOptions {
+    NativeClientGcOptions {
+        complete_roots: roots,
+        transient_roots: Vec::new(),
+        now: now().unwrap() + 7200,
+        grace_seconds: 0,
+        limits: tinytree_store::ClientGcLimits::default(),
+        deadline: std::time::Instant::now() + std::time::Duration::from_secs(5),
+    }
+}
+
+#[test]
+fn owned_client_gc_keeps_resident_closure_and_blocks_missing_file_without_deletion() {
+    let _serial = CLIENT_GC_TEST.lock().unwrap();
+    let directory = tempfile::tempdir().unwrap();
+    let io = DirectObjectIo::init(directory.path(), Default::default()).unwrap();
+    block_on(async {
+        let keep = io.write_file(&mut Cursor::new(b"keep"), 4).await.unwrap();
+        let spare = io.write_file(&mut Cursor::new(b"spare"), 5).await.unwrap();
+        let tree = io
+            .write_metadata(m::Object::Tree(m::Tree {
+                entries: vec![m::TreeEntry {
+                    name: "file".into(),
+                    value: m::TreeValue::File {
+                        id: keep,
+                        executable: false,
+                        size_bytes: 4,
+                        copy_id: None,
+                    },
+                }],
+            }))
+            .await
+            .unwrap();
+        let missing = m::describe_file(b"not resident");
+        let incomplete = io
+            .write_metadata(m::Object::Tree(m::Tree {
+                entries: vec![m::TreeEntry {
+                    name: "missing".into(),
+                    value: m::TreeValue::File {
+                        id: m::FileId(missing.key.id.0),
+                        executable: false,
+                        size_bytes: missing.size_bytes,
+                        copy_id: None,
+                    },
+                }],
+            }))
+            .await
+            .unwrap();
+        assert!(
+            matches!(io.client_gc_with_owner(client_gc_options(vec![incomplete.key]), Arc::new(())).await,
+            Err(NativeClientGcError::Store(tinytree_store::Error::MissingObject(key))) if key == missing.key)
+        );
+        let spare_key = m::ObjectKey {
+            kind: m::Kind::File,
+            id: m::ObjectId(spare.0),
+        };
+        assert!(io.descriptor(spare_key).await.unwrap().is_some());
+        let plan = io
+            .plan_client_gc_with_owner(client_gc_options(vec![tree.key]), Arc::new(()))
+            .await
+            .unwrap();
+        assert_eq!(plan.would_delete_objects, 2);
+        assert_eq!(
+            plan,
+            io.plan_client_gc_with_owner(client_gc_options(vec![tree.key]), Arc::new(()))
+                .await
+                .unwrap()
+        );
+        assert!(io.descriptor(spare_key).await.unwrap().is_some());
+        assert_eq!(
+            io.descriptor(incomplete.key).await.unwrap(),
+            Some(incomplete)
+        );
+        let report = io
+            .client_gc_with_owner(client_gc_options(vec![tree.key]), Arc::new(()))
+            .await
+            .unwrap();
+        assert_eq!(report.deleted_objects, plan.would_delete_objects);
+        assert_eq!(report.deleted_bytes, plan.would_delete_bytes);
+        assert!(io.descriptor(spare_key).await.unwrap().is_none());
+        assert_eq!(io.descriptor(tree.key).await.unwrap(), Some(tree));
+        let (_, mut reader) = io.read_file(keep).await.unwrap().into_parts();
+        let mut bytes = Vec::new();
+        reader.read_to_end(&mut bytes).await.unwrap();
+        assert_eq!(bytes, b"keep");
+        let mut expired = client_gc_options(vec![tree.key]);
+        expired.deadline = std::time::Instant::now();
+        assert!(matches!(
+            io.client_gc_with_owner(expired, Arc::new(())).await,
+            Err(NativeClientGcError::Deadline)
+        ));
+        let mut excessive = client_gc_options(vec![tree.key]);
+        excessive.limits.max_catalog_records += 1;
+        assert!(matches!(
+            io.client_gc_with_owner(excessive, Arc::new(())).await,
+            Err(NativeClientGcError::InvalidLimits)
+        ));
+    });
+}
+
+#[test]
+fn owned_client_gc_rejects_catalog_change_after_same_store_epoch() {
+    let _serial = CLIENT_GC_TEST.lock().unwrap();
+    let directory = tempfile::tempdir().unwrap();
+    let mut io = DirectObjectIo::init(directory.path(), Default::default()).unwrap();
+    let gate = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
+    let worker_gate = gate.clone();
+    let (entered, started) = std::sync::mpsc::channel();
+    io.set_client_gc_hook(Arc::new(move || {
+        entered.send(()).unwrap();
+        let (lock, changed) = &*worker_gate;
+        let mut released = lock.lock().unwrap();
+        while !*released {
+            released = changed.wait(released).unwrap();
+        }
+    }));
+    let io = Arc::new(io);
+    let spare = block_on(io.write_file(&mut Cursor::new(b"old"), 3)).unwrap();
+    let worker = io.clone();
+    let task = std::thread::spawn(move || {
+        block_on(worker.client_gc_with_owner(client_gc_options(Vec::new()), Arc::new(())))
+    });
+    started
+        .recv_timeout(std::time::Duration::from_secs(5))
+        .unwrap();
+    block_on(io.write_file(&mut Cursor::new(b"new"), 3)).unwrap();
+    let (lock, changed) = &*gate;
+    *lock.lock().unwrap() = true;
+    changed.notify_all();
+    assert!(matches!(
+        task.join().unwrap(),
+        Err(NativeClientGcError::Store(tinytree_store::Error::Invalid(
+            "stale client GC epoch"
+        )))
+    ));
+    assert!(
+        block_on(io.descriptor(m::ObjectKey {
+            kind: m::Kind::File,
+            id: m::ObjectId(spare.0)
+        }))
+        .unwrap()
+        .is_some()
+    );
+}
+
+#[test]
+fn timed_out_client_gc_keeps_exclusive_owner_and_nonqueued_slot_until_physical_completion() {
+    use std::time::{Duration, Instant};
+    let _serial = CLIENT_GC_TEST.lock().unwrap();
+    let directory = tempfile::tempdir().unwrap();
+    let mut io = DirectObjectIo::init(directory.path(), Default::default()).unwrap();
+    let spare = block_on(io.write_file(&mut Cursor::new(b"orphan"), 6)).unwrap();
+    let gate = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
+    let worker_gate = gate.clone();
+    let (entered, started) = std::sync::mpsc::channel();
+    io.set_client_gc_hook(Arc::new(move || {
+        entered.send(()).unwrap();
+        let (lock, changed) = &*worker_gate;
+        let mut released = lock.lock().unwrap();
+        while !*released {
+            released = changed.wait(released).unwrap();
+        }
+    }));
+    let io = Arc::new(io);
+    let pool = Arc::new(tokio::sync::Semaphore::new(1));
+    let owner = Arc::new(pool.clone().try_acquire_owned().unwrap());
+    let weak = Arc::downgrade(&owner);
+    let worker = io.clone();
+    let mut options = client_gc_options(Vec::new());
+    options.deadline = Instant::now() + Duration::from_secs(1);
+    let task = std::thread::spawn(move || block_on(worker.client_gc_with_owner(options, owner)));
+    started.recv_timeout(Duration::from_secs(5)).unwrap();
+    assert!(matches!(
+        task.join().unwrap(),
+        Err(NativeClientGcError::Deadline)
+    ));
+    assert!(weak.upgrade().is_some());
+    assert!(pool.clone().try_acquire_owned().is_err());
+    assert!(matches!(
+        block_on(io.client_gc_with_owner(client_gc_options(Vec::new()), Arc::new(()))),
+        Err(NativeClientGcError::Busy)
+    ));
+    let (lock, changed) = &*gate;
+    *lock.lock().unwrap() = true;
+    changed.notify_all();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    // Weak::upgrade may fail before the last Arc's payload destructor has
+    // finished returning its permit. Observe the actual admission boundary.
+    let _released = loop {
+        if let Ok(permit) = pool.clone().try_acquire_owned() {
+            break permit;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "physical collector admission did not release"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    };
+    assert!(
+        block_on(io.descriptor(m::ObjectKey {
+            kind: m::Kind::File,
+            id: m::ObjectId(spare.0)
+        }))
+        .unwrap()
+        .is_some()
+    );
+    let report =
+        block_on(io.client_gc_with_owner(client_gc_options(Vec::new()), Arc::new(()))).unwrap();
+    assert_eq!(report.deleted_objects, 1);
+}
+
+#[test]
+fn dropped_client_gc_waiter_does_not_release_its_physical_owner() {
+    use std::time::{Duration, Instant};
+    let _serial = CLIENT_GC_TEST.lock().unwrap();
+    let directory = tempfile::tempdir().unwrap();
+    let mut io = DirectObjectIo::init(directory.path(), Default::default()).unwrap();
+    let gate = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
+    let worker_gate = gate.clone();
+    let (entered, started) = std::sync::mpsc::channel();
+    io.set_client_gc_hook(Arc::new(move || {
+        entered.send(()).unwrap();
+        let (lock, changed) = &*worker_gate;
+        let mut released = lock.lock().unwrap();
+        while !*released {
+            released = changed.wait(released).unwrap();
+        }
+    }));
+    let spare = block_on(io.write_file(&mut Cursor::new(b"cancelled orphan"), 16)).unwrap();
+    let io = Arc::new(io);
+    let observer = io.clone();
+    let owner = Arc::new(());
+    let weak = Arc::downgrade(&owner);
+    let (abort, registration) = futures::future::AbortHandle::new_pair();
+    let task = std::thread::spawn(move || {
+        block_on(futures::future::Abortable::new(
+            io.client_gc_with_owner(client_gc_options(Vec::new()), owner),
+            registration,
+        ))
+    });
+    started.recv_timeout(Duration::from_secs(5)).unwrap();
+    abort.abort();
+    assert!(task.join().unwrap().is_err());
+    // The caller is gone, but the accepted physical job still owns the same
+    // Store and collector fence independently.
+    assert!(weak.upgrade().is_some());
+    let (lock, changed) = &*gate;
+    *lock.lock().unwrap() = true;
+    changed.notify_all();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while weak.upgrade().is_some() {
+        assert!(
+            Instant::now() < deadline,
+            "cancelled collector owner did not release"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert!(
+        block_on(observer.descriptor(m::ObjectKey {
+            kind: m::Kind::File,
+            id: m::ObjectId(spare.0)
+        }))
+        .unwrap()
+        .is_none()
+    );
+}

@@ -14,4 +14,4 @@ jj-lib = { version = "=0.46.0", default-features = false }
 tempfile = "3"
 tinytree-model = { path = "../tinytree-model" }
 tinytree-store = { path = "../tinytree-store" }
-tokio = { version = "1", features = ["rt-multi-thread", "sync"] }
+tokio = { version = "1", features = ["rt-multi-thread", "sync", "time"] }
