@@ -75,8 +75,8 @@ entry points. Most also expose Rust libraries; `jj-native-cli` is executable-onl
 | [`workspace-nfs`](crates/workspace-nfs) | `git-nfs` | macOS source mounts over loopback NFS. |
 | [`workspace-projfs`](crates/workspace-projfs) | `git-projfs` | Windows source mounts using ProjFS. |
 | [`jj-vfs`](crates/jj-vfs) | `git-jj` | Jujutsu working-copy integration with the source VFS. |
-| [`tinytree-server`](crates/tinytree-server) | `tinytree` | Separate jj-native object, reference and graph-query server over compressed gRPC. |
-| [`jj-native-cli`](crates/jj-native-cli) | `tinytree-jj` | Native jj commands through daemon-owned lazy workspaces; clone/fetch/push and exact capture restore. |
+| [`tinytree-server`](crates/tinytree-server) | `tinytree` | Separate jj-native object, reference, graph and content-query server over compressed gRPC. |
+| [`jj-native-cli`](crates/jj-native-cli) | `tinytree-jj` | Native jj commands, publication, restore and scoped history/search through lazy workspaces. |
 | [`bazel-output-service`](crates/bazel-output-service) | `git-output-service` | Lazy Bazel output service backed by remote CAS. |
 
 ### Library-only crates
@@ -88,7 +88,8 @@ entry points. Most also expose Rust libraries; `jj-native-cli` is executable-onl
 | [`local-cas`](crates/local-cas) | Verified local blob storage with bounded LRU eviction. |
 | [`packblob`](crates/packblob) | Indexed immutable blob packs with bounded dictionary compression and selective verified reads. |
 | [`tinytree-model`](crates/tinytree-model) | Canonical jj-native objects, typed IDs and bounded verification. |
-| [`tinytree-index`](crates/tinytree-index) | Rebuildable shared commit DAG and exact scoped graph facts; not a jj client index adapter. |
+| [`tinytree-index`](crates/tinytree-index) | Rebuildable commit DAG, scoped graph facts and bounded content-search records. |
+| [`tinytree-search`](crates/tinytree-search) | Shared bounded literal matching and trigram candidate filters for server search and local overlays. |
 | [`tinytree-cloud`](crates/tinytree-cloud) | Verified jj operation/view recovery codecs; not an automatic backup service. |
 | [`tinytree-proto`](crates/tinytree-proto) | Native repository gRPC bindings; not a server implementation. |
 | [`tinytree-client`](crates/tinytree-client) | Bounded, verifying native RPCs and immutable transfer snapshots. |

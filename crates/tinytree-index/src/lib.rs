@@ -6,6 +6,7 @@ use fjall::{
 use fs2::FileExt;
 use private_fs::PrivateDir;
 mod codec;
+pub mod content;
 mod scoped;
 use codec::{RecordCodec, decode, encode};
 pub use scoped::{
@@ -279,6 +280,7 @@ struct State {
     table: SingleWriterTxKeyspace,
     header: Header,
     failed: bool,
+    content: Option<content::ContentState>,
 }
 pub struct Index {
     // Drop the database before releasing exclusive/private path ownership.
@@ -471,6 +473,7 @@ impl Index {
             table,
             header,
             failed: false,
+            content: None,
         };
         validate_storage(&state, limits)?;
         Ok(Arc::new(Self {

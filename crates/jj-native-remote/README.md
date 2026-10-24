@@ -21,6 +21,8 @@ witnesses are distinct from canonical parent edges. Private overlays never gain
 remote retention grants. Sessions, replay and checked SDK memory are bounded;
 close partial queries explicitly, with SDK cleanup/expiry as the fallback.
 These APIs do not yet replace jj's local index or provide complete client GC.
+Content-search continuations are wrapped in source-bound broker-local cursors.
+Search snippets grant neither canonical file-read authority nor remote retention.
 
 Reads prefer authoritative local files, then verified scoped CAS bytes. New
 writes are durable locally without a network dependency. Publication uploads

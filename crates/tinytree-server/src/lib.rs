@@ -20,11 +20,13 @@ mod query_index;
 mod query_ingress;
 mod query_overlay;
 mod query_prefix;
+mod query_search;
 mod query_service;
 mod retention;
 mod service;
 pub use query_index::QueryConfig;
 pub use query_ingress::QueryGrpcService;
+pub use query_search::SearchStats;
 pub use query_service::QueryService;
 
 pub use auth::Principal;

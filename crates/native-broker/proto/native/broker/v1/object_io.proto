@@ -64,6 +64,7 @@ service QueryIo {
   rpc ReadCommit(QueryReadCommitRequest) returns (Metadata);
   rpc PathHistory(QueryPathRequest) returns (tinytree.query.v1.PathHistoryResult);
   rpc Blame(QueryPathRequest) returns (tinytree.query.v1.BlameResult);
+  rpc Search(QuerySearchRequest) returns (tinytree.query.v1.SearchResult);
   rpc CloseQuery(QueryCloseRequest) returns (QueryCloseReply);
   rpc CloseScope(QueryCloseRequest) returns (QueryCloseReply);
 }
@@ -136,6 +137,17 @@ message QueryPathRequest {
   string path = 4;
   tinytree.query.v1.HistoryPolicy policy = 5;
   uint32 max_commits = 6;
+}
+// Search cursors are provider-owned local envelopes, not upstream handles.
+message QuerySearchRequest {
+  string store_id = 1;
+  bytes scope = 2;
+  bytes revision = 3;
+  bytes pattern = 4;
+  string path_prefix = 5;
+  tinytree.query.v1.SearchPolicy policy = 6;
+  uint32 page_size = 7;
+  bytes cursor = 8;
 }
 message QueryCloseRequest { string store_id = 1; bytes handle = 2; }
 message QueryCloseReply {}

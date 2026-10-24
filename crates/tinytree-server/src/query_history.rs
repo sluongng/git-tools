@@ -717,3 +717,287 @@ pub(crate) fn blame(
     }
     Ok(result)
 }
+
+// Search receives only sealed children of an authorized canonical revision, or
+// children loaded from its integrity-checked derived manifest. These are internal
+// provenance tokens, not new client-supplied object-read capabilities.
+pub(crate) struct SearchRead<'a> {
+    pub index: &'a std::sync::Arc<tinytree_index::Index>,
+    pub store: &'a tinytree_store::Store,
+    pub metadata_max: usize,
+}
+#[derive(Clone)]
+pub(crate) struct SearchTree {
+    id: m::TreeId,
+    source: [u8; 32],
+    intrinsic: bool,
+}
+#[derive(Clone)]
+pub(crate) struct SearchFile {
+    id: m::FileId,
+    size: u64,
+    source: [u8; 32],
+}
+pub(crate) enum SearchChild {
+    Tree(SearchTree),
+    File(SearchFile),
+    Other,
+}
+pub(crate) struct SearchEntry {
+    pub name: String,
+    pub child: SearchChild,
+}
+pub(crate) struct SearchManifest {
+    root: SearchTree,
+    value: tinytree_index::content::ContentManifest,
+}
+fn search_source(scope: &Scoped, repository: &str) -> [u8; 32] {
+    let mut hash = blake3::Hasher::new();
+    hash.update(b"tinytree-search-canonical-source-v1\0");
+    hash.update(&(repository.len() as u64).to_be_bytes());
+    hash.update(repository.as_bytes());
+    hash.update(&scope.wire.content_digest);
+    if let Some(key) = &scope.wire.key {
+        hash.update(&key.handle);
+    }
+    *hash.finalize().as_bytes()
+}
+pub(crate) fn search_root(
+    host: &QueryHost,
+    scope: &Scoped,
+    repository: &str,
+    id: m::CommitId,
+    budget: &mut WorkBudget,
+    deadline: Instant,
+) -> Result<SearchTree, Status> {
+    let mut reader = Reader {
+        host,
+        scope,
+        repository,
+        budget,
+        deadline,
+        read_bytes: 0,
+    };
+    let commit = if id == m::CommitId::ROOT {
+        reader.canonical_source(id).map_err(search_failure)?;
+        m::synthetic_root()
+    } else {
+        reader.commit(id).map_err(search_failure)?
+    };
+    if commit.root_tree.terms.len() != 1 {
+        return Err(Status::failed_precondition(
+            "search requires a resolved canonical tree",
+        ));
+    }
+    Ok(SearchTree {
+        id: commit.root_tree.terms[0],
+        source: search_source(scope, repository),
+        intrinsic: id == m::CommitId::ROOT,
+    })
+}
+fn search_failure(error: Failure) -> Status {
+    match error {
+        Failure::Status(status) => status,
+        Failure::Boundary(Coverage::HistoryPrivateOverlay) => Status::unimplemented(
+            "search private metadata-only source has no canonical file authority",
+        ),
+        Failure::Boundary(_) => {
+            Status::resource_exhausted("canonical search source exceeds metadata limits")
+        }
+    }
+}
+impl SearchTree {
+    pub fn id(&self) -> m::TreeId {
+        self.id
+    }
+    pub fn entries(
+        &self,
+        read: &SearchRead<'_>,
+        scope: &Scoped,
+        repository: &str,
+        budget: &mut WorkBudget,
+        deadline: Instant,
+    ) -> Result<Vec<SearchEntry>, Status> {
+        if self.source != search_source(scope, repository) {
+            return Err(Status::internal("search canonical source mismatch"));
+        }
+        if self.intrinsic {
+            return Ok(Vec::new());
+        }
+        if Instant::now() >= deadline {
+            return Err(Status::deadline_exceeded("search tree deadline exceeded"));
+        }
+        let key = m::ObjectKey {
+            kind: m::Kind::Tree,
+            id: m::ObjectId(self.id.0),
+        };
+        let descriptor = read
+            .store
+            .descriptor(repository, key)
+            .map_err(|_| Status::unavailable("search tree metadata unavailable"))?
+            .ok_or_else(|| Status::data_loss("retained search tree missing"))?;
+        if descriptor.key != key
+            || descriptor.format_version != m::FORMAT_VERSION
+            || descriptor.size_bytes > read.metadata_max as u64
+        {
+            return Err(Status::resource_exhausted(
+                "search tree exceeds configured limit",
+            ));
+        }
+        budget
+            .charge(1, 0, descriptor.size_bytes)
+            .map_err(index_error)?;
+        let (actual, bytes) = read
+            .store
+            .read_metadata(repository, key)
+            .map_err(|_| Status::data_loss("search tree read failed"))?;
+        if actual != descriptor
+            || bytes.len() as u64 != descriptor.size_bytes
+            || blake3::hash(&bytes).as_bytes() != &key.id.0
+        {
+            return Err(Status::data_loss("search tree identity mismatch"));
+        }
+        let object = m::decode(
+            &bytes,
+            m::Limits {
+                max_object_bytes: read.metadata_max,
+                max_items: 65_536,
+                max_field_bytes: read.metadata_max,
+                max_path_bytes: 4096,
+            },
+        )
+        .map_err(|_| Status::data_loss("invalid search tree"))?;
+        let m::Object::Tree(tree) = object else {
+            return Err(Status::data_loss("search canonical tree has wrong kind"));
+        };
+        Ok(tree
+            .entries
+            .into_iter()
+            .map(|entry| SearchEntry {
+                name: entry.name,
+                child: match entry.value {
+                    m::TreeValue::Tree(id) => SearchChild::Tree(SearchTree {
+                        id,
+                        source: self.source,
+                        intrinsic: false,
+                    }),
+                    m::TreeValue::File { id, size_bytes, .. } => SearchChild::File(SearchFile {
+                        id,
+                        size: size_bytes,
+                        source: self.source,
+                    }),
+                    _ => SearchChild::Other,
+                },
+            })
+            .collect())
+    }
+    pub fn manifest(
+        &self,
+        read: &SearchRead<'_>,
+        scope: &Scoped,
+        repository: &str,
+        limits: &tinytree_index::content::ContentLimits,
+    ) -> Result<Option<SearchManifest>, Status> {
+        if self.source != search_source(scope, repository) {
+            return Err(Status::internal("search canonical source mismatch"));
+        }
+        read.index
+            .content_manifest(repository, self.id, limits)
+            .map_err(|_| Status::unavailable("search derived manifest unavailable"))?
+            .map(|value| {
+                if value.root != self.id {
+                    return Err(Status::data_loss("search manifest root mismatch"));
+                }
+                Ok(SearchManifest {
+                    root: self.clone(),
+                    value,
+                })
+            })
+            .transpose()
+    }
+}
+impl SearchManifest {
+    pub fn value(&self) -> &tinytree_index::content::ContentManifest {
+        &self.value
+    }
+    pub fn file(&self, index: usize) -> Option<SearchFile> {
+        self.value.entries.get(index).map(|entry| SearchFile {
+            id: entry.file,
+            size: entry.size,
+            source: self.root.source,
+        })
+    }
+}
+impl SearchFile {
+    pub fn id(&self) -> m::FileId {
+        self.id
+    }
+    pub fn size(&self) -> u64 {
+        self.size
+    }
+    pub fn read(
+        &self,
+        read: &SearchRead<'_>,
+        scope: &Scoped,
+        repository: &str,
+        maximum: usize,
+        budget: &mut WorkBudget,
+        deadline: Instant,
+    ) -> Result<Vec<u8>, Status> {
+        if self.source != search_source(scope, repository) {
+            return Err(Status::internal("search canonical source mismatch"));
+        }
+        if Instant::now() >= deadline {
+            return Err(Status::deadline_exceeded("search source deadline exceeded"));
+        }
+        let size = usize::try_from(self.size)
+            .map_err(|_| Status::resource_exhausted("search file exceeds size limit"))?;
+        if size > maximum {
+            return Err(Status::resource_exhausted("search file exceeds size limit"));
+        }
+        // Store::read verifies the whole member and can reconstruct a packed
+        // member before returning. Admission therefore covers the entire FILE.
+        budget.charge(1, 0, self.size).map_err(index_error)?;
+        let key = m::ObjectKey {
+            kind: m::Kind::File,
+            id: m::ObjectId(self.id.0),
+        };
+        let descriptor = read
+            .store
+            .descriptor(repository, key)
+            .map_err(|_| Status::unavailable("search FILE metadata unavailable"))?
+            .ok_or_else(|| Status::data_loss("retained search FILE missing"))?;
+        if descriptor.key != key
+            || descriptor.size_bytes != self.size
+            || descriptor.format_version != m::FORMAT_VERSION
+        {
+            return Err(Status::data_loss(
+                "search canonical FILE descriptor mismatch",
+            ));
+        }
+        let mut lease = read
+            .store
+            .read(repository, key)
+            .map_err(|_| Status::data_loss("search FILE read failed"))?;
+        if lease.descriptor() != descriptor {
+            return Err(Status::data_loss("search FILE descriptor changed"));
+        }
+        let mut bytes = vec![0; size];
+        lease
+            .read_exact(&mut bytes)
+            .map_err(|_| Status::data_loss("truncated search FILE"))?;
+        let mut tail = [0];
+        if lease
+            .read(&mut tail)
+            .map_err(|_| Status::data_loss("search FILE read failed"))?
+            != 0
+            || m::file_id(&bytes) != self.id
+        {
+            return Err(Status::data_loss("search FILE identity mismatch"));
+        }
+        if Instant::now() >= deadline {
+            return Err(Status::deadline_exceeded("search source deadline exceeded"));
+        }
+        Ok(bytes)
+    }
+}

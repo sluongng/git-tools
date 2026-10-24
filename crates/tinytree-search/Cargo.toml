@@ -1,0 +1,8 @@
+[package]
+name = "tinytree-search"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+description = "Bounded byte-literal matching and rebuildable trigram filters"
+
+[dependencies]

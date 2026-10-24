@@ -777,6 +777,80 @@ async fn timed_out_provider_job_keeps_admission_until_its_blocking_work_finishes
             .unwrap();
 }
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn object_client_absolute_deadline_expires_queued_owned_reads_without_renewal() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path().canonicalize().unwrap();
+    private(&root);
+    let backend = root.join("store");
+    private(&backend);
+    let spool = root.join("spool");
+    private(&spool);
+    let release = Release(Arc::new((
+        std::sync::Mutex::new(false),
+        std::sync::Condvar::new(),
+    )));
+    let entered = Arc::new(AtomicUsize::new(0));
+    let provider = Arc::new(PausedObjectRead {
+        resources: None,
+        inner: Arc::new(DirectObjectIo::init(&backend, backend_config()).unwrap()),
+        entered: entered.clone(),
+        release: release.0.clone(),
+    });
+    let socket = root.join("deadline.sock");
+    let mut cfg = config();
+    cfg.max_inflight = 1;
+    cfg.policy.operation_timeout_ms = 2000;
+    let host = Running::start(&socket, provider, cfg.clone()).await;
+    let client = BrokerObjectIo::connect(&socket, "example", &spool, cfg)
+        .await
+        .unwrap();
+    let key = tinytree_model::empty_tree().descriptor.key;
+    let active = client.clone();
+    let first = tokio::spawn(async move { active.descriptor(key).await });
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while entered.load(Ordering::SeqCst) == 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    let deadline = tokio::time::Instant::now() + Duration::from_millis(80);
+    let bounded = client
+        .clone()
+        .with_operation_deadline(deadline)
+        .with_operation_deadline(tokio::time::Instant::now() + Duration::from_secs(2))
+        .with_command_token([99; 32]);
+    assert!(
+        tokio::time::timeout(Duration::from_millis(400), bounded.descriptor(key))
+            .await
+            .expect("queued object read renewed its operation allowance")
+            .is_err()
+    );
+    assert_eq!(
+        entered.load(Ordering::SeqCst),
+        1,
+        "expired queued read must not reach the provider"
+    );
+    assert!(
+        tokio::time::timeout(Duration::from_millis(100), bounded.descriptor(key))
+            .await
+            .expect("reusing an expired object clone renewed its allowance")
+            .is_err()
+    );
+    assert_eq!(entered.load(Ordering::SeqCst), 1);
+    release.release();
+    assert!(first.await.unwrap().unwrap().is_some());
+    assert!(
+        client.descriptor(key).await.unwrap().is_some(),
+        "unbounded sibling is unaffected"
+    );
+    assert_eq!(entered.load(Ordering::SeqCst), 2);
+    drop((bounded, client));
+    host.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn cancelled_metadata_waiter_keeps_owners_until_local_and_provider_jobs_finish() {
     // Exercise each global pool independently: either missing reservation would
     // otherwise let the second alias enter while the first job is still live.
@@ -1733,6 +1807,8 @@ struct FakeQuery {
     page_calls: std::sync::Mutex<Vec<([u8; 32], u64)>>,
     fact_calls: std::sync::atomic::AtomicUsize,
     history_calls: std::sync::atomic::AtomicUsize,
+    search_calls: std::sync::atomic::AtomicUsize,
+    search_fault: std::sync::atomic::AtomicUsize,
     malformed_history_echo: std::sync::atomic::AtomicBool,
     corrupt_blame_bytes: std::sync::atomic::AtomicBool,
     page_pause: Option<Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>>,
@@ -1756,6 +1832,8 @@ impl FakeQuery {
             page_calls: Default::default(),
             fact_calls: Default::default(),
             history_calls: Default::default(),
+            search_calls: Default::default(),
+            search_fault: Default::default(),
             malformed_history_echo: Default::default(),
             corrupt_blame_bytes: Default::default(),
             page_pause: None,
@@ -2137,6 +2215,68 @@ impl native_broker::NativeQueryIo for FakeQuery {
             }],
         }))
     }
+    async fn search(
+        &self,
+        input: native_broker::ScopedSearchQuery,
+        _: native_broker::QueryOwner,
+    ) -> Result<native_broker::QueryReply<native_broker::query_protocol::SearchResult>, tonic::Status>
+    {
+        use native_broker::query_protocol as q;
+        self.scope(input.scope)?;
+        self.search_calls
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let first = input.cursor.is_empty();
+        if !first && input.cursor != [self.marker] {
+            return Err(tonic::Status::permission_denied(
+                "fixture cursor belongs to another provider",
+            ));
+        }
+        let offset = if first {
+            0
+        } else {
+            input.pattern.len() as u64 + 1
+        };
+        let mut value = q::SearchResult {
+            scope_digest: vec![self.marker; 32],
+            index_epoch: vec![self.marker; 16],
+            revision: Some(q::CommitId {
+                value: input.revision.0.to_vec(),
+            }),
+            root_tree: vec![self.marker; 32],
+            manifest_digest: vec![self.marker + 1; 32],
+            pattern: input.pattern.clone(),
+            path_prefix: input.path_prefix,
+            policy: input.policy as i32,
+            coverage: if first {
+                q::SearchCoverage::SearchMore
+            } else {
+                q::SearchCoverage::SearchComplete
+            } as i32,
+            hits: vec![q::SearchHit {
+                path: "src/main.rs".into(),
+                file_id: vec![self.marker; 32],
+                file_size: input.pattern.len() as u64 * 2 + 1,
+                byte_offset: offset,
+                match_bytes: input.pattern.len() as u32,
+                line: 1,
+                byte_column: offset,
+                snippet_offset: offset,
+                snippet: input.pattern,
+            }],
+            cursor: if first { vec![self.marker] } else { vec![] },
+            entries_examined: if first { 1 } else { 2 },
+            file_bytes_read: 32,
+            page_size: input.page_size.max(1),
+        };
+        match self.search_fault.load(std::sync::atomic::Ordering::SeqCst) {
+            1 => value.pattern.push(b'!'),
+            2 => value.hits[0].snippet[0] ^= 1,
+            3 => value.hits.push(value.hits[0].clone()),
+            4 => value.cursor.clear(),
+            _ => {}
+        }
+        Ok(self.reply(value))
+    }
     async fn close_query(
         &self,
         _: [u8; 32],
@@ -2301,6 +2441,156 @@ async fn scoped_path_queries_route_exact_aliases_and_reject_invalid_results() {
         local.blame(input, Arc::new(())).await.unwrap_err().code(),
         tonic::Code::DataLoss
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn indexed_search_routes_aliases_and_checks_paged_hit_provenance() {
+    use native_broker::{NativeQueryIo, ScopedSearchQuery, query_protocol as q};
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path().canonicalize().unwrap();
+    private(&root);
+    let first_provider = Arc::new(FakeQuery::new(1, 1024));
+    let second_provider = Arc::new(FakeQuery::new(2, 1024));
+    let cfg = Config {
+        max_inflight: 1,
+        ..query_config()
+    };
+    let service = query_service(&root, first_provider.clone(), second_provider, cfg.clone());
+    let socket = root.join("search.sock");
+    let host = Running::start_service(&socket, service.clone()).await;
+    let first = native_broker::BrokerQueryClient::connect(&socket, "first", cfg.clone())
+        .await
+        .unwrap();
+    let second = native_broker::BrokerQueryClient::connect(&socket, "second", cfg)
+        .await
+        .unwrap();
+    let input = ScopedSearchQuery {
+        scope: [1; 32],
+        revision: native_broker::CommitId([5; 32]),
+        pattern: b"needle".to_vec(),
+        path_prefix: "src".into(),
+        policy: q::SearchPolicy::LiteralBytesV1,
+        page_size: 1,
+        cursor: vec![],
+    };
+    let page = first.search(input.clone(), Arc::new(())).await.unwrap();
+    assert_eq!(page.value.scope_digest, vec![1; 32]);
+    assert_eq!(page.value.coverage, q::SearchCoverage::SearchMore as i32);
+    let next = first
+        .search(
+            ScopedSearchQuery {
+                cursor: page.value.cursor.clone(),
+                ..input.clone()
+            },
+            Arc::new(()),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        next.value.coverage,
+        q::SearchCoverage::SearchComplete as i32
+    );
+    assert!(next.value.hits[0].byte_offset > page.value.hits[0].byte_offset);
+    let other = second
+        .search(
+            ScopedSearchQuery {
+                scope: [2; 32],
+                ..input.clone()
+            },
+            Arc::new(()),
+        )
+        .await
+        .unwrap();
+    assert_eq!(other.value.scope_digest, vec![2; 32]);
+    assert_eq!(
+        second
+            .search(input.clone(), Arc::new(()))
+            .await
+            .unwrap_err()
+            .code(),
+        tonic::Code::PermissionDenied
+    );
+    assert_eq!(
+        second
+            .search(
+                ScopedSearchQuery {
+                    scope: [2; 32],
+                    cursor: page.value.cursor.clone(),
+                    ..input.clone()
+                },
+                Arc::new(())
+            )
+            .await
+            .unwrap_err()
+            .code(),
+        tonic::Code::PermissionDenied
+    );
+    let local = service.query_io("first").unwrap();
+    let calls = first_provider
+        .search_calls
+        .load(std::sync::atomic::Ordering::SeqCst);
+    for prefix in ["../src", "src/", "src//nested"] {
+        let invalid = ScopedSearchQuery {
+            path_prefix: prefix.into(),
+            ..input.clone()
+        };
+        assert_eq!(
+            first
+                .search(invalid.clone(), Arc::new(()))
+                .await
+                .unwrap_err()
+                .code(),
+            tonic::Code::InvalidArgument
+        );
+        assert_eq!(
+            local
+                .search(invalid, Arc::new(()))
+                .await
+                .unwrap_err()
+                .code(),
+            tonic::Code::InvalidArgument
+        );
+    }
+    assert_eq!(
+        first_provider
+            .search_calls
+            .load(std::sync::atomic::Ordering::SeqCst),
+        calls
+    );
+    for (behavior, fault) in [
+        ("pattern binding", 1),
+        ("snippet match", 2),
+        ("duplicate position", 3),
+        ("continuation coverage", 4),
+    ] {
+        let invalid = ScopedSearchQuery {
+            page_size: 2,
+            ..input.clone()
+        };
+        first_provider
+            .search_fault
+            .store(fault, std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(
+            first
+                .search(invalid.clone(), Arc::new(()))
+                .await
+                .unwrap_err()
+                .code(),
+            tonic::Code::DataLoss,
+            "{behavior}"
+        );
+        assert_eq!(
+            local
+                .search(invalid.clone(), Arc::new(()))
+                .await
+                .unwrap_err()
+                .code(),
+            tonic::Code::DataLoss,
+            "{behavior}"
+        );
+    }
+    drop((page, next, other, first, second, local));
+    host.stop().await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

@@ -4,6 +4,8 @@ pub(crate) mod cloud;
 pub(crate) mod history;
 #[path = "query.rs"]
 pub(crate) mod query;
+#[path = "search.rs"]
+pub(crate) mod search;
 use crate::transport::Client as RepositoryClient;
 use crate::{
     CanonicalCommitSummaries, Config, MetadataOutcome, UploadSource, VerifiedFile,

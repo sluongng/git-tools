@@ -40,12 +40,14 @@ instance refusal, and insecure-server rejection. Cross-compilation alone is not
 native transport acceptance.
 
 Optional `NativeQueryIo` adapters and `BrokerQueryClient` provide bounded graph
-queries through the same local endpoint. Handles are broker-local; upstream
+queries, path history and literal search through the same local endpoint.
+Handles are broker-local; upstream
 credentials and cursors stay in the configured adapter. Distinct repository or
 trust scopes require distinct adapters; aliases explicitly sharing one adapter
 are trusted synonyms for its handles. Partial-query close is
 explicit cancellation, not proof of exhaustion. Returned pages retain byte/root
 owners independently of transport slots.
+Both clients support clone-local, shrink-only absolute operation deadlines.
 
 `max_query_bytes` defaults to 512 KiB. The separate
 `max_query_persistent_bytes` defaults to 512 MiB and bounds the sum of declared

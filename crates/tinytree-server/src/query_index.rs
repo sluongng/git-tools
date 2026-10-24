@@ -99,6 +99,23 @@ pub struct QueryConfig {
     /// across history or exact resident bytes. Physical admission is separate.
     pub max_blame_diff_memory_bytes: usize,
     pub max_blame_diff_depth: usize,
+    pub max_search_entries: usize,
+    pub max_search_manifest_bytes: usize,
+    pub max_search_cache_bytes: u64,
+    pub max_search_cache_records: usize,
+    pub max_search_file_bytes: usize,
+    pub max_search_read_bytes: usize,
+    pub max_search_entries_per_page: usize,
+    pub max_search_total_entries: u64,
+    pub max_search_total_read_bytes: u64,
+    pub max_search_match_work: usize,
+    pub max_search_total_work: u64,
+    pub max_search_path_depth: usize,
+    pub max_pending_search_warms: usize,
+    pub search_warm_timeout_seconds: u64,
+    pub max_search_warm_file_bytes: usize,
+    pub max_search_warm_read_bytes: u64,
+    pub max_search_warm_memory_bytes: usize,
 }
 impl Default for QueryConfig {
     fn default() -> Self {
@@ -176,6 +193,23 @@ impl Default for QueryConfig {
             max_blame_diff_steps: 16_000_000,
             max_blame_diff_memory_bytes: 8 * 1024 * 1024,
             max_blame_diff_depth: 64,
+            max_search_entries: 65_536,
+            max_search_manifest_bytes: 8 * 1024 * 1024,
+            max_search_cache_bytes: 64 * 1024 * 1024,
+            max_search_cache_records: 65_536,
+            max_search_file_bytes: 1024 * 1024,
+            max_search_read_bytes: 8 * 1024 * 1024,
+            max_search_entries_per_page: 2048,
+            max_search_total_entries: 262_144,
+            max_search_total_read_bytes: 256 * 1024 * 1024,
+            max_search_match_work: 8_000_000,
+            max_search_total_work: 64_000_000,
+            max_search_path_depth: 128,
+            max_pending_search_warms: 4,
+            search_warm_timeout_seconds: 60,
+            max_search_warm_file_bytes: 64 * 1024 * 1024,
+            max_search_warm_read_bytes: 512 * 1024 * 1024,
+            max_search_warm_memory_bytes: 192 * 1024 * 1024,
         }
     }
 }
@@ -200,6 +234,31 @@ impl QueryConfig {
             .saturating_add(self.max_blame_diff_memory_bytes.saturating_mul(2))
             .saturating_add(self.max_blame_lines.saturating_mul(256))
             .saturating_add(self.max_history_commits.saturating_mul(512))
+    }
+    pub(crate) fn search_memory(&self) -> usize {
+        self.max_search_manifest_bytes
+            .saturating_mul(3)
+            .saturating_add(self.max_search_file_bytes.saturating_mul(4))
+            .saturating_add(self.max_response_bytes.saturating_mul(2))
+    }
+    pub(crate) fn search_warm_memory(&self) -> usize {
+        // Packed FILE reconstruction plus the caller's verified bytes; manifest
+        // strings/serialization; wide TREE decode before the entry limit; and
+        // amortized inventory/unzip/dedup container capacity (not just length).
+        self.max_search_warm_file_bytes
+            .saturating_mul(2)
+            .saturating_add(self.max_search_manifest_bytes.saturating_mul(3))
+            .saturating_add(self.max_history_object_bytes.saturating_mul(8))
+            .saturating_add(self.max_search_entries.saturating_mul(512))
+    }
+    pub(crate) fn search_content_limits(&self) -> tinytree_index::content::ContentLimits {
+        tinytree_index::content::ContentLimits {
+            max_bytes: self.max_search_cache_bytes,
+            max_records: self.max_search_cache_records,
+            max_manifest_entries: self.max_search_entries,
+            max_manifest_bytes: self.max_search_manifest_bytes,
+            max_path_bytes: 4096,
+        }
     }
     fn warm_memory(&self) -> usize {
         self.max_warm_bytes
@@ -281,6 +340,29 @@ impl QueryConfig {
             || !(1..=100_000_000).contains(&self.max_blame_diff_steps)
             || !(1024..=64 * 1024 * 1024).contains(&self.max_blame_diff_memory_bytes)
             || !(1..=256).contains(&self.max_blame_diff_depth)
+            || !(1..=65_536).contains(&self.max_search_entries)
+            || !(1024..=16 * 1024 * 1024).contains(&self.max_search_manifest_bytes)
+            || !(1024 * 1024..=1024 * 1024 * 1024).contains(&self.max_search_cache_bytes)
+            || !(16..=262_144).contains(&self.max_search_cache_records)
+            || !(1..=4 * 1024 * 1024).contains(&self.max_search_file_bytes)
+            || self.max_search_read_bytes < self.max_search_file_bytes
+            || self.max_search_read_bytes > 64 * 1024 * 1024
+            || !(1..=65_536).contains(&self.max_search_entries_per_page)
+            || self.max_search_total_entries < self.max_search_entries_per_page as u64
+            || self.max_search_total_entries > 1_000_000
+            || self.max_search_total_read_bytes < self.max_search_read_bytes as u64
+            || self.max_search_total_read_bytes > 4 * 1024 * 1024 * 1024
+            || !(1..=100_000_000).contains(&self.max_search_match_work)
+            || self.max_search_total_work < self.max_search_match_work as u64
+            || self.max_search_total_work > 1_000_000_000
+            || !(1..=1024).contains(&self.max_search_path_depth)
+            || !(1..=32).contains(&self.max_pending_search_warms)
+            || !(1..=600).contains(&self.search_warm_timeout_seconds)
+            || self.max_search_warm_file_bytes < self.max_search_file_bytes
+            || self.max_search_warm_file_bytes > 64 * 1024 * 1024
+            || self.max_search_warm_read_bytes < self.max_search_warm_file_bytes as u64
+            || self.max_search_warm_read_bytes > 4 * 1024 * 1024 * 1024
+            || !(1024..=512 * 1024 * 1024).contains(&self.max_search_warm_memory_bytes)
             || self
                 .max_scope_overlay_bytes
                 .saturating_mul(4)
@@ -498,6 +580,7 @@ pub(crate) struct QueryHost {
     pub config: QueryConfig,
     pub store: tinytree_store::Store,
     pub cursors: crate::query_cursor::CursorHost,
+    pub search: std::sync::Arc<crate::query_search::SearchHost>,
     registry: Mutex<Registry>,
     scope_memory: Arc<Semaphore>,
     overlay_memory: Arc<Semaphore>,
@@ -525,9 +608,13 @@ pub(crate) struct Work {
     _inflight: OwnedSemaphorePermit,
     _host: Arc<QueryHost>,
     history_admitted: bool,
+    search_admitted: bool,
 }
 
 impl Work {
+    pub fn has_search_memory(&self) -> bool {
+        self.search_admitted
+    }
     pub fn has_history_memory(&self) -> bool {
         self.history_admitted
     }
@@ -615,8 +702,15 @@ impl QueryHost {
             workers.push(worker);
         }
         let cursors = crate::query_cursor::CursorHost::new(&config)?;
+        let search = crate::query_search::SearchHost::new(
+            index.clone(),
+            store.clone(),
+            config.clone(),
+            closing.clone(),
+        )?;
         let host = Arc::new(Self {
             cursors,
+            search,
             index,
             store,
             request_memory: config.request_memory(service.max_request_bytes),
@@ -703,6 +797,7 @@ impl QueryHost {
         else {
             return false;
         };
+        success &= self.search.drain().await;
         self.warm.lock().unwrap().take();
         let workers = std::mem::take(&mut *self.workers.lock().unwrap());
         success &= tokio::task::spawn_blocking(move || {
@@ -757,21 +852,40 @@ impl QueryHost {
         self: &Arc<Self>,
         deadline: tokio::time::Instant,
     ) -> Result<Arc<Work>, Status> {
-        self.admit_kind(deadline, false).await
+        self.admit_kind(deadline, false, false).await
     }
     pub async fn admit_history(
         self: &Arc<Self>,
         deadline: tokio::time::Instant,
     ) -> Result<Arc<Work>, Status> {
-        self.admit_kind(deadline, true).await
+        self.admit_kind(deadline, true, false).await
+    }
+    pub async fn admit_search(
+        self: &Arc<Self>,
+        deadline: tokio::time::Instant,
+    ) -> Result<Arc<Work>, Status> {
+        self.admit_kind(deadline, false, true).await
     }
     async fn admit_kind(
         self: &Arc<Self>,
         deadline: tokio::time::Instant,
         history: bool,
+        search: bool,
     ) -> Result<Arc<Work>, Status> {
         if self.closing.load(Ordering::Acquire) {
             return Err(Status::unavailable("query host draining"));
+        }
+        let bytes = self.request_memory.saturating_add(if history {
+            self.config.history_memory()
+        } else if search {
+            self.config.search_memory()
+        } else {
+            0
+        });
+        if bytes > self.config.max_request_memory_bytes {
+            return Err(Status::resource_exhausted(
+                "requested query memory exceeds configured pool",
+            ));
         }
         let permit = tokio::time::timeout_at(deadline, self.inflight.clone().acquire_owned())
             .await
@@ -779,11 +893,6 @@ impl QueryHost {
             .map_err(|_| Status::unavailable("query host draining"))?;
         // One weighted acquisition, before decoding. Never hold the base memory
         // reservation while waiting to upgrade to history buffers.
-        let bytes = self.request_memory.saturating_add(if history {
-            self.config.history_memory()
-        } else {
-            0
-        });
         let memory = tokio::time::timeout_at(
             deadline,
             self.memory.clone().acquire_many_owned(bytes as u32),
@@ -800,6 +909,7 @@ impl QueryHost {
             _inflight: permit,
             _memory: memory,
             history_admitted: history,
+            search_admitted: search,
             scopes: Mutex::new(Vec::new()),
             query_owners: Mutex::new(Vec::new()),
         }))

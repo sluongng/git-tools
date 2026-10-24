@@ -1618,3 +1618,557 @@ fn lexical_cursor_policy_and_resource_errors_never_become_absent_prefix_results(
         .unwrap();
     assert_eq!(retry.nodes[0].commit(), node.commit);
 }
+
+#[test]
+fn content_manifests_publish_atomically_and_survive_restart_without_graph_changes() {
+    use crate::content::{ContentEntry, ContentLimits};
+    let (dir, index) = fixture();
+    let limits = ContentLimits::default();
+    let before = index.stats().unwrap();
+    let root = m::TreeId([42; 32]);
+    let bytes = b"verified example needle bytes";
+    let file = m::file_id(bytes);
+    let entries = vec![ContentEntry {
+        path: "src/example.rs".into(),
+        file,
+        size: bytes.len() as u64,
+    }];
+    assert!(matches!(
+        index.put_content_manifest("example", root, &entries, &limits),
+        Err(Error::NotReady)
+    ));
+    assert!(
+        index
+            .content_manifest("example", root, &limits)
+            .unwrap()
+            .is_none()
+    );
+    let mut filter = tinytree_search::FilterBuilder::new();
+    filter.update(bytes);
+    index
+        .put_content_file(
+            "example",
+            file,
+            bytes.len() as u64,
+            filter.finish(),
+            &limits,
+        )
+        .unwrap();
+    let digest = index
+        .put_content_manifest("example", root, &entries, &limits)
+        .unwrap();
+    assert_eq!(
+        index
+            .put_content_manifest("example", root, &entries, &limits)
+            .unwrap(),
+        digest
+    );
+    assert_eq!(index.stats().unwrap(), before);
+    assert!(
+        index
+            .content_file("other", file, bytes.len() as u64, &limits)
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        index
+            .content_manifest("other", root, &limits)
+            .unwrap()
+            .is_none()
+    );
+    drop(index);
+    let index = Index::open(dir.path().join("graph"), &Limits::default()).unwrap();
+    let manifest = index
+        .content_manifest("example", root, &limits)
+        .unwrap()
+        .unwrap();
+    assert_eq!(manifest.entries, entries);
+    assert_eq!(manifest.digest, digest);
+    assert!(
+        index
+            .content_file("example", file, bytes.len() as u64, &limits)
+            .unwrap()
+            .unwrap()
+            .filter
+            .may_match(b"needle")
+    );
+    assert_eq!(index.stats().unwrap(), before);
+    let unsorted = vec![entries[0].clone(), entries[0].clone()];
+    assert!(matches!(
+        index.put_content_manifest("example", m::TreeId([43; 32]), &unsorted, &limits),
+        Err(Error::Invalid(_))
+    ));
+    assert!(
+        index
+            .content_manifest("example", m::TreeId([43; 32]), &limits)
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[test]
+fn content_fifo_eviction_cannot_turn_missing_filters_into_negative_results() {
+    use crate::content::{ContentEntry, ContentLimits};
+    let (dir, index) = fixture();
+    let limits = ContentLimits {
+        max_bytes: 2048,
+        max_records: 2,
+        ..Default::default()
+    };
+    let root = m::TreeId([44; 32]);
+    let one = b"first content";
+    let two = b"second content";
+    let first = m::file_id(one);
+    let second = m::file_id(two);
+    let put = |id, bytes: &[u8]| {
+        let mut filter = tinytree_search::FilterBuilder::new();
+        filter.update(bytes);
+        index
+            .put_content_file("example", id, bytes.len() as u64, filter.finish(), &limits)
+            .unwrap();
+    };
+    put(first, one);
+    let entries = vec![ContentEntry {
+        path: "one".into(),
+        file: first,
+        size: one.len() as u64,
+    }];
+    index
+        .put_content_manifest("example", root, &entries, &limits)
+        .unwrap();
+    put(second, two); // FIFO evicts the filter, not a canonical object or graph row.
+    assert!(
+        index
+            .content_manifest("example", root, &limits)
+            .unwrap()
+            .is_some()
+    );
+    assert!(
+        index
+            .content_file("example", first, one.len() as u64, &limits)
+            .unwrap()
+            .is_none()
+    );
+    assert!(matches!(
+        index.put_content_manifest("example", root, &entries, &limits),
+        Err(Error::NotReady)
+    ));
+    drop(index);
+    let index = Index::open(dir.path().join("graph"), &Limits::default()).unwrap();
+    assert!(
+        index
+            .content_file("example", first, one.len() as u64, &limits)
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        index
+            .content_file("example", second, two.len() as u64, &limits)
+            .unwrap()
+            .is_some()
+    );
+}
+
+#[test]
+fn content_records_detect_corruption_without_disabling_graph_facts() {
+    use crate::content::ContentLimits;
+    let (dir, index) = fixture();
+    let limits = ContentLimits::default();
+    let bytes = b"content whose derived checksum will be corrupted";
+    let id = m::file_id(bytes);
+    let mut filter = tinytree_search::FilterBuilder::new();
+    filter.update(bytes);
+    index
+        .put_content_file("example", id, bytes.len() as u64, filter.finish(), &limits)
+        .unwrap();
+    let before = index.stats().unwrap();
+    {
+        let state = index.state.lock().unwrap();
+        let table = state
+            .db
+            .keyspace("content-search-v1", KeyspaceCreateOptions::default)
+            .unwrap();
+        let key = key(b'f', &repo_hash("example").unwrap(), &id.0);
+        let mut raw = table.get(&key).unwrap().unwrap().to_vec();
+        let last = raw.len() - 1;
+        raw[last] ^= 1;
+        let mut tx = state.db.write_tx().durability(Some(PersistMode::SyncAll));
+        tx.insert(&table, key, raw);
+        tx.commit().unwrap();
+    }
+    assert!(matches!(
+        index.content_file("example", id, bytes.len() as u64, &limits),
+        Err(Error::Corrupt)
+    ));
+    assert_eq!(index.stats().unwrap(), before);
+    drop(index);
+    let index = Index::open(dir.path().join("graph"), &Limits::default()).unwrap();
+    assert_eq!(index.stats().unwrap(), before);
+    assert!(matches!(
+        index.content_file("example", id, bytes.len() as u64, &limits),
+        Err(Error::Corrupt)
+    ));
+}
+
+#[test]
+fn permanently_infeasible_content_manifests_are_not_retryable_cache_misses() {
+    use crate::content::{ContentEntry, ContentLimits};
+    let (_dir, index) = fixture();
+    let before = index.stats().unwrap();
+    let limits = ContentLimits {
+        max_records: 16,
+        ..Default::default()
+    };
+    let root = m::TreeId([45; 32]);
+    let entries = (0..17)
+        .map(|n| ContentEntry {
+            path: format!("file-{n:02}"),
+            file: m::file_id(&[n as u8]),
+            size: 1,
+        })
+        .collect::<Vec<_>>();
+    assert!(matches!(
+        limits.check_manifest(root, &entries),
+        Err(Error::BudgetExceeded)
+    ));
+    assert!(matches!(
+        index.put_content_manifest("example", root, &entries, &limits),
+        Err(Error::BudgetExceeded)
+    ));
+    assert!(
+        index.state.lock().unwrap().content.is_none(),
+        "permanent quota rejection must precede header initialization"
+    );
+    assert_eq!(index.stats().unwrap(), before);
+    let feasible = &entries[..15];
+    limits.check_manifest(root, feasible).unwrap();
+    assert!(matches!(
+        index.put_content_manifest("example", root, feasible, &limits),
+        Err(Error::NotReady)
+    ));
+    assert!(
+        index
+            .content_manifest("example", root, &limits)
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(index.stats().unwrap(), before);
+
+    let bytes = ContentLimits {
+        max_bytes: 1024,
+        ..Default::default()
+    };
+    assert!(matches!(
+        bytes.check_manifest(root, &entries[..2]),
+        Err(Error::BudgetExceeded)
+    ));
+    let repeated = entries
+        .iter()
+        .map(|entry| ContentEntry {
+            file: entries[0].file,
+            ..entry.clone()
+        })
+        .collect::<Vec<_>>();
+    let shared = ContentLimits {
+        max_records: 2,
+        ..Default::default()
+    };
+    shared.check_manifest(root, &repeated).unwrap(); // Duplicate paths share one FILE filter.
+}
+
+// Spawned only by the public-API recovery case below. process::exit deliberately
+// bypasses Index/Fjall Drop so graceful journal flushing cannot establish proof.
+#[test]
+fn content_durability_child() {
+    let Some(path) = std::env::var_os("TINYTREE_INDEX_CONTENT_CHILD_PATH") else {
+        return;
+    };
+    let mode = std::env::var("TINYTREE_INDEX_CONTENT_CHILD_MODE").unwrap();
+    let index = Index::open(Path::new(&path), &Limits::default()).unwrap();
+    let limits = content::ContentLimits::default();
+    let bytes = b"first verified needle content";
+    let file = m::file_id(bytes);
+    let mut filter = tinytree_search::FilterBuilder::new();
+    filter.update(bytes);
+    index
+        .put_content_file(
+            "example",
+            file,
+            bytes.len() as u64,
+            filter.finish(),
+            &limits,
+        )
+        .unwrap();
+    let root = m::TreeId([46; 32]);
+    let entries = vec![content::ContentEntry {
+        path: "first".into(),
+        file,
+        size: bytes.len() as u64,
+    }];
+    if mode != "partial" {
+        index
+            .put_content_manifest("example", root, &entries, &limits)
+            .unwrap();
+    }
+    if mode == "idempotent" {
+        let second = b"second verified needle content";
+        let id = m::file_id(second);
+        let mut filter = tinytree_search::FilterBuilder::new();
+        filter.update(second);
+        index
+            .put_content_file("example", id, second.len() as u64, filter.finish(), &limits)
+            .unwrap();
+        // The old manifest already exists: this call must nevertheless flush
+        // the newly journaled filter rather than return early without syncing.
+        index
+            .put_content_manifest("example", root, &entries, &limits)
+            .unwrap();
+    }
+    std::process::exit(0);
+}
+
+#[test]
+fn completed_content_publication_survives_exit_without_destructor_flush() {
+    use crate::content::{ContentEntry, ContentLimits};
+    for mode in ["partial", "complete", "idempotent"] {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("graph");
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "tests::content_durability_child", "--nocapture"])
+            .env("TINYTREE_INDEX_CONTENT_CHILD_PATH", &path)
+            .env("TINYTREE_INDEX_CONTENT_CHILD_MODE", mode)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{mode}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let index = Index::open(&path, &Limits::default()).unwrap();
+        let limits = ContentLimits::default();
+        let root = m::TreeId([46; 32]);
+        let bytes = b"first verified needle content";
+        let file = m::file_id(bytes);
+        let manifest = index.content_manifest("example", root, &limits).unwrap();
+        if mode == "partial" {
+            assert!(
+                manifest.is_none(),
+                "unpublished filters are not a complete revision"
+            );
+            // A recovered filter is optional before publication; rebuilding it
+            // and atomically completing the revision is always safe.
+            let mut filter = tinytree_search::FilterBuilder::new();
+            filter.update(bytes);
+            index
+                .put_content_file(
+                    "example",
+                    file,
+                    bytes.len() as u64,
+                    filter.finish(),
+                    &limits,
+                )
+                .unwrap();
+            index
+                .put_content_manifest(
+                    "example",
+                    root,
+                    &[ContentEntry {
+                        path: "first".into(),
+                        file,
+                        size: bytes.len() as u64,
+                    }],
+                    &limits,
+                )
+                .unwrap();
+        } else {
+            assert_eq!(
+                manifest.unwrap().entries,
+                vec![ContentEntry {
+                    path: "first".into(),
+                    file,
+                    size: bytes.len() as u64
+                }]
+            );
+            assert!(
+                index
+                    .content_file("example", file, bytes.len() as u64, &limits)
+                    .unwrap()
+                    .unwrap()
+                    .filter
+                    .may_match(b"needle")
+            );
+        }
+        if mode == "idempotent" {
+            let second = b"second verified needle content";
+            assert!(
+                index
+                    .content_file("example", m::file_id(second), second.len() as u64, &limits)
+                    .unwrap()
+                    .is_some(),
+                "idempotent completion must synchronize preceding buffered filter writes"
+            );
+        }
+        assert_eq!(
+            index.stats().unwrap(),
+            IndexStats {
+                repositories: 0,
+                nodes: 0,
+                logical_bytes: 0
+            }
+        );
+    }
+}
+
+#[test]
+#[ignore = "manual paired durability component benchmark"]
+fn benchmark_paired_content_filter_durability() {
+    use crate::content::{ContentEntry, ContentLimits};
+    use std::time::Instant;
+    let overall = Instant::now();
+    for count in [64usize, 1024] {
+        // Verify and derive every input outside the timed publication phases.
+        let mut filters = Vec::with_capacity(count);
+        let mut entries = Vec::with_capacity(count);
+        let mut tree_entries = Vec::with_capacity(count);
+        for n in 0..count {
+            let mut bytes = vec![b'a'; 4096];
+            let label = format!("derived filter fixture {n:05}\n");
+            bytes[..label.len()].copy_from_slice(label.as_bytes());
+            let descriptor = m::describe_file(&bytes);
+            m::verify(&descriptor, &bytes, m::Limits::default()).unwrap();
+            let file = m::FileId(descriptor.key.id.0);
+            let mut filter = tinytree_search::FilterBuilder::new();
+            filter.update(&bytes);
+            filters.push((file, descriptor.size_bytes, filter.finish()));
+            let path = format!("file-{n:05}");
+            entries.push(ContentEntry {
+                path: path.clone(),
+                file,
+                size: descriptor.size_bytes,
+            });
+            tree_entries.push(m::TreeEntry {
+                name: path,
+                value: m::TreeValue::File {
+                    id: file,
+                    executable: false,
+                    size_bytes: descriptor.size_bytes,
+                    copy_id: None,
+                },
+            });
+        }
+        let tree = m::encode(
+            &m::Object::Tree(m::Tree {
+                entries: tree_entries,
+            }),
+            m::Limits::default(),
+        )
+        .unwrap();
+        m::verify(&tree.descriptor, &tree.bytes, m::Limits::default()).unwrap();
+        let root = m::TreeId(tree.descriptor.key.id.0);
+        let limits = ContentLimits::default();
+        limits.check_manifest(root, &entries).unwrap();
+        for pair in 0..5 {
+            let order = if pair % 2 == 0 {
+                [true, false]
+            } else {
+                [false, true]
+            };
+            let mut pair_metadata = None;
+            for (order_index, synced) in order.into_iter().enumerate() {
+                assert!(
+                    overall.elapsed().as_secs() < 60,
+                    "paired component benchmark elapsed budget exceeded"
+                );
+                let directory = tempfile::tempdir().unwrap();
+                let index =
+                    Index::open(directory.path().join("graph"), &Limits::default()).unwrap();
+                // Cache/keyspace initialization has its own fixed header barrier
+                // and is deliberately outside both measured profiles.
+                assert!(
+                    index
+                        .content_manifest("example", root, &limits)
+                        .unwrap()
+                        .is_none()
+                );
+                let graph_before = index.stats().unwrap();
+                let started = Instant::now();
+                for (file, size, filter) in &filters {
+                    if synced {
+                        index
+                            .put_content_file_synced_for_benchmark(
+                                "example",
+                                *file,
+                                *size,
+                                filter.clone(),
+                                &limits,
+                            )
+                            .unwrap();
+                    } else {
+                        index
+                            .put_content_file("example", *file, *size, filter.clone(), &limits)
+                            .unwrap();
+                    }
+                }
+                let filter_ns = started.elapsed().as_nanos() as u64;
+                let complete_started = Instant::now();
+                let digest = index
+                    .put_content_manifest("example", root, &entries, &limits)
+                    .unwrap();
+                let complete_ns = complete_started.elapsed().as_nanos() as u64;
+                let total_ns = started.elapsed().as_nanos() as u64;
+                // Every recorded sample is semantically complete, not a faster
+                // incomplete-write profile. Verification is outside its timer.
+                let manifest = index
+                    .content_manifest("example", root, &limits)
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(manifest.digest, digest);
+                assert_eq!(manifest.entries, entries);
+                for (file, size, filter) in &filters {
+                    assert_eq!(
+                        index
+                            .content_file("example", *file, *size, &limits)
+                            .unwrap()
+                            .unwrap()
+                            .filter,
+                        *filter
+                    );
+                }
+                assert_eq!(index.stats().unwrap(), graph_before);
+                let (records, logical_bytes) = {
+                    let state = index.state.lock().unwrap();
+                    let table = state
+                        .db
+                        .keyspace("content-search-v1", KeyspaceCreateOptions::default)
+                        .unwrap();
+                    let mut records = 0;
+                    let mut bytes = 0u64;
+                    for item in state.db.read_tx().prefix(&table, b"") {
+                        let (key, value) = item.into_inner().unwrap();
+                        if key.as_ref() != b"header" {
+                            records += 1;
+                            bytes += (key.len() + value.len()) as u64;
+                        }
+                    }
+                    (records, bytes)
+                };
+                assert_eq!(records, count + 1);
+                if let Some(metadata) = pair_metadata {
+                    assert_eq!(metadata, (records, logical_bytes));
+                }
+                pair_metadata = Some((records, logical_bytes));
+                println!(
+                    "TINYTREE_CONTENT_FILTER_DURABILITY_PAIR_V1 {}",
+                    serde_json::json!({
+                        "component":"derived_filter_publication", "files":count,"pair":pair,"order_index":order_index,
+                        "profile":if synced {"sync_per_filter"} else {"buffered_filters"},
+                        "filter_sync_barriers":if synced {count} else {0},"complete_sync_barriers":1,
+                        "filter_phase_ns":filter_ns,"complete_phase_ns":complete_ns,"elapsed_ns":total_ns,
+                        "records":records,"logical_metadata_bytes":logical_bytes,"complete":true,
+                        "scope":"same action; fresh directories; verified input/filter/root construction and database/cache initialization excluded; derived writes and complete barrier only, not RPC or user latency",
+                    })
+                );
+            }
+        }
+    }
+}

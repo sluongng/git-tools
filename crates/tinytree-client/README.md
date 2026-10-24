@@ -33,6 +33,11 @@ completed-query replay state. `query_cleanup_timeout_ms` defaults to 5000 and
 `limits.query_cleanup_capacity` is configurable. Queue saturation, shutdown or
 network failures fall back to server expiry. Closing a scope is not query cancellation.
 
+`path_history`, `blame` and `search` pin immutable revisions within checked scopes.
+`begin_search` / `search_page` preserve source, cursor and ordering checks across
+literal-search pages. Snippets and completeness trust the authenticated server;
+they are not canonical whole-file verification or retention proofs.
+
 Load [the TOML example](examples/client.toml) with `Config::load`, then call
 `NativeClient::connect`. Plaintext is loopback-only; other TCP endpoints require
 explicit TLS roots. Unix endpoints must have private owner-controlled parents.

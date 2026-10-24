@@ -3127,6 +3127,7 @@ dependencies = [
  "tinytree-fixture",
  "tinytree-index",
  "tinytree-model",
+ "tinytree-search",
  "tinytree-server",
  "tinytree-store",
  "tokio",
@@ -5655,6 +5656,7 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.21",
  "tinytree-model",
+ "tinytree-search",
  "uuid",
 ]
 
@@ -5675,6 +5677,10 @@ dependencies = [
  "tonic-prost",
  "tonic-prost-build",
 ]
+
+[[package]]
+name = "tinytree-search"
+version = "0.1.0"
 
 [[package]]
 name = "tinytree-server"
@@ -5701,6 +5707,7 @@ dependencies = [
  "tinytree-index",
  "tinytree-model",
  "tinytree-proto",
+ "tinytree-search",
  "tinytree-store",
  "tokio",
  "tokio-stream",

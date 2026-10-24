@@ -73,6 +73,20 @@ fn path_query(value: p::QueryPathRequest, cap: usize) -> Result<ScopedPathQuery,
     input.validate(cap)?;
     Ok(input)
 }
+fn search_query(value: p::QuerySearchRequest, cap: usize) -> Result<ScopedSearchQuery, Status> {
+    let input = ScopedSearchQuery {
+        scope: handle(&value.scope)?,
+        revision: tinytree_model::CommitId(handle(&value.revision)?),
+        pattern: value.pattern,
+        path_prefix: value.path_prefix,
+        policy: q::SearchPolicy::try_from(value.policy)
+            .map_err(|_| Status::unimplemented("native search policy unsupported"))?,
+        page_size: value.page_size,
+        cursor: value.cursor,
+    };
+    input.validate(cap)?;
+    Ok(input)
+}
 fn input<T: Message>(request: Request<T>, cap: usize) -> Result<(T, Arc<Work>), Status> {
     let work = request
         .extensions()
@@ -755,6 +769,21 @@ impl p::query_io_server::QueryIo for BrokerService {
         input.check_blame(&result.value, self.query_config().model_limits())?;
         reply(result, work, self.query_limit())
     }
+    async fn search(
+        &self,
+        request: Request<p::QuerySearchRequest>,
+    ) -> Result<Response<q::SearchResult>, Status> {
+        let (input, work) = input(request, self.query_limit())?;
+        self.authorize_command(&input.store_id, &work)?;
+        let provider = self.query_provider(&input.store_id)?;
+        let input = search_query(input, self.query_limit())?;
+        let result = provider
+            .search(input.clone(), work.clone())
+            .await
+            .map_err(crate::query::status)?;
+        input.check_result(&result.value)?;
+        reply(result, work, self.query_limit())
+    }
     async fn close_query(
         &self,
         request: Request<p::QueryCloseRequest>,
@@ -885,7 +914,8 @@ message_size!(
     q::ChangePrefixResult,
     q::ShortestPrefixResult,
     q::PathHistoryResult,
-    q::BlameResult
+    q::BlameResult,
+    q::SearchResult
 );
 impl WireSize for QueryScope {
     fn wire_size(&self) -> usize {
@@ -1188,6 +1218,19 @@ impl NativeQueryIo for GuardedQuery {
         self.run(owner, move |provider, owner| async move {
             let result = provider.blame(input.clone(), owner).await?;
             input.check_blame(&result.value, limits)?;
+            Ok(result)
+        })
+        .await
+    }
+    async fn search(
+        &self,
+        input: ScopedSearchQuery,
+        owner: QueryOwner,
+    ) -> Result<QueryReply<q::SearchResult>, Status> {
+        input.validate(self.service.query_limit())?;
+        self.run(owner, move |provider, owner| async move {
+            let result = provider.search(input.clone(), owner).await?;
+            input.check_result(&result.value)?;
             Ok(result)
         })
         .await

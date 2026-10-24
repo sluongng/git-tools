@@ -6,7 +6,7 @@ use jj_native_backend::NativeObjectIo;
 use native_broker::{
     BeginQuery, ForkQueryScope, NativeQueryIo, OpenCloudQueryScope, OpenQueryScope, QueryHandle,
     QueryOwner, QueryPage, QueryReply, QueryResources, QueryScope, ScopedPathQuery,
-    query_protocol as q,
+    ScopedSearchQuery, query_protocol as q,
 };
 use prost::Message;
 use std::{
@@ -28,6 +28,7 @@ pub struct RemoteQueryIo {
     memory: Arc<Semaphore>,
     operations: Arc<Semaphore>,
     restore_bound: Option<Arc<crate::restore_io::RestoreBound>>,
+    search_cursor_key: [u8; 32],
 }
 impl std::fmt::Debug for RemoteQueryIo {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -168,6 +169,244 @@ fn hash(parts: &[&[u8]]) -> [u8; 32] {
         h.update(p);
     }
     *h.finalize().as_bytes()
+}
+// Continuation envelopes authenticate adapter-local source/progress. They never
+// contain credentials or upstream scope handles and do not allocate registry
+// sessions. Closing the captured scope invalidates every continuation.
+struct SearchContinuation {
+    root: [u8; 32],
+    manifest: [u8; 32],
+    page_size: u32,
+    entries: u64,
+    bytes: u64,
+    last_path: String,
+    next_offset: u64,
+    last_file: [u8; 32],
+    last_size: u64,
+    last_line: u64,
+    next_column: u64,
+    upstream: Vec<u8>,
+}
+fn cursor_part<'a>(bytes: &mut &'a [u8], count: usize) -> Result<&'a [u8]> {
+    ensure!(
+        bytes.len() >= count,
+        tonic::Status::invalid_argument("invalid native search cursor")
+    );
+    let (part, rest) = bytes.split_at(count);
+    *bytes = rest;
+    Ok(part)
+}
+fn search_fingerprint(input: &ScopedSearchQuery, scope: &CapturedScope) -> [u8; 32] {
+    hash(&[
+        b"indexed-search-v1",
+        &input.scope,
+        &input.revision.0,
+        &input.pattern,
+        input.path_prefix.as_bytes(),
+        &(input.policy as i32).to_be_bytes(),
+        &input.page_size.to_be_bytes(),
+        scope.checked.handle(),
+        scope.checked.content_digest(),
+        scope.checked.index_epoch(),
+    ])
+}
+impl RemoteQueryIo {
+    fn read_search_cursor(
+        &self,
+        input: &ScopedSearchQuery,
+        scope: &CapturedScope,
+    ) -> Result<Option<SearchContinuation>> {
+        if input.cursor.is_empty() {
+            return Ok(None);
+        }
+        ensure!(
+            input.cursor.len() <= 8192 && input.cursor.len() >= 228,
+            tonic::Status::invalid_argument("invalid native search cursor")
+        );
+        let (body, tag) = input.cursor.split_at(input.cursor.len() - 32);
+        let supplied = blake3::Hash::from_bytes(tag.try_into().expect("fixed tag"));
+        ensure!(
+            blake3::keyed_hash(&self.search_cursor_key, body) == supplied,
+            tonic::Status::invalid_argument("invalid native search cursor")
+        );
+        let mut body = body;
+        ensure!(
+            cursor_part(&mut body, 4)? == b"NSR1",
+            tonic::Status::invalid_argument("invalid native search cursor")
+        );
+        ensure!(
+            cursor_part(&mut body, 32)? == search_fingerprint(input, scope),
+            tonic::Status::invalid_argument("native search cursor input mismatch")
+        );
+        let expires = i64::from_be_bytes(cursor_part(&mut body, 8)?.try_into().unwrap());
+        ensure!(
+            expires == scope.checked.expires_at_unix_seconds() && expires > now()?,
+            tonic::Status::failed_precondition("native search cursor expired")
+        );
+        let page_size = u32::from_be_bytes(cursor_part(&mut body, 4)?.try_into().unwrap());
+        let root = cursor_part(&mut body, 32)?.try_into().unwrap();
+        let manifest = cursor_part(&mut body, 32)?.try_into().unwrap();
+        let entries = u64::from_be_bytes(cursor_part(&mut body, 8)?.try_into().unwrap());
+        let bytes = u64::from_be_bytes(cursor_part(&mut body, 8)?.try_into().unwrap());
+        let next_offset = u64::from_be_bytes(cursor_part(&mut body, 8)?.try_into().unwrap());
+        let last_file = cursor_part(&mut body, 32)?.try_into().unwrap();
+        let last_size = u64::from_be_bytes(cursor_part(&mut body, 8)?.try_into().unwrap());
+        let last_line = u64::from_be_bytes(cursor_part(&mut body, 8)?.try_into().unwrap());
+        let next_column = u64::from_be_bytes(cursor_part(&mut body, 8)?.try_into().unwrap());
+        let path_len = u16::from_be_bytes(cursor_part(&mut body, 2)?.try_into().unwrap()) as usize;
+        ensure!(
+            path_len <= 4096,
+            tonic::Status::invalid_argument("invalid native search cursor")
+        );
+        let last_path = std::str::from_utf8(cursor_part(&mut body, path_len)?)
+            .map_err(|_| tonic::Status::invalid_argument("invalid native search cursor"))?
+            .to_owned();
+        let upstream_len =
+            u16::from_be_bytes(cursor_part(&mut body, 2)?.try_into().unwrap()) as usize;
+        ensure!(
+            upstream_len != 0 && upstream_len <= 512,
+            tonic::Status::invalid_argument("invalid native search cursor")
+        );
+        let upstream = cursor_part(&mut body, upstream_len)?.to_vec();
+        ensure!(
+            body.is_empty(),
+            tonic::Status::invalid_argument("invalid native search cursor")
+        );
+        Ok(Some(SearchContinuation {
+            root,
+            manifest,
+            page_size,
+            entries,
+            bytes,
+            last_path,
+            next_offset,
+            last_file,
+            last_size,
+            last_line,
+            next_column,
+            upstream,
+        }))
+    }
+    fn write_search_cursor(
+        &self,
+        input: &ScopedSearchQuery,
+        scope: &CapturedScope,
+        result: &q::SearchResult,
+        prior: Option<&SearchContinuation>,
+    ) -> Result<Vec<u8>> {
+        let (last_path, next_offset) = result.hits.last().map_or_else(
+            || {
+                prior.map_or(("", 0), |value| {
+                    (value.last_path.as_str(), value.next_offset)
+                })
+            },
+            |hit| (hit.path.as_str(), hit.byte_offset + hit.match_bytes as u64),
+        );
+        ensure!(
+            last_path.len() <= 4096 && !result.cursor.is_empty() && result.cursor.len() <= 512,
+            tonic::Status::data_loss("invalid upstream search continuation")
+        );
+        let (last_file, last_size, last_line, next_column) = result.hits.last().map_or_else(
+            || {
+                prior.map_or(([0; 32], 0, 0, 0), |value| {
+                    (
+                        value.last_file,
+                        value.last_size,
+                        value.last_line,
+                        value.next_column,
+                    )
+                })
+            },
+            |hit| {
+                (
+                    hit.file_id
+                        .as_slice()
+                        .try_into()
+                        .expect("SDK checked FILE ID"),
+                    hit.file_size,
+                    hit.line,
+                    hit.byte_column + hit.match_bytes as u64,
+                )
+            },
+        );
+        let mut body = Vec::with_capacity(228 + last_path.len() + result.cursor.len());
+        body.extend_from_slice(b"NSR1");
+        body.extend_from_slice(&search_fingerprint(input, scope));
+        body.extend_from_slice(&scope.checked.expires_at_unix_seconds().to_be_bytes());
+        body.extend_from_slice(&result.page_size.to_be_bytes());
+        body.extend_from_slice(&result.root_tree);
+        body.extend_from_slice(&result.manifest_digest);
+        body.extend_from_slice(&result.entries_examined.to_be_bytes());
+        body.extend_from_slice(&result.file_bytes_read.to_be_bytes());
+        body.extend_from_slice(&next_offset.to_be_bytes());
+        body.extend_from_slice(&last_file);
+        body.extend_from_slice(&last_size.to_be_bytes());
+        body.extend_from_slice(&last_line.to_be_bytes());
+        body.extend_from_slice(&next_column.to_be_bytes());
+        body.extend_from_slice(&(last_path.len() as u16).to_be_bytes());
+        body.extend_from_slice(last_path.as_bytes());
+        body.extend_from_slice(&(result.cursor.len() as u16).to_be_bytes());
+        body.extend_from_slice(&result.cursor);
+        let tag = blake3::keyed_hash(&self.search_cursor_key, &body);
+        body.extend_from_slice(tag.as_bytes());
+        Ok(body)
+    }
+}
+fn search_progress(result: &q::SearchResult, prior: Option<&SearchContinuation>) -> Result<()> {
+    use q::SearchCoverage as C;
+    let coverage = C::try_from(result.coverage)
+        .map_err(|_| tonic::Status::data_loss("invalid search coverage"))?;
+    if let Some(prior) = prior {
+        ensure!(
+            result.root_tree.as_slice() == prior.root,
+            tonic::Status::data_loss("search root changed during continuation")
+        );
+        if coverage == C::SearchWarming {
+            // An evicted derived manifest can be rebuilt. Retry exactly the
+            // original input cursor instead of starting a different traversal.
+            return Ok(());
+        }
+        ensure!(
+            result.manifest_digest.as_slice() == prior.manifest
+                && result.page_size == prior.page_size
+                && result.entries_examined >= prior.entries
+                && result.file_bytes_read >= prior.bytes,
+            tonic::Status::data_loss("search progress changed during continuation")
+        );
+        if let Some(first) = result.hits.first() {
+            ensure!(
+                first.path.as_bytes() > prior.last_path.as_bytes()
+                    || (first.path == prior.last_path && first.byte_offset >= prior.next_offset),
+                tonic::Status::data_loss("search results repeated or moved backwards")
+            );
+            if first.path == prior.last_path {
+                ensure!(
+                    first.file_id.as_slice() == prior.last_file
+                        && first.file_size == prior.last_size
+                        && first.line >= prior.last_line,
+                    tonic::Status::data_loss("search file identity changed during continuation")
+                );
+                let offset_delta = first.byte_offset - prior.next_offset;
+                ensure!(
+                    (first.line == prior.last_line
+                        && first.byte_column >= prior.next_column
+                        && first.byte_column - prior.next_column == offset_delta)
+                        || (first.line > prior.last_line
+                            && first.line - prior.last_line <= offset_delta),
+                    tonic::Status::data_loss("search line position changed during continuation")
+                );
+            }
+        }
+    }
+    if coverage == C::SearchMore {
+        ensure!(
+            result.entries_examined > prior.map_or(0, |v| v.entries)
+                || result.file_bytes_read > prior.map_or(0, |v| v.bytes)
+                || !result.hits.is_empty(),
+            tonic::Status::data_loss("search continuation made no progress")
+        );
+    }
+    Ok(())
 }
 impl Registry {
     fn expire(&mut self, time: i64) -> Retired {
@@ -344,6 +583,7 @@ impl RemoteQueryIo {
             memory,
             operations,
             restore_bound: None,
+            search_cursor_key: random(),
         })
     }
     pub(crate) fn shares_inner(&self, objects: &crate::RemoteObjectIo) -> bool {
@@ -1990,6 +2230,82 @@ impl NativeQueryIo for RemoteQueryIo {
             let retained = this.charge(bytes)?;
             Ok(QueryReply {
                 value: checked.result().clone(),
+                owner: Arc::new((scope, checked, retained)),
+            })
+        })
+        .await
+    }
+    async fn search(
+        &self,
+        input: ScopedSearchQuery,
+        owner: QueryOwner,
+    ) -> std::result::Result<QueryReply<q::SearchResult>, tonic::Status> {
+        if input
+            .pattern
+            .len()
+            .saturating_add(input.path_prefix.len())
+            .saturating_add(input.cursor.len())
+            .saturating_add(256)
+            > self.inner.config.remote.limits.max_request_bytes
+            || input.cursor.len() > 8192
+        {
+            return Err(tonic::Status::resource_exhausted(
+                "native search request limit exceeded",
+            ));
+        }
+        self.run(owner, move |this, operation| async move {
+            let scope = this.captured(input.scope).await?;
+            this.online(&scope).await?;
+            let prior = this.read_search_cursor(&input, &scope)?;
+            let cursor = prior
+                .as_ref()
+                .map_or(&[][..], |value| value.upstream.as_slice());
+            let checked = operation
+                .client(&scope.client)
+                .search(
+                    &scope.checked,
+                    input.revision,
+                    &input.pattern,
+                    &input.path_prefix,
+                    input.policy,
+                    input.page_size,
+                    cursor,
+                )
+                .await?;
+            search_progress(checked.result(), prior.as_ref())?;
+            // Charge the independent wire copy and local cursor before either
+            // allocation. SDK retained bytes and scope ownership are separate
+            // from the physical operation/inflight owner.
+            let more = checked.result().coverage == q::SearchCoverage::SearchMore as i32;
+            let cursor_capacity = if more {
+                let path_bytes = checked.result().hits.last().map_or_else(
+                    || prior.as_ref().map_or(0, |value| value.last_path.len()),
+                    |hit| hit.path.len(),
+                );
+                228usize
+                    .saturating_add(path_bytes)
+                    .saturating_add(checked.result().cursor.len())
+            } else {
+                0
+            };
+            let bytes = checked
+                .result()
+                .encoded_len()
+                .checked_add(cursor_capacity)
+                .and_then(|n| n.checked_add(16))
+                .and_then(|n| n.checked_mul(128))
+                .and_then(|n| n.checked_add(4096))
+                .context("native search reply allocation bound overflow")?;
+            let retained = this.charge(bytes)?;
+            let local_cursor = if more {
+                this.write_search_cursor(&input, &scope, checked.result(), prior.as_ref())?
+            } else {
+                Vec::new()
+            };
+            let mut value = checked.result().clone();
+            value.cursor = local_cursor;
+            Ok(QueryReply {
+                value,
                 owner: Arc::new((scope, checked, retained)),
             })
         })

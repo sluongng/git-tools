@@ -24,6 +24,7 @@ service RepositoryQuery {
   rpc CloseQuery(CloseQueryRequest) returns (CloseQueryResponse);
   rpc PathHistory(PathHistoryRequest) returns (PathHistoryResult);
   rpc Blame(BlameRequest) returns (BlameResult);
+  rpc Search(SearchRequest) returns (SearchResult);
 }
 
 message CommitId { bytes value = 1; } // Exactly 32 bytes; zero is intrinsic root.
@@ -442,4 +443,61 @@ message BlameResult {
   tinytree.v1.ObjectDescriptor target = 9; // Verified raw FILE descriptor.
   bytes target_bytes = 10; // Only selected FILE bytes, never historical bodies.
   repeated BlameRange ranges = 11; // Exact partition of selected file lines.
+}
+
+// Case-sensitive non-overlapping literal byte matches in regular FILE entries.
+// Patterns are nonempty, at most 1024 bytes and contain no LF. Symlinks are not
+// followed; a resolved tree may be searched regardless of commit parent count.
+enum SearchPolicy {
+  SEARCH_POLICY_UNSPECIFIED = 0;
+  LITERAL_BYTES_V1 = 1;
+}
+enum SearchCoverage {
+  SEARCH_COVERAGE_UNSPECIFIED = 0;
+  SEARCH_COMPLETE = 1;
+  SEARCH_MORE = 2;
+  SEARCH_WARMING = 3;
+  SEARCH_READ_LIMIT = 4;
+  SEARCH_WORK_LIMIT = 5;
+  SEARCH_PRIVATE_OVERLAY = 6;
+  SEARCH_CONFLICT = 7;
+  SEARCH_INDEX_LIMIT = 8;
+}
+message SearchRequest {
+  ScopeKey scope = 1;
+  CommitId revision = 2;
+  bytes pattern = 3;
+  // Empty means all regular files; otherwise exact canonical directory prefix
+  // or a complete file path. No dot/empty components, backslash or NUL.
+  string path_prefix = 4;
+  SearchPolicy policy = 5;
+  uint32 page_size = 6; // Zero uses server default; fixed across a continuation.
+  bytes cursor = 7; // Opaque authenticated server token, never object authority.
+}
+message SearchHit {
+  string path = 1;
+  bytes file_id = 2; // Exact canonical32; metadata, not a file-read capability.
+  uint64 file_size = 3;
+  uint64 byte_offset = 4;
+  uint32 match_bytes = 5;
+  uint64 line = 6; // One-based; LF delimits lines, arbitrary body bytes allowed.
+  uint64 byte_column = 7; // Zero-based byte offset from this line's start.
+  uint64 snippet_offset = 8; // Absolute FILE offset of bounded snippet bytes.
+  bytes snippet = 9; // Includes entire match and at most128 context bytes/side.
+}
+message SearchResult {
+  bytes scope_digest = 1; // Exact32 from selected scope.
+  bytes index_epoch = 2; // Exact16 from selected scope.
+  CommitId revision = 3;
+  bytes root_tree = 4; // Exact32 after canonical source validation, else empty.
+  bytes manifest_digest = 5; // Exact32 only when complete manifest is available.
+  bytes pattern = 6;
+  string path_prefix = 7;
+  SearchPolicy policy = 8;
+  SearchCoverage coverage = 9;
+  repeated SearchHit hits = 10; // Strict (path UTF-8 bytes, byte_offset) order.
+  bytes cursor = 11; // Nonempty iff MORE; repeated token returns identical page.
+  uint64 entries_examined = 12; // Cumulative; includes repeated candidate reads.
+  uint64 file_bytes_read = 13; // Cumulative actual candidate payloads opened.
+  uint32 page_size = 14; // Effective fixed result cap, echoed for validation.
 }

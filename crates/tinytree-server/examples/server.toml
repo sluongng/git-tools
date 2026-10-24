@@ -42,6 +42,25 @@ max_blame_lines = 16384
 max_blame_diff_steps = 16000000
 max_blame_diff_memory_bytes = 8388608
 max_blame_diff_depth = 64
+# Literal content search uses a rebuildable, repository-scoped candidate index.
+# Large Bloom-positive FILEs and exhausted budgets are explicitly incomplete.
+max_search_entries = 65536
+max_search_manifest_bytes = 8388608
+max_search_cache_bytes = 67108864
+max_search_cache_records = 65536
+max_search_file_bytes = 1048576
+max_search_read_bytes = 8388608
+max_search_entries_per_page = 2048
+max_search_total_entries = 262144
+max_search_total_read_bytes = 268435456
+max_search_match_work = 8000000
+max_search_total_work = 64000000
+max_search_path_depth = 128
+max_pending_search_warms = 4
+search_warm_timeout_seconds = 60
+max_search_warm_file_bytes = 67108864
+max_search_warm_read_bytes = 536870912
+max_search_warm_memory_bytes = 201326592
 # Selected graph lookahead/edges and cumulative reduction work are bounded.
 max_graph_query_nodes = 8192
 max_graph_query_edges = 8192

@@ -5,6 +5,7 @@ mod history;
 mod remote;
 mod remote_state;
 mod roots;
+mod search;
 mod vfs;
 use std::path::PathBuf;
 
@@ -25,6 +26,8 @@ enum NativeCommand {
 
 #[derive(clap::Subcommand, Clone, Debug)]
 enum TinytreeCommand {
+    /// Search an immutable revision, including local draft and dirty-file overlays.
+    Search(search::SearchArgs),
     /// Inspect exact-path history without downloading historical file bodies.
     History(history::PathArgs),
     /// Attribute a file using remote history and local draft/working-copy edits.
@@ -125,6 +128,9 @@ async fn run_native_command(
     args: NativeCommand,
 ) -> Result<(), CommandError> {
     match args {
+        NativeCommand::Tinytree {
+            command: TinytreeCommand::Search(args),
+        } => search::run(ui, command, args).await,
         NativeCommand::Tinytree {
             command: TinytreeCommand::History(args),
         } => history::run(ui, command, args, false).await,

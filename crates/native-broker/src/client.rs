@@ -52,24 +52,33 @@ async fn run<T: Send + 'static>(
 }
 /// Unlike ordinary request waiters, a source load must retain its external
 /// owner until its bounded RPC and synchronous verification actually finish.
+// An abandoned JoinHandle may destroy a completed result without polling the
+// caller again. Keep its payload ahead of the physical owner through that drop.
+struct OwnedOutput<T> {
+    value: Result<T, Status>,
+    _owner: Arc<dyn std::any::Any + Send + Sync>,
+}
 pub(crate) async fn run_owned<T: Send + 'static>(
     owner: Arc<dyn std::any::Any + Send + Sync>,
     future: impl Future<Output = Result<T, Status>> + Send + 'static,
 ) -> BackendResult<T> {
-    runtime()?
+    let output = runtime()?
         .spawn(async move {
-            let _owner = owner;
-            future.await
+            let value = future.await;
+            OwnedOutput {
+                value,
+                _owner: owner,
+            }
         })
         .await
-        .map_err(|_| wire::other(std::io::Error::other("native broker job failed")))?
-        .map_err(wire::other)
+        .map_err(|_| wire::other(std::io::Error::other("native broker job failed")))?;
+    output.value.map_err(wire::other)
 }
 async fn read_metadata_request(
     inner: Arc<Inner>,
     key: tinytree_model::ObjectKey,
 ) -> Result<VerifiedMetadata, Status> {
-    let deadline = Instant::now() + inner.config.policy.operation_timeout();
+    let deadline = inner.deadline();
     reapi::policy::timeout(deadline, async {
         let _budget = inner.budget(inner.config.metadata_memory()).await?;
         let value = inner
@@ -99,6 +108,7 @@ struct Budget {
 struct Inner {
     channel: CommandChannel,
     physical_owner: Option<crate::CommandGuard>,
+    operation_deadline: Option<Instant>,
     store: String,
     spool: PathBuf,
     config: Config,
@@ -118,6 +128,19 @@ impl std::fmt::Debug for BrokerObjectIo {
     }
 }
 impl BrokerObjectIo {
+    /// Bound this clone's operations by one shrink-only absolute deadline.
+    /// Owned physical reads retain their guards after a caller stops waiting.
+    pub fn with_operation_deadline(mut self, deadline: Instant) -> Self {
+        let mut inner = (*self.inner).clone();
+        inner.operation_deadline = Some(
+            inner
+                .operation_deadline
+                .map_or(deadline, |old| old.min(deadline)),
+        );
+        self.inner = Arc::new(inner);
+        self
+    }
+
     /// Bind subsequent local RPCs to a live host command. Runtime only: shared
     /// channel/pools and configured provider identity remain unchanged.
     pub fn with_command_token(mut self, token: [u8; 32]) -> Self {
@@ -174,6 +197,7 @@ impl BrokerObjectIo {
                 inner: Arc::new(Inner {
                     channel,
                     physical_owner: None,
+                    operation_deadline: None,
                     store,
                     spool,
                     calls: Arc::new(Semaphore::new(config.max_inflight)),
@@ -189,6 +213,12 @@ impl BrokerObjectIo {
     }
 }
 impl Inner {
+    fn deadline(&self) -> Instant {
+        let configured = Instant::now() + self.config.policy.operation_timeout();
+        self.operation_deadline
+            .map_or(configured, |bound| bound.min(configured))
+    }
+
     fn client(
         &self,
         limit: usize,
@@ -244,7 +274,7 @@ impl NativeObjectIo for BrokerObjectIo {
     ) -> BackendResult<Option<tinytree_model::Descriptor>> {
         let inner = self.inner.clone();
         run(async move {
-            let deadline = Instant::now() + inner.config.policy.operation_timeout();
+            let deadline = inner.deadline();
             reapi::policy::timeout(deadline, async {
                 let _budget = inner.budget(4096).await?;
                 let value = inner
@@ -309,7 +339,7 @@ impl NativeObjectIo for BrokerObjectIo {
     ) -> BackendResult<tinytree_model::Descriptor> {
         let inner = self.inner.clone();
         run(async move {
-            let deadline = Instant::now() + inner.config.policy.operation_timeout();
+            let deadline = inner.deadline();
             reapi::policy::timeout(deadline, async {
                 let _budget = inner.budget(inner.config.metadata_memory()).await?;
                 let encoded = tinytree_model::encode(&object, inner.config.model_limits())
@@ -357,7 +387,7 @@ impl NativeObjectIo for BrokerObjectIo {
     ) -> BackendResult<FileRead> {
         let inner = self.clone().with_physical_owner(owner.clone()).inner;
         run_owned(owner.clone(), async move {
-            let deadline = Instant::now() + inner.config.policy.operation_timeout();
+            let deadline = inner.deadline();
             reapi::policy::timeout(deadline, async {
                 let budget = inner.budget(inner.config.file_memory()).await?;
                 let disk = Arc::new(
@@ -508,7 +538,7 @@ impl NativeObjectIo for BrokerObjectIo {
         let frame_bytes = inner.config.max_frame_bytes;
         let admission = inner.clone();
         let (budget, deadline) = run(async move {
-            let deadline = Instant::now() + admission.config.policy.operation_timeout();
+            let deadline = admission.deadline();
             let budget =
                 reapi::policy::timeout(deadline, admission.budget(admission.config.file_memory()))
                     .await?;
@@ -614,7 +644,7 @@ impl NativeObjectIo for BrokerObjectIo {
     ) -> BackendResult<CopyCatalogSnapshot> {
         let inner = self.inner.clone();
         run(async move {
-            let deadline = Instant::now() + inner.config.policy.operation_timeout();
+            let deadline = inner.deadline();
             reapi::policy::timeout(deadline, async {
                 if limits.max_objects == 0
                     || limits.max_objects > inner.config.max_catalog_objects

@@ -60,6 +60,11 @@ Revision-pinned `PathHistory` and `Blame` support bounded fixed-path linear
 history. Only the selected file body is returned; private metadata-only overlays
 do not grant file access. Unsupported ancestry and exhausted budgets carry
 explicit incomplete coverage. Limits are configurable under `[service.query]`.
+`Search` pages literal matches at an immutable revision. Its separate background
+indexer builds bounded, rebuildable manifests and per-file trigram filters;
+positive candidates still require verified content reads. Warming, eviction and
+resource limits never become complete empty results. Search cache and work
+limits are configurable in the same TOML example.
 Active graph/canonical work and retained replay bytes share a configurable cursor
 memory pool; completed queries retain their actual cached page size.
 

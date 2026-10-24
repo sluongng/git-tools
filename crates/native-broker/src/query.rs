@@ -362,6 +362,140 @@ fn path_state(value: &q::HistoryPathState) -> Result<(), Status> {
         _ => Err(history_integrity()),
     }
 }
+/// Indexed literal search against one captured immutable source. The cursor is
+/// opaque and local to the configured provider; it is not an object capability.
+#[derive(Clone, Debug)]
+pub struct ScopedSearchQuery {
+    pub scope: [u8; 32],
+    pub revision: CommitId,
+    pub pattern: Vec<u8>,
+    pub path_prefix: String,
+    pub policy: q::SearchPolicy,
+    pub page_size: u32,
+    pub cursor: Vec<u8>,
+}
+impl ScopedSearchQuery {
+    pub(crate) fn validate(&self, cap: usize) -> Result<(), Status> {
+        crate::query_service::bounded_input(
+            self.pattern
+                .len()
+                .saturating_add(self.path_prefix.len())
+                .saturating_add(self.cursor.len())
+                .saturating_add(256),
+            cap,
+        )?;
+        if self.policy != q::SearchPolicy::LiteralBytesV1 {
+            return Err(Status::unimplemented("native search policy unsupported"));
+        }
+        if self.pattern.is_empty()
+            || self.pattern.len() > 1024
+            || self.pattern.contains(&b'\n')
+            || self.page_size > 4096
+            || self.cursor.len() > 8192
+            || !search_path(&self.path_prefix, true)
+        {
+            return Err(Status::invalid_argument("invalid native search input"));
+        }
+        Ok(())
+    }
+    pub(crate) fn check_result(&self, value: &q::SearchResult) -> Result<(), Status> {
+        use q::SearchCoverage as C;
+        let coverage = C::try_from(value.coverage).map_err(|_| search_integrity())?;
+        let ready = matches!(coverage, C::SearchComplete | C::SearchMore);
+        if value
+            .revision
+            .as_ref()
+            .is_none_or(|id| id.value.as_slice() != self.revision.0)
+            || value.pattern != self.pattern
+            || value.path_prefix != self.path_prefix
+            || value.policy != self.policy as i32
+            || value.scope_digest.len() != 32
+            || value.index_epoch.len() != 16
+            || coverage == C::Unspecified
+            || !matches!(value.root_tree.len(), 0 | 32)
+            || !matches!(value.manifest_digest.len(), 0 | 32)
+            || ((ready || !value.hits.is_empty())
+                && (value.root_tree.len() != 32 || value.manifest_digest.len() != 32))
+            || ((coverage == C::SearchMore) != !value.cursor.is_empty())
+            || value.cursor.len() > 8192
+            || value.page_size == 0
+            || value.page_size > 4096
+            || (self.page_size != 0 && value.page_size != self.page_size)
+            || value.hits.len() > value.page_size as usize
+            || (matches!(
+                coverage,
+                C::SearchWarming | C::SearchPrivateOverlay | C::SearchConflict
+            ) && !value.hits.is_empty())
+        {
+            return Err(search_integrity());
+        }
+        let mut previous: Option<&q::SearchHit> = None;
+        for hit in &value.hits {
+            let end = hit
+                .byte_offset
+                .checked_add(self.pattern.len() as u64)
+                .ok_or_else(search_integrity)?;
+            let snippet_end = hit
+                .snippet_offset
+                .checked_add(hit.snippet.len() as u64)
+                .ok_or_else(search_integrity)?;
+            if !search_path(&hit.path, false)
+                || !search_prefix(&hit.path, &self.path_prefix)
+                || hit.file_id.len() != 32
+                || hit.match_bytes as usize != self.pattern.len()
+                || end > hit.file_size
+                || hit.line == 0
+                || hit.line > hit.byte_offset.saturating_add(1)
+                || hit.byte_column > hit.byte_offset
+                || hit.snippet_offset > hit.byte_offset
+                || snippet_end < end
+                || snippet_end > hit.file_size
+                || hit.byte_offset - hit.snippet_offset > 128
+                || snippet_end - end > 128
+                || hit.snippet.len() > self.pattern.len() + 256
+            {
+                return Err(search_integrity());
+            }
+            let relative = usize::try_from(hit.byte_offset - hit.snippet_offset)
+                .map_err(|_| search_integrity())?;
+            if hit.snippet.get(relative..relative + self.pattern.len())
+                != Some(self.pattern.as_slice())
+            {
+                return Err(search_integrity());
+            }
+            if let Some(prior) = previous {
+                if hit.path.as_bytes() < prior.path.as_bytes()
+                    || (hit.path == prior.path
+                        && (hit.byte_offset < prior.byte_offset + prior.match_bytes as u64
+                            || hit.file_id != prior.file_id
+                            || hit.file_size != prior.file_size))
+                {
+                    return Err(search_integrity());
+                }
+            }
+            previous = Some(hit);
+        }
+        Ok(())
+    }
+}
+fn search_path(path: &str, empty: bool) -> bool {
+    (empty && path.is_empty())
+        || (!path.is_empty()
+            && path.len() <= 4096
+            && !path.contains(['\\', '\0'])
+            && path.split('/').all(|part| !matches!(part, "" | "." | "..")))
+}
+fn search_prefix(path: &str, prefix: &str) -> bool {
+    prefix.is_empty()
+        || path == prefix
+        || path
+            .strip_prefix(prefix)
+            .is_some_and(|suffix| suffix.starts_with('/'))
+}
+fn search_integrity() -> Status {
+    Status::data_loss("invalid native search response")
+}
+
 /// Aliases explicitly registered with the same adapter Arc are trusted synonyms
 /// for the same handles/capability, not isolation boundaries. Distinct repository
 /// or trust scopes require distinct adapters.
@@ -489,6 +623,13 @@ pub trait NativeQueryIo: Send + Sync + std::fmt::Debug {
         _owner: QueryOwner,
     ) -> Result<QueryReply<q::BlameResult>, Status> {
         Err(Status::unimplemented("native blame unsupported"))
+    }
+    async fn search(
+        &self,
+        _input: ScopedSearchQuery,
+        _owner: QueryOwner,
+    ) -> Result<QueryReply<q::SearchResult>, Status> {
+        Err(Status::unimplemented("native indexed search unsupported"))
     }
     async fn close_query(&self, query: [u8; 32], owner: QueryOwner) -> Result<(), Status>;
     async fn close_scope(&self, scope: [u8; 32], owner: QueryOwner) -> Result<(), Status>;

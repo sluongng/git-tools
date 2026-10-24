@@ -1043,6 +1043,44 @@ impl NativeQueryIo for BrokerQueryClient {
         expected.check_blame(&result.value, self.inner.config.model_limits())?;
         Ok(result)
     }
+    async fn search(
+        &self,
+        input: ScopedSearchQuery,
+        owner: QueryOwner,
+    ) -> Result<QueryReply<q::SearchResult>, Status> {
+        input.validate(self.inner.config.max_query_bytes)?;
+        self.preflight(
+            input
+                .pattern
+                .len()
+                .saturating_add(input.path_prefix.len())
+                .saturating_add(input.cursor.len())
+                .saturating_add(256),
+        )?;
+        let expected = input.clone();
+        let result = self
+            .execute(owner, move |mut client, deadline, store_id, cap| {
+                let payload = p::QuerySearchRequest {
+                    store_id,
+                    scope: input.scope.to_vec(),
+                    revision: input.revision.0.to_vec(),
+                    pattern: input.pattern.clone(),
+                    path_prefix: input.path_prefix.clone(),
+                    policy: input.policy as i32,
+                    page_size: input.page_size,
+                    cursor: input.cursor.clone(),
+                };
+                async move {
+                    Ok(client
+                        .search(request(payload, deadline, cap)?)
+                        .await?
+                        .into_inner())
+                }
+            })
+            .await?;
+        expected.check_result(&result.value)?;
+        Ok(result)
+    }
     async fn close_query(&self, h: [u8; 32], o: QueryOwner) -> Result<(), Status> {
         self.execute(o, move |mut c, d, store_id, cap| async move {
             Ok(c.close_query(request(

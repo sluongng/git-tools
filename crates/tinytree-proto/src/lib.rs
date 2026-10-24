@@ -120,6 +120,7 @@ mod tests {
                 ("CloseQuery", false, false),
                 ("PathHistory", false, false),
                 ("Blame", false, false),
+                ("Search", false, false),
             ]
         );
 

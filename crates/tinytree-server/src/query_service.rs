@@ -935,6 +935,51 @@ impl RepositoryQuery for QueryService {
         )
         .await
     }
+    async fn search(
+        &self,
+        request: Request<q::SearchRequest>,
+    ) -> Result<Response<q::SearchResult>, Status> {
+        let (identity, deadline, host) = self.context(&request, false)?;
+        let admission = request.extensions().get::<Arc<Work>>().cloned();
+        self.bounded(request.get_ref())?;
+        let input = request.into_inner();
+        let key = scope_key(input.scope.clone())?;
+        identity.authorize(&key.repository_id, false)?;
+        let work = if let Some(work) = admission {
+            if !work.belongs_to(&host) || !work.has_search_memory() {
+                return Err(Status::internal("search ingress memory owner mismatch"));
+            }
+            if Instant::now() >= deadline {
+                return Err(Status::deadline_exceeded("search deadline exceeded"));
+            }
+            work
+        } else {
+            host.admit_search(deadline).await?
+        };
+        let (value, work) = execute(host, work, deadline, move |host, work| {
+            let scope = host.lookup(&identity.id, &key.repository_id, &key.handle)?;
+            if scope.is_cloud() {
+                identity.cloud_capability()?;
+            }
+            work.scopes.lock().unwrap().push(scope.clone());
+            let mut budget = host.config.budget();
+            host.search.query(
+                host,
+                scope,
+                &key.repository_id,
+                &identity.id,
+                input,
+                &mut budget,
+                deadline,
+            )
+        })
+        .await?;
+        response(
+            value,
+            work,
+            self.repository.service_config().query.max_response_bytes,
+        )
+    }
     async fn path_history(
         &self,
         request: Request<q::PathHistoryRequest>,

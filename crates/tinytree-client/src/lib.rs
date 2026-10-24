@@ -18,6 +18,7 @@ pub use client::query::{
     CheckedIdsPage, CheckedIdsQuery, CheckedScopeHandle, CommitPrefix, FactAnswer, GraphEdge,
     GraphRow, IdRow, PrefixTarget, QueryFact,
 };
+pub use client::search::{CheckedSearch, CheckedSearchPage};
 pub use config::{Config, ConfigError, Limits, Tls};
 pub use tinytree_proto::cloud_v1 as cloud_protocol;
 pub use tinytree_proto::query_v1 as query_protocol;

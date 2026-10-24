@@ -15,6 +15,7 @@ cd project
 "$JJ" status
 "$JJ" tinytree history path/to/file.rs
 "$JJ" tinytree blame path/to/file.rs --json
+"$JJ" tinytree search 'literal text' --path-prefix src --json
 "$JJ" tinytree fetch --reference main --bookmark main
 # Make changes, then select the bookmark to publish.
 "$JJ" bookmark set main -r @
@@ -40,6 +41,14 @@ merges, conflicts and exhausted limits are explicit, not complete results.
 These commands currently require a clone/fetch observation; restored cloud-only
 workspaces are not yet supported. Ordinary `jj file annotate` is not wired to
 this service and remains unsupported with the Federated index.
+
+`search` matches case-sensitive literals in regular files at the selected
+revision, merging remote results with local additions, edits, deletions and
+renames. It does not follow symlinks or interpret regular expressions. Index
+warming is asynchronous; output reports incomplete coverage when limits apply.
+The same observed-baseline requirement applies.
+Private baseline discovery is currently linear-only; the server can search
+resolved merge trees directly.
 
 Push uses this workspace's durable observed generation, which jj undo cannot
 roll back. Retry an interrupted push to reconcile its original intent.

@@ -97,6 +97,7 @@ where
         self.inner.poll_ready(cx)
     }
     fn call(&mut self, mut request: http::Request<Body>) -> Self::Future {
+        let search = request.uri().path().ends_with("/Search");
         let history = request.uri().path().ends_with("/PathHistory")
             || request.uri().path().ends_with("/Blame");
         let cloud_open = request.uri().path().ends_with("/OpenCloudScope");
@@ -135,7 +136,9 @@ where
                 Ok(context) => context,
                 Err(status) => return Ok(status.into_http()),
             };
-            let admission = if history {
+            let admission = if search {
+                host.admit_search(deadline).await
+            } else if history {
                 host.admit_history(deadline).await
             } else {
                 host.admit(deadline).await
@@ -379,6 +382,44 @@ mod tests {
             .await
             .unwrap();
         assert!(history.has_history_memory());
+    }
+    #[tokio::test]
+    async fn unused_search_does_not_raise_graph_startup_memory_and_rejects_unfunded_work() {
+        let temporary = tempfile::tempdir().unwrap();
+        let index =
+            tinytree_index::Index::open(temporary.path().join("index"), &Default::default())
+                .unwrap();
+        let store =
+            tinytree_store::Store::open(temporary.path().join("objects"), Default::default())
+                .unwrap();
+        store.create_repository("example").unwrap();
+        let mut config = ServiceConfig::default();
+        config.query.max_search_manifest_bytes = 16 * 1024 * 1024;
+        config.query.max_search_warm_memory_bytes = 256 * 1024 * 1024;
+        config.query.max_request_memory_bytes = config
+            .query
+            .request_memory(config.max_request_bytes)
+            .saturating_add(config.query.history_memory());
+        let repository = RepositoryService::new(
+            store,
+            config,
+            vec!["example".into()],
+            vec![Principal::new("agent", TOKEN, vec!["example".into()], true).unwrap()],
+        )
+        .unwrap()
+        .with_query_index(index)
+        .unwrap();
+        let service = repository.query_grpc_service();
+        let (mut search, polls) = request(true);
+        *search.uri_mut() = "/tinytree.query.v1.RepositoryQuery/Search".parse().unwrap();
+        let response = service.clone().oneshot(search).await.unwrap();
+        assert_eq!(response.headers().get("grpc-status").unwrap(), "8");
+        assert_eq!(polls.load(Ordering::SeqCst), 0);
+        drop(response);
+        let (graph, polls) = request(true);
+        let response = service.oneshot(graph).await.unwrap();
+        assert_eq!(response.headers().get("grpc-status").unwrap(), "9");
+        assert!(polls.load(Ordering::SeqCst) > 0);
     }
     #[tokio::test]
     async fn cloud_proof_admission_precedes_body_without_taxing_ordinary_queries() {

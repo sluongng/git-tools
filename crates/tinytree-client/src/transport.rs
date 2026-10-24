@@ -333,6 +333,17 @@ impl Client {
         )
         .await
     }
+    pub async fn search(
+        &mut self,
+        request: Request<q::SearchRequest>,
+    ) -> Result<Response<q::SearchResult>, Status> {
+        self.unary(
+            request,
+            "/tinytree.query.v1.RepositoryQuery/Search",
+            Shape::Search,
+        )
+        .await
+    }
     pub async fn path_history(
         &mut self,
         request: Request<q::PathHistoryRequest>,
@@ -529,6 +540,8 @@ impl Client {
 }
 #[derive(Clone, Copy)]
 pub(crate) enum Shape {
+    Search,
+    SearchHit,
     PathHistory,
     PathHistoryEntry,
     HistoryPathState,
@@ -825,12 +838,13 @@ fn scan(
                         | (Shape::ScopeKey, 2)
                         | (Shape::CommitId, 1)
                         | (Shape::QueryFacts, 2)
-                        | (Shape::PathHistory | Shape::Blame, 1) => Some(32),
+                        | (Shape::PathHistory | Shape::Blame | Shape::Search, 1)
+                        | (Shape::SearchHit, 2) => Some(32),
                         (Shape::QueryScope, 3)
                         | (Shape::IdsPage | Shape::GraphPage | Shape::CanonicalPage, 2)
                         | (Shape::ChangeId, 1)
                         | (Shape::QueryFacts, 3)
-                        | (Shape::PathHistory | Shape::Blame, 2) => Some(16),
+                        | (Shape::PathHistory | Shape::Blame | Shape::Search, 2) => Some(16),
                         _ => None,
                     };
                     if exact.is_some_and(|n| data.len() != n) {
@@ -850,6 +864,10 @@ fn scan(
         }
     }
     let required = match shape {
+        Shape::Search => {
+            (1 << 1) | (1 << 2) | (1 << 3) | (1 << 6) | (1 << 8) | (1 << 9) | (1 << 14)
+        }
+        Shape::SearchHit => (1 << 1) | (1 << 2) | (1 << 3) | (1 << 5) | (1 << 6) | (1 << 9),
         Shape::PathHistory | Shape::Blame => {
             (1 << 1) | (1 << 2) | (1 << 3) | (1 << 4) | (1 << 5) | (1 << 6)
         }
@@ -918,6 +936,22 @@ fn rule(shape: Shape, n: u32, l: &Limits) -> Option<(u8, Option<Shape>, usize, u
     let nested = |child| Some((2, Some(child), 1, 0));
     let repeated = |child, count, allocation| Some((2, Some(child), count, allocation));
     match (shape, n) {
+        (Shape::Search, 1 | 4 | 5) => text(32),
+        (Shape::Search, 2) => text(16),
+        (Shape::Search, 3) => nested(Shape::CommitId),
+        (Shape::Search, 6) => text(1024),
+        (Shape::Search, 7) => text(4096),
+        (Shape::Search, 8 | 9 | 12 | 13 | 14) => scalar(),
+        (Shape::Search, 10) => repeated(
+            Shape::SearchHit,
+            l.max_batch_items,
+            4 * std::mem::size_of::<q::SearchHit>(),
+        ),
+        (Shape::Search, 11) => text(4096),
+        (Shape::SearchHit, 1) => text(4096),
+        (Shape::SearchHit, 2) => text(32),
+        (Shape::SearchHit, 3..=8) => scalar(),
+        (Shape::SearchHit, 9) => text(1280),
         (Shape::PathHistory | Shape::Blame, 1) => text(32),
         (Shape::PathHistory | Shape::Blame, 2) => text(16),
         (Shape::PathHistory | Shape::Blame, 3) => nested(Shape::CommitId),

@@ -72,6 +72,7 @@ impl Running {
             counts: queries.clone(),
             first_scope: Arc::new(std::sync::Mutex::new(None)),
             first_page: Arc::new(std::sync::Mutex::new(None)),
+            first_search: Arc::new(std::sync::Mutex::new(None)),
         })
         .accept_compressed(tonic::codec::CompressionEncoding::Zstd)
         .send_compressed(tonic::codec::CompressionEncoding::Zstd);
@@ -1474,6 +1475,24 @@ enum QueryMode {
     BlameOriginOverflow,
     BlamePartialReply,
     BlameUnavailableTarget,
+    SearchRetry,
+    SearchWrongDigest,
+    SearchRootWidth,
+    SearchMissingManifest,
+    SearchWrongPattern,
+    SearchWrongPrefix,
+    SearchWrongPolicy,
+    SearchFalseComplete,
+    SearchCorruptSnippet,
+    SearchDuplicateHit,
+    SearchOutsidePrefix,
+    SearchInvalidLine,
+    SearchOverflow,
+    SearchLargePath,
+    SearchChangedManifest,
+    SearchChangedFile,
+    SearchRegressedHit,
+    SearchRegressedProgress,
     CloudMissingBinding,
     CloudWrongBinding,
     CloudBindingWidth,
@@ -1542,6 +1561,8 @@ struct QueryCounts {
     facts: AtomicUsize,
     histories: AtomicUsize,
     blames: AtomicUsize,
+    searches: AtomicUsize,
+    search_ready: AtomicUsize,
     commit_prefixes: AtomicUsize,
     change_prefixes: AtomicUsize,
     shortest_prefixes: AtomicUsize,
@@ -1560,9 +1581,71 @@ struct QueryFaults {
     counts: Arc<QueryCounts>,
     first_scope: Arc<std::sync::Mutex<Option<q::QueryScope>>>,
     first_page: Arc<std::sync::Mutex<Option<q::EvaluatePage>>>,
+    first_search: Arc<std::sync::Mutex<Option<q::SearchResult>>>,
 }
 #[tonic::async_trait]
 impl RepositoryQuery for QueryFaults {
+    async fn search(
+        &self,
+        request: Request<q::SearchRequest>,
+    ) -> Result<Response<q::SearchResult>, Status> {
+        self.counts.searches.fetch_add(1, Ordering::SeqCst);
+        let mut reply = self.service.search(request).await?;
+        if reply.get_ref().coverage == q::SearchCoverage::SearchWarming as i32 {
+            return Ok(reply);
+        }
+        let attempt = self.counts.search_ready.fetch_add(1, Ordering::SeqCst);
+        let result = reply.get_mut();
+        if self.mode == QueryMode::SearchRetry {
+            if attempt == 0 {
+                *self.first_search.lock().unwrap() = Some(result.clone());
+                return Err(Status::unavailable(
+                    "Search ACK withheld for exact page retry",
+                ));
+            }
+            if attempt == 1 && self.first_search.lock().unwrap().as_ref() != Some(result) {
+                return Err(Status::data_loss("Search retry changed immutable page"));
+            }
+        }
+        match self.mode {
+            QueryMode::SearchWrongDigest => result.scope_digest[0] ^= 1,
+            QueryMode::SearchRootWidth => {
+                result.root_tree.pop();
+            }
+            QueryMode::SearchMissingManifest => result.manifest_digest.clear(),
+            QueryMode::SearchWrongPattern => result.pattern.push(b'!'),
+            QueryMode::SearchWrongPrefix => result.path_prefix.push_str("/different"),
+            QueryMode::SearchWrongPolicy => result.policy = 0,
+            QueryMode::SearchFalseComplete => {
+                result.coverage = q::SearchCoverage::SearchComplete as i32;
+                result.cursor = vec![1];
+            }
+            QueryMode::SearchCorruptSnippet => result.hits[0].snippet.fill(b'!'),
+            QueryMode::SearchDuplicateHit => {
+                result.hits[1] = result.hits[0].clone();
+            }
+            QueryMode::SearchOutsidePrefix => result.hits[0].path = "different/file".into(),
+            QueryMode::SearchInvalidLine => result.hits[0].line = 0,
+            QueryMode::SearchOverflow => result.hits[0].byte_offset = u64::MAX,
+            QueryMode::SearchLargePath => result.hits[0].path = "x".repeat(4097),
+            QueryMode::SearchChangedManifest if attempt > 0 => result.manifest_digest[0] ^= 1,
+            QueryMode::SearchChangedFile if attempt > 0 => result.hits[0].file_id[0] ^= 1,
+            QueryMode::SearchRegressedProgress if attempt > 0 => {
+                result.entries_examined = 1;
+                result.file_bytes_read = 0;
+            }
+            QueryMode::SearchRegressedHit => {
+                if attempt == 0 {
+                    *self.first_search.lock().unwrap() = Some(result.clone());
+                } else {
+                    result.hits[0] =
+                        self.first_search.lock().unwrap().as_ref().unwrap().hits[0].clone();
+                }
+            }
+            _ => {}
+        }
+        Ok(reply)
+    }
     async fn path_history(
         &self,
         request: Request<q::PathHistoryRequest>,
@@ -2096,6 +2179,7 @@ impl QueryRunning {
             counts: counts.clone(),
             first_scope: Arc::new(std::sync::Mutex::new(None)),
             first_page: Arc::new(std::sync::Mutex::new(None)),
+            first_search: Arc::new(std::sync::Mutex::new(None)),
         };
         let (stop, stopped) = tokio::sync::oneshot::channel();
         let cloud = CloudFaults::default();
@@ -7696,4 +7780,308 @@ async fn checked_blame_preserves_explicit_partial_coverage_without_invented_orig
         client.close_query_scope(&scope).await.unwrap();
         running.stop().await;
     }
+}
+
+async fn first_ready_search(
+    client: &NativeClient,
+    scope: &tinytree_client::CheckedScopeHandle,
+    revision: tinytree_model::CommitId,
+    page_size: u32,
+) -> Result<tinytree_client::CheckedSearchPage, Status> {
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            let page = client
+                .search(
+                    scope,
+                    revision,
+                    b"cc_binary",
+                    "BUILD.bazel",
+                    q::SearchPolicy::LiteralBytesV1,
+                    page_size,
+                    &[],
+                )
+                .await?;
+            if page.result().coverage != q::SearchCoverage::SearchWarming as i32 {
+                return Ok(page);
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("bounded search index warming")
+}
+
+#[tokio::test]
+async fn checked_search_pages_pin_revision_replay_and_release_rpc_owners() {
+    let fixture = setup_query_retained();
+    let running = QueryRunning::start(fixture.service.clone(), QueryMode::SearchRetry).await;
+    let mut config = running.config.clone();
+    config.limits.max_inflight = 1;
+    let client = NativeClient::connect(config).await.unwrap();
+    let scope = client.open_query_scope(vec![fixture.root]).await.unwrap();
+    let persistent = Arc::new(AtomicUsize::new(0));
+    let physical = Arc::new(AtomicUsize::new(0));
+    let guarded = client
+        .clone()
+        .with_lifetime_guard(Arc::new(LifetimeProbe(persistent.clone())))
+        .with_rpc_lifetime_guard(Arc::new(LifetimeProbe(physical.clone())));
+    let first = first_ready_search(&guarded, &scope, fixture.root, 1)
+        .await
+        .unwrap();
+    assert_eq!(first.result().hits.len(), 1);
+    assert_eq!(
+        first.result().coverage,
+        q::SearchCoverage::SearchMore as i32
+    );
+    assert_eq!(
+        running.counts.search_ready.load(Ordering::SeqCst),
+        2,
+        "lost first-page ACK replays the exact immutable page"
+    );
+    let second = guarded
+        .search(
+            &scope,
+            fixture.root,
+            b"cc_binary",
+            "BUILD.bazel",
+            q::SearchPolicy::LiteralBytesV1,
+            1,
+            &first.result().cursor,
+        )
+        .await
+        .unwrap();
+    let replay = guarded
+        .search(
+            &scope,
+            fixture.root,
+            b"cc_binary",
+            "BUILD.bazel",
+            q::SearchPolicy::LiteralBytesV1,
+            1,
+            &first.result().cursor,
+        )
+        .await
+        .unwrap();
+    assert_eq!(second.result(), replay.result());
+    assert!(second.result().hits[0].byte_offset > first.result().hits[0].byte_offset);
+    drop(guarded);
+    assert_released(&physical).await;
+    assert_eq!(persistent.load(Ordering::SeqCst), 0);
+    // Retained snippets and session state must leave the sole RPC slot free.
+    let mut query = client
+        .begin_search(
+            &scope,
+            fixture.root,
+            b"cc_binary",
+            "BUILD.bazel",
+            q::SearchPolicy::LiteralBytesV1,
+            1,
+        )
+        .await
+        .unwrap();
+    let mut hits = Vec::new();
+    while !query.is_terminal() {
+        let page = client.search_page(&mut query).await.unwrap();
+        hits.extend(page.result().hits.clone());
+        if query.is_warming() {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    }
+    assert!(query.is_complete());
+    let seed = crate::fixture();
+    let source = seed
+        .objects()
+        .iter()
+        .find(|object| {
+            object.descriptor.key.kind == Kind::File && object.bytes.starts_with(b"load(")
+        })
+        .unwrap();
+    let expected: Vec<_> = source
+        .bytes
+        .windows(b"cc_binary".len())
+        .enumerate()
+        .filter_map(|(index, bytes)| (bytes == b"cc_binary").then_some(index as u64))
+        .collect();
+    assert_eq!(
+        hits.iter().map(|hit| hit.byte_offset).collect::<Vec<_>>(),
+        expected
+    );
+    assert!(hits.iter().all(|hit| hit.path == "BUILD.bazel"));
+    drop(first);
+    drop(second);
+    assert_eq!(persistent.load(Ordering::SeqCst), 0);
+    drop(replay);
+    assert_released(&persistent).await;
+    assert_eq!(
+        client.search_page(&mut query).await.unwrap_err().code(),
+        Code::FailedPrecondition
+    );
+    client.close_query_scope(&scope).await.unwrap();
+    running.stop().await;
+}
+
+#[tokio::test]
+async fn checked_search_rejects_unbound_or_malformed_snippet_pages() {
+    for mode in [
+        QueryMode::SearchWrongDigest,
+        QueryMode::SearchRootWidth,
+        QueryMode::SearchMissingManifest,
+        QueryMode::SearchWrongPattern,
+        QueryMode::SearchWrongPrefix,
+        QueryMode::SearchWrongPolicy,
+        QueryMode::SearchFalseComplete,
+        QueryMode::SearchCorruptSnippet,
+        QueryMode::SearchDuplicateHit,
+        QueryMode::SearchOutsidePrefix,
+        QueryMode::SearchInvalidLine,
+        QueryMode::SearchOverflow,
+        QueryMode::SearchLargePath,
+    ] {
+        let fixture = setup_query_retained();
+        let running = QueryRunning::start(fixture.service.clone(), mode).await;
+        let client = running.client().await;
+        let scope = client.open_query_scope(vec![fixture.root]).await.unwrap();
+        let page_size = if mode == QueryMode::SearchDuplicateHit {
+            2
+        } else {
+            1
+        };
+        let error = first_ready_search(&client, &scope, fixture.root, page_size)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(error.code(), Code::DataLoss | Code::ResourceExhausted),
+            "{mode:?}: {error}"
+        );
+        client.close_query_scope(&scope).await.unwrap();
+        running.stop().await;
+    }
+}
+
+#[tokio::test]
+async fn checked_search_session_rejects_manifest_progress_and_result_regressions() {
+    for mode in [
+        QueryMode::SearchChangedManifest,
+        QueryMode::SearchChangedFile,
+        QueryMode::SearchRegressedHit,
+        QueryMode::SearchRegressedProgress,
+    ] {
+        let fixture = setup_query_retained();
+        let running = QueryRunning::start(fixture.service.clone(), mode).await;
+        let client = running.client().await;
+        let scope = client.open_query_scope(vec![fixture.root]).await.unwrap();
+        let mut query = client
+            .begin_search(
+                &scope,
+                fixture.root,
+                b"cc_binary",
+                "BUILD.bazel",
+                q::SearchPolicy::LiteralBytesV1,
+                1,
+            )
+            .await
+            .unwrap();
+        loop {
+            let page = client.search_page(&mut query).await.unwrap();
+            if !query.is_warming() {
+                assert_eq!(page.result().hits.len(), 1);
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert_eq!(
+            client.search_page(&mut query).await.unwrap_err().code(),
+            Code::DataLoss,
+            "{mode:?}"
+        );
+        client.close_query_scope(&scope).await.unwrap();
+        running.stop().await;
+    }
+}
+
+#[tokio::test]
+async fn immutable_search_inputs_sessions_and_deadlines_fail_before_remote_work() {
+    let fixture = setup_query_retained();
+    let running = QueryRunning::start(fixture.service.clone(), QueryMode::Normal).await;
+    let client = running.client().await;
+    let scope = client.open_query_scope(vec![fixture.root]).await.unwrap();
+    let before = running.counts.searches.load(Ordering::SeqCst);
+    for (pattern, prefix, policy, size, cursor) in [
+        (&b""[..], "", q::SearchPolicy::LiteralBytesV1, 1, Vec::new()),
+        (
+            &b"a\nb"[..],
+            "",
+            q::SearchPolicy::LiteralBytesV1,
+            1,
+            Vec::new(),
+        ),
+        (
+            &b"a"[..],
+            "../escape",
+            q::SearchPolicy::LiteralBytesV1,
+            1,
+            Vec::new(),
+        ),
+        (
+            &b"a"[..],
+            "",
+            q::SearchPolicy::LiteralBytesV1,
+            1,
+            vec![1; 4097],
+        ),
+        (
+            &b"a"[..],
+            "",
+            q::SearchPolicy::try_from(0).unwrap(),
+            1,
+            Vec::new(),
+        ),
+        (
+            &b"a"[..],
+            "",
+            q::SearchPolicy::LiteralBytesV1,
+            4097,
+            Vec::new(),
+        ),
+    ] {
+        assert_eq!(
+            client
+                .search(&scope, fixture.root, pattern, prefix, policy, size, &cursor)
+                .await
+                .unwrap_err()
+                .code(),
+            Code::InvalidArgument
+        );
+    }
+    assert_eq!(running.counts.searches.load(Ordering::SeqCst), before);
+    let foreign = running.client().await;
+    let mut query = client
+        .begin_search(
+            &scope,
+            fixture.root,
+            b"cc",
+            "",
+            q::SearchPolicy::LiteralBytesV1,
+            1,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        foreign.search_page(&mut query).await.unwrap_err().code(),
+        Code::InvalidArgument
+    );
+    let expired = client
+        .clone()
+        .with_operation_deadline(tokio::time::Instant::now() - Duration::from_millis(1));
+    assert_eq!(
+        expired.search_page(&mut query).await.unwrap_err().code(),
+        Code::DeadlineExceeded
+    );
+    assert_eq!(running.counts.searches.load(Ordering::SeqCst), before);
+    client.close_query_scope(&scope).await.unwrap();
+    assert_eq!(
+        client.search_page(&mut query).await.unwrap_err().code(),
+        Code::FailedPrecondition
+    );
+    running.stop().await;
 }

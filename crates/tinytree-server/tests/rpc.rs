@@ -5503,6 +5503,13 @@ async fn cloud_rpc_private_compressed_history_replay_gc_and_restart() {
     );
     // Frozen cloud drafts are not in the live index; their selected retained
     // source, not COMMIT-only overlay membership, authorizes canonical path I/O.
+    let frozen_search = search_ready(
+        &mut query,
+        &search_input(&scope, frozen[1].descriptor.key, b"cc_binary", 1),
+    )
+    .await;
+    assert_eq!(frozen_search.coverage, q::SearchCoverage::SearchMore as i32);
+    assert_eq!(frozen_search.hits[0].path, "BUILD.bazel");
     let frozen_blame_response = query
         .blame(request(
             q::BlameRequest {
@@ -6624,6 +6631,20 @@ async fn history_canonical_source_excludes_private_metadata_only_overlays() {
                 q::HistoryCoverage::HistoryPrivateOverlay as i32
             );
             assert!(response.target.is_none());
+            let search = client
+                .search(request(
+                    search_input(&overlay, draft.descriptor.key, b"selected", 1),
+                    ALPHA,
+                ))
+                .await
+                .unwrap()
+                .into_inner();
+            assert_eq!(
+                search.coverage,
+                q::SearchCoverage::SearchPrivateOverlay as i32
+            );
+            assert!(search.root_tree.is_empty());
+            assert!(search.hits.is_empty());
             assert!(response.target_bytes.is_empty());
             assert!(response.ranges.is_empty());
             let response = client
@@ -6997,4 +7018,661 @@ async fn benchmark_remote_blame_default_limits() {
             drop(objects);drop(query);server.stop().await;
         }
     }).await.expect("bounded remote blame benchmark expired");
+}
+
+fn search_input(
+    scope: &q::QueryScope,
+    revision: ObjectKey,
+    pattern: &[u8],
+    page_size: u32,
+) -> q::SearchRequest {
+    q::SearchRequest {
+        scope: scope.key.clone(),
+        revision: Some(query_id(revision)),
+        pattern: pattern.to_vec(),
+        path_prefix: String::new(),
+        policy: q::SearchPolicy::LiteralBytesV1 as i32,
+        page_size,
+        cursor: vec![],
+    }
+}
+async fn search_ready(
+    client: &mut q::repository_query_client::RepositoryQueryClient<Channel>,
+    input: &q::SearchRequest,
+) -> q::SearchResult {
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let response = client.search(request(input.clone(), ALPHA)).await.unwrap();
+            assert_eq!(response.metadata().get("grpc-encoding").unwrap(), "zstd");
+            let value = response.into_inner();
+            if value.coverage != q::SearchCoverage::SearchWarming as i32 {
+                break value;
+            }
+            assert!(value.hits.is_empty());
+            assert!(value.cursor.is_empty());
+            assert!(value.manifest_digest.is_empty());
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap()
+}
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn indexed_search_pins_revision_and_pages_exact_matches_with_bound_cursors() {
+    let (temporary, store) = setup();
+    let index =
+        tinytree_index::Index::open(temporary.path().join("derived"), &Default::default()).unwrap();
+    let a = history_commit(
+        &store,
+        &index,
+        &[],
+        Some(history_file(
+            &store,
+            b"needle one\nmiddle needle\n\xffneedle\0 tail",
+            false,
+        )),
+        101,
+    )
+    .descriptor
+    .key;
+    let b = history_commit(
+        &store,
+        &index,
+        &[a],
+        Some(history_file(
+            &store,
+            b"different selected revision\n",
+            false,
+        )),
+        102,
+    )
+    .descriptor
+    .key;
+    let server = Running::start_query(store.clone(), ServiceConfig::default(), index).await;
+    let mut client = server.query_client().await;
+    let scope = query_ready(&mut client, &[b], 101).await;
+    let input = search_input(&scope, a, b"needle", 1);
+    let first = client
+        .search(request(input.clone(), ALPHA))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(first.coverage, q::SearchCoverage::SearchWarming as i32);
+    assert!(first.hits.is_empty());
+    let first = search_ready(&mut client, &input).await;
+    assert_eq!(first.coverage, q::SearchCoverage::SearchMore as i32);
+    assert_eq!(first.hits.len(), 1);
+    assert_eq!(
+        (
+            first.hits[0].byte_offset,
+            first.hits[0].line,
+            first.hits[0].byte_column
+        ),
+        (0, 1, 0)
+    );
+    assert_eq!(first.revision, Some(query_id(a)));
+    let mut next = input.clone();
+    next.cursor = first.cursor.clone();
+    let second = search_ready(&mut client, &next).await;
+    assert_eq!(second.coverage, q::SearchCoverage::SearchMore as i32);
+    assert_eq!(
+        (
+            second.hits[0].byte_offset,
+            second.hits[0].line,
+            second.hits[0].byte_column
+        ),
+        (18, 2, 7)
+    );
+    let replay = client
+        .search(request(next.clone(), ALPHA))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(
+        replay, second,
+        "same authenticated continuation replays the exact immutable page"
+    );
+    for changed in [
+        q::SearchRequest {
+            pattern: b"one".to_vec(),
+            ..next.clone()
+        },
+        q::SearchRequest {
+            path_prefix: "other".into(),
+            ..next.clone()
+        },
+        q::SearchRequest {
+            revision: Some(query_id(b)),
+            ..next.clone()
+        },
+        q::SearchRequest {
+            page_size: 2,
+            ..next.clone()
+        },
+    ] {
+        assert_eq!(
+            client
+                .search(request(changed, ALPHA))
+                .await
+                .unwrap_err()
+                .code(),
+            Code::InvalidArgument
+        );
+    }
+    let mut tampered = next.clone();
+    tampered.cursor[9] ^= 1;
+    assert_eq!(
+        client
+            .search(request(tampered, ALPHA))
+            .await
+            .unwrap_err()
+            .code(),
+        Code::InvalidArgument
+    );
+    assert_eq!(
+        client
+            .search(request(next.clone(), PEER))
+            .await
+            .unwrap_err()
+            .code(),
+        Code::PermissionDenied
+    );
+    next.cursor = second.cursor.clone();
+    let third = search_ready(&mut client, &next).await;
+    assert_eq!(third.hits[0].byte_offset, 26);
+    next.cursor = third.cursor.clone();
+    let final_page = if third.coverage == q::SearchCoverage::SearchComplete as i32 {
+        third
+    } else {
+        search_ready(&mut client, &next).await
+    };
+    assert_eq!(
+        final_page.coverage,
+        q::SearchCoverage::SearchComplete as i32
+    );
+    assert!(final_page.cursor.is_empty());
+    let negative = search_ready(&mut client, &search_input(&scope, b, b"needle", 2)).await;
+    assert_eq!(negative.coverage, q::SearchCoverage::SearchComplete as i32);
+    assert!(negative.hits.is_empty());
+    let short = search_ready(&mut client, &search_input(&scope, a, b"e", 128)).await;
+    assert_eq!(short.coverage, q::SearchCoverage::SearchComplete as i32);
+    assert_eq!(
+        short.hits.len(),
+        b"needle one\nmiddle needle\n\xffneedle\0 tail"
+            .iter()
+            .filter(|&&v| v == b'e')
+            .count()
+    );
+    for (prefix, count) in [("file", 3), ("fi", 0), ("other", 0)] {
+        let mut selected = search_input(&scope, a, b"needle", 128);
+        selected.path_prefix = prefix.into();
+        let selected = search_ready(&mut client, &selected).await;
+        assert_eq!(selected.coverage, q::SearchCoverage::SearchComplete as i32);
+        assert_eq!(selected.hits.len(), count);
+    }
+    for pattern in [b"".as_slice(), b"line\nbreak".as_slice()] {
+        assert_eq!(
+            client
+                .search(request(search_input(&scope, a, pattern, 1), ALPHA))
+                .await
+                .unwrap_err()
+                .code(),
+            Code::InvalidArgument
+        );
+    }
+    client
+        .close_scope(request(q::CloseScopeRequest { scope: scope.key }, ALPHA))
+        .await
+        .unwrap();
+    assert_eq!(
+        client
+            .search(request(next, ALPHA))
+            .await
+            .unwrap_err()
+            .code(),
+        Code::FailedPrecondition
+    );
+    drop(client);
+    server.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn indexed_search_limits_do_not_turn_unread_or_unscanned_files_into_empty_success() {
+    let (temporary, store) = setup();
+    let index =
+        tinytree_index::Index::open(temporary.path().join("derived"), &Default::default()).unwrap();
+    let head = history_commit(
+        &store,
+        &index,
+        &[],
+        Some(history_file(
+            &store,
+            b"needle much larger than the requested read cap",
+            false,
+        )),
+        103,
+    )
+    .descriptor
+    .key;
+    let mut config = ServiceConfig::default();
+    config.query.max_search_file_bytes = 4;
+    let server = Running::start_query(store, config, index).await;
+    let mut client = server.query_client().await;
+    let scope = query_ready(&mut client, &[head], 102).await;
+    let oversized = search_ready(&mut client, &search_input(&scope, head, b"needle", 128)).await;
+    assert_eq!(
+        oversized.coverage,
+        q::SearchCoverage::SearchReadLimit as i32
+    );
+    assert!(oversized.hits.is_empty());
+    assert!(oversized.cursor.is_empty());
+    // A verified filter negative is still conclusive for an oversized body;
+    // oversized positives, not all large files indiscriminately, are incomplete.
+    let negative = search_ready(&mut client, &search_input(&scope, head, b"zzzzzzzzzz", 128)).await;
+    assert_eq!(negative.coverage, q::SearchCoverage::SearchComplete as i32);
+    assert!(negative.hits.is_empty());
+    drop(client);
+    server.stop().await;
+}
+
+fn search_many_files(store: &Store, index: &tinytree_index::Index, files: usize) -> ObjectKey {
+    let mut entries = Vec::new();
+    for i in 0..files {
+        let bytes = format!("distinct file {i:04} has no requested match\n");
+        entries.push(tinytree_model::TreeEntry {
+            name: format!("a{i:04}"),
+            value: history_file(store, bytes.as_bytes(), false),
+        });
+    }
+    entries.push(tinytree_model::TreeEntry {
+        name: "z-match".into(),
+        value: history_file(store, b"needle final\n", false),
+    });
+    let tree = tinytree_model::encode(
+        &Object::Tree(tinytree_model::Tree { entries }),
+        Limits::default(),
+    )
+    .unwrap();
+    store.put("alpha", tree.descriptor, &tree.bytes, 0).unwrap();
+    let mut commit = tinytree_model::synthetic_root();
+    commit.parents = vec![CommitId::ROOT];
+    commit.change_id = tinytree_model::ChangeId([104; 16]);
+    commit.root_tree.terms = vec![TreeId(tree.descriptor.key.id.0)];
+    let commit = tinytree_model::encode(&Object::Commit(commit), Limits::default()).unwrap();
+    store
+        .put("alpha", commit.descriptor, &commit.bytes, 0)
+        .unwrap();
+    index
+        .ingest("alpha", commit.descriptor, &commit.bytes)
+        .unwrap();
+    commit.descriptor.key
+}
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn indexed_search_empty_progress_and_cache_quota_preserve_completeness() {
+    for quota in [65_536, 16] {
+        let (temporary, store) = setup();
+        let index =
+            tinytree_index::Index::open(temporary.path().join("derived"), &Default::default())
+                .unwrap();
+        let head = search_many_files(&store, &index, 17);
+        let mut config = ServiceConfig::default();
+        config.query.max_search_cache_records = quota;
+        config.query.max_search_entries_per_page = 1;
+        let server = Running::start_query(store, config, index).await;
+        let mut client = server.query_client().await;
+        let scope = query_ready(&mut client, &[head], 105).await;
+        let mut input = search_input(&scope, head, b"needle", 1);
+        let mut page = search_ready(&mut client, &input).await;
+        if quota == 16 {
+            assert_eq!(page.coverage, q::SearchCoverage::SearchIndexLimit as i32);
+            assert!(page.hits.is_empty());
+            assert!(page.cursor.is_empty());
+        } else {
+            let mut hits = Vec::new();
+            let mut empty_pages = 0;
+            loop {
+                if page.hits.is_empty() && page.coverage == q::SearchCoverage::SearchMore as i32 {
+                    empty_pages += 1;
+                }
+                hits.extend(page.hits.clone());
+                if page.coverage == q::SearchCoverage::SearchComplete as i32 {
+                    break;
+                }
+                assert_eq!(page.coverage, q::SearchCoverage::SearchMore as i32);
+                assert!(!page.cursor.is_empty());
+                let progress = page.entries_examined;
+                input.cursor = page.cursor;
+                page = search_ready(&mut client, &input).await;
+                assert!(page.entries_examined > progress);
+            }
+            assert_eq!(empty_pages, 17);
+            assert_eq!(hits.len(), 1);
+            assert_eq!(hits[0].path, "z-match");
+        }
+        drop(client);
+        server.stop().await;
+    }
+}
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn indexed_search_filter_positive_is_not_a_match_or_canonical_authority() {
+    let (temporary, store) = setup();
+    let index =
+        tinytree_index::Index::open(temporary.path().join("derived"), &Default::default()).unwrap();
+    let bytes = b"haystack without the requested literal\n";
+    let value = history_file(&store, bytes, false);
+    let head = history_commit(&store, &index, &[], Some(value), 106)
+        .descriptor
+        .key;
+    // An all-positive Bloom filter is conservative but cannot establish a hit.
+    index
+        .put_content_file(
+            "alpha",
+            tinytree_model::file_id(bytes),
+            bytes.len() as u64,
+            tinytree_search::FileFilter::from_bytes([255; 512]),
+            &Default::default(),
+        )
+        .unwrap();
+    let server = Running::start_query(store, ServiceConfig::default(), index).await;
+    let mut client = server.query_client().await;
+    let scope = query_ready(&mut client, &[head], 106).await;
+    let found = search_ready(&mut client, &search_input(&scope, head, b"needle", 128)).await;
+    assert_eq!(found.coverage, q::SearchCoverage::SearchComplete as i32);
+    assert!(found.hits.is_empty());
+    assert_eq!(found.file_bytes_read, bytes.len() as u64);
+    drop(client);
+    server.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn indexed_search_work_is_spent_on_visited_entries_and_stays_aggregate_across_pages() {
+    for limited in [false, true] {
+        let (temporary, store) = setup();
+        let index =
+            tinytree_index::Index::open(temporary.path().join("derived"), &Default::default())
+                .unwrap();
+        let mut bytes = vec![b'x'; 16 * 1024];
+        for offset in (0..bytes.len()).step_by(2048) {
+            bytes[offset..offset + 6].copy_from_slice(b"needle");
+        }
+        let head = history_commit(
+            &store,
+            &index,
+            &[],
+            Some(history_file(&store, &bytes, false)),
+            107,
+        )
+        .descriptor
+        .key;
+        let mut config = ServiceConfig::default();
+        if limited {
+            config.query.max_search_match_work = 20_000;
+            config.query.max_search_total_work = 25_000;
+        }
+        let server = Running::start_query(store, config, index).await;
+        let mut client = server.query_client().await;
+        let scope = query_ready(&mut client, &[head], 107).await;
+        let mut input = search_input(&scope, head, b"needle", if limited { 1 } else { 128 });
+        let mut count = 0;
+        let mut terminal = false;
+        for _ in 0..32 {
+            let page = search_ready(&mut client, &input).await;
+            count += page.hits.len();
+            if page.coverage == q::SearchCoverage::SearchMore as i32 {
+                input.cursor = page.cursor;
+                continue;
+            }
+            if limited {
+                assert_eq!(page.coverage, q::SearchCoverage::SearchWorkLimit as i32);
+                assert!(
+                    count > 0 && count < 8,
+                    "aggregate work cannot be reset by a result page"
+                );
+            } else {
+                assert_eq!(page.coverage, q::SearchCoverage::SearchComplete as i32);
+                assert_eq!(
+                    count, 8,
+                    "one ordinary 16KiB candidate must have its full matcher allowance"
+                );
+                let short = search_ready(&mut client, &search_input(&scope, head, b"e", 128)).await;
+                assert_eq!(short.coverage, q::SearchCoverage::SearchComplete as i32);
+                assert_eq!(short.hits.len(), 24);
+            }
+            terminal = true;
+            break;
+        }
+        assert!(
+            terminal,
+            "bounded query must reach its complete or exhausted terminal state"
+        );
+        drop(client);
+        server.stop().await;
+    }
+}
+
+fn search_benchmark_revision(
+    store: &Store,
+    index: &tinytree_index::Index,
+    files: &[(String, Descriptor, Vec<u8>)],
+    parent: Option<ObjectKey>,
+    change: u8,
+) -> ObjectKey {
+    let entries = files
+        .iter()
+        .map(|(path, descriptor, bytes)| tinytree_model::TreeEntry {
+            name: path.clone(),
+            value: tinytree_model::TreeValue::File {
+                id: tinytree_model::FileId(descriptor.key.id.0),
+                executable: false,
+                size_bytes: bytes.len() as u64,
+                copy_id: None,
+            },
+        })
+        .collect();
+    let tree = tinytree_model::encode(
+        &Object::Tree(tinytree_model::Tree { entries }),
+        Limits::default(),
+    )
+    .unwrap();
+    store.put("alpha", tree.descriptor, &tree.bytes, 0).unwrap();
+    let mut commit = tinytree_model::synthetic_root();
+    commit.parents = vec![parent.map_or(CommitId::ROOT, |key| CommitId(key.id.0))];
+    commit.change_id = tinytree_model::ChangeId([change; 16]);
+    commit.root_tree.terms = vec![TreeId(tree.descriptor.key.id.0)];
+    let commit = tinytree_model::encode(&Object::Commit(commit), Limits::default()).unwrap();
+    store
+        .put("alpha", commit.descriptor, &commit.bytes, 0)
+        .unwrap();
+    index
+        .ingest("alpha", commit.descriptor, &commit.bytes)
+        .unwrap();
+    commit.descriptor.key
+}
+async fn search_benchmark_server(
+    store: Store,
+    index: std::sync::Arc<tinytree_index::Index>,
+) -> (Running, RepositoryService) {
+    let service = RepositoryService::new(
+        store,
+        ServiceConfig::default(),
+        vec!["alpha".into()],
+        vec![Principal::new("alpha", ALPHA, vec!["alpha".into()], true).unwrap()],
+    )
+    .unwrap()
+    .with_query_index(index)
+    .unwrap();
+    let observer = service.clone();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let (stop, stopped) = oneshot::channel();
+    let task = tokio::spawn(serve_tcp(listener, service, None, async {
+        let _ = stopped.await;
+    }));
+    (
+        Running {
+            address,
+            stop: Some(stop),
+            task: Some(task),
+        },
+        observer,
+    )
+}
+async fn benchmark_search_complete(
+    client: &mut q::repository_query_client::RepositoryQueryClient<Channel>,
+    mut input: q::SearchRequest,
+) -> (q::SearchResult, Vec<(String, u64)>, u64, u64) {
+    let mut hits = Vec::new();
+    let mut polls = 0;
+    let mut pages = 0;
+    tokio::time::timeout(Duration::from_secs(60), async {
+        loop {
+            let response = client.search(request(input.clone(), ALPHA)).await.unwrap();
+            assert_eq!(response.metadata().get("grpc-encoding").unwrap(), "zstd");
+            let page = response.into_inner();
+            assert_eq!(page.revision, input.revision);
+            if page.coverage == q::SearchCoverage::SearchWarming as i32 {
+                polls += 1;
+                tokio::time::sleep(Duration::from_millis(5)).await;
+                continue;
+            }
+            pages += 1;
+            hits.extend(
+                page.hits
+                    .iter()
+                    .map(|hit| (hit.path.clone(), hit.byte_offset)),
+            );
+            if page.coverage == q::SearchCoverage::SearchMore as i32 {
+                input.cursor = page.cursor.clone();
+                continue;
+            }
+            break (page, hits, polls, pages);
+        }
+    })
+    .await
+    .unwrap()
+}
+fn naive_literal_offsets(bytes: &[u8], pattern: &[u8]) -> Vec<u64> {
+    let mut offsets = Vec::new();
+    let mut at = 0;
+    while at + pattern.len() <= bytes.len() {
+        if &bytes[at..at + pattern.len()] == pattern {
+            offsets.push(at as u64);
+            at += pattern.len();
+        } else {
+            at += 1;
+        }
+    }
+    offsets
+}
+async fn benchmark_search_stats(
+    service: &RepositoryService,
+    jobs: u64,
+) -> tinytree_server::SearchStats {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let stats = service.search_stats().unwrap();
+            if stats.warm_jobs_completed >= jobs {
+                break stats;
+            }
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    })
+    .await
+    .unwrap()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "manual indexed-search cold, warm and one-file iteration RPC benchmark"]
+async fn benchmark_indexed_search_cold_warm_and_single_file_iteration() {
+    tokio::time::timeout(Duration::from_secs(120), async {
+        const PATTERN: &[u8] = b"UNIQUE_NEEDLE_9fe7";
+        for count in [64usize, 1024] {
+            for trial in 0..3u8 {
+                let (temporary,store) = setup();
+                let index = tinytree_index::Index::open(temporary.path().join("derived"), &Default::default()).unwrap();
+                let mut files = Vec::new();
+                for i in 0..count {
+                    let text = b"fn shared_code() { return 7; }\n";
+                    let mut bytes = (0..4096).map(|at| text[at%text.len()]).collect::<Vec<_>>();
+                    let header = format!("// file {i:06}\n"); bytes[..header.len()].copy_from_slice(header.as_bytes());
+                    if i == 0 { bytes[2048..2048+PATTERN.len()].copy_from_slice(PATTERN); }
+                    let descriptor = tinytree_model::describe_file(&bytes);
+                    store.put("alpha",descriptor,&bytes,0).unwrap();
+                    files.push((format!("file{i:06}.rs"),descriptor,bytes));
+                }
+                let first = search_benchmark_revision(&store,&index,&files,None,108);
+                let (server,observer) = search_benchmark_server(store.clone(),index.clone()).await;
+                let mut query = server.query_client().await;
+                let mut objects = server.client().await;
+                let scope = query_ready(&mut query,&[first],110+trial).await;
+                let input = search_input(&scope,first,PATTERN,128);
+                let start = std::time::Instant::now();
+                let (cold,cold_hits,cold_polls,cold_pages) = benchmark_search_complete(&mut query,input.clone()).await;
+                let cold_ms = start.elapsed().as_secs_f64()*1000.0;
+                let base_stats = benchmark_search_stats(&observer,1).await;
+                assert_eq!(base_stats.warm_files_built,count as u64);
+                assert_eq!(base_stats.warm_file_bytes,(count*4096) as u64);
+                let start = std::time::Instant::now();
+                let (warm,warm_hits,warm_polls,warm_pages) = benchmark_search_complete(&mut query,input).await;
+                let warm_ms = start.elapsed().as_secs_f64()*1000.0;
+                assert_eq!(cold_hits,warm_hits);
+                assert_eq!(warm_polls,0);
+                let start = std::time::Instant::now();
+                let mut downloaded = 0u64; let mut baseline_hits = Vec::new();
+                for (path,descriptor,expected) in &files {
+                    let response = objects.read_file(request(p::ReadFileRequest { repository_id:"alpha".into(),native_file_id:descriptor.key.id.0.to_vec() },ALPHA)).await.unwrap();
+                    assert_eq!(response.metadata().get("grpc-encoding").unwrap(),"zstd");
+                    let mut stream = response.into_inner(); let mut bytes = Vec::new();
+                    while let Some(frame) = stream.message().await.unwrap() {
+                        match frame.frame.unwrap() {
+                            p::file_frame::Frame::Header(actual) => assert_eq!(actual,crate::descriptor(*descriptor)),
+                            p::file_frame::Frame::Chunk(chunk) => { assert_eq!(chunk.offset,bytes.len() as u64); bytes.extend(chunk.data); }
+                        }
+                    }
+                    assert_eq!(&bytes,expected); downloaded += bytes.len() as u64;
+                    baseline_hits.extend(naive_literal_offsets(&bytes,PATTERN).into_iter().map(|offset| (path.clone(),offset)));
+                }
+                let baseline_ms = start.elapsed().as_secs_f64()*1000.0;
+                if warm.coverage == q::SearchCoverage::SearchComplete as i32 { assert_eq!(warm_hits,baseline_hits); }
+                else { assert!(warm_hits.iter().all(|hit| baseline_hits.contains(hit))); }
+                files[1].2[2048..2048+PATTERN.len()].copy_from_slice(PATTERN);
+                files[1].1 = tinytree_model::describe_file(&files[1].2);
+                store.put("alpha",files[1].1,&files[1].2,0).unwrap();
+                let second = search_benchmark_revision(&store,&index,&files,Some(first),109);
+                let second_scope = query_ready(&mut query,&[second],120+trial).await;
+                let start = std::time::Instant::now();
+                let (iteration,iteration_hits,iteration_polls,iteration_pages) = benchmark_search_complete(&mut query,search_input(&second_scope,second,PATTERN,128)).await;
+                let iteration_ms = start.elapsed().as_secs_f64()*1000.0;
+                let after_stats = benchmark_search_stats(&observer,2).await;
+                assert_eq!(after_stats.warm_files_built-base_stats.warm_files_built,1);
+                assert_eq!(after_stats.warm_files_reused-base_stats.warm_files_reused,(count-1) as u64);
+                assert_eq!(after_stats.warm_file_bytes-base_stats.warm_file_bytes,4096);
+                let expected_iteration = files.iter().flat_map(|(path,_,bytes)| naive_literal_offsets(bytes,PATTERN).into_iter().map(move |offset| (path.clone(),offset))).collect::<Vec<_>>();
+                if iteration.coverage == q::SearchCoverage::SearchComplete as i32 { assert_eq!(iteration_hits,expected_iteration); }
+                let start = std::time::Instant::now();
+                let (short,short_hits,short_polls,short_pages) = benchmark_search_complete(&mut query,search_input(&second_scope,second,&[0xfe],128)).await;
+                let short_ms = start.elapsed().as_secs_f64()*1000.0;
+                assert!(short_hits.is_empty());
+                if short.coverage == q::SearchCoverage::SearchComplete as i32 { assert_eq!(short.file_bytes_read,downloaded); }
+                println!("TINYTREE_INDEXED_SEARCH_RPC_V1 {}",serde_json::json!({
+                    "files":count,"file_bytes":4096,"trial":trial,
+                    "transport":"production compressed loopback TCP; decoded bytes, not compressed wire bytes",
+                    "storage_state":"warm canonical Store and graph index; cold content index per trial; OS cache uncontrolled",
+                    "poll_interval_ms":5,
+                    "cold_ready_ms":cold_ms,"cold_warming_polls":cold_polls,"cold_pages":cold_pages,"cold_coverage":q::SearchCoverage::try_from(cold.coverage).unwrap().as_str_name(),
+                    "warm_query_ms":warm_ms,"warm_pages":warm_pages,"warm_coverage":q::SearchCoverage::try_from(warm.coverage).unwrap().as_str_name(),"warm_candidate_file_bytes":warm.file_bytes_read,
+                    "base_filters_built":base_stats.warm_files_built,"base_filter_file_bytes":base_stats.warm_file_bytes,
+                    "naive_snapshot_download_and_scan_ms":baseline_ms,"naive_snapshot_file_rpcs":count,"naive_snapshot_file_bytes":downloaded,
+                    "iteration_ready_ms":iteration_ms,"iteration_warming_polls":iteration_polls,"iteration_pages":iteration_pages,"iteration_coverage":q::SearchCoverage::try_from(iteration.coverage).unwrap().as_str_name(),
+                    "iteration_filters_built":after_stats.warm_files_built-base_stats.warm_files_built,"iteration_filters_reused":after_stats.warm_files_reused-base_stats.warm_files_reused,"iteration_filter_file_bytes":after_stats.warm_file_bytes-base_stats.warm_file_bytes,
+                    "short_negative_ms":short_ms,"short_pages":short_pages,"short_warming_polls":short_polls,"short_coverage":q::SearchCoverage::try_from(short.coverage).unwrap().as_str_name(),"short_candidate_file_bytes":short.file_bytes_read,
+                    "baseline_scope":"actual serial ReadFile of every known snapshot FILE plus independent naive nonoverlapping literal scan; excludes tree enumeration, clone, checkout and client indexing",
+                    "comparability":"same complete literal hit set only when COMPLETE; no partial-result speedup, WAN, shallow-clone or ripgrep claim",
+                    "warming_durability":"buffered rebuildable filter transactions; SyncAll complete manifest barrier",
+                    "logical_bytes":"FILE payloads opened, not physical disk IO; Store verification/reconstruction can read more"
+                }));
+                drop(query);drop(objects);server.stop().await;
+            }
+        }
+    }).await.unwrap();
 }

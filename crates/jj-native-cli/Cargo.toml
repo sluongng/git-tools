@@ -28,6 +28,7 @@ jj-lib = { version = "=0.46.0", default-features = false }
 jj-native-index = { path = "../jj-native-index" }
 jj-native-backend = { path = "../jj-native-backend" }
 native-broker = { path = "../native-broker" }
+tinytree-search = { path = "../tinytree-search" }
 tinytree-model = { path = "../tinytree-model" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

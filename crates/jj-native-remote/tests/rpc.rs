@@ -7717,3 +7717,265 @@ async fn restore_factory_bounds_independent_runtime_data_but_allows_release_only
     repo.wait_for_idle().await;
     server.stop().await;
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn indexed_search_local_cursors_bind_source_inputs_and_replay_without_pinning_slots() {
+    use native_broker::{NativeQueryIo, OpenQueryScope, ScopedSearchQuery, query_protocol as q};
+    let (_serverdir, store, fixture, old) = seed();
+    let payload = b"needle first\nneedle second\n";
+    let file = m::describe_file(payload);
+    store.put("example", file, payload, 0).unwrap();
+    let tree = m::encode(
+        &m::Object::Tree(m::Tree {
+            entries: vec![m::TreeEntry {
+                name: "search.txt".into(),
+                value: m::TreeValue::File {
+                    id: m::FileId(file.key.id.0),
+                    executable: false,
+                    size_bytes: file.size_bytes,
+                    copy_id: None,
+                },
+            }],
+        }),
+        m::Limits::default(),
+    )
+    .unwrap();
+    store
+        .put("example", tree.descriptor, &tree.bytes, 0)
+        .unwrap();
+    let base = fixture
+        .objects()
+        .iter()
+        .find(|object| object.descriptor.key.id.0 == old.0)
+        .unwrap();
+    let m::Object::Commit(mut commit) = m::decode(&base.bytes, m::Limits::default()).unwrap()
+    else {
+        unreachable!()
+    };
+    commit.parents = vec![old];
+    commit.predecessors.clear();
+    commit.root_tree = m::TreeMerge {
+        terms: vec![m::TreeId(tree.descriptor.key.id.0)],
+        labels: vec![String::new()],
+    };
+    commit.description = "indexed search cursor fixture".into();
+    let commit = m::encode(&m::Object::Commit(commit), m::Limits::default()).unwrap();
+    store
+        .put("example", commit.descriptor, &commit.bytes, 0)
+        .unwrap();
+    let head = m::CommitId(commit.descriptor.key.id.0);
+    store
+        .publish(
+            "example",
+            &tinytree_store::PublishRequest {
+                idempotency_key: "indexed-search-head".into(),
+                reference_name: "main".into(),
+                expected_generation: 1,
+                new_commit: Some(head),
+                staging_leases: vec![],
+            },
+            1,
+        )
+        .unwrap();
+    let indexdir = private_dir();
+    let index = tinytree_index::Index::open(indexdir.path(), &Default::default()).unwrap();
+    let service = RepositoryService::new(
+        store,
+        ServiceConfig::default(),
+        vec!["example".into()],
+        vec![
+            Principal::new("test", TOKEN, vec!["example".into()], true)
+                .unwrap()
+                .with_retention(true),
+        ],
+    )
+    .unwrap()
+    .with_query_index(index)
+    .unwrap();
+    let counts = Counters::new();
+    let server = Server::start_service(service, counts.clone(), None).await;
+    let directory = private_dir();
+    let mut cfg = config(&server);
+    cfg.remote.limits.max_inflight = 1;
+    let (_direct, repo) = local(directory.path(), cache(directory.path()), cfg, true);
+    repo.control.admit_reference("main").await.unwrap();
+    let scope = repo
+        .query
+        .open_scope(
+            OpenQueryScope {
+                roots: vec![head],
+                overlay: vec![],
+                replay_key: [141; 32],
+                query_identity_version: 2,
+            },
+            Arc::new(()),
+        )
+        .await
+        .unwrap();
+    let other = repo
+        .query
+        .open_scope(
+            OpenQueryScope {
+                roots: vec![head],
+                overlay: vec![],
+                replay_key: [142; 32],
+                query_identity_version: 2,
+            },
+            Arc::new(()),
+        )
+        .await
+        .unwrap();
+    let input = ScopedSearchQuery {
+        scope: scope.value.handle,
+        revision: head,
+        pattern: b"needle".to_vec(),
+        path_prefix: "".into(),
+        policy: q::SearchPolicy::LiteralBytesV1,
+        page_size: 1,
+        cursor: vec![],
+    };
+    let file_reads = counts.files.load(Ordering::SeqCst);
+    let first = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let page = repo
+                .query
+                .search(input.clone(), Arc::new(()))
+                .await
+                .unwrap();
+            if page.value.coverage != q::SearchCoverage::SearchWarming as i32 {
+                break page;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(first.value.coverage, q::SearchCoverage::SearchMore as i32);
+    assert_eq!(first.value.hits[0].path, "search.txt");
+    assert_eq!(first.value.hits[0].byte_offset, 0);
+    assert!(!first.value.cursor.is_empty());
+    let replay = tokio::time::timeout(
+        Duration::from_secs(2),
+        repo.query.search(input.clone(), Arc::new(())),
+    )
+    .await
+    .expect("retained search reply held the single upstream slot")
+    .unwrap();
+    assert_eq!(replay.value, first.value);
+    let continuing = ScopedSearchQuery {
+        cursor: first.value.cursor.clone(),
+        ..input.clone()
+    };
+    let next = repo
+        .query
+        .clone()
+        .search(continuing.clone(), Arc::new(()))
+        .await
+        .unwrap();
+    assert_eq!(next.value.hits.len(), 1);
+    assert_eq!(next.value.hits[0].byte_offset, 13);
+    assert_eq!(next.value.hits[0].line, 2);
+    assert_eq!(next.value.hits[0].byte_column, 0);
+    let mut final_cursor = next.value.cursor.clone();
+    let mut final_coverage = next.value.coverage;
+    let mut pages = 0;
+    while final_coverage == q::SearchCoverage::SearchMore as i32 {
+        assert!(pages < 3, "bounded fixture failed to terminate its cursor");
+        let final_page = repo
+            .query
+            .search(
+                ScopedSearchQuery {
+                    cursor: final_cursor,
+                    ..input.clone()
+                },
+                Arc::new(()),
+            )
+            .await
+            .unwrap();
+        assert!(
+            final_page.value.hits.is_empty(),
+            "two-match file returned duplicate or invented matches"
+        );
+        final_cursor = final_page.value.cursor.clone();
+        final_coverage = final_page.value.coverage;
+        pages += 1;
+    }
+    assert_eq!(final_coverage, q::SearchCoverage::SearchComplete as i32);
+    assert_eq!(
+        counts.files.load(Ordering::SeqCst),
+        file_reads,
+        "search does not download native FILE bodies into the client"
+    );
+    let mut tampered = continuing.clone();
+    *tampered.cursor.last_mut().unwrap() ^= 1;
+    let invalid = [
+        ("authentication", tampered),
+        (
+            "pattern",
+            ScopedSearchQuery {
+                pattern: b"first".to_vec(),
+                ..continuing.clone()
+            },
+        ),
+        (
+            "prefix",
+            ScopedSearchQuery {
+                path_prefix: "search.txt".into(),
+                ..continuing.clone()
+            },
+        ),
+        (
+            "revision",
+            ScopedSearchQuery {
+                revision: old,
+                ..continuing.clone()
+            },
+        ),
+        (
+            "page size",
+            ScopedSearchQuery {
+                page_size: 2,
+                ..continuing.clone()
+            },
+        ),
+        (
+            "local scope",
+            ScopedSearchQuery {
+                scope: other.value.handle,
+                ..continuing.clone()
+            },
+        ),
+    ];
+    let before = counts.query_rpcs.load(Ordering::SeqCst);
+    for (behavior, input) in invalid {
+        assert_eq!(
+            repo.query
+                .search(input, Arc::new(()))
+                .await
+                .unwrap_err()
+                .code(),
+            tonic::Code::InvalidArgument,
+            "{behavior}"
+        );
+    }
+    assert_eq!(
+        counts.query_rpcs.load(Ordering::SeqCst),
+        before,
+        "invalid local cursors must fail before any upstream RPC"
+    );
+    repo.query
+        .close_scope(scope.value.handle, Arc::new(()))
+        .await
+        .unwrap();
+    assert!(
+        repo.query.search(continuing, Arc::new(())).await.is_err(),
+        "closing a captured scope invalidates its continuations"
+    );
+    repo.query
+        .close_scope(other.value.handle, Arc::new(()))
+        .await
+        .unwrap();
+    drop((first, replay, next, scope, other));
+    repo.wait_for_idle().await;
+    server.stop().await;
+}

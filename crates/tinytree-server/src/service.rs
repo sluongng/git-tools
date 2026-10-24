@@ -133,6 +133,11 @@ impl RepositoryService {
     pub(crate) fn cloud_host(&self) -> Option<Arc<crate::cloud::CloudHost>> {
         self.cloud.clone()
     }
+    /// Process-local diagnostics for derived content warming. This does not
+    /// expose a network endpoint or prove that canonical content is retained.
+    pub fn search_stats(&self) -> Option<crate::SearchStats> {
+        self.query_host().map(|host| host.search.stats())
+    }
     /// Globally drains shared query hosting across all cloned service listeners.
     pub async fn drain_query(&self) -> Result<(), Status> {
         if let Some(host) = &self.query {

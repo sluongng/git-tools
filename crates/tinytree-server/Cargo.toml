@@ -22,6 +22,7 @@ reapi = { path = "../reapi" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tinytree-cloud = { path = "../tinytree-cloud" }
+tinytree-search = { path = "../tinytree-search" }
 tinytree-model = { path = "../tinytree-model" }
 tinytree-index = { path = "../tinytree-index" }
 tinytree-proto = { path = "../tinytree-proto" }

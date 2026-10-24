@@ -878,6 +878,7 @@ where
 
 #[derive(Default)]
 struct MetadataReads {
+    file_keys: Mutex<HashSet<[u8; 32]>>,
     writes: AtomicUsize,
     keys: Mutex<HashSet<(i32, [u8; 32])>>,
     calls: AtomicUsize,
@@ -996,6 +997,9 @@ impl Repository for CountMetadata {
         &self,
         request: RpcRequest<p::ReadFileRequest>,
     ) -> Result<RpcResponse<Self::ReadFileStream>, Status> {
+        if let Ok(id) = request.get_ref().native_file_id.as_slice().try_into() {
+            self.reads.file_keys.lock().unwrap().insert(id);
+        }
         self.inner.read_file(request).await
     }
 
@@ -1030,6 +1034,12 @@ struct CountQueryMetadata {
 }
 #[tonic::async_trait]
 impl RepositoryQuery for CountQueryMetadata {
+    async fn search(
+        &self,
+        r: RpcRequest<q::SearchRequest>,
+    ) -> Result<RpcResponse<q::SearchResult>, Status> {
+        self.inner.search(r).await
+    }
     async fn path_history(
         &self,
         r: RpcRequest<q::PathHistoryRequest>,
@@ -1150,6 +1160,17 @@ impl RemoteServer {
         Self::start_configured(8, false, Some(bytes))
     }
     fn start_configured(history: usize, cloud_enabled: bool, blame_bytes: Option<usize>) -> Self {
+        Self::start_search_configured(history, cloud_enabled, blame_bytes, false)
+    }
+    fn start_with_search() -> Self {
+        Self::start_search_configured(8, false, None, true)
+    }
+    fn start_search_configured(
+        history: usize,
+        cloud_enabled: bool,
+        blame_bytes: Option<usize>,
+        search_seed: bool,
+    ) -> Self {
         assert!((1..=1024).contains(&history));
         let setup_started = Instant::now();
         let directory = tempfile::tempdir().unwrap();
@@ -1216,7 +1237,7 @@ max_manifest_members=1024
             .iter()
             .find(|object| object.descriptor.key.kind == m::Kind::Commit)
             .unwrap();
-        let m::Object::Commit(template) =
+        let m::Object::Commit(mut template) =
             m::decode(&root_commit.bytes, m::Limits::default()).unwrap()
         else {
             unreachable!()
@@ -1226,10 +1247,62 @@ max_manifest_members=1024
             .iter()
             .find(|object| object.descriptor.key.id.0 == template.root_tree.terms[0].0)
             .unwrap();
-        let m::Object::Tree(current_tree) = m::decode(&root.bytes, m::Limits::default()).unwrap()
+        let m::Object::Tree(mut current_tree) =
+            m::decode(&root.bytes, m::Limits::default()).unwrap()
         else {
             unreachable!()
         };
+        if search_seed {
+            let file = |bytes: &[u8]| {
+                let descriptor = m::describe_file(bytes);
+                store.put("example", descriptor, bytes, 0).unwrap();
+                m::TreeValue::File {
+                    id: m::FileId(descriptor.key.id.0),
+                    executable: false,
+                    size_bytes: descriptor.size_bytes,
+                    copy_id: None,
+                }
+            };
+            for (name, bytes) in [
+                ("a-many.txt", b"needle\n".repeat(300)),
+                ("deleted.txt", b"needle deleted baseline\n".to_vec()),
+                ("keep.txt", b"needle unchanged baseline\n".to_vec()),
+                ("modified.txt", b"needle modified baseline\n".to_vec()),
+                ("rename.txt", b"needle rename baseline\n".to_vec()),
+                ("shape.txt", b"needle file before directory\n".to_vec()),
+            ] {
+                current_tree.entries.push(m::TreeEntry {
+                    name: name.into(),
+                    value: file(&bytes),
+                });
+            }
+            let swap = m::encode(
+                &m::Object::Tree(m::Tree {
+                    entries: vec![m::TreeEntry {
+                        name: "old.txt".into(),
+                        value: file(b"needle child before replacement\n"),
+                    }],
+                }),
+                m::Limits::default(),
+            )
+            .unwrap();
+            store
+                .put("example", swap.descriptor, &swap.bytes, 0)
+                .unwrap();
+            current_tree.entries.push(m::TreeEntry {
+                name: "swap".into(),
+                value: m::TreeValue::Tree(m::TreeId(swap.descriptor.key.id.0)),
+            });
+            current_tree
+                .entries
+                .sort_by(|a, b| a.name.as_bytes().cmp(b.name.as_bytes()));
+            let tree =
+                m::encode(&m::Object::Tree(current_tree.clone()), m::Limits::default()).unwrap();
+            store
+                .put("example", tree.descriptor, &tree.bytes, 0)
+                .unwrap();
+            template.root_tree.terms = vec![m::TreeId(tree.descriptor.key.id.0)];
+        }
         let source_value = current_tree
             .entries
             .iter()
@@ -1773,6 +1846,279 @@ fn shipped_remote_blame_composes_private_and_dirty_paths_without_uploading() {
         &["tinytree", "unmount", thin_root.to_str().unwrap()],
     );
     thin.stop_daemon();
+}
+
+fn materialized_search_files(
+    store: &tinytree_store::Store,
+    head: &str,
+) -> BTreeMap<String, Vec<u8>> {
+    fn walk(
+        store: &tinytree_store::Store,
+        tree: m::TreeId,
+        prefix: &str,
+        files: &mut BTreeMap<String, Vec<u8>>,
+    ) {
+        let (_, bytes) = store
+            .read_metadata(
+                "example",
+                m::ObjectKey {
+                    kind: m::Kind::Tree,
+                    id: m::ObjectId(tree.0),
+                },
+            )
+            .unwrap();
+        let m::Object::Tree(tree) = m::decode(&bytes, m::Limits::default()).unwrap() else {
+            unreachable!()
+        };
+        for entry in tree.entries {
+            let path = if prefix.is_empty() {
+                entry.name
+            } else {
+                format!("{prefix}/{}", entry.name)
+            };
+            match entry.value {
+                m::TreeValue::Tree(id) => walk(store, id, &path, files),
+                m::TreeValue::File { id, .. } => {
+                    let mut lease = store
+                        .read(
+                            "example",
+                            m::ObjectKey {
+                                kind: m::Kind::File,
+                                id: m::ObjectId(id.0),
+                            },
+                        )
+                        .unwrap();
+                    let mut bytes = Vec::new();
+                    lease.read_to_end(&mut bytes).unwrap();
+                    files.insert(path, bytes);
+                }
+                _ => {}
+            }
+        }
+    }
+    let id = m::ObjectId(*blake3::Hash::from_hex(head).unwrap().as_bytes());
+    let (_, bytes) = store
+        .read_metadata(
+            "example",
+            m::ObjectKey {
+                kind: m::Kind::Commit,
+                id,
+            },
+        )
+        .unwrap();
+    let m::Object::Commit(commit) = m::decode(&bytes, m::Limits::default()).unwrap() else {
+        unreachable!()
+    };
+    let mut files = BTreeMap::new();
+    walk(store, commit.root_tree.terms[0], "", &mut files);
+    files
+}
+fn naive_search(
+    files: &BTreeMap<String, Vec<u8>>,
+    pattern: &[u8],
+) -> Vec<(String, String, u64, u64, u64)> {
+    let mut hits = Vec::new();
+    for (path, bytes) in files {
+        let mut offset = 0;
+        while offset + pattern.len() <= bytes.len() {
+            if bytes[offset..].starts_with(pattern) {
+                let line = bytes[..offset].iter().filter(|&&b| b == b'\n').count() + 1;
+                let column = bytes[..offset]
+                    .iter()
+                    .rposition(|&b| b == b'\n')
+                    .map_or(offset, |at| offset - at - 1);
+                hits.push((
+                    path.clone(),
+                    blake3::Hash::from(m::file_id(bytes).0).to_hex().to_string(),
+                    offset as u64,
+                    line as u64,
+                    column as u64,
+                ));
+                offset += pattern.len();
+            } else {
+                offset += 1;
+            }
+        }
+    }
+    hits
+}
+fn search_rows(result: &serde_json::Value) -> Vec<(String, String, u64, u64, u64)> {
+    result["hits"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|hit| {
+            (
+                hit["path"].as_str().unwrap().to_owned(),
+                hit["file_id"].as_str().unwrap().to_owned(),
+                hit["byte_offset"].as_u64().unwrap(),
+                hit["line"].as_u64().unwrap(),
+                hit["byte_column"].as_u64().unwrap(),
+            )
+        })
+        .collect()
+}
+#[test]
+#[ignore = "requires usable /dev/fuse and fusermount3; run mounted_tests locally"]
+fn shipped_indexed_search_reconciles_selected_private_and_dirty_trees() {
+    let upstream = RemoteServer::start_with_search();
+    let mut fixture = Fixture::new();
+    fixture.configure_remote(&upstream.endpoint);
+    fixture.index_mode("federated");
+    fixture.start();
+    let base = fixture.base().to_owned();
+    let root = base.join("indexed-search");
+    fixture.clone_remote(&root);
+    let binding = fixture.binding(&root);
+    assert_eq!(
+        fs::read_to_string(binding.repo.join("index/type")).unwrap(),
+        jj_native_index::NAME
+    );
+    let observed = remote_observation(&binding).0;
+    let public = upstream.public();
+    let writes = upstream.metadata.writes.load(Ordering::SeqCst);
+    let public_files = materialized_search_files(&upstream.store, &upstream.head);
+    let initial: serde_json::Value = serde_json::from_str(&fixture.success(
+        &root,
+        &[
+            "tinytree", "search", "needle", "-r", "main", "--limit", "10000", "--json",
+        ],
+    ))
+    .unwrap();
+    assert_eq!(initial["coverage"], "complete");
+    assert_eq!(initial["revision"], upstream.head);
+    assert_eq!(
+        search_rows(&initial),
+        naive_search(&public_files, b"needle")
+    );
+    assert_eq!(
+        upstream.file_reads(),
+        0,
+        "remote search must not download matching or unrelated FILEs into the source client"
+    );
+    fixture.success(&root, &["new", "-m", "private search changes"]);
+    fs::write(root.join("modified.txt"), b"old match removed\n").unwrap();
+    fs::remove_file(root.join("deleted.txt")).unwrap();
+    fs::rename(root.join("rename.txt"), root.join("renamed.txt")).unwrap();
+    fs::remove_file(root.join("shape.txt")).unwrap();
+    fs::create_dir(root.join("shape.txt")).unwrap();
+    fs::write(
+        root.join("shape.txt/nested.txt"),
+        b"needle new nested file\n",
+    )
+    .unwrap();
+    fs::remove_dir_all(root.join("swap")).unwrap();
+    fs::write(root.join("swap"), b"needle replacement file\n").unwrap();
+    fs::write(root.join("new.txt"), b"needle private addition\n").unwrap();
+    fs::write(root.join("z-local.txt"), b"needle local late\n".repeat(240)).unwrap();
+    fixture.success(&root, &["status"]);
+    let older = fixture.revision(&root, "@");
+    let mut older_files = public_files.clone();
+    older_files.insert("modified.txt".into(), b"old match removed\n".to_vec());
+    older_files.remove("deleted.txt");
+    let renamed = older_files.remove("rename.txt").unwrap();
+    older_files.insert("renamed.txt".into(), renamed.clone());
+    older_files.remove("shape.txt");
+    older_files.insert(
+        "shape.txt/nested.txt".into(),
+        b"needle new nested file\n".to_vec(),
+    );
+    older_files.remove("swap/old.txt");
+    older_files.insert("swap".into(), b"needle replacement file\n".to_vec());
+    older_files.insert("new.txt".into(), b"needle private addition\n".to_vec());
+    older_files.insert("z-local.txt".into(), b"needle local late\n".repeat(240));
+    fixture.success(&root, &["new", "-m", "dirty search child"]);
+    fs::write(root.join("modified.txt"), b"needle dirty replacement\n").unwrap();
+    fs::remove_file(root.join("new.txt")).unwrap();
+    fs::remove_file(root.join("keep.txt")).unwrap();
+    std::os::unix::fs::symlink("modified.txt", root.join("keep.txt")).unwrap();
+    fs::write(
+        root.join("binary.bin"),
+        b"\0needle\xff binary selected content",
+    )
+    .unwrap();
+    let mut dirty_files = older_files.clone();
+    dirty_files.insert(
+        "modified.txt".into(),
+        b"needle dirty replacement\n".to_vec(),
+    );
+    dirty_files.remove("new.txt");
+    dirty_files.remove("keep.txt"); // Regular-file policy must not follow the symlink.
+    dirty_files.insert(
+        "binary.bin".into(),
+        b"\0needle\xff binary selected content".to_vec(),
+    );
+    let dirty: serde_json::Value = serde_json::from_str(&fixture.success(
+        &root,
+        &["tinytree", "search", "needle", "--limit", "10000", "--json"],
+    ))
+    .unwrap();
+    assert_eq!(dirty["coverage"], "complete");
+    assert_eq!(dirty["revision"], fixture.revision(&root, "@"));
+    assert_eq!(search_rows(&dirty), naive_search(&dirty_files, b"needle"));
+    let selected: serde_json::Value = serde_json::from_str(&fixture.success(
+        &root,
+        &[
+            "tinytree", "search", "needle", "-r", &older, "--limit", "10000", "--json",
+        ],
+    ))
+    .unwrap();
+    assert_eq!(selected["coverage"], "complete");
+    assert_eq!(selected["revision"], older);
+    assert_eq!(
+        search_rows(&selected),
+        naive_search(&older_files, b"needle")
+    );
+    let limited: serde_json::Value = serde_json::from_str(&fixture.success(
+        &root,
+        &["tinytree", "search", "needle", "--limit", "200", "--json"],
+    ))
+    .unwrap();
+    assert_eq!(limited["coverage"], "result_limit");
+    assert!(limited["remote_pages"].as_u64().unwrap() >= 2);
+    assert_eq!(
+        search_rows(&limited),
+        naive_search(&dirty_files, b"needle")[..200],
+        "late local matches cannot hide earlier remote matches on later pages"
+    );
+    let prefix: serde_json::Value = serde_json::from_str(&fixture.success(
+        &root,
+        &[
+            "tinytree",
+            "search",
+            "needle",
+            "--path-prefix",
+            "shape.txt",
+            "--json",
+        ],
+    ))
+    .unwrap();
+    assert_eq!(prefix["coverage"], "complete");
+    assert_eq!(prefix["hits"].as_array().unwrap().len(), 1);
+    assert_eq!(prefix["hits"][0]["path"], "shape.txt/nested.txt");
+    let empty: serde_json::Value = serde_json::from_str(&fixture.success(
+        &root,
+        &["tinytree", "search", "absent-search-literal", "--json"],
+    ))
+    .unwrap();
+    assert_eq!(empty["coverage"], "complete");
+    assert!(empty["hits"].as_array().unwrap().is_empty());
+    let allowed = m::file_id(&renamed).0;
+    assert!(
+        upstream
+            .metadata
+            .file_keys
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|id| *id == allowed),
+        "only renamed selected content may hydrate; untouched public files/assets stay remote"
+    );
+    assert_eq!(upstream.metadata.writes.load(Ordering::SeqCst), writes);
+    assert_eq!(remote_observation(&binding).0, observed);
+    assert_eq!(upstream.public(), public);
+    fixture.success(&base, &["tinytree", "unmount", root.to_str().unwrap()]);
+    fixture.stop_daemon();
 }
 
 #[test]
