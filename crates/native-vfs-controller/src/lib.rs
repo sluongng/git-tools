@@ -476,6 +476,59 @@ struct Ledger {
     acknowledgement: Option<Acknowledgement>,
 }
 
+/// Private controller fence retained while disposable candidate files are removed.
+pub struct CandidateRetirementGuard {
+    _directory: PrivateDir,
+    _lock: File,
+}
+/// Recognize only a pristine immutable-check controller, never pending user work.
+/// This is local inspection and does not connect to the repository provider.
+pub fn lock_candidate_retirement(
+    state: &Path,
+    root: &Path,
+    workspace: [u8; 32],
+    backend: &str,
+    root_tree: [u8; 32],
+    config: &Config,
+) -> Result<CandidateRetirementGuard> {
+    config.validate()?;
+    let directory = PrivateDir::open_existing(state.join("jj-controller"))?;
+    for item in fs::read_dir(directory.path())? {
+        ensure!(
+            matches!(
+                item?.file_name().to_str(),
+                Some("ledger.json" | "owner.lock")
+            ),
+            "unknown candidate controller state is preserved"
+        );
+    }
+    let lock = directory.open_existing_file("owner.lock", 4096)?;
+    lock.try_lock_exclusive()
+        .context("candidate controller is still owned")?;
+    let ledger: Ledger =
+        serde_json::from_slice(&directory.read("ledger.json", config.max_ledger_bytes)?)?;
+    validate_ledger(&ledger, config)?;
+    let expected = Binding {
+        format: 1,
+        repository: config.repository.clone(),
+        root: root.to_owned(),
+        working_copy_state: config.working_copy_state.clone(),
+        workspace,
+        backend: backend.into(),
+    };
+    ensure!(
+        ledger.binding == expected
+            && ledger.baseline == projected(&config.repository, root_tree, 1)
+            && ledger.requests.is_empty()
+            && ledger.acknowledgement.is_none(),
+        "candidate controller binding changed or contains pending work"
+    );
+    Ok(CandidateRetirementGuard {
+        _directory: directory,
+        _lock: lock,
+    })
+}
+
 struct Owner {
     directory: PrivateDir,
     _working_copy: PrivateDir,

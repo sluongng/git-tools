@@ -711,10 +711,63 @@ async fn immutable_candidate_is_lazy_sealed_and_recovers_only_with_its_access_po
     );
     drop(candidate);
     cache.wait_for_idle().await.unwrap();
-    let candidate = native_vfs::prepare_existing_immutable_candidate(config, provider, cache)
-        .await
-        .unwrap();
+    let candidate = native_vfs::prepare_existing_immutable_candidate(
+        config.clone(),
+        provider.clone(),
+        cache.clone(),
+    )
+    .await
+    .unwrap();
     assert_eq!(candidate.tree().identity(), identity);
+    assert!(
+        native_vfs::lock_candidate_for_retirement(
+            &config.state,
+            &config.root,
+            config.workspace_identity,
+            config.scope.clone(),
+            provider.clone(),
+            cache.clone()
+        )
+        .is_err(),
+        "a live owner cannot be retired"
+    );
+    drop(candidate);
+    let reads = (
+        provider.file_reads.load(Ordering::SeqCst),
+        provider.metadata_reads.load(Ordering::SeqCst),
+    );
+    fs::write(config.root.join("foreign"), b"preserve").unwrap();
+    let mut guard = native_vfs::lock_candidate_for_retirement(
+        &config.state,
+        &config.root,
+        config.workspace_identity,
+        config.scope.clone(),
+        provider.clone(),
+        cache.clone(),
+    )
+    .unwrap();
+    assert_eq!(guard.root_tree, root_tree);
+    guard.close_namespace();
+    assert_eq!(
+        (
+            provider.file_reads.load(Ordering::SeqCst),
+            provider.metadata_reads.load(Ordering::SeqCst)
+        ),
+        reads
+    );
+    assert_eq!(fs::read(config.root.join("foreign")).unwrap(), b"preserve");
+    assert!(
+        native_vfs::lock_candidate_for_retirement(
+            &config.state,
+            &config.root,
+            config.workspace_identity,
+            config.scope,
+            provider,
+            cache
+        )
+        .is_err(),
+        "closing the database must not release the owner fence"
+    );
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]

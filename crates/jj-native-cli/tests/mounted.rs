@@ -862,6 +862,7 @@ where
     }
 
     fn call(&mut self, request: http::Request<B>) -> Self::Future {
+        self.metadata.transport_calls.fetch_add(1, Ordering::SeqCst);
         if request.uri().path() == "/tinytree.v1.Repository/ReadFile" {
             self.reads.fetch_add(1, Ordering::SeqCst);
         }
@@ -881,6 +882,7 @@ where
 
 #[derive(Default)]
 struct MetadataReads {
+    transport_calls: AtomicUsize,
     file_keys: Mutex<HashSet<[u8; 32]>>,
     writes: AtomicUsize,
     keys: Mutex<HashSet<(i32, [u8; 32])>>,
@@ -4328,4 +4330,351 @@ fn immutable_unpublished_candidate_mount_survives_restart_without_editable_downg
         let kept = fixture.directory.take().unwrap().keep();
         eprintln!("TINYTREE_IMMUTABLE_FIXTURE={}", kept.display());
     }
+}
+
+#[test]
+#[ignore = "requires usable /dev/fuse and fusermount3; run mounted_tests locally"]
+fn stopped_immutable_candidates_retire_locally_and_release_workspace_quota() {
+    let upstream = RemoteServer::start();
+    let mut fixture = Fixture::new();
+    fixture.configure_remote(&upstream.endpoint);
+    let config = fs::read_to_string(&fixture.daemon_config).unwrap().replace(
+        "[native.workspaces]\n",
+        "[native.workspaces]\nmax_workspaces=1\n",
+    );
+    fs::write(&fixture.daemon_config, config).unwrap();
+    fixture.start();
+    let original = upstream.public();
+    let id = "c2".repeat(32);
+    let root = fixture.base().join("retiring-candidate");
+    let mount = |fixture: &mut Fixture, id: &str, root: &Path| {
+        fixture.workspace(&[
+            "native-candidate-mount",
+            root.to_str().unwrap(),
+            "--store",
+            "example",
+            "--commit",
+            &upstream.head,
+            "--workspace-id",
+            id,
+        ])
+    };
+    let retire = |fixture: &mut Fixture, id: &str, commit: &str| {
+        fixture.workspace(&[
+            "native-candidate-retire",
+            "--workspace-id",
+            id,
+            "--expected-commit",
+            commit,
+        ])
+    };
+    assert!(mount(&mut fixture, &id, &root).status.success());
+    let (_, commit_bytes) = upstream
+        .store
+        .read_metadata("example", original.commit.unwrap().key)
+        .unwrap();
+    let m::Object::Commit(commit_object) = m::decode(&commit_bytes, m::Limits::default()).unwrap()
+    else {
+        unreachable!()
+    };
+    let inspected = fixture.workspace(&[
+        "native-candidate-inspect",
+        "--workspace-id",
+        &id,
+        "--commit",
+        &upstream.head,
+    ]);
+    assert!(
+        inspected.status.success(),
+        "{}",
+        String::from_utf8_lossy(&inspected.stderr)
+    );
+    let proof: serde_json::Value = serde_json::from_slice(&inspected.stdout).unwrap();
+    assert_eq!(
+        proof["report"],
+        serde_json::json!({"version":1,"workspace_id":id,"commit":upstream.head,
+        "root_tree":blake3::Hash::from(commit_object.root_tree.terms[0].0).to_hex().to_string(),
+        "access":"immutable_candidate","root":root,"store":"example","active":true})
+    );
+    assert!(
+        !fixture
+            .workspace(&[
+                "native-candidate-inspect",
+                "--workspace-id",
+                &id,
+                "--commit",
+                &"11".repeat(32)
+            ])
+            .status
+            .success()
+    );
+    assert!(
+        fixture
+            .control(Request::NativeCandidateInspect {
+                workspace_id: id.clone(),
+                commit: upstream.head.clone()
+            })
+            .is_err()
+    );
+
+    assert!(
+        !retire(&mut fixture, &id, &upstream.head).status.success(),
+        "active candidate must be preserved"
+    );
+    assert!(
+        fixture
+            .control(Request::NativeCandidateRetire {
+                workspace_id: id.clone(),
+                expected_commit: upstream.head.clone()
+            })
+            .is_err(),
+        "unscoped retirement must be rejected"
+    );
+    let second_id = "c3".repeat(32);
+    let second_root = fixture.base().join("next-candidate");
+    assert!(
+        !mount(&mut fixture, &second_id, &second_root)
+            .status
+            .success(),
+        "the one-workspace quota must be real"
+    );
+    assert!(
+        fixture
+            .workspace(&["native-unmount", "--workspace-id", &id])
+            .status
+            .success()
+    );
+    assert!(
+        !fixture
+            .workspace(&[
+                "native-candidate-inspect",
+                "--workspace-id",
+                &id,
+                "--commit",
+                &upstream.head
+            ])
+            .status
+            .success()
+    );
+    let child = fixture.base().join("daemon/native-workspaces").join(&id);
+    let record_bytes = fs::read(child.join("workspace.json")).unwrap();
+    assert!(!retire(&mut fixture, &id, &"11".repeat(32)).status.success());
+    assert_eq!(
+        fs::read(child.join("workspace.json")).unwrap(),
+        record_bytes
+    );
+    let header_path = child.join("mount/native-vfs.json");
+    let header_bytes = fs::read(&header_path).unwrap();
+    let mut header: serde_json::Value = serde_json::from_slice(&header_bytes).unwrap();
+    header["ready"] = false.into();
+    fs::write(&header_path, serde_json::to_vec(&header).unwrap()).unwrap();
+    assert!(
+        !retire(&mut fixture, &id, &upstream.head).status.success(),
+        "unready namespaces cannot be discarded"
+    );
+    fs::write(&header_path, &header_bytes).unwrap();
+    fs::write(root.join("foreign"), b"preserve user data").unwrap();
+    // Crash before initial receipt rename: partial atomic-write bytes must not
+    // become disposal authority, nor prevent reopening this stopped candidate.
+    fixture.stop_daemon();
+    let temporary = fixture
+        .base()
+        .join("daemon/native-candidate-retirements/.private-1-1.tmp");
+    use std::os::unix::fs::OpenOptionsExt;
+    fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&temporary)
+        .unwrap()
+        .write_all(b"{incomplete")
+        .unwrap();
+    let calls_before_temp_recovery = upstream.metadata.transport_calls.load(Ordering::SeqCst);
+    fixture.start();
+    assert_eq!(
+        upstream.metadata.transport_calls.load(Ordering::SeqCst),
+        calls_before_temp_recovery
+    );
+    assert!(!temporary.exists());
+    assert!(
+        child.join("mount/native-vfs.json").exists(),
+        "an uncommitted temporary cannot retire its candidate"
+    );
+    let calls_before_retire = upstream.metadata.transport_calls.load(Ordering::SeqCst);
+    let result = retire(&mut fixture, &id, &upstream.head);
+    assert!(
+        result.status.success(),
+        "{}; candidate children={:?}; mount children={:?}",
+        String::from_utf8_lossy(&result.stderr),
+        fs::read_dir(&child)
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect::<Vec<_>>(),
+        fs::read_dir(child.join("mount"))
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(
+        upstream.metadata.transport_calls.load(Ordering::SeqCst),
+        calls_before_retire,
+        "retirement is local, not a provider operation"
+    );
+    let response: serde_json::Value = serde_json::from_slice(&result.stdout).unwrap();
+    assert_eq!(response["report"]["retired"], true);
+    assert_eq!(response["report"]["root_removed"], false);
+    assert_eq!(response["report"]["retention_gc"], false);
+    assert!(!child.exists());
+    assert!(!fixture.registry.join("admin").join(&id).exists());
+    assert_eq!(
+        fs::read(root.join("foreign")).unwrap(),
+        b"preserve user data"
+    );
+    assert!(retire(&mut fixture, &id, &upstream.head).status.success());
+    assert!(!retire(&mut fixture, &id, &"11".repeat(32)).status.success());
+    assert!(
+        !mount(&mut fixture, &id, &root).status.success(),
+        "retired IDs cannot be reused"
+    );
+    assert!(
+        fixture
+            .control(Request::NativeMount {
+                root: root.clone(),
+                store: "example".into(),
+                commit: upstream.head.clone(),
+                workspace_id: id.clone()
+            })
+            .is_err()
+    );
+    assert!(
+        mount(&mut fixture, &second_id, &second_root)
+            .status
+            .success(),
+        "retirement must release max_workspaces quota"
+    );
+    assert_eq!(
+        fs::read(second_root.join("hello.cc")).unwrap(),
+        upstream.source_bytes
+    );
+    assert_eq!(
+        upstream.public(),
+        original,
+        "retirement must not alter canonical references"
+    );
+    fixture
+        .control(Request::NativeUnmount {
+            workspace_id: second_id.clone(),
+        })
+        .unwrap();
+    assert!(
+        retire(&mut fixture, &second_id, &upstream.head)
+            .status
+            .success()
+    );
+    assert!(
+        !second_root.exists(),
+        "only empty mount directories should be removed"
+    );
+    fixture.stop_daemon();
+
+    // Model a crash prefix: durable intent survived, namespace/admin cleanup
+    // finished, but workspace.json and completion publication did not. Startup
+    // must finish this locally rather than initialize or contact a provider.
+    let receipt_path = fixture
+        .base()
+        .join("daemon/native-candidate-retirements")
+        .join(format!("{id}.json"));
+    let mut receipt: serde_json::Value =
+        serde_json::from_slice(&fs::read(&receipt_path).unwrap()).unwrap();
+    receipt["complete"] = false.into();
+    fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&temporary)
+        .unwrap()
+        .write_all(b"{incomplete completion")
+        .unwrap();
+
+    fs::write(&receipt_path, serde_json::to_vec(&receipt).unwrap()).unwrap();
+    fs::create_dir(&child).unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    fs::set_permissions(&child, fs::Permissions::from_mode(0o700)).unwrap();
+    fs::write(child.join("workspace.json"), &record_bytes).unwrap();
+    let calls_before_replay = upstream.metadata.transport_calls.load(Ordering::SeqCst);
+    fixture.start();
+    assert_eq!(
+        upstream.metadata.transport_calls.load(Ordering::SeqCst),
+        calls_before_replay,
+        "pending retirement recovery must not contact a provider"
+    );
+    assert!(!temporary.exists());
+    assert!(!child.exists());
+    assert_eq!(
+        fs::read(root.join("foreign")).unwrap(),
+        b"preserve user data"
+    );
+    assert!(retire(&mut fixture, &id, &upstream.head).status.success());
+    assert!(
+        !mount(&mut fixture, &id, &root).status.success(),
+        "restart cannot forget retired identities"
+    );
+    assert!(
+        !fixture
+            .workspace(&["native-resume", root.to_str().unwrap()])
+            .status
+            .success()
+    );
+    let rw_id = "c4".repeat(32);
+    let rw_root = fixture.base().join("editable");
+    fixture
+        .control(Request::NativeMount {
+            root: rw_root.clone(),
+            store: "example".into(),
+            commit: upstream.head.clone(),
+            workspace_id: rw_id.clone(),
+        })
+        .unwrap();
+    assert!(
+        !fixture
+            .workspace(&[
+                "native-candidate-inspect",
+                "--workspace-id",
+                &rw_id,
+                "--commit",
+                &upstream.head
+            ])
+            .status
+            .success(),
+        "editable mounts cannot produce immutable proof"
+    );
+    let reads_before = upstream.file_reads();
+    assert_eq!(
+        fs::read(rw_root.join("hello.cc")).unwrap(),
+        upstream.source_bytes
+    );
+    assert_eq!(
+        upstream.file_reads(),
+        reads_before,
+        "shared clean CAS survives candidate retirement"
+    );
+    fixture
+        .control(Request::NativeUnmount {
+            workspace_id: rw_id.clone(),
+        })
+        .unwrap();
+    assert!(
+        !retire(&mut fixture, &rw_id, &upstream.head)
+            .status
+            .success(),
+        "ordinary writable workspaces are not disposable candidates"
+    );
+    assert!(
+        fixture
+            .base()
+            .join("daemon/native-workspaces")
+            .join(rw_id)
+            .exists()
+    );
+    fixture.stop_daemon();
 }

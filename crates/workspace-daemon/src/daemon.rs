@@ -1144,6 +1144,20 @@ pub async fn serve(mut config: Config) -> Result<()> {
                         None => Err(anyhow::anyhow!("native repositories are not configured")),
                     }}
                 }
+                Ok(Request::NativeCandidateInspect { workspace_id, commit }) => {
+                    if !configuration_scoped { Err(anyhow::anyhow!("candidate inspection requires configuration-scoped control")) }
+                    else { match state_slot.as_ref().unwrap().native_workspaces.as_ref() {
+                        Some(manager) => manager.inspect_candidate(&workspace_id, &commit),
+                        None => Err(anyhow::anyhow!("native repositories are not configured")),
+                    }}
+                }
+                Ok(Request::NativeCandidateRetire { workspace_id, expected_commit }) => {
+                    if !configuration_scoped { Err(anyhow::anyhow!("candidate retirement requires configuration-scoped control")) }
+                    else { match state_slot.as_mut().unwrap().native_workspaces.as_mut() {
+                        Some(manager) => manager.retire_candidate(&workspace_id, &expected_commit).await,
+                        None => Err(anyhow::anyhow!("native repositories are not configured")),
+                    }}
+                }
                 Ok(Request::NativeGc { store, apply }) => {
                     if !configuration_scoped { Err(anyhow::anyhow!("native collection requires configuration-scoped control")) }
                     else { match state_slot.as_ref().unwrap().native_workspaces.as_ref() {

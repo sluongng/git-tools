@@ -2470,3 +2470,47 @@ async fn fresh_restore_stages_original_plural_operations_and_wc_without_publishi
     assert_eq!(queries.calls.load(Ordering::SeqCst), calls);
     server.abort();
 }
+
+#[test]
+fn candidate_retirement_removes_only_uninitialized_administration() {
+    let fixture = Fixture::new();
+    fixture.registry.provision(&fixture.binding).unwrap();
+    let guard = fixture
+        .registry
+        .lock_candidate_retirement(&fixture.binding)
+        .unwrap();
+    fixture
+        .registry
+        .remove_candidate_admin(&fixture.binding, &guard)
+        .unwrap();
+    fixture
+        .registry
+        .remove_candidate_admin(&fixture.binding, &guard)
+        .unwrap();
+    assert!(!fixture.binding.admin.exists());
+    assert!(fixture.binding.root.join(MARKER).exists());
+    drop(guard);
+    futures::executor::block_on(async {
+        let initialized = Fixture::new();
+        let (_workspace, _repo) = initialized.initialize().await.unwrap();
+        let before = fs::read(initialized.binding.admin.join(JOURNAL)).unwrap();
+        assert!(
+            initialized
+                .registry
+                .lock_candidate_retirement(&initialized.binding)
+                .is_err()
+        );
+        assert_eq!(
+            fs::read(initialized.binding.admin.join(JOURNAL)).unwrap(),
+            before
+        );
+        assert!(initialized.binding.repo.exists());
+        assert_eq!(
+            initialized
+                .registry
+                .lookup(&initialized.binding.root)
+                .unwrap(),
+            initialized.binding
+        );
+    });
+}

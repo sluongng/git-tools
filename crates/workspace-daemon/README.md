@@ -84,3 +84,14 @@ Stop sessions before `workspace shutdown`. After a crash, preserve state and use
 inspection. `workspace recover` without a session targets the stale output mount.
 Unified source-session lifecycle is currently Linux-only; native NFS/ProjFS
 adapters have separate [platform setup](../../docs/platforms.md).
+
+## Retire immutable check candidates
+
+After unmounting a Linux immutable check candidate, run
+`workspace native-candidate-retire --workspace-id ID --expected-commit COMMIT`.
+This frees its private namespace and workspace slot, not ordinary editable jj
+workspaces, shared objects/CAS, server holds or retention history. Nonempty mount
+directories are preserved. Exact retries and retired-ID reservations survive
+restart. Downgrading a state directory after retirement is unsupported. Receipts
+are capped at 4096 per daemon; retirement fails closed at that bound (pruning is
+not yet implemented).

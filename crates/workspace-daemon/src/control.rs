@@ -49,6 +49,15 @@ pub enum Request {
         commit: String,
         workspace_id: String,
     },
+    /// Retire a stopped immutable check source, never a user working copy.
+    NativeCandidateInspect {
+        workspace_id: String,
+        commit: String,
+    },
+    NativeCandidateRetire {
+        workspace_id: String,
+        expected_commit: String,
+    },
     NativeRestore {
         root: PathBuf,
         store: String,

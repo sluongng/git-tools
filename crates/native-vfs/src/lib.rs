@@ -374,6 +374,94 @@ async fn prepare_mode(
     })
 }
 
+/// Owner locks and validated immutable namespace retained through disposal.
+/// Dropping this guard is not itself permission to delete any paths.
+pub struct CandidateRetirementGuard {
+    _tree: Option<Arc<Tree>>,
+    _directory: PrivateDir,
+    _lock: File,
+    pub root_tree: [u8; 32],
+}
+impl CandidateRetirementGuard {
+    /// Close the database before unlinking its files, keeping the owner fence.
+    pub fn close_namespace(&mut self) {
+        self._tree.take();
+    }
+}
+/// Inspect an existing ready candidate locally, without repairing state,
+/// attaching a provider, reading source bytes, or inspecting user root contents.
+pub fn lock_candidate_for_retirement(
+    state: &Path,
+    root: &Path,
+    workspace_identity: [u8; 32],
+    scope: Scope,
+    provider: Arc<dyn NativeObjectIo>,
+    cache: Arc<LocalCas>,
+) -> Result<CandidateRetirementGuard> {
+    let directory = PrivateDir::open_existing(state)?;
+    for item in fs::read_dir(directory.path())? {
+        let item = item?;
+        ensure!(
+            matches!(
+                item.file_name().to_str(),
+                Some("native-vfs.json" | "owner.lock" | "namespace" | "jj-controller")
+            ),
+            "unknown candidate state is preserved"
+        );
+    }
+    let previous = directory.read("native-vfs.json", 32 * 1024)?;
+    let header: Header = serde_json::from_slice(&previous)?;
+    let SourceAccess::ImmutableCandidate { root_tree } = header.access else {
+        anyhow::bail!("retirement requires an immutable candidate");
+    };
+    ensure!(
+        header.format == 2
+            && header.ready
+            && root_tree != [0; 32]
+            && header.bootstrap_root == root_tree
+            && header.mount_root == root
+            && header.workspace_identity == workspace_identity
+            && header.backend == scope.backend(),
+        "candidate retirement header is unready or has another identity"
+    );
+    let identity = header
+        .namespace_identity
+        .as_deref()
+        .context("candidate namespace identity missing")?;
+    let lock = directory.open_existing_file("owner.lock", 4096)?;
+    lock.try_lock_exclusive()
+        .context("candidate namespace is still owned")?;
+    ensure!(
+        directory.read("native-vfs.json", 32 * 1024)? == previous,
+        "candidate header changed during retirement"
+    );
+    let compiler = Compiler::new(provider, scope, Limits::default())?;
+    let namespace = directory.path().join("namespace");
+    preflight_namespace(&namespace, true)?;
+    let tree = Tree::open_existing_lazy_source_with_cache_and_source(
+        namespace,
+        header.backend,
+        cache,
+        compiler.source(),
+        identity,
+        hex(&workspace_identity).as_bytes(),
+    )?;
+    ensure!(
+        tree.source_access() == header.access
+            && tree.source_baseline()?.0 == root_tree
+            && tree
+                .lazy_source_pin()
+                .is_some_and(|pin| pin.root == root_tree),
+        "candidate retirement namespace policy or root mismatch"
+    );
+    Ok(CandidateRetirementGuard {
+        _tree: Some(tree),
+        _directory: directory,
+        _lock: lock,
+        root_tree,
+    })
+}
+
 pub struct NativeMount {
     prepared: PreparedWorkspace,
     projection: Arc<dyn Projection>,

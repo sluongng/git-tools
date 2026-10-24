@@ -74,6 +74,27 @@ enum Operation {
         #[arg(long)]
         workspace_id: String,
     },
+    /// Retire a stopped immutable check source; canonical retention is separate.
+    NativeCandidateRetire {
+        #[arg(long)]
+        workspace_id: String,
+        #[arg(long)]
+        expected_commit: String,
+    },
+    /// Inspect a live exact immutable check source.
+    #[command(hide = true)]
+    NativeCandidateInspect {
+        #[arg(long)]
+        workspace_id: String,
+        #[arg(long)]
+        commit: String,
+    },
+    /// Stop one privately recorded native mount.
+    #[command(hide = true)]
+    NativeUnmount {
+        #[arg(long)]
+        workspace_id: String,
+    },
     /// Resume a privately recorded native mount using its original access policy.
     #[command(hide = true)]
     NativeResume {
@@ -234,6 +255,27 @@ async fn run(cli: Cli) -> Result<serde_json::Value> {
                 commit,
                 workspace_id,
             });
+        }
+        Operation::NativeCandidateRetire {
+            workspace_id,
+            expected_commit,
+        } => {
+            return controller.call(Request::NativeCandidateRetire {
+                workspace_id,
+                expected_commit,
+            });
+        }
+        Operation::NativeCandidateInspect {
+            workspace_id,
+            commit,
+        } => {
+            return controller.call(Request::NativeCandidateInspect {
+                workspace_id,
+                commit,
+            });
+        }
+        Operation::NativeUnmount { workspace_id } => {
+            return controller.call(Request::NativeUnmount { workspace_id });
         }
         Operation::NativeResume { root } => {
             return controller.call(Request::NativeResume { root });

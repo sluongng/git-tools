@@ -113,6 +113,13 @@ struct Initialization {
     restore_origin: Option<[u8; 32]>,
 }
 
+/// Exclusive registry and per-ID initialization fences for disposable check admin.
+pub struct CandidateAdminRetirement {
+    binding: Binding,
+    registry_path: PathBuf,
+    _registry: File,
+    _initializer: File,
+}
 pub struct Registry {
     root: PrivateDir,
     records: PrivateDir,
@@ -288,6 +295,71 @@ impl Registry {
         self.records.replace(name, &bounded_encode(binding)?)?;
         Ok(())
     }
+    /// Lock only an uninitialized candidate's external administration. A jj
+    /// initialization journal, repository, working-copy data, or published
+    /// registration is user history and is never eligible for this cleanup.
+    pub fn lock_candidate_retirement(&self, binding: &Binding) -> Result<CandidateAdminRetirement> {
+        self.validate(binding)?;
+        let registry = self.root.open_existing_file("registry.lock", 4096)?;
+        registry
+            .try_lock_exclusive()
+            .context("native registry is busy")?;
+        let initializer = self
+            .root
+            .open_existing_file(format!("initialize-{}.lock", binding.id()), 4096)?;
+        initializer
+            .try_lock_exclusive()
+            .context("native administration is busy")?;
+        self.check_candidate_admin(binding)?;
+        Ok(CandidateAdminRetirement {
+            binding: binding.clone(),
+            registry_path: self.root.path().to_owned(),
+            _registry: registry,
+            _initializer: initializer,
+        })
+    }
+    fn check_candidate_admin(&self, binding: &Binding) -> Result<()> {
+        self.validate(binding)?;
+        ensure!(
+            !self
+                .records
+                .path()
+                .join(record_name(&binding.workspace_id))
+                .try_exists()?,
+            "published native administration cannot be retired as a candidate"
+        );
+        if binding.admin.try_exists()? {
+            let admin = PrivateDir::open_existing(&binding.admin)?;
+            ensure!(
+                fresh_admin(&admin)?,
+                "initialized or unknown native administration is preserved"
+            );
+            if binding.working_copy.try_exists()? {
+                let wc = PrivateDir::open_existing(&binding.working_copy)?;
+                ensure!(
+                    fs::read_dir(wc.path())?.next().is_none(),
+                    "candidate working-copy data is preserved"
+                );
+            }
+        }
+        Ok(())
+    }
+    /// Called only after durable candidate retirement intent, under the guard.
+    /// Idempotent after partial cleanup; never deletes a jj repository/history.
+    pub fn remove_candidate_admin(
+        &self,
+        binding: &Binding,
+        guard: &CandidateAdminRetirement,
+    ) -> Result<()> {
+        ensure!(
+            guard.binding == *binding && guard.registry_path == self.root.path(),
+            "candidate retirement guard differs"
+        );
+        self.check_candidate_admin(binding)?;
+        self.admins.remove_child_tree(binding.id(), 2, 3)?;
+        Ok(())
+    }
+
     fn validate(&self, binding: &Binding) -> Result<()> {
         ensure!(
             binding.version == 1 && binding.workspace_id != [0; 32],

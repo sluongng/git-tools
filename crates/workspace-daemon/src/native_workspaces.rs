@@ -3,6 +3,7 @@
 //! dirty namespace or adopt an unrelated directory.
 use crate::config::Config;
 use anyhow::{Context, Result, ensure};
+use fs2::FileExt;
 use jj_native_backend::NativeObjectIo;
 use local_cas::LocalCas;
 use native_broker::{BrokerControlClient, LocalEndpoint};
@@ -22,6 +23,20 @@ use std::{
 use tinytree_model as m;
 
 const MAX_RECORD: usize = 32 * 1024;
+const MAX_RETIREMENTS: usize = 4096;
+const MAX_CLEANUP_ENTRIES: usize = 16384;
+const MAX_CLEANUP_DEPTH: usize = 32;
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CandidateRetirement {
+    version: u32,
+    record: Record,
+    binding: Binding,
+    root_tree: [u8; 32],
+    complete: bool,
+    root_removed: bool,
+}
 
 #[derive(Clone)]
 pub(crate) struct Repository {
@@ -132,12 +147,16 @@ pub struct Mounted {
 pub(crate) struct Manager {
     config: Config,
     directory: PrivateDir,
+    retirements_directory: PrivateDir,
+    retirements: BTreeMap<String, CandidateRetirement>,
     registry: Option<Arc<Registry>>,
     cache: Arc<LocalCas>,
     repositories: BTreeMap<String, Repository>,
     service: ProjectionService,
     entries: BTreeMap<String, Entry>,
     commands: Option<Arc<crate::native_commands::NativeCommandHost>>,
+    #[cfg(test)]
+    after_retirement_publication: Option<Box<dyn FnOnce() -> Result<()> + Send + Sync>>,
     #[cfg(test)]
     before_provider_start: Option<Box<dyn FnOnce(&Path) -> Result<()> + Send + Sync>>,
 }
@@ -158,6 +177,49 @@ impl Manager {
         limits.transport = config.native.broker_config(&config.reapi);
         let service = ProjectionService::new(limits)
             .map_err(|_| anyhow::anyhow!("invalid native projection RPC configuration"))?;
+        let retirements_directory =
+            PrivateDir::create(config.state_dir.join("native-candidate-retirements"))?;
+        let mut retirements = BTreeMap::new();
+        for (count, item) in fs::read_dir(retirements_directory.path())?.enumerate() {
+            ensure!(
+                count < MAX_RETIREMENTS * 2,
+                "candidate retirement directory entry limit exceeded"
+            );
+            let item = item?;
+            let name = item
+                .file_name()
+                .into_string()
+                .map_err(|_| anyhow::anyhow!("invalid retirement name"))?;
+            if is_retirement_temporary(&name) {
+                // A killed atomic replace can leave partial bytes before
+                // rename. These bytes are never disposal authority. Bound and
+                // validate the owner-private regular file, then remove it.
+                retirements_directory.read(&name, MAX_RECORD)?;
+                fs::remove_file(item.path())?;
+                fs::File::open(retirements_directory.path())?.sync_all()?;
+                continue;
+            }
+            ensure!(
+                retirements.len() < MAX_RETIREMENTS,
+                "candidate retirement receipt limit exceeded"
+            );
+            let id = name
+                .strip_suffix(".json")
+                .context("unknown candidate retirement entry")?;
+            let expected = unhex(id)?;
+            let mut receipt: CandidateRetirement =
+                serde_json::from_slice(&retirements_directory.read(&name, MAX_RECORD)?)?;
+            validate_retirement(&receipt, expected)?;
+            if !receipt.complete {
+                finish_candidate_retirement(&config, &directory, &mut receipt)?;
+                retirements_directory.replace(&name, &serde_json::to_vec(&receipt)?)?;
+            }
+            ensure!(
+                !directory.path().join(id).try_exists()?,
+                "retired candidate identity has live state"
+            );
+            retirements.insert(id.to_owned(), receipt);
+        }
         let mut entries = BTreeMap::new();
         for item in fs::read_dir(directory.path())? {
             ensure!(
@@ -205,12 +267,16 @@ impl Manager {
         Ok(Self {
             config,
             directory,
+            retirements_directory,
+            retirements,
             registry: None,
             cache,
             repositories,
             service,
             entries,
             commands: None,
+            #[cfg(test)]
+            after_retirement_publication: None,
             #[cfg(test)]
             before_provider_start: None,
         })
@@ -338,6 +404,10 @@ impl Manager {
             .as_ref()
             .map(|host| host.host_access())
             .transpose()?;
+        ensure!(
+            !self.retirements.contains_key(&workspace_id),
+            "native workspace identity is retired"
+        );
         let id = unhex(&workspace_id)?;
         ensure!(id != [0; 32], "native workspace identity must be nonzero");
         let commit = unhex(&commit)?;
@@ -735,6 +805,10 @@ impl Manager {
     ) -> Result<Mounted> {
         #[cfg(not(target_os = "linux"))]
         anyhow::bail!("startup-gated native restore requires Linux; no checkout was created");
+        ensure!(
+            !self.retirements.contains_key(workspace_id),
+            "native workspace identity is retired"
+        );
         let id = unhex(workspace_id)?;
         ensure!(id != [0; 32], "native workspace identity must be nonzero");
         validate_selection(&selection)?;
@@ -1369,6 +1443,222 @@ impl Manager {
         entry.record.state = Lifecycle::Stopped;
         persist(entry)
     }
+    /// Runtime proof for a check runner. This does not parse client-selected
+    /// state or weaken the ordinary Mounted response compatibility boundary.
+    pub fn inspect_candidate(&self, id: &str, commit: &str) -> Result<serde_json::Value> {
+        let identity = unhex(id)?;
+        let expected = unhex(commit)?;
+        ensure!(
+            !self.retirements.contains_key(id),
+            "candidate identity is retired"
+        );
+        let entry = self
+            .entries
+            .get(id)
+            .context("candidate is not registered")?;
+        ensure!(
+            entry.record.version == 3
+                && entry.record.state == Lifecycle::Ready
+                && entry.record.workspace_id == identity
+                && matches!(entry.record.origin, Origin::Candidate { bootstrap_commit } if bootstrap_commit == expected)
+                && entry.registered
+                && entry.provider_failure.is_none()
+                && entry.startup.is_none(),
+            "candidate is not ready with the requested immutable commit"
+        );
+        let mount = entry.mount.as_ref().context("candidate is not active")?;
+        let tree = mount.tree();
+        let output_core::SourceAccess::ImmutableCandidate { root_tree } = tree.source_access()
+        else {
+            anyhow::bail!("candidate source is not immutable");
+        };
+        ensure!(
+            mount.workspace_identity() == identity
+                && mount.root() == entry.record.root
+                && tree.source_baseline()?.0 == root_tree
+                && root_tree != [0; 32],
+            "candidate runtime binding changed"
+        );
+        Ok(
+            serde_json::json!({"version":1,"workspace_id":id,"commit":commit,"root_tree":hex(&root_tree),
+            "access":"immutable_candidate","root":entry.record.root,"store":entry.record.store,"active":true}),
+        )
+    }
+    fn publish_retirement_intent(&mut self, id: &str, receipt: &CandidateRetirement) -> Result<()> {
+        let bytes = serde_json::to_vec(receipt)?;
+        ensure!(
+            bytes.len() <= MAX_RECORD,
+            "retirement receipt exceeds limit"
+        );
+        // Even a failed directory fsync can follow a successful rename. Close
+        // this identity in memory BEFORE attempting publication, never reopen
+        // commands or permit resume after an ambiguous storage error.
+        self.retirements.insert(id.into(), receipt.clone());
+        self.retirements_directory
+            .replace(format!("{id}.json"), &bytes)?;
+        #[cfg(test)]
+        if let Some(failure) = self.after_retirement_publication.take() {
+            failure()?;
+        }
+        Ok(())
+    }
+
+    /// Retire only disposable, stopped immutable check state. Canonical stores,
+    /// CAS, server holds, and authoritative retention roots are not collected.
+    pub async fn retire_candidate(
+        &mut self,
+        id: &str,
+        expected_commit: &str,
+    ) -> Result<serde_json::Value> {
+        #[cfg(not(target_os = "linux"))]
+        anyhow::bail!("candidate retirement requires native Linux unmounted-state proof");
+        let identity = unhex(id)?;
+        let expected = unhex(expected_commit)?;
+        ensure!(
+            identity != [0; 32] && expected != [0; 32],
+            "retirement requires exact candidate and commit identities"
+        );
+        if let Some(mut receipt) = self.retirements.get(id).cloned() {
+            ensure!(
+                matches!(receipt.record.origin, Origin::Candidate { bootstrap_commit } if bootstrap_commit == expected),
+                "retired candidate commit differs"
+            );
+            if !receipt.complete {
+                // A prior publication error may have happened before rename.
+                // Reestablish durable intent before performing any cleanup.
+                self.publish_retirement_intent(id, &receipt)?;
+                finish_candidate_retirement(&self.config, &self.directory, &mut receipt)?;
+                self.retirements_directory
+                    .replace(format!("{id}.json"), &serde_json::to_vec(&receipt)?)?;
+                self.retirements.insert(id.into(), receipt.clone());
+                self.entries.remove(id);
+            }
+            return Ok(
+                serde_json::json!({"retired":true,"root_removed":receipt.root_removed,"retention_gc":false}),
+            );
+        }
+        ensure!(
+            self.retirements.len() < MAX_RETIREMENTS,
+            "candidate retirement receipt limit reached; preserve state"
+        );
+        let entry = self
+            .entries
+            .get(id)
+            .context("candidate is not registered")?;
+        ensure!(
+            entry.record.version == 3
+                && matches!(entry.record.origin, Origin::Candidate { bootstrap_commit } if bootstrap_commit == expected),
+            "retirement requires the exact immutable candidate commit"
+        );
+        ensure!(
+            entry.record.state == Lifecycle::Stopped
+                && entry.mount.is_none()
+                && entry.controller.is_none()
+                && !entry.registered
+                && entry.provider_failure.is_none()
+                && entry.startup.is_none()
+                && entry.command_startup.is_none()
+                && entry.restore_intent.is_none()
+                && entry.restore_receipt.is_none(),
+            "stop and quiesce the candidate before retiring it"
+        );
+        ensure!(
+            crate::recovery::identity(&entry.record.root)?.is_none(),
+            "candidate kernel mount is still present"
+        );
+        let record = entry.record.clone();
+        let registry = self.open_existing_registry()?;
+        let binding = self.binding(&record)?;
+        let repository = self
+            .repositories
+            .get(&record.store)
+            .context("candidate repository unavailable")?
+            .clone();
+        let commands = self
+            .commands
+            .as_ref()
+            .context("candidate retirement requires command admission fencing")?
+            .clone();
+        let access = commands.host_access()?;
+        let admin_guard = registry.lock_candidate_retirement(&binding)?;
+        for item in fs::read_dir(self.directory.path().join(id))? {
+            let item = item?;
+            ensure!(
+                matches!(item.file_name().to_str(), Some("workspace.json" | "mount")),
+                "unknown candidate state is preserved"
+            );
+        }
+        self.directory
+            .check_child_tree(id, MAX_CLEANUP_ENTRIES, MAX_CLEANUP_DEPTH)?;
+        let mut namespace = native_vfs::lock_candidate_for_retirement(
+            &self.directory.path().join(id).join("mount"),
+            &record.root,
+            identity,
+            repository.scope.clone(),
+            repository.io,
+            self.cache.clone(),
+        )?;
+        let controller_config =
+            native_vfs_controller::Config::new(record.store.clone(), binding.working_copy.clone());
+        let controller_guard = native_vfs_controller::lock_candidate_retirement(
+            &self.directory.path().join(id).join("mount"),
+            &record.root,
+            identity,
+            repository.scope.backend(),
+            namespace.root_tree,
+            &controller_config,
+        )?;
+        let mut receipt = CandidateRetirement {
+            version: 1,
+            record,
+            binding,
+            root_tree: namespace.root_tree,
+            complete: false,
+            root_removed: false,
+        };
+        validate_retirement(&receipt, identity)?;
+        namespace.close_namespace();
+        let bytes = serde_json::to_vec(&receipt)?;
+        ensure!(
+            bytes.len() <= MAX_RECORD,
+            "retirement receipt exceeds limit"
+        );
+        let reservation = commands
+            .register_reserved_with_host_access(
+                &receipt.binding,
+                repository.identity,
+                access.clone(),
+            )
+            .await?;
+        let command_guard = reservation.validate_for_activation(
+            &commands,
+            &receipt.binding,
+            repository.identity,
+        )?;
+        self.publish_retirement_intent(id, &receipt)?;
+        // The namespace owner and command writer fences remain held until all
+        // private files are removed. Restart replays this durable intent locally.
+        registry.remove_candidate_admin(&receipt.binding, &admin_guard)?;
+        self.directory
+            .remove_child_tree(id, MAX_CLEANUP_ENTRIES, MAX_CLEANUP_DEPTH)?;
+        receipt.root_removed = remove_empty_candidate_root(&receipt.record.root)?;
+        receipt.complete = true;
+        self.retirements_directory
+            .replace(format!("{id}.json"), &serde_json::to_vec(&receipt)?)?;
+        self.retirements.insert(id.into(), receipt.clone());
+        self.entries.remove(id);
+        drop((
+            namespace,
+            controller_guard,
+            command_guard,
+            admin_guard,
+            access,
+        ));
+        Ok(
+            serde_json::json!({"retired":true,"root_removed":receipt.root_removed,"retention_gc":false}),
+        )
+    }
+
     pub async fn stop_all(&mut self) -> Result<()> {
         let ids: Vec<_> = self
             .entries
@@ -1397,6 +1687,132 @@ impl Manager {
             .map_err(|_| anyhow::anyhow!("native projection RPCs did not drain"))
     }
 }
+fn is_retirement_temporary(name: &str) -> bool {
+    let Some(body) = name
+        .strip_prefix(".private-")
+        .and_then(|s| s.strip_suffix(".tmp"))
+    else {
+        return false;
+    };
+    let Some((pid, sequence)) = body.split_once('-') else {
+        return false;
+    };
+    !pid.is_empty()
+        && !sequence.is_empty()
+        && pid.bytes().all(|b| b.is_ascii_digit())
+        && sequence.bytes().all(|b| b.is_ascii_digit())
+        && pid.parse::<u32>().is_ok()
+        && sequence.parse::<u64>().is_ok()
+}
+fn validate_retirement(receipt: &CandidateRetirement, id: [u8; 32]) -> Result<()> {
+    validate_record(&receipt.record)?;
+    ensure!(
+        receipt.version == 1
+            && receipt.record.version == 3
+            && receipt.record.workspace_id == id
+            && receipt.record.state == Lifecycle::Stopped
+            && receipt.root_tree != [0; 32]
+            && matches!(receipt.record.origin, Origin::Candidate { bootstrap_commit } if bootstrap_commit != [0;32])
+            && receipt.binding.workspace_id == id
+            && receipt.binding.root == receipt.record.root
+            && receipt.binding.repository == receipt.record.store
+            && receipt.binding.rpc_mount_id == hex(&id),
+        "invalid candidate retirement intent"
+    );
+    Ok(())
+}
+fn remove_empty_candidate_root(root: &Path) -> Result<bool> {
+    if !root.try_exists()? {
+        return Ok(true);
+    }
+    let directory = PrivateDir::open_existing(root)?;
+    if fs::read_dir(directory.path())?.next().is_some() {
+        return Ok(false);
+    }
+    drop(directory);
+    match fs::remove_dir(root) {
+        Ok(()) => {
+            fs::File::open(root.parent().context("candidate root parent missing")?)?.sync_all()?;
+            Ok(true)
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::DirectoryNotEmpty => Ok(false),
+        Err(error) => Err(error.into()),
+    }
+}
+/// Replay only daemon-authored durable disposal intent; no provider or network.
+fn finish_candidate_retirement(
+    config: &Config,
+    directory: &PrivateDir,
+    receipt: &mut CandidateRetirement,
+) -> Result<()> {
+    #[cfg(not(target_os = "linux"))]
+    anyhow::bail!("candidate retirement recovery requires native Linux mount proof");
+    validate_retirement(receipt, receipt.record.workspace_id)?;
+    ensure!(
+        crate::recovery::identity(&receipt.record.root)?.is_none(),
+        "candidate mount is still present during retirement recovery"
+    );
+    let registry_path = config
+        .native
+        .workspaces
+        .registry_path
+        .clone()
+        .map(Ok)
+        .unwrap_or_else(Registry::default_path)?;
+    let registry = Registry::open_existing(registry_path)?;
+    let admin = registry.lock_candidate_retirement(&receipt.binding)?;
+    let lease_path =
+        native_vfs_rpc::command_lock_path(&receipt.binding.admin, &receipt.binding.rpc_mount_id)?;
+    let leases = PrivateDir::open_existing(
+        lease_path
+            .parent()
+            .context("candidate lease parent missing")?,
+    )?;
+    let lease = leases.open_existing_file(
+        lease_path.file_name().context("candidate lease missing")?,
+        4096,
+    )?;
+    lease
+        .try_lock_exclusive()
+        .context("candidate writer remains active")?;
+    let id = hex(&receipt.record.workspace_id);
+    let state_path = directory.path().join(&id).join("mount");
+    let owner = if state_path.try_exists()? {
+        let state = PrivateDir::open_existing(&state_path)?;
+        match state.open_existing_file("owner.lock", 4096) {
+            Ok(lock) => {
+                lock.try_lock_exclusive()
+                    .context("candidate namespace remains owned")?;
+                Some(lock)
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(error) => return Err(error.into()),
+        }
+    } else {
+        None
+    };
+    let controller_owner = if state_path.join("jj-controller").try_exists()? {
+        let state = PrivateDir::open_existing(state_path.join("jj-controller"))?;
+        match state.open_existing_file("owner.lock", 4096) {
+            Ok(lock) => {
+                lock.try_lock_exclusive()
+                    .context("candidate controller remains owned")?;
+                Some(lock)
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(error) => return Err(error.into()),
+        }
+    } else {
+        None
+    };
+    registry.remove_candidate_admin(&receipt.binding, &admin)?;
+    directory.remove_child_tree(&id, MAX_CLEANUP_ENTRIES, MAX_CLEANUP_DEPTH)?;
+    receipt.root_removed = remove_empty_candidate_root(&receipt.record.root)?;
+    receipt.complete = true;
+    drop((owner, controller_owner, lease, admin));
+    Ok(())
+}
+
 fn validate_selection(selection: &crate::control::NativeRestoreSelection) -> Result<()> {
     ensure!(
         selection.workspace_id != [0; 32]
@@ -1844,6 +2260,137 @@ mod tests {
             anyhow::bail!("provider failure fixture must not query remote content")
         }
     }
+    #[tokio::test]
+    async fn ambiguous_retirement_publication_keeps_identity_closed_without_cleanup() -> Result<()>
+    {
+        let directory = tempfile::tempdir()?;
+        let state = PrivateDir::create(directory.path().join("state"))?;
+        let objects = PrivateDir::create(directory.path().join("objects"))?;
+        let provider = Arc::new(jj_native_backend::DirectObjectIo::init(
+            objects.path(),
+            Default::default(),
+        )?);
+        let cache = LocalCas::open(
+            directory.path().join("cas"),
+            Arc::new(NoRemoteContent),
+            Default::default(),
+        )?;
+        let mut config = Config::default();
+        config.state_dir = state.path().to_owned();
+        let mut manager = Manager::open(
+            config,
+            cache,
+            BTreeMap::from([(
+                "example".into(),
+                Repository {
+                    local_objects: provider.clone(),
+                    upload: None,
+                    query: None,
+                    io: provider,
+                    scope: Scope::from_configured_identity("example", &[8; 32])?,
+                    remote: false,
+                    identity: [8; 32],
+                },
+            )]),
+        )?;
+        let id = [9; 32];
+        let name = hex(&id);
+        let root = directory.path().join("candidate");
+        drop(PrivateDir::create(&root)?);
+        fs::write(root.join("foreign"), b"preserve")?;
+        let registry = Registry::create(directory.path().join("registry"))?;
+        let binding = registry.binding(
+            id,
+            &root,
+            "example".into(),
+            LocalEndpoint::UnixSocket(state.path().join("rbe.sock")),
+            name.clone(),
+        )?;
+        let record = Record {
+            version: 3,
+            workspace_id: id,
+            store: "example".into(),
+            root: root.clone(),
+            origin: Origin::Candidate {
+                bootstrap_commit: [7; 32],
+            },
+            scope: format!("native-workspace-v1:{name}"),
+            state: Lifecycle::Stopped,
+            native_mount: None,
+        };
+        let child = PrivateDir::create(manager.directory.path().join(&name))?;
+        child.replace("workspace.json", &serde_json::to_vec(&record)?)?;
+        manager.entries.insert(
+            name.clone(),
+            Entry {
+                record: record.clone(),
+                directory: child,
+                mount: None,
+                controller: None,
+                registered: false,
+                startup: None,
+                command_startup: None,
+                restore_intent: None,
+                restore_receipt: None,
+                provider_failure: None,
+            },
+        );
+        let receipt = CandidateRetirement {
+            version: 1,
+            record,
+            binding,
+            root_tree: [6; 32],
+            complete: false,
+            root_removed: false,
+        };
+        // Model replace's ambiguous after-rename directory-fsync error at the
+        // persistence boundary, without depending on a native mounted provider.
+        manager.after_retirement_publication = Some(Box::new(|| {
+            anyhow::bail!("injected after-rename publication failure")
+        }));
+        assert!(manager.publish_retirement_intent(&name, &receipt).is_err());
+        let persisted: CandidateRetirement = serde_json::from_slice(
+            &manager
+                .retirements_directory
+                .read(format!("{name}.json"), MAX_RECORD)?,
+        )?;
+        assert!(!persisted.complete);
+        assert!(
+            manager
+                .create(root.clone(), "example".into(), hex(&[7; 32]), name.clone())
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("retired")
+        );
+        assert!(
+            manager
+                .create_candidate(root.clone(), "example".into(), hex(&[7; 32]), name.clone())
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("retired")
+        );
+        assert!(
+            manager
+                .resume_root(root.clone())
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("retired")
+        );
+        assert!(
+            manager
+                .directory
+                .path()
+                .join(&name)
+                .join("workspace.json")
+                .exists()
+        );
+        assert_eq!(fs::read(root.join("foreign"))?, b"preserve");
+        Ok(())
+    }
+
     #[tokio::test]
     async fn changed_mountpoint_after_preparation_retains_command_identity_and_allows_stop()
     -> Result<()> {

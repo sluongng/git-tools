@@ -206,3 +206,28 @@ fn existing_file_handle_is_bounded_readonly_and_never_creates() {
         );
     }
 }
+
+#[cfg(unix)]
+#[test]
+fn disposable_cleanup_is_bounded_nofollow_and_replayable() {
+    use std::os::unix::fs::symlink;
+    let temp = root();
+    let parent = PrivateDir::create(temp.path().join("private")).unwrap();
+    let child = PrivateDir::create(parent.path().join("candidate")).unwrap();
+    child.replace("data", b"candidate").unwrap();
+    let foreign = temp.path().join("foreign");
+    std::fs::write(&foreign, b"preserve").unwrap();
+    symlink(&foreign, child.path().join("link")).unwrap();
+    assert!(parent.remove_child_tree("candidate", 16, 4).is_err());
+    assert_eq!(
+        std::fs::read(child.path().join("data")).unwrap(),
+        b"candidate"
+    );
+    assert_eq!(std::fs::read(&foreign).unwrap(), b"preserve");
+    std::fs::remove_file(child.path().join("link")).unwrap();
+    assert!(parent.remove_child_tree("candidate", 0, 4).is_err());
+    assert!(parent.remove_child_tree("../foreign", 16, 4).is_err());
+    parent.remove_child_tree("candidate", 16, 4).unwrap();
+    parent.remove_child_tree("candidate", 16, 4).unwrap();
+    assert_eq!(std::fs::read(foreign).unwrap(), b"preserve");
+}

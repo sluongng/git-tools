@@ -82,6 +82,145 @@ impl PrivateDir {
         &self.path
     }
 
+    /// Bound and validate a daemon-owned child tree before deleting any of it.
+    /// This rejects symlinks and special files; it never follows them. The caller
+    /// must separately own the lifecycle and prove this is disposable state.
+    pub fn check_child_tree(
+        &self,
+        name: impl AsRef<OsStr>,
+        max_entries: usize,
+        max_depth: usize,
+    ) -> io::Result<()> {
+        let name = name.as_ref();
+        single_name(name)?;
+        let child = Self::open_existing(self.path.join(name))?;
+        self.check_disposable_mount(child._chain.last().expect("directory chain"))?;
+        let mut remaining = max_entries;
+        child.walk_disposable(max_depth, &mut remaining, false)
+    }
+    /// Idempotently remove a bounded, prevalidated private child tree. Not for
+    /// user data or shared stores. Retain lifecycle locks across this operation.
+    pub fn remove_child_tree(
+        &self,
+        name: impl AsRef<OsStr>,
+        max_entries: usize,
+        max_depth: usize,
+    ) -> io::Result<()> {
+        let name = name.as_ref();
+        single_name(name)?;
+        match std::fs::symlink_metadata(self.path.join(name)) {
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
+            Err(e) => return Err(e),
+            Ok(_) => {}
+        }
+        self.check_child_tree(name, max_entries, max_depth)?;
+        let child = Self::open_existing(self.path.join(name))?;
+        let mut remaining = max_entries;
+        child.walk_disposable(max_depth, &mut remaining, true)?;
+        drop(child);
+        std::fs::remove_dir(self.path.join(name))?;
+        self.sync_directory()
+    }
+    fn walk_disposable(&self, depth: usize, remaining: &mut usize, remove: bool) -> io::Result<()> {
+        if depth == 0 {
+            return Err(invalid("disposable tree depth limit exceeded"));
+        }
+        for item in std::fs::read_dir(&self.path)? {
+            let item = item?;
+            *remaining = remaining
+                .checked_sub(1)
+                .ok_or_else(|| invalid("disposable tree entry limit exceeded"))?;
+            let kind = item.file_type()?;
+            if kind.is_dir() {
+                let path = item.path();
+                // Database internals may use 0755 inside our private ancestor.
+                // Still reject symlinks and writable/untrusted ancestors.
+                #[cfg(unix)]
+                let chain = unix::open_chain(&path, false)?;
+                #[cfg(windows)]
+                let chain = windows::open_chain(&path, false)?;
+                #[cfg(not(any(unix, windows)))]
+                return Err(io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    "private cleanup unsupported",
+                ));
+                let child = Self {
+                    path,
+                    _chain: chain,
+                };
+                self.check_disposable_mount(child._chain.last().expect("directory chain"))?;
+                child.walk_disposable(depth - 1, remaining, remove)?;
+                drop(child);
+                if remove {
+                    std::fs::remove_dir(item.path())?;
+                }
+            } else if kind.is_file() {
+                let file = Self::open_regular(&item.path(), u64::MAX, false)?;
+                self.check_disposable_mount(&file)?;
+                drop(file);
+                if remove {
+                    std::fs::remove_file(item.path())?;
+                }
+            } else {
+                return Err(denied("disposable tree contains a symlink or special file"));
+            }
+        }
+        if remove {
+            self.sync_directory()?;
+        }
+        Ok(())
+    }
+    fn check_disposable_mount(&self, file: &File) -> io::Result<()> {
+        #[cfg(target_os = "linux")]
+        {
+            use std::os::fd::AsRawFd;
+            let mount = |file: &File| -> io::Result<u64> {
+                let mut stat: libc::statx = unsafe { std::mem::zeroed() };
+                // Empty-path statx addresses the retained nofollow descriptor,
+                // detecting bind mounts as well as different-device mounts.
+                if unsafe {
+                    libc::statx(
+                        file.as_raw_fd(),
+                        c"".as_ptr(),
+                        libc::AT_EMPTY_PATH,
+                        libc::STATX_MNT_ID,
+                        &mut stat,
+                    )
+                } != 0
+                {
+                    return Err(io::Error::last_os_error());
+                }
+                if stat.stx_mask & libc::STATX_MNT_ID == 0 {
+                    return Err(denied("mount identity unavailable for private cleanup"));
+                }
+                Ok(stat.stx_mnt_id)
+            };
+            if mount(self._chain.last().expect("directory chain"))? != mount(file)? {
+                return Err(denied("private cleanup cannot cross a mount boundary"));
+            }
+        }
+        #[cfg(all(unix, not(target_os = "linux")))]
+        {
+            use std::os::unix::fs::MetadataExt;
+            if self
+                ._chain
+                .last()
+                .expect("directory chain")
+                .metadata()?
+                .dev()
+                != file.metadata()?.dev()
+            {
+                return Err(denied("private cleanup cannot cross a filesystem boundary"));
+            }
+        }
+        Ok(())
+    }
+    fn sync_directory(&self) -> io::Result<()> {
+        #[cfg(unix)]
+        self._chain.last().expect("directory chain").sync_all()?;
+        Ok(())
+    }
+
     /// Open/create a persistent owner-private lock file without following a
     /// symlink or reparse point. Callers apply their OS locking primitive and
     /// keep both this directory guard and returned file alive.
