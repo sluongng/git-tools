@@ -46,6 +46,11 @@ struct Workspace {
     closed: Mutex<Option<[u8; 32]>>,
     capture: Mutex<Option<Arc<crate::native_capture::Target>>>,
     pending: Mutex<Option<([u8; 32], CommandPreparation)>>,
+    binding: Binding,
+    admission: Arc<CommandAdmission>,
+}
+struct CommandAdmission {
+    active: AtomicBool,
 }
 struct Session {
     workspace: Arc<Workspace>,
@@ -79,6 +84,91 @@ struct Inner {
 #[derive(Clone)]
 pub(crate) struct NativeCommandHost {
     inner: Arc<Inner>,
+}
+/// Private host startup capability; dropping it never admits commands. The
+/// trusted caller must keep the actual frontend stopped or startup-gated before
+/// registering/re-arming this workspace. No user RPC can issue this capability.
+pub(crate) struct CommandStartupReservation {
+    inner: Arc<Inner>,
+    workspace: Arc<Workspace>,
+}
+/// All fallible command identity/lease checks have completed. The host activates
+/// its actual frontend before consuming this value's infallible final commit.
+pub(crate) struct CommandStartupActivation {
+    admission: Arc<CommandAdmission>,
+    _workspace: Arc<Workspace>,
+    _inner: Arc<Inner>,
+    // Release the exact writer lease only after all capability owners drop.
+    _lease: File,
+}
+impl CommandStartupReservation {
+    pub(crate) fn validate_for_activation(
+        self,
+        host: &NativeCommandHost,
+        binding: &Binding,
+        identity: [u8; 32],
+    ) -> Result<CommandStartupActivation> {
+        ensure!(
+            Arc::ptr_eq(&self.inner, &host.inner),
+            "native command startup host differs"
+        );
+        ensure!(
+            self.workspace.binding == *binding && self.workspace.mapping.identity == identity,
+            "native command startup binding differs"
+        );
+        let entries = self
+            .inner
+            .workspaces
+            .read()
+            .map_err(|_| anyhow::anyhow!("command map unavailable"))?;
+        ensure!(
+            entries
+                .get(&binding.rpc_mount_id)
+                .is_some_and(|entry| Arc::ptr_eq(entry, &self.workspace)),
+            "native command startup registration differs"
+        );
+        ensure!(
+            !self.workspace.admission.active.load(Ordering::Acquire),
+            "native command startup already active"
+        );
+        ensure!(
+            !self
+                .inner
+                .sessions
+                .lock()
+                .map_err(|_| anyhow::anyhow!("command map unavailable"))?
+                .values()
+                .any(|session| session.workspace.registration == self.workspace.registration),
+            "native command startup has an active command"
+        );
+        let lease = existing_lease(&self.workspace.lease, Some(self.workspace.lease_identity))?;
+        lease
+            .try_lock_exclusive()
+            .context("native command startup writer lease is held")?;
+        drop(entries);
+        Ok(CommandStartupActivation {
+            admission: self.workspace.admission.clone(),
+            _workspace: self.workspace,
+            _inner: self.inner,
+            _lease: lease,
+        })
+    }
+}
+impl CommandStartupActivation {
+    /// Release the startup-only lease while commands are still closed, then
+    /// publish the infallible final in-memory transition. Retained owners pin
+    /// the exact registration; no fallible identity/lease checks remain.
+    pub(crate) fn commit(self) {
+        let Self {
+            admission,
+            _workspace,
+            _inner,
+            _lease,
+        } = self;
+        // Begin must never mistake this host lease for a CLI's writer lease.
+        drop(_lease);
+        admission.active.store(true, Ordering::Release);
+    }
 }
 impl std::fmt::Debug for NativeCommandHost {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -194,6 +284,31 @@ impl NativeCommandHost {
         Ok(host)
     }
     pub async fn register(&self, binding: &Binding, identity: [u8; 32]) -> Result<()> {
+        self.register_inner(binding, identity, false)
+            .await
+            .map(|_| ())
+    }
+    /// Reserve command admission before starting/reopening a frontend. Matching
+    /// active registrations may be re-armed only when no command or writer lease
+    /// exists. The trusted Manager must separately own a stopped/gated frontend.
+    pub(crate) async fn register_reserved(
+        &self,
+        binding: &Binding,
+        identity: [u8; 32],
+    ) -> Result<CommandStartupReservation> {
+        let workspace = self.register_inner(binding, identity, true).await?;
+        Ok(CommandStartupReservation {
+            inner: self.inner.clone(),
+            workspace,
+        })
+    }
+    async fn register_inner(
+        &self,
+        binding: &Binding,
+        identity: [u8; 32],
+        reserved: bool,
+    ) -> Result<Arc<Workspace>> {
+        let _start = self.inner.starts.lock().await;
         let mount = binding.rpc_mount_id.clone();
         ensure!(
             !mount.is_empty()
@@ -265,6 +380,10 @@ impl NativeCommandHost {
             closed: Mutex::new(None),
             capture: Mutex::new(None),
             pending: Mutex::new(None),
+            binding: binding.clone(),
+            admission: Arc::new(CommandAdmission {
+                active: AtomicBool::new(!reserved),
+            }),
         });
         let mut entries = self
             .inner
@@ -278,6 +397,40 @@ impl NativeCommandHost {
                     && existing.lease_identity == workspace.lease_identity,
                 "native command registration changed"
             );
+            ensure!(
+                existing.admission.active.load(Ordering::Acquire),
+                "native command startup is reserved; preserve its owner"
+            );
+            if reserved {
+                ensure!(
+                    existing.binding == *binding && existing.mapping.identity == identity,
+                    "native command startup binding differs"
+                );
+                ensure!(
+                    !self
+                        .inner
+                        .sessions
+                        .lock()
+                        .map_err(|_| anyhow::anyhow!("command map unavailable"))?
+                        .values()
+                        .any(|session| session.workspace.registration == existing.registration),
+                    "native command is already active"
+                );
+                let lease = existing_lease(&existing.lease, Some(existing.lease_identity))?;
+                lease
+                    .try_lock_exclusive()
+                    .context("native command writer lease is held")?;
+                // Failed/busy re-arm leaves old preparations valid. Only after
+                // all proofs succeed may the exact private host close admission.
+                existing
+                    .pending
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("command preparation unavailable"))?
+                    .take();
+                existing.admission.active.store(false, Ordering::Release);
+                FileExt::unlock(&lease)?;
+            }
+            Ok(existing.clone())
         } else {
             ensure!(
                 entries.len() < 4096,
@@ -289,9 +442,9 @@ impl NativeCommandHost {
                     .any(|entry| entry.registration == workspace.registration),
                 "native command registration aliases another workspace"
             );
-            entries.insert(mount, workspace);
+            entries.insert(mount, workspace.clone());
+            Ok(workspace)
         }
-        Ok(())
     }
     pub(crate) fn set_capture_target(
         &self,
@@ -345,6 +498,11 @@ impl NativeCommandHost {
         }
         let _start = self.inner.starts.lock().await;
         let workspace = self.workspace(mount)?;
+        if !workspace.admission.active.load(Ordering::Acquire) {
+            return Err(Status::failed_precondition(
+                "native command startup is not active",
+            ));
+        }
         {
             let sessions = self
                 .inner
@@ -403,6 +561,11 @@ impl NativeCommandHost {
         }
         let _start = self.inner.starts.lock().await;
         let workspace = self.workspace(mount)?;
+        if !workspace.admission.active.load(Ordering::Acquire) {
+            return Err(Status::failed_precondition(
+                "native command startup is not active",
+            ));
+        }
         {
             let sessions = self
                 .inner
@@ -898,5 +1061,208 @@ impl native_broker::CommandResolver for NativeCommandHost {
                 .resolve(CommandToken::from_bytes(token))
                 .map_err(status)?,
         ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    fn binding(parent: &Path, name: &str, byte: u8) -> Result<Binding> {
+        let root = parent.join(format!("root-{name}"));
+        std::fs::create_dir(&root)?;
+        let admins = PrivateDir::create(parent.join("admins"))?;
+        let admin = admins.path().join(name);
+        Ok(Binding {
+            version: 1,
+            workspace_id: [byte; 32],
+            root,
+            repo: admin.join("repo"),
+            working_copy: admin.join("working_copy"),
+            admin,
+            repository: "example".into(),
+            endpoint: native_workspace_admin::Endpoint::UnixSocket {
+                path: parent.join("rbe.sock"),
+            },
+            rpc_mount_id: name.into(),
+        })
+    }
+    fn forged() -> CommandPreparation {
+        CommandPreparation {
+            incarnation: [1; 16],
+            nonce: [2; 32],
+            expected_epoch: 0,
+        }
+    }
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn startup_registration_is_closed_until_exact_prevalidated_activation_and_drop_stays_closed()
+    -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let private = PrivateDir::create(directory.path().join("private"))?;
+        let host = NativeCommandHost::open(&private.path().join("commands")).await?;
+        let dropped = binding(private.path(), "dropped", 1)?;
+        let reservation = host.register_reserved(&dropped, [8; 32]).await?;
+        assert_eq!(
+            host.prepare("dropped", [1; 32]).await.unwrap_err().code(),
+            tonic::Code::FailedPrecondition
+        );
+        assert_eq!(
+            host.begin("dropped", [1; 32], forged())
+                .await
+                .unwrap_err()
+                .code(),
+            tonic::Code::FailedPrecondition
+        );
+        assert_eq!(host.workspace_state("dropped").await?.command_epoch, 0);
+        assert!(
+            !host.active("dropped"),
+            "stop/recovery probes still work before activation"
+        );
+        assert!(host.register_reserved(&dropped, [8; 32]).await.is_err());
+        assert!(
+            host.register(&dropped, [8; 32]).await.is_err(),
+            "ordinary registration cannot bypass reserved startup"
+        );
+        drop(reservation);
+        assert!(
+            host.prepare("dropped", [1; 32]).await.is_err(),
+            "cancellation never opens admission"
+        );
+        assert!(!host.active("dropped"));
+
+        let foreign = binding(private.path(), "foreign", 2)?;
+        let reservation = host.register_reserved(&foreign, [8; 32]).await?;
+        let other = NativeCommandHost::open(&private.path().join("other-commands")).await?;
+        assert!(
+            reservation
+                .validate_for_activation(&other, &foreign, [8; 32])
+                .is_err()
+        );
+        assert!(host.prepare("foreign", [1; 32]).await.is_err());
+        let mismatched = binding(private.path(), "mismatched", 3)?;
+        let reservation = host.register_reserved(&mismatched, [8; 32]).await?;
+        let mut wrong = mismatched.clone();
+        wrong.root = dropped.root.clone();
+        assert!(
+            reservation
+                .validate_for_activation(&host, &wrong, [8; 32])
+                .is_err(),
+            "same alias/lease cannot substitute a different root binding"
+        );
+        assert!(host.prepare("mismatched", [1; 32]).await.is_err());
+
+        let held = binding(private.path(), "validated-drop", 4)?;
+        let activation = host
+            .register_reserved(&held, [8; 32])
+            .await?
+            .validate_for_activation(&host, &held, [8; 32])?;
+        assert!(
+            host.active("validated-drop"),
+            "the exact lease pins the activation critical section"
+        );
+        assert!(host.prepare("validated-drop", [1; 32]).await.is_err());
+        assert!(host.register(&held, [8; 32]).await.is_err());
+        drop(activation);
+        assert!(!host.active("validated-drop"));
+        assert!(host.prepare("validated-drop", [1; 32]).await.is_err());
+
+        let ready = binding(private.path(), "activated", 5)?;
+        let activation = host
+            .register_reserved(&ready, [8; 32])
+            .await?
+            .validate_for_activation(&host, &ready, [8; 32])?;
+        // The actual frontend activation belongs between these two calls. This
+        // unit verifies command admission only, not a native frontend proof.
+        activation.commit();
+        assert!(!host.active("activated"));
+        host.register(&ready, [8; 32]).await?;
+        let preparation = host.prepare("activated", [1; 32]).await?;
+        assert!(
+            host.begin("activated", [1; 32], preparation.clone())
+                .await
+                .is_err(),
+            "startup activation must not stand in for a CLI writer lease"
+        );
+        assert_eq!(host.workspace_state("activated").await?.command_epoch, 0);
+        let lease = existing_lease(
+            &native_vfs_rpc::command_lock_path(&ready.admin, "activated")?,
+            None,
+        )?;
+        lease.try_lock_exclusive()?;
+        let started = host.begin("activated", [1; 32], preparation).await?;
+        assert_eq!(
+            started.epoch, 1,
+            "the SAME preparation is accepted only with an actual CLI lease"
+        );
+        drop(lease);
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            host.finish_dirty("activated", started.token),
+        )
+        .await??;
+        let ordinary = binding(private.path(), "ordinary", 6)?;
+        host.register(&ordinary, [8; 32]).await?;
+        host.register(&ordinary, [8; 32]).await?;
+        assert!(host.prepare("ordinary", [1; 32]).await.is_ok());
+        Ok(())
+    }
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn startup_rearm_rejects_busy_without_invalidating_command_and_clears_old_preparations()
+    -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let private = PrivateDir::create(directory.path().join("private"))?;
+        let host = NativeCommandHost::open(&private.path().join("commands")).await?;
+        let binding = binding(private.path(), "workspace", 7)?;
+        host.register(&binding, [8; 32]).await?;
+        let preparation = host.prepare("workspace", [1; 32]).await?;
+        let path = native_vfs_rpc::command_lock_path(&binding.admin, "workspace")?;
+        let lease = existing_lease(&path, None)?;
+        lease.try_lock_exclusive()?;
+        assert!(host.register_reserved(&binding, [8; 32]).await.is_err());
+        // Failure above did not clear the pending preparation or close an
+        // ordinary registration while its legitimate CLI was taking the lease.
+        let started = host.begin("workspace", [1; 32], preparation).await?;
+        let physical = native_broker::CommandResolver::resolve(&host, "example", started.token)?;
+        assert!(host.register_reserved(&binding, [8; 32]).await.is_err());
+        assert!(native_broker::CommandResolver::resolve(&host, "example", started.token).is_ok());
+        drop(lease);
+        drop(physical);
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            host.finish_dirty("workspace", started.token),
+        )
+        .await??;
+        let stale = host.prepare("workspace", [2; 32]).await?;
+        let reservation = host.register_reserved(&binding, [8; 32]).await?;
+        assert!(host.prepare("workspace", [3; 32]).await.is_err());
+        assert!(
+            host.begin("workspace", [2; 32], stale.clone())
+                .await
+                .is_err()
+        );
+        assert!(host.register_reserved(&binding, [8; 32]).await.is_err());
+        reservation
+            .validate_for_activation(&host, &binding, [8; 32])?
+            .commit();
+        let lease = existing_lease(&path, None)?;
+        lease.try_lock_exclusive()?;
+        assert!(
+            host.begin("workspace", [2; 32], stale).await.is_err(),
+            "pre-rearm preparation must not resurrect after activation"
+        );
+        assert_eq!(host.workspace_state("workspace").await?.command_epoch, 1);
+        let fresh = host.prepare("workspace", [3; 32]).await?;
+        let next = host.begin("workspace", [3; 32], fresh).await?;
+        assert_eq!(next.epoch, 2);
+        drop(lease);
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            host.finish_dirty("workspace", next.token),
+        )
+        .await??;
+        assert_eq!(
+            host.workspace_state("workspace").await?.state,
+            native_retention::WorkspaceState::Dirty
+        );
+        Ok(())
     }
 }

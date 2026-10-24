@@ -10,9 +10,82 @@ async fn native_mount_is_metadata_only_lazy_writable_and_restartable() {
     let dir = tempfile::tempdir().unwrap();
     let (config, provider) = common::fixture(dir.path());
     let cache = common::cache(dir.path());
-    let mount = native_vfs::start(config.clone(), provider.clone(), cache.clone())
+    let prepared = native_vfs::prepare(config.clone(), provider.clone(), cache.clone())
         .await
         .unwrap();
+    let startup = native_vfs::mount_prepared_for_restore(prepared)
+        .await
+        .unwrap();
+    let retained = startup.mount().clone();
+    let marker = config.root.join(".jj/native-workspace");
+    let identity: String = config
+        .workspace_identity
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    assert_eq!(fs::read(&marker).unwrap(), identity.as_bytes());
+    assert!(fs::metadata(&config.root).unwrap().is_dir());
+    let file = config.root.join("tool");
+    assert!(
+        fs::read(&file).is_err(),
+        "regular reads are closed from first visible mount"
+    );
+    assert!(fs::OpenOptions::new().write(true).open(&file).is_err());
+    assert!(fs::write(config.root.join("not-created"), b"blocked").is_err());
+    assert!(
+        fs::OpenOptions::new()
+            .write(true)
+            .truncate(true)
+            .open(&file)
+            .is_err()
+    );
+    assert!(fs::rename(&file, config.root.join("not-renamed")).is_err());
+    assert!(fs::create_dir(config.root.join("not-a-directory")).is_err());
+    assert!(
+        fs::OpenOptions::new()
+            .write(true)
+            .truncate(true)
+            .open(&marker)
+            .is_err()
+    );
+    assert!(
+        retained
+            .capture_for_backup(
+                &config.source_limits,
+                tokio::time::Instant::now() + std::time::Duration::from_secs(2)
+            )
+            .await
+            .is_err()
+    );
+    assert!(
+        fs::read(&file).is_err(),
+        "failed capture cannot clear startup admission"
+    );
+    assert_eq!(provider.file_reads.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        provider.metadata_reads.load(Ordering::SeqCst),
+        0,
+        "marker readiness cannot hydrate source directories"
+    );
+    drop(startup);
+    assert!(
+        fs::read(&file).is_err(),
+        "dropping startup fence must leave mount closed"
+    );
+    assert_eq!(fs::read(&marker).unwrap(), identity.as_bytes());
+    retained.shutdown().await.unwrap();
+    drop(retained);
+    let prepared = native_vfs::prepare(config.clone(), provider.clone(), cache.clone())
+        .await
+        .unwrap();
+    let mut startup = native_vfs::mount_prepared_for_restore(prepared)
+        .await
+        .unwrap();
+    assert!(fs::read(&file).is_err());
+    startup.activate().await.unwrap();
+    let mount = startup.mount().clone();
+    drop(startup);
+
     assert_eq!(provider.file_reads.load(Ordering::SeqCst), 0);
     assert_eq!(provider.metadata_reads.load(Ordering::SeqCst), 0);
     assert_eq!(

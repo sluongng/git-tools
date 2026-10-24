@@ -457,6 +457,65 @@ pub async fn start(
         mount_prepared(prepare(config, provider, cache).await?).await
     }
 }
+/// Startup-gated lazy native mount. The actual frontend remains closed on Drop;
+/// callers retain this owner before any fallible external restore initialization.
+/// Exposing the mount permits marker/controller checks, not ordinary kernel I/O.
+pub struct StartupNativeMount {
+    mount: Arc<NativeMount>,
+    #[cfg(target_os = "linux")]
+    fence: output_fuse::StartupFence,
+}
+impl StartupNativeMount {
+    pub fn mount(&self) -> &Arc<NativeMount> {
+        &self.mount
+    }
+    /// Final activation only after the host has committed all restore checks.
+    pub async fn activate(&mut self) -> Result<()> {
+        #[cfg(target_os = "linux")]
+        {
+            self.fence.activate().await
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "startup-gated native restore requires Linux",
+            )
+            .into())
+        }
+    }
+}
+/// Acquire a frontend whose ordinary kernel admission starts closed. Other
+/// platforms fail before acquiring a provider; there is no materialized fallback.
+pub async fn mount_prepared_for_restore(prepared: PreparedWorkspace) -> Result<StartupNativeMount> {
+    #[cfg(target_os = "linux")]
+    {
+        let (source_frontend, fence) = output_fuse::start_native_source_gated(
+            prepared.tree(),
+            prepared.root(),
+            prepared.workspace_identity(),
+        )
+        .await?;
+        let projection: Arc<dyn Projection> = source_frontend.clone();
+        Ok(StartupNativeMount {
+            mount: Arc::new(NativeMount {
+                prepared,
+                projection,
+                source_frontend,
+            }),
+            fence,
+        })
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = prepared;
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "startup-gated native restore requires Linux",
+        )
+        .into())
+    }
+}
 /// Start a native provider after successful metadata preparation. On macOS an
 /// error may own a recoverable NFS session; retain it until explicit shutdown.
 pub async fn mount_prepared(prepared: PreparedWorkspace) -> Result<NativeMount> {

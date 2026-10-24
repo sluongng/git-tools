@@ -140,6 +140,26 @@ impl Drop for RequestTicket {
 #[derive(Default)]
 struct Admission {
     source_capture: bool,
+    startup_pending: bool,
+}
+#[derive(Clone, Copy)]
+struct StartupMarker {
+    admin: u64,
+    file: u64,
+}
+impl StartupMarker {
+    fn lookup(self, parent: u64, name: &OsStr) -> Option<u64> {
+        if parent == 1 && name == OsStr::new(".jj") {
+            Some(self.admin)
+        } else if parent == self.admin && name == OsStr::new("native-workspace") {
+            Some(self.file)
+        } else {
+            None
+        }
+    }
+    fn metadata(self, ino: u64) -> bool {
+        ino == 1 || ino == self.admin || ino == self.file
+    }
 }
 struct SourceAdmissionPause {
     admission: Arc<Mutex<Admission>>,
@@ -268,6 +288,7 @@ struct Adapter {
     payload: Arc<Semaphore>,
     pending: Arc<Pending>,
     admission: Arc<Mutex<Admission>>,
+    startup_marker: Option<StartupMarker>,
     stopped: Arc<AtomicBool>,
     references: Arc<KernelReferences>,
     maintenance: Arc<Mutex<Maintenance>>,
@@ -322,11 +343,14 @@ impl Adapter {
         });
     }
     fn enter(&self) -> Result<RequestTicket, i32> {
+        self.enter_startup(false)
+    }
+    fn enter_startup(&self, immutable_marker_io: bool) -> Result<RequestTicket, i32> {
         // Count before testing stopped. Sequential consistency across these
         // two atomics excludes store-buffering: shutdown cannot observe zero
         // while this callback observes the pre-shutdown admission flag.
         let admission = self.admission.lock().unwrap();
-        if admission.source_capture {
+        if admission.source_capture || (admission.startup_pending && !immutable_marker_io) {
             return Err(libc::EAGAIN);
         }
         self.pending.count.fetch_add(1, Ordering::SeqCst);
@@ -377,10 +401,26 @@ impl Filesystem for Adapter {
         Ok(())
     }
     fn lookup(&mut self, _: &Request<'_>, parent: u64, name_: &OsStr, reply: ReplyEntry) {
-        let ticket = match self.enter() {
+        let marker = self.startup_marker.and_then(|m| m.lookup(parent, name_));
+        let ticket = match self.enter_startup(marker.is_some()) {
             Ok(ticket) => ticket,
             Err(error) => return reply.error(error),
         };
+        if let Some(id) = marker {
+            // These immutable prepared IDs bypass lazy-source directory loading,
+            // never pathname traversal or a caller-selected inode exemption.
+            let result = (|| -> Result<Node> {
+                let node = self.tree.get(id)?;
+                self.tree.retain_lookup(id)?;
+                self.references.entry(&node, true)?;
+                Ok(node)
+            })();
+            match result {
+                Ok(node) => reply.entry(&TTL, &attrs(&node), node.generation),
+                Err(error) => reply.error(errno(error)),
+            }
+            return;
+        }
         let owned_name = match name(name_) {
             Ok(name) => name,
             Err(error) => return reply.error(errno(error)),
@@ -450,7 +490,9 @@ impl Filesystem for Adapter {
         reply.ok();
     }
     fn getattr(&mut self, _: &Request<'_>, ino: u64, _: Option<u64>, reply: ReplyAttr) {
-        let _ticket = match self.enter() {
+        let _ticket = match self
+            .enter_startup(ino == 1 || self.startup_marker.is_some_and(|m| m.metadata(ino)))
+        {
             Ok(ticket) => ticket,
             Err(error) => return reply.error(error),
         };
@@ -504,7 +546,10 @@ impl Filesystem for Adapter {
         }
     }
     fn open(&mut self, _: &Request<'_>, ino: u64, flags: i32, reply: ReplyOpen) {
-        let permit = match self.enter() {
+        let marker_read = self.startup_marker.is_some_and(|m| m.file == ino)
+            && flags & libc::O_ACCMODE == libc::O_RDONLY
+            && flags & (libc::O_TRUNC | libc::O_APPEND | libc::O_CREAT) == 0;
+        let permit = match self.enter_startup(marker_read) {
             Ok(ticket) => ticket,
             Err(error) => return reply.error(error),
         };
@@ -583,7 +628,7 @@ impl Filesystem for Adapter {
             reply.error(libc::EINVAL);
             return;
         }
-        let permit = match self.enter() {
+        let permit = match self.enter_startup(self.startup_marker.is_some_and(|m| m.file == ino)) {
             Ok(p) => p,
             Err(e) => {
                 reply.error(e);
@@ -940,7 +985,7 @@ impl Filesystem for Adapter {
         reply.ok();
     }
     fn statfs(&mut self, _: &Request<'_>, _: u64, reply: ReplyStatfs) {
-        let _ticket = match self.enter() {
+        let _ticket = match self.enter_startup(true) {
             Ok(ticket) => ticket,
             Err(error) => return reply.error(error),
         };
@@ -973,7 +1018,8 @@ impl Filesystem for Adapter {
         );
     }
     fn getxattr(&mut self, _: &Request<'_>, ino: u64, attr: &OsStr, size: u32, reply: ReplyXattr) {
-        let _ticket = match self.enter() {
+        let _ticket = match self.enter_startup(self.startup_marker.is_some_and(|m| m.metadata(ino)))
+        {
             Ok(ticket) => ticket,
             Err(error) => return reply.error(error),
         };
@@ -1130,7 +1176,14 @@ pub async fn start_with_retirement_budget(
     root: &Path,
     retirement_budget: usize,
 ) -> Result<Arc<FuseMount>> {
-    start_named(tree, root, retirement_budget, "git-tools-outputs".into()).await
+    start_named(
+        tree,
+        root,
+        retirement_budget,
+        "git-tools-outputs".into(),
+        None,
+    )
+    .await
 }
 /// Native source mounts have a workspace-specific kernel source name, so
 /// disconnected recovery cannot mistake an output mount for a source mount.
@@ -1147,13 +1200,93 @@ pub async fn start_native_source(
         .iter()
         .map(|byte| format!("{byte:02x}"))
         .collect();
-    start_named(tree, root, 64, format!("git-tools-native-{id}")).await
+    start_named(tree, root, 64, format!("git-tools-native-{id}"), None).await
+}
+/// Start with ordinary kernel access closed before Session::new makes the mount
+/// visible. Only the exact immutable prepared native marker is readable.
+pub async fn start_native_source_gated(
+    tree: Arc<Tree>,
+    root: &Path,
+    workspace_identity: [u8; 32],
+) -> Result<(Arc<FuseMount>, StartupFence)> {
+    ensure!(
+        workspace_identity != [0; 32],
+        "native source identity must be nonzero"
+    );
+    let id: String = workspace_identity
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    // This validates/reuses the same immutable control marker without loading
+    // any lazy source directory, and runs before provider/session acquisition.
+    let marker =
+        tree.install_source_control(id.as_bytes(), &output_core::SourceLimits::default())?;
+    let admin = tree.get(marker.parent)?;
+    ensure!(
+        admin.parent == 1
+            && admin.name == ".jj"
+            && admin.kind == NodeKind::Directory
+            && marker.name == "native-workspace"
+            && marker.remote.is_none()
+            && marker.mode & 0o222 == 0,
+        "invalid prepared native startup marker"
+    );
+    let mount = start_named(
+        tree,
+        root,
+        64,
+        format!("git-tools-native-{id}"),
+        Some(StartupMarker {
+            admin: admin.id,
+            file: marker.id,
+        }),
+    )
+    .await?;
+    Ok((mount.clone(), StartupFence { mount }))
+}
+/// An opaque actual-session startup fence. Drop intentionally does NOT activate
+/// the frontend: failure leaves it closed until its owner explicitly stops it.
+pub struct StartupFence {
+    mount: Arc<FuseMount>,
+}
+impl StartupFence {
+    pub async fn activate(&mut self) -> Result<()> {
+        // Only activation itself owns this short serialization barrier; admin
+        // initialization may use control operations while startup remains closed.
+        let control = self.mount.control.clone().lock_owned().await;
+        self.mount.adapter.pending.drain().await;
+        let mount = self.mount.clone();
+        let (control, mount) = tokio::task::spawn_blocking(move || -> Result<_> {
+            let session = mount.session.lock().unwrap();
+            let session = session
+                .as_ref()
+                .context("startup source mount is not live")?;
+            ensure!(
+                !mount.adapter.stopped.load(Ordering::SeqCst)
+                    && !session.stop.load(Ordering::Acquire)
+                    && session.worker.as_ref().is_some_and(|w| !w.is_finished())
+                    && mounted_ids(&mount.root)? == [session.mount_id],
+                "startup source session changed or stopped"
+            );
+            // Move the control owner through the real physical verification.
+            Ok((control, mount.clone()))
+        })
+        .await
+        .context("startup source verification failed")??;
+        let mut admission = mount.adapter.admission.lock().unwrap();
+        ensure!(!admission.source_capture, "source capture is active");
+        admission.startup_pending = false;
+        drop(admission);
+        drop(control);
+        Ok(())
+    }
 }
 async fn start_named(
     tree: Arc<Tree>,
     root: &Path,
     retirement_budget: usize,
     source_name: String,
+    startup_marker: Option<StartupMarker>,
 ) -> Result<Arc<FuseMount>> {
     let root = root.to_owned();
     let runtime = Handle::current();
@@ -1189,7 +1322,11 @@ async fn start_named(
             runtime,
             payload: Arc::new(Semaphore::new(PAYLOAD_SLOTS)),
             pending: Arc::new(Pending::default()),
-            admission: Arc::new(Mutex::new(Admission::default())),
+            admission: Arc::new(Mutex::new(Admission {
+                source_capture: false,
+                startup_pending: startup_marker.is_some(),
+            })),
+            startup_marker,
             stopped: Arc::new(AtomicBool::new(false)),
         };
         let mut session = Session::new(
@@ -1276,6 +1413,10 @@ impl FuseMount {
             .await?;
         {
             let mut admission = self.adapter.admission.lock().unwrap();
+            ensure!(
+                !admission.startup_pending,
+                "source startup is not activated"
+            );
             ensure!(!admission.source_capture, "source capture already active");
             admission.source_capture = true;
         }

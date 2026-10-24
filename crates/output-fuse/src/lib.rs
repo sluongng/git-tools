@@ -4,5 +4,6 @@
 mod linux;
 #[cfg(target_os = "linux")]
 pub use linux::{
-    FuseMount, FuseSourceCapture, start, start_native_source, start_with_retirement_budget,
+    FuseMount, FuseSourceCapture, StartupFence, start, start_native_source,
+    start_native_source_gated, start_with_retirement_budget,
 };
