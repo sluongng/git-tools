@@ -62,3 +62,12 @@ make interrupted unlink recoverable on a later successful collection. Its
 logical scan/deletion limits do not cap database or crash-orphan disk overhead.
 `plan_client_gc` is nonmutating and grants no deletion permission; apply recomputes
 the selection under its gate and revalidates the supplied epoch.
+
+Trusted external-check embeddings call `enable_external_checks` before dispatch.
+It durably creates the fixed private `external-checks/` journal layout and upgrades
+storage to format 7, which older binaries reject. Reopen validates that layout
+even when checking is disabled; missing or altered layout is not auto-repaired.
+The embedding owns journal recovery and must fence dispatch, uncertain cleanup
+and job expiry with `journal.lock` plus its shared gate. This layout capability
+is not proof that a check ran or that roots may be released. Activated stores
+require authoritative server GC, never client GC.

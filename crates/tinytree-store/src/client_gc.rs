@@ -203,7 +203,10 @@ impl Store {
         gate: &Runtime,
     ) -> Result<ClientGcPlan> {
         let repository = self.inner.repository(repo)?;
-        if self.inner.has_cloud_state(repo)? || self.inner.has_landing_state(repo)? {
+        if self.inner.external_checks_active()?
+            || self.inner.has_cloud_state(repo)?
+            || self.inner.has_landing_state(repo)?
+        {
             return Err(Error::Invalid(
                 "authoritative service state requires server GC",
             ));

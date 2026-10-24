@@ -35,6 +35,11 @@ impl Read for InterruptedUpload {
 
 #[cfg(unix)]
 fn fail_regular_file_writes() -> io::Result<()> {
+    limit_regular_file_size(0)
+}
+
+#[cfg(unix)]
+fn limit_regular_file_size(bytes: u64) -> io::Result<()> {
     // This process is disposable. Its own regular-file writes fail with EFBIG;
     // the parent, host filesystem capacity and pipe checkpoints are unaffected.
     unsafe {
@@ -42,8 +47,8 @@ fn fail_regular_file_writes() -> io::Result<()> {
             return Err(io::Error::last_os_error());
         }
         let limit = libc::rlimit {
-            rlim_cur: 0,
-            rlim_max: 0,
+            rlim_cur: bytes,
+            rlim_max: bytes,
         };
         if libc::setrlimit(libc::RLIMIT_FSIZE, &limit) != 0 {
             return Err(io::Error::last_os_error());
@@ -186,6 +191,29 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         }
         #[cfg(unix)]
         "landing-write-failure" => landing(&store, "landing-write-failure"),
+        "external-layout-ack" => {
+            store.enable_external_checks()?;
+            checkpoint("EXTERNAL_LAYOUT_ACK")?;
+            wait_for_kill()
+        }
+        #[cfg(unix)]
+        "external-layout-write-failure" => {
+            // Header and empty lock fit; the already-used database journal does
+            // not. Exercise the real ambiguous feature-marker write path.
+            limit_regular_file_size(256)?;
+            let error = store
+                .enable_external_checks()
+                .expect_err("journal must fail");
+            if !matches!(error, Error::Database(fjall::Error::Io(ref io)) if io.raw_os_error()==Some(libc::EFBIG))
+            {
+                return Err(format!("expected journal EFBIG, got {error}").into());
+            }
+            if !matches!(store.external_checks_directory(), Err(Error::Poisoned)) {
+                return Err("uncertain layout marker did not poison access".into());
+            }
+            checkpoint("WRITE_FAILED_POISONED")?;
+            wait_for_kill()
+        }
         "after-ack" => {
             checkpoint("DURABLE_ACK")?;
             wait_for_kill()

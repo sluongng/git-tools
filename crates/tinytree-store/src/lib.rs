@@ -32,6 +32,7 @@ pub use cloud::{
     CloudVersionSelector, CloudWorkspace, CloudWriteReceipt, PublishCapturedCloudRequest,
     PublishCloudRequest,
 };
+mod external_checks;
 mod landing;
 pub use landing::{
     LandingCandidate, LandingCandidateLease, LandingCheckIdentity, LandingCheckProfile,
@@ -372,6 +373,7 @@ fn store_feature(value: Option<&[u8]>) -> Result<u8> {
         Some(b"tinytree-store-4") => Ok(4),
         Some(b"tinytree-store-5") => Ok(5),
         Some(b"tinytree-store-6") => Ok(6),
+        Some(b"tinytree-store-7") => Ok(7),
         _ => Err(Error::Corrupt("store format")),
     }
 }
@@ -388,6 +390,7 @@ fn advance_feature(
             4 => b"tinytree-store-4".as_slice(),
             5 => b"tinytree-store-5".as_slice(),
             6 => b"tinytree-store-6".as_slice(),
+            7 => b"tinytree-store-7".as_slice(),
             _ => return Err(Error::Invalid("store feature")),
         };
         tx.insert(meta, b"format", value);
@@ -612,6 +615,7 @@ impl Store {
             let meta = db.keyspace("meta", KeyspaceCreateOptions::default)?;
             store_feature(db.read_tx().get(&meta, b"format")?.as_deref())?
         };
+        external_checks::preflight(&root, feature)?;
         if !planned.fresh
             && feature >= 2
             && (!db.keyspace_exists("pack-locations-v1") || !db.keyspace_exists("packs-v1"))

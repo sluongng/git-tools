@@ -480,3 +480,49 @@ fn real_landing_journal_write_failure_recovers_reference_and_rewrite_receipt_ato
         other => panic!("non-atomic recovered landing state: {other:?}"),
     }
 }
+
+#[test]
+fn acknowledged_external_check_layout_survives_owned_process_termination() {
+    #[cfg(unix)]
+    let root = tempfile::Builder::new()
+        .prefix("tinytree-layout-ack-")
+        .tempdir_in("/tmp")
+        .unwrap();
+    #[cfg(not(unix))]
+    let root = tempfile::tempdir().unwrap();
+    let mut child = Driver::start(root.path(), "external-layout-ack");
+    child.checkpoint("BASELINE_DURABLE");
+    child.checkpoint("EXTERNAL_LAYOUT_ACK");
+    child.kill_and_reap();
+    let store = Store::open_existing(root.path(), Config::default()).unwrap();
+    verify_initial(&store);
+    assert_eq!(
+        store.external_checks_directory().unwrap(),
+        Some(root.path().join("external-checks"))
+    );
+}
+#[cfg(unix)]
+#[test]
+fn external_check_layout_marker_failure_latches_and_recovers_complete_prefix() {
+    let root = tempfile::Builder::new()
+        .prefix("tinytree-layout-failure-")
+        .tempdir_in("/tmp")
+        .unwrap();
+    let mut child = Driver::start(root.path(), "external-layout-write-failure");
+    child.checkpoint("BASELINE_DURABLE");
+    child.checkpoint("WRITE_FAILED_POISONED");
+    child.kill_and_reap();
+    let store = Store::open_existing(root.path(), Config::default()).unwrap();
+    verify_initial(&store);
+    assert!(root.path().join("external-checks/.header.json").is_file());
+    let path = store.enable_external_checks().unwrap();
+    assert_eq!(path, root.path().join("external-checks"));
+    drop(store);
+    assert_eq!(
+        Store::open_existing(root.path(), Config::default())
+            .unwrap()
+            .external_checks_directory()
+            .unwrap(),
+        Some(path)
+    );
+}

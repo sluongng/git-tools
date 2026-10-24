@@ -6,6 +6,7 @@ license = "MIT"
 description = "Durable native repository objects and compare-and-set references"
 
 [dependencies]
+private-fs = { path = "../private-fs" }
 packblob = { path = "../packblob" }
 tinytree-model = { path = "../tinytree-model" }
 tinytree-landing = { path = "../tinytree-landing" }
@@ -24,3 +25,9 @@ zstd = "0.13"
 
 [target.'cfg(unix)'.dev-dependencies]
 libc = "0.2"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Storage_FileSystem"] }

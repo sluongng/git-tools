@@ -7696,3 +7696,262 @@ fn benchmark_landing_store_phases_with_verified_file_closures() {
         }
     }
 }
+
+// Private layout acceptance uses a trusted ancestor, not a test-runner scratch
+// directory whose permissions are deliberately broader than this capability.
+fn external_layout_directory() -> tempfile::TempDir {
+    #[cfg(unix)]
+    {
+        tempfile::Builder::new()
+            .prefix("tinytree-layout-")
+            .tempdir_in("/tmp")
+            .unwrap()
+    }
+    #[cfg(not(unix))]
+    {
+        tempfile::tempdir().unwrap()
+    }
+}
+fn external_layout_format(root: &Path, format: &[u8]) {
+    let db = SingleWriterTxDatabase::builder(root.join("metadata"))
+        .open()
+        .unwrap();
+    let meta = db.keyspace("meta", KeyspaceCreateOptions::default).unwrap();
+    let mut tx = db.write_tx().durability(Some(PersistMode::SyncAll));
+    tx.insert(&meta, b"format", format);
+    tx.commit().unwrap();
+}
+#[test]
+fn external_layout_activation_is_private_durable_idempotent_and_server_gc_only() {
+    let directory = external_layout_directory();
+    let store = Store::open(directory.path(), config()).unwrap();
+    store.create_repository("demo").unwrap();
+    assert_eq!(store.external_checks_directory().unwrap(), None);
+    let handles = [store.clone(), store.clone()];
+    let workers =
+        handles.map(|store| std::thread::spawn(move || store.enable_external_checks().unwrap()));
+    let [a, b] = workers.map(|worker| worker.join().unwrap());
+    assert_eq!(a, b);
+    assert_eq!(a, directory.path().join("external-checks"));
+    assert_eq!(
+        fs::read(a.join(".header.json")).unwrap(),
+        b"{\"format\":\"tinytree-external-checks\",\"version\":1}\n"
+    );
+    assert_eq!(fs::metadata(a.join("journal.lock")).unwrap().len(), 0);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        for name in ["", "jobs", "binaries", ".header.json", "journal.lock"] {
+            assert_eq!(
+                fs::metadata(a.join(name)).unwrap().permissions().mode() & 0o077,
+                0
+            );
+        }
+    }
+    assert!(matches!(
+        store.plan_client_gc("demo", &client_collection(&store, 100)),
+        Err(Error::Invalid(
+            "authoritative service state requires server GC"
+        ))
+    ));
+    store.gc("demo", 100).unwrap();
+    drop(store);
+    let reopened = Store::open_existing(directory.path(), config()).unwrap();
+    assert_eq!(reopened.external_checks_directory().unwrap(), Some(a));
+}
+#[test]
+fn external_layout_activation_preserves_feature_six_landing_receipts() {
+    let directory = external_layout_directory();
+    let store = Store::open(directory.path(), config()).unwrap();
+    store.create_repository("demo").unwrap();
+    let (base, source, dest) = landing_fixture(&store, "demo");
+    let owner = LandingOwner([1; 32]);
+    store
+        .begin_landing(
+            "demo",
+            owner,
+            &landing_request(base, source, dest, "layout"),
+            0,
+        )
+        .unwrap();
+    let prepared = store.prepare_landing("demo", owner, "layout", 1).unwrap();
+    let identity = landing_identity(&prepared);
+    store
+        .record_landing_check(
+            "demo",
+            owner,
+            "layout",
+            &identity,
+            LandingVerdict {
+                passed: true,
+                evidence: [9; 32],
+            },
+            2,
+        )
+        .unwrap();
+    let before = store.finalize_landing("demo", owner, "layout", 3).unwrap();
+    assert_eq!(before.state, LandingState::Committed);
+    let receipt = before.receipt.as_ref().unwrap();
+    assert_eq!(receipt.evidence, [9; 32]);
+    assert_eq!(receipt.rewrites.len(), 1);
+    assert_eq!(receipt.rewrites[0].old, CommitId(source.key.id.0));
+    assert_eq!(receipt.rewrites[0].new, identity.candidate);
+    store.enable_external_checks().unwrap();
+    drop(store);
+    let reopened = Store::open_existing(directory.path(), config()).unwrap();
+    assert_eq!(
+        reopened
+            .landing_job("demo", owner, "layout")
+            .unwrap()
+            .unwrap(),
+        before
+    );
+    assert!(reopened.external_checks_directory().unwrap().is_some());
+}
+#[test]
+fn external_layout_reopen_refuses_corruption_without_repair() {
+    struct Case {
+        name: &'static str,
+        damage: fn(&Path),
+    }
+    for case in [
+        Case {
+            name: "missing header",
+            damage: |p| fs::remove_file(p.join(".header.json")).unwrap(),
+        },
+        Case {
+            name: "unknown version",
+            damage: |p| {
+                fs::write(
+                    p.join(".header.json"),
+                    b"{\"format\":\"tinytree-external-checks\",\"version\":2}\n",
+                )
+                .unwrap()
+            },
+        },
+        Case {
+            name: "oversized header",
+            damage: |p| fs::write(p.join(".header.json"), vec![b'x'; 129]).unwrap(),
+        },
+        Case {
+            name: "missing child",
+            damage: |p| fs::remove_dir(p.join("jobs")).unwrap(),
+        },
+        Case {
+            name: "nonempty lock",
+            damage: |p| fs::write(p.join("journal.lock"), b"x").unwrap(),
+        },
+        Case {
+            name: "unknown entry",
+            damage: |p| fs::write(p.join("unexpected"), b"").unwrap(),
+        },
+        Case {
+            name: "missing layout",
+            damage: |p| fs::remove_dir_all(p).unwrap(),
+        },
+    ] {
+        let directory = external_layout_directory();
+        let store = Store::open(directory.path(), config()).unwrap();
+        let path = store.enable_external_checks().unwrap();
+        drop(store);
+        (case.damage)(&path);
+        assert!(
+            Store::open_existing(directory.path(), config()).is_err(),
+            "{}",
+            case.name
+        );
+    }
+}
+#[test]
+fn external_layout_complete_empty_prefix_recovers_but_unmarked_journals_do_not() {
+    for populated in [false, true] {
+        let directory = external_layout_directory();
+        let store = Store::open(directory.path(), config()).unwrap();
+        let path = store.enable_external_checks().unwrap();
+        drop(store);
+        external_layout_format(directory.path(), b"tinytree-store-6");
+        if populated {
+            fs::write(path.join("jobs/attempt"), b"not dispatched legally").unwrap();
+        }
+        let reopened = Store::open_existing(directory.path(), config());
+        if populated {
+            assert!(matches!(
+                reopened,
+                Err(Error::Corrupt("external check data precedes Store feature"))
+            ));
+        } else {
+            let store = reopened.unwrap();
+            assert_eq!(store.external_checks_directory().unwrap(), None);
+            assert_eq!(store.enable_external_checks().unwrap(), path);
+            drop(store);
+            assert!(
+                Store::open_existing(directory.path(), config())
+                    .unwrap()
+                    .external_checks_directory()
+                    .unwrap()
+                    .is_some()
+            );
+        }
+    }
+    let directory = external_layout_directory();
+    let store = Store::open(directory.path(), config()).unwrap();
+    fs::create_dir(directory.path().join("external-checks")).unwrap();
+    assert!(store.enable_external_checks().is_err());
+    assert!(
+        !directory
+            .path()
+            .join("external-checks/.header.json")
+            .exists()
+    );
+    drop(store);
+    assert!(Store::open_existing(directory.path(), config()).is_err());
+}
+#[cfg(unix)]
+#[test]
+fn external_layout_rejects_symlinks_broad_permissions_and_foreign_ownership() {
+    use std::os::unix::fs::{PermissionsExt, symlink};
+    for target in ["", "jobs", ".header.json", "journal.lock"] {
+        let directory = external_layout_directory();
+        let store = Store::open(directory.path(), config()).unwrap();
+        let path = store.enable_external_checks().unwrap();
+        drop(store);
+        let target = if target.is_empty() {
+            path
+        } else {
+            path.join(target)
+        };
+        let saved = directory.path().join("saved");
+        fs::rename(&target, &saved).unwrap();
+        symlink(&saved, &target).unwrap();
+        assert!(Store::open_existing(directory.path(), config()).is_err());
+        assert!(
+            fs::symlink_metadata(&target)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+    }
+    for target in ["", "jobs", ".header.json"] {
+        let directory = external_layout_directory();
+        let store = Store::open(directory.path(), config()).unwrap();
+        let path = store.enable_external_checks().unwrap().join(target);
+        drop(store);
+        let mode = fs::metadata(&path).unwrap().permissions().mode() | 0o040;
+        fs::set_permissions(&path, fs::Permissions::from_mode(mode)).unwrap();
+        assert!(Store::open_existing(directory.path(), config()).is_err());
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            mode & 0o777
+        );
+    }
+    if unsafe { libc::geteuid() } == 0 {
+        use std::os::unix::ffi::OsStrExt;
+        let directory = external_layout_directory();
+        let store = Store::open(directory.path(), config()).unwrap();
+        let header = store.enable_external_checks().unwrap().join(".header.json");
+        drop(store);
+        let name = std::ffi::CString::new(header.as_os_str().as_bytes()).unwrap();
+        assert_eq!(unsafe { libc::chown(name.as_ptr(), 1, u32::MAX) }, 0);
+        assert!(Store::open_existing(directory.path(), config()).is_err());
+    }
+}
