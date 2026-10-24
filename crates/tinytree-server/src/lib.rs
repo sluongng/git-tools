@@ -43,7 +43,8 @@ pub use query_service::QueryService;
 
 pub use auth::Principal;
 pub use config::{
-    CloudStoreConfig, Config, ConfigError, PrincipalConfig, ServiceConfig, StoreConfig, TlsConfig,
+    CloudStoreConfig, Config, ConfigError, PrincipalConfig, ProtectedReference, ServiceConfig,
+    StoreConfig, TlsConfig,
 };
 pub use service::RepositoryService;
 
@@ -455,6 +456,96 @@ mod tests {
         config.service.query.index_rebuild_generation = 0;
         config.service.max_frame_bytes = usize::MAX;
         assert!(config.validate().is_err());
+    }
+    #[test]
+    fn config_protects_exact_public_references_in_configured_repositories() {
+        let mut config: Config = toml::from_str(
+            r#"
+repositories = ["default", "other"]
+[[service.protected_references]]
+repository = "default"
+reference = "Main/feature"
+[[service.protected_references]]
+repository = "other"
+reference = "Main/feature"
+"#,
+        )
+        .unwrap();
+        assert!(config.validate().is_ok());
+        struct Case {
+            name: &'static str,
+            repository: &'static str,
+            reference: String,
+        }
+        for case in [
+            Case {
+                name: "duplicate pair",
+                repository: "default",
+                reference: "Main/feature".into(),
+            },
+            Case {
+                name: "unknown repository",
+                repository: "absent",
+                reference: "main".into(),
+            },
+            Case {
+                name: "invalid repository",
+                repository: "../default",
+                reference: "main".into(),
+            },
+            Case {
+                name: "empty name",
+                repository: "default",
+                reference: String::new(),
+            },
+            Case {
+                name: "nul name",
+                repository: "default",
+                reference: "main\0hidden".into(),
+            },
+            Case {
+                name: "oversized name",
+                repository: "default",
+                reference: "a".repeat(513),
+            },
+            Case {
+                name: "internal root",
+                repository: "default",
+                reference: "_tinytree".into(),
+            },
+            Case {
+                name: "internal namespace",
+                repository: "default",
+                reference: "_tinytree/hold/v1/example".into(),
+            },
+        ] {
+            config
+                .service
+                .protected_references
+                .push(ProtectedReference {
+                    repository: case.repository.into(),
+                    reference: case.reference,
+                });
+            assert!(config.validate().is_err(), "{}", case.name);
+            config.service.protected_references.pop();
+        }
+        config.service.protected_references = (0..1025)
+            .map(|i| ProtectedReference {
+                repository: "default".into(),
+                reference: format!("branch-{i}"),
+            })
+            .collect();
+        assert!(config.validate().is_err());
+        config.service.protected_references.pop();
+        assert!(config.validate().is_ok());
+
+        // Library callers get the same configured-repository validation as TOML.
+        let temporary = tempfile::tempdir().unwrap();
+        let store = tinytree_store::Store::open(temporary.path(), Default::default()).unwrap();
+        assert!(
+            RepositoryService::new(store, config.service, vec!["other".into()], Vec::new())
+                .is_err()
+        );
     }
     #[test]
     fn cloud_profile_preflight_accepts_nonaligned_pool_but_rejects_insufficient_work_budget() {

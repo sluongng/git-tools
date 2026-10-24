@@ -30,6 +30,15 @@ stops at pending checks. Optional `service.landing.checker` runs a pinned
 only its exact verified candidate with destination-generation CAS. No client
 verdict or raw finalization RPC is exposed.
 
+To require checked landing for a destination, add an exact `repository` and
+`reference` pair to `service.protected_references` as shown in the landing
+example. Ordinary publication cannot create, change, delete or replay that
+destination, even for a writer; uploads, private holds and other destinations
+are unaffected. The default list is empty. Seed a destination before protecting
+it. Protection remains effective with landing disabled, so removing a checker
+does not reopen ordinary writes; it can leave the destination read-only until
+checked landing is available again.
+
 Checker activation upgrades storage to format7. Its fixed Store-owned journals
 survive configuration removal; uncertain cleanup retains roots past TTL.
 Restart reconciles the same attempt before retrying, and shutdown drains physical

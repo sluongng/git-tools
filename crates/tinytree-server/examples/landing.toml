@@ -10,6 +10,12 @@ repositories = ["example"]
 write = true
 landing_profiles = ["checks"]
 
+# Seed the destination first, then uncomment to reject ordinary publication.
+# Each pair is exact and repository-scoped; other destinations are unchanged.
+# [[service.protected_references]]
+# repository = "example"
+# reference = "main"
+
 [service.landing]
 enabled = true
 committer_name = "Tinytree landing"

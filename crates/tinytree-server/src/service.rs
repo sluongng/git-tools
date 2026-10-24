@@ -77,7 +77,7 @@ impl RepositoryService {
         {
             return Err(ConfigError("invalid native repository identifiers"));
         }
-        config.landing.validate_repositories(&repositories)?;
+        config.validate_repositories(&repositories)?;
         for principal in &principals {
             config
                 .landing
@@ -915,6 +915,19 @@ impl Repository for RepositoryService {
         let admission = self
             .admit(&identity, &input.repository_id, public, deadline)
             .await?;
+        if public
+            && self
+                .inner
+                .config
+                .reference_protected(&input.repository_id, &input.reference_name)
+        {
+            // Check after ordinary authorization, but before publication replay
+            // or any Store mutation. Only the server's checked landing path may
+            // advance this destination; upload rights do not grant a bypass.
+            return Err(Status::permission_denied(
+                "reference requires checked landing",
+            ));
+        }
         let commit = input.new_commit.as_ref().map(commit_key).transpose()?;
         if commit.is_some_and(|k| intrinsic(k)) {
             return Err(Status::invalid_argument(

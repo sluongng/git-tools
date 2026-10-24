@@ -265,6 +265,185 @@ fn publish(commit: ObjectKey, id: &str, generation: u64) -> p::PublishReferenceR
 }
 
 #[tokio::test]
+async fn protected_references_reject_ordinary_writes_and_replay_without_affecting_other_scopes() {
+    let (_temporary, store) = setup();
+    let server = Running::start(store.clone(), ServiceConfig::default()).await;
+    let mut client = server.client().await;
+    let fixture = fixture();
+    seed(&mut client, &fixture).await;
+    let head = root(&fixture);
+    let original = publish(head, "before-protection", 0);
+    let receipt = client
+        .publish_reference(request(original.clone(), ALPHA))
+        .await
+        .unwrap()
+        .into_inner();
+    server.stop().await;
+    let before = store
+        .references("alpha", &["main".into(), "new-main".into()])
+        .unwrap();
+    let mut config = ServiceConfig::default();
+    config.protected_references = ["main", "new-main"]
+        .into_iter()
+        .map(|reference| tinytree_server::ProtectedReference {
+            repository: "alpha".into(),
+            reference: reference.into(),
+        })
+        .collect();
+    let server = Running::start(store.clone(), config).await;
+    let mut client = server.client().await;
+    struct Case {
+        name: &'static str,
+        input: p::PublishReferenceRequest,
+    }
+    for case in [
+        Case {
+            name: "create",
+            input: p::PublishReferenceRequest {
+                reference_name: "new-main".into(),
+                ..publish(head, "blocked-create", 0)
+            },
+        },
+        Case {
+            name: "update",
+            input: publish(head, "blocked-update", 1),
+        },
+        Case {
+            name: "delete",
+            input: p::PublishReferenceRequest {
+                new_commit: None,
+                ..publish(head, "blocked-delete", 1)
+            },
+        },
+        Case {
+            name: "replay predating protection",
+            input: original,
+        },
+    ] {
+        let error = client
+            .publish_reference(request(case.input, ALPHA))
+            .await
+            .unwrap_err();
+        assert_eq!(error.code(), Code::PermissionDenied, "{}", case.name);
+        assert_eq!(
+            error.message(),
+            "reference requires checked landing",
+            "{}",
+            case.name
+        );
+        assert_eq!(
+            store
+                .references("alpha", &["main".into(), "new-main".into()])
+                .unwrap(),
+            before
+        );
+    }
+    // Policy is checked only after ordinary repository/write authorization.
+    for token in [BETA, READER] {
+        let error = client
+            .publish_reference(request(publish(head, "denied-caller", 1), token))
+            .await
+            .unwrap_err();
+        assert_eq!(error.code(), Code::PermissionDenied);
+        assert_eq!(error.message(), "native repository access denied");
+    }
+    assert_eq!(
+        client
+            .get_publication(request(
+                p::GetPublicationRequest {
+                    repository_id: "alpha".into(),
+                    idempotency_key: "blocked-update".into(),
+                },
+                ALPHA
+            ))
+            .await
+            .unwrap_err()
+            .code(),
+        Code::NotFound
+    );
+    assert_eq!(
+        client
+            .get_publication(request(
+                p::GetPublicationRequest {
+                    repository_id: "alpha".into(),
+                    idempotency_key: "before-protection".into(),
+                },
+                ALPHA
+            ))
+            .await
+            .unwrap()
+            .into_inner(),
+        receipt
+    );
+    // Exact matching keeps other names and the same name in another repository writable.
+    for name in ["feature", "Main"] {
+        let result = client
+            .publish_reference(request(
+                p::PublishReferenceRequest {
+                    reference_name: name.into(),
+                    ..publish(head, name, 0)
+                },
+                ALPHA,
+            ))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(result.reference.unwrap().name, name);
+    }
+    for object in fixture.objects() {
+        upload(&mut client, "beta", BETA, object.descriptor, &object.bytes)
+            .await
+            .unwrap();
+    }
+    let other = client
+        .publish_reference(request(
+            p::PublishReferenceRequest {
+                repository_id: "beta".into(),
+                ..publish(head, "other-repository", 0)
+            },
+            BETA,
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(other.reference.unwrap().generation, 1);
+    let hold_name = format!(
+        "_tinytree/hold/v1/{}/{}",
+        "01".repeat(16),
+        fixture.manifest.root_commit
+    );
+    let mut hold = publish(head, "private-hold", 0);
+    hold.reference_name = hold_name.clone();
+    let retained = client
+        .publish_reference(request(hold.clone(), PEER))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(retained.reference.unwrap().name, hold_name);
+    hold.idempotency_key = "release-private-hold".into();
+    hold.expected_generation = 1;
+    hold.new_commit = None;
+    assert!(
+        client
+            .publish_reference(request(hold, PEER))
+            .await
+            .unwrap()
+            .into_inner()
+            .reference
+            .unwrap()
+            .commit
+            .is_none()
+    );
+    assert_eq!(
+        store
+            .references("alpha", &["main".into(), "new-main".into()])
+            .unwrap(),
+        before
+    );
+    server.stop().await;
+}
+
+#[tokio::test]
 async fn compressed_native_upload_publication_fetch_and_restart() {
     let (temporary, store) = setup();
     let server = Running::start(store, ServiceConfig::default()).await;
@@ -8038,7 +8217,11 @@ async fn pinned_checker_receipts_publish_or_reject_and_recover_lost_reply() {
         ("fail", l::Phase::CheckFailed, 1, false),
         ("lost_reply", l::Phase::Committed, 2, true),
     ] {
-        let (_temporary, store, config, input, scratch) = checked_landing_setup(mode);
+        let (_temporary, store, mut config, input, scratch) = checked_landing_setup(mode);
+        config.service.protected_references = vec![tinytree_server::ProtectedReference {
+            repository: "alpha".into(),
+            reference: "main".into(),
+        }];
         let running = Running::start_landing(
             store.clone(),
             config.service,

@@ -16,8 +16,17 @@ impl std::fmt::Display for ConfigError {
 impl std::error::Error for ConfigError {}
 
 #[derive(Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProtectedReference {
+    pub repository: String,
+    pub reference: String,
+}
+
+#[derive(Clone, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct ServiceConfig {
+    /// Exact repository/reference pairs writable only through checked landing.
+    pub protected_references: Vec<ProtectedReference>,
     pub max_batch_items: usize,
     pub max_frame_bytes: usize,
     pub max_request_bytes: usize,
@@ -36,6 +45,7 @@ pub struct ServiceConfig {
 impl Default for ServiceConfig {
     fn default() -> Self {
         Self {
+            protected_references: Vec::new(),
             max_batch_items: 256,
             max_frame_bytes: 64 * 1024,
             max_request_bytes: 256 * 1024,
@@ -55,6 +65,25 @@ impl Default for ServiceConfig {
 }
 impl ServiceConfig {
     pub fn validate(&self) -> Result<(), ConfigError> {
+        if self.protected_references.len() > 1024 {
+            return Err(ConfigError("too many protected native references"));
+        }
+        let mut protected = HashSet::new();
+        for entry in &self.protected_references {
+            // Native references are database values, not Git or filesystem paths.
+            if tinytree_store::validate_repository_id(&entry.repository).is_err()
+                || entry.reference.is_empty()
+                || entry.reference.len() > 512
+                || entry.reference.contains('\0')
+                || entry.reference == "_tinytree"
+                || entry.reference.starts_with("_tinytree/")
+                || !protected.insert((&entry.repository, &entry.reference))
+            {
+                return Err(ConfigError(
+                    "invalid or duplicate protected native reference",
+                ));
+            }
+        }
         self.query.validate(self.max_request_bytes)?;
         self.cloud.validate()?;
         self.landing.validate()?;
@@ -84,6 +113,22 @@ impl ServiceConfig {
             return Err(ConfigError("invalid native service limits"));
         }
         Ok(())
+    }
+    pub(crate) fn validate_repositories(&self, repositories: &[String]) -> Result<(), ConfigError> {
+        self.landing.validate_repositories(repositories)?;
+        if self
+            .protected_references
+            .iter()
+            .any(|entry| !repositories.contains(&entry.repository))
+        {
+            return Err(ConfigError("unknown protected native reference repository"));
+        }
+        Ok(())
+    }
+    pub(crate) fn reference_protected(&self, repository: &str, reference: &str) -> bool {
+        self.protected_references
+            .iter()
+            .any(|entry| entry.repository == repository && entry.reference == reference)
     }
     pub(crate) fn decode_limit(&self) -> usize {
         self.max_request_bytes.max(self.max_frame_bytes + 1024)
@@ -283,9 +328,7 @@ impl Config {
                 .cloud
                 .validate_store_profile(&self.store.materialize(self.service.max_metadata_bytes))?;
         }
-        self.service
-            .landing
-            .validate_repositories(&self.repositories)?;
+        self.service.validate_repositories(&self.repositories)?;
         self.service
             .landing
             .validate_store(&self.store.materialize(self.service.max_metadata_bytes))?;
