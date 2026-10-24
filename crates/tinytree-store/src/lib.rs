@@ -27,9 +27,9 @@ mod cloud;
 pub use cloud::{
     CloudConfig, CloudIndexReadLease, CloudIndexWriteReceipt, CloudNativeReadLease,
     CloudNativeReadLimits, CloudObjectDescriptor, CloudOwner, CloudPublication,
-    CloudPublicationLimits, CloudReadLease, CloudResourceProfile, CloudVersion,
-    CloudVersionReadGuard, CloudVersionSelector, CloudWorkspace, CloudWriteReceipt,
-    PublishCloudRequest,
+    CloudPublicationLimits, CloudReadLease, CloudResourceProfile, CloudSnapshotCommit,
+    CloudSnapshotReadGuard, CloudVersion, CloudVersionReadGuard, CloudVersionSelector,
+    CloudWorkspace, CloudWriteReceipt, PublishCloudRequest,
 };
 mod client_gc;
 mod closure;

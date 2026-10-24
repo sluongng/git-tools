@@ -1693,6 +1693,7 @@ fn query_frames(roots: &[ObjectKey], replay: u8) -> Vec<q::OpenScopeFrame> {
                 roots,
                 overlay_object_count: 0,
                 overlay_bytes: 0,
+                cloud_source: None,
             })),
         },
         q::OpenScopeFrame {
@@ -4695,6 +4696,8 @@ async fn cloud_rpc_private_compressed_history_replay_gc_and_restart() {
     let mut profile: tinytree_server::Config =
         toml::from_str(include_str!("../examples/cloud.toml")).unwrap();
     profile.service.cloud.indexed_versions = true;
+    profile.service.cloud.max_inflight = 1;
+    profile.service.query.max_scope_memory_bytes = 40 * 1024;
     profile.validate().unwrap();
     let store_config = profile
         .store
@@ -4709,12 +4712,18 @@ async fn cloud_rpc_private_compressed_history_replay_gc_and_restart() {
             .unwrap();
     }
     let (mut manifest, objects) = cloud_fixture(&data).await;
-    let server = Running::start(store.clone(), profile.service.clone()).await;
+    let index =
+        tinytree_index::Index::open(directory.path().join("query-index"), &Default::default())
+            .unwrap();
+    let server = Running::start_query(store.clone(), profile.service.clone(), index.clone()).await;
     let channel = Endpoint::from_shared(format!("http://{}", server.address))
         .unwrap()
         .connect()
         .await
         .unwrap();
+    let mut query = q::repository_query_client::RepositoryQueryClient::new(channel.clone())
+        .send_compressed(CompressionEncoding::Zstd)
+        .accept_compressed(CompressionEncoding::Zstd);
     let mut client = WorkspaceCloudClient::new(channel)
         .send_compressed(CompressionEncoding::Zstd)
         .accept_compressed(CompressionEncoding::Zstd)
@@ -4845,12 +4854,50 @@ async fn cloud_rpc_private_compressed_history_replay_gc_and_restart() {
         Default::default(),
     )
     .unwrap();
+    let Object::Commit(mut frozen_model) = tinytree_model::decode(
+        &data
+            .objects()
+            .iter()
+            .find(|object| object.descriptor.key == root(&data))
+            .unwrap()
+            .bytes,
+        Limits::default(),
+    )
+    .unwrap() else {
+        panic!("fixture commit");
+    };
+    frozen_model.parents = vec![CommitId(root(&data).id.0)];
+    let mut frozen = Vec::new();
+    let mut draft_records = Vec::new();
+    for order in 1..=2u64 {
+        frozen_model.change_id = tinytree_model::ChangeId([80 + order as u8; 16]);
+        frozen_model.description = format!("frozen baseline sibling {order}");
+        let object =
+            tinytree_model::encode(&Object::Commit(frozen_model.clone()), Limits::default())
+                .unwrap();
+        store
+            .put("alpha", object.descriptor, &object.bytes, 0)
+            .unwrap();
+        manifest.native_roots.push(object.descriptor.key);
+        draft_records.push(tinytree_cloud::IndexDraft {
+            descriptor: object.descriptor,
+            change: frozen_model.change_id,
+            parents: frozen_model.parents.clone(),
+            order,
+        });
+        frozen.push(object);
+    }
+    manifest
+        .native_roots
+        .sort_by_key(|key| (key.kind as u8, key.id.0));
+    manifest.native_roots.dedup();
+    draft_records.sort_by_key(|record| record.descriptor.key.id);
     let selected_index = tinytree_cloud::build_index_artifacts(
         &tinytree_cloud::PortableIndexSnapshot {
             roots: vec![tinytree_model::CommitId(
                 manifest.working_copy.snapshot_commit,
             )],
-            drafts: vec![],
+            drafts: draft_records,
         },
         Default::default(),
     )
@@ -5164,6 +5211,456 @@ async fn cloud_rpc_private_compressed_history_replay_gc_and_restart() {
             .code(),
         Code::Unimplemented
     );
+    let selected_ids = vec![selected_index.root.id.0];
+    let source = q::CloudSnapshotSource {
+        selector: native_request.selector.clone(),
+        authority: native_request.authority.clone(),
+        index_root_ids: selected_ids.iter().map(|id| id.to_vec()).collect(),
+    };
+    let source_frames = |key: u8| {
+        vec![
+            q::OpenScopeFrame {
+                frame: Some(q::open_scope_frame::Frame::Header(q::ScopeHeader {
+                    version: 2,
+                    repository_id: "alpha".into(),
+                    replay_key: vec![key; 32],
+                    roots: vec![],
+                    overlay_object_count: 0,
+                    overlay_bytes: 0,
+                    cloud_source: Some(source.clone()),
+                })),
+            },
+            q::OpenScopeFrame {
+                frame: Some(q::open_scope_frame::Frame::ScopeEnd(Default::default())),
+            },
+        ]
+    };
+    assert_eq!(
+        query
+            .open_scope(request(tokio_stream::iter(source_frames(91)), ALPHA))
+            .await
+            .unwrap_err()
+            .code(),
+        Code::InvalidArgument
+    );
+    assert_eq!(
+        query
+            .open_cloud_scope(request(tokio_stream::iter(source_frames(91)), PEER))
+            .await
+            .unwrap_err()
+            .code(),
+        Code::PermissionDenied
+    );
+    let mut intrinsic_frames = source_frames(89);
+    if let Some(q::open_scope_frame::Frame::Header(header)) = &mut intrinsic_frames[0].frame {
+        header.cloud_source.as_mut().unwrap().index_root_ids = vec![intrinsic.root.id.0.to_vec()];
+    }
+    let intrinsic_scope = query
+        .open_cloud_scope(request(tokio_stream::iter(intrinsic_frames), ALPHA))
+        .await
+        .unwrap()
+        .into_inner();
+    let intrinsic_facts = query
+        .query_facts(request(
+            q::QueryFactsRequest {
+                scope: intrinsic_scope.key.clone(),
+                facts: vec![q::GraphFact {
+                    fact: Some(q::graph_fact::Fact::HasId(q::HasId {
+                        commit: Some(query_id(frozen[1].descriptor.key)),
+                    })),
+                }],
+            },
+            ALPHA,
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(
+        intrinsic_facts.answers[0].answer,
+        Some(q::graph_fact_answer::Answer::HasId(false)),
+        "other snapshot's frozen drafts must not leak into intrinsic-only selection"
+    );
+    let full_prefix = frozen[1]
+        .descriptor
+        .key
+        .id
+        .0
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    let intrinsic_prefix = query
+        .resolve_commit_prefix(request(
+            q::ResolveCommitPrefixRequest {
+                scope: intrinsic_scope.key.clone(),
+                hex_prefix: full_prefix.clone(),
+                selection: None,
+            },
+            ALPHA,
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(matches!(
+        intrinsic_prefix.result,
+        Some(q::commit_prefix_result::Result::NoMatch(_))
+    ));
+    query
+        .close_scope(request(
+            q::CloseScopeRequest {
+                scope: intrinsic_scope.key,
+            },
+            ALPHA,
+        ))
+        .await
+        .unwrap();
+    // Cold warming is independently bounded; retry the same exact source/key.
+    let scope = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            match query
+                .open_cloud_scope(request(tokio_stream::iter(source_frames(91)), ALPHA))
+                .await
+            {
+                Ok(response) => break response.into_inner(),
+                Err(status)
+                    if matches!(status.code(), Code::Unavailable | Code::ResourceExhausted) =>
+                {
+                    tokio::time::sleep(Duration::from_millis(10)).await
+                }
+                Err(status) => panic!("cloud scope: {status}"),
+            }
+        }
+    })
+    .await
+    .unwrap();
+    let epoch: [u8; 16] = scope.index_epoch.as_slice().try_into().unwrap();
+    let binding: [u8; 32] = authority.binding_digest.as_slice().try_into().unwrap();
+    assert_eq!(
+        scope.cloud_source_binding,
+        tinytree_model::cloud_query_source_binding(
+            binding,
+            &selected_ids,
+            &[CommitId(root(&data).id.0)],
+            epoch
+        )
+    );
+    assert_eq!(
+        query
+            .open_cloud_scope(request(tokio_stream::iter(source_frames(91)), ALPHA))
+            .await
+            .unwrap()
+            .into_inner(),
+        scope
+    );
+    let selected_prefix = query
+        .resolve_commit_prefix(request(
+            q::ResolveCommitPrefixRequest {
+                scope: scope.key.clone(),
+                hex_prefix: full_prefix,
+                selection: None,
+            },
+            ALPHA,
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(
+        matches!(selected_prefix.result, Some(q::commit_prefix_result::Result::Single(q::CommitMatch { commit:Some(ref id) })) if id==&query_id(frozen[1].descriptor.key))
+    );
+    for object in &frozen {
+        assert!(
+            index
+                .node("alpha", CommitId(object.descriptor.key.id.0))
+                .unwrap()
+                .is_none(),
+            "frozen private baseline is not published into the shared derived index"
+        );
+    }
+    // Force global index position to disagree with portable order. The captured
+    // frozen lane must still use parent-first (original order, ID) ranks.
+    for object in frozen.iter().rev() {
+        index
+            .ingest("alpha", object.descriptor, &object.bytes)
+            .unwrap();
+    }
+    let latest = q::GraphExpr {
+        version: 1,
+        expression: Some(q::graph_expr::Expression::Latest(
+            q::LatestExpr {
+                candidates: Some(Box::new(q::GraphExpr {
+                    version: 1,
+                    expression: Some(q::graph_expr::Expression::Commits(q::CommitSet {
+                        commits: frozen
+                            .iter()
+                            .map(|object| query_id(object.descriptor.key))
+                            .collect(),
+                    })),
+                })),
+                count: 1,
+            }
+            .into(),
+        )),
+    };
+    let facts = query
+        .query_facts(request(
+            q::QueryFactsRequest {
+                scope: scope.key.clone(),
+                facts: frozen
+                    .iter()
+                    .map(|object| q::GraphFact {
+                        fact: Some(q::graph_fact::Fact::HasId(q::HasId {
+                            commit: Some(query_id(object.descriptor.key)),
+                        })),
+                    })
+                    .chain(frozen.iter().map(|object| q::GraphFact {
+                        fact: Some(q::graph_fact::Fact::Membership(q::Membership {
+                            expression: Some(latest.clone()),
+                            candidate: Some(query_id(object.descriptor.key)),
+                        })),
+                    }))
+                    .collect(),
+            },
+            ALPHA,
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(
+        facts
+            .answers
+            .iter()
+            .map(|answer| answer.answer.clone())
+            .collect::<Vec<_>>(),
+        vec![
+            Some(q::graph_fact_answer::Answer::HasId(true)),
+            Some(q::graph_fact_answer::Answer::HasId(true)),
+            Some(q::graph_fact_answer::Answer::Membership(false)),
+            Some(q::graph_fact_answer::Answer::Membership(true))
+        ]
+    );
+    let scope_key = scope.key.clone().unwrap();
+    let nonce = [95u8; 16];
+    let mut query_identity = nonce.to_vec();
+    let mut hash = blake3::Hasher::new();
+    hash.update(b"tinytree-query-scope-id-v2\0");
+    hash.update(&(scope_key.repository_id.len() as u64).to_be_bytes());
+    hash.update(scope_key.repository_id.as_bytes());
+    hash.update(&scope_key.handle);
+    hash.update(&nonce);
+    query_identity.extend_from_slice(&hash.finalize().as_bytes()[..16]);
+    let page = query
+        .evaluate(request(
+            q::EvaluateRequest {
+                scope: Some(scope_key.clone()),
+                query_id: query_identity.clone(),
+                expression: Some(latest.clone()),
+                projection: q::Projection::Canonical as i32,
+                page_size: 8,
+                cursor: vec![],
+            },
+            ALPHA,
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(page.rows.len(), 1);
+    assert_eq!(
+        page.rows[0].commit,
+        Some(query_id(frozen[1].descriptor.key))
+    );
+    assert_eq!(
+        page.rows[0].canonical.as_ref().unwrap().canonical_envelope,
+        frozen[1].bytes,
+        "frozen canonical payload is read on demand under the selected version guard"
+    );
+    query
+        .close_query(request(
+            q::CloseQueryRequest {
+                scope: Some(scope_key),
+                query_id: query_identity,
+            },
+            ALPHA,
+        ))
+        .await
+        .unwrap();
+    // The single cloud call permit must not remain in the idle scope.
+    client
+        .get_workspace(request(
+            c::GetWorkspaceRequest {
+                repository_id: "alpha".into(),
+                workspace_id: manifest.workspace.to_vec(),
+            },
+            ALPHA,
+        ))
+        .await
+        .unwrap();
+    let mut child_model = frozen_model.clone();
+    child_model.parents = vec![CommitId(frozen[1].descriptor.key.id.0)];
+    child_model.change_id = tinytree_model::ChangeId([83; 16]);
+    child_model.description = "private child of selected frozen draft".into();
+    let child = tinytree_model::encode(&Object::Commit(child_model), Limits::default()).unwrap();
+    let mut child_frames = private_query_frames(&[], 92, &[&child]);
+    if let Some(q::open_scope_frame::Frame::Header(header)) = &mut child_frames[0].frame {
+        header.version = 2;
+    }
+    let fork_frames = private_fork_frames(scope.key.clone().unwrap(), child_frames);
+    let fork = query
+        .fork_scope(request(tokio_stream::iter(fork_frames.clone()), ALPHA))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(fork.cloud_source_binding, scope.cloud_source_binding);
+    for (key, expected) in [(scope.key.clone(), false), (fork.key.clone(), true)] {
+        let facts = query
+            .query_facts(request(
+                q::QueryFactsRequest {
+                    scope: key,
+                    facts: vec![q::GraphFact {
+                        fact: Some(q::graph_fact::Fact::HasId(q::HasId {
+                            commit: Some(query_id(child.descriptor.key)),
+                        })),
+                    }],
+                },
+                ALPHA,
+            ))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(
+            facts.answers[0].answer,
+            Some(q::graph_fact_answer::Answer::HasId(expected))
+        );
+    }
+    assert_eq!(
+        store.descriptor("alpha", child.descriptor.key).unwrap(),
+        None,
+        "private fork child must not enter canonical Store"
+    );
+    assert!(
+        index
+            .node("alpha", CommitId(child.descriptor.key.id.0))
+            .unwrap()
+            .is_none(),
+        "private fork child must not enter shared derived Index"
+    );
+
+    assert_eq!(fork.expires_at_unix_seconds, scope.expires_at_unix_seconds);
+    assert_eq!(
+        query
+            .open_cloud_scope(request(tokio_stream::iter(source_frames(93)), ALPHA))
+            .await
+            .unwrap_err()
+            .code(),
+        Code::ResourceExhausted,
+        "an independent version guard must fit the shared retained scope pool"
+    );
+    let mut mixed = fork_frames.clone();
+    if let Some(q::fork_scope_frame::Frame::Header(header)) = &mut mixed[0].frame {
+        let header = header.scope.as_mut().unwrap();
+        header.replay_key = vec![94; 32];
+        header.roots = vec![q::CommitId {
+            value: root(&data).id.0.to_vec(),
+        }];
+    }
+    assert_eq!(
+        query
+            .fork_scope(request(tokio_stream::iter(mixed), ALPHA))
+            .await
+            .unwrap_err()
+            .code(),
+        Code::Unimplemented
+    );
+    query
+        .close_scope(request(
+            q::CloseScopeRequest {
+                scope: scope.key.clone(),
+            },
+            ALPHA,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        query
+            .fork_scope(request(tokio_stream::iter(fork_frames.clone()), ALPHA))
+            .await
+            .unwrap()
+            .into_inner(),
+        fork,
+        "cloud replay must retain its exact source after parent close"
+    );
+    let facts = query
+        .query_facts(request(
+            q::QueryFactsRequest {
+                scope: fork.key.clone(),
+                facts: vec![q::GraphFact {
+                    fact: Some(q::graph_fact::Fact::HasId(q::HasId {
+                        commit: Some(q::CommitId {
+                            value: root(&data).id.0.to_vec(),
+                        }),
+                    })),
+                }],
+            },
+            ALPHA,
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(
+        facts.answers[0].answer,
+        Some(q::graph_fact_answer::Answer::HasId(true))
+    );
+    query
+        .close_scope(request(q::CloseScopeRequest { scope: fork.key }, ALPHA))
+        .await
+        .unwrap();
+    let recovered = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            match query
+                .open_cloud_scope(request(tokio_stream::iter(source_frames(93)), ALPHA))
+                .await
+            {
+                Ok(response) => break response.into_inner(),
+                Err(status) if status.code() == Code::ResourceExhausted => {
+                    tokio::time::sleep(Duration::from_millis(10)).await
+                }
+                Err(status) => panic!("cloud scope cleanup: {status}"),
+            }
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(recovered.cloud_source_binding, scope.cloud_source_binding);
+    let recovered_latest = query
+        .query_facts(request(
+            q::QueryFactsRequest {
+                scope: recovered.key.clone(),
+                facts: vec![q::GraphFact {
+                    fact: Some(q::graph_fact::Fact::Membership(q::Membership {
+                        expression: Some(latest),
+                        candidate: Some(query_id(frozen[1].descriptor.key)),
+                    })),
+                }],
+            },
+            ALPHA,
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(
+        recovered_latest.answers[0].answer,
+        Some(q::graph_fact_answer::Answer::Membership(true)),
+        "fresh cloud scope must ignore reversed shared-index positions for frozen Latest ties"
+    );
+
+    query
+        .close_scope(request(
+            q::CloseScopeRequest {
+                scope: recovered.key,
+            },
+            ALPHA,
+        ))
+        .await
+        .unwrap();
+    drop(query);
     let held = store.clone();
     tokio::task::spawn_blocking(move || held.gc("alpha", i64::MAX).unwrap())
         .await
@@ -5207,7 +5704,7 @@ async fn cloud_rpc_private_compressed_history_replay_gc_and_restart() {
     server.stop().await;
     drop(store);
     let store = Store::open_existing(directory.path(), store_config).unwrap();
-    let server = Running::start(store, profile.service).await;
+    let server = Running::start_query(store, profile.service, index).await;
     let channel = Endpoint::from_shared(format!("http://{}", server.address))
         .unwrap()
         .connect()

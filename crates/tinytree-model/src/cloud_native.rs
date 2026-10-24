@@ -21,3 +21,26 @@ pub fn cloud_native_binding_digest(
     hash.update(&manifest_size.to_be_bytes());
     *hash.finalize().as_bytes()
 }
+
+/// Public normalization, not a bearer credential. Inputs must already be sorted
+/// unique; callers enforce their own cardinality and authority checks.
+pub fn cloud_query_source_binding(
+    native_binding: [u8; 32],
+    selected: &[[u8; 32]],
+    anchors: &[crate::CommitId],
+    epoch: [u8; 16],
+) -> [u8; 32] {
+    let mut hash = blake3::Hasher::new();
+    hash.update(b"tinytree-cloud-query-source-v1\0");
+    hash.update(&native_binding);
+    hash.update(&(selected.len() as u64).to_be_bytes());
+    for id in selected {
+        hash.update(id);
+    }
+    hash.update(&(anchors.len() as u64).to_be_bytes());
+    for id in anchors {
+        hash.update(&id.0);
+    }
+    hash.update(&epoch);
+    *hash.finalize().as_bytes()
+}

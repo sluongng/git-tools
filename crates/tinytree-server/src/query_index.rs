@@ -8,13 +8,16 @@ use crate::{
 use prost::Message;
 use std::{
     collections::{HashMap, HashSet, VecDeque},
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+    },
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 use tinytree_index::{Index, Scope, WorkBudget};
 use tinytree_model as m;
 use tinytree_proto::query_v1 as q;
-use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore};
 use tonic::Status;
 
 #[derive(Clone, serde::Deserialize)]
@@ -296,8 +299,18 @@ pub(crate) fn index_error(error: tinytree_index::Error) -> Status {
         _ => Status::unavailable("derived graph storage unavailable"),
     }
 }
+pub(crate) struct CloudScopeRetention {
+    guard: tinytree_store::CloudSnapshotReadGuard,
+    native_binding: [u8; 32],
+    _memory: OwnedSemaphorePermit,
+}
+struct FrozenGraphOwner {
+    _source: Arc<CloudScopeRetention>,
+    _memory: OwnedSemaphorePermit,
+}
 pub(crate) struct Scoped {
     pub scope: Arc<Scope>,
+    cloud: Option<Arc<CloudScopeRetention>>,
     graph: Option<Arc<OverlayGraph>>,
     pub wire: q::QueryScope,
     parent: Option<Arc<Scoped>>,
@@ -307,11 +320,24 @@ pub(crate) struct Scoped {
     cleanup: std::sync::mpsc::Sender<Cleanup>,
 }
 impl Scoped {
+    pub fn authorizes_frozen(&self, descriptor: m::Descriptor) -> bool {
+        self.cloud.as_ref().is_some_and(|source| {
+            source
+                .guard
+                .frozen_commits()
+                .binary_search_by_key(&descriptor.key.id, |record| record.descriptor.key.id)
+                .is_ok_and(|index| source.guard.frozen_commits()[index].descriptor == descriptor)
+        })
+    }
+    pub fn is_cloud(&self) -> bool {
+        self.cloud.is_some()
+    }
     pub fn graph(&self) -> &Arc<OverlayGraph> {
         self.graph.as_ref().expect("live scope graph")
     }
 }
 struct Cleanup {
+    cloud: Option<Arc<CloudScopeRetention>>,
     graph: Option<Arc<OverlayGraph>>,
     parent: Option<Arc<Scoped>>,
     roots: Vec<tinytree_store::RootReadGuard>,
@@ -321,6 +347,7 @@ struct Cleanup {
 impl Drop for Scoped {
     fn drop(&mut self) {
         let cleanup = Cleanup {
+            cloud: self.cloud.take(),
             graph: self.graph.take(),
             parent: self.parent.take(),
             roots: std::mem::take(&mut self.roots),
@@ -380,6 +407,7 @@ fn scope_binding(header: &q::ScopeHeader, parent: Option<&q::ScopeKey>) -> [u8; 
     *hash.finalize().as_bytes()
 }
 struct Record {
+    cloud_mode: bool,
     owner: String,
     repository: String,
     replay: [u8; 32],
@@ -398,6 +426,7 @@ struct WarmJob {
     repository: String,
     root: m::CommitId,
     _pin: tinytree_store::RootReadGuard,
+    _cloud: Option<Arc<CloudScopeRetention>>,
 }
 #[derive(Default)]
 struct Warming {
@@ -405,6 +434,7 @@ struct Warming {
     failures: HashMap<(String, m::CommitId), (Status, std::time::Instant)>,
 }
 struct WarmRuntime {
+    closing: Arc<AtomicBool>,
     index: Arc<Index>,
     store: tinytree_store::Store,
     config: QueryConfig,
@@ -413,6 +443,11 @@ struct WarmRuntime {
 pub(crate) struct QueryPause {
     pub entered: std::sync::mpsc::SyncSender<()>,
     pub resume: std::sync::mpsc::Receiver<()>,
+}
+enum DrainState {
+    Idle,
+    Running(tokio::task::JoinHandle<bool>),
+    Done(bool),
 }
 pub(crate) struct QueryHost {
     pub index: Arc<Index>,
@@ -425,20 +460,28 @@ pub(crate) struct QueryHost {
     inflight: Arc<Semaphore>,
     memory: Arc<Semaphore>,
     request_memory: usize,
-    warm: std::sync::mpsc::SyncSender<WarmJob>,
+    warm: Mutex<Option<std::sync::mpsc::SyncSender<WarmJob>>>,
     warming: Arc<Mutex<Warming>>,
-    cleanup: std::sync::mpsc::Sender<Cleanup>,
+    cleanup: Mutex<Option<std::sync::mpsc::Sender<Cleanup>>>,
+    workers: Mutex<Vec<std::thread::JoinHandle<()>>>,
+    cleanup_worker: Mutex<Option<std::thread::JoinHandle<()>>>,
+    janitor: Mutex<Option<tokio::task::JoinHandle<()>>>,
+    closing: Arc<AtomicBool>,
+    stop: Arc<Notify>,
+    drain: tokio::sync::Mutex<DrainState>,
     #[cfg(test)]
     pub pause: Mutex<Option<QueryPause>>,
 }
 pub(crate) struct Work {
-    _host: Arc<QueryHost>,
     pub deadline: tokio::time::Instant,
-    _inflight: OwnedSemaphorePermit,
-    _memory: OwnedSemaphorePermit,
+    // Actual payload owners must drop before physical admission is released.
     pub scopes: Mutex<Vec<Arc<Scoped>>>,
     pub query_owners: Mutex<Vec<Arc<dyn std::any::Any + Send + Sync>>>,
+    _memory: OwnedSemaphorePermit,
+    _inflight: OwnedSemaphorePermit,
+    _host: Arc<QueryHost>,
 }
+
 impl Work {
     pub fn belongs_to(&self, host: &Arc<QueryHost>) -> bool {
         Arc::ptr_eq(&self._host, host)
@@ -458,7 +501,9 @@ impl QueryHost {
         let receiver = Arc::new(Mutex::new(receiver));
         let warming = Arc::new(Mutex::new(Warming::default()));
         let (cleanup, cleanups) = std::sync::mpsc::channel::<Cleanup>();
-        std::thread::Builder::new()
+        let closing = Arc::new(AtomicBool::new(false));
+        let stop = Arc::new(Notify::new());
+        let cleanup_worker = std::thread::Builder::new()
             .name("tinytree-query-cleanup".into())
             .spawn(move || {
                 while let Ok(batch) = cleanups.recv() {
@@ -468,19 +513,22 @@ impl QueryHost {
                     drop(batch.parent);
                     drop(batch.roots);
                     drop(batch.scope);
+                    drop(batch.cloud);
                     drop(batch.memory);
                 }
             })
             .map_err(|_| ConfigError("cannot start query cleanup owner"))?;
+        let mut workers = Vec::new();
         for _ in 0..config.max_warm_jobs {
             let receiver = receiver.clone();
             let warming = warming.clone();
             let engine = WarmRuntime {
+                closing: closing.clone(),
                 index: index.clone(),
                 store: store.clone(),
                 config: config.clone(),
             };
-            std::thread::Builder::new()
+            let worker = std::thread::Builder::new()
                 .name("tinytree-query-warmer".into())
                 .spawn(move || {
                     loop {
@@ -516,6 +564,7 @@ impl QueryHost {
                     }
                 })
                 .map_err(|_| ConfigError("cannot start derived query warmer"))?;
+            workers.push(worker);
         }
         let cursors = crate::query_cursor::CursorHost::new(&config)?;
         let host = Arc::new(Self {
@@ -529,19 +578,31 @@ impl QueryHost {
             memory: Arc::new(Semaphore::new(config.max_request_memory_bytes)),
             config,
             registry: Mutex::new(Registry::default()),
-            warm: sender,
+            warm: Mutex::new(Some(sender)),
             warming,
-            cleanup,
+            cleanup: Mutex::new(Some(cleanup)),
+            workers: Mutex::new(workers),
+            cleanup_worker: Mutex::new(Some(cleanup_worker)),
+            janitor: Mutex::new(None),
+            closing: closing.clone(),
+            stop: stop.clone(),
+            drain: tokio::sync::Mutex::new(DrainState::Idle),
             #[cfg(test)]
             pause: Mutex::new(None),
         });
         let weak = Arc::downgrade(&host);
         let interval = host.config.expiry_interval_ms;
-        runtime.spawn(async move {
+        let janitor = runtime.spawn(async move {
             let mut ticks = tokio::time::interval(Duration::from_millis(interval));
             ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             loop {
-                ticks.tick().await;
+                if closing.load(Ordering::Acquire) {
+                    break;
+                }
+                tokio::select! { _ = ticks.tick() => {}, _ = stop.notified() => {} }
+                if closing.load(Ordering::Acquire) {
+                    break;
+                }
                 let Some(host) = weak.upgrade() else { break };
                 // Root guard destruction may wait behind Store GC. Never do it
                 // on an async worker, and await each bounded cleanup batch.
@@ -553,7 +614,81 @@ impl QueryHost {
                 .await;
             }
         });
+        *host.janitor.lock().unwrap() = Some(janitor);
         Ok(host)
+    }
+    /// Service-wide, cancellation-safe shutdown. Cloned listeners share the same
+    /// owned task/result; canceling one waiter never detaches physical cleanup.
+    pub async fn drain(self: &Arc<Self>) -> Result<(), Status> {
+        let mut state = self.drain.lock().await;
+        if matches!(*state, DrainState::Idle) {
+            self.closing.store(true, Ordering::Release);
+            self.stop.notify_one();
+            let host = self.clone();
+            *state = DrainState::Running(tokio::spawn(async move { host.drain_owned().await }));
+        }
+        let result = match &mut *state {
+            DrainState::Done(ok) => *ok,
+            DrainState::Running(task) => task.await.unwrap_or(false),
+            DrainState::Idle => unreachable!(),
+        };
+        *state = DrainState::Done(result);
+        if result {
+            Ok(())
+        } else {
+            Err(Status::internal("query physical shutdown failed"))
+        }
+    }
+    async fn drain_owned(self: Arc<Self>) -> bool {
+        let janitor = self.janitor.lock().unwrap().take();
+        let mut success = match janitor {
+            Some(task) => task.await.is_ok(),
+            None => true,
+        };
+        // All accepted physical calls and response payloads release their slots
+        // before this barrier can complete. Admissions recheck closing.
+        let Ok(_calls) = self
+            .inflight
+            .clone()
+            .acquire_many_owned(self.config.max_inflight as u32)
+            .await
+        else {
+            return false;
+        };
+        self.warm.lock().unwrap().take();
+        let workers = std::mem::take(&mut *self.workers.lock().unwrap());
+        success &= tokio::task::spawn_blocking(move || {
+            let mut ok = true;
+            for worker in workers {
+                ok &= worker.join().is_ok();
+            }
+            ok
+        })
+        .await
+        .unwrap_or(false);
+        let host = self.clone();
+        success &= tokio::task::spawn_blocking(move || {
+            host.expire(i64::MAX);
+            // Cursor cleanup can itself release captured scopes. Flush it before
+            // disconnecting the recursively draining scope cleanup receiver.
+            let mut ok = host.cursors.drain_cleanup().is_ok();
+            host.cleanup.lock().unwrap().take();
+            if let Some(worker) = host.cleanup_worker.lock().unwrap().take() {
+                ok &= worker.join().is_ok();
+            }
+            ok
+        })
+        .await
+        .unwrap_or(false);
+        success
+    }
+    fn cleanup_sender(&self) -> Result<std::sync::mpsc::Sender<Cleanup>, Status> {
+        self.cleanup
+            .lock()
+            .unwrap()
+            .as_ref()
+            .cloned()
+            .ok_or_else(|| Status::unavailable("query host draining"))
     }
     #[cfg(test)]
     pub fn pause_query(&self) -> Result<(), Status> {
@@ -574,6 +709,9 @@ impl QueryHost {
         self: &Arc<Self>,
         deadline: tokio::time::Instant,
     ) -> Result<Arc<Work>, Status> {
+        if self.closing.load(Ordering::Acquire) {
+            return Err(Status::unavailable("query host draining"));
+        }
         let permit = tokio::time::timeout_at(deadline, self.inflight.clone().acquire_owned())
             .await
             .map_err(|_| Status::deadline_exceeded("query admission expired"))?
@@ -587,6 +725,9 @@ impl QueryHost {
         .await
         .map_err(|_| Status::deadline_exceeded("query admission expired"))?
         .map_err(|_| Status::unavailable("query host draining"))?;
+        if self.closing.load(Ordering::Acquire) {
+            return Err(Status::unavailable("query host draining"));
+        }
         Ok(Arc::new(Work {
             _host: self.clone(),
             deadline,
@@ -664,6 +805,24 @@ impl QueryHost {
             record.scope.is_none(),
         )))
     }
+    pub fn requires_cloud(
+        &self,
+        owner: &str,
+        repository: &str,
+        handle: &[u8],
+    ) -> Result<bool, Status> {
+        let id: [u8; 32] = handle
+            .try_into()
+            .map_err(|_| Status::invalid_argument("invalid scope handle"))?;
+        let registry = self.registry.lock().unwrap();
+        let Some(record) = registry.records.get(&id) else {
+            return Ok(false);
+        };
+        if record.owner != owner || record.repository != repository {
+            return Err(Status::permission_denied("query scope access denied"));
+        }
+        Ok(record.cloud_mode)
+    }
     pub fn close(&self, owner: &str, repository: &str, handle: &[u8]) -> Result<(), Status> {
         let id: [u8; 32] = handle
             .try_into()
@@ -705,8 +864,9 @@ impl QueryHost {
                 .collect(),
             overlay_object_count: 0,
             overlay_bytes: 0,
+            cloud_source: None,
         };
-        let prepared = self.prepare(owner, &header, roots, None)?;
+        let prepared = self.prepare(owner, &header, roots, None, false)?;
         let digest = *prepared.digest().finalize().as_bytes();
         self.install(owner, &header, replay, prepared, Vec::new(), digest)
             .map(|scope| scope.wire.clone())
@@ -787,6 +947,120 @@ impl QueryHost {
         header: &q::ScopeHeader,
         roots: Vec<m::CommitId>,
         parent: Option<q::ScopeKey>,
+        cloud_authorized: bool,
+    ) -> Result<Arc<Prepared>, Status> {
+        self.prepare_source(owner, header, roots, parent, None, cloud_authorized)
+    }
+    pub fn prepare_cloud(
+        &self,
+        owner: &str,
+        header: &q::ScopeHeader,
+        cloud_owner: tinytree_store::CloudOwner,
+    ) -> Result<Arc<Prepared>, Status> {
+        if header.version != 2 || !header.roots.is_empty() {
+            return Err(Status::invalid_argument(
+                "cloud scope requires identity2 and empty roots",
+            ));
+        }
+        let source = header
+            .cloud_source
+            .as_ref()
+            .ok_or_else(|| Status::invalid_argument("cloud snapshot source missing"))?;
+        let selector = source
+            .selector
+            .as_ref()
+            .ok_or_else(|| Status::invalid_argument("cloud version selector missing"))?;
+        let authority = source
+            .authority
+            .as_ref()
+            .ok_or_else(|| Status::invalid_argument("cloud native authority missing"))?;
+        let (selector, native_binding) = crate::cloud::checked_native_source(
+            cloud_owner,
+            &header.repository_id,
+            selector,
+            authority,
+        )?;
+        if source.index_root_ids.is_empty() || source.index_root_ids.len() > self.config.max_roots {
+            return Err(Status::resource_exhausted(
+                "cloud selected snapshot count exceeded",
+            ));
+        }
+        let selected = source
+            .index_root_ids
+            .iter()
+            .map(|id| {
+                id.as_slice()
+                    .try_into()
+                    .map(tinytree_cloud::IndexRootId)
+                    .map_err(|_| Status::invalid_argument("invalid cloud snapshot root ID"))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        if selected.windows(2).any(|pair| pair[0] >= pair[1]) {
+            return Err(Status::invalid_argument(
+                "cloud snapshot roots must be sorted unique",
+            ));
+        }
+        let replay: [u8; 32] = header
+            .replay_key
+            .as_slice()
+            .try_into()
+            .map_err(|_| Status::invalid_argument("invalid scope replay key"))?;
+        self.expire(now()?);
+        if self
+            .replay(
+                owner,
+                &header.repository_id,
+                replay,
+                scope_binding(header, None),
+                None,
+            )?
+            .is_some()
+        {
+            return self.prepare_source(owner, header, Vec::new(), None, None, true);
+        }
+        let guard = self
+            .store
+            .open_cloud_snapshot(
+                &header.repository_id,
+                cloud_owner,
+                selector,
+                &selected,
+                self.config
+                    .max_roots
+                    .min(self.store.resource_config().max_closure_objects),
+            )
+            .map_err(|error| match error {
+                tinytree_store::Error::Invalid("cloud snapshots require indexed version") => {
+                    Status::unimplemented("cloud query scopes require an indexed version")
+                }
+                error => crate::service::store_status(error),
+            })?;
+        let charge = guard
+            .retained_size_upper_bound()
+            .map_err(crate::service::store_status)?;
+        let memory =
+            self.scope_memory
+                .clone()
+                .try_acquire_many_owned(u32::try_from(charge).map_err(|_| {
+                    Status::resource_exhausted("cloud scope retained memory exceeded")
+                })?)
+                .map_err(|_| Status::resource_exhausted("cloud scope retained memory exceeded"))?;
+        let roots = guard.anchors().to_vec();
+        let cloud = Arc::new(CloudScopeRetention {
+            guard,
+            native_binding,
+            _memory: memory,
+        });
+        self.prepare_source(owner, header, roots, None, Some(cloud), true)
+    }
+    fn prepare_source(
+        &self,
+        owner: &str,
+        header: &q::ScopeHeader,
+        roots: Vec<m::CommitId>,
+        parent: Option<q::ScopeKey>,
+        cloud: Option<Arc<CloudScopeRetention>>,
+        cloud_authorized: bool,
     ) -> Result<Arc<Prepared>, Status> {
         let repository = &header.repository_id;
         if !matches!(header.version, 1 | 2) {
@@ -804,6 +1078,14 @@ impl QueryHost {
         let now = now()?;
         self.expire(now);
         if let Some(existing) = self.replay(owner, repository, replay, binding, None)? {
+            // A known child replay owns its captured source independently of a
+            // logically closed parent. Reauthorize that source before returning
+            // it; do not look up/reopen the parent or acquire another guard.
+            if existing.is_cloud() && !cloud_authorized {
+                return Err(Status::permission_denied(
+                    "cloud query capability is required",
+                ));
+            }
             let base = existing
                 .parent
                 .clone()
@@ -817,18 +1099,33 @@ impl QueryHost {
                 expires_cap: Some(existing.wire.expires_at_unix_seconds),
             }));
         }
+        if parent.is_none() && header.cloud_source.is_some() && cloud.is_none() {
+            return Err(Status::failed_precondition(
+                "cloud source replay no longer available",
+            ));
+        }
         self.room(owner, repository, &self.registry.lock().unwrap())?;
         let (base, depth, expires_cap) = if let Some(parent) = parent {
             if parent.repository_id != *repository {
                 return Err(Status::invalid_argument("fork parent repository differs"));
             }
             let base = self.lookup(owner, repository, &parent.handle)?;
+            if base.is_cloud() && !cloud_authorized {
+                return Err(Status::permission_denied(
+                    "cloud query capability is required",
+                ));
+            }
             if base.wire.query_identity_version != header.version {
                 return Err(Status::invalid_argument(
                     "fork scope identity version mismatch",
                 ));
             }
-            if base.scope.roots() != roots.as_slice() {
+            if base.cloud.is_some() && !roots.is_empty() {
+                return Err(Status::unimplemented(
+                    "mixed cloud and reference sources are unsupported",
+                ));
+            }
+            if base.cloud.is_none() && base.scope.roots() != roots.as_slice() {
                 return Err(Status::invalid_argument(
                     "fork remote roots differ from parent",
                 ));
@@ -861,7 +1158,7 @@ impl QueryHost {
                 Ok(scope) => Arc::new(scope),
                 Err(tinytree_index::Error::NotReady) => {
                     for (root, pin) in pins {
-                        self.schedule(repository, root, pin)?;
+                        self.schedule(repository, root, pin, cloud.clone())?;
                     }
                     return Err(Status::unavailable(
                         "derived graph warming; retry the same logical roots",
@@ -893,7 +1190,27 @@ impl QueryHost {
             for root in &roots {
                 hash.update(&root.0);
             }
+            let cloud_source_binding = cloud
+                .as_ref()
+                .map(|source| {
+                    let selected: Vec<_> = source
+                        .guard
+                        .selected_roots()
+                        .iter()
+                        .map(|id| id.0)
+                        .collect();
+                    m::cloud_query_source_binding(
+                        source.native_binding,
+                        &selected,
+                        &roots,
+                        scope.epoch(),
+                    )
+                    .to_vec()
+                })
+                .unwrap_or_default();
+            hash.update(&cloud_source_binding);
             let wire = q::QueryScope {
+                cloud_source_binding,
                 key: None,
                 content_digest: hash.finalize().as_bytes().to_vec(),
                 index_epoch: scope.epoch().to_vec(),
@@ -901,9 +1218,44 @@ impl QueryHost {
                 expires_at_unix_seconds: now + self.config.scope_ttl_seconds as i64,
                 query_identity_version: header.version,
             };
-            let graph = OverlayGraph::remote(scope.clone());
+            let mut graph = OverlayGraph::remote(scope.clone());
+            if let Some(source) = &cloud {
+                if !source.guard.frozen_commits().is_empty() {
+                    let limits = OverlayLimits {
+                        max_depth: self.config.max_overlay_layers,
+                        max_nodes: self.config.max_scope_overlay_nodes,
+                        max_bytes: self.config.max_scope_overlay_bytes,
+                        max_parents: self.config.max_commit_parents,
+                        max_edges: self.config.max_work_edges as usize,
+                        max_commit_bytes: self.config.max_commit_bytes,
+                    };
+                    let charge =
+                        OverlayGraph::frozen_memory(&source.guard, &limits).map_err(index_error)?;
+                    let permit = self
+                        .scope_memory
+                        .clone()
+                        .try_acquire_many_owned(u32::try_from(charge).map_err(|_| {
+                            Status::resource_exhausted("frozen graph memory exceeded")
+                        })?)
+                        .map_err(|_| Status::resource_exhausted("frozen graph memory exceeded"))?;
+                    let owner: Arc<dyn std::any::Any + Send + Sync> = Arc::new(FrozenGraphOwner {
+                        _source: source.clone(),
+                        _memory: permit,
+                    });
+                    graph = OverlayGraph::from_retained_baseline(
+                        graph,
+                        &source.guard,
+                        &limits,
+                        &mut self.config.budget(),
+                        owner,
+                    )
+                    .map_err(index_error)?;
+                }
+            }
+
             (
                 Arc::new(Scoped {
+                    cloud,
                     scope,
                     graph: Some(graph),
                     wire,
@@ -911,7 +1263,7 @@ impl QueryHost {
                     depth: 0,
                     roots: pins.into_iter().map(|(_, pin)| pin).collect(),
                     memory: Some(Arc::new(memory)),
-                    cleanup: self.cleanup.clone(),
+                    cleanup: self.cleanup_sender()?,
                 }),
                 usize::from(header.overlay_object_count > 0),
                 None,
@@ -1055,6 +1407,7 @@ impl QueryHost {
         handle[..16].copy_from_slice(uuid::Uuid::new_v4().as_bytes());
         handle[16..].copy_from_slice(uuid::Uuid::new_v4().as_bytes());
         let wire = q::QueryScope {
+            cloud_source_binding: prepared.base.wire.cloud_source_binding.clone(),
             key: Some(q::ScopeKey {
                 repository_id: header.repository_id.clone(),
                 handle: handle.to_vec(),
@@ -1066,6 +1419,7 @@ impl QueryHost {
             query_identity_version: header.version,
         };
         let scope = Arc::new(Scoped {
+            cloud: prepared.base.cloud.clone(),
             scope: prepared.base.scope.clone(),
             graph: Some(graph),
             wire,
@@ -1073,11 +1427,12 @@ impl QueryHost {
             depth: prepared.depth,
             roots: Vec::new(),
             memory: Some(memory.clone()),
-            cleanup: self.cleanup.clone(),
+            cleanup: self.cleanup_sender()?,
         });
         registry.records.insert(
             handle,
             Record {
+                cloud_mode: scope.is_cloud(),
                 owner: owner.into(),
                 repository: header.repository_id.clone(),
                 replay,
@@ -1096,7 +1451,11 @@ impl QueryHost {
         repository: &str,
         root: m::CommitId,
         pin: tinytree_store::RootReadGuard,
+        cloud: Option<Arc<CloudScopeRetention>>,
     ) -> Result<(), Status> {
+        if self.closing.load(Ordering::Acquire) {
+            return Err(Status::unavailable("query host draining"));
+        }
         if self
             .index
             .node(repository, root)
@@ -1122,10 +1481,15 @@ impl QueryHost {
         state.pending.insert(key.clone());
         if self
             .warm
+            .lock()
+            .unwrap()
+            .as_ref()
+            .ok_or_else(|| Status::unavailable("query host draining"))?
             .try_send(WarmJob {
                 repository: repository.into(),
                 root,
                 _pin: pin,
+                _cloud: cloud,
             })
             .is_err()
         {
@@ -1193,6 +1557,9 @@ impl WarmPayloadCache {
 }
 impl WarmRuntime {
     fn build(&self, job: &WarmJob) -> Result<(), Status> {
+        if self.closing.load(Ordering::Acquire) {
+            return Err(Status::unavailable("query host draining"));
+        }
         let deadline =
             std::time::Instant::now() + Duration::from_secs(self.config.warm_timeout_seconds);
         let mut stack = vec![(job.root, false)];
@@ -1202,6 +1569,9 @@ impl WarmRuntime {
         let mut payloads = WarmPayloadCache::new(self.config.max_warm_bytes);
         let mut edges = 0usize;
         while let Some((id, exit)) = stack.pop() {
+            if self.closing.load(Ordering::Acquire) {
+                return Err(Status::unavailable("query host draining"));
+            }
             if std::time::Instant::now() >= deadline {
                 return Err(Status::deadline_exceeded("derived warm work expired"));
             }

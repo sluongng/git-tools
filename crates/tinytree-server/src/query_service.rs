@@ -67,6 +67,7 @@ impl QueryService {
         deadline: Instant,
         host: Arc<QueryHost>,
         work: Arc<Work>,
+        cloud_proof: Option<Arc<crate::cloud::Work>>,
         header: q::ScopeHeader,
         parent: Option<q::ScopeKey>,
         mut stream: Streaming<T>,
@@ -93,15 +94,50 @@ impl QueryService {
             ));
         }
         let roots = ids(&header.roots, host.config.max_roots)?;
-        if roots.is_empty() || roots.windows(2).any(|pair| pair[0] >= pair[1]) {
+        if (roots.is_empty() && cloud_proof.is_none() && parent.is_none())
+            || roots.windows(2).any(|pair| pair[0] >= pair[1])
+        {
             return Err(Status::invalid_argument(
                 "scope roots must be nonempty sorted unique IDs",
             ));
         }
+        if cloud_proof.is_some()
+            && (header.version != 2
+                || !roots.is_empty()
+                || header.cloud_source.is_none()
+                || parent.is_some())
+        {
+            return Err(Status::invalid_argument(
+                "cloud scope requires identity2, empty roots and exact source",
+            ));
+        }
+        if cloud_proof.is_none() && header.cloud_source.is_some() {
+            return Err(Status::invalid_argument(
+                "cloud source requires OpenCloudScope",
+            ));
+        }
+        let cloud_owner = if let Some(proof) = &cloud_proof {
+            Some(
+                self.repository
+                    .cloud_host()
+                    .ok_or_else(|| Status::unimplemented("cloud query scopes are disabled"))?
+                    .repository(proof, &identity, &header.repository_id, false)?,
+            )
+        } else {
+            None
+        };
+        let cloud_capability = identity.cloud_capability().is_ok();
         let prepare_header = header.clone();
         let owner = identity.id.clone();
         let (prepared, work) = execute(host.clone(), work, deadline, move |host, work| {
-            let prepared = host.prepare(&owner, &prepare_header, roots, parent)?;
+            // The proof owner is physical-only. Prepared/Scoped retain an
+            // independently charged compact Store guard, never this Work.
+            let _proof = cloud_proof;
+            let prepared = if let Some(cloud_owner) = cloud_owner {
+                host.prepare_cloud(&owner, &prepare_header, cloud_owner)?
+            } else {
+                host.prepare(&owner, &prepare_header, roots, parent, cloud_capability)?
+            };
             work.scopes.lock().unwrap().push(prepared.base.clone());
             Ok(prepared)
         })
@@ -264,6 +300,9 @@ impl QueryService {
         let work = admitted(&host, deadline, admission).await?;
         let (value, work) = execute(host, work, deadline, move |host, work| {
             let scope = host.lookup(&identity.id, &key.repository_id, &key.handle)?;
+            if scope.is_cloud() {
+                identity.cloud_capability()?;
+            }
             work.scopes.lock().unwrap().push(scope.clone());
             #[cfg(test)]
             host.pause_query()?;
@@ -410,6 +449,54 @@ impl RepositoryQuery for QueryService {
             deadline,
             host,
             work,
+            None,
+            header,
+            None,
+            stream,
+            |frame| match frame.frame {
+                Some(q::open_scope_frame::Frame::Commit(v)) => UploadFrame::Commit(v),
+                Some(q::open_scope_frame::Frame::Chunk(v)) => UploadFrame::Chunk(v),
+                Some(q::open_scope_frame::Frame::CommitEnd(v)) => UploadFrame::CommitEnd(v),
+                Some(q::open_scope_frame::Frame::ScopeEnd(v)) => UploadFrame::End(v),
+                _ => UploadFrame::Invalid,
+            },
+        )
+        .await
+    }
+    async fn open_cloud_scope(
+        &self,
+        request: Request<Streaming<q::OpenScopeFrame>>,
+    ) -> Result<Response<q::QueryScope>, Status> {
+        let (identity, deadline, host) = self.context(&request, true)?;
+        let proof = request
+            .extensions()
+            .get::<Arc<crate::query_ingress::CloudProofAdmission>>()
+            .ok_or_else(|| Status::failed_precondition("cloud scope transport admission required"))?
+            .0
+            .lock()
+            .map_err(|_| Status::internal("cloud proof admission poisoned"))?
+            .take()
+            .ok_or_else(|| Status::failed_precondition("cloud proof admission already consumed"))?;
+        let admission = request.extensions().get::<Arc<Work>>().cloned();
+        let work = admitted(&host, deadline, admission).await?;
+        let idle = std::time::Duration::from_millis(
+            self.repository.service_config().rpc.stream_idle_timeout_ms,
+        );
+        let mut stream = request.into_inner();
+        let first = next(&mut stream, deadline, idle)
+            .await?
+            .ok_or_else(|| Status::invalid_argument("scope header missing"))?;
+        self.bounded(&first)?;
+        let Some(q::open_scope_frame::Frame::Header(header)) = first.frame else {
+            return Err(Status::invalid_argument("scope header must be first"));
+        };
+        identity.authorize(&header.repository_id, false)?;
+        self.upload(
+            identity,
+            deadline,
+            host,
+            work,
+            Some(proof),
             header,
             None,
             stream,
@@ -452,6 +539,7 @@ impl RepositoryQuery for QueryService {
             deadline,
             host,
             work,
+            None,
             header_scope,
             Some(parent),
             stream,
@@ -873,6 +961,9 @@ impl RepositoryQuery for QueryService {
         identity.authorize(&key.repository_id, false)?;
         let work = admitted(&host, deadline, admission).await?;
         let (value, work) = execute(host, work, deadline, move |host, work| {
+            if host.requires_cloud(&identity.id, &key.repository_id, &key.handle)? {
+                identity.cloud_capability()?;
+            }
             let result = host.cursors.evaluate(host, &identity.id, input)?;
             work.query_owners.lock().unwrap().push(result.owner);
             Ok(result.page)
@@ -1341,5 +1432,104 @@ mod tests {
             tonic::Code::InvalidArgument,
             "out-of-scope literals preserve Evaluate errors"
         );
+    }
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn shared_query_shutdown_survives_cancelled_waiter_and_releases_store_after_physical_work()
+     {
+        use std::future::Future;
+        let temporary = tempfile::tempdir().unwrap();
+        let objects = temporary.path().join("objects");
+        let store = tinytree_store::Store::open(&objects, Default::default()).unwrap();
+        store.create_repository("example").unwrap();
+        let index =
+            tinytree_index::Index::open(temporary.path().join("index"), &Default::default())
+                .unwrap();
+        let mut config = crate::ServiceConfig::default();
+        config.query.max_inflight = 1;
+        config.query.expiry_interval_ms = 60_000;
+        let repository =
+            RepositoryService::new(store.clone(), config, vec!["example".into()], vec![])
+                .unwrap()
+                .with_query_index(index)
+                .unwrap();
+        let host = repository.query_host().unwrap();
+        let captured = host.clone();
+        let scope = tokio::task::spawn_blocking(move || {
+            captured.open("local-owner", "example", [8; 32], vec![m::CommitId::ROOT])
+        })
+        .await
+        .unwrap()
+        .unwrap();
+        let (entered, started) = std::sync::mpsc::sync_channel(1);
+        let (resume, wait) = std::sync::mpsc::sync_channel(1);
+        *host.pause.lock().unwrap() = Some(crate::query_index::QueryPause {
+            entered,
+            resume: wait,
+        });
+        let service = repository.query_service();
+        let worker = service.clone();
+        let key = scope.key.clone();
+        let call = tokio::spawn(async move {
+            worker
+                .query_facts(Request::new(q::QueryFactsRequest {
+                    scope: key,
+                    facts: vec![],
+                }))
+                .await
+        });
+        tokio::task::spawn_blocking(move || started.recv().unwrap())
+            .await
+            .unwrap();
+        call.abort();
+        let _ = call.await;
+        let owned = repository.clone();
+        let (pending, observed) = tokio::sync::oneshot::channel();
+        let waiter = tokio::spawn(async move {
+            let future = owned.drain_query();
+            tokio::pin!(future);
+            let mut pending = Some(pending);
+            std::future::poll_fn(|cx| {
+                let result = future.as_mut().poll(cx);
+                if result.is_pending() {
+                    if let Some(pending) = pending.take() {
+                        let _ = pending.send(());
+                    }
+                }
+                result
+            })
+            .await
+        });
+        observed.await.unwrap();
+        waiter.abort();
+        let _ = waiter.await;
+        assert_eq!(
+            service
+                .query_facts(Request::new(q::QueryFactsRequest {
+                    scope: scope.key,
+                    facts: vec![]
+                }))
+                .await
+                .unwrap_err()
+                .code(),
+            tonic::Code::Unavailable
+        );
+        let owned = repository.clone();
+        let second = tokio::spawn(async move { owned.drain_query().await });
+        assert!(
+            !second.is_finished(),
+            "accepted paused work still owns its physical admission"
+        );
+        resume.send(()).unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(5), second)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        repository.drain_query().await.unwrap();
+        drop(host);
+        drop(service);
+        drop(repository);
+        drop(store);
+        tinytree_store::Store::open_existing(objects, Default::default()).unwrap();
     }
 }

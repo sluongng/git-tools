@@ -42,7 +42,7 @@ enum Parent {
 }
 struct DraftNode {
     descriptor: m::Descriptor,
-    bytes: Arc<[u8]>,
+    bytes: Option<Arc<[u8]>>,
     change: m::ChangeId,
     parents: Vec<Parent>,
     generation: u64,
@@ -129,6 +129,9 @@ impl GraphNode {
             Parent::Remote(node) => node.has_conflict(),
             Parent::Draft(node) => node.has_conflict,
         }
+    }
+    pub fn is_frozen(&self) -> bool {
+        matches!(&self.0, Parent::Draft(node) if node.bytes.is_none())
     }
     pub fn descriptor(&self) -> m::Descriptor {
         match &self.0 {
@@ -289,7 +292,7 @@ impl OverlayGraph {
                 id,
                 Arc::new(DraftNode {
                     descriptor,
-                    bytes,
+                    bytes: Some(bytes),
                     change,
                     parents,
                     generation,
@@ -322,6 +325,197 @@ impl OverlayGraph {
             }),
         };
         Ok(Arc::new(graph))
+    }
+    /// Prospective graph+topology scratch admission, separate from the compact
+    /// Store records. No canonical commit payload is retained by this graph.
+    pub fn frozen_memory(
+        guard: &tinytree_store::CloudSnapshotReadGuard,
+        limits: &OverlayLimits,
+    ) -> Result<usize> {
+        let records = guard.frozen_commits();
+        let edges = records.iter().try_fold(0usize, |sum, record| {
+            if record.parents.len() > limits.max_parents {
+                return Err(Error::BudgetExceeded);
+            }
+            sum.checked_add(record.parents.len())
+                .ok_or(Error::BudgetExceeded)
+        })?;
+        if edges > limits.max_edges {
+            return Err(Error::BudgetExceeded);
+        }
+        records
+            .len()
+            .checked_mul(1024)
+            .and_then(|n| n.checked_add(edges.checked_mul(128)?))
+            .and_then(|n| n.checked_add(4096))
+            .ok_or(Error::BudgetExceeded)
+    }
+    pub fn from_retained_baseline(
+        base: Arc<Self>,
+        guard: &tinytree_store::CloudSnapshotReadGuard,
+        limits: &OverlayLimits,
+        budget: &mut WorkBudget,
+        owner: Arc<dyn Any + Send + Sync>,
+    ) -> Result<Arc<Self>> {
+        Self::frozen_memory(guard, limits)?;
+        let records = guard.frozen_commits();
+        if records.is_empty() {
+            return Ok(base);
+        }
+        let mut order: Vec<_> = (0..records.len()).collect();
+        order.sort_by_key(|index| (records[*index].order, records[*index].descriptor.key.id));
+        let mut state = vec![0u8; records.len()];
+        let mut nodes = BTreeMap::<m::CommitId, Arc<DraftNode>>::new();
+        let mut changes = BTreeMap::<m::ChangeId, Vec<m::CommitId>>::new();
+        let mut ordinal = base.ordinal_end;
+        let mut edges = base.edges;
+        let mut digest = blake3::Hasher::new();
+        digest.update(b"tinytree-retained-baseline-v1\0");
+        digest.update(&base.digest);
+        let edge_bound = records.iter().try_fold(0usize, |sum, record| {
+            sum.checked_add(record.parents.len())
+                .ok_or(Error::BudgetExceeded)
+        })?;
+        let work_bound = records
+            .len()
+            .checked_mul(2)
+            .and_then(|n| n.checked_add(edge_bound))
+            .ok_or(Error::BudgetExceeded)?;
+        let mut steps = 0usize;
+        for start in order {
+            let mut pending = vec![(start, false, 0usize)];
+            while let Some((index, exit, depth)) = pending.pop() {
+                steps = steps.checked_add(1).ok_or(Error::BudgetExceeded)?;
+                if steps > work_bound
+                    || depth > records.len()
+                    || pending.len() > records.len().saturating_add(limits.max_parents)
+                {
+                    return Err(Error::BudgetExceeded);
+                }
+                if state[index] == 2 {
+                    continue;
+                }
+                let record = &records[index];
+                let id = m::CommitId(record.descriptor.key.id.0);
+                if !exit {
+                    budget.charge(1, 0, 0)?;
+                    if let Some(remote) = base.lookup_node(id, budget)? {
+                        if remote.descriptor() != record.descriptor {
+                            return Err(Error::Corrupt);
+                        }
+                        state[index] = 2;
+                        continue;
+                    }
+                    if state[index] == 1 {
+                        return Err(Error::Corrupt);
+                    }
+                    state[index] = 1;
+                    if pending
+                        .len()
+                        .checked_add(record.parents.len())
+                        .and_then(|n| n.checked_add(1))
+                        .is_none_or(|n| {
+                            n > records
+                                .len()
+                                .saturating_add(limits.max_parents)
+                                .saturating_add(1)
+                        })
+                    {
+                        return Err(Error::BudgetExceeded);
+                    }
+                    pending.push((index, true, depth));
+                    for parent in record.parents.iter().rev() {
+                        if let Ok(parent_index) = records.binary_search_by_key(parent, |record| {
+                            m::CommitId(record.descriptor.key.id.0)
+                        }) {
+                            if state[parent_index] != 2 {
+                                pending.push((parent_index, false, depth + 1));
+                            }
+                        }
+                    }
+                    continue;
+                }
+                if record.descriptor.key.kind != m::Kind::Commit || id == m::CommitId::ROOT {
+                    return Err(Error::Corrupt);
+                }
+                if nodes
+                    .len()
+                    .checked_add(base.nodes)
+                    .is_none_or(|count| count >= limits.max_nodes)
+                {
+                    return Err(Error::BudgetExceeded);
+                }
+                edges = edges
+                    .checked_add(record.parents.len())
+                    .filter(|edges| *edges <= limits.max_edges)
+                    .ok_or(Error::BudgetExceeded)?;
+                budget.charge(0, record.parents.len() as u64, 0)?;
+                budget.frontier(record.parents.len())?;
+                let mut parents = Vec::with_capacity(record.parents.len());
+                let mut generation = 0u64;
+                for parent in &record.parents {
+                    let parent = if let Some(node) = nodes.get(parent) {
+                        Parent::Draft(node.clone())
+                    } else {
+                        base.lookup_node(*parent, budget)?
+                            .ok_or(Error::Invalid(
+                                "frozen baseline parent is outside exact anchor graph",
+                            ))?
+                            .0
+                    };
+                    generation = generation.max(GraphNode(parent.clone()).generation());
+                    parents.push(parent);
+                }
+                ordinal = ordinal.checked_add(1).ok_or(Error::BudgetExceeded)?;
+                generation = generation.checked_add(1).ok_or(Error::Corrupt)?;
+                digest.update(&id.0);
+                digest.update(&record.order.to_le_bytes());
+                nodes.insert(
+                    id,
+                    Arc::new(DraftNode {
+                        descriptor: record.descriptor,
+                        bytes: None,
+                        change: record.change,
+                        parents,
+                        generation,
+                        ordinal,
+                        committer_millis: record.committer_millis,
+                        has_conflict: record.has_conflict,
+                        _owner: owner.clone(),
+                    }),
+                );
+                changes.entry(record.change).or_default().push(id);
+                state[index] = 2;
+            }
+        }
+        if nodes.is_empty() {
+            return Ok(base);
+        }
+        if base
+            .depth
+            .checked_add(1)
+            .is_none_or(|depth| depth > limits.max_depth)
+        {
+            return Err(Error::BudgetExceeded);
+        }
+        for ids in changes.values_mut() {
+            ids.sort_unstable();
+        }
+        Ok(Arc::new(Self {
+            remote: base.remote.clone(),
+            depth: base.depth + 1,
+            nodes: base.nodes + nodes.len(),
+            bytes: base.bytes,
+            edges,
+            ordinal_end: ordinal,
+            digest: *digest.finalize().as_bytes(),
+            base: Some(base),
+            chunk: Some(OverlayChunk {
+                nodes,
+                changes,
+                _owner: owner,
+            }),
+        }))
     }
     /// One lexical private candidate, without enumerating the overlay. Each
     /// immutable layer contributes at most one range-seek candidate. Evaluation
@@ -463,8 +657,10 @@ impl OverlayGraph {
             if !Arc::ptr_eq(&own, value) {
                 return Err(Error::Invalid("draft token belongs to another graph"));
             }
-            budget.charge(0, 0, value.bytes.len() as u64)?;
-            Ok(Some(value.bytes.clone()))
+            if let Some(bytes) = &value.bytes {
+                budget.charge(0, 0, bytes.len() as u64)?;
+            }
+            Ok(value.bytes.clone())
         } else {
             // None carries no remote payload authorization; canonical reads
             // require the host's independently retained remote anchor.

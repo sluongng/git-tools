@@ -229,7 +229,11 @@ impl CloudHost {
         let wire = self.config.wire_limit(method) as u64;
         if matches!(
             method,
-            "PutIndexArtifact" | "LookupIndexArtifacts" | "ReadIndexArtifact" | "ReadNativeClosure"
+            "PutIndexArtifact"
+                | "LookupIndexArtifacts"
+                | "ReadIndexArtifact"
+                | "ReadNativeClosure"
+                | "OpenCloudScope"
         ) && !self.config.indexed_versions
         {
             return Err(Status::unimplemented(
@@ -240,6 +244,7 @@ impl CloudHost {
             "PublishVersion" | "GetVersion" => self.store_work,
             "PutIndexArtifact" | "ReadIndexArtifact" => self.profile.index_artifact_bytes,
             "ReadNativeClosure" => self.profile.native_read_bytes,
+            "OpenCloudScope" => self.profile.version_v2_bytes,
             _ => self.profile.object_bytes,
         };
         let bytes = wire
@@ -499,6 +504,55 @@ fn owner_binding(owner: s::CloudOwner, repo: &str) -> [u8; 32] {
     hash.update(repo.as_bytes());
     hash.update(&owner.principal);
     *hash.finalize().as_bytes()
+}
+pub(crate) fn checked_native_source(
+    owner: s::CloudOwner,
+    repo: &str,
+    selector: &p::RetainedVersionSelector,
+    authority: &p::NativeVersionAuthority,
+) -> Result<(s::CloudVersionSelector, [u8; 32]), Status> {
+    if selector.generation == 0 {
+        return Err(Status::invalid_argument(
+            "invalid retained version generation",
+        ));
+    }
+    let workspace = array(&selector.workspace_id)?;
+    let manifest = array(&selector.manifest_id)?;
+    let selected = authority
+        .manifest_selected
+        .as_ref()
+        .ok_or_else(|| Status::invalid_argument("missing retained manifest selection"))?;
+    let raw = array(&selected.blake3)?;
+    let owner_binding = owner_binding(owner, repo);
+    let binding = tinytree_model::cloud_native_binding_digest(
+        repo,
+        owner_binding,
+        workspace,
+        selector.generation,
+        manifest,
+        raw,
+        selected.size_bytes,
+    );
+    if authority.version != 1
+        || authority.owner_binding != owner_binding
+        || authority.binding_digest != binding
+    {
+        return Err(Status::permission_denied(
+            "retained version authority does not match authenticated source",
+        ));
+    }
+    Ok((
+        s::CloudVersionSelector {
+            workspace,
+            generation: selector.generation,
+            manifest: tinytree_cloud::ManifestId(manifest),
+            selected: tinytree_cloud::BlobDigest {
+                blake3: raw,
+                size_bytes: selected.size_bytes,
+            },
+        },
+        binding,
+    ))
 }
 fn native_authority(
     owner: s::CloudOwner,

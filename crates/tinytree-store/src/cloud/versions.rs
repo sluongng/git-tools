@@ -730,12 +730,39 @@ impl Inner {
         files: Option<bool>,
         planned: &HashSet<ObjectKey>,
     ) -> Result<VersionRoots> {
+        self.validate_manifest_selection(repo, owner, manifest, limits, files, planned, None)
+    }
+    fn validate_manifest_selection(
+        &self,
+        repo: &str,
+        owner: CloudOwner,
+        manifest: &RecoveryManifest,
+        limits: ManifestLimits,
+        files: Option<bool>,
+        planned: &HashSet<ObjectKey>,
+        mut selection: Option<&mut SnapshotSelection<'_>>,
+    ) -> Result<VersionRoots> {
         self.check_version_work(manifest)?;
         let mut objects = Vec::with_capacity(manifest.members.len());
         let mut retained = objects
             .capacity()
             .checked_mul(std::mem::size_of::<VerifiedObject>())
             .ok_or(Error::Limit("cloud version member allocation"))?;
+        if let Some(selected) = selection.as_mut() {
+            let charge = selected
+                .maximum
+                .checked_mul(std::mem::size_of::<CommitId>())
+                .and_then(|n| n.checked_add(4096))
+                .ok_or(Error::Limit("cloud selected anchors memory"))?;
+            retained = retained
+                .checked_add(charge)
+                .filter(|n| *n <= self.config.cloud.max_version_decode_bytes)
+                .ok_or(Error::Limit("cloud selected anchors memory"))?;
+            selected
+                .anchors
+                .try_reserve_exact(selected.maximum)
+                .map_err(|_| Error::Limit("cloud selected anchors memory"))?;
+        }
         let mut scan = Scan {
             records: 0,
             bytes: 0,
@@ -811,6 +838,7 @@ impl Inner {
         let op_retained = retained;
         let mut extra = ExtraWork::default();
         let mut artifacts = Vec::new();
+        let mut frozen_retained = 0usize;
         match manifest {
             RecoveryManifest::V1(value) => {
                 verify_coverage(value, &objects, limits)
@@ -840,9 +868,39 @@ impl Inner {
                     .map_err(|error| v2_error(error, "cloud v2 manifest coverage"))?;
                 let mut steps = 0usize;
                 for root in &value.index_roots {
+                    // The codec charges one full configured snapshot worker.
+                    // Previously retained frozen rows must also fit BEFORE
+                    // another reconstruction can allocate its model/scratch.
+                    let snapshot_peak = loaded
+                        .len()
+                        .checked_mul(512)
+                        .and_then(|n| n.checked_add(4096))
+                        .and_then(|n| n.checked_add(policy.artifacts.snapshot.max_decode_bytes))
+                        .and_then(|n| n.checked_add(retained))
+                        .ok_or(Error::Limit("cloud frozen snapshot reconstruction memory"))?;
+                    if snapshot_peak > self.config.cloud.max_version_decode_bytes {
+                        return Err(Error::Limit("cloud frozen snapshot reconstruction memory"));
+                    }
                     let snapshot = graph
                         .snapshot(root.id)
                         .map_err(|error| v2_error(error, "cloud index logical snapshot"))?;
+                    if let Some(selected) = selection.as_mut() {
+                        if selected.ids.binary_search(&root.id).is_ok() {
+                            for id in &snapshot.roots {
+                                match selected.anchors.binary_search(id) {
+                                    Ok(_) => {}
+                                    Err(at) => {
+                                        if selected.anchors.len() == selected.maximum {
+                                            return Err(Error::Limit(
+                                                "cloud selected anchor count",
+                                            ));
+                                        }
+                                        selected.anchors.insert(at, *id);
+                                    }
+                                }
+                            }
+                        }
+                    }
                     // The codec's graph validation already admitted one whole
                     // reconstructed snapshot. Its temporary walk scratch has
                     // dropped; keep the actual owned vectors and the live graph
@@ -860,9 +918,23 @@ impl Inner {
                         .and_then(|n| n.checked_sub(graph_lookup))
                         .and_then(|n| n.checked_sub(snapshot_memory(&snapshot).ok()?))
                         .ok_or(Error::Limit("cloud index native proof memory"))?;
-                    self.prove_index_native(
-                        repo, &snapshot, &mut extra, &mut steps, available, planned,
+                    let frozen = selection.as_mut().and_then(|selected| {
+                        selected
+                            .ids
+                            .binary_search(&root.id)
+                            .is_ok()
+                            .then_some(&mut selected.frozen)
+                    });
+                    let frozen_bytes = self.prove_index_native(
+                        repo, &snapshot, &mut extra, &mut steps, available, planned, frozen,
                     )?;
+                    frozen_retained = frozen_retained
+                        .checked_add(frozen_bytes)
+                        .ok_or(Error::Limit("cloud frozen index memory"))?;
+                    retained = retained
+                        .checked_add(frozen_bytes)
+                        .filter(|n| *n <= self.config.cloud.max_version_decode_bytes)
+                        .ok_or(Error::Limit("cloud frozen index memory"))?;
                 }
                 artifacts = loaded
                     .iter()
@@ -886,6 +958,7 @@ impl Inner {
                 .cloud
                 .max_version_decode_bytes
                 .checked_sub(op_retained)
+                .and_then(|n| n.checked_sub(frozen_retained))
                 .and_then(|n| n.checked_sub(descriptors))
                 .ok_or(Error::Limit("cloud index native proof memory"))?;
             let mut memory = ProofMemory {
@@ -1159,8 +1232,10 @@ impl Inner {
         steps: &mut usize,
         available: usize,
         planned: &HashSet<ObjectKey>,
-    ) -> Result<()> {
+        mut frozen: Option<&mut FrozenCommits>,
+    ) -> Result<usize> {
         let limits = self.config.cloud.index_artifacts;
+        let mut frozen_bytes = 0usize;
         let mut memory = ProofMemory {
             used: 0,
             maximum: available,
@@ -1217,7 +1292,7 @@ impl Inner {
             .map(|draft| draft.commit())
             .collect::<HashSet<_>>();
         for draft in &snapshot.drafts {
-            let (commit, scratch) = self.read_index_commit(
+            let (mut commit, scratch) = self.read_index_commit(
                 repo,
                 draft.commit(),
                 Some(draft.descriptor),
@@ -1245,10 +1320,114 @@ impl Inner {
                     ));
                 }
             }
+            if let Some(frozen) = frozen.as_mut() {
+                let millis = commit.committer.timestamp.millis_since_epoch;
+                let has_conflict = commit.root_tree.terms.len() > 1;
+                let at = frozen
+                    .nodes
+                    .binary_search_by_key(&draft.commit().0, |node| node.descriptor.key.id.0);
+                match at {
+                    Ok(at) => {
+                        let previous = &mut frozen.nodes[at];
+                        if previous.descriptor != draft.descriptor
+                            || previous.change != commit.change_id
+                            || previous.parents != commit.parents
+                            || previous.committer_millis != millis
+                            || previous.has_conflict != has_conflict
+                        {
+                            return Err(Error::Invalid(
+                                "cloud selected draft canonical metadata disagrees",
+                            ));
+                        }
+                        previous.order = previous.order.min(draft.order);
+                    }
+                    Err(at) => {
+                        let maximum = limits
+                            .snapshot
+                            .max_drafts
+                            .min(self.config.max_closure_objects);
+                        if frozen.nodes.len() >= maximum {
+                            return Err(Error::Limit("cloud selected draft count"));
+                        }
+                        let edges = frozen
+                            .edges
+                            .checked_add(commit.parents.len())
+                            .filter(|n| {
+                                *n <= limits.snapshot.max_edges.min(self.config.max_closure_edges)
+                            })
+                            .ok_or(Error::Limit("cloud selected draft edges"))?;
+                        // Binary search is logarithmic; account sorted insertion's
+                        // actual shift work across the complete selected union.
+                        *steps = steps
+                            .checked_add(frozen.nodes.len() - at)
+                            .filter(|n| *n <= limits.max_graph_steps)
+                            .ok_or(Error::Limit("cloud index native proof steps"))?;
+                        let mut growth = 0usize;
+                        if frozen.nodes.len() == frozen.nodes.capacity() {
+                            let capacity = frozen
+                                .nodes
+                                .capacity()
+                                .saturating_mul(2)
+                                .max(4)
+                                .min(maximum);
+                            let before = frozen.nodes.capacity();
+                            // Reallocation can own old and new buffers at once.
+                            // Reserve the FULL new buffer before asking Vec to grow.
+                            let predicted = capacity
+                                .checked_mul(std::mem::size_of::<CloudSnapshotCommit>())
+                                .ok_or(Error::Limit("cloud frozen index memory"))?;
+                            memory.charge(predicted)?;
+                            frozen
+                                .nodes
+                                .try_reserve_exact(capacity - frozen.nodes.len())
+                                .map_err(|_| Error::Limit("cloud frozen index memory"))?;
+                            let actual = frozen
+                                .nodes
+                                .capacity()
+                                .checked_mul(std::mem::size_of::<CloudSnapshotCommit>())
+                                .ok_or(Error::Limit("cloud frozen index memory"))?;
+                            if actual >= predicted {
+                                memory.charge(actual - predicted)?;
+                            } else {
+                                memory.release(predicted - actual);
+                            }
+                            let old = before
+                                .checked_mul(std::mem::size_of::<CloudSnapshotCommit>())
+                                .ok_or(Error::Limit("cloud frozen index memory"))?;
+                            memory.release(old);
+                            growth = actual
+                                .checked_sub(old)
+                                .ok_or(Error::Corrupt("cloud frozen index capacity"))?;
+                        }
+                        let parent_bytes = commit
+                            .parents
+                            .capacity()
+                            .checked_mul(std::mem::size_of::<CommitId>())
+                            .ok_or(Error::Limit("cloud frozen index memory"))?;
+                        memory.charge(parent_bytes)?;
+                        frozen_bytes = frozen_bytes
+                            .checked_add(growth)
+                            .and_then(|n| n.checked_add(parent_bytes))
+                            .ok_or(Error::Limit("cloud frozen index memory"))?;
+                        frozen.nodes.insert(
+                            at,
+                            CloudSnapshotCommit {
+                                descriptor: draft.descriptor,
+                                change: commit.change_id,
+                                parents: std::mem::take(&mut commit.parents),
+                                committer_millis: millis,
+                                has_conflict,
+                                order: draft.order,
+                            },
+                        );
+                        frozen.edges = edges;
+                    }
+                }
+            }
             drop(commit);
             memory.release(scratch);
         }
-        Ok(())
+        Ok(frozen_bytes)
     }
 }
 impl ValidationGuard {
@@ -1355,6 +1534,18 @@ impl Store {
         limits: ManifestLimits,
         v1_only: bool,
     ) -> Result<Option<CloudVersionReadGuard>> {
+        self.read_cloud_version_selection(repo, owner, workspace, generation, limits, v1_only, None)
+    }
+    fn read_cloud_version_selection(
+        &self,
+        repo: &str,
+        owner: CloudOwner,
+        workspace: [u8; 32],
+        generation: u64,
+        limits: ManifestLimits,
+        v1_only: bool,
+        mut selection: Option<&mut SnapshotSelection<'_>>,
+    ) -> Result<Option<CloudVersionReadGuard>> {
         let limits = self.inner.manifest_limits(limits)?;
         let (record, manifest_bytes, manifest, mut guard, indexed) = {
             let mut gate = self.inner.lock()?;
@@ -1395,6 +1586,19 @@ impl Store {
             if manifest.format() != record.format {
                 return Err(Error::Corrupt("cloud version manifest format"));
             }
+            if let Some(selected) = selection.as_ref() {
+                let RecoveryManifest::V2(indexed) = &manifest else {
+                    return Err(Error::Invalid("cloud snapshots require indexed version"));
+                };
+                if selected.ids.iter().any(|id| {
+                    indexed
+                        .index_roots
+                        .binary_search_by_key(id, |root| root.id)
+                        .is_err()
+                }) {
+                    return Err(Error::Invalid("cloud selected snapshot outside version"));
+                }
+            }
             if manifest.workspace != workspace {
                 return Err(Error::Corrupt("cloud version workspace"));
             }
@@ -1423,9 +1627,15 @@ impl Store {
             guard.version = Some((workspace, generation));
             (record, bytes, manifest, guard, indexed)
         };
-        let verified = self
-            .inner
-            .validate_manifest(repo, owner, &manifest, limits, Some(false))?;
+        let verified = self.inner.validate_manifest_selection(
+            repo,
+            owner,
+            &manifest,
+            limits,
+            Some(false),
+            &HashSet::new(),
+            selection.as_deref_mut(),
+        )?;
         if verified.artifacts != indexed.artifacts || verified.extra != indexed.extra {
             return Err(Error::Corrupt("cloud version artifact proof"));
         }
@@ -2263,4 +2473,172 @@ impl Inner {
 
 fn version_key_for(repo: &str, owner: CloudOwner, workspace: [u8; 32], generation: u64) -> Vec<u8> {
     version_key(repo, owner, workspace, generation)
+}
+
+struct SnapshotSelection<'a> {
+    ids: &'a [IndexRootId],
+    maximum: usize,
+    anchors: Vec<CommitId>,
+    frozen: FrozenCommits,
+}
+#[derive(Default)]
+struct FrozenCommits {
+    nodes: Vec<CloudSnapshotCommit>,
+    edges: usize,
+}
+/// Canonically verified draft metadata from the exact selected snapshots.
+/// Original draft order is retained; these commits are not remote anchors.
+#[derive(Debug, Eq, PartialEq)]
+pub struct CloudSnapshotCommit {
+    pub descriptor: Descriptor,
+    pub change: tinytree_model::ChangeId,
+    pub parents: Vec<CommitId>,
+    pub committer_millis: i64,
+    pub has_conflict: bool,
+    pub order: u64,
+}
+/// Compact authority for one exact selected snapshot union. Decoded artifact
+/// graphs and raw manifests are intentionally not retained between requests.
+pub struct CloudSnapshotReadGuard {
+    version: CloudVersion,
+    selector: super::CloudVersionSelector,
+    selected: Vec<IndexRootId>,
+    anchors: Vec<CommitId>,
+    frozen: Vec<CloudSnapshotCommit>,
+    pins: ValidationGuard,
+}
+impl CloudSnapshotReadGuard {
+    pub fn version(&self) -> &CloudVersion {
+        &self.version
+    }
+    pub fn selector(&self) -> super::CloudVersionSelector {
+        self.selector
+    }
+    pub fn selected_roots(&self) -> &[IndexRootId] {
+        &self.selected
+    }
+    pub fn anchors(&self) -> &[CommitId] {
+        &self.anchors
+    }
+    /// All selected frozen drafts, including hidden records, sorted by commit ID.
+    /// Canonically identical overlap preserves the minimum original order.
+    pub fn frozen_commits(&self) -> &[CloudSnapshotCommit] {
+        &self.frozen
+    }
+    /// Conservative live admission charge, not process/cache RSS. Runtime reader
+    /// entries are included even though they reside in Store's shared maps.
+    pub fn retained_size_upper_bound(&self) -> Result<usize> {
+        let entries = self
+            .pins
+            .native
+            .len()
+            .checked_add(self.pins.cloud.len())
+            .and_then(|n| n.checked_add(self.pins.artifacts.len()))
+            .and_then(|n| n.checked_add(1))
+            .ok_or(Error::Limit("cloud scope retained memory"))?;
+        [
+            Some(std::mem::size_of::<Self>()),
+            self.selected
+                .capacity()
+                .checked_mul(std::mem::size_of::<IndexRootId>()),
+            self.anchors
+                .capacity()
+                .checked_mul(std::mem::size_of::<CommitId>()),
+            self.frozen
+                .capacity()
+                .checked_mul(std::mem::size_of::<CloudSnapshotCommit>()),
+            self.frozen.iter().try_fold(0usize, |sum, node| {
+                sum.checked_add(
+                    node.parents
+                        .capacity()
+                        .checked_mul(std::mem::size_of::<CommitId>())?,
+                )
+            }),
+            self.pins
+                .native
+                .capacity()
+                .checked_mul(std::mem::size_of::<ObjectKey>()),
+            self.pins
+                .cloud
+                .capacity()
+                .checked_mul(std::mem::size_of::<CloudId>()),
+            self.pins
+                .artifacts
+                .capacity()
+                .checked_mul(std::mem::size_of::<IndexArtifactId>()),
+            Some(self.pins.repo.capacity()),
+            self.pins
+                .repo
+                .len()
+                .checked_mul(4)
+                .and_then(|n| n.checked_add(1024))
+                .and_then(|n| n.checked_mul(entries)),
+            Some(4096),
+        ]
+        .into_iter()
+        .try_fold(0usize, |sum, term| {
+            sum.checked_add(term.ok_or(Error::Limit("cloud scope retained memory"))?)
+                .ok_or(Error::Limit("cloud scope retained memory"))
+        })
+    }
+}
+impl Store {
+    pub fn open_cloud_snapshot(
+        &self,
+        repo: &str,
+        owner: CloudOwner,
+        selector: super::CloudVersionSelector,
+        selected: &[IndexRootId],
+        max_anchors: usize,
+    ) -> Result<CloudSnapshotReadGuard> {
+        if selector.generation == 0
+            || selected.is_empty()
+            || selected.len() > self.inner.config.cloud.index_artifacts.max_snapshots
+            || max_anchors == 0
+            || max_anchors > self.inner.config.max_closure_objects
+            || selected.windows(2).any(|pair| pair[0] >= pair[1])
+        {
+            return Err(Error::Invalid("cloud snapshot selection"));
+        }
+        let mut selection = SnapshotSelection {
+            ids: selected,
+            maximum: max_anchors,
+            anchors: Vec::new(),
+            frozen: FrozenCommits::default(),
+        };
+        let value = self
+            .read_cloud_version_selection(
+                repo,
+                owner,
+                selector.workspace,
+                selector.generation,
+                self.inner.config.cloud.manifest_limits,
+                false,
+                Some(&mut selection),
+            )?
+            .ok_or(Error::Corrupt("cloud snapshot schema dispatch"))?;
+        if value.version.manifest != selector.manifest
+            || value.manifest.len() as u64 != selector.selected.size_bytes
+            || blake3::hash(&value.manifest).as_bytes() != &selector.selected.blake3
+        {
+            return Err(Error::Invalid("cloud snapshot version selection"));
+        }
+        if selection.anchors.is_empty() {
+            return Err(Error::Corrupt("cloud selected anchors empty"));
+        }
+        let CloudVersionReadGuard {
+            version,
+            manifest,
+            _guard,
+        } = value;
+        drop(manifest);
+        Ok(CloudSnapshotReadGuard {
+            version,
+            selector,
+            selected: selected.to_vec(),
+            anchors: selection.anchors,
+            frozen: selection.frozen.nodes,
+            pins: _guard,
+        })
+    }
 }

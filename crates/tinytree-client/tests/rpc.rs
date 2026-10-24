@@ -1421,6 +1421,12 @@ use tinytree_proto::query_v1 as q;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum QueryMode {
     Normal,
+    CloudMissingBinding,
+    CloudWrongBinding,
+    CloudBindingWidth,
+    CloudLegacyVersion,
+    CloudRetry,
+    CloudPause,
     RetryOpen,
     RetryOverlay,
     PauseFork,
@@ -1502,6 +1508,96 @@ struct QueryFaults {
 }
 #[tonic::async_trait]
 impl RepositoryQuery for QueryFaults {
+    // SDK transport boundary fixture: no claim that this synthetic echo
+    // authorizes a real stored portable index. Server acceptance is separate.
+    async fn open_cloud_scope(
+        &self,
+        request: Request<Streaming<q::OpenScopeFrame>>,
+    ) -> Result<Response<q::QueryScope>, Status> {
+        let mut stream = request.into_inner();
+        let Some(q::OpenScopeFrame {
+            frame: Some(q::open_scope_frame::Frame::Header(header)),
+        }) = stream.message().await?
+        else {
+            return Err(Status::invalid_argument("missing header"));
+        };
+        assert_eq!(header.version, 2);
+        assert!(
+            header.roots.is_empty(),
+            "expected anchors must never be wire grants"
+        );
+        let source = header.cloud_source.expect("explicit retained source");
+        assert!(!source.index_root_ids.is_empty());
+        assert!(source.index_root_ids.windows(2).all(|ids| ids[0] < ids[1]));
+        let mut ended = false;
+        while let Some(frame) = stream.message().await? {
+            if matches!(frame.frame, Some(q::open_scope_frame::Frame::ScopeEnd(_))) {
+                ended = true;
+            }
+        }
+        assert!(ended);
+        let attempt = self.counts.opens.fetch_add(1, Ordering::SeqCst);
+        if self.mode == QueryMode::CloudPause {
+            self.counts.fork_entered.notify_one();
+            tokio::time::timeout(Duration::from_secs(5), self.counts.fork_release.notified())
+                .await
+                .map_err(|_| {
+                    Status::deadline_exceeded("cloud scope fixture release not signalled")
+                })?;
+        }
+        let epoch = [3; 16];
+        let selected: Vec<[u8; 32]> = source
+            .index_root_ids
+            .iter()
+            .map(|id| id.as_slice().try_into().unwrap())
+            .collect();
+        let binding = tinytree_model::cloud_query_source_binding(
+            source
+                .authority
+                .unwrap()
+                .binding_digest
+                .as_slice()
+                .try_into()
+                .unwrap(),
+            &selected,
+            &[tinytree_model::CommitId::ROOT],
+            epoch,
+        );
+        let mut scope = q::QueryScope {
+            key: Some(q::ScopeKey {
+                repository_id: header.repository_id,
+                handle: vec![9; 32],
+            }),
+            content_digest: vec![4; 32],
+            index_epoch: epoch.to_vec(),
+            high_water: 0,
+            expires_at_unix_seconds: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs() as i64
+                + 60,
+            query_identity_version: 2,
+            cloud_source_binding: binding.to_vec(),
+        };
+        if self.mode == QueryMode::CloudRetry {
+            if attempt == 0 {
+                *self.first_scope.lock().unwrap() = Some(scope);
+                return Err(Status::unavailable("cloud scope ACK withheld"));
+            }
+            scope = self.first_scope.lock().unwrap().clone().unwrap();
+        }
+        match self.mode {
+            QueryMode::CloudMissingBinding => scope.cloud_source_binding.clear(),
+            QueryMode::CloudWrongBinding => scope.cloud_source_binding[0] ^= 1,
+            QueryMode::CloudBindingWidth => {
+                scope.cloud_source_binding.pop();
+            }
+            QueryMode::CloudLegacyVersion => scope.query_identity_version = 1,
+            _ => {}
+        }
+        *self.first_scope.lock().unwrap() = Some(scope.clone());
+        Ok(Response::new(scope))
+    }
     async fn open_scope(
         &self,
         request: Request<Streaming<q::OpenScopeFrame>>,
@@ -1532,6 +1628,30 @@ impl RepositoryQuery for QueryFaults {
         &self,
         request: Request<Streaming<q::ForkScopeFrame>>,
     ) -> Result<Response<q::QueryScope>, Status> {
+        let cloud_parent = self
+            .first_scope
+            .lock()
+            .unwrap()
+            .clone()
+            .filter(|scope| !scope.cloud_source_binding.is_empty());
+        if let Some(mut scope) = cloud_parent {
+            let mut stream = request.into_inner();
+            let Some(q::ForkScopeFrame {
+                frame: Some(q::fork_scope_frame::Frame::Header(header)),
+            }) = stream.message().await?
+            else {
+                return Err(Status::invalid_argument("missing fork header"));
+            };
+            let source = header.scope.unwrap();
+            assert!(source.cloud_source.is_none());
+            assert!(source.roots.is_empty());
+            assert_eq!(source.version, 2);
+            assert_eq!(header.parent_scope, scope.key);
+            while stream.message().await?.is_some() {}
+            self.counts.forks.fetch_add(1, Ordering::SeqCst);
+            scope.key.as_mut().unwrap().handle = vec![10; 32];
+            return Ok(Response::new(scope));
+        }
         let attempt = self.counts.forks.fetch_add(1, Ordering::SeqCst);
         if self.mode == QueryMode::PauseFork {
             self.counts.fork_entered.notify_one();
@@ -1864,6 +1984,8 @@ impl QueryRunning {
             first_page: Arc::new(std::sync::Mutex::new(None)),
         };
         let (stop, stopped) = tokio::sync::oneshot::channel();
+        let cloud = CloudFaults::default();
+        cloud.mode.store(30, Ordering::SeqCst);
         let task = tokio::spawn(async move {
             tonic::transport::Server::builder()
                 .add_service(
@@ -1871,6 +1993,9 @@ impl QueryRunning {
                         .accept_compressed(tonic::codec::CompressionEncoding::Zstd)
                         .send_compressed(tonic::codec::CompressionEncoding::Zstd),
                 )
+                .add_service(tinytree_client::cloud_protocol::workspace_cloud_server::WorkspaceCloudServer::new(cloud)
+                    .accept_compressed(tonic::codec::CompressionEncoding::Zstd)
+                    .send_compressed(tonic::codec::CompressionEncoding::Zstd))
                 .serve_with_incoming_shutdown(
                     tokio_stream::wrappers::TcpListenerStream::new(listener),
                     async {
@@ -6482,4 +6607,253 @@ async fn retained_native_reads_bind_fresh_versions_and_stream_files_beyond_cloud
     );
     server.abort();
     let _ = server.await;
+}
+
+#[tokio::test]
+async fn cloud_scope_sdk_checks_source_echo_and_forks_without_wire_root_grants() {
+    use tinytree_model::CommitId;
+    let (_store, _index, service, _, _) = setup_query();
+    let running = QueryRunning::start(service, QueryMode::CloudRetry).await;
+    let client = running.client().await;
+    let version = client.cloud_retained_version([8; 32], 1).await.unwrap();
+    let drops = Arc::new(AtomicUsize::new(0));
+    let guarded = client
+        .clone()
+        .with_rpc_lifetime_guard(Arc::new(LifetimeProbe(drops.clone())));
+    let scope = guarded
+        .open_cloud_query_scope(
+            &version,
+            vec![[2; 32], [1; 32]],
+            vec![CommitId::ROOT],
+            Vec::new(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        running.opens.load(Ordering::SeqCst),
+        2,
+        "lost ACK reuses immutable cloud intent"
+    );
+    assert_eq!(scope.query_identity_version(), 2);
+    assert_eq!(scope.remote_roots(), &[CommitId::ROOT]);
+    let fork = guarded.fork_query_scope(&scope, Vec::new()).await.unwrap();
+    assert_ne!(scope.handle(), fork.handle());
+    assert_eq!(scope.index_epoch(), fork.index_epoch());
+    assert_eq!(scope.remote_roots(), fork.remote_roots());
+    assert!(fork.expires_at_unix_seconds() <= scope.expires_at_unix_seconds());
+    drop(guarded);
+    assert_released(&drops).await;
+    // A held checked scope/fork cannot retain the physical request guard.
+    let foreign = running.client().await;
+    let before = running.opens.load(Ordering::SeqCst);
+    let counters = || {
+        [
+            running.counts.forks.load(Ordering::SeqCst),
+            running.counts.facts.load(Ordering::SeqCst),
+            running.counts.commit_prefixes.load(Ordering::SeqCst),
+            running.counts.evaluations.load(Ordering::SeqCst),
+            running.counts.closes.load(Ordering::SeqCst),
+        ]
+    };
+    let before_foreign = counters();
+    let expression = q::GraphExpr {
+        version: 1,
+        expression: Some(q::graph_expr::Expression::Commits(q::CommitSet {
+            commits: vec![q::CommitId {
+                value: CommitId::ROOT.0.to_vec(),
+            }],
+        })),
+    };
+    for retained_scope in [&scope, &fork] {
+        assert_eq!(
+            foreign
+                .fork_query_scope(retained_scope, Vec::new())
+                .await
+                .unwrap_err()
+                .code(),
+            Code::FailedPrecondition
+        );
+        assert_eq!(
+            foreign
+                .query_facts(retained_scope, vec![QueryFact::HasId(CommitId::ROOT)])
+                .await
+                .unwrap_err()
+                .code(),
+            Code::FailedPrecondition
+        );
+        assert_eq!(
+            foreign
+                .resolve_commit_prefix(retained_scope, "0")
+                .await
+                .unwrap_err()
+                .code(),
+            Code::FailedPrecondition
+        );
+        assert_eq!(
+            foreign
+                .begin_query(retained_scope, &expression, 1)
+                .await
+                .unwrap_err()
+                .code(),
+            Code::FailedPrecondition
+        );
+        assert_eq!(
+            foreign
+                .close_query_scope(retained_scope)
+                .await
+                .unwrap_err()
+                .code(),
+            Code::FailedPrecondition
+        );
+    }
+    assert_eq!(
+        counters(),
+        before_foreign,
+        "foreign client rejects captured cloud scopes before transport"
+    );
+    drop((scope, fork));
+    let ordinary = client.open_query_scope(vec![CommitId::ROOT]).await.unwrap();
+    assert_eq!(
+        foreign
+            .query_facts(&ordinary, vec![QueryFact::HasId(CommitId::ROOT)])
+            .await
+            .unwrap(),
+        vec![FactAnswer::HasId(true)],
+        "ordinary handle compatibility is unchanged"
+    );
+    // Ordinary OpenScope above adds exactly one unrelated request.
+    let before = before + 1;
+    assert_eq!(
+        foreign
+            .open_cloud_query_scope(&version, vec![[1; 32]], vec![CommitId::ROOT], Vec::new())
+            .await
+            .unwrap_err()
+            .code(),
+        Code::FailedPrecondition
+    );
+    assert_eq!(
+        client
+            .open_cloud_query_scope(
+                &version,
+                vec![[1; 32]; running.config.limits.max_batch_items + 1],
+                vec![CommitId::ROOT],
+                Vec::new()
+            )
+            .await
+            .unwrap_err()
+            .code(),
+        Code::ResourceExhausted
+    );
+    assert_eq!(
+        client
+            .open_cloud_query_scope(
+                &version,
+                vec![[1; 32], [1; 32]],
+                vec![CommitId::ROOT],
+                Vec::new()
+            )
+            .await
+            .unwrap_err()
+            .code(),
+        Code::InvalidArgument
+    );
+    assert_eq!(
+        running.opens.load(Ordering::SeqCst),
+        before,
+        "borrowed preflight rejects before any RPC"
+    );
+    tokio::time::timeout(Duration::from_secs(5), running.stop())
+        .await
+        .expect("cloud scope fixture did not shut down");
+}
+
+#[tokio::test]
+async fn cloud_scope_sdk_never_accepts_missing_wrong_or_legacy_source_echoes() {
+    use tinytree_model::CommitId;
+    for (mode, anchors) in [
+        (QueryMode::CloudMissingBinding, vec![CommitId::ROOT]),
+        (QueryMode::CloudWrongBinding, vec![CommitId::ROOT]),
+        (QueryMode::CloudBindingWidth, vec![CommitId::ROOT]),
+        (QueryMode::CloudLegacyVersion, vec![CommitId::ROOT]),
+        (QueryMode::Normal, vec![CommitId([1; 32])]),
+    ] {
+        let (_store, _index, service, _, _) = setup_query();
+        let running = QueryRunning::start(service, mode).await;
+        let client = running.client().await;
+        let version = client.cloud_retained_version([8; 32], 1).await.unwrap();
+        let error = client
+            .open_cloud_query_scope(&version, vec![[1; 32]], anchors, Vec::new())
+            .await
+            .unwrap_err();
+        assert_eq!(error.code(), Code::DataLoss, "{mode:?}");
+        assert_eq!(
+            running.opens.load(Ordering::SeqCst),
+            1,
+            "never ordinary-scope fallback"
+        );
+        tokio::time::timeout(Duration::from_secs(5), running.stop())
+            .await
+            .expect("cloud scope fixture did not shut down");
+    }
+}
+
+#[tokio::test]
+async fn cancelled_cloud_scope_releases_transport_admission_after_physical_response_drains() {
+    let (_store, _index, service, _, _) = setup_query();
+    let running = QueryRunning::start(service, QueryMode::CloudPause).await;
+    let mut config = running.config.clone();
+    config.limits.max_inflight = 1;
+    let client = NativeClient::connect(config).await.unwrap();
+    let version = client.cloud_retained_version([8; 32], 1).await.unwrap();
+    let first = client.clone();
+    let mut task = tokio::spawn(async move {
+        first
+            .open_cloud_query_scope(
+                &version,
+                vec![[1; 32]],
+                vec![tinytree_model::CommitId::ROOT],
+                Vec::new(),
+            )
+            .await
+    });
+    tokio::time::timeout(Duration::from_secs(5), async {
+        tokio::select! {
+            _ = running.counts.fork_entered.notified() => {},
+            result = &mut task => panic!("cloud scope completed before reaching the accepted-response pause: {result:?}"),
+        }
+    }).await.expect("cloud scope did not reach the accepted-response pause");
+    task.abort();
+    let _ = tokio::time::timeout(Duration::from_secs(5), task)
+        .await
+        .expect("cancelled cloud scope task did not stop");
+    running.counts.fork_release.notify_one();
+    // Same client and sole slot: completion cannot depend on dropping an
+    // unrelated retained scope, increasing a pool, or timeout changes.
+    let version = client.cloud_retained_version([8; 32], 1).await.unwrap();
+    let second = client.clone();
+    let mut task = tokio::spawn(async move {
+        second
+            .open_cloud_query_scope(
+                &version,
+                vec![[1; 32]],
+                vec![tinytree_model::CommitId::ROOT],
+                Vec::new(),
+            )
+            .await
+    });
+    tokio::time::timeout(Duration::from_secs(5), async {
+        tokio::select! {
+            _ = running.counts.fork_entered.notified() => {},
+            result = &mut task => panic!("cloud scope completed before reaching the accepted-response pause: {result:?}"),
+        }
+    }).await.expect("cloud scope did not reach the accepted-response pause");
+    running.counts.fork_release.notify_one();
+    tokio::time::timeout(Duration::from_secs(5), task)
+        .await
+        .expect("next cloud scope did not recover the sole transport slot")
+        .unwrap()
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(5), running.stop())
+        .await
+        .expect("cloud scope fixture did not shut down");
 }

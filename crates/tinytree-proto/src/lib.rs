@@ -81,7 +81,13 @@ mod tests {
             .find(|file| file.name.as_deref() == Some("tinytree/query/v1/query.proto"))
             .unwrap();
         assert_eq!(query_file.package.as_deref(), Some("tinytree.query.v1"));
-        assert_eq!(query_file.dependency, ["tinytree/v1/repository.proto"]);
+        assert_eq!(
+            query_file.dependency,
+            [
+                "tinytree/v1/repository.proto",
+                "tinytree/cloud/v1/cloud.proto"
+            ]
+        );
         assert_eq!(query_file.service.len(), 1);
         let query = query_file
             .service
@@ -103,6 +109,7 @@ mod tests {
             query_methods,
             [
                 ("OpenScope", true, false),
+                ("OpenCloudScope", true, false),
                 ("ForkScope", true, false),
                 ("CloseScope", false, false),
                 ("QueryFacts", false, false),

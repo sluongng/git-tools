@@ -100,8 +100,8 @@ mod artifacts;
 pub use artifacts::{CloudIndexReadLease, CloudIndexWriteReceipt};
 mod versions;
 pub use versions::{
-    CloudPublication, CloudPublicationLimits, CloudVersion, CloudVersionReadGuard, CloudWorkspace,
-    PublishCloudRequest,
+    CloudPublication, CloudPublicationLimits, CloudSnapshotCommit, CloudSnapshotReadGuard,
+    CloudVersion, CloudVersionReadGuard, CloudWorkspace, PublishCloudRequest,
 };
 fn decode<T: serde::de::DeserializeOwned>(bytes: &[u8]) -> Result<T> {
     if bytes.len() > CLOUD_JSON_ROW_BYTES {

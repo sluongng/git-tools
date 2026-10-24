@@ -83,7 +83,9 @@ pub async fn serve_tcp(
         )
         .await
         .context("native gRPC listener failed");
+    let query_drain = drain.drain_query().await;
     drain.drain_cloud().await;
+    query_drain.context("native query shutdown failed")?;
     result
 }
 
@@ -115,7 +117,9 @@ async fn run_unix(
         )
         .await
         .context("native Unix gRPC listener failed");
+    let query_drain = drain.drain_query().await;
     drain.drain_cloud().await;
+    query_drain.context("native query shutdown failed")?;
     result
 }
 

@@ -169,9 +169,12 @@ struct State {
     replay_memory: Option<OwnedSemaphorePermit>,
     active_memory: Option<Arc<ActiveReservation>>,
 }
-struct Garbage {
-    state: Mutex<State>,
-    _memory: Arc<OwnedSemaphorePermit>,
+enum Garbage {
+    State {
+        state: Mutex<State>,
+        memory: Arc<OwnedSemaphorePermit>,
+    },
+    Barrier(std::sync::mpsc::SyncSender<()>),
 }
 struct Record {
     owner: String,
@@ -192,9 +195,9 @@ struct Record {
 }
 impl Drop for Record {
     fn drop(&mut self) {
-        let garbage = Garbage {
+        let garbage = Garbage::State {
             state: self.state.take().expect("cursor state"),
-            _memory: self.memory.take().expect("cursor memory"),
+            memory: self.memory.take().expect("cursor memory"),
         };
         if let Err(error) = self.cleanup.send(garbage) {
             let _ = std::thread::Builder::new()
@@ -225,8 +228,15 @@ impl CursorHost {
             .name("tinytree-cursor-cleanup".into())
             .spawn(move || {
                 while let Ok(garbage) = receiver.recv() {
-                    drop(garbage.state);
-                    drop(garbage._memory);
+                    match garbage {
+                        Garbage::State { state, memory } => {
+                            drop(state);
+                            drop(memory);
+                        }
+                        Garbage::Barrier(done) => {
+                            let _ = done.send(());
+                        }
+                    }
                 }
             })
             .map_err(|_| ConfigError("cannot start cursor cleanup owner"))?;
@@ -251,6 +261,14 @@ impl CursorHost {
                 .collect::<Vec<_>>()
         };
         drop(removed);
+    }
+    pub fn drain_cleanup(&self) -> Result<(), Status> {
+        let (done, wait) = std::sync::mpsc::sync_channel(1);
+        self.cleanup
+            .send(Garbage::Barrier(done))
+            .map_err(|_| Status::internal("cursor cleanup stopped"))?;
+        wait.recv()
+            .map_err(|_| Status::internal("cursor cleanup failed"))
     }
     fn mac(&self, owner: &str, binding: &[u8; 32], prefix: &[u8]) -> blake3::Hash {
         let mut hash = blake3::Hasher::new_keyed(&self.key);
@@ -1025,6 +1043,11 @@ fn graph_row(
         {
             bytes.to_vec()
         } else {
+            if selected.node.is_frozen() && !scope.authorizes_frozen(expected) {
+                return Err(Status::data_loss(
+                    "frozen canonical row lacks its exact retained source",
+                ));
+            }
             let descriptor = host
                 .store
                 .descriptor(repository, expected.key)

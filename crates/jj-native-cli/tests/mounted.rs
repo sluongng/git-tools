@@ -798,6 +798,12 @@ impl RepositoryQuery for CountQueryMetadata {
     ) -> Result<RpcResponse<q::QueryScope>, Status> {
         self.inner.open_scope(r).await
     }
+    async fn open_cloud_scope(
+        &self,
+        r: RpcRequest<Streaming<q::OpenScopeFrame>>,
+    ) -> Result<RpcResponse<q::QueryScope>, Status> {
+        self.inner.open_cloud_scope(r).await
+    }
     async fn fork_scope(
         &self,
         r: RpcRequest<Streaming<q::ForkScopeFrame>>,

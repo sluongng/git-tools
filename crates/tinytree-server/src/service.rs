@@ -133,6 +133,13 @@ impl RepositoryService {
     pub(crate) fn cloud_host(&self) -> Option<Arc<crate::cloud::CloudHost>> {
         self.cloud.clone()
     }
+    /// Globally drains shared query hosting across all cloned service listeners.
+    pub async fn drain_query(&self) -> Result<(), Status> {
+        if let Some(host) = &self.query {
+            host.drain().await?;
+        }
+        Ok(())
+    }
     pub async fn drain_cloud(&self) {
         if let Some(host) = &self.cloud {
             host.drain().await;

@@ -4061,6 +4061,15 @@ fn indexed_cloud_versions_preserve_hidden_drafts_artifacts_and_mixed_schema_hist
     );
     let hidden_tree = put_object(&store, Object::Tree(hidden_entries), 0);
     let mut hidden = commit(TreeId(hidden_tree.key.id.0), "hidden draft");
+    hidden.committer.timestamp.millis_since_epoch = -7000;
+    hidden.root_tree = TreeMerge {
+        terms: vec![
+            TreeId(hidden_tree.key.id.0),
+            TreeId(root.key.id.0),
+            TreeId(hidden_tree.key.id.0),
+        ],
+        labels: vec!["left".into(), "base".into(), "right".into()],
+    };
     hidden.parents = vec![CommitId(head.key.id.0)];
     let hidden = put_object(&store, Object::Commit(hidden), 0);
     let logical = tinytree_cloud::PortableIndexSnapshot {
@@ -4079,6 +4088,117 @@ fn indexed_cloud_versions_preserve_hidden_drafts_artifacts_and_mixed_schema_hist
         manifest: first.manifest,
         selected: tinytree_cloud::BlobDigest::of(&first.manifest_bytes),
     };
+    let selected_index = value
+        .operation_indexes
+        .iter()
+        .find(|entry| entry.operation != [0; 64])
+        .unwrap()
+        .root;
+    let intrinsic_index = value
+        .operation_indexes
+        .iter()
+        .find(|entry| entry.operation == [0; 64])
+        .unwrap()
+        .root;
+    let snapshot = store
+        .open_cloud_snapshot("demo", owner, selector, &[selected_index], 4)
+        .unwrap();
+    assert_eq!(snapshot.anchors(), &[CommitId(head.key.id.0)]);
+    assert!(
+        !snapshot.anchors().contains(&CommitId(hidden.key.id.0)),
+        "retained private drafts are not remote query roots"
+    );
+    let frozen = snapshot.frozen_commits();
+    assert_eq!(
+        frozen.len(),
+        1,
+        "hidden drafts belong to the frozen baseline"
+    );
+    assert_eq!(frozen[0].descriptor, hidden);
+    assert_eq!(frozen[0].parents, vec![CommitId(head.key.id.0)]);
+    assert_eq!(
+        frozen[0].change,
+        cloud_index_draft(&store, hidden, 7).change
+    );
+    assert_eq!(frozen[0].committer_millis, -7000);
+    assert!(frozen[0].has_conflict);
+    assert_eq!(
+        frozen[0].order, 7,
+        "preserve original ordinal, not commit-ID order"
+    );
+    assert_eq!(snapshot.selected_roots(), &[selected_index]);
+    assert_eq!(snapshot.selector(), selector);
+    assert!(snapshot.retained_size_upper_bound().unwrap() < 1024 * 1024);
+    let intrinsic = store
+        .open_cloud_snapshot("demo", owner, selector, &[intrinsic_index], 4)
+        .unwrap();
+    assert_eq!(
+        intrinsic.anchors(),
+        &[CommitId::ROOT],
+        "intrinsic selection is not a missing-source fallback"
+    );
+    assert!(
+        intrinsic.frozen_commits().is_empty(),
+        "unselected drafts must not leak into intrinsic snapshot"
+    );
+    let mut both = vec![selected_index, intrinsic_index];
+    both.sort();
+    both.dedup();
+    assert_eq!(
+        store
+            .open_cloud_snapshot("demo", owner, selector, &both, 4)
+            .unwrap()
+            .anchors(),
+        &[CommitId::ROOT, CommitId(head.key.id.0)]
+    );
+    assert_eq!(
+        store
+            .open_cloud_snapshot("demo", owner, selector, &both, 4)
+            .unwrap()
+            .frozen_commits(),
+        snapshot.frozen_commits()
+    );
+    assert!(matches!(
+        store.open_cloud_snapshot("demo", owner, selector, &both, 1),
+        Err(Error::Limit("cloud selected anchor count"))
+    ));
+    assert!(
+        store
+            .open_cloud_snapshot(
+                "demo",
+                owner,
+                selector,
+                &[selected_index, selected_index],
+                4
+            )
+            .is_err()
+    );
+    assert!(
+        store
+            .open_cloud_snapshot(
+                "demo",
+                owner,
+                selector,
+                &[tinytree_cloud::IndexRootId([99; 32])],
+                4
+            )
+            .is_err()
+    );
+    assert!(
+        store
+            .open_cloud_snapshot(
+                "demo",
+                CloudOwner {
+                    principal: [99; 32]
+                },
+                selector,
+                &[selected_index],
+                4
+            )
+            .is_err()
+    );
+    drop(snapshot);
+    drop(intrinsic);
     let path = [hidden_tree.key, hidden_file.key];
     let mut read = store
         .read_cloud_native(
@@ -4323,6 +4443,14 @@ fn indexed_cloud_versions_preserve_hidden_drafts_artifacts_and_mixed_schema_hist
         2
     );
     assert_eq!(store.descriptor("demo", hidden.key).unwrap(), Some(hidden));
+    assert_eq!(
+        store
+            .open_cloud_snapshot("demo", owner, selector, &[selected_index], 4)
+            .unwrap()
+            .anchors(),
+        &[CommitId(head.key.id.0)]
+    );
+
     let mut restored = Vec::new();
     store
         .read_cloud_native(
@@ -4730,6 +4858,123 @@ fn small_index_cloud_config() -> Config {
     small.cloud.index_artifacts.snapshot.max_encoded_bytes = 4096;
     small
 }
+#[test]
+fn selected_cloud_snapshot_overlap_preserves_minimum_original_order() {
+    for (name, other_order, expected_order) in [
+        ("same original ordinal deduplicates", 7, 7),
+        (
+            "larger overlapping ordinal preserves original minimum",
+            8,
+            7,
+        ),
+        ("smaller overlapping ordinal becomes minimum", 6, 6),
+    ] {
+        let (_directory, store) = open();
+        let owner = CloudOwner {
+            principal: [81; 32],
+        };
+        let (_, root, head) = fixture(&store, "overlapping checkpoint anchor");
+        let mut draft = commit(TreeId(root.key.id.0), "retained hidden draft");
+        draft.parents = vec![CommitId(head.key.id.0)];
+        let draft = put_object(&store, Object::Commit(draft), 0);
+        let logical = tinytree_cloud::PortableIndexSnapshot {
+            roots: vec![CommitId(head.key.id.0)],
+            drafts: vec![cloud_index_draft(&store, draft, 7)],
+        };
+        let (mut value, mut leases, _) = cloud_v2_capture(&store, owner, head, root, logical);
+        let original = value
+            .operation_indexes
+            .iter()
+            .find(|entry| entry.operation != [0; 64])
+            .unwrap()
+            .root;
+        // A real second operation/view has a different reference set, while
+        // sharing exactly the same native history and immutable draft bytes.
+        let (other_operation, receipts) = cloud_capture_with_refs(&store, owner, head, root, 1);
+        let operation = other_operation.operation_heads[0];
+        assert!(
+            !value
+                .operation_indexes
+                .iter()
+                .any(|entry| entry.operation == operation)
+        );
+        value.recovery.undo_operations.push(operation);
+        value.recovery.members.extend(other_operation.members);
+        value.recovery.members.sort_by_key(|member| member.id);
+        value.recovery.members.dedup_by_key(|member| member.id);
+        leases.extend(receipts.into_iter().map(|receipt| receipt.staging_lease));
+        let alternate = tinytree_cloud::build_index_artifacts(
+            &tinytree_cloud::PortableIndexSnapshot {
+                roots: vec![CommitId::ROOT, CommitId(head.key.id.0)],
+                drafts: vec![cloud_index_draft(&store, draft, other_order)],
+            },
+            Default::default(),
+        )
+        .unwrap();
+        for artifact in &alternate.artifacts {
+            leases.push(
+                store
+                    .put_cloud_index_artifact(
+                        "demo",
+                        owner,
+                        artifact.descriptor,
+                        &artifact.bytes,
+                        0,
+                        Default::default(),
+                    )
+                    .unwrap()
+                    .staging_lease,
+            );
+        }
+        value.index_roots.push(alternate.root);
+        value.index_roots.sort_by_key(|root| root.id);
+        value
+            .operation_indexes
+            .push(tinytree_cloud::OperationIndex {
+                operation,
+                root: alternate.root.id,
+            });
+        value.operation_indexes.sort_by_key(|entry| entry.operation);
+        leases.sort();
+        leases.dedup();
+        let request = cloud_v2_request(&value, 0, "overlapping-checkpoints", leases);
+        store
+            .publish_cloud_version("demo", owner, &request, 1, &Default::default())
+            .unwrap();
+        let selector = CloudVersionSelector {
+            workspace: value.recovery.workspace,
+            generation: 1,
+            manifest: request.manifest,
+            selected: tinytree_cloud::BlobDigest::of(&request.manifest_bytes),
+        };
+        assert_eq!(
+            store
+                .open_cloud_snapshot("demo", owner, selector, &[original], 4)
+                .unwrap()
+                .frozen_commits()[0]
+                .order,
+            7,
+            "{name}"
+        );
+        assert_eq!(
+            store
+                .open_cloud_snapshot("demo", owner, selector, &[alternate.root.id], 4)
+                .unwrap()
+                .frozen_commits()[0]
+                .order,
+            other_order,
+            "{name}"
+        );
+        let mut selected = vec![original, alternate.root.id];
+        selected.sort();
+        let result = store.open_cloud_snapshot("demo", owner, selector, &selected, 4);
+        let guard = result.unwrap();
+        assert_eq!(guard.frozen_commits().len(), 1, "{name}");
+        assert_eq!(guard.frozen_commits()[0].descriptor, draft, "{name}");
+        assert_eq!(guard.frozen_commits()[0].order, expected_order, "{name}");
+    }
+}
+
 #[test]
 fn indexed_native_ancestry_proof_admits_frontier_and_decode_within_remaining_version_memory() {
     let directory = tempfile::tempdir().unwrap();

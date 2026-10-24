@@ -1,6 +1,7 @@
 //! Checked immutable query scopes with private canonical draft overlays. Exact negative/completeness answers trust the
 //! authenticated server; canonical IDs cannot prove that results were not omitted.
 use super::*;
+use crate::VerifiedRetainedVersion;
 use tinytree_model::{ChangeId, CommitId};
 use tinytree_proto::query_v1 as q;
 
@@ -14,7 +15,31 @@ pub struct CheckedScopeHandle {
     expires_at: i64,
     remote_roots: Arc<[CommitId]>,
     query_identity_version: u32,
+    cloud_source: Option<Arc<CloudScopeSource>>,
 }
+#[derive(Clone)]
+struct CloudScopeSource {
+    wire: q::CloudSnapshotSource,
+    native_binding: [u8; 32],
+    selected: Vec<[u8; 32]>,
+    client_identity: std::sync::Weak<Inner>,
+}
+impl std::fmt::Debug for CloudScopeSource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CloudScopeSource")
+            .field("selected", &self.selected)
+            .finish_non_exhaustive()
+    }
+}
+impl PartialEq for CloudScopeSource {
+    fn eq(&self, other: &Self) -> bool {
+        self.wire == other.wire
+            && self.native_binding == other.native_binding
+            && self.selected == other.selected
+            && self.client_identity.ptr_eq(&other.client_identity)
+    }
+}
+impl Eq for CloudScopeSource {}
 impl CheckedScopeHandle {
     pub fn query_identity_version(&self) -> u32 {
         self.query_identity_version
@@ -130,6 +155,15 @@ impl NativeClient {
                 "query scope belongs to another repository",
             ));
         }
+        if scope
+            .cloud_source
+            .as_ref()
+            .is_some_and(|source| !source.client_identity.ptr_eq(&Arc::downgrade(&self.inner)))
+        {
+            return Err(Status::failed_precondition(
+                "cloud query scope belongs to another client",
+            ));
+        }
         if !allow_expired && scope.expires_at <= unix_seconds()? {
             return Err(Status::failed_precondition("native query scope expired"));
         }
@@ -156,7 +190,7 @@ impl NativeClient {
         if roots.is_empty() {
             return Err(Status::invalid_argument("query scope requires roots"));
         }
-        self.install_query_scope(roots.into(), overlay, None, 1)
+        self.install_query_scope(roots.into(), overlay, None, 1, None)
             .await
     }
     /// Explicitly negotiate scope-bound query identities; never downgrade.
@@ -178,8 +212,41 @@ impl NativeClient {
         if roots.is_empty() {
             return Err(Status::invalid_argument("query scope requires roots"));
         }
-        self.install_query_scope(roots.into(), overlay, None, 2)
+        self.install_query_scope(roots.into(), overlay, None, 2, None)
             .await
+    }
+    /// Open an explicitly retained portable-index snapshot. Expected anchors are
+    /// local verification inputs, not roots granted on the wire. This requires
+    /// server support and never falls back to an ordinary root-based scope.
+    pub async fn open_cloud_query_scope(
+        &self,
+        version: &VerifiedRetainedVersion,
+        mut selected_index_roots: Vec<[u8; 32]>,
+        mut expected_anchors: Vec<CommitId>,
+        overlay: Vec<VerifiedMetadata>,
+    ) -> Result<CheckedScopeHandle, Status> {
+        version.check_query_client(self)?;
+        self.batch(selected_index_roots.len())?;
+        self.batch(expected_anchors.len())?;
+        if selected_index_roots.is_empty() || expected_anchors.is_empty() {
+            return Err(Status::invalid_argument(
+                "cloud query scope requires selected roots and expected anchors",
+            ));
+        }
+        selected_index_roots.sort_unstable();
+        if selected_index_roots.windows(2).any(|ids| ids[0] == ids[1]) {
+            return Err(Status::invalid_argument("duplicate cloud query index root"));
+        }
+        expected_anchors.sort_unstable();
+        expected_anchors.dedup();
+        self.install_query_scope(
+            expected_anchors.into(),
+            overlay,
+            None,
+            2,
+            Some((version, selected_index_roots)),
+        )
+        .await
     }
     /// Shares the parent's immutable remote checkpoint and private graph, adding
     /// only these parent-first drafts. Forks cannot extend the parent's expiry.
@@ -194,6 +261,7 @@ impl NativeClient {
             overlay,
             Some(parent),
             parent.query_identity_version,
+            None,
         )
         .await
     }
@@ -203,6 +271,7 @@ impl NativeClient {
         overlay: Vec<VerifiedMetadata>,
         parent: Option<&CheckedScopeHandle>,
         identity_version: u32,
+        cloud: Option<(&VerifiedRetainedVersion, Vec<[u8; 32]>)>,
     ) -> Result<CheckedScopeHandle, Status> {
         let deadline = self.deadline();
         self.batch(overlay.len())?;
@@ -238,7 +307,32 @@ impl NativeClient {
             })
             .and_then(|n| n.checked_add(self.unary_memory()))
             .ok_or_else(|| Status::resource_exhausted("query overlay memory exceeds budget"))?;
+        let source_bytes = cloud
+            .as_ref()
+            .map_or(0, |(_, ids)| ids.len().saturating_mul(128))
+            .checked_add(roots.len().saturating_mul(128))
+            .ok_or_else(|| {
+                Status::resource_exhausted("query scope source memory exceeds budget")
+            })?;
+        let memory = memory.checked_add(source_bytes).ok_or_else(|| {
+            Status::resource_exhausted("query scope source memory exceeds budget")
+        })?;
         let budget = self.admit(deadline, memory).await?;
+        let cloud_source = if let Some((version, selected)) = cloud {
+            let (selector, authority) = version.query_source_parts(self)?;
+            Some(Arc::new(CloudScopeSource {
+                wire: q::CloudSnapshotSource {
+                    selector: Some(selector),
+                    authority: Some(authority),
+                    index_root_ids: selected.iter().map(|id| id.to_vec()).collect(),
+                },
+                native_binding: version.binding_digest(),
+                selected,
+                client_identity: Arc::downgrade(&self.inner),
+            }))
+        } else {
+            parent.and_then(|parent| parent.cloud_source.clone())
+        };
         let all: HashSet<_> = overlay
             .iter()
             .map(|object| object.descriptor.key.id)
@@ -280,7 +374,16 @@ impl NativeClient {
             version: identity_version,
             repository_id: self.inner.config.repository_id.clone(),
             replay_key: replay_key.to_vec(),
-            roots: roots.iter().copied().map(wire_commit).collect(),
+            roots: if cloud_source.is_some() {
+                Vec::new()
+            } else {
+                roots.iter().copied().map(wire_commit).collect()
+            },
+            cloud_source: if parent.is_none() {
+                cloud_source.as_ref().map(|source| source.wire.clone())
+            } else {
+                None
+            },
             overlay_object_count: overlay.commits.len() as u64,
             overlay_bytes: overlay.total,
         };
@@ -305,6 +408,7 @@ impl NativeClient {
         }
         self.retry(deadline, true, |allowance| {
             let mut grpc = self.rpc_client(budget.clone());
+            let cloud_source = cloud_source.clone();
             let (header, fork_header, overlay, budget, roots) = (
                 header.clone(),
                 fork_header.clone(),
@@ -319,6 +423,16 @@ impl NativeClient {
                     grpc.fork_scope(
                         self.request(
                             fork_scope_frames(header, overlay, budget, frame_bytes, done),
+                            allowance,
+                        ),
+                        physical_owner,
+                    )
+                    .await?
+                    .into_inner()
+                } else if cloud_source.is_some() {
+                    grpc.open_cloud_scope(
+                        self.request(
+                            scope_frames(header, overlay, budget, frame_bytes, done),
                             allowance,
                         ),
                         physical_owner,
@@ -352,6 +466,24 @@ impl NativeClient {
                 {
                     return Err(integrity());
                 }
+                let epoch: [u8; 16] = scope
+                    .index_epoch
+                    .as_slice()
+                    .try_into()
+                    .map_err(|_| integrity())?;
+                if let Some(source) = &cloud_source {
+                    let expected = tinytree_model::cloud_query_source_binding(
+                        source.native_binding,
+                        &source.selected,
+                        &roots,
+                        epoch,
+                    );
+                    if scope.cloud_source_binding.as_slice() != expected {
+                        return Err(integrity());
+                    }
+                } else if !scope.cloud_source_binding.is_empty() {
+                    return Err(integrity());
+                }
                 Ok(CheckedScopeHandle {
                     repository: key.repository_id,
                     handle: key.handle.try_into().map_err(|_| integrity())?,
@@ -361,6 +493,7 @@ impl NativeClient {
                     expires_at: scope.expires_at_unix_seconds,
                     remote_roots: roots,
                     query_identity_version: identity_version,
+                    cloud_source,
                 })
             }
         })

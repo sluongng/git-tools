@@ -1,7 +1,7 @@
 //! Native-only canonical objects. This is not protobuf or upstream Commit serde.
 //! No storage, transport, signing-key access, Git conversion or GC is performed.
 mod cloud_native;
-pub use cloud_native::cloud_native_binding_digest;
+pub use cloud_native::{cloud_native_binding_digest, cloud_query_source_binding};
 use std::fmt;
 
 pub const FORMAT_VERSION: u16 = 1;

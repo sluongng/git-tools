@@ -24,6 +24,28 @@ impl std::fmt::Debug for VerifiedRetainedVersion {
     }
 }
 impl VerifiedRetainedVersion {
+    pub(crate) fn query_source_parts(
+        &self,
+        client: &NativeClient,
+    ) -> Result<(c::RetainedVersionSelector, c::NativeVersionAuthority), Status> {
+        self.check_query_client(client)?;
+        Ok((
+            c::RetainedVersionSelector {
+                workspace_id: self.selector.workspace_id.to_vec(),
+                generation: self.selector.generation,
+                manifest_id: self.selector.manifest_id.0.to_vec(),
+            },
+            self.authority.clone(),
+        ))
+    }
+    pub(crate) fn check_query_client(&self, client: &NativeClient) -> Result<(), Status> {
+        if !Arc::ptr_eq(&client.inner, &self._client) {
+            return Err(Status::failed_precondition(
+                "retained version belongs to another client",
+            ));
+        }
+        Ok(())
+    }
     pub fn selector(&self) -> RetainedVersionSelector {
         self.selector
     }

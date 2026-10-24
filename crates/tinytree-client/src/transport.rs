@@ -204,6 +204,30 @@ impl Client {
             )
             .await
     }
+    pub async fn open_cloud_scope(
+        &mut self,
+        request: impl tonic::IntoStreamingRequest<Message = q::OpenScopeFrame>,
+        owner: PhysicalOwner,
+    ) -> Result<Response<q::QueryScope>, Status> {
+        self.inner
+            .ready()
+            .await
+            .map_err(|_| Status::unavailable("native gRPC transport not ready"))?;
+        self.inner
+            .client_streaming(
+                request.into_streaming_request(),
+                http::uri::PathAndQuery::from_static(
+                    "/tinytree.query.v1.RepositoryQuery/OpenCloudScope",
+                ),
+                BoundedCodec::<q::OpenScopeFrame, q::QueryScope>::new(
+                    Shape::QueryScope,
+                    self.limits.clone(),
+                    self.decode,
+                )
+                .with_owner(owner),
+            )
+            .await
+    }
     pub async fn fork_scope(
         &mut self,
         request: impl tonic::IntoStreamingRequest<Message = q::ForkScopeFrame>,
@@ -734,7 +758,7 @@ fn scan(
                     }
                     charge(budget, data.len().saturating_mul(2))?;
                     let exact = match (shape, number) {
-                        (Shape::QueryScope, 2)
+                        (Shape::QueryScope, 2 | 8)
                         | (Shape::IdsPage | Shape::GraphPage | Shape::CanonicalPage, 1)
                         | (Shape::ScopeKey, 2)
                         | (Shape::CommitId, 1)
@@ -903,7 +927,7 @@ fn rule(shape: Shape, n: u32, l: &Limits) -> Option<(u8, Option<Shape>, usize, u
         (Shape::IdsRow, 1) => nested(Shape::CommitId),
         (Shape::IdsRow, 2) => nested(Shape::ChangeId),
         (Shape::QueryScope, 1) => nested(Shape::ScopeKey),
-        (Shape::QueryScope, 2)
+        (Shape::QueryScope, 2 | 8)
         | (Shape::ScopeKey, 2)
         | (Shape::CommitId, 1)
         | (Shape::QueryFacts, 2) => text(32),

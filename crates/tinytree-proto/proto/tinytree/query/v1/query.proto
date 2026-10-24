@@ -3,6 +3,7 @@ syntax = "proto3";
 package tinytree.query.v1;
 
 import "tinytree/v1/repository.proto";
+import "tinytree/cloud/v1/cloud.proto";
 
 // Experimental derived-index contract, separate from authoritative object I/O.
 // Bindings alone provide no authentication, validation, retention or resource
@@ -12,6 +13,7 @@ import "tinytree/v1/repository.proto";
 // allocation. Accepted physical jobs retain their guards after cancellation.
 service RepositoryQuery {
   rpc OpenScope(stream OpenScopeFrame) returns (QueryScope);
+  rpc OpenCloudScope(stream OpenScopeFrame) returns (QueryScope);
   rpc ForkScope(stream ForkScopeFrame) returns (QueryScope);
   rpc CloseScope(CloseScopeRequest) returns (CloseScopeResponse);
   rpc QueryFacts(QueryFactsRequest) returns (GraphFacts);
@@ -34,6 +36,7 @@ message QueryScope {
   bytes index_epoch = 3; // Exactly 16 bytes, durable index incarnation.
   uint64 high_water = 4;
   int64 expires_at_unix_seconds = 5; // Absolute expiry, not sliding access TTL.
+  bytes cloud_source_binding = 8; // Mandatory32 for cloud scopes, empty for legacy.
   uint32 query_identity_version = 7; // 1 legacy; 2 scope-bound query identities.
 }
 
@@ -66,11 +69,14 @@ message ScopeHeader {
   repeated CommitId roots = 4;
   uint64 overlay_object_count = 5;
   uint64 overlay_bytes = 6;
+  CloudSnapshotSource cloud_source = 7;
 }
 message ForkScopeHeader {
   ScopeHeader scope = 1;
   ScopeKey parent_scope = 2; // Same repository/principal; share immutable nodes.
-  // scope.roots must equal the parent's remote roots. Use OpenScope for a new base.
+  // Ordinary scope.roots must equal the parent's remote roots. Cloud forks
+  // require empty roots and absent cloud_source, inheriting the exact parent.
+  // Use an explicit Open method for a new base; mixed sources are unsupported.
 }
 message OverlayCommitHeader {
   tinytree.v1.ObjectDescriptor descriptor = 1; // Non-root COMMIT only.
@@ -338,3 +344,11 @@ message EvaluatePage {
 // its absolute expiry. Closing a scope prevents new queries; it does not revoke
 // an accepted cursor or its replay identity. Continuations repeat the same AST,
 // projection and page_size; changing any immutable input under query_id errors.
+
+// Only OpenCloudScope accepts this source. Header.roots must be empty and
+// identity version2. The server derives exact selected anchors, never drafts.
+message CloudSnapshotSource {
+  tinytree.cloud.v1.RetainedVersionSelector selector = 1;
+  tinytree.cloud.v1.NativeVersionAuthority authority = 2;
+  repeated bytes index_root_ids = 3; // Nonempty, strictly sorted unique32.
+}

@@ -5,7 +5,7 @@ use std::{
     convert::Infallible,
     future::Future,
     pin::Pin,
-    sync::Arc,
+    sync::{Arc, Mutex},
     task::{Context, Poll},
 };
 use tonic::{Status, body::Body, metadata::MetadataMap, server::NamedService};
@@ -13,6 +13,9 @@ use tower::{Layer, Service};
 
 /// Authenticated, globally bounded transport for the repository query service.
 /// Custom listeners should use this wrapper, not only the raw trait adapter.
+/// Taken exactly once by the cloud-open handler. The HTTP wrapper deliberately
+/// holds no clone after insertion; the heavy proof owner ends with the Store job.
+pub(crate) struct CloudProofAdmission(pub Mutex<Option<Arc<crate::cloud::Work>>>);
 #[derive(Clone)]
 pub struct QueryGrpcService {
     inner: tower::util::BoxCloneSyncService<http::Request<Body>, http::Response<Body>, Infallible>,
@@ -67,22 +70,39 @@ where
         self.inner.poll_ready(cx)
     }
     fn call(&mut self, mut request: http::Request<Body>) -> Self::Future {
-        let streaming = request.uri().path().ends_with("/OpenScope")
+        let cloud_open = request.uri().path().ends_with("/OpenCloudScope");
+        let streaming = cloud_open
+            || request.uri().path().ends_with("/OpenScope")
             || request.uri().path().ends_with("/ForkScope");
         let metadata = MetadataMap::from_headers(request.headers().clone());
         // Authenticate before body polling or revealing derived-host availability.
-        let context = self.repository.query_identity(&metadata).and_then(|_| {
-            let deadline = self.repository.query_deadline(&metadata, streaming)?;
-            let host = self
-                .repository
-                .query_host()
-                .ok_or_else(|| Status::unavailable("derived queries are not configured"))?;
-            Ok((deadline, host))
-        });
+        let context =
+            self.repository
+                .query_identity(&metadata)
+                .and_then(|identity| {
+                    let cloud = if cloud_open {
+                        identity.cloud_capability()?;
+                        let cloud = self.repository.cloud_host().ok_or_else(|| {
+                            Status::unimplemented("cloud query scopes are disabled")
+                        })?;
+                        if !cloud.config.indexed_versions {
+                            return Err(Status::unimplemented("cloud query scopes are disabled"));
+                        }
+                        Some(cloud)
+                    } else {
+                        None
+                    };
+                    let deadline = self.repository.query_deadline(&metadata, streaming)?;
+                    let host = self
+                        .repository
+                        .query_host()
+                        .ok_or_else(|| Status::unavailable("derived queries are not configured"))?;
+                    Ok((deadline, host, cloud))
+                });
         let replacement = self.inner.clone();
         let mut inner = std::mem::replace(&mut self.inner, replacement);
         Box::pin(async move {
-            let (deadline, host) = match context {
+            let (deadline, host, cloud) = match context {
                 Ok(context) => context,
                 Err(status) => return Ok(status.into_http()),
             };
@@ -90,6 +110,17 @@ where
                 Ok(work) => work,
                 Err(status) => return Ok(status.into_http()),
             };
+            if let Some(cloud) = cloud {
+                // Fail-fast second admission: never await an upgrade while the
+                // ordinary query reservation is held.
+                let proof = match cloud.admit("OpenCloudScope", deadline) {
+                    Ok(proof) => proof,
+                    Err(status) => return Ok(status.into_http()),
+                };
+                request
+                    .extensions_mut()
+                    .insert(Arc::new(CloudProofAdmission(Mutex::new(Some(proof)))));
+            }
             request.extensions_mut().insert(work.clone());
             // Deadline/cancellation may drop a decoding or handler future, but
             // accepted blocking jobs retain their cloned Work until completion.
@@ -236,6 +267,110 @@ mod tests {
         drop(response);
         assert!(
             host.admit(tokio::time::Instant::now() + Duration::from_secs(1))
+                .await
+                .is_ok()
+        );
+    }
+    #[tokio::test]
+    async fn cloud_proof_admission_precedes_body_without_taxing_ordinary_queries() {
+        let temporary = tempfile::tempdir().unwrap();
+        let mut profile: crate::Config =
+            toml::from_str(include_str!("../examples/cloud.toml")).unwrap();
+        profile.service.cloud.indexed_versions = true;
+        profile.service.cloud.max_inflight = 1;
+        profile.service.query.max_inflight = 1;
+        profile.validate().unwrap();
+        let store = tinytree_store::Store::open(
+            temporary.path().join("objects"),
+            profile
+                .store
+                .materialize(profile.service.max_metadata_bytes),
+        )
+        .unwrap();
+        store.create_repository("example").unwrap();
+        let index =
+            tinytree_index::Index::open(temporary.path().join("index"), &Default::default())
+                .unwrap();
+        let repository = RepositoryService::new(
+            store,
+            profile.service,
+            vec!["example".into()],
+            vec![
+                Principal::new("agent", TOKEN, vec!["example".into()], true)
+                    .unwrap()
+                    .with_cloud(true),
+            ],
+        )
+        .unwrap()
+        .with_query_index(index)
+        .unwrap();
+        let cloud = repository.cloud_host().unwrap();
+        let held = cloud
+            .admit(
+                "OpenCloudScope",
+                tokio::time::Instant::now() + Duration::from_secs(1),
+            )
+            .unwrap();
+        let service = repository.query_grpc_service();
+        let (mut blocked, polls) = request(true);
+        *blocked.uri_mut() = "/tinytree.query.v1.RepositoryQuery/OpenCloudScope"
+            .parse()
+            .unwrap();
+        let response = service.clone().oneshot(blocked).await.unwrap();
+        assert_eq!(response.headers().get("grpc-status").unwrap(), "8");
+        assert_eq!(
+            polls.load(Ordering::SeqCst),
+            0,
+            "full proof admission must precede Prost/body polling"
+        );
+        drop(response);
+        let (ordinary, polls) = request(true);
+        let response = service.clone().oneshot(ordinary).await.unwrap();
+        assert_eq!(
+            response.headers().get("grpc-status").unwrap(),
+            "9",
+            "ordinary query reaches its real missing-scope lookup without a cloud proof reservation"
+        );
+        assert!(polls.load(Ordering::SeqCst) > 0);
+        drop(response);
+        drop(held);
+        let malformed = q::OpenScopeFrame {
+            frame: Some(q::open_scope_frame::Frame::ScopeEnd(Default::default())),
+        }
+        .encode_to_vec();
+        let mut frame = vec![0];
+        frame.extend_from_slice(&(malformed.len() as u32).to_be_bytes());
+        frame.extend_from_slice(&malformed);
+        let (accepted, polls) = request(true);
+        let (mut parts, _) = accepted.into_parts();
+        parts.uri = "/tinytree.query.v1.RepositoryQuery/OpenCloudScope"
+            .parse()
+            .unwrap();
+        let accepted = http::Request::from_parts(
+            parts,
+            Body::new(CountedBody {
+                bytes: Some(frame.into()),
+                polls: polls.clone(),
+            }),
+        );
+        let response = service.oneshot(accepted).await.unwrap();
+        assert_eq!(response.headers().get("grpc-status").unwrap(), "3");
+        assert!(polls.load(Ordering::SeqCst) > 0);
+        drop(response);
+        assert!(
+            cloud
+                .admit(
+                    "OpenCloudScope",
+                    tokio::time::Instant::now() + Duration::from_secs(1)
+                )
+                .is_ok(),
+            "malformed header must release the one-shot proof owner"
+        );
+        assert!(
+            repository
+                .query_host()
+                .unwrap()
+                .admit(tokio::time::Instant::now() + Duration::from_secs(1))
                 .await
                 .is_ok()
         );
