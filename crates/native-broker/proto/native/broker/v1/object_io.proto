@@ -81,15 +81,17 @@ message QueryFactsRequest {
   string store_id = 1; bytes scope = 2;
   repeated tinytree.query.v1.GraphFact facts = 3;
 }
-message QueryCommitPrefixRequest { string store_id = 1; bytes scope = 2; string hex_prefix = 3; }
+message QueryCommitPrefixRequest { string store_id = 1; bytes scope = 2; string hex_prefix = 3; tinytree.query.v1.GraphExpr selection = 4; }
 message QueryChangePrefixRequest {
   string store_id = 1; bytes scope = 2; string hex_prefix = 3;
   repeated bytes visible_heads = 4;
+  tinytree.query.v1.GraphExpr selection = 5;
 }
 message QueryShortestPrefixRequest {
   string store_id = 1; bytes scope = 2;
   oneof target { bytes commit = 3; bytes change = 4; }
   repeated bytes visible_heads = 5;
+  tinytree.query.v1.GraphExpr selection = 6;
 }
 message QueryBeginRequest {
   string store_id = 1; bytes scope = 2;

@@ -1679,6 +1679,7 @@ impl native_broker::NativeQueryIo for FakeQuery {
         self.scope(s)?;
         Ok(
             self.reply(native_broker::query_protocol::CommitPrefixResult {
+                selection_digest: None,
                 result: Some(
                     native_broker::query_protocol::commit_prefix_result::Result::Single(
                         native_broker::query_protocol::CommitMatch {

@@ -386,11 +386,29 @@ impl p::query_io_server::QueryIo for BrokerService {
     ) -> Result<Response<q::CommitPrefixResult>, Status> {
         let (i, w) = input(request, self.query_limit())?;
         prefix(&i.hex_prefix, 64)?;
-        let v = self
-            .query_provider(&i.store_id)?
-            .resolve_commit_prefix(handle(&i.scope)?, i.hex_prefix, w.clone())
-            .await
-            .map_err(crate::query::status)?;
+        let provider = self.query_provider(&i.store_id)?;
+        let v = match i.selection {
+            Some(selection) => {
+                let digest = crate::prefix_selection_digest(&selection, self.query_limit())?;
+                let v = provider
+                    .resolve_commit_prefix_selected(
+                        handle(&i.scope)?,
+                        i.hex_prefix,
+                        selection,
+                        w.clone(),
+                    )
+                    .await
+                    .map_err(crate::query::status)?;
+                if v.value.selection_digest.as_deref() != Some(digest.as_slice()) {
+                    return Err(Status::data_loss("selected prefix digest mismatch"));
+                }
+                v
+            }
+            None => provider
+                .resolve_commit_prefix(handle(&i.scope)?, i.hex_prefix, w.clone())
+                .await
+                .map_err(crate::query::status)?,
+        };
         reply(v, w, self.query_limit())
     }
     async fn resolve_change_prefix(
@@ -399,16 +417,35 @@ impl p::query_io_server::QueryIo for BrokerService {
     ) -> Result<Response<q::ChangePrefixResult>, Status> {
         let (i, w) = input(request, self.query_limit())?;
         prefix(&i.hex_prefix, 32)?;
-        let v = self
-            .query_provider(&i.store_id)?
-            .resolve_change_prefix(
-                handle(&i.scope)?,
-                i.hex_prefix,
-                commits(i.visible_heads)?,
-                w.clone(),
-            )
-            .await
-            .map_err(crate::query::status)?;
+        let provider = self.query_provider(&i.store_id)?;
+        let v = match i.selection {
+            Some(selection) => {
+                let digest = crate::prefix_selection_digest(&selection, self.query_limit())?;
+                let v = provider
+                    .resolve_change_prefix_selected(
+                        handle(&i.scope)?,
+                        i.hex_prefix,
+                        commits(i.visible_heads)?,
+                        selection,
+                        w.clone(),
+                    )
+                    .await
+                    .map_err(crate::query::status)?;
+                if v.value.selection_digest.as_deref() != Some(digest.as_slice()) {
+                    return Err(Status::data_loss("selected prefix digest mismatch"));
+                }
+                v
+            }
+            None => provider
+                .resolve_change_prefix(
+                    handle(&i.scope)?,
+                    i.hex_prefix,
+                    commits(i.visible_heads)?,
+                    w.clone(),
+                )
+                .await
+                .map_err(crate::query::status)?,
+        };
         reply(v, w, self.query_limit())
     }
     async fn shortest_prefix(
@@ -432,16 +469,39 @@ impl p::query_io_server::QueryIo for BrokerService {
                 q::shortest_prefix_request::Target::Change(q::ChangeId { value: v })
             }
         };
-        let v = self
-            .query_provider(&i.store_id)?
-            .shortest_prefix(
-                handle(&i.scope)?,
-                target,
-                commits(i.visible_heads)?,
-                w.clone(),
-            )
-            .await
-            .map_err(crate::query::status)?;
+        let provider = self.query_provider(&i.store_id)?;
+        let v = match i.selection {
+            Some(selection) => {
+                let digest = crate::prefix_selection_digest(&selection, self.query_limit())?;
+                let v = provider
+                    .shortest_prefix_selected(
+                        handle(&i.scope)?,
+                        target,
+                        commits(i.visible_heads)?,
+                        selection,
+                        w.clone(),
+                    )
+                    .await
+                    .map_err(crate::query::status)?;
+                if v.value.selection_digest.as_deref() != Some(digest.as_slice())
+                    || v.value.in_selection.is_none()
+                {
+                    return Err(Status::data_loss(
+                        "selected shortest prefix binding missing",
+                    ));
+                }
+                v
+            }
+            None => provider
+                .shortest_prefix(
+                    handle(&i.scope)?,
+                    target,
+                    commits(i.visible_heads)?,
+                    w.clone(),
+                )
+                .await
+                .map_err(crate::query::status)?,
+        };
         reply(v, w, self.query_limit())
     }
     async fn begin(
@@ -776,6 +836,80 @@ impl NativeQueryIo for GuardedQuery {
             o,
             move |p, o| async move { p.shortest_prefix(s, t, h, o).await },
         )
+        .await
+    }
+    async fn resolve_commit_prefix_selected(
+        &self,
+        s: [u8; 32],
+        f: String,
+        selection: q::GraphExpr,
+        o: QueryOwner,
+    ) -> Result<QueryReply<q::CommitPrefixResult>, Status> {
+        crate::validate_prefix_selection(&selection, self.service.query_limit())?;
+        bounded_input(
+            selection
+                .encoded_len()
+                .saturating_add(f.len())
+                .saturating_add(128)
+                .saturating_add(field_bytes(selection.encoded_len())),
+            self.service.query_limit(),
+        )?;
+        prefix(&f, 64)?;
+        self.run(o, move |p, o| async move {
+            p.resolve_commit_prefix_selected(s, f, selection, o).await
+        })
+        .await
+    }
+    async fn resolve_change_prefix_selected(
+        &self,
+        s: [u8; 32],
+        f: String,
+        h: Vec<tinytree_model::CommitId>,
+        selection: q::GraphExpr,
+        o: QueryOwner,
+    ) -> Result<QueryReply<q::ChangePrefixResult>, Status> {
+        crate::validate_prefix_selection(&selection, self.service.query_limit())?;
+        bounded_input(
+            selection
+                .encoded_len()
+                .saturating_add(f.len())
+                .saturating_add(128)
+                .saturating_add(field_bytes(selection.encoded_len())),
+            self.service.query_limit(),
+        )?;
+        prefix(&f, 32)?;
+        bounded_input(
+            visible_bytes(&h, self.service.query_limit())?
+                .saturating_add(f.len())
+                .saturating_add(128)
+                .saturating_add(field_bytes(selection.encoded_len())),
+            self.service.query_limit(),
+        )?;
+        self.run(o, move |p, o| async move {
+            p.resolve_change_prefix_selected(s, f, h, selection, o)
+                .await
+        })
+        .await
+    }
+    async fn shortest_prefix_selected(
+        &self,
+        s: [u8; 32],
+        t: q::shortest_prefix_request::Target,
+        h: Vec<tinytree_model::CommitId>,
+        selection: q::GraphExpr,
+        o: QueryOwner,
+    ) -> Result<QueryReply<q::ShortestPrefixResult>, Status> {
+        crate::validate_prefix_selection(&selection, self.service.query_limit())?;
+        bounded_input(
+            visible_bytes(&h, self.service.query_limit())?
+                .saturating_add(target_bytes(&t)?)
+                .saturating_add(128)
+                .saturating_add(field_bytes(selection.encoded_len())),
+            self.service.query_limit(),
+        )?;
+        self.run(o, move |p, o| async move {
+            p.shortest_prefix_selected(s, t, h, selection, o).await
+        })
         .await
     }
     async fn begin(&self, i: BeginQuery, o: QueryOwner) -> Result<QueryReply<QueryHandle>, Status> {

@@ -124,7 +124,7 @@ pub(crate) fn validate_config(c: &QueryConfig) -> Result<(), ConfigError> {
     }
     Ok(())
 }
-fn limits(c: &QueryConfig) -> EvalLimits {
+pub(crate) fn limits(c: &QueryConfig) -> EvalLimits {
     EvalLimits {
         max_ast_nodes: c.max_eval_ast_nodes,
         max_ast_depth: c.max_eval_ast_depth,
@@ -467,6 +467,21 @@ impl CursorHost {
             self.retire_closed(owner, &key.repository_id, scope_handle);
         }
         Ok(())
+    }
+    pub(crate) fn reserve_ephemeral(
+        &self,
+        config: &QueryConfig,
+        extra_bytes: usize,
+    ) -> Result<OwnedSemaphorePermit, Status> {
+        let bytes = limits(config)
+            .memory_bytes()
+            .and_then(|n| n.checked_add(extra_bytes))
+            .and_then(|n| u32::try_from(n).ok())
+            .ok_or_else(|| Status::resource_exhausted("selected prefix memory exceeds budget"))?;
+        self.memory
+            .clone()
+            .try_acquire_many_owned(bytes)
+            .map_err(|_| Status::resource_exhausted("selected prefix memory unavailable"))
     }
     /// Ephemeral fact evaluation shares the cursor allocation pool but owns no
     /// Record, query ID, replay history or tombstone. Scope/Work ownership comes

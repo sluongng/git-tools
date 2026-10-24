@@ -15,6 +15,17 @@ pub fn cloud_manifest_id(bytes: &[u8]) -> [u8; 32] {
     *hash.finalize().as_bytes()
 }
 
+/// Hash canonical known-field query-expression bytes for prefix selection.
+///
+/// This binds a response to the requested structural selection. It is not
+/// authorization, expression validation or permission to fetch object contents.
+pub fn query_prefix_selection_digest(canonical_known_expr_bytes: &[u8]) -> [u8; 32] {
+    let mut hash = blake3::Hasher::new();
+    hash.update(b"tinytree-query-prefix-selection-v1\0");
+    hash.update(canonical_known_expr_bytes);
+    *hash.finalize().as_bytes()
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Error {
     Invalid(&'static str),

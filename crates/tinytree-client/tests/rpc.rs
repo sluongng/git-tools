@@ -1442,6 +1442,10 @@ enum QueryMode {
     WrongCommitWidth,
     WrongShortestKind,
     LongestOverflow,
+    PrefixSelectionIgnored,
+    PrefixSelectionDigestWrong,
+    ShortestSelectionMissing,
+    ShortestFalseWithLength,
     EvaluateRetry,
     EvaluateRetryAfterScopeClose,
     EvaluatePauseAfter,
@@ -1624,10 +1628,17 @@ impl RepositoryQuery for QueryFaults {
     }
     async fn resolve_commit_prefix(
         &self,
-        request: Request<q::ResolveCommitPrefixRequest>,
+        mut request: Request<q::ResolveCommitPrefixRequest>,
     ) -> Result<Response<q::CommitPrefixResult>, Status> {
         self.counts.commit_prefixes.fetch_add(1, Ordering::SeqCst);
+        if self.mode == QueryMode::PrefixSelectionIgnored {
+            request.get_mut().selection = None;
+        }
         let mut reply = self.service.resolve_commit_prefix(request).await?;
+        if self.mode == QueryMode::PrefixSelectionDigestWrong {
+            reply.get_mut().selection_digest = Some(vec![9; 32]);
+        }
+
         if self.mode == QueryMode::WrongCommitWidth {
             if let Some(q::commit_prefix_result::Result::Single(value)) =
                 &mut reply.get_mut().result
@@ -1639,10 +1650,17 @@ impl RepositoryQuery for QueryFaults {
     }
     async fn resolve_change_prefix(
         &self,
-        request: Request<q::ResolveChangePrefixRequest>,
+        mut request: Request<q::ResolveChangePrefixRequest>,
     ) -> Result<Response<q::ChangePrefixResult>, Status> {
         self.counts.change_prefixes.fetch_add(1, Ordering::SeqCst);
+        if self.mode == QueryMode::PrefixSelectionIgnored {
+            request.get_mut().selection = None;
+        }
         let mut reply = self.service.resolve_change_prefix(request).await?;
+        if self.mode == QueryMode::PrefixSelectionDigestWrong {
+            reply.get_mut().selection_digest = Some(vec![9; 32]);
+        }
+
         if let Some(q::change_prefix_result::Result::Single(value)) = &mut reply.get_mut().result {
             match self.mode {
                 QueryMode::MissingVisibility => value.targets[0].visible = None,
@@ -1654,15 +1672,29 @@ impl RepositoryQuery for QueryFaults {
     }
     async fn shortest_prefix(
         &self,
-        request: Request<q::ShortestPrefixRequest>,
+        mut request: Request<q::ShortestPrefixRequest>,
     ) -> Result<Response<q::ShortestPrefixResult>, Status> {
         self.counts.shortest_prefixes.fetch_add(1, Ordering::SeqCst);
+        if self.mode == QueryMode::PrefixSelectionIgnored {
+            request.get_mut().selection = None;
+        }
         let mut reply = self.service.shortest_prefix(request).await?;
+        if self.mode == QueryMode::PrefixSelectionDigestWrong {
+            reply.get_mut().selection_digest = Some(vec![9; 32]);
+        }
+
         if self.mode == QueryMode::WrongShortestKind {
             reply.get_mut().kind = q::PrefixKind::ChangePrefix as i32;
         }
         if self.mode == QueryMode::LongestOverflow {
             reply.get_mut().hex_length = 65;
+        }
+        if self.mode == QueryMode::ShortestSelectionMissing {
+            reply.get_mut().in_selection = None;
+        }
+        if self.mode == QueryMode::ShortestFalseWithLength {
+            reply.get_mut().in_selection = Some(false);
+            reply.get_mut().hex_length = 1;
         }
         Ok(reply)
     }
@@ -5609,4 +5641,302 @@ async fn v2_scope_close_orders_against_inflight_creation_and_existing_pages() {
         client.close_ids_query(&mut query).await.unwrap();
         running.stop().await;
     }
+}
+
+#[tokio::test]
+async fn selected_prefixes_keep_subsets_divergence_visibility_and_explicit_absence() {
+    use tinytree_model::{ChangeId, CommitId};
+    let fixture = setup_query_retained();
+    let running = QueryRunning::start(fixture.service.clone(), QueryMode::Normal).await;
+    let client = running.client().await;
+    let a = private_draft(
+        fixture.root,
+        ChangeId([0xab; 16]),
+        "selected visible sibling",
+    );
+    let aid = CommitId(a.descriptor.key.id.0);
+    let b = private_draft(
+        fixture.root,
+        ChangeId([0xab; 16]),
+        "selected hidden sibling",
+    );
+    let bid = CommitId(b.descriptor.key.id.0);
+    let c = private_draft(fixture.root, ChangeId([0xac; 16]), "other change sibling");
+    let cid = CommitId(c.descriptor.key.id.0);
+    let scope = client
+        .open_query_scope_with_overlay(
+            vec![fixture.root],
+            vec![
+                checked_draft(&client, &a).await,
+                checked_draft(&client, &b).await,
+                checked_draft(&client, &c).await,
+            ],
+        )
+        .await
+        .unwrap();
+    let all = ids_commits(&[CommitId::ROOT, fixture.root, aid, bid, cid]);
+    for prefix in [
+        "".to_string(),
+        blake3::Hash::from(aid.0).to_hex().to_string(),
+    ] {
+        assert_eq!(
+            client
+                .resolve_commit_prefix_selected(&scope, &prefix, &all)
+                .await
+                .unwrap(),
+            client.resolve_commit_prefix(&scope, &prefix).await.unwrap()
+        );
+    }
+    for prefix in ["a", "ab"] {
+        assert_eq!(
+            client
+                .resolve_change_prefix_selected(&scope, prefix, vec![aid], &all)
+                .await
+                .unwrap(),
+            client
+                .resolve_change_prefix(&scope, prefix, vec![aid])
+                .await
+                .unwrap()
+        );
+    }
+    let only_a = ids_commits(&[aid]);
+    assert_eq!(
+        client
+            .resolve_commit_prefix_selected(&scope, "", &only_a)
+            .await
+            .unwrap(),
+        CommitPrefix::Single(aid)
+    );
+    assert_eq!(
+        client
+            .resolve_commit_prefix_selected(&scope, &blake3::Hash::from(bid.0).to_hex(), &only_a)
+            .await
+            .unwrap(),
+        CommitPrefix::NoMatch
+    );
+    assert_eq!(
+        client
+            .resolve_commit_prefix(&scope, &blake3::Hash::from(bid.0).to_hex())
+            .await
+            .unwrap(),
+        CommitPrefix::Single(bid)
+    );
+    let siblings = ids_commits(&[aid, bid]);
+    let ChangePrefix::Single(selected) = client
+        .resolve_change_prefix_selected(&scope, "a", vec![aid], &siblings)
+        .await
+        .unwrap()
+    else {
+        panic!("one distinct selected change must not be ambiguous")
+    };
+    assert_eq!(selected.change, ChangeId([0xab; 16]));
+    let flags: std::collections::BTreeMap<_, _> = selected
+        .targets
+        .iter()
+        .map(|v| (v.commit, v.visible))
+        .collect();
+    assert_eq!(
+        flags,
+        std::collections::BTreeMap::from([(aid, true), (bid, false)])
+    );
+    assert_eq!(
+        client
+            .resolve_change_prefix(&scope, "a", vec![aid])
+            .await
+            .unwrap(),
+        ChangePrefix::Ambiguous
+    );
+    for (selection, target, expected) in [
+        (&only_a, PrefixTarget::Commit(aid), Some(0)),
+        (&only_a, PrefixTarget::Commit(bid), None),
+        (&only_a, PrefixTarget::Change(ChangeId([0xab; 16])), Some(0)),
+        (&only_a, PrefixTarget::Change(ChangeId([0xac; 16])), None),
+    ] {
+        assert_eq!(
+            client
+                .shortest_prefix_selected(&scope, target, vec![], selection)
+                .await
+                .unwrap(),
+            expected
+        );
+    }
+    assert!(
+        client
+            .shortest_prefix(&scope, PrefixTarget::Commit(bid), vec![])
+            .await
+            .unwrap()
+            > 0,
+        "the caller may explicitly request global fallback for a target absent from selection"
+    );
+    let empty = ids_commits(&[]);
+    assert_eq!(
+        client
+            .resolve_commit_prefix_selected(&scope, "", &empty)
+            .await
+            .unwrap(),
+        CommitPrefix::NoMatch
+    );
+    assert_eq!(
+        client
+            .shortest_prefix_selected(&scope, PrefixTarget::Commit(aid), vec![], &empty)
+            .await
+            .unwrap(),
+        None
+    );
+    let root = ids_commits(&[CommitId::ROOT]);
+    assert_eq!(
+        client
+            .resolve_commit_prefix_selected(&scope, "", &root)
+            .await
+            .unwrap(),
+        CommitPrefix::Single(CommitId::ROOT)
+    );
+    assert_eq!(
+        client
+            .shortest_prefix_selected(&scope, PrefixTarget::Commit(CommitId::ROOT), vec![], &root)
+            .await
+            .unwrap(),
+        Some(0)
+    );
+    assert_eq!(
+        running.counts.evaluations.load(Ordering::SeqCst),
+        0,
+        "selected prefix methods are bounded unary operations, not resumable history materialization"
+    );
+    client.close_query_scope(&scope).await.unwrap();
+    running.stop().await;
+}
+
+#[tokio::test]
+async fn selected_prefixes_reject_ignored_selection_digest_and_inconsistent_presence() {
+    for mode in [
+        QueryMode::PrefixSelectionIgnored,
+        QueryMode::PrefixSelectionDigestWrong,
+    ] {
+        let fixture = setup_query_retained();
+        let running = QueryRunning::start(fixture.service.clone(), mode).await;
+        let client = running.client().await;
+        let scope = client.open_query_scope(vec![fixture.root]).await.unwrap();
+        let selection = ids_commits(&[fixture.root]);
+        assert_eq!(
+            client
+                .resolve_commit_prefix_selected(&scope, "", &selection)
+                .await
+                .unwrap_err()
+                .code(),
+            Code::DataLoss
+        );
+        assert_eq!(
+            client
+                .resolve_change_prefix_selected(&scope, "", vec![], &selection)
+                .await
+                .unwrap_err()
+                .code(),
+            Code::DataLoss
+        );
+        assert_eq!(
+            client
+                .shortest_prefix_selected(
+                    &scope,
+                    PrefixTarget::Commit(fixture.root),
+                    vec![],
+                    &selection
+                )
+                .await
+                .unwrap_err()
+                .code(),
+            Code::DataLoss
+        );
+        client.close_query_scope(&scope).await.unwrap();
+        running.stop().await;
+    }
+    for mode in [
+        QueryMode::ShortestSelectionMissing,
+        QueryMode::ShortestFalseWithLength,
+        QueryMode::LongestOverflow,
+    ] {
+        let fixture = setup_query_retained();
+        let running = QueryRunning::start(fixture.service.clone(), mode).await;
+        let client = running.client().await;
+        let scope = client.open_query_scope(vec![fixture.root]).await.unwrap();
+        assert_eq!(
+            client
+                .shortest_prefix_selected(
+                    &scope,
+                    PrefixTarget::Commit(fixture.root),
+                    vec![],
+                    &ids_commits(&[fixture.root])
+                )
+                .await
+                .unwrap_err()
+                .code(),
+            Code::DataLoss
+        );
+        client.close_query_scope(&scope).await.unwrap();
+        running.stop().await;
+    }
+}
+
+#[tokio::test]
+async fn selected_prefixes_validate_original_ast_and_propagate_work_exhaustion() {
+    let fixture = setup_query_retained();
+    let running = QueryRunning::start(fixture.service.clone(), QueryMode::Normal).await;
+    let client = running.client().await;
+    let scope = client.open_query_scope(vec![fixture.root]).await.unwrap();
+    let mut malformed = ids_commits(&[]);
+    malformed.version = 2;
+    assert_eq!(
+        client
+            .resolve_commit_prefix_selected(&scope, "", &malformed)
+            .await
+            .unwrap_err()
+            .code(),
+        Code::InvalidArgument
+    );
+    assert_eq!(
+        client
+            .resolve_change_prefix_selected(&scope, "", vec![], &malformed)
+            .await
+            .unwrap_err()
+            .code(),
+        Code::InvalidArgument
+    );
+    assert_eq!(
+        client
+            .shortest_prefix_selected(
+                &scope,
+                PrefixTarget::Commit(tinytree_model::CommitId([99; 32])),
+                vec![],
+                &malformed
+            )
+            .await
+            .unwrap_err()
+            .code(),
+        Code::InvalidArgument
+    );
+    assert_eq!(
+        running.counts.commit_prefixes.load(Ordering::SeqCst)
+            + running.counts.change_prefixes.load(Ordering::SeqCst)
+            + running.counts.shortest_prefixes.load(Ordering::SeqCst),
+        0
+    );
+    client.close_query_scope(&scope).await.unwrap();
+    running.stop().await;
+    let mut config = ServiceConfig::default();
+    config.query.max_eval_steps = 1;
+    let fixture = setup_query_configured(config);
+    let running = QueryRunning::start(fixture.service.clone(), QueryMode::Normal).await;
+    let client = running.client().await;
+    let scope = client.open_query_scope(vec![fixture.root]).await.unwrap();
+    assert_eq!(
+        client
+            .resolve_commit_prefix_selected(&scope, "", &ids_ancestors(fixture.root))
+            .await
+            .unwrap_err()
+            .code(),
+        Code::ResourceExhausted,
+        "work exhaustion must not become NoMatch"
+    );
+    client.close_query_scope(&scope).await.unwrap();
+    running.stop().await;
 }

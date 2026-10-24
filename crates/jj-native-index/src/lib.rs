@@ -4,6 +4,7 @@ mod cleanup;
 pub use cleanup::CleanupHandle;
 mod memo;
 mod persistence;
+mod prefix;
 mod query;
 mod revsets;
 mod selected;

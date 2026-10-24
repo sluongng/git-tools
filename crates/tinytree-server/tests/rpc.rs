@@ -1858,6 +1858,7 @@ async fn root_query_service_warms_persistently_and_returns_exact_facts_and_prefi
     let resolved = client
         .resolve_commit_prefix(request(
             q::ResolveCommitPrefixRequest {
+                selection: None,
                 scope: Some(key.clone()),
                 hex_prefix: heads[0].id.0.iter().map(|b| format!("{b:02x}")).collect(),
             },
@@ -1873,6 +1874,7 @@ async fn root_query_service_warms_persistently_and_returns_exact_facts_and_prefi
     let changes = client
         .resolve_change_prefix(request(
             q::ResolveChangePrefixRequest {
+                selection: None,
                 scope: Some(key.clone()),
                 hex_prefix: "2a".repeat(16),
                 visible_heads: vec![query_id(heads[0])],
@@ -1905,6 +1907,7 @@ async fn root_query_service_warms_persistently_and_returns_exact_facts_and_prefi
     let shortest = client
         .shortest_prefix(request(
             q::ShortestPrefixRequest {
+                selection: None,
                 scope: Some(key.clone()),
                 target: Some(q::shortest_prefix_request::Target::Commit(query_id(
                     heads[0],
@@ -1917,6 +1920,109 @@ async fn root_query_service_warms_persistently_and_returns_exact_facts_and_prefi
         .unwrap()
         .into_inner();
     assert!(shortest.hex_length <= 64);
+    assert!(shortest.in_selection.is_none());
+    assert!(shortest.selection_digest.is_none());
+    let selection = q::GraphExpr {
+        version: 1,
+        expression: Some(q::graph_expr::Expression::Commits(q::CommitSet {
+            commits: vec![query_id(heads[0])],
+        })),
+    };
+    let selected = client
+        .resolve_commit_prefix(request(
+            q::ResolveCommitPrefixRequest {
+                scope: Some(key.clone()),
+                hex_prefix: String::new(),
+                selection: Some(selection.clone()),
+            },
+            ALPHA,
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(
+        matches!(selected.result,Some(q::commit_prefix_result::Result::Single(q::CommitMatch{commit:Some(ref id)}))if id==&query_id(heads[0]))
+    );
+    let digest = selected.selection_digest.unwrap();
+    assert_eq!(digest.len(), 32);
+    let selected_change = client
+        .resolve_change_prefix(request(
+            q::ResolveChangePrefixRequest {
+                scope: Some(key.clone()),
+                hex_prefix: "2a".repeat(16),
+                visible_heads: vec![query_id(heads[1])],
+                selection: Some(selection.clone()),
+            },
+            ALPHA,
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(selected_change.selection_digest, Some(digest.clone()));
+    let Some(q::change_prefix_result::Result::Single(selected_change)) = selected_change.result
+    else {
+        panic!("selected divergence must preserve its one distinct change")
+    };
+    assert_eq!(selected_change.targets.len(), 1);
+    assert_eq!(selected_change.targets[0].commit, Some(query_id(heads[0])));
+    assert_eq!(selected_change.targets[0].visible, Some(false));
+    for (target, present) in [(heads[0], true), (heads[1], false)] {
+        let value = client
+            .shortest_prefix(request(
+                q::ShortestPrefixRequest {
+                    scope: Some(key.clone()),
+                    target: Some(q::shortest_prefix_request::Target::Commit(query_id(target))),
+                    visible_heads: vec![],
+                    selection: Some(selection.clone()),
+                },
+                ALPHA,
+            ))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(value.in_selection, Some(present));
+        assert_eq!(value.hex_length, 0);
+        assert_eq!(value.selection_digest, Some(digest.clone()));
+    }
+    let malformed = q::GraphExpr {
+        version: 2,
+        expression: selection.expression.clone(),
+    };
+    assert_eq!(
+        client
+            .shortest_prefix(request(
+                q::ShortestPrefixRequest {
+                    scope: Some(key.clone()),
+                    target: Some(q::shortest_prefix_request::Target::Commit(query_id(
+                        unknown
+                    ))),
+                    visible_heads: vec![],
+                    selection: Some(malformed.clone())
+                },
+                ALPHA
+            ))
+            .await
+            .unwrap_err()
+            .code(),
+        Code::InvalidArgument,
+        "an absent target must not disguise an invalid original AST"
+    );
+    assert_eq!(
+        client
+            .resolve_commit_prefix(request(
+                q::ResolveCommitPrefixRequest {
+                    scope: Some(key.clone()),
+                    hex_prefix: String::new(),
+                    selection: Some(malformed)
+                },
+                PEER
+            ))
+            .await
+            .unwrap_err()
+            .code(),
+        Code::PermissionDenied,
+        "scope authorization precedes selection inspection"
+    );
     assert_eq!(
         client
             .query_facts(request(
@@ -2208,6 +2314,7 @@ async fn query_scope_expiry_and_close_release_roots_without_future_requests() {
     let shortest = client
         .shortest_prefix(request(
             q::ShortestPrefixRequest {
+                selection: None,
                 scope: scope.key,
                 target: Some(q::shortest_prefix_request::Target::Commit(query_id(zero))),
                 visible_heads: Vec::new(),
@@ -2913,6 +3020,7 @@ async fn private_query_scopes_share_forks_without_publishing_or_disclosing_draft
     let changes = client
         .resolve_change_prefix(request(
             q::ResolveChangePrefixRequest {
+                selection: None,
                 scope: parent.key.clone(),
                 hex_prefix: "47".repeat(16),
                 visible_heads: vec![query_id(first.descriptor.key)],

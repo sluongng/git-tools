@@ -4814,3 +4814,472 @@ async fn native_v2_retires_only_acknowledged_queries_after_scope_close_and_keeps
         .unwrap();
     server.stop().await;
 }
+
+// Use the public Repo surface so IdPrefixContext performs its actual policy,
+// rather than testing the optional provider in isolation.
+struct PrefixContextRepo {
+    base: Arc<jj_lib::repo::ReadonlyRepo>,
+    native: Option<jj_native_index::NativeReadonlyIndex>,
+    view: jj_lib::view::View,
+}
+#[async_trait(?Send)]
+impl jj_lib::repo::Repo for PrefixContextRepo {
+    fn base_repo(&self) -> &jj_lib::repo::ReadonlyRepo {
+        &self.base
+    }
+    fn store(&self) -> &Arc<jj_lib::store::Store> {
+        self.base.store()
+    }
+    fn op_store(&self) -> &Arc<dyn jj_lib::op_store::OpStore> {
+        self.base.op_store()
+    }
+    fn index(&self) -> &dyn jj_lib::index::Index {
+        use jj_lib::index::ReadonlyIndex;
+        match &self.native {
+            Some(i) => i.as_index(),
+            None => self.base.index(),
+        }
+    }
+    fn view(&self) -> &jj_lib::view::View {
+        &self.view
+    }
+    fn submodule_store(&self) -> &Arc<dyn jj_lib::submodule_store::SubmoduleStore> {
+        self.base.submodule_store()
+    }
+    async fn resolve_change_id_prefix(
+        &self,
+        prefix: &jj_lib::object_id::HexPrefix,
+    ) -> jj_lib::index::IndexResult<
+        jj_lib::object_id::PrefixResolution<jj_lib::index::ResolvedChangeTargets>,
+    > {
+        use jj_lib::index::ReadonlyIndex;
+        match &self.native {
+            Some(i) => {
+                i.change_id_index(&mut self.view.heads().iter())
+                    .unwrap()
+                    .resolve_prefix(prefix)
+                    .await
+            }
+            None => self.base.resolve_change_id_prefix(prefix).await,
+        }
+    }
+    async fn shortest_unique_change_id_prefix_len(
+        &self,
+        id: &jj_lib::backend::ChangeId,
+    ) -> jj_lib::index::IndexResult<usize> {
+        use jj_lib::index::ReadonlyIndex;
+        match &self.native {
+            Some(i) => {
+                i.change_id_index(&mut self.view.heads().iter())
+                    .unwrap()
+                    .shortest_unique_prefix_len(id)
+                    .await
+            }
+            None => self.base.shortest_unique_change_id_prefix_len(id).await,
+        }
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn native_prefix_context_matches_pinned_default_through_broker_on_current_thread() {
+    use jj_lib::{
+        object_id::{HexPrefix, ObjectId as _},
+        repo::Repo,
+    };
+
+    // ResolvedChangeTargets explicitly leaves ordering to the index. Compare
+    // sorted vectors (not sets) so multiplicity and visibility remain checked;
+    // separately check native stability because offsets use its own ordering.
+    fn comparable_changes(
+        value: jj_lib::object_id::PrefixResolution<jj_lib::index::ResolvedChangeTargets>,
+    ) -> jj_lib::object_id::PrefixResolution<Vec<(jj_lib::backend::CommitId, bool)>> {
+        value.map(|targets| {
+            let mut values = targets
+                .targets
+                .into_iter()
+                .map(|(id, state)| (id, state == jj_lib::index::ResolvedChangeState::Visible))
+                .collect::<Vec<_>>();
+            values.sort();
+            values
+        })
+    }
+    let mut reference = pinned_graph_reference(&[&[0], &[1], &[1], &[2, 3]], true).await;
+    // Workspace initialization also creates an initial working-copy commit.
+    // Include every DefaultIndex head so global fallback sees identical logical
+    // universes, rather than accidentally comparing only our authored fixture.
+    let roots = reference
+        .repo
+        .index()
+        .all_heads_for_gc()
+        .unwrap()
+        .collect::<Vec<_>>();
+    for root in &roots {
+        if !reference.ids.contains(root) {
+            let metadata = reference
+                ._io
+                .read_metadata(m::ObjectKey {
+                    kind: m::Kind::Commit,
+                    id: m::ObjectId::from_slice(root.as_bytes()).unwrap(),
+                })
+                .await
+                .unwrap();
+            let m::Object::Commit(commit) =
+                m::decode(metadata.bytes(), m::Limits::default()).unwrap()
+            else {
+                panic!("fixture head is not a commit")
+            };
+            assert_eq!(
+                commit.parents,
+                vec![m::CommitId::ROOT],
+                "unexpected initial-workspace fixture ancestry"
+            );
+            reference.ids.push(root.clone());
+            reference
+                .canonical
+                .push((metadata.descriptor(), metadata.bytes().to_vec()));
+        }
+    }
+    let server_dir = private_dir();
+    let store = Store::open(server_dir.path(), Default::default()).unwrap();
+    store.create_repository("example").unwrap();
+    let empty = m::empty_tree();
+    store
+        .put("example", empty.descriptor, &empty.bytes, 0)
+        .unwrap();
+    let index_dir = private_dir();
+    let index = tinytree_index::Index::open(index_dir.path(), &Default::default()).unwrap();
+    for (descriptor, bytes) in &reference.canonical {
+        store.put("example", *descriptor, bytes, 0).unwrap();
+        index.ingest("example", *descriptor, bytes).unwrap();
+    }
+    let head = m::CommitId::from_slice(reference.ids[4].as_bytes()).unwrap();
+    store
+        .publish(
+            "example",
+            &tinytree_store::PublishRequest {
+                idempotency_key: "prefix-head".into(),
+                reference_name: "main".into(),
+                expected_generation: 0,
+                new_commit: Some(head),
+                staging_leases: vec![],
+            },
+            1,
+        )
+        .unwrap();
+    for (position, root) in roots
+        .iter()
+        .filter(|id| id.as_bytes() != head.0.as_slice())
+        .enumerate()
+    {
+        store
+            .publish(
+                "example",
+                &tinytree_store::PublishRequest {
+                    idempotency_key: format!("prefix-extra-{position}"),
+                    reference_name: format!("extra-{position}"),
+                    expected_generation: 0,
+                    new_commit: Some(m::CommitId::from_slice(root.as_bytes()).unwrap()),
+                    staging_leases: vec![],
+                },
+                1,
+            )
+            .unwrap();
+    }
+    let service = RepositoryService::new(
+        store,
+        ServiceConfig::default(),
+        vec!["example".into()],
+        vec![
+            Principal::new("test", TOKEN, vec!["example".into()], true)
+                .unwrap()
+                .with_retention(true),
+        ],
+    )
+    .unwrap()
+    .with_query_index(index)
+    .unwrap();
+    let counts = Counters::new();
+    let server = Server::start_service(service, counts.clone(), None).await;
+    let directory = private_dir();
+    let (_direct, remote) = local(
+        directory.path(),
+        cache(directory.path()),
+        config(&server),
+        true,
+    );
+    remote.control.admit_reference("main").await.unwrap();
+    for (position, _) in roots
+        .iter()
+        .filter(|id| id.as_bytes() != head.0.as_slice())
+        .enumerate()
+    {
+        remote
+            .control
+            .admit_reference(&format!("extra-{position}"))
+            .await
+            .unwrap();
+    }
+    let mut broker_config = native_broker::Config::default();
+    broker_config.max_inflight = 1;
+    let broker = native_broker::BrokerService::new(
+        std::collections::HashMap::from([(
+            "example".into(),
+            remote.io.clone() as Arc<dyn NativeObjectIo>,
+        )]),
+        broker_config.clone(),
+    )
+    .unwrap()
+    .with_queries(std::collections::HashMap::from([(
+        "example".into(),
+        remote.query.clone() as Arc<dyn native_broker::NativeQueryIo>,
+    )]))
+    .unwrap();
+    let socket = directory.path().join("prefix.sock");
+    let serving = socket.clone();
+    let (stop, stopped) = tokio::sync::oneshot::channel();
+    let task = tokio::spawn(async move {
+        native_broker::serve_unix(&serving, broker, async {
+            let _ = stopped.await;
+        })
+        .await
+    });
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while !socket.exists() {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let query = Arc::new(
+        native_broker::BrokerQueryClient::connect(&socket, "example", broker_config)
+            .await
+            .unwrap(),
+    );
+    let native_store = jj_native_index::NativeIndexStore::init(
+        &directory.path().join("index"),
+        jj_native_index::Config {
+            endpoint: jj_native_index::Endpoint::UnixSocket(socket),
+            store_alias: "example".into(),
+            provider_fingerprint: [8; 32],
+        },
+        Default::default(),
+        query.clone(),
+        remote.io.clone(),
+        roots
+            .iter()
+            .map(|id| m::CommitId::from_slice(id.as_bytes()).unwrap())
+            .collect(),
+    )
+    .unwrap();
+    let readonly = native_store.seed_index().unwrap();
+    let empty_store = jj_native_index::NativeIndexStore::init(
+        &directory.path().join("empty-index"),
+        jj_native_index::Config {
+            endpoint: jj_native_index::Endpoint::UnixSocket(directory.path().join("prefix.sock")),
+            store_alias: "example".into(),
+            provider_fingerprint: [8; 32],
+        },
+        Default::default(),
+        query.clone(),
+        remote.io.clone(),
+        vec![],
+    )
+    .unwrap();
+    let empty_index = empty_store.seed_index().unwrap();
+    let baseline_metadata = counts.metadata_rpcs.load(Ordering::SeqCst);
+    let ids = reference.ids.clone();
+    let base = reference.repo.clone();
+    // Synchronous IdPrefixContext methods run inside an actual current-thread
+    // runtime. The broker transport, not that blocked caller, drives its I/O.
+    tokio::task::spawn_blocking(move || {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async move {
+                let mut view = base.view().clone();
+                view.set_local_bookmark_target(
+                    ids[2].to_string()[..1].as_ref(),
+                    jj_lib::op_store::RefTarget::normal(ids[1].clone()),
+                );
+                let default = PrefixContextRepo {
+                    base: base.clone(),
+                    native: None,
+                    view: view.clone(),
+                };
+                let native = PrefixContextRepo {
+                    base: base.clone(),
+                    native: Some(readonly),
+                    view,
+                };
+                use jj_lib::{
+                    fileset::FilesetExpression,
+                    revset::{
+                        ResolvedExpression as R, ResolvedPredicateExpression as P,
+                        RevsetFilterPredicate as F,
+                    },
+                };
+                let selected_files = R::FilterWithin {
+                    candidates: Box::new(R::Commits(ids.clone())),
+                    predicate: P::Intersection(
+                        Box::new(P::Filter(F::HasConflict)),
+                        Box::new(P::Filter(F::File(FilesetExpression::all()))),
+                    ),
+                };
+                let selected_revset = native
+                    .index()
+                    .evaluate_revset(&selected_files, native.store())
+                    .unwrap();
+                assert!(
+                    selected_revset
+                        .prefix_disambiguation_index()
+                        .unwrap()
+                        .is_none(),
+                    "selected file work cannot be delegated as a graph-only set"
+                );
+                drop(selected_revset);
+                for (selection_name, selected) in [
+                    ("singleton", vec![ids[2].clone()]),
+                    ("divergent change", vec![ids[2].clone(), ids[3].clone()]),
+                    (
+                        "root and ancestry",
+                        vec![ids[0].clone(), ids[2].clone(), ids[4].clone()],
+                    ),
+                ] {
+                    let expression = jj_lib::revset::UserRevsetExpression::commits(selected);
+                    let expected_context = jj_lib::id_prefix::IdPrefixContext::new(Arc::new(
+                        jj_lib::revset::RevsetExtensions::default(),
+                    ))
+                    .disambiguate_within(expression.clone());
+                    let actual_context = jj_lib::id_prefix::IdPrefixContext::new(Arc::new(
+                        jj_lib::revset::RevsetExtensions::default(),
+                    ))
+                    .disambiguate_within(expression);
+                    let expected = expected_context.populate(&default).unwrap();
+                    let actual = actual_context.populate(&native).unwrap();
+                    for id in &ids {
+                        for prefix in [
+                            HexPrefix::try_from_hex("").unwrap(),
+                            HexPrefix::from_id(id),
+                            HexPrefix::try_from_hex(id.to_string()[..1].to_owned()).unwrap(),
+                        ] {
+                            assert_eq!(
+                                actual.resolve_commit_prefix(&native, &prefix).unwrap(),
+                                expected.resolve_commit_prefix(&default, &prefix).unwrap(),
+                                "selection={selection_name} commit prefix={prefix:?} target={id}"
+                            );
+                        }
+                        assert_eq!(
+                            actual.shortest_commit_prefix_len(&native, id).unwrap(),
+                            expected.shortest_commit_prefix_len(&default, id).unwrap(),
+                            "selection={selection_name} shortest commit target={id}"
+                        );
+                        let change = base
+                            .store()
+                            .get_commit_async(id)
+                            .await
+                            .unwrap()
+                            .change_id()
+                            .clone();
+                        assert_eq!(
+                            actual
+                                .resolve_change_prefix(
+                                    &native,
+                                    &HexPrefix::try_from_hex("").unwrap()
+                                )
+                                .await
+                                .unwrap(),
+                            expected
+                                .resolve_change_prefix(
+                                    &default,
+                                    &HexPrefix::try_from_hex("").unwrap()
+                                )
+                                .await
+                                .unwrap()
+                        );
+                        let actual_changes = actual
+                            .resolve_change_prefix(&native, &HexPrefix::from_id(&change))
+                            .await
+                            .unwrap();
+                        let expected_changes = expected
+                            .resolve_change_prefix(&default, &HexPrefix::from_id(&change))
+                            .await
+                            .unwrap();
+                        assert_eq!(
+                            actual
+                                .resolve_change_prefix(&native, &HexPrefix::from_id(&change))
+                                .await
+                                .unwrap(),
+                            actual_changes,
+                            "native target offsets must remain stable within an immutable context"
+                        );
+                        assert_eq!(
+                            comparable_changes(actual_changes),
+                            comparable_changes(expected_changes),
+                            "selection={selection_name} change target={change}"
+                        );
+                        assert_eq!(
+                            actual
+                                .shortest_change_prefix_len(&native, &change)
+                                .await
+                                .unwrap(),
+                            expected
+                                .shortest_change_prefix_len(&default, &change)
+                                .await
+                                .unwrap(),
+                            "selection={selection_name} shortest change target={change}"
+                        );
+                    }
+                    let mut current_view = base.view().clone();
+                    for head in base.view().heads() {
+                        current_view.remove_head(head);
+                    }
+                    current_view.add_head(&ids[0]);
+                    let current = PrefixContextRepo {
+                        base: base.clone(),
+                        native: Some(empty_index.clone()),
+                        view: current_view,
+                    };
+                    assert_eq!(
+                        actual
+                            .resolve_commit_prefix(&current, &HexPrefix::from_id(&ids[2]))
+                            .unwrap(),
+                        expected
+                            .resolve_commit_prefix(&current, &HexPrefix::from_id(&ids[2]))
+                            .unwrap(),
+                        "captured narrow result must respect current-index membership"
+                    );
+                    let change = base
+                        .store()
+                        .get_commit_async(&ids[2])
+                        .await
+                        .unwrap()
+                        .change_id()
+                        .clone();
+                    assert_eq!(
+                        actual
+                            .resolve_change_prefix(&current, &HexPrefix::from_id(&change))
+                            .await
+                            .unwrap(),
+                        expected
+                            .resolve_change_prefix(&current, &HexPrefix::from_id(&change))
+                            .await
+                            .unwrap(),
+                        "current view supplies change targets"
+                    );
+                }
+            });
+    })
+    .await
+    .unwrap();
+    assert_eq!(
+        counts.metadata_rpcs.load(Ordering::SeqCst),
+        baseline_metadata,
+        "prefix contexts must not hydrate canonical public history"
+    );
+    assert_eq!(counts.files.load(Ordering::SeqCst), 0);
+    let _ = stop.send(());
+    task.await.unwrap().unwrap();
+    server.stop().await;
+}

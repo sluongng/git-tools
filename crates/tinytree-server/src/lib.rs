@@ -18,6 +18,7 @@ mod query_graph;
 mod query_index;
 mod query_ingress;
 mod query_overlay;
+mod query_prefix;
 mod query_service;
 mod retention;
 mod service;

@@ -1066,6 +1066,7 @@ impl NativeQueryIo for RemoteQueryIo {
                 }
             };
             Ok(q::CommitPrefixResult {
+                selection_digest: None,
                 result: Some(result),
             })
         })
@@ -1106,6 +1107,7 @@ impl NativeQueryIo for RemoteQueryIo {
                 }
             };
             Ok(q::ChangePrefixResult {
+                selection_digest: None,
                 result: Some(result),
             })
         })
@@ -1137,8 +1139,133 @@ impl NativeQueryIo for RemoteQueryIo {
                 .shortest_prefix(&scope.checked, target, heads)
                 .await?;
             Ok(q::ShortestPrefixResult {
+                selection_digest: None,
                 kind: kind as i32,
                 hex_length,
+                in_selection: None,
+            })
+        })
+        .await
+    }
+    async fn resolve_commit_prefix_selected(
+        &self,
+        scope: [u8; 32],
+        prefix: String,
+        selection: q::GraphExpr,
+        owner: QueryOwner,
+    ) -> std::result::Result<QueryReply<q::CommitPrefixResult>, tonic::Status> {
+        native_broker::validate_prefix_selection(
+            &selection,
+            self.inner.config.remote.limits.max_request_bytes,
+        )?;
+        self.scope_request(scope, owner, move |scope, rpc_client| async move {
+            let digest = tinytree_model::query_prefix_selection_digest(&selection.encode_to_vec());
+            let result = match rpc_client
+                .resolve_commit_prefix_selected(&scope.checked, &prefix, &selection)
+                .await?
+            {
+                tinytree_client::CommitPrefix::NoMatch => {
+                    q::commit_prefix_result::Result::NoMatch(q::NoMatch {})
+                }
+                tinytree_client::CommitPrefix::Ambiguous => {
+                    q::commit_prefix_result::Result::Ambiguous(q::AmbiguousCommits {})
+                }
+                tinytree_client::CommitPrefix::Single(id) => {
+                    q::commit_prefix_result::Result::Single(q::CommitMatch {
+                        commit: Some(wire_commit(id)),
+                    })
+                }
+            };
+            Ok(q::CommitPrefixResult {
+                selection_digest: Some(digest.to_vec()),
+                result: Some(result),
+            })
+        })
+        .await
+    }
+    async fn resolve_change_prefix_selected(
+        &self,
+        scope: [u8; 32],
+        prefix: String,
+        heads: Vec<m::CommitId>,
+        selection: q::GraphExpr,
+        owner: QueryOwner,
+    ) -> std::result::Result<QueryReply<q::ChangePrefixResult>, tonic::Status> {
+        native_broker::validate_prefix_selection(
+            &selection,
+            self.inner.config.remote.limits.max_request_bytes,
+        )?;
+        self.scope_request(scope, owner, move |scope, rpc_client| async move {
+            let digest = tinytree_model::query_prefix_selection_digest(&selection.encode_to_vec());
+            let result = match rpc_client
+                .resolve_change_prefix_selected(&scope.checked, &prefix, heads, &selection)
+                .await?
+            {
+                tinytree_client::ChangePrefix::NoMatch => {
+                    q::change_prefix_result::Result::NoMatch(q::NoMatch {})
+                }
+                tinytree_client::ChangePrefix::Ambiguous => {
+                    q::change_prefix_result::Result::Ambiguous(q::AmbiguousChanges {})
+                }
+                tinytree_client::ChangePrefix::Single(m) => {
+                    q::change_prefix_result::Result::Single(q::ChangeMatch {
+                        change: Some(q::ChangeId {
+                            value: m.change.0.to_vec(),
+                        }),
+                        targets: m
+                            .targets
+                            .into_iter()
+                            .map(|t| q::ChangeTarget {
+                                commit: Some(wire_commit(t.commit)),
+                                visible: Some(t.visible),
+                            })
+                            .collect(),
+                    })
+                }
+            };
+            Ok(q::ChangePrefixResult {
+                selection_digest: Some(digest.to_vec()),
+                result: Some(result),
+            })
+        })
+        .await
+    }
+    async fn shortest_prefix_selected(
+        &self,
+        scope: [u8; 32],
+        target: q::shortest_prefix_request::Target,
+        heads: Vec<m::CommitId>,
+        selection: q::GraphExpr,
+        owner: QueryOwner,
+    ) -> std::result::Result<QueryReply<q::ShortestPrefixResult>, tonic::Status> {
+        native_broker::validate_prefix_selection(
+            &selection,
+            self.inner.config.remote.limits.max_request_bytes,
+        )?;
+        self.scope_request(scope, owner, move |scope, rpc_client| async move {
+            let digest = tinytree_model::query_prefix_selection_digest(&selection.encode_to_vec());
+            let (target, kind) = match target {
+                q::shortest_prefix_request::Target::Commit(id) => (
+                    tinytree_client::PrefixTarget::Commit(commit(id)?),
+                    q::PrefixKind::CommitPrefix,
+                ),
+                q::shortest_prefix_request::Target::Change(id) => (
+                    tinytree_client::PrefixTarget::Change(m::ChangeId(
+                        id.value.try_into().map_err(|_| {
+                            tonic::Status::invalid_argument("invalid native ChangeId")
+                        })?,
+                    )),
+                    q::PrefixKind::ChangePrefix,
+                ),
+            };
+            let hex_length = rpc_client
+                .shortest_prefix_selected(&scope.checked, target, heads, &selection)
+                .await?;
+            Ok(q::ShortestPrefixResult {
+                selection_digest: Some(digest.to_vec()),
+                kind: kind as i32,
+                hex_length: hex_length.unwrap_or(0),
+                in_selection: Some(hex_length.is_some()),
             })
         })
         .await

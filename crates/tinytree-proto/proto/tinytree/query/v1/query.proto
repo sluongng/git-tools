@@ -157,13 +157,18 @@ message GraphFacts {
 message NoMatch {}
 message CommitMatch { CommitId commit = 1; }
 message AmbiguousCommits {} // Exact ambiguity, not early budget exhaustion.
-message ResolveCommitPrefixRequest { ScopeKey scope = 1; string hex_prefix = 2; }
+message ResolveCommitPrefixRequest {
+  ScopeKey scope = 1;
+  string hex_prefix = 2;
+  optional GraphExpr selection = 3; // Absent preserves full-scope legacy behavior.
+}
 message CommitPrefixResult {
   oneof result {
     NoMatch no_match = 1;
     CommitMatch single = 2;
     AmbiguousCommits ambiguous = 3;
   }
+  optional bytes selection_digest = 4;
 }
 message ChangeTarget {
   CommitId commit = 1;
@@ -171,13 +176,16 @@ message ChangeTarget {
 }
 message ChangeMatch {
   ChangeId change = 1;
-  repeated ChangeTarget targets = 2; // All scoped divergent targets, visible/hidden.
+  // All matching divergent targets in the requested selection, or the complete
+  // scope when selection is absent. Ambiguity counts distinct ChangeIds.
+  repeated ChangeTarget targets = 2;
 }
 message AmbiguousChanges {} // Multiple distinct ChangeIds, not divergent commits.
 message ResolveChangePrefixRequest {
   ScopeKey scope = 1;
   string hex_prefix = 2;
   repeated CommitId visible_heads = 3; // Explicit; never use ambient latest refs.
+  optional GraphExpr selection = 4;
 }
 message ChangePrefixResult {
   oneof result {
@@ -185,6 +193,7 @@ message ChangePrefixResult {
     ChangeMatch single = 2;
     AmbiguousChanges ambiguous = 3;
   }
+  optional bytes selection_digest = 4;
 }
 message ShortestPrefixRequest {
   ScopeKey scope = 1;
@@ -193,13 +202,22 @@ message ShortestPrefixRequest {
     ChangeId change = 3;
   }
   repeated CommitId visible_heads = 4;
+  optional GraphExpr selection = 5;
 }
 enum PrefixKind { PREFIX_KIND_UNSPECIFIED = 0; COMMIT_PREFIX = 1; CHANGE_PREFIX = 2; }
 message ShortestPrefixResult {
   PrefixKind kind = 1;
-  uint32 hex_length = 2; // Exact shortest unique length, never a guessed full width.
+  uint32 hex_length = 2; // Exact shortest unique length; zero is valid for a singleton.
+  // Required iff a selection was supplied. False requires hex_length=0 and
+  // means no selected target, not a guessed length/global fallback answer.
+  optional bool in_selection = 3;
+  optional bytes selection_digest = 4;
 }
 
+// Selected prefix responses MUST include selection_digest = BLAKE3(
+// "tinytree-query-prefix-selection-v1\0" || canonical known GraphExpr protobuf).
+// Legacy absent-selection responses omit this field. Clients must reject a
+// missing/wrong digest, including old servers silently ignoring selection.
 // Structural AST, not executable text. Every node version MUST equal 1. Servers
 // bound depth/nodes/literal IDs/decoded bytes before execution and all subsequent
 // scanned nodes/edges/frontier/replay memory. Unsupported operations return

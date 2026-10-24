@@ -418,6 +418,7 @@ impl NativeQueryIo for FixtureIo {
         };
         Ok(reply(
             q::ChangePrefixResult {
+                selection_digest: None,
                 result: Some(result),
             },
             owner,

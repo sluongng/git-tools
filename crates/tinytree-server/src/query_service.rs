@@ -359,6 +359,9 @@ fn set(values: Vec<m::CommitId>, maximum: usize) -> Result<q::CommitSet, Status>
 fn scope_key(key: Option<q::ScopeKey>) -> Result<q::ScopeKey, Status> {
     key.ok_or_else(|| Status::invalid_argument("query scope is required"))
 }
+fn selection_digest(expression: &q::GraphExpr) -> Vec<u8> {
+    tinytree_model::query_prefix_selection_digest(&expression.encode_to_vec()).to_vec()
+}
 fn prefix(text: &str, width: usize) -> Result<(), Status> {
     if text.len() > width
         || !text
@@ -619,18 +622,37 @@ impl RepositoryQuery for QueryService {
         let input = request.into_inner();
         let key = scope_key(input.scope)?;
         prefix(&input.hex_prefix, 64)?;
+        let prefix_host = host.clone();
         self.scoped(
             identity,
             deadline,
             host,
             admission,
             key,
-            move |scope, budget, _| {
-                let result = match scope
-                    .graph()
-                    .resolve_commit_prefix(&input.hex_prefix, budget)
-                    .map_err(index_error)?
-                {
+            move |scope, budget, config| {
+                let (resolved, selection_digest) = if let Some(expression) = &input.selection {
+                    let mut selected = crate::query_prefix::PrefixSelection::new(
+                        scope,
+                        expression,
+                        config,
+                        &prefix_host.cursors,
+                        deadline,
+                    )?;
+                    let digest = selection_digest(expression);
+                    (
+                        selected.resolve_commit(&input.hex_prefix, budget)?,
+                        Some(digest),
+                    )
+                } else {
+                    (
+                        scope
+                            .graph()
+                            .resolve_commit_prefix(&input.hex_prefix, budget)
+                            .map_err(index_error)?,
+                        None,
+                    )
+                };
+                let result = match resolved {
                     PrefixResolution::NoMatch => {
                         q::commit_prefix_result::Result::NoMatch(q::NoMatch {})
                     }
@@ -645,6 +667,7 @@ impl RepositoryQuery for QueryService {
                 };
                 Ok(q::CommitPrefixResult {
                     result: Some(result),
+                    selection_digest,
                 })
             },
         )
@@ -660,6 +683,7 @@ impl RepositoryQuery for QueryService {
         let input = request.into_inner();
         let key = scope_key(input.scope)?;
         prefix(&input.hex_prefix, 32)?;
+        let prefix_host = host.clone();
         self.scoped(
             identity,
             deadline,
@@ -669,11 +693,29 @@ impl RepositoryQuery for QueryService {
             move |scope, budget, config| {
                 let heads = ids(&input.visible_heads, config.max_input_ids)?;
                 visible(scope, &heads, budget)?;
-                let result = match scope
-                    .graph()
-                    .resolve_change_prefix(&input.hex_prefix, budget)
-                    .map_err(index_error)?
-                {
+                let (resolved, selection_digest) = if let Some(expression) = &input.selection {
+                    let mut selected = crate::query_prefix::PrefixSelection::new(
+                        scope,
+                        expression,
+                        config,
+                        &prefix_host.cursors,
+                        deadline,
+                    )?;
+                    let digest = selection_digest(expression);
+                    (
+                        selected.resolve_change(&input.hex_prefix, budget)?,
+                        Some(digest),
+                    )
+                } else {
+                    (
+                        scope
+                            .graph()
+                            .resolve_change_prefix(&input.hex_prefix, budget)
+                            .map_err(index_error)?,
+                        None,
+                    )
+                };
+                let result = match resolved {
                     PrefixResolution::NoMatch => {
                         q::change_prefix_result::Result::NoMatch(q::NoMatch {})
                     }
@@ -714,6 +756,7 @@ impl RepositoryQuery for QueryService {
                 };
                 Ok(q::ChangePrefixResult {
                     result: Some(result),
+                    selection_digest,
                 })
             },
         )
@@ -728,6 +771,7 @@ impl RepositoryQuery for QueryService {
         self.bounded(request.get_ref())?;
         let input = request.into_inner();
         let key = scope_key(input.scope)?;
+        let prefix_host = host.clone();
         self.scoped(
             identity,
             deadline,
@@ -737,6 +781,34 @@ impl RepositoryQuery for QueryService {
             move |scope, budget, config| {
                 let heads = ids(&input.visible_heads, config.max_input_ids)?;
                 visible(scope, &heads, budget)?;
+                if let Some(expression) = &input.selection {
+                    let mut selected = crate::query_prefix::PrefixSelection::new(
+                        scope,
+                        expression,
+                        config,
+                        &prefix_host.cursors,
+                        deadline,
+                    )?;
+                    let (kind, length) = match input
+                        .target
+                        .ok_or_else(|| Status::invalid_argument("prefix target missing"))?
+                    {
+                        q::shortest_prefix_request::Target::Commit(id) => (
+                            q::PrefixKind::CommitPrefix,
+                            selected.shortest_commit(commit(&id)?, budget)?,
+                        ),
+                        q::shortest_prefix_request::Target::Change(id) => (
+                            q::PrefixKind::ChangePrefix,
+                            selected.shortest_change(change(&id)?, budget)?,
+                        ),
+                    };
+                    return Ok(q::ShortestPrefixResult {
+                        kind: kind as i32,
+                        hex_length: length.unwrap_or(0) as u32,
+                        in_selection: Some(length.is_some()),
+                        selection_digest: Some(selection_digest(expression)),
+                    });
+                }
                 let (kind, length) = match input
                     .target
                     .ok_or_else(|| Status::invalid_argument("prefix target missing"))?
@@ -759,6 +831,8 @@ impl RepositoryQuery for QueryService {
                 Ok(q::ShortestPrefixResult {
                     kind: kind as i32,
                     hex_length: length as u32,
+                    in_selection: None,
+                    selection_digest: None,
                 })
             },
         )

@@ -522,6 +522,7 @@ impl NativeQueryIo for BrokerQueryClient {
                             store_id,
                             scope: s.to_vec(),
                             hex_prefix: f,
+                            selection: None,
                         },
                         d,
                         cap,
@@ -560,6 +561,7 @@ impl NativeQueryIo for BrokerQueryClient {
                             scope: s.to_vec(),
                             hex_prefix: f,
                             visible_heads: ids(h),
+                            selection: None,
                         },
                         d,
                         cap,
@@ -604,6 +606,7 @@ impl NativeQueryIo for BrokerQueryClient {
                         scope: s.to_vec(),
                         target: Some(target),
                         visible_heads: ids(h),
+                        selection: None,
                     },
                     d,
                     cap,
@@ -613,6 +616,164 @@ impl NativeQueryIo for BrokerQueryClient {
             }
         })
         .await
+    }
+    async fn resolve_commit_prefix_selected(
+        &self,
+        s: [u8; 32],
+        f: String,
+        selection: q::GraphExpr,
+        o: QueryOwner,
+    ) -> Result<QueryReply<q::CommitPrefixResult>, Status> {
+        crate::validate_prefix_selection(&selection, self.inner.config.max_query_bytes)?;
+        crate::query_service::prefix(&f, 64)?;
+        self.preflight(
+            34usize
+                .saturating_add(crate::query_service::field_bytes(selection.encoded_len()))
+                .saturating_add(crate::query_service::field_bytes(f.len())),
+        )?;
+        self.preflight(
+            crate::query_service::field_bytes(selection.encoded_len()).saturating_add(128),
+        )?;
+        let r = self
+            .execute(o, move |mut c, d, store_id, cap| {
+                let selection = selection.clone();
+                let f = f.clone();
+                async move {
+                    let digest = crate::prefix_selection_digest(&selection, cap)?;
+                    let value = c
+                        .resolve_commit_prefix(request(
+                            p::QueryCommitPrefixRequest {
+                                store_id,
+                                scope: s.to_vec(),
+                                hex_prefix: f,
+                                selection: Some(selection),
+                            },
+                            d,
+                            cap,
+                        )?)
+                        .await?
+                        .into_inner();
+                    if value.selection_digest.as_deref() != Some(digest.as_slice()) {
+                        return Err(Status::data_loss("selected prefix digest mismatch"));
+                    }
+                    Ok(value)
+                }
+            })
+            .await?;
+        if r.value.result.is_none() {
+            return Err(Status::data_loss("missing native commit prefix result"));
+        }
+        Ok(r)
+    }
+    async fn resolve_change_prefix_selected(
+        &self,
+        s: [u8; 32],
+        f: String,
+        h: Vec<CommitId>,
+        selection: q::GraphExpr,
+        o: QueryOwner,
+    ) -> Result<QueryReply<q::ChangePrefixResult>, Status> {
+        crate::validate_prefix_selection(&selection, self.inner.config.max_query_bytes)?;
+        crate::query_service::prefix(&f, 32)?;
+        self.preflight(
+            crate::query_service::visible_bytes(&h, self.inner.config.max_query_bytes)?
+                .saturating_add(34)
+                .saturating_add(crate::query_service::field_bytes(selection.encoded_len()))
+                .saturating_add(crate::query_service::field_bytes(f.len())),
+        )?;
+        self.preflight(
+            crate::query_service::field_bytes(selection.encoded_len()).saturating_add(128),
+        )?;
+        let r = self
+            .execute(o, move |mut c, d, store_id, cap| {
+                let selection = selection.clone();
+                let f = f.clone();
+                let h = h.clone();
+                async move {
+                    let digest = crate::prefix_selection_digest(&selection, cap)?;
+                    let value = c
+                        .resolve_change_prefix(request(
+                            p::QueryChangePrefixRequest {
+                                store_id,
+                                scope: s.to_vec(),
+                                hex_prefix: f,
+                                visible_heads: ids(h),
+                                selection: Some(selection),
+                            },
+                            d,
+                            cap,
+                        )?)
+                        .await?
+                        .into_inner();
+                    if value.selection_digest.as_deref() != Some(digest.as_slice()) {
+                        return Err(Status::data_loss("selected prefix digest mismatch"));
+                    }
+                    Ok(value)
+                }
+            })
+            .await?;
+        if r.value.result.is_none() {
+            return Err(Status::data_loss("missing native change prefix result"));
+        }
+        Ok(r)
+    }
+    async fn shortest_prefix_selected(
+        &self,
+        s: [u8; 32],
+        t: q::shortest_prefix_request::Target,
+        h: Vec<CommitId>,
+        selection: q::GraphExpr,
+        o: QueryOwner,
+    ) -> Result<QueryReply<q::ShortestPrefixResult>, Status> {
+        crate::validate_prefix_selection(&selection, self.inner.config.max_query_bytes)?;
+        self.preflight(
+            crate::query_service::visible_bytes(&h, self.inner.config.max_query_bytes)?
+                .saturating_add(34)
+                .saturating_add(crate::query_service::field_bytes(selection.encoded_len()))
+                .saturating_add(crate::query_service::target_bytes(&t)?),
+        )?;
+        let target = match t {
+            q::shortest_prefix_request::Target::Commit(v) => {
+                p::query_shortest_prefix_request::Target::Commit(v.value)
+            }
+            q::shortest_prefix_request::Target::Change(v) => {
+                p::query_shortest_prefix_request::Target::Change(v.value)
+            }
+        };
+        let r = self
+            .execute(o, move |mut c, d, store_id, cap| {
+                let selection = selection.clone();
+                let target = target.clone();
+                let h = h.clone();
+                async move {
+                    let digest = crate::prefix_selection_digest(&selection, cap)?;
+                    let value = c
+                        .shortest_prefix(request(
+                            p::QueryShortestPrefixRequest {
+                                store_id,
+                                scope: s.to_vec(),
+                                target: Some(target),
+                                visible_heads: ids(h),
+                                selection: Some(selection),
+                            },
+                            d,
+                            cap,
+                        )?)
+                        .await?
+                        .into_inner();
+                    if value.selection_digest.as_deref() != Some(digest.as_slice()) {
+                        return Err(Status::data_loss("selected prefix digest mismatch"));
+                    }
+                    Ok(value)
+                }
+            })
+            .await?;
+        if r.value.in_selection.is_none() {
+            return Err(Status::data_loss(
+                "selected shortest prefix binding missing",
+            ));
+        }
+        Ok(r)
     }
     async fn begin(&self, i: BeginQuery, o: QueryOwner) -> Result<QueryReply<QueryHandle>, Status> {
         crate::query_service::expression_shape(&i.expression, self.inner.config.max_query_bytes)?;

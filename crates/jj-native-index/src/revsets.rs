@@ -614,6 +614,17 @@ async fn selected_file_changed(
     Ok(changed)
 }
 impl Revset for NativeRevset {
+    fn prefix_disambiguation_index(
+        &self,
+    ) -> IndexResult<Option<Arc<dyn jj_lib::id_prefix::PrefixDisambiguationIndex>>> {
+        if self.file_all.is_some() {
+            return Ok(None);
+        }
+        Ok(Some(Arc::new(
+            crate::prefix::PrefixIndex::new(self.index.clone(), &self.expression).map_err(err)?,
+        )))
+    }
+
     fn stream<'a>(&self) -> LocalBoxStream<'a, Result<CommitId, RevsetEvaluationError>>
     where
         Self: 'a,

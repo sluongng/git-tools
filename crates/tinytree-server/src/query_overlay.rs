@@ -301,6 +301,11 @@ impl OverlayGraph {
             );
             changes.entry(change).or_default().push(id);
         }
+        // This is CPU work over the already admitted immutable batch, not
+        // additional metadata probes. Keep per-change lexical seeks reusable.
+        for ids in changes.values_mut() {
+            ids.sort_unstable();
+        }
         let graph = Self {
             remote: base.remote.clone(),
             depth: base.depth + 1,
@@ -317,6 +322,77 @@ impl OverlayGraph {
             }),
         };
         Ok(Arc::new(graph))
+    }
+    /// One lexical private candidate, without enumerating the overlay. Each
+    /// immutable layer contributes at most one range-seek candidate. Evaluation
+    /// happens after this method returns; no derived-index lock is held.
+    pub fn next_private_commit(
+        &self,
+        prefix: &str,
+        after: Option<m::CommitId>,
+        budget: &mut WorkBudget,
+    ) -> Result<Option<GraphNode>> {
+        use std::ops::Bound::{Excluded, Included, Unbounded};
+        let (lower, upper) = prefix_bounds::<32>(prefix)?;
+        let start = after.map(Excluded).unwrap_or(Included(m::CommitId(lower)));
+        let end = upper.map(|v| Excluded(m::CommitId(v))).unwrap_or(Unbounded);
+        let mut found: Option<Arc<DraftNode>> = None;
+        let mut layer = Some(self);
+        while let Some(graph) = layer {
+            budget.charge(1, 0, 0)?;
+            if let Some(chunk) = &graph.chunk {
+                if let Some((_, node)) = chunk.nodes.range((start, end)).next() {
+                    budget.frontier(1)?;
+                    charge_draft(node, budget)?;
+                    if found
+                        .as_ref()
+                        .is_none_or(|old| node.descriptor.key.id < old.descriptor.key.id)
+                    {
+                        found = Some(node.clone());
+                    }
+                }
+            }
+            layer = graph.base.as_deref();
+        }
+        Ok(found.map(|n| GraphNode(Parent::Draft(n))))
+    }
+    pub fn next_private_change(
+        &self,
+        prefix: &str,
+        after: Option<(m::ChangeId, m::CommitId)>,
+        budget: &mut WorkBudget,
+    ) -> Result<Option<GraphNode>> {
+        use std::ops::Bound::{Excluded, Included, Unbounded};
+        let (lower, upper) = prefix_bounds::<16>(prefix)?;
+        let start = Included(after.map(|p| p.0).unwrap_or(m::ChangeId(lower)));
+        let end = upper.map(|v| Excluded(m::ChangeId(v))).unwrap_or(Unbounded);
+        let mut found: Option<((m::ChangeId, m::CommitId), Arc<DraftNode>)> = None;
+        let mut layer = Some(self);
+        while let Some(graph) = layer {
+            budget.charge(1, 0, 0)?;
+            if let Some(chunk) = &graph.chunk {
+                // At most two groups: an exhausted cursor group and its successor.
+                for (change, ids) in chunk.changes.range((start, end)).take(2) {
+                    budget.charge(1 + (ids.len() as u64).ilog2() as u64, 0, 0)?;
+                    let index = after
+                        .filter(|p| p.0 == *change)
+                        .map(|p| ids.partition_point(|id| *id <= p.1))
+                        .unwrap_or(0);
+                    if let Some(id) = ids.get(index) {
+                        let node = chunk.nodes.get(id).ok_or(Error::Corrupt)?;
+                        budget.frontier(1)?;
+                        charge_draft(node, budget)?;
+                        let key = (*change, *id);
+                        if found.as_ref().is_none_or(|old| key < old.0) {
+                            found = Some((key, node.clone()));
+                        }
+                        break;
+                    }
+                }
+            }
+            layer = graph.base.as_deref();
+        }
+        Ok(found.map(|(_, n)| GraphNode(Parent::Draft(n))))
     }
     fn find_draft(
         &self,
@@ -754,6 +830,33 @@ fn queue(
         pending.insert(node.key(), (node, flags));
     }
     Ok(())
+}
+fn prefix_bounds<const N: usize>(prefix: &str) -> Result<([u8; N], Option<[u8; N]>)> {
+    validate_prefix(prefix, N * 2)?;
+    let mut lower = [0; N];
+    for (i, byte) in prefix.bytes().enumerate() {
+        let nibble = if byte <= b'9' {
+            byte - b'0'
+        } else {
+            byte - b'a' + 10
+        };
+        lower[i / 2] |= nibble << if i % 2 == 0 { 4 } else { 0 };
+    }
+    if prefix.is_empty() {
+        return Ok((lower, None));
+    }
+    let mut upper = lower;
+    let increment = if prefix.len() % 2 == 1 { 16u16 } else { 1u16 };
+    let mut carry = increment;
+    for i in (0..prefix.len().div_ceil(2)).rev() {
+        let sum = upper[i] as u16 + carry;
+        upper[i] = sum as u8;
+        carry = sum >> 8;
+        if carry == 0 {
+            break;
+        }
+    }
+    Ok((lower, (carry == 0).then_some(upper)))
 }
 fn validate_prefix(prefix: &str, width: usize) -> Result<()> {
     if prefix.len() > width

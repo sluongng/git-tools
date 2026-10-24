@@ -648,6 +648,7 @@ fn scan(
                         | (Shape::ChangeTarget, 2)
                         | (Shape::IdsPage | Shape::GraphPage | Shape::CanonicalPage, 6)
                         | (Shape::CloudChunk, 4)
+                        | (Shape::ShortestPrefix, 3)
                 )
             {
                 let mut offset = 0;
@@ -814,7 +815,7 @@ fn rule(shape: Shape, n: u32, l: &Limits) -> Option<(u8, Option<Shape>, usize, u
         | (Shape::CommitId, 1)
         | (Shape::QueryFacts, 2) => text(32),
         (Shape::QueryScope, 3) | (Shape::ChangeId, 1) | (Shape::QueryFacts, 3) => text(16),
-        (Shape::QueryScope, 4 | 5 | 7) | (Shape::ShortestPrefix, 1 | 2) => scalar(),
+        (Shape::QueryScope, 4 | 5 | 7) | (Shape::ShortestPrefix, 1 | 2 | 3) => scalar(),
         (Shape::ScopeKey, 1) => text(128),
         (Shape::QueryFacts, 1) => repeated(
             Shape::FactAnswer,
@@ -828,6 +829,7 @@ fn rule(shape: Shape, n: u32, l: &Limits) -> Option<(u8, Option<Shape>, usize, u
             l.max_batch_items,
             4 * std::mem::size_of::<q::CommitId>(),
         ),
+        (Shape::CommitPrefix | Shape::ChangePrefix | Shape::ShortestPrefix, 4) => text(32),
         (Shape::CommitPrefix, 1 | 3) | (Shape::ChangePrefix, 1 | 3) => nested(Shape::QueryEmpty),
         (Shape::CommitPrefix, 2) => nested(Shape::CommitMatch),
         (Shape::ChangePrefix, 2) => nested(Shape::ChangeMatch),

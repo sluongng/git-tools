@@ -173,6 +173,38 @@ pub trait NativeQueryIo: Send + Sync + std::fmt::Debug {
         visible_heads: Vec<CommitId>,
         owner: QueryOwner,
     ) -> Result<QueryReply<q::ShortestPrefixResult>, Status>;
+    /// Exact prefix within a validated graph selection; no global fallback.
+    async fn resolve_commit_prefix_selected(
+        &self,
+        _scope: [u8; 32],
+        _prefix: String,
+        _selection: q::GraphExpr,
+        _owner: QueryOwner,
+    ) -> Result<QueryReply<q::CommitPrefixResult>, Status> {
+        Err(Status::unimplemented("selected commit prefix unavailable"))
+    }
+    async fn resolve_change_prefix_selected(
+        &self,
+        _scope: [u8; 32],
+        _prefix: String,
+        _visible_heads: Vec<CommitId>,
+        _selection: q::GraphExpr,
+        _owner: QueryOwner,
+    ) -> Result<QueryReply<q::ChangePrefixResult>, Status> {
+        Err(Status::unimplemented("selected change prefix unavailable"))
+    }
+    async fn shortest_prefix_selected(
+        &self,
+        _scope: [u8; 32],
+        _target: q::shortest_prefix_request::Target,
+        _visible_heads: Vec<CommitId>,
+        _selection: q::GraphExpr,
+        _owner: QueryOwner,
+    ) -> Result<QueryReply<q::ShortestPrefixResult>, Status> {
+        Err(Status::unimplemented(
+            "selected shortest prefix unavailable",
+        ))
+    }
     async fn begin(
         &self,
         input: BeginQuery,
@@ -226,4 +258,26 @@ pub(crate) fn status(error: Status) -> Status {
             _ => "native repository query failed",
         },
     )
+}
+
+/// Digest of a bounded structural prefix selection. This is not fetch authority.
+pub fn validate_prefix_selection(
+    expression: &q::GraphExpr,
+    max_bytes: usize,
+) -> Result<(), Status> {
+    use prost::Message as _;
+    crate::query_service::expression_shape(expression, max_bytes)?;
+    if expression.encoded_len() > max_bytes {
+        return Err(Status::resource_exhausted("selected prefix AST byte limit"));
+    }
+    Ok(())
+}
+pub fn prefix_selection_digest(
+    expression: &q::GraphExpr,
+    max_bytes: usize,
+) -> Result<[u8; 32], Status> {
+    use prost::Message as _;
+    validate_prefix_selection(expression, max_bytes)?;
+    let bytes = expression.encode_to_vec();
+    Ok(tinytree_model::query_prefix_selection_digest(&bytes))
 }

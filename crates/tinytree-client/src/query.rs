@@ -540,18 +540,51 @@ impl NativeClient {
         })
         .await
     }
+    fn prefix_selection_digest(expression: &q::GraphExpr) -> [u8; 32] {
+        tinytree_model::query_prefix_selection_digest(&expression.encode_to_vec())
+    }
+    fn checked_selection_digest(
+        actual: Option<&[u8]>,
+        expected: Option<[u8; 32]>,
+    ) -> Result<(), Status> {
+        if actual != expected.as_ref().map(|v| v.as_slice()) {
+            return Err(integrity());
+        }
+        Ok(())
+    }
     pub async fn resolve_commit_prefix(
         &self,
         scope: &CheckedScopeHandle,
         prefix: &str,
     ) -> Result<CommitPrefix, Status> {
+        self.resolve_commit_prefix_inner(scope, prefix, None).await
+    }
+    /// Resolve only within the complete supplied structural selection.
+    pub async fn resolve_commit_prefix_selected(
+        &self,
+        scope: &CheckedScopeHandle,
+        prefix: &str,
+        selection: &q::GraphExpr,
+    ) -> Result<CommitPrefix, Status> {
+        self.resolve_commit_prefix_inner(scope, prefix, Some(selection))
+            .await
+    }
+    async fn resolve_commit_prefix_inner(
+        &self,
+        scope: &CheckedScopeHandle,
+        prefix: &str,
+        selection: Option<&q::GraphExpr>,
+    ) -> Result<CommitPrefix, Status> {
+        self.checked_selection(selection, 256)?;
         self.checked_scope(scope, false)?;
         check_prefix(prefix, 64)?;
         let deadline = self.deadline();
         let budget = self.admit(deadline, self.unary_memory()).await?;
+        let expected_selection = selection.map(Self::prefix_selection_digest);
         let request = q::ResolveCommitPrefixRequest {
             scope: Some(scope.key()),
             hex_prefix: prefix.into(),
+            selection: selection.cloned(),
         };
         self.bounded(&request)?;
         self.retry(deadline, false, |allowance| {
@@ -559,12 +592,15 @@ impl NativeClient {
             let request = request.clone();
             async move {
                 use q::commit_prefix_result::Result as R;
-                match grpc
+                let reply = grpc
                     .resolve_commit_prefix(self.request(request, allowance))
                     .await?
-                    .into_inner()
-                    .result
-                {
+                    .into_inner();
+                Self::checked_selection_digest(
+                    reply.selection_digest.as_deref(),
+                    expected_selection,
+                )?;
+                match reply.result {
                     Some(R::NoMatch(_)) => Ok(CommitPrefix::NoMatch),
                     Some(R::Single(value)) => {
                         let id = checked_commit(value.commit)?;
@@ -584,8 +620,40 @@ impl NativeClient {
         &self,
         scope: &CheckedScopeHandle,
         prefix: &str,
-        mut visible_heads: Vec<CommitId>,
+        visible_heads: Vec<CommitId>,
     ) -> Result<ChangePrefix, Status> {
+        self.resolve_change_prefix_inner(scope, prefix, visible_heads, None)
+            .await
+    }
+    /// Return the selected targets of one distinct change; targets outside the
+    /// selection are omitted, while explicit visible-head flags are preserved.
+    pub async fn resolve_change_prefix_selected(
+        &self,
+        scope: &CheckedScopeHandle,
+        prefix: &str,
+        visible_heads: Vec<CommitId>,
+        selection: &q::GraphExpr,
+    ) -> Result<ChangePrefix, Status> {
+        self.resolve_change_prefix_inner(scope, prefix, visible_heads, Some(selection))
+            .await
+    }
+    async fn resolve_change_prefix_inner(
+        &self,
+        scope: &CheckedScopeHandle,
+        prefix: &str,
+        mut visible_heads: Vec<CommitId>,
+        selection: Option<&q::GraphExpr>,
+    ) -> Result<ChangePrefix, Status> {
+        self.checked_selection(
+            selection,
+            visible_heads
+                .len()
+                .checked_mul(40)
+                .and_then(|n| n.checked_add(256))
+                .ok_or_else(|| {
+                    Status::resource_exhausted("selected prefix request exceeds budget")
+                })?,
+        )?;
         self.checked_scope(scope, false)?;
         check_prefix(prefix, 32)?;
         self.batch(visible_heads.len())?;
@@ -593,10 +661,12 @@ impl NativeClient {
         visible_heads.dedup();
         let deadline = self.deadline();
         let budget = self.admit(deadline, self.unary_memory()).await?;
+        let expected_selection = selection.map(Self::prefix_selection_digest);
         let request = q::ResolveChangePrefixRequest {
             scope: Some(scope.key()),
             hex_prefix: prefix.into(),
             visible_heads: visible_heads.into_iter().map(wire_commit).collect(),
+            selection: selection.cloned(),
         };
         self.bounded(&request)?;
         self.retry(deadline, false, |allowance| {
@@ -604,12 +674,15 @@ impl NativeClient {
             let request = request.clone();
             async move {
                 use q::change_prefix_result::Result as R;
-                match grpc
+                let reply = grpc
                     .resolve_change_prefix(self.request(request, allowance))
                     .await?
-                    .into_inner()
-                    .result
-                {
+                    .into_inner();
+                Self::checked_selection_digest(
+                    reply.selection_digest.as_deref(),
+                    expected_selection,
+                )?;
+                match reply.result {
                     Some(R::NoMatch(_)) => Ok(ChangePrefix::NoMatch),
                     Some(R::Ambiguous(_)) => Ok(ChangePrefix::Ambiguous),
                     Some(R::Single(value)) => {
@@ -651,8 +724,59 @@ impl NativeClient {
         &self,
         scope: &CheckedScopeHandle,
         target: PrefixTarget,
-        mut visible_heads: Vec<CommitId>,
+        visible_heads: Vec<CommitId>,
     ) -> Result<u32, Status> {
+        self.shortest_prefix_inner(scope, target, visible_heads, None)
+            .await?
+            .ok_or_else(integrity)
+    }
+    /// Selected absence is explicit and lets the native caller decide whether
+    /// to fall back to its complete repository, never a fabricated full length.
+    pub async fn shortest_prefix_selected(
+        &self,
+        scope: &CheckedScopeHandle,
+        target: PrefixTarget,
+        visible_heads: Vec<CommitId>,
+        selection: &q::GraphExpr,
+    ) -> Result<Option<u32>, Status> {
+        self.shortest_prefix_inner(scope, target, visible_heads, Some(selection))
+            .await
+    }
+    fn checked_selection(
+        &self,
+        selection: Option<&q::GraphExpr>,
+        other_bytes: usize,
+    ) -> Result<(), Status> {
+        if let Some(expression) = selection {
+            let (_, bytes, _) = validate_expression(expression, &self.inner.config.limits)?;
+            if bytes
+                .checked_add(other_bytes)
+                .is_none_or(|n| n > self.inner.config.limits.max_request_bytes)
+            {
+                return Err(Status::resource_exhausted(
+                    "selected prefix request exceeds budget",
+                ));
+            }
+        }
+        Ok(())
+    }
+    async fn shortest_prefix_inner(
+        &self,
+        scope: &CheckedScopeHandle,
+        target: PrefixTarget,
+        mut visible_heads: Vec<CommitId>,
+        selection: Option<&q::GraphExpr>,
+    ) -> Result<Option<u32>, Status> {
+        self.checked_selection(
+            selection,
+            visible_heads
+                .len()
+                .checked_mul(40)
+                .and_then(|n| n.checked_add(256))
+                .ok_or_else(|| {
+                    Status::resource_exhausted("selected prefix request exceeds budget")
+                })?,
+        )?;
         self.checked_scope(scope, false)?;
         self.batch(visible_heads.len())?;
         visible_heads.sort_unstable();
@@ -673,10 +797,12 @@ impl NativeClient {
         };
         let deadline = self.deadline();
         let budget = self.admit(deadline, self.unary_memory()).await?;
+        let expected_selection = selection.map(Self::prefix_selection_digest);
         let request = q::ShortestPrefixRequest {
             scope: Some(scope.key()),
             target: Some(target),
             visible_heads: visible_heads.into_iter().map(wire_commit).collect(),
+            selection: selection.cloned(),
         };
         self.bounded(&request)?;
         self.retry(deadline, false, |allowance| {
@@ -687,10 +813,24 @@ impl NativeClient {
                     .shortest_prefix(self.request(request, allowance))
                     .await?
                     .into_inner();
+                Self::checked_selection_digest(
+                    reply.selection_digest.as_deref(),
+                    expected_selection,
+                )?;
                 if reply.kind != kind as i32 || reply.hex_length > maximum {
                     return Err(integrity());
                 }
-                Ok(reply.hex_length)
+                if selection.is_some() {
+                    match reply.in_selection {
+                        Some(true) => Ok(Some(reply.hex_length)),
+                        Some(false) if reply.hex_length == 0 => Ok(None),
+                        _ => Err(integrity()),
+                    }
+                } else if reply.in_selection.is_none() {
+                    Ok(Some(reply.hex_length))
+                } else {
+                    Err(integrity())
+                }
             }
         })
         .await
