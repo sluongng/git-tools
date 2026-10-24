@@ -86,6 +86,66 @@ fn selected(expr: &q::GraphExpr, nodes: &[m::Commit]) -> BTreeSet<m::CommitId> {
             }
             out
         }
+        X::Heads(v) => {
+            let candidates = selected(v.input.as_deref().unwrap(), nodes);
+            candidates
+                .iter()
+                .filter(|candidate| {
+                    !candidates.iter().any(|other| {
+                        other != *candidate
+                            && fixture_ancestors([*other], nodes).contains(candidate)
+                    })
+                })
+                .copied()
+                .collect()
+        }
+        X::Range(v) => {
+            let roots = fixture_ancestors(selected(v.roots.as_deref().unwrap(), nodes), nodes);
+            let ancestors = selected(
+                &q::GraphExpr {
+                    version: 1,
+                    expression: Some(X::Ancestors(Box::new(q::AncestorsExpr {
+                        heads: v.heads.clone(),
+                        generations: v.generations.clone(),
+                        parents: v.parents.clone(),
+                    }))),
+                },
+                nodes,
+            );
+            ancestors.difference(&roots).copied().collect()
+        }
+        X::DagRange(v) => {
+            let roots = selected(v.roots.as_deref().unwrap(), nodes);
+            let heads = selected(v.heads.as_deref().unwrap(), nodes);
+            let allowed = fixture_ancestors(heads, nodes);
+            let mut pending: Vec<_> = roots.into_iter().map(|id| (id, 0u64)).collect();
+            let mut seen = BTreeSet::new();
+            let mut out = BTreeSet::new();
+            while let Some((candidate, distance)) = pending.pop() {
+                if !seen.insert((candidate, distance)) || !allowed.contains(&candidate) {
+                    continue;
+                }
+                if v.generations_from_roots.as_ref().is_none_or(|r| {
+                    distance >= r.start && r.end_exclusive.is_none_or(|end| distance < end)
+                }) {
+                    out.insert(candidate);
+                }
+                if v.generations_from_roots
+                    .as_ref()
+                    .and_then(|r| r.end_exclusive)
+                    .is_some_and(|end| distance.saturating_add(1) >= end)
+                {
+                    continue;
+                }
+                pending.extend(
+                    nodes
+                        .iter()
+                        .filter(|node| node.parents.contains(&candidate))
+                        .map(|node| (model_commit_id(node), distance + 1)),
+                );
+            }
+            out
+        }
         X::Union(v) => v.inputs.iter().flat_map(|v| selected(v, nodes)).collect(),
         X::Difference(v) => {
             let mut left = selected(v.left.as_deref().unwrap(), nodes);
@@ -110,8 +170,36 @@ fn selected(expr: &q::GraphExpr, nodes: &[m::Commit]) -> BTreeSet<m::CommitId> {
             }
             out
         }
-        _ => panic!("fixture operation not exercised"),
+        other => panic!("fixture operation not exercised: {other:?}"),
     }
+}
+fn fixture_ancestors(
+    commits: impl IntoIterator<Item = m::CommitId>,
+    nodes: &[m::Commit],
+) -> BTreeSet<m::CommitId> {
+    selected(
+        &q::GraphExpr {
+            version: 1,
+            expression: Some(q::graph_expr::Expression::Ancestors(Box::new(
+                q::AncestorsExpr {
+                    heads: Some(Box::new(q::GraphExpr {
+                        version: 1,
+                        expression: Some(q::graph_expr::Expression::Commits(q::CommitSet {
+                            commits: commits
+                                .into_iter()
+                                .map(|id| q::CommitId {
+                                    value: id.0.to_vec(),
+                                })
+                                .collect(),
+                        })),
+                    })),
+                    generations: None,
+                    parents: None,
+                },
+            ))),
+        },
+        nodes,
+    )
 }
 fn model_commit_id(node: &m::Commit) -> m::CommitId {
     m::CommitId(
@@ -356,6 +444,32 @@ impl NativeQueryIo for FixtureIo {
                         ids.contains(&id(v.commit.as_ref())),
                     )),
                 }),
+                q::graph_fact::Fact::IsAncestor(v) => answers.push(q::GraphFactAnswer {
+                    answer: Some(q::graph_fact_answer::Answer::IsAncestor(
+                        fixture_ancestors([id(v.descendant.as_ref())], nodes)
+                            .contains(&id(v.ancestor.as_ref())),
+                    )),
+                }),
+                q::graph_fact::Fact::Heads(v) => {
+                    let candidates: BTreeSet<_> = v.commits.iter().map(|v| id(Some(v))).collect();
+                    let heads = candidates
+                        .iter()
+                        .filter(|candidate| {
+                            !candidates.iter().any(|other| {
+                                other != *candidate
+                                    && fixture_ancestors([*other], nodes).contains(candidate)
+                            })
+                        })
+                        .map(|id| q::CommitId {
+                            value: id.0.to_vec(),
+                        })
+                        .collect();
+                    answers.push(q::GraphFactAnswer {
+                        answer: Some(q::graph_fact_answer::Answer::Heads(q::CommitSet {
+                            commits: heads,
+                        })),
+                    });
+                }
                 q::graph_fact::Fact::Membership(v) => {
                     let candidate = id(v.candidate.as_ref());
                     let expression = v.expression.as_ref().ok_or_else(|| {
@@ -563,16 +677,24 @@ impl NativeQueryIo for FixtureIo {
                 q::graph_expr::Expression::Ancestors(v) => {
                     pending.push(v.heads.as_deref().unwrap())
                 }
+                q::graph_expr::Expression::Range(v) => {
+                    pending.push(v.roots.as_deref().unwrap());
+                    pending.push(v.heads.as_deref().unwrap());
+                }
+                q::graph_expr::Expression::DagRange(v) => {
+                    pending.push(v.roots.as_deref().unwrap());
+                    pending.push(v.heads.as_deref().unwrap());
+                }
                 q::graph_expr::Expression::Intersection(v)
                 | q::graph_expr::Expression::Union(v) => pending.extend(v.inputs.iter()),
-                q::graph_expr::Expression::HasConflict(v) => {
+                q::graph_expr::Expression::Heads(v) | q::graph_expr::Expression::HasConflict(v) => {
                     pending.push(v.input.as_deref().unwrap())
                 }
                 q::graph_expr::Expression::Difference(v) => {
                     pending.push(v.left.as_deref().unwrap());
                     pending.push(v.right.as_deref().unwrap());
                 }
-                _ => panic!("fixture operation not exercised"),
+                other => panic!("fixture operation not exercised: {other:?}"),
             }
         }
         let set = selected(&i.expression, nodes);
@@ -4002,5 +4124,198 @@ fn portable_import_preserves_exact_cloud_baselines_without_canonical_hydration_o
                 .source,
             CheckpointSource::LiveRoots
         ));
+    });
+}
+
+// Federated index repository acceptance with the existing reference query provider;
+// not network, broker-process, mount or CLI acceptance.
+#[test]
+fn admitted_external_rewrite_is_fresh_to_old_operation_and_survives_index_reopen() {
+    use jj_lib::{
+        config::{ConfigLayer, ConfigSource, StackedConfig},
+        evolution::walk_predecessors,
+        op_store::RefTarget,
+        ref_name::RefName,
+        repo::{ReadonlyRepo, Repo},
+        settings::UserSettings,
+        signing::Signer,
+    };
+    let _sync_test = SYNC_TEST.lock().unwrap();
+    block_on(async {
+        let (directory, _objects_directory, _unused, io, objects, config) = fixture();
+        let repo_path = directory.path().join("repo");
+        let _private_repo = private_fs::PrivateDir::create(&repo_path).unwrap();
+        let mut settings = StackedConfig::with_defaults();
+        settings.add_layer(ConfigLayer::parse(ConfigSource::User,
+            "[user]\nname='Native Author'\nemail='author@example.invalid'\n[operation]\nhostname='test'\nusername='test'\n").unwrap());
+        let settings = UserSettings::from_config_and_home_dir(settings, None).unwrap();
+        let backend =
+            jj_native_backend::NativeBackend::from_io(objects.clone(), Default::default())
+                .await
+                .unwrap();
+        let backend = Mutex::new(Some(backend));
+        let repo = ReadonlyRepo::init(
+            &settings,
+            &repo_path,
+            &|_, _| Ok(Box::new(backend.lock().unwrap().take().unwrap())),
+            Signer::new(None, vec![]),
+            ReadonlyRepo::default_workspace_store_initializer(),
+            ReadonlyRepo::default_op_store_initializer(),
+            ReadonlyRepo::default_op_heads_store_initializer(),
+            &|_, path| {
+                Ok(Box::new(
+                    NativeIndexStore::init_fresh_for_root_operation(
+                        path,
+                        config.clone(),
+                        Default::default(),
+                        io.clone(),
+                        objects.clone(),
+                        vec![m::CommitId::ROOT],
+                        &[0; 64],
+                    )
+                    .unwrap(),
+                ))
+            },
+            ReadonlyRepo::default_submodule_store_initializer(),
+        )
+        .await
+        .unwrap();
+        let root = repo.store().root_commit();
+        let mut tx = repo.start_transaction();
+        let old = tx
+            .repo_mut()
+            .new_commit(vec![root.id().clone()], root.tree())
+            .set_description("local stack")
+            .write()
+            .await
+            .unwrap();
+        let child = tx
+            .repo_mut()
+            .new_commit(vec![old.id().clone()], root.tree())
+            .set_description("unsubmitted child")
+            .write()
+            .await
+            .unwrap();
+        tx.repo_mut()
+            .set_local_bookmark_target(RefName::new("landed"), RefTarget::normal(old.id().clone()));
+        tx.repo_mut().set_local_bookmark_target(
+            RefName::new("child"),
+            RefTarget::normal(child.id().clone()),
+        );
+        let repo = tx.commit("create native indexed draft").await.unwrap();
+        let index_store = NativeIndexStore::open(
+            &repo_path.join("index"),
+            &config,
+            Default::default(),
+            io.clone(),
+            objects.clone(),
+        )
+        .unwrap();
+        let old_operation: &[u8; 64] = repo.op_id().as_bytes().try_into().unwrap();
+        let old_index = index_store.index_at_operation(old_operation).unwrap();
+
+        let mut canonical = old.store_commit().as_ref().clone();
+        canonical.description = "canonical landed stack".into();
+        canonical.committer.timestamp.timestamp = jj_lib::backend::MillisSinceEpoch(42);
+        let canonical = repo.store().write_commit(canonical, None).await.unwrap();
+        let canonical_id = model_id(canonical.id()).unwrap();
+        let m::Object::Commit(value) = objects
+            .read_metadata(m::ObjectKey {
+                kind: m::Kind::Commit,
+                id: m::ObjectId(canonical_id.0),
+            })
+            .await
+            .unwrap()
+            .into_object()
+        else {
+            panic!()
+        };
+        io.remote.lock().unwrap().push(value);
+        io.admitted.lock().unwrap().insert(canonical_id);
+        assert!(!old_index.has_id(canonical.id()).await.unwrap());
+        assert!(
+            !repo.index().has_id(canonical.id()).await.unwrap(),
+            "server admission must not mutate the base-operation membership"
+        );
+        let prepared = old_index
+            .with_remote_roots(vec![canonical_id])
+            .await
+            .unwrap();
+        assert!(prepared.has_id(canonical.id()).await.unwrap());
+        assert!(!old_index.has_id(canonical.id()).await.unwrap());
+
+        let mut tx = repo.start_transaction();
+        tx.repo_mut().merge_index_from(&prepared).unwrap();
+        assert!(tx.repo_mut().index().has_id(canonical.id()).await.unwrap());
+        assert!(
+            !tx.repo_mut()
+                .base_repo()
+                .index()
+                .has_id(canonical.id())
+                .await
+                .unwrap()
+        );
+        tx.repo_mut()
+            .record_external_rewrites(&[(old.id().clone(), canonical.id().clone())])
+            .await
+            .unwrap();
+        assert_eq!(tx.repo_mut().rebase_descendants().await.unwrap(), 1);
+        let landed = tx
+            .commit("import exact canonical native rewrite")
+            .await
+            .unwrap();
+        let persisted_operation: [u8; 64] = landed.op_id().as_bytes().try_into().unwrap();
+        let operation = landed.operation().clone();
+        drop(index_store);
+        let reopened = NativeIndexStore::open(
+            &repo_path.join("index"),
+            &config,
+            Default::default(),
+            io.clone(),
+            objects.clone(),
+        )
+        .unwrap();
+        let index = reopened.index_at_operation(&persisted_operation).unwrap();
+        assert!(index.has_id(canonical.id()).await.unwrap());
+        assert!(
+            !reopened
+                .index_at_operation(old_operation)
+                .unwrap()
+                .has_id(canonical.id())
+                .await
+                .unwrap()
+        );
+        // Reload the published operation through jj, which reopens its immutable
+        // operation association rather than reusing the transaction's index.
+        let reloaded = landed.loader().load_at(&operation).await.unwrap();
+        assert_eq!(
+            reloaded
+                .view()
+                .get_local_bookmark(RefName::new("landed"))
+                .as_normal(),
+            Some(canonical.id())
+        );
+        let child_id = reloaded
+            .view()
+            .get_local_bookmark(RefName::new("child"))
+            .as_normal()
+            .unwrap();
+        assert_ne!(child_id, child.id());
+        assert_eq!(
+            reloaded
+                .store()
+                .get_commit_async(child_id)
+                .await
+                .unwrap()
+                .parent_ids(),
+            &[canonical.id().clone()]
+        );
+        let history: Vec<_> = walk_predecessors(&reloaded, std::slice::from_ref(canonical.id()))
+            .try_collect()
+            .await
+            .unwrap();
+        assert_eq!(history[0].commit.id(), canonical.id());
+        assert_eq!(history[0].predecessor_ids(), &[old.id().clone()]);
+        assert!(history[0].commit.store_commit().predecessors.is_empty());
     });
 }

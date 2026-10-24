@@ -1244,3 +1244,424 @@ fn dropped_client_gc_waiter_does_not_release_its_physical_owner() {
         .is_none()
     );
 }
+
+#[test]
+fn external_stack_rewrite_keeps_server_ids_and_operation_evolution() {
+    use jj_lib::{
+        config::{ConfigLayer, ConfigSource, StackedConfig},
+        evolution::walk_predecessors,
+        op_store::RefTarget,
+        ref_name::RefName,
+        repo::{ReadonlyRepo, Repo},
+        settings::UserSettings,
+        signing::Signer,
+    };
+    block_on(async {
+        let directory = tempfile::tempdir().unwrap();
+        let mut config = StackedConfig::with_defaults();
+        config.add_layer(ConfigLayer::parse(ConfigSource::User,
+            "[user]\nname='Native Author'\nemail='author@example.invalid'\n[operation]\nhostname='test'\nusername='test'\n[experimental]\nrecord-predecessors-in-commit=false\n").unwrap());
+        let settings = UserSettings::from_config_and_home_dir(config, None).unwrap();
+        // Metadata-only repository: no materialized or mounted working copy.
+        let repo = ReadonlyRepo::init(
+            &settings,
+            directory.path(),
+            &|_, path| Ok(Box::new(NativeBackend::init(path, Config::default())?)),
+            Signer::new(None, vec![]),
+            ReadonlyRepo::default_workspace_store_initializer(),
+            ReadonlyRepo::default_op_store_initializer(),
+            ReadonlyRepo::default_op_heads_store_initializer(),
+            ReadonlyRepo::default_index_store_initializer(),
+            ReadonlyRepo::default_submodule_store_initializer(),
+        )
+        .await
+        .unwrap();
+        let root = repo.store().root_commit();
+        let mut tx = repo.start_transaction();
+        let a = tx
+            .repo_mut()
+            .new_commit(vec![root.id().clone()], root.tree())
+            .set_description("stack base")
+            .write()
+            .await
+            .unwrap();
+        let b = tx
+            .repo_mut()
+            .new_commit(vec![a.id().clone()], root.tree())
+            .set_description("stack tip")
+            .write()
+            .await
+            .unwrap();
+        let child = tx
+            .repo_mut()
+            .new_commit(vec![b.id().clone()], root.tree())
+            .set_description("unsubmitted child")
+            .write()
+            .await
+            .unwrap();
+        tx.repo_mut()
+            .set_local_bookmark_target(RefName::new("landed"), RefTarget::normal(b.id().clone()));
+        tx.repo_mut().set_local_bookmark_target(
+            RefName::new("child"),
+            RefTarget::normal(child.id().clone()),
+        );
+        let repo = tx.commit("create local stack").await.unwrap();
+
+        // Model exact objects returned by a server. Do not use CommitBuilder:
+        // its committer update would change these canonical IDs.
+        let mut canonical_a = a.store_commit().as_ref().clone();
+        canonical_a.description = "canonical stack base".into();
+        canonical_a.committer.timestamp.timestamp = MillisSinceEpoch(42);
+        let new_a = repo.store().write_commit(canonical_a, None).await.unwrap();
+        let mut canonical_b = b.store_commit().as_ref().clone();
+        canonical_b.parents = vec![new_a.id().clone()];
+        canonical_b.committer.timestamp.timestamp = MillisSinceEpoch(43);
+        let new_b = repo.store().write_commit(canonical_b, None).await.unwrap();
+        assert!(new_a.store_commit().predecessors.is_empty());
+        assert!(new_b.store_commit().predecessors.is_empty());
+        let pairs = vec![
+            (a.id().clone(), new_a.id().clone()),
+            (b.id().clone(), new_b.id().clone()),
+        ];
+
+        let mut mismatch = b.store_commit().as_ref().clone();
+        mismatch.change_id = ChangeId::from_bytes(&[99; 16]);
+        let mismatch = repo.store().write_commit(mismatch, None).await.unwrap();
+        let mut obsolete = b.store_commit().as_ref().clone();
+        obsolete.parents = vec![a.id().clone()];
+        obsolete.description = "invalid canonical parent".into();
+        let obsolete = repo.store().write_commit(obsolete, None).await.unwrap();
+        let invalid_batches = [
+            vec![pairs[1].clone(), pairs[0].clone()],
+            vec![pairs[0].clone(), (b.id().clone(), mismatch.id().clone())],
+            vec![(a.id().clone(), a.id().clone())],
+            vec![pairs[0].clone(), pairs[0].clone()],
+            vec![pairs[0].clone(), (b.id().clone(), obsolete.id().clone())],
+            vec![pairs[0].clone(), (new_a.id().clone(), a.id().clone())],
+        ];
+        for batch in invalid_batches {
+            let mut tx = repo.start_transaction();
+            tx.repo_mut()
+                .index_commits(&[
+                    new_a.clone(),
+                    new_b.clone(),
+                    mismatch.clone(),
+                    obsolete.clone(),
+                ])
+                .await
+                .unwrap();
+            assert!(
+                tx.repo_mut()
+                    .record_external_rewrites(&batch)
+                    .await
+                    .is_err()
+            );
+            assert!(!tx.repo_mut().has_rewrites());
+            assert!(
+                !tx.repo_mut().has_changes(),
+                "invalid batch must not record operation evolution"
+            );
+            drop(tx);
+        }
+        for limits in [
+            jj_lib::repo::ExternalRewriteValidationLimits {
+                max_rewrites: 1,
+                ..Default::default()
+            },
+            jj_lib::repo::ExternalRewriteValidationLimits {
+                max_operation_steps: 1,
+                ..Default::default()
+            },
+            jj_lib::repo::ExternalRewriteValidationLimits {
+                max_evolution_steps: 1,
+                ..Default::default()
+            },
+        ] {
+            let mut tx = repo.start_transaction();
+            tx.repo_mut().index_commits(&[new_b.clone()]).await.unwrap();
+            assert!(matches!(
+                tx.repo_mut()
+                    .record_external_rewrites_with_limits(&pairs, limits)
+                    .await,
+                Err(jj_lib::repo::ExternalRewriteError::ValidationLimitExceeded(
+                    _
+                ))
+            ));
+            assert!(!tx.repo_mut().has_changes());
+        }
+        // No-op operations have no relevant evolution rows. The preflight
+        // must still stop before scanning an arbitrarily long operation chain.
+        let mut long_history = repo.clone();
+        for _ in 0..16 {
+            long_history = long_history
+                .start_transaction()
+                .commit("unrelated operation")
+                .await
+                .unwrap();
+        }
+        let mut limited = long_history.start_transaction();
+        limited
+            .repo_mut()
+            .index_commits(&[new_b.clone()])
+            .await
+            .unwrap();
+        assert!(matches!(
+            limited
+                .repo_mut()
+                .record_external_rewrites_with_limits(
+                    &pairs,
+                    jj_lib::repo::ExternalRewriteValidationLimits {
+                        max_operation_steps: 4,
+                        ..Default::default()
+                    }
+                )
+                .await,
+            Err(jj_lib::repo::ExternalRewriteError::ValidationLimitExceeded(
+                "operation history"
+            ))
+        ));
+        assert!(!limited.repo_mut().has_changes());
+        assert!(matches!(
+            limited
+                .repo_mut()
+                .record_external_rewrites_with_limits(
+                    &pairs,
+                    jj_lib::repo::ExternalRewriteValidationLimits {
+                        max_rewrites: 0,
+                        ..Default::default()
+                    }
+                )
+                .await,
+            Err(jj_lib::repo::ExternalRewriteError::InvalidLimits)
+        ));
+        assert!(!limited.repo_mut().has_changes());
+
+        // A legacy operation can carry commit-embedded predecessor edges that
+        // modern operation maps cannot prove absent. Do not silently skip it.
+        let mut legacy_data = repo.operation().store_operation().clone();
+        legacy_data.parents = vec![repo.op_id().clone()];
+        legacy_data.commit_predecessors = None;
+        let op_store = repo.operation().op_store();
+        let legacy_id = op_store.write_operation(&legacy_data).await.unwrap();
+        let legacy_op = jj_lib::operation::Operation::new(op_store, legacy_id, legacy_data);
+        let legacy_repo = repo.loader().load_at(&legacy_op).await.unwrap();
+        let mut legacy = legacy_repo.start_transaction();
+        legacy
+            .repo_mut()
+            .index_commits(&[new_b.clone()])
+            .await
+            .unwrap();
+        assert!(matches!(
+            legacy.repo_mut().record_external_rewrites(&pairs).await,
+            Err(jj_lib::repo::ExternalRewriteError::IncompleteEvolutionHistory)
+        ));
+        assert!(!legacy.repo_mut().has_changes());
+
+        let mut empty = repo.start_transaction();
+        empty
+            .repo_mut()
+            .record_external_rewrites_with_limits(
+                &[],
+                jj_lib::repo::ExternalRewriteValidationLimits {
+                    max_rewrites: 0,
+                    max_operation_steps: 0,
+                    max_evolution_steps: 0,
+                },
+            )
+            .await
+            .unwrap();
+        assert!(!empty.repo_mut().has_changes());
+        let mut tx = repo.start_transaction();
+        tx.repo_mut().add_head(&new_b).await.unwrap();
+        tx.repo_mut()
+            .record_external_rewrites(&pairs)
+            .await
+            .unwrap();
+        // Duplicate invocation in one transaction is rejected without replacing
+        // the successful mapping or introducing duplicate evolution edges.
+        assert!(
+            tx.repo_mut()
+                .record_external_rewrites(&pairs)
+                .await
+                .is_err()
+        );
+        assert_eq!(tx.repo_mut().rebase_descendants().await.unwrap(), 1);
+        let landed = tx.commit("import canonical stack rewrite").await.unwrap();
+        assert_eq!(
+            landed
+                .view()
+                .get_local_bookmark(RefName::new("landed"))
+                .as_normal(),
+            Some(new_b.id())
+        );
+        let rebased_child = landed
+            .view()
+            .get_local_bookmark(RefName::new("child"))
+            .as_normal()
+            .unwrap();
+        assert_ne!(rebased_child, child.id());
+        assert_eq!(
+            landed
+                .store()
+                .get_commit_async(rebased_child)
+                .await
+                .unwrap()
+                .parent_ids(),
+            &[new_b.id().clone()]
+        );
+        for (old, new) in &pairs {
+            // This is the same operation-history walker used by jj evolog.
+            let history: Vec<_> = walk_predecessors(&landed, std::slice::from_ref(new))
+                .try_collect()
+                .await
+                .unwrap();
+            assert_eq!(history[0].commit.id(), new);
+            assert_eq!(history[0].predecessor_ids(), &[old.clone()]);
+            assert!(history.iter().any(|entry| entry.commit.id() == old));
+            assert!(
+                landed
+                    .store()
+                    .get_commit_async(new)
+                    .await
+                    .unwrap()
+                    .store_commit()
+                    .predecessors
+                    .is_empty()
+            );
+        }
+        // Replay after publication cannot overwrite history or reverse an edge.
+        let mut replay = landed.start_transaction();
+        assert!(matches!(
+            replay.repo_mut().record_external_rewrites(&pairs).await,
+            Err(jj_lib::repo::ExternalRewriteError::DestinationAlreadyRecorded(_))
+        ));
+        assert!(!replay.repo_mut().has_changes());
+        let reverse = vec![(new_b.id().clone(), b.id().clone())];
+        assert!(
+            replay
+                .repo_mut()
+                .record_external_rewrites(&reverse)
+                .await
+                .is_err()
+        );
+        assert!(!replay.repo_mut().has_changes());
+
+        // An operation predecessor need not be indexed. Base index freshness
+        // alone must not permit X -> hidden Y to become Y -> X on import.
+        let mut hidden = a.store_commit().as_ref().clone();
+        hidden.parents = vec![root.id().clone()];
+        hidden.change_id = ChangeId::from_bytes(&[101; 16]);
+        hidden.description = "hidden predecessor-only object".into();
+        let hidden = landed.store().write_commit(hidden, None).await.unwrap();
+        let mut tx = landed.start_transaction();
+        let successor = tx
+            .repo_mut()
+            .new_commit(vec![root.id().clone()], root.tree())
+            .set_change_id(hidden.change_id().clone())
+            .set_description("indexed successor of hidden object")
+            .set_predecessors(vec![hidden.id().clone()])
+            .write()
+            .await
+            .unwrap();
+        let with_hidden_evolution = tx
+            .commit("record predecessor-only evolution")
+            .await
+            .unwrap();
+        assert!(
+            !with_hidden_evolution
+                .index()
+                .has_id(hidden.id())
+                .await
+                .unwrap()
+        );
+        let mut tx = with_hidden_evolution.start_transaction();
+        tx.repo_mut()
+            .index_commits(&[hidden.clone()])
+            .await
+            .unwrap();
+        assert!(
+            matches!(tx.repo_mut().record_external_rewrites(&[(successor.id().clone(), hidden.id().clone())]).await,
+            Err(jj_lib::repo::ExternalRewriteError::EvolutionCycle(id)) if id == *hidden.id())
+        );
+        assert!(!tx.repo_mut().has_rewrites());
+        assert!(!tx.repo_mut().has_changes());
+
+        // A pending predecessor edge can bridge two historical chains through
+        // hidden intermediate commits: X -> Z (history), Z -> W (pending),
+        // W -> Y (history). Importing X as Y must not close that cycle.
+        let mut hidden_y = a.store_commit().as_ref().clone();
+        hidden_y.parents = vec![root.id().clone()];
+        hidden_y.change_id = ChangeId::from_bytes(&[105; 16]);
+        hidden_y.description = "hidden pending-bridge target".into();
+        let hidden_y = landed.store().write_commit(hidden_y, None).await.unwrap();
+        let mut hidden_z = a.store_commit().as_ref().clone();
+        hidden_z.parents = vec![root.id().clone()];
+        hidden_z.change_id = ChangeId::from_bytes(&[106; 16]);
+        hidden_z.description = "hidden pending-bridge intermediate".into();
+        let hidden_z = landed.store().write_commit(hidden_z, None).await.unwrap();
+        let mut tx = with_hidden_evolution.start_transaction();
+        let x = tx
+            .repo_mut()
+            .new_commit(vec![root.id().clone()], root.tree())
+            .set_change_id(hidden_y.change_id().clone())
+            .set_description("bridge source X")
+            .set_predecessors(vec![hidden_z.id().clone()])
+            .write()
+            .await
+            .unwrap();
+        let w = tx
+            .repo_mut()
+            .new_commit(vec![root.id().clone()], root.tree())
+            .set_description("bridge source W")
+            .set_predecessors(vec![hidden_y.id().clone()])
+            .write()
+            .await
+            .unwrap();
+        let bridge_base = tx
+            .commit("record independent hidden predecessor chains")
+            .await
+            .unwrap();
+        assert!(!bridge_base.index().has_id(hidden_y.id()).await.unwrap());
+        assert!(!bridge_base.index().has_id(hidden_z.id()).await.unwrap());
+        let mut tx = bridge_base.start_transaction();
+        // This exact object is not indexed yet, so the public builder can
+        // legitimately attach a new operation evolution edge without rewriting
+        // an existing source or changing the canonical object bytes.
+        let z = tx
+            .repo_mut()
+            .new_commit(vec![root.id().clone()], root.tree())
+            .set_change_id(hidden_z.change_id().clone())
+            .set_description(hidden_z.description())
+            .set_author(hidden_z.author().clone())
+            .set_committer(hidden_z.committer().clone())
+            .set_predecessors(vec![w.id().clone()])
+            .write()
+            .await
+            .unwrap();
+        assert_eq!(z.id(), hidden_z.id());
+        tx.repo_mut()
+            .index_commits(&[hidden_y.clone()])
+            .await
+            .unwrap();
+        assert!(!tx.repo_mut().has_rewrites());
+        assert!(
+            matches!(tx.repo_mut().record_external_rewrites(&[(x.id().clone(), hidden_y.id().clone())]).await,
+            Err(jj_lib::repo::ExternalRewriteError::EvolutionCycle(id)) if id == *hidden_y.id())
+        );
+        assert!(!tx.repo_mut().has_rewrites());
+        let after_rejection = tx
+            .commit("preserve original pending evolution")
+            .await
+            .unwrap();
+        assert_eq!(
+            after_rejection.operation().predecessors_for_commit(z.id()),
+            Some(&[w.id().clone()][..])
+        );
+        assert!(
+            after_rejection
+                .operation()
+                .predecessors_for_commit(hidden_y.id())
+                .is_none()
+        );
+    });
+}

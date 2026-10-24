@@ -13,6 +13,7 @@ crate.annotation(
         "//third_party/patches:jj-index-capabilities.patch",
         "//third_party/patches:jj-merge-prepared-index.patch",
         "//third_party/patches:jj-lazy-prefix-context.patch",
+        "//third_party/patches:jj-external-rewrites.patch",
     ],
     version = "0.46.0",
 )

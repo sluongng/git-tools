@@ -1,0 +1,288 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Son Luong Ngoc <26684313+sluongng@users.noreply.github.com>
+Date: Sat, 24 Oct 2026 16:25:00 +0000
+Subject: [PATCH] jj: Import exact external stack rewrites
+
+A server can return canonical rewritten commits whose IDs must survive
+local reconciliation. Rebuilding these commits changes their metadata and
+IDs, while recording only descendant rewrites loses operation evolution.
+
+Add a validated batch API for already-imported, parent-first rewrites.
+Load both ends from the repository store and require matching change IDs,
+fresh destinations and preserved stack parent links. Reject replay,
+cycles and conflicting mappings before changing either rewrite map.
+Scan operation evolution with explicit read and edge budgets so hidden
+predecessor-only IDs cannot introduce cycles. Reject incomplete legacy
+history and exhausted budgets without mutating either map.
+Record operation predecessors as well as descendant rewrites without
+modifying the canonical commit objects. Callers still own import,
+descendant rebasing and transaction publication.
+
+---
+diff --git a/src/repo.rs b/src/repo.rs
+--- a/src/repo.rs
++++ b/src/repo.rs
+@@ -1026,6 +1026,49 @@
+     }
+ }
+ 
++/// Physical work limits for external rewrite validation.
++#[derive(Clone, Copy, Debug)]
++pub struct ExternalRewriteValidationLimits {
++    pub max_rewrites: usize,
++    /// Operation reads plus parent references inspected, including duplicates.
++    pub max_operation_steps: usize,
++    /// Evolution map keys, predecessor references and reachability steps.
++    pub max_evolution_steps: usize,
++}
++
++impl Default for ExternalRewriteValidationLimits {
++    fn default() -> Self {
++        Self {
++            max_rewrites: 128,
++            max_operation_steps: 10_000,
++            max_evolution_steps: 100_000,
++        }
++    }
++}
++
++/// Failure to record an external, one-to-one stack rewrite.
++#[derive(Debug, Error)]
++pub enum ExternalRewriteError {
++    #[error(transparent)]
++    Backend(#[from] BackendError),
++    #[error(transparent)]
++    Index(#[from] IndexError),
++    #[error(transparent)]
++    OpStore(#[from] OpStoreError),
++    #[error("External rewrite destination {0} already exists in the base operation history")]
++    DestinationAlreadyRecorded(CommitId),
++    #[error("Invalid external rewrite validation limits")]
++    InvalidLimits,
++    #[error("External rewrite validation exceeded its {0} budget")]
++    ValidationLimitExceeded(&'static str),
++    #[error("External rewrite validation requires modern operation evolution records")]
++    IncompleteEvolutionHistory,
++    #[error("External rewrite would create an evolution cycle through {0}")]
++    EvolutionCycle(CommitId),
++    #[error("Invalid external rewrite: {0}")]
++    Invalid(&'static str),
++}
++
+ pub struct MutableRepo {
+     base_repo: Arc<ReadonlyRepo>,
+     index: Box<dyn MutableIndex>,
+@@ -1097,6 +1140,213 @@
+         // `self.rewritten_commits`
+     }
+ 
++    /// Records exact, already-imported external commits as stack rewrites.
++    ///
++    /// Both ends are loaded from this repository's store. Destinations must be
++    /// new to the base operation, and all commits must already be indexed in
++    /// this transaction. Pairs must be parent-first, with disjoint sources and
++    /// destinations, and preserve rewritten parent links. This narrow contract
++    /// excludes replay; a bounded operation-history scan also checks hidden
++    /// predecessor-only IDs that index membership cannot detect.
++    /// Receipt replay must be handled by the caller before invoking this method.
++    ///
++    /// Validation changes neither rewrite maps nor the view. On success, call
++    /// `rebase_descendants()` before committing the transaction. If importing or
++    /// rebasing fails, discard the whole transaction. No commit is reconstructed,
++    /// and no legacy predecessor field is added to its content-addressed object.
++    pub async fn record_external_rewrites(
++        &mut self,
++        pairs: &[(CommitId, CommitId)],
++    ) -> Result<(), ExternalRewriteError> {
++        self.record_external_rewrites_with_limits(pairs, ExternalRewriteValidationLimits::default())
++            .await
++    }
++
++    /// Records external rewrites with explicit physical history-work budgets.
++    ///
++    /// Empty batches do no work. Nonempty batches fail closed on budget exhaustion
++    /// or legacy operations without modern evolution maps. Limits bound operation
++    /// reads, inspected references, graph storage and the number of pairwise index
++    /// queries; they do not bound bytes decoded by a single OpStore read.
++    pub async fn record_external_rewrites_with_limits(
++        &mut self,
++        pairs: &[(CommitId, CommitId)],
++        limits: ExternalRewriteValidationLimits,
++    ) -> Result<(), ExternalRewriteError> {
++        if pairs.is_empty() {
++            return Ok(());
++        }
++        if !(1..=4096).contains(&limits.max_rewrites)
++            || !(1..=1_000_000).contains(&limits.max_operation_steps)
++            || !(1..=10_000_000).contains(&limits.max_evolution_steps)
++        {
++            return Err(ExternalRewriteError::InvalidLimits);
++        }
++        if pairs.len() > limits.max_rewrites {
++            return Err(ExternalRewriteError::ValidationLimitExceeded(
++                "rewrite batch",
++            ));
++        }
++        let invalid = ExternalRewriteError::Invalid;
++        let mut sources = HashMap::new();
++        let mut destinations = HashSet::new();
++        for (position, (old, new)) in pairs.iter().enumerate() {
++            if old == new || old == self.store().root_commit_id() {
++                return Err(invalid("self rewrite or root source"));
++            }
++            if sources.insert(old, position).is_some() || !destinations.insert(new) {
++                return Err(invalid("duplicate source or destination"));
++            }
++        }
++        if sources.keys().any(|old| destinations.contains(old)) {
++            return Err(invalid("source and destination sets overlap"));
++        }
++        for (position, (old, new)) in pairs.iter().enumerate() {
++            if self.parent_mapping.contains_key(old)
++                || self.parent_mapping.contains_key(new)
++                || self.commit_predecessors.contains_key(old)
++                || self.commit_predecessors.contains_key(new)
++                || self
++                    .commit_predecessors
++                    .values()
++                    .any(|ids| ids.contains(new))
++                || self.parent_mapping.values().any(|rewrite| {
++                    rewrite.new_parent_ids().contains(old) || rewrite.new_parent_ids().contains(new)
++                })
++            {
++                return Err(invalid("conflicting pending rewrite"));
++            }
++            if !self.base_repo.index().has_id(old).await? {
++                return Err(invalid("source unknown to the base operation"));
++            }
++            if self.base_repo.index().has_id(new).await? {
++                return Err(ExternalRewriteError::DestinationAlreadyRecorded(
++                    new.clone(),
++                ));
++            }
++            if !self.index().has_id(old).await? || !self.index().has_id(new).await? {
++                return Err(invalid(
++                    "commits must be imported before recording rewrites",
++                ));
++            }
++            let old_commit = self.store().get_commit_async(old).await?;
++            let new_commit = self.store().get_commit_async(new).await?;
++            if old_commit.change_id() != new_commit.change_id() {
++                return Err(invalid("change IDs differ"));
++            }
++            // A destination based on its own obsolete source would make
++            // descendant rebasing chase the rewrite back into itself.
++            for (source, _) in pairs {
++                if self.index().is_ancestor(source, new).await? {
++                    return Err(invalid("destination descends from an obsolete source"));
++                }
++            }
++            for parent in old_commit.parent_ids() {
++                if let Some(&parent_position) = sources.get(parent) {
++                    if parent_position >= position {
++                        return Err(invalid("stack is not parent-first"));
++                    }
++                    if !new_commit.parent_ids().contains(&pairs[parent_position].1) {
++                        return Err(invalid("rewritten parent link is missing"));
++                    }
++                }
++            }
++        }
++        self.validate_external_evolution(&sources, &destinations, limits)
++            .await?;
++        // All fallible validation precedes either map mutation.
++        for (old, new) in pairs {
++            self.set_predecessors(new.clone(), vec![old.clone()]);
++            self.set_rewritten_commit(old.clone(), new.clone());
++        }
++        Ok(())
++    }
++
++    async fn validate_external_evolution(
++        &self,
++        sources: &HashMap<&CommitId, usize>,
++        destinations: &HashSet<&CommitId>,
++        limits: ExternalRewriteValidationLimits,
++    ) -> Result<(), ExternalRewriteError> {
++        fn charge(
++            remaining: &mut usize,
++            resource: &'static str,
++        ) -> Result<(), ExternalRewriteError> {
++            *remaining = remaining
++                .checked_sub(1)
++                .ok_or(ExternalRewriteError::ValidationLimitExceeded(resource))?;
++            Ok(())
++        }
++        let mut operation_steps = limits.max_operation_steps;
++        let mut evolution_steps = limits.max_evolution_steps;
++        let base = self.base_repo.operation();
++        let store = base.op_store();
++        let mut pending = vec![base.id().clone()];
++        let mut seen_operations = HashSet::from([base.id().clone()]);
++        let mut predecessors: HashMap<CommitId, Vec<CommitId>> = HashMap::new();
++        // Pending evolution can bridge two historical predecessor chains even
++        // when neither endpoint appears directly in the pending map.
++        for (successor, previous) in &self.commit_predecessors {
++            charge(&mut evolution_steps, "evolution history")?;
++            let entry = predecessors.entry(successor.clone()).or_default();
++            for predecessor in previous {
++                charge(&mut evolution_steps, "evolution history")?;
++                entry.push(predecessor.clone());
++            }
++        }
++        while let Some(id) = pending.pop() {
++            // Charge before a read. Do not use op_walk or Operation::parents:
++            // those can load multiple ancestors before yielding control here.
++            charge(&mut operation_steps, "operation history")?;
++            let op = if &id == base.id() {
++                base.clone()
++            } else {
++                Operation::new(store.clone(), id.clone(), store.read_operation(&id).await?)
++            };
++            let map = op
++                .store_operation()
++                .commit_predecessors
++                .as_ref()
++                .ok_or(ExternalRewriteError::IncompleteEvolutionHistory)?;
++            for (successor, previous) in map {
++                charge(&mut evolution_steps, "evolution history")?;
++                if destinations.contains(successor) {
++                    return Err(ExternalRewriteError::DestinationAlreadyRecorded(
++                        successor.clone(),
++                    ));
++                }
++                let entry = predecessors.entry(successor.clone()).or_default();
++                for predecessor in previous {
++                    charge(&mut evolution_steps, "evolution history")?;
++                    entry.push(predecessor.clone());
++                }
++            }
++            for parent in op.parent_ids() {
++                charge(&mut operation_steps, "operation history")?;
++                if seen_operations.insert(parent.clone()) {
++                    pending.push(parent.clone());
++                }
++            }
++        }
++        let mut pending: Vec<_> = sources.keys().map(|id| (*id).clone()).collect();
++        let mut seen = HashSet::new();
++        while let Some(id) = pending.pop() {
++            charge(&mut evolution_steps, "evolution reachability")?;
++            if !seen.insert(id.clone()) {
++                continue;
++            }
++            if destinations.contains(&id) {
++                return Err(ExternalRewriteError::EvolutionCycle(id));
++            }
++            if let Some(previous) = predecessors.get(&id) {
++                for predecessor in previous {
++                    charge(&mut evolution_steps, "evolution reachability")?;
++                    pending.push(predecessor.clone());
++                }
++            }
++        }
++        Ok(())
++    }
+     pub(crate) fn set_predecessors(&mut self, id: CommitId, predecessors: Vec<CommitId>) {
+         self.commit_predecessors.insert(id, predecessors);
+     }
