@@ -28,6 +28,7 @@ pub struct Provider {
     files: Mutex<HashMap<m::FileId, (m::Descriptor, Vec<u8>)>>,
     pub file_reads: AtomicUsize,
     pub metadata_reads: AtomicUsize,
+    pub metadata_gate: Mutex<Option<Arc<tokio::sync::Semaphore>>>,
 }
 impl Provider {
     pub fn object(&self, object: m::Object) -> m::Descriptor {
@@ -62,6 +63,10 @@ impl NativeObjectIo for Provider {
     }
     async fn read_metadata(&self, key: m::ObjectKey) -> BackendResult<VerifiedMetadata> {
         self.metadata_reads.fetch_add(1, Ordering::SeqCst);
+        let gate = self.metadata_gate.lock().unwrap().clone();
+        if let Some(gate) = gate {
+            gate.acquire().await.map_err(|_| error())?.forget();
+        }
         let (d, b) = self
             .metadata
             .lock()

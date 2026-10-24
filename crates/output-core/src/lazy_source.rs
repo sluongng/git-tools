@@ -16,6 +16,8 @@ pub struct SourcePin {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct SourceLoadLimits {
     pub max_concurrent: usize,
+    /// Admitted physical loads, including work waiting for a concurrent slot.
+    /// Additional callers wait asynchronously within their original deadline.
     pub max_pending: usize,
     pub max_directory_entries: usize,
     pub max_directory_bytes: usize,
@@ -207,6 +209,13 @@ pub(super) struct Runtime {
     slots: Arc<Semaphore>,
     pending: Arc<Semaphore>,
     flights: Mutex<HashMap<u64, Arc<Flight>>>,
+}
+// Queued calls and physical loads never copy the potentially large edit journal.
+#[derive(Clone)]
+struct LoadContext {
+    pin: SourcePin,
+    load_limits: SourceLoadLimits,
+    limits: SourceLimits,
 }
 struct Flight {
     result: Mutex<Option<std::result::Result<(), LoadFailure>>>,
@@ -503,15 +512,10 @@ fn checked_directory(
     dir: &VerifiedSourceDirectory,
     id: [u8; 32],
     base_path: &str,
-    meta: &LazyMeta,
+    limits: &SourceLimits,
+    load_limits: &SourceLoadLimits,
 ) -> Result<()> {
-    dir.validate_for_projection(
-        id,
-        base_path,
-        &meta.limits,
-        &meta.load_limits,
-        &tree.backend,
-    )
+    dir.validate_for_projection(id, base_path, limits, load_limits, &tree.backend)
 }
 impl VerifiedSourceDirectory {
     /// Validate a whole canonical directory before authorizing its file
@@ -953,6 +957,7 @@ impl Tree {
             .map(|s| s.pin.clone())
     }
     pub async fn ensure_directory_loaded(&self, inode: u64) -> Result<()> {
+        let started = tokio::time::Instant::now();
         let meta = {
             let ns = self.namespace.lock().unwrap();
             ensure!(
@@ -965,7 +970,12 @@ impl Tree {
             if record.source_directory.as_ref().is_none_or(|d| d.loaded) {
                 return Ok(());
             }
-            lazy(&ns.state)?.clone()
+            let current = lazy(&ns.state)?;
+            LoadContext {
+                pin: current.pin.clone(),
+                load_limits: current.load_limits.clone(),
+                limits: current.limits.clone(),
+            }
         };
         let runtime = self
             .lazy_runtime
@@ -974,18 +984,46 @@ impl Tree {
             .clone()
             .ok_or(SourceNotLoaded)?;
         require(runtime.pin == meta.pin, CoreError::Stale)?;
-        let flight = {
+        let deadline = started + Duration::from_millis(meta.load_limits.timeout_ms);
+        let existing = runtime.flights.lock().unwrap().get(&inode).cloned();
+        let flight = if let Some(flight) = existing {
+            flight
+        } else {
+            let pending =
+                tokio::time::timeout_at(deadline, runtime.pending.clone().acquire_owned())
+                    .await
+                    .map_err(|_| CacheTimeoutError)??;
+            ensure!(tokio::time::Instant::now() < deadline, CacheTimeoutError);
+            // Admission can wait across cancellation, loading or root replacement.
+            // Establish a physical owner before rechecking so replacement cannot
+            // race the checks and start a request against a retired provider.
+            let job = self.source_job()?;
+            {
+                let ns = self.namespace.lock().unwrap();
+                ensure!(
+                    !ns.failed,
+                    "source namespace unavailable; reopen for recovery"
+                );
+                require(lazy(&ns.state)?.pin == meta.pin, CoreError::Stale)?;
+                let record = record(&ns.state, inode)?;
+                require(record.node.linked, CoreError::Stale)?;
+                directory(&ns.state, inode)?;
+                if record.source_directory.as_ref().is_none_or(|d| d.loaded) {
+                    return Ok(());
+                }
+            }
+            require(
+                self.lazy_runtime
+                    .lock()
+                    .unwrap()
+                    .as_ref()
+                    .is_some_and(|current| Arc::ptr_eq(current, &runtime)),
+                CoreError::Stale,
+            )?;
             let mut flights = runtime.flights.lock().unwrap();
             if let Some(flight) = flights.get(&inode) {
                 flight.clone()
             } else {
-                ensure!(flights.len() < meta.load_limits.max_pending, SourceLoadBusy);
-                let pending = runtime
-                    .pending
-                    .clone()
-                    .try_acquire_owned()
-                    .map_err(|_| SourceLoadBusy)?;
-                let job = self.source_job()?;
                 let tree = self
                     .self_ref
                     .upgrade()
@@ -1002,17 +1040,13 @@ impl Tree {
                     let work = tokio::spawn(async move {
                         let operation = async {
                             let permit = worker.slots.clone().acquire_owned().await?;
+                            ensure!(tokio::time::Instant::now() < deadline, CacheTimeoutError);
                             let owner: Arc<dyn std::any::Any + Send + Sync> =
                                 Arc::new((tree.clone(), job, pending, permit));
                             tree.load_directory(inode, &meta, worker.provider.clone(), owner)
                                 .await
                         };
-                        match tokio::time::timeout(
-                            Duration::from_millis(meta.load_limits.timeout_ms),
-                            operation,
-                        )
-                        .await
-                        {
+                        match tokio::time::timeout_at(deadline, operation).await {
                             Ok(result) => result,
                             Err(_) => Err(CacheTimeoutError.into()),
                         }
@@ -1027,20 +1061,24 @@ impl Tree {
                 flight
             }
         };
-        loop {
-            let notified = flight.ready.notified();
-            tokio::pin!(notified);
-            notified.as_mut().enable();
-            if let Some(result) = flight.result.lock().unwrap().clone() {
-                return result.map_err(LoadFailure::into_error);
+        tokio::time::timeout_at(deadline, async {
+            loop {
+                let notified = flight.ready.notified();
+                tokio::pin!(notified);
+                notified.as_mut().enable();
+                if let Some(result) = flight.result.lock().unwrap().clone() {
+                    return result.map_err(LoadFailure::into_error);
+                }
+                notified.await;
             }
-            notified.await;
-        }
+        })
+        .await
+        .map_err(|_| CacheTimeoutError)?
     }
     async fn load_directory(
         &self,
         inode: u64,
-        meta: &LazyMeta,
+        meta: &LoadContext,
         provider: Arc<dyn SourceDirectoryProvider>,
         owner: Arc<dyn std::any::Any + Send + Sync>,
     ) -> Result<()> {
@@ -1074,7 +1112,14 @@ impl Tree {
                 owner.clone(),
             )
             .await?;
-        checked_directory(self, &decoded, base.tree_id, &base_path, meta)?;
+        checked_directory(
+            self,
+            &decoded,
+            base.tree_id,
+            &base_path,
+            &meta.limits,
+            &meta.load_limits,
+        )?;
         let _gate = self.source_gate.lock().unwrap();
         let mut ns = self.namespace.lock().unwrap();
         Self::change_locked_mode(&mut ns, true, |state| {
@@ -1233,6 +1278,7 @@ impl Tree {
         Ok(SourceDirectoryPage { entries, next })
     }
     pub async fn readlink_source(&self, inode: u64) -> Result<String> {
+        let started = tokio::time::Instant::now();
         let (origin, pin, timeout) = {
             let ns = self.namespace.lock().unwrap();
             ensure!(
@@ -1268,16 +1314,46 @@ impl Tree {
             .clone()
             .ok_or(SourceNotLoaded)?;
         require(runtime.pin == pin, CoreError::Stale)?;
+        let deadline = started + Duration::from_millis(timeout);
+        let pending = tokio::time::timeout_at(deadline, runtime.pending.clone().acquire_owned())
+            .await
+            .map_err(|_| CacheTimeoutError)??;
+        ensure!(tokio::time::Instant::now() < deadline, CacheTimeoutError);
         let tree = self.self_ref.upgrade().context("source owner gone")?;
         let job = self.source_job()?;
-        let pending = runtime
-            .pending
-            .clone()
-            .try_acquire_owned()
-            .map_err(|_| SourceLoadBusy)?;
+        {
+            let ns = self.namespace.lock().unwrap();
+            ensure!(
+                !ns.failed,
+                "source namespace unavailable; reopen for recovery"
+            );
+            require(lazy(&ns.state)?.pin == pin, CoreError::Stale)?;
+            let record = record(&ns.state, inode)?;
+            require(record.node.linked, CoreError::Stale)?;
+            require(
+                record.node.kind == NodeKind::Symlink,
+                CoreError::InvalidInput,
+            )?;
+            ensure!(
+                record.source_origin.as_ref() == Some(&origin),
+                "source symlink changed"
+            );
+            if let Some(target) = &record.target {
+                return Ok(target.clone());
+            }
+        }
+        require(
+            self.lazy_runtime
+                .lock()
+                .unwrap()
+                .as_ref()
+                .is_some_and(|current| Arc::ptr_eq(current, &runtime)),
+            CoreError::Stale,
+        )?;
         let task = tokio::spawn(async move {
             let operation = async move {
                 let permit = runtime.slots.clone().acquire_owned().await?;
+                ensure!(tokio::time::Instant::now() < deadline, CacheTimeoutError);
                 let owner: Arc<dyn std::any::Any + Send + Sync> =
                     Arc::new((tree.clone(), job, pending, permit));
                 let target = runtime
@@ -1307,7 +1383,7 @@ impl Tree {
                     Ok(target)
                 })
             };
-            tokio::time::timeout(Duration::from_millis(timeout), operation)
+            tokio::time::timeout_at(deadline, operation)
                 .await
                 .map_err(|_| CacheTimeoutError)?
         });
@@ -1566,7 +1642,8 @@ impl SourceDeltaSnapshot {
                 &update.directory,
                 update.directory.tree_id,
                 &update.path,
-                &new_meta,
+                &new_meta.limits,
+                &new_meta.load_limits,
             )?;
             count = count
                 .checked_add(update.directory.entries.len())

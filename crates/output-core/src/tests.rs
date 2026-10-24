@@ -1587,6 +1587,7 @@ async fn source_freeze_rejects_inflight_cow_and_nonempty_initial_namespace() {
 #[derive(Default)]
 struct Directories {
     panic: AtomicBool,
+    symlink_calls: AtomicU64,
     directories: Mutex<HashMap<[u8; 32], Vec<SourceDirectoryEntry>>>,
     calls: Mutex<Vec<([u8; 32], String)>>,
     delay: AtomicBool,
@@ -1635,6 +1636,7 @@ impl SourceDirectoryProvider for Directories {
         _: u64,
         _: Arc<dyn std::any::Any + Send + Sync>,
     ) -> Result<String> {
+        self.symlink_calls.fetch_add(1, Ordering::SeqCst);
         Ok("target".into())
     }
 }
@@ -1816,6 +1818,258 @@ async fn lazy_directory_fetch_singleflight_and_physical_owner_outlive_cancelled_
     .await
     .unwrap();
 }
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn lazy_metadata_capacity_waits_and_retains_physical_owners() {
+    use std::future::Future;
+    let (_dir, source, tree) = setup(CacheConfig::default());
+    let directories = Arc::new(Directories::default());
+    let mut root = lazy_fixture(&tree, &source, &directories);
+    root.load_limits.max_pending = 1;
+    root.load_limits.max_concurrent = 1;
+    directories
+        .directories
+        .lock()
+        .unwrap()
+        .get_mut(&[1; 32])
+        .unwrap()
+        .insert(
+            1,
+            SourceDirectoryEntry {
+                name: "link".into(),
+                mode: 0o777,
+                kind: SourceDirectoryEntryKind::Symlink {
+                    object_id: [4; 32],
+                    target_size: 6,
+                },
+            },
+        );
+    tree.install_lazy_source(root, None, "one-slot", &SourceLimits::default())
+        .unwrap();
+    let a = tree.lookup_source(1, "a").await.unwrap();
+    let other = tree.lookup_source(1, "unvisited").await.unwrap();
+    let link = tree.lookup_source(1, "link").await.unwrap();
+    directories.delay.store(true, Ordering::SeqCst);
+    directories.retain_owner.store(true, Ordering::SeqCst);
+    let first = {
+        let tree = tree.clone();
+        tokio::spawn(async move { tree.ensure_directory_loaded(a.id).await })
+    };
+    tokio::time::timeout(Duration::from_secs(2), directories.entered.notified())
+        .await
+        .unwrap();
+    let mut same = Box::pin(tree.ensure_directory_loaded(a.id));
+    assert!(
+        std::future::poll_fn(|cx| std::task::Poll::Ready(same.as_mut().poll(cx)))
+            .await
+            .is_pending()
+    );
+    let mut waiting = Box::pin(tree.ensure_directory_loaded(other.id));
+    assert!(
+        std::future::poll_fn(|cx| std::task::Poll::Ready(waiting.as_mut().poll(cx)))
+            .await
+            .is_pending(),
+        "a distinct directory waits instead of returning capacity EAGAIN"
+    );
+    let mut canceled = Box::pin(tree.readlink_source(link.id));
+    assert!(
+        std::future::poll_fn(|cx| std::task::Poll::Ready(canceled.as_mut().poll(cx)))
+            .await
+            .is_pending()
+    );
+    drop(canceled);
+    let mut symlink = Box::pin(tree.readlink_source(link.id));
+    assert!(
+        std::future::poll_fn(|cx| std::task::Poll::Ready(symlink.as_mut().poll(cx)))
+            .await
+            .is_pending()
+    );
+    first.abort();
+    let _ = first.await;
+    directories.release.notify_one();
+    tokio::time::timeout(Duration::from_secs(2), same)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        std::future::poll_fn(|cx| std::task::Poll::Ready(waiting.as_mut().poll(cx)))
+            .await
+            .is_pending(),
+        "provider-owned physical resources still consume admission after result delivery"
+    );
+    assert_eq!(directories.symlink_calls.load(Ordering::SeqCst), 0);
+    directories.held_owner.lock().unwrap().take();
+    tokio::time::timeout(Duration::from_secs(2), waiting)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(2), symlink)
+            .await
+            .unwrap()
+            .unwrap(),
+        "target"
+    );
+    assert_eq!(
+        directories.symlink_calls.load(Ordering::SeqCst),
+        1,
+        "cancelled queued symlink must never start"
+    );
+    assert_eq!(
+        directories.calls.lock().unwrap().len(),
+        3,
+        "root plus two distinct directories, with same-inode singleflight"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn lazy_admission_and_provider_share_one_original_deadline() {
+    let (_dir, source, tree) = setup(CacheConfig::default());
+    let directories = Arc::new(Directories::default());
+    let mut root = lazy_fixture(&tree, &source, &directories);
+    root.load_limits.max_pending = 1;
+    root.load_limits.max_concurrent = 1;
+    root.load_limits.timeout_ms = 1000;
+    tree.install_lazy_source(root, None, "one-deadline", &SourceLimits::default())
+        .unwrap();
+    let a = tree.lookup_source(1, "a").await.unwrap();
+    let other = tree.lookup_source(1, "unvisited").await.unwrap();
+    directories.delay.store(true, Ordering::SeqCst);
+    let first = {
+        let tree = tree.clone();
+        tokio::spawn(async move { tree.ensure_directory_loaded(a.id).await })
+    };
+    tokio::time::timeout(Duration::from_secs(2), directories.entered.notified())
+        .await
+        .unwrap();
+    let started = tokio::time::Instant::now();
+    let waiter = {
+        let tree = tree.clone();
+        tokio::spawn(async move { tree.ensure_directory_loaded(other.id).await })
+    };
+    tokio::time::sleep(Duration::from_millis(700)).await;
+    directories.delay.store(true, Ordering::SeqCst);
+    directories.release.notify_one();
+    first.await.unwrap().unwrap();
+    tokio::time::timeout(Duration::from_secs(2), directories.entered.notified())
+        .await
+        .unwrap();
+    let error = tokio::time::timeout(Duration::from_secs(2), waiter)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap_err();
+    assert!(error.downcast_ref::<CacheTimeoutError>().is_some());
+    assert!(
+        started.elapsed() < Duration::from_millis(1450),
+        "provider timeout must not restart after admission"
+    );
+    assert!(
+        tree.lookup(other.id, "untouched.txt")
+            .unwrap_err()
+            .is::<SourceNotLoaded>(),
+        "timed out provider must not publish a partial directory"
+    );
+}
+
+#[tokio::test]
+async fn queued_lazy_load_revalidates_replaced_roots_and_providers() {
+    use std::future::Future;
+    for replace_root in [true, false] {
+        let (_dir, source, tree) = setup(CacheConfig::default());
+        let directories = Arc::new(Directories::default());
+        let mut root = lazy_fixture(&tree, &source, &directories);
+        root.load_limits.max_pending = 1;
+        root.load_limits.max_concurrent = 1;
+        let pin = root.pin.clone();
+        tree.install_lazy_source(root, None, "initial", &Default::default())
+            .unwrap();
+        let a = tree.lookup_source(1, "a").await.unwrap();
+        let other = tree.lookup_source(1, "unvisited").await.unwrap();
+        directories.retain_owner.store(true, Ordering::SeqCst);
+        tree.ensure_directory_loaded(a.id).await.unwrap();
+        let mut queued = Box::pin(tree.ensure_directory_loaded(other.id));
+        assert!(
+            std::future::poll_fn(|cx| std::task::Poll::Ready(queued.as_mut().poll(cx)))
+                .await
+                .is_pending()
+        );
+        let new_provider = Arc::new(Directories::default());
+        let mut replacement = lazy_fixture(&tree, &source, &new_provider);
+        directories.held_owner.lock().unwrap().take();
+        if replace_root {
+            replacement.pin.generation += 1;
+            let snapshot = tree
+                .freeze_lazy_source(SourceFrontendFence::TreeOnly, &Default::default())
+                .unwrap();
+            let expected = snapshot.version().clone();
+            drop(snapshot);
+            tree.install_lazy_source(
+                replacement,
+                Some(expected),
+                "replacement",
+                &Default::default(),
+            )
+            .unwrap();
+        } else {
+            tree.attach_lazy_source(new_provider.clone(), pin).unwrap();
+        }
+        let error = tokio::time::timeout(Duration::from_secs(2), queued)
+            .await
+            .unwrap()
+            .unwrap_err();
+        assert_eq!(error.downcast_ref::<CoreError>(), Some(&CoreError::Stale));
+        assert_eq!(
+            directories.calls.lock().unwrap().len(),
+            2,
+            "queued request must not enter retired provider"
+        );
+        assert!(
+            new_provider.calls.lock().unwrap().is_empty(),
+            "stale caller must not silently switch providers"
+        );
+    }
+}
+
+#[tokio::test]
+async fn queued_lazy_load_deadline_does_not_release_provider_owned_capacity() {
+    let (_dir, source, tree) = setup(CacheConfig::default());
+    let directories = Arc::new(Directories::default());
+    let mut root = lazy_fixture(&tree, &source, &directories);
+    root.load_limits.max_pending = 1;
+    root.load_limits.max_concurrent = 1;
+    root.load_limits.timeout_ms = 100;
+    tree.install_lazy_source(root, None, "timeout", &Default::default())
+        .unwrap();
+    let a = tree.lookup_source(1, "a").await.unwrap();
+    let other = tree.lookup_source(1, "unvisited").await.unwrap();
+    directories.delay.store(true, Ordering::SeqCst);
+    directories.retain_owner.store(true, Ordering::SeqCst);
+    let error = tree.ensure_directory_loaded(a.id).await.unwrap_err();
+    assert!(error.is::<CacheTimeoutError>());
+    let error = tree.ensure_directory_loaded(other.id).await.unwrap_err();
+    assert!(
+        error.is::<CacheTimeoutError>(),
+        "capacity wait expires with timeout, not EAGAIN"
+    );
+    assert_eq!(
+        directories.calls.lock().unwrap().len(),
+        2,
+        "timed-out waiter never reaches provider"
+    );
+    assert!(
+        tree.freeze_lazy_source(SourceFrontendFence::TreeOnly, &Default::default())
+            .unwrap_err()
+            .is::<SourceFreezeBusy>()
+    );
+    directories.held_owner.lock().unwrap().take();
+    tree.ensure_directory_loaded(other.id).await.unwrap();
+    assert_eq!(
+        directories.calls.lock().unwrap().len(),
+        3,
+        "expiry releases semaphore queue position"
+    );
+}
+
 #[tokio::test]
 async fn lazy_directory_failure_bounds_and_real_emptiness_never_publish_a_subset() {
     // Canonical prefixes are repeated in every child's provenance. The wire

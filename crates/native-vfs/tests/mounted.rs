@@ -298,3 +298,146 @@ async fn cached_native_metadata_is_invalidated_on_checked_root_switch() {
     assert!(!config.root.join("link").exists());
     mount.shutdown().await.unwrap();
 }
+
+/// More simultaneous directory misses than the admitted metadata-job budget
+/// must backpressure kernel callers, not expose capacity as transient ENOENT/EAGAIN.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires usable /dev/fuse and fusermount3"]
+async fn native_metadata_fanout_waits_beyond_the_pending_load_budget() {
+    use std::sync::{Arc, Barrier};
+    use std::time::Duration;
+    use tinytree_model as m;
+    let directory = tempfile::tempdir().unwrap();
+    let (mut config, provider) = common::fixture(directory.path());
+    let mut entries = Vec::new();
+    for index in 0..40 {
+        let bytes = format!("file-{index:02}");
+        let file = provider.file(bytes.as_bytes());
+        let child = provider.object(m::Object::Tree(m::Tree {
+            entries: vec![m::TreeEntry {
+                name: "child".into(),
+                value: m::TreeValue::File {
+                    id: m::FileId(file.key.id.0),
+                    size_bytes: file.size_bytes,
+                    executable: false,
+                    copy_id: None,
+                },
+            }],
+        }));
+        entries.push(m::TreeEntry {
+            name: format!("dir{index:02}"),
+            value: m::TreeValue::Tree(m::TreeId(child.key.id.0)),
+        });
+    }
+    let root = provider.object(m::Object::Tree(m::Tree { entries }));
+    config.root_merge = m::TreeMerge {
+        terms: vec![m::TreeId(root.key.id.0)],
+        labels: vec![String::new()],
+    };
+    let prepared = native_vfs::prepare(
+        config.clone(),
+        provider.clone(),
+        common::cache(directory.path()),
+    )
+    .await
+    .unwrap();
+    let mount_ids = || {
+        fs::read_to_string("/proc/self/mountinfo")
+            .unwrap()
+            .lines()
+            .filter(|line| line.split_whitespace().nth(4) == config.root.to_str())
+            .map(|line| line.split_whitespace().next().unwrap().to_owned())
+            .collect::<Vec<_>>()
+    };
+    let mounts_before = mount_ids();
+    let mount = native_vfs::mount_prepared_with_metadata_ttl(prepared, Duration::ZERO)
+        .await
+        .unwrap();
+    assert_eq!(fs::read_dir(&config.root).unwrap().count(), 41); // Includes immutable .jj marker.
+    let before = provider.metadata_reads.load(Ordering::SeqCst);
+    let gate = Arc::new(tokio::sync::Semaphore::new(0));
+    *provider.metadata_gate.lock().unwrap() = Some(gate.clone());
+    struct ReleaseOnDrop(Arc<tokio::sync::Semaphore>);
+    impl Drop for ReleaseOnDrop {
+        fn drop(&mut self) {
+            self.0.add_permits(128);
+        }
+    }
+    let _release_on_failure = ReleaseOnDrop(gate.clone());
+    let barrier = Arc::new(Barrier::new(41));
+    let mut receivers = Vec::new();
+    let mut threads = Vec::new();
+    for index in 0..40 {
+        let (send, receive) = tokio::sync::oneshot::channel();
+        receivers.push(receive);
+        let start = barrier.clone();
+        let path = config.root.join(format!("dir{index:02}/child"));
+        threads.push(std::thread::spawn(move || {
+            start.wait();
+            let _ = send.send(fs::metadata(path));
+        }));
+    }
+    barrier.wait();
+    let provider_started = tokio::time::timeout(Duration::from_secs(5), async {
+        while provider.metadata_reads.load(Ordering::SeqCst) < before + 1 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .is_ok();
+    // Collect early failures without asserting: the old capacity-rejection
+    // baseline must release providers, join OS callers and unmount before failing.
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let early: Vec<_> = receivers
+        .iter_mut()
+        .map(|result| match result.try_recv() {
+            Ok(value) => Some(value.map_err(|error| error.to_string())),
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty) => None,
+            Err(error) => Some(Err(error.to_string())),
+        })
+        .collect();
+    let early_count = early.iter().filter(|result| result.is_some()).count();
+    gate.add_permits(64);
+    let mut outcomes = Vec::new();
+    for (result, early) in receivers.into_iter().zip(early) {
+        let outcome = if let Some(value) = early {
+            value
+        } else {
+            match tokio::time::timeout(Duration::from_secs(5), result).await {
+                Ok(Ok(value)) => value.map_err(|error| error.to_string()),
+                Ok(Err(error)) => Err(error.to_string()),
+                Err(error) => Err(error.to_string()),
+            }
+        };
+        outcomes.push(outcome.map(|metadata| metadata.len()));
+    }
+    let threads_joined = threads
+        .into_iter()
+        .map(|thread| thread.join().is_ok())
+        .fold(true, |all, success| all & success);
+    let file_reads = provider.file_reads.load(Ordering::SeqCst);
+    let shutdown = mount.shutdown().await;
+    let mounts_after = mount_ids();
+    assert!(
+        shutdown.is_ok(),
+        "fanout fixture shutdown must complete before assertions: {shutdown:?}"
+    );
+    assert_eq!(
+        mounts_after, mounts_before,
+        "fanout fixture must restore its original kernel mount IDs"
+    );
+    assert!(
+        threads_joined,
+        "all metadata callers must join before result assertions"
+    );
+    assert!(provider_started, "blocked provider read did not start");
+    assert_eq!(
+        early_count, 0,
+        "no metadata request may fail early at capacity; outcomes: {outcomes:?}"
+    );
+    assert!(
+        outcomes.iter().all(|result| matches!(result, Ok(7))),
+        "high-fanout metadata must wait instead of returning EAGAIN: {outcomes:?}"
+    );
+    assert_eq!(file_reads, 0, "stat-only fanout must not hydrate FILE data");
+}
