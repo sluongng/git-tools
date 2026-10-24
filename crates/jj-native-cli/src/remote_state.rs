@@ -152,7 +152,13 @@ pub(crate) fn retained_roots(
             "native sidecar cannot retain an intrinsic commit as a publication target",
         ));
     }
-    let active_operations = state.retained_operations().map(str::to_owned).collect();
+    // Only active replay requires its saved operation. Archived publication
+    // heads stay retained even after operation GC expires their base.
+    let active_operations = state
+        .pending
+        .iter()
+        .map(|intent| intent.base_operation.clone())
+        .collect();
     Ok(Some(RetentionInput {
         commit_heads: heads,
         active_operations,
