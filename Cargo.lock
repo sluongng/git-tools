@@ -5681,6 +5681,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "tinytree-landing"
+version = "0.1.0"
+dependencies = [
+ "blake3",
+ "tinytree-model",
+]
+
+[[package]]
 name = "tinytree-model"
 version = "0.1.0"
 dependencies = [

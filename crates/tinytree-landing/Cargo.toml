@@ -1,0 +1,10 @@
+[package]
+name = "tinytree-landing"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+description = "Bounded deterministic candidates for resolved linear native stacks"
+
+[dependencies]
+blake3 = "1"
+tinytree-model = { path = "../tinytree-model" }
