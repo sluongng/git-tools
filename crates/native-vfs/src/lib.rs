@@ -303,6 +303,16 @@ impl NativeMount {
         expected: output_core::SourceVersion,
         request_id: String,
     ) -> Result<output_core::SourceReceipt> {
+        self.checkout_resolved_with_owner(merge, expected, request_id, None)
+            .await
+    }
+    pub async fn checkout_resolved_with_owner(
+        &self,
+        merge: &m::TreeMerge,
+        expected: output_core::SourceVersion,
+        request_id: String,
+        owner: Option<Arc<dyn std::any::Any + Send + Sync>>,
+    ) -> Result<output_core::SourceReceipt> {
         if self.prepared.tree.lazy_source_pin().is_some() {
             // Replays use the original expected version even if the root was
             // installed before the controller could persist its completion.
@@ -325,7 +335,14 @@ impl NativeMount {
                 )
                 .await;
         }
-        let compiled = self.prepared.compiler.compile_merge(merge).await?;
+        let compiled = if let Some(owner) = owner {
+            self.prepared
+                .compiler
+                .compile_merge_with_owner(merge, owner)
+                .await?
+        } else {
+            self.prepared.compiler.compile_merge(merge).await?
+        };
         self.projection
             .publish_source(
                 compiled.manifest(self.prepared.tree.identity()),

@@ -86,14 +86,27 @@ fn pending(
         confirmed_generation: None,
     }
 }
-async fn control(locator: &Locator) -> Result<BrokerControlClient, CommandError> {
-    BrokerControlClient::connect(
+async fn control(
+    locator: &Locator,
+    repo: Option<&std::path::Path>,
+) -> Result<BrokerControlClient, CommandError> {
+    let client = BrokerControlClient::connect(
         &locator.socket,
         locator.store.clone(),
         native_broker::Config::default(),
     )
     .await
-    .map_err(failure)
+    .map_err(failure)?;
+    let token = repo
+        .map(crate::commands::token)
+        .transpose()
+        .map_err(failure)?
+        .flatten();
+    Ok(if let Some(token) = token {
+        client.with_command_token(token)
+    } else {
+        client
+    })
 }
 fn open_state(command: &CommandHelper) -> Result<(Locator, LockedState), CommandError> {
     reject_overrides(command)?;
@@ -369,7 +382,7 @@ pub(crate) async fn clone(
     let locator = Locator::new(command.cwd().join(socket), store).map_err(failure)?;
     #[cfg(not(feature = "protocol-fixture"))]
     broker::creation_policy(&locator).map_err(failure)?;
-    let client = control(&locator).await?;
+    let client = control(&locator, None).await?;
     let snapshot = client
         .observe_reference(&reference)
         .await
@@ -459,7 +472,7 @@ pub(crate) async fn fetch(
         locked.save().map_err(failure)?;
     }
     let mut helper = command.workspace_helper(ui).await?;
-    let client = control(&locator).await?;
+    let client = control(&locator, Some(command.workspace_loader()?.repo_path())).await?;
     resolve_pending_push(ui, &mut helper, &mut locked, &client, true).await?;
     locked
         .state
@@ -517,7 +530,7 @@ pub(crate) async fn push(
         ));
     }
     let mut helper = command.workspace_helper(ui).await?;
-    let client = control(&locator).await?;
+    let client = control(&locator, Some(command.workspace_loader()?.repo_path())).await?;
     if locked
         .state
         .pending

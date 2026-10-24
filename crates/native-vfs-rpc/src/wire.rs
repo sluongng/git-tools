@@ -165,6 +165,17 @@ pub(crate) fn decode<T: DeserializeOwned>(frame: Envelope, limits: &Limits) -> R
     serde_json::from_slice(&frame.payload)
         .map_err(|_| Status::invalid_argument("invalid projection domain frame"))
 }
+pub(crate) fn decode_command<T: DeserializeOwned>(
+    frame: Envelope,
+    limits: &Limits,
+) -> Result<T, Status> {
+    if frame.payload.len() > limits.max_frame_bytes {
+        return Err(Status::resource_exhausted("command frame exceeds limit"));
+    }
+    crate::bounded_json::check_command(&frame.payload, limits)?;
+    serde_json::from_slice(&frame.payload)
+        .map_err(|_| Status::invalid_argument("invalid command domain frame"))
+}
 pub(crate) fn mount(id: &str) -> Result<(), Status> {
     if id.is_empty()
         || id.len() > 128

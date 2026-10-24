@@ -7,6 +7,7 @@ message Envelope {
   bytes payload = 1;
 }
 service Projection {
+  rpc Command(Envelope) returns (Envelope);
   rpc Inspect(Envelope) returns (Envelope);
   rpc Receipt(Envelope) returns (Envelope);
   rpc Acknowledge(Envelope) returns (Envelope);

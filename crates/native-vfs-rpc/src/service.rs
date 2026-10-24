@@ -41,6 +41,7 @@ struct Inner {
     calls: Arc<Semaphore>,
     memory: Arc<Semaphore>,
     closing: AtomicBool,
+    command_host: RwLock<Option<Arc<dyn crate::CommandHost>>>,
 }
 struct Mount {
     controller: Arc<Controller>,
@@ -57,6 +58,7 @@ struct Work {
     _memory: OwnedSemaphorePermit,
     _call: OwnedSemaphorePermit,
     deadline: Instant,
+    command: std::sync::Mutex<Option<crate::CommandJob>>,
 }
 impl ProjectionService {
     pub fn new(limits: Limits) -> Result<Self, Status> {
@@ -68,8 +70,23 @@ impl ProjectionService {
                 limits,
                 mounts: RwLock::new(HashMap::new()),
                 closing: AtomicBool::new(false),
+                command_host: RwLock::new(None),
             }),
         })
+    }
+    /// Install once before serving. A configured host makes user mutation
+    /// requests command-scoped; protocol fixtures without a host stay explicit.
+    pub fn set_command_host(&self, host: Arc<dyn crate::CommandHost>) -> Result<(), Status> {
+        let mut slot = self
+            .inner
+            .command_host
+            .write()
+            .map_err(|_| Status::internal("command host unavailable"))?;
+        if slot.is_some() {
+            return Err(Status::already_exists("command host already configured"));
+        }
+        *slot = Some(host);
+        Ok(())
     }
     /// Host-only configuration. Incoming requests never choose paths or mounts.
     pub fn register(
@@ -194,6 +211,63 @@ impl ProjectionService {
         }
         Ok(lease)
     }
+    fn command_scope<T>(
+        &self,
+        request: &Request<T>,
+    ) -> Result<(Arc<Work>, Option<[u8; 32]>), Status> {
+        let work = request
+            .extensions()
+            .get::<Arc<Work>>()
+            .cloned()
+            .ok_or_else(|| Status::internal("projection admission scope missing"))?;
+        let all = request.metadata().get_all_bin("native-command-bin");
+        let mut values = all.iter();
+        let token = match values.next() {
+            Some(value) => Some(
+                value
+                    .to_bytes()
+                    .map_err(|_| Status::invalid_argument("invalid native command token"))?
+                    .as_ref()
+                    .try_into()
+                    .map_err(|_| Status::invalid_argument("invalid native command token width"))?,
+            ),
+            None => None,
+        };
+        if values.next().is_some() {
+            return Err(Status::invalid_argument("duplicate native command token"));
+        }
+        Ok((work, token))
+    }
+    fn bind_command(
+        &self,
+        scope: &(Arc<Work>, Option<[u8; 32]>),
+        mount: &str,
+    ) -> Result<Option<crate::CommandJob>, Status> {
+        let host = self
+            .inner
+            .command_host
+            .read()
+            .map_err(|_| Status::internal("command host unavailable"))?
+            .clone();
+        match (host, scope.1) {
+            (Some(host), Some(token)) => {
+                let guard = host.resolve(mount, token)?;
+                *scope
+                    .0
+                    .command
+                    .lock()
+                    .map_err(|_| Status::internal("command guard unavailable"))? = Some(guard);
+                Ok(Some(scope.0.clone()))
+            }
+            (Some(_), None) => Err(Status::failed_precondition(
+                "native projection requires an admitted command",
+            )),
+            (None, Some(_)) => Err(Status::failed_precondition(
+                "native command host is not configured",
+            )),
+            (None, None) => Ok(None),
+        }
+    }
     pub fn rpc_service(&self) -> RpcService {
         let raw = p::projection_server::ProjectionServer::new(self.clone())
             .accept_compressed(CompressionEncoding::Zstd)
@@ -299,6 +373,7 @@ where
                     _memory: memory,
                     _call: call,
                     deadline,
+                    command: std::sync::Mutex::new(None),
                 });
                 let mut request = request.map(|body| {
                     Body::new(InboundBody::new(
@@ -333,15 +408,61 @@ where
 }
 #[tonic::async_trait]
 impl p::projection_server::Projection for ProjectionService {
+    async fn command(
+        &self,
+        request: Request<p::Envelope>,
+    ) -> Result<Response<p::Envelope>, Status> {
+        use crate::command::{CommandReply, CommandRequest};
+        let host = self
+            .inner
+            .command_host
+            .read()
+            .map_err(|_| Status::internal("command host unavailable"))?
+            .clone()
+            .ok_or_else(|| Status::failed_precondition("native command host is not configured"))?;
+        let input: CommandRequest = wire::decode_command(request.into_inner(), &self.inner.limits)?;
+        let result = match input {
+            CommandRequest::Prepare {
+                version: 1,
+                mount,
+                replay,
+            } => {
+                let _lease = self.lease(&mount).await?;
+                CommandReply::Prepared(host.prepare(&mount, replay).await?)
+            }
+            CommandRequest::Begin {
+                version: 1,
+                mount,
+                replay,
+                preparation,
+            } => {
+                let _lease = self.lease(&mount).await?;
+                CommandReply::Began(host.begin(&mount, replay, preparation).await?)
+            }
+            CommandRequest::FinishDirty {
+                version: 1,
+                mount,
+                token,
+            } => {
+                let _lease = self.lease(&mount).await?;
+                host.finish_dirty(&mount, token).await?;
+                CommandReply::DrainedDirty
+            }
+            _ => return Err(Status::invalid_argument("native command protocol version")),
+        };
+        Ok(Response::new(wire::encode(&result, &self.inner.limits)?))
+    }
     async fn inspect(
         &self,
         request: Request<p::Envelope>,
     ) -> Result<Response<p::Envelope>, Status> {
+        let command_scope = self.command_scope(&request)?;
         let Unary::Inspect { mount, expected } =
             wire::decode(request.into_inner(), &self.inner.limits)?
         else {
             return Err(Status::invalid_argument("expected projection inspection"));
         };
+        self.bind_command(&command_scope, &mount)?;
         let lease = match expected {
             Some(expected) => self.lease_bound(&mount, &expected).await?,
             None => self.lease(&mount).await?,
@@ -375,6 +496,7 @@ impl p::projection_server::Projection for ProjectionService {
         &self,
         request: Request<p::Envelope>,
     ) -> Result<Response<p::Envelope>, Status> {
+        let command_scope = self.command_scope(&request)?;
         let Unary::Receipt {
             mount,
             registration,
@@ -386,6 +508,7 @@ impl p::projection_server::Projection for ProjectionService {
             ));
         };
         wire::request_id(&request_id)?;
+        self.bind_command(&command_scope, &mount)?;
         let lease = self.lease_bound(&mount, &registration).await?;
         let outcome = lease
             .mount
@@ -407,6 +530,7 @@ impl p::projection_server::Projection for ProjectionService {
         &self,
         request: Request<p::Envelope>,
     ) -> Result<Response<p::Envelope>, Status> {
+        let command_scope = self.command_scope(&request)?;
         let Unary::Acknowledge {
             mount,
             registration,
@@ -419,6 +543,7 @@ impl p::projection_server::Projection for ProjectionService {
                 "expected projection acknowledgement",
             ));
         };
+        self.bind_command(&command_scope, &mount)?;
         let lease = self.lease_bound(&mount, &registration).await?;
         wire::state(&state, &lease.mount.binding.repository)?;
         if let Some(receipt) = &receipt {
@@ -440,6 +565,7 @@ impl p::projection_server::Projection for ProjectionService {
         &self,
         request: Request<tonic::Streaming<p::Envelope>>,
     ) -> Result<Response<Self::SessionStream>, Status> {
+        let command_scope = self.command_scope(&request)?;
         let work = request
             .extensions()
             .get::<Arc<Work>>()
@@ -464,14 +590,18 @@ impl p::projection_server::Projection for ProjectionService {
                 "projection session must begin with binding",
             ));
         };
+        let physical_owner = self.bind_command(&command_scope, &mount)?;
         let lease = self.lease_bound(&mount, &registration).await?;
         wire::state(&expected, &lease.mount.binding.repository)?;
-        let mutation = lease
+        let mut mutation = lease
             .mount
             .controller
             .begin_session(&expected)
             .await
             .map_err(|_| Status::failed_precondition("cannot begin native projection mutation"))?;
+        if let Some(owner) = physical_owner {
+            mutation.set_physical_owner(owner);
+        }
         let (send, receive) = mpsc::channel(2);
         let (incoming, input) = mpsc::channel(1);
         let revoked = Arc::new(AtomicBool::new(false));
@@ -532,6 +662,13 @@ impl p::projection_server::Projection for ProjectionService {
             .await;
             revoked.store(true, Ordering::Release);
             reader.abort();
+            // Keep mutation, mounted-provider lease and command/resource Work
+            // until real source work has stopped, not merely its logical wait.
+            // One existing admitted worker/session retries an unavailable
+            // barrier; an unprovable stop stays owned for explicit recovery.
+            while mutation.drain_physical().await.is_err() {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
             if let Err(error) = result {
                 let _ =
                     tokio::time::timeout(session_cfg.session_idle_timeout, send.send(Err(error)))

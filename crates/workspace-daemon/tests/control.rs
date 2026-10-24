@@ -431,7 +431,9 @@ async fn public_state_directory_is_rejected_before_binding() -> Result<()> {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn offline_upstream_does_not_prevent_durable_bes_admission_startup() -> Result<()> {
+async fn offline_managed_daemon_preserves_seeded_native_objects_and_requires_command_fences()
+-> Result<()> {
+    use jj_native_backend::NativeObjectIo as _;
     use std::os::unix::fs::PermissionsExt;
     // The tool launcher may use a writable TEST_TMPDIR ancestor. Native storage
     // requires the same trusted ancestry as production, not a relaxed test rule.
@@ -454,8 +456,109 @@ async fn offline_upstream_does_not_prevent_durable_bes_admission_startup() -> Re
     let mut remote = jj_native_remote::Config::default();
     remote.remote.endpoint = format!("http://127.0.0.1:{upstream_port}");
     config.native.repositories.get_mut("other").unwrap().remote = Some(remote);
+    let content = b"native bytes seeded through the trusted owner before startup\n";
+    drop(private_fs::PrivateDir::create(&config.state_dir)?);
+    let native_root = config.state_dir.join("native");
+    drop(private_fs::PrivateDir::create(&native_root)?);
+    for alias in ["example", "other"] {
+        drop(private_fs::PrivateDir::create(native_root.join(alias))?);
+    }
+    let seed =
+        jj_native_backend::DirectObjectIo::init(&native_root.join("example"), Default::default())?;
+    let empty = tinytree_model::empty_tree();
+    assert_eq!(
+        seed.write_metadata(tinytree_model::Object::Tree(Default::default()))
+            .await?,
+        empty.descriptor
+    );
+    let id = seed
+        .write_file(&mut futures::io::Cursor::new(content), content.len() as u64)
+        .await?;
+    let key = tinytree_model::ObjectKey {
+        kind: tinytree_model::Kind::File,
+        id: tinytree_model::ObjectId(id.0),
+    };
+    let seeded = seed.descriptor(key).await?.unwrap();
+    drop(seed);
+    let other =
+        jj_native_backend::DirectObjectIo::init(&native_root.join("other"), Default::default())?;
+    assert!(
+        other.descriptor(key).await?.is_none(),
+        "configured aliases have distinct authoritative contents"
+    );
+    drop(other);
+    async fn verify_seed(
+        config: &Config,
+        descriptor: tinytree_model::Descriptor,
+        content: &[u8],
+    ) -> Result<()> {
+        use futures::AsyncReadExt;
+        use jj_native_backend::NativeObjectIo as _;
+        let provider = jj_native_backend::DirectObjectIo::load(
+            &config.state_dir.join("native/example"),
+            Default::default(),
+        )?;
+        assert_eq!(provider.descriptor(descriptor.key).await?, Some(descriptor));
+        let read = provider
+            .read_file(tinytree_model::FileId(descriptor.key.id.0))
+            .await?;
+        let (actual, mut reader) = read.into_parts();
+        assert_eq!(actual, descriptor);
+        let mut bytes = Vec::new();
+        reader.read_to_end(&mut bytes).await?;
+        assert_eq!(bytes, content);
+        assert_eq!(blake3::hash(&bytes).as_bytes(), &descriptor.key.id.0);
+        drop(reader);
+        drop(provider);
+        let other = jj_native_backend::DirectObjectIo::load(
+            &config.state_dir.join("native/other"),
+            Default::default(),
+        )?;
+        assert!(
+            other.descriptor(descriptor.key).await?.is_none(),
+            "reopening the other alias must not resolve the seeded object"
+        );
+        Ok(())
+    }
+    struct DaemonCleanup {
+        socket: PathBuf,
+        tasks: Vec<tokio::task::AbortHandle>,
+    }
+    impl Drop for DaemonCleanup {
+        fn drop(&mut self) {
+            if self.tasks.iter().all(|task| task.is_finished()) {
+                return;
+            }
+            // Failures still ask the owned daemon to stop; bound synchronous
+            // teardown so an assertion cannot leave its listeners running.
+            use std::io::{Read, Write};
+            if let Ok(mut stream) = std::os::unix::net::UnixStream::connect(&self.socket) {
+                let _ = stream.set_read_timeout(Some(Duration::from_secs(1)));
+                let _ = stream.set_write_timeout(Some(Duration::from_secs(1)));
+                if let Ok(mut body) = serde_json::to_vec(&ControlRequest::Shutdown) {
+                    body.push(b'\n');
+                    let _ = stream.write_all(&body);
+                    let _ = stream.read(&mut [0u8; 1024]);
+                }
+            }
+            for _ in 0..100 {
+                if self.tasks.iter().all(|task| task.is_finished()) {
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            for task in &self.tasks {
+                task.abort();
+            }
+        }
+    }
     let socket = config.socket();
+    let mut cleanup = DaemonCleanup {
+        socket: socket.clone(),
+        tasks: Vec::new(),
+    };
     let mut task = tokio::spawn(workspace_daemon::daemon::serve(config.clone()));
+    cleanup.tasks.push(task.abort_handle());
     let status = tokio::time::timeout(Duration::from_secs(5), async {
         loop {
             if task.is_finished() {
@@ -482,67 +585,58 @@ async fn offline_upstream_does_not_prevent_durable_bes_admission_startup() -> Re
         serde_json::json!(["example", "other"])
     );
     use native_broker::proto as p;
+    let descriptor = p::ObjectDescriptor {
+        kind: seeded.key.kind as u32,
+        id: seeded.key.id.0.to_vec(),
+        size_bytes: seeded.size_bytes,
+        format_version: seeded.format_version as u32,
+    };
     let mut first = native_client(&config).await?;
-    let empty = tinytree_model::empty_tree().descriptor;
-    let found = first
-        .descriptor(p::ObjectRequest {
-            store_id: "example".into(),
-            kind: empty.key.kind as u32,
-            id: empty.key.id.0.to_vec(),
-        })
-        .await?
-        .into_inner()
-        .descriptor
-        .unwrap();
-    assert_eq!(found.size_bytes, empty.size_bytes);
-    let content = b"native bytes shared by independent clients\n";
-    let descriptor = first
-        .write_file(tokio_stream::iter([
-            p::WriteFrame {
-                frame: Some(p::write_frame::Frame::Header(p::WriteHeader {
-                    store_id: "example".into(),
-                    max_bytes: content.len() as u64,
-                })),
-            },
-            p::WriteFrame {
-                frame: Some(p::write_frame::Frame::Chunk(p::Chunk {
-                    offset: 0,
-                    data: content.to_vec(),
-                })),
-            },
-            p::WriteFrame {
-                frame: Some(p::write_frame::Frame::Complete(true)),
-            },
-        ]))
-        .await?
-        .into_inner();
-    assert_eq!(descriptor.id, blake3::hash(content).as_bytes());
-    let mut second = native_client(&config).await?;
-    assert_eq!(native_read(&mut second, &descriptor).await?, content);
-    assert!(
-        second
-            .descriptor(p::ObjectRequest {
-                store_id: "other".into(),
-                kind: descriptor.kind,
-                id: descriptor.id.clone()
-            })
-            .await?
-            .into_inner()
-            .descriptor
-            .is_none(),
-        "configured aliases must not fall back to the first store"
+    let mut identities = Vec::new();
+    for alias in ["example", "other"] {
+        let query = native_broker::BrokerQueryClient::connect(
+            config.state_dir.join("rbe.sock"),
+            alias,
+            Default::default(),
+        )
+        .await?;
+        identities.push(query.describe_provider().await?.identity);
+    }
+    assert_ne!(
+        identities[0], identities[1],
+        "discovery must resolve the requested distinct configured aliases"
+    );
+    for alias in ["example", "other"] {
+        assert_eq!(
+            first
+                .descriptor(p::ObjectRequest {
+                    store_id: alias.into(),
+                    kind: descriptor.kind,
+                    id: descriptor.id.clone()
+                })
+                .await
+                .unwrap_err()
+                .code(),
+            tonic::Code::Unauthenticated
+        );
+    }
+    let error = native_read(&mut first, &descriptor).await.unwrap_err();
+    assert_eq!(
+        error.downcast_ref::<tonic::Status>().unwrap().code(),
+        tonic::Code::Unauthenticated
     );
     assert_eq!(
-        second
-            .descriptor(p::ObjectRequest {
-                store_id: "missing".into(),
-                kind: descriptor.kind,
-                id: descriptor.id.clone()
-            })
+        first
+            .write_file(tokio_stream::iter([p::WriteFrame {
+                frame: Some(p::write_frame::Frame::Header(p::WriteHeader {
+                    store_id: "example".into(),
+                    max_bytes: content.len() as u64
+                }))
+            }]))
             .await
             .unwrap_err()
             .code(),
-        tonic::Code::NotFound
+        tonic::Code::Unauthenticated
     );
     let path = config.state_dir.join("native/example");
     assert!(
@@ -565,7 +659,9 @@ async fn offline_upstream_does_not_prevent_durable_bes_admission_startup() -> Re
         .await
         .map_err(|error| anyhow::anyhow!("initial native daemon drain: {error}"))???;
     assert!(!config.state_dir.join("native/example/.jj").exists());
+    verify_seed(&config, seeded, content).await?;
     let mut task = tokio::spawn(workspace_daemon::daemon::serve(config.clone()));
+    cleanup.tasks.push(task.abort_handle());
     tokio::time::timeout(Duration::from_secs(5), async {
         loop {
             if task.is_finished() {
@@ -583,15 +679,17 @@ async fn offline_upstream_does_not_prevent_durable_bes_admission_startup() -> Re
     .await
     .map_err(|error| anyhow::anyhow!("restarted native daemon readiness: {error}"))?;
     let mut reopened = native_client(&config).await?;
+    let error = native_read(&mut reopened, &descriptor).await.unwrap_err();
     assert_eq!(
-        native_read(&mut reopened, &descriptor).await?,
-        content,
-        "authoritative objects survive daemon restart with upstream unavailable"
+        error.downcast_ref::<tonic::Status>().unwrap().code(),
+        tonic::Code::Unauthenticated,
+        "restart must not restore tokenless access"
     );
     call(socket, ControlRequest::Shutdown).await?;
     tokio::time::timeout(Duration::from_secs(5), task)
         .await
         .map_err(|error| anyhow::anyhow!("restarted native daemon drain: {error}"))???;
+    verify_seed(&config, seeded, content).await?;
     Ok(())
 }
 

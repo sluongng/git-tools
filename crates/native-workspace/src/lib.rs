@@ -180,6 +180,7 @@ pub struct Compiler {
     limits: Limits,
     compilation: Arc<Semaphore>,
     source: Arc<NativeBlobSource>,
+    metadata_owner: Option<Arc<dyn Any + Send + Sync>>,
 }
 impl Compiler {
     pub fn new(provider: Arc<dyn NativeObjectIo>, scope: Scope, limits: Limits) -> Result<Self> {
@@ -198,6 +199,7 @@ impl Compiler {
             source,
             limits,
             compilation: Arc::new(Semaphore::new(1)),
+            metadata_owner: None,
         })
     }
     /// Physical file copy jobs retain these guards, even after cancellation.
@@ -211,6 +213,32 @@ impl Compiler {
         self.source.clone()
     }
 
+    /// Per-call physical metadata ownership. This is deliberately NOT appended
+    /// to the shared blob source: a completed command must not pin a mount.
+    fn owned_compilation(&self, owner: Arc<dyn Any + Send + Sync>) -> Self {
+        Self {
+            provider: self.provider.clone(),
+            scope: self.scope.clone(),
+            limits: self.limits.clone(),
+            compilation: self.compilation.clone(),
+            source: self.source.clone(),
+            metadata_owner: Some(owner),
+        }
+    }
+    pub async fn compile_tree_with_owner(
+        &self,
+        root: m::TreeId,
+        owner: Arc<dyn Any + Send + Sync>,
+    ) -> Result<CompiledWorkspace> {
+        self.owned_compilation(owner).compile_tree(root).await
+    }
+    pub async fn compile_merge_with_owner(
+        &self,
+        merge: &m::TreeMerge,
+        owner: Arc<dyn Any + Send + Sync>,
+    ) -> Result<CompiledWorkspace> {
+        self.owned_compilation(owner).compile_merge(merge).await
+    }
     pub async fn compile_tree(&self, root: m::TreeId) -> Result<CompiledWorkspace> {
         self.compile_merge(&m::TreeMerge {
             terms: vec![root],
@@ -260,11 +288,15 @@ impl Compiler {
             budget.objects <= self.limits.max_metadata_objects,
             "native metadata count exceeded"
         );
-        let descriptor = self
-            .provider
-            .descriptor(key)
-            .await?
-            .ok_or_else(|| anyhow::anyhow!("native source metadata unavailable"))?;
+        let descriptor = if let Some(owner) = &self.metadata_owner {
+            self.provider
+                .descriptor_with_owner(key, owner.clone())
+                .await?
+        } else {
+            self.provider.descriptor(key).await?
+        };
+        let descriptor =
+            descriptor.ok_or_else(|| anyhow::anyhow!("native source metadata unavailable"))?;
         ensure!(
             descriptor.key == key
                 && descriptor.format_version == m::FORMAT_VERSION
@@ -279,7 +311,13 @@ impl Compiler {
             budget.bytes <= self.limits.max_metadata_bytes,
             "native metadata bytes exceeded"
         );
-        let verified = self.provider.read_metadata(key).await?;
+        let verified = if let Some(owner) = &self.metadata_owner {
+            self.provider
+                .read_metadata_with_owner(key, owner.clone())
+                .await?
+        } else {
+            self.provider.read_metadata(key).await?
+        };
         ensure!(
             verified.descriptor() == descriptor,
             "native source metadata descriptor changed"

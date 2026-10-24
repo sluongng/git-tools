@@ -15,3 +15,6 @@ pub mod identity;
 
 #[cfg(unix)]
 pub mod native_workspaces;
+
+#[cfg(unix)]
+mod native_commands;

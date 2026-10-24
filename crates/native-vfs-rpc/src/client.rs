@@ -39,7 +39,7 @@ fn runtime() -> Result<&'static Runtime> {
         .as_ref()
         .map_err(|_| anyhow::anyhow!("projection transport runtime unavailable"))
 }
-async fn run<T: Send + 'static>(
+pub(crate) async fn run<T: Send + 'static>(
     future: impl Future<Output = Result<T>> + Send + 'static,
 ) -> Result<T> {
     struct Task<T>(tokio::task::JoinHandle<Result<T>>);
@@ -58,6 +58,7 @@ pub struct ClientConnector {
     endpoint: LocalEndpoint,
     mount: String,
     limits: Limits,
+    command: Option<[u8; 32]>,
 }
 impl ClientConnector {
     pub fn new(endpoint: LocalEndpoint, mount: impl Into<String>, limits: Limits) -> Result<Self> {
@@ -69,7 +70,12 @@ impl ClientConnector {
             endpoint,
             mount,
             limits,
+            command: None,
         })
+    }
+    pub fn with_command_token(mut self, token: [u8; 32]) -> Self {
+        self.command = Some(token);
+        self
     }
 }
 impl ProjectionConnector for ClientConnector {
@@ -89,6 +95,7 @@ impl ProjectionConnector for ClientConnector {
                     expected: None,
                 },
                 config.limits.clone(),
+                config.command,
             )
             .await?;
             let Reply::Inspected {
@@ -118,6 +125,7 @@ impl ProjectionConnector for ClientConnector {
             limits: self.limits.clone(),
             binding: binding.clone(),
             registration,
+            command: self.command,
         }))
     }
 }
@@ -127,18 +135,36 @@ struct RemoteController {
     limits: Limits,
     binding: ProjectionBinding,
     registration: wire::Registration,
+    command: Option<[u8; 32]>,
 }
-fn client(channel: Channel, limits: &Limits) -> p::projection_client::ProjectionClient<Channel> {
+pub(crate) fn client(
+    channel: Channel,
+    limits: &Limits,
+) -> p::projection_client::ProjectionClient<Channel> {
     p::projection_client::ProjectionClient::new(channel)
         .send_compressed(CompressionEncoding::Zstd)
         .accept_compressed(CompressionEncoding::Zstd)
         .max_decoding_message_size(limits.max_frame_bytes + 4096)
         .max_encoding_message_size(limits.max_frame_bytes + 4096)
 }
-async fn unary(channel: Channel, input: Unary, limits: Limits) -> Result<Reply> {
+fn attach_command<T>(request: &mut Request<T>, command: Option<[u8; 32]>) {
+    if let Some(command) = command {
+        request.metadata_mut().insert_bin(
+            "native-command-bin",
+            tonic::metadata::MetadataValue::from_bytes(&command),
+        );
+    }
+}
+async fn unary(
+    channel: Channel,
+    input: Unary,
+    limits: Limits,
+    command: Option<[u8; 32]>,
+) -> Result<Reply> {
     let mut client = client(channel, &limits);
     let mut request = Request::new(wire::encode(&input, &limits)?);
     request.set_timeout(limits.operation_timeout);
+    attach_command(&mut request, command);
     let response = tokio::time::timeout(limits.operation_timeout, async {
         match &input {
             Unary::Inspect { .. } => client.inspect(request).await,
@@ -157,6 +183,7 @@ impl NativeProjectionController for RemoteController {
         let mount = self.mount.clone();
         let limits = self.limits.clone();
         let expected = self.registration.clone();
+        let command = self.command;
         futures::executor::block_on(run(async move {
             let Reply::Inspected {
                 binding,
@@ -169,6 +196,7 @@ impl NativeProjectionController for RemoteController {
                     expected: Some(expected.clone()),
                 },
                 limits,
+                command,
             )
             .await?
             else {
@@ -193,6 +221,7 @@ impl NativeProjectionController for RemoteController {
         let expected = expected.clone();
         let current = expected.clone();
         let registration = self.registration.clone();
+        let command = self.command;
         // One absolute begin budget includes bridge queueing, channel reconnect,
         // response headers, and the Began frame; headers never renew it.
         let session = run(async move {
@@ -204,6 +233,7 @@ impl NativeProjectionController for RemoteController {
                 limits,
                 begin_deadline,
                 session_deadline,
+                command,
             )
             .await
         })
@@ -226,8 +256,9 @@ impl NativeProjectionController for RemoteController {
         let limits = self.limits.clone();
         let id = request_id.to_owned();
         let repository = self.binding.repository.clone();
+        let command = self.command;
         run(async move {
-            Ok(match unary(channel, input, limits).await? {
+            Ok(match unary(channel, input, limits, command).await? {
                 Reply::Applied { receipt } => {
                     wire::receipt(&receipt, &repository)?;
                     ensure!(
@@ -262,9 +293,13 @@ impl NativeProjectionController for RemoteController {
         };
         let channel = self.channel.clone();
         let limits = self.limits.clone();
+        let command = self.command;
         run(async move {
             ensure!(
-                matches!(unary(channel, input, limits).await?, Reply::Acknowledged),
+                matches!(
+                    unary(channel, input, limits, command).await?,
+                    Reply::Acknowledged
+                ),
                 "projection acknowledgement response mismatch"
             );
             Ok(())
@@ -318,6 +353,7 @@ impl Session {
         limits: Limits,
         begin_deadline: Instant,
         session_deadline: Instant,
+        command: Option<[u8; 32]>,
     ) -> Result<Self> {
         ensure!(
             Instant::now() < begin_deadline,
@@ -327,6 +363,7 @@ impl Session {
         let (output, events) = mpsc::channel(2);
         let mut request = Request::new(tokio_stream::wrappers::ReceiverStream::new(receive));
         request.set_timeout(session_deadline.saturating_duration_since(Instant::now()));
+        attach_command(&mut request, command);
         // The first frame must be available before tonic waits for response
         // headers: server attestation/session admission requires that begin.
         send.send(wire::encode(

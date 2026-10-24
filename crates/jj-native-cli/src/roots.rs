@@ -458,6 +458,9 @@ pub(crate) fn load_native_workspace(
             "native repository selection differs from its registration",
         ));
     }
+    #[cfg(not(feature = "protocol-fixture"))]
+    crate::commands::ensure_binding(&registration)
+        .map_err(|_| CollectError("native audit command fence is unavailable"))?;
     let location = NativeLocation {
         state_path: registration.working_copy.clone(),
         repository: registration.repository.clone(),

@@ -1,5 +1,6 @@
 //! Native jj entry point. User workspaces require daemon-owned lazy jj-vfs.
 mod broker;
+mod commands;
 mod remote;
 mod remote_state;
 mod roots;
@@ -304,6 +305,25 @@ fn main() -> std::process::ExitCode {
             Box::new(vfs::WorkingCopyFactory) as _,
         );
         runner
+            .add_dispatch_hook(async |ui, command, dispatch| {
+                if let Ok(loader) = command.workspace_loader() {
+                    let registry = native_workspace_admin::Registry::open_existing(
+                        native_workspace_admin::Registry::default_path().map_err(|error| {
+                            user_error_with_message("Cannot select native command registry", error)
+                        })?,
+                    )
+                    .map_err(|error| {
+                        user_error_with_message("Cannot open native command registry", error)
+                    })?;
+                    let binding = registry.lookup(loader.workspace_root()).map_err(|error| {
+                        user_error_with_message("Cannot bind native command", error)
+                    })?;
+                    commands::ensure_binding(&binding).map_err(|error| {
+                        user_error_with_message("Cannot admit native command", error)
+                    })?;
+                }
+                dispatch.call(ui, command).await
+            })
             .set_workspace_loader_factory(Box::new(vfs::Loader))
             .add_working_copy_factories(working_copies)
     };
@@ -312,6 +332,8 @@ fn main() -> std::process::ExitCode {
         .add_store_factories(factories)
         .add_subcommand(run_native_command)
         .run();
-    broker::drain_cleanup();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    broker::drain_cleanup(deadline);
+    commands::finish(deadline);
     status.into()
 }

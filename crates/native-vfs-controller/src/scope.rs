@@ -8,10 +8,19 @@ use std::sync::{
 };
 use tokio::time::Instant;
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct ActionScope {
     deadline: Instant,
     revoked: Arc<AtomicBool>,
+    owner: Option<Arc<dyn std::any::Any + Send + Sync>>,
+}
+impl std::fmt::Debug for ActionScope {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ActionScope")
+            .field("deadline", &self.deadline)
+            .field("owned", &self.owner.is_some())
+            .finish_non_exhaustive()
+    }
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ActionScopeError {
@@ -31,7 +40,18 @@ impl ActionScope {
     /// `revoked == true` means EOF/revocation. A subsequent transport action may
     /// receive a new scope; cloned stages share this exact original deadline.
     pub fn new(deadline: Instant, revoked: Arc<AtomicBool>) -> Self {
-        Self { deadline, revoked }
+        Self {
+            deadline,
+            revoked,
+            owner: None,
+        }
+    }
+    pub fn with_owner(mut self, owner: Arc<dyn std::any::Any + Send + Sync>) -> Self {
+        self.owner = Some(owner);
+        self
+    }
+    pub fn owner(&self) -> Option<Arc<dyn std::any::Any + Send + Sync>> {
+        self.owner.clone()
     }
     pub fn deadline(&self) -> Instant {
         self.deadline
@@ -49,6 +69,7 @@ impl ActionScope {
         Self {
             deadline: self.deadline.min(maximum),
             revoked: self.revoked.clone(),
+            owner: self.owner.clone(),
         }
     }
 }

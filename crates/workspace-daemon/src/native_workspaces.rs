@@ -28,6 +28,7 @@ pub(crate) struct Repository {
     pub io: Arc<dyn NativeObjectIo>,
     pub scope: Scope,
     pub remote: bool,
+    pub identity: [u8; 32],
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -75,6 +76,9 @@ pub(crate) struct Manager {
     repositories: BTreeMap<String, Repository>,
     service: ProjectionService,
     entries: BTreeMap<String, Entry>,
+    commands: Option<Arc<crate::native_commands::NativeCommandHost>>,
+    #[cfg(test)]
+    before_provider_start: Option<Box<dyn FnOnce(&Path) -> Result<()> + Send + Sync>>,
 }
 impl Manager {
     pub fn open(
@@ -142,7 +146,20 @@ impl Manager {
             repositories,
             service,
             entries,
+            commands: None,
+            #[cfg(test)]
+            before_provider_start: None,
         })
+    }
+    pub(crate) fn with_commands(
+        mut self,
+        commands: Arc<crate::native_commands::NativeCommandHost>,
+    ) -> Result<Self> {
+        self.service
+            .set_command_host(commands.clone())
+            .map_err(|_| anyhow::anyhow!("cannot configure native command host"))?;
+        self.commands = Some(commands);
+        Ok(self)
     }
     pub fn rpc(&self) -> native_vfs_rpc::RpcService {
         self.service.rpc_service()
@@ -151,6 +168,12 @@ impl Manager {
         self.entries
             .values()
             .any(|entry| entry.mount.is_some() || entry.provider_failure.is_some())
+    }
+    pub fn command_status(&self) -> serde_json::Value {
+        self.commands
+            .as_ref()
+            .map(|commands| commands.status())
+            .unwrap_or(serde_json::Value::Null)
     }
     pub fn status(&self) -> serde_json::Value {
         serde_json::json!(self.entries.iter().map(|(id,entry)| serde_json::json!({"workspace_id":id,"root":entry.record.root,"store":entry.record.store,"state":entry.record.state,"active":entry.mount.is_some(),"provider_recovery_owned":entry.provider_failure.is_some()})).collect::<Vec<_>>())
@@ -348,6 +371,26 @@ impl Manager {
                 );
             }
         };
+        // Command identity must exist before a native start can acquire a
+        // recoverable provider. A later start/proof/persist failure still needs
+        // stop() to distinguish an idle known lease from an unreadable one.
+        // Providers already create this leaf mountpoint; no checkout/admin is
+        // initialized here and existing directory contents are never reset.
+        if !root.try_exists()? {
+            fs::create_dir(&root)?;
+        }
+        ensure!(
+            fs::metadata(&root)?.is_dir(),
+            "native mountpoint is not a directory"
+        );
+        let binding = self.binding(&record)?;
+        if let Some(commands) = &self.commands {
+            commands.register(&binding, repository.identity).await?;
+        }
+        #[cfg(test)]
+        if let Some(before) = self.before_provider_start.take() {
+            before(&root)?;
+        }
         let mount = match native_vfs::mount_prepared(prepared).await {
             Ok(mount) => Arc::new(mount),
             Err(error) => {
@@ -392,7 +435,6 @@ impl Manager {
             // durable. A crash before this write requires manual inspection.
             persist(entry)?;
         }
-        let binding = self.binding(&record)?;
         let provision = match registry.lookup(&binding.root) {
             Ok(existing) => {
                 ensure!(
@@ -503,6 +545,13 @@ impl Manager {
     }
     pub async fn stop(&mut self, id: &str) -> Result<()> {
         let _ = unhex(id)?;
+        ensure!(
+            !self
+                .commands
+                .as_ref()
+                .is_some_and(|commands| commands.active(id)),
+            "native workspace has active command writers; preserve the mount"
+        );
         let entry = self
             .entries
             .get_mut(id)
@@ -766,4 +815,101 @@ fn private_parents(path: &Path) -> Result<()> {
         owners.push(PrivateDir::create(path)?);
     }
     Ok(())
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod tests {
+    use super::*;
+    struct NoRemoteContent;
+    #[async_trait::async_trait]
+    impl local_cas::BlobSource for NoRemoteContent {
+        async fn fetch(&self, _: &local_cas::Artifact, _: &mut fs::File) -> Result<()> {
+            anyhow::bail!("provider failure fixture must not fetch file content")
+        }
+        async fn missing(&self, _: &[local_cas::Artifact]) -> Result<Vec<local_cas::Artifact>> {
+            anyhow::bail!("provider failure fixture must not query remote content")
+        }
+    }
+    #[tokio::test]
+    async fn changed_mountpoint_after_preparation_retains_command_identity_and_allows_stop()
+    -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let state = PrivateDir::create(directory.path().join("state"))?;
+        let objects = PrivateDir::create(directory.path().join("objects"))?;
+        let provider = Arc::new(jj_native_backend::DirectObjectIo::init(
+            objects.path(),
+            Default::default(),
+        )?);
+        provider
+            .write_metadata(m::Object::Tree(Default::default()))
+            .await?;
+        let cache = LocalCas::open(
+            directory.path().join("cas"),
+            Arc::new(NoRemoteContent),
+            Default::default(),
+        )?;
+        let mut config = Config::default();
+        config.state_dir = state.path().to_owned();
+        config.native.workspaces.registry_path = Some(directory.path().join("registry"));
+        config
+            .native
+            .repositories
+            .insert("example".into(), Default::default());
+        let commands = Arc::new(
+            crate::native_commands::NativeCommandHost::open(&state.path().join("commands")).await?,
+        );
+        let mut manager = Manager::open(
+            config,
+            cache,
+            BTreeMap::from([(
+                "example".into(),
+                Repository {
+                    io: provider,
+                    scope: Scope::from_configured_identity("example", &[8; 32])?,
+                    remote: false,
+                    identity: [8; 32],
+                },
+            )]),
+        )?
+        .with_commands(commands.clone())?;
+        let root = directory.path().join("mount");
+        // Supported native provisioning creates an owner-private root; ordinary
+        // create_dir inherits the fixture's shell umask and may yield 0755.
+        drop(PrivateDir::create(&root)?);
+        let preserved = root.join("unrelated-content");
+        manager.before_provider_start = Some(Box::new(|root| {
+            fs::write(root.join("unrelated-content"), b"preserve this file")?;
+            Ok(())
+        }));
+        let id = hex(&[7; 32]);
+        // Arrange the real filesystem race only AFTER preparation checked the
+        // empty directory. Actual provider preflight must then reject it before
+        // /dev/fuse; no fake provider or native kernel capability is involved.
+        let error = manager
+            .create(root, "example".into(), "0".repeat(64), id.clone())
+            .await
+            .expect_err("changed mountpoint must be rejected");
+        assert!(
+            error
+                .to_string()
+                .contains("native provider start requires explicit recovery"),
+            "failed before intended provider-start boundary: {error:#}"
+        );
+        assert_eq!(manager.status()[0]["state"], "recovery_required");
+        assert_eq!(manager.status()[0]["provider_recovery_owned"], true);
+        assert_eq!(
+            commands.workspace_state(&id).await?.state,
+            native_retention::WorkspaceState::Dirty
+        );
+        assert!(
+            !commands.active(&id),
+            "idle validated command lease must not block provider recovery"
+        );
+        manager.stop_all().await?;
+        assert!(!manager.active());
+        assert_eq!(manager.status()[0]["state"], "stopped");
+        assert_eq!(manager.status()[0]["provider_recovery_owned"], false);
+        assert_eq!(fs::read(&preserved)?, b"preserve this file");
+        Ok(())
+    }
 }

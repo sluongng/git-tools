@@ -720,3 +720,44 @@ async fn failed_capture_preserves_dirty_state_and_allows_a_new_command() {
     drop(owner);
     registry.acquire_collector().await.unwrap();
 }
+
+#[tokio::test]
+async fn dirty_drain_seals_physical_jobs_without_cleaning_or_losing_fence_on_cancel() {
+    let (_directory, registry) = registry().await;
+    let registration = registry
+        .register(WorkspaceId([2; 16]), OpStoreId([3; 16]))
+        .await
+        .unwrap();
+    let owner = registry.begin_command(registration).await.unwrap();
+    let token = owner.token();
+    let physical = registry.resolve(token).unwrap();
+    let waiter_registry = registry.clone();
+    let waiter = tokio::spawn(async move { waiter_registry.drain_dirty(token).await });
+    loop {
+        match registry.resolve(token) {
+            Err(Error::ClosedCommand) => break,
+            Ok(job) => drop(job),
+            other => panic!("unexpected resolve: {other:?}"),
+        }
+        tokio::task::yield_now().await;
+    }
+    assert!(!waiter.is_finished());
+    waiter.abort();
+    assert!(matches!(
+        registry.begin_command(registration).await,
+        Err(Error::Busy)
+    ));
+    drop(physical);
+    registry.drain_dirty(token).await.unwrap();
+    assert_eq!(
+        registry.workspace(registration).await.unwrap().state,
+        WorkspaceState::Dirty
+    );
+    drop(owner);
+    assert!(matches!(
+        registry.acquire_collector().await,
+        Err(Error::DirtyWorkspace)
+    ));
+    let next = registry.begin_command(registration).await.unwrap();
+    assert_eq!(next.epoch(), 2);
+}

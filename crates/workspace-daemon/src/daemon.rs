@@ -115,7 +115,7 @@ impl State {
     fn status(&self) -> serde_json::Value {
         let metrics = self.cache.metrics();
         let proxy = self.proxy.metrics();
-        json!({"pid":std::process::id(),"runtime":{"open_files":self.startup_limits,"control_accept_resource_exhaustions":self.control_accept.resource_exhaustions()},"rbe_endpoint":self.config.rbe_endpoint(),"cache_endpoint":self.config.cache_endpoint(),"bytestream_uri_prefix":self.config.bytestream_uri_prefix(),"instance_name":self.config.cache.instance_name,"bes_endpoint":self.bes.as_ref().map(|_|self.config.bes_endpoint()),"bes":self.bes.as_ref().map(|bes|bes.metrics()),"native":{"endpoint":self.native.as_ref().map(|_|self.config.rbe_endpoint()),"repositories":self.config.native.repositories.keys().collect::<Vec<_>>(),"workspaces":self.native_workspaces.as_ref().map(|manager|manager.status())},"bos_endpoint":if self.config.bos.enabled {Some(self.config.rbe_endpoint())}else{None},"output_path_prefix":self.config.state_dir.join("outputs"),"mounts":self.registry.mounts.iter().map(|(path,record)|json!({"session":path,"state":record.state})).collect::<Vec<_>>(),"proxy":{"download_failures":proxy.download_failures,"serving_read_failures":proxy.serving_read_failures,"accept_resource_exhaustions":proxy.accept_resource_exhaustions,"action_cache_hits":proxy.action_cache_hits,"action_cache_upstream":proxy.action_cache_upstream,"blob_reads":proxy.blob_reads,"read_slots_in_use":proxy.read_slots_in_use,"read_slots_queued":proxy.read_slots_queued,"asset_cache_hits":proxy.asset_cache_hits,"asset_upstream_requests":proxy.asset_upstream_requests,"execution_requests":proxy.execution_requests,"execution_waits":proxy.execution_waits,"retention":{"action_refreshes":proxy.retention.action_refreshes,"output_refreshes":proxy.retention.output_refreshes,"blob_refreshes":proxy.retention.blob_refreshes,"blob_repairs":proxy.retention.blob_repairs,"blob_repair_failures":proxy.retention.blob_repair_failures,"failures":proxy.retention.failures,"missing_blobs":proxy.retention.missing_blobs,"dropped":proxy.retention.dropped}},"cache":metrics})
+        json!({"pid":std::process::id(),"runtime":{"open_files":self.startup_limits,"control_accept_resource_exhaustions":self.control_accept.resource_exhaustions()},"rbe_endpoint":self.config.rbe_endpoint(),"cache_endpoint":self.config.cache_endpoint(),"bytestream_uri_prefix":self.config.bytestream_uri_prefix(),"instance_name":self.config.cache.instance_name,"bes_endpoint":self.bes.as_ref().map(|_|self.config.bes_endpoint()),"bes":self.bes.as_ref().map(|bes|bes.metrics()),"native":{"endpoint":self.native.as_ref().map(|_|self.config.rbe_endpoint()),"repositories":self.config.native.repositories.keys().collect::<Vec<_>>(),"workspaces":self.native_workspaces.as_ref().map(|manager|manager.status()),"commands":self.native_workspaces.as_ref().map(|manager|manager.command_status())},"bos_endpoint":if self.config.bos.enabled {Some(self.config.rbe_endpoint())}else{None},"output_path_prefix":self.config.state_dir.join("outputs"),"mounts":self.registry.mounts.iter().map(|(path,record)|json!({"session":path,"state":record.state})).collect::<Vec<_>>(),"proxy":{"download_failures":proxy.download_failures,"serving_read_failures":proxy.serving_read_failures,"accept_resource_exhaustions":proxy.accept_resource_exhaustions,"action_cache_hits":proxy.action_cache_hits,"action_cache_upstream":proxy.action_cache_upstream,"blob_reads":proxy.blob_reads,"read_slots_in_use":proxy.read_slots_in_use,"read_slots_queued":proxy.read_slots_queued,"asset_cache_hits":proxy.asset_cache_hits,"asset_upstream_requests":proxy.asset_upstream_requests,"execution_requests":proxy.execution_requests,"execution_waits":proxy.execution_waits,"retention":{"action_refreshes":proxy.retention.action_refreshes,"output_refreshes":proxy.retention.output_refreshes,"blob_refreshes":proxy.retention.blob_refreshes,"blob_repairs":proxy.retention.blob_repairs,"blob_repair_failures":proxy.retention.blob_repair_failures,"failures":proxy.retention.failures,"missing_blobs":proxy.retention.missing_blobs,"dropped":proxy.retention.dropped}},"cache":metrics})
     }
     fn mounted(&self, path: &Path) -> bool {
         #[cfg(target_os = "linux")]
@@ -550,13 +550,14 @@ fn open_native_repositories(
     cache: &Arc<LocalCas>,
     native_ca: &BTreeMap<String, Arc<[u8]>>,
 ) -> Result<Option<native_broker::BrokerService>> {
-    Ok(open_native_host(config, cache, native_ca, &BTreeMap::new())?.0)
+    Ok(open_native_host(config, cache, native_ca, &BTreeMap::new(), None)?.0)
 }
 fn open_native_host(
     config: &Config,
     cache: &Arc<LocalCas>,
     native_ca: &BTreeMap<String, Arc<[u8]>>,
     native_credentials: &BTreeMap<String, Option<String>>,
+    command_host: Option<Arc<crate::native_commands::NativeCommandHost>>,
 ) -> Result<(
     Option<native_broker::BrokerService>,
     BTreeMap<String, crate::native_workspaces::Repository>,
@@ -662,6 +663,10 @@ fn open_native_host(
             },
         );
     }
+    let identities = descriptions
+        .iter()
+        .map(|(alias, description)| (alias.clone(), description.identity))
+        .collect::<BTreeMap<_, _>>();
     let broker =
         native_broker::BrokerService::new(stores, config.native.broker_config(&config.reapi))
             .and_then(|broker| broker.with_controls(controls))
@@ -670,6 +675,13 @@ fn open_native_host(
             .map_err(|status| {
                 anyhow::anyhow!("cannot configure native broker: {}", status.message())
             })?;
+    let broker = if let Some(commands) = command_host {
+        broker
+            .with_command_resolver(commands)
+            .map_err(|_| anyhow::anyhow!("cannot configure native command admission"))?
+    } else {
+        broker
+    };
 
     for (alias, settings) in &config.native.repositories {
         retained.insert(
@@ -680,6 +692,7 @@ fn open_native_host(
                     .map_err(|_| anyhow::anyhow!("cannot configure native source provider"))?,
                 scope: scopes.remove(alias).expect("configured provider scope"),
                 remote: settings.remote.is_some(),
+                identity: identities[alias],
             },
         );
     }
@@ -797,12 +810,24 @@ pub async fn serve(mut config: Config) -> Result<()> {
     let native_cache = cache.clone();
     let native_ca = credentials.native_ca.clone();
     let native_credentials = credentials.native.clone();
+    let native_commands = if config.native.repositories.is_empty() {
+        None
+    } else {
+        Some(Arc::new(
+            crate::native_commands::NativeCommandHost::open(
+                &config.state_dir.join("native-commands"),
+            )
+            .await?,
+        ))
+    };
+    let startup_commands = native_commands.clone();
     let (native, native_repositories) = tokio::task::spawn_blocking(move || {
         open_native_host(
             &native_config,
             &native_cache,
             &native_ca,
             &native_credentials,
+            startup_commands,
         )
     })
     .await
@@ -820,11 +845,18 @@ pub async fn serve(mut config: Config) -> Result<()> {
     let mut native_workspaces = if native_repositories.is_empty() {
         None
     } else {
-        Some(crate::native_workspaces::Manager::open(
-            config.clone(),
-            cache.clone(),
-            native_repositories,
-        )?)
+        Some(
+            crate::native_workspaces::Manager::open(
+                config.clone(),
+                cache.clone(),
+                native_repositories,
+            )?
+            .with_commands(
+                native_commands
+                    .clone()
+                    .expect("configured native command host"),
+            )?,
+        )
     };
     if let Some(manager) = &native_workspaces {
         rbe_router = rbe_router.add_service(manager.rpc());
@@ -1403,7 +1435,7 @@ mod tests {
         drop(reopened);
 
         let (broker, providers) =
-            open_native_host(&config, &cache, &BTreeMap::new(), &BTreeMap::new())?;
+            open_native_host(&config, &cache, &BTreeMap::new(), &BTreeMap::new(), None)?;
         assert_eq!(providers.len(), 1);
         let scope = providers["example"].scope.backend().to_owned();
         drop(broker);
@@ -1413,7 +1445,7 @@ mod tests {
         );
         drop(providers);
         let (broker, providers) =
-            open_native_host(&config, &cache, &BTreeMap::new(), &BTreeMap::new())?;
+            open_native_host(&config, &cache, &BTreeMap::new(), &BTreeMap::new(), None)?;
         assert_eq!(providers["example"].scope.backend(), scope);
         config.native.workspaces.registry_path = Some(directory.path().join("registry"));
         let mut manager =
@@ -1537,5 +1569,183 @@ mod tests {
         ] {
             assert!(git_cas_endpoint(upstream).is_err());
         }
+    }
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn native_command_dirty_fence_survives_client_timeout_and_kernel_lease_until_drain()
+    -> Result<()> {
+        use native_vfs_rpc::CommandHost as _;
+        let directory = tempfile::tempdir()?;
+        let private = private_fs::PrivateDir::create(directory.path().join("private"))?;
+        let admins = private_fs::PrivateDir::create(private.path().join("admins"))?;
+        let root = private.path().join("projection");
+        std::fs::create_dir(&root)?;
+        let admin = admins.path().join("workspace");
+        let binding = native_workspace_admin::Binding {
+            version: 1,
+            workspace_id: [7; 32],
+            root,
+            repo: admin.join("repo"),
+            working_copy: admin.join("working_copy"),
+            admin,
+            repository: "example".into(),
+            endpoint: native_workspace_admin::Endpoint::UnixSocket {
+                path: private.path().join("rbe.sock"),
+            },
+            rpc_mount_id: "workspace".into(),
+        };
+        let path = private.path().join("retention");
+        let host = crate::native_commands::NativeCommandHost::open(&path).await?;
+        host.register(&binding, [8; 32]).await?;
+        assert_eq!(
+            host.workspace_state("workspace").await?.state,
+            native_retention::WorkspaceState::Dirty
+        );
+        let preparation_a = host.prepare("workspace", [1; 32]).await?;
+        assert_eq!(host.prepare("workspace", [1; 32]).await?, preparation_a);
+        assert!(
+            host.begin("workspace", [1; 32], preparation_a.clone())
+                .await
+                .is_err(),
+            "no local writer lease is held"
+        );
+        let lock_path = native_vfs_rpc::command_lock_path(&binding.admin, "workspace")?;
+        let lease = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&lock_path)?;
+        lease.try_lock_exclusive()?;
+        let started = host
+            .begin("workspace", [1; 32], preparation_a.clone())
+            .await?;
+        assert_eq!(
+            host.begin("workspace", [1; 32], preparation_a.clone())
+                .await?
+                .token,
+            started.token
+        );
+        let dirty = host.workspace_state("workspace").await?;
+        assert_eq!(
+            (dirty.state, dirty.command_epoch),
+            (native_retention::WorkspaceState::Dirty, 1)
+        );
+        // A local writer is admitted only after the durable Dirty ACK.
+        std::fs::write(
+            private.path().join("operation-written-after-dirty"),
+            b"operation",
+        )?;
+        let physical = native_broker::CommandResolver::resolve(&host, "example", started.token)?;
+        assert!(
+            native_broker::CommandResolver::resolve(&host, "different", started.token).is_err()
+        );
+        let finishing = host.clone();
+        let token = started.token;
+        let mut waiter =
+            tokio::spawn(async move { finishing.finish_dirty("workspace", token).await });
+        assert!(
+            tokio::time::timeout(Duration::from_millis(30), &mut waiter)
+                .await
+                .is_err()
+        );
+        waiter.abort();
+        assert!(host.active("workspace"));
+        drop(lease);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(
+            host.active("workspace"),
+            "an accepted physical job still holds the fence"
+        );
+        drop(physical);
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while host.active("workspace") {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await?;
+        host.finish_dirty("workspace", token).await?;
+        assert_eq!(
+            host.workspace_state("workspace").await?.state,
+            native_retention::WorkspaceState::Dirty
+        );
+        assert_eq!(host.status()["collection_enabled"], false);
+        // Old closed A and old never-accepted preparations cannot mint a ghost
+        // epoch merely because a later CLI now holds the same kernel lock.
+        let unaccepted_a = host.prepare("workspace", [2; 32]).await?;
+        let preparation_b = host.prepare("workspace", [3; 32]).await?;
+        let lease_b = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&lock_path)?;
+        lease_b.try_lock_exclusive()?;
+        assert!(
+            host.begin("workspace", [1; 32], preparation_a)
+                .await
+                .is_err()
+        );
+        assert!(
+            host.begin("workspace", [2; 32], unaccepted_a)
+                .await
+                .is_err()
+        );
+        assert_eq!(host.workspace_state("workspace").await?.command_epoch, 1);
+        let started_b = host.begin("workspace", [3; 32], preparation_b).await?;
+        assert_eq!(started_b.epoch, 2);
+        drop(lease_b);
+        host.finish_dirty("workspace", started_b.token).await?;
+        let before_restart = host.prepare("workspace", [4; 32]).await?;
+        let old_process_lease = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&lock_path)?;
+        old_process_lease.try_lock_exclusive()?;
+        assert!(host.active("workspace"));
+
+        assert!(
+            host.register(&binding, [9; 32]).await.is_err(),
+            "changed provider identity must not be adopted"
+        );
+        drop(host);
+        let reopened = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                match crate::native_commands::NativeCommandHost::open(&path).await {
+                    Ok(host) => break host,
+                    Err(_) => tokio::task::yield_now().await,
+                }
+            }
+        })
+        .await?;
+        reopened.register(&binding, [8; 32]).await?;
+        assert!(
+            reopened.active("workspace"),
+            "a pre-restart CLI kernel lease must still block stop/unmount"
+        );
+        drop(old_process_lease);
+        assert!(!reopened.active("workspace"));
+        let persisted = reopened.workspace_state("workspace").await?;
+        assert_eq!(
+            (persisted.state, persisted.command_epoch),
+            (native_retention::WorkspaceState::Dirty, 2)
+        );
+        let after_restart = reopened.prepare("workspace", [5; 32]).await?;
+        let lease_d = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&lock_path)?;
+        lease_d.try_lock_exclusive()?;
+        assert!(
+            reopened
+                .begin("workspace", [4; 32], before_restart)
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            reopened.workspace_state("workspace").await?.command_epoch,
+            2
+        );
+        let started_d = reopened.begin("workspace", [5; 32], after_restart).await?;
+        assert_eq!(started_d.epoch, 3);
+        drop(lease_d);
+        reopened.finish_dirty("workspace", started_d.token).await?;
+        assert!(native_broker::CommandResolver::resolve(&reopened, "example", token).is_err());
+        Ok(())
     }
 }

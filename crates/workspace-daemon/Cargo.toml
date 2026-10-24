@@ -19,6 +19,7 @@ native-workspace-admin = { path = "../native-workspace-admin" }
 native-vfs-rpc = { path = "../native-vfs-rpc" }
 native-vfs-controller = { path = "../native-vfs-controller" }
 native-vfs = { path = "../native-vfs" }
+native-retention = { path = "../native-retention" }
 anyhow = "1"
 async-trait = "0.1"
 agent-session = { path = "../agent-session" }
@@ -50,6 +51,7 @@ workspace-fuse = { path = "../workspace-fuse" }
 workspace-core = { path = "../workspace-core" }
 
 [dev-dependencies]
+futures = "0.3"
 tinytree-model = { path = "../tinytree-model" }
 tempfile = "3"
 hyper-util = { version = "0.1", features = ["tokio"] }

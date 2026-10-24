@@ -2,6 +2,10 @@
 //! namespace authority; this transport never falls back to materialized files.
 mod bounded_json;
 mod client;
+mod command;
+pub use command::{
+    CommandClient, CommandHost, CommandJob, CommandPreparation, CommandStarted, command_lock_path,
+};
 mod service;
 pub use client::ClientConnector;
 mod wire;

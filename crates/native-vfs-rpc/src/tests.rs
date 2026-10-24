@@ -91,6 +91,73 @@ impl NativeObjectIo for Counting {
         }
         result
     }
+    async fn descriptor_with_owner(
+        &self,
+        key: m::ObjectKey,
+        owner: Arc<dyn std::any::Any + Send + Sync>,
+    ) -> jj_lib::backend::BackendResult<Option<m::Descriptor>> {
+        self.direct.descriptor_with_owner(key, owner).await
+    }
+    async fn read_metadata_with_owner(
+        &self,
+        key: m::ObjectKey,
+        owner: Arc<dyn std::any::Any + Send + Sync>,
+    ) -> jj_lib::backend::BackendResult<VerifiedMetadata> {
+        self.direct.read_metadata_with_owner(key, owner).await
+    }
+    async fn read_file_with_owner(
+        &self,
+        id: m::FileId,
+        owner: Arc<dyn std::any::Any + Send + Sync>,
+    ) -> jj_lib::backend::BackendResult<FileRead> {
+        self.direct.read_file_with_owner(id, owner).await
+    }
+    async fn write_metadata_with_owner(
+        &self,
+        object: m::Object,
+        owner: Arc<dyn std::any::Any + Send + Sync>,
+    ) -> jj_lib::backend::BackendResult<m::Descriptor> {
+        self.direct.write_metadata_with_owner(object, owner).await
+    }
+    async fn write_file_with_owner(
+        &self,
+        input: &mut (dyn AsyncRead + Send + Unpin),
+        max: u64,
+        owner: Arc<dyn std::any::Any + Send + Sync>,
+    ) -> jj_lib::backend::BackendResult<m::FileId> {
+        let gate = self.gate.lock().unwrap().clone();
+        let Some(gate) = gate else {
+            return self.direct.write_file_with_owner(input, max, owner).await;
+        };
+        // A provider may return its transport timeout while the already-owned
+        // physical write continues. Stage the borrowed input before detaching.
+        use futures::AsyncReadExt;
+        let mut bytes = Vec::new();
+        input
+            .take(max + 1)
+            .read_to_end(&mut bytes)
+            .await
+            .map_err(|error| jj_lib::backend::BackendError::Other(error.into()))?;
+        if bytes.len() as u64 > max {
+            return Err(jj_lib::backend::BackendError::Other(
+                std::io::Error::other("fixture upload exceeds limit").into(),
+            ));
+        }
+        let direct = self.direct.clone();
+        tokio::spawn(async move {
+            let _owner = owner.clone();
+            gate.entered.add_permits(1);
+            gate.release.acquire().await.unwrap().forget();
+            direct
+                .write_file_with_owner(&mut Cursor::new(bytes), max, owner)
+                .await
+                .unwrap();
+            gate.completed.add_permits(1);
+        });
+        Err(jj_lib::backend::BackendError::Other(
+            std::io::Error::new(std::io::ErrorKind::TimedOut, "fixture provider timeout").into(),
+        ))
+    }
     async fn copy_catalog_snapshot(
         &self,
         limits: CopyCatalogLimits,
@@ -851,4 +918,159 @@ async fn expired_or_disconnected_actions_drain_admitted_file_write_without_root_
         );
         fixture.stop().await;
     }
+}
+
+struct CommandFixture {
+    active: Arc<AtomicUsize>,
+}
+struct CommandFixtureGuard(Arc<AtomicUsize>);
+impl Drop for CommandFixtureGuard {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+#[async_trait]
+impl CommandHost for CommandFixture {
+    async fn prepare(
+        &self,
+        mount: &str,
+        _replay: [u8; 32],
+    ) -> Result<CommandPreparation, tonic::Status> {
+        if mount != "workspace" {
+            return Err(tonic::Status::not_found("fixture mount"));
+        }
+        Ok(CommandPreparation {
+            incarnation: [1; 16],
+            nonce: [2; 32],
+            expected_epoch: 0,
+        })
+    }
+    async fn begin(
+        &self,
+        mount: &str,
+        _replay: [u8; 32],
+        preparation: CommandPreparation,
+    ) -> Result<CommandStarted, tonic::Status> {
+        if preparation.incarnation != [1; 16]
+            || preparation.nonce != [2; 32]
+            || preparation.expected_epoch != 0
+        {
+            return Err(tonic::Status::failed_precondition("fixture preparation"));
+        }
+        if mount != "workspace" {
+            return Err(tonic::Status::not_found("fixture mount"));
+        }
+        Ok(CommandStarted {
+            token: [4; 32],
+            epoch: 1,
+        })
+    }
+    async fn finish_dirty(&self, mount: &str, token: [u8; 32]) -> Result<(), tonic::Status> {
+        if mount != "workspace" || token != [4; 32] {
+            return Err(tonic::Status::permission_denied("fixture command"));
+        }
+        Ok(())
+    }
+    fn resolve(&self, mount: &str, token: [u8; 32]) -> Result<CommandJob, tonic::Status> {
+        if mount != "workspace" || token != [4; 32] {
+            return Err(tonic::Status::permission_denied("fixture command"));
+        }
+        self.active.fetch_add(1, Ordering::SeqCst);
+        Ok(Arc::new(CommandFixtureGuard(self.active.clone())))
+    }
+}
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn managed_command_wire_and_guard_survive_provider_timeout_until_physical_write_finishes() {
+    let fixture = Fixture::new().await;
+    let active = Arc::new(AtomicUsize::new(0));
+    fixture
+        .service
+        .set_command_host(Arc::new(CommandFixture {
+            active: active.clone(),
+        }))
+        .unwrap();
+    let command =
+        CommandClient::new(fixture.endpoint.clone(), "workspace", Limits::default()).unwrap();
+    let channel = native_broker::connect_local_channel(
+        fixture.endpoint.clone(),
+        &Limits::default().transport,
+    )
+    .await
+    .unwrap();
+    let mut raw = client::client(channel, &Limits::default());
+    let oversized =
+        serde_json::json!({"Prepare":{"version":1,"mount":"workspace","replay":vec![5u8;33]}});
+    assert_eq!(
+        raw.command(tonic::Request::new(proto::Envelope {
+            payload: serde_json::to_vec(&oversized).unwrap()
+        }))
+        .await
+        .unwrap_err()
+        .code(),
+        tonic::Code::InvalidArgument
+    );
+    let preparation = command.prepare([5; 32]).await.unwrap();
+    let started = command.begin([5; 32], preparation).await.unwrap();
+    assert_eq!(started.epoch, 1);
+    let missing =
+        ClientConnector::new(fixture.endpoint.clone(), "workspace", Limits::default()).unwrap();
+    assert!(missing.connect(&fixture.binding).is_err());
+    let wrong = missing.clone().with_command_token([6; 32]);
+    assert!(wrong.connect(&fixture.binding).is_err());
+    let connector = missing.with_command_token(started.token);
+    let binding = fixture.binding.clone();
+    let remote = tokio::task::spawn_blocking(move || connector.connect(&binding))
+        .await
+        .unwrap()
+        .unwrap();
+    fixture.local("new", b"owned bytes").await;
+    let expected = remote.inspect().unwrap();
+    let gate = Arc::new(TransferGate {
+        entered: tokio::sync::Semaphore::new(0),
+        release: tokio::sync::Semaphore::new(0),
+        completed: tokio::sync::Semaphore::new(0),
+    });
+    *fixture.provider.gate.lock().unwrap() = Some(gate.clone());
+    let operation = tokio::spawn(async move {
+        let mut session = remote.begin(&expected).await.unwrap();
+        let options = SnapshotOptions {
+            base_ignores: GitIgnoreFile::empty(),
+            progress: None,
+            start_tracking_matcher: &EverythingMatcher,
+            force_tracking_matcher: &NothingMatcher,
+            max_new_file_size: 1024,
+        };
+        session.snapshot(SNAPSHOT, &options).await
+    });
+    tokio::time::timeout(Duration::from_secs(5), gate.entered.acquire())
+        .await
+        .unwrap()
+        .unwrap()
+        .forget();
+    assert!(
+        tokio::time::timeout(Duration::from_secs(5), operation)
+            .await
+            .unwrap()
+            .unwrap()
+            .is_err()
+    );
+    assert!(
+        active.load(Ordering::SeqCst) > 0,
+        "physical provider job must retain its command after returning a timeout"
+    );
+    gate.release.add_permits(1);
+    tokio::time::timeout(Duration::from_secs(5), gate.completed.acquire())
+        .await
+        .unwrap()
+        .unwrap()
+        .forget();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while active.load(Ordering::SeqCst) != 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    command.finish_dirty(started.token).await.unwrap();
+    fixture.stop().await;
 }

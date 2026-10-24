@@ -4,7 +4,7 @@ use std::{
     io::{self, Read, Write},
     path::{Component, Path, PathBuf},
     sync::{Arc, Mutex, OnceLock},
-    time::{Duration, Instant},
+    time::Instant,
 };
 
 use jj_lib::{
@@ -57,6 +57,11 @@ impl Locator {
 }
 
 fn connect(locator: Locator, spool: PathBuf) -> Result<NativeBackend, Failure> {
+    let repo = spool
+        .parent()
+        .and_then(Path::parent)
+        .ok_or_else(|| io::Error::other("native spool has no repository"))?;
+    let token = crate::commands::token(repo)?;
     // StoreFactories has a synchronous loader, sometimes called from jj's
     // futures executor. A separate owned thread avoids nesting that executor.
     std::thread::spawn(move || {
@@ -68,6 +73,11 @@ fn connect(locator: Locator, spool: PathBuf) -> Result<NativeBackend, Failure> {
                 native_broker::Config::default(),
             )
             .await?;
+            let provider = if let Some(token) = token {
+                provider.with_command_token(token)
+            } else {
+                provider
+            };
             NativeBackend::from_io(Arc::new(provider), Config::default()).await
         })
     })
@@ -79,6 +89,10 @@ fn connect(locator: Locator, spool: PathBuf) -> Result<NativeBackend, Failure> {
 pub(crate) fn init(path: &Path, locator: Locator) -> Result<Box<dyn Backend>, BackendInitError> {
     let initialize = || -> Result<Box<dyn Backend>, Failure> {
         locator.validate()?;
+        crate::commands::token(
+            path.parent()
+                .ok_or_else(|| io::Error::other("native store has no repository"))?,
+        )?;
         let spool = path.join(SPOOL);
         let mut builder = fs::DirBuilder::new();
         #[cfg(unix)]
@@ -182,8 +196,7 @@ fn retain_cleanup(index: &jj_native_index::NativeIndexStore) -> Result<(), Failu
     handles.push(index.cleanup_handle());
     Ok(())
 }
-pub(crate) fn drain_cleanup() {
-    let deadline = Instant::now() + Duration::from_secs(5);
+pub(crate) fn drain_cleanup(deadline: Instant) {
     let handles = CLEANUP
         .get_or_init(Default::default)
         .lock()
@@ -278,7 +291,16 @@ fn open_index(
             .ok_or_else(|| io::Error::other("native index has no repository"))?
             .join("store");
         let locator = locator(&store_path)?;
+        let token = crate::commands::token(
+            path.parent()
+                .ok_or_else(|| io::Error::other("native index has no repository"))?,
+        )?;
         let query = query_client(&locator)?;
+        let query = if let Some(token) = token {
+            query.with_command_token(token)
+        } else {
+            query
+        };
         let live = description(&query)?;
         if !live.query_capable {
             return Err(io::Error::other("native index provider has no query capability").into());
@@ -298,6 +320,11 @@ fn open_index(
         })
         .join()
         .map_err(|_| io::Error::other("native index object loader failed"))??;
+        let objects = if let Some(token) = token {
+            objects.with_command_token(token)
+        } else {
+            objects
+        };
         let objects: Arc<dyn jj_native_backend::NativeObjectIo> = Arc::new(objects);
         let index = match initial {
             Some((root, operation)) => {
@@ -335,6 +362,10 @@ pub(crate) fn init_index(
     root: &jj_lib::backend::CommitId,
     operation: &jj_lib::op_store::OperationId,
 ) -> Result<Box<dyn jj_lib::index::IndexStore>, BackendInitError> {
+    crate::commands::token(path.parent().ok_or_else(|| {
+        BackendInitError(Box::new(io::Error::other("native index has no repository")))
+    })?)
+    .map_err(|error| BackendInitError(error.into()))?;
     match mode {
         native_broker::ProviderIndexMode::Legacy => {
             jj_lib::repo::ReadonlyRepo::default_index_store_initializer()(settings, path)

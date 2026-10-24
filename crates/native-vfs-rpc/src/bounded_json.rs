@@ -19,6 +19,7 @@ enum Shape<'a> {
 struct Seed<'a> {
     shape: Shape<'a>,
     limits: &'a Limits,
+    command: bool,
 }
 impl<'de> DeserializeSeed<'de> for Seed<'_> {
     type Value = ();
@@ -45,6 +46,7 @@ enum Key {
     Contents,
     Digest,
     Incarnation,
+    CommandId,
     Repository,
     Mount,
     Request,
@@ -72,6 +74,7 @@ impl<'de> Visitor<'de> for Key {
             "contents" => Key::Contents,
             "digest" | "fingerprint" => Key::Digest,
             "incarnation" => Key::Incarnation,
+            "replay" | "nonce" | "token" => Key::CommandId,
             "repository" => Key::Repository,
             "mount" => Key::Mount,
             "request_id" => Key::Request,
@@ -137,6 +140,8 @@ impl<'de> Visitor<'de> for Seed<'_> {
                 ),
                 Key::Digest => Shape::Bytes(32),
                 Key::Incarnation => Shape::Bytes(16),
+                Key::CommandId if self.command => Shape::Bytes(32),
+                Key::CommandId => Shape::Value,
                 Key::Repository => Shape::Text(256),
                 Key::Mount => Shape::Text(128),
                 Key::Request => Shape::Text(128),
@@ -148,6 +153,7 @@ impl<'de> Visitor<'de> for Seed<'_> {
             map.next_value_seed(Seed {
                 shape,
                 limits: self.limits,
+                command: self.command,
             })?;
         }
         Ok(())
@@ -169,6 +175,7 @@ impl<'de> Visitor<'de> for Seed<'_> {
                 .next_element_seed(Seed {
                     shape: element,
                     limits: self.limits,
+                    command: self.command,
                 })?
                 .is_none()
             {
@@ -181,10 +188,17 @@ impl<'de> Visitor<'de> for Seed<'_> {
     }
 }
 pub(crate) fn check(payload: &[u8], limits: &Limits) -> Result<(), tonic::Status> {
+    check_mode(payload, limits, false)
+}
+pub(crate) fn check_command(payload: &[u8], limits: &Limits) -> Result<(), tonic::Status> {
+    check_mode(payload, limits, true)
+}
+fn check_mode(payload: &[u8], limits: &Limits, command: bool) -> Result<(), tonic::Status> {
     let mut decoder = serde_json::Deserializer::from_slice(payload);
     Seed {
         shape: Shape::Value,
         limits,
+        command,
     }
     .deserialize(&mut decoder)
     .and_then(|_| decoder.end())

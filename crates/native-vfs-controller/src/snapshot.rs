@@ -165,7 +165,8 @@ pub(super) async fn plan(
             .get(path.as_str())
             .filter(|entry| entry.node.kind == NodeKind::File)
         {
-            let bytes = ignore_bytes(controller, &snapshot, entry, &mut remaining_ignore).await?;
+            let bytes =
+                ignore_bytes(controller, &snapshot, entry, &mut remaining_ignore, scope).await?;
             scope.check()?;
             budget = budget
                 .checked_add(bytes.len().saturating_mul(6))
@@ -359,6 +360,7 @@ async fn ignore_bytes(
     snapshot: &SourceSnapshot,
     entry: &SourceSnapshotEntry,
     remaining: &mut usize,
+    scope: &ActionScope,
 ) -> Result<Vec<u8>> {
     let size = usize::try_from(entry.node.size)?;
     ensure!(
@@ -374,7 +376,16 @@ async fn ignore_bytes(
             "native ignore-file descriptor mismatch"
         );
         let id = file_id(&artifact.hash)?;
-        let (descriptor, reader) = controller.inner.provider.read_file(id).await?.into_parts();
+        let file = if let Some(owner) = scope.owner() {
+            controller
+                .inner
+                .provider
+                .read_file_with_owner(id, owner)
+                .await?
+        } else {
+            controller.inner.provider.read_file(id).await?
+        };
+        let (descriptor, reader) = file.into_parts();
         ensure!(
             descriptor.key.kind == m::Kind::File
                 && descriptor.key.id.0 == id.0
@@ -422,11 +433,19 @@ pub(super) async fn write(
                         offset: 0,
                         buffer: controller.inner.config.io_buffer_bytes,
                     };
-                    let result = controller
-                        .inner
-                        .provider
-                        .write_file(&mut reader, size)
-                        .await;
+                    let result = if let Some(owner) = scope.owner() {
+                        controller
+                            .inner
+                            .provider
+                            .write_file_with_owner(&mut reader, size, owner)
+                            .await
+                    } else {
+                        controller
+                            .inner
+                            .provider
+                            .write_file(&mut reader, size)
+                            .await
+                    };
                     // Do not cancel the admitted physical upload. Gate the
                     // next logical stage only after its future has drained.
                     scope.check()?;
@@ -533,7 +552,15 @@ async fn write_metadata(
     scope: &ActionScope,
 ) -> Result<()> {
     scope.check()?;
-    let result = controller.inner.provider.write_metadata(object).await;
+    let result = if let Some(owner) = scope.owner() {
+        controller
+            .inner
+            .provider
+            .write_metadata_with_owner(object, owner)
+            .await
+    } else {
+        controller.inner.provider.write_metadata(object).await
+    };
     scope.check()?;
     let actual = result?;
     ensure!(

@@ -40,7 +40,11 @@ fn file_id(hash: &str) -> Result<m::FileId> {
 }
 impl<'a> Graph<'a> {
     fn owner(&self) -> Arc<dyn std::any::Any + Send + Sync> {
-        Arc::new((self.controller.inner.clone(), self.snapshot.clone()))
+        Arc::new((
+            self.controller.inner.clone(),
+            self.snapshot.clone(),
+            self.scope.owner(),
+        ))
     }
     async fn read(&mut self, key: m::ObjectKey) -> Result<m::Object> {
         self.scope.check()?;
@@ -451,7 +455,15 @@ impl<'a> Graph<'a> {
         let size = usize::try_from(size_bytes)?;
         ensure!(size <= *remaining, "ignore file byte budget exceeded");
         *remaining -= size;
-        let result = self.controller.inner.provider.read_file(id).await;
+        let result = if let Some(owner) = self.scope.owner() {
+            self.controller
+                .inner
+                .provider
+                .read_file_with_owner(id, owner)
+                .await
+        } else {
+            self.controller.inner.provider.read_file(id).await
+        };
         self.scope.check()?;
         let (descriptor, reader) = result?.into_parts();
         ensure!(
@@ -650,12 +662,19 @@ impl<'a> Graph<'a> {
                 offset: 0,
                 buffer: self.controller.inner.config.io_buffer_bytes,
             };
-            let result = self
-                .controller
-                .inner
-                .provider
-                .write_file(&mut reader, size)
-                .await;
+            let result = if let Some(owner) = self.scope.owner() {
+                self.controller
+                    .inner
+                    .provider
+                    .write_file_with_owner(&mut reader, size, owner)
+                    .await
+            } else {
+                self.controller
+                    .inner
+                    .provider
+                    .write_file(&mut reader, size)
+                    .await
+            };
             self.scope.check()?;
             ensure!(
                 result? == expected && reader.offset == size,
@@ -769,7 +788,15 @@ impl<'a> Graph<'a> {
     }
     async fn write_object(&self, object: m::Object, expected: m::ObjectKey) -> Result<()> {
         self.scope.check()?;
-        let result = self.controller.inner.provider.write_metadata(object).await;
+        let result = if let Some(owner) = self.scope.owner() {
+            self.controller
+                .inner
+                .provider
+                .write_metadata_with_owner(object, owner)
+                .await
+        } else {
+            self.controller.inner.provider.write_metadata(object).await
+        };
         self.scope.check()?;
         ensure!(result?.key == expected, "lazy canonical write differs");
         Ok(())

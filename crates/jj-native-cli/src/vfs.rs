@@ -90,6 +90,7 @@ pub(crate) async fn initialize(
             &intent.initial_commit(),
             intent.workspace_id(),
         )?;
+        crate::commands::ensure_binding(&binding).map_err(failure)?;
         // A crash can occur after Ready publication but before intent completion.
         // Inspect the exact record rather than initializing existing jj state.
         let ready_record = registry
@@ -138,11 +139,15 @@ pub(crate) async fn initialize(
 pub(crate) fn connector(
     binding: &native_workspace_admin::Binding,
 ) -> anyhow::Result<Arc<dyn jj_vfs::native::ProjectionConnector>> {
-    Ok(Arc::new(native_vfs_rpc::ClientConnector::new(
-        binding.endpoint.local(),
-        binding.rpc_mount_id.clone(),
-        Default::default(),
-    )?))
+    let token = crate::commands::ensure_binding(binding)?;
+    Ok(Arc::new(
+        native_vfs_rpc::ClientConnector::new(
+            binding.endpoint.local(),
+            binding.rpc_mount_id.clone(),
+            Default::default(),
+        )?
+        .with_command_token(token),
+    ))
 }
 
 pub(crate) fn working_copy_path(root: &Path) -> anyhow::Result<PathBuf> {
@@ -184,6 +189,12 @@ impl jj_lib::workspace::WorkspaceLoaderFactory for Loader {
         if !root.join(".jj/native-workspace").exists() {
             return Err(WorkspaceLoadError::NoWorkspaceHere(root.to_owned()));
         }
+        let registry = native_workspace_admin::Registry::open_existing(
+            native_workspace_admin::Registry::default_path().map_err(load_error)?,
+        )
+        .map_err(load_error)?;
+        let binding = registry.lookup(root).map_err(load_error)?;
+        crate::commands::ensure_binding(&binding).map_err(load_error)?;
         loader().map_err(load_error)?.create(root)
     }
 }
@@ -218,6 +229,12 @@ impl jj_lib::working_copy::WorkingCopyFactory for WorkingCopyFactory {
         Box<dyn jj_lib::working_copy::WorkingCopy>,
         jj_lib::working_copy::WorkingCopyStateError,
     > {
+        let registry = native_workspace_admin::Registry::open_existing(
+            native_workspace_admin::Registry::default_path().map_err(state_error)?,
+        )
+        .map_err(state_error)?;
+        let binding = registry.lookup(&root).map_err(state_error)?;
+        crate::commands::ensure_binding(&binding).map_err(state_error)?;
         loader()
             .map_err(state_error)?
             .working_copy_factory()
@@ -326,6 +343,7 @@ async fn load_ready(
     binding: &native_workspace_admin::Binding,
 ) -> Result<(Workspace, Arc<ReadonlyRepo>), CommandError> {
     use jj_lib::workspace::WorkspaceLoaderFactory;
+    crate::commands::ensure_binding(binding).map_err(failure)?;
     let factory = native_workspace_admin::LoaderFactory::new(registry.clone(), Arc::new(connector));
     let loader = factory.create(&binding.root).map_err(failure)?;
     let mut stores = jj_lib::default_backend_factories::default_backend_factories();
@@ -374,6 +392,7 @@ pub(crate) async fn resume(
                 &intent.initial_commit(),
                 intent.workspace_id(),
             )?;
+            crate::commands::ensure_binding(&binding).map_err(failure)?;
             let ready_record = registry
                 .path()
                 .join("records")
@@ -529,6 +548,7 @@ pub(crate) async fn recover(
         .map_err(failure)?;
         // Recovery requires an actually mounted, marker-verified registration.
         let binding = registry.lookup(destination).map_err(failure)?;
+        crate::commands::ensure_binding(&binding).map_err(failure)?;
         let mut stores = jj_lib::default_backend_factories::default_backend_factories();
         broker::register(&mut stores);
         let loader = RepoLoader::init_from_file_system(command.settings(), &binding.repo, &stores)

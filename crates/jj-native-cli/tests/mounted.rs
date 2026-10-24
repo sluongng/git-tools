@@ -1411,6 +1411,17 @@ fn federated_index_production_factory_preserves_operations_and_drains_cli_querie
             "CLI cleanup iteration {command} {args:?}: {}",
             String::from_utf8_lossy(&output.stderr)
         );
+        assert!(
+            !String::from_utf8_lossy(&output.stderr)
+                .contains("native command drain remains pending"),
+            "command fence did not drain after iteration {command}"
+        );
+        let status = fixture.control(Request::Status).unwrap();
+        assert_eq!(
+            status["native"]["commands"]["active_commands"], 0,
+            "command fence leaked after iteration {command}"
+        );
+        assert_eq!(status["native"]["commands"]["collection_enabled"], false);
     }
     let second = base.join("federated-reader");
     fixture.clone_remote(&second);
@@ -1869,6 +1880,61 @@ impl Drop for StartupTrialFailure<'_> {
         }
     }
 }
+fn mounted_command_retention_cumulative(fixture: &Fixture) -> serde_json::Value {
+    let status = fixture
+        .control(Request::Status)
+        .expect("command retention diagnostics unavailable");
+    let stats = &status["native"]["commands"];
+    assert_eq!(
+        stats["active_commands"], 0,
+        "timed commands returned with command fences still pending"
+    );
+    assert_eq!(
+        stats["collection_enabled"], false,
+        "checkpoint A must not enable collection"
+    );
+    let mut output = serde_json::Map::new();
+    for field in [
+        "active_commands",
+        "registered_workspaces",
+        "dirty_transitions",
+        "dirty_transition_ns",
+        "physical_drains",
+        "physical_drain_ns",
+        "retention_transactions",
+        "retention_encoded_write_bytes",
+    ] {
+        output.insert(
+            field.into(),
+            stats[field]
+                .as_u64()
+                .expect("missing numeric command retention metric")
+                .into(),
+        );
+    }
+    output.insert("collection_enabled".into(), false.into());
+    output.insert(
+        "counter_window".into(),
+        "daemon_start_through_four_timed_commands_before_cleanup".into(),
+    );
+    output.insert(
+        "timing_attribution".into(),
+        "cumulative_only_not_per_phase".into(),
+    );
+    output.insert(
+        "control_snapshot_outside_measured_phases".into(),
+        true.into(),
+    );
+    output.insert(
+        "dirty_transition_includes_registry_queueing".into(),
+        true.into(),
+    );
+    output.insert(
+        "physical_drain_includes_accepted_job_wait".into(),
+        true.into(),
+    );
+    serde_json::Value::Object(output)
+}
 fn mounted_startup_phase(
     tracker: &mut StartupTrialFailure<'_>,
     phase: &'static str,
@@ -1974,6 +2040,11 @@ fn native_mounted_startup_benchmark_ladder() {
             assert_ne!(first_binding.repo, second_binding.repo);
             assert_ne!(first_binding.working_copy, second_binding.working_copy);
             let total = upstream.startup_counters();
+            // Do not add status RPCs between measured phases: their untimed
+            // delay could warm asynchronous prefetch before the next command.
+            // One final snapshot observes counts, never waits for pending work.
+            failure.begin("command_retention_diagnostics");
+            let command_retention = mounted_command_retention_cumulative(fixture);
             failure.begin("cleanup_second_unmount");
             fixture.success(&base, &["tinytree", "unmount", second.to_str().unwrap()]);
             failure.begin("cleanup_first_unmount");
@@ -1995,6 +2066,8 @@ fn native_mounted_startup_benchmark_ladder() {
                     "first_default_log_n40":cold_log,"repeated_warm_log_n40":warm_log,
                     "second_agent_clone_shared_daemon_cache":shared_daemon_second_clone,
                     "total_command_boundary_counters":total,"file_payload_free":total.file_rpcs==0,
+                    "command_retention_cumulative":command_retention,
+                    "retention_component_timings_not_phase_attribution":true,
                     "byte_measure":"uncompressed_canonical_envelopes_not_network_wire_bytes",
                     "counters_are_command_boundary_snapshots":true,
                     "background_work_may_cross_phase_boundaries":true,

@@ -316,7 +316,14 @@ impl Host {
                 if let Some(scope) = scope {
                     scope.check()?;
                 }
-                mount.checkout_resolved(&merge, expected, id.into()).await
+                mount
+                    .checkout_resolved_with_owner(
+                        &merge,
+                        expected,
+                        id.into(),
+                        scope.and_then(ActionScope::owner),
+                    )
+                    .await
             }
             #[cfg(any(test, feature = "protocol-test-support"))]
             Self::Protocol { tree, compiler, .. } => {
@@ -342,7 +349,11 @@ impl Host {
                         limits,
                     );
                 }
-                let compiled = compiler.compile_merge(&merge).await?;
+                let compiled = if let Some(owner) = scope.and_then(ActionScope::owner) {
+                    compiler.compile_merge_with_owner(&merge, owner).await?
+                } else {
+                    compiler.compile_merge(&merge).await?
+                };
                 if let Some(scope) = scope {
                     scope.check()?;
                 }
@@ -363,6 +374,28 @@ impl Host {
             #[cfg(any(test, feature = "protocol-test-support"))]
             Self::Protocol { .. } => Ok(()),
         }
+    }
+}
+async fn compile_tree_for_scope(
+    compiler: &Compiler,
+    root: m::TreeId,
+    scope: &ActionScope,
+) -> Result<native_workspace::CompiledWorkspace> {
+    if let Some(owner) = scope.owner() {
+        compiler.compile_tree_with_owner(root, owner).await
+    } else {
+        compiler.compile_tree(root).await
+    }
+}
+async fn compile_merge_for_scope(
+    compiler: &Compiler,
+    merge: &m::TreeMerge,
+    scope: &ActionScope,
+) -> Result<native_workspace::CompiledWorkspace> {
+    if let Some(owner) = scope.owner() {
+        compiler.compile_merge_with_owner(merge, owner).await
+    } else {
+        compiler.compile_merge(merge).await
     }
 }
 fn resolved_merge(tree: &NativeTree) -> Result<m::TreeMerge> {
@@ -943,6 +976,7 @@ impl Controller {
             controller: self.clone(),
             current: expected.clone(),
             admission_scope: None,
+            physical_owner: None,
             _guard: guard,
         })
     }
@@ -1083,9 +1117,18 @@ pub struct Mutation {
     controller: Controller,
     current: ProjectionState,
     admission_scope: Option<ActionScope>,
+    physical_owner: Option<Arc<dyn std::any::Any + Send + Sync>>,
     _guard: OwnedMutexGuard<()>,
 }
 impl Mutation {
+    /// Physical source-provider barrier after the final logical action. A
+    /// timeout/rejected action alone does not prove native publication stopped.
+    pub async fn drain_physical(&self) -> Result<()> {
+        self.controller.inner.host.wait_source_idle().await
+    }
+    pub fn set_physical_owner(&mut self, owner: Arc<dyn std::any::Any + Send + Sync>) {
+        self.physical_owner = Some(owner);
+    }
     /// Set one transport action's absolute deadline and independent EOF flag.
     /// The next action may set a new scope; an admitted physical stage is never
     /// aborted merely because this scope expires while that stage is running.
@@ -1097,10 +1140,15 @@ impl Mutation {
     }
     fn action_scope(&self) -> ActionScope {
         let deadline = tokio::time::Instant::now() + self.controller.inner.config.operation_timeout;
-        self.admission_scope.as_ref().map_or_else(
+        let scope = self.admission_scope.as_ref().map_or_else(
             || ActionScope::new(deadline, Arc::new(AtomicBool::new(false))),
             |scope| scope.bounded(deadline),
-        )
+        );
+        if let Some(owner) = &self.physical_owner {
+            scope.with_owner(owner.clone())
+        } else {
+            scope
+        }
     }
     fn check_admission(
         &self,
@@ -1199,14 +1247,13 @@ impl Mutation {
             Capture::Complete(snapshot) => Arc::new(snapshot),
         };
         scope.check().map_err(rejected)?;
-        let base = self
-            .controller
-            .inner
-            .host
-            .compiler()
-            .compile_tree(m::TreeId(snapshot.base_root()))
-            .await
-            .map_err(rejected)?;
+        let base = compile_tree_for_scope(
+            &self.controller.inner.host.compiler(),
+            m::TreeId(snapshot.base_root()),
+            &scope,
+        )
+        .await
+        .map_err(rejected)?;
         scope.check().map_err(rejected)?;
         let plan = snapshot::plan(&self.controller, snapshot.clone(), &base, policy, &scope)
             .await
@@ -1296,14 +1343,10 @@ impl NativeProjectionMutation for Mutation {
         {
             return lazy_snapshot::checkout(self, id, tree, scope).await;
         }
-        let target = self
-            .controller
-            .inner
-            .host
-            .compiler()
-            .compile_merge(&merge)
-            .await
-            .map_err(rejected)?;
+        let target =
+            compile_merge_for_scope(&self.controller.inner.host.compiler(), &merge, &scope)
+                .await
+                .map_err(rejected)?;
         scope.check().map_err(rejected)?;
         let snapshot = Arc::new(
             self.controller
@@ -1319,14 +1362,13 @@ impl NativeProjectionMutation for Mutation {
                 .map_err(rejected)?,
         );
         scope.check().map_err(rejected)?;
-        let base = self
-            .controller
-            .inner
-            .host
-            .compiler()
-            .compile_tree(m::TreeId(snapshot.base_root()))
-            .await
-            .map_err(rejected)?;
+        let base = compile_tree_for_scope(
+            &self.controller.inner.host.compiler(),
+            m::TreeId(snapshot.base_root()),
+            &scope,
+        )
+        .await
+        .map_err(rejected)?;
         scope.check().map_err(rejected)?;
         snapshot::unchanged(&snapshot, &base, &scope).map_err(rejected)?;
         let stats = snapshot::checkout_stats(&base, &target);
@@ -1390,11 +1432,7 @@ impl NativeProjectionMutation for Mutation {
         {
             return lazy_snapshot::reset(self, id, tree, recover, scope).await;
         }
-        self.controller
-            .inner
-            .host
-            .compiler()
-            .compile_merge(&merge)
+        compile_merge_for_scope(&self.controller.inner.host.compiler(), &merge, &scope)
             .await
             .map_err(rejected)?;
         scope.check().map_err(rejected)?;

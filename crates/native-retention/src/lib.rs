@@ -226,6 +226,8 @@ struct CommandState {
 enum Phase {
     Open,
     Capturing,
+    SealingDirty,
+    DrainedDirty,
     Frozen([u8; 32]),
     Complete(CheckpointReceipt),
     Failed,
@@ -523,6 +525,48 @@ impl Registry {
             .await;
             finish_checkpoint(&context, &result)?;
             result
+        });
+        worker.await.map_err(|_| Error::Poisoned)?
+    }
+    /// Stop ordinary admission and drain accepted physical work WITHOUT
+    /// checkpointing or making a dirty workspace collectable. The worker owns
+    /// the command fence after caller cancellation. Hosts use this when exact
+    /// final inventory is unavailable; it is not a backup or Clean receipt.
+    pub async fn drain_dirty(&self, token: CommandToken) -> Result<()> {
+        self.inner.check()?;
+        let context = self.lookup(token)?;
+        let runtime = storage::runtime()?;
+        let first = {
+            let mut state = context.state.lock().map_err(|_| Error::Poisoned)?;
+            if !state.owner_alive {
+                return Err(Error::ClosedCommand);
+            }
+            match state.phase {
+                Phase::Open => {
+                    state.phase = Phase::SealingDirty;
+                    true
+                }
+                Phase::SealingDirty => false,
+                Phase::DrainedDirty => return Ok(()),
+                _ => return Err(Error::CheckpointConflict),
+            }
+        };
+        let worker = runtime.spawn(async move {
+            if first {
+                drain_jobs(&context).await?;
+                context.state.lock().map_err(|_| Error::Poisoned)?.phase = Phase::DrainedDirty;
+                context.changed.notify_waiters();
+                return Ok(());
+            }
+            loop {
+                let changed = context.changed.notified();
+                match context.state.lock().map_err(|_| Error::Poisoned)?.phase {
+                    Phase::DrainedDirty => return Ok(()),
+                    Phase::SealingDirty => {}
+                    _ => return Err(Error::CheckpointConflict),
+                }
+                changed.await;
+            }
         });
         worker.await.map_err(|_| Error::Poisoned)?
     }
