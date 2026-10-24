@@ -79,6 +79,7 @@ buildbuddy = "https://github.com/buildbuddy-io/buildbuddy.git"
 # max_query_persistent_bytes = 536870912
 # max_temporary_bytes = 1073741824
 # [native.workspaces]
+# metadata_cache_ttl_ms = 1000 # Linux default (max 5000); use 0 on other platforms.
 # index_mode = "legacy" # Experimental "federated" avoids eager jj history indexing.
 # Existing workspaces retain their recorded index type.
 # Explicit Linux-only collection; preview never deletes and no automatic GC runs.

@@ -79,6 +79,8 @@ pub enum NativeIndexMode {
 #[derive(Clone, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct NativeWorkspaces {
+    /// Linux native sources only; zero retains uncached metadata responses.
+    pub metadata_cache_ttl_ms: u64,
     /// Experimental opt-in; existing index/type always wins on reload.
     pub index_mode: NativeIndexMode,
     pub capture: NativeCapture,
@@ -95,6 +97,7 @@ pub struct NativeWorkspaces {
 impl Default for NativeWorkspaces {
     fn default() -> Self {
         Self {
+            metadata_cache_ttl_ms: if cfg!(target_os = "linux") { 1000 } else { 0 },
             index_mode: NativeIndexMode::Legacy,
             capture: NativeCapture::default(),
             upload: NativeCaptureUpload::default(),
@@ -110,6 +113,15 @@ impl Default for NativeWorkspaces {
 }
 impl NativeWorkspaces {
     fn validate(&self) -> Result<()> {
+        ensure!(
+            self.metadata_cache_ttl_ms <= 5000,
+            "native metadata TTL exceeds five seconds"
+        );
+        #[cfg(not(target_os = "linux"))]
+        ensure!(
+            self.metadata_cache_ttl_ms == 0,
+            "native kernel metadata caching requires Linux"
+        );
         self.capture.validate()?;
         self.upload.validate()?;
         self.gc.validate()?;
@@ -996,6 +1008,16 @@ mod tests {
             NativeIndexMode::Federated
         );
         assert!(old.native.workspaces.registry_path.is_none());
+        assert_eq!(
+            old.native.workspaces.metadata_cache_ttl_ms,
+            if cfg!(target_os = "linux") { 1000 } else { 0 }
+        );
+        let mut metadata_cache = old.clone();
+        metadata_cache.native.workspaces.metadata_cache_ttl_ms = 1000;
+        #[cfg(target_os = "linux")]
+        assert!(metadata_cache.validate().is_ok());
+        metadata_cache.native.workspaces.metadata_cache_ttl_ms = 5001;
+        assert!(metadata_cache.validate().is_err());
         for value in [0, 4097] {
             let mut invalid = old.clone();
             invalid.native.workspaces.max_workspaces = value;

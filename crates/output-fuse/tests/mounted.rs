@@ -654,9 +654,16 @@ async fn mounted_lazy_source_capture_fences_open_mmap_deferred_work_and_cancella
     )
     .unwrap();
     let root = directory.path().join("source");
-    let mount = output_fuse::start_native_source(tree, &root, [4; 32])
-        .await
-        .unwrap();
+    let mount = output_fuse::start_native_source_with_options(
+        tree,
+        &root,
+        [4; 32],
+        output_fuse::NativeSourceOptions {
+            metadata_ttl: Duration::from_millis(1000),
+        },
+    )
+    .await
+    .unwrap();
     let path = root.join("mapped");
     let read_path = path.clone();
     assert_eq!(
@@ -820,4 +827,129 @@ async fn mounted_lazy_source_capture_fences_open_mmap_deferred_work_and_cancella
     let raced = root.join("raced/child");
     assert_eq!(io(move || fs::read(raced).unwrap()).await.len(), 4096);
     mount.shutdown().await.unwrap();
+}
+
+/// A publication waiting for an accepted lazy lookup must not occupy the only
+/// blocking worker that lookup needs, and cancelled callers must not reopen the
+/// cache-admission fence before the committed publication finishes.
+#[test]
+#[ignore = "requires usable /dev/fuse and fusermount3"]
+fn cached_metadata_publication_drains_without_blocking_pool_starvation() {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .max_blocking_threads(1)
+        .enable_all()
+        .build()
+        .unwrap();
+    runtime.block_on(async {
+        let directory = tempfile::tempdir().unwrap();
+        let source = Arc::new(Source::new());
+        let provider = Arc::new(CaptureDirectories {
+            artifact: source.artifact(b"metadata-only fixture"),
+            entered: Notify::new(),
+            release: Semaphore::new(0),
+        });
+        let tree = Tree::open(
+            directory.path().join("state"),
+            "test",
+            source,
+            CacheConfig::default(),
+        )
+        .unwrap();
+        tree.install_lazy_source(
+            output_core::LazySourceRoot {
+                identity: tree.identity().into(),
+                root_tree: [1; 32],
+                pin: output_core::SourcePin {
+                    root: [1; 32],
+                    generation: 1,
+                },
+                provider: provider.clone(),
+                load_limits: Default::default(),
+            },
+            None,
+            "single-worker-source",
+            &Default::default(),
+        )
+        .unwrap();
+        let root = directory.path().join("source");
+        let mount = output_fuse::start_native_source_with_options(
+            tree,
+            &root,
+            [5; 32],
+            output_fuse::NativeSourceOptions {
+                metadata_ttl: Duration::from_millis(1000),
+            },
+        )
+        .await
+        .unwrap();
+        // A failed assertion must release the synthetic provider before mount
+        // and runtime cleanup, otherwise the regression would hang on failure.
+        struct ReleaseOnDrop(Arc<CaptureDirectories>);
+        impl Drop for ReleaseOnDrop {
+            fn drop(&mut self) {
+                self.0.release.add_permits(4);
+            }
+        }
+        let _release_on_failure = ReleaseOnDrop(provider.clone());
+        // The OS caller must not itself consume the runtime's sole blocking lane.
+        let (done, result) = tokio::sync::oneshot::channel();
+        let path = root.join("blocked/child");
+        let reader = std::thread::spawn(move || {
+            let _ = done.send(fs::metadata(path));
+        });
+        tokio::time::timeout(Duration::from_secs(5), provider.entered.notified())
+            .await
+            .unwrap();
+        let owner = mount.clone();
+        let publishing = tokio::spawn(async move { owner.ensure_dir("published").await });
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let probe = root.join("metadata-fence-probe");
+                let error = std::thread::spawn(move || fs::metadata(probe).err())
+                    .join()
+                    .unwrap();
+                if error.is_some_and(|error| error.raw_os_error() == Some(libc::EAGAIN)) {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("metadata admission was not paused");
+        publishing.abort();
+        let _ = publishing.await;
+        let after_cancel = root.join("metadata-fence-probe-after-cancel");
+        let error = std::thread::spawn(move || fs::metadata(after_cancel).err())
+            .join()
+            .unwrap();
+        assert_eq!(
+            error.and_then(|e| e.raw_os_error()),
+            Some(libc::EAGAIN),
+            "caller cancellation must not release the committed metadata fence"
+        );
+        provider.release.add_permits(1);
+        tokio::time::timeout(Duration::from_secs(5), result)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        reader.join().unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let path = root.join("published");
+                let ready =
+                    std::thread::spawn(move || fs::metadata(path).is_ok_and(|m| m.is_dir()))
+                        .join()
+                        .unwrap();
+                if ready {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("committed publication did not finish after caller cancellation");
+        mount.shutdown().await.unwrap();
+    });
 }

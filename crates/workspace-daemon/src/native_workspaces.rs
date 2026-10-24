@@ -263,7 +263,7 @@ impl Manager {
             .await
     }
     pub fn status(&self) -> serde_json::Value {
-        serde_json::json!(self.entries.iter().map(|(id,entry)| serde_json::json!({"workspace_id":id,"root":entry.record.root,"store":entry.record.store,"state":entry.record.state,"active":entry.mount.is_some(),"provider_recovery_owned":entry.provider_failure.is_some()})).collect::<Vec<_>>())
+        serde_json::json!(self.entries.iter().map(|(id,entry)| serde_json::json!({"workspace_id":id,"root":entry.record.root,"store":entry.record.store,"state":entry.record.state,"active":entry.mount.is_some(),"provider_recovery_owned":entry.provider_failure.is_some(),"fuse_metadata":entry.mount.as_ref().and_then(|mount|mount.metadata_diagnostics())})).collect::<Vec<_>>())
     }
     pub fn mounted(&self, id: &str) -> Result<bool> {
         let _ = unhex(id)?;
@@ -494,7 +494,12 @@ impl Manager {
         if let Some(before) = self.before_provider_start.take() {
             before(&root)?;
         }
-        let mount = match native_vfs::mount_prepared(prepared).await {
+        let mount = match native_vfs::mount_prepared_with_metadata_ttl(
+            prepared,
+            std::time::Duration::from_millis(self.config.native.workspaces.metadata_cache_ttl_ms),
+        )
+        .await
+        {
             Ok(mount) => Arc::new(mount),
             Err(error) => {
                 let entry = self.entries.get_mut(&workspace_id).unwrap();
@@ -943,7 +948,12 @@ impl Manager {
         } else {
             native_vfs::prepare(config, repository.io.clone(), self.cache.clone()).await?
         };
-        let startup = match native_vfs::mount_prepared_for_restore(workspace).await {
+        let startup = match native_vfs::mount_prepared_for_restore_with_metadata_ttl(
+            workspace,
+            std::time::Duration::from_millis(self.config.native.workspaces.metadata_cache_ttl_ms),
+        )
+        .await
+        {
             Ok(startup) => startup,
             Err(error) => {
                 let entry = self.entries.get_mut(workspace_id).unwrap();

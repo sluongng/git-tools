@@ -330,7 +330,34 @@ impl std::fmt::Debug for NativeMount {
         f.debug_struct("NativeMount").finish_non_exhaustive()
     }
 }
+#[derive(Clone, Copy, Debug, Serialize)]
+pub struct MetadataDiagnostics {
+    pub lookups: u64,
+    pub getattrs: u64,
+    pub readdirs: u64,
+    pub reads: u64,
+    pub directory_load_waits: u64,
+    pub directory_load_wait_ns: u64,
+}
 impl NativeMount {
+    pub fn metadata_diagnostics(&self) -> Option<MetadataDiagnostics> {
+        #[cfg(target_os = "linux")]
+        {
+            let d = self.source_frontend.metadata_diagnostics();
+            Some(MetadataDiagnostics {
+                lookups: d.lookups,
+                getattrs: d.getattrs,
+                readdirs: d.readdirs,
+                reads: d.reads,
+                directory_load_waits: d.directory_load_waits,
+                directory_load_wait_ns: d.directory_load_wait_ns,
+            })
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            None
+        }
+    }
     pub fn tree(&self) -> Arc<Tree> {
         self.prepared.tree()
     }
@@ -551,12 +578,20 @@ impl StartupNativeMount {
 /// Acquire a frontend whose ordinary kernel admission starts closed. Other
 /// platforms fail before acquiring a provider; there is no materialized fallback.
 pub async fn mount_prepared_for_restore(prepared: PreparedWorkspace) -> Result<StartupNativeMount> {
+    mount_prepared_for_restore_with_metadata_ttl(prepared, std::time::Duration::ZERO).await
+}
+/// Configure bounded Linux-native positive kernel metadata caching.
+pub async fn mount_prepared_for_restore_with_metadata_ttl(
+    prepared: PreparedWorkspace,
+    metadata_ttl: std::time::Duration,
+) -> Result<StartupNativeMount> {
     #[cfg(target_os = "linux")]
     {
-        let (source_frontend, fence) = output_fuse::start_native_source_gated(
+        let (source_frontend, fence) = output_fuse::start_native_source_gated_with_options(
             prepared.tree(),
             prepared.root(),
             prepared.workspace_identity(),
+            output_fuse::NativeSourceOptions { metadata_ttl },
         )
         .await?;
         let projection: Arc<dyn Projection> = source_frontend.clone();
@@ -582,6 +617,18 @@ pub async fn mount_prepared_for_restore(prepared: PreparedWorkspace) -> Result<S
 /// Start a native provider after successful metadata preparation. On macOS an
 /// error may own a recoverable NFS session; retain it until explicit shutdown.
 pub async fn mount_prepared(prepared: PreparedWorkspace) -> Result<NativeMount> {
+    mount_prepared_with_metadata_ttl(prepared, std::time::Duration::ZERO).await
+}
+/// Nonzero metadata caching is currently available only on Linux native mounts.
+pub async fn mount_prepared_with_metadata_ttl(
+    prepared: PreparedWorkspace,
+    metadata_ttl: std::time::Duration,
+) -> Result<NativeMount> {
+    #[cfg(not(target_os = "linux"))]
+    ensure!(
+        metadata_ttl.is_zero(),
+        "native kernel metadata caching requires Linux"
+    );
     #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
     {
         let _ = prepared;
@@ -590,10 +637,11 @@ pub async fn mount_prepared(prepared: PreparedWorkspace) -> Result<NativeMount> 
     #[cfg(any(target_os = "linux", target_os = "macos", windows))]
     {
         #[cfg(target_os = "linux")]
-        let source_frontend = output_fuse::start_native_source(
+        let source_frontend = output_fuse::start_native_source_with_options(
             prepared.tree(),
             prepared.root(),
             prepared.workspace_identity(),
+            output_fuse::NativeSourceOptions { metadata_ttl },
         )
         .await?;
         #[cfg(target_os = "linux")]

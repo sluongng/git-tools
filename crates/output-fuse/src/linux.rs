@@ -12,7 +12,7 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         Arc, Mutex,
-        atomic::{AtomicBool, AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
     },
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
@@ -23,6 +23,61 @@ use tokio::{
 
 const TTL: Duration = Duration::ZERO;
 const PAYLOAD_SLOTS: usize = 64;
+
+/// Native-source-only kernel metadata policy. Output-service mounts remain uncached.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct NativeSourceOptions {
+    pub metadata_ttl: Duration,
+}
+impl NativeSourceOptions {
+    pub fn validate(self) -> Result<()> {
+        ensure!(
+            self.metadata_ttl <= Duration::from_secs(5),
+            "native metadata TTL exceeds five seconds"
+        );
+        Ok(())
+    }
+}
+#[derive(Clone, Copy, Debug, Default)]
+pub struct MetadataDiagnostics {
+    pub lookups: u64,
+    pub getattrs: u64,
+    pub readdirs: u64,
+    pub reads: u64,
+    pub directory_load_waits: u64,
+    pub directory_load_wait_ns: u64,
+}
+#[derive(Default)]
+struct MetadataCounters {
+    lookups: AtomicU64,
+    getattrs: AtomicU64,
+    readdirs: AtomicU64,
+    reads: AtomicU64,
+    directory_load_waits: AtomicU64,
+    directory_load_wait_ns: AtomicU64,
+}
+impl MetadataCounters {
+    fn snapshot(&self) -> MetadataDiagnostics {
+        MetadataDiagnostics {
+            lookups: self.lookups.load(Ordering::Relaxed),
+            getattrs: self.getattrs.load(Ordering::Relaxed),
+            readdirs: self.readdirs.load(Ordering::Relaxed),
+            reads: self.reads.load(Ordering::Relaxed),
+            directory_load_waits: self.directory_load_waits.load(Ordering::Relaxed),
+            directory_load_wait_ns: self.directory_load_wait_ns.load(Ordering::Relaxed),
+        }
+    }
+    async fn load_directory(&self, tree: &Tree, inode: u64) -> Result<()> {
+        self.directory_load_waits.fetch_add(1, Ordering::Relaxed);
+        let now = std::time::Instant::now();
+        let result = tree.ensure_directory_loaded(inode).await;
+        self.directory_load_wait_ns.fetch_add(
+            now.elapsed().as_nanos().min(u64::MAX as u128) as u64,
+            Ordering::Relaxed,
+        );
+        result
+    }
+}
 
 fn errno(error: anyhow::Error) -> i32 {
     if error.is::<output_core::SourceLoadBusy>()
@@ -169,6 +224,14 @@ impl Drop for SourceAdmissionPause {
         self.admission.lock().unwrap().source_capture = false;
     }
 }
+struct MetadataAdmissionPause {
+    admission: Arc<Mutex<bool>>,
+}
+impl Drop for MetadataAdmissionPause {
+    fn drop(&mut self) {
+        *self.admission.lock().unwrap() = false;
+    }
+}
 #[derive(Default)]
 struct Maintenance {
     running: bool,
@@ -293,6 +356,10 @@ struct Adapter {
     references: Arc<KernelReferences>,
     maintenance: Arc<Mutex<Maintenance>>,
     retirement_budget: usize,
+    metadata_ttl: Duration,
+    metadata_counters: Arc<MetadataCounters>,
+    metadata_admission: Arc<Mutex<bool>>,
+    metadata_pending: Arc<Pending>,
 }
 impl Adapter {
     fn dispatch<F: Future<Output = ()> + Send + 'static>(&self, work: F) {
@@ -341,6 +408,24 @@ impl Adapter {
                 }
             }
         });
+    }
+    fn enter_metadata(
+        &self,
+        immutable_marker_io: bool,
+    ) -> Result<(RequestTicket, RequestTicket), i32> {
+        let admission = self.metadata_admission.lock().unwrap();
+        if *admission {
+            return Err(libc::EAGAIN);
+        }
+        let request = self.enter_startup(immutable_marker_io)?;
+        self.metadata_pending.count.fetch_add(1, Ordering::SeqCst);
+        Ok((
+            request,
+            RequestTicket {
+                pending: self.metadata_pending.clone(),
+                _generation: None,
+            },
+        ))
     }
     fn enter(&self) -> Result<RequestTicket, i32> {
         self.enter_startup(false)
@@ -401,8 +486,12 @@ impl Filesystem for Adapter {
         Ok(())
     }
     fn lookup(&mut self, _: &Request<'_>, parent: u64, name_: &OsStr, reply: ReplyEntry) {
+        self.metadata_counters
+            .lookups
+            .fetch_add(1, Ordering::Relaxed);
+        let ttl = self.metadata_ttl;
         let marker = self.startup_marker.and_then(|m| m.lookup(parent, name_));
-        let ticket = match self.enter_startup(marker.is_some()) {
+        let ticket = match self.enter_metadata(marker.is_some()) {
             Ok(ticket) => ticket,
             Err(error) => return reply.error(error),
         };
@@ -416,7 +505,7 @@ impl Filesystem for Adapter {
                 Ok(node)
             })();
             match result {
-                Ok(node) => reply.entry(&TTL, &attrs(&node), node.generation),
+                Ok(node) => reply.entry(&ttl, &attrs(&node), node.generation),
                 Err(error) => reply.error(errno(error)),
             }
             return;
@@ -432,17 +521,18 @@ impl Filesystem for Adapter {
         {
             let tree = self.tree.clone();
             let references = self.references.clone();
+            let counters = self.metadata_counters.clone();
             self.dispatch(async move {
                 let _ticket = ticket;
                 let result = async {
-                    tree.ensure_directory_loaded(parent).await?;
+                    counters.load_directory(&tree, parent).await?;
                     let node = tree.lookup_referenced(parent, &owned_name)?;
                     references.entry(&node, true)?;
                     Ok::<_, anyhow::Error>(node)
                 }
                 .await;
                 match result {
-                    Ok(node) => reply.entry(&TTL, &attrs(&node), node.generation),
+                    Ok(node) => reply.entry(&ttl, &attrs(&node), node.generation),
                     Err(error) => reply.error(errno(error)),
                 }
             });
@@ -450,7 +540,7 @@ impl Filesystem for Adapter {
         }
         match result {
             Ok(n) => match self.references.entry(&n, true) {
-                Ok(()) => reply.entry(&TTL, &attrs(&n), n.generation),
+                Ok(()) => reply.entry(&ttl, &attrs(&n), n.generation),
                 Err(e) => reply.error(errno(e)),
             },
             Err(e) => reply.error(errno(e)),
@@ -490,14 +580,17 @@ impl Filesystem for Adapter {
         reply.ok();
     }
     fn getattr(&mut self, _: &Request<'_>, ino: u64, _: Option<u64>, reply: ReplyAttr) {
+        self.metadata_counters
+            .getattrs
+            .fetch_add(1, Ordering::Relaxed);
         let _ticket = match self
-            .enter_startup(ino == 1 || self.startup_marker.is_some_and(|m| m.metadata(ino)))
+            .enter_metadata(ino == 1 || self.startup_marker.is_some_and(|m| m.metadata(ino)))
         {
             Ok(ticket) => ticket,
             Err(error) => return reply.error(error),
         };
         match self.tree.get(ino) {
-            Ok(n) => reply.attr(&TTL, &attrs(&n)),
+            Ok(n) => reply.attr(&self.metadata_ttl, &attrs(&n)),
             Err(e) => reply.error(errno(e)),
         }
     }
@@ -522,6 +615,9 @@ impl Filesystem for Adapter {
         }
     }
     fn readdir(&mut self, _: &Request<'_>, ino: u64, _: u64, offset: i64, reply: ReplyDirectory) {
+        self.metadata_counters
+            .readdirs
+            .fetch_add(1, Ordering::Relaxed);
         let ticket = match self.enter() {
             Ok(ticket) => ticket,
             Err(error) => return reply.error(error),
@@ -534,9 +630,10 @@ impl Filesystem for Adapter {
             Ok(_) => reply_directory(&self.tree, ino, offset, reply),
             Err(error) if error.is::<output_core::SourceNotLoaded>() => {
                 let tree = self.tree.clone();
+                let counters = self.metadata_counters.clone();
                 self.dispatch(async move {
                     let _ticket = ticket;
-                    match tree.ensure_directory_loaded(ino).await {
+                    match counters.load_directory(&tree, ino).await {
                         Ok(()) => reply_directory(&tree, ino, offset, reply),
                         Err(error) => reply.error(errno(error)),
                     }
@@ -628,6 +725,7 @@ impl Filesystem for Adapter {
             reply.error(libc::EINVAL);
             return;
         }
+        self.metadata_counters.reads.fetch_add(1, Ordering::Relaxed);
         let permit = match self.enter_startup(self.startup_marker.is_some_and(|m| m.file == ino)) {
             Ok(p) => p,
             Err(e) => {
@@ -1182,6 +1280,7 @@ pub async fn start_with_retirement_budget(
         retirement_budget,
         "git-tools-outputs".into(),
         None,
+        NativeSourceOptions::default(),
     )
     .await
 }
@@ -1192,6 +1291,21 @@ pub async fn start_native_source(
     root: &Path,
     workspace_identity: [u8; 32],
 ) -> Result<Arc<FuseMount>> {
+    start_native_source_with_options(
+        tree,
+        root,
+        workspace_identity,
+        NativeSourceOptions::default(),
+    )
+    .await
+}
+pub async fn start_native_source_with_options(
+    tree: Arc<Tree>,
+    root: &Path,
+    workspace_identity: [u8; 32],
+    options: NativeSourceOptions,
+) -> Result<Arc<FuseMount>> {
+    options.validate()?;
     ensure!(
         workspace_identity != [0; 32],
         "native source identity must be nonzero"
@@ -1200,7 +1314,15 @@ pub async fn start_native_source(
         .iter()
         .map(|byte| format!("{byte:02x}"))
         .collect();
-    start_named(tree, root, 64, format!("git-tools-native-{id}"), None).await
+    start_named(
+        tree,
+        root,
+        64,
+        format!("git-tools-native-{id}"),
+        None,
+        options,
+    )
+    .await
 }
 /// Start with ordinary kernel access closed before Session::new makes the mount
 /// visible. Only the exact immutable prepared native marker is readable.
@@ -1209,6 +1331,21 @@ pub async fn start_native_source_gated(
     root: &Path,
     workspace_identity: [u8; 32],
 ) -> Result<(Arc<FuseMount>, StartupFence)> {
+    start_native_source_gated_with_options(
+        tree,
+        root,
+        workspace_identity,
+        NativeSourceOptions::default(),
+    )
+    .await
+}
+pub async fn start_native_source_gated_with_options(
+    tree: Arc<Tree>,
+    root: &Path,
+    workspace_identity: [u8; 32],
+    options: NativeSourceOptions,
+) -> Result<(Arc<FuseMount>, StartupFence)> {
+    options.validate()?;
     ensure!(
         workspace_identity != [0; 32],
         "native source identity must be nonzero"
@@ -1240,6 +1377,7 @@ pub async fn start_native_source_gated(
             admin: admin.id,
             file: marker.id,
         }),
+        options,
     )
     .await?;
     Ok((mount.clone(), StartupFence { mount }))
@@ -1287,6 +1425,7 @@ async fn start_named(
     retirement_budget: usize,
     source_name: String,
     startup_marker: Option<StartupMarker>,
+    options: NativeSourceOptions,
 ) -> Result<Arc<FuseMount>> {
     let root = root.to_owned();
     let runtime = Handle::current();
@@ -1319,6 +1458,10 @@ async fn start_named(
             maintenance: Arc::new(Mutex::new(Maintenance::default())),
             retirement_budget,
             atomic_truncate: false,
+            metadata_ttl: options.metadata_ttl,
+            metadata_counters: Arc::new(MetadataCounters::default()),
+            metadata_admission: Arc::new(Mutex::new(false)),
+            metadata_pending: Arc::new(Pending::default()),
             runtime,
             payload: Arc::new(Semaphore::new(PAYLOAD_SLOTS)),
             pending: Arc::new(Pending::default()),
@@ -1384,6 +1527,9 @@ impl FuseSourceCapture {
     }
 }
 impl FuseMount {
+    pub fn metadata_diagnostics(&self) -> MetadataDiagnostics {
+        self.adapter.metadata_counters.snapshot()
+    }
     /// Fence native kernel writers before freezing a lazy source delta. Existing
     /// file handles (including the last mmap reference) must close first.
     pub async fn capture_lazy_source(
@@ -1485,28 +1631,47 @@ impl FuseMount {
     ) -> Result<T> {
         let tree = self.adapter.tree.clone();
         let notifier = self.notifier.clone();
-        // Await serialization without occupying a blocking worker. Once
-        // spawned, the committed worker owns the guard through cancellation.
+        // Admission and accepted metadata replies are drained asynchronously.
+        // Do not occupy a blocking worker that those replies may still need.
         let guard = self.control.clone().lock_owned().await;
         let runtime = self.adapter.runtime.clone();
-        let stopped = self.adapter.stopped.clone();
         let adapter = self.adapter.clone();
-        tokio::task::spawn_blocking(move || {
-            runtime.block_on(async move {
-                let _guard = guard;
-                ensure!(
-                    !stopped.load(Ordering::Acquire),
-                    "output projection stopped"
-                );
-                let generation = tree.pin_generation();
-                let result = operation(tree, notifier).await;
-                drop(generation);
-                adapter.collect();
-                result
+        self.adapter
+            .runtime
+            .spawn(async move {
+                let pause = if !adapter.metadata_ttl.is_zero() {
+                    *adapter.metadata_admission.lock().unwrap() = true;
+                    let pause = MetadataAdmissionPause {
+                        admission: adapter.metadata_admission.clone(),
+                    };
+                    adapter.metadata_pending.drain().await;
+                    Some(pause)
+                } else {
+                    None
+                };
+                // The committed task owns control/pause through physical completion
+                // even if the caller drops its JoinHandle. Only TTL-bearing replies
+                // pause: READ/WRITE/RELEASE and dirty mapping flushes remain admitted.
+                tokio::task::spawn_blocking(move || {
+                    runtime.block_on(async move {
+                        let _guard = guard;
+                        let _pause = pause;
+                        ensure!(
+                            !adapter.stopped.load(Ordering::Acquire),
+                            "output projection stopped"
+                        );
+                        let generation = tree.pin_generation();
+                        let result = operation(tree, notifier).await;
+                        drop(generation);
+                        adapter.collect();
+                        result
+                    })
+                })
+                .await
+                .context("output publication worker failed")?
             })
-        })
-        .await
-        .context("output publication worker failed")?
+            .await
+            .context("output publication task failed")?
     }
 }
 fn notify_result(result: std::io::Result<()>) -> Result<()> {
@@ -1600,6 +1765,7 @@ impl Projection for FuseMount {
         request_id: String,
         limits: output_core::SourceLimits,
     ) -> Result<output_core::SourceReceipt> {
+        let cached_metadata = !self.adapter.metadata_ttl.is_zero();
         self.complete(move |tree, notifier| {
             Box::pin(async move {
                 // Capture only metadata/local dirty state, never clean contents.
@@ -1613,6 +1779,12 @@ impl Projection for FuseMount {
                     .map(|entry| entry.node.clone())
                     .collect();
                 drop(snapshot);
+                if cached_metadata {
+                    for node in &old {
+                        invalidate(&notifier, node)?;
+                    }
+                    invalidate(&notifier, &tree.get(tree.root_id())?)?;
+                }
                 let receipt =
                     tree.install_source(manifest, Some(expected), &request_id, &limits)?;
                 // complete() owns a generation lease across publication and all
@@ -1638,6 +1810,7 @@ impl Projection for FuseMount {
         request_id: String,
         limits: output_core::SourceLimits,
     ) -> Result<output_core::SourceReceipt> {
+        let cached_metadata = !self.adapter.metadata_ttl.is_zero();
         self.complete(move |tree, notifier| {
             Box::pin(async move {
                 // Capture only the explicit lazy delta. Unopened directories
@@ -1652,6 +1825,12 @@ impl Projection for FuseMount {
                     )
                     .await?;
                 let old = tree.known_source_nodes(&limits)?;
+                if cached_metadata {
+                    for node in &old {
+                        invalidate(&notifier, node)?;
+                    }
+                    invalidate(&notifier, &tree.get(tree.root_id())?)?;
+                }
                 // Retain the same source fence through replacement: dropping it
                 // and reacquiring lets a kernel metadata job race publication.
                 // The explicit original version also preserves exact replay.
