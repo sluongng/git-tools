@@ -849,7 +849,40 @@ fn dirty_captures_are_atomic_and_keep_independent_roots_through_newer_checkpoint
         drop(collector);
         expected.sort_by_key(|ticket| ticket.id);
         assert_eq!(registry.pending_captures().await.unwrap(), expected);
+        let before = registry.storage_stats();
+        assert!(matches!(
+            registry.read_capture(CaptureId([0; 32])).await,
+            Err(Error::UnknownCapture)
+        ));
+        let read = registry.read_capture(expected[0].id).await.unwrap();
+        assert_eq!(
+            read.pending(),
+            &expected[0],
+            "exact historical ticket survives forget and newer epochs"
+        );
+        let collecting = registry.clone();
+        let blocked = storage::runtime().unwrap().spawn(async move {
+            tokio::time::timeout(Duration::from_millis(20), collecting.acquire_collector()).await
+        });
+        assert!(
+            blocked.await.unwrap().is_err(),
+            "independent read guard blocks collection"
+        );
+        assert_eq!(
+            registry.storage_stats(),
+            before,
+            "lookup and unknown ID do not mutate the ledger"
+        );
         drop(registry);
+        assert!(
+            matches!(
+                Registry::open_existing(directory.path(), RegistryId([1; 16]), Limits::default())
+                    .await,
+                Err(Error::Busy)
+            ),
+            "guard retains the process owner even without Registry handles"
+        );
+        drop(read);
         let reopened =
             Registry::open_existing(directory.path(), RegistryId([1; 16]), Limits::default())
                 .await
@@ -962,6 +995,51 @@ async fn dirty_capture_drains_physical_jobs_and_commits_after_the_caller_is_canc
         registry.workspace(registration).await.unwrap().state,
         WorkspaceState::Dirty
     );
+    registry.forget(registration).await.unwrap();
+    let before_read = registry.storage_stats();
+    // Pause the actual bounded lookup on the existing registry mutex. No test
+    // production hook or caller-only future stands in for physical work.
+    let locked_inner = registry.inner.clone();
+    let (locked, arrived) = tokio::sync::oneshot::channel();
+    let (release, released) = std::sync::mpsc::channel();
+    let blocking = std::thread::spawn(move || {
+        let _data = locked_inner.data.lock().unwrap();
+        locked.send(()).unwrap();
+        released.recv().unwrap();
+    });
+    arrived.await.unwrap();
+    let reading = registry.clone();
+    let ticket_id = tickets[0].id;
+    let read = tokio::spawn(async move { reading.read_capture(ticket_id).await });
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            if registry.inner.fence.try_write().is_err() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    read.abort();
+    assert!(read.await.unwrap_err().is_cancelled());
+    assert!(
+        registry.inner.fence.try_write().is_err(),
+        "cancelled lookup retains the read fence until the real blocking job finishes"
+    );
+    let collecting = registry.clone();
+    let collection = tokio::spawn(async move { collecting.acquire_collector().await });
+    release.send(()).unwrap();
+    blocking.join().unwrap();
+    let collector = tokio::time::timeout(Duration::from_secs(2), collection)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert!(collector.roots().contains(&tickets[0].checkpoint.roots[1]));
+    drop(collector);
+    assert_eq!(registry.storage_stats(), before_read);
+    assert_eq!(registry.pending_captures().await.unwrap(), tickets);
     drop(registry);
     let reopened =
         Registry::open_existing(directory.path(), RegistryId([1; 16]), Limits::default())

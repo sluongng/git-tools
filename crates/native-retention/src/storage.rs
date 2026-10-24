@@ -667,6 +667,18 @@ impl Inner {
         self.persist_with_capture(&mut data, entry, None, Some(capture))?;
         Ok(pending)
     }
+    pub fn read_capture(&self, id: CaptureId) -> Result<PendingCapture> {
+        self.check()?;
+        let data = self.data.lock().map_err(|_| Error::Poisoned)?;
+        let capture = data.captures.get(&id).ok_or(Error::UnknownCapture)?;
+        // Validate the selected already-loaded row only. An old pending capture
+        // deliberately does not have to match the workspace's current epoch.
+        if capture.id != id {
+            return Err(Error::Corrupt("capture lookup identity"));
+        }
+        validate_capture(capture, self.id, data.manifest.epoch, &self.limits)?;
+        capture.pending()
+    }
     pub fn pending_captures(&self) -> Result<Vec<PendingCapture>> {
         self.check()?;
         let data = self.data.lock().map_err(|_| Error::Poisoned)?;

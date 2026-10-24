@@ -293,6 +293,252 @@ pub fn capture_recovery_intents(
     };
     remote_intents(data, id, 100_000, &mut budget)
 }
+/// Caller-declared publication metadata. No implicit parent selection or rebase.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CaptureExportIdentity {
+    pub workspace: [u8; 32],
+    pub exporter: [u8; 16],
+    pub sequence: u64,
+    pub parents: Vec<ManifestId>,
+}
+/// Exact immutable publication DATA prepared from a saved canonical capsule.
+/// This is not physical quiescence, authentication, retention or restore proof.
+/// Callers retain their admission owner while this allocation remains live.
+pub struct PreparedCaptureManifest {
+    manifest: ManifestV3,
+    bytes: Vec<u8>,
+    retained: usize,
+    work: u64,
+    id: ManifestId,
+}
+impl PreparedCaptureManifest {
+    pub fn manifest(&self) -> &ManifestV3 {
+        &self.manifest
+    }
+    pub fn bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+    pub fn id(&self) -> ManifestId {
+        self.id
+    }
+    pub fn retained_size_upper_bound(&self) -> usize {
+        self.retained
+    }
+    /// Conservative deterministic preparation/verification/encoding charge,
+    /// including both sequential capsule decodes; not measured CPU or DB rows.
+    pub fn preparation_work(&self) -> u64 {
+        self.work
+    }
+}
+/// Prepare an exact V3 publication without changing the saved capsule or its
+/// selected OP/VIEW representation. The mandatory independent verifier checks
+/// all claimed roots/inventories against the supplied immutable object proofs.
+pub fn prepare_capture_manifest(
+    identity: &CaptureExportIdentity,
+    saved_capture: &[u8],
+    objects: &[c::VerifiedObject],
+    artifacts: &[c::VerifiedIndexArtifact],
+    graph: &c::VerifiedIndexGraph<'_>,
+    limits: ManifestV3Limits,
+) -> Result<PreparedCaptureManifest> {
+    limits.validate()?;
+    if saved_capture.len() > limits.capture.max_bytes
+        || identity.parents.len() > limits.history.recovery.max_operation_roots
+        || objects.len() > limits.history.recovery.max_members
+        || artifacts.len() > limits.history.artifacts.max_artifacts
+        || graph.roots().len() > limits.history.max_index_roots
+    {
+        return Err(limit());
+    }
+    let decoded = sum(4096, mul(saved_capture.len(), 128)?)?;
+    if decoded > limits.capture.max_decode_bytes {
+        return Err(limit());
+    }
+    let mut budget = Budget {
+        bytes: 0,
+        work: 0,
+        limits: limits.binding,
+    };
+    budget.bytes(decoded)?;
+    budget.work(saved_capture.len())?;
+    let capture_id = CaptureDataId::of(saved_capture);
+    let data = c::decode_data(saved_capture, capture_id.0, &limits.capture)
+        .map_err(|_| invalid("canonical saved capture mismatch"))?;
+    // Reserve the simultaneously live output model BEFORE any deep clone.
+    // 4096/record dominates Vec elements and B-tree nodes, including the small
+    // remote-intent frontier; string storage is accounted independently.
+    let records = [
+        data.operation_heads.len(),
+        data.operations.len(),
+        objects.len(),
+        data.indexes.len(),
+        graph.roots().len(),
+        data.roots.len(),
+        data.working_copy.tree.terms.len(),
+        data.working_copy.tree.labels.len(),
+        identity.parents.len(),
+    ]
+    .into_iter()
+    .try_fold(0usize, sum)?;
+    let strings = data
+        .working_copy
+        .tree
+        .labels
+        .iter()
+        .try_fold(data.working_copy.workspace.len(), |n, s| sum(n, s.len()))?;
+    let model = sum(4096, sum(mul(records, 4096)?, mul(strings, 2)?)?)?;
+    budget.bytes(model)?;
+    budget.work(sum(mul(records, 256)?, strings)?)?;
+    let recovery_intents = remote_intents(
+        &data,
+        capture_id,
+        limits.history.recovery.max_native_roots,
+        &mut budget,
+    )?;
+    let operation_heads = data
+        .operation_heads
+        .iter()
+        .map(|id| hex(id))
+        .collect::<Result<Vec<_>>>()?;
+    let undo_operations = data
+        .operations
+        .iter()
+        .skip(1)
+        .filter(|op| data.operation_heads.binary_search(&op.operation).is_err())
+        .map(|op| hex(&op.operation))
+        .collect::<Result<Vec<_>>>()?;
+    let wc = &data.working_copy;
+    let labels = if wc.tree.labels.is_empty() {
+        vec![String::new(); wc.tree.terms.len()]
+    } else {
+        wc.tree.labels.clone()
+    };
+    let working_copy = c::WorkingCopy {
+        workspace_name: wc.workspace.clone(),
+        wc_operation: hex(&wc.wc_operation)?,
+        snapshot_operation: hex(&wc.snapshot_operation)?,
+        snapshot_commit: wc.snapshot_commit,
+        tree: m::TreeMerge {
+            terms: wc.tree.terms.iter().copied().map(m::TreeId).collect(),
+            labels,
+        },
+    };
+    let mut members = objects
+        .iter()
+        .map(|object| {
+            Ok(c::Member {
+                id: object.id(),
+                selected: object
+                    .digest()
+                    .ok_or_else(|| invalid("intrinsic saved payload"))?,
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    members.sort_by_key(|member| member.id);
+    let manifest = ManifestV3 {
+        history: c::ManifestV2 {
+            recovery: c::Manifest {
+                workspace: identity.workspace,
+                exporter: identity.exporter,
+                sequence: identity.sequence,
+                parents: identity.parents.clone(),
+                operation_heads,
+                undo_operations,
+                intent_operations: vec![],
+                working_copy,
+                members,
+                intent_roots: recovery_intents,
+                native_roots: data
+                    .roots
+                    .iter()
+                    .map(|root| {
+                        Ok(m::ObjectKey {
+                            kind: m::Kind::try_from(root.kind)
+                                .map_err(|_| invalid("saved native root kind"))?,
+                            id: m::ObjectId(root.id),
+                        })
+                    })
+                    .collect::<Result<Vec<_>>>()?,
+                coverage: c::Coverage::FullRequired,
+                detached: vec![],
+            },
+            operation_indexes: data
+                .indexes
+                .iter()
+                .map(|index| {
+                    Ok(c::OperationIndex {
+                        operation: hex(&index.operation)?,
+                        root: c::IndexRootId(index.root),
+                    })
+                })
+                .collect::<Result<Vec<_>>>()?,
+            index_roots: graph.roots().to_vec(),
+        },
+        capture: CaptureDescriptor {
+            id: capture_id,
+            selected: BlobDigest::of(saved_capture),
+        },
+    };
+    // Do not retain two decoded capsules. The output model stays charged while
+    // the existing verifier independently decodes and checks the ORIGINAL bytes.
+    drop(data);
+    let retained_model = budget.bytes.checked_sub(decoded).ok_or_else(limit)?;
+    let remaining_bytes = limits
+        .binding
+        .max_bytes
+        .checked_sub(retained_model)
+        .ok_or_else(limit)?;
+    let mut verify_limits = limits;
+    verify_limits.binding.max_bytes = remaining_bytes;
+    verify_limits.binding.max_work = limits
+        .binding
+        .max_work
+        .checked_sub(budget.work)
+        .filter(|remaining| *remaining > 0)
+        .ok_or_else(limit)?;
+    let verified_work = {
+        let verified = verify_capture_export_binding(
+            &manifest,
+            saved_capture,
+            objects,
+            artifacts,
+            graph,
+            verify_limits,
+        )?;
+        verified.binding_work()
+    };
+    budget.work(usize::try_from(verified_work).map_err(|_| limit())?)?;
+    // This record/string envelope bounds canonical binary output and all its
+    // writer passes. Encoding scratch uses the SAME remaining pool, not a new
+    // independent child allowance. The second decoded capsule is now dropped.
+    let encoded_bound = sum(4096, sum(mul(records, 256)?, strings)?)?;
+    budget.work(encoded_bound)?;
+    let mut encoding = limits;
+    encoding.history.recovery.max_decode_bytes = encoding
+        .history
+        .recovery
+        .max_decode_bytes
+        .min(remaining_bytes);
+    encoding.history.recovery.max_manifest_bytes = encoding
+        .history
+        .recovery
+        .max_manifest_bytes
+        .min(encoded_bound);
+    let bytes = encode_manifest_v3(&manifest, encoding)?;
+    let retained = sum(retained_model, bytes.capacity())?;
+    if retained > limits.binding.max_bytes {
+        return Err(limit());
+    }
+    let id = ManifestId::of(&bytes);
+    Ok(PreparedCaptureManifest {
+        manifest,
+        bytes,
+        retained,
+        work: budget.work,
+        id,
+    })
+}
+
 /// Structural capture/export binding only. This type cannot create the opaque
 /// host QuiescentCapture and does not prove native payload closure or retention.
 pub struct VerifiedCaptureManifest<'a> {
@@ -1128,6 +1374,63 @@ mod tests {
         let limits = ManifestV3Limits::default();
         let (value, data, artifacts) = fixture(&[], vec![[0; 64]], intrinsic(), false);
         assert!(assert_binding(&value, &data, &[], &artifacts, limits).unwrap() > 0);
+        let graph = c::verify_index_artifact_graph(
+            &value.history.index_roots,
+            &artifacts,
+            Default::default(),
+        )
+        .unwrap();
+        let identity = CaptureExportIdentity {
+            workspace: value.history.recovery.workspace,
+            exporter: value.history.recovery.exporter,
+            sequence: value.history.recovery.sequence,
+            parents: value.history.recovery.parents.clone(),
+        };
+        let saved = c::encode_capture_data(&data, limits.capture).unwrap();
+        let prepared =
+            prepare_capture_manifest(&identity, &saved, &[], &artifacts, &graph, limits).unwrap();
+        assert_eq!(prepared.manifest(), &value);
+        assert_eq!(prepared.id(), ManifestId::of(prepared.bytes()));
+        assert!(prepared.retained_size_upper_bound() >= prepared.bytes().len());
+        let mut noncanonical = saved.clone();
+        noncanonical.push(b' ');
+        assert!(
+            prepare_capture_manifest(&identity, &noncanonical, &[], &artifacts, &graph, limits)
+                .is_err()
+        );
+        for scarce in [
+            CaptureBindingLimits {
+                max_work: saved.len() as u64 - 1,
+                ..limits.binding
+            },
+            CaptureBindingLimits {
+                max_bytes: saved.len() * 128 + 4095,
+                ..limits.binding
+            },
+        ] {
+            assert!(matches!(
+                prepare_capture_manifest(
+                    &identity,
+                    &saved,
+                    &[],
+                    &artifacts,
+                    &graph,
+                    ManifestV3Limits {
+                        binding: scarce,
+                        ..limits
+                    }
+                ),
+                Err(Error::Limit(_))
+            ));
+        }
+        let mut crowded = identity.clone();
+        crowded.parents =
+            vec![ManifestId([1; 32]); limits.history.recovery.max_operation_roots + 1];
+        assert!(matches!(
+            prepare_capture_manifest(&crowded, &saved, &[], &artifacts, &graph, limits),
+            Err(Error::Limit(_))
+        ));
+
         let bytes = encode_manifest_v3(&value, limits).unwrap();
         assert_eq!(
             decode_manifest_v3(&bytes, ManifestId::of(&bytes), limits).unwrap(),
@@ -1340,6 +1643,103 @@ mod tests {
         );
         let limits = ManifestV3Limits::default();
         assert!(assert_binding(&value, &data, &objects, &artifacts, limits).is_ok());
+        let saved = c::encode_capture_data(&data, limits.capture).unwrap();
+        let graph = c::verify_index_artifact_graph(
+            &value.history.index_roots,
+            &artifacts,
+            Default::default(),
+        )
+        .unwrap();
+        let identity = CaptureExportIdentity {
+            workspace: value.history.recovery.workspace,
+            exporter: value.history.recovery.exporter,
+            sequence: value.history.recovery.sequence,
+            parents: value.history.recovery.parents.clone(),
+        };
+        let prepared =
+            prepare_capture_manifest(&identity, &saved, &objects, &artifacts, &graph, limits)
+                .unwrap();
+        assert_eq!(
+            prepared.manifest(),
+            &value,
+            "saved undo, remote observations/archive heads and hidden index drafts remain exact"
+        );
+        assert_eq!(
+            prepared.bytes(),
+            encode_manifest_v3(&value, limits).unwrap()
+        );
+        assert!(
+            prepared.preparation_work()
+                > assert_binding(&value, &data, &objects, &artifacts, limits).unwrap()
+                    + saved.len() as u64,
+            "both sequential capsule decodes are charged"
+        );
+        assert_eq!(prepared.manifest().capture, CaptureDescriptor::of(&saved));
+        // A valid semantic alias is still a DIFFERENT selected raw object; the
+        // builder cannot silently change the saved capsule's original choice.
+        let selected_op = objects
+            .iter()
+            .position(|o| o.operation().is_some())
+            .unwrap();
+        let alternate_objects: Vec<_> = objects
+            .iter()
+            .enumerate()
+            .map(|(i, object)| {
+                let mut raw = Vec::new();
+                if i == selected_op {
+                    raw.extend_from_slice(&[0x0a, 0x40]);
+                    raw.extend_from_slice(&[5; 64]);
+                }
+                raw.extend_from_slice(object.payload().unwrap());
+                c::VerifiedObject::verify(
+                    object.id(),
+                    BlobDigest::of(&raw),
+                    &raw,
+                    Default::default(),
+                )
+                .unwrap()
+            })
+            .collect();
+        assert_eq!(
+            alternate_objects[selected_op].operation(),
+            objects[selected_op].operation()
+        );
+        assert_ne!(
+            alternate_objects[selected_op].digest(),
+            objects[selected_op].digest()
+        );
+        assert!(
+            prepare_capture_manifest(
+                &identity,
+                &saved,
+                &alternate_objects,
+                &artifacts,
+                &graph,
+                limits
+            )
+            .is_err()
+        );
+        let mut invented = data.clone();
+        invented.roots.push(c::CapturedRoot {
+            kind: m::Kind::Commit as u8,
+            id: [99; 32],
+        });
+        invented.roots.sort();
+        invented.roots.dedup();
+        let invented = c::encode_capture_data(&invented, limits.capture).unwrap();
+        assert!(
+            prepare_capture_manifest(&identity, &invented, &objects, &artifacts, &graph, limits)
+                .is_err(),
+            "copying capsule root claims is not independent root proof"
+        );
+        let mut malformed = identity.clone();
+        malformed.parents = vec![ManifestId([2; 32]), ManifestId([1; 32])];
+        assert!(
+            prepare_capture_manifest(&malformed, &saved, &objects, &artifacts, &graph, limits)
+                .is_err(),
+            "caller-declared parent ordering is not normalized or rebased"
+        );
+
         let mut wrong = value.clone();
         wrong.history.recovery.undo_operations.pop();
         assert!(assert_binding(&wrong, &data, &objects, &artifacts, limits).is_err());

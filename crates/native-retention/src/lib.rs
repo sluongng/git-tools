@@ -23,6 +23,7 @@ pub enum Error {
     Storage,
     Busy,
     UnknownWorkspace,
+    UnknownCapture,
     Forgotten,
     IdentityMismatch,
     StaleRegistration,
@@ -45,6 +46,7 @@ impl fmt::Display for Error {
                     Self::Storage => "storage operation failed",
                     Self::Busy => "workspace command or draining work is active",
                     Self::UnknownWorkspace => "workspace is unregistered",
+                    Self::UnknownCapture => "capture ticket is unknown",
                     Self::Forgotten => "workspace is explicitly forgotten",
                     Self::IdentityMismatch => "identity does not match",
                     Self::StaleRegistration => "registration generation changed",
@@ -240,6 +242,29 @@ pub struct PendingCapture {
     pub fingerprint: [u8; 32],
     pub bundle: BundleDescriptor,
     pub checkpoint: RootCheckpoint,
+}
+/// An exact durable pending ticket plus an independent collector/read fence.
+/// This is not a command token, live frontend proof, or remote backup receipt.
+/// It remains valid after the originating workspace is forgotten or advanced.
+/// Physical jobs must retain the whole guard, not a cloned ticket alone.
+pub struct CaptureReadGuard {
+    // Declaration order keeps the payload and collector fence inside the DB /
+    // process-owner lifetime, including discarded cancelled blocking results.
+    pending: PendingCapture,
+    _read: OwnedRwLockReadGuard<()>,
+    _registry: Arc<storage::Inner>,
+}
+impl CaptureReadGuard {
+    pub fn pending(&self) -> &PendingCapture {
+        &self.pending
+    }
+}
+impl fmt::Debug for CaptureReadGuard {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("CaptureReadGuard")
+            .field("id", &self.pending.id)
+            .finish_non_exhaustive()
+    }
 }
 /// Process-local counters since opening, excluding initialization. Encoded bytes
 /// count successful transaction keys/values, not physical Fjall/WAL disk writes.
@@ -667,6 +692,26 @@ impl Registry {
     pub async fn pending_captures(&self) -> Result<Vec<PendingCapture>> {
         let inner = self.inner.clone();
         storage::blocking(move || inner.pending_captures()).await
+    }
+    /// Pin one exact pending ticket and its native roots against collection.
+    /// Lookup does not require a current workspace registration or command and
+    /// cannot clean, acknowledge, or remove the ticket. A future acknowledgement
+    /// must acquire the exclusive collector fence separately.
+    pub async fn read_capture(&self, id: CaptureId) -> Result<CaptureReadGuard> {
+        self.inner.check()?;
+        let read = self.inner.fence.clone().read_owned().await;
+        let inner = self.inner.clone();
+        // Both owners move into the actual blocking job BEFORE waiting. Caller
+        // cancellation cannot release the fence while lookup is still running.
+        storage::blocking(move || {
+            let pending = inner.read_capture(id)?;
+            Ok(CaptureReadGuard {
+                pending,
+                _read: read,
+                _registry: inner,
+            })
+        })
+        .await
     }
     /// Stop ordinary admission and drain accepted physical work WITHOUT
     /// checkpointing or making a dirty workspace collectable. The worker owns
