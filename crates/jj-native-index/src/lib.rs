@@ -5,10 +5,14 @@ pub use cleanup::CleanupHandle;
 mod memo;
 mod persistence;
 mod portable;
+mod portable_import;
+pub use portable_import::{PortableImportLimits, PortableImportReceipt, PortableImportVersion};
+mod source;
 pub use portable::{
     ExportArtifact, IndexArtifactSink, PortableExportLimits, PortableExportWork,
     PortableIndexExport,
 };
+use source::CheckpointSource;
 mod prefix;
 mod query;
 mod revsets;
@@ -258,12 +262,22 @@ struct Checkpoint {
     tips: Vec<SegmentId>,
     roots: Vec<m::CommitId>,
     drafts: Vec<Arc<Draft>>,
+    source: CheckpointSource,
+    baseline: BTreeSet<m::CommitId>,
     scope: tokio::sync::Mutex<ScopeState>,
 }
 impl Checkpoint {
-    fn new(tips: Vec<SegmentId>, roots: Vec<m::CommitId>, drafts: Vec<Arc<Draft>>) -> Self {
+    fn new(
+        tips: Vec<SegmentId>,
+        roots: Vec<m::CommitId>,
+        drafts: Vec<Arc<Draft>>,
+        source: CheckpointSource,
+        baseline: BTreeSet<m::CommitId>,
+    ) -> Self {
         Self {
-            memo_id: memo::checkpoint(&roots, &drafts),
+            memo_id: source.memo_key(memo::checkpoint(&roots, &drafts)),
+            source,
+            baseline,
             tips,
             roots,
             drafts,
@@ -391,12 +405,16 @@ impl NativeIndexStore {
         Ok(store)
     }
     pub fn seed_index(&self) -> Result<NativeReadonlyIndex, Error> {
-        self.core.load(vec![self.core.storage.seed()?])
+        if self.core.storage.imported() {
+            self.index_at_operation(&[0; 64])
+        } else {
+            self.core.load(vec![self.core.storage.seed()?])
+        }
     }
     /// Exact 64-byte operation association. Missing associations fail closed.
     pub fn index_at_operation(&self, id: &[u8; 64]) -> Result<NativeReadonlyIndex, Error> {
-        self.core
-            .load(self.core.storage.operation(id, &self.core.limits)?)
+        let (tips, source) = self.core.storage.association(id, &self.core.limits)?;
+        self.core.load_source(tips, source)
     }
     /// Persist this compatible mutable checkpoint before associating an operation.
     /// This never publishes canonical objects or changes remote references.
@@ -414,7 +432,8 @@ impl NativeIndexStore {
             &mutable.pending,
             &self.core.limits,
         )?;
-        self.core.load(tips)
+        self.core
+            .load_source(tips, mutable.inner.checkpoint.source.clone())
     }
     pub fn associate_operation(
         &self,
@@ -422,10 +441,16 @@ impl NativeIndexStore {
         index: &NativeReadonlyIndex,
     ) -> Result<(), Error> {
         self.core.same(&index.core)?;
-        self.core.load(index.checkpoint.tips.clone())?;
-        self.core
-            .storage
-            .associate(id, &index.checkpoint.tips, &self.core.limits)
+        self.core.load_source(
+            index.checkpoint.tips.clone(),
+            index.checkpoint.source.clone(),
+        )?;
+        self.core.storage.associate_source(
+            id,
+            &index.checkpoint.tips,
+            &index.checkpoint.source,
+            &self.core.limits,
+        )
     }
 }
 #[derive(Clone)]
@@ -481,10 +506,18 @@ impl Core {
         }
     }
     fn load(self: &Arc<Self>, tips: Vec<SegmentId>) -> Result<NativeReadonlyIndex, Error> {
+        self.load_source(tips, CheckpointSource::LiveRoots)
+    }
+    fn load_source(
+        self: &Arc<Self>,
+        tips: Vec<SegmentId>,
+        source: CheckpointSource,
+    ) -> Result<NativeReadonlyIndex, Error> {
         let (roots, drafts) = self.storage.load(&tips, &self.limits)?;
+        let baseline = source.validate_checkpoint(&self.storage, &roots, &drafts, &self.limits)?;
         Ok(NativeReadonlyIndex {
             core: self.clone(),
-            checkpoint: Arc::new(Checkpoint::new(tips, roots, drafts)),
+            checkpoint: Arc::new(Checkpoint::new(tips, roots, drafts, source, baseline)),
         })
     }
 }
@@ -627,6 +660,8 @@ impl MutableIndex for NativeMutableIndex {
             self.inner.checkpoint.tips.clone(),
             self.inner.checkpoint.roots.clone(),
             drafts,
+            self.inner.checkpoint.source.clone(),
+            self.inner.checkpoint.baseline.clone(),
         ));
         Ok(())
     }
@@ -635,6 +670,9 @@ impl MutableIndex for NativeMutableIndex {
             .downcast_ref::<NativeReadonlyIndex>()
             .ok_or_else(|| err(Error::Foreign))?;
         self.inner.core.same(&other.core).map_err(err)?;
+        if self.inner.checkpoint.source != other.checkpoint.source {
+            return Err(err(Error::Unsupported));
+        }
         let mut roots: BTreeSet<_> = self.inner.checkpoint.roots.iter().copied().collect();
         roots.extend(other.checkpoint.roots.iter().copied());
         let mut drafts: BTreeMap<_, _> = self
@@ -670,6 +708,8 @@ impl MutableIndex for NativeMutableIndex {
             self.parents.clone(),
             roots.into_iter().collect(),
             drafts,
+            self.inner.checkpoint.source.clone(),
+            self.inner.checkpoint.baseline.clone(),
         ));
         Ok(())
     }

@@ -13,6 +13,10 @@ use std::sync::{
 #[derive(Debug, Default)]
 struct FixtureIo {
     scopes: Mutex<BTreeMap<[u8; 32], Vec<m::Commit>>>,
+    cloud_snapshots: Mutex<BTreeMap<[u8; 32], (native_broker::CloudQuerySource, Vec<m::Commit>)>>,
+    cloud_scope_sources: Mutex<BTreeMap<[u8; 32], [u8; 32]>>,
+    cloud_opens: AtomicUsize,
+    scope_closes: AtomicUsize,
     queries: Mutex<BTreeMap<[u8; 32], (Vec<q::GraphRow>, usize, u64)>>,
     opens: AtomicUsize,
     facts_count: AtomicUsize,
@@ -168,6 +172,37 @@ impl NativeQueryIo for FixtureIo {
             persistent_memory_bytes: 1024 * 1024,
         }
     }
+    async fn open_cloud_scope(
+        &self,
+        input: native_broker::OpenCloudQueryScope,
+        owner: QueryOwner,
+    ) -> Result<QueryReply<QueryScope>, tonic::Status> {
+        self.cloud_opens.fetch_add(1, Ordering::SeqCst);
+        if input.source.index_root_ids.len() != 1 || !input.overlay.is_empty() {
+            return Err(tonic::Status::invalid_argument(
+                "fixture exact cloud selection",
+            ));
+        }
+        let (expected, nodes) = self
+            .cloud_snapshots
+            .lock()
+            .unwrap()
+            .get(&input.source.index_root_ids[0])
+            .cloned()
+            .ok_or_else(|| tonic::Status::unimplemented("fixture cloud snapshot unavailable"))?;
+        if expected != input.source {
+            return Err(tonic::Status::permission_denied(
+                "fixture cloud selection differs",
+            ));
+        }
+        let mut reply = self.install_scope(nodes, owner);
+        reply.value.cloud_source_digest = Some(input.source.digest());
+        self.cloud_scope_sources
+            .lock()
+            .unwrap()
+            .insert(reply.value.handle, input.source.digest());
+        Ok(reply)
+    }
     async fn open_scope(
         &self,
         i: OpenQueryScope,
@@ -233,7 +268,26 @@ impl NativeQueryIo for FixtureIo {
             .collect();
         self.fork_overlays.lock().unwrap().push(ids);
         append_overlay(&mut nodes, i.overlay)?;
-        Ok(self.install_scope(nodes, o))
+        let cloud = self
+            .cloud_scope_sources
+            .lock()
+            .unwrap()
+            .get(&i.parent)
+            .copied();
+        if cloud != i.expected_cloud_source_digest {
+            return Err(tonic::Status::invalid_argument(
+                "fixture fork source mismatch",
+            ));
+        }
+        let mut reply = self.install_scope(nodes, o);
+        reply.value.cloud_source_digest = cloud;
+        if let Some(source) = cloud {
+            self.cloud_scope_sources
+                .lock()
+                .unwrap()
+                .insert(reply.value.handle, source);
+        }
+        Ok(reply)
     }
     async fn facts(
         &self,
@@ -634,7 +688,9 @@ impl NativeQueryIo for FixtureIo {
         Ok(())
     }
     async fn close_scope(&self, h: [u8; 32], _: QueryOwner) -> Result<(), tonic::Status> {
+        self.scope_closes.fetch_add(1, Ordering::SeqCst);
         self.scopes.lock().unwrap().remove(&h);
+        self.cloud_scope_sources.lock().unwrap().remove(&h);
         Ok(())
     }
 }
@@ -2756,4 +2812,601 @@ async fn cancelled_portable_export_keeps_accepted_sink_artifact_owned_until_phys
         .unwrap();
     assert_eq!(retry.operation_indexes().len(), 1);
     assert_eq!(retry.artifacts().len(), sink.values.len());
+}
+
+#[test]
+fn portable_import_preserves_exact_cloud_baselines_without_canonical_hydration_or_live_fallback() {
+    block_on(async {
+        use tinytree_cloud as cloud;
+        let (directory, _objects_directory, _unused, io, objects, config) = fixture();
+        let backend =
+            jj_native_backend::NativeBackend::from_io(objects.clone(), Default::default())
+                .await
+                .unwrap();
+        let jj_store = Store::new(
+            Box::new(backend),
+            jj_lib::signing::Signer::new(None, vec![]),
+            jj_lib::tree_merge::MergeOptions {
+                hunk_level: jj_lib::files::FileMergeHunkLevel::Line,
+                same_change: jj_lib::merge::SameChange::Accept,
+            },
+        );
+        let root = jj_store.root_commit();
+        let mut value = root.store_commit().as_ref().clone();
+        value.parents = vec![root.id().clone()];
+        value.description = "public baseline".into();
+        let public = jj_store.write_commit(value, None).await.unwrap();
+        let public_id = model_id(public.id()).unwrap();
+        let public_key = m::ObjectKey {
+            kind: m::Kind::Commit,
+            id: m::ObjectId(public_id.0),
+        };
+        let m::Object::Commit(public_value) = objects
+            .read_metadata(public_key)
+            .await
+            .unwrap()
+            .into_object()
+        else {
+            panic!()
+        };
+        io.remote.lock().unwrap().push(public_value.clone());
+        io.admitted.lock().unwrap().insert(public_id);
+        // A genuine supported initializer can seed operation0 at a NONROOT
+        // anchor. Import must not add intrinsic ROOT to its stored anchor set.
+        let original = NativeIndexStore::init(
+            &directory.path().join("original"),
+            config.clone(),
+            Default::default(),
+            io.clone(),
+            objects.clone(),
+            vec![public_id],
+        )
+        .unwrap();
+        let seed = original.seed_index().unwrap();
+        original.associate_operation(&[0; 64], &seed).unwrap();
+        let mut branches = Vec::new();
+        let mut commits = Vec::new();
+        let mut models = vec![public_value];
+        for description in ["visible working draft", "hidden divergent draft"] {
+            let mut value = public.store_commit().as_ref().clone();
+            value.parents = vec![public.id().clone()];
+            value.change_id = ChangeId::from_bytes(&[29; 16]);
+            value.description = description.into();
+            let commit = jj_store.write_commit(value, None).await.unwrap();
+            let mut mutable = seed.start_modification();
+            mutable.add_commit(&commit).await.unwrap();
+            branches.push(original.persist_index(mutable).unwrap());
+            let key = m::ObjectKey {
+                kind: m::Kind::Commit,
+                id: m::ObjectId(model_id(commit.id()).unwrap().0),
+            };
+            let m::Object::Commit(value) = objects.read_metadata(key).await.unwrap().into_object()
+            else {
+                panic!()
+            };
+            models.push(value);
+            commits.push(commit);
+        }
+        let mut merge = branches[0].start_modification();
+        merge.merge_in(&branches[1]).unwrap();
+        let merged = original.persist_index(merge).unwrap();
+        original.associate_operation(&[1; 64], &merged).unwrap();
+        original.associate_operation(&[2; 64], &merged).unwrap();
+        io.remote.lock().unwrap().push(models[1].clone());
+        io.admitted
+            .lock()
+            .unwrap()
+            .insert(model_commit_id(&models[1]));
+        let promoted = merged
+            .with_remote_roots(vec![model_commit_id(&models[1])])
+            .await
+            .unwrap();
+        original.associate_operation(&[3; 64], &promoted).unwrap();
+        let operations = [[0; 64], [1; 64], [2; 64], [3; 64]];
+        let mut artifacts = PortableArtifactSink::default();
+        let exported = original
+            .export_operation_indexes(
+                &operations,
+                Default::default(),
+                &mut artifacts,
+                Arc::new(()),
+            )
+            .await
+            .unwrap();
+        let graph = cloud::verify_index_artifact_graph(
+            exported.index_roots(),
+            &artifacts.values,
+            Default::default(),
+        )
+        .unwrap();
+        // This is the existing index-only QueryIo adapter fixture: OP/VIEW
+        // coverage/semantic identity is server/restore acceptance, not fabricated
+        // by importing declared member descriptors into an index.
+        let manifest = cloud::ManifestV2 {
+            recovery: cloud::Manifest {
+                workspace: [8; 32],
+                exporter: [9; 16],
+                sequence: 1,
+                operation_heads: vec![[3; 64]],
+                undo_operations: vec![[1; 64]],
+                intent_operations: vec![],
+                working_copy: cloud::WorkingCopy {
+                    workspace_name: "task".into(),
+                    wc_operation: [3; 64],
+                    snapshot_operation: [3; 64],
+                    snapshot_commit: model_id(commits[0].id()).unwrap().0,
+                    tree: m::TreeMerge {
+                        terms: vec![m::TreeId([11; 32])],
+                        labels: vec![String::new()],
+                    },
+                },
+                parents: vec![],
+                members: operations[1..]
+                    .iter()
+                    .map(|operation| cloud::Member {
+                        id: cloud::ObjectId::Operation(*operation),
+                        selected: cloud::BlobDigest::of(b"index-only operation descriptor"),
+                    })
+                    .collect(),
+                intent_roots: vec![],
+                native_roots: vec![],
+                coverage: cloud::Coverage::FullRequired,
+                detached: vec![],
+            },
+            operation_indexes: exported.operation_indexes().to_vec(),
+            index_roots: exported.index_roots().to_vec(),
+        };
+        let bytes = cloud::encode_manifest_v2(&manifest, Default::default()).unwrap();
+        let version = PortableImportVersion {
+            provider_identity: config.provider_fingerprint,
+            workspace_id: [8; 32],
+            generation: 1,
+            manifest_id: cloud::ManifestId::of(&bytes).0,
+            manifest_blake3: *blake3::hash(&bytes).as_bytes(),
+            manifest_size_bytes: bytes.len() as u64,
+        };
+        for descriptor in graph.roots() {
+            let snapshot = graph.snapshot(descriptor.id).unwrap();
+            let wanted: BTreeSet<_> = snapshot
+                .roots
+                .iter()
+                .copied()
+                .chain(snapshot.drafts.iter().map(|d| d.commit()))
+                .collect();
+            let nodes = models
+                .iter()
+                .filter(|node| wanted.contains(&model_commit_id(node)))
+                .cloned()
+                .collect();
+            io.cloud_snapshots.lock().unwrap().insert(
+                descriptor.id.0,
+                (
+                    native_broker::CloudQuerySource {
+                        provider_identity: version.provider_identity,
+                        workspace_id: version.workspace_id,
+                        generation: version.generation,
+                        manifest_id: version.manifest_id,
+                        manifest_blake3: version.manifest_blake3,
+                        manifest_size_bytes: version.manifest_size_bytes,
+                        index_root_ids: vec![descriptor.id.0],
+                        expected_anchors: snapshot.roots,
+                    },
+                    nodes,
+                ),
+            );
+        }
+        let observed = Arc::new(CountingObjects {
+            inner: objects.clone(),
+            reads: Mutex::new(Vec::new()),
+            files: AtomicUsize::new(0),
+            file_writes: AtomicUsize::new(0),
+            reply_owner_probe: None,
+            pause_metadata: AtomicBool::new(false),
+            metadata_waiters: Mutex::new(Vec::new()),
+        });
+        let opens = io.opens.load(Ordering::SeqCst);
+        let cloud_before = io.cloud_opens.load(Ordering::SeqCst);
+        let close_before = io.scope_closes.load(Ordering::SeqCst);
+        let path = directory.path().join("restored-index");
+        let receipt = NativeIndexStore::import_fresh_operation_indexes(
+            &path,
+            config.clone(),
+            Default::default(),
+            io.clone(),
+            observed.clone(),
+            version.clone(),
+            &bytes,
+            &graph,
+            Default::default(),
+            Arc::new(()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            io.scope_closes.load(Ordering::SeqCst) - close_before,
+            graph.roots().len(),
+            "one acknowledged Close per validated snapshot, without duplicate queued closes"
+        );
+        let restored = receipt.store;
+        assert_eq!(receipt.operation_indexes, manifest.operation_indexes);
+        assert_eq!(
+            restored.seed_index().unwrap().checkpoint.roots,
+            vec![public_id]
+        );
+        assert_eq!(
+            io.cloud_opens.load(Ordering::SeqCst) - cloud_before,
+            graph.roots().len()
+        );
+        assert_eq!(
+            io.opens.load(Ordering::SeqCst) - opens,
+            graph.roots().len(),
+            "only explicit cloud fixture scopes were opened"
+        );
+        let mut roundtrip_artifacts = PortableArtifactSink::default();
+        let roundtrip = restored
+            .export_operation_indexes(
+                &operations,
+                Default::default(),
+                &mut roundtrip_artifacts,
+                Arc::new(()),
+            )
+            .await
+            .unwrap();
+        assert_eq!(roundtrip.operation_indexes(), exported.operation_indexes());
+        assert_eq!(roundtrip.index_roots(), exported.index_roots());
+        let reopened = NativeIndexStore::open(
+            &path,
+            &config,
+            Default::default(),
+            io.clone(),
+            observed.clone(),
+        )
+        .unwrap();
+        let historical = reopened.index_at_operation(&[1; 64]).unwrap();
+        assert_eq!(historical.checkpoint.drafts.len(), 2);
+        assert!(
+            historical
+                .checkpoint
+                .drafts
+                .iter()
+                .all(|draft| draft.order == 1)
+        );
+        let expression =
+            ResolvedExpression::Commits(commits.iter().map(|commit| commit.id().clone()).collect());
+        let rows = historical
+            .evaluate_revset(&expression, &jj_store)
+            .unwrap()
+            .stream()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 2);
+        assert!(commits.iter().all(|commit| rows.contains(commit.id())));
+        assert!(
+            observed.reads.lock().unwrap().is_empty(),
+            "frozen canonical baseline is not hydrated at import/open/query"
+        );
+        assert_eq!(observed.files.load(Ordering::SeqCst), 0);
+        assert!(matches!(
+            historical.with_remote_roots(vec![public_id]).await,
+            Err(Error::Unsupported)
+        ));
+        let mut delta_value = commits[0].store_commit().as_ref().clone();
+        delta_value.parents = vec![commits[0].id().clone()];
+        delta_value.description = "post-restore local delta".into();
+        let delta = jj_store.write_commit(delta_value, None).await.unwrap();
+        let mut updated = historical.start_modification();
+        updated.add_commit(&delta).await.unwrap();
+        let updated = restored.persist_index(updated).unwrap();
+        restored.associate_operation(&[5; 64], &updated).unwrap();
+        let rows = updated
+            .evaluate_revset(
+                &ResolvedExpression::Commits(vec![delta.id().clone()]),
+                &jj_store,
+            )
+            .unwrap()
+            .stream()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        assert_eq!(rows, vec![delta.id().clone()]);
+        assert_eq!(
+            io.fork_overlays.lock().unwrap().last().unwrap(),
+            &vec![model_id(delta.id()).unwrap()],
+            "only new local delta is uploaded, never frozen baseline"
+        );
+        assert!(
+            observed
+                .reads
+                .lock()
+                .unwrap()
+                .iter()
+                .all(|key| key.id.0 == model_id(delta.id()).unwrap().0)
+        );
+        let mut branch = historical.start_modification();
+        assert!(
+            branch
+                .merge_in(&reopened.index_at_operation(&[0; 64]).unwrap())
+                .is_err(),
+            "different frozen snapshot sources cannot silently merge"
+        );
+        let view_only = restored
+            .persist_index(historical.start_modification())
+            .unwrap();
+        restored.associate_operation(&[4; 64], &view_only).unwrap();
+        assert_eq!(
+            restored
+                .index_at_operation(&[4; 64])
+                .unwrap()
+                .checkpoint
+                .source,
+            historical.checkpoint.source
+        );
+        assert!(matches!(
+            restored.index_at_operation(&[99; 64]),
+            Err(Error::MissingOperation)
+        ));
+        let mut wrong = config.clone();
+        wrong.provider_fingerprint = [6; 32];
+        assert!(matches!(
+            NativeIndexStore::open(
+                &path,
+                &wrong,
+                Default::default(),
+                io.clone(),
+                observed.clone()
+            ),
+            Err(Error::Foreign)
+        ));
+        // Exact fresh-only API never adopts an existing complete or partial dir.
+        assert!(matches!(
+            NativeIndexStore::import_fresh_operation_indexes(
+                &path,
+                config.clone(),
+                Default::default(),
+                io.clone(),
+                observed.clone(),
+                version.clone(),
+                &bytes,
+                &graph,
+                Default::default(),
+                Arc::new(())
+            )
+            .await,
+            Err(Error::Corrupt)
+        ));
+        let partial = directory.path().join("interrupted-index");
+        let mut tiny = Limits::default();
+        tiny.max_segment_bytes = 128;
+        assert!(matches!(
+            NativeIndexStore::import_fresh_operation_indexes(
+                &partial,
+                config.clone(),
+                tiny,
+                io.clone(),
+                observed.clone(),
+                version.clone(),
+                &bytes,
+                &graph,
+                Default::default(),
+                Arc::new(())
+            )
+            .await,
+            Err(Error::Limit)
+        ));
+        assert!(partial.exists() && !partial.join("import_complete").exists());
+        assert!(
+            NativeIndexStore::open(
+                &partial,
+                &config,
+                Default::default(),
+                io.clone(),
+                observed.clone()
+            )
+            .is_err()
+        );
+        assert!(matches!(
+            NativeIndexStore::import_fresh_operation_indexes(
+                &partial,
+                config.clone(),
+                Default::default(),
+                io.clone(),
+                observed.clone(),
+                version.clone(),
+                &bytes,
+                &graph,
+                Default::default(),
+                Arc::new(())
+            )
+            .await,
+            Err(Error::Corrupt)
+        ));
+        // An anchor-only backend must fail BEFORE creating staging, even though
+        // it echoes the source and supports ordinary cloud scope framing.
+        let root_id = exported.operation_indexes()[1].root.0;
+        let saved = io
+            .cloud_snapshots
+            .lock()
+            .unwrap()
+            .get(&root_id)
+            .cloned()
+            .unwrap();
+        io.cloud_snapshots
+            .lock()
+            .unwrap()
+            .get_mut(&root_id)
+            .unwrap()
+            .1 = vec![models[0].clone()];
+        let rejected = directory.path().join("missing-baseline");
+        assert!(matches!(
+            NativeIndexStore::import_fresh_operation_indexes(
+                &rejected,
+                config.clone(),
+                Default::default(),
+                io.clone(),
+                observed.clone(),
+                version.clone(),
+                &bytes,
+                &graph,
+                Default::default(),
+                Arc::new(())
+            )
+            .await,
+            Err(Error::Corrupt)
+        ));
+        assert!(!rejected.exists());
+        io.cloud_snapshots.lock().unwrap().insert(root_id, saved);
+        let absent = io.cloud_snapshots.lock().unwrap().clone();
+        io.cloud_snapshots.lock().unwrap().clear();
+        let unsupported = directory.path().join("unsupported-source");
+        assert!(matches!(
+            NativeIndexStore::import_fresh_operation_indexes(
+                &unsupported,
+                config.clone(),
+                Default::default(),
+                io.clone(),
+                observed.clone(),
+                version.clone(),
+                &bytes,
+                &graph,
+                Default::default(),
+                Arc::new(())
+            )
+            .await,
+            Err(Error::Query(tonic::Code::Unimplemented))
+        ));
+        assert!(!unsupported.exists());
+        *io.cloud_snapshots.lock().unwrap() = absent;
+        let malformed = directory.path().join("malformed-source");
+        let mut tampered = bytes.clone();
+        *tampered.last_mut().unwrap() ^= 1;
+        assert!(matches!(
+            NativeIndexStore::import_fresh_operation_indexes(
+                &malformed,
+                config.clone(),
+                Default::default(),
+                io.clone(),
+                observed.clone(),
+                version.clone(),
+                &tampered,
+                &graph,
+                Default::default(),
+                Arc::new(())
+            )
+            .await,
+            Err(Error::Corrupt)
+        ));
+        assert!(!malformed.exists());
+        let unrelated = cloud::build_index_artifacts(
+            &cloud::PortableIndexSnapshot {
+                roots: vec![m::CommitId::ROOT],
+                drafts: vec![],
+            },
+            Default::default(),
+        )
+        .unwrap();
+        let unrelated_roots = [unrelated.root];
+        let unrelated_artifacts: Vec<_> = unrelated
+            .artifacts
+            .iter()
+            .map(|artifact| {
+                cloud::decode_index_artifact(
+                    &artifact.bytes,
+                    artifact.descriptor,
+                    Default::default(),
+                )
+                .unwrap()
+            })
+            .collect();
+        let unrelated_graph = cloud::verify_index_artifact_graph(
+            &unrelated_roots,
+            &unrelated_artifacts,
+            Default::default(),
+        )
+        .unwrap();
+        assert!(matches!(
+            NativeIndexStore::import_fresh_operation_indexes(
+                &malformed,
+                config.clone(),
+                Default::default(),
+                io.clone(),
+                observed.clone(),
+                version.clone(),
+                &bytes,
+                &unrelated_graph,
+                Default::default(),
+                Arc::new(())
+            )
+            .await,
+            Err(Error::Corrupt)
+        ));
+        assert!(!malformed.exists());
+        let policy = PortableImportLimits {
+            max_operations: 1,
+            ..Default::default()
+        };
+        assert!(matches!(
+            NativeIndexStore::import_fresh_operation_indexes(
+                &malformed,
+                config.clone(),
+                Default::default(),
+                io.clone(),
+                observed.clone(),
+                version,
+                &bytes,
+                &graph,
+                policy,
+                Arc::new(())
+            )
+            .await,
+            Err(Error::Limit)
+        ));
+        assert!(!malformed.exists());
+        std::fs::remove_file(path.join("operations").join("01".repeat(64))).unwrap();
+        assert!(matches!(
+            restored.index_at_operation(&[1; 64]),
+            Err(Error::MissingOperation)
+        ));
+        let source = restored.seed_index().unwrap().checkpoint.source.clone();
+        let source_id = blake3::hash(&source.encode(&Limits::default()).unwrap());
+        let source_path = path.join("sources").join(source_id.to_hex().to_string());
+        let mut damaged = std::fs::read(&source_path).unwrap();
+        *damaged.last_mut().unwrap() ^= 1;
+        std::fs::write(&source_path, damaged).unwrap();
+        assert!(matches!(
+            restored.index_at_operation(&[0; 64]),
+            Err(Error::Corrupt)
+        ));
+        assert!(
+            NativeIndexStore::open(
+                &path,
+                &config,
+                Default::default(),
+                io.clone(),
+                observed.clone()
+            )
+            .is_err()
+        );
+        // Legacy source files and root lookups remain compatible and unchanged.
+        let legacy = NativeIndexStore::open(
+            &directory.path().join("original"),
+            &config,
+            Default::default(),
+            io.clone(),
+            objects,
+        )
+        .unwrap();
+        assert_eq!(
+            legacy.seed_index().unwrap().checkpoint.roots,
+            vec![public_id]
+        );
+        assert!(matches!(
+            legacy
+                .index_at_operation(&[3; 64])
+                .unwrap()
+                .checkpoint
+                .source,
+            CheckpointSource::LiveRoots
+        ));
+    });
 }

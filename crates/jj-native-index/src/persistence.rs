@@ -59,6 +59,7 @@ pub(super) struct Storage {
     root: private_fs::PrivateDir,
     segments: private_fs::PrivateDir,
     operations: private_fs::PrivateDir,
+    sources: Option<private_fs::PrivateDir>,
     manifest: Manifest,
 }
 fn hex(bytes: &[u8]) -> String {
@@ -191,6 +192,7 @@ impl Storage {
             root,
             segments,
             operations,
+            sources: None,
             manifest,
         };
         let segment = storage.segment(&[], &roots, &[], limits)?;
@@ -216,7 +218,7 @@ impl Storage {
         let manifest: Manifest =
             toml::from_str(std::str::from_utf8(bytes).map_err(|_| Error::Corrupt)?)
                 .map_err(|_| Error::Corrupt)?;
-        if manifest.version != 1 {
+        if !matches!(manifest.version, 1 | 2) {
             return Err(Error::Unsupported);
         }
         if &manifest.config != expected {
@@ -228,19 +230,122 @@ impl Storage {
         }
         let segments = private_fs::PrivateDir::open_existing(root.path().join("segments"))?;
         let operations = private_fs::PrivateDir::open_existing(root.path().join("operations"))?;
+        let sources = if manifest.version == 2 {
+            let completion = root.read("import_complete", 128)?;
+            if payload(6, b"import_complete", &completion)?.len() != 32 {
+                return Err(Error::Corrupt);
+            }
+            Some(private_fs::PrivateDir::open_existing(
+                root.path().join("sources"),
+            )?)
+        } else {
+            None
+        };
         let storage = Self {
             location: root.path().canonicalize()?,
             root,
             segments,
             operations,
+            sources,
             manifest,
         };
-        storage.load(&[storage.seed()?], limits)?;
+        if storage.imported() {
+            let (tips, source) = storage.association(&[0; 64], limits)?;
+            let (roots, drafts) = storage.load(&tips, limits)?;
+            source.validate_checkpoint(&storage, &roots, &drafts, limits)?;
+            let CheckpointSource::CloudSnapshot { pins, .. } = source else {
+                return Err(Error::Corrupt);
+            };
+            let completion = storage.root.read("import_complete", 128)?;
+            if payload(6, b"import_complete", &completion)? != pins.manifest_id.as_slice() {
+                return Err(Error::Corrupt);
+            }
+        } else {
+            storage.load(&[storage.seed()?], limits)?;
+        }
         #[cfg(unix)]
         File::open(storage.root.path())?.sync_all()?;
         #[cfg(unix)]
         File::open(storage.root.path().parent().ok_or(Error::Invalid)?)?.sync_all()?;
         Ok(storage)
+    }
+    /// Restore-journal-owned fresh staging. Normal open rejects it until finish.
+    pub(super) fn init_import(path: &Path, config: Config) -> Result<Self, Error> {
+        require_durable_writer()?;
+        let root = private_fs::PrivateDir::create(path)?;
+        if std::fs::read_dir(root.path())?.next().is_some() {
+            return Err(Error::Corrupt);
+        }
+        let _lock = lock(&root)?;
+        if std::fs::read_dir(root.path())?
+            .any(|e| e.map_or(true, |e| e.file_name() != "writer.lock"))
+        {
+            return Err(Error::Corrupt);
+        }
+        let segments = private_fs::PrivateDir::create(root.path().join("segments"))?;
+        let operations = private_fs::PrivateDir::create(root.path().join("operations"))?;
+        let sources = Some(private_fs::PrivateDir::create(root.path().join("sources"))?);
+        let manifest = Manifest {
+            version: 2,
+            identity: random(),
+            config,
+        };
+        let storage = Self {
+            location: root.path().canonicalize()?,
+            root,
+            segments,
+            operations,
+            sources,
+            manifest,
+        };
+        let body = toml::to_string(&storage.manifest).map_err(|_| Error::Invalid)?;
+        install(
+            &storage.root,
+            "manifest",
+            &envelope(0, b"manifest", body.as_bytes()),
+            16384,
+        )?;
+        #[cfg(unix)]
+        File::open(storage.root.path().parent().ok_or(Error::Invalid)?)?.sync_all()?;
+        Ok(storage)
+    }
+    fn install_source(
+        &self,
+        source: &CheckpointSource,
+        limits: &Limits,
+    ) -> Result<[u8; 32], Error> {
+        if matches!(source, CheckpointSource::LiveRoots) {
+            return Ok([0; 32]);
+        }
+        let body = source.encode(limits)?;
+        let id = *blake3::hash(&body).as_bytes();
+        install(
+            self.sources.as_ref().ok_or(Error::Unsupported)?,
+            &hex(&id),
+            &envelope(5, &id, &body),
+            limits.max_segment_bytes,
+        )?;
+        Ok(id)
+    }
+    pub(super) fn finish_import(&self, expected: [u8; 32], limits: &Limits) -> Result<(), Error> {
+        let (tips, source) = self.association(&[0; 64], limits)?;
+        if matches!(source, CheckpointSource::LiveRoots) {
+            return Err(Error::Corrupt);
+        }
+        let (roots, drafts) = self.load(&tips, limits)?;
+        source.validate_checkpoint(self, &roots, &drafts, limits)?;
+        install(
+            &self.root,
+            "import_complete",
+            &envelope(6, b"import_complete", &expected),
+            128,
+        )
+    }
+    pub(super) fn imported(&self) -> bool {
+        self.manifest.version == 2
+    }
+    pub(super) fn config(&self) -> &Config {
+        &self.manifest.config
     }
     pub(super) fn location(&self) -> &Path {
         &self.location
@@ -316,11 +421,11 @@ impl Storage {
         install(&self.segments, &hex(&id), &bytes, limits.max_segment_bytes)?;
         Ok(id)
     }
-    pub(super) fn operation(
+    pub(super) fn association(
         &self,
         id: &[u8; 64],
         limits: &Limits,
-    ) -> Result<Vec<SegmentId>, Error> {
+    ) -> Result<(Vec<SegmentId>, CheckpointSource), Error> {
         self.operation_export(id, limits, None)
     }
     fn operation_export(
@@ -328,7 +433,7 @@ impl Storage {
         id: &[u8; 64],
         limits: &Limits,
         mut budget: Option<&mut ExportReadBudget>,
-    ) -> Result<Vec<SegmentId>, Error> {
+    ) -> Result<(Vec<SegmentId>, CheckpointSource), Error> {
         let cap = match budget.as_deref_mut() {
             Some(b) => b.cap(limits.max_segment_bytes)?,
             None => limits.max_segment_bytes,
@@ -349,10 +454,15 @@ impl Storage {
             }
             Err(e) => return Err(e.into()),
         };
-        if let Some(b) = budget {
+        if let Some(b) = budget.as_deref_mut() {
             b.charge(bytes.len())?;
         }
-        let mut reader = Reader(payload(3, id, &bytes)?);
+        let mut reader = Reader(payload(if self.imported() { 4 } else { 3 }, id, &bytes)?);
+        let source_id = if self.imported() {
+            reader.array()?
+        } else {
+            [0; 32]
+        };
         let n = reader.count_width(limits.max_segments, 32)?;
         let mut tips = Vec::with_capacity(n);
         for _ in 0..n {
@@ -362,12 +472,39 @@ impl Storage {
         if tips.is_empty() {
             return Err(Error::Corrupt);
         }
-        Ok(tips)
+        let source = if source_id == [0; 32] {
+            CheckpointSource::LiveRoots
+        } else {
+            let cap = match budget.as_deref_mut() {
+                Some(b) => b.cap(limits.max_segment_bytes)?,
+                None => limits.max_segment_bytes,
+            };
+            let bytes = self
+                .sources
+                .as_ref()
+                .ok_or(Error::Corrupt)?
+                .read(hex(&source_id), cap)?;
+            if let Some(b) = budget {
+                b.charge(bytes.len())?;
+            }
+            let body = payload(5, &source_id, &bytes)?;
+            if blake3::hash(body).as_bytes() != &source_id {
+                return Err(Error::Corrupt);
+            }
+            CheckpointSource::decode(body, limits)?
+        };
+        if let CheckpointSource::CloudSnapshot { pins, .. } = &source {
+            if pins.provider_identity != self.manifest.config.provider_fingerprint {
+                return Err(Error::Foreign);
+            }
+        }
+        Ok((tips, source))
     }
-    pub(super) fn associate(
+    pub(super) fn associate_source(
         &self,
         id: &[u8; 64],
         tips: &[SegmentId],
+        source: &CheckpointSource,
         limits: &Limits,
     ) -> Result<(), Error> {
         require_durable_writer()?;
@@ -377,13 +514,18 @@ impl Storage {
         if tips
             .len()
             .checked_mul(32)
-            .and_then(|n| n.checked_add(49))
+            .and_then(|n| n.checked_add(if self.imported() { 81 } else { 49 }))
             .is_none_or(|n| n > limits.max_segment_bytes)
         {
             return Err(Error::Limit);
         }
         let _lock = lock(&self.root)?;
-        let mut body = Vec::with_capacity(4 + 32 * tips.len());
+        let mut body = Vec::with_capacity(36 + 32 * tips.len());
+        if self.imported() {
+            body.extend_from_slice(&self.install_source(source, limits)?);
+        } else if !matches!(source, CheckpointSource::LiveRoots) {
+            return Err(Error::Unsupported);
+        }
         put_count(&mut body, tips.len());
         for tip in tips {
             body.extend_from_slice(tip)
@@ -391,7 +533,7 @@ impl Storage {
         install(
             &self.operations,
             &hex(id),
-            &envelope(3, id, &body),
+            &envelope(if self.imported() { 4 } else { 3 }, id, &body),
             limits.max_segment_bytes,
         )
     }
@@ -416,7 +558,7 @@ impl Storage {
         limits: &Limits,
         budget: &mut ExportReadBudget,
     ) -> Result<(Vec<m::CommitId>, Vec<Arc<Draft>>), Error> {
-        let tips = self.operation_export(id, limits, Some(&mut *budget))?;
+        let (tips, _) = self.operation_export(id, limits, Some(&mut *budget))?;
         let (roots, drafts, _) = self.load_layout_export(&tips, limits, Some(&mut *budget))?;
         Ok((roots, drafts))
     }
@@ -621,6 +763,22 @@ impl Storage {
         }
         let roots: Vec<_> = all_roots.into_iter().collect();
         let drafts = order_drafts(all_drafts, limits)?;
+        self.persist_exact_snapshot(&roots, &drafts, limits)
+    }
+    pub(super) fn persist_exact_snapshot(
+        &self,
+        roots: &[m::CommitId],
+        drafts: &[Arc<Draft>],
+        limits: &Limits,
+    ) -> Result<Vec<SegmentId>, Error> {
+        require_durable_writer()?;
+        if roots.is_empty()
+            || roots.len() > limits.max_roots
+            || !roots.windows(2).all(|ids| ids[0] < ids[1])
+            || drafts.len() > limits.max_drafts
+        {
+            return Err(Error::Invalid);
+        }
         // Plan exact encoded sizes before any shard publication. Ranges borrow
         // complete records; no per-shard copies or split parent vectors.
         let mut plan = Vec::new();
@@ -666,7 +824,7 @@ impl Storage {
         if plan
             .len()
             .checked_mul(32)
-            .and_then(|n| n.checked_add(49))
+            .and_then(|n| n.checked_add(if self.imported() { 81 } else { 49 }))
             .is_none_or(|n| n > limits.max_segment_bytes)
         {
             return Err(Error::Limit);
@@ -682,14 +840,14 @@ impl Storage {
 fn put_count(out: &mut Vec<u8>, n: usize) {
     out.extend_from_slice(&(n as u32).to_le_bytes())
 }
-struct Reader<'a>(&'a [u8]);
+pub(super) struct Reader<'a>(pub(super) &'a [u8]);
 impl Reader<'_> {
-    fn array<const N: usize>(&mut self) -> Result<[u8; N], Error> {
+    pub(super) fn array<const N: usize>(&mut self) -> Result<[u8; N], Error> {
         let (head, tail) = self.0.split_at_checked(N).ok_or(Error::Corrupt)?;
         self.0 = tail;
         head.try_into().map_err(|_| Error::Corrupt)
     }
-    fn count_width(&mut self, cap: usize, width: usize) -> Result<usize, Error> {
+    pub(super) fn count_width(&mut self, cap: usize, width: usize) -> Result<usize, Error> {
         let n = u32::from_le_bytes(self.array()?) as usize;
         if n > cap
             || n.checked_mul(width)
@@ -699,7 +857,7 @@ impl Reader<'_> {
         }
         Ok(n)
     }
-    fn end(self) -> Result<(), Error> {
+    pub(super) fn end(self) -> Result<(), Error> {
         if self.0.is_empty() {
             Ok(())
         } else {

@@ -1,7 +1,7 @@
 # jj-native-index · library
 
 A jj 0.46 index over immutable remote checkpoints and all admitted local drafts,
-including hidden siblings. Only local broker endpoints and provider identities
+including hidden siblings. Host settings and immutable checkpoint source pins
 are persisted. Queries never fall back to a truncated DefaultIndex or hydrate
 complete public history.
 
@@ -15,6 +15,12 @@ not current references. `with_remote_roots` verifies explicit admitted roots,
 retains old checkpoints, and filters newly remote-covered drafts from uploads
 without deleting local history. `init_fresh_for_root_operation` seeds and associates the captured
 root operation during journal-owned initialization.
+
+`import_fresh_operation_indexes` stages exact retained operation indexes in a
+fresh private directory. It requires explicit cloud snapshot support, preserves
+frozen draft membership without canonical history downloads, and never falls
+back to live refs. It does not restore OP/VIEW data, publish a workspace, or
+establish backup completion. Different source checkpoints cannot silently merge.
 
 Checksummed immutable segments and no-clobber, synced operation associations
 support multiple processes. Unix publication also syncs directory entries,

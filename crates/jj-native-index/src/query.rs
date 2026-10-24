@@ -77,11 +77,22 @@ impl NativeReadonlyIndex {
         reply: native_broker::QueryReply<native_broker::QueryScope>,
         parent: Option<Arc<CachedScope>>,
     ) -> Result<Arc<CachedScope>, Error> {
-        if reply.value.query_identity_version != 2 {
-            return Err(Error::Unsupported);
-        }
-        if reply.value.expires_at_unix_seconds <= now()? {
-            return Err(Error::Corrupt);
+        let expected = match &self.checkpoint.source {
+            CheckpointSource::LiveRoots => None,
+            CheckpointSource::CloudSnapshot { pins, .. } => Some(pins.digest()),
+        };
+        let invalid = if reply.value.query_identity_version != 2 {
+            Some(Error::Unsupported)
+        } else if reply.value.cloud_source_digest != expected
+            || reply.value.expires_at_unix_seconds <= now()?
+        {
+            Some(Error::Corrupt)
+        } else {
+            None
+        };
+        if let Some(error) = invalid {
+            self.core.enqueue(reply.value.handle, true, reply.owner);
+            return Err(error);
         }
         Ok(Arc::new(CachedScope {
             value: reply.value,
@@ -97,20 +108,39 @@ impl NativeReadonlyIndex {
         roots: Vec<m::CommitId>,
         replay_key: [u8; 32],
     ) -> Result<Arc<CachedScope>, Error> {
-        let reply = self
-            .core
-            .query
-            .open_scope(
-                native_broker::OpenQueryScope {
-                    roots,
-                    query_identity_version: 2,
-                    overlay: Vec::new(),
-                    replay_key,
-                },
-                self.core.owner(),
-            )
-            .await
-            .map_err(status)?;
+        let reply = match &self.checkpoint.source {
+            CheckpointSource::LiveRoots => {
+                self.core
+                    .query
+                    .open_scope(
+                        native_broker::OpenQueryScope {
+                            roots,
+                            query_identity_version: 2,
+                            overlay: Vec::new(),
+                            replay_key,
+                        },
+                        self.core.owner(),
+                    )
+                    .await
+            }
+            CheckpointSource::CloudSnapshot { pins, .. } => {
+                if pins.expected_anchors != roots {
+                    return Err(Error::Corrupt);
+                }
+                self.core
+                    .query
+                    .open_cloud_scope(
+                        native_broker::OpenCloudQueryScope {
+                            source: pins.clone(),
+                            overlay: Vec::new(),
+                            replay_key,
+                        },
+                        self.core.owner(),
+                    )
+                    .await
+            }
+        }
+        .map_err(status)?;
         self.lease(reply, None)
     }
     async fn classify(
@@ -162,6 +192,9 @@ impl NativeReadonlyIndex {
         }
         if roots.is_empty() {
             return Ok(self.clone());
+        }
+        if !matches!(self.checkpoint.source, CheckpointSource::LiveRoots) {
+            return Err(Error::Unsupported);
         }
         let mut union: BTreeSet<_> = self.checkpoint.roots.iter().copied().collect();
         union.extend(roots.iter().copied());
@@ -237,6 +270,7 @@ impl NativeReadonlyIndex {
             .checkpoint
             .drafts
             .iter()
+            .filter(|draft| !self.checkpoint.baseline.contains(&draft.id()))
             .map(|draft| draft.id())
             .collect();
         let covered = match self.classify(&base, &ids).await {
@@ -249,9 +283,15 @@ impl NativeReadonlyIndex {
                 return Err(error);
             }
         };
-        let mut overlay = Vec::with_capacity(self.checkpoint.drafts.len());
+        let mut overlay = Vec::with_capacity(ids.len());
         let mut total = 0usize;
-        for (draft, covered) in self.checkpoint.drafts.iter().zip(covered) {
+        for (draft, covered) in self
+            .checkpoint
+            .drafts
+            .iter()
+            .filter(|draft| !self.checkpoint.baseline.contains(&draft.id()))
+            .zip(covered)
+        {
             let metadata = self
                 .core
                 .objects
@@ -281,7 +321,7 @@ impl NativeReadonlyIndex {
                 .query
                 .fork_scope(
                     native_broker::ForkQueryScope {
-                        expected_cloud_source_digest: None,
+                        expected_cloud_source_digest: base.value.cloud_source_digest,
                         parent: base.value.handle,
                         overlay,
                         replay_key: state.replay,
