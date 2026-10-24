@@ -4026,11 +4026,40 @@ fn indexed_cloud_versions_preserve_hidden_drafts_artifacts_and_mixed_schema_hist
     let bytes = b"private hidden source";
     let hidden_file = tinytree_model::describe_file(bytes);
     store.put("demo", hidden_file, bytes, 0).unwrap();
-    let hidden_tree = put_object(
+    let copy_parent = put_object(
         &store,
-        Object::Tree(tree(hidden_file, bytes.len() as u64)),
+        Object::CopyHistory(CopyHistory {
+            current_path: "source.txt".into(),
+            parents: vec![],
+            salt: vec![1],
+        }),
         0,
     );
+    let copy = put_object(
+        &store,
+        Object::CopyHistory(CopyHistory {
+            current_path: "source.txt".into(),
+            parents: vec![CopyId(copy_parent.key.id.0)],
+            salt: vec![2],
+        }),
+        0,
+    );
+    let symlink = put_object(&store, Object::Symlink("source.txt".into()), 0);
+    let mut hidden_entries = tree(hidden_file, bytes.len() as u64);
+    if let TreeValue::File { copy_id, .. } = &mut hidden_entries.entries[0].value {
+        *copy_id = Some(CopyId(copy.key.id.0));
+    }
+    hidden_entries.entries.insert(
+        0,
+        TreeEntry {
+            name: "link".into(),
+            value: TreeValue::Symlink {
+                id: tinytree_model::SymlinkId(symlink.key.id.0),
+                target_bytes: 10,
+            },
+        },
+    );
+    let hidden_tree = put_object(&store, Object::Tree(hidden_entries), 0);
     let mut hidden = commit(TreeId(hidden_tree.key.id.0), "hidden draft");
     hidden.parents = vec![CommitId(head.key.id.0)];
     let hidden = put_object(&store, Object::Commit(hidden), 0);
@@ -4044,6 +4073,170 @@ fn indexed_cloud_versions_preserve_hidden_drafts_artifacts_and_mixed_schema_hist
         .publish_cloud_version("demo", owner, &first, 1, &Default::default())
         .unwrap();
     assert_eq!(publication.workspace.generation, 1);
+    let selector = CloudVersionSelector {
+        workspace: value.recovery.workspace,
+        generation: 1,
+        manifest: first.manifest,
+        selected: tinytree_cloud::BlobDigest::of(&first.manifest_bytes),
+    };
+    let path = [hidden_tree.key, hidden_file.key];
+    let mut read = store
+        .read_cloud_native(
+            "demo",
+            owner,
+            selector,
+            hidden_file.key,
+            hidden.key,
+            &path,
+            Default::default(),
+        )
+        .unwrap();
+    assert_eq!(read.descriptor(), hidden_file);
+    // Active read retains the complete exact version while GC runs.
+    store.gc("demo", 100).unwrap();
+    let mut restored = Vec::new();
+    read.read_to_end(&mut restored).unwrap();
+    assert_eq!(restored, bytes);
+    drop(read);
+    for (requested, path) in [
+        (hidden.key, vec![]),
+        (hidden_tree.key, vec![hidden_tree.key]),
+        (symlink.key, vec![hidden_tree.key, symlink.key]),
+        (
+            copy_parent.key,
+            vec![hidden_tree.key, copy.key, copy_parent.key],
+        ),
+    ] {
+        let mut lease = store
+            .read_cloud_native(
+                "demo",
+                owner,
+                selector,
+                requested,
+                hidden.key,
+                &path,
+                Default::default(),
+            )
+            .unwrap();
+        let mut actual = Vec::new();
+        lease.read_to_end(&mut actual).unwrap();
+        assert_eq!(blake3::hash(&actual).as_bytes(), &requested.id.0);
+    }
+    let mut final_bound = CloudNativeReadLimits::default();
+    final_bound.max_metadata_bytes = hidden.size_bytes - 1;
+    assert!(matches!(
+        store.read_cloud_native(
+            "demo",
+            owner,
+            selector,
+            hidden.key,
+            hidden.key,
+            &[],
+            final_bound
+        ),
+        Err(Error::Limit("cloud native proof metadata bytes"))
+    ));
+    assert!(
+        store
+            .read_cloud_native(
+                "demo",
+                owner,
+                selector,
+                hidden_file.key,
+                head.key,
+                &path,
+                Default::default()
+            )
+            .is_err(),
+        "arbitrary CAS reachability is not a canonical proof"
+    );
+    assert!(
+        store
+            .read_cloud_native(
+                "demo",
+                owner,
+                selector,
+                hidden_file.key,
+                hidden.key,
+                &[hidden_file.key],
+                Default::default()
+            )
+            .is_err(),
+        "proof cannot skip the tree"
+    );
+    assert!(
+        store
+            .read_cloud_native(
+                "demo",
+                CloudOwner {
+                    principal: [99; 32]
+                },
+                selector,
+                hidden_file.key,
+                hidden.key,
+                &path,
+                Default::default()
+            )
+            .is_err()
+    );
+    let mut wrong = selector;
+    wrong.manifest = tinytree_cloud::ManifestId([31; 32]);
+    assert!(
+        store
+            .read_cloud_native(
+                "demo",
+                owner,
+                wrong,
+                hidden_file.key,
+                hidden.key,
+                &path,
+                Default::default()
+            )
+            .is_err()
+    );
+    let mut small = CloudNativeReadLimits::default();
+    small.max_metadata_bytes = hidden.size_bytes - 1;
+    assert!(matches!(
+        store.read_cloud_native(
+            "demo",
+            owner,
+            selector,
+            hidden_file.key,
+            hidden.key,
+            &path,
+            small
+        ),
+        Err(Error::Limit("cloud native proof metadata bytes"))
+    ));
+    small = Default::default();
+    small.max_edges = 1;
+    assert!(matches!(
+        store.read_cloud_native(
+            "demo",
+            owner,
+            selector,
+            hidden_file.key,
+            hidden.key,
+            &path,
+            small
+        ),
+        Err(Error::Limit("cloud native proof edges"))
+    ));
+    small = Default::default();
+    small.max_path_steps = 1;
+    assert!(matches!(
+        store.read_cloud_native(
+            "demo",
+            owner,
+            selector,
+            hidden_file.key,
+            hidden.key,
+            &path,
+            small
+        ),
+        Err(Error::Limit("cloud native proof path"))
+    ));
+
     assert!(
         store
             .read_cloud_version_v1(
@@ -4130,6 +4323,24 @@ fn indexed_cloud_versions_preserve_hidden_drafts_artifacts_and_mixed_schema_hist
         2
     );
     assert_eq!(store.descriptor("demo", hidden.key).unwrap(), Some(hidden));
+    let mut restored = Vec::new();
+    store
+        .read_cloud_native(
+            "demo",
+            owner,
+            selector,
+            hidden_file.key,
+            hidden.key,
+            &path,
+            Default::default(),
+        )
+        .unwrap()
+        .read_to_end(&mut restored)
+        .unwrap();
+    assert_eq!(
+        restored, bytes,
+        "restart and later workspace versions preserve exact old native authority"
+    );
 }
 
 #[test]

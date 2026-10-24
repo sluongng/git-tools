@@ -510,6 +510,9 @@ pub struct CloudVersionReadGuard {
     _guard: ValidationGuard,
 }
 impl CloudVersionReadGuard {
+    pub(super) fn native_roots(&self) -> &[ObjectKey] {
+        &self._guard.native
+    }
     pub fn version(&self) -> &CloudVersion {
         &self.version
     }

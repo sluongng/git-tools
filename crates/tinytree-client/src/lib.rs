@@ -9,7 +9,7 @@ pub use client::cloud::{
     CloudDescriptor, CloudIndexArtifact, CloudIndexArtifactDescriptor, CloudIndexArtifactId,
     CloudIndexWriteReceipt, CloudLimits, CloudManifestId, CloudObject, CloudObjectId,
     CloudPublication, CloudPublishIntent, CloudRawDigest, CloudVersion, CloudWorkspace,
-    CloudWriteReceipt,
+    CloudWriteReceipt, RetainedVersionSelector, VerifiedRetainedVersion,
 };
 pub use client::query::{
     ChangeMatch, ChangePrefix, ChangeTarget, CheckedGraphPage, CheckedGraphQuery, CheckedGraphRows,

@@ -4992,6 +4992,31 @@ impl tinytree_client::cloud_protocol::workspace_cloud_server::WorkspaceCloud for
         self.calls.fetch_add(1, Ordering::SeqCst);
         let request = request.into_inner();
         let manifest = b"raw manifest transport fixture".to_vec();
+        let native_authority =
+            if self.mode.load(Ordering::SeqCst) >= 30 && self.mode.load(Ordering::SeqCst) != 35 {
+                let raw = tinytree_client::CloudRawDigest::of(&manifest);
+                let workspace: [u8; 32] = request.workspace_id.as_slice().try_into().unwrap();
+                let binding = tinytree_model::cloud_native_binding_digest(
+                    &request.repository_id,
+                    [7; 32],
+                    workspace,
+                    request.generation,
+                    tinytree_client::CloudManifestId::of(&manifest).0,
+                    raw.blake3,
+                    raw.size_bytes,
+                );
+                Some(tinytree_client::cloud_protocol::NativeVersionAuthority {
+                    version: 1,
+                    owner_binding: vec![7; 32],
+                    binding_digest: binding.to_vec(),
+                    manifest_selected: Some(tinytree_client::cloud_protocol::RawDigest {
+                        blake3: raw.blake3.to_vec(),
+                        size_bytes: raw.size_bytes,
+                    }),
+                })
+            } else {
+                None
+            };
         Ok(Response::new(tinytree_client::cloud_protocol::Version {
             workspace_id: request.workspace_id,
             generation: request.generation,
@@ -5002,7 +5027,60 @@ impl tinytree_client::cloud_protocol::workspace_cloud_server::WorkspaceCloud for
                 Some(vec![3; 32])
             },
             manifest,
+            native_authority,
         }))
+    }
+    type ReadNativeClosureStream = std::pin::Pin<
+        Box<
+            dyn futures_util::Stream<
+                    Item = Result<tinytree_client::cloud_protocol::NativeClosureChunk, Status>,
+                > + Send,
+        >,
+    >;
+    async fn read_native_closure(
+        &self,
+        request: Request<tinytree_client::cloud_protocol::ReadNativeClosureRequest>,
+    ) -> Result<Response<Self::ReadNativeClosureStream>, Status> {
+        use tinytree_client::cloud_protocol as c;
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        let request = request.into_inner();
+        let mode = self.mode.load(Ordering::SeqCst);
+        let requested = request.requested.unwrap();
+        let (descriptor, mut bytes) = if requested.kind == Kind::File as i32 {
+            let bytes = vec![0x5a; 5 * 1024 * 1024];
+            (tinytree_model::describe_file(&bytes), bytes)
+        } else {
+            let encoded = tinytree_model::encode(
+                &tinytree_model::Object::Symlink("retained target".into()),
+                Default::default(),
+            )
+            .unwrap();
+            (encoded.descriptor, encoded.bytes)
+        };
+        assert_eq!(requested.native_id, descriptor.key.id.0);
+        let binding = if mode == 32 {
+            vec![0; 32]
+        } else {
+            request.authority.unwrap().binding_digest
+        };
+        if mode == 34 {
+            bytes[0] ^= 1;
+        }
+        let wire = p::ObjectDescriptor {
+            key: Some(p::ObjectKey {
+                kind: descriptor.key.kind as i32,
+                native_id: descriptor.key.id.0.to_vec(),
+            }),
+            size_bytes: descriptor.size_bytes,
+            content_blake3: descriptor.key.id.0.to_vec(),
+            object_format_version: u32::from(descriptor.format_version),
+        };
+        let stream = async_stream::stream! {
+            yield Ok(c::NativeClosureChunk{descriptor:Some(wire.clone()),offset:0,data:vec![],eof:false,source_binding_digest:binding.clone()});
+            for (n,chunk) in bytes.chunks(64*1024).enumerate(){yield Ok(c::NativeClosureChunk{descriptor:Some(wire.clone()),offset:(n*64*1024) as u64,data:chunk.to_vec(),eof:false,source_binding_digest:binding.clone()});}
+            if mode!=33 {yield Ok(c::NativeClosureChunk{descriptor:Some(wire),offset:bytes.len() as u64,data:vec![],eof:true,source_binding_digest:binding});}
+        };
+        Ok(Response::new(Box::pin(stream)))
     }
     async fn get_publication(
         &self,
@@ -6241,6 +6319,166 @@ async fn typed_index_artifact_rpc_checks_domains_bounds_retained_results_and_can
             .payload(),
         payload,
         "cancelled physical read must release the sole call slot"
+    );
+    server.abort();
+    let _ = server.await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn retained_native_reads_bind_fresh_versions_and_stream_files_beyond_cloud_object_limit() {
+    use tinytree_client::cloud_protocol::workspace_cloud_server::WorkspaceCloudServer;
+    use tinytree_client::{CloudManifestId, CloudRawDigest, RetainedVersionSelector};
+    let faults = CloudFaults::default();
+    faults.mode.store(30, Ordering::SeqCst);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let incoming = async_stream::stream! {loop{match listener.accept().await{Ok((stream,_))=>yield Ok::<_,std::io::Error>(stream),Err(error)=>{yield Err(error);break}}}};
+    let service = WorkspaceCloudServer::new(faults.clone())
+        .accept_compressed(tonic::codec::CompressionEncoding::Zstd)
+        .send_compressed(tonic::codec::CompressionEncoding::Zstd);
+    let server = tokio::spawn(async move {
+        tonic::transport::Server::builder()
+            .add_service(service)
+            .serve_with_incoming(incoming)
+            .await
+            .unwrap()
+    });
+    let mut config = Config::default();
+    config.endpoint = format!("http://{address}");
+    config.repository_id = "example".into();
+    config.limits.max_inflight = 1;
+    config.limits.max_metadata_bytes = 4 * 1024 * 1024;
+    config.limits.max_batch_bytes = 4 * 1024 * 1024;
+    config.limits.max_graph_bytes = 8 * 1024 * 1024;
+    config.limits.max_graph_objects = 65_536;
+    config.limits.max_file_bytes = 64 * 1024 * 1024;
+    config.limits.max_temporary_bytes = 128 * 1024 * 1024;
+    config.limits.max_buffered_bytes = 32 * 1024 * 1024;
+    config.rpc.retry.max_attempts = 1;
+    let client = NativeClient::connect(config.clone()).await.unwrap();
+    let manifest = b"raw manifest transport fixture";
+    let selector = RetainedVersionSelector {
+        workspace_id: [4; 32],
+        generation: 1,
+        manifest_id: CloudManifestId::of(manifest),
+    };
+    let selected = CloudRawDigest::of(manifest);
+    let drops = Arc::new(AtomicUsize::new(0));
+    let guarded = client
+        .clone()
+        .with_lifetime_guard(Arc::new(LifetimeProbe(drops.clone())));
+    let version = guarded
+        .cloud_retained_version_selected(selector, selected)
+        .await
+        .unwrap();
+    drop(guarded);
+    assert_eq!(version.manifest(), manifest);
+    let encoded = tinytree_model::encode(
+        &tinytree_model::Object::Symlink("retained target".into()),
+        Default::default(),
+    )
+    .unwrap();
+    let key = encoded.descriptor.key;
+    let physical_drops = Arc::new(AtomicUsize::new(0));
+    let physical = Arc::new(LifetimeProbe(physical_drops.clone()));
+    let physical_weak = Arc::downgrade(&physical);
+    let calls = client.clone().with_rpc_lifetime_guard(physical);
+    let metadata = calls
+        .cloud_read_native_metadata(&version, key, &[], key)
+        .await
+        .unwrap();
+    assert_eq!(metadata.canonical_bytes(), encoded.bytes);
+    let other = NativeClient::connect(config.clone()).await.unwrap();
+    let before = faults.calls.load(Ordering::SeqCst);
+    assert_eq!(
+        other
+            .cloud_read_native_metadata(&version, key, &[], key)
+            .await
+            .err()
+            .unwrap()
+            .code(),
+        Code::FailedPrecondition
+    );
+    assert_eq!(faults.calls.load(Ordering::SeqCst), before);
+    let directory = private_tempdir();
+    let filebytes = vec![0x5a; 5 * 1024 * 1024];
+    let descriptor = tinytree_model::describe_file(&filebytes);
+    assert!(filebytes.len() > config.cloud.max_object_bytes);
+    let file = calls
+        .cloud_download_native_file(
+            &version,
+            descriptor.key,
+            &[],
+            tinytree_model::FileId(descriptor.key.id.0),
+            directory.path(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(file.descriptor(), descriptor);
+    drop(calls);
+    assert_released(&physical_drops).await;
+    assert!(
+        physical_weak.upgrade().is_none(),
+        "retained native results must not capture a physical inflight/RPC owner"
+    );
+    // Both result allocations remain held here, but max_inflight is one.
+    let followup = client
+        .cloud_retained_version_selected(selector, selected)
+        .await
+        .unwrap();
+    assert_eq!(followup.selector(), selector);
+    drop(followup);
+    let mut reader = file.open().unwrap();
+    drop(file);
+    drop(version);
+    drop(metadata);
+    assert_eq!(
+        drops.load(Ordering::SeqCst),
+        0,
+        "verified file reader retains version/caller owners without an inflight slot"
+    );
+    let mut copy = Vec::new();
+    std::io::Read::read_to_end(&mut reader, &mut copy).unwrap();
+    assert_eq!(copy, filebytes);
+    drop(reader);
+    assert_released(&drops).await;
+    for mode in [32, 33, 34] {
+        faults.mode.store(mode, Ordering::SeqCst);
+        let version = client
+            .cloud_retained_version_selected(selector, selected)
+            .await
+            .unwrap();
+        assert_eq!(
+            client
+                .cloud_read_native_metadata(&version, key, &[], key)
+                .await
+                .err()
+                .unwrap()
+                .code(),
+            Code::DataLoss
+        );
+    }
+    faults.mode.store(35, Ordering::SeqCst);
+    assert_eq!(
+        client
+            .cloud_retained_version_selected(selector, selected)
+            .await
+            .err()
+            .unwrap()
+            .code(),
+        Code::Unimplemented
+    );
+    faults.mode.store(30, Ordering::SeqCst);
+    let mut wrong = selected;
+    wrong.blake3[0] ^= 1;
+    assert_eq!(
+        client
+            .cloud_retained_version_selected(selector, wrong)
+            .await
+            .err()
+            .unwrap()
+            .code(),
+        Code::DataLoss
     );
     server.abort();
     let _ = server.await;

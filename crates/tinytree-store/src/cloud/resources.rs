@@ -8,6 +8,7 @@ pub struct CloudResourceProfile {
     pub index_artifact_bytes: u64,
     pub version_v1_bytes: u64,
     pub version_v2_bytes: u64,
+    pub native_read_bytes: u64,
 }
 impl Config {
     /// Pure preflight usable before opening storage. The same calculation is
@@ -66,11 +67,20 @@ impl Config {
             (self.cloud.index_artifacts.max_artifact_bytes as u64).checked_mul(4),
             Some(8 * 1024 * 1024),
         ])?;
+        // The version guard stays live while sequential canonical proof/read
+        // scratch and one packed reconstruction are owned by the same call.
+        let native_read_bytes = add(&[
+            Some(version_v1_bytes.max(version_v2_bytes)),
+            (self.model_limits.max_object_bytes as u64).checked_mul(16),
+            Some(self.max_packed_read_memory_bytes),
+            Some(1024 * 1024),
+        ])?;
         Ok(CloudResourceProfile {
             object_bytes,
             index_artifact_bytes,
             version_v1_bytes,
             version_v2_bytes,
+            native_read_bytes,
         })
     }
 }

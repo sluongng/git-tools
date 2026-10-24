@@ -1,6 +1,8 @@
 syntax = "proto3";
 package tinytree.cloud.v1;
 
+import "tinytree/v1/repository.proto";
+
 // Private workspace history. Ownership comes exclusively from authentication.
 // OP/VIEW semantic IDs and selected raw encodings are separate hash domains.
 service WorkspaceCloud {
@@ -13,6 +15,7 @@ service WorkspaceCloud {
   rpc PublishVersion(PublishVersionRequest) returns (Publication);
   rpc GetWorkspace(GetWorkspaceRequest) returns (Workspace);
   rpc GetVersion(GetVersionRequest) returns (Version);
+  rpc ReadNativeClosure(ReadNativeClosureRequest) returns (stream NativeClosureChunk);
   rpc GetPublication(GetPublicationRequest) returns (GetPublicationResponse);
 }
 enum ObjectKind {
@@ -91,6 +94,7 @@ message Version {
   bytes manifest_id = 3;
   optional bytes previous_manifest_id = 4;
   bytes manifest = 5;
+  NativeVersionAuthority native_authority = 6;
 }
 message GetPublicationRequest {
   string repository_id = 1;
@@ -141,4 +145,45 @@ message IndexArtifactChunk {
   uint64 offset = 2;
   bytes data = 3;
   bool eof = 4;
+}
+
+// Stateless authority. The server always reauthenticates and reacquires the
+// exact retained version; these fields do not grant generic repository access.
+message RetainedVersionSelector {
+  bytes workspace_id = 1;
+  uint64 generation = 2;
+  bytes manifest_id = 3;
+}
+message NativeVersionAuthority {
+  uint32 version = 1;
+  bytes owner_binding = 2;
+  bytes binding_digest = 3;
+  RawDigest manifest_selected = 4;
+}
+message SnapshotCommitTerminal {
+  repeated bytes index_root_ids = 1;
+  bytes commit_id = 2;
+}
+message NativeClosureProof {
+  oneof terminal {
+    tinytree.v1.ObjectKey version_root = 1;
+    SnapshotCommitTerminal snapshot_commit = 2;
+  }
+  // Excludes terminal. Each key must be an actual direct canonical reference
+  // of its predecessor. An empty path reads the terminal itself.
+  repeated tinytree.v1.ObjectKey edge_path = 3;
+}
+message ReadNativeClosureRequest {
+  string repository_id = 1;
+  RetainedVersionSelector selector = 2;
+  NativeVersionAuthority authority = 3;
+  tinytree.v1.ObjectKey requested = 4;
+  NativeClosureProof proof = 5;
+}
+message NativeClosureChunk {
+  tinytree.v1.ObjectDescriptor descriptor = 1;
+  uint64 offset = 2;
+  bytes data = 3;
+  bool eof = 4;
+  bytes source_binding_digest = 5;
 }

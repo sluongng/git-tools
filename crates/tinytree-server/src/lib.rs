@@ -421,6 +421,12 @@ mod tests {
         assert!(config.validate().is_err());
         config.service.cloud.max_buffered_bytes = 1024 * 1024 * 1024;
         assert!(config.validate().is_ok());
+        // Cloud OP/VIEW limits do not bound native canonical metadata. A wider
+        // native model requires its own proof/read reservation under this pool.
+        config.service.max_metadata_bytes = 16 * 1024 * 1024;
+        assert!(config.validate().is_err());
+        config.service.max_metadata_bytes = 4 * 1024 * 1024;
+        assert!(config.validate().is_ok());
         let absent = tempfile::tempdir().unwrap().path().join("not-created");
         config.storage = absent.clone();
         config.service.cloud.max_buffered_bytes = 1024 * 1024;

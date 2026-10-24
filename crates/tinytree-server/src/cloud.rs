@@ -23,6 +23,9 @@ use tonic::{Request, Response, Status, codec::CompressionEncoding};
 pub struct CloudConfig {
     pub enabled: bool,
     pub indexed_versions: bool,
+    pub max_native_proof_steps: usize,
+    pub max_native_proof_bytes: u64,
+    pub max_native_proof_edges: usize,
     pub max_object_bytes: usize,
     pub max_manifest_bytes: usize,
     pub max_lookup_items: usize,
@@ -38,6 +41,9 @@ impl Default for CloudConfig {
         Self {
             enabled: false,
             indexed_versions: false,
+            max_native_proof_steps: 256,
+            max_native_proof_bytes: 64 * 1024 * 1024,
+            max_native_proof_edges: 1_000_000,
             max_object_bytes: 4 * 1024 * 1024,
             max_manifest_bytes: 8 * 1024 * 1024,
             max_lookup_items: 256,
@@ -52,7 +58,10 @@ impl Default for CloudConfig {
 }
 impl CloudConfig {
     pub(crate) fn validate(&self) -> Result<(), ConfigError> {
-        if !(1024..=64 * 1024 * 1024).contains(&self.max_object_bytes)
+        if !(1..=4096).contains(&self.max_native_proof_steps)
+            || !(1024..=16 * 1024 * 1024 * 1024).contains(&self.max_native_proof_bytes)
+            || !(1..=10_000_000).contains(&self.max_native_proof_edges)
+            || !(1024..=64 * 1024 * 1024).contains(&self.max_object_bytes)
             || !(1024..=64 * 1024 * 1024).contains(&self.max_manifest_bytes)
             || !(1..=1024).contains(&self.max_lookup_items)
             || !(1..=65536).contains(&self.max_staging_leases)
@@ -82,6 +91,14 @@ impl CloudConfig {
             ("GetVersion", store_work),
             ("PutObject", ordinary_work),
             ("LookupObjects", ordinary_work),
+            (
+                "ReadNativeClosure",
+                if self.indexed_versions {
+                    profile.native_read_bytes
+                } else {
+                    0
+                },
+            ),
             (
                 "PutIndexArtifact",
                 if self.indexed_versions {
@@ -212,7 +229,7 @@ impl CloudHost {
         let wire = self.config.wire_limit(method) as u64;
         if matches!(
             method,
-            "PutIndexArtifact" | "LookupIndexArtifacts" | "ReadIndexArtifact"
+            "PutIndexArtifact" | "LookupIndexArtifacts" | "ReadIndexArtifact" | "ReadNativeClosure"
         ) && !self.config.indexed_versions
         {
             return Err(Status::unimplemented(
@@ -222,6 +239,7 @@ impl CloudHost {
         let store = match method {
             "PublishVersion" | "GetVersion" => self.store_work,
             "PutIndexArtifact" | "ReadIndexArtifact" => self.profile.index_artifact_bytes,
+            "ReadNativeClosure" => self.profile.native_read_bytes,
             _ => self.profile.object_bytes,
         };
         let bytes = wire
@@ -450,8 +468,74 @@ fn publication(value: s::CloudPublication) -> p::Publication {
         workspace: Some(workspace(value.workspace)),
     }
 }
+fn native_key(
+    value: Option<tinytree_proto::v1::ObjectKey>,
+) -> Result<tinytree_model::ObjectKey, Status> {
+    let value = value.ok_or_else(|| Status::invalid_argument("missing native object key"))?;
+    let kind = u8::try_from(value.kind)
+        .ok()
+        .and_then(|kind| tinytree_model::Kind::try_from(kind).ok())
+        .ok_or_else(|| Status::invalid_argument("invalid native object kind"))?;
+    Ok(tinytree_model::ObjectKey {
+        kind,
+        id: tinytree_model::ObjectId(array(&value.native_id)?),
+    })
+}
+fn native_descriptor(value: tinytree_model::Descriptor) -> tinytree_proto::v1::ObjectDescriptor {
+    tinytree_proto::v1::ObjectDescriptor {
+        key: Some(tinytree_proto::v1::ObjectKey {
+            kind: value.key.kind as i32,
+            native_id: value.key.id.0.to_vec(),
+        }),
+        content_blake3: value.key.id.0.to_vec(),
+        size_bytes: value.size_bytes,
+        object_format_version: value.format_version as u32,
+    }
+}
+fn owner_binding(owner: s::CloudOwner, repo: &str) -> [u8; 32] {
+    let mut hash = blake3::Hasher::new();
+    hash.update(b"tinytree-cloud-native-owner-v1\0");
+    hash.update(&(repo.len() as u64).to_be_bytes());
+    hash.update(repo.as_bytes());
+    hash.update(&owner.principal);
+    *hash.finalize().as_bytes()
+}
+fn native_authority(
+    owner: s::CloudOwner,
+    repo: &str,
+    workspace: [u8; 32],
+    generation: u64,
+    manifest: [u8; 32],
+    bytes: &[u8],
+) -> p::NativeVersionAuthority {
+    let owner_binding = owner_binding(owner, repo);
+    let raw = *blake3::hash(bytes).as_bytes();
+    let size = bytes.len() as u64;
+    p::NativeVersionAuthority {
+        version: 1,
+        owner_binding: owner_binding.to_vec(),
+        binding_digest: tinytree_model::cloud_native_binding_digest(
+            repo,
+            owner_binding,
+            workspace,
+            generation,
+            manifest,
+            raw,
+            size,
+        )
+        .to_vec(),
+        manifest_selected: Some(p::RawDigest {
+            blake3: raw.to_vec(),
+            size_bytes: size,
+        }),
+    }
+}
 fn status(error: s::Error) -> Status {
-    crate::service::store_status(error)
+    if matches!(error, s::Error::Limit("cloud native read deadline")) {
+        Status::deadline_exceeded("retained native read deadline exceeded")
+    } else {
+        crate::service::store_status(error)
+    }
 }
 fn now() -> Result<i64, Status> {
     crate::service::now()
@@ -805,6 +889,7 @@ impl p::workspace_cloud_server::WorkspaceCloud for CloudService {
         let mut limits = tinytree_cloud::ManifestLimits::default();
         limits.max_manifest_bytes = host.config.max_manifest_bytes;
         let indexed_versions = host.config.indexed_versions;
+        let authority_repo = input.repository_id.clone();
         let value = execute(work.clone(), move || {
             if indexed_versions {
                 store
@@ -840,8 +925,152 @@ impl p::workspace_cloud_server::WorkspaceCloud for CloudService {
             manifest_id: version.manifest.0.to_vec(),
             previous_manifest_id: version.previous.map(|id| id.0.to_vec()),
             manifest: value.manifest_bytes().to_vec(),
+            native_authority: indexed_versions.then(|| {
+                native_authority(
+                    owner,
+                    &authority_repo,
+                    version.workspace,
+                    version.generation,
+                    version.manifest.0,
+                    value.manifest_bytes(),
+                )
+            }),
         };
         Ok(response(output, work, value))
+    }
+    type ReadNativeClosureStream = RpcStream<p::NativeClosureChunk>;
+    async fn read_native_closure(
+        &self,
+        request: Request<p::ReadNativeClosureRequest>,
+    ) -> Result<Response<Self::ReadNativeClosureStream>, Status> {
+        let (host, work, owner) =
+            self.context(&request, &request.get_ref().repository_id, false)?;
+        let input = request.into_inner();
+        let selector = input
+            .selector
+            .ok_or_else(|| Status::invalid_argument("missing retained version selector"))?;
+        let workspace = array(&selector.workspace_id)?;
+        let manifest = array(&selector.manifest_id)?;
+        if selector.generation == 0 {
+            return Err(Status::invalid_argument(
+                "invalid retained version generation",
+            ));
+        }
+        let authority = input
+            .authority
+            .ok_or_else(|| Status::failed_precondition("retained native authority is required"))?;
+        let selected = authority
+            .manifest_selected
+            .ok_or_else(|| Status::invalid_argument("missing retained manifest selection"))?;
+        let raw = array(&selected.blake3)?;
+        let owner_binding = owner_binding(owner, &input.repository_id);
+        let binding = tinytree_model::cloud_native_binding_digest(
+            &input.repository_id,
+            owner_binding,
+            workspace,
+            selector.generation,
+            manifest,
+            raw,
+            selected.size_bytes,
+        );
+        if authority.version != 1
+            || authority.owner_binding != owner_binding
+            || authority.binding_digest != binding
+        {
+            return Err(Status::permission_denied(
+                "retained version authority does not match authenticated source",
+            ));
+        }
+        let requested = native_key(input.requested)?;
+        let proof = input
+            .proof
+            .ok_or_else(|| Status::invalid_argument("missing native closure proof"))?;
+        if proof.edge_path.len() > host.config.max_native_proof_steps {
+            return Err(Status::resource_exhausted(
+                "native proof path exceeds budget",
+            ));
+        }
+        let root = match proof.terminal {
+            Some(p::native_closure_proof::Terminal::VersionRoot(value)) => native_key(Some(value))?,
+            Some(p::native_closure_proof::Terminal::SnapshotCommit(value)) => {
+                if value.index_root_ids.len() > host.config.max_native_proof_steps {
+                    return Err(Status::resource_exhausted(
+                        "snapshot terminal exceeds budget",
+                    ));
+                }
+                let _: [u8; 32] = array(&value.commit_id)?;
+                for id in &value.index_root_ids {
+                    let _: [u8; 32] = array(id)?;
+                }
+                return Err(Status::unimplemented(
+                    "snapshot membership terminals are not supported",
+                ));
+            }
+            None => return Err(Status::invalid_argument("missing native proof terminal")),
+        };
+        let path = proof
+            .edge_path
+            .into_iter()
+            .map(|key| native_key(Some(key)))
+            .collect::<Result<Vec<_>, _>>()?;
+        let store = host.store.clone();
+        let limits = s::CloudNativeReadLimits {
+            max_path_steps: host.config.max_native_proof_steps,
+            max_metadata_bytes: host.config.max_native_proof_bytes,
+            max_edges: host.config.max_native_proof_edges,
+            deadline: Some(work.deadline.into_std()),
+        };
+        let lease = execute(work.clone(), move || {
+            store
+                .read_cloud_native(
+                    &input.repository_id,
+                    owner,
+                    s::CloudVersionSelector {
+                        workspace,
+                        generation: selector.generation,
+                        manifest: tinytree_cloud::ManifestId(manifest),
+                        selected: tinytree_cloud::BlobDigest {
+                            blake3: raw,
+                            size_bytes: selected.size_bytes,
+                        },
+                    },
+                    requested,
+                    root,
+                    &path,
+                    limits,
+                )
+                .map_err(status)
+        })
+        .await?;
+        let descriptor = native_descriptor(lease.descriptor());
+        let lease = Arc::new(Mutex::new(lease));
+        let held = lease.clone();
+        let stream_work = work.clone();
+        let frame = host.config.max_frame_bytes;
+        let stream = async_stream::try_stream! {
+            let mut offset = 0u64;
+            loop {
+                let lease = lease.clone();
+                let bytes = execute(stream_work.clone(), move || {
+                    let mut bytes = vec![0; frame];
+                    let n = lease.lock().map_err(|_| Status::internal("retained native read failed"))?
+                        .read(&mut bytes).map_err(|_| Status::data_loss("retained native payload unavailable"))?;
+                    bytes.truncate(n); Ok(bytes)
+                }).await?;
+                let n = bytes.len();
+                let eof = offset + n as u64 == descriptor.size_bytes;
+                if n == 0 && !eof { Err(Status::data_loss("retained native payload truncated"))?; }
+                yield p::NativeClosureChunk { descriptor: Some(descriptor.clone()), offset, data: bytes,
+                    eof, source_binding_digest: binding.to_vec() };
+                offset += n as u64;
+                if eof { break; }
+            }
+        };
+        Ok(response(
+            Box::pin(stream) as Self::ReadNativeClosureStream,
+            work,
+            held,
+        ))
     }
     async fn get_publication(
         &self,

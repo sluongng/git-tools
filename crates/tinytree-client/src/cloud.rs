@@ -3,11 +3,14 @@
 //! caller's responsibility. Neither a receipt nor lookup establishes retention.
 #[path = "cloud_index.rs"]
 mod index;
+#[path = "cloud_native.rs"]
+mod native;
 use super::*;
 use crate::transport::Shape;
 pub use index::{
     CloudIndexArtifact, CloudIndexArtifactDescriptor, CloudIndexArtifactId, CloudIndexWriteReceipt,
 };
+pub use native::{RetainedVersionSelector, VerifiedRetainedVersion};
 use serde::{Deserialize, Serialize};
 use tinytree_proto::cloud_v1 as c;
 
@@ -173,6 +176,7 @@ pub struct CloudVersion {
     pub generation: u64,
     pub manifest_id: CloudManifestId,
     pub previous_manifest_id: Option<CloudManifestId>,
+    native_authority: Option<c::NativeVersionAuthority>,
     manifest: Vec<u8>,
     _owner: Arc<RetainedCloud>,
 }
@@ -697,24 +701,32 @@ impl NativeClient {
         id: [u8; 32],
         generation: u64,
     ) -> Result<CloudVersion, Status> {
+        self.cloud_version_bounded(id, generation, self.inner.config.cloud.max_manifest_bytes)
+            .await
+    }
+    async fn cloud_version_bounded(
+        &self,
+        id: [u8; 32],
+        generation: u64,
+        maximum: usize,
+    ) -> Result<CloudVersion, Status> {
+        if maximum > self.inner.config.cloud.max_manifest_bytes {
+            return Err(limit());
+        }
         if generation == 0 {
             return Err(Status::invalid_argument(
                 "cloud version generation must be positive",
             ));
         }
         let deadline = self.deadline();
-        let l = &self.inner.config.cloud;
-        self.cloud_payload_fits(
-            l.max_manifest_bytes,
-            self.cloud_memory(l.max_manifest_bytes + 4096)?,
-        )?;
-        let retained = self.cloud_retained(l.max_manifest_bytes)?;
+        self.cloud_payload_fits(maximum, self.cloud_memory(maximum + 4096)?)?;
+        let retained = self.cloud_retained(maximum)?;
         let (value, budget) = self
             .cloud_call(
                 deadline,
                 "/tinytree.cloud.v1.WorkspaceCloud/GetVersion",
                 Shape::CloudVersion,
-                l.max_manifest_bytes + 4096,
+                maximum + 4096,
                 4096,
                 || c::GetVersionRequest {
                     repository_id: self.inner.config.repository_id.clone(),
@@ -726,7 +738,7 @@ impl NativeClient {
         let value: c::Version = value;
         if array::<32>(&value.workspace_id)? != id
             || value.generation != generation
-            || value.manifest.len() > l.max_manifest_bytes
+            || value.manifest.len() > maximum
         {
             return Err(corrupt());
         }
@@ -744,6 +756,7 @@ impl NativeClient {
                 generation,
                 manifest_id: expected,
                 previous_manifest_id: previous,
+                native_authority: value.native_authority,
                 manifest: value.manifest,
                 _owner: retained,
             };

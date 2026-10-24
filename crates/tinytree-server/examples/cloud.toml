@@ -11,6 +11,10 @@ repositories = ["example"]
 write = true
 cloud = true
 
+# Bound native canonical metadata independently from cloud OP/VIEW payloads.
+[service]
+max_metadata_bytes = 4194304
+
 [service.cloud]
 enabled = true
 # Opt in to portable logical indexes and indexed recovery manifests.

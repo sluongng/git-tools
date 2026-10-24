@@ -152,6 +152,34 @@ impl Client {
             )
             .await
     }
+    pub(crate) async fn cloud_native_read(
+        &mut self,
+        request: Request<tinytree_proto::cloud_v1::ReadNativeClosureRequest>,
+    ) -> Result<Response<Streaming<tinytree_proto::cloud_v1::NativeClosureChunk>>, Status> {
+        let cap = self.limits.max_frame_bytes.saturating_add(1024);
+        self.inner = self
+            .inner
+            .clone()
+            .max_decoding_message_size(cap)
+            .max_encoding_message_size(self.limits.max_request_bytes);
+        self.inner
+            .ready()
+            .await
+            .map_err(|_| Status::unavailable("native gRPC transport not ready"))?;
+        self.inner
+            .server_streaming(
+                request,
+                http::uri::PathAndQuery::from_static(
+                    "/tinytree.cloud.v1.WorkspaceCloud/ReadNativeClosure",
+                ),
+                BoundedCodec::<
+                    tinytree_proto::cloud_v1::ReadNativeClosureRequest,
+                    tinytree_proto::cloud_v1::NativeClosureChunk,
+                >::new(Shape::CloudNativeChunk, self.limits.clone(), cap)
+                .with_optional_owner(self.owner.clone()),
+            )
+            .await
+    }
     pub async fn open_scope(
         &mut self,
         request: impl tonic::IntoStreamingRequest<Message = q::OpenScopeFrame>,
@@ -451,6 +479,8 @@ pub(crate) enum Shape {
     CloudPublication,
     CloudPublicationResult,
     CloudVersion,
+    CloudNativeAuthority,
+    CloudNativeChunk,
     CloudIndexId,
     CloudIndexDescriptor,
     CloudIndexReceipt,
@@ -685,6 +715,7 @@ fn scan(
                         | (Shape::IdsPage | Shape::GraphPage | Shape::CanonicalPage, 6)
                         | (Shape::CloudChunk | Shape::CloudIndexChunk, 4)
                         | (Shape::ShortestPrefix, 3)
+                        | (Shape::CloudNativeChunk, 4)
                 )
             {
                 let mut offset = 0;
@@ -740,6 +771,8 @@ fn scan(
         | Shape::CloudIndexReceipt => (1 << 1) | (1 << 2),
         Shape::CloudChunk | Shape::CloudWorkspace | Shape::CloudIndexChunk => 1 << 1,
         Shape::CloudVersion => (1 << 1) | (1 << 3),
+        Shape::CloudNativeAuthority => (1 << 2) | (1 << 3) | (1 << 4),
+        Shape::CloudNativeChunk => (1 << 1) | (1 << 5),
         Shape::IdsPage | Shape::GraphPage | Shape::CanonicalPage => (1 << 1) | (1 << 2) | (1 << 6),
         Shape::IdsRow | Shape::GraphRow | Shape::CanonicalRow => (1 << 1) | (1 << 2),
         Shape::QueryScope => (1 << 1) | (1 << 2) | (1 << 3) | (1 << 5),
@@ -832,6 +865,12 @@ fn rule(shape: Shape, n: u32, l: &Limits) -> Option<(u8, Option<Shape>, usize, u
         (Shape::CloudPublication, 2) => nested(Shape::CloudWorkspace),
         (Shape::CloudPublicationResult, 1) => nested(Shape::CloudPublication),
         (Shape::CloudVersion, 5) => text(l.max_metadata_bytes),
+        (Shape::CloudVersion, 6) => nested(Shape::CloudNativeAuthority),
+        (Shape::CloudNativeAuthority, 1) | (Shape::CloudNativeChunk, 2 | 4) => scalar(),
+        (Shape::CloudNativeAuthority, 2 | 3) | (Shape::CloudNativeChunk, 5) => text(32),
+        (Shape::CloudNativeAuthority, 4) => nested(Shape::CloudDigest),
+        (Shape::CloudNativeChunk, 1) => nested(Shape::Descriptor),
+        (Shape::CloudNativeChunk, 3) => text(l.max_frame_bytes),
         (Shape::GraphPage, 4) => repeated(
             Shape::GraphRow,
             l.max_batch_items,

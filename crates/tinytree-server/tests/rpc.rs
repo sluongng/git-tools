@@ -4994,6 +4994,176 @@ async fn cloud_rpc_private_compressed_history_replay_gc_and_restart() {
             .code(),
         Code::AlreadyExists
     );
+    let retained = client
+        .get_version(request(
+            c::GetVersionRequest {
+                repository_id: "alpha".into(),
+                workspace_id: manifest.workspace.to_vec(),
+                generation: 2,
+            },
+            ALPHA,
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+    let authority = retained
+        .native_authority
+        .clone()
+        .expect("indexed version native authority");
+    assert_eq!(authority.version, 1);
+    assert_eq!(
+        authority
+            .manifest_selected
+            .as_ref()
+            .unwrap()
+            .blake3
+            .as_slice(),
+        blake3::hash(&retained.manifest).as_bytes()
+    );
+    let tree_key = ObjectKey {
+        kind: Kind::Tree,
+        id: ObjectId(manifest.working_copy.tree.terms[0].0),
+    };
+    let tree_object = data
+        .objects()
+        .iter()
+        .find(|object| object.descriptor.key == tree_key)
+        .unwrap();
+    let Object::Tree(native_tree) =
+        tinytree_model::decode(&tree_object.bytes, Limits::default()).unwrap()
+    else {
+        panic!("fixture tree");
+    };
+    let file_key = Object::Tree(native_tree)
+        .references()
+        .into_iter()
+        .find(|key| key.kind == Kind::File)
+        .unwrap();
+    let native_request = c::ReadNativeClosureRequest {
+        repository_id: "alpha".into(),
+        selector: Some(c::RetainedVersionSelector {
+            workspace_id: retained.workspace_id.clone(),
+            generation: retained.generation,
+            manifest_id: retained.manifest_id.clone(),
+        }),
+        authority: Some(authority.clone()),
+        requested: Some(wire_key(file_key)),
+        proof: Some(c::NativeClosureProof {
+            terminal: Some(c::native_closure_proof::Terminal::VersionRoot(wire_key(
+                root(&data),
+            ))),
+            edge_path: vec![wire_key(tree_key), wire_key(file_key)],
+        }),
+    };
+    for (requested, path) in [
+        (root(&data), vec![]),
+        (tree_key, vec![wire_key(tree_key)]),
+        (file_key, vec![wire_key(tree_key), wire_key(file_key)]),
+    ] {
+        let mut input = native_request.clone();
+        input.requested = Some(wire_key(requested));
+        input.proof.as_mut().unwrap().edge_path = path;
+        let response = client
+            .read_native_closure(request(input, ALPHA))
+            .await
+            .unwrap();
+        assert_eq!(response.metadata().get("grpc-encoding").unwrap(), "zstd");
+        let mut stream = response.into_inner();
+        let mut bytes = Vec::new();
+        let mut eof = false;
+        while let Some(chunk) = stream.message().await.unwrap() {
+            assert_eq!(chunk.source_binding_digest, authority.binding_digest);
+            assert_eq!(chunk.offset, bytes.len() as u64);
+            assert_eq!(
+                chunk.descriptor.as_ref().unwrap().key,
+                Some(wire_key(requested))
+            );
+            bytes.extend(chunk.data);
+            eof = chunk.eof;
+        }
+        assert!(eof);
+        assert_eq!(blake3::hash(&bytes).as_bytes(), &requested.id.0);
+        assert_eq!(
+            bytes,
+            data.objects()
+                .iter()
+                .find(|object| object.descriptor.key == requested)
+                .unwrap()
+                .bytes
+        );
+    }
+    assert_eq!(
+        client
+            .read_native_closure(request(native_request.clone(), PEER))
+            .await
+            .err()
+            .unwrap()
+            .code(),
+        Code::PermissionDenied
+    );
+    let mut bad = native_request.clone();
+    bad.authority = None;
+    assert_eq!(
+        client
+            .read_native_closure(request(bad, ALPHA))
+            .await
+            .err()
+            .unwrap()
+            .code(),
+        Code::FailedPrecondition
+    );
+    let mut bad = native_request.clone();
+    bad.selector.as_mut().unwrap().generation += 1;
+    assert_eq!(
+        client
+            .read_native_closure(request(bad, ALPHA))
+            .await
+            .err()
+            .unwrap()
+            .code(),
+        Code::PermissionDenied
+    );
+    let mut bad = native_request.clone();
+    bad.proof.as_mut().unwrap().edge_path = vec![wire_key(file_key)];
+    assert_eq!(
+        client
+            .read_native_closure(request(bad, ALPHA))
+            .await
+            .err()
+            .unwrap()
+            .code(),
+        Code::InvalidArgument
+    );
+    let mut bad = native_request.clone();
+    bad.proof.as_mut().unwrap().terminal = Some(c::native_closure_proof::Terminal::VersionRoot(
+        wire_key(file_key),
+    ));
+    bad.proof.as_mut().unwrap().edge_path.clear();
+    assert_eq!(
+        client
+            .read_native_closure(request(bad, ALPHA))
+            .await
+            .err()
+            .unwrap()
+            .code(),
+        Code::InvalidArgument
+    );
+    let mut future = native_request.clone();
+    future.proof.as_mut().unwrap().terminal = Some(
+        c::native_closure_proof::Terminal::SnapshotCommit(c::SnapshotCommitTerminal {
+            index_root_ids: vec![selected_index.root.id.0.to_vec()],
+            commit_id: root(&data).id.0.to_vec(),
+        }),
+    );
+    assert_eq!(
+        client
+            .read_native_closure(request(future, ALPHA))
+            .await
+            .err()
+            .unwrap()
+            .code(),
+        Code::Unimplemented
+    );
     let held = store.clone();
     tokio::task::spawn_blocking(move || held.gc("alpha", i64::MAX).unwrap())
         .await
@@ -5070,6 +5240,16 @@ async fn cloud_rpc_private_compressed_history_replay_gc_and_restart() {
             .manifest,
         bytes
     );
+    let mut restored = client
+        .read_native_closure(request(native_request, ALPHA))
+        .await
+        .unwrap()
+        .into_inner();
+    let mut restored_bytes = Vec::new();
+    while let Some(chunk) = restored.message().await.unwrap() {
+        restored_bytes.extend(chunk.data);
+    }
+    assert_eq!(blake3::hash(&restored_bytes).as_bytes(), &file_key.id.0);
     assert_eq!(
         client
             .get_publication(request(

@@ -58,6 +58,7 @@ impl Service<http::Request<Body>> for CloudGrpcService {
                         | "PutIndexArtifact"
                         | "LookupIndexArtifacts"
                         | "ReadIndexArtifact"
+                        | "ReadNativeClosure"
                         | "LookupObjects"
                         | "ReadObject"
                         | "PublishVersion"
@@ -75,7 +76,10 @@ impl Service<http::Request<Body>> for CloudGrpcService {
                 }
                 let deadline = repository.query_deadline(
                     &metadata,
-                    matches!(method.as_str(), "ReadObject" | "ReadIndexArtifact"),
+                    matches!(
+                        method.as_str(),
+                        "ReadObject" | "ReadIndexArtifact" | "ReadNativeClosure"
+                    ),
                 )?;
                 let work: Arc<Work> = host.admit(&method, deadline)?;
                 let cap = host.config.wire_limit(&method);
