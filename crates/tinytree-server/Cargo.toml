@@ -6,6 +6,7 @@ license = "MIT AND Apache-2.0"
 description = "Native repository gRPC service and standalone server"
 
 [dependencies]
+axum = "0.8"
 jj-lib = { version = "=0.46.0", default-features = false }
 anyhow = "1"
 async-stream = "0.3"

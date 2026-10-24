@@ -9191,3 +9191,89 @@ async fn a_late_passing_receipt_after_transport_timeout_is_cleanup_only() {
     );
     running.stop().await;
 }
+
+#[tokio::test]
+async fn browser_http_and_native_grpc_share_the_listener() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let (_temporary, store) = setup();
+    let running = Running::start(store, ServiceConfig::default()).await;
+    let mut client = running.client().await;
+    let view = client
+        .open_repository(request(
+            p::OpenRepositoryRequest {
+                repository_id: "alpha".into(),
+                reference_names: Vec::new(),
+            },
+            READER,
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(view.repository_id, "alpha");
+    let body = "{}";
+    let mut stream = tokio::net::TcpStream::connect(running.address)
+        .await
+        .unwrap();
+    let request = format!(
+        "POST /ui/api/repositories HTTP/1.1\r\nHost: {}\r\nOrigin: http://{}\r\nAuthorization: Bearer {READER}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        running.address,
+        running.address,
+        body.len()
+    );
+    stream.write_all(request.as_bytes()).await.unwrap();
+    let mut response = Vec::new();
+    tokio::time::timeout(Duration::from_secs(5), stream.read_to_end(&mut response))
+        .await
+        .unwrap()
+        .unwrap();
+    let response = String::from_utf8(response).unwrap();
+    assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+    let (headers, body) = response.split_once("\r\n\r\n").unwrap();
+    let body = if headers
+        .to_ascii_lowercase()
+        .contains("transfer-encoding: chunked")
+    {
+        let mut remaining = body;
+        let mut decoded = String::new();
+        loop {
+            let (size, rest) = remaining.split_once("\r\n").unwrap();
+            let size = usize::from_str_radix(size.split(';').next().unwrap(), 16).unwrap();
+            if size == 0 {
+                break;
+            }
+            decoded.push_str(&rest[..size]);
+            remaining = rest[size..].strip_prefix("\r\n").unwrap();
+        }
+        decoded
+    } else {
+        body.to_owned()
+    };
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&body).unwrap(),
+        serde_json::json!({"repositories":["alpha"]})
+    );
+    let mut stream = tokio::net::TcpStream::connect(running.address)
+        .await
+        .unwrap();
+    stream
+        .write_all(
+            format!(
+                "GET /ui/ HTTP/1.1\r\nHost: {}\r\nConnection: close\r\n\r\n",
+                running.address
+            )
+            .as_bytes(),
+        )
+        .await
+        .unwrap();
+    let mut response = Vec::new();
+    tokio::time::timeout(Duration::from_secs(5), stream.read_to_end(&mut response))
+        .await
+        .unwrap()
+        .unwrap();
+    let response = String::from_utf8(response).unwrap();
+    assert!(response.starts_with("HTTP/1.1 200"));
+    assert!(response.contains("text/html"));
+    assert!(response.contains("content-security-policy:"));
+    drop(client);
+    running.stop().await;
+}

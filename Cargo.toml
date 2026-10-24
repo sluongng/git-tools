@@ -31,6 +31,7 @@ members = [
     "crates/tinytree-check-runner",
     "crates/tinytree-store",
     "crates/tinytree-server",
+    "crates/tinytree-ui",
     "crates/tinytree-client",
     "crates/jj-native-backend",
     "crates/jj-native-index",

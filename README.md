@@ -75,7 +75,7 @@ entry points. Most also expose Rust libraries; `jj-native-cli` is executable-onl
 | [`workspace-nfs`](crates/workspace-nfs) | `git-nfs` | macOS source mounts over loopback NFS. |
 | [`workspace-projfs`](crates/workspace-projfs) | `git-projfs` | Windows source mounts using ProjFS. |
 | [`jj-vfs`](crates/jj-vfs) | `git-jj` | Jujutsu working-copy integration with the source VFS. |
-| [`tinytree-server`](crates/tinytree-server) | `tinytree` | Separate jj-native object, reference, graph and content-query server over compressed gRPC. |
+| [`tinytree-server`](crates/tinytree-server) | `tinytree` | Separate jj-native object, reference, graph and content-query server, with compressed gRPC and a read-only WASM repository browser. |
 | [`tinytree-import`](crates/tinytree-import) | `tinytree-import` | Seed one verified Git revision into a native reference without reading a checkout; not a history adapter. |
 | [`tinytree-check-runner`](crates/tinytree-check-runner) | `tinytree-check-runner` | Operator-configured checks on immutable Linux native mounts; produces bound evidence, not landing publication. |
 | [`jj-native-cli`](crates/jj-native-cli) | `tinytree-jj` | Native jj commands, publication, restore and scoped history/search through lazy workspaces. |

@@ -73,7 +73,7 @@ pub async fn serve_tcp(
         address.ip().is_loopback() || (tls.is_some() && service.authentication_enabled()),
         "non-loopback listeners require TLS and authorization"
     );
-    let mut server = Server::builder();
+    let mut server = Server::builder().accept_http1(true);
     if let Some(identity) = tls {
         server = server
             .tls_config(ServerTlsConfig::new().identity(identity))
@@ -86,10 +86,7 @@ pub async fn serve_tcp(
     let result = server
         .layer(service.deadline_layer())
         .concurrency_limit_per_connection(service.maximum_inflight())
-        .add_service(service.grpc_service())
-        .add_service(service.query_grpc_service())
-        .add_service(service.cloud_grpc_service())
-        .add_service(service.landing_grpc_service())
+        .add_routes(service::web::routes(service.clone(), Some(address.port())))
         .serve_with_incoming_shutdown(
             tokio_stream::wrappers::TcpListenerStream::new(listener).map(|accepted| {
                 accepted.and_then(|stream| {
@@ -129,12 +126,10 @@ async fn run_unix(
         .map_err(|_| anyhow::anyhow!("cannot start landing worker"))?;
     let drain = service.clone();
     let result = Server::builder()
+        .accept_http1(true)
         .layer(service.deadline_layer())
         .concurrency_limit_per_connection(service.maximum_inflight())
-        .add_service(service.grpc_service())
-        .add_service(service.query_grpc_service())
-        .add_service(service.cloud_grpc_service())
-        .add_service(service.landing_grpc_service())
+        .add_routes(service::web::routes(service.clone(), None))
         .serve_with_incoming_shutdown(
             tokio_stream::wrappers::UnixListenerStream::new(listener),
             shutdown,

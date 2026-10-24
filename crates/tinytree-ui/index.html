@@ -1,0 +1,63 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light">
+  <title>tinytree — repository browser</title>
+  <link rel="stylesheet" href="/ui/style.css">
+  <script type="module" src="/ui/app.js"></script>
+</head>
+<body>
+  <a class="skip-link" href="#document">Skip to content</a>
+  <header class="site-header">
+    <a class="brand" href="/ui/" aria-label="tinytree home"><svg class="tree-mark" aria-hidden="true" viewBox="0 0 28 32" fill="none"><path d="M14 29V8M14 20L5 12M14 15L23 7" stroke="currentColor" stroke-width="1.6"/><circle cx="14" cy="6" r="2.5" fill="currentColor"/><circle cx="5" cy="11" r="2.5" fill="currentColor"/><circle cx="23" cy="6" r="2.5" fill="currentColor"/></svg>tinytree<span class="brand-note">a little closer to your code</span></a>
+    <details class="connection" id="connection">
+      <summary>Connection <span class="connection-dot" id="connection-dot" aria-hidden="true"></span></summary>
+      <form id="connection-form" class="connection-panel">
+        <label for="token">Access token <span>if required by this server</span></label>
+        <input id="token" type="password" autocomplete="off" spellcheck="false" placeholder="Bearer token" aria-describedby="token-note">
+        <p id="token-note">Kept in this tab only. Never saved.</p>
+        <div class="button-row"><button type="submit" class="primary">Connect</button><button type="button" id="disconnect">Disconnect</button></div>
+      </form>
+    </details>
+  </header>
+  <main>
+    <section class="workspace-bar" aria-label="Repository selection">
+      <form id="repository-form">
+        <div class="field"><label for="repository">Repository</label><select id="repository"><option value="default">default</option></select></div>
+        <span class="divider-slash" aria-hidden="true">/</span>
+        <div class="field ref-field"><label for="reference">Reference</label><input id="reference" value="main" autocomplete="off" spellcheck="false"></div>
+        <button type="submit" id="open-repository">Open <span aria-hidden="true">↗</span></button>
+      </form>
+      <p class="revision" id="revision">No revision selected</p>
+    </section>
+    <section class="search-section" aria-label="Repository search">
+      <div class="search-intro"><p class="eyebrow">FOLLOW A THREAD</p><p>Find a file. Find an idea.</p></div>
+      <form id="search-form" role="search" class="search-shell">
+        <span class="search-icon" aria-hidden="true">⌕</span>
+        <label for="search" class="sr-only">Search files and repository contents</label>
+        <input id="search" type="search" placeholder="Search this repository…" autocomplete="off" spellcheck="false" role="combobox" aria-autocomplete="list" aria-expanded="false" aria-controls="suggestions" disabled>
+        <kbd aria-hidden="true">/</kbd><button type="submit" id="search-submit" class="primary" disabled>Search <span aria-hidden="true">↵</span></button>
+        <ul id="suggestions" role="listbox" aria-label="File and search suggestions" hidden></ul>
+      </form>
+      <div class="search-notes"><span>Instant file suggestions · Enter to search contents</span><span id="path-count">A fresh perspective on your source.</span></div>
+    </section>
+    <div class="content-layout">
+      <aside class="repository-sidebar" aria-label="Repository overview">
+        <p class="eyebrow">IN THIS TREE</p>
+        <button id="readme-home" type="button" class="sidebar-link active"><span aria-hidden="true">▤</span> Overview <span class="sidebar-arrow" aria-hidden="true">↗</span></button>
+        <div class="sidebar-rule"></div>
+        <p class="sidebar-description">Start with the README.<br>Let curiosity take it from there.</p>
+        <div class="snapshot-note"><span class="tiny-branch" aria-hidden="true">⑂</span><p>One revision.<br>A consistent view.</p></div>
+      </aside>
+      <section class="document-panel" aria-label="Repository content">
+        <div class="document-toolbar"><span id="document-path">README</span><button id="back-to-readme" type="button" hidden>Back to overview</button></div>
+        <p id="status" class="status" role="status" aria-live="polite">Starting the browser…</p>
+        <article id="document" tabindex="-1"><div class="empty-state initial-state"><span class="large-branch" aria-hidden="true">⑂</span><p class="eyebrow">WELCOME TO TINYTREE</p><h1>Your repository,<br>in view.</h1><p>Open a reference to read its README and explore the code.</p></div></article>
+      </section>
+    </div>
+  </main>
+  <footer><span>Small interface. Room to explore.</span><span>tinytree <span aria-hidden="true">↟</span></span></footer>
+</body>
+</html>

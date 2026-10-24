@@ -26,6 +26,9 @@ use tokio::{
 };
 use tonic::{Request, Response, Status, Streaming, codec::CompressionEncoding};
 
+#[path = "web.rs"]
+pub(crate) mod web;
+
 pub type RpcStream<T> = Pin<Box<dyn Stream<Item = Result<T, Status>> + Send + 'static>>;
 
 #[derive(Clone)]

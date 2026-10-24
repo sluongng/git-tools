@@ -90,3 +90,27 @@ under storage. Restarting with the same generation reuses it; increment
 a fresh epoch. Older generations and legacy `derived-index` data remain untouched;
 remove them only through explicit offline maintenance. There is no automatic eviction
 or in-place format conversion. An unavailable index does not disable object serving.
+
+## Browser UI
+
+Open `/ui/` on the server's TCP address for the embedded WebAssembly browser.
+Search and the repository README are the initial view. Select an authorized
+repository and an exact public reference (initially `main`); later file reads and
+literal content searches stay pinned to that immutable revision. The browser
+keeps an entered bearer token in memory only. It does not create commits or
+publish references. The existing TLS and principal requirements also apply to
+browser access; unauthenticated loopback access requires a loopback-literal or
+`localhost` browser address.
+
+Autocomplete ranks the snapshot's bounded file-path list locally, without a
+network round trip for each keystroke. README/file previews accept UTF-8 regular
+files up to 1 MiB and do not follow symlinks. Markdown presentation is limited to
+256 KiB and 20,000 formatting events; source views show up to 3,000 lines around
+the selected match. Truncated views are labeled. Raw HTML is displayed as text,
+and images as alt text without fetching remote resources. Conflicted root trees
+are reported as unsupported. The browser's read-only JSON facade bounds path discovery to
+10,000 entries and 1 MiB of paths, each metadata object and path-discovery walk
+to 8 MiB, and each content search to 8 MiB of file bytes and 100 matching lines. Large files, exhausted
+budgets, and truncated path lists carry explicit incomplete coverage; this
+preview facade is separate from the native paginated indexed `Search` RPC.
+Refresh the snapshot after reference movement or unavailable historical content.
