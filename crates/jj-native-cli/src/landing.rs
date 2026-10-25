@@ -178,6 +178,9 @@ mod native {
                     "recovery_required: restored landing must be looked up before a new intent",
                 ));
             }
+            // Helper loading itself can merge plural operation heads. Reject
+            // stale/uncertain restored state before lookup bookkeeping too.
+            restored_preflight(command)?;
             // Gate BEFORE orphan reconciliation, saved checkout recovery and WC
             // freezing. Capsule receipts and operation tags are not authority.
             let control = client(&locator, loader.repo_path()).await?;
@@ -400,7 +403,7 @@ mod native {
             return print(ui, locked.state.landing.as_ref().unwrap(), "applied", None);
         }
         if pending.fork_operation.is_none() {
-            let mut helper = command.workspace_helper(ui).await?;
+            let mut helper = landing_helper(ui, command, pending.restored_lookup_only).await?;
             freeze_working_copy(command, &mut helper, &mut locked).await?;
         }
         let control = client(&locator, loader.repo_path()).await?;
@@ -543,6 +546,88 @@ mod native {
             tx.set_attribute("tinytree.landing.candidate".into(), id.clone());
         }
     }
+    struct RestoredPreflight {
+        binding: native_workspace_admin::Binding,
+        retained: jj_vfs::native::RetainedState,
+        projection: jj_vfs::native::ProjectionState,
+    }
+    fn restored_preflight(command: &CommandHelper) -> Result<RestoredPreflight, CommandError> {
+        let loader = command.workspace_loader()?;
+        let registry = native_workspace_admin::Registry::open_existing(
+            native_workspace_admin::Registry::default_path().map_err(fail)?,
+        )
+        .map_err(fail)?;
+        let binding = registry.lookup(loader.workspace_root()).map_err(fail)?;
+        crate::commands::ensure_binding(&binding).map_err(fail)?;
+        if binding.repo != loader.repo_path() {
+            return Err(fail(
+                "recovery_required: restored repository binding differs",
+            ));
+        }
+        let (retained, projection) =
+            jj_vfs::native::read_retained_state_for_capture(&binding.projection(), 1024 * 1024)
+                .map_err(fail)?;
+        let heads =
+            jj_lib::simple_op_heads_store::SimpleOpHeadsStore::load(&binding.repo.join("op_heads"))
+                .get_op_heads_bounded(2)
+                .map_err(fail)?;
+        if retained.pending || heads.as_slice() != [retained.operation.clone()] {
+            return Err(fail(
+                "recovery_required: restored landing requires one current operation matching the settled working copy; state preserved",
+            ));
+        }
+        Ok(RestoredPreflight {
+            binding,
+            retained,
+            projection,
+        })
+    }
+    async fn landing_helper(
+        ui: &Ui,
+        command: &CommandHelper,
+        restored: bool,
+    ) -> Result<jj_cli::cli_util::WorkspaceCommandHelper, CommandError> {
+        if !restored {
+            return command.workspace_helper(ui).await;
+        }
+        // The existing native command fence excludes other CLI writers. Read
+        // the actual marker-verified WC and bounded heads BEFORE helper loading:
+        // even no_snapshot would otherwise merge plural heads automatically.
+        let before = restored_preflight(command)?;
+        let mut helper = command.workspace_helper_no_snapshot(ui).await?;
+        if helper.repo().op_id() != &before.retained.operation
+            || helper.workspace_name().as_str() != before.retained.workspace.as_str()
+        {
+            return Err(fail(
+                "recovery_required: restored loaded operation/workspace differs; state preserved",
+            ));
+        }
+        let wc_id = helper
+            .get_wc_commit_id()
+            .ok_or_else(|| fail("recovery_required: restored working-copy commit missing"))?;
+        let wc = helper.repo().store().get_commit_async(wc_id).await?;
+        if jj_vfs::native::NativeTree::from_merged_tree(&wc.tree()).map_err(fail)?
+            != before.projection.tree
+        {
+            return Err(fail(
+                "recovery_required: restored operation/projection differs; state preserved",
+            ));
+        }
+        let after = restored_preflight(command)?;
+        if after.binding != before.binding
+            || after.retained.persisted_bytes != before.retained.persisted_bytes
+            || after.projection != before.projection
+        {
+            return Err(fail(
+                "recovery_required: restored working copy changed during loading; state preserved",
+            ));
+        }
+        // Unlike workspace_helper(), this explicit snapshot has NO configured
+        // auto-update-stale fallback. Dirty editor changes are snapshotted by
+        // the native fenced workflow; stale state is never checked out for us.
+        helper.maybe_snapshot(ui).await?;
+        Ok(helper)
+    }
     async fn apply(
         ui: &mut Ui,
         command: &CommandHelper,
@@ -560,7 +645,7 @@ mod native {
             .receipt
             .as_ref()
             .ok_or_else(|| fail("committed receipt missing"))?;
-        let mut helper = command.workspace_helper(ui).await?;
+        let mut helper = landing_helper(ui, command, p.restored_lookup_only).await?;
         let repo = helper.repo().clone();
         let workspace = helper.workspace_name().to_owned();
         // Explicit amendments/abandonment of frozen sources are divergence, not
@@ -593,12 +678,12 @@ mod native {
             .readonly_index()
             .downcast_ref::<jj_native_index::NativeReadonlyIndex>()
             .ok_or_else(|| fail("native landing requires the federated lazy index"))?;
-        let prepared = old_index
-            .with_remote_roots(vec![head])
-            .await
-            .map_err(fail)?;
         let mut parent = id(&p.expected_head)?;
         let mut pairs = Vec::new();
+        // The original source stack is bounded at 128. Preserve the exact
+        // admitted, fully checked canonical chain for a frozen local overlay;
+        // never merge a moving public-root index into a restored checkpoint.
+        let mut admitted = Vec::with_capacity(p.source_stack.len());
         for old in &p.source_stack {
             let old_id = id(old)?;
             let old_commit = repo.store().get_commit_async(&old_id).await?;
@@ -624,6 +709,7 @@ mod native {
             if new_id != old_id {
                 pairs.push((old_id, new_id.clone()));
             }
+            admitted.push(new);
             parent = new_id;
         }
         if parent.as_bytes() != candidate.head
@@ -640,6 +726,21 @@ mod native {
                 "canonical landing head/root differs from the checked candidate",
             ));
         }
+        // Both routes run only after fresh admission and complete canonical
+        // validation. Frozen capture pins stay frozen: only the exact linear
+        // COMMIT stack becomes a durable local index delta, with no FILE grant.
+        let prepared = if old_index.cloud_query_source().is_some() {
+            old_index
+                .with_admitted_commit_stack(&admitted)
+                .await
+                .map_err(fail)?
+        } else {
+            old_index
+                .with_remote_roots(vec![head])
+                .await
+                .map_err(fail)?
+        };
+        drop(admitted);
         let mut tx =
             jj_cli::cli_util::start_repo_transaction(&repo, &workspace, command.string_args());
         stamp(&mut tx, &p, "apply");

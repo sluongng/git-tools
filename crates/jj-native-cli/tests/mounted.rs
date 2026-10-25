@@ -983,6 +983,19 @@ where
             .into_http())));
         }
         self.metadata.transport_calls.fetch_add(1, Ordering::SeqCst);
+        if request
+            .uri()
+            .path()
+            .starts_with("/tinytree.cloud.v1.WorkspaceCloud/")
+        {
+            *self
+                .metadata
+                .cloud_calls
+                .lock()
+                .unwrap()
+                .entry(request.uri().path().to_owned())
+                .or_default() += 1;
+        }
         if request.uri().path() == "/tinytree.v1.Repository/ReadFile" {
             self.reads.fetch_add(1, Ordering::SeqCst);
         }
@@ -1002,6 +1015,15 @@ where
             .starts_with("/tinytree.landing.v1.Landing/")
         {
             self.metadata.landing_calls.fetch_add(1, Ordering::SeqCst);
+            match request.uri().path() {
+                "/tinytree.landing.v1.Landing/StartLanding" => {
+                    self.metadata.landing_starts.fetch_add(1, Ordering::SeqCst);
+                }
+                "/tinytree.landing.v1.Landing/GetLanding" => {
+                    self.metadata.landing_lookups.fetch_add(1, Ordering::SeqCst);
+                }
+                _ => {}
+            }
         }
         futures::future::Either::Right(self.inner.call(request))
     }
@@ -1016,6 +1038,7 @@ struct MetadataReads {
     creation_fault: AtomicUsize,
     unavailable_versions: AtomicBool,
     transport_calls: AtomicUsize,
+    cloud_calls: Mutex<BTreeMap<String, usize>>,
     file_keys: Mutex<HashSet<[u8; 32]>>,
     writes: AtomicUsize,
     keys: Mutex<HashSet<(i32, [u8; 32])>>,
@@ -1029,6 +1052,8 @@ struct MetadataReads {
     query_calls: AtomicUsize,
     query_commit_bytes: AtomicUsize,
     landing_calls: AtomicUsize,
+    landing_starts: AtomicUsize,
+    landing_lookups: AtomicUsize,
     public_paused: AtomicBool,
     public_started: AtomicBool,
     public_release: tokio::sync::Notify,
@@ -3552,6 +3577,333 @@ fn automatic_remote_creation_requires_live_features_before_destination_or_intent
 
 #[test]
 #[ignore = "requires usable /dev/fuse and fusermount3; run mounted_tests locally"]
+fn pending_landing_cloud_restore_preserves_original_intent_and_applies_over_frozen_index() {
+    let upstream = RemoteServer::start_landing_configured(8, true, None, false, true);
+    let mut producer = Fixture::new();
+    producer.configure_remote(&upstream.endpoint);
+    producer.automatic_policies();
+    producer.start();
+    let producer_base = producer.base().to_owned();
+    let (source_root, source, key, candidate) =
+        prepare_native_landing(&mut producer, &upstream, "pending-cloud-source");
+    let binding = producer.binding(&source_root);
+    let job = upstream
+        .store
+        .landing_job("example", RemoteServer::landing_owner(), &key)
+        .unwrap()
+        .unwrap();
+    assert_eq!(job.state, tinytree_store::LandingState::Prepared);
+    assert_eq!(
+        job.candidate.as_ref().unwrap().head.0,
+        *blake3::Hash::from_hex(&candidate).unwrap().as_bytes()
+    );
+    producer.success(&source_root, &["status"]);
+    let deadline = Instant::now() + Duration::from_secs(90);
+    // A local Published record is ONLY a selector for the exact sealed job,
+    // never proof of current cloud availability. Quiesce the producer before
+    // independently authenticating the selected immutable cloud version below.
+    let upload_directory = producer
+        .socket
+        .parent()
+        .unwrap()
+        .join("native-commands/upload");
+    let (selected_generation, selected_manifest, capsule) = loop {
+        let selected = fs::read_dir(&upload_directory).unwrap().find_map(|entry| {
+            let path = entry.unwrap().path();
+            if path.extension().and_then(|v| v.to_str()) != Some("published") {
+                return None;
+            }
+            // Retirement may unlink older selectors during this scan.
+            let read = |path: &Path| match fs::read(path) {
+                Ok(bytes) => Some(bytes),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+                Err(error) => panic!("publication selector read failed: {error}"),
+            };
+            let bytes = read(&path)?;
+            let header: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            let job_bytes = read(&path.with_extension("job"))?;
+            assert_eq!(&job_bytes[..8], b"TTUPJOB1");
+            let size = u32::from_le_bytes(job_bytes[8..12].try_into().unwrap()) as usize;
+            assert!(size <= 4096);
+            let job_header: serde_json::Value =
+                serde_json::from_slice(&job_bytes[12..12 + size]).unwrap();
+            assert_eq!(header, job_header);
+            assert_eq!(header["workspace"], serde_json::json!(binding.workspace_id));
+            let capture_offset = 12 + size + header["manifest_size"].as_u64().unwrap() as usize;
+            let capsule = job_bytes[capture_offset..].to_vec();
+            assert_eq!(
+                capsule.len() as u64,
+                header["capture_size"].as_u64().unwrap()
+            );
+            let data = tinytree_cloud::decode_data(
+                &capsule,
+                tinytree_cloud::CaptureDataId::of(&capsule).0,
+                &Default::default(),
+            )
+            .unwrap();
+            let pending = data.version == 2
+                && data
+                    .remote
+                    .as_ref()
+                    .and_then(|r| r.landing.as_ref())
+                    .is_some_and(|p| {
+                        p.request_id == key && p.observed.as_ref().is_some_and(|j| {
+                            j.phase == tinytree_cloud::HistoricalLandingPhase::PreparedPendingChecks
+                        })
+                    });
+            pending.then(|| {
+                (
+                    header["expected_generation"].as_u64().unwrap() + 1,
+                    serde_json::from_value::<[u8; 32]>(header["manifest_id"].clone()).unwrap(),
+                    capsule,
+                )
+            })
+        });
+        if let Some(selected) = selected {
+            break selected;
+        }
+        if Instant::now() >= deadline {
+            let jobs = fs::read_dir(&upload_directory)
+                .unwrap()
+                .filter_map(|entry| {
+                    let path = entry.unwrap().path();
+                    if path.extension().and_then(|v| v.to_str()) != Some("job") {
+                        return None;
+                    }
+                    let bytes = fs::read(path).ok()?;
+                    let size = u32::from_le_bytes(bytes[8..12].try_into().unwrap()) as usize;
+                    Some(
+                        serde_json::from_slice::<serde_json::Value>(&bytes[12..12 + size]).unwrap(),
+                    )
+                })
+                .collect::<Vec<_>>();
+            let cloud_calls = upstream.metadata.cloud_calls.lock().unwrap().clone();
+            panic!(
+                "pending DATA-v2 landing capture was not published: local={};upload={};jobs={jobs:?};cloud_calls={cloud_calls:?};daemon={}",
+                local_capture_status(&producer),
+                producer.control(Request::Status).unwrap()["native"]["commands"]["capture_upload"],
+                fs::read_to_string(producer_base.join("daemon.log")).unwrap()
+            );
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    let selected_data = tinytree_cloud::decode_data(
+        &capsule,
+        tinytree_cloud::CaptureDataId::of(&capsule).0,
+        &Default::default(),
+    )
+    .unwrap();
+    assert_eq!(
+        native_operation_heads(&binding),
+        selected_data.operation_heads
+    );
+    let (source_wc, _) =
+        jj_vfs::native::read_retained_state_for_capture(&binding.projection(), 1024 * 1024)
+            .unwrap();
+    assert!(!source_wc.pending);
+    assert_eq!(
+        source_wc.operation.hex(),
+        selected_data.working_copy.wc_operation
+    );
+    assert_eq!(
+        source_wc.workspace.as_str(),
+        selected_data.working_copy.workspace
+    );
+    assert_eq!(
+        source_wc.trees[0].terms,
+        selected_data.working_copy.tree.terms
+    );
+    producer.success(
+        &producer_base,
+        &["tinytree", "unmount", source_root.to_str().unwrap()],
+    );
+    producer.stop_daemon();
+    // No source uploader owns the repository admission now. Require actual
+    // authenticated GetVersion/ReadCapture and all manifest/root bindings while
+    // the original evidence still exists; a receipt alone cannot pass recovery.
+    let (generation, manifest_id, raw, _manifest, authenticated_capsule) =
+        retained_capture_versions_observed(
+            &upstream,
+            binding.workspace_id,
+            None,
+            Instant::now() + Duration::from_secs(30),
+        )
+        .into_iter()
+        .find(|(generation, id, _, _, _)| {
+            *generation == selected_generation && id.0 == selected_manifest
+        })
+        .expect("published pending landing immutable version missing");
+    assert_eq!(authenticated_capsule, capsule);
+    let data = tinytree_cloud::decode_data(
+        &capsule,
+        tinytree_cloud::CaptureDataId::of(&capsule).0,
+        &Default::default(),
+    )
+    .unwrap();
+    let original = data
+        .remote
+        .as_ref()
+        .unwrap()
+        .landing
+        .as_ref()
+        .unwrap()
+        .clone();
+    assert_eq!(original.source_head, source);
+    assert_eq!(
+        original.job_id.as_deref(),
+        Some(capture_identity(&job.id).as_str())
+    );
+    assert_eq!(
+        original.observed.as_ref().unwrap().expires_at_seconds,
+        job.expires_at
+    );
+    let selection = workspace_daemon::control::NativeRestoreSelection {
+        workspace_id: binding.workspace_id,
+        generation,
+        manifest_id: manifest_id.0,
+        manifest_blake3: raw.blake3,
+        manifest_size_bytes: raw.size_bytes,
+    };
+    let original_public = upstream.public();
+    let starts = upstream.metadata.landing_starts.load(Ordering::SeqCst);
+    // The source workspace, registry, native object store, packs and provider
+    // cache disappear. Recovery below owns a NEW empty daemon/cache namespace.
+    drop(producer);
+    assert!(!producer_base.exists());
+    let mut restored = Fixture::new();
+    let restored_base = restored.base().to_owned();
+    assert_ne!(restored_base, producer_base);
+    assert!(!restored_base.join("daemon").exists());
+    restored.configure_remote(&upstream.endpoint);
+    restored.automatic_policies();
+    restored.start();
+    let root = restored_base.join("restored-pending");
+    assert!(!root.exists());
+    let workspace = capture_identity(&selection.workspace_id);
+    let generation = selection.generation.to_string();
+    let file_reads = upstream.file_reads();
+    let result: workspace_daemon::control::NativeCloudRestored =
+        serde_json::from_str(&restored.cloud(
+            &restored_base,
+            &[
+                "restore",
+                &workspace,
+                root.to_str().unwrap(),
+                "--generation",
+                &generation,
+                "--json",
+            ],
+        ))
+        .unwrap();
+    assert_eq!(result.source, selection);
+    assert_fuse_mounted(&root);
+    assert_eq!(
+        upstream.file_reads(),
+        file_reads,
+        "cloud restore admission reads metadata, not FILE bodies"
+    );
+    assert_eq!(
+        upstream.metadata.landing_starts.load(Ordering::SeqCst),
+        starts,
+        "restore never resubmits the original job"
+    );
+    assert_eq!(upstream.public(), original_public);
+    let restored_binding = restored.binding(&root);
+    assert_eq!(
+        native_operation_heads(&restored_binding),
+        data.operation_heads
+    );
+    let (wc, _) = jj_vfs::native::read_retained_state_for_capture(
+        &restored_binding.projection(),
+        1024 * 1024,
+    )
+    .unwrap();
+    assert!(!wc.pending);
+    assert_eq!(wc.operation.hex(), data.working_copy.wc_operation);
+    assert_eq!(wc.workspace.as_str(), data.working_copy.workspace);
+    assert_eq!(wc.trees[0].terms, data.working_copy.tree.terms);
+    let scope = native_workspace_admin::remote_state::RemoteScope::new(
+        restored.broker.clone(),
+        "example".into(),
+    )
+    .unwrap();
+    let (sidecar_before, _) = remote_observation(&restored_binding);
+    let saved = native_workspace_admin::remote_state::decode(&sidecar_before, &scope).unwrap();
+    let mut expected = original.clone();
+    expected.restored_lookup_only = true;
+    assert_eq!(saved.landing.as_ref(), Some(&expected));
+    let heads = native_operation_heads(&restored_binding);
+    let state_before = jj_vfs::native::read_retained_state(
+        &restored_binding.root,
+        &restored_binding.working_copy,
+        &restored_binding.repository,
+    )
+    .unwrap()
+    .persisted_bytes;
+    let lookups = upstream.metadata.landing_lookups.load(Ordering::SeqCst);
+    let status = landing_report(&mut restored, &root, &["tinytree", "land", "--status"]);
+    assert_eq!(status["phase"], "prepared_pending_checks");
+    assert_eq!(status["request_id"], key);
+    assert_eq!(status["job_id"], original.job_id.as_deref().unwrap());
+    assert_eq!(
+        upstream.metadata.landing_starts.load(Ordering::SeqCst),
+        starts
+    );
+    assert!(upstream.metadata.landing_lookups.load(Ordering::SeqCst) > lookups);
+    assert_eq!(remote_observation(&restored_binding).0, sidecar_before);
+    assert_eq!(native_operation_heads(&restored_binding), heads);
+    assert_eq!(
+        jj_vfs::native::read_retained_state(
+            &restored_binding.root,
+            &restored_binding.working_copy,
+            &restored_binding.repository
+        )
+        .unwrap()
+        .persisted_bytes,
+        state_before
+    );
+    assert_eq!(upstream.file_reads(), file_reads);
+    // Existing trusted fixture checks provide functional protocol evidence only,
+    // not evidence that a compiler or remote Bazel check actually ran.
+    let committed = upstream.finish_fixture_landing(&key, true);
+    assert_eq!(committed.id, job.id);
+    assert_eq!(committed.expires_at, job.expires_at);
+    let applied = landing_report(&mut restored, &root, &["tinytree", "land", "--resume"]);
+    assert_eq!(applied["phase"], "applied");
+    assert_eq!(applied["acknowledged"], true);
+    assert_eq!(restored.revision(&root, "@-"), candidate);
+    assert_eq!(
+        upstream.metadata.landing_starts.load(Ordering::SeqCst),
+        starts
+    );
+    let (bytes, _) = remote_observation(&restored_binding);
+    let final_state = native_workspace_admin::remote_state::decode(&bytes, &scope).unwrap();
+    let final_landing = final_state.landing.unwrap();
+    assert_eq!(final_landing.request_id, original.request_id);
+    assert_eq!(final_landing.job_id, original.job_id);
+    assert_eq!(final_landing.source_operation, original.source_operation);
+    assert_eq!(final_landing.source_stack, original.source_stack);
+    assert_eq!(
+        final_landing.observed.as_ref().unwrap().expires_at_seconds,
+        job.expires_at
+    );
+    assert!(final_landing.acknowledged);
+    assert!(!final_landing.restored_lookup_only);
+    assert!(final_landing.result_roots.is_empty());
+    assert!(final_landing.observed.as_ref().unwrap().receipt.is_some());
+    assert_eq!(
+        fs::read(root.join("pending-cloud-source.txt")).unwrap(),
+        b"source pending-cloud-source\n"
+    );
+    restored.success(
+        &restored_base,
+        &["tinytree", "unmount", root.to_str().unwrap()],
+    );
+    restored.stop_daemon();
+}
+
+#[test]
+#[ignore = "requires usable /dev/fuse and fusermount3; run mounted_tests locally"]
 fn published_capture_retirement_continues_distinct_edits_and_restores_old_versions() {
     let upstream = RemoteServer::start_with_cloud();
     let mut fixture = Fixture::new();
@@ -4354,50 +4706,91 @@ fn retained_capture_versions(
     workspace_id: [u8; 32],
     expected_publications: u64,
 ) -> Vec<RetainedCaptureVersion> {
+    retained_capture_versions_observed(
+        upstream,
+        workspace_id,
+        Some(expected_publications),
+        Instant::now() + Duration::from_secs(30),
+    )
+}
+
+fn retained_capture_versions_observed(
+    upstream: &RemoteServer,
+    workspace_id: [u8; 32],
+    expected_publications: Option<u64>,
+    deadline: Instant,
+) -> Vec<RetainedCaptureVersion> {
     use tinytree_client::cloud_protocol as c;
-    fn authenticated<T>(value: T) -> RpcRequest<T> {
+    fn authenticated<T>(value: T, allowance: Duration) -> RpcRequest<T> {
         let mut request = RpcRequest::new(value);
         request.metadata_mut().insert(
             "authorization",
             format!("Bearer {REMOTE_TOKEN}").parse().unwrap(),
         );
-        request.set_timeout(Duration::from_secs(10));
+        request.set_timeout(allowance);
         request
     }
     let selections = upstream.runtime.as_ref().unwrap().block_on(async {
-        tokio::time::timeout(Duration::from_secs(30), async {
-            let mut client =
+        let deadline =
+            tokio::time::Instant::now() + deadline.saturating_duration_since(Instant::now());
+        tokio::time::timeout_at(deadline, async {
+            let policy = tinytree_client::Config::default().rpc;
+            let client =
                 c::workspace_cloud_client::WorkspaceCloudClient::connect(upstream.endpoint.clone())
                     .await
                     .unwrap()
                     .accept_compressed(CompressionEncoding::Zstd)
                     .send_compressed(CompressionEncoding::Zstd);
-            let workspace = client
-                .get_workspace(authenticated(c::GetWorkspaceRequest {
-                    repository_id: "example".into(),
-                    workspace_id: workspace_id.to_vec(),
-                }))
+            // Share one absolute operation deadline; retry only the shipped
+            // policy's transient statuses and server RetryInfo admission hints.
+            let workspace = policy
+                .retry(deadline, Duration::from_secs(30), |allowance| {
+                    let mut client = client.clone();
+                    async move {
+                        client
+                            .get_workspace(authenticated(
+                                c::GetWorkspaceRequest {
+                                    repository_id: "example".into(),
+                                    workspace_id: workspace_id.to_vec(),
+                                },
+                                allowance,
+                            ))
+                            .await
+                            .map(|value| value.into_inner())
+                    }
+                })
                 .await
-                .unwrap()
-                .into_inner();
+                .unwrap();
             assert_eq!(workspace.workspace_id, workspace_id);
             assert!((1..=256).contains(&workspace.generation));
-            assert_eq!(
-                workspace.generation, expected_publications,
-                "every durable Published record must correspond to a retained generation"
-            );
+            if let Some(expected_publications) = expected_publications {
+                assert_eq!(
+                    workspace.generation, expected_publications,
+                    "every durable Published record must correspond to a retained generation"
+                );
+            }
             let mut selections = Vec::new();
             let mut previous = None;
             for generation in 1..=workspace.generation {
-                let version = client
-                    .get_version(authenticated(c::GetVersionRequest {
-                        repository_id: "example".into(),
-                        workspace_id: workspace_id.to_vec(),
-                        generation,
-                    }))
+                let version = policy
+                    .retry(deadline, Duration::from_secs(30), |allowance| {
+                        let mut client = client.clone();
+                        async move {
+                            client
+                                .get_version(authenticated(
+                                    c::GetVersionRequest {
+                                        repository_id: "example".into(),
+                                        workspace_id: workspace_id.to_vec(),
+                                        generation,
+                                    },
+                                    allowance,
+                                ))
+                                .await
+                                .map(|value| value.into_inner())
+                        }
+                    })
                     .await
-                    .unwrap()
-                    .into_inner();
+                    .unwrap();
                 assert_eq!(version.workspace_id, workspace_id);
                 assert_eq!(version.generation, generation);
                 let manifest_id = tinytree_cloud::ManifestId::of(&version.manifest);
@@ -4435,23 +4828,32 @@ fn retained_capture_versions(
                     )
                 );
 
-                let mut stream = client
-                    .read_capture(authenticated(c::ReadCaptureRequest {
-                        repository_id: "example".into(),
-                        selector: Some(c::RetainedVersionSelector {
-                            workspace_id: workspace_id.to_vec(),
-                            generation,
-                            manifest_id: manifest_id.0.to_vec(),
-                        }),
-                        expected_capture_id: manifest.capture.id.0.to_vec(),
-                        manifest_selected: Some(c::RawDigest {
-                            blake3: raw.blake3.to_vec(),
-                            size_bytes: raw.size_bytes,
-                        }),
-                    }))
+                let request = c::ReadCaptureRequest {
+                    repository_id: "example".into(),
+                    selector: Some(c::RetainedVersionSelector {
+                        workspace_id: workspace_id.to_vec(),
+                        generation,
+                        manifest_id: manifest_id.0.to_vec(),
+                    }),
+                    expected_capture_id: manifest.capture.id.0.to_vec(),
+                    manifest_selected: Some(c::RawDigest {
+                        blake3: raw.blake3.to_vec(),
+                        size_bytes: raw.size_bytes,
+                    }),
+                };
+                let mut stream = policy
+                    .retry(deadline, Duration::from_secs(30), |allowance| {
+                        let mut client = client.clone();
+                        let request = request.clone();
+                        async move {
+                            client
+                                .read_capture(authenticated(request, allowance))
+                                .await
+                                .map(|value| value.into_inner())
+                        }
+                    })
                     .await
-                    .unwrap()
-                    .into_inner();
+                    .unwrap();
                 let mut capsule = Vec::new();
                 let mut eof = false;
                 while let Some(chunk) = stream.message().await.unwrap() {
@@ -6976,6 +7378,86 @@ fn native_landing_recovery_edges_preserve_divergence_and_terminal_states() {
             b"conflicting source addition\n"
         );
         fixture.success(&base, &["tinytree", "unmount", conflict.to_str().unwrap()]);
+        fixture.stop_daemon();
+    }
+    // Restored helper security boundary: jj helper loading normally resolves
+    // plural heads, and optional stale-WC auto-update can check out a new tree.
+    // Both actual retained shapes must be refused BEFORE either behavior.
+    for (name, plural) in [
+        ("restored-plural-heads", true),
+        ("restored-stale-wc", false),
+    ] {
+        use jj_lib::op_heads_store::OpHeadsStore as _;
+        let (upstream, mut fixture, base) = new_landing_fixture();
+        let (root, _, key, _) = prepare_native_landing(&mut fixture, &upstream, name);
+        upstream.finish_fixture_landing(&key, true);
+        let binding = fixture.binding(&root);
+        let (_, mut saved) = remote_observation(&binding);
+        let source_op = jj_lib::op_store::OperationId::try_from_hex(
+            saved["landing"]["source_operation"].as_str().unwrap(),
+        )
+        .unwrap();
+        saved
+            .get_mut("landing")
+            .unwrap()
+            .as_table_mut()
+            .unwrap()
+            .insert("restored_lookup_only".into(), toml::Value::Boolean(true));
+        let path = binding.working_copy.join("native-remote.toml");
+        fs::write(&path, toml::to_string(&saved).unwrap()).unwrap();
+        fs::OpenOptions::new()
+            .append(true)
+            .open(&fixture.jj_config)
+            .unwrap()
+            .write_all(b"\n[snapshot]\nauto-update-stale=true\n")
+            .unwrap();
+        let store =
+            jj_lib::simple_op_heads_store::SimpleOpHeadsStore::load(&binding.repo.join("op_heads"));
+        let original_heads = store.get_op_heads_bounded(2).unwrap();
+        assert_eq!(original_heads.len(), 1);
+        assert_ne!(original_heads[0], source_op);
+        upstream.runtime.as_ref().unwrap().block_on(async {
+            store
+                .update_op_heads(if plural { &[] } else { &original_heads }, &source_op)
+                .await
+                .unwrap();
+        });
+        let heads = native_operation_heads(&binding);
+        assert_eq!(heads.len(), if plural { 2 } else { 1 });
+        let wc_before =
+            jj_vfs::native::read_retained_state_for_capture(&binding.projection(), 1024 * 1024)
+                .unwrap()
+                .0
+                .persisted_bytes;
+        let sidecar_before = fs::read(&path).unwrap();
+        let public = upstream.public();
+        let starts = upstream.metadata.landing_starts.load(Ordering::SeqCst);
+        for action in ["--status", "--resume"] {
+            let rejected = fixture.run(&root, &["tinytree", "land", action]);
+            assert!(
+                !rejected.status.success(),
+                "{name} {action} unexpectedly accepted"
+            );
+            assert!(String::from_utf8_lossy(&rejected.stderr).contains("recovery_required"));
+            assert_eq!(native_operation_heads(&binding), heads);
+            assert_eq!(fs::read(&path).unwrap(), sidecar_before);
+            assert_eq!(jj_vfs::native::read_retained_state_for_capture(
+                &binding.projection(), 1024 * 1024,
+            ).unwrap().0.persisted_bytes, wc_before);
+            assert_eq!(upstream.public(), public);
+            assert_eq!(
+                upstream.metadata.landing_starts.load(Ordering::SeqCst),
+                starts
+            );
+        }
+        upstream.runtime.as_ref().unwrap().block_on(async {
+            let selected = store.get_op_heads_bounded(2).unwrap();
+            store
+                .update_op_heads(&selected, &original_heads[0])
+                .await
+                .unwrap();
+        });
+        fixture.success(&base, &["tinytree", "unmount", root.to_str().unwrap()]);
         fixture.stop_daemon();
     }
     // Security boundary: an untrusted restored journal may claim a raw apply
