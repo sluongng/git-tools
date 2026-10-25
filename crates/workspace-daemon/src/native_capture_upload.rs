@@ -216,6 +216,8 @@ impl Intent {
 #[derive(Default)]
 struct TestHooks {
     #[cfg(test)]
+    idle_entries: AtomicU64,
+    #[cfg(test)]
     fail_namespace: std::sync::atomic::AtomicBool,
     #[cfg(test)]
     catalog_pause: Mutex<Option<Arc<CatalogPause>>>,
@@ -321,10 +323,21 @@ async fn start_inner(
             if *rx.borrow() {
                 break;
             }
-            if worker.poll().await.is_err() {
-                worker.stats.failed.fetch_add(1, Ordering::Relaxed);
-                worker.stats.set("inventory_unavailable");
+            match worker.poll().await {
+                Ok(true) => {
+                    // A durable publication or completed cleanup may expose more
+                    // ready work. Yield and check stop before the next bounded job.
+                    tokio::task::yield_now().await;
+                    continue;
+                }
+                Ok(false) => {}
+                Err(_) => {
+                    worker.stats.failed.fetch_add(1, Ordering::Relaxed);
+                    worker.stats.set("inventory_unavailable");
+                }
             }
+            #[cfg(test)]
+            worker._hooks.idle_entries.fetch_add(1, Ordering::Release);
             tokio::select! {_=rx.changed()=>{if *rx.borrow(){break;}},_=tokio::time::sleep(Duration::from_millis(worker.policy.poll_ms))=>{}}
         }
         // Detached provider/SDK work owns independent read fences. Stop polling,
@@ -475,7 +488,8 @@ impl Worker {
         self.sync_namespace()?;
         Ok(())
     }
-    async fn poll(self: &Arc<Self>) -> Result<()> {
+    async fn poll(self: &Arc<Self>) -> Result<bool> {
+        let mut progressed = false;
         let deadline = tokio::time::Instant::now() + Duration::from_millis(self.policy.timeout_ms);
         let admission = Arc::new(Admission {
             _permit: tokio::time::timeout_at(deadline, self.admission.clone().acquire_owned())
@@ -485,7 +499,9 @@ impl Worker {
             self.policy.policy,
             NativeCaptureUploadPolicy::Auto | NativeCaptureUploadPolicy::PublishRetiringRedundant
         ) {
-            tokio::time::timeout_at(deadline, self.complete_cleanup(admission.clone())).await??;
+            progressed |=
+                tokio::time::timeout_at(deadline, self.complete_cleanup(admission.clone()))
+                    .await??;
         }
         let worker = self.clone();
         let physical = admission.clone();
@@ -549,6 +565,7 @@ impl Worker {
             .await;
             match result {
                 Ok(Ok(())) => {
+                    progressed = true;
                     self.stats.published.fetch_add(1, Ordering::Relaxed);
                     self.stats.set("published_roots_retained");
                 }
@@ -569,35 +586,35 @@ impl Worker {
             match tokio::time::timeout_at(deadline, self.retire_one(deadline, admission.clone()))
                 .await
             {
-                Ok(Ok(())) => {}
+                Ok(Ok(retired)) => progressed |= retired,
                 _ => {
                     self.stats.failed.fetch_add(1, Ordering::Relaxed);
                     self.stats.set("retirement_retry_preserved");
                 }
             }
         }
-        Ok(())
+        Ok(progressed)
     }
-    async fn complete_cleanup(self: &Arc<Self>, admission: Arc<Admission>) -> Result<()> {
+    async fn complete_cleanup(self: &Arc<Self>, admission: Arc<Admission>) -> Result<bool> {
         let worker = self.clone();
         // Accepted cleanup owns both fences and admission after waiter expiry.
         tokio::spawn(async move { worker.cleanup_owned(admission).await }).await?
     }
-    async fn cleanup_owned(self: Arc<Self>, admission: Arc<Admission>) -> Result<()> {
+    async fn cleanup_owned(self: Arc<Self>, admission: Arc<Admission>) -> Result<bool> {
         let registry = self.host.capture_registry();
         let pending = registry.capture_cleanup().await?;
         self.stats
             .cleanup_pending
             .store(pending.is_some(), Ordering::Release);
         if pending.is_none() {
-            return Ok(());
+            return Ok(false);
         }
         // Capture callbacks acquire this permit before taking registry read
         // fences. Preserve that order, otherwise cleanup could deadlock a writer.
         let paused = self.host.pause_capture_cleanup().await?;
         let Some(guard) = registry.try_capture_cleanup().await? else {
             self.stats.cleanup_pending.store(false, Ordering::Release);
-            return Ok(());
+            return Ok(false);
         };
         let worker = self.clone();
         let physical = paused.clone();
@@ -617,7 +634,7 @@ impl Worker {
         self.stats.retired.fetch_add(1, Ordering::Relaxed);
         self.stats.cleanup_pending.store(false, Ordering::Release);
         self.stats.set("retired_redundant_local_capture");
-        Ok(())
+        Ok(true)
     }
     fn unlink_retired(
         &self,
@@ -665,7 +682,7 @@ impl Worker {
         self: &Arc<Self>,
         deadline: tokio::time::Instant,
         admission: Arc<Admission>,
-    ) -> Result<()> {
+    ) -> Result<bool> {
         let worker = self.clone();
         tokio::spawn(async move { worker.retire_one_owned(deadline, admission).await }).await?
     }
@@ -673,7 +690,7 @@ impl Worker {
         self: Arc<Self>,
         deadline: tokio::time::Instant,
         admission: Arc<Admission>,
-    ) -> Result<()> {
+    ) -> Result<bool> {
         let registry = self.host.capture_registry();
         if registry.capture_cleanup().await?.is_some() {
             return self.cleanup_owned(admission).await;
@@ -730,7 +747,7 @@ impl Worker {
                 .await?
             else {
                 self.stats.set("local_capture_not_covered");
-                return Ok(());
+                return Ok(false);
             };
             ensure!(
                 tokio::time::Instant::now() < deadline,
@@ -744,7 +761,7 @@ impl Worker {
             self.stats.cleanup_pending.store(true, Ordering::Release);
             return self.cleanup_owned(admission).await;
         }
-        Ok(())
+        Ok(false)
     }
     async fn prove_redundant(
         self: &Arc<Self>,
@@ -1801,6 +1818,375 @@ mod tests {
                 .unwrap(),
         ))
     }
+
+    struct NoFiles;
+    #[async_trait::async_trait]
+    impl local_cas::BlobSource for NoFiles {
+        async fn fetch(&self, _: &local_cas::Artifact, _: &mut File) -> Result<()> {
+            anyhow::bail!("intrinsic capture must not fetch FILE bytes")
+        }
+        async fn missing(
+            &self,
+            values: &[local_cas::Artifact],
+        ) -> Result<Vec<local_cas::Artifact>> {
+            Ok(values.to_vec())
+        }
+    }
+    fn private(parent: &std::path::Path, name: &str) -> Result<PrivateDir> {
+        Ok(PrivateDir::create(parent.join(name))?)
+    }
+    // Loopback exercises the real scheduler, saved pack verifier and durable
+    // publication protocol. Intrinsic roots require no kernel mount or FILE IO.
+    async fn ready_uploads(
+        count: usize,
+        configured: bool,
+    ) -> Result<(
+        tempfile::TempDir,
+        Handle,
+        tinytree_client::NativeClient,
+        tokio::sync::oneshot::Sender<()>,
+        tokio::task::JoinHandle<Result<(), tonic::transport::Error>>,
+    )> {
+        use futures::StreamExt;
+        let root = tempfile::Builder::new().tempdir_in(std::env::temp_dir().canonicalize()?)?;
+        let server_root = private(root.path(), "server")?;
+        let profile: tinytree_server::Config = toml::from_str(
+            r#"
+[service]
+max_metadata_bytes=4194304
+[service.cloud]
+enabled=true
+indexed_versions=true
+captured_versions=true
+max_capture_bytes=262144
+max_manifest_bytes=524288
+max_staging_leases=256
+max_buffered_bytes=2147483648
+[store]
+max_retention_validation_records=4096
+max_retention_validation_bytes=8388608
+max_closure_objects=8192
+max_closure_edges=32768
+max_path_contexts=8192
+max_path_context_bytes=8388608
+[store.cloud]
+max_object_bytes=4194304
+max_decode_bytes=16777216
+max_version_decode_bytes=268435456
+max_manifest_bytes=524288
+max_manifest_decode_bytes=16777216
+max_manifest_members=1024
+"#,
+        )?;
+        profile.validate()?;
+        let store = tinytree_store::Store::open(
+            server_root.path(),
+            profile
+                .store
+                .materialize(profile.service.max_metadata_bytes),
+        )?;
+        store.create_repository("example")?;
+        let empty = tinytree_model::empty_tree();
+        store.put("example", empty.descriptor, &empty.bytes, 0)?;
+        let index_root = private(root.path(), "index")?;
+        let index = tinytree_index::Index::open(index_root.path(), &Default::default())?;
+        let service = tinytree_server::RepositoryService::new(
+            store.clone(),
+            profile.service,
+            vec!["example".into()],
+            vec![],
+        )?
+        .with_query_index(index)?;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let address = listener.local_addr()?;
+        let (stop, stopped) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            tonic::transport::Server::builder()
+                .layer(service.deadline_layer())
+                .add_service(service.grpc_service())
+                .add_service(service.query_grpc_service())
+                .add_service(service.cloud_grpc_service())
+                .serve_with_incoming_shutdown(
+                    tokio_stream::wrappers::TcpListenerStream::new(listener).map(|accepted| {
+                        accepted.and_then(|stream| {
+                            stream.set_nodelay(true)?;
+                            Ok(stream)
+                        })
+                    }),
+                    async {
+                        let _ = stopped.await;
+                    },
+                )
+                .await
+        });
+        let direct = Arc::new(jj_native_backend::DirectObjectIo::init(
+            private(root.path(), "local")?.path(),
+            Default::default(),
+        )?);
+        let cache = local_cas::LocalCas::open(
+            root.path().join("cas"),
+            Arc::new(NoFiles),
+            local_cas::CacheConfig::default(),
+        )?;
+        let mut remote_config = jj_native_remote::Config::default();
+        remote_config.remote.endpoint = format!("http://{address}");
+        remote_config.remote.repository_id = "example".into();
+        remote_config.remote.rpc.retry.initial_backoff_ms = 1;
+        remote_config.remote.rpc.retry.max_backoff_ms = 5;
+        let client = tinytree_client::NativeClient::connect(remote_config.remote.clone()).await?;
+        let ledger = private(root.path(), "remote")?;
+        let remote = jj_native_remote::RemoteRepository::open(
+            direct.clone(),
+            cache,
+            &ledger.path().join("ledger"),
+            &ledger.path().join("staging"),
+            remote_config,
+        )?;
+        let source = Arc::new(Source {
+            local: direct,
+            restore: jj_native_remote::RemoteRestoreIo::new(
+                remote.io.clone(),
+                remote.query.clone(),
+            )?,
+            io: remote.io.clone(),
+            control: remote.control.clone(),
+            identity: [9; 32],
+        });
+        let state = private(root.path(), "state")?;
+        let mut config = Config::default();
+        config.state_dir = state.path().to_owned();
+        config.native.workspaces.upload.policy = NativeCaptureUploadPolicy::PublishRetainingRoots;
+        assert_eq!(config.native.workspaces.upload.poll_ms, 30_000);
+        let host = Arc::new(
+            NativeCommandHost::open_with_capture(
+                &state.path().join("native-commands"),
+                config.native.workspaces.capture.clone(),
+            )
+            .await?,
+        );
+        let workspace = [7; 32];
+        let mount = hex(&workspace);
+        let workspace_root = private(root.path(), "workspace")?;
+        let admin = private(root.path(), "admin")?;
+        host.register(
+            &native_workspace_admin::Binding {
+                version: 1,
+                workspace_id: workspace,
+                root: workspace_root.path().to_owned(),
+                admin: admin.path().to_owned(),
+                repo: admin.path().join("repo"),
+                working_copy: admin.path().join("working_copy"),
+                repository: "example".into(),
+                endpoint: native_workspace_admin::Endpoint::UnixSocket {
+                    path: root.path().join("rbe.sock"),
+                },
+                rpc_mount_id: mount.clone(),
+            },
+            source.identity,
+        )
+        .await?;
+        let records = private(state.path(), "native-workspaces")?;
+        let record = private(records.path(), &mount)?;
+        record.replace("workspace.json", &serde_json::to_vec(&serde_json::json!({
+            "version":2,"workspace_id":workspace,"store":"example","root":workspace_root.path(),
+            "origin":{"kind":"clone","bootstrap_commit":vec![0u8;32]},
+            "scope":native_workspace::Scope::from_configured_identity("example", &source.identity)?.backend(),
+            "state":"stopped"
+        }))?)?;
+        let built = c::build_index_artifacts(
+            &c::PortableIndexSnapshot {
+                roots: vec![tinytree_model::CommitId::ROOT],
+                drafts: vec![],
+            },
+            Default::default(),
+        )?;
+        let mut payloads = Vec::new();
+        let mut blobs = Vec::new();
+        for encoded in &built.artifacts {
+            let descriptor = encoded.descriptor;
+            let (kind, id) = match descriptor.id {
+                c::IndexArtifactId::Root(id) => (3, id.0),
+                c::IndexArtifactId::Node(id) => (4, id.0),
+            };
+            payloads.push((kind, hex(&id), encoded.bytes.clone()));
+            blobs.push(c::BlobRecord {
+                kind,
+                id: hex(&id),
+                blake3: descriptor.selected.blake3,
+                size: descriptor.selected.size_bytes,
+            });
+        }
+        blobs.sort_by(|a, b| (a.kind, &a.id).cmp(&(b.kind, &b.id)));
+        let tree = tinytree_model::synthetic_root().root_tree;
+        let data = c::CaptureData {
+            version: 1,
+            policy: c::CapturePolicy::HostQuiescentV1,
+            codec: c::CODEC.into(),
+            operation_heads: vec![hex(&[0; 64])],
+            working_copy: c::PortableWorkingCopy {
+                workspace: "default".into(),
+                wc_operation: hex(&[0; 64]),
+                snapshot_operation: hex(&[0; 64]),
+                snapshot_commit: [0; 32],
+                tree: c::CaptureTree {
+                    terms: tree.terms.iter().map(|id| id.0).collect(),
+                    labels: vec![],
+                },
+            },
+            operations: vec![c::OperationRecord {
+                operation: hex(&[0; 64]),
+                view: hex(&[0; 64]),
+                parents: vec![],
+            }],
+            indexes: vec![c::IndexRecord {
+                operation: hex(&[0; 64]),
+                root: built.root.id.0,
+            }],
+            blobs,
+            roots: tree
+                .terms
+                .iter()
+                .map(|id| c::CapturedRoot {
+                    kind: tinytree_model::Kind::Tree as u8,
+                    id: id.0,
+                })
+                .collect(),
+            remote: None,
+        };
+        let capsule = c::encode_capture_data(&data, Default::default())?;
+        payloads.push((5, hex(&c::CaptureDataId::of(&capsule).0), capsule));
+        let registry = host.capture_registry();
+        let registration = host.workspace_state(&mount).await?.registration;
+        let captures = PrivateDir::open_existing(state.path().join("native-commands/captures"))?;
+        for number in 0..count {
+            let mut payloads = payloads.clone();
+            let private = vec![number as u8];
+            payloads.push((128, hex(blake3::hash(&private).as_bytes()), private));
+            let mut pack = native_capture_pack::MAGIC.to_vec();
+            let mut entries = Vec::new();
+            for (kind, id, bytes) in payloads {
+                let hash = *blake3::hash(&bytes).as_bytes();
+                pack.extend(native_capture_pack::frame_header(
+                    kind,
+                    &id,
+                    bytes.len() as u64,
+                    hash,
+                )?);
+                entries.push(native_capture_pack::Entry {
+                    kind,
+                    id,
+                    blake3: hash,
+                    size: bytes.len() as u64,
+                    offset: pack.len() as u64,
+                });
+                pack.extend(bytes);
+            }
+            entries.sort_by(|a, b| (a.kind, &a.id).cmp(&(b.kind, &b.id)));
+            let table = native_capture_pack::encode_table(&entries)?;
+            pack.extend(native_capture_pack::TABLE_MAGIC);
+            pack.extend((table.len() as u64).to_le_bytes());
+            pack.extend(table);
+            let descriptor = raw_descriptor(&pack);
+            private_file(
+                &captures
+                    .path()
+                    .join(format!("{}.pack", hex(&descriptor.blake3))),
+                &pack,
+            )?;
+            let command = registry.begin_command(registration).await?;
+            let roots = tree
+                .terms
+                .iter()
+                .map(|id| tinytree_model::ObjectKey {
+                    kind: tinytree_model::Kind::Tree,
+                    id: tinytree_model::ObjectId(id.0),
+                })
+                .collect();
+            registry
+                .capture_dirty(command.token(), move || async move {
+                    Ok(native_retention::CaptureBundle {
+                        checkpoint: native_retention::RootCheckpoint {
+                            roots,
+                            op_heads: vec![vec![0; 64]],
+                            working_copy_operation: Some(vec![0; 64]),
+                        },
+                        bundle: descriptor,
+                    })
+                })
+                .await?;
+            drop(command);
+        }
+        let sources = if configured {
+            BTreeMap::from([("example".into(), source)])
+        } else {
+            BTreeMap::new()
+        };
+        let handle = start_inner(config, host, sources, Arc::new(TestHooks::default()))
+            .await?
+            .unwrap();
+        Ok((root, handle, client, stop, server))
+    }
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn default_poll_drains_queued_publications_then_backs_off_when_idle() -> Result<()> {
+        let (_root, handle, client, stop, server) = ready_uploads(3, true).await?;
+        let worker = handle.worker.clone();
+        // Less than ONE default idle interval, with all tickets queued before start.
+        tokio::time::timeout(Duration::from_secs(15), async {
+            while worker.stats.published.load(Ordering::Acquire) != 3 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await?;
+        assert_eq!(client.cloud_workspace([7; 32]).await?.generation, 3);
+        assert_eq!(
+            worker
+                .host
+                .capture_registry()
+                .pending_captures()
+                .await?
+                .len(),
+            3
+        );
+        assert_eq!(worker.stats.attempts.load(Ordering::Acquire), 3);
+        assert_eq!(worker.stats.failed.load(Ordering::Acquire), 0);
+        // Observe the final no-progress inventory reaching backoff before
+        // injecting a failure. Blocking-pool scheduling must not decide whether
+        // the preceding legitimate poll can discover this file.
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while worker._hooks.idle_entries.load(Ordering::Acquire) == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await?;
+        private_file(&worker.directory.path().join("invalid.job"), b"invalid")?;
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(worker.stats.failed.load(Ordering::Acquire), 0);
+        handle.shutdown().await;
+        let _ = stop.send(());
+        server.await??;
+        Ok(())
+    }
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn default_poll_backs_off_after_unavailable_provider_without_spinning() -> Result<()> {
+        let (_root, handle, _client, stop, server) = ready_uploads(3, false).await?;
+        let worker = handle.worker.clone();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while worker.stats.failed.load(Ordering::Acquire) == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await?;
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(worker.stats.attempts.load(Ordering::Acquire), 1);
+        assert_eq!(worker.stats.failed.load(Ordering::Acquire), 1);
+        assert_eq!(worker.stats.published.load(Ordering::Acquire), 0);
+        handle.shutdown().await;
+        let _ = stop.send(());
+        server.await??;
+        Ok(())
+    }
+
     fn private_file(path: &std::path::Path, bytes: &[u8]) -> Result<()> {
         use std::os::unix::fs::OpenOptionsExt;
         let mut file = OpenOptions::new()
