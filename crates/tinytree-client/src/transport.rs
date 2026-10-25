@@ -13,6 +13,7 @@ use tonic::{
 };
 #[derive(Clone)]
 pub(crate) struct Client {
+    channel: Channel,
     inner: tonic::client::Grpc<Channel>,
     limits: Limits,
     decode: usize,
@@ -22,11 +23,19 @@ impl Client {
     pub fn new(channel: Channel, limits: Limits) -> Self {
         let decode = limits.max_batch_bytes;
         Self {
-            inner: tonic::client::Grpc::new(channel),
+            inner: tonic::client::Grpc::new(channel.clone()),
+            channel,
             limits,
             decode,
             owner: None,
         }
+    }
+    /// Small replies use no compression: a decoded-byte cap alone does not
+    /// bound an advertised compression window. Keep the same channel and owner.
+    pub fn uncompressed(mut self) -> Self {
+        self.inner =
+            tonic::client::Grpc::new(self.channel.clone()).max_decoding_message_size(self.decode);
+        self
     }
     pub fn with_owner(mut self, owner: PhysicalOwner) -> Self {
         self.owner = Some(owner);
@@ -1521,6 +1530,72 @@ mod landing_wire_tests {
                 slots.available_permits(),
                 crate::client::landing::ZSTD_WORKSPACE_BYTES
             );
+        }
+    }
+    #[tokio::test]
+    async fn uncompressed_small_query_rejects_compression_before_workspace_and_keeps_owner() {
+        let reply = q::ShortestPrefixResult {
+            kind: q::PrefixKind::CommitPrefix as i32,
+            hex_length: 1,
+            ..Default::default()
+        }
+        .encode_to_vec();
+        let mut plain = vec![0];
+        plain.extend_from_slice(&(reply.len() as u32).to_be_bytes());
+        plain.extend_from_slice(&reply);
+        for (name, body, accepted) in [
+            ("bounded plaintext", bytes::Bytes::from(plain), true),
+            (
+                "unsolicited compressed reply",
+                grpc_zstd(10, &reply, None),
+                false,
+            ),
+            (
+                "unsolicited huge decoder window",
+                grpc_zstd(28, &reply, None),
+                false,
+            ),
+            (
+                "unsolicited high ratio reply",
+                grpc_zstd(10, b"x", Some(128 * 1024)),
+                false,
+            ),
+        ] {
+            let slots = Arc::new(tokio::sync::Semaphore::new(1));
+            let drops = Arc::new(AtomicUsize::new(0));
+            let owner = Arc::new(Physical {
+                drops: drops.clone(),
+                _permit: slots.clone().acquire_owned().await.unwrap(),
+            });
+            let mut codec = BoundedCodec::<q::ShortestPrefixRequest, q::ShortestPrefixResult>::new(
+                Shape::ShortestPrefix,
+                Limits::default(),
+                1024,
+            )
+            .with_owner(owner.clone());
+            let decoder = codec.decoder();
+            drop(codec);
+            drop(owner);
+            // No negotiated compression: compressed frames are rejected before
+            // a decompressor can inspect a peer-controlled window or ratio.
+            let mut stream = Streaming::new_response(
+                decoder,
+                Once(Some(body)),
+                http::StatusCode::OK,
+                None,
+                Some(1024),
+            );
+            let result = stream.message().await;
+            assert_eq!(result.is_ok(), accepted, "{name}: {result:?}");
+            assert_eq!(
+                drops.load(Ordering::SeqCst),
+                0,
+                "{name}: early owner release"
+            );
+            assert_eq!(slots.available_permits(), 0);
+            drop(stream);
+            assert_eq!(drops.load(Ordering::SeqCst), 1);
+            assert_eq!(slots.available_permits(), 1);
         }
     }
     #[test]

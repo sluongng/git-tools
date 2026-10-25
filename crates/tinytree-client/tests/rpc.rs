@@ -44,6 +44,7 @@ struct Running {
     stop: Option<tokio::sync::oneshot::Sender<()>>,
     task: tokio::task::JoinHandle<()>,
     metadata: Arc<AtomicUsize>,
+    metadata_release: Arc<tokio::sync::Notify>,
     graph: Arc<AtomicUsize>,
     canonical_bytes: Arc<AtomicUsize>,
     files: Arc<AtomicUsize>,
@@ -62,6 +63,7 @@ impl Running {
         let address = listener.local_addr().unwrap();
         let (stop, stopped) = tokio::sync::oneshot::channel();
         let metadata = Arc::new(AtomicUsize::new(0));
+        let metadata_release = Arc::new(tokio::sync::Notify::new());
         let graph = Arc::new(AtomicUsize::new(0));
         let canonical_bytes = Arc::new(AtomicUsize::new(0));
         let files = Arc::new(AtomicUsize::new(0));
@@ -82,6 +84,7 @@ impl Running {
             reads: files.clone(),
             writes: Arc::new(AtomicUsize::new(0)),
             metadata: metadata.clone(),
+            metadata_release: metadata_release.clone(),
             graph: graph.clone(),
             canonical_bytes: canonical_bytes.clone(),
             publications: Arc::new(AtomicUsize::new(0)),
@@ -117,6 +120,7 @@ impl Running {
             stop: Some(stop),
             task,
             metadata,
+            metadata_release,
             graph,
             canonical_bytes,
             files,
@@ -172,6 +176,7 @@ enum Mode {
     TruncateFile,
     DelayFile,
     PartialMetadata,
+    PausedMetadata,
     WrongGraph,
     LegacyGraph,
     MissingGraphObject,
@@ -251,6 +256,7 @@ struct Faults {
     reads: Arc<AtomicUsize>,
     writes: Arc<AtomicUsize>,
     metadata: Arc<AtomicUsize>,
+    metadata_release: Arc<tokio::sync::Notify>,
     graph: Arc<AtomicUsize>,
     canonical_bytes: Arc<AtomicUsize>,
     publications: Arc<AtomicUsize>,
@@ -381,6 +387,9 @@ impl Repository for Faults {
         r: Request<p::BatchReadObjectsRequest>,
     ) -> Result<Response<Self::BatchReadObjectsStream>, Status> {
         let first = self.metadata.fetch_add(1, Ordering::SeqCst) == 0;
+        if self.mode == Mode::PausedMetadata {
+            self.metadata_release.notified().await;
+        }
         let requested = r.get_ref().keys.len();
         let mut body = self.service.batch_read_objects(r).await?.into_inner();
         if self.mode == Mode::PartialMetadata && first {
@@ -1613,6 +1622,11 @@ enum QueryMode {
     ForkParentHandle,
     MalformedScope,
     LegacyScopeVersion,
+    SmallUncompressed,
+    FactOversizedReply,
+    FactAllocationFlood,
+    FactWrongVariantEmptyIds,
+    ShortestOversizedReply,
     MissingFact,
     ExtraFact,
     MissingAnswer,
@@ -2038,9 +2052,27 @@ impl RepositoryQuery for QueryFaults {
         request: Request<q::QueryFactsRequest>,
     ) -> Result<Response<q::GraphFacts>, Status> {
         self.counts.facts.fetch_add(1, Ordering::SeqCst);
+        if self.mode == QueryMode::SmallUncompressed {
+            assert!(request.metadata().get("grpc-accept-encoding").is_none());
+            assert!(request.metadata().get("grpc-encoding").is_none());
+        }
         let mut reply = self.service.query_facts(request).await?;
         let value = reply.get_mut();
         match self.mode {
+            QueryMode::FactOversizedReply => value.scope_digest = vec![0; 2048],
+            QueryMode::FactAllocationFlood => {
+                value.answers = vec![
+                    q::GraphFactAnswer {
+                        answer: Some(q::graph_fact_answer::Answer::HasId(false)),
+                    };
+                    200
+                ];
+            }
+            QueryMode::FactWrongVariantEmptyIds => {
+                value.answers[0].answer = Some(q::graph_fact_answer::Answer::Heads(q::CommitSet {
+                    commits: vec![q::CommitId::default(); 200],
+                }));
+            }
             QueryMode::MissingFact => {
                 value.answers.pop();
             }
@@ -2109,6 +2141,10 @@ impl RepositoryQuery for QueryFaults {
         mut request: Request<q::ShortestPrefixRequest>,
     ) -> Result<Response<q::ShortestPrefixResult>, Status> {
         self.counts.shortest_prefixes.fetch_add(1, Ordering::SeqCst);
+        if self.mode == QueryMode::SmallUncompressed {
+            assert!(request.metadata().get("grpc-accept-encoding").is_none());
+            assert!(request.metadata().get("grpc-encoding").is_none());
+        }
         if self.mode == QueryMode::PrefixSelectionIgnored {
             request.get_mut().selection = None;
         }
@@ -2117,6 +2153,9 @@ impl RepositoryQuery for QueryFaults {
             reply.get_mut().selection_digest = Some(vec![9; 32]);
         }
 
+        if self.mode == QueryMode::ShortestOversizedReply {
+            reply.get_mut().selection_digest = Some(vec![0; 2048]);
+        }
         if self.mode == QueryMode::WrongShortestKind {
             reply.get_mut().kind = q::PrefixKind::ChangePrefix as i32;
         }
@@ -9657,6 +9696,131 @@ async fn checked_regex_search_pages_preserve_variable_width_spans_and_reject_mal
         } else {
             assert_eq!(result.unwrap_err().code(), Code::DataLoss, "{mode:?}");
         }
+        client.close_query_scope(&scope).await.unwrap();
+        running.stop().await;
+    }
+}
+
+#[tokio::test]
+async fn small_query_replies_share_the_metadata_pool_without_waiting_for_a_page() {
+    let fixture = setup_query_retained();
+    let running = Running::start(fixture.service.clone(), Mode::PausedMetadata).await;
+    let mut config = running.config();
+    config.limits.max_metadata_bytes = 4 * 1024 * 1024;
+    config.limits.max_batch_bytes = 4 * 1024 * 1024;
+    config.limits.max_graph_bytes = 8 * 1024 * 1024;
+    config.limits.max_buffered_bytes = 32 * 1024 * 1024;
+    let client = NativeClient::connect(config).await.unwrap();
+    let scope = client.open_query_scope(vec![fixture.root]).await.unwrap();
+    let drops = Arc::new(AtomicUsize::new(0));
+    let guarded = client
+        .clone()
+        .with_rpc_lifetime_guard(Arc::new(LifetimeProbe(drops.clone())));
+    let key = ObjectKey {
+        kind: Kind::Commit,
+        id: ObjectId(fixture.root.0),
+    };
+    let background = tokio::spawn(async move { guarded.read_objects(vec![key]).await });
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while running.metadata.load(Ordering::SeqCst) == 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(drops.load(Ordering::SeqCst), 0);
+    let facts = tokio::time::timeout(
+        Duration::from_millis(500),
+        client.query_facts(&scope, vec![QueryFact::HasId(fixture.root)]),
+    )
+    .await
+    .expect("scalar facts must coexist with a physically paused metadata page")
+    .unwrap();
+    assert_eq!(facts, vec![FactAnswer::HasId(true)]);
+    assert!(
+        tokio::time::timeout(
+            Duration::from_millis(500),
+            client.shortest_prefix(&scope, PrefixTarget::Commit(fixture.root), vec![])
+        )
+        .await
+        .expect("shortest prefix must coexist with a physically paused metadata page")
+        .unwrap()
+            <= 64
+    );
+    // The variable-reply path keeps the full page allowance and still waits.
+    let general = client.query_facts(&scope, vec![QueryFact::Heads(vec![fixture.root])]);
+    tokio::pin!(general);
+    assert!(
+        tokio::time::timeout(Duration::from_millis(30), &mut general)
+            .await
+            .is_err()
+    );
+    assert_eq!(drops.load(Ordering::SeqCst), 0);
+    running.metadata_release.notify_one();
+    assert_eq!(background.await.unwrap().unwrap().len(), 1);
+    assert_eq!(
+        general.await.unwrap(),
+        vec![FactAnswer::Heads(vec![fixture.root])]
+    );
+    assert_released(&drops).await;
+    client.close_query_scope(&scope).await.unwrap();
+    running.stop().await;
+}
+
+#[tokio::test]
+async fn small_query_reply_caps_reject_oversize_and_predecode_collection_expansion() {
+    for mode in [
+        QueryMode::FactOversizedReply,
+        QueryMode::FactAllocationFlood,
+        QueryMode::FactWrongVariantEmptyIds,
+        QueryMode::ShortestOversizedReply,
+        QueryMode::SmallUncompressed,
+    ] {
+        let fixture = setup_query_retained();
+        let running = QueryRunning::start(fixture.service.clone(), mode).await;
+        let client = running.client().await;
+        let scope = client.open_query_scope(vec![fixture.root]).await.unwrap();
+        let drops = Arc::new(AtomicUsize::new(0));
+        let guarded = client
+            .clone()
+            .with_rpc_lifetime_guard(Arc::new(LifetimeProbe(drops.clone())));
+        if mode == QueryMode::ShortestOversizedReply {
+            assert_eq!(
+                guarded
+                    .shortest_prefix(&scope, PrefixTarget::Commit(fixture.root), vec![])
+                    .await
+                    .unwrap_err()
+                    .code(),
+                Code::OutOfRange
+            );
+        } else {
+            let result = guarded
+                .query_facts(&scope, vec![QueryFact::HasId(fixture.root)])
+                .await;
+            match mode {
+                QueryMode::FactOversizedReply => {
+                    assert_eq!(result.unwrap_err().code(), Code::OutOfRange)
+                }
+                QueryMode::FactAllocationFlood => {
+                    assert_eq!(result.unwrap_err().code(), Code::ResourceExhausted)
+                }
+                QueryMode::FactWrongVariantEmptyIds => {
+                    let status = result.unwrap_err();
+                    assert_eq!(status.code(), Code::DataLoss);
+                    assert!(status.message().contains("bounded shape"));
+                }
+                QueryMode::SmallUncompressed => {
+                    assert_eq!(result.unwrap(), vec![FactAnswer::HasId(true)]);
+                    guarded
+                        .shortest_prefix(&scope, PrefixTarget::Commit(fixture.root), vec![])
+                        .await
+                        .unwrap();
+                }
+                _ => unreachable!(),
+            }
+        }
+        drop(guarded);
+        assert_released(&drops).await;
         client.close_query_scope(&scope).await.unwrap();
         running.stop().await;
     }

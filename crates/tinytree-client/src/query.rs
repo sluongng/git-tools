@@ -586,8 +586,35 @@ impl NativeClient {
                 return Err(Status::resource_exhausted("query request exceeds budget"));
             }
         }
+        let small_cap = if facts.iter().all(|fact| {
+            matches!(
+                fact,
+                QueryFact::Membership { .. } | QueryFact::HasId(_) | QueryFact::IsAncestor { .. }
+            )
+        }) {
+            Some(
+                facts
+                    .len()
+                    .checked_mul(256)
+                    .and_then(|n| n.checked_add(128))
+                    .ok_or_else(|| Status::resource_exhausted("fact response budget overflow"))?
+                    .max(1024)
+                    .min(self.inner.config.limits.max_batch_bytes),
+            )
+        } else {
+            None
+        };
+        let small_memory = small_cap
+            .map(|cap| self.small_query_memory(cap))
+            .transpose()?
+            .flatten();
         let deadline = self.deadline();
-        let budget = self.admit(deadline, self.unary_memory()).await?;
+        let budget = self
+            .admit(
+                deadline,
+                small_memory.unwrap_or_else(|| self.unary_memory()),
+            )
+            .await?;
         let mut wire = Vec::with_capacity(facts.len());
         for fact in &facts {
             use q::graph_fact::Fact;
@@ -633,6 +660,12 @@ impl NativeClient {
         self.bounded(&request)?;
         self.retry(deadline, false, |allowance| {
             let mut grpc = self.rpc_client(budget.clone());
+            if small_memory.is_some() {
+                grpc = grpc
+                    .uncompressed()
+                    .max_decoding_message_size(small_cap.expect("small fact reply cap"))
+                    .max_encoding_message_size(self.inner.config.limits.max_request_bytes);
+            }
             let request = request.clone();
             let expected = &facts;
             async move {
@@ -932,8 +965,15 @@ impl NativeClient {
                 32,
             ),
         };
+        let response_cap = 1024.min(self.inner.config.limits.max_batch_bytes);
+        let small_memory = self.small_query_memory(response_cap)?;
         let deadline = self.deadline();
-        let budget = self.admit(deadline, self.unary_memory()).await?;
+        let budget = self
+            .admit(
+                deadline,
+                small_memory.unwrap_or_else(|| self.unary_memory()),
+            )
+            .await?;
         let expected_selection = selection.map(Self::prefix_selection_digest);
         let request = q::ShortestPrefixRequest {
             scope: Some(scope.key()),
@@ -944,6 +984,12 @@ impl NativeClient {
         self.bounded(&request)?;
         self.retry(deadline, false, |allowance| {
             let mut grpc = self.rpc_client(budget.clone());
+            if small_memory.is_some() {
+                grpc = grpc
+                    .uncompressed()
+                    .max_decoding_message_size(response_cap)
+                    .max_encoding_message_size(self.inner.config.limits.max_request_bytes);
+            }
             let request = request.clone();
             async move {
                 let reply = grpc

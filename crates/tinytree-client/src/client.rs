@@ -355,6 +355,34 @@ impl NativeClient {
     fn unary_memory(&self) -> usize {
         unary_memory(&self.inner.config.limits)
     }
+    /// Bound small, uncompressed query replies without charging a metadata page.
+    /// Query validation bounds each aggregate of facts, AST nodes and IDs by
+    /// max_batch_items. Include retained inputs, request clones/encoding, vector
+    /// growth and output conversion. The codec separately scans before Prost
+    /// with a collection allocation budget of twice the response byte cap.
+    fn small_query_memory(&self, response_cap: usize) -> Result<Option<usize>, Status> {
+        use tinytree_proto::query_v1 as q;
+        let containers = std::mem::size_of::<q::GraphExpr>()
+            + std::mem::size_of::<q::GraphFact>()
+            + std::mem::size_of::<q::CommitId>()
+            + std::mem::size_of::<q::GraphFactAnswer>();
+        let limits = &self.inner.config.limits;
+        let memory = limits
+            .max_request_bytes
+            .checked_mul(4)
+            .and_then(|n| {
+                limits
+                    .max_batch_items
+                    .checked_mul(containers)
+                    .and_then(|v| v.checked_mul(16))
+                    .and_then(|v| n.checked_add(v))
+            })
+            .and_then(|n| response_cap.checked_mul(8).and_then(|v| n.checked_add(v)))
+            .and_then(|n| n.checked_add(4096))
+            .ok_or_else(|| Status::resource_exhausted("small query memory budget overflow"))?;
+        // Preserve tighter configurations' existing admission and transport.
+        Ok((memory < self.unary_memory()).then_some(memory))
+    }
     fn bounded<T: Message>(&self, value: &T) -> Result<(), Status> {
         if value.encoded_len() > self.inner.config.limits.max_request_bytes {
             Err(Status::resource_exhausted(
