@@ -3,10 +3,14 @@ use std::{path::PathBuf, time::Duration};
 use tinytree_import::{Limits, Options, import_snapshot_at};
 
 #[derive(Parser)]
-#[command(about = "Seed one immutable Git snapshot into a native Tinytree reference")]
+#[command(about = "Import an immutable Git snapshot or explicitly migrate verified history")]
 struct Args {
     #[arg(long)]
     source_git: PathBuf,
+    #[arg(long, requires = "state")]
+    history: bool,
+    #[arg(long, requires = "history")]
+    state: Option<PathBuf>,
     #[arg(long)]
     revision: String,
     #[arg(long)]
@@ -29,6 +33,34 @@ struct Args {
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let args = Args::parse();
+    #[cfg(unix)]
+    if args.history {
+        use tinytree_import::history::{HistoryLimits, HistoryOptions, import_history};
+        let limits = HistoryLimits {
+            max_entries: args.max_entries,
+            max_file_bytes: args.max_file_bytes,
+            max_total_bytes: args.max_total_bytes,
+            timeout: Duration::from_secs(args.timeout_seconds),
+            ..Default::default()
+        };
+        let report = import_history(
+            tinytree_client::Config::load(&args.config)?,
+            HistoryOptions {
+                source_git: args.source_git,
+                revision: args.revision,
+                state_dir: args.state.expect("clap requires state"),
+                reference: args.reference,
+                expected_generation: args.expected_generation,
+                git_program: args.git,
+                limits,
+            },
+        )
+        .await?;
+        println!("{}", serde_json::to_string(&report)?);
+        return Ok(());
+    }
+    #[cfg(not(unix))]
+    anyhow::ensure!(!args.history, "history mode currently requires Unix");
     let limits = Limits {
         max_entries: args.max_entries,
         max_file_bytes: args.max_file_bytes,

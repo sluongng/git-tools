@@ -757,3 +757,6 @@ async fn import_inner(client: NativeClient, options: Options) -> Result<Report> 
     report.generation = current.generation;
     Ok(report)
 }
+
+#[cfg(unix)]
+pub mod history;
