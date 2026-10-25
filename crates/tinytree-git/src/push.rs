@@ -31,6 +31,8 @@ pub struct PushOptions {
     pub(crate) after_push: bool,
     #[cfg(test)]
     pub(crate) after_ack: bool,
+    #[cfg(test)]
+    pub(crate) before_idle: Option<(u64, Arc<crate::watch::TestPause>)>,
 }
 impl PushOptions {
     pub fn new(export: ExportOptions, push_dir: PathBuf, remote: String) -> Self {
@@ -46,6 +48,8 @@ impl PushOptions {
             after_push: false,
             #[cfg(test)]
             after_ack: false,
+            #[cfg(test)]
+            before_idle: None,
         }
     }
     fn validate(&self) -> Result<()> {
@@ -871,6 +875,15 @@ async fn run_inner(
             disk.save(id, &mut s)
                 .await
                 .map_err(|_| PushError::PushUnconfirmed)?;
+            #[cfg(test)]
+            if let Some((generation, pause)) = &o.before_idle {
+                if p.generation == *generation {
+                    let pause = pause.clone();
+                    tokio::task::spawn_blocking(move || pause.block(None))
+                        .await
+                        .map_err(|_| PushError::PushUnconfirmed)?;
+                }
+            }
             Ok(())
         }
         .await;

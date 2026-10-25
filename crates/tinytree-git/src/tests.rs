@@ -2120,12 +2120,34 @@ async fn push_outbox_replays_exact_pending_before_latest_delivery_and_only_publi
     std::fs::create_dir_all(hook.parent().unwrap()).unwrap();
     std::fs::write(&hook,format!("#!/bin/sh\nwhile read old new reference; do printf '%s %s\\n' \"$new\" \"$reference\" >> {}; done\n",shell_quote(receipts.to_str().unwrap()))).unwrap();
     std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o700)).unwrap();
-    let mut h = push::start_push_watch(r.config.clone(), o.clone()).unwrap();
+    let expected = push::PushPosition {
+        generation: second.source_generation,
+        native_head: second.native_head.clone(),
+        git_head: second.git_head.clone(),
+    };
+    assert_eq!(expected.generation, 2);
+    let pause = watch::TestPause::new(None, true);
+    let release = Unpause(pause.clone());
+    let mut completing = o.clone();
+    completing.before_idle = Some((2, pause.clone()));
+    let mut h = push::start_push_watch(r.config.clone(), completing).unwrap();
+    wait_pause(&pause).await;
+    // Delivery and pin release are durable before the later successful Idle
+    // checkpoint computes lag. The intermediate public status is valid, not a
+    // completed observation from which the test can require zero lag.
+    let intermediate = push::push_status(&o.push_dir).unwrap();
+    assert_eq!(intermediate.phase, push::PushPhase::Draining);
+    assert_eq!(intermediate.desired.as_ref(), Some(&expected));
+    assert_eq!(intermediate.delivered.as_ref(), Some(&expected));
+    assert!(intermediate.pending.is_none());
+    assert_eq!(intermediate.lag_at_last_observation, None);
+    drop(release);
     let delivered = wait_push(&o.push_dir, |s| {
-        s.delivered
-            .as_ref()
-            .is_some_and(|p| p.git_head == second.git_head)
+        s.desired.as_ref() == Some(&expected)
+            && s.delivered.as_ref() == Some(&expected)
             && s.pending.is_none()
+            && s.phase == push::PushPhase::Idle
+            && s.last_error.is_none()
     })
     .await;
     assert_eq!(delivered.lag_at_last_observation, Some(0));
@@ -2202,10 +2224,16 @@ async fn push_reconciles_ambiguous_remote_success_without_reselection_and_reject
     h.shutdown().await.unwrap();
     o.after_push = false;
     let mut h = push::start_push_watch(r.config.clone(), o.clone()).unwrap();
-    let ack = wait_push(&o.push_dir, |s| {
-        s.delivered.is_some() && s.pending.is_none()
-    })
-    .await;
+    let ack = tokio::select! {
+        biased;
+        result = h.wait() => panic!(
+            "push actor exited before ACK: {result:#?}; durable status: {:?}",
+            push::push_status(&o.push_dir)
+        ),
+        status = wait_push(&o.push_dir, |s| {
+            s.delivered.is_some() && s.pending.is_none()
+        }) => status,
+    };
     assert_eq!(ack.attempts, 1);
     assert_eq!(ack.delivered.unwrap().git_head, report.git_head);
     h.shutdown().await.unwrap();
