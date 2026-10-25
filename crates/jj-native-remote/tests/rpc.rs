@@ -65,6 +65,8 @@ struct Counters {
     largest_metadata_batch: Arc<AtomicUsize>,
     paused: Arc<AtomicBool>,
     metadata_started: Arc<tokio::sync::Notify>,
+    capture_hold_pause: Arc<std::sync::Mutex<Option<String>>>,
+    capture_hold_entered: Arc<tokio::sync::Notify>,
     public_paused: Arc<AtomicBool>,
     public_started: Arc<tokio::sync::Notify>,
     missing_paused: Arc<AtomicBool>,
@@ -95,6 +97,8 @@ impl Counters {
             largest_metadata_batch: Arc::new(AtomicUsize::new(0)),
             paused: Arc::new(AtomicBool::new(false)),
             metadata_started: Arc::new(tokio::sync::Notify::new()),
+            capture_hold_pause: Arc::new(std::sync::Mutex::new(None)),
+            capture_hold_entered: Arc::new(tokio::sync::Notify::new()),
             public_paused: Arc::new(AtomicBool::new(false)),
             public_started: Arc::new(tokio::sync::Notify::new()),
             missing_paused: Arc::new(AtomicBool::new(false)),
@@ -138,6 +142,24 @@ impl Repository for Counting {
                     .unwrap_or("missing")
                     .to_owned(),
             );
+        }
+        let paused_hold = self.counts.capture_hold_pause.lock().unwrap().clone();
+        if paused_hold
+            .as_ref()
+            .is_some_and(|name| r.get_ref().reference_names == [name.clone()])
+        {
+            self.counts.capture_hold_entered.notify_one();
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while self.counts.capture_hold_pause.lock().unwrap().as_ref()
+                    == paused_hold.as_ref()
+                {
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            })
+            .await
+            .map_err(|_| {
+                Status::deadline_exceeded("capture hold fixture release deadline exceeded")
+            })?;
         }
         self.service.open_repository(r).await
     }
@@ -1022,6 +1044,7 @@ async fn cancelled_owned_metadata_operations_retain_external_guard_until_physica
                     head,
                     true,
                     false,
+                    false,
                     tokio::time::Instant::now() + Duration::from_secs(5),
                     owner,
                 )
@@ -1081,6 +1104,7 @@ async fn cancelled_owned_metadata_operations_retain_external_guard_until_physica
                     head,
                     true,
                     false,
+                    false,
                     tokio::time::Instant::now() + Duration::from_secs(5),
                     Arc::new(())
                 )
@@ -1103,6 +1127,7 @@ async fn cancelled_owned_metadata_operations_retain_external_guard_until_physica
             .preflight_creation(
                 head,
                 true,
+                false,
                 false,
                 tokio::time::Instant::now() + Duration::from_secs(5),
                 Arc::new(()),
@@ -8813,5 +8838,345 @@ async fn indexed_search_local_cursors_bind_source_inputs_and_replay_without_pinn
         .unwrap();
     drop((first, replay, next, scope, other));
     repo.wait_for_idle().await;
+    server.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn capture_frontier_stays_fixed_across_public_history_and_preserves_merge_drafts() {
+    for depth in [8, 128] {
+        let (_serverdir, store, _fixture, head, _history) = seed_history(depth);
+        let counts = Counters::new();
+        let server = Server::start(store.clone(), counts.clone()).await;
+        let directory = private_dir();
+        let (_direct, repo) = local(
+            directory.path(),
+            cache(directory.path()),
+            config(&server),
+            true,
+        );
+        repo.control.admit_commit(head).await.unwrap();
+        let head_key = m::ObjectKey {
+            kind: m::Kind::Commit,
+            id: m::ObjectId(head.0),
+        };
+        let m::Object::Commit(base) = repo.io.read_metadata(head_key).await.unwrap().into_object()
+        else {
+            unreachable!()
+        };
+        let root = m::ObjectKey {
+            kind: m::Kind::Tree,
+            id: m::ObjectId(base.root_tree.terms[0].0),
+        };
+        let mut left = base.clone();
+        left.parents = vec![head];
+        left.predecessors.clear();
+        left.description = "private left capture branch".into();
+        let left = repo
+            .io
+            .write_metadata(m::Object::Commit(left))
+            .await
+            .unwrap();
+        let mut right = base.clone();
+        right.parents = vec![head];
+        right.predecessors = vec![m::CommitId(left.key.id.0)];
+        right.description = "private right capture branch".into();
+        let right = repo
+            .io
+            .write_metadata(m::Object::Commit(right))
+            .await
+            .unwrap();
+        let mut merge = base;
+        merge.parents = vec![m::CommitId(left.key.id.0), m::CommitId(right.key.id.0)];
+        merge.predecessors = vec![head];
+        merge.root_tree = m::TreeMerge {
+            terms: vec![m::TreeId(root.id.0); 3],
+            labels: vec!["left".into(), "base".into(), "right".into()],
+        };
+        merge.description = "private unresolved merge capture".into();
+        let merge = repo
+            .io
+            .write_metadata(m::Object::Commit(merge))
+            .await
+            .unwrap();
+        let before = counts.metadata_keys.load(Ordering::SeqCst);
+        let observations = counts.reference_observations.load(Ordering::SeqCst);
+        let holds = counts.holds.load(Ordering::SeqCst);
+        let refs = store.references("example", &["main".into()]).unwrap();
+        let mut limits = jj_native_remote::NativeTransferLimits::default();
+        limits.max_roots = 8;
+        limits.max_files = 8;
+        limits.closure.max_objects = 16;
+        limits.closure.max_edges = 128;
+        limits.closure.max_metadata_bytes = 128 * 1024;
+        limits.closure.max_path_contexts = 16;
+        limits.closure.max_path_context_bytes = 4096;
+        // Independent TREE root deliberately precedes all COMMIT roots.
+        let staged = repo
+            .control
+            .transfer_native_capture_frontier(
+                vec![root, merge.key, left.key, right.key],
+                Arc::new(()),
+                limits.clone(),
+                tokio::time::Instant::now() + Duration::from_secs(10),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            staged.metadata_objects(),
+            3,
+            "public depth {depth} must not enter the capture frontier"
+        );
+        assert_eq!(staged.file_objects(), 0);
+        assert_eq!(staged.stages().len(), 3);
+        assert_eq!(
+            counts.metadata_keys.load(Ordering::SeqCst) - before,
+            0,
+            "cached canonical anchors need no remote metadata payload"
+        );
+        assert_eq!(
+            counts.reference_observations.load(Ordering::SeqCst) - observations,
+            1,
+            "the exact private hold is freshly observed"
+        );
+        assert_eq!(counts.files.load(Ordering::SeqCst), 0);
+        assert_eq!(counts.holds.load(Ordering::SeqCst), holds);
+        assert_eq!(store.references("example", &["main".into()]).unwrap(), refs);
+        let warm = repo
+            .control
+            .transfer_native_capture_frontier(
+                vec![root, merge.key],
+                Arc::new(()),
+                limits,
+                tokio::time::Instant::now() + Duration::from_secs(10),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            warm.metadata_objects(),
+            3,
+            "presence cannot hide the private parent/predecessor graph"
+        );
+        assert!(warm.stages().is_empty());
+        assert_eq!(warm.present_objects(), 3);
+        repo.wait_for_idle().await;
+        server.stop().await;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn capture_frontier_repairs_children_of_an_already_present_private_commit() {
+    let (_serverdir, store, _fixture, head) = seed();
+    let counts = Counters::new();
+    let server = Server::start(store.clone(), counts.clone()).await;
+    let directory = private_dir();
+    let (_direct, repo) = local(
+        directory.path(),
+        cache(directory.path()),
+        config(&server),
+        true,
+    );
+    repo.control.admit_commit(head).await.unwrap();
+    let m::Object::Commit(mut commit) = repo
+        .io
+        .read_metadata(m::ObjectKey {
+            kind: m::Kind::Commit,
+            id: m::ObjectId(head.0),
+        })
+        .await
+        .unwrap()
+        .into_object()
+    else {
+        unreachable!()
+    };
+    let m::Object::Tree(mut tree) = repo
+        .io
+        .read_metadata(m::ObjectKey {
+            kind: m::Kind::Tree,
+            id: m::ObjectId(commit.root_tree.terms[0].0),
+        })
+        .await
+        .unwrap()
+        .into_object()
+    else {
+        unreachable!()
+    };
+    let payload = b"private capture repair bytes";
+    let file = repo
+        .io
+        .write_file(&mut futures::io::Cursor::new(payload), 4096)
+        .await
+        .unwrap();
+    tree.entries.push(m::TreeEntry {
+        name: "new-private.txt".into(),
+        value: m::TreeValue::File {
+            id: file,
+            executable: false,
+            size_bytes: payload.len() as u64,
+            copy_id: None,
+        },
+    });
+    tree.entries.sort_by(|a, b| a.name.cmp(&b.name));
+    let tree = repo.io.write_metadata(m::Object::Tree(tree)).await.unwrap();
+    commit.parents = vec![head];
+    commit.predecessors.clear();
+    commit.description = "partially staged private capture".into();
+    commit.root_tree = m::TreeMerge {
+        terms: vec![m::TreeId(tree.key.id.0)],
+        labels: vec![String::new()],
+    };
+    let commit = repo
+        .io
+        .write_metadata(m::Object::Commit(commit))
+        .await
+        .unwrap();
+    // Deliberately stage only the parent object, not its new TREE/FILE children.
+    let bytes = repo.io.read_metadata(commit.key).await.unwrap();
+    store.put("example", commit, bytes.bytes(), 0).unwrap();
+    let holds = counts.holds.load(Ordering::SeqCst);
+    let refs = store.references("example", &["main".into()]).unwrap();
+    let staged = repo
+        .control
+        .transfer_native_capture_frontier(
+            vec![tree.key, commit.key],
+            Arc::new(()),
+            jj_native_remote::NativeTransferLimits::default(),
+            tokio::time::Instant::now() + Duration::from_secs(10),
+        )
+        .await
+        .unwrap();
+    assert!(staged.stages().iter().any(|s| s.descriptor == tree));
+    assert!(
+        staged
+            .stages()
+            .iter()
+            .any(|s| s.descriptor.key.kind == m::Kind::File && s.descriptor.key.id.0 == file.0)
+    );
+    assert!(!staged.stages().iter().any(|s| s.descriptor == commit));
+    assert!(staged.present_objects() > 0);
+    assert_eq!(
+        counts.files.load(Ordering::SeqCst),
+        0,
+        "unrelated public FILE bodies are not hydrated"
+    );
+    assert_eq!(counts.holds.load(Ordering::SeqCst), holds);
+    assert_eq!(store.references("example", &["main".into()]).unwrap(), refs);
+    repo.wait_for_idle().await;
+    server.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn capture_frontier_requires_a_retained_boundary_and_keeps_cancelled_work_owned() {
+    let (_serverdir, store, fixture, head) = seed();
+    let counts = Counters::new();
+    let server = Server::start(store.clone(), counts.clone()).await;
+    let directory = private_dir();
+    let (_direct, repo) = local(
+        directory.path(),
+        cache(directory.path()),
+        config(&server),
+        true,
+    );
+    let original = fixture
+        .objects()
+        .iter()
+        .find(|o| o.descriptor.key.id.0 == head.0)
+        .unwrap();
+    let m::Object::Commit(mut draft) = m::decode(&original.bytes, m::Limits::default()).unwrap()
+    else {
+        unreachable!()
+    };
+    draft.parents = vec![head];
+    draft.predecessors.clear();
+    draft.description = "draft without retained public boundary".into();
+    let draft = repo
+        .io
+        .write_metadata(m::Object::Commit(draft))
+        .await
+        .unwrap();
+    let error = repo
+        .control
+        .transfer_native_capture_frontier(
+            vec![draft.key],
+            Arc::new(()),
+            jj_native_remote::NativeTransferLimits::default(),
+            tokio::time::Instant::now() + Duration::from_secs(2),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(
+        error.downcast_ref::<Status>().unwrap().code(),
+        tonic::Code::Unimplemented
+    );
+    assert_eq!(
+        counts.metadata_keys.load(Ordering::SeqCst),
+        0,
+        "an unproved public parent must not trigger ancestry hydration"
+    );
+    assert_eq!(counts.holds.load(Ordering::SeqCst), 0);
+    repo.control.admit_commit(head).await.unwrap();
+    struct ReleaseCaptureHold(Counters);
+    impl Drop for ReleaseCaptureHold {
+        fn drop(&mut self) {
+            *self.0.capture_hold_pause.lock().unwrap() = None;
+        }
+    }
+    let hex = |bytes: &[u8]| bytes.iter().map(|b| format!("{b:02x}")).collect::<String>();
+    let hold_name = format!(
+        "_tinytree/hold/v1/{}/{}",
+        hex(&repo.control.client_id()),
+        hex(&head.0)
+    );
+    *counts.capture_hold_pause.lock().unwrap() = Some(hold_name);
+    let release = ReleaseCaptureHold(counts.clone());
+    let owner = Arc::new(());
+    let weak = Arc::downgrade(&owner);
+    let control = repo.control.clone();
+    let caller = tokio::spawn(async move {
+        control
+            .transfer_native_capture_frontier(
+                vec![draft.key],
+                owner,
+                jj_native_remote::NativeTransferLimits::default(),
+                tokio::time::Instant::now() + Duration::from_secs(2),
+            )
+            .await
+    });
+    tokio::time::timeout(
+        Duration::from_secs(1),
+        counts.capture_hold_entered.notified(),
+    )
+    .await
+    .unwrap();
+    caller.abort();
+    let _ = caller.await;
+    assert!(
+        weak.upgrade().is_some(),
+        "cancelled waiter does not release accepted proof/decode work"
+    );
+    assert!(
+        tokio::time::timeout(Duration::from_millis(25), repo.wait_for_idle())
+            .await
+            .is_err()
+    );
+    drop(release);
+    tokio::time::timeout(Duration::from_secs(5), repo.wait_for_idle())
+        .await
+        .unwrap();
+    assert!(weak.upgrade().is_none());
+    let error = repo
+        .control
+        .transfer_native_capture_frontier(
+            vec![draft.key],
+            Arc::new(()),
+            jj_native_remote::NativeTransferLimits::default(),
+            tokio::time::Instant::now() - Duration::from_millis(1),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(
+        error.downcast_ref::<Status>().unwrap().code(),
+        tonic::Code::DeadlineExceeded
+    );
+    assert_eq!(counts.files.load(Ordering::SeqCst), 0);
     server.stop().await;
 }

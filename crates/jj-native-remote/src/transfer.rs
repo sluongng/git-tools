@@ -13,6 +13,9 @@ use tonic::Status;
 
 type Owner = Arc<dyn Any + Send + Sync>;
 
+#[path = "capture_frontier.rs"]
+mod capture_frontier;
+
 /// Bounds for one full canonical walk. Public ancestry may be hydrated; this is
 /// not a thin missing-closure protocol. Source and target pools remain bounded
 /// independently and are included in the declared admission below.
@@ -201,6 +204,83 @@ impl RemoteRepositoryControl {
                 )
                 .await
                 .map_err(|_| Status::deadline_exceeded("native transfer deadline exceeded"))?
+            })
+            .await;
+            Ok(Completed {
+                result,
+                _scope: scope,
+            })
+        })
+        .await?;
+        completed.result
+    }
+
+    /// Stage a private capture's bounded local frontier. Fresh provider-created
+    /// retained boundaries terminate traversal before reads; descriptor presence
+    /// never does. This creates no holds or public references. Exact checkout
+    /// reads may extend existing source grants; they create no new retention
+    /// authority. This is not proof that a complete cloud version was published.
+    pub async fn transfer_native_capture_frontier(
+        &self,
+        roots: Vec<m::ObjectKey>,
+        owner: Owner,
+        limits: NativeTransferLimits,
+        originaldeadline: tokio::time::Instant,
+    ) -> Result<NativeTransferReceipt> {
+        let deadline = io::bounded_deadline(originaldeadline);
+        let source: Arc<dyn NativeObjectIo> = self.inner.local.clone();
+        // Exact nonresident TREE/SYMLINK reads use the provider's bounded SDK
+        // profile, never its generic descriptor/ancestry hydration. Fund that
+        // profile even though FILE upload snapshots remain strictly local.
+        let read_profile = crate::RemoteObjectIo {
+            inner: self.inner.clone(),
+        };
+        self.native_transfer_resources(&read_profile, &limits)?;
+        if roots.is_empty() || roots.len() > limits.max_roots {
+            return Err(limit());
+        }
+        if io::scope().is_some() {
+            return Err(Status::failed_precondition(
+                "native capture transfer requires independent host admission",
+            )
+            .into());
+        }
+        let permit = tokio::time::timeout_at(
+            deadline,
+            self.inner.background_transfer.clone().acquire_owned(),
+        )
+        .await
+        .map_err(|_| Status::deadline_exceeded("native capture admission deadline exceeded"))??;
+        let scope = Arc::new(io::ControlScope::background_transfer(
+            permit,
+            deadline,
+            owner.clone(),
+        ));
+        let control = self.clone();
+        struct Completed {
+            result: Result<NativeTransferReceipt>,
+            _scope: Arc<io::ControlScope>,
+        }
+        let completed = io::owned(async move {
+            let result = io::control_scope(scope.clone(), async {
+                tokio::time::timeout_at(deadline, async {
+                    let physical: Owner = scope.clone();
+                    let boundaries = control
+                        .capture_boundaries(&roots, physical.clone(), &limits, deadline)
+                        .await?;
+                    let closure =
+                        capture_frontier::collect(&control, roots, &boundaries, &limits, physical)
+                            .await?;
+                    let result = control
+                        .upload_collected(source, closure, owner, limits, deadline)
+                        .await;
+                    drop(boundaries);
+                    result
+                })
+                .await
+                .map_err(|_| {
+                    Status::deadline_exceeded("native capture transfer deadline exceeded")
+                })?
             })
             .await;
             Ok(Completed {

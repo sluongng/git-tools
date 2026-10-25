@@ -1025,6 +1025,7 @@ impl NativeQueryIo for RemoteQueryIo {
         root: m::CommitId,
         query: bool,
         cloud: bool,
+        thin_capture: bool,
         deadline: tokio::time::Instant,
         owner: QueryOwner,
     ) -> std::result::Result<QueryReply<()>, tonic::Status> {
@@ -1049,6 +1050,16 @@ impl NativeQueryIo for RemoteQueryIo {
                         .all(|feature| feature.supported && feature.authorized),
                     "native creation requires configured and authorized query/cloud features"
                 );
+                if thin_capture && root != m::CommitId::ROOT {
+                    // Normal clone already admitted this exact public head.
+                    // Raw host creation must prove that same existing retained
+                    // anchor before allocating a destination, not create one.
+                    crate::RemoteRepositoryControl {
+                        inner: this.inner.clone(),
+                    }
+                    .capture_anchor_ready(root, operation.clone(), operation.deadline)
+                    .await?;
+                }
                 if query {
                     let scope = client.open_query_scope(vec![root]).await?;
                     let mut cleanup = PreflightScope {

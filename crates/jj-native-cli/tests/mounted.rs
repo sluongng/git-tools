@@ -1010,6 +1010,7 @@ where
 #[derive(Default)]
 struct MetadataReads {
     ordinary_scope_opens: AtomicUsize,
+    hold_publications: AtomicUsize,
     capability_requests: Mutex<Vec<Vec<i32>>>,
     retained_scope_opens: AtomicUsize,
     creation_fault: AtomicUsize,
@@ -1182,6 +1183,16 @@ impl Repository for CountMetadata {
         &self,
         request: RpcRequest<p::PublishReferenceRequest>,
     ) -> Result<RpcResponse<p::Publication>, Status> {
+        if request
+            .get_ref()
+            .reference_name
+            .starts_with("_tinytree/hold/")
+        {
+            self.reads.hold_publications.fetch_add(1, Ordering::SeqCst);
+            if self.reads.creation_fault.load(Ordering::SeqCst) == 7 {
+                return Err(Status::permission_denied("selected root retention denied"));
+            }
+        }
         if request.get_ref().reference_name == "main"
             && self.reads.public_paused.load(Ordering::SeqCst)
         {
@@ -1331,6 +1342,8 @@ struct RemoteServer {
     head: String,
     historical_head: String,
     historical_trees: Vec<tinytree_model::ObjectKey>,
+    historical_commits: Vec<tinytree_model::ObjectKey>,
+    summary_parent_commits: Vec<tinytree_model::ObjectKey>,
     source_file: tinytree_model::ObjectKey,
     source_bytes: Vec<u8>,
     reads: Arc<AtomicUsize>,
@@ -1350,12 +1363,15 @@ impl RemoteServer {
         Self::start_with_history_and_cloud(8, true)
     }
     fn start_with_cloud_capture_capacity() -> Self {
+        Self::start_with_cloud_capture_capacity_and_history(8)
+    }
+    fn start_with_cloud_capture_capacity_and_history(history: usize) -> Self {
         // This many-capture workload retains historical operation/index proofs
         // for both workspaces. Give its catalog an explicit bounded profile;
         // keep the small fixtures and production defaults unchanged. The cloud
         // pool accounts configured worst-case work, not eager allocation/RSS.
         Self::start_profile_configured(
-            8,
+            history,
             true,
             None,
             false,
@@ -1588,6 +1604,7 @@ repositories=["example"]
         let mut parent = m::CommitId::ROOT;
         let mut historical_head = None;
         let mut historical_trees = Vec::new();
+        let mut historical_commits = Vec::new();
         for number in 0..history {
             let mut tree = current_tree.clone();
             tree.entries.push(m::TreeEntry {
@@ -1616,6 +1633,7 @@ repositories=["example"]
                 .put("example", commit.descriptor, &commit.bytes, 0)
                 .unwrap();
             index_commits.push((commit.descriptor, commit.bytes.clone()));
+            historical_commits.push(commit.descriptor.key);
             parent = m::CommitId(commit.descriptor.key.id.0);
             historical_head
                 .get_or_insert_with(|| blake3::Hash::from(parent.0).to_hex().to_string());
@@ -1760,6 +1778,28 @@ repositories=["example"]
             });
             (endpoint, task)
         });
+        let published = store
+            .references("example", &["main".into()])
+            .unwrap()
+            .remove(0)
+            .commit
+            .unwrap();
+        let (published_descriptor, published_bytes) =
+            store.read_metadata("example", published.key).unwrap();
+        assert_eq!(published_descriptor, published);
+        let m::Object::Commit(published_commit) =
+            m::decode(&published_bytes, m::Limits::default()).unwrap()
+        else {
+            panic!("published head must be a commit");
+        };
+        let summary_parent_commits = published_commit
+            .parents
+            .into_iter()
+            .map(|id| m::ObjectKey {
+                kind: m::Kind::Commit,
+                id: m::ObjectId(id.0),
+            })
+            .collect();
         Self {
             _directory: directory,
             runtime: Some(runtime),
@@ -1770,6 +1810,8 @@ repositories=["example"]
             head,
             historical_head: historical_head.unwrap(),
             historical_trees,
+            historical_commits,
+            summary_parent_commits,
             source_file,
             source_bytes,
             reads,
@@ -1787,6 +1829,26 @@ repositories=["example"]
         let requested = self.metadata.keys.lock().unwrap();
         self.historical_trees
             .iter()
+            .filter(|key| requested.contains(&(key.kind as i32, key.id.0)))
+            .count()
+    }
+
+    fn historical_commit_reads(&self) -> usize {
+        let requested = self.metadata.keys.lock().unwrap();
+        self.historical_commits
+            .iter()
+            .filter(|key| requested.contains(&(key.kind as i32, key.id.0)))
+            .count()
+    }
+
+    fn unrelated_historical_commit_reads(&self) -> usize {
+        // The default public-tip summary asks whether that commit is empty,
+        // which needs its exact parent COMMITs, but not their ancestry or TREEs.
+        // Derive that allowance from the published canonical head, not a count.
+        let requested = self.metadata.keys.lock().unwrap();
+        self.historical_commits
+            .iter()
+            .filter(|key| !self.summary_parent_commits.contains(key))
             .filter(|key| requested.contains(&(key.kind as i32, key.id.0)))
             .count()
     }
@@ -3057,7 +3119,7 @@ fn federated_index_production_factory_preserves_operations_and_drains_cli_querie
 #[test]
 #[ignore = "requires usable /dev/fuse and fusermount3; run mounted_tests locally"]
 fn parallel_native_workspaces_keep_backing_up_beyond_capture_capacity() {
-    let upstream = RemoteServer::start_with_cloud_capture_capacity();
+    let upstream = RemoteServer::start_with_cloud_capture_capacity_and_history(64);
     let mut fixture = Fixture::new();
     fixture.configure_remote(&upstream.endpoint);
     // Match the upstream replay share for this rapid single-operator workload.
@@ -3116,21 +3178,6 @@ fn parallel_native_workspaces_keep_backing_up_beyond_capture_capacity() {
         assert!(plan.policy.auto_capture && plan.policy.auto_upload);
         assert_eq!(plan.index_mode, native_broker::ProviderIndexMode::Federated);
     }
-    for root in &roots {
-        fixture.success(&base, &["tinytree", "unmount", root.to_str().unwrap()]);
-    }
-    fixture.stop_daemon();
-    // A creation-policy change must not reinterpret either saved index or
-    // revoke the immutable eligibility of these already enrolled workspaces.
-    fixture.index_mode("legacy");
-    fixture.start();
-    for root in &roots {
-        fixture.success(&base, &["tinytree", "resume", root.to_str().unwrap()]);
-    }
-    for root in &roots {
-        fixture.success(root, &["status"]);
-    }
-    let public = upstream.public();
     fn wait_latest(fixture: &Fixture, queued: u64) {
         let deadline = Instant::now() + Duration::from_secs(90);
         loop {
@@ -3152,6 +3199,32 @@ fn parallel_native_workspaces_keep_backing_up_beyond_capture_capacity() {
             std::thread::sleep(Duration::from_millis(50));
         }
     }
+    let first_captures = local_capture_status(&fixture)["queued"].as_u64().unwrap();
+    wait_latest(&fixture, first_captures);
+    assert_eq!(cloud_generation(&upstream, bindings[0].workspace_id), 1);
+    assert_eq!(cloud_generation(&upstream, bindings[1].workspace_id), 1);
+    assert_eq!(upstream.historical_commit_reads(), 0);
+    assert_eq!(upstream.historical_tree_reads(), 0);
+    let retained_holds = upstream.metadata.hold_publications.load(Ordering::SeqCst);
+    assert_eq!(
+        retained_holds, 1,
+        "both clones share their exact retained public anchor"
+    );
+    for root in &roots {
+        fixture.success(&base, &["tinytree", "unmount", root.to_str().unwrap()]);
+    }
+    fixture.stop_daemon();
+    // A creation-policy change must not reinterpret either saved index or
+    // revoke the immutable eligibility of these already enrolled workspaces.
+    fixture.index_mode("legacy");
+    fixture.start();
+    for root in &roots {
+        fixture.success(&base, &["tinytree", "resume", root.to_str().unwrap()]);
+    }
+    for root in &roots {
+        fixture.success(root, &["status"]);
+    }
+    let public = upstream.public();
     let initial = local_capture_status(&fixture)["queued"].as_u64().unwrap();
     wait_latest(&fixture, initial);
     let first: workspace_daemon::control::NativeCloudWorkspaces =
@@ -3212,8 +3285,9 @@ fn parallel_native_workspaces_keep_backing_up_beyond_capture_capacity() {
     // four-ticket fixture limit and the ordinary 64-ticket default.
     for round in 0..35 {
         for (agent, root) in roots.iter().enumerate() {
+            fs::create_dir_all(root.join("private/nested")).unwrap();
             fs::write(
-                root.join("agent.txt"),
+                root.join("private/nested/agent.txt"),
                 format!("private agent {agent} iteration {round}\n"),
             )
             .unwrap();
@@ -3244,12 +3318,23 @@ fn parallel_native_workspaces_keep_backing_up_beyond_capture_capacity() {
         assert_eq!(local_capture_bundles(&fixture).len(), 2);
         for (agent, root) in roots.iter().enumerate() {
             assert_eq!(
-                fs::read_to_string(root.join("agent.txt")).unwrap(),
+                fs::read_to_string(root.join("private/nested/agent.txt")).unwrap(),
                 format!("private agent {agent} iteration {round}\n")
             );
         }
         assert_eq!(upstream.public(), public);
         assert_eq!(upstream.file_reads(), 0);
+        assert_eq!(
+            upstream.unrelated_historical_commit_reads(),
+            0,
+            "status and automatic backup must not walk unrelated public history"
+        );
+        assert_eq!(upstream.historical_tree_reads(), 0);
+        assert_eq!(
+            upstream.metadata.hold_publications.load(Ordering::SeqCst),
+            retained_holds,
+            "capture publication must not create per-command retention holds"
+        );
     }
     assert!(expected >= 70);
     assert!(cloud_generation(&upstream, bindings[0].workspace_id) >= 35);
@@ -3355,6 +3440,7 @@ fn automatic_remote_creation_requires_live_features_before_destination_or_intent
         ("legacy server", 1),
         ("denied features", 2),
         ("unreadable selected root", 3),
+        ("selected root retention denied", 7),
     ] {
         let mut denied = Fixture::new();
         denied.configure_remote(&capable.endpoint);
@@ -3393,6 +3479,75 @@ fn automatic_remote_creation_requires_live_features_before_destination_or_intent
         denied.stop_daemon();
     }
     capable.metadata.creation_fault.store(0, Ordering::SeqCst);
+    // Negotiated features and a caller-visible plan do not create retention
+    // authority for a raw nonempty host mount. Normal clone admits its exact
+    // public head first; this bypass has deliberately never observed it.
+    let mut raw = Fixture::new();
+    raw.configure_remote(&capable.endpoint);
+    raw.automatic_policies();
+    raw.start();
+    let base = raw.base().to_owned();
+    let destination = base.join("unadmitted-auto");
+    let query = capable.runtime.as_ref().unwrap().block_on(async {
+        native_broker::BrokerQueryClient::connect(raw.broker.clone(), "example", Default::default())
+            .await
+            .unwrap()
+    });
+    let description = capable
+        .runtime
+        .as_ref()
+        .unwrap()
+        .block_on(query.describe_provider())
+        .unwrap();
+    let commit = *blake3::Hash::from_hex(&capable.head).unwrap().as_bytes();
+    let plan = description.creation_plan(commit).unwrap();
+    assert!(plan.policy.auto_upload);
+    let holds = capable.metadata.hold_publications.load(Ordering::SeqCst);
+    let preflight = capable
+        .runtime
+        .as_ref()
+        .unwrap()
+        .block_on(query.preflight_creation(m::CommitId(commit)));
+    assert!(
+        preflight.is_err(),
+        "missing ready anchor cannot pass automatic preflight"
+    );
+    assert!(
+        raw.control(Request::NativeMountPlanned {
+            root: destination.clone(),
+            store: "example".into(),
+            commit: capable.head.clone(),
+            workspace_id: "6b".repeat(32),
+            creation_plan: plan.encode(),
+        })
+        .is_err()
+    );
+    assert!(!destination.exists());
+    assert!(!raw.registry.exists());
+    assert!(
+        !raw.base()
+            .join("daemon/native-workspaces")
+            .join("6b".repeat(32))
+            .exists()
+    );
+    assert_eq!(
+        capable.metadata.hold_publications.load(Ordering::SeqCst),
+        holds,
+        "read-only preflight must never create a missing anchor"
+    );
+    // Intrinsic-root init needs no public anchor. Its entirely local first
+    // capture still reaches the configured retained cloud automatically.
+    let empty = base.join("intrinsic-auto");
+    raw.initialize(&empty);
+    let binding = raw.binding(&empty);
+    wait_for_capture_publications(&raw, 1);
+    assert!(cloud_generation(&capable, binding.workspace_id) >= 1);
+    assert_eq!(
+        capable.metadata.hold_publications.load(Ordering::SeqCst),
+        holds
+    );
+    raw.success(&base, &["tinytree", "unmount", empty.to_str().unwrap()]);
+    raw.stop_daemon();
 }
 
 #[test]
@@ -3825,6 +3980,11 @@ fn restore_retired_capture(
         jj_native_index::NAME
     );
     let restored_identity = binding.workspace_id;
+    let holds_before_backup = upstream.metadata.hold_publications.load(Ordering::SeqCst);
+    let public_scopes_before_backup = upstream
+        .metadata
+        .ordinary_scope_opens
+        .load(Ordering::SeqCst);
     let later = b"later local edit must survive restore retry\n";
     fs::write(root.join("capture-only.txt"), later).unwrap();
     let retry: workspace_daemon::control::NativeCloudRestored =
@@ -3865,6 +4025,19 @@ fn restore_retired_capture(
     assert!(cloud_generation(upstream, restored_identity) >= 1);
     let native_reads_after_selected_file = upstream.file_reads();
     assert_eq!(upstream.public(), public);
+    assert_eq!(
+        upstream.metadata.hold_publications.load(Ordering::SeqCst),
+        holds_before_backup,
+        "restored private roots reuse retained cloud authority, never new public holds"
+    );
+    assert_eq!(
+        upstream
+            .metadata
+            .ordinary_scope_opens
+            .load(Ordering::SeqCst),
+        public_scopes_before_backup,
+        "restored automatic backup never opens public query scopes for private roots"
+    );
     fixture.success(&base, &["tinytree", "unmount", root.to_str().unwrap()]);
     fixture.stop_daemon();
     fixture.start();
@@ -3927,6 +4100,19 @@ fn restore_retired_capture(
         "continued backup must not hydrate unrelated native FILE bodies"
     );
     assert_eq!(upstream.public(), public);
+    assert_eq!(
+        upstream.metadata.hold_publications.load(Ordering::SeqCst),
+        holds_before_backup,
+        "restored private roots reuse retained cloud authority, never new public holds"
+    );
+    assert_eq!(
+        upstream
+            .metadata
+            .ordinary_scope_opens
+            .load(Ordering::SeqCst),
+        public_scopes_before_backup,
+        "restored automatic backup never opens public query scopes for private roots"
+    );
     fixture.success(&base, &["tinytree", "unmount", root.to_str().unwrap()]);
     fixture.stop_daemon();
     // Explicit Legacy opts out of the new capability contract. First fail its

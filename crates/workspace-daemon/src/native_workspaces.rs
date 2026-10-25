@@ -780,6 +780,7 @@ impl Manager {
                         m::CommitId(commit),
                         query,
                         plan.policy.upload_enabled,
+                        plan.policy.auto_upload,
                         deadline,
                         // Clone the existing lease, never acquire a new fence:
                         // accepted cleanup outlives a cancelled control waiter.

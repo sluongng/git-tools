@@ -1059,6 +1059,9 @@ impl Worker {
     ) -> Result<()> {
         // Identity/routing validation precedes payload reads AND credential use.
         let (mount, alias, identity) = self.host.capture_mapping(&ticket)?;
+        // Eligibility is frozen in the workspace registration, not selected by
+        // the current global policy after a restart or configuration change.
+        let automatic = self.host.capture_auto_upload(&ticket)?;
         let source = self
             .sources
             .get(&alias)
@@ -1161,8 +1164,10 @@ impl Worker {
         }
         let existing = client.cloud_publication(&intent.header.key).await?;
         if existing.is_none() {
-            // Full metadata closure walk is a bounded background cost, not a
-            // thin missing-closure optimization. No target ref/hold is created.
+            // Automatically enrolled workspaces reuse authenticated retained
+            // boundaries and transfer only their local frontier. An unavailable
+            // proof remains queued; it never falls back to a public-history walk.
+            // Explicit/manual workspaces retain the original full-transfer path.
             let decoded = c::decode_manifest_v3(
                 &intent.manifest,
                 c::ManifestId(intent.header.manifest_id),
@@ -1181,16 +1186,24 @@ impl Worker {
                 max_temporary_bytes: self.policy.max_temporary_bytes,
                 ..Default::default()
             };
-            let receipt = source
-                .control
-                .transfer_native_closure(
-                    source.io.clone(),
-                    decoded.history.recovery.native_roots.clone(),
-                    owner.clone(),
-                    transfer,
-                    deadline,
-                )
-                .await?;
+            let roots = decoded.history.recovery.native_roots.clone();
+            let receipt = if automatic {
+                source
+                    .control
+                    .transfer_native_capture_frontier(roots, owner.clone(), transfer, deadline)
+                    .await?
+            } else {
+                source
+                    .control
+                    .transfer_native_closure(
+                        source.io.clone(),
+                        roots,
+                        owner.clone(),
+                        transfer,
+                        deadline,
+                    )
+                    .await?
+            };
             drop(receipt);
             drop(decoded);
             let pack = self.pack(&ticket, owner.clone()).await?;

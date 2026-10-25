@@ -68,7 +68,12 @@ exact-restore compatibility route also remain unenrolled. New cloud restores
 freeze their eligibility with the exact selected version before destination
 creation; their required query readiness uses that retained private source,
 not an ordinary public-root query. Captured index types are never converted by
-later creation-policy changes.
+later creation-policy changes. Automatic uploads transfer locally authored native
+metadata and FILEs only up to freshly verified existing retained hold/cloud
+boundaries; they do not download canonical public history to reconstruct a
+closure. Missing or unsupported boundary proof leaves the capture queued with
+an error, without a full-history fallback or a false backup acknowledgment.
+Explicit manual upload policies retain their full-transfer compatibility path.
 
 Set capture `policy = "disabled"` to disable capture and automatic upload, or
 upload `policy = "disabled"` to retain local captures without uploading them.

@@ -486,6 +486,36 @@ impl Ledger {
             self.config.max_admitted_roots + self.config.max_pending_operations,
         )
     }
+    pub fn capture_root(&self, head: CommitId, max_bytes: usize) -> Result<Option<Root>> {
+        self.check()?;
+        self.db
+            .read_tx()
+            .get(&self.roots, hex(&head.0).as_bytes())?
+            .map(|bytes| {
+                ensure!(
+                    bytes
+                        .len()
+                        .checked_mul(16)
+                        .and_then(|n| n.checked_add(2 * std::mem::size_of::<Root>()))
+                        .is_some_and(|n| n <= max_bytes),
+                    "capture anchor record exceeds byte budget"
+                );
+                Ok(serde_json::from_slice(&bytes)?)
+            })
+            .transpose()
+    }
+    /// Read-only capture proof snapshot, charged before JSON/model allocation.
+    pub fn capture_roots(&self, max_count: usize, max_bytes: usize) -> Result<(Vec<Root>, usize)> {
+        self.list_capture_bounded(
+            &self.roots,
+            max_count.min(
+                self.config
+                    .max_admitted_roots
+                    .saturating_add(self.config.max_pending_operations),
+            ),
+            max_bytes,
+        )
+    }
     pub fn pending_request(&self, id: &str) -> Result<Option<Request>> {
         self.get(&self.pending, id.as_bytes())
     }
@@ -974,6 +1004,36 @@ impl Ledger {
             values.push(serde_json::from_slice(&bytes)?);
         }
         Ok(values)
+    }
+    fn list_capture_bounded<T: serde::de::DeserializeOwned>(
+        &self,
+        space: &fjall::SingleWriterTxKeyspace,
+        max_count: usize,
+        max_bytes: usize,
+    ) -> Result<(Vec<T>, usize)> {
+        self.check()?;
+        let mut values = Vec::new();
+        let mut charged = 0usize;
+        for item in self.db.read_tx().iter(space) {
+            ensure!(
+                values.len() < max_count,
+                "capture proof record count exceeds budget"
+            );
+            let (_, bytes) = item.into_inner()?;
+            // JSON strings, sequence capacities, and the Vec's growth are
+            // included before allocating a decoded ledger record.
+            let cost = bytes
+                .len()
+                .checked_mul(16)
+                .and_then(|n| n.checked_add(2 * std::mem::size_of::<T>()))
+                .context("capture proof record budget overflow")?;
+            charged = charged
+                .checked_add(cost)
+                .filter(|n| *n <= max_bytes)
+                .context("capture proof record bytes exceed budget")?;
+            values.push(serde_json::from_slice(&bytes)?);
+        }
+        Ok((values, charged))
     }
     fn write(
         &self,

@@ -36,6 +36,10 @@ pub(crate) struct CloudVersionAuthority {
     roots: Vec<CloudKey>,
 }
 impl CloudVersionAuthority {
+    /// Saved keys are selection hints only until a fresh selected proof agrees.
+    pub fn native_root_hints(&self) -> impl Iterator<Item = Result<ObjectKey>> + '_ {
+        self.roots.iter().map(|root| root.key())
+    }
     pub fn root_count(&self) -> usize {
         self.roots.len()
     }
@@ -187,6 +191,50 @@ impl Ledger {
     }
     pub fn cloud_authorities(&self) -> Result<Vec<CloudVersionAuthority>> {
         self.list(&self.cloud_authorities, self.config.query.max_authorities)
+    }
+    pub fn capture_cloud_authorities(
+        &self,
+        max_count: usize,
+        max_bytes: usize,
+    ) -> Result<(Vec<CloudVersionAuthority>, usize)> {
+        self.list_capture_bounded(
+            &self.cloud_authorities,
+            max_count.min(self.config.query.max_authorities),
+            max_bytes,
+        )
+    }
+    /// Recheck the exact bounded snapshot without decoding a concurrently
+    /// replaced ledger value outside the capture reservation.
+    pub fn capture_valid_cloud_authority(
+        &self,
+        authority: &CloudVersionAuthority,
+        max_bytes: usize,
+    ) -> Result<bool> {
+        self.check()?;
+        ensure!(
+            authority.version == 1
+                && authority.id == authority.identity()?
+                && authority.generation > 0
+                && authority.roots.len() <= self.config.max_admitted_roots
+                && authority.roots.windows(2).all(|p| p[0] < p[1]),
+            "cloud version admission corrupt"
+        );
+        for root in &authority.roots {
+            root.key()?;
+        }
+        let Some(raw) = self
+            .db
+            .read_tx()
+            .get(&self.cloud_authorities, authority.id.as_bytes())?
+        else {
+            return Ok(false);
+        };
+        ensure!(
+            raw.len() <= max_bytes,
+            "capture cloud authority exceeds byte budget"
+        );
+        Ok(authority.binding == self.binding.scope
+            && raw.as_ref() == serde_json::to_vec(authority)?.as_slice())
     }
     pub fn valid_cloud_authority(&self, authority: &CloudVersionAuthority) -> Result<bool> {
         ensure!(

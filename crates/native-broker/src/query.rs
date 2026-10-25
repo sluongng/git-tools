@@ -645,6 +645,9 @@ pub trait NativeQueryIo: Send + Sync + std::fmt::Debug {
         _root: CommitId,
         _query: bool,
         _cloud: bool,
+        // Selected only from the host's saved/expected creation policy, never
+        // supplied as an independent caller-controlled wire flag.
+        _thin_capture: bool,
         _deadline: tokio::time::Instant,
         _owner: QueryOwner,
     ) -> Result<QueryReply<()>, Status> {

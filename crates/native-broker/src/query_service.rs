@@ -365,6 +365,7 @@ impl p::query_io_server::QueryIo for BrokerService {
                     tinytree_model::CommitId(root),
                     query,
                     plan.policy.upload_enabled,
+                    plan.policy.auto_upload,
                     work.deadline,
                     work.clone(),
                 )

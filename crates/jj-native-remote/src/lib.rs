@@ -1,6 +1,7 @@
 //! Broker-hosted lazy native I/O. Canonical local objects remain authoritative;
 //! the admission ledger records roots/proofs, never fabricated file residency.
 mod broker;
+mod capture_boundaries;
 mod closure;
 mod cloud;
 pub use cloud::AdmittedCloudVersion;
