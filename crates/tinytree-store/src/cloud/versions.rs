@@ -2660,6 +2660,17 @@ impl Inner {
         added: &[ObjectKey],
         replacement: Option<(&str, ObjectKey)>,
     ) -> Result<()> {
+        if let Some(roots) = self.cloud_gc_union_roots(repo, added, replacement)? {
+            self.closure(repo, roots, true, false)?;
+        }
+        Ok(())
+    }
+    fn cloud_gc_union_roots(
+        &self,
+        repo: &str,
+        added: &[ObjectKey],
+        replacement: Option<(&str, ObjectKey)>,
+    ) -> Result<Option<HashSet<ObjectKey>>> {
         let mut scan = Scan {
             records: 0,
             bytes: 0,
@@ -2668,7 +2679,7 @@ impl Inner {
         let plan = self.retained_cloud_plan(Some(repo), None, false, &mut scan)?;
         let landing = self.landing_roots(repo)?;
         if added.is_empty() && plan.versions.is_empty() && landing.is_empty() {
-            return Ok(());
+            return Ok(None);
         }
         let mut roots = plan.native;
         roots.extend(landing);
@@ -2694,8 +2705,7 @@ impl Inner {
         if let Some((_, target)) = replacement {
             roots.insert(target);
         }
-        self.closure(repo, roots, true, false)?;
-        Ok(())
+        Ok(Some(roots))
     }
     fn check_cloud_promise_quota(
         &self,
@@ -2710,7 +2720,7 @@ impl Inner {
             bytes: 0,
             payload: 0,
         };
-        self.check_cloud_gc_union(repo, &manifest.native_roots, None)?;
+        let gc_roots = self.cloud_gc_union_roots(repo, &manifest.native_roots, None)?;
         let mut plan = self.retained_cloud_plan(Some(repo), Some(owner), false, &mut scan)?;
         plan.native.extend(manifest.native_roots.iter().copied());
         plan.native.extend(self.legacy_principal_roots(
@@ -2742,22 +2752,26 @@ impl Inner {
         if plan.native.len() > limits.max_quota_scan_roots
             || plan.cloud.len().saturating_add(plan.index.len()) > limits.max_quota_scan_roots
         {
+            // An oversized owner plan must not suppress validation of the
+            // required repository post-state. Walk only that bounded union:
+            // there is no reason to seed an over-limit owner traversal when
+            // the original root-limit verdict will follow regardless.
+            if let Some(roots) = gc_roots {
+                self.closure(repo, roots, true, false)?;
+            }
             return Err(Error::Limit("cloud promised root quota scan"));
         }
-        let closure = self.closure(repo, plan.native, true, false)?;
+        // Validate the owner first and extend that same strict proof to the GC
+        // union. Shared immutable history and path contexts need not be read a
+        // second time; repository-only history never enters the owner charge.
+        let owner_bytes = self.cloud_quota_closure(repo, plan.native, gc_roots)?;
         let mut bytes = plan.blobs.values().try_fold(0u64, |sum, size| {
             sum.checked_add(*size)
                 .ok_or(Error::Limit("cloud promised bytes"))
         })?;
-        for key in closure {
-            bytes = bytes
-                .checked_add(
-                    self.descriptor(repo, key)?
-                        .ok_or(Error::MissingObject(key))?
-                        .size_bytes,
-                )
-                .ok_or(Error::Limit("cloud promised bytes"))?;
-        }
+        bytes = bytes
+            .checked_add(owner_bytes)
+            .ok_or(Error::Limit("cloud promised bytes"))?;
         if bytes > limits.max_unique_bytes_per_principal {
             return Err(Error::Limit("principal promised closure byte quota"));
         }

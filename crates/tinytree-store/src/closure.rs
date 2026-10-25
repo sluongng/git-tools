@@ -21,6 +21,39 @@ impl Budget {
     }
 }
 
+// One operation-local walk may be extended with more roots. Graph and path
+// context budgets remain cumulative; an object seen under one path is not a
+// proof of valid copy provenance under another path.
+struct Walk {
+    budget: Budget,
+    discovered: HashSet<ObjectKey>,
+    pending: Vec<ObjectKey>,
+    tree_roots: HashSet<TreeId>,
+    contexts: HashSet<(TreeId, Arc<str>)>,
+    pending_contexts: Vec<(TreeId, Arc<str>)>,
+    context_bytes: usize,
+    descriptor_bytes: Option<u64>,
+}
+impl Walk {
+    fn new(config: &Config, max_metadata_bytes: u64) -> Self {
+        Self {
+            budget: Budget {
+                edges: 0,
+                maximum: config.max_closure_edges,
+                metadata_bytes: 0,
+                max_metadata_bytes,
+            },
+            discovered: HashSet::new(),
+            pending: Vec::new(),
+            tree_roots: HashSet::new(),
+            contexts: HashSet::new(),
+            pending_contexts: Vec::new(),
+            context_bytes: 0,
+            descriptor_bytes: None,
+        }
+    }
+}
+
 fn enqueue(
     key: ObjectKey,
     discovered: &mut HashSet<ObjectKey>,
@@ -72,29 +105,81 @@ impl Inner {
         config: &Config,
         max_metadata_bytes: u64,
     ) -> Result<HashSet<ObjectKey>> {
-        let mut budget = Budget {
-            edges: 0,
-            maximum: config.max_closure_edges,
-            metadata_bytes: 0,
-            max_metadata_bytes,
-        };
-        let mut discovered = HashSet::new();
-        let mut pending = Vec::new();
-        let mut explicit_tree_roots = HashSet::new();
+        let mut walk = Walk::new(config, max_metadata_bytes);
+        self.extend_closure(
+            repo,
+            roots,
+            strict,
+            verify_file_bytes,
+            promises,
+            config,
+            &mut walk,
+        )?;
+        Ok(walk.discovered)
+    }
+
+    /// The owner roots are a subset of the required GC union. Count the owner
+    /// descriptors on their first graph visit, then finish the repository union
+    /// with the same graph/path proof and budgets, without charging repository-
+    /// only objects to the owner. The caller holds the existing Store gate.
+    pub(super) fn cloud_quota_closure(
+        &self,
+        repo: &str,
+        owner_roots: HashSet<ObjectKey>,
+        mut gc_roots: Option<HashSet<ObjectKey>>,
+    ) -> Result<u64> {
+        if let Some(roots) = &mut gc_roots {
+            if !owner_roots.is_subset(roots) {
+                return Err(Error::Corrupt("cloud owner roots outside GC union"));
+            }
+            // Only original roots have already paid a root edge. A GC root
+            // previously reached as a descendant must still pay its root edge.
+            for root in &owner_roots {
+                roots.remove(root);
+            }
+        }
+        let mut walk = Walk::new(&self.config, u64::MAX);
+        walk.descriptor_bytes = Some(0);
+        let promises = HashMap::new();
+        self.extend_closure(
+            repo,
+            owner_roots,
+            true,
+            false,
+            &promises,
+            &self.config,
+            &mut walk,
+        )?;
+        let owner_bytes = walk.descriptor_bytes.take().unwrap();
+        if let Some(roots) = gc_roots {
+            self.extend_closure(repo, roots, true, false, &promises, &self.config, &mut walk)?;
+        }
+        Ok(owner_bytes)
+    }
+
+    fn extend_closure(
+        &self,
+        repo: &str,
+        roots: impl IntoIterator<Item = ObjectKey>,
+        strict: bool,
+        verify_file_bytes: bool,
+        promises: &HashMap<ObjectKey, Descriptor>,
+        config: &Config,
+        walk: &mut Walk,
+    ) -> Result<()> {
         for root in roots {
             if strict && root.kind == Kind::Tree {
-                explicit_tree_roots.insert(TreeId(root.id.0));
+                walk.tree_roots.insert(TreeId(root.id.0));
             }
             enqueue(
                 root,
-                &mut discovered,
-                &mut pending,
-                &mut budget,
+                &mut walk.discovered,
+                &mut walk.pending,
+                &mut walk.budget,
                 config.max_closure_objects,
             )?;
         }
-        let mut tree_roots = explicit_tree_roots;
-        while let Some(key) = pending.pop() {
+        while let Some(key) = walk.pending.pop() {
             let descriptor = self.descriptor(repo, key)?.or_else(|| {
                 (key.kind == Kind::File)
                     .then(|| promises.get(&key).copied())
@@ -107,6 +192,11 @@ impl Inner {
                     continue;
                 }
             };
+            if let Some(bytes) = &mut walk.descriptor_bytes {
+                *bytes = bytes
+                    .checked_add(descriptor.size_bytes)
+                    .ok_or(Error::Limit("cloud promised bytes"))?;
+            }
             // File content cannot introduce edges. GC validates its presence and
             // length, while reads/publication verify bytes outside the gate.
             if key.kind == Kind::File {
@@ -116,7 +206,7 @@ impl Inner {
                 }
                 continue;
             }
-            let object = self.budgeted_metadata(repo, descriptor, &mut budget)?;
+            let object = self.budgeted_metadata(repo, descriptor, &mut walk.budget)?;
             match &object {
                 Object::Tree(tree) => {
                     for entry in &tree.entries {
@@ -147,7 +237,11 @@ impl Inner {
                             }) {
                                 Some(actual) => {
                                     let size = if symlink {
-                                        match self.budgeted_metadata(repo, actual, &mut budget)? {
+                                        match self.budgeted_metadata(
+                                            repo,
+                                            actual,
+                                            &mut walk.budget,
+                                        )? {
                                             Object::Symlink(target) => target.len() as u64,
                                             _ => return Err(Error::Corrupt("symlink type")),
                                         }
@@ -168,8 +262,8 @@ impl Inner {
                     // Every commit, including ancestors/legacy predecessors, and
                     // EVERY positive and negative merge term supplies a root.
                     for id in &commit.root_tree.terms {
-                        tree_roots.insert(*id);
-                        if tree_roots.len() > config.max_path_contexts {
+                        walk.tree_roots.insert(*id);
+                        if walk.tree_roots.len() > config.max_path_contexts {
                             return Err(Error::Limit("tree path contexts"));
                         }
                     }
@@ -179,17 +273,17 @@ impl Inner {
             for child in object.references() {
                 enqueue(
                     child,
-                    &mut discovered,
-                    &mut pending,
-                    &mut budget,
+                    &mut walk.discovered,
+                    &mut walk.pending,
+                    &mut walk.budget,
                     config.max_closure_objects,
                 )?;
             }
         }
         if strict {
-            self.copy_paths(repo, tree_roots, &mut budget, config)?;
+            self.copy_paths(repo, walk, config)?;
         }
-        Ok(discovered)
+        Ok(())
     }
 
     fn budgeted_metadata(
@@ -220,27 +314,18 @@ impl Inner {
         Ok(tinytree_model::decode(&bytes, self.config.model_limits)?)
     }
 
-    fn copy_paths(
-        &self,
-        repo: &str,
-        roots: HashSet<TreeId>,
-        budget: &mut Budget,
-        config: &Config,
-    ) -> Result<()> {
-        let mut seen: HashSet<(TreeId, Arc<str>)> = HashSet::new();
-        let mut pending = Vec::new();
-        let mut context_bytes = 0usize;
-        for id in roots {
+    fn copy_paths(&self, repo: &str, walk: &mut Walk, config: &Config) -> Result<()> {
+        for &id in &walk.tree_roots {
             self.enqueue_context(
                 id,
                 Arc::from(""),
-                &mut seen,
-                &mut pending,
-                &mut context_bytes,
+                &mut walk.contexts,
+                &mut walk.pending_contexts,
+                &mut walk.context_bytes,
                 config,
             )?;
         }
-        while let Some((id, prefix)) = pending.pop() {
+        while let Some((id, prefix)) = walk.pending_contexts.pop() {
             let key = ObjectKey {
                 kind: Kind::Tree,
                 id: ObjectId(id.0),
@@ -248,11 +333,12 @@ impl Inner {
             let descriptor = self
                 .descriptor(repo, key)?
                 .ok_or(Error::MissingObject(key))?;
-            let Object::Tree(tree) = self.budgeted_metadata(repo, descriptor, budget)? else {
+            let Object::Tree(tree) = self.budgeted_metadata(repo, descriptor, &mut walk.budget)?
+            else {
                 return Err(Error::Corrupt("tree context type"));
             };
             for entry in tree.entries {
-                budget.edge()?;
+                walk.budget.edge()?;
                 let length = prefix
                     .len()
                     .checked_add(usize::from(!prefix.is_empty()))
@@ -281,16 +367,16 @@ impl Inner {
                     TreeValue::Tree(child) => self.enqueue_context(
                         child,
                         Arc::from(path),
-                        &mut seen,
-                        &mut pending,
-                        &mut context_bytes,
+                        &mut walk.contexts,
+                        &mut walk.pending_contexts,
+                        &mut walk.context_bytes,
                         config,
                     )?,
                     TreeValue::File {
                         copy_id: Some(copy),
                         ..
                     } => {
-                        budget.edge()?;
+                        walk.budget.edge()?;
                         let key = ObjectKey {
                             kind: Kind::CopyHistory,
                             id: ObjectId(copy.0),
@@ -299,7 +385,7 @@ impl Inner {
                             .descriptor(repo, key)?
                             .ok_or(Error::MissingObject(key))?;
                         let Object::CopyHistory(history) =
-                            self.budgeted_metadata(repo, descriptor, budget)?
+                            self.budgeted_metadata(repo, descriptor, &mut walk.budget)?
                         else {
                             return Err(Error::Corrupt("copy history type"));
                         };

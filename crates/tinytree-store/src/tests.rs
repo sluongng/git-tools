@@ -3261,6 +3261,32 @@ fn cloud_and_legacy_holds_share_one_deduplicated_principal_promise_quota() {
         .map(|member| member.selected.size_bytes)
         .sum::<u64>();
     let exact_bytes = cloud_bytes + file.size_bytes + root.size_bytes + head.size_bytes;
+    // The repository union also includes another owner's history and public
+    // roots. Neither its canonical bytes nor opaque recovery blobs belong to
+    // this principal's byte-exact promise charge.
+    let (_, unrelated_root, unrelated_head) = fixture(&store, "another owner's history");
+    let unrelated_owner = CloudOwner {
+        principal: [43; 32],
+    };
+    let (unrelated_manifest, unrelated_leases) =
+        cloud_capture(&store, unrelated_owner, unrelated_head, unrelated_root);
+    store
+        .publish_cloud_version(
+            "demo",
+            unrelated_owner,
+            &cloud_request(&unrelated_manifest, 0, "other-owner", &unrelated_leases),
+            0,
+            &CloudPublicationLimits::default(),
+        )
+        .unwrap();
+    let public_head = put_object(
+        &store,
+        Object::Commit(commit(TreeId(root.key.id.0), "public-only history")),
+        0,
+    );
+    store
+        .publish("demo", &request("public-only", 0, Some(public_head)), 0)
+        .unwrap();
     let retention = RetentionLimits {
         max_unique_bytes_per_principal: exact_bytes,
         ..RetentionLimits::default()
@@ -3594,6 +3620,211 @@ fn prospective_cloud_repeated_metadata_work_is_bounded_before_ack() {
     );
     drop(store);
     Store::open_existing(directory.path(), cfg).unwrap();
+}
+
+#[test]
+fn legacy_only_quota_does_not_introduce_public_reference_union_validation() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut cfg = config();
+    cfg.max_closure_objects = 3;
+    let store = Store::open(directory.path(), cfg).unwrap();
+    store.create_repository("demo").unwrap();
+    let (_, _, public) = fixture(&store, "public history");
+    let (file, root, held) = fixture(&store, "separate legacy history");
+    store
+        .publish("demo", &request("public", 0, Some(public)), 0)
+        .unwrap();
+    let owner = hold_owner(65, 1);
+    let limits = RetentionLimits {
+        max_unique_bytes_per_principal: file.size_bytes + root.size_bytes + held.size_bytes,
+        ..RetentionLimits::default()
+    };
+    // Each history fits three objects; their union does not. With no cloud or
+    // landing roots, the existing legacy-only policy must remain owner-local.
+    store
+        .publish_retention(
+            "demo",
+            owner,
+            &hold_request(owner, held, "legacy-only", 0, true),
+            &limits,
+            1,
+        )
+        .unwrap();
+}
+
+#[test]
+fn cloud_gc_extension_charges_descendant_roots_without_recharging_owner_roots() {
+    for (edges, accepted) in [(8, false), (9, true)] {
+        let directory = tempfile::tempdir().unwrap();
+        let mut cfg = config();
+        cfg.max_closure_edges = edges;
+        let store = Store::open(directory.path(), cfg).unwrap();
+        store.create_repository("demo").unwrap();
+        let (_, root, parent) = fixture(&store, "retained ancestor");
+        let previous_owner = CloudOwner {
+            principal: [61; 32],
+        };
+        let (previous, previous_leases) = cloud_capture(&store, previous_owner, parent, root);
+        store
+            .publish_cloud_version(
+                "demo",
+                previous_owner,
+                &cloud_request(&previous, 0, "ancestor", &previous_leases),
+                0,
+                &CloudPublicationLimits::default(),
+            )
+            .unwrap();
+        let mut child = commit(TreeId(root.key.id.0), "owner descendant");
+        child.parents = vec![CommitId(parent.key.id.0)];
+        let child = put_object(&store, Object::Commit(child), 0);
+        let owner = CloudOwner {
+            principal: [62; 32],
+        };
+        let (manifest, leases) = cloud_capture(&store, owner, child, root);
+        let publication = cloud_request(&manifest, 0, "descendant", &leases);
+        // Owner graph/root edges cost six and its file context costs one.
+        // The GC union adds the intrinsic empty TREE and the already-seen
+        // ancestor as explicit roots: both must still pay their root edge.
+        let result = store.publish_cloud_version(
+            "demo",
+            owner,
+            &publication,
+            1,
+            &CloudPublicationLimits::default(),
+        );
+        if accepted {
+            result.unwrap();
+        } else {
+            assert!(matches!(result, Err(Error::Limit("closure edges"))));
+            assert_eq!(
+                store
+                    .cloud_publication("demo", owner, "descendant")
+                    .unwrap(),
+                None
+            );
+        }
+    }
+}
+
+#[test]
+fn cloud_gc_extension_preserves_tree_context_and_path_byte_budgets() {
+    struct Case {
+        previous_is_child: bool,
+        contexts: usize,
+        bytes: usize,
+        owner_roots: usize,
+        expected: &'static str,
+    }
+    for case in [
+        Case {
+            previous_is_child: true,
+            contexts: 3,
+            bytes: 1024,
+            owner_roots: 100,
+            expected: "tree path contexts",
+        },
+        Case {
+            previous_is_child: false,
+            contexts: 100,
+            bytes: 8,
+            owner_roots: 100,
+            expected: "tree path context bytes",
+        },
+        Case {
+            previous_is_child: true,
+            contexts: 3,
+            bytes: 1024,
+            owner_roots: 1,
+            expected: "tree path contexts",
+        },
+        Case {
+            previous_is_child: true,
+            contexts: 4,
+            bytes: 1024,
+            owner_roots: 1,
+            expected: "cloud promised root quota scan",
+        },
+    ] {
+        let directory = tempfile::tempdir().unwrap();
+        let mut cfg = config();
+        cfg.max_path_contexts = case.contexts;
+        cfg.max_path_context_bytes = case.bytes;
+        let store = Store::open(directory.path(), cfg).unwrap();
+        store.create_repository("demo").unwrap();
+        let (file, _, _) = fixture(&store, "context base");
+        let shared = put_object(&store, Object::Tree(tree(file, file.size_bytes)), 0);
+        let nested = |name: &str| Tree {
+            entries: vec![TreeEntry {
+                name: name.into(),
+                value: TreeValue::Tree(TreeId(shared.key.id.0)),
+            }],
+        };
+        let previous_root = if case.previous_is_child {
+            shared
+        } else {
+            put_object(&store, Object::Tree(nested("right")), 0)
+        };
+        let previous_head = put_object(
+            &store,
+            Object::Commit(commit(TreeId(previous_root.key.id.0), "previous contexts")),
+            0,
+        );
+        let previous_owner = CloudOwner {
+            principal: [63; 32],
+        };
+        let (previous, previous_leases) =
+            cloud_capture(&store, previous_owner, previous_head, previous_root);
+        store
+            .publish_cloud_version(
+                "demo",
+                previous_owner,
+                &cloud_request(&previous, 0, "previous-contexts", &previous_leases),
+                0,
+                &CloudPublicationLimits::default(),
+            )
+            .unwrap();
+        let root = put_object(&store, Object::Tree(nested("left")), 0);
+        let head = put_object(
+            &store,
+            Object::Commit(commit(TreeId(root.key.id.0), "new contexts")),
+            0,
+        );
+        let owner = CloudOwner {
+            principal: [64; 32],
+        };
+        let (manifest, leases) = cloud_capture(&store, owner, head, root);
+        let mut limits = CloudPublicationLimits::default();
+        limits.retention.max_unique_bytes_per_principal = 1;
+        limits.retention.max_quota_scan_roots = case.owner_roots;
+        // The owner's left subtree is valid by itself. Extending to an older
+        // explicit TREE root must add its empty-prefix context even when its
+        // graph object was visited below left. Different prefixes also share
+        // one cumulative path-byte budget, not separate per-phase budgets.
+        // Required GC validation also precedes known owner-byte excess and,
+        // in the final two cases, the owner's root-count limit (two native
+        // roots). With sufficient GC contexts, the root-count verdict wins.
+        let result = store.publish_cloud_version(
+            "demo",
+            owner,
+            &cloud_request(&manifest, 0, "new-contexts", &leases),
+            1,
+            &limits,
+        );
+        assert!(
+            matches!(&result, Err(Error::Limit(reason)) if *reason == case.expected),
+            "contexts={}, path bytes={}, owner roots={}: expected {}, got {result:?}",
+            case.contexts,
+            case.bytes,
+            case.owner_roots,
+            case.expected
+        );
+        assert_eq!(
+            store
+                .cloud_publication("demo", owner, "new-contexts")
+                .unwrap(),
+            None
+        );
+    }
 }
 
 #[test]
