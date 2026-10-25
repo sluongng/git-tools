@@ -18,6 +18,8 @@ struct IntentRecord {
     workspace_id: [u8; 32],
     initial_commit: Vec<u8>,
     completed: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    creation_plan: Option<Vec<u8>>,
 }
 
 /// An exclusive per-root provisioning lease. Keep this handle alive across the
@@ -31,6 +33,14 @@ pub struct ProvisioningIntent {
     record: IntentRecord,
 }
 impl ProvisioningIntent {
+    pub fn creation_plan(&self) -> Result<Option<native_broker::CreationPlan>> {
+        self.record
+            .creation_plan
+            .as_deref()
+            .map(native_broker::CreationPlan::decode)
+            .transpose()
+            .map_err(Into::into)
+    }
     pub fn workspace_id(&self) -> [u8; 32] {
         self.record.workspace_id
     }
@@ -124,6 +134,36 @@ impl Registry {
         endpoint: LocalEndpoint,
         initial_commit: &CommitId,
     ) -> Result<ProvisioningIntent> {
+        self.begin_provisioning_inner(root, repository, endpoint, initial_commit, None)
+    }
+    pub fn begin_provisioning_with_plan(
+        self: &Arc<Self>,
+        root: &Path,
+        repository: String,
+        endpoint: LocalEndpoint,
+        initial_commit: &CommitId,
+        plan: native_broker::CreationPlan,
+    ) -> Result<ProvisioningIntent> {
+        ensure!(
+            plan.root.as_slice() == initial_commit.as_bytes(),
+            "creation plan root differs from provisioning root"
+        );
+        self.begin_provisioning_inner(
+            root,
+            repository,
+            endpoint,
+            initial_commit,
+            Some(plan.encode()),
+        )
+    }
+    fn begin_provisioning_inner(
+        self: &Arc<Self>,
+        root: &Path,
+        repository: String,
+        endpoint: LocalEndpoint,
+        initial_commit: &CommitId,
+        creation_plan: Option<Vec<u8>>,
+    ) -> Result<ProvisioningIntent> {
         normalized(root)?;
         let root = root.canonicalize()?;
         let endpoint: Endpoint = endpoint.into();
@@ -146,7 +186,8 @@ impl Registry {
             ensure!(
                 record.repository == repository
                     && record.endpoint == endpoint
-                    && record.initial_commit == initial_commit.as_bytes(),
+                    && record.initial_commit == initial_commit.as_bytes()
+                    && (creation_plan.is_none() || record.creation_plan == creation_plan),
                 "another durable provisioning request reserves this root; recover the original intent explicitly"
             );
             ensure!(
@@ -173,6 +214,7 @@ impl Registry {
             workspace_id,
             initial_commit: initial_commit.as_bytes().to_vec(),
             completed: false,
+            creation_plan,
         };
         {
             let _global = self.lock()?;
@@ -250,6 +292,13 @@ impl Registry {
                 && record.initial_commit.len() == 32,
             "invalid durable provisioning intent; preserve and reconcile explicitly"
         );
+        if let Some(bytes) = &record.creation_plan {
+            let plan = native_broker::CreationPlan::decode(bytes)?;
+            ensure!(
+                plan.root.as_slice() == record.initial_commit,
+                "durable creation plan root mismatch"
+            );
+        }
         self.binding(
             record.workspace_id,
             root,

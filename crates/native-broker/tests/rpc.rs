@@ -3440,6 +3440,7 @@ async fn live_provider_description_binds_alias_identity_and_separate_creation_po
         ("second".to_owned(), provider),
     ]);
     let description = ProviderDescription {
+        creation_policy: None,
         identity: [17; 32],
         query_capable: false,
         index_mode: ProviderIndexMode::Legacy,
@@ -3660,6 +3661,7 @@ async fn managed_commands_bind_all_client_routes_to_exact_registered_alias_and_f
             (
                 "first".into(),
                 native_broker::ProviderDescription {
+                    creation_policy: None,
                     identity: [1; 32],
                     query_capable: true,
                     index_mode: native_broker::ProviderIndexMode::Legacy,
@@ -3668,6 +3670,7 @@ async fn managed_commands_bind_all_client_routes_to_exact_registered_alias_and_f
             (
                 "second".into(),
                 native_broker::ProviderDescription {
+                    creation_policy: None,
                     identity: [2; 32],
                     query_capable: true,
                     index_mode: native_broker::ProviderIndexMode::Legacy,
@@ -3676,6 +3679,7 @@ async fn managed_commands_bind_all_client_routes_to_exact_registered_alias_and_f
             (
                 "local-only".into(),
                 native_broker::ProviderDescription {
+                    creation_policy: None,
                     identity: [3; 32],
                     query_capable: false,
                     index_mode: native_broker::ProviderIndexMode::Legacy,
@@ -4067,6 +4071,7 @@ fn cloud_query_service(root: &Path, query: Arc<FakeQuery>, cfg: Config) -> Broke
             (
                 "first".into(),
                 native_broker::ProviderDescription {
+                    creation_policy: None,
                     identity: [1; 32],
                     query_capable: true,
                     index_mode: native_broker::ProviderIndexMode::Legacy,
@@ -4075,6 +4080,7 @@ fn cloud_query_service(root: &Path, query: Arc<FakeQuery>, cfg: Config) -> Broke
             (
                 "second".into(),
                 native_broker::ProviderDescription {
+                    creation_policy: None,
                     identity: [2; 32],
                     query_capable: true,
                     index_mode: native_broker::ProviderIndexMode::Legacy,
@@ -4083,6 +4089,7 @@ fn cloud_query_service(root: &Path, query: Arc<FakeQuery>, cfg: Config) -> Broke
             (
                 "local-only".into(),
                 native_broker::ProviderDescription {
+                    creation_policy: None,
                     identity: [3; 32],
                     query_capable: false,
                     index_mode: native_broker::ProviderIndexMode::Legacy,

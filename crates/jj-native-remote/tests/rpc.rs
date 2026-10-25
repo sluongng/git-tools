@@ -16,6 +16,7 @@ use tinytree_client::protocol as p;
 use tinytree_model as m;
 use tinytree_server::{Principal, RepositoryService, ServiceConfig};
 use tinytree_store::Store;
+use tonic::codegen::http;
 use tonic::{Request, Response, Status, Streaming, codec::CompressionEncoding};
 const TOKEN: &str = "native-remote-loopback-test-token";
 fn private_dir() -> tempfile::TempDir {
@@ -66,6 +67,11 @@ struct Counters {
     public_started: Arc<tokio::sync::Notify>,
     missing_paused: Arc<AtomicBool>,
     missing_started: Arc<tokio::sync::Notify>,
+    preflight_close_mode: Arc<AtomicUsize>,
+    preflight_close_calls: Arc<AtomicUsize>,
+    preflight_close_paused: Arc<AtomicBool>,
+    preflight_close_entered: Arc<tokio::sync::Notify>,
+    preflight_close_release: Arc<tokio::sync::Notify>,
 }
 impl Counters {
     fn new() -> Self {
@@ -89,6 +95,11 @@ impl Counters {
             public_started: Arc::new(tokio::sync::Notify::new()),
             missing_paused: Arc::new(AtomicBool::new(false)),
             missing_started: Arc::new(tokio::sync::Notify::new()),
+            preflight_close_mode: Arc::new(AtomicUsize::new(0)),
+            preflight_close_calls: Arc::new(AtomicUsize::new(0)),
+            preflight_close_paused: Arc::new(AtomicBool::new(false)),
+            preflight_close_entered: Arc::new(tokio::sync::Notify::new()),
+            preflight_close_release: Arc::new(tokio::sync::Notify::new()),
         }
     }
 }
@@ -218,6 +229,67 @@ impl Repository for Counting {
         self.service.get_publication(r).await
     }
 }
+// Fault only the physical CloseScope transport boundary. All successful
+// responses still come from the real authenticated query service.
+#[derive(Clone)]
+struct PreflightCloseFault<S> {
+    inner: S,
+    counts: Counters,
+}
+impl<S: tonic::server::NamedService> tonic::server::NamedService for PreflightCloseFault<S> {
+    const NAME: &'static str = S::NAME;
+}
+impl<S> tonic::codegen::Service<http::Request<tonic::body::Body>> for PreflightCloseFault<S>
+where
+    S: tonic::codegen::Service<
+            http::Request<tonic::body::Body>,
+            Response = http::Response<tonic::body::Body>,
+            Error = std::convert::Infallible,
+        > + Clone
+        + Send
+        + 'static,
+    S::Future: Send + 'static,
+{
+    type Response = http::Response<tonic::body::Body>;
+    type Error = std::convert::Infallible;
+    type Future = std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<Self::Response, Self::Error>> + Send>,
+    >;
+    fn poll_ready(
+        &mut self,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<(), Self::Error>> {
+        self.inner.poll_ready(cx)
+    }
+    fn call(&mut self, request: http::Request<tonic::body::Body>) -> Self::Future {
+        let mode = self.counts.preflight_close_mode.load(Ordering::SeqCst);
+        if mode == 0 || !request.uri().path().ends_with("/CloseScope") {
+            return Box::pin(self.inner.call(request));
+        }
+        let counts = self.counts.clone();
+        let count = counts.preflight_close_calls.fetch_add(1, Ordering::SeqCst);
+        counts.preflight_close_entered.notify_one();
+        let ready = self.inner.clone();
+        let mut inner = std::mem::replace(&mut self.inner, ready);
+        Box::pin(async move {
+            if mode == 1 && count == 0 {
+                return Ok(
+                    Status::unavailable("preflight close acknowledgment unavailable").into_http(),
+                );
+            }
+            while counts.preflight_close_paused.load(Ordering::SeqCst) {
+                let released = counts.preflight_close_release.notified();
+                tokio::pin!(released);
+                released.as_mut().enable();
+                if !counts.preflight_close_paused.load(Ordering::SeqCst) {
+                    break;
+                }
+                released.await;
+            }
+            inner.call(request).await
+        })
+    }
+}
 struct Server {
     address: std::net::SocketAddr,
     stop: tokio::sync::oneshot::Sender<()>,
@@ -270,7 +342,10 @@ impl Server {
         let capture_timeouts = counts.capture_timeouts.clone();
         let query_timeouts = counts.query_timeouts.clone();
         let query = tonic::service::interceptor::InterceptedService::new(
-            service.query_grpc_service(),
+            PreflightCloseFault {
+                inner: service.query_grpc_service(),
+                counts: counts.clone(),
+            },
             move |request: Request<()>| {
                 query_requests.fetch_add(1, Ordering::SeqCst);
                 if capture_timeouts.load(Ordering::SeqCst) {
@@ -876,6 +951,148 @@ async fn cancelled_owned_metadata_operations_retain_external_guard_until_physica
             weak.upgrade().is_none(),
             "idle must follow worker and owner destruction"
         );
+        server.stop().await;
+    }
+    use native_broker::NativeQueryIo as _;
+    for (name, mode) in [("close error", 1), ("cancelled close caller", 2)] {
+        let (_serverdir, store, _fixture, head) = seed();
+        let counts = Counters::new();
+        counts.preflight_close_mode.store(mode, Ordering::SeqCst);
+        counts.preflight_close_paused.store(true, Ordering::SeqCst);
+        let indexdir = private_dir();
+        let index = tinytree_index::Index::open(indexdir.path(), &Default::default()).unwrap();
+        // This case faults the first close, so its single-attempt client uses
+        // a declared ready index instead of testing asynchronous cold warming.
+        let (descriptor, canonical) = store
+            .read_metadata(
+                "example",
+                m::ObjectKey {
+                    kind: m::Kind::Commit,
+                    id: m::ObjectId(head.0),
+                },
+            )
+            .unwrap();
+        index.ingest("example", descriptor, &canonical).unwrap();
+        let service = RepositoryService::new(
+            store,
+            ServiceConfig::default(),
+            vec!["example".into()],
+            vec![Principal::new("test", TOKEN, vec!["example".into()], true).unwrap()],
+        )
+        .unwrap()
+        .with_query_index(index)
+        .unwrap();
+        let server = Server::start_service(service, counts.clone(), None).await;
+        let directory = private_dir();
+        let mut configuration = config(&server);
+        configuration.operation_timeout_ms = 1000;
+        configuration.remote.rpc.retry.max_attempts = 1;
+        configuration.remote.limits.max_inflight = 1;
+        configuration.remote.query_cleanup_timeout_ms = 2000;
+        let (_direct, repo) = local(
+            directory.path(),
+            cache(directory.path()),
+            configuration,
+            true,
+        );
+        let owner = Arc::new(());
+        let weak = Arc::downgrade(&owner);
+        let query = repo.query.clone();
+        let mut caller = tokio::spawn(async move {
+            query
+                .preflight_creation(
+                    head,
+                    true,
+                    false,
+                    tokio::time::Instant::now() + Duration::from_secs(5),
+                    owner,
+                )
+                .await
+        });
+        let mut completed = None;
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if counts.preflight_close_calls.load(Ordering::SeqCst) > 0 {
+                    break;
+                }
+                tokio::select! {
+                    _ = counts.preflight_close_entered.notified() => {},
+                    result = &mut caller => {
+                        if counts.preflight_close_calls.load(Ordering::SeqCst) == 0 {
+                            panic!("{name}: preflight failed before close: {result:?}");
+                        }
+                        completed = Some(result);
+                        break;
+                    },
+                }
+            }
+        })
+        .await
+        .unwrap();
+        if mode == 2 {
+            caller.abort();
+            let _ = caller.await;
+        } else {
+            assert_eq!(
+                match completed {
+                    Some(result) => result,
+                    None => caller.await,
+                }
+                .unwrap()
+                .unwrap_err()
+                .code(),
+                tonic::Code::Unavailable,
+                "{name}"
+            );
+        }
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while counts.preflight_close_calls.load(Ordering::SeqCst) < 2 {
+                counts.preflight_close_entered.notified().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(
+            weak.upgrade().is_some(),
+            "{name}: physical cleanup keeps caller owner"
+        );
+        assert!(
+            tokio::time::timeout(
+                Duration::from_millis(25),
+                repo.query.preflight_creation(
+                    head,
+                    true,
+                    false,
+                    tokio::time::Instant::now() + Duration::from_secs(5),
+                    Arc::new(())
+                )
+            )
+            .await
+            .is_err(),
+            "{name}: sole operation permit remains with the blocked cleanup"
+        );
+        counts.preflight_close_paused.store(false, Ordering::SeqCst);
+        counts.preflight_close_release.notify_waiters();
+        tokio::time::timeout(Duration::from_secs(5), repo.wait_for_idle())
+            .await
+            .unwrap();
+        assert!(
+            weak.upgrade().is_none(),
+            "{name}: idle follows physical owner destruction"
+        );
+        counts.preflight_close_mode.store(0, Ordering::SeqCst);
+        repo.query
+            .preflight_creation(
+                head,
+                true,
+                false,
+                tokio::time::Instant::now() + Duration::from_secs(5),
+                Arc::new(()),
+            )
+            .await
+            .unwrap();
+        assert_eq!(counts.files.load(Ordering::SeqCst), 0);
+        assert_eq!(counts.holds.load(Ordering::SeqCst), 0);
         server.stop().await;
     }
 }
@@ -6849,6 +7066,7 @@ async fn exercise_retained_query_facade(
     .with_provider_descriptions(std::collections::HashMap::from([(
         "example".into(),
         native_broker::ProviderDescription {
+            creation_policy: None,
             identity: [41; 32],
             query_capable: true,
             index_mode: native_broker::ProviderIndexMode::Legacy,

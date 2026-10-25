@@ -334,7 +334,11 @@ impl Service<HttpRequest<Body>> for QueryRpcService {
         self.describe.poll_ready(cx)
     }
     fn call(&mut self, request: HttpRequest<Body>) -> Self::Future {
-        if request.uri().path() == "/native.broker.v1.QueryIo/DescribeProvider" {
+        if matches!(
+            request.uri().path(),
+            "/native.broker.v1.QueryIo/DescribeProvider"
+                | "/native.broker.v1.QueryIo/PreflightCreation"
+        ) {
             self.describe.call(request)
         } else {
             self.inner.call(request)
@@ -343,6 +347,40 @@ impl Service<HttpRequest<Body>> for QueryRpcService {
 }
 #[tonic::async_trait]
 impl p::query_io_server::QueryIo for BrokerService {
+    async fn preflight_creation(
+        &self,
+        request: Request<p::CreationRequest>,
+    ) -> Result<Response<p::CreationPlan>, Status> {
+        let (input, work) = input(request, 1024)?;
+        self.authorize_command(&input.store_id, &work)?;
+        let root = handle(&input.root)?;
+        let plan = self
+            .describe_provider(&input.store_id)?
+            .creation_plan(root)?;
+        let query = plan.index_mode == crate::ProviderIndexMode::Federated;
+        if query || plan.policy.upload_enabled {
+            let checked = self
+                .query_provider(&input.store_id)?
+                .preflight_creation(
+                    tinytree_model::CommitId(root),
+                    query,
+                    plan.policy.upload_enabled,
+                    work.deadline,
+                    work.clone(),
+                )
+                .await?;
+            drop(checked);
+        }
+        reply(
+            QueryReply {
+                value: plan.wire(),
+                owner: Arc::new(()),
+            },
+            work,
+            1024,
+        )
+    }
+
     async fn describe_provider(
         &self,
         request: Request<p::DescribeProviderRequest>,
@@ -356,6 +394,7 @@ impl p::query_io_server::QueryIo for BrokerService {
                     store_id: input.store_id,
                     identity: description.identity.to_vec(),
                     query_capable: Some(description.query_capable),
+                    creation_policy: description.creation_policy.map(CreationPolicy::wire),
                     index_mode: match description.index_mode {
                         crate::ProviderIndexMode::Legacy => p::ProviderIndexMode::Legacy,
                         crate::ProviderIndexMode::Federated => p::ProviderIndexMode::Federated,

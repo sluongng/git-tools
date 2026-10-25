@@ -79,6 +79,14 @@ pub enum Request {
         commit: String,
         workspace_id: String,
     },
+    /// Checked creation selection; never an upstream authorization credential.
+    NativeMountPlanned {
+        root: PathBuf,
+        store: String,
+        commit: String,
+        workspace_id: String,
+        creation_plan: Vec<u8>,
+    },
     /// Exact unpublished commit for an immutable trusted-check source.
     NativeCandidateMount {
         root: PathBuf,

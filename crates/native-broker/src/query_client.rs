@@ -261,7 +261,44 @@ impl BrokerQueryClient {
             identity,
             index_mode,
             query_capable: reply.query_capable.ok_or_else(integrity)?,
+            creation_policy: reply
+                .creation_policy
+                .map(CreationPolicy::checked)
+                .transpose()?,
         })
+    }
+    pub async fn preflight_creation(&self, root: CommitId) -> Result<CreationPlan, Status> {
+        let client = self
+            .clone()
+            .with_operation_deadline(Instant::now() + self.inner.config.policy.operation_timeout());
+        let expected = client.describe_provider().await?.creation_plan(root.0)?;
+        let reply = client
+            .execute(
+                Arc::new(()),
+                move |mut client, deadline, store, _| async move {
+                    client = client
+                        .max_decoding_message_size(1024)
+                        .max_encoding_message_size(1024);
+                    Ok(client
+                        .preflight_creation(request(
+                            p::CreationRequest {
+                                store_id: store,
+                                root: root.0.to_vec(),
+                            },
+                            deadline,
+                            1024,
+                        )?)
+                        .await?
+                        .into_inner())
+                },
+            )
+            .await?
+            .value;
+        let checked = CreationPlan::checked(reply)?;
+        if checked != expected {
+            return Err(integrity());
+        }
+        Ok(checked)
     }
     fn preflight(&self, payload_bytes: usize) -> Result<(), Status> {
         crate::query_service::bounded_input(

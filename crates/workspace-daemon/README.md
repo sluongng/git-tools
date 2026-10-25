@@ -58,20 +58,29 @@ See the [TOML example](../../examples/workspace.toml) for conservative defaults.
 
 ## Retained captures
 
-With federated indexes on Linux, set `native.workspaces.capture.policy` to
-`"after_command_best_effort"` to queue a durable local capture after each command.
-To publish queued captures asynchronously, also set
-`native.workspaces.upload.policy` to `"publish_retaining_roots"` and enable captured
-versions on the remote server. Both policies are disabled by default; capture
-adds command-completion work, while upload runs in the background.
-Status distinguishes local queuing from historical publication. Upload never
-moves public references or removes local tickets, roots or packs; it is not
-current availability proof, a Clean transition, or permission to evict data.
+New remote native `init`/`clone` workspaces on Linux use `"auto"` capture and
+upload policies by default. Creation requires authenticated query and captured
+cloud support before it creates a destination. After each command, the daemon
+queues a durable local capture; a background worker publishes it without moving
+public references. Local aliases and workspaces created before this automatic
+enrollment remain unchanged. Restored workspaces currently require explicit
+capture/upload policies for continued backup.
+
+Set capture `policy = "disabled"` to disable capture and automatic upload, or
+upload `policy = "disabled"` to retain local captures without uploading them.
+For explicit opt-in on existing workspaces, use capture
+`"after_command_best_effort"` and upload `"publish_retaining_roots"` (or the
+retirement policy below). Capture adds command-completion work; upload runs in
+the background. Status distinguishes local queuing from historical publication;
+neither publication nor a catalog row proves current remote availability or a
+Clean transition.
 Use the native CLI's [restore guide](../jj-native-cli#restore-a-retained-capture)
 for an exact selected capture and scoped current-state resume.
 
-Alternatively, `"publish_retiring_redundant"` explicitly permits an older saved
-local capsule to become remote-only. It requires at least two capture slots and
+Automatic upload for enrolled workspaces uses the same bounded retirement
+rules as explicit `"publish_retiring_redundant"`, allowing an older saved local
+capsule to become remote-only. `"publish_retaining_roots"` instead keeps every
+local ticket and pack. Retirement requires at least two capture slots and
 retains the newest capsule for each workspace. Retirement needs a freshly verified
 exact remote capture, a newer durable capture for the same registration, and exact
 OP/VIEW/index representation coverage in that newer capture. Native roots must

@@ -390,9 +390,21 @@ fn provisioning_intent_survives_restart_and_conflicting_requests_never_replace_i
             .unwrap()
             .is_none()
     );
+    let plan = native_broker::CreationPlan {
+        provider_identity: [7; 32],
+        root: [0; 32],
+        index_mode: native_broker::ProviderIndexMode::Federated,
+        policy: native_broker::CreationPolicy {
+            digest: [8; 32],
+            capture_enabled: true,
+            upload_enabled: true,
+            auto_capture: true,
+            auto_upload: true,
+        },
+    };
     let intent = fixture
         .registry
-        .begin_provisioning(root, "fixture".into(), endpoint.clone(), &head)
+        .begin_provisioning_with_plan(root, "fixture".into(), endpoint.clone(), &head, plan)
         .unwrap();
     let id = intent.workspace_id();
     assert_ne!(id, [0; 32]);
@@ -404,6 +416,7 @@ fn provisioning_intent_survives_restart_and_conflicting_requests_never_replace_i
     assert_eq!(pending.initial_commit(), head);
     assert_eq!(pending.repository(), "fixture");
     assert_eq!(pending.endpoint(), endpoint);
+    assert_eq!(pending.creation_plan().unwrap(), Some(plan));
     drop(pending);
     let retry = reopened
         .begin_provisioning(root, "fixture".into(), endpoint.clone(), &head)
@@ -433,6 +446,13 @@ fn provisioning_intent_survives_restart_and_conflicting_requests_never_replace_i
                 LocalEndpoint::UnixSocket(root.parent().unwrap().join("other.sock")),
                 &head
             )
+            .is_err()
+    );
+    let mut changed = plan;
+    changed.index_mode = native_broker::ProviderIndexMode::Legacy;
+    assert!(
+        reopened
+            .begin_provisioning_with_plan(root, "fixture".into(), endpoint.clone(), &head, changed)
             .is_err()
     );
     let mut pending = reopened.pending_provisioning(root).unwrap().unwrap();
@@ -1580,6 +1600,29 @@ struct RestoreCloudFixture {
 impl tinytree_client::cloud_protocol::workspace_cloud_server::WorkspaceCloud
     for RestoreCloudFixture
 {
+    async fn list_workspaces(
+        &self,
+        _: tonic::Request<tinytree_client::cloud_protocol::ListWorkspacesRequest>,
+    ) -> std::result::Result<
+        tonic::Response<tinytree_client::cloud_protocol::ListWorkspacesResponse>,
+        tonic::Status,
+    > {
+        Err(tonic::Status::unimplemented(
+            "legacy exact-restore fixture has no discovery service",
+        ))
+    }
+    async fn list_versions(
+        &self,
+        _: tonic::Request<tinytree_client::cloud_protocol::ListVersionsRequest>,
+    ) -> std::result::Result<
+        tonic::Response<tinytree_client::cloud_protocol::ListVersionsResponse>,
+        tonic::Status,
+    > {
+        Err(tonic::Status::unimplemented(
+            "legacy exact-restore fixture has no discovery service",
+        ))
+    }
+
     async fn put_object(
         &self,
         _: tonic::Request<tinytree_client::cloud_protocol::PutObjectRequest>,

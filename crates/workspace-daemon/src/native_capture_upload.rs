@@ -271,12 +271,20 @@ async fn start_inner(
     hooks: Arc<TestHooks>,
 ) -> Result<Option<Handle>> {
     let policy = config.native.workspaces.upload.clone();
-    if policy.policy == NativeCaptureUploadPolicy::Disabled {
+    if policy.policy == NativeCaptureUploadPolicy::Disabled
+        || (policy.policy == NativeCaptureUploadPolicy::Auto
+            && (sources.is_empty()
+                || config.native.workspaces.capture.policy
+                    == crate::config::NativeCapturePolicy::Disabled))
+    {
         return Ok(None);
     }
     let stats = Arc::new(Stats::default());
     stats.retiring.store(
-        policy.policy == NativeCaptureUploadPolicy::PublishRetiringRedundant,
+        matches!(
+            policy.policy,
+            NativeCaptureUploadPolicy::Auto | NativeCaptureUploadPolicy::PublishRetiringRedundant
+        ),
         Ordering::Relaxed,
     );
     stats.set("idle");
@@ -473,7 +481,10 @@ impl Worker {
             _permit: tokio::time::timeout_at(deadline, self.admission.clone().acquire_owned())
                 .await??,
         });
-        if self.policy.policy == NativeCaptureUploadPolicy::PublishRetiringRedundant {
+        if matches!(
+            self.policy.policy,
+            NativeCaptureUploadPolicy::Auto | NativeCaptureUploadPolicy::PublishRetiringRedundant
+        ) {
             tokio::time::timeout_at(deadline, self.complete_cleanup(admission.clone())).await??;
         }
         let worker = self.clone();
@@ -507,6 +518,11 @@ impl Worker {
             tickets.rotate_left(split);
         }
         for ticket in tickets {
+            if self.policy.policy == NativeCaptureUploadPolicy::Auto
+                && !self.host.capture_auto_upload(&ticket)?
+            {
+                continue;
+            }
             let published = format!("{}.published", hex(&ticket.id.0));
             if self.directory.path().join(&published).try_exists()? {
                 let header: Header =
@@ -546,7 +562,10 @@ impl Worker {
         }
         // Publish pending work BEFORE proving retirement of old versions. A
         // missing/unavailable old proof must retain it, not starve new backups.
-        if self.policy.policy == NativeCaptureUploadPolicy::PublishRetiringRedundant {
+        if matches!(
+            self.policy.policy,
+            NativeCaptureUploadPolicy::Auto | NativeCaptureUploadPolicy::PublishRetiringRedundant
+        ) {
             match tokio::time::timeout_at(deadline, self.retire_one(deadline, admission.clone()))
                 .await
             {
@@ -664,6 +683,15 @@ impl Worker {
             tickets.len() <= self.policy.max_jobs,
             "capture retirement inventory limit"
         );
+        if self.policy.policy == NativeCaptureUploadPolicy::Auto {
+            let mut enrolled = Vec::with_capacity(tickets.len());
+            for ticket in tickets {
+                if self.host.capture_auto_upload(&ticket)? {
+                    enrolled.push(ticket);
+                }
+            }
+            tickets = enrolled;
+        }
         tickets.sort_by_key(|ticket| (ticket.registry_epoch, ticket.id));
         let mut candidates = tickets.clone();
         if let Some(last) = *self

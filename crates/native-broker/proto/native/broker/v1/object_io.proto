@@ -53,6 +53,7 @@ message PublicationReply {
 // broker-local and never carry upstream connection settings or cursor tokens.
 service QueryIo {
   rpc DescribeProvider(DescribeProviderRequest) returns (ProviderDescription);
+  rpc PreflightCreation(CreationRequest) returns (CreationPlan);
   rpc OpenCloudScope(QueryOpenCloudScopeRequest) returns (QueryScopeReply);
   rpc OpenScope(QueryOpenScopeRequest) returns (QueryScopeReply);
   rpc ForkScope(QueryForkScopeRequest) returns (QueryScopeReply);
@@ -162,6 +163,7 @@ message ProviderDescription {
   bytes identity = 2; // Exactly 32 nonzero opaque daemon-computed bytes.
   optional bool query_capable = 3;
   ProviderIndexMode index_mode = 4;
+  CreationPolicy creation_policy = 5;
 }
 
 // Compact bounded envelopes keep repeated upstream fields out of the local
@@ -175,3 +177,20 @@ message LandingRequest {
   bool submit = 5;
 }
 message LandingReply { bytes job = 1; }
+
+// Frozen selection policy, not a credential or retained-root grant.
+message CreationPolicy {
+  bytes digest = 1;
+  optional bool capture_enabled = 2;
+  optional bool upload_enabled = 3;
+  optional bool auto_capture = 4;
+  optional bool auto_upload = 5;
+}
+message CreationRequest { string store_id = 1; bytes root = 2; }
+message CreationPlan {
+  uint32 version = 1;
+  bytes provider_identity = 2;
+  bytes root = 3;
+  ProviderIndexMode index_mode = 4;
+  CreationPolicy policy = 5;
+}

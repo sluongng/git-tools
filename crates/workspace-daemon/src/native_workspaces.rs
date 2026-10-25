@@ -68,6 +68,8 @@ struct Record {
     state: Lifecycle,
     #[serde(default)]
     native_mount: Option<crate::recovery::NativeMountProof>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    creation_plan: Option<Vec<u8>>,
 }
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
@@ -107,6 +109,7 @@ fn read_record(bytes: &[u8]) -> Result<Record> {
             let old: LegacyRecord = serde_json::from_slice(bytes)?;
             ensure!(old.version == 1, "invalid legacy native record");
             Ok(Record {
+                creation_plan: None,
                 version: 2,
                 workspace_id: old.workspace_id,
                 store: old.store,
@@ -651,8 +654,29 @@ impl Manager {
         workspace_id: String,
     ) -> Result<Mounted> {
         let deadline = self.host_admission_deadline();
-        self.create_mode(root, store, commit, workspace_id, false, deadline)
+        self.create_mode(root, store, commit, workspace_id, false, None, deadline)
             .await
+    }
+    pub async fn create_planned(
+        &mut self,
+        root: PathBuf,
+        store: String,
+        commit: String,
+        workspace_id: String,
+        creation_plan: Vec<u8>,
+    ) -> Result<Mounted> {
+        let plan = native_broker::CreationPlan::decode(&creation_plan)?;
+        let deadline = self.host_admission_deadline();
+        self.create_mode(
+            root,
+            store,
+            commit,
+            workspace_id,
+            false,
+            Some(plan),
+            deadline,
+        )
+        .await
     }
     /// Fresh immutable check source; ordinary native creation stays writable.
     pub async fn create_candidate(
@@ -663,7 +687,7 @@ impl Manager {
         workspace_id: String,
     ) -> Result<Mounted> {
         let deadline = self.host_admission_deadline();
-        self.create_mode(root, store, commit, workspace_id, true, deadline)
+        self.create_mode(root, store, commit, workspace_id, true, None, deadline)
             .await
     }
     async fn create_mode(
@@ -673,6 +697,7 @@ impl Manager {
         commit: String,
         workspace_id: String,
         immutable: bool,
+        requested_plan: Option<native_broker::CreationPlan>,
         deadline: tokio::time::Instant,
     ) -> Result<Mounted> {
         #[cfg(not(any(target_os = "linux", target_os = "macos")))]
@@ -705,8 +730,54 @@ impl Manager {
                 .any(|intent| intent.workspace_id == id || overlaps(&intent.root, &root)),
             "native destination is reserved by a cloud restore intent"
         );
+        let creation_plan = if let Some(existing) = self.entries.get(&workspace_id) {
+            if let Some(plan) = requested_plan {
+                ensure!(
+                    existing.record.creation_plan.as_deref() == Some(plan.encode().as_slice()),
+                    "saved native creation plan differs; preserve the original intent"
+                );
+            }
+            existing.record.creation_plan.clone()
+        } else if let Some(plan) = requested_plan {
+            ensure!(
+                !immutable && plan.root == commit,
+                "native creation plan root mismatch"
+            );
+            let description = self.config.native.workspaces.creation_description(
+                repository.identity,
+                repository.remote,
+                repository.query.is_some(),
+            );
+            let expected = description.creation_plan(commit)?;
+            ensure!(
+                plan == expected,
+                "native creation policy changed before first host admission; preserve the client intent"
+            );
+            let query = plan.index_mode == native_broker::ProviderIndexMode::Federated;
+            if query || plan.policy.upload_enabled {
+                let checked = repository
+                    .query
+                    .as_ref()
+                    .context("native creation query adapter unavailable")?
+                    .preflight_creation(
+                        m::CommitId(commit),
+                        query,
+                        plan.policy.upload_enabled,
+                        deadline,
+                        // Clone the existing lease, never acquire a new fence:
+                        // accepted cleanup outlives a cancelled control waiter.
+                        Arc::new(access.clone()),
+                    )
+                    .await?;
+                drop(checked);
+            }
+            Some(plan.encode())
+        } else {
+            None
+        };
         let registry = self.open_registry()?;
         let record = Record {
+            creation_plan,
             version: if immutable { 3 } else { 2 },
             workspace_id: id,
             root: root.clone(),
@@ -874,7 +945,12 @@ impl Manager {
         if let Some(commands) = &self.commands {
             if let Some(access) = &access {
                 commands
-                    .register_with_host_access(&binding, repository.identity, access.clone())
+                    .register_enrolled_with_host_access(
+                        &binding,
+                        repository.identity,
+                        creation_policy(&record)?.is_some_and(|p| p.auto_upload),
+                        access.clone(),
+                    )
                     .await?;
                 commands
                     .invalidate_workspace_with_host_access(
@@ -988,6 +1064,7 @@ impl Manager {
             commands.set_capture_target(
                 &workspace_id,
                 Some(Arc::new(crate::native_capture::Target {
+                    auto_enrolled: creation_policy(&record)?.is_some_and(|p| p.auto_capture),
                     controller: Arc::downgrade(&controller),
                     registry: registry.clone(),
                     binding: binding.clone(),
@@ -1046,6 +1123,7 @@ impl Manager {
                     hex(bootstrap_commit),
                     id.into(),
                     true,
+                    None,
                     deadline,
                 )
                 .await
@@ -1057,6 +1135,11 @@ impl Manager {
                     hex(bootstrap_commit),
                     id.into(),
                     false,
+                    record
+                        .creation_plan
+                        .as_deref()
+                        .map(native_broker::CreationPlan::decode)
+                        .transpose()?,
                     deadline,
                 )
                 .await
@@ -1318,6 +1401,7 @@ impl Manager {
                 );
             }
             let record = Record {
+                creation_plan: None,
                 version: 2,
                 workspace_id: id,
                 store: store.clone(),
@@ -1566,6 +1650,7 @@ impl Manager {
         commands.set_capture_target(
             workspace_id,
             Some(Arc::new(crate::native_capture::Target {
+                auto_enrolled: false,
                 controller: Arc::downgrade(&controller),
                 registry: registry.clone(),
                 binding: binding.clone(),
@@ -2654,6 +2739,15 @@ fn persist(entry: &Entry) -> Result<()> {
     entry.directory.replace("workspace.json", &encoded.0)?;
     Ok(())
 }
+fn creation_policy(record: &Record) -> Result<Option<native_broker::CreationPolicy>> {
+    record
+        .creation_plan
+        .as_deref()
+        .map(native_broker::CreationPlan::decode)
+        .transpose()
+        .map(|plan| plan.map(|p| p.policy))
+        .map_err(Into::into)
+}
 fn same_intent(a: &Record, b: &Record) -> bool {
     a.version == b.version
         && a.workspace_id == b.workspace_id
@@ -2661,6 +2755,7 @@ fn same_intent(a: &Record, b: &Record) -> bool {
         && a.root == b.root
         && a.origin == b.origin
         && a.scope == b.scope
+        && a.creation_plan == b.creation_plan
 }
 fn validate_record(record: &Record) -> Result<()> {
     ensure!(
@@ -2670,6 +2765,16 @@ fn validate_record(record: &Record) -> Result<()> {
             && record.workspace_id != [0; 32],
         "invalid native workspace record"
     );
+    if let Some(bytes) = &record.creation_plan {
+        let plan = native_broker::CreationPlan::decode(bytes)?;
+        let Origin::Clone { bootstrap_commit } = record.origin else {
+            anyhow::bail!("creation policy is only supported for clone origins");
+        };
+        ensure!(
+            plan.root == bootstrap_commit,
+            "saved native creation root differs"
+        );
+    }
     normalized(&record.root)?;
     if let Origin::Restore { source, seed, .. } = &record.origin {
         ensure!(
@@ -3042,6 +3147,7 @@ mod tests {
             "capture_blake3":vec![6;32],"capture_bytes":512,"provider":vec![8;32]
         }))?;
         let record = Record {
+            creation_plan: None,
             version: 2,
             workspace_id: id,
             root: root.clone(),
@@ -3154,6 +3260,7 @@ mod tests {
             name.clone(),
         )?;
         let record = Record {
+            creation_plan: None,
             version: 3,
             workspace_id: id,
             store: "example".into(),
@@ -3284,6 +3391,58 @@ mod tests {
             )]),
         )?
         .with_commands(commands.clone())?;
+        // The client has frozen a plan, but the host has not admitted its first
+        // record. A changed creation policy must preserve that exact intent,
+        // rather than adopting the caller's booleans or choosing a new policy.
+        let policy_root = directory.path().join("pending-policy");
+        drop(PrivateDir::create(&policy_root)?);
+        let registry = Registry::create(directory.path().join("registry"))?;
+        let plan = manager
+            .config
+            .native
+            .workspaces
+            .creation_description([8; 32], false, false)
+            .creation_plan([0; 32])?;
+        let pending = registry.begin_provisioning_with_plan(
+            &policy_root,
+            "example".into(),
+            LocalEndpoint::UnixSocket(state.path().join("rbe.sock")),
+            &jj_lib::backend::CommitId::new(vec![0; 32]),
+            plan,
+        )?;
+        let pending_id = pending.workspace_id();
+        drop(pending);
+        manager.config.native.workspaces.index_mode = crate::config::NativeIndexMode::Legacy;
+        let error = manager
+            .create_planned(
+                policy_root.clone(),
+                "example".into(),
+                "0".repeat(64),
+                hex(&pending_id),
+                plan.encode(),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("policy changed before first host admission")
+        );
+        assert!(
+            !state
+                .path()
+                .join("native-workspaces")
+                .join(hex(&pending_id))
+                .exists()
+        );
+        assert!(!policy_root.join(".jj").exists());
+        let pending = registry
+            .pending_provisioning(&policy_root)?
+            .expect("original pending intent");
+        assert_eq!(pending.workspace_id(), pending_id);
+        assert_eq!(pending.creation_plan()?, Some(plan));
+        drop(pending);
+        manager.config.native.workspaces.index_mode = crate::config::NativeIndexMode::Auto;
         let root = directory.path().join("mount");
         // Supported native provisioning creates an owner-private root; ordinary
         // create_dir inherits the fixture's shell umask and may yield 0755.

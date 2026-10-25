@@ -18,6 +18,118 @@ pub struct ProviderDescription {
     pub identity: [u8; 32],
     pub query_capable: bool,
     pub index_mode: ProviderIndexMode,
+    pub creation_policy: Option<CreationPolicy>,
+}
+/// Configured creation semantics. The digest excludes provider security identity
+/// and resource tuning; it binds only the explicit/automatic policy choices.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CreationPolicy {
+    pub digest: [u8; 32],
+    pub capture_enabled: bool,
+    pub upload_enabled: bool,
+    pub auto_capture: bool,
+    pub auto_upload: bool,
+}
+impl CreationPolicy {
+    pub fn wire(self) -> crate::proto::CreationPolicy {
+        crate::proto::CreationPolicy {
+            digest: self.digest.to_vec(),
+            capture_enabled: Some(self.capture_enabled),
+            upload_enabled: Some(self.upload_enabled),
+            auto_capture: Some(self.auto_capture),
+            auto_upload: Some(self.auto_upload),
+        }
+    }
+    pub fn checked(value: crate::proto::CreationPolicy) -> Result<Self, Status> {
+        let invalid = || Status::data_loss("invalid native creation policy");
+        let policy = Self {
+            digest: value.digest.try_into().map_err(|_| invalid())?,
+            capture_enabled: value.capture_enabled.ok_or_else(invalid)?,
+            upload_enabled: value.upload_enabled.ok_or_else(invalid)?,
+            auto_capture: value.auto_capture.ok_or_else(invalid)?,
+            auto_upload: value.auto_upload.ok_or_else(invalid)?,
+        };
+        if policy.digest == [0; 32]
+            || (policy.upload_enabled && !policy.capture_enabled)
+            || (policy.auto_capture && !policy.capture_enabled)
+            || (policy.auto_upload && !policy.upload_enabled)
+        {
+            return Err(invalid());
+        }
+        Ok(policy)
+    }
+}
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CreationPlan {
+    pub provider_identity: [u8; 32],
+    pub root: [u8; 32],
+    pub index_mode: ProviderIndexMode,
+    pub policy: CreationPolicy,
+}
+impl CreationPlan {
+    pub fn wire(self) -> crate::proto::CreationPlan {
+        crate::proto::CreationPlan {
+            version: 1,
+            provider_identity: self.provider_identity.to_vec(),
+            root: self.root.to_vec(),
+            index_mode: match self.index_mode {
+                ProviderIndexMode::Legacy => crate::proto::ProviderIndexMode::Legacy,
+                ProviderIndexMode::Federated => crate::proto::ProviderIndexMode::Federated,
+            } as i32,
+            policy: Some(self.policy.wire()),
+        }
+    }
+    pub fn checked(value: crate::proto::CreationPlan) -> Result<Self, Status> {
+        let invalid = || Status::data_loss("invalid native creation plan");
+        if value.version != 1 {
+            return Err(invalid());
+        }
+        let plan = Self {
+            provider_identity: value.provider_identity.try_into().map_err(|_| invalid())?,
+            root: value.root.try_into().map_err(|_| invalid())?,
+            index_mode: match crate::proto::ProviderIndexMode::try_from(value.index_mode) {
+                Ok(crate::proto::ProviderIndexMode::Legacy) => ProviderIndexMode::Legacy,
+                Ok(crate::proto::ProviderIndexMode::Federated) => ProviderIndexMode::Federated,
+                _ => return Err(invalid()),
+            },
+            policy: CreationPolicy::checked(value.policy.ok_or_else(invalid)?)?,
+        };
+        if plan.provider_identity == [0; 32] {
+            return Err(invalid());
+        }
+        Ok(plan)
+    }
+    pub fn encode(self) -> Vec<u8> {
+        use prost::Message;
+        self.wire().encode_to_vec()
+    }
+    pub fn decode(bytes: &[u8]) -> Result<Self, Status> {
+        use prost::Message;
+        if bytes.len() > 1024 {
+            return Err(Status::resource_exhausted(
+                "native creation plan exceeds bound",
+            ));
+        }
+        let value = crate::proto::CreationPlan::decode(bytes)
+            .map_err(|_| Status::data_loss("invalid native creation plan"))?;
+        let plan = Self::checked(value)?;
+        if plan.encode() != bytes {
+            return Err(Status::data_loss("noncanonical native creation plan"));
+        }
+        Ok(plan)
+    }
+}
+impl ProviderDescription {
+    pub fn creation_plan(self, root: [u8; 32]) -> Result<CreationPlan, Status> {
+        Ok(CreationPlan {
+            provider_identity: self.identity,
+            root,
+            index_mode: self.index_mode,
+            policy: self.creation_policy.ok_or_else(|| {
+                Status::failed_precondition("native creation policy is unavailable")
+            })?,
+        })
+    }
 }
 /// Owner of physical request/job work only. It may contain an inflight slot;
 /// implementations must not move it into persistent registry or reply owners.
@@ -526,6 +638,21 @@ fn search_integrity() -> Status {
 #[async_trait]
 pub trait NativeQueryIo: Send + Sync + std::fmt::Debug {
     fn resources(&self) -> QueryResources;
+    /// Read-only upstream checks, without retaining a broker scope or granting
+    /// an anchor. The configured host chooses requirements, never the caller.
+    async fn preflight_creation(
+        &self,
+        _root: CommitId,
+        _query: bool,
+        _cloud: bool,
+        _deadline: tokio::time::Instant,
+        _owner: QueryOwner,
+    ) -> Result<QueryReply<()>, Status> {
+        Err(Status::unimplemented(
+            "native creation preflight unsupported",
+        ))
+    }
+
     /// Explicit retained snapshot support; unsupported providers must not
     /// reinterpret this request as ordinary root/reference admission.
     async fn open_cloud_scope(

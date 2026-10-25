@@ -72,6 +72,7 @@ impl Default for Native {
 #[serde(rename_all = "snake_case")]
 pub enum NativeIndexMode {
     #[default]
+    Auto,
     Legacy,
     Federated,
 }
@@ -81,7 +82,8 @@ pub enum NativeIndexMode {
 pub struct NativeWorkspaces {
     /// Linux native sources only; zero retains uncached metadata responses.
     pub metadata_cache_ttl_ms: u64,
-    /// Experimental opt-in; existing index/type always wins on reload.
+    /// New remote workspaces use capability-checked lazy queries; existing
+    /// index/type always wins on reload.
     pub index_mode: NativeIndexMode,
     pub capture: NativeCapture,
     pub upload: NativeCaptureUpload,
@@ -98,7 +100,7 @@ impl Default for NativeWorkspaces {
     fn default() -> Self {
         Self {
             metadata_cache_ttl_ms: if cfg!(target_os = "linux") { 1000 } else { 0 },
-            index_mode: NativeIndexMode::Legacy,
+            index_mode: NativeIndexMode::Auto,
             capture: NativeCapture::default(),
             upload: NativeCaptureUpload::default(),
             gc: NativeGc::default(),
@@ -112,6 +114,52 @@ impl Default for NativeWorkspaces {
     }
 }
 impl NativeWorkspaces {
+    pub(crate) fn creation_description(
+        &self,
+        identity: [u8; 32],
+        remote: bool,
+        query_capable: bool,
+    ) -> native_broker::ProviderDescription {
+        let index_mode = match self.index_mode {
+            NativeIndexMode::Auto if remote => native_broker::ProviderIndexMode::Federated,
+            NativeIndexMode::Federated => native_broker::ProviderIndexMode::Federated,
+            _ => native_broker::ProviderIndexMode::Legacy,
+        };
+        let federated = index_mode == native_broker::ProviderIndexMode::Federated;
+        let auto_capture = remote && federated && self.capture.policy == NativeCapturePolicy::Auto;
+        let capture_enabled =
+            auto_capture || self.capture.policy == NativeCapturePolicy::AfterCommandBestEffort;
+        let auto_upload = remote
+            && federated
+            && capture_enabled
+            && self.upload.policy == NativeCaptureUploadPolicy::Auto;
+        let upload_enabled = auto_upload
+            || matches!(
+                self.upload.policy,
+                NativeCaptureUploadPolicy::PublishRetainingRoots
+                    | NativeCaptureUploadPolicy::PublishRetiringRedundant
+            );
+        let mut digest = blake3::Hasher::new();
+        digest.update(b"native-creation-policy-v1\0");
+        digest.update(&[
+            self.index_mode as u8,
+            self.capture.policy as u8,
+            self.upload.policy as u8,
+            remote as u8,
+        ]);
+        native_broker::ProviderDescription {
+            identity,
+            query_capable,
+            index_mode,
+            creation_policy: Some(native_broker::CreationPolicy {
+                digest: *digest.finalize().as_bytes(),
+                capture_enabled,
+                upload_enabled,
+                auto_capture,
+                auto_upload,
+            }),
+        }
+    }
     fn validate(&self) -> Result<()> {
         ensure!(
             self.metadata_cache_ttl_ms <= 5000,
@@ -125,6 +173,15 @@ impl NativeWorkspaces {
         self.capture.validate()?;
         self.upload.validate()?;
         self.gc.validate()?;
+        ensure!(
+            self.capture.policy != NativeCapturePolicy::Disabled
+                || !matches!(
+                    self.upload.policy,
+                    NativeCaptureUploadPolicy::PublishRetainingRoots
+                        | NativeCaptureUploadPolicy::PublishRetiringRedundant
+                ),
+            "explicit native upload requires capture policy",
+        );
         if self.upload.policy == NativeCaptureUploadPolicy::PublishRetiringRedundant {
             ensure!(
                 self.capture.max_pending >= 2 && self.upload.max_jobs >= 2,
@@ -133,12 +190,20 @@ impl NativeWorkspaces {
         }
         if self.gc.policy == NativeGcPolicy::LocalComplete {
             ensure!(
-                self.index_mode == NativeIndexMode::Legacy,
+                matches!(
+                    self.index_mode,
+                    NativeIndexMode::Auto | NativeIndexMode::Legacy
+                ),
                 "local-complete collection requires legacy local index mode"
             );
             ensure!(
-                self.capture.policy == NativeCapturePolicy::Disabled
-                    && self.upload.policy == NativeCaptureUploadPolicy::Disabled,
+                matches!(
+                    self.capture.policy,
+                    NativeCapturePolicy::Auto | NativeCapturePolicy::Disabled
+                ) && matches!(
+                    self.upload.policy,
+                    NativeCaptureUploadPolicy::Auto | NativeCaptureUploadPolicy::Disabled
+                ),
                 "local-complete collection cannot combine with capture or upload policy"
             );
         }
@@ -245,6 +310,7 @@ impl NativeGc {
 #[serde(rename_all = "snake_case")]
 pub enum NativeCaptureUploadPolicy {
     #[default]
+    Auto,
     Disabled,
     PublishRetainingRoots,
     PublishRetiringRedundant,
@@ -265,7 +331,7 @@ pub struct NativeCaptureUpload {
 impl Default for NativeCaptureUpload {
     fn default() -> Self {
         Self {
-            policy: NativeCaptureUploadPolicy::Disabled,
+            policy: NativeCaptureUploadPolicy::Auto,
             poll_ms: 30_000,
             timeout_ms: 120_000,
             max_jobs: 256,
@@ -300,6 +366,7 @@ impl NativeCaptureUpload {
 #[serde(rename_all = "snake_case")]
 pub enum NativeCapturePolicy {
     #[default]
+    Auto,
     Disabled,
     AfterCommandBestEffort,
 }
@@ -315,7 +382,7 @@ pub struct NativeCapture {
 impl Default for NativeCapture {
     fn default() -> Self {
         Self {
-            policy: NativeCapturePolicy::Disabled,
+            policy: NativeCapturePolicy::Auto,
             max_bundle_bytes: 256 * 1024 * 1024,
             max_pending_bytes: 4 * 1024 * 1024 * 1024,
             max_pending: 64,
@@ -435,6 +502,20 @@ impl Native {
             "too many native repository aliases"
         );
         for (alias, repo) in &self.repositories {
+            let policy = self
+                .workspaces
+                .creation_description([1; 32], repo.remote.is_some(), repo.remote.is_some())
+                .creation_policy
+                .expect("configured policy");
+            native_broker::CreationPolicy::checked(policy.wire())
+                .context("inconsistent native capture/upload policy")?;
+            if policy.auto_upload {
+                ensure!(
+                    self.workspaces.capture.max_pending >= 2
+                        && self.workspaces.upload.max_jobs >= 2,
+                    "automatic redundant capture retirement requires at least two capture and upload slots"
+                );
+            }
             ensure!(alias.len() <= 64, "native repository alias is too long");
             tinytree_store::validate_repository_id(alias)
                 .context("invalid native repository alias")?;
@@ -973,11 +1054,62 @@ mod tests {
         let old: Config = toml::from_str(EXAMPLE).unwrap();
         assert!(old.native.repositories.is_empty());
         assert_eq!(old.native.workspaces.max_workspaces, 128);
-        assert_eq!(old.native.workspaces.index_mode, NativeIndexMode::Legacy);
+        assert_eq!(old.native.workspaces.index_mode, NativeIndexMode::Auto);
         assert_eq!(old.native.workspaces.gc.policy, NativeGcPolicy::Disabled);
+        let local = old
+            .native
+            .workspaces
+            .creation_description([1; 32], false, false);
+        assert_eq!(local.index_mode, native_broker::ProviderIndexMode::Legacy);
+        let local_policy = local.creation_policy.unwrap();
+        assert!(!local_policy.capture_enabled && !local_policy.upload_enabled);
+        let remote = old
+            .native
+            .workspaces
+            .creation_description([1; 32], true, true);
+        assert_eq!(
+            remote.index_mode,
+            native_broker::ProviderIndexMode::Federated
+        );
+        let remote_policy = remote.creation_policy.unwrap();
+        assert!(remote_policy.auto_capture && remote_policy.auto_upload);
+        let mut legacy = old.clone();
+        legacy.native.workspaces.index_mode = NativeIndexMode::Legacy;
+        let policy = legacy
+            .native
+            .workspaces
+            .creation_description([1; 32], true, true)
+            .creation_policy
+            .unwrap();
+        assert!(
+            !policy.auto_capture
+                && !policy.auto_upload
+                && !policy.capture_enabled
+                && !policy.upload_enabled
+        );
+        let mut disabled = old.clone();
+        disabled.native.workspaces.capture.policy = NativeCapturePolicy::Disabled;
+        let policy = disabled
+            .native
+            .workspaces
+            .creation_description([1; 32], true, true)
+            .creation_policy
+            .unwrap();
+        assert!(!policy.capture_enabled && !policy.upload_enabled && !policy.auto_upload);
+        disabled.native.workspaces.upload.policy = NativeCaptureUploadPolicy::PublishRetainingRoots;
+        assert!(disabled.validate().is_err());
+        assert_eq!(
+            toml::from_str::<Config>("[native.workspaces]\nindex_mode='legacy'\n")
+                .unwrap()
+                .native
+                .workspaces
+                .index_mode,
+            NativeIndexMode::Legacy
+        );
+
         assert_eq!(
             old.native.workspaces.capture.policy,
-            NativeCapturePolicy::Disabled
+            NativeCapturePolicy::Auto
         );
         let parsed: Config = toml::from_str(
             "[native.workspaces.capture]\npolicy='after_command_best_effort'\nmax_pending=8\n",
@@ -992,7 +1124,7 @@ mod tests {
         assert!(enabled.validate().is_ok());
         assert_eq!(
             old.native.workspaces.upload.policy,
-            NativeCaptureUploadPolicy::Disabled
+            NativeCaptureUploadPolicy::Auto
         );
         let upload: Config = toml::from_str(
             "[native.workspaces.upload]\npolicy='publish_retaining_roots'\npoll_ms=250\n",

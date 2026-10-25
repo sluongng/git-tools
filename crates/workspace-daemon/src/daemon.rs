@@ -658,18 +658,11 @@ fn open_native_host(
         scopes.insert(alias.clone(), scope);
         descriptions.insert(
             alias.clone(),
-            native_broker::ProviderDescription {
+            config.native.workspaces.creation_description(
                 identity,
-                query_capable: queries.contains_key(alias),
-                index_mode: match config.native.workspaces.index_mode {
-                    crate::config::NativeIndexMode::Legacy => {
-                        native_broker::ProviderIndexMode::Legacy
-                    }
-                    crate::config::NativeIndexMode::Federated => {
-                        native_broker::ProviderIndexMode::Federated
-                    }
-                },
-            },
+                settings.remote.is_some(),
+                queries.contains_key(alias),
+            ),
         );
     }
     let identities = descriptions
@@ -1135,6 +1128,12 @@ pub async fn serve(mut config: Config) -> Result<()> {
                 Ok(Request::NativeMount { root, store, commit, workspace_id }) => {
                     match state_slot.as_mut().unwrap().native_workspaces.as_mut() {
                         Some(manager) => manager.create(root, store, commit, workspace_id).await.and_then(|value| serde_json::to_value(value).map_err(Into::into)),
+                        None => Err(anyhow::anyhow!("native repositories are not configured")),
+                    }
+                }
+                Ok(Request::NativeMountPlanned { root, store, commit, workspace_id, creation_plan }) => {
+                    match state_slot.as_mut().unwrap().native_workspaces.as_mut() {
+                        Some(manager) => manager.create_planned(root, store, commit, workspace_id, creation_plan).await.and_then(|value| serde_json::to_value(value).map_err(Into::into)),
                         None => Err(anyhow::anyhow!("native repositories are not configured")),
                     }
                 }

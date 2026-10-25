@@ -29,6 +29,7 @@ pub(crate) async fn initialize(
     destination: &Path,
     locator: Option<Locator>,
     _initial: &CommitId,
+    _plan: Option<native_broker::CreationPlan>,
 ) -> Result<(Workspace, Arc<ReadonlyRepo>), CommandError> {
     let (settings, _) = command.settings_for_new_workspace(ui, destination)?;
     let initializer =
@@ -57,6 +58,7 @@ pub(crate) async fn initialize(
     destination: &Path,
     locator: Option<Locator>,
     initial: &CommitId,
+    plan: Option<native_broker::CreationPlan>,
 ) -> Result<(Workspace, Arc<ReadonlyRepo>), CommandError> {
     use jj_lib::ref_name::WorkspaceName;
     let locator = locator.ok_or_else(|| {
@@ -73,13 +75,15 @@ pub(crate) async fn initialize(
     }
     #[cfg(unix)]
     {
+        let plan = plan.ok_or_else(|| failure("native creation requires a checked plan"))?;
         let registry = provisioning_registry().map_err(failure)?;
         let mut intent = registry
-            .begin_provisioning(
+            .begin_provisioning_with_plan(
                 destination,
                 locator.store.clone(),
                 native_broker::LocalEndpoint::UnixSocket(locator.socket.clone()),
                 initial,
+                plan,
             )
             .map_err(failure)?;
         let binding = mount(
@@ -89,6 +93,7 @@ pub(crate) async fn initialize(
             intent.endpoint(),
             &intent.initial_commit(),
             intent.workspace_id(),
+            Some(plan),
         )?;
         crate::commands::ensure_binding(&binding).map_err(failure)?;
         // A crash can occur after Ready publication but before intent completion.
@@ -112,7 +117,7 @@ pub(crate) async fn initialize(
             |_: &UserSettings, path: &Path| -> Result<Box<dyn Backend>, BackendInitError> {
                 broker::init(path, locator.clone())
             };
-        let mode = broker::creation_policy(&locator).map_err(failure)?;
+        let mode = intent.creation_plan().map_err(failure)?.ok_or_else(|| failure("pending native creation lacks its saved policy; preserve and reconcile explicitly"))?.index_mode;
         let index_initializer =
             |settings: &UserSettings, path: &Path, operation: &jj_lib::op_store::OperationId| {
                 broker::init_index(path, mode, settings, initial, operation)
@@ -300,6 +305,7 @@ fn mount(
     endpoint: native_broker::LocalEndpoint,
     initial: &CommitId,
     id: [u8; 32],
+    plan: Option<native_broker::CreationPlan>,
 ) -> Result<native_workspace_admin::Binding, CommandError> {
     use jj_lib::object_id::ObjectId;
     #[derive(serde::Deserialize)]
@@ -310,11 +316,20 @@ fn mount(
     let workspace_id: String = id.iter().map(|b| format!("{b:02x}")).collect();
     let response = control_call(
         endpoint.clone(),
-        workspace_daemon::control::Request::NativeMount {
-            root: root.to_owned(),
-            store: repository.into(),
-            commit: initial.hex(),
-            workspace_id: workspace_id.clone(),
+        match plan {
+            Some(plan) => workspace_daemon::control::Request::NativeMountPlanned {
+                root: root.to_owned(),
+                store: repository.into(),
+                commit: initial.hex(),
+                workspace_id: workspace_id.clone(),
+                creation_plan: plan.encode(),
+            },
+            None => workspace_daemon::control::Request::NativeMount {
+                root: root.to_owned(),
+                store: repository.into(),
+                commit: initial.hex(),
+                workspace_id: workspace_id.clone(),
+            },
         },
     )?;
     let created: Created = serde_json::from_value(response).map_err(failure)?;
@@ -538,6 +553,20 @@ pub(crate) async fn resume(
             .pending_provisioning(destination)
             .map_err(failure)?
         {
+            let saved_plan = intent.creation_plan().map_err(failure)?;
+            let ready_record = registry.path().join("records").join(format!(
+                "{}.json",
+                intent
+                    .workspace_id()
+                    .iter()
+                    .map(|b| format!("{b:02x}"))
+                    .collect::<String>()
+            ));
+            if saved_plan.is_none() && !ready_record.try_exists().map_err(failure)? {
+                return Err(failure(
+                    "pending workspace predates durable creation policy; preserve and reconcile its original index mode explicitly",
+                ));
+            }
             let binding = mount(
                 &registry,
                 intent.root(),
@@ -545,6 +574,7 @@ pub(crate) async fn resume(
                 intent.endpoint(),
                 &intent.initial_commit(),
                 intent.workspace_id(),
+                saved_plan,
             )?;
             crate::commands::ensure_binding(&binding).map_err(failure)?;
             let ready_record = registry
@@ -576,7 +606,9 @@ pub(crate) async fn resume(
                     broker::init(path, locator.clone())
                 };
             use jj_lib::ref_name::WorkspaceName;
-            let mode = broker::creation_policy(&locator).map_err(failure)?;
+            let mode = saved_plan
+                .ok_or_else(|| failure("pending workspace has no saved creation policy"))?
+                .index_mode;
             let initial = intent.initial_commit();
             let index_initializer =
                 |settings: &UserSettings,
@@ -611,6 +643,7 @@ pub(crate) async fn resume(
                 ready.binding.endpoint.local(),
                 &ready.initial_commit,
                 ready.binding.workspace_id,
+                None,
             )?;
             if binding != ready.binding {
                 return Err(failure("resumed mount differs from the Ready binding"));

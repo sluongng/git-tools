@@ -80,8 +80,8 @@ buildbuddy = "https://github.com/buildbuddy-io/buildbuddy.git"
 # max_temporary_bytes = 1073741824
 # [native.workspaces]
 # metadata_cache_ttl_ms = 1000 # Linux default (max 5000); use 0 on other platforms.
-# index_mode = "legacy" # Experimental "federated" avoids eager jj history indexing.
-# Existing workspaces retain their recorded index type.
+# index_mode = "auto" # New remote init/clone: checked lazy queries; local: legacy.
+# Existing workspaces retain their recorded index type and backup enrollment.
 # Explicit Linux-only collection; preview never deletes and no automatic GC runs.
 # "local_complete" requires a genuinely fresh native cohort under state_dir,
 # one fully local alias, legacy indexes, and disabled capture/upload policies.
@@ -91,19 +91,20 @@ buildbuddy = "https://github.com/buildbuddy-io/buildbuddy.git"
 # grace_seconds = 3600
 # timeout_ms = 30000
 # [native.workspaces.capture]
-# policy = "disabled" # Opt in: "after_command_best_effort" (Linux + federated).
+# policy = "auto" # New remote init/clone only; "disabled" or explicit "after_command_best_effort".
 # max_bundle_bytes = 268435456
 # max_pending_bytes = 4294967296
 # max_pending = 64
 # timeout_ms = 30000
 # [native.workspaces.upload]
-# policy = "disabled" # Opt in: "publish_retaining_roots"; requires remote cloud support.
+# policy = "auto" # Enrolled remote workspaces; requires authenticated captured-cloud support.
 # poll_ms = 30000
 # timeout_ms = 120000
 # max_jobs = 256
 # max_disk_bytes = 536870912
 # max_memory_bytes = 2147483648
-# Publication retains every local recovery ticket and pack; no automatic eviction.
+# Auto uses checked redundant-capsule retirement; latest/unsynced/uncertain data stays local.
+# "publish_retaining_roots" retains every ticket; "disabled" turns upload off.
 # [native.repositories.example]
 # max_repository_bytes = 17179869184
 # max_file_bytes = 268435456

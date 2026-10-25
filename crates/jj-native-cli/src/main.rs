@@ -304,11 +304,17 @@ async fn run_native_command(
                 ));
             }
             #[cfg(not(feature = "protocol-fixture"))]
-            broker::creation_policy(locator.as_ref().expect("validated broker locator")).map_err(
-                |error| {
+            let plan = Some(
+                broker::creation_plan(
+                    locator.as_ref().expect("validated broker locator"),
+                    &jj_lib::backend::CommitId::new(vec![0; 32]),
+                )
+                .map_err(|error| {
                     user_error_with_message("Native provider cannot create this workspace", error)
-                },
-            )?;
+                })?,
+            );
+            #[cfg(feature = "protocol-fixture")]
+            let plan = None;
             let destination = command.cwd().join(destination);
             vfs::prepare_destination(&destination)
                 .map_err(|error| user_error_with_message("Failed to create workspace", error))?;
@@ -321,6 +327,7 @@ async fn run_native_command(
                 &destination,
                 locator,
                 &jj_lib::backend::CommitId::new(vec![0; 32]),
+                plan,
             )
             .await?;
             Ok(())

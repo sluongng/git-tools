@@ -29,10 +29,22 @@ operation, index and working-copy state live in private external administration.
 Fetch an absent reference explicitly before its first push. Native publication
 is not Git push.
 
-For new remote workspaces, experimental `[native.workspaces] index_mode =
-"federated"` uses immutable native index checkpoints and broker queries rather
-than building a full local history index. The default remains `"legacy"`. Existing
-workspaces keep their recorded index type; missing native state fails closed.
+For new remote `init` and `clone` workspaces on Linux, the default
+`[native.workspaces] index_mode = "auto"` selects immutable native index checkpoints
+and lazy broker queries. Automatic capture and background cloud publication are
+also enabled for those new workspaces. Creation checks the remote server's
+features and caller access, then opens the exact selected query root before
+creating the destination. Unsupported servers or roots fail explicitly; there is
+no eager or legacy fallback.
+
+Local aliases remain legacy and are not automatically backed up. Explicit
+`index_mode = "legacy"` also opts out of automatic portable backup; capture/upload
+`policy = "disabled"` remain available independently.
+Existing workspaces keep their recorded index type and are not enrolled merely
+by upgrading the daemon. Restored workspaces currently keep their captured index
+and require explicit capture/upload policies for continued backup. Missing native
+state always fails closed. A pending new initialization retains its selected mode
+and backup eligibility across retries rather than adopting later config defaults.
 
 With a federated workspace and an operator-configured landing profile:
 
@@ -90,10 +102,11 @@ ID as proof.
 
 ## Restore a retained capture
 
-To create backups, enable capture and asynchronous upload in the
-[daemon configuration](../workspace-daemon); both are opt-in. Use the matching
-daemon and configured alias to discover backups without supplying server URLs,
-credentials or raw manifest digests:
+New remote clones use automatic capture and publication. To back up an existing
+or restored workspace, select explicit capture and asynchronous upload policies
+in the [daemon configuration](../workspace-daemon). Use the matching daemon and
+configured alias to discover backups without supplying server URLs, credentials
+or raw manifest digests:
 
 ```sh
 "$JJ" tinytree cloud --daemon-config CONFIG --store example workspaces

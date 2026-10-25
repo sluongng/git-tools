@@ -29,6 +29,7 @@ const MAX_ENTRIES: usize = 102_051;
 const MAX_TABLE: usize = 31 * 1024 * 1024;
 #[derive(Clone)]
 pub(crate) struct Target {
+    pub auto_enrolled: bool,
     pub controller: std::sync::Weak<native_vfs_controller::Controller>,
     pub registry: Arc<Registry>,
     pub binding: Binding,
@@ -178,6 +179,9 @@ impl Coordinator {
             self.disposition("target_unavailable", false);
             return Plan::DrainOnly;
         };
+        if self.config.policy == NativeCapturePolicy::Auto && !target.auto_enrolled {
+            return Plan::DrainOnly;
+        }
         let permit =
             match tokio::time::timeout_at(deadline, self.active.clone().acquire_owned()).await {
                 Ok(Ok(permit)) => permit,

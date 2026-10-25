@@ -123,6 +123,33 @@ struct PhysicalOperation {
     _lease: OwnedSemaphorePermit,
     _ticket: io::WorkTicket,
 }
+// A returned scope needs explicit closure: CheckedScopeHandle itself has no
+// Drop cleanup. Cancellation retains the accepted operation slot and host owner
+// through one independent, bounded close attempt.
+struct PreflightScope {
+    client: NativeClient,
+    scope: Option<CheckedScopeHandle>,
+    operation: Arc<PhysicalOperation>,
+    cleanup: std::time::Duration,
+}
+impl Drop for PreflightScope {
+    fn drop(&mut self) {
+        let Some(scope) = self.scope.take() else {
+            return;
+        };
+        let client = self
+            .client
+            .clone()
+            .with_cleanup_deadline(tokio::time::Instant::now() + self.cleanup);
+        let operation = self.operation.clone();
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            runtime.spawn(async move {
+                let _owner = operation;
+                let _ = client.close_query_scope(&scope).await;
+            });
+        }
+    }
+}
 impl PhysicalOperation {
     fn client(self: &Arc<Self>, client: &NativeClient) -> NativeClient {
         let client = client.clone().with_operation_deadline(self.deadline);
@@ -993,6 +1020,61 @@ impl RemoteQueryIo {
 }
 #[async_trait]
 impl NativeQueryIo for RemoteQueryIo {
+    async fn preflight_creation(
+        &self,
+        root: m::CommitId,
+        query: bool,
+        cloud: bool,
+        deadline: tokio::time::Instant,
+        owner: QueryOwner,
+    ) -> std::result::Result<QueryReply<()>, tonic::Status> {
+        io::operation_context_scope(
+            deadline,
+            owner.clone(),
+            self.run(owner, move |this, operation| async move {
+                use tinytree_client::CapabilityFeature as F;
+                let mut required = Vec::with_capacity(5);
+                if query {
+                    required.extend([F::FederatedScopeLog, F::PathHistory, F::Blame]);
+                }
+                if cloud {
+                    required.extend([F::CapturedIndexedCloudRead, F::CapturedIndexedCloudWrite]);
+                }
+                let client = operation.client(&this.inner.connector.get_bare().await?);
+                let capabilities = client.capabilities(&required).await?;
+                ensure!(
+                    capabilities
+                        .features
+                        .iter()
+                        .all(|feature| feature.supported && feature.authorized),
+                    "native creation requires configured and authorized query/cloud features"
+                );
+                if query {
+                    let scope = client.open_query_scope(vec![root]).await?;
+                    let mut cleanup = PreflightScope {
+                        client: client.clone(),
+                        scope: Some(scope),
+                        operation: operation.clone(),
+                        cleanup: std::time::Duration::from_millis(
+                            this.inner.config.remote.query_cleanup_timeout_ms,
+                        ),
+                    };
+                    client
+                        .clone()
+                        .with_cleanup_deadline(operation.deadline)
+                        .close_query_scope(cleanup.scope.as_ref().expect("owned preflight scope"))
+                        .await?;
+                    cleanup.scope = None;
+                }
+                Ok(QueryReply {
+                    value: (),
+                    owner: operation,
+                })
+            }),
+        )
+        .await
+    }
+
     fn resources(&self) -> QueryResources {
         let budget = self.inner.config.control_work_budget();
         QueryResources {

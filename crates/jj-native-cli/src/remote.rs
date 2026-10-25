@@ -380,8 +380,6 @@ pub(crate) async fn clone(
     let bookmark_name = names(&reference, &bookmark)?;
     let bookmark = bookmark_name.as_str().to_owned();
     let locator = Locator::new(command.cwd().join(socket), store).map_err(failure)?;
-    #[cfg(not(feature = "protocol-fixture"))]
-    broker::creation_policy(&locator).map_err(failure)?;
     let client = control(&locator, None).await?;
     let snapshot = client
         .observe_reference(&reference)
@@ -393,6 +391,16 @@ pub(crate) async fn clone(
             "cannot clone an absent native reference; use init and fetch before the first push",
         ));
     }
+    let initial = parse_id(
+        observation
+            .head
+            .as_deref()
+            .expect("validated present native head"),
+    )?;
+    #[cfg(not(feature = "protocol-fixture"))]
+    let plan = Some(broker::creation_plan(&locator, &initial).map_err(failure)?);
+    #[cfg(feature = "protocol-fixture")]
+    let plan = None;
     let destination = command.cwd().join(destination);
     match std::fs::read_dir(&destination) {
         Ok(mut contents) => {
@@ -406,14 +414,15 @@ pub(crate) async fn clone(
         Err(error) => return Err(failure(error)),
     }
     let destination = destination.canonicalize().map_err(failure)?;
-    let initial = parse_id(
-        observation
-            .head
-            .as_deref()
-            .expect("validated present native head"),
-    )?;
-    let (workspace, repo) =
-        crate::vfs::initialize(ui, command, &destination, Some(locator.clone()), &initial).await?;
+    let (workspace, repo) = crate::vfs::initialize(
+        ui,
+        command,
+        &destination,
+        Some(locator.clone()),
+        &initial,
+        plan,
+    )
+    .await?;
     let mut helper = command.for_workable_repo(ui, workspace, repo)?;
     let mut locked = LockedState::open(
         &crate::vfs::working_copy_path(&destination).map_err(failure)?,

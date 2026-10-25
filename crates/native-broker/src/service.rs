@@ -77,7 +77,7 @@ impl Inner {
         let is_control = path.starts_with("/native.broker.v1.RepositoryControl/");
         let is_query =
             path.starts_with("/native.broker.v1.QueryIo/") && !path.ends_with("/DescribeProvider");
-        if is_query && self.queries.is_empty() {
+        if is_query && self.queries.is_empty() && !path.ends_with("/PreflightCreation") {
             return Err(Status::failed_precondition(
                 "native repository query is not configured",
             ));
@@ -667,6 +667,7 @@ where
                 let bootstrap = matches!(
                     path.as_str(),
                     "/native.broker.v1.QueryIo/DescribeProvider"
+                        | "/native.broker.v1.QueryIo/PreflightCreation"
                         | "/native.broker.v1.RepositoryControl/ObserveReference"
                         | "/native.broker.v1.RepositoryControl/AdmitCommit"
                 );

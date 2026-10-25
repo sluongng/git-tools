@@ -114,7 +114,9 @@ impl Fixture {
                  api_key_env='TINYTREE_UNUSED_TEST_KEY'\n\
                  [git_proxy]\nlisten='{}'\n\
                  [bes]\nenabled=false\n[bos]\nenabled=false\n\
-                 [native.workspaces]\nregistry_path={}\n\
+                 [native.workspaces]\nregistry_path={}\nindex_mode='legacy'\n\
+                 [native.workspaces.capture]\npolicy='disabled'\n\
+                 [native.workspaces.upload]\npolicy='disabled'\n\
                  [native.repositories.example]\n",
                 quoted(&state),
                 cache_port.local_addr().unwrap(),
@@ -172,6 +174,16 @@ impl Fixture {
                 Ok(())
             });
         }
+    }
+
+    fn automatic_policies(&mut self) {
+        let mut config: toml::Value =
+            toml::from_str(&fs::read_to_string(&self.daemon_config).unwrap()).unwrap();
+        let policies = config["native"]["workspaces"].as_table_mut().unwrap();
+        policies.remove("index_mode");
+        policies.remove("capture");
+        policies.remove("upload");
+        fs::write(&self.daemon_config, toml::to_string(&config).unwrap()).unwrap();
     }
 
     fn configure_remote(&mut self, endpoint: &str) {
@@ -997,6 +1009,7 @@ where
 
 #[derive(Default)]
 struct MetadataReads {
+    creation_fault: AtomicUsize,
     unavailable_versions: AtomicBool,
     transport_calls: AtomicUsize,
     file_keys: Mutex<HashSet<[u8; 32]>>,
@@ -1030,7 +1043,13 @@ impl Repository for CountMetadata {
         &self,
         request: RpcRequest<p::GetCapabilitiesRequest>,
     ) -> Result<RpcResponse<p::Capabilities>, Status> {
-        self.inner.get_capabilities(request).await
+        match self.reads.creation_fault.load(Ordering::SeqCst) {
+            1 => Err(Status::unimplemented(
+                "legacy server has no feature negotiation",
+            )),
+            2 => Err(Status::permission_denied("creation features denied")),
+            _ => self.inner.get_capabilities(request).await,
+        }
     }
 
     async fn open_repository(
@@ -1200,6 +1219,11 @@ impl RepositoryQuery for CountQueryMetadata {
         &self,
         r: RpcRequest<Streaming<q::OpenScopeFrame>>,
     ) -> Result<RpcResponse<q::QueryScope>, Status> {
+        if self.reads.creation_fault.load(Ordering::SeqCst) == 3 {
+            return Err(Status::failed_precondition(
+                "selected immutable root is unavailable",
+            ));
+        }
         self.inner.open_scope(r).await
     }
     async fn open_cloud_scope(
@@ -3011,7 +3035,29 @@ fn parallel_native_workspaces_keep_backing_up_beyond_capture_capacity() {
     // Match the upstream replay share for this rapid single-operator workload.
     // Active scope/query limits and registry memory remain unchanged.
     fixture.query_replay_capacity(1024);
-    fixture.index_mode("federated");
+    fixture.automatic_policies();
+    // Keep the policy keys omitted. Only this stress fixture's queue bounds and
+    // polling interval differ from the ordinary automatic profile.
+    let mut config: toml::Value =
+        toml::from_str(&fs::read_to_string(&fixture.daemon_config).unwrap()).unwrap();
+    config["native"]["workspaces"]
+        .as_table_mut()
+        .unwrap()
+        .insert(
+            "capture".into(),
+            toml::Value::Table(toml::map::Map::from_iter([(
+                "max_pending".into(),
+                4.into(),
+            )])),
+        );
+    config["native"]["workspaces"]
+        .as_table_mut()
+        .unwrap()
+        .insert(
+            "upload".into(),
+            toml::Value::Table(toml::map::Map::from_iter([("poll_ms".into(), 250.into())])),
+        );
+    fs::write(&fixture.daemon_config, toml::to_string(&config).unwrap()).unwrap();
     fixture.start();
     let base = fixture.base().to_owned();
     let roots = [base.join("agent-a"), base.join("agent-b")];
@@ -3021,11 +3067,34 @@ fn parallel_native_workspaces_keep_backing_up_beyond_capture_capacity() {
     let bindings = roots.each_ref().map(|root| fixture.binding(root));
     assert_ne!(bindings[0].workspace_id, bindings[1].workspace_id);
     assert_ne!(bindings[0].repo, bindings[1].repo);
+    for binding in &bindings {
+        assert_eq!(
+            fs::read_to_string(binding.repo.join("index/type")).unwrap(),
+            jj_native_index::NAME
+        );
+        let record: serde_json::Value = serde_json::from_slice(
+            &fs::read(
+                fixture
+                    .base()
+                    .join("daemon/native-workspaces")
+                    .join(binding.id())
+                    .join("workspace.json"),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let bytes: Vec<u8> = serde_json::from_value(record["creation_plan"].clone()).unwrap();
+        let plan = native_broker::CreationPlan::decode(&bytes).unwrap();
+        assert!(plan.policy.auto_capture && plan.policy.auto_upload);
+        assert_eq!(plan.index_mode, native_broker::ProviderIndexMode::Federated);
+    }
     for root in &roots {
         fixture.success(&base, &["tinytree", "unmount", root.to_str().unwrap()]);
     }
     fixture.stop_daemon();
-    fixture.enable_capture_retirement_with_limit(4);
+    // A creation-policy change must not reinterpret either saved index or
+    // revoke the immutable eligibility of these already enrolled workspaces.
+    fixture.index_mode("legacy");
     fixture.start();
     for root in &roots {
         fixture.success(&base, &["tinytree", "resume", root.to_str().unwrap()]);
@@ -3161,6 +3230,141 @@ fn parallel_native_workspaces_keep_backing_up_beyond_capture_capacity() {
         fixture.success(&base, &["tinytree", "unmount", root.to_str().unwrap()]);
     }
     fixture.stop_daemon();
+}
+
+#[test]
+#[ignore = "requires usable /dev/fuse and fusermount3; run mounted_tests locally"]
+fn automatic_remote_creation_requires_live_features_before_destination_or_intent() {
+    let upstream = RemoteServer::start(); // query available, captured cloud disabled
+    let mut fixture = Fixture::new();
+    fixture.configure_remote(&upstream.endpoint);
+    fixture.automatic_policies();
+    fixture.start();
+    let base = fixture.base().to_owned();
+    let root = base.join("unsupported-auto");
+    let broker = fixture.broker.clone();
+    let args = [
+        "tinytree",
+        "clone",
+        root.to_str().unwrap(),
+        "--broker",
+        broker.to_str().unwrap(),
+        "--store",
+        "example",
+        "--reference",
+        "main",
+    ];
+    let output = fixture.run(&base, &args);
+    assert!(!output.status.success());
+    assert!(
+        !root.exists(),
+        "failed live preflight must precede destination creation"
+    );
+    assert!(
+        !fixture.registry.exists(),
+        "failed live preflight must precede client intent creation"
+    );
+    assert_eq!(upstream.file_reads(), 0);
+    // A caller-visible plan is selection data, not a bearer proof. Bypassing
+    // the CLI still requires the host's own authenticated feature/root check.
+    let query = upstream.runtime.as_ref().unwrap().block_on(async {
+        native_broker::BrokerQueryClient::connect(
+            fixture.broker.clone(),
+            "example",
+            Default::default(),
+        )
+        .await
+        .unwrap()
+    });
+    let description = upstream
+        .runtime
+        .as_ref()
+        .unwrap()
+        .block_on(query.describe_provider())
+        .unwrap();
+    let root_id: [u8; 32] = (0..32)
+        .map(|i| u8::from_str_radix(&upstream.head[i * 2..i * 2 + 2], 16).unwrap())
+        .collect::<Vec<_>>()
+        .try_into()
+        .unwrap();
+    let plan = description.creation_plan(root_id).unwrap();
+    assert!(
+        fixture
+            .control(Request::NativeMountPlanned {
+                root: root.clone(),
+                store: "example".into(),
+                commit: upstream.head.clone(),
+                workspace_id: "6a".repeat(32),
+                creation_plan: plan.encode(),
+            })
+            .is_err()
+    );
+    assert!(!root.exists());
+    assert!(
+        !fixture
+            .base()
+            .join("daemon/native-workspaces")
+            .join("6a".repeat(32))
+            .exists()
+    );
+    fixture.stop_daemon();
+    // An explicit no-backup policy needs only the query features and remains
+    // usable against this server; it is not silently converted into backup.
+    fixture.capture_policy("disabled");
+    fixture.start();
+    fixture.clone_remote(&root);
+    let binding = fixture.binding(&root);
+    assert_eq!(
+        fs::read_to_string(binding.repo.join("index/type")).unwrap(),
+        jj_native_index::NAME
+    );
+    fixture.success(&root, &["status"]);
+    assert_eq!(local_capture_status(&fixture)["queued"], 0);
+    fixture.success(&base, &["tinytree", "unmount", root.to_str().unwrap()]);
+    fixture.stop_daemon();
+    let capable = RemoteServer::start_with_cloud();
+    for (name, fault) in [
+        ("legacy server", 1),
+        ("denied features", 2),
+        ("unreadable selected root", 3),
+    ] {
+        let mut denied = Fixture::new();
+        denied.configure_remote(&capable.endpoint);
+        denied.automatic_policies();
+        denied.start();
+        capable
+            .metadata
+            .creation_fault
+            .store(fault, Ordering::SeqCst);
+        let denied_root = denied.base().join("denied-destination");
+        let broker = denied.broker.clone();
+        let base = denied.base().to_owned();
+        let result = denied.run(
+            &base,
+            &[
+                "tinytree",
+                "clone",
+                denied_root.to_str().unwrap(),
+                "--broker",
+                broker.to_str().unwrap(),
+                "--store",
+                "example",
+                "--reference",
+                "main",
+            ],
+        );
+        assert!(!result.status.success(), "{name}");
+        assert!(
+            !denied_root.exists(),
+            "{name}: destination must not be created"
+        );
+        assert!(
+            !denied.registry.exists(),
+            "{name}: client intent must not be created"
+        );
+        denied.stop_daemon();
+    }
+    capable.metadata.creation_fault.store(0, Ordering::SeqCst);
 }
 
 #[test]

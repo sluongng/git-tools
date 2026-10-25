@@ -45,6 +45,8 @@ struct Mapping {
     identity: [u8; 32],
     workspace: WorkspaceId,
     op_store: OpStoreId,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    auto_upload: bool,
 }
 struct Workspace {
     mapping: Mapping,
@@ -361,7 +363,7 @@ impl NativeCommandHost {
             .map_err(status)
     }
     pub async fn register(&self, binding: &Binding, identity: [u8; 32]) -> Result<()> {
-        self.register_inner(binding, identity, false, None)
+        self.register_inner(binding, identity, false, None, None)
             .await
             .map(|_| ())
     }
@@ -373,7 +375,9 @@ impl NativeCommandHost {
         binding: &Binding,
         identity: [u8; 32],
     ) -> Result<CommandStartupReservation> {
-        let workspace = self.register_inner(binding, identity, true, None).await?;
+        let workspace = self
+            .register_inner(binding, identity, true, None, None)
+            .await?;
         Ok(CommandStartupReservation {
             inner: self.inner.clone(),
             workspace,
@@ -385,7 +389,18 @@ impl NativeCommandHost {
         identity: [u8; 32],
         access: Arc<native_retention::HostAccessGuard>,
     ) -> Result<()> {
-        self.register_inner(binding, identity, false, Some(access))
+        self.register_inner(binding, identity, false, Some(access), None)
+            .await
+            .map(|_| ())
+    }
+    pub(crate) async fn register_enrolled_with_host_access(
+        &self,
+        binding: &Binding,
+        identity: [u8; 32],
+        auto_upload: bool,
+        access: Arc<native_retention::HostAccessGuard>,
+    ) -> Result<()> {
+        self.register_inner(binding, identity, false, Some(access), Some(auto_upload))
             .await
             .map(|_| ())
     }
@@ -396,7 +411,7 @@ impl NativeCommandHost {
         access: Arc<native_retention::HostAccessGuard>,
     ) -> Result<CommandStartupReservation> {
         let workspace = self
-            .register_inner(binding, identity, true, Some(access))
+            .register_inner(binding, identity, true, Some(access), None)
             .await?;
         Ok(CommandStartupReservation {
             inner: self.inner.clone(),
@@ -430,6 +445,7 @@ impl NativeCommandHost {
         identity: [u8; 32],
         reserved: bool,
         access: Option<Arc<native_retention::HostAccessGuard>>,
+        auto_upload: Option<bool>,
     ) -> Result<Arc<Workspace>> {
         if let Some(access) = &access {
             self.inner.registry.validate_host_access(access)?;
@@ -453,8 +469,9 @@ impl NativeCommandHost {
                 mapping.version == 1
                     && mapping.mount == mount
                     && mapping.alias == binding.repository
-                    && mapping.identity == identity,
-                "native command provider identity changed"
+                    && mapping.identity == identity
+                    && auto_upload.is_none_or(|expected| expected == mapping.auto_upload),
+                "native command provider identity or saved enrollment changed"
             );
             mapping
         } else {
@@ -465,6 +482,7 @@ impl NativeCommandHost {
                 identity,
                 workspace: WorkspaceId::random(),
                 op_store: OpStoreId::random(),
+                auto_upload: auto_upload.unwrap_or(false),
             };
             self.inner
                 .records
@@ -1186,10 +1204,7 @@ impl NativeCommandHost {
             .set(stats)
             .map_err(|_| anyhow::anyhow!("capture uploader already configured"))
     }
-    pub(crate) fn capture_mapping(
-        &self,
-        ticket: &native_retention::PendingCapture,
-    ) -> Result<(String, String, [u8; 32])> {
+    fn capture_mapping_record(&self, ticket: &native_retention::PendingCapture) -> Result<Mapping> {
         let mut found = None;
         let mut count = 0;
         for item in std::fs::read_dir(self.inner.records.path())? {
@@ -1207,10 +1222,23 @@ impl NativeCommandHost {
                 && mapping.op_store == ticket.registration.op_store
             {
                 ensure!(found.is_none(), "ambiguous capture mapping");
-                found = Some((mapping.mount, mapping.alias, mapping.identity));
+                found = Some(mapping);
             }
         }
         found.context("capture mapping unavailable")
+    }
+    pub(crate) fn capture_mapping(
+        &self,
+        ticket: &native_retention::PendingCapture,
+    ) -> Result<(String, String, [u8; 32])> {
+        let mapping = self.capture_mapping_record(ticket)?;
+        Ok((mapping.mount, mapping.alias, mapping.identity))
+    }
+    pub(crate) fn capture_auto_upload(
+        &self,
+        ticket: &native_retention::PendingCapture,
+    ) -> Result<bool> {
+        Ok(self.capture_mapping_record(ticket)?.auto_upload)
     }
     pub fn status(&self) -> serde_json::Value {
         let stats = self.inner.registry.storage_stats();
@@ -1407,6 +1435,7 @@ mod tests {
         let objects = PrivateDir::create(private.path().join("objects"))?;
         let socket = private.path().join("rbe.sock");
         let target = Arc::new(Target {
+            auto_enrolled: false,
             controller: std::sync::Weak::new(),
             registry: native_workspace_admin::Registry::create(
                 private.path().join("admin-registry"),

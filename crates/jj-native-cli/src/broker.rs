@@ -7,6 +7,7 @@ use std::{
     time::Instant,
 };
 
+use jj_lib::object_id::ObjectId as _;
 use jj_lib::{
     backend::{Backend, BackendInitError, BackendLoadError},
     repo::StoreFactories,
@@ -293,26 +294,30 @@ fn description(
         .map_err(|_| io::Error::other("native provider handshake failed"))?
         .map_err(|e| Box::new(e) as Failure)
 }
-/// Creation policy is live, not persisted trust. Existing repositories instead
-/// select the factory named by their recorded index/type.
-pub(crate) fn creation_policy(
+/// Freeze the selected root and effective policy before destination mutation.
+/// Existing repositories instead load their recorded index/type.
+pub(crate) fn creation_plan(
     locator: &Locator,
-) -> Result<native_broker::ProviderIndexMode, Failure> {
-    let description = description(&query_client(locator)?)?;
-    if description.index_mode == native_broker::ProviderIndexMode::Federated {
-        #[cfg(windows)]
-        return Err(
-            io::Error::other("federated native index writers are unsupported on Windows").into(),
-        );
-        if !description.query_capable {
-            return Err(io::Error::other(
-                "federated native index requires a query-capable provider",
-            )
-            .into());
-        }
-    }
-    Ok(description.index_mode)
+    initial: &jj_lib::backend::CommitId,
+) -> Result<native_broker::CreationPlan, Failure> {
+    #[cfg(not(target_os = "linux"))]
+    return Err(io::Error::other(
+        "default native workspace creation requires the Linux provider; no checkout was created",
+    )
+    .into());
+    let root = native_broker::CommitId(
+        initial
+            .as_bytes()
+            .try_into()
+            .map_err(|_| io::Error::other("invalid native creation root"))?,
+    );
+    let query = query_client(locator)?;
+    std::thread::spawn(move || futures::executor::block_on(query.preflight_creation(root)))
+        .join()
+        .map_err(|_| io::Error::other("native creation preflight failed"))?
+        .map_err(|error| Box::new(error) as Failure)
 }
+
 fn open_index(
     path: &Path,
     initial: Option<(&jj_lib::backend::CommitId, &jj_lib::op_store::OperationId)>,
