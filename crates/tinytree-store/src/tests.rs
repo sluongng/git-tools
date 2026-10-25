@@ -3603,42 +3603,100 @@ fn cloud_reopen_rejects_missing_retained_version_root_record() {
 
 #[test]
 fn prospective_cloud_repeated_metadata_work_is_bounded_before_ack() {
-    let (directory, store) = open();
-    let owner = CloudOwner {
-        principal: [50; 32],
-    };
-    let (_, root, head) = fixture(&store, "bounded metadata validation");
-    let (manifest, leases) = cloud_capture(&store, owner, head, root);
-    drop(store);
-    let mut cfg = config();
-    cfg.max_retention_validation_records = 15;
-    let store = Store::open_existing(directory.path(), cfg.clone()).unwrap();
-    let request = cloud_request(&manifest, 0, "metadata-budget", &leases);
-    assert!(matches!(
-        store.publish_cloud_version(
-            "demo",
-            owner,
-            &request,
-            1,
-            &CloudPublicationLimits::default()
-        ),
-        Err(Error::Limit("cloud validation catalog budget"))
-    ));
-    assert_eq!(
-        store
-            .get_cloud_workspace("demo", owner, manifest.workspace)
-            .unwrap()
-            .generation,
-        0
-    );
-    assert_eq!(
-        store
-            .cloud_publication("demo", owner, "metadata-budget")
-            .unwrap(),
-        None
-    );
-    drop(store);
-    Store::open_existing(directory.path(), cfg).unwrap();
+    for (name, record_limit, expects_prior_versions) in [
+        ("first_version_exceeds_budget", 15, false),
+        ("retained_history_fills_catalog", 1024, true),
+    ] {
+        let (directory, store) = open();
+        let owner = CloudOwner {
+            principal: [50; 32],
+        };
+        let (_, root, head) = fixture(&store, "bounded metadata validation");
+        let (mut manifest, leases) = cloud_capture(&store, owner, head, root);
+        drop(store);
+        let mut cfg = config();
+        cfg.max_retention_validation_records = record_limit;
+        let store = Store::open_existing(directory.path(), cfg.clone()).unwrap();
+        let mut generation = 0;
+        let mut latest = None;
+        let mut rejected = None;
+        for attempt in 0..128 {
+            manifest.sequence = attempt + 1;
+            let key = format!("metadata-budget-{attempt}");
+            let request = cloud_request(
+                &manifest,
+                generation,
+                &key,
+                if generation == 0 { &leases } else { &[] },
+            );
+            let before = store
+                .get_cloud_workspace("demo", owner, manifest.workspace)
+                .unwrap();
+            match store.publish_cloud_version(
+                "demo",
+                owner,
+                &request,
+                1,
+                &CloudPublicationLimits::default(),
+            ) {
+                Ok(receipt) => {
+                    generation += 1;
+                    assert_eq!(receipt.workspace.generation, generation, "{name}");
+                    latest = Some((key, receipt));
+                }
+                Err(Error::Limit("cloud validation catalog budget")) => {
+                    assert_eq!(
+                        store
+                            .get_cloud_workspace("demo", owner, manifest.workspace)
+                            .unwrap(),
+                        before,
+                        "{name}"
+                    );
+                    assert_eq!(
+                        store.cloud_publication("demo", owner, &key).unwrap(),
+                        None,
+                        "{name}"
+                    );
+                    rejected = Some(key);
+                    break;
+                }
+                other => panic!("{name}: unexpected publication result {other:?}"),
+            }
+        }
+        assert!(
+            rejected.is_some(),
+            "{name}: bounded catalog must reject growth"
+        );
+        assert_eq!(generation > 0, expects_prior_versions, "{name}");
+        assert_eq!(store.descriptor("demo", head.key).unwrap(), Some(head));
+        assert_eq!(store.descriptor("demo", root.key).unwrap(), Some(root));
+        drop(store);
+        let reopened = Store::open_existing(directory.path(), cfg).unwrap();
+        assert_eq!(
+            reopened
+                .get_cloud_workspace("demo", owner, manifest.workspace)
+                .unwrap()
+                .generation,
+            generation,
+            "{name}"
+        );
+        assert_eq!(
+            reopened
+                .cloud_publication("demo", owner, &rejected.unwrap())
+                .unwrap(),
+            None,
+            "{name}"
+        );
+        if let Some((key, receipt)) = latest {
+            assert_eq!(
+                reopened.cloud_publication("demo", owner, &key).unwrap(),
+                Some(receipt),
+                "{name}"
+            );
+        }
+        assert_eq!(reopened.descriptor("demo", head.key).unwrap(), Some(head));
+        assert_eq!(reopened.descriptor("demo", root.key).unwrap(), Some(root));
+    }
 }
 
 #[test]

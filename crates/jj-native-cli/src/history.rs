@@ -5,6 +5,8 @@ use futures::io::AsyncReadExt as _;
 use jj_cli::{
     cli_util::{CommandHelper, RevisionArg},
     command_error::{CommandError, cli_error, user_error},
+    commit_templater::AnnotationLine,
+    formatter::{FormatRecorder, Formatter},
     ui::Ui,
 };
 use jj_lib::{
@@ -17,10 +19,11 @@ use jj_lib::{
     store::Store,
 };
 use native_broker::{
-    BrokerQueryClient, NativeQueryIo, QueryScope, ScopedPathQuery, query_protocol as q,
+    BrokerQueryClient, NativeQueryIo, QueryReply, QueryScope, ScopedPathQuery, query_protocol as q,
 };
 use serde::Serialize;
 use std::{
+    collections::HashMap,
     io::Write as _,
     sync::Arc,
     time::{Duration, Instant},
@@ -455,8 +458,7 @@ fn propagate(
     *pending = mappings;
     Ok(())
 }
-async fn blame(
-    ui: &mut Ui,
+async fn attribution(
     query: &BrokerQueryClient,
     scope: &QueryScope,
     captured: &CapturedPath,
@@ -465,7 +467,7 @@ async fn blame(
     store: &Store,
     args: &PathArgs,
     started: Instant,
-) -> Result<(), CommandError> {
+) -> Result<(BlameOutput, Option<QueryReply<q::BlameResult>>), CommandError> {
     if captured.target.kind != "file" {
         return Err(user_error(
             "native blame requires an existing resolved regular file",
@@ -620,7 +622,11 @@ async fn blame(
             })
             .collect(),
     };
-    if args.json {
+    Ok((output, remote))
+}
+
+fn render_blame(ui: &mut Ui, output: &BlameOutput, json: bool) -> Result<(), CommandError> {
+    if json {
         serde_json::to_writer(ui.stdout(), &output).map_err(failure)?;
         writeln!(ui.stdout())?;
     } else {
@@ -643,7 +649,251 @@ async fn blame(
             )?;
         }
     }
-    drop(remote);
+    Ok(())
+}
+
+// Parsed matches include jj aliases and global options. Never reparse raw argv.
+pub(crate) async fn ordinary_annotate(
+    ui: &mut Ui,
+    command: &CommandHelper,
+) -> Result<bool, CommandError> {
+    let Some(("file", file)) = command.matches().subcommand() else {
+        return Ok(false);
+    };
+    let Some(("annotate", matches)) = file.subcommand() else {
+        return Ok(false);
+    };
+    let loader = command.workspace_loader()?;
+    if std::fs::read_to_string(loader.repo_path().join("index/type"))
+        .ok()
+        .as_deref()
+        != Some(jj_native_index::NAME)
+    {
+        return Ok(false);
+    }
+    let args = PathArgs {
+        path: matches.get_one::<String>("path").unwrap().clone(),
+        revision: matches.get_one::<RevisionArg>("revision").cloned(),
+        max_commits: 256,
+        json: false,
+    };
+    let template = matches.get_one::<String>("template").cloned();
+    if tokio::runtime::Handle::try_current().is_ok() {
+        run_query(ui, command, args, true, Some(template)).await?;
+    } else {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .map_err(failure)?;
+        runtime.block_on(run_query(ui, command, args, true, Some(template)))?;
+    }
+    Ok(true)
+}
+
+// Bound emitted template bytes and formatting operations before recording.
+// This does not bound the template interpreter's own internal computation.
+struct AnnotationRecorder {
+    inner: FormatRecorder,
+    retained: usize,
+    exhausted: bool,
+    started: Instant,
+}
+impl AnnotationRecorder {
+    fn charge(&mut self, bytes: usize) -> bool {
+        self.retained = self.retained.saturating_add(bytes);
+        self.exhausted |=
+            self.retained > MAX_LOCAL_BYTES || self.started.elapsed() >= MAX_COMMAND_TIME;
+        !self.exhausted
+    }
+}
+fn output_limit() -> std::io::Error {
+    std::io::Error::other("native annotation rendered output or elapsed limit reached")
+}
+impl std::io::Write for AnnotationRecorder {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        if !self.charge(bytes.len()) {
+            return Err(output_limit());
+        }
+        self.inner.write(bytes)
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.inner.flush()
+    }
+}
+struct AnnotationRawWriter<'a> {
+    inner: Box<dyn std::io::Write + 'a>,
+    retained: &'a mut usize,
+    exhausted: &'a mut bool,
+    started: Instant,
+}
+impl std::io::Write for AnnotationRawWriter<'_> {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        // Each raw write creates a distinct recorder operation and Vec,
+        // including an empty write through the same raw writer.
+        *self.retained = self.retained.saturating_add(bytes.len().saturating_add(64));
+        *self.exhausted |=
+            *self.retained > MAX_LOCAL_BYTES || self.started.elapsed() >= MAX_COMMAND_TIME;
+        if *self.exhausted {
+            return Err(output_limit());
+        }
+        self.inner.write(bytes)
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.inner.flush()
+    }
+}
+impl Formatter for AnnotationRecorder {
+    fn raw(&mut self) -> std::io::Result<Box<dyn std::io::Write + '_>> {
+        if !self.charge(64) {
+            return Err(output_limit());
+        }
+        Ok(Box::new(AnnotationRawWriter {
+            inner: self.inner.raw()?,
+            retained: &mut self.retained,
+            exhausted: &mut self.exhausted,
+            started: self.started,
+        }))
+    }
+    fn push_label(&mut self, label: &str) {
+        if self.charge(label.len().saturating_add(64)) {
+            self.inner.push_label(label);
+        }
+    }
+    fn pop_label(&mut self) {
+        if self.charge(64) {
+            self.inner.pop_label();
+        }
+    }
+    fn maybe_color(&self) -> bool {
+        self.inner.maybe_color()
+    }
+}
+
+async fn render_annotation(
+    ui: &mut Ui,
+    helper: &jj_cli::cli_util::WorkspaceCommandHelper,
+    query: &BrokerQueryClient,
+    scope: &QueryScope,
+    captured: &CapturedPath,
+    output: &BlameOutput,
+    template: Option<&str>,
+    started: Instant,
+) -> Result<(), CommandError> {
+    if output.coverage != "complete" || output.lines.iter().any(|line| line.origin.is_none()) {
+        return Err(user_error(format!(
+            "native file annotate requires complete attribution ({}); no history fallback is available",
+            output.coverage
+        )));
+    }
+    let template_text = match template {
+        Some(text) => text.to_owned(),
+        None => helper.settings().get_string("templates.file_annotate")?,
+    };
+    let language = helper.commit_template_language();
+    let template = helper.parse_template(ui, &language, &template_text)?;
+    let mut commits = HashMap::new();
+    // Keep canonical reply/proof owners alive until rendering has finished.
+    let mut metadata = Vec::new();
+    let mut metadata_bytes = 0usize;
+    for line in &output.lines {
+        check_time(started)?;
+        let origin = line.origin.as_ref().unwrap();
+        if commits.contains_key(&origin.commit) {
+            continue;
+        }
+        if commits.len() >= 4096 {
+            return Err(user_error(
+                "native annotation origin metadata count limit reached",
+            ));
+        }
+        if origin.commit.len() != 64 {
+            return Err(user_error("invalid native annotation origin identity"));
+        }
+        let bytes = (0..32)
+            .map(|i| u8::from_str_radix(&origin.commit[i * 2..i * 2 + 2], 16))
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(failure)?;
+        let id = jj_lib::backend::CommitId::from_bytes(&bytes);
+        let native = CommitId::from_slice(id.as_bytes()).map_err(failure)?;
+        if !captured.steps.iter().any(|step| step.id == native) {
+            // A returned origin ID is not object-read authority. Fetch its
+            // canonical COMMIT through the exact captured query scope first.
+            let reply = query
+                .read_commit(scope.handle, native, Arc::new(()))
+                .await
+                .map_err(failure)?;
+            metadata_bytes =
+                metadata_bytes.saturating_add(reply.value.bytes().len().saturating_mul(8));
+            if metadata_bytes > MAX_LOCAL_BYTES {
+                return Err(user_error(
+                    "native annotation origin metadata byte limit reached",
+                ));
+            }
+            metadata.push(reply);
+        }
+        let commit = helper.repo().store().get_commit_async(&id).await?;
+        // Private metadata was already admitted locally, but its retained
+        // buffers still consume this command's bounded projection allowance.
+        let data = commit.store_commit();
+        metadata_bytes = metadata_bytes
+            .saturating_add(data.change_id.as_bytes().len())
+            .saturating_add(data.description.capacity())
+            .saturating_add(data.author.name.capacity())
+            .saturating_add(data.author.email.capacity())
+            .saturating_add(data.committer.name.capacity())
+            .saturating_add(data.committer.email.capacity())
+            .saturating_add(data.parents.capacity().saturating_mul(128))
+            .saturating_add(data.predecessors.capacity().saturating_mul(128))
+            .saturating_add(data.root_tree.iter().count().saturating_mul(128))
+            .saturating_add(1024);
+        for label in &data.conflict_labels {
+            metadata_bytes = metadata_bytes
+                .saturating_add(label.capacity())
+                .saturating_add(128);
+        }
+        if let Some(signature) = &data.secure_sig {
+            metadata_bytes = metadata_bytes
+                .saturating_add(signature.data.capacity())
+                .saturating_add(signature.sig.capacity());
+        }
+        if metadata_bytes > MAX_LOCAL_BYTES {
+            return Err(user_error(
+                "native annotation origin metadata byte limit reached",
+            ));
+        }
+        commits.insert(origin.commit.clone(), commit);
+    }
+    // Complete all attribution, metadata and template work before ordinary
+    // stdout. Preserve formatter labels and raw escapes when replaying.
+    let mut rendered = AnnotationRecorder {
+        inner: FormatRecorder::new(ui.color()),
+        retained: 0,
+        exhausted: false,
+        started,
+    };
+    let mut last_id = None;
+    for line in &output.lines {
+        check_time(started)?;
+        let origin = line.origin.as_ref().unwrap();
+        let annotation = AnnotationLine {
+            commit: commits[&origin.commit].clone(),
+            content: line.bytes.clone().into(),
+            line_number: line.line,
+            original_line_number: origin.original_line,
+            first_line_in_hunk: last_id != Some(&origin.commit),
+        };
+        template.format(&annotation, &mut rendered)?;
+        if rendered.exhausted {
+            return Err(user_error(
+                "native annotation rendered output limit reached",
+            ));
+        }
+        last_id = Some(&origin.commit);
+    }
+    check_time(started)?;
+    ui.request_pager();
+    rendered.inner.replay(ui.stdout_formatter().as_mut())?;
+    drop(metadata);
     Ok(())
 }
 
@@ -656,13 +906,13 @@ pub(crate) async fn run(
     // jj's CLI runner uses pollster rather than a Tokio executor. Drive timers
     // explicitly for this command; broker transport still uses its owned runtime.
     if tokio::runtime::Handle::try_current().is_ok() {
-        return run_query(ui, command, args, annotate).await;
+        return run_query(ui, command, args, annotate, None).await;
     }
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_time()
         .build()
         .map_err(failure)?;
-    runtime.block_on(run_query(ui, command, args, annotate))
+    runtime.block_on(run_query(ui, command, args, annotate, None))
 }
 
 async fn run_query(
@@ -670,6 +920,7 @@ async fn run_query(
     command: &CommandHelper,
     args: PathArgs,
     annotate: bool,
+    ordinary_template: Option<Option<String>>,
 ) -> Result<(), CommandError> {
     if args.max_commits == 0 || args.max_commits > 4096 {
         return Err(cli_error("--max-commits must be between 1 and 4096"));
@@ -730,8 +981,7 @@ async fn run_query(
         )
         .await?;
         if annotate {
-            blame(
-                ui,
+            let (output, attribution_owner) = attribution(
                 &query,
                 &scope.value,
                 &captured,
@@ -741,7 +991,30 @@ async fn run_query(
                 &args,
                 started,
             )
-            .await
+            .await?;
+            if let Some(template) = &ordinary_template {
+                if let Some(reply) = &attribution_owner {
+                    if coverage(reply.value.coverage)? != "complete" {
+                        return Err(user_error(format!(
+                            "native file annotate requires complete attribution ({}); no history fallback is available",
+                            coverage(reply.value.coverage)?
+                        )));
+                    }
+                }
+                render_annotation(
+                    ui,
+                    &helper,
+                    &query,
+                    &scope.value,
+                    &captured,
+                    &output,
+                    template.as_deref(),
+                    started,
+                )
+                .await
+            } else {
+                render_blame(ui, &output, args.json)
+            }
         } else {
             history(
                 ui,

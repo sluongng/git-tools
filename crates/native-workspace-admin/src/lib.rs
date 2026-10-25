@@ -2,6 +2,7 @@
 //! The projected control marker contains an opaque ID, never an admin path.
 //! Only an owner-private registry supplies paths and local transport authority.
 pub mod capture;
+pub mod landing_resolution;
 pub mod remote_state;
 pub mod restore;
 

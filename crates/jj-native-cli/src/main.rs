@@ -418,6 +418,9 @@ fn main() -> std::process::ExitCode {
                         user_error_with_message("Cannot admit native command", error)
                     })?;
                 }
+                if history::ordinary_annotate(ui, command).await? {
+                    return Ok(());
+                }
                 dispatch.call(ui, command).await
             })
             .set_workspace_loader_factory(Box::new(vfs::Loader))

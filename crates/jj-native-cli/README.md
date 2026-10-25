@@ -71,9 +71,13 @@ compose local drafts and dirty edits over this workspace's immutable remote
 baseline, without uploading them. They use fixed-path, linear-history semantics;
 merges, conflicts and exhausted limits are explicit, not complete results.
 Queries use an observed clone/fetch baseline or the exact retained version of a
-restored cloud workspace; later private edits stay local. Ordinary
-`jj file annotate` is not wired to this service and remains unsupported with the
-Federated index.
+restored cloud workspace; later private edits stay local. With the Federated
+index, ordinary `jj file annotate` uses the same bounded linear attribution,
+including dirty edits and `-r` selection, and renders jj's configured annotation
+template or `-T` override. It requires complete attribution before output;
+merges, conflicts and exhausted limits are unsupported, without an eager history
+fallback. This does not yet provide jj's full multi-parent annotation semantics.
+Explicit Legacy indexes retain jj's ordinary annotation implementation.
 
 `search` interprets its pattern as a case-sensitive regular expression in regular
 files at the selected revision, merging remote results with local additions,

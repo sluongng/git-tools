@@ -1402,7 +1402,14 @@ impl RemoteServer {
             false,
             false,
             Some((262_144, 64 * 1024 * 1024, 12 * 1024 * 1024 * 1024)),
+            false,
         )
+    }
+    fn start_with_cloud_landing_recovery() -> Self {
+        // Recovery retains ordinary cloud versions before its pending landing
+        // capsule. Use the ordinary cloud catalog budget for this combined
+        // workflow, without changing the small landing/performance profiles.
+        Self::start_profile_configured(8, true, None, false, true, None, true)
     }
     fn start_with_history_and_cloud(history: usize, cloud_enabled: bool) -> Self {
         Self::start_configured(history, cloud_enabled, None)
@@ -1441,6 +1448,7 @@ impl RemoteServer {
             search_seed,
             landing_enabled,
             None,
+            false,
         )
     }
     fn start_profile_configured(
@@ -1450,8 +1458,13 @@ impl RemoteServer {
         search_seed: bool,
         landing_enabled: bool,
         cloud_catalog: Option<(usize, u64, u64)>,
+        cloud_landing_recovery: bool,
     ) -> Self {
         assert!((1..=1024).contains(&history));
+        assert!(
+            !cloud_landing_recovery
+                || (cloud_enabled && landing_enabled && cloud_catalog.is_none())
+        );
         let setup_started = Instant::now();
         let directory = tempfile::tempdir().unwrap();
         let (mut configuration, store_configuration) = if cloud_enabled || landing_enabled {
@@ -1485,8 +1498,10 @@ max_manifest_members=1024
             )
             .unwrap();
             if landing_enabled {
-                profile.store.max_retention_validation_records = 1024;
-                profile.store.max_retention_validation_bytes = 2 * 1024 * 1024;
+                if !cloud_landing_recovery {
+                    profile.store.max_retention_validation_records = 1024;
+                    profile.store.max_retention_validation_bytes = 2 * 1024 * 1024;
+                }
                 profile.store.max_closure_objects = 4096;
                 profile.store.max_closure_edges = 16384;
                 profile.store.max_path_contexts = 4096;
@@ -1529,6 +1544,11 @@ repositories=["example"]
 "#,
             )
             .unwrap();
+            if cloud_landing_recovery {
+                // The combined catalog also needs funded Store-validation work
+                // in landing admission; keep the small profiles unchanged.
+                configuration.landing.max_buffered_bytes = 4 * 1024 * 1024 * 1024;
+            }
         }
         if let Some(bytes) = blame_bytes {
             configuration.query.max_blame_file_bytes = bytes;
@@ -2218,6 +2238,354 @@ fn shipped_remote_blame_composes_private_and_dirty_paths_without_uploading() {
         &["tinytree", "unmount", thin_root.to_str().unwrap()],
     );
     thin.stop_daemon();
+}
+
+// Explicit compatibility oracle only: keep the native objects/operation/IDs,
+// but let stock FileAnnotator build its own eager Legacy index. Native-path
+// hydration counters are checked before this separate oracle is invoked.
+fn legacy_annotation_oracle(fixture: &mut Fixture, root: &Path, args: &[&str]) -> Vec<u8> {
+    struct RestoreIndex {
+        index: PathBuf,
+        saved: PathBuf,
+    }
+    impl Drop for RestoreIndex {
+        fn drop(&mut self) {
+            fs::remove_dir_all(&self.index).unwrap();
+            fs::rename(&self.saved, &self.index).unwrap();
+        }
+    }
+    let binding = fixture.binding(root);
+    let index = binding.repo.join("index");
+    let saved = binding.repo.join("annotate-oracle-native-index");
+    fs::rename(&index, &saved).unwrap();
+    fs::create_dir(&index).unwrap();
+    let _restore = RestoreIndex {
+        index: index.clone(),
+        saved,
+    };
+    jj_lib::default_index::DefaultIndexStore::init(&index).unwrap();
+    fs::write(
+        index.join("type"),
+        jj_lib::default_index::DefaultIndexStore::NAME,
+    )
+    .unwrap();
+    let output = fixture.run(root, args);
+    assert!(
+        output.status.success(),
+        "stock annotate oracle: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    output.stdout
+}
+
+#[test]
+#[ignore = "requires usable /dev/fuse and fusermount3; run mounted_tests locally"]
+fn ordinary_annotate_matches_stock_templates_private_revisions_and_dirty_bytes() {
+    let upstream = RemoteServer::start();
+    let mut fixture = Fixture::new();
+    fixture.configure_remote(&upstream.endpoint);
+    fixture.index_mode("federated");
+    fixture.start();
+    let base = fixture.base().to_owned();
+    let root = base.join("ordinary-annotate");
+    fixture.clone_remote(&root);
+    let binding = fixture.binding(&root);
+    let observation = remote_observation(&binding).0;
+    let public = upstream.public();
+    let writes = upstream.metadata.writes.load(Ordering::SeqCst);
+    let detail = "commit.commit_id() ++ \":\" ++ original_line_number ++ \":\" ++ line_number ++ \":\" ++ first_line_in_hunk ++ \":\" ++ content";
+    let baseline_args = ["file", "annotate", "hello.cc", "-r", "main", "-T", detail];
+    let baseline = fixture.run(&root, &baseline_args);
+    assert!(
+        baseline.status.success(),
+        "{}",
+        String::from_utf8_lossy(&baseline.stderr)
+    );
+    let default_args = ["file", "annotate", "hello.cc", "-r", "main"];
+    let baseline_default = fixture.success(&root, &default_args);
+    assert!(!baseline_default.contains("<Error"));
+    // Primary oracle is the supported explicit Legacy creation workflow.
+    let mut legacy = Fixture::new();
+    legacy.configure_remote(&upstream.endpoint);
+    legacy.index_mode("legacy");
+    legacy.start();
+    let legacy_base = legacy.base().to_owned();
+    let legacy_root = legacy_base.join("ordinary-annotate-legacy");
+    legacy.clone_remote(&legacy_root);
+    let legacy_baseline = legacy.run(&legacy_root, &baseline_args);
+    assert!(legacy_baseline.status.success());
+    assert_eq!(baseline.stdout, legacy_baseline.stdout);
+    assert_eq!(
+        baseline_default,
+        legacy.success(&legacy_root, &default_args)
+    );
+    let mut initial_dirty = b"ordinary dirty line\n".to_vec();
+    initial_dirty.extend_from_slice(&upstream.source_bytes);
+    initial_dirty.extend_from_slice(b"dirty\0\xff without newline");
+    fs::write(root.join("hello.cc"), &initial_dirty).unwrap();
+    fs::write(legacy_root.join("hello.cc"), &initial_dirty).unwrap();
+    let primary_args = ["file", "annotate", "hello.cc", "-T", detail];
+    let before_primary = upstream.file_reads();
+    let native_dirty = fixture.run(&root, &primary_args);
+    assert!(
+        native_dirty.status.success(),
+        "{}",
+        String::from_utf8_lossy(&native_dirty.stderr)
+    );
+    assert_eq!(upstream.file_reads(), before_primary);
+    let native_wc = fixture.revision(&root, "@");
+    let legacy_dirty = legacy.run(&legacy_root, &primary_args);
+    assert!(legacy_dirty.status.success());
+    let legacy_wc = legacy.revision(&legacy_root, "@");
+    // Only the independently allocated dirty working-copy identity differs.
+    // Preserve every canonical committed origin, line index, hunk and byte.
+    let normalize = |bytes: &[u8], wc: &str| {
+        bytes
+            .split_inclusive(|byte| *byte == b'\n')
+            .map(|line| {
+                if line.starts_with(wc.as_bytes()) {
+                    [b"<working-copy>".as_slice(), &line[wc.len()..]].concat()
+                } else {
+                    line.to_vec()
+                }
+            })
+            .flatten()
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        normalize(&native_dirty.stdout, &native_wc),
+        normalize(&legacy_dirty.stdout, &legacy_wc)
+    );
+    legacy.success(
+        &legacy_base,
+        &["tinytree", "unmount", legacy_root.to_str().unwrap()],
+    );
+    legacy.stop_daemon();
+    fs::write(root.join("hello.cc"), &upstream.source_bytes).unwrap();
+    fixture.success(&root, &["status"]);
+    let reads = upstream.file_reads();
+    fixture.success(&root, &["new", "-m", "ordinary annotate private base"]);
+    let mut first = b"repeat\nrepeat\nprivate base\n".to_vec();
+    first.extend_from_slice(&upstream.source_bytes);
+    fs::write(root.join("hello.cc"), &first).unwrap();
+    fixture.success(&root, &["status"]);
+    let private_revision = fixture.revision(&root, "@");
+    fixture.success(&root, &["new", "-m", "ordinary annotate private child"]);
+    let mut dirty = b"repeat\nprivate child\nrepeat\n".to_vec();
+    dirty.extend_from_slice(&upstream.source_bytes);
+    dirty.extend_from_slice(b"dirty\0\xff without newline");
+    fs::write(root.join("hello.cc"), &dirty).unwrap();
+    // This ordinary command, not a preceding status/dedicated query, snapshots @.
+    let dirty_args = ["file", "annotate", "hello.cc", "-T", detail];
+    let dirty_output = fixture.run(&root, &dirty_args);
+    assert!(
+        dirty_output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&dirty_output.stderr)
+    );
+    let dirty_revision = fixture.revision(&root, "@");
+    let private_args = [
+        "file",
+        "annotate",
+        "hello.cc",
+        "-r",
+        &private_revision,
+        "-T",
+        detail,
+    ];
+    let private_output = fixture.run(&root, &private_args);
+    assert!(
+        private_output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&private_output.stderr)
+    );
+    let configured = "templates.file_annotate='line_number ++ \":\" ++ content'";
+    let configured_args = [
+        "--config",
+        configured,
+        "file",
+        "annotate",
+        "hello.cc",
+        "-r",
+        &dirty_revision,
+    ];
+    let configured_output = fixture.run(&root, &configured_args);
+    assert!(configured_output.status.success());
+    let precedence_args = [
+        "--config",
+        configured,
+        "file",
+        "annotate",
+        "hello.cc",
+        "-r",
+        &dirty_revision,
+        "-T",
+        detail,
+    ];
+    let precedence = fixture.run(&root, &precedence_args);
+    assert!(precedence.status.success());
+    assert_eq!(precedence.stdout, dirty_output.stdout);
+    fs::create_dir(root.join("subdir")).unwrap();
+    let relative = fixture.run(
+        &root.join("subdir"),
+        &[
+            "file",
+            "annotate",
+            "../hello.cc",
+            "-r",
+            &dirty_revision,
+            "-T",
+            detail,
+        ],
+    );
+    assert!(relative.status.success());
+    assert_eq!(relative.stdout, dirty_output.stdout);
+    writeln!(
+        fs::OpenOptions::new()
+            .append(true)
+            .open(&fixture.jj_config)
+            .unwrap(),
+        "\n[aliases]\nattribute=['file','annotate']"
+    )
+    .unwrap();
+    let alias = fixture.run(
+        &root,
+        &["attribute", "hello.cc", "-r", &dirty_revision, "-T", detail],
+    );
+    assert!(
+        alias.status.success(),
+        "{}",
+        String::from_utf8_lossy(&alias.stderr)
+    );
+    assert_eq!(alias.stdout, dirty_output.stdout);
+    let output_limited = fixture.run(
+        &root,
+        &[
+            "file",
+            "annotate",
+            "hello.cc",
+            "-r",
+            "main",
+            "-T",
+            "pad_end(33554433, content)",
+        ],
+    );
+    assert!(!output_limited.status.success());
+    assert!(
+        output_limited.stdout.is_empty(),
+        "template output budget must refuse before ordinary stdout"
+    );
+    assert!(String::from_utf8_lossy(&output_limited.stderr).contains("rendered output"));
+    // One raw writer emits many one-byte writes. Its operation/Vec overhead,
+    // not just the much smaller payload, must consume the output allowance.
+    let raw_limited = fixture.run(
+        &root,
+        &[
+            "file",
+            "annotate",
+            "hello.cc",
+            "-r",
+            "main",
+            "-T",
+            "raw_escape_sequence(pad_end(1048576, \"\"))",
+        ],
+    );
+    assert!(!raw_limited.status.success());
+    assert!(raw_limited.stdout.is_empty());
+    assert!(String::from_utf8_lossy(&raw_limited.stderr).contains("rendered output"));
+
+    assert_eq!(
+        upstream.file_reads(),
+        reads,
+        "ordinary annotate cannot hydrate historical/unrelated FILEs"
+    );
+    assert_eq!(upstream.metadata.writes.load(Ordering::SeqCst), writes);
+    assert_eq!(upstream.public(), public);
+    assert_eq!(remote_observation(&binding).0, observation);
+    assert_eq!(
+        baseline.stdout,
+        legacy_annotation_oracle(&mut fixture, &root, &baseline_args)
+    );
+    assert_eq!(
+        baseline_default.as_bytes(),
+        legacy_annotation_oracle(&mut fixture, &root, &default_args)
+    );
+    assert_eq!(
+        private_output.stdout,
+        legacy_annotation_oracle(&mut fixture, &root, &private_args)
+    );
+    let pinned_dirty_args = [
+        "--ignore-working-copy",
+        "file",
+        "annotate",
+        "hello.cc",
+        "-r",
+        &dirty_revision,
+        "-T",
+        detail,
+    ];
+    assert_eq!(
+        dirty_output.stdout,
+        legacy_annotation_oracle(&mut fixture, &root, &pinned_dirty_args)
+    );
+    assert_eq!(
+        configured_output.stdout,
+        legacy_annotation_oracle(&mut fixture, &root, &configured_args)
+    );
+    fs::remove_dir(root.join("subdir")).unwrap();
+    fixture.success(&root, &["status"]);
+    fixture.success(&root, &["new", "-m", "annotation bounds child"]);
+    fs::write(root.join("hello.cc"), b"line\n".repeat(16_385)).unwrap();
+    let oversized = fixture.run(&root, &["file", "annotate", "hello.cc"]);
+    assert!(!oversized.status.success());
+    assert!(oversized.stdout.is_empty());
+    assert!(String::from_utf8_lossy(&oversized.stderr).contains("content limit"));
+    fs::write(root.join("hello.cc"), &dirty).unwrap();
+    fixture.success(&root, &["status"]);
+    // A resolved merge with redundant ancestry still has ordered parent edges;
+    // the linear service must not quietly simplify it to first-parent blame.
+    fixture.success(
+        &root,
+        &[
+            "new",
+            "-r",
+            "@",
+            "-r",
+            "@-",
+            "-m",
+            "annotation merge boundary",
+        ],
+    );
+    let before_merge_reads = upstream.file_reads();
+    let merge = fixture.run(&root, &["file", "annotate", "hello.cc"]);
+    assert!(!merge.status.success());
+    assert!(merge.stdout.is_empty());
+    assert!(String::from_utf8_lossy(&merge.stderr).contains("resolved linear ancestry"));
+    assert_eq!(upstream.file_reads(), before_merge_reads);
+    fixture.success(&base, &["tinytree", "unmount", root.to_str().unwrap()]);
+    fixture.stop_daemon();
+
+    let limited_upstream = RemoteServer::start_with_blame_limit(1);
+    let mut limited = Fixture::new();
+    limited.configure_remote(&limited_upstream.endpoint);
+    limited.index_mode("federated");
+    limited.start();
+    let limited_base = limited.base().to_owned();
+    let limited_root = limited_base.join("ordinary-annotate-limit");
+    limited.clone_remote(&limited_root);
+    let rejected = limited.run(
+        &limited_root,
+        &["file", "annotate", "hello.cc", "-r", "main"],
+    );
+    assert!(!rejected.status.success());
+    assert!(rejected.stdout.is_empty());
+    assert!(String::from_utf8_lossy(&rejected.stderr).contains("baseline content unavailable"));
+    assert_eq!(limited_upstream.file_reads(), 0);
+    limited.success(
+        &limited_base,
+        &["tinytree", "unmount", limited_root.to_str().unwrap()],
+    );
+    limited.stop_daemon();
 }
 
 fn materialized_search_files(
@@ -3578,7 +3946,7 @@ fn automatic_remote_creation_requires_live_features_before_destination_or_intent
 #[test]
 #[ignore = "requires usable /dev/fuse and fusermount3; run mounted_tests locally"]
 fn pending_landing_cloud_restore_preserves_original_intent_and_applies_over_frozen_index() {
-    let upstream = RemoteServer::start_landing_configured(8, true, None, false, true);
+    let upstream = RemoteServer::start_with_cloud_landing_recovery();
     let mut producer = Fixture::new();
     producer.configure_remote(&upstream.endpoint);
     producer.automatic_policies();
@@ -3693,6 +4061,15 @@ fn pending_landing_cloud_restore_preserves_original_intent_and_applies_over_froz
         &Default::default(),
     )
     .unwrap();
+    eprintln!(
+        "cloud-landing-recovery selected_generation={} operations={} indexes={} blobs={} native_roots={} capture_bytes={}",
+        selected_generation,
+        selected_data.operations.len(),
+        selected_data.indexes.len(),
+        selected_data.blobs.len(),
+        selected_data.roots.len(),
+        capsule.len()
+    );
     assert_eq!(
         native_operation_heads(&binding),
         selected_data.operation_heads
@@ -5262,6 +5639,51 @@ fn restore_captured_workspace(
         blame["lines"][0]["bytes"],
         serde_json::json!(authored_bytes)
     );
+    let ordinary_scopes_before = upstream
+        .metadata
+        .ordinary_scope_opens
+        .load(Ordering::SeqCst);
+    let canonical_before = upstream.metadata.query_commit_bytes.load(Ordering::SeqCst);
+    let annotation = fixture.success(&root, &[
+        "file", "annotate", "capture-only.txt", "-r", &captured_revision,
+        "-T", "commit.commit_id() ++ \":\" ++ original_line_number ++ \":\" ++ line_number ++ \":\" ++ first_line_in_hunk ++ \":\" ++ content",
+    ]);
+    assert_eq!(
+        annotation.as_bytes(),
+        [
+            format!("{captured_revision}:1:1:true:").as_bytes(),
+            authored_bytes
+        ]
+        .concat()
+    );
+    // Default prefix/author/timestamp rendering must use captured-only COMMIT
+    // metadata, not IDs returned by blame as an ambient read capability.
+    let default_annotation = fixture.success(
+        &root,
+        &[
+            "file",
+            "annotate",
+            "capture-only.txt",
+            "-r",
+            &captured_revision,
+        ],
+    );
+    assert!(!default_annotation.contains("<Error"));
+    assert!(default_annotation.contains(std::str::from_utf8(authored_bytes).unwrap().trim_end()));
+    let inherited_annotation = fixture.success(
+        &root,
+        &["file", "annotate", "hello.cc", "-r", &captured_revision],
+    );
+    assert!(!inherited_annotation.contains("<Error"));
+    assert!(upstream.metadata.query_commit_bytes.load(Ordering::SeqCst) > canonical_before);
+    assert_eq!(
+        upstream
+            .metadata
+            .ordinary_scope_opens
+            .load(Ordering::SeqCst),
+        ordinary_scopes_before,
+        "frozen ordinary annotate must not open a live scope for origin metadata or prefixes"
+    );
     let search: serde_json::Value = serde_json::from_str(&fixture.success(
         &root,
         &[
@@ -5343,6 +5765,23 @@ fn restore_captured_workspace(
     );
     assert_eq!(fs::read(root.join("capture-only.txt")).unwrap(), dirty);
     let reads_before_dirty_queries = upstream.file_reads();
+    let dirty_annotation = fixture.run(
+        &root,
+        &["file", "annotate", "capture-only.txt", "-T", "content"],
+    );
+    assert!(
+        dirty_annotation.status.success(),
+        "{}",
+        String::from_utf8_lossy(&dirty_annotation.stderr)
+    );
+    assert_eq!(dirty_annotation.stdout, dirty);
+    assert_eq!(
+        upstream
+            .metadata
+            .ordinary_scope_opens
+            .load(Ordering::SeqCst),
+        ordinary_scopes_before
+    );
     let dirty_blame: serde_json::Value = serde_json::from_str(
         &fixture.success(&root, &["tinytree", "blame", "capture-only.txt", "--json"]),
     )

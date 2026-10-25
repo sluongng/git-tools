@@ -38,8 +38,9 @@ impl NativeProjectionController for Controller {
     fn inspect(&self) -> Result<ProjectionState> {
         Ok(self.0.clone())
     }
-    async fn begin(&self, _: &ProjectionState) -> Result<Box<dyn NativeProjectionMutation>> {
-        anyhow::bail!("not used by external administration tests")
+    async fn begin(&self, expected: &ProjectionState) -> Result<Box<dyn NativeProjectionMutation>> {
+        ensure!(expected == &self.0, "fixture mutation baseline changed");
+        Ok(Box::new(FinishOnlyMutation(self.0.clone())))
     }
     async fn receipt(&self, _: &str) -> Result<ProjectionOutcome> {
         Ok(ProjectionOutcome::Unknown)
@@ -50,6 +51,53 @@ impl NativeProjectionController for Controller {
         _: &OperationId,
         _: Option<&ProjectionReceipt>,
     ) -> Result<()> {
+        Ok(())
+    }
+}
+
+// The registry tests advance only OP acknowledgement with an unchanged native
+// tree. Any attempted projection or FILE work remains a fixture failure.
+struct FinishOnlyMutation(ProjectionState);
+#[async_trait]
+impl NativeProjectionMutation for FinishOnlyMutation {
+    async fn snapshot(
+        &mut self,
+        _: &str,
+        _: &jj_lib::working_copy::SnapshotOptions<'_>,
+    ) -> std::result::Result<
+        (ProjectionReceipt, jj_lib::working_copy::SnapshotStats),
+        jj_vfs::native::ProjectionFailure,
+    > {
+        panic!("registry journal must not snapshot user files")
+    }
+    async fn check_out(
+        &mut self,
+        _: &str,
+        _: &NativeTree,
+    ) -> std::result::Result<
+        (ProjectionReceipt, jj_lib::working_copy::CheckoutStats),
+        jj_vfs::native::ProjectionFailure,
+    > {
+        panic!("registry journal must not change the projection")
+    }
+    async fn reset(
+        &mut self,
+        _: &str,
+        _: &NativeTree,
+        _: bool,
+    ) -> std::result::Result<ProjectionReceipt, jj_vfs::native::ProjectionFailure> {
+        panic!("registry journal must not reset the projection")
+    }
+    async fn finish(
+        &mut self,
+        state: &ProjectionState,
+        _: &OperationId,
+        receipt: Option<&ProjectionReceipt>,
+    ) -> Result<()> {
+        ensure!(
+            state == &self.0 && receipt.is_none(),
+            "fixture requires unchanged acknowledged projection"
+        );
         Ok(())
     }
 }
@@ -964,6 +1012,28 @@ fn local_capture_reads_exact_existing_state_without_loaders_or_provider_queries(
             &Default::default(),
         )
         .unwrap();
+        // Host retry provenance lives outside administration captured below.
+        // Use a setup worker, as for backend initialization, without nesting
+        // this test's futures executor or opening a provider scope.
+        let host_registry = fixture.registry.clone();
+        let host_binding = fixture.binding.clone();
+        let context = resolution_context(&fixture);
+        let admission = resolution_admission();
+        let proofs = resolution_proofs(&fixture.binding, &objects, &admission).await;
+        let resolution = std::thread::spawn(move || {
+            tokio::runtime::Runtime::new().unwrap().block_on(async {
+                let base = host_registry
+                    .landing_resolution_base(&host_binding, &proofs, &admission)
+                    .await
+                    .unwrap();
+                host_registry
+                    .begin_landing_resolution(&host_binding, &context, &base, &proofs, &admission)
+                    .await
+                    .unwrap()
+            })
+        })
+        .join()
+        .unwrap();
         let before = fixture.connector.calls.load(Ordering::SeqCst);
         let snapshot = tree
             .freeze_lazy_source(
@@ -990,6 +1060,16 @@ fn local_capture_reads_exact_existing_state_without_loaders_or_provider_queries(
         .await
         .unwrap();
         assert!(sink.blobs > 0);
+        let host_nonce = hex(&resolution.nonce());
+        assert!(!String::from_utf8_lossy(candidate.encoded_data()).contains(&host_nonce));
+        assert!(
+            !String::from_utf8_lossy(candidate.private_working_copy_bytes()).contains(&host_nonce)
+        );
+        assert!(
+            !candidate
+                .private_remote_bytes()
+                .is_some_and(|bytes| String::from_utf8_lossy(bytes).contains(&host_nonce))
+        );
         assert_eq!(
             setup_queries.calls.load(Ordering::SeqCst),
             setup_calls,
@@ -2689,4 +2769,1188 @@ fn landing_intent_fences_legacy_readers_and_retains_frozen_and_unpublished_roots
     let mut bad = intent;
     bad.profile_name = "not.allowed".into();
     assert!(State::new(&scope).begin_landing(bad).is_err());
+}
+
+fn resolution_admission() -> Arc<landing_resolution::ReadAdmission> {
+    let limits = landing_resolution::WorkingLimits::default();
+    let bytes = limits.required_read_bytes().unwrap();
+    let pool = Arc::new(tokio::sync::Semaphore::new(bytes));
+    let permit = Arc::new(
+        pool.try_acquire_many_owned(bytes.try_into().unwrap())
+            .unwrap(),
+    );
+    landing_resolution::ReadAdmission::new(limits, bytes, permit).unwrap()
+}
+async fn resolution_initialize(
+    fixture: &Fixture,
+) -> (
+    Workspace,
+    Arc<ReadonlyRepo>,
+    Arc<jj_native_backend::DirectObjectIo>,
+) {
+    let shared = std::cell::RefCell::new(None);
+    let initializer = |_: &UserSettings,
+                       path: &Path|
+     -> std::result::Result<Box<dyn Backend>, BackendInitError> {
+        let objects = Arc::new(
+            jj_native_backend::DirectObjectIo::init(path, BackendConfig::default())
+                .map_err(|error| BackendInitError(Box::new(error)))?,
+        );
+        *shared.borrow_mut() = Some(objects.clone());
+        let backend = std::thread::spawn(move || {
+            futures::executor::block_on(NativeBackend::from_io(objects, BackendConfig::default()))
+        })
+        .join()
+        .unwrap()
+        .map_err(|error| BackendInitError(Box::new(error)))?;
+        Ok(Box::new(backend))
+    };
+    let (workspace, repo) = initialize(
+        &fixture.registry,
+        &fixture.binding,
+        &fixture.settings,
+        &initializer,
+        Signer::new(None, vec![]),
+        fixture.connector.clone(),
+        &CommitId::from_bytes(&[0; 32]),
+        WorkspaceName::DEFAULT.to_owned(),
+    )
+    .await
+    .unwrap();
+    let objects = shared.into_inner().unwrap();
+    (workspace, repo, objects)
+}
+async fn resolution_proofs(
+    binding: &Binding,
+    objects: &jj_native_backend::DirectObjectIo,
+    admission: &Arc<landing_resolution::ReadAdmission>,
+) -> Vec<landing_resolution::CommitProof> {
+    let (state, _) =
+        jj_vfs::native::read_retained_state_for_capture(&binding.projection(), 4 * 1024 * 1024)
+            .unwrap();
+    let store = jj_lib::simple_op_store::SimpleOpStore::load(
+        &binding.repo.join("op_store"),
+        jj_lib::op_store::RootOperationData {
+            root_commit_id: CommitId::from_bytes(&[0; 32]),
+        },
+    );
+    let operation = store
+        .read_operation_bounded(&state.operation, 4 * 1024 * 1024, 128 * 1024 * 1024)
+        .unwrap();
+    let view = store
+        .read_view_bounded(&operation.view_id, 4 * 1024 * 1024, 128 * 1024 * 1024)
+        .unwrap();
+    let commit = view.wc_commit_ids.get(&state.workspace).unwrap();
+    if commit.as_bytes() == [0; 32] {
+        return vec![landing_resolution::CommitProof::root(admission).unwrap()];
+    }
+    let value = objects
+        .read_metadata(tinytree_model::ObjectKey {
+            kind: tinytree_model::Kind::Commit,
+            id: tinytree_model::ObjectId(commit.as_bytes().try_into().unwrap()),
+        })
+        .await
+        .unwrap();
+    vec![landing_resolution::CommitProof::from_metadata(&value, &admission).unwrap()]
+}
+fn resolution_context(fixture: &Fixture) -> landing_resolution::Context {
+    landing_resolution::Context {
+        provider_identity: [9; 32],
+        scope: remote_state::RemoteScope::new(
+            fixture.binding.admin.join("broker.sock"),
+            fixture.binding.repository.clone(),
+        )
+        .unwrap(),
+        request_id: hex(&[1; 16]),
+        request_digest: [2; 32],
+        purpose: landing_resolution::Purpose::Apply {
+            job_id: hex(&[3; 32]),
+            candidate_head: hex(&[4; 32]),
+            candidate_digest: [5; 32],
+        },
+    }
+}
+async fn resolution_operation(
+    fixture: &Fixture,
+    journal: &landing_resolution::Journal,
+    tagged: bool,
+) -> OperationId {
+    use jj_lib::op_store::OpStore as _;
+    let store = jj_lib::simple_op_store::SimpleOpStore::load(
+        &fixture.binding.repo.join("op_store"),
+        jj_lib::op_store::RootOperationData {
+            root_commit_id: CommitId::from_bytes(&[0; 32]),
+        },
+    );
+    let mut raw = store
+        .read_operation_bounded(
+            &OperationId::try_from_hex(journal.base().operation()).unwrap(),
+            4 * 1024 * 1024,
+            128 * 1024 * 1024,
+        )
+        .unwrap();
+    raw.parents = vec![OperationId::try_from_hex(journal.base().operation()).unwrap()];
+    raw.commit_predecessors = Some(Default::default());
+    raw.metadata.description = "resolve landing locally".into();
+    if tagged {
+        raw.metadata
+            .attributes
+            .extend(journal.operation_attributes());
+    }
+    store.write_operation(&raw).await.unwrap()
+}
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn host_resolution_journal_reuses_nonce_and_tracks_only_exact_owned_progress() {
+    use jj_lib::op_heads_store::OpHeadsStore as _;
+    use landing_resolution::Position;
+    for checkout_first in [false, true] {
+        let fixture = Fixture::new();
+        let (mut workspace, _, objects) = resolution_initialize(&fixture).await;
+        let admission = resolution_admission();
+        let proofs = resolution_proofs(&fixture.binding, &objects, &admission).await;
+        assert!(
+            landing_resolution::CommitProof::verify([9; 32], b"invalid native commit", &admission)
+                .is_err()
+        );
+        assert!(
+            landing_resolution::CommitProof::verify(
+                [9; 32],
+                &vec![0; 4 * 1024 * 1024 + 1],
+                &admission
+            )
+            .is_err()
+        );
+        assert!(
+            fixture
+                .registry
+                .landing_resolution_base(&fixture.binding, &[], &admission)
+                .await
+                .is_err()
+        );
+        let context = resolution_context(&fixture);
+        let base = fixture
+            .registry
+            .landing_resolution_base(&fixture.binding, &proofs, &admission)
+            .await
+            .unwrap();
+        assert!(
+            fixture
+                .registry
+                .load_landing_resolution(&fixture.binding, &context, &proofs, &admission)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        let journal = fixture
+            .registry
+            .begin_landing_resolution(&fixture.binding, &context, &base, &proofs, &admission)
+            .await
+            .unwrap();
+        assert_ne!(journal.nonce(), [0; 32]);
+        assert_eq!(journal.position(), Position::AtBase);
+        assert_eq!(
+            fixture
+                .registry
+                .begin_landing_resolution(&fixture.binding, &context, &base, &proofs, &admission)
+                .await
+                .unwrap()
+                .nonce(),
+            journal.nonce()
+        );
+        let operation = resolution_operation(&fixture, &journal, true).await;
+        let untagged = resolution_operation(&fixture, &journal, false).await;
+        assert!(
+            fixture
+                .registry
+                .record_landing_resolution_operation(
+                    &fixture.binding,
+                    &context,
+                    journal.nonce(),
+                    &untagged.hex(),
+                    &proofs,
+                    &admission
+                )
+                .await
+                .is_err()
+        );
+        assert!(
+            fixture
+                .registry
+                .record_landing_resolution_operation(
+                    &fixture.binding,
+                    &context,
+                    [33; 32],
+                    &operation.hex(),
+                    &proofs,
+                    &admission
+                )
+                .await
+                .is_err()
+        );
+        let written = fixture
+            .registry
+            .record_landing_resolution_operation(
+                &fixture.binding,
+                &context,
+                journal.nonce(),
+                &operation.hex(),
+                &proofs,
+                &admission,
+            )
+            .await
+            .unwrap();
+        assert_eq!(written.position(), Position::OperationWritten);
+        assert_eq!(written.owned_operation(), Some(operation.hex().as_str()));
+        assert_eq!(
+            fixture
+                .registry
+                .record_landing_resolution_operation(
+                    &fixture.binding,
+                    &context,
+                    journal.nonce(),
+                    &operation.hex(),
+                    &proofs,
+                    &admission
+                )
+                .await
+                .unwrap()
+                .nonce(),
+            journal.nonce()
+        );
+        assert!(
+            fixture
+                .registry
+                .record_landing_resolution_operation(
+                    &fixture.binding,
+                    &context,
+                    journal.nonce(),
+                    &untagged.hex(),
+                    &proofs,
+                    &admission
+                )
+                .await
+                .is_err()
+        );
+        assert!(
+            fixture
+                .registry
+                .complete_landing_resolution(
+                    &fixture.binding,
+                    &context,
+                    journal.nonce(),
+                    &proofs,
+                    &admission
+                )
+                .await
+                .is_err()
+        );
+        let heads = jj_lib::simple_op_heads_store::SimpleOpHeadsStore::load(
+            &fixture.binding.repo.join("op_heads"),
+        );
+        let parent = OperationId::try_from_hex(base.operation()).unwrap();
+        if checkout_first {
+            workspace
+                .start_working_copy_mutation()
+                .await
+                .unwrap()
+                .finish(operation.clone())
+                .await
+                .unwrap();
+        } else {
+            heads
+                .update_op_heads(std::slice::from_ref(&parent), &operation)
+                .await
+                .unwrap();
+        }
+        let partial = fixture
+            .registry
+            .load_landing_resolution(&fixture.binding, &context, &proofs, &admission)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            partial.position(),
+            if checkout_first {
+                Position::WorkingCopyAdvanced
+            } else {
+                Position::OperationPublished
+            }
+        );
+        assert_eq!(
+            fixture
+                .registry
+                .begin_landing_resolution(&fixture.binding, &context, &base, &proofs, &admission)
+                .await
+                .unwrap()
+                .nonce(),
+            journal.nonce()
+        );
+        if checkout_first {
+            heads.update_op_heads(&[], &operation).await.unwrap();
+            assert_eq!(
+                fixture
+                    .registry
+                    .load_landing_resolution(&fixture.binding, &context, &proofs, &admission)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .position(),
+                Position::RecoveryRequired
+            );
+            assert!(
+                fixture
+                    .registry
+                    .complete_landing_resolution(
+                        &fixture.binding,
+                        &context,
+                        journal.nonce(),
+                        &proofs,
+                        &admission
+                    )
+                    .await
+                    .is_err()
+            );
+            heads
+                .update_op_heads(std::slice::from_ref(&parent), &operation)
+                .await
+                .unwrap();
+        } else {
+            workspace
+                .start_working_copy_mutation()
+                .await
+                .unwrap()
+                .finish(operation.clone())
+                .await
+                .unwrap();
+        }
+        assert_eq!(
+            fixture
+                .registry
+                .load_landing_resolution(&fixture.binding, &context, &proofs, &admission)
+                .await
+                .unwrap()
+                .unwrap()
+                .position(),
+            Position::Applied
+        );
+        let completed = fixture
+            .registry
+            .complete_landing_resolution(
+                &fixture.binding,
+                &context,
+                journal.nonce(),
+                &proofs,
+                &admission,
+            )
+            .await
+            .unwrap();
+        assert_eq!(completed.position(), Position::Completed);
+        assert_eq!(
+            fixture
+                .registry
+                .complete_landing_resolution(
+                    &fixture.binding,
+                    &context,
+                    journal.nonce(),
+                    &proofs,
+                    &admission
+                )
+                .await
+                .unwrap()
+                .nonce(),
+            journal.nonce()
+        );
+        let reopened = Registry::open_existing(fixture.registry.path()).unwrap();
+        assert_eq!(
+            reopened
+                .load_landing_resolution(&fixture.binding, &context, &proofs, &admission)
+                .await
+                .unwrap()
+                .unwrap()
+                .position(),
+            Position::Completed
+        );
+        assert_eq!(
+            fs::read_dir(fixture.registry.path().join("records"))
+                .unwrap()
+                .count(),
+            1
+        );
+        assert!(!fixture.binding.admin.join("landing-resolutions").exists());
+        assert!(
+            !fixture
+                .binding
+                .working_copy
+                .join("landing-resolutions")
+                .exists()
+        );
+    }
+}
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn host_resolution_context_mismatches_preserve_original_attempt() {
+    let fixture = Fixture::new();
+    let (_workspace, _, objects) = resolution_initialize(&fixture).await;
+    let admission = resolution_admission();
+    let proofs = resolution_proofs(&fixture.binding, &objects, &admission).await;
+    let context = resolution_context(&fixture);
+    let base = fixture
+        .registry
+        .landing_resolution_base(&fixture.binding, &proofs, &admission)
+        .await
+        .unwrap();
+    let journal = fixture
+        .registry
+        .begin_landing_resolution(&fixture.binding, &context, &base, &proofs, &admission)
+        .await
+        .unwrap();
+    let path = fixture
+        .registry
+        .path()
+        .join("landing-resolutions")
+        .join(fixture.binding.id())
+        .join(format!("{}-apply.json", context.request_id));
+    let original = fs::read(&path).unwrap();
+    let mut cases = Vec::new();
+    let mut changed = context.clone();
+    changed.provider_identity = [8; 32];
+    cases.push(("provider", changed));
+    let mut changed = context.clone();
+    changed.scope.socket = fixture.binding.admin.join("other.sock");
+    cases.push(("socket", changed));
+    let mut changed = context.clone();
+    changed.scope.store = "other".into();
+    cases.push(("store", changed));
+    let mut changed = context.clone();
+    changed.request_digest = [8; 32];
+    cases.push(("original request", changed));
+    let mut changed = context.clone();
+    if let landing_resolution::Purpose::Apply { job_id, .. } = &mut changed.purpose {
+        *job_id = hex(&[8; 32]);
+    }
+    cases.push(("job", changed));
+    let mut changed = context.clone();
+    if let landing_resolution::Purpose::Apply { candidate_head, .. } = &mut changed.purpose {
+        *candidate_head = hex(&[8; 32]);
+    }
+    cases.push(("candidate head", changed));
+    let mut changed = context.clone();
+    if let landing_resolution::Purpose::Apply {
+        candidate_digest, ..
+    } = &mut changed.purpose
+    {
+        *candidate_digest = [8; 32];
+    }
+    cases.push(("complete candidate", changed));
+    for (name, changed) in cases {
+        assert!(
+            fixture
+                .registry
+                .load_landing_resolution(&fixture.binding, &changed, &proofs, &admission)
+                .await
+                .is_err(),
+            "{name}"
+        );
+        assert!(
+            fixture
+                .registry
+                .begin_landing_resolution(&fixture.binding, &changed, &base, &proofs, &admission)
+                .await
+                .is_err(),
+            "{name}"
+        );
+        assert_eq!(fs::read(&path).unwrap(), original, "{name}");
+    }
+    // Opaque immutable Base values cannot be caller-overwritten. Exercise the
+    // corresponding host-record corruption boundary through the public API.
+    let base_cases = [
+        ("operation", serde_json::json!(hex(&[8; 64]))),
+        ("working_copy_commit", serde_json::json!(hex(&[8; 32]))),
+        (
+            "tree",
+            serde_json::json!({"terms":vec![[8;32]],"labels":[]}),
+        ),
+        (
+            "projection_generation",
+            serde_json::json!(base.projection_generation() + 1),
+        ),
+        ("state_fingerprint", serde_json::json!(hex(&[8; 64]))),
+    ];
+    let directory = PrivateDir::open_existing(path.parent().unwrap()).unwrap();
+    for (field, changed) in base_cases {
+        let mut record: serde_json::Value = serde_json::from_slice(&original).unwrap();
+        record["base"][field] = changed;
+        let malformed = serde_json::to_vec(&record).unwrap();
+        directory
+            .replace(path.file_name().unwrap(), &malformed)
+            .unwrap();
+        assert!(
+            fixture
+                .registry
+                .load_landing_resolution(&fixture.binding, &context, &proofs, &admission)
+                .await
+                .is_err(),
+            "{field}"
+        );
+        assert!(
+            fixture
+                .registry
+                .begin_landing_resolution(&fixture.binding, &context, &base, &proofs, &admission)
+                .await
+                .is_err(),
+            "{field}"
+        );
+        assert_eq!(fs::read(&path).unwrap(), malformed, "{field}");
+    }
+    directory
+        .replace(path.file_name().unwrap(), &original)
+        .unwrap();
+    let mut changed_binding = fixture.binding.clone();
+    changed_binding.workspace_id = [8; 32];
+    assert!(
+        fixture
+            .registry
+            .load_landing_resolution(&changed_binding, &context, &proofs, &admission)
+            .await
+            .is_err()
+    );
+    assert_eq!(fs::read(&path).unwrap(), original);
+    assert_eq!(
+        fixture
+            .registry
+            .load_landing_resolution(&fixture.binding, &context, &proofs, &admission)
+            .await
+            .unwrap()
+            .unwrap()
+            .nonce(),
+        journal.nonce()
+    );
+    let mut changed_request = context.clone();
+    changed_request.request_id = hex(&[8; 16]);
+    assert!(
+        fixture
+            .registry
+            .load_landing_resolution(&fixture.binding, &changed_request, &proofs, &admission)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    // A different new host identity has no access to this workspace's record.
+    let mut restored = Fixture::new();
+    fs::write(restored.binding.root.join(MARKER), hex(&[8; 32])).unwrap();
+    restored.binding = restored
+        .registry
+        .binding(
+            [8; 32],
+            &restored.binding.root,
+            "fixture".into(),
+            restored.binding.endpoint.local(),
+            "fresh-workspace".into(),
+        )
+        .unwrap();
+    restored.initialize().await.unwrap();
+    assert!(
+        restored
+            .registry
+            .load_landing_resolution(&restored.binding, &context, &proofs, &admission)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    // A changed live marker is never repaired or adopted by the journal API.
+    fs::write(fixture.binding.root.join(MARKER), hex(&[8; 32])).unwrap();
+    assert!(
+        fixture
+            .registry
+            .load_landing_resolution(&fixture.binding, &context, &proofs, &admission)
+            .await
+            .is_err()
+    );
+    assert_eq!(fs::read(&path).unwrap(), original);
+}
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn host_resolution_rejects_malformed_oversize_and_linked_records_without_repair() {
+    let fixture = Fixture::new();
+    let (_workspace, _, objects) = resolution_initialize(&fixture).await;
+    let admission = resolution_admission();
+    let proofs = resolution_proofs(&fixture.binding, &objects, &admission).await;
+    let context = resolution_context(&fixture);
+    let base = fixture
+        .registry
+        .landing_resolution_base(&fixture.binding, &proofs, &admission)
+        .await
+        .unwrap();
+    fixture
+        .registry
+        .begin_landing_resolution(&fixture.binding, &context, &base, &proofs, &admission)
+        .await
+        .unwrap();
+    let directory = PrivateDir::open_existing(
+        fixture
+            .registry
+            .path()
+            .join("landing-resolutions")
+            .join(fixture.binding.id()),
+    )
+    .unwrap();
+    let name = format!("{}-apply.json", context.request_id);
+    for malformed in [b"{".to_vec(), vec![b' '; 64 * 1024 + 1]] {
+        directory.replace(&name, &malformed).unwrap();
+        assert!(
+            fixture
+                .registry
+                .load_landing_resolution(&fixture.binding, &context, &proofs, &admission)
+                .await
+                .is_err()
+        );
+        assert!(
+            fixture
+                .registry
+                .begin_landing_resolution(&fixture.binding, &context, &base, &proofs, &admission)
+                .await
+                .is_err()
+        );
+        assert!(
+            fixture
+                .registry
+                .landing_resolution_presence(
+                    &fixture.binding,
+                    &resolution_common(&context),
+                    &admission
+                )
+                .await
+                .is_err()
+        );
+        assert_eq!(fs::read(directory.path().join(&name)).unwrap(), malformed);
+    }
+    #[cfg(unix)]
+    {
+        let target = fixture.registry.path().join("untrusted.json");
+        fs::write(&target, b"preserve target").unwrap();
+        fs::remove_file(directory.path().join(&name)).unwrap();
+        std::os::unix::fs::symlink(&target, directory.path().join(&name)).unwrap();
+        assert!(
+            fixture
+                .registry
+                .load_landing_resolution(&fixture.binding, &context, &proofs, &admission)
+                .await
+                .is_err()
+        );
+        assert!(
+            fixture
+                .registry
+                .begin_landing_resolution(&fixture.binding, &context, &base, &proofs, &admission)
+                .await
+                .is_err()
+        );
+        assert!(
+            fs::symlink_metadata(directory.path().join(&name))
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert!(
+            fixture
+                .registry
+                .landing_resolution_presence(
+                    &fixture.binding,
+                    &resolution_common(&context),
+                    &admission
+                )
+                .await
+                .is_err()
+        );
+        assert_eq!(fs::read(target).unwrap(), b"preserve target");
+    }
+}
+
+fn resolution_common(context: &landing_resolution::Context) -> landing_resolution::CommonContext {
+    landing_resolution::CommonContext {
+        provider_identity: context.provider_identity,
+        scope: context.scope.clone(),
+        request_id: context.request_id.clone(),
+        request_digest: context.request_digest,
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn host_resolution_presence_needs_no_source_proof_and_preserves_mismatches() {
+    use landing_resolution::{ReadAdmission, Stage, WorkingLimits};
+    let fixture = Fixture::new();
+    let (_workspace, _, objects) = resolution_initialize(&fixture).await;
+    let context = resolution_context(&fixture);
+    let common = resolution_common(&context);
+    let limits = WorkingLimits::default();
+    let bytes = limits.required_read_bytes().unwrap();
+    let pool = Arc::new(tokio::sync::Semaphore::new(bytes));
+    let owner = Arc::new(
+        pool.clone()
+            .try_acquire_many_owned(bytes.try_into().unwrap())
+            .unwrap(),
+    );
+    let admission = ReadAdmission::new(limits, bytes, owner).unwrap();
+    let absent = fixture
+        .registry
+        .landing_resolution_presence(&fixture.binding, &common, &admission)
+        .await
+        .unwrap();
+    assert!(absent.is_absent());
+    assert!(!fixture.registry.path().join("landing-resolutions").exists());
+    drop(admission);
+    assert_eq!(
+        pool.available_permits(),
+        bytes,
+        "value-only presence retains no reservation"
+    );
+    let admission = resolution_admission();
+    let proofs = resolution_proofs(&fixture.binding, &objects, &admission).await;
+    let base = fixture
+        .registry
+        .landing_resolution_base(&fixture.binding, &proofs, &admission)
+        .await
+        .unwrap();
+    fixture
+        .registry
+        .begin_landing_resolution(&fixture.binding, &context, &base, &proofs, &admission)
+        .await
+        .unwrap();
+    drop(base);
+    drop(proofs);
+    let present = fixture
+        .registry
+        .landing_resolution_presence(&fixture.binding, &common, &admission)
+        .await
+        .unwrap();
+    assert_eq!(present.apply(), Some(Stage::Prepared));
+    assert_eq!(present.freeze(), None);
+    let path = fixture
+        .registry
+        .path()
+        .join("landing-resolutions")
+        .join(fixture.binding.id())
+        .join(format!("{}-apply.json", common.request_id));
+    let original = fs::read(&path).unwrap();
+    let mut provider = common.clone();
+    provider.provider_identity[0] ^= 1;
+    let mut scope = common.clone();
+    scope.scope.store = "other-store".into();
+    let mut digest = common.clone();
+    digest.request_digest = [9; 32];
+    for changed in [provider, scope, digest] {
+        assert!(
+            fixture
+                .registry
+                .landing_resolution_presence(&fixture.binding, &changed, &admission)
+                .await
+                .is_err()
+        );
+        assert_eq!(fs::read(&path).unwrap(), original);
+    }
+    let directory = PrivateDir::open_existing(path.parent().unwrap()).unwrap();
+    for (field, pointer, replacement) in [
+        ("zero nonce", "/nonce", serde_json::json!(vec![0; 32])),
+        (
+            "wrong purpose file",
+            "/context/purpose",
+            serde_json::json!({"purpose":"freeze", "observed_job":null}),
+        ),
+        (
+            "malformed written stage",
+            "/stage",
+            serde_json::json!({"stage":"written", "operation":"invalid"}),
+        ),
+        (
+            "wrong workspace",
+            "/binding/workspace_id",
+            serde_json::json!(vec![0; 32]),
+        ),
+    ] {
+        let mut malformed: serde_json::Value = serde_json::from_slice(&original).unwrap();
+        *malformed.pointer_mut(pointer).unwrap() = replacement;
+        let encoded = serde_json::to_vec(&malformed).unwrap();
+        directory
+            .replace(path.file_name().unwrap(), &encoded)
+            .unwrap();
+        assert!(
+            fixture
+                .registry
+                .landing_resolution_presence(&fixture.binding, &common, &admission)
+                .await
+                .is_err(),
+            "{field}"
+        );
+        assert_eq!(fs::read(&path).unwrap(), encoded);
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn host_freeze_resolution_does_not_fabricate_or_adopt_an_apply_candidate() {
+    use jj_lib::op_heads_store::OpHeadsStore as _;
+    use landing_resolution::{Position, Purpose};
+    for observed_job in [None, Some(hex(&[3; 32]))] {
+        let fixture = Fixture::new();
+        let (mut workspace, _, objects) = resolution_initialize(&fixture).await;
+        let admission = resolution_admission();
+        let proofs = resolution_proofs(&fixture.binding, &objects, &admission).await;
+        let apply = resolution_context(&fixture);
+        let mut freeze = apply.clone();
+        freeze.purpose = Purpose::Freeze {
+            observed_job: observed_job.clone(),
+        };
+        let common = resolution_common(&freeze);
+        let base = fixture
+            .registry
+            .landing_resolution_base(&fixture.binding, &proofs, &admission)
+            .await
+            .unwrap();
+        let journal = fixture
+            .registry
+            .begin_landing_resolution(&fixture.binding, &freeze, &base, &proofs, &admission)
+            .await
+            .unwrap();
+        let apply_journal = fixture
+            .registry
+            .begin_landing_resolution(&fixture.binding, &apply, &base, &proofs, &admission)
+            .await
+            .unwrap();
+        assert_ne!(journal.nonce(), apply_journal.nonce());
+        let presence = fixture
+            .registry
+            .landing_resolution_presence(&fixture.binding, &common, &admission)
+            .await
+            .unwrap();
+        assert_eq!(presence.freeze(), Some(landing_resolution::Stage::Prepared));
+        assert_eq!(presence.apply(), Some(landing_resolution::Stage::Prepared));
+        let attributes = journal.operation_attributes();
+        assert_eq!(
+            attributes.get("tinytree.landing.job"),
+            observed_job.as_ref()
+        );
+        assert!(!attributes.contains_key("tinytree.landing.candidate"));
+        assert!(!attributes.contains_key("tinytree.landing.resolution_candidate"));
+        let operation = resolution_operation(&fixture, &journal, true).await;
+        assert!(
+            fixture
+                .registry
+                .record_landing_resolution_operation(
+                    &fixture.binding,
+                    &apply,
+                    apply_journal.nonce(),
+                    &operation.hex(),
+                    &proofs,
+                    &admission
+                )
+                .await
+                .is_err()
+        );
+        fixture
+            .registry
+            .record_landing_resolution_operation(
+                &fixture.binding,
+                &freeze,
+                journal.nonce(),
+                &operation.hex(),
+                &proofs,
+                &admission,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            fixture
+                .registry
+                .landing_resolution_presence(&fixture.binding, &common, &admission)
+                .await
+                .unwrap()
+                .freeze(),
+            Some(landing_resolution::Stage::Written)
+        );
+        workspace
+            .start_working_copy_mutation()
+            .await
+            .unwrap()
+            .finish(operation.clone())
+            .await
+            .unwrap();
+        jj_lib::simple_op_heads_store::SimpleOpHeadsStore::load(
+            &fixture.binding.repo.join("op_heads"),
+        )
+        .update_op_heads(
+            &[OperationId::try_from_hex(base.operation()).unwrap()],
+            &operation,
+        )
+        .await
+        .unwrap();
+        let completed = fixture
+            .registry
+            .complete_landing_resolution(
+                &fixture.binding,
+                &freeze,
+                journal.nonce(),
+                &proofs,
+                &admission,
+            )
+            .await
+            .unwrap();
+        assert_eq!(completed.position(), Position::Completed);
+        assert_eq!(
+            fixture
+                .registry
+                .landing_resolution_presence(&fixture.binding, &common, &admission)
+                .await
+                .unwrap()
+                .freeze(),
+            Some(landing_resolution::Stage::Completed)
+        );
+        assert_eq!(completed.purpose(), &freeze.purpose);
+        assert!(
+            fixture
+                .registry
+                .load_landing_resolution(&fixture.binding, &apply, &proofs, &admission)
+                .await
+                .is_err(),
+            "a completed freeze cannot promote the independent apply attempt"
+        );
+    }
+}
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn resolution_read_reservation_bounds_live_proofs_and_outlives_returned_results() {
+    use landing_resolution::{CommitProof, ReadAdmission, WorkingLimits};
+    let fixture = Fixture::new();
+    let (_workspace, _, objects) = resolution_initialize(&fixture).await;
+    let limits = WorkingLimits::default();
+    let bytes = limits.required_read_bytes().unwrap();
+    let pool = Arc::new(tokio::sync::Semaphore::new(bytes));
+    let owner = Arc::new(
+        pool.clone()
+            .try_acquire_many_owned(bytes.try_into().unwrap())
+            .unwrap(),
+    );
+    assert!(ReadAdmission::new(limits.clone(), bytes - 1, owner.clone()).is_err());
+    assert!(!fixture.registry.path().join("landing-resolutions").exists());
+    let admission = ReadAdmission::new(limits, bytes, owner.clone()).unwrap();
+    drop(owner);
+    let proofs = resolution_proofs(&fixture.binding, &objects, &admission).await;
+    let extra = CommitProof::root(&admission).unwrap();
+    assert!(
+        CommitProof::root(&admission).is_err(),
+        "live proof count is charged before decoding"
+    );
+    drop(extra);
+    let extra = CommitProof::root(&admission).unwrap();
+    drop(extra);
+    let base = fixture
+        .registry
+        .landing_resolution_base(&fixture.binding, &proofs, &admission)
+        .await
+        .unwrap();
+    let journal = fixture
+        .registry
+        .begin_landing_resolution(
+            &fixture.binding,
+            &resolution_context(&fixture),
+            &base,
+            &proofs,
+            &admission,
+        )
+        .await
+        .unwrap();
+    drop(proofs);
+    drop(admission);
+    assert_eq!(
+        pool.available_permits(),
+        0,
+        "returned base/journal retain the physical memory reservation"
+    );
+    let shared_base = base.clone();
+    let shared_journal = journal.clone();
+    drop(base);
+    drop(journal);
+    assert_eq!(
+        pool.available_permits(),
+        0,
+        "cheap immutable clones keep the same charged payload alive"
+    );
+    drop(shared_journal);
+    assert_eq!(pool.available_permits(), 0);
+    drop(shared_base);
+    assert_eq!(pool.available_permits(), bytes);
+
+    // Independently charge cumulative canonical input bytes, not just each
+    // object's cap or the count. One dropped proof releases its exact charge.
+    let mut commit = tinytree_model::synthetic_root();
+    commit.parents = vec![tinytree_model::CommitId::ROOT];
+    commit.change_id = tinytree_model::ChangeId([9; 16]);
+    commit.description = "bounded canonical proof fixture".into();
+    let encoded =
+        tinytree_model::encode(&tinytree_model::Object::Commit(commit), Default::default())
+            .unwrap();
+    let mut limits = WorkingLimits::default();
+    limits.max_proof_bytes = encoded.bytes.len();
+    limits.max_proof_input_bytes = encoded.bytes.len();
+    let bytes = limits.required_read_bytes().unwrap();
+    let pool = Arc::new(tokio::sync::Semaphore::new(bytes));
+    let owner = Arc::new(
+        pool.clone()
+            .try_acquire_many_owned(bytes.try_into().unwrap())
+            .unwrap(),
+    );
+    let admission = ReadAdmission::new(limits, bytes, owner).unwrap();
+    let proof =
+        CommitProof::verify(encoded.descriptor.key.id.0, &encoded.bytes, &admission).unwrap();
+    assert!(CommitProof::verify(encoded.descriptor.key.id.0, &encoded.bytes, &admission).is_err());
+    drop(proof);
+    let proof =
+        CommitProof::verify(encoded.descriptor.key.id.0, &encoded.bytes, &admission).unwrap();
+    drop(admission);
+    assert_eq!(pool.available_permits(), 0);
+    drop(proof);
+    assert_eq!(pool.available_permits(), bytes);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn host_resolution_selects_exact_proofs_after_owned_op_before_sidecar_crash() {
+    use jj_lib::op_store::OpStore as _;
+    use landing_resolution::{CommitProof, Position};
+    let fixture = Fixture::new();
+    let (_workspace, repo, objects) = resolution_initialize(&fixture).await;
+    let admission = resolution_admission();
+    let context = resolution_context(&fixture);
+    let mut proofs = resolution_proofs(&fixture.binding, &objects, &admission).await;
+    let base = fixture
+        .registry
+        .landing_resolution_base(&fixture.binding, &proofs, &admission)
+        .await
+        .unwrap();
+    let journal = fixture
+        .registry
+        .begin_landing_resolution(&fixture.binding, &context, &base, &proofs, &admission)
+        .await
+        .unwrap();
+    let current = repo
+        .store()
+        .get_commit_async(&CommitId::try_from_hex(base.working_copy_commit()).unwrap())
+        .await
+        .unwrap();
+    let mut contents = current.store_commit().as_ref().clone();
+    contents.description = "host-owned retry result before sidecar persistence".into();
+    contents.change_id = jj_lib::backend::ChangeId::from_bytes(&[19; 16]);
+    let result = repo.store().write_commit(contents, None).await.unwrap();
+    let store = jj_lib::simple_op_store::SimpleOpStore::load(
+        &fixture.binding.repo.join("op_store"),
+        jj_lib::op_store::RootOperationData {
+            root_commit_id: CommitId::from_bytes(&[0; 32]),
+        },
+    );
+    let mut operation = store
+        .read_operation_bounded(
+            &OperationId::try_from_hex(base.operation()).unwrap(),
+            4 * 1024 * 1024,
+            128 * 1024 * 1024,
+        )
+        .unwrap();
+    let mut view = store
+        .read_view_bounded(&operation.view_id, 4 * 1024 * 1024, 128 * 1024 * 1024)
+        .unwrap();
+    view.wc_commit_ids
+        .insert(WorkspaceName::DEFAULT.to_owned(), result.id().clone());
+    operation.view_id = store.write_view(&view).await.unwrap();
+    operation.parents = vec![OperationId::try_from_hex(base.operation()).unwrap()];
+    operation.commit_predecessors = Some(Default::default());
+    operation
+        .metadata
+        .attributes
+        .extend(journal.operation_attributes());
+    let owned = store.write_operation(&operation).await.unwrap();
+    let value = objects
+        .read_metadata_with_owner(
+            tinytree_model::ObjectKey {
+                kind: tinytree_model::Kind::Commit,
+                id: tinytree_model::ObjectId(result.id().as_bytes().try_into().unwrap()),
+            },
+            admission.clone(),
+        )
+        .await
+        .unwrap();
+    proofs.push(CommitProof::from_metadata(&value, &admission).unwrap());
+    drop(value);
+    fixture
+        .registry
+        .record_landing_resolution_operation(
+            &fixture.binding,
+            &context,
+            journal.nonce(),
+            &owned.hex(),
+            &proofs,
+            &admission,
+        )
+        .await
+        .unwrap();
+    drop(proofs);
+    drop(journal);
+    // No portable sidecar operation/result claim is supplied on retry. Only the
+    // fresh actual WC and host-created journal may select metadata for reading.
+    let reopened = Registry::open_existing(fixture.registry.path()).unwrap();
+    let selectors = reopened
+        .resolution_proof_ids(&fixture.binding, &context, &admission)
+        .await
+        .unwrap();
+    let old_id: [u8; 32] = CommitId::try_from_hex(base.working_copy_commit())
+        .unwrap()
+        .as_bytes()
+        .try_into()
+        .unwrap();
+    let result_id: [u8; 32] = result.id().as_bytes().try_into().unwrap();
+    assert_eq!(selectors.ids(), &[old_id, result_id]);
+    let mut restored_proofs = Vec::new();
+    for id in selectors.ids() {
+        let value = objects
+            .read_metadata_with_owner(
+                tinytree_model::ObjectKey {
+                    kind: tinytree_model::Kind::Commit,
+                    id: tinytree_model::ObjectId(*id),
+                },
+                admission.clone(),
+            )
+            .await
+            .unwrap();
+        restored_proofs.push(CommitProof::from_metadata(&value, &admission).unwrap());
+    }
+    let resumed = reopened
+        .load_landing_resolution(&fixture.binding, &context, &restored_proofs, &admission)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(resumed.owned_operation(), Some(owned.hex().as_str()));
+    assert_eq!(resumed.position(), Position::OperationWritten);
+    let path = fixture
+        .registry
+        .path()
+        .join("landing-resolutions")
+        .join(fixture.binding.id())
+        .join(format!("{}-apply.json", context.request_id));
+    let original = fs::read(&path).unwrap();
+    let mut changed = context.clone();
+    changed.request_digest = [99; 32];
+    assert!(
+        reopened
+            .resolution_proof_ids(&fixture.binding, &changed, &admission)
+            .await
+            .is_err()
+    );
+    assert_eq!(fs::read(&path).unwrap(), original);
+    // A syntactically valid alternate result in the host record still cannot
+    // select an ID absent from the exact nonce-stamped owned OP's view.
+    let mut malformed: serde_json::Value = serde_json::from_slice(&original).unwrap();
+    malformed["stage"]["working_copy_commit"] = serde_json::json!(hex(&[99; 32]));
+    let malformed = serde_json::to_vec(&malformed).unwrap();
+    PrivateDir::open_existing(path.parent().unwrap())
+        .unwrap()
+        .replace(path.file_name().unwrap(), &malformed)
+        .unwrap();
+    assert!(
+        reopened
+            .resolution_proof_ids(&fixture.binding, &context, &admission)
+            .await
+            .is_err()
+    );
+    assert_eq!(fs::read(&path).unwrap(), malformed);
 }
