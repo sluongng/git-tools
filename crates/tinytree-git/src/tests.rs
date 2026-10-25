@@ -485,6 +485,112 @@ async fn receiver_divergence_and_resource_limits_preserve_pending_native_retenti
             .is_err()
     );
     assert!(status(&bounded.state_dir).unwrap().pending_phase.is_some());
+    // The same subtree first appears shallow, then under an extra directory.
+    // A cache hit must account for descendants, not only its current depth.
+    let leaf = running.tree(b"bounded\n");
+    let subtree = |name: &str, child| {
+        m::TreeId(
+            running
+                .object(m::Object::Tree(m::Tree {
+                    entries: vec![m::TreeEntry {
+                        name: name.into(),
+                        value: m::TreeValue::Tree(child),
+                    }],
+                }))
+                .0,
+        )
+    };
+    let shared = subtree("d", leaf);
+    let nested = subtree("c", shared);
+    let root = m::TreeId(
+        running
+            .object(m::Object::Tree(m::Tree {
+                entries: vec![
+                    m::TreeEntry {
+                        name: "a".into(),
+                        value: m::TreeValue::Tree(shared),
+                    },
+                    m::TreeEntry {
+                        name: "b".into(),
+                        value: m::TreeValue::Tree(nested),
+                    },
+                ],
+            }))
+            .0,
+    );
+    let deeper = running.commit(root, vec![head], vec![], "shared subtree at two depths\n");
+    running.publish(deeper, 1);
+    for (name, max_depth, allowed) in [
+        ("cached subtree too deep", 3, false),
+        ("cached subtree at boundary", 4, true),
+    ] {
+        let mut depth_options = ExportOptions::new(
+            running.temp.path().join(format!("depth-{max_depth}-state")),
+            running.temp.path().join(format!("depth-{max_depth}.git")),
+            git_program(),
+        );
+        depth_options.limits.max_depth = max_depth;
+        let result = export(running.config.clone(), depth_options.clone()).await;
+        if allowed {
+            result.unwrap_or_else(|error| panic!("{name}: {error:#}"));
+            assert_eq!(
+                git(
+                    &depth_options.destination_git,
+                    &["show", "refs/heads/main:a/d/binary"]
+                ),
+                b"bounded\n"
+            );
+            assert_eq!(
+                git(
+                    &depth_options.destination_git,
+                    &["show", "refs/heads/main:b/c/d/binary"]
+                ),
+                b"bounded\n"
+            );
+        } else {
+            let error = result.unwrap_err();
+            assert!(
+                format!("{error:#}").contains("native tree depth limit exceeded"),
+                "{name}: {error:#}"
+            );
+            assert!(
+                status(&depth_options.state_dir)
+                    .unwrap()
+                    .pending_phase
+                    .is_some(),
+                "{name}"
+            );
+            assert!(
+                text(
+                    &depth_options.destination_git,
+                    &["for-each-ref", "refs/heads/main"]
+                )
+                .is_empty(),
+                "{name}: rejected depth must not publish Git ref"
+            );
+            let envelope: serde_json::Value = serde_json::from_slice(
+                &std::fs::read(depth_options.state_dir.join("state.json")).unwrap(),
+            )
+            .unwrap();
+            let hold = envelope["state"]["pending"]["hold"].as_str().unwrap();
+            let client = tinytree_client::NativeClient::connect(running.config.clone())
+                .await
+                .unwrap();
+            let retained = client.open(vec![hold.into()]).await.unwrap();
+            assert_eq!(
+                retained.references[0]
+                    .commit
+                    .as_ref()
+                    .unwrap()
+                    .key
+                    .as_ref()
+                    .unwrap()
+                    .native_id,
+                deeper.0,
+                "{name}: failed export keeps exact native head retained"
+            );
+        }
+    }
     running.stop().await;
 }
 

@@ -14,12 +14,18 @@ use tinytree_client::{MetadataOutcome, NativeClient};
 use tinytree_model as m;
 use tokio::time::Instant;
 
+struct CachedTree {
+    oid: String,
+    // Greatest number of child-tree edges below this tree (leaf/empty = 0).
+    height: usize,
+}
 pub(crate) struct Converter {
     pub client: NativeClient,
     pub git: Git,
     pub owner: Arc<Resources>,
     pub mappings: BTreeMap<String, Mapping>,
     objects: BTreeMap<(u8, [u8; 32]), String>,
+    trees: BTreeMap<[u8; 32], CachedTree>,
     pub new_commits: usize,
     pub file_bytes: u64,
     io_bytes: u64,
@@ -43,6 +49,7 @@ impl Converter {
             git,
             mappings,
             objects: BTreeMap::new(),
+            trees: BTreeMap::new(),
             new_commits: 0,
             file_bytes: 0,
             io_bytes: 0,
@@ -76,7 +83,11 @@ impl Converter {
         let base = (l.max_file_bytes as u64)
             .saturating_mul(2)
             .saturating_add((l.max_state_bytes as u64).saturating_mul(4))
-            .saturating_add((l.max_objects as u64).saturating_mul(256))
+            // Tree and leaf caches are disjoint. Reserve the extra height for
+            // every bounded object, even when most objects are not trees.
+            .saturating_add(
+                (l.max_objects as u64).saturating_mul(256 + std::mem::size_of::<usize>() as u64),
+            )
             .saturating_add(self.sdk_bytes);
         ensure!(
             base.saturating_add(self.metadata_held)
@@ -277,9 +288,14 @@ impl Converter {
                 depth < self.owner.options.limits.max_depth,
                 "native tree depth limit exceeded"
             );
-            let key = (m::Kind::Tree as u8, id.0);
-            if let Some(oid) = self.objects.get(&key) {
-                return Ok(oid.clone());
+            if let Some(cached) = self.trees.get(&id.0) {
+                ensure!(
+                    depth
+                        .checked_add(cached.height)
+                        .is_some_and(|deepest| deepest < self.owner.options.limits.max_depth),
+                    "native tree depth limit exceeded"
+                );
+                return Ok(cached.oid.clone());
             }
             let (object, charge) = self
                 .metadata(m::ObjectKey {
@@ -299,6 +315,7 @@ impl Converter {
                 "native tree entry work limit exceeded"
             );
             let mut entries = Vec::with_capacity(tree.entries.len());
+            let mut height = 0usize;
             for entry in tree.entries {
                 ensure!(
                     !entry.name.is_empty()
@@ -307,7 +324,25 @@ impl Converter {
                     "native path cannot be represented safely in Git"
                 );
                 let (mode, oid, is_tree) = match entry.value {
-                    m::TreeValue::Tree(id) => ("40000", self.tree(id, depth + 1).await?, true),
+                    m::TreeValue::Tree(child) => {
+                        let oid = self
+                            .tree(
+                                child,
+                                depth.checked_add(1).context("native tree depth overflow")?,
+                            )
+                            .await?;
+                        let child_height = self
+                            .trees
+                            .get(&child.0)
+                            .context("exported child tree summary missing")?
+                            .height;
+                        height = height.max(
+                            child_height
+                                .checked_add(1)
+                                .context("native tree height overflow")?,
+                        );
+                        ("40000", oid, true)
+                    }
                     m::TreeValue::File { id, executable, .. } => (
                         if executable { "100755" } else { "100644" },
                         self.file(id).await?,
@@ -340,6 +375,12 @@ impl Converter {
                 order.push(if is_tree { b'/' } else { 0 });
                 entries.push((order, entry.name, mode, oid));
             }
+            ensure!(
+                depth
+                    .checked_add(height)
+                    .is_some_and(|deepest| deepest < self.owner.options.limits.max_depth),
+                "native tree depth limit exceeded"
+            );
             entries.sort_by(|a, b| a.0.cmp(&b.0));
             let mut raw = Vec::new();
             for (_, name, mode, oid) in entries {
@@ -355,7 +396,13 @@ impl Converter {
             }
             let oid = self.write("tree", raw).await?.oid;
             self.metadata_held -= charge;
-            self.objects.insert(key, oid.clone());
+            self.trees.insert(
+                id.0,
+                CachedTree {
+                    oid: oid.clone(),
+                    height,
+                },
+            );
             Ok(oid)
         })
     }
