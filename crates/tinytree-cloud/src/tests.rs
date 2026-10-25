@@ -36,6 +36,7 @@ fn rich_view() -> View {
     view.git_heads
         .insert("task".into(), RefTarget::normal(commit(8)));
     view.wc_commit_ids.insert("task".into(), commit(9));
+    view.wc_commit_ids.insert("peer".into(), commit(9));
     view.remote_views.insert(
         "origin".into(),
         RemoteView {
@@ -83,7 +84,10 @@ fn operation(
             username: "agent".into(),
             is_snapshot: true,
             workspace_name: Some("task".into()),
-            attributes: BTreeMap::from([("command".into(), "snapshot".into())]),
+            attributes: BTreeMap::from([
+                ("command".into(), "snapshot".into()),
+                ("mode".into(), "retained".into()),
+            ]),
         },
         commit_predecessors: predecessors,
     }
@@ -276,6 +280,95 @@ async fn raw_and_semantic_identity_checks_are_independent() {
     )
     .unwrap();
     assert_eq!(alternate_object.operation(), exported.operation());
+    let target_path = dir.path().join("exact-import");
+    let target = init(&target_path);
+    alternate_object.import(&target).await.unwrap();
+    alternate_object.import(&target).await.unwrap();
+    for _ in 0..8 {
+        assert_eq!(
+            target
+                .write_operation(exported.operation().unwrap())
+                .await
+                .unwrap(),
+            id
+        );
+        let actual = export_operation(&target, &id, Limits::default())
+            .await
+            .unwrap();
+        assert_eq!(actual.payload(), alternate_object.payload());
+        assert_eq!(actual.digest(), alternate_object.digest());
+    }
+    assert!(
+        exported.import(&target).await.is_err(),
+        "same semantic ID with different selected bytes is not idempotent"
+    );
+    assert_eq!(
+        std::fs::read(target_path.join("operations").join(id.hex())).unwrap(),
+        alternate
+    );
+
+    // A legal unknown field also distinguishes a selected view representation
+    // from a fresh ordinary map encoding, without depending on random map order.
+    let source_view_id = &exported.operation().unwrap().view_id;
+    let source_view = export_view(&store, source_view_id, Limits::default())
+        .await
+        .unwrap();
+    let alternate_view_bytes = [&[0xf8, 0x07, 0x01][..], source_view.payload().unwrap()].concat();
+    let alternate_view = VerifiedObject::verify(
+        source_view.id(),
+        BlobDigest::of(&alternate_view_bytes),
+        &alternate_view_bytes,
+        Limits::default(),
+    )
+    .unwrap();
+    alternate_view.import(&target).await.unwrap();
+    alternate_view.import(&target).await.unwrap();
+    for _ in 0..8 {
+        target
+            .write_view(source_view.view().unwrap())
+            .await
+            .unwrap();
+        let actual = export_view(&target, source_view_id, Limits::default())
+            .await
+            .unwrap();
+        assert_eq!(actual.payload(), alternate_view.payload());
+        assert_eq!(actual.digest(), alternate_view.digest());
+    }
+    assert!(source_view.import(&target).await.is_err());
+
+    // Competing exact imports use a real no-clobber collision: only one raw
+    // representation can win, and a different same-ID loser must fail closed.
+    let racing_path = dir.path().join("racing-import");
+    let racing = init(&racing_path);
+    let barrier = std::sync::Barrier::new(2);
+    let results = std::thread::scope(|threads| {
+        let first = threads.spawn(|| {
+            barrier.wait();
+            racing.import_cloud_operation_payload(&id, bytes, Limits::default())
+        });
+        let second = threads.spawn(|| {
+            barrier.wait();
+            racing.import_cloud_operation_payload(&id, &alternate, Limits::default())
+        });
+        [first.join().unwrap(), second.join().unwrap()]
+    });
+    assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
+    let winner = std::fs::read(racing_path.join("operations").join(id.hex())).unwrap();
+    assert_eq!(
+        winner,
+        if results[0].is_ok() {
+            bytes
+        } else {
+            alternate.as_slice()
+        }
+    );
+    assert_eq!(
+        std::fs::read_dir(racing_path.join("operations"))
+            .unwrap()
+            .count(),
+        1
+    );
+
     assert!(
         alternate_object.retained_size_upper_bound().unwrap()
             >= std::mem::size_of::<VerifiedObject>() + alternate.len() + overwritten_bytes
@@ -443,6 +536,38 @@ async fn intrinsic_roots_are_explicit_and_non_native_stores_are_rejected() {
         },
     )
     .unwrap();
+    // Ordinary repositories keep their backend widths and admission policy.
+    // Preserving a valid existing slot must not invoke cloud-only limits.
+    let mut ordinary_view = View::make_root(CommitId::from_bytes(&[1; 20]));
+    ordinary_view
+        .wc_commit_ids
+        .insert("legacy".into(), CommitId::from_bytes(&[2; 20]));
+    let ordinary_view_id = foreign.write_view(&ordinary_view).await.unwrap();
+    let view_path = foreign_path.join("views").join(ordinary_view_id.hex());
+    let ordinary_view_raw = [
+        &[0xf8, 0x07, 0x01][..],
+        std::fs::read(&view_path).unwrap().as_slice(),
+    ]
+    .concat();
+    std::fs::write(&view_path, &ordinary_view_raw).unwrap();
+    foreign.write_view(&ordinary_view).await.unwrap();
+    assert_eq!(std::fs::read(&view_path).unwrap(), ordinary_view_raw);
+    let mut ordinary_operation = operation(ordinary_view_id, None);
+    ordinary_operation.metadata.description = "x".repeat(Limits::default().max_field_bytes + 1);
+    let ordinary_id = foreign.write_operation(&ordinary_operation).await.unwrap();
+    let operation_path = foreign_path.join("operations").join(ordinary_id.hex());
+    let ordinary_raw = [
+        &[0xf8, 0x07, 0x01][..],
+        std::fs::read(&operation_path).unwrap().as_slice(),
+    ]
+    .concat();
+    std::fs::write(&operation_path, &ordinary_raw).unwrap();
+    foreign.write_operation(&ordinary_operation).await.unwrap();
+    assert_eq!(std::fs::read(&operation_path).unwrap(), ordinary_raw);
+    assert_eq!(
+        foreign.read_operation(&ordinary_id).await.unwrap(),
+        ordinary_operation
+    );
     assert!(
         export_view(&foreign, &ViewId::from_bytes(&[0; 64]), Limits::default())
             .await
@@ -478,6 +603,43 @@ async fn corrupt_stored_identity_and_unroundtrippable_legacy_operation_are_rejec
         b"corrupt existing object"
     );
 
+    assert!(target_store.write_operation(&original).await.is_err());
+    assert_eq!(
+        std::fs::read(target_path.join("operations").join(id.hex())).unwrap(),
+        b"corrupt existing object"
+    );
+    let view_object = export_view(&store, &view, Limits::default()).await.unwrap();
+    let view_slot = target_path.join("views").join(view.hex());
+    std::fs::create_dir(&view_slot).unwrap();
+    assert!(view_object.import(&target_store).await.is_err());
+    assert!(
+        target_store
+            .write_view(view_object.view().unwrap())
+            .await
+            .is_err()
+    );
+    assert!(view_slot.is_dir());
+    #[cfg(unix)]
+    {
+        std::fs::remove_dir(&view_slot).unwrap();
+        let elsewhere = target_path.join("unchanged");
+        std::fs::write(&elsewhere, b"preserve target").unwrap();
+        std::os::unix::fs::symlink(&elsewhere, &view_slot).unwrap();
+        assert!(view_object.import(&target_store).await.is_err());
+        assert!(
+            target_store
+                .write_view(view_object.view().unwrap())
+                .await
+                .is_err()
+        );
+        assert_eq!(std::fs::read(&elsewhere).unwrap(), b"preserve target");
+        assert!(
+            std::fs::symlink_metadata(&view_slot)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+    }
     let other = operation(view, Some(BTreeMap::new()));
     let other_id = store.write_operation(&other).await.unwrap();
     let source = path.join("operations").join(other_id.hex());

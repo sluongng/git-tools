@@ -1944,10 +1944,18 @@ async fn fresh_restore_stages_original_plural_operations_and_wc_without_publishi
     let mut view = View::make_root(CommitId::from_bytes(&[0; 32]));
     view.wc_commit_ids
         .insert("original-workspace".into(), CommitId::from_bytes(&[0; 32]));
+    view.wc_commit_ids
+        .insert("retained-peer".into(), CommitId::from_bytes(&[0; 32]));
     let view_id = store.write_view(&view).await.unwrap();
     let mut old = Operation::make_root(view_id.clone());
     old.parents = vec![OperationId::from_bytes(&[0; 64])];
     old.metadata.description = "retained original working copy".into();
+    old.metadata
+        .attributes
+        .insert("command".into(), "snapshot".into());
+    old.metadata
+        .attributes
+        .insert("mode".into(), "retained".into());
     let wc_operation = store.write_operation(&old).await.unwrap();
     let mut current = old.clone();
     current.metadata.description = "retained independent snapshot operation".into();
@@ -1964,7 +1972,7 @@ async fn fresh_restore_stages_original_plural_operations_and_wc_without_publishi
             .unwrap(),
     ];
     // Supported codec compatibility case: the final view_id wins on decode,
-    // while local import normalizes the selected raw protobuf representation.
+    // and restore must retain this exact selected protobuf representation.
     let old_at = objects
         .iter()
         .position(|object| {
@@ -1982,6 +1990,18 @@ async fn fresh_restore_stages_original_plural_operations_and_wc_without_publishi
     )
     .unwrap();
     assert_eq!(objects[old_at].operation(), Some(&old));
+    let view_at = objects
+        .iter()
+        .position(|object| matches!(object.id(), c::ObjectId::View(_)))
+        .unwrap();
+    let alternate_view = [&[0xf8, 0x07, 0x01][..], objects[view_at].payload().unwrap()].concat();
+    objects[view_at] = c::VerifiedObject::verify(
+        objects[view_at].id(),
+        c::BlobDigest::of(&alternate_view),
+        &alternate_view,
+        Default::default(),
+    )
+    .unwrap();
     let source_records = objects
         .iter()
         .map(|object| {
@@ -2302,7 +2322,9 @@ async fn fresh_restore_stages_original_plural_operations_and_wc_without_publishi
         }),
     };
     let task = tokio::spawn(restore::initialize_restored(intent, prepared, host));
-    waiting.await.unwrap();
+    if waiting.await.is_err() {
+        panic!("restore stage ended before pause: {:?}", task.await);
+    }
     drop(source_owner);
     task.abort();
     assert!(task.await.unwrap_err().is_cancelled());
@@ -2424,11 +2446,66 @@ async fn fresh_restore_stages_original_plural_operations_and_wc_without_publishi
         })
         .unwrap()
         .1;
-    assert_ne!(
+    assert_eq!(
         c::BlobDigest::of(&local_raw),
         original_raw,
-        "local codec normalization must preserve semantic contents rather than the source wire representation"
+        "restore must preserve the immutable selected representation"
     );
+    // Ordinary writes of unchanged state must not replace restored map/unknown
+    // field order with newly encoded bytes before the next backup.
+    restored.write_view(&view).await.unwrap();
+    restored.write_operation(&old).await.unwrap();
+    restored.write_operation(&current).await.unwrap();
+    let mut captured_objects = Vec::new();
+    for (id, digest, bytes) in &source_records {
+        let actual = match id {
+            c::ObjectId::Operation(id) => {
+                c::export_operation(&restored, &OperationId::from_bytes(id), Default::default())
+                    .await
+                    .unwrap()
+            }
+            c::ObjectId::View(id) => c::export_view(
+                &restored,
+                &jj_lib::op_store::ViewId::from_bytes(id),
+                Default::default(),
+            )
+            .await
+            .unwrap(),
+        };
+        assert_eq!(actual.payload(), Some(bytes.as_slice()));
+        assert_eq!(actual.digest(), Some(*digest));
+        captured_objects.push(actual);
+    }
+    captured_objects.sort_by_key(|object| object.id());
+    let captured_artifacts = encoded
+        .artifacts
+        .iter()
+        .map(|artifact| {
+            c::decode_index_artifact(&artifact.bytes, artifact.descriptor, Default::default())
+                .unwrap()
+        })
+        .collect::<Vec<_>>();
+    let captured_graph =
+        c::verify_index_artifact_graph(&roots, &captured_artifacts, Default::default()).unwrap();
+    let recaptured = c::encode_capture_data(&data, Default::default()).unwrap();
+    let republished = c::prepare_capture_manifest(
+        &c::CaptureExportIdentity {
+            workspace: [42; 32],
+            exporter: [43; 16],
+            sequence: 1,
+            parents: vec![],
+        },
+        &recaptured,
+        &captured_objects,
+        &captured_artifacts,
+        &captured_graph,
+        Default::default(),
+    )
+    .unwrap();
+    assert_eq!(republished.id(), prepared_manifest.id());
+    assert_eq!(republished.bytes(), prepared_manifest.bytes());
+    drop(captured_graph);
+    drop((captured_objects, captured_artifacts));
 
     assert_eq!(
         jj_lib::simple_op_heads_store::SimpleOpHeadsStore::load(
@@ -2478,6 +2555,71 @@ async fn fresh_restore_stages_original_plural_operations_and_wc_without_publishi
     );
     fs::write(&journal_path, &journal_bytes).unwrap();
 
+    let normalized = store
+        .read_cloud_operation_payload(&wc_operation, Default::default())
+        .unwrap();
+    let staged_slot = fixture
+        .binding
+        .repo
+        .join("op_store/operations")
+        .join(wc_operation.hex());
+    let selected = fs::read(&staged_slot).unwrap();
+    assert_ne!(normalized, selected);
+    fs::write(&staged_slot, &normalized).unwrap();
+    let before_mismatch = fs::read(&journal_path).unwrap();
+    let calls = queries.calls.load(Ordering::SeqCst);
+    let version = client
+        .cloud_captured_version(client.cloud_retained_version([42; 32], 1).await.unwrap())
+        .unwrap();
+    let fresh_objects = source_records
+        .iter()
+        .map(|(id, raw, bytes)| {
+            c::VerifiedObject::verify(*id, *raw, bytes, Default::default()).unwrap()
+        })
+        .collect();
+    let fresh_artifacts = encoded
+        .artifacts
+        .iter()
+        .map(|artifact| {
+            c::decode_index_artifact(&artifact.bytes, artifact.descriptor, Default::default())
+                .unwrap()
+        })
+        .collect();
+    let prepared = restore::prepare_restore_until(
+        client.clone(),
+        restore::RestoreInputs {
+            version,
+            objects: fresh_objects,
+            artifacts: fresh_artifacts,
+        },
+        provider.clone(),
+        Default::default(),
+        Arc::new(()),
+        std::time::Instant::now() + std::time::Duration::from_secs(30),
+    )
+    .await
+    .unwrap();
+    assert!(
+        queries.calls.load(Ordering::SeqCst) > calls,
+        "reopen requires fresh current provider authorization"
+    );
+    let mismatch = restore::reopen_staged_restore(
+        fixture.registry.clone(),
+        fixture.binding.clone(),
+        prepared,
+        readback_host(),
+    )
+    .await;
+    assert!(mismatch.is_err());
+    assert_eq!(
+        fs::read(&staged_slot).unwrap(),
+        normalized,
+        "failed pre-Ready readback must preserve mismatched state"
+    );
+    assert_eq!(fs::read(&journal_path).unwrap(), before_mismatch);
+    assert!(!fixture.binding.admin.join("initialization.json").exists());
+    // Reset only this test's injected corruption to exercise valid continuation.
+    fs::write(&staged_slot, selected).unwrap();
     let calls = queries.calls.load(Ordering::SeqCst);
     let version = client
         .cloud_captured_version(client.cloud_retained_version([42; 32], 1).await.unwrap())

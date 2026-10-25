@@ -268,7 +268,7 @@ impl VerifiedObject {
             limits: Limits::default(),
         })
     }
-    /// Install through the real OpStore writer and sync before returning success.
+    /// Install the exact verified payload and sync before returning success.
     ///
     /// This does not check dependency residency, advance operation heads, install a
     /// working copy or fence concurrent commands. The caller must do those under
@@ -278,46 +278,21 @@ impl VerifiedObject {
         if self.id.is_intrinsic() {
             return Ok(self.id);
         }
-        let actual = match &self.state {
-            State::Operation(operation) => {
-                let expected = OperationId::from_bytes(self.id.bytes());
-                // Unix OpStore writers replace existing files. Never turn a corrupt
-                // slot into an acknowledged import by silently overwriting it.
-                if store.cloud_operation_is_present(&expected, self.limits)? {
-                    store.sync_cloud_operation(&expected)?;
-                    return Ok(self.id);
-                }
-                let id = store
-                    .write_operation(operation)
-                    .await
-                    .map_err(Error::Store)?;
-                let actual = ObjectId::Operation(array(id.as_bytes())?);
-                if actual != self.id {
-                    return Err(Error::Invalid("import changed operation identity"));
-                }
-                // The writer may reuse an existing content-addressed file.
-                // Re-read it before ACK so corrupt existing bytes are not trusted.
-                store.read_cloud_operation_payload(&id, self.limits)?;
-                store.sync_cloud_operation(&id)?;
-                actual
+        let bytes = self
+            .bytes
+            .as_deref()
+            .ok_or(Error::Invalid("verified payload missing"))?;
+        match self.id {
+            ObjectId::Operation(id) => store.import_cloud_operation_payload(
+                &OperationId::from_bytes(&id),
+                bytes,
+                self.limits,
+            )?,
+            ObjectId::View(id) => {
+                store.import_cloud_view_payload(&ViewId::from_bytes(&id), bytes, self.limits)?
             }
-            State::View(view) => {
-                let expected = ViewId::from_bytes(self.id.bytes());
-                if store.cloud_view_is_present(&expected, self.limits)? {
-                    store.sync_cloud_view(&expected)?;
-                    return Ok(self.id);
-                }
-                let id = store.write_view(view).await.map_err(Error::Store)?;
-                let actual = ObjectId::View(array(id.as_bytes())?);
-                if actual != self.id {
-                    return Err(Error::Invalid("import changed view identity"));
-                }
-                store.read_cloud_view_payload(&id, self.limits)?;
-                store.sync_cloud_view(&id)?;
-                actual
-            }
-        };
-        Ok(actual)
+        }
+        Ok(self.id)
     }
 }
 const RETAINED_OVERFLOW: Error = Error::Limit("retained allocation accounting overflow");

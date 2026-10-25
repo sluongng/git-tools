@@ -1110,6 +1110,47 @@ async fn stage(
         source.limits.manifest.binding.max_bytes,
         source.limits.max_working_bytes,
     )?;
+    // OP/VIEW codec work finishes before the index importer starts. Both
+    // peaks retain the source, borrowed artifact graph and backend owner; do
+    // not reserve two mutually exclusive workers in the same peak.
+    let mut raw_peak = source.retained_bytes;
+    add(
+        &mut raw_peak,
+        source.limits.manifest.history.artifacts.max_decode_bytes,
+        source.limits.max_working_bytes,
+    )?;
+    add(
+        &mut raw_peak,
+        source.limits.manifest.binding.max_bytes,
+        source.limits.max_working_bytes,
+    )?;
+    let codec = c::Limits::default();
+    add(
+        &mut raw_peak,
+        codec.max_decode_bytes,
+        source.limits.max_working_bytes,
+    )?;
+    add(
+        &mut raw_peak,
+        codec
+            .max_payload_bytes
+            .checked_mul(2)
+            .context("restore raw import memory overflow")?,
+        source.limits.max_working_bytes,
+    )?;
+    // The pending-operation map and installed-ID set contain references/IDs,
+    // not copied payloads. Charge their node/slot slack in this phase.
+    add(
+        &mut raw_peak,
+        source
+            .inputs
+            .objects
+            .len()
+            .checked_add(1)
+            .and_then(|n| n.checked_mul(512))
+            .context("restore ordering memory overflow")?,
+        source.limits.max_working_bytes,
+    )?;
     let projected = host.connector.connect(&binding.projection())?.inspect()?;
     let expected_tree = jj_vfs::native::NativeTree {
         terms: source.data.working_copy.tree.terms.clone(),
@@ -1198,6 +1239,8 @@ async fn stage(
         installed.insert(next);
     }
     drop(op_store);
+    drop(pending);
+    drop(installed);
     sync_directory(&op_path)?;
     sync_directory(staging.path())?;
     intent.advance(Phase::ObjectsStaged)?;
@@ -1717,9 +1760,13 @@ async fn readback(
                 )?
             }
         };
-        // The pinned writer may normalize legal protobuf representations.
-        // Source admission keeps its original raw hash; local import preserves
-        // semantic identity and exact decoded contents, not arbitrary wire order.
+        // A semantic ID can have multiple legal protobuf representations. The
+        // selected immutable capture binds this exact representation as well.
+        ensure!(
+            Some(bytes.as_slice()) == object.payload()
+                && Some(c::BlobDigest::of(&bytes)) == object.digest(),
+            "restore OP/VIEW selected representation differs; preserve state"
+        );
         let actual =
             c::VerifiedObject::verify(object.id(), c::BlobDigest::of(&bytes), &bytes, codec)?;
         ensure!(

@@ -1,24 +1,42 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
-From: Son Luong Ngoc <26684313+sluongng@users.noreply.github.com>
+From: sluongng <26684313+sluongng@users.noreply.github.com>
 Date: Fri, 23 Oct 2026 11:20:00 +0000
-Subject: [PATCH] jj: Expose bounded lossless operation cloud codecs
+Subject: [PATCH] jj: Preserve verified operation cloud representations
 
-Native workspace backup must preserve operation views and rewrite history.
-Generic operation serialization omits those fields, and protobuf bytes do
-not define the semantic operation or view identity.
+Native workspace backup binds both semantic operation/view IDs and the
+selected raw protobuf bytes. Re-encoding a restored object can reorder
+protobuf maps and lose that immutable representation even when its semantic
+identity is unchanged.
 
-Expose the pinned SimpleOpStore codecs with predecode work, field and byte
-limits, backend identity-width validation and semantic hash checks. Keep
-intrinsic roots outside payload decoding and reject parentless legacy
-operations that cannot round-trip through the current writer. Expose a
-file/directory sync boundary so imports can be acknowledged durably.
-Ordinary upstream operation readers and writers remain unchanged.
+Expose bounded lossless codecs and exact verified raw imports with durable
+same-directory no-clobber installation and readback. Reject a corrupt slot,
+non-regular slot or different representation rather than overwriting it.
+Keep intrinsic, legacy and predecessor cloud validation unchanged.
+
+Ordinary writers also retain a valid existing representation instead of
+replacing it with a new map ordering. Validate collision winners with the
+ordinary semantic decoder, without imposing cloud resource or legacy policy
+on ordinary repositories. Readers and object formats remain unchanged.
 
 ---
 diff --git a/src/simple_op_store.rs b/src/simple_op_store.rs
 --- a/src/simple_op_store.rs
 +++ b/src/simple_op_store.rs
-@@ -247,5 +247,427 @@
+@@ -40,11 +40,11 @@
+ use crate::backend::MillisSinceEpoch;
+ use crate::backend::Timestamp;
+ use crate::content_hash::blake2b_hash;
+ use crate::dag_walk_async;
++use crate::file_util::FileIdentity;
+ use crate::file_util::IoResultExt as _;
+ use crate::file_util::PathError;
+-use crate::file_util::persist_content_addressed_temp_file;
+ use crate::object_id::HexPrefix;
+ use crate::object_id::ObjectId;
+ use crate::object_id::PrefixResolution;
+ use crate::op_store;
+@@ -246,8 +246,561 @@
+             // parents.
              operation.parents.push(self.root_operation_id.clone());
          }
          Ok(operation)
@@ -346,7 +364,138 @@ diff --git a/src/simple_op_store.rs b/src/simple_op_store.rs
 +        Err(error) => Err(error),
 +    }
 +}
++// Slots are immutable representations, not merely semantic-ID names. Cloud
++// imports require exact bytes; ordinary writers accept an already valid encoding
++// of their semantic state. Both paths verify a no-clobber collision winner.
++fn operation_slot(path: &Path) -> io::Result<fs::File> {
++    if !fs::symlink_metadata(path)?.is_file() {
++        return Err(cloud_invalid("operation slot is not a regular file"));
++    }
++    #[cfg(unix)]
++    let file = fs::File::from(rustix::fs::open(
++        path,
++        rustix::fs::OFlags::RDONLY
++            | rustix::fs::OFlags::NOFOLLOW
++            | rustix::fs::OFlags::NONBLOCK
++            | rustix::fs::OFlags::CLOEXEC,
++        rustix::fs::Mode::empty(),
++    )?);
++    #[cfg(not(unix))]
++    let file = fs::File::open(path)?;
++    verify_operation_slot(path, &file)?;
++    Ok(file)
++}
++fn verify_operation_slot(path: &Path, file: &fs::File) -> io::Result<()> {
++    if !file.metadata()?.is_file()
++        || !fs::symlink_metadata(path)?.is_file()
++        || FileIdentity::from_file(file.try_clone()?)? != FileIdentity::from_symlink_path(path)?
++    {
++        return Err(cloud_invalid(
++            "operation slot changed or is not a regular file",
++        ));
++    }
++    Ok(())
++}
++fn install_operation_payload(
++    path: &Path,
++    bytes: &[u8],
++    max_payload: Option<usize>,
++    durable: bool,
++    verify: impl FnOnce(&[u8]) -> io::Result<()>,
++) -> io::Result<()> {
++    let directory = path
++        .parent()
++        .ok_or_else(|| cloud_invalid("operation slot has no directory"))?;
++    let mut temp = NamedTempFile::new_in(directory)?;
++    temp.write_all(bytes)?;
++    temp.as_file().sync_all()?;
++    let installed = match temp.persist_noclobber(path) {
++        Ok(_) => true,
++        Err(error) if error.error.kind() == io::ErrorKind::AlreadyExists => false,
++        Err(error) => return Err(error.error),
++    };
++    // Fresh ordinary writes retain their existing codec/admission behavior.
++    // Only collision winners need an extra ordinary semantic decode; cloud
++    // imports always require exact bounded readback before their durable ACK.
++    if installed && !durable {
++        return Ok(());
++    }
++    let file = operation_slot(path)?;
++    let mut actual = Vec::new();
++    if let Some(limit) = max_payload {
++        if file.metadata()?.len() > limit as u64 {
++            return Err(cloud_invalid("existing operation payload exceeds limit"));
++        }
++        (&file).take(limit as u64 + 1).read_to_end(&mut actual)?;
++        if actual.len() > limit {
++            return Err(cloud_invalid("existing operation payload exceeds limit"));
++        }
++    } else {
++        // Ordinary OpStore reads have no cloud-specific byte or legacy policy.
++        (&file).read_to_end(&mut actual)?;
++    }
++    verify(&actual)?;
++    verify_operation_slot(path, &file)?;
++    if durable {
++        file.sync_all()?;
++        fs::File::open(directory)?.sync_all()?;
++        fs::File::open(
++            directory
++                .parent()
++                .ok_or_else(|| cloud_invalid("operation store directory missing"))?,
++        )?
++        .sync_all()?;
++    }
++    verify_operation_slot(path, &file)
++}
 +impl SimpleOpStore {
++    /// Durably install the exact verified cloud representation without replacing a slot.
++    /// A different representation of the same semantic ID is a conflict, not idempotence.
++    pub fn import_cloud_operation_payload(
++        &self,
++        expected: &OperationId,
++        bytes: &[u8],
++        limits: CloudOpLimits,
++    ) -> io::Result<()> {
++        decode_cloud_operation(expected, bytes, limits)?;
++        install_operation_payload(
++            &self.operations_dir().join(expected.hex()),
++            bytes,
++            Some(limits.max_payload_bytes),
++            true,
++            |actual| {
++                if actual != bytes {
++                    return Err(cloud_invalid(
++                        "existing cloud operation representation differs",
++                    ));
++                }
++                decode_cloud_operation(expected, actual, limits)?;
++                Ok(())
++            },
++        )
++    }
++    /// Durably install the exact verified cloud view representation without replacing a slot.
++    pub fn import_cloud_view_payload(
++        &self,
++        expected: &ViewId,
++        bytes: &[u8],
++        limits: CloudOpLimits,
++    ) -> io::Result<()> {
++        decode_cloud_view(expected, bytes, limits)?;
++        install_operation_payload(
++            &self.views_dir().join(expected.hex()),
++            bytes,
++            Some(limits.max_payload_bytes),
++            true,
++            |actual| {
++                if actual != bytes {
++                    return Err(cloud_invalid("existing cloud view representation differs"));
++                }
++                decode_cloud_view(expected, actual, limits)?;
++                Ok(())
++            },
++        )
++    }
 +    /// Validate any existing slot before a caller invokes the ordinary writer.
 +    /// The caller must fence concurrent mutations through installation and sync.
 +    pub fn cloud_operation_is_present(
@@ -446,3 +595,95 @@ diff --git a/src/simple_op_store.rs b/src/simple_op_store.rs
 +        fs::File::open(&self.path)?.sync_all()
      }
  }
+ 
+ // Semantic preflight for the opt-in view reader. Upstream conversion accepts
+@@ -504,26 +1057,24 @@
+         view_from_proto(proto).map_err(|err| to_read_error(err.into(), id))
+     }
+ 
+     async fn write_view(&self, view: &View) -> OpStoreResult<ViewId> {
+-        let dir = self.views_dir();
+-        let temp_file = NamedTempFile::new_in(&dir)
+-            .context(&dir)
+-            .map_err(|err| io_to_write_error(err, "view"))?;
+-
+-        let proto = view_to_proto(view);
+-        temp_file
+-            .as_file()
+-            .write_all(&proto.encode_to_vec())
+-            .context(temp_file.path())
+-            .map_err(|err| io_to_write_error(err, "view"))?;
+-
+         let id = ViewId::new(blake2b_hash(view).to_vec());
+-
+-        let new_path = dir.join(id.hex());
+-        persist_content_addressed_temp_file(temp_file, &new_path)
+-            .context(&new_path)
+-            .map_err(|err| io_to_write_error(err, "view"))?;
++        let path = self.views_dir().join(id.hex());
++        let bytes = view_to_proto(view).encode_to_vec();
++        install_operation_payload(&path, &bytes, None, false, |actual| {
++            let proto = crate::protos::simple_op_store::View::decode(actual)
++                .map_err(|_| cloud_invalid("invalid existing view protobuf"))?;
++            validate_bounded_view(&proto)?;
++            let existing =
++                view_from_proto(proto).map_err(|_| cloud_invalid("invalid existing view state"))?;
++            if &existing != view || blake2b_hash(&existing).as_slice() != id.as_bytes() {
++                return Err(cloud_invalid("existing view semantic identity mismatch"));
++            }
++            Ok(())
++        })
++        .context(&path)
++        .map_err(|err| io_to_write_error(err, "view"))?;
+         Ok(id)
+     }
+ 
+     async fn read_operation(&self, id: &OperationId) -> OpStoreResult<Operation> {
+@@ -549,26 +1100,30 @@
+     }
+ 
+     async fn write_operation(&self, operation: &Operation) -> OpStoreResult<OperationId> {
+         assert!(!operation.parents.is_empty());
+-        let dir = self.operations_dir();
+-        let temp_file = NamedTempFile::new_in(&dir)
+-            .context(&dir)
+-            .map_err(|err| io_to_write_error(err, "operation"))?;
+-
+-        let proto = operation_to_proto(operation);
+-        temp_file
+-            .as_file()
+-            .write_all(&proto.encode_to_vec())
+-            .context(temp_file.path())
+-            .map_err(|err| io_to_write_error(err, "operation"))?;
+-
+         let id = OperationId::new(blake2b_hash(operation).to_vec());
+-
+-        let new_path = dir.join(id.hex());
+-        persist_content_addressed_temp_file(temp_file, &new_path)
+-            .context(&new_path)
+-            .map_err(|err| io_to_write_error(err, "operation"))?;
++        let path = self.operations_dir().join(id.hex());
++        let bytes = operation_to_proto(operation).encode_to_vec();
++        install_operation_payload(&path, &bytes, None, false, |actual| {
++            let proto = crate::protos::simple_op_store::Operation::decode(actual)
++                .map_err(|_| cloud_invalid("invalid existing operation protobuf"))?;
++            let mut existing = operation_from_proto(proto)
++                .map_err(|_| cloud_invalid("invalid existing operation state"))?;
++            // Match the ordinary reader's legacy root interpretation, without
++            // imposing cloud-only shape, identity-width or resource policy.
++            if existing.parents.is_empty() {
++                existing.parents.push(self.root_operation_id.clone());
++            }
++            if &existing != operation || blake2b_hash(&existing).as_slice() != id.as_bytes() {
++                return Err(cloud_invalid(
++                    "existing operation semantic identity mismatch",
++                ));
++            }
++            Ok(())
++        })
++        .context(&path)
++        .map_err(|err| io_to_write_error(err, "operation"))?;
+         Ok(id)
+     }
+ 
+     async fn resolve_operation_id_prefix(
