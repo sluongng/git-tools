@@ -26,7 +26,12 @@ async fn drained<T>(
     control: &RemoteRepositoryControl,
     result: anyhow::Result<T>,
 ) -> Result<T, Status> {
-    control.drain_control().await;
+    // A reentrant real-control caller already owns the drain barrier. On a
+    // rejected foreign-control call no work was accepted by this adapter. In
+    // either case waiting here could self-deadlock or create a cross-alias cycle.
+    if !crate::io::scope().is_some_and(|scope| scope.has_control()) {
+        control.drain_control().await;
+    }
     result.map_err(status)
 }
 #[async_trait]

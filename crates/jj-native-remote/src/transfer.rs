@@ -163,24 +163,31 @@ impl RemoteRepositoryControl {
         limits: NativeTransferLimits,
         deadline: tokio::time::Instant,
     ) -> Result<NativeTransferReceipt> {
+        let deadline = io::bounded_deadline(deadline);
         self.native_transfer_resources(source.as_ref(), &limits)?;
         if roots.is_empty() || roots.len() > limits.max_roots {
             return Err(limit());
         }
-        if io::in_control() {
+        if io::scope().is_some() {
             return Err(Status::failed_precondition(
                 "native transfer requires independent host admission",
             )
             .into());
         }
-        let permit = tokio::time::timeout_at(deadline, self.inner.control.clone().acquire_owned())
-            .await
-            .map_err(|_| {
-                Status::deadline_exceeded("native transfer admission deadline exceeded")
-            })??;
-        let scope = Arc::new(io::ControlScope::new(permit, deadline, owner.clone()));
+        let permit = tokio::time::timeout_at(
+            deadline,
+            self.inner.background_transfer.clone().acquire_owned(),
+        )
+        .await
+        .map_err(|_| Status::deadline_exceeded("native transfer admission deadline exceeded"))??;
+        let scope = Arc::new(io::ControlScope::background_transfer(
+            permit,
+            deadline,
+            owner.clone(),
+        ));
         let control = self.clone();
-        // At most one accepted task per configured control; never spawn tasks
+        // At most one independently funded closure transfer per repository;
+        // foreground control remains serialized on its separate lane. Never spawn tasks
         // waiting for admission. Result fields drop before their physical owner.
         struct Completed {
             result: Result<NativeTransferReceipt>,
@@ -254,6 +261,7 @@ impl RemoteRepositoryControl {
         deadline: tokio::time::Instant,
         remote_metadata: bool,
     ) -> Result<NativeTransferReceipt> {
+        let deadline = io::bounded_deadline(deadline);
         self.native_transfer_resources(source.as_ref(), &limits)?;
         if stack.is_empty()
             || stack.len() > 128
@@ -264,7 +272,7 @@ impl RemoteRepositoryControl {
         {
             return Err(Status::invalid_argument("invalid native landing stack").into());
         }
-        if io::in_control() {
+        if io::scope().is_some() {
             return Err(Status::failed_precondition(
                 "native stack transfer requires independent host admission",
             )
@@ -278,7 +286,12 @@ impl RemoteRepositoryControl {
         let permit = tokio::time::timeout_at(deadline, self.inner.control.clone().acquire_owned())
             .await
             .map_err(|_| Status::deadline_exceeded("native stack admission deadline exceeded"))??;
-        let scope = Arc::new(io::ControlScope::new(permit, deadline, owner.clone()));
+        let scope = Arc::new(io::ControlScope::new(
+            permit,
+            self.inner.control.clone(),
+            deadline,
+            owner.clone(),
+        ));
         let control = self.clone();
         struct Completed {
             result: Result<NativeTransferReceipt>,

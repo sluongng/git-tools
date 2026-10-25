@@ -108,7 +108,7 @@ impl RemoteRepositoryControl {
         original: tokio::time::Instant,
     ) -> Result<crate::AdmittedCloudVersion> {
         ensure!(
-            !io::in_control(),
+            io::scope().is_none(),
             "cloud host admission requires an independent scope"
         );
         // run_owned acquires the sole control lease once. The cloud admission
@@ -123,6 +123,11 @@ impl RemoteRepositoryControl {
     /// Drain independently accepted host/connector work after stopping producers.
     pub async fn wait_for_owned_work(&self) {
         self.drain_control().await;
+        // Never hold one lane while waiting for another: a source callback may
+        // acquire foreground control while its transfer owner remains active.
+        if let Ok(permit) = self.inner.background_transfer.clone().acquire_owned().await {
+            drop(permit);
+        }
         self.inner.metadata_work.wait_for_idle().await;
     }
     pub fn client_id(&self) -> [u8; 16] {
@@ -135,7 +140,7 @@ impl RemoteRepositoryControl {
             self.current_hold(&client, root).await?;
             Ok(())
         };
-        if io::in_control() {
+        if io::in_control_for(&self.inner.control) {
             operation.await
         } else {
             let deadline = self.inner.deadline();
@@ -208,7 +213,7 @@ impl RemoteRepositoryControl {
         deadline: tokio::time::Instant,
         operation: impl std::future::Future<Output = Result<T>>,
     ) -> Result<T> {
-        if io::in_control() {
+        if io::in_control_for(&self.inner.control) {
             io::check_deadline()?;
             operation.await
         } else {
@@ -221,9 +226,26 @@ impl RemoteRepositoryControl {
         owner: Arc<dyn std::any::Any + Send + Sync>,
         operation: impl std::future::Future<Output = Result<T>>,
     ) -> Result<T> {
-        if let Some(parent) = io::scope() {
+        let deadline = io::bounded_deadline(deadline);
+        let parent = io::scope();
+        let deadline = parent
+            .as_ref()
+            .map_or(deadline, |p| deadline.min(p.deadline));
+        if let Some(parent) = parent {
             io::check_deadline()?;
-            return io::control_scope(io::ControlScope::with_owner(parent, owner), operation).await;
+            if parent.is_control_for(&self.inner.control) {
+                return io::control_scope(
+                    io::ControlScope::with_owner(parent, owner, deadline),
+                    operation,
+                )
+                .await;
+            }
+            ensure!(
+                !parent.has_control(),
+                tonic::Status::failed_precondition("foreign native control admission")
+            );
+            // Background scope ownership is retained by the new foreground
+            // scope, but it must acquire this adapter's real control lease.
         }
         // Only admission is cancellable here. Once DirectObjectIo owns a job,
         // await its physical completion; the broker's owned request task keeps
@@ -233,7 +255,12 @@ impl RemoteRepositoryControl {
             .map_err(|_| {
                 tonic::Status::deadline_exceeded("native control admission deadline exceeded")
             })??;
-        let scope = Arc::new(io::ControlScope::new(permit, deadline, owner));
+        let scope = Arc::new(io::ControlScope::new(
+            permit,
+            self.inner.control.clone(),
+            deadline,
+            owner,
+        ));
         let result = io::control_scope(scope, operation).await;
         if tokio::time::Instant::now() >= deadline {
             return Err(tonic::Status::deadline_exceeded(
@@ -703,7 +730,7 @@ impl RemoteRepositoryControl {
             }
             Ok(())
         };
-        if io::in_control() {
+        if io::in_control_for(&self.inner.control) {
             operation.await
         } else {
             self.run(self.inner.deadline(), operation).await

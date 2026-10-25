@@ -51,6 +51,8 @@ struct Counters {
     files: Arc<AtomicUsize>,
     holds: Arc<AtomicUsize>,
     metadata_rpcs: Arc<AtomicUsize>,
+    reference_observations: Arc<AtomicUsize>,
+    reference_timeouts: Arc<std::sync::Mutex<Vec<String>>>,
     capture_timeouts: Arc<AtomicBool>,
     metadata_timeouts: Arc<std::sync::Mutex<Vec<String>>>,
     query_timeouts: Arc<std::sync::Mutex<Vec<String>>>,
@@ -79,6 +81,8 @@ impl Counters {
             files: Arc::new(AtomicUsize::new(0)),
             holds: Arc::new(AtomicUsize::new(0)),
             metadata_rpcs: Arc::new(AtomicUsize::new(0)),
+            reference_observations: Arc::new(AtomicUsize::new(0)),
+            reference_timeouts: Arc::new(std::sync::Mutex::new(Vec::new())),
             capture_timeouts: Arc::new(AtomicBool::new(false)),
             metadata_timeouts: Arc::new(std::sync::Mutex::new(Vec::new())),
             query_timeouts: Arc::new(std::sync::Mutex::new(Vec::new())),
@@ -121,6 +125,20 @@ impl Repository for Counting {
         &self,
         r: Request<p::OpenRepositoryRequest>,
     ) -> Result<Response<p::RepositoryView>, Status> {
+        self.counts
+            .reference_observations
+            .fetch_add(1, Ordering::SeqCst);
+        if self.counts.capture_timeouts.load(Ordering::SeqCst)
+            && r.get_ref().reference_names == ["absent"]
+        {
+            self.counts.reference_timeouts.lock().unwrap().push(
+                r.metadata()
+                    .get("grpc-timeout")
+                    .and_then(|value| value.to_str().ok())
+                    .unwrap_or("missing")
+                    .to_owned(),
+            );
+        }
         self.service.open_repository(r).await
     }
     async fn get_commit_graph(
@@ -1541,10 +1559,73 @@ async fn cancelled_admission_reconciles_current_durable_hold_after_restart() {
 }
 
 #[derive(Debug)]
+struct TransferHook {
+    started: AtomicBool,
+    entered: tokio::sync::Notify,
+    paused: AtomicBool,
+    released: tokio::sync::Notify,
+    callback: Option<jj_native_remote::RemoteRepositoryControl>,
+    callback_entered: tokio::sync::Notify,
+    callback_finished: tokio::sync::Notify,
+    callback_result: std::sync::Mutex<Option<Result<(), tonic::Code>>>,
+}
+impl TransferHook {
+    fn new(callback: Option<jj_native_remote::RemoteRepositoryControl>) -> Arc<Self> {
+        Arc::new(Self {
+            started: AtomicBool::new(false),
+            entered: tokio::sync::Notify::new(),
+            paused: AtomicBool::new(true),
+            released: tokio::sync::Notify::new(),
+            callback,
+            callback_entered: tokio::sync::Notify::new(),
+            callback_finished: tokio::sync::Notify::new(),
+            callback_result: std::sync::Mutex::new(None),
+        })
+    }
+    fn release(&self) {
+        self.paused.store(false, Ordering::SeqCst);
+        self.released.notify_waiters();
+    }
+    async fn run(&self, owner: Arc<dyn std::any::Any + Send + Sync>) {
+        if self.started.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        self.entered.notify_one();
+        if let Some(control) = &self.callback {
+            use native_broker::NativeRepositoryControl as _;
+            self.callback_entered.notify_one();
+            let result = control
+                .observe_reference_with_owner("absent", owner)
+                .await
+                .map(|snapshot| assert!(snapshot.head.is_none()))
+                .map_err(|error| error.code());
+            *self.callback_result.lock().unwrap() = Some(result);
+            self.callback_finished.notify_one();
+        }
+        while self.paused.load(Ordering::SeqCst) {
+            let released = self.released.notified();
+            tokio::pin!(released);
+            released.as_mut().enable();
+            if !self.paused.load(Ordering::SeqCst) {
+                break;
+            }
+            released.await;
+        }
+    }
+}
+struct ReleaseTransfer(Arc<TransferHook>);
+impl Drop for ReleaseTransfer {
+    fn drop(&mut self) {
+        self.0.release();
+    }
+}
+
+#[derive(Debug)]
 struct TransferSource {
     inner: Arc<dyn NativeObjectIo>,
     files: AtomicUsize,
     metadata_reads: AtomicUsize,
+    hook: Option<Arc<TransferHook>>,
 }
 #[async_trait]
 impl NativeObjectIo for TransferSource {
@@ -1576,6 +1657,9 @@ impl NativeObjectIo for TransferSource {
         owner: Arc<dyn std::any::Any + Send + Sync>,
     ) -> jj_lib::backend::BackendResult<jj_native_backend::VerifiedMetadata> {
         self.metadata_reads.fetch_add(1, Ordering::SeqCst);
+        if let Some(hook) = &self.hook {
+            hook.run(owner.clone()).await;
+        }
         self.inner.read_metadata_with_owner(key, owner).await
     }
     async fn read_file(
@@ -1607,6 +1691,374 @@ impl NativeObjectIo for TransferSource {
         _: jj_native_backend::CopyCatalogLimits,
     ) -> jj_lib::backend::BackendResult<jj_native_backend::CopyCatalogSnapshot> {
         panic!("transfer cannot query unrelated source catalog")
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn background_transfer_allows_foreground_observation_but_remains_in_physical_drain() {
+    use native_broker::NativeRepositoryControl as _;
+    let (_serverdir, store, _fixture, _head) = seed();
+    let counts = Counters::new();
+    let server = Server::start(store.clone(), counts.clone()).await;
+    let directory = private_dir();
+    let (direct, repo) = local(
+        directory.path(),
+        cache(directory.path()),
+        config(&server),
+        true,
+    );
+    let metadata = direct
+        .write_metadata(m::Object::Symlink("transfer-target".into()))
+        .await
+        .unwrap();
+    let hook = TransferHook::new(None);
+    let release = ReleaseTransfer(hook.clone());
+    let source = Arc::new(TransferSource {
+        inner: direct,
+        files: AtomicUsize::new(0),
+        metadata_reads: AtomicUsize::new(0),
+        hook: Some(hook.clone()),
+    });
+    let owner = Arc::new(());
+    let weak = Arc::downgrade(&owner);
+    let control = repo.control.clone();
+    let transfer_source = source.clone();
+    let transfer = tokio::spawn(async move {
+        control
+            .transfer_native_closure(
+                transfer_source,
+                vec![metadata.key],
+                owner,
+                Default::default(),
+                tokio::time::Instant::now() + Duration::from_secs(10),
+            )
+            .await
+    });
+    tokio::time::timeout(Duration::from_secs(2), hook.entered.notified())
+        .await
+        .unwrap();
+    // Exercise the public broker bridge, including its post-RPC drain. A raw
+    // control method alone would miss a drain accidentally coupling both lanes.
+    let observed = tokio::time::timeout(
+        Duration::from_secs(2),
+        repo.control
+            .observe_reference_with_owner("absent", Arc::new(())),
+    )
+    .await
+    .expect("foreground observation must not wait for paused background work")
+    .unwrap();
+    assert!(observed.head.is_none());
+    assert!(!transfer.is_finished());
+    let second_control = repo.control.clone();
+    let second_source = source.clone();
+    let second_owner = Arc::new(());
+    let second_weak = Arc::downgrade(&second_owner);
+    let second_transfer = tokio::spawn(async move {
+        second_control
+            .transfer_native_closure(
+                second_source,
+                vec![metadata.key],
+                second_owner,
+                Default::default(),
+                tokio::time::Instant::now() + Duration::from_secs(10),
+            )
+            .await
+    });
+    tokio::time::sleep(Duration::from_millis(25)).await;
+    assert!(
+        !second_transfer.is_finished(),
+        "only one background transfer may be admitted"
+    );
+    assert_eq!(
+        source.metadata_reads.load(Ordering::SeqCst),
+        1,
+        "unaccepted transfer must not start source work"
+    );
+    second_transfer.abort();
+    let _ = second_transfer.await;
+    assert!(
+        second_weak.upgrade().is_none(),
+        "unaccepted admission is cancellable"
+    );
+    assert!(
+        tokio::time::timeout(Duration::from_millis(25), repo.wait_for_idle())
+            .await
+            .is_err()
+    );
+    assert!(
+        tokio::time::timeout(
+            Duration::from_millis(25),
+            repo.control.wait_for_owned_work()
+        )
+        .await
+        .is_err()
+    );
+    transfer.abort();
+    let _ = transfer.await;
+    assert!(
+        weak.upgrade().is_some(),
+        "cancelled caller cannot drop the physical transfer owner"
+    );
+    assert!(
+        tokio::time::timeout(Duration::from_millis(25), repo.wait_for_idle())
+            .await
+            .is_err()
+    );
+    drop(release);
+    tokio::time::timeout(Duration::from_secs(2), repo.wait_for_idle())
+        .await
+        .unwrap();
+    assert!(weak.upgrade().is_none());
+    assert_eq!(
+        store.descriptor("example", metadata.key).unwrap(),
+        Some(metadata)
+    );
+    assert_eq!(source.files.load(Ordering::SeqCst), 0);
+    assert_eq!(counts.files.load(Ordering::SeqCst), 0);
+    assert_eq!(counts.holds.load(Ordering::SeqCst), 0);
+    server.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn background_source_callback_cannot_bypass_busy_foreground_control() {
+    use native_broker::NativeRepositoryControl as _;
+    let (_serverdir, store, _fixture, _head) = seed();
+    let counts = Counters::new();
+    let server = Server::start(store.clone(), counts.clone()).await;
+    let directory = private_dir();
+    let mut configuration = config(&server);
+    configuration.operation_timeout_ms = 4000;
+    configuration.remote.rpc.rpc_timeout_ms = 4000;
+    configuration.remote.rpc.retry.max_attempts = 1;
+    counts.capture_timeouts.store(true, Ordering::SeqCst);
+    let (direct, repo) = local(
+        directory.path(),
+        cache(directory.path()),
+        configuration,
+        true,
+    );
+    let metadata = direct
+        .write_metadata(m::Object::Symlink("callback-target".into()))
+        .await
+        .unwrap();
+    let mut commit = m::synthetic_root();
+    commit.parents = vec![m::CommitId::ROOT];
+    commit.change_id = m::ChangeId([91; 16]);
+    commit.description = "foreground admission boundary".into();
+    let commit = direct
+        .write_metadata(m::Object::Commit(commit))
+        .await
+        .unwrap();
+    counts.missing_paused.store(true, Ordering::SeqCst);
+    struct ReleaseMissing(Arc<AtomicBool>);
+    impl Drop for ReleaseMissing {
+        fn drop(&mut self) {
+            self.0.store(false, Ordering::SeqCst);
+        }
+    }
+    let release_missing = ReleaseMissing(counts.missing_paused.clone());
+    let control = repo.control.clone();
+    let foreground = tokio::spawn(async move {
+        control
+            .publish_with_owner(
+                native_broker::PublishRequest {
+                    name: "foreground".into(),
+                    head: m::CommitId(commit.key.id.0),
+                    expected_generation: 0,
+                    idempotency_key: "foreground-admission-boundary".into(),
+                },
+                Arc::new(()),
+            )
+            .await
+    });
+    tokio::time::timeout(Duration::from_secs(2), counts.missing_started.notified())
+        .await
+        .unwrap();
+    let hook = TransferHook::new(Some(repo.control.clone()));
+    let release = ReleaseTransfer(hook.clone());
+    let source = Arc::new(TransferSource {
+        inner: direct,
+        files: AtomicUsize::new(0),
+        metadata_reads: AtomicUsize::new(0),
+        hook: Some(hook.clone()),
+    });
+    let control = repo.control.clone();
+    let transfer = tokio::spawn(async move {
+        control
+            .transfer_native_closure(
+                source,
+                vec![metadata.key],
+                Arc::new(()),
+                Default::default(),
+                tokio::time::Instant::now() + Duration::from_secs(1),
+            )
+            .await
+    });
+    tokio::time::timeout(Duration::from_secs(2), hook.callback_entered.notified())
+        .await
+        .unwrap();
+    assert!(
+        tokio::time::timeout(Duration::from_millis(25), hook.callback_finished.notified())
+            .await
+            .is_err(),
+        "a background source callback must acquire the real foreground lease"
+    );
+    assert!(hook.callback_result.lock().unwrap().is_none());
+    drop(release_missing);
+    foreground.await.unwrap().unwrap();
+    tokio::time::timeout(Duration::from_secs(2), hook.callback_finished.notified())
+        .await
+        .unwrap();
+    assert_eq!(*hook.callback_result.lock().unwrap(), Some(Ok(())));
+    let timeouts = counts.reference_timeouts.lock().unwrap().clone();
+    assert_eq!(
+        timeouts.len(),
+        1,
+        "one actual nested foreground observation"
+    );
+    let encoded = &timeouts[0];
+    let (digits, unit) = encoded.split_at(encoded.len() - 1);
+    let amount: u64 = digits.parse().expect("valid grpc-timeout required");
+    let allowance = match unit {
+        "n" => Duration::from_nanos(amount),
+        "u" => Duration::from_micros(amount),
+        "m" => Duration::from_millis(amount),
+        "S" => Duration::from_secs(amount),
+        "M" => Duration::from_secs(amount * 60),
+        "H" => Duration::from_secs(amount * 3600),
+        _ => panic!("invalid grpc-timeout unit"),
+    };
+    assert!(
+        allowance <= Duration::from_secs(1),
+        "entering foreground control must not renew the shorter transfer bound: {encoded}"
+    );
+    drop(release);
+    transfer.await.unwrap().unwrap();
+    repo.wait_for_idle().await;
+    assert_eq!(counts.files.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        store.references("example", &["main".into()]).unwrap()[0].generation,
+        1
+    );
+    server.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn foreground_transfer_source_reentry_is_bound_to_its_repository_control() {
+    use native_broker::NativeRepositoryControl as _;
+    for (name, foreign, expected, expected_network) in [
+        ("same repository reentry", false, Ok(()), 1),
+        (
+            "foreign repository rejection",
+            true,
+            Err(tonic::Code::FailedPrecondition),
+            0,
+        ),
+    ] {
+        let (_serverdir, store, _fixture, _head) = seed();
+        let counts = Counters::new();
+        let server = Server::start(store, counts.clone()).await;
+        let directory = private_dir();
+        let (direct, repo) = local(
+            directory.path(),
+            cache(directory.path()),
+            config(&server),
+            true,
+        );
+        let other_directory = private_dir();
+        let (other_direct, other) = local(
+            other_directory.path(),
+            cache(other_directory.path()),
+            config(&server),
+            true,
+        );
+        let make_commit = |change: u8, description: &str| {
+            let mut commit = m::synthetic_root();
+            commit.parents = vec![m::CommitId::ROOT];
+            commit.change_id = m::ChangeId([change; 16]);
+            commit.description = description.into();
+            m::Object::Commit(commit)
+        };
+        let staged = direct
+            .write_metadata(make_commit(92, "foreground stack callback"))
+            .await
+            .unwrap();
+        let published = other_direct
+            .write_metadata(make_commit(93, "busy foreign repository control"))
+            .await
+            .unwrap();
+        counts.missing_paused.store(true, Ordering::SeqCst);
+        struct ReleaseMissing(Arc<AtomicBool>);
+        impl Drop for ReleaseMissing {
+            fn drop(&mut self) {
+                self.0.store(false, Ordering::SeqCst);
+            }
+        }
+        let release_missing = ReleaseMissing(counts.missing_paused.clone());
+        let other_control = other.control.clone();
+        let blocked = tokio::spawn(async move {
+            other_control
+                .publish_with_owner(
+                    native_broker::PublishRequest {
+                        name: "foreground".into(),
+                        head: m::CommitId(published.key.id.0),
+                        expected_generation: 0,
+                        idempotency_key: "foreign-admission-boundary".into(),
+                    },
+                    Arc::new(()),
+                )
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(2), counts.missing_started.notified())
+            .await
+            .unwrap();
+        let observations = counts.reference_observations.load(Ordering::SeqCst);
+        let hook = TransferHook::new(Some(if foreign {
+            other.control.clone()
+        } else {
+            repo.control.clone()
+        }));
+        // This case observes reentry rather than pausing the source afterward.
+        hook.release();
+        let source = Arc::new(TransferSource {
+            inner: direct,
+            files: AtomicUsize::new(0),
+            metadata_reads: AtomicUsize::new(0),
+            hook: Some(hook.clone()),
+        });
+        let control = repo.control.clone();
+        let transfer = tokio::spawn(async move {
+            control
+                .transfer_native_stack(
+                    source,
+                    m::CommitId::ROOT,
+                    vec![m::CommitId(staged.key.id.0)],
+                    Arc::new(()),
+                    Default::default(),
+                    tokio::time::Instant::now() + Duration::from_secs(10),
+                )
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(2), hook.callback_finished.notified()).await
+            .expect("same-control reentry and foreign-control rejection must not self-drain or wait for another repository");
+        assert!(!blocked.is_finished());
+        assert_eq!(
+            *hook.callback_result.lock().unwrap(),
+            Some(expected),
+            "{name}"
+        );
+        assert_eq!(
+            counts.reference_observations.load(Ordering::SeqCst) - observations,
+            expected_network,
+            "{name}: foreign scope must be rejected before network access"
+        );
+        drop(release_missing);
+        blocked.await.unwrap().unwrap();
+        transfer.await.unwrap().unwrap();
+        repo.wait_for_idle().await;
+        other.wait_for_idle().await;
+        assert_eq!(counts.files.load(Ordering::SeqCst), 0);
+        server.stop().await;
     }
 }
 
@@ -1680,6 +2132,7 @@ async fn unrelated_tree_write_and_publication_upload_only_new_local_content() {
         inner: repo.io.clone(),
         files: AtomicUsize::new(0),
         metadata_reads: AtomicUsize::new(0),
+        hook: None,
     });
     let fence: Arc<dyn std::any::Any + Send + Sync> = Arc::new(());
     let transfer_limits = jj_native_remote::NativeTransferLimits::default();

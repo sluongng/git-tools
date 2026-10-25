@@ -49,6 +49,8 @@ pub(crate) struct Inner {
     pub staging_owner: Arc<staging::Owner>,
     pub config: Config,
     pub control: Arc<tokio::sync::Semaphore>,
+    // Independently funded no-ref graph work must not hold foreground control.
+    pub background_transfer: Arc<tokio::sync::Semaphore>,
     pub metadata: Arc<tokio::sync::Mutex<()>>,
     pub landing_client: tokio::sync::OnceCell<NativeClient>,
     pub metadata_work: Arc<io::OwnedWork>,
@@ -73,8 +75,7 @@ impl Inner {
 impl RemoteRepository {
     /// Stop producers before awaiting accepted owned metadata/control work.
     pub async fn wait_for_idle(&self) {
-        self.control.drain_control().await;
-        self.io.inner.metadata_work.wait_for_idle().await;
+        self.control.wait_for_owned_work().await;
     }
 
     /// Paths/configuration are trusted broker inputs, never incoming RPC fields.
@@ -177,6 +178,7 @@ impl RemoteRepository {
             staging,
             staging_owner,
             control: Arc::new(tokio::sync::Semaphore::new(1)),
+            background_transfer: Arc::new(tokio::sync::Semaphore::new(1)),
             metadata: Arc::new(tokio::sync::Mutex::new(())),
             landing_client: tokio::sync::OnceCell::new(),
             metadata_work: Arc::new(io::OwnedWork::default()),

@@ -823,6 +823,7 @@ mod tests {
         let permit = repo.io.inner.control.clone().acquire_owned().await.unwrap();
         let scope = Arc::new(io::ControlScope::new(
             permit,
+            repo.io.inner.control.clone(),
             tokio::time::Instant::now() + Duration::from_millis(50),
             Arc::new(()),
         ));

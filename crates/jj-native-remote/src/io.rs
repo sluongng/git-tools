@@ -139,14 +139,22 @@ pub(crate) struct ControlScope {
     pub deadline: tokio::time::Instant,
     _owner: Arc<dyn std::any::Any + Send + Sync>,
     _parent: Option<Arc<ControlScope>>,
+    // Only the exact foreground semaphore grants control reentry. A transfer
+    // scope carries ownership/deadlines, never foreground mutation authority.
+    control: Option<Arc<tokio::sync::Semaphore>>,
     // Admission is the physical drain barrier: release only after external
     // command owners and inherited scopes have completed their teardown.
     _lease: Option<tokio::sync::OwnedSemaphorePermit>,
 }
 impl ControlScope {
-    pub fn with_owner(parent: Arc<Self>, owner: Arc<dyn std::any::Any + Send + Sync>) -> Arc<Self> {
+    pub fn with_owner(
+        parent: Arc<Self>,
+        owner: Arc<dyn std::any::Any + Send + Sync>,
+        deadline: tokio::time::Instant,
+    ) -> Arc<Self> {
         Arc::new(Self {
-            deadline: parent.deadline,
+            deadline: parent.deadline.min(deadline),
+            control: parent.control.clone(),
             _lease: None,
             _parent: Some(parent),
             _owner: owner,
@@ -154,23 +162,46 @@ impl ControlScope {
     }
     pub fn new(
         lease: tokio::sync::OwnedSemaphorePermit,
+        control: Arc<tokio::sync::Semaphore>,
         deadline: tokio::time::Instant,
         owner: Arc<dyn std::any::Any + Send + Sync>,
     ) -> Self {
         Self {
             _lease: Some(lease),
-            _parent: None,
+            _parent: scope(),
+            control: Some(control),
             deadline,
             _owner: owner,
         }
+    }
+    pub fn background_transfer(
+        lease: tokio::sync::OwnedSemaphorePermit,
+        deadline: tokio::time::Instant,
+        owner: Arc<dyn std::any::Any + Send + Sync>,
+    ) -> Self {
+        Self {
+            deadline,
+            _owner: owner,
+            _parent: None,
+            _lease: Some(lease),
+            control: None,
+        }
+    }
+    pub fn is_control_for(&self, control: &Arc<tokio::sync::Semaphore>) -> bool {
+        self.control
+            .as_ref()
+            .is_some_and(|held| Arc::ptr_eq(held, control))
+    }
+    pub fn has_control(&self) -> bool {
+        self.control.is_some()
     }
 }
 tokio::task_local! {static CONTROL_SCOPE:Arc<ControlScope>;}
 pub(crate) fn scope() -> Option<Arc<ControlScope>> {
     CONTROL_SCOPE.try_with(Arc::clone).ok()
 }
-pub(crate) fn in_control() -> bool {
-    scope().is_some()
+pub(crate) fn in_control_for(control: &Arc<tokio::sync::Semaphore>) -> bool {
+    scope().is_some_and(|scope| scope.is_control_for(control))
 }
 pub(crate) fn check_deadline() -> anyhow::Result<()> {
     if operation_context().is_some_and(|bound| tokio::time::Instant::now() >= bound.deadline)

@@ -152,7 +152,7 @@ impl RemoteObjectIo {
             match job.scope.clone() {
                 Some(scope) => {
                     io::control_scope(
-                        io::ControlScope::with_owner(scope, owner.clone()),
+                        io::ControlScope::with_owner(scope, owner.clone(), deadline),
                         operation,
                     )
                     .await
