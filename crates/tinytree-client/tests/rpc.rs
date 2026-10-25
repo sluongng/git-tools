@@ -8925,6 +8925,25 @@ async fn landing_compressed_preparation_replay_and_retained_results_are_checked(
     assert_eq!(receipt.destination, "main");
     assert_eq!(receipt.evidence, [44; 32]);
 
+    // The original target moved before Start. This is a durable rejection,
+    // without a candidate/check/receipt or a promise to retain source objects.
+    let mut preparation_stale = start.clone();
+    preparation_stale.idempotency_key = "stale-before-start-sdk".into();
+    let stale = ordinary.start_landing(&preparation_stale).await.unwrap();
+    assert_eq!(stale.phase(), LandingPhase::StaleTarget);
+    assert!(stale.candidate().is_none() && stale.receipt().is_none());
+    assert!(!stale.roots_retained());
+    let stale_id = stale.handle().id();
+    let stale_expiry = stale.expires_at_seconds();
+    drop(stale);
+    let replay = ordinary
+        .lookup_landing(&preparation_stale, Some(stale_id))
+        .await
+        .unwrap();
+    assert_eq!(replay.phase(), LandingPhase::StaleTarget);
+    assert_eq!(replay.expires_at_seconds(), stale_expiry);
+    drop(replay);
+
     // A trusted non-verdict terminal result is distinct from failed checks and
     // does not change the already committed reference or fabricate evidence.
     let committed_head = tinytree_model::CommitId(receipt.commit.key.id.0);
@@ -9281,7 +9300,25 @@ async fn landing_rejects_malformed_and_overbudget_assertions_and_cancellation_re
         ..Default::default()
     };
     let client = NativeClient::connect(config).await.unwrap();
-    let cases: [(&str, Box<dyn Fn(&mut l::LandingResponse)>); 17] = [
+    let cases: [(&str, Box<dyn Fn(&mut l::LandingResponse)>); 19] = [
+        (
+            "preparation stale with retained roots",
+            Box::new(|r| {
+                let job = r.job.as_mut().unwrap();
+                job.phase = l::Phase::StaleTarget as i32;
+                job.candidate = None;
+            }),
+        ),
+        (
+            "preparation stale with conflict",
+            Box::new(|r| {
+                let job = r.job.as_mut().unwrap();
+                job.phase = l::Phase::StaleTarget as i32;
+                job.candidate = None;
+                job.roots_retained = false;
+                job.conflict_path = Some("file.rs".into());
+            }),
+        ),
         (
             "unknown phase",
             Box::new(|r| r.job.as_mut().unwrap().phase = 999),

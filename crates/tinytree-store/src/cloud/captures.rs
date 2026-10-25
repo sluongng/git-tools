@@ -55,6 +55,28 @@ pub(super) fn decode_record(row: &[u8]) -> Result<CaptureRecord> {
         bytes: row[HEADER..].to_vec(),
     })
 }
+/// Minimum durable format for independently validated capture semantics. This
+/// classifies untrusted historical data; it never creates landing authority.
+pub(super) fn minimum_store_feature(data: &tinytree_cloud::CaptureData) -> u8 {
+    if data.version == 2 {
+        if data
+            .remote
+            .as_ref()
+            .and_then(|remote| remote.landing.as_ref())
+            .and_then(|landing| landing.observed.as_ref())
+            .is_some_and(|job| {
+                job.phase == tinytree_cloud::HistoricalLandingPhase::StaleTarget
+                    && job.candidate.is_none()
+            })
+        {
+            10
+        } else {
+            9
+        }
+    } else {
+        5
+    }
+}
 impl Inner {
     pub(super) fn capture_record(
         &self,

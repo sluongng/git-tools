@@ -377,9 +377,10 @@ fn checked(
         LandingPhase::Committed => has && received && !conflict,
         LandingPhase::Conflict => !has && !received && conflict && !job.roots_retained,
         LandingPhase::Unsupported => !has && !received && !conflict && !job.roots_retained,
-        LandingPhase::CheckFailed | LandingPhase::CheckUnavailable | LandingPhase::StaleTarget => {
+        LandingPhase::CheckFailed | LandingPhase::CheckUnavailable => {
             has && !received && !conflict && !job.roots_retained
         }
+        LandingPhase::StaleTarget => !received && !conflict && !job.roots_retained,
         LandingPhase::Expired => !received && !job.roots_retained && !(has && conflict),
     };
     if !valid {

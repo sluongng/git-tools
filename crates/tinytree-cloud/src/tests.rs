@@ -1717,6 +1717,13 @@ fn capture_data_is_bounded_portable_data_not_frontend_authority() {
             None,
         ),
         (
+            "stale_before_start",
+            HistoricalLandingPhase::StaleTarget,
+            false,
+            false,
+            Some("stale_target"),
+        ),
+        (
             "terminal_unavailable",
             HistoricalLandingPhase::CheckUnavailable,
             false,
@@ -1740,7 +1747,7 @@ fn capture_data_is_bounded_portable_data_not_frontend_authority() {
             expires_at_seconds: 12345,
             profile_name: "checks".into(),
             profile_version: "v1".into(),
-            candidate: Some(candidate.clone()),
+            candidate: (name != "stale_before_start").then(|| candidate.clone()),
             receipt: with_receipt.then(|| HistoricalLandingReceipt {
                 reference: "main".into(),
                 generation: 2,
@@ -1759,6 +1766,34 @@ fn capture_data_is_bounded_portable_data_not_frontend_authority() {
             p.result_roots.clear();
         }
         data.remote.as_mut().unwrap().landing = Some(p);
+        if name == "stale_before_start" {
+            let mut invalid = data.clone();
+            invalid
+                .remote
+                .as_mut()
+                .unwrap()
+                .landing
+                .as_mut()
+                .unwrap()
+                .observed
+                .as_mut()
+                .unwrap()
+                .roots_retained = true;
+            assert!(encode_capture_data(&invalid, limits).is_err());
+            let mut invalid = data.clone();
+            invalid
+                .remote
+                .as_mut()
+                .unwrap()
+                .landing
+                .as_mut()
+                .unwrap()
+                .observed
+                .as_mut()
+                .unwrap()
+                .conflict_path = Some("file.rs".into());
+            assert!(encode_capture_data(&invalid, limits).is_err());
+        }
         let encoded = encode_capture_data(&data, limits).unwrap_or_else(|e| panic!("{name}: {e}"));
         assert_eq!(
             decode_data(&encoded, data_digest(&encoded), &limits).unwrap(),

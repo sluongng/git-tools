@@ -196,9 +196,8 @@ impl HistoricalLandingJob {
             Committed => has && receipt && !conflict,
             Conflict => !has && !receipt && conflict && !self.roots_retained,
             Unsupported => !has && !receipt && !conflict && !self.roots_retained,
-            CheckFailed | CheckUnavailable | StaleTarget => {
-                has && !receipt && !conflict && !self.roots_retained
-            }
+            CheckFailed | CheckUnavailable => has && !receipt && !conflict && !self.roots_retained,
+            StaleTarget => !receipt && !conflict && !self.roots_retained,
             Expired => !receipt && !self.roots_retained && !(has && conflict),
         };
         if !valid {

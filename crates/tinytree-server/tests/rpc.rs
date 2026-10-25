@@ -8804,6 +8804,89 @@ async fn pinned_checker_receipts_publish_or_reject_and_recover_lost_reply() {
 }
 
 #[tokio::test]
+async fn target_movement_before_start_is_terminal_without_checker_dispatch() {
+    use tinytree_proto::landing_v1 as l;
+    let (_temporary, store, config, input, scratch) = checked_landing_setup("pass");
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+    store
+        .publish(
+            "alpha",
+            &tinytree_store::PublishRequest {
+                idempotency_key: "advance-before-start".into(),
+                reference_name: input.destination.clone(),
+                expected_generation: input.expected_generation,
+                new_commit: Some(CommitId(input.source_head.as_slice().try_into().unwrap())),
+                staging_leases: vec![],
+            },
+            now,
+        )
+        .unwrap();
+    let before = store
+        .references("alpha", &[input.destination.clone()])
+        .unwrap();
+    let running = Running::start_landing(
+        store.clone(),
+        config.service,
+        landing_principals(true),
+        true,
+    )
+    .await;
+    let mut client = running.landing_client().await;
+    let job = client
+        .start_landing(request(input.clone(), ALPHA))
+        .await
+        .unwrap()
+        .into_inner()
+        .job
+        .unwrap();
+    assert_eq!(job.phase, l::Phase::StaleTarget as i32);
+    assert!(!job.roots_retained);
+    assert!(job.candidate.is_none() && job.receipt.is_none() && job.conflict_path.is_none());
+    let replay = client
+        .start_landing(request(input.clone(), ALPHA))
+        .await
+        .unwrap()
+        .into_inner()
+        .job
+        .unwrap();
+    assert_eq!(job, replay);
+    let get = l::GetLandingRequest {
+        repository_id: "alpha".into(),
+        idempotency_key: input.idempotency_key,
+    };
+    assert_eq!(
+        client
+            .get_landing(request(get, ALPHA))
+            .await
+            .unwrap()
+            .into_inner()
+            .job
+            .unwrap(),
+        job
+    );
+    assert!(
+        store
+            .scan_pending_landings("alpha", None, Default::default())
+            .unwrap()
+            .jobs
+            .is_empty()
+    );
+    assert_eq!(
+        store.references("alpha", &[input.destination]).unwrap(),
+        before
+    );
+    running.stop().await;
+    assert!(
+        !scratch.join("started").exists(),
+        "terminal rejection never launches a check"
+    );
+    assert!(!scratch.join("executions").exists());
+}
+
+#[tokio::test]
 async fn target_movement_while_checking_rejects_exact_old_candidate() {
     use tinytree_proto::landing_v1 as l;
     let (_temporary, store, config, input, scratch) = checked_landing_setup("pause");

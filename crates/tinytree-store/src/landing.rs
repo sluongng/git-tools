@@ -575,9 +575,10 @@ impl Inner {
                     && r.conflict.is_none()
             }
             LandingState::StaleTarget => {
-                r.candidate.is_some()
-                    && r.check.as_ref().is_some_and(|v| v.passed)
-                    && r.reference.is_none()
+                (match &r.candidate {
+                    Some(_) => r.check.as_ref().is_some_and(|v| v.passed),
+                    None => r.check.is_none(),
+                }) && r.reference.is_none()
                     && r.conflict.is_none()
             }
             LandingState::Expired => r.reference.is_none(),
@@ -691,7 +692,9 @@ impl Inner {
         advance_feature(
             &mut tx,
             &self.spaces.meta,
-            if r.state == LandingState::CheckUnavailable {
+            if r.state == LandingState::StaleTarget && r.candidate.is_none() {
+                10
+            } else if r.state == LandingState::CheckUnavailable {
                 8
             } else {
                 6
@@ -904,6 +907,14 @@ impl Inner {
                 .try_into()
                 .map_err(|_| Error::Corrupt("landing key"))?;
             let record = self.decode_landing(repo, id, &v)?;
+            if record.state == LandingState::StaleTarget
+                && record.candidate.is_none()
+                && feature < 10
+            {
+                return Err(Error::Corrupt(
+                    "preparation-stale landing without store feature",
+                ));
+            }
             if record.state == LandingState::CheckUnavailable && feature < 8 {
                 return Err(Error::Corrupt("unavailable landing without store feature"));
             }
@@ -987,63 +998,79 @@ impl Store {
             &self.inner.config,
             self.inner.config.landing.max_validation_metadata_bytes,
         )?;
-        let _gate = self.inner.lock()?;
-        if let Some(r) = self.inner.landing_record(repo, id)? {
-            if r.fingerprint != digest {
-                return Err(Error::IdempotencyConflict);
+        loop {
+            let _gate = self.inner.lock()?;
+            if let Some(r) = self.inner.landing_record(repo, id)? {
+                if r.fingerprint != digest {
+                    return Err(Error::IdempotencyConflict);
+                }
+                return public(id, &r);
             }
+            let view = self.inner.db.read_tx();
+            let current = super::reference(
+                intent.reference.clone(),
+                view.get(
+                    &self.inner.spaces.refs,
+                    key(repo, intent.reference.as_bytes()),
+                )?
+                .as_deref(),
+            )?;
+            let stale = current.generation != intent.generation
+                || current.commit.map(|d| d.key)
+                    != Some(ObjectKey {
+                        kind: Kind::Commit,
+                        id: ObjectId(intent.target),
+                    });
+            if stale && store_feature(view.get(&self.inner.spaces.meta, b"format")?.as_deref())? < 7
+            {
+                // Higher formats require the durable external-check namespace, but
+                // no check runner or attempt is created for this terminal rejection.
+                // Keep the source WorkGuard alive while changing the layout outside
+                // the Store gate, then repeat all acceptance checks under the gate.
+                drop(view);
+                drop(_gate);
+                self.enable_external_checks()?;
+                continue;
+            }
+            let count = view
+                .prefix(&self.inner.spaces.landing, key(repo, b""))
+                .take(self.inner.config.landing.max_jobs_per_repository + 1)
+                .try_fold(0usize, |n, item| {
+                    item.into_inner()?;
+                    Ok::<_, Error>(n + 1)
+                })?;
+            if count >= self.inner.config.landing.max_jobs_per_repository {
+                return Err(Error::Limit("landing accepted job quota"));
+            }
+            if !stale {
+                self.inner
+                    .check_cloud_gc_union(repo, &roots(&intent).collect::<Vec<_>>(), None)?;
+            }
+            let limits = limits_record(self.inner.config.landing.candidate);
+            let r = Record {
+                version: 1,
+                owner: owner.0,
+                fingerprint: digest,
+                frozen: frozen(&intent, limits, self.inner.config.landing.max_record_bytes)?,
+                intent,
+                limits,
+                state: if stale {
+                    LandingState::StaleTarget
+                } else {
+                    LandingState::Intent
+                },
+                roots_released: stale,
+                candidate: None,
+                candidate_digest: None,
+                check: None,
+                reference: None,
+                conflict: None,
+            };
+            self.inner.landing_write(repo, id, &r)?;
+            drop(_gate);
+            drop(guard);
             return public(id, &r);
         }
-        let view = self.inner.db.read_tx();
-        let current = super::reference(
-            intent.reference.clone(),
-            view.get(
-                &self.inner.spaces.refs,
-                key(repo, intent.reference.as_bytes()),
-            )?
-            .as_deref(),
-        )?;
-        if current.generation != intent.generation
-            || current.commit.map(|d| d.key)
-                != Some(ObjectKey {
-                    kind: Kind::Commit,
-                    id: ObjectId(intent.target),
-                })
-        {
-            return Err(Error::StaleReference(current));
-        }
-        let count = view
-            .prefix(&self.inner.spaces.landing, key(repo, b""))
-            .take(self.inner.config.landing.max_jobs_per_repository + 1)
-            .try_fold(0usize, |n, item| {
-                item.into_inner()?;
-                Ok::<_, Error>(n + 1)
-            })?;
-        if count >= self.inner.config.landing.max_jobs_per_repository {
-            return Err(Error::Limit("landing accepted job quota"));
-        }
-        self.inner
-            .check_cloud_gc_union(repo, &roots(&intent).collect::<Vec<_>>(), None)?;
-        let limits = limits_record(self.inner.config.landing.candidate);
-        let r = Record {
-            version: 1,
-            owner: owner.0,
-            fingerprint: digest,
-            frozen: frozen(&intent, limits, self.inner.config.landing.max_record_bytes)?,
-            intent,
-            limits,
-            state: LandingState::Intent,
-            roots_released: false,
-            candidate: None,
-            candidate_digest: None,
-            check: None,
-            reference: None,
-            conflict: None,
-        };
-        self.inner.landing_write(repo, id, &r)?;
-        drop(_gate);
-        drop(guard);
-        public(id, &r)
     }
     /// Build from the persisted immutable intent. Restart retries reconstruct the
     /// same candidate. Physical root ownership outlives concurrent expiry.

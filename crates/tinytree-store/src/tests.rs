@@ -6162,122 +6162,236 @@ fn capture_size_boundary_accepts_a_large_canonical_operation_inventory_as_a_bina
 #[test]
 fn landing_capture_activates_its_atomic_feature_and_rejects_downgraded_reopen() {
     use tinytree_cloud as c;
-    let (directory, store) = open();
-    let owner = CloudOwner {
-        principal: [95; 32],
-    };
-    let (_, tree, head) = fixture(&store, "portable landing source");
-    let (history, leases, artifacts) = cloud_v2_capture(
-        &store,
-        owner,
-        head,
-        tree,
-        c::PortableIndexSnapshot {
-            roots: vec![CommitId(head.key.id.0)],
-            drafts: vec![],
-        },
-    );
-    let mut request = captured_cloud_request(
-        &store,
-        owner,
-        history,
-        leases,
-        &artifacts,
-        0,
-        "landing-capture",
-    );
-    let mut data = c::decode_data(
-        &request.capture_data,
-        c::data_digest(&request.capture_data),
-        &Default::default(),
-    )
-    .unwrap();
-    data.version = 2;
-    data.remote = Some(c::PortableRemoteState {
-        observations: vec![],
-        archived_pushes: vec![],
-        landing: Some(c::PortableLanding {
-            request_id: "12".repeat(16),
-            source_base: "00".repeat(32),
-            source_head: hex(&head.key.id.0),
-            reference: "main".into(),
-            bookmark: "main".into(),
-            generation: 1,
-            expected_head: hex(&head.key.id.0),
-            profile_name: "checks".into(),
-            profile_version: "v1".into(),
-            source_operation: data.working_copy.wc_operation.clone(),
-            source_stack: vec![hex(&head.key.id.0)],
-            fork_operation: None,
-            fork_acknowledged: false,
-            job_id: None,
-            result_roots: vec![],
-            candidate_head: None,
-            apply_operation: None,
-            operation_writing: None,
-            acknowledged: false,
-            terminal: None,
-            observed: None,
-            restored_lookup_only: false,
-        }),
-    });
-    request.capture_data = c::encode_capture_data(&data, Default::default()).unwrap();
-    let mut manifest = c::decode_manifest_v3(
-        &request.publication.manifest_bytes,
-        request.publication.manifest,
-        Default::default(),
-    )
-    .unwrap();
-    manifest.capture = c::CaptureDescriptor::of(&request.capture_data);
-    manifest.history.recovery.intent_roots =
-        c::capture_recovery_intents(&data, manifest.capture.id, Default::default()).unwrap();
-    request.publication.manifest_bytes =
-        c::encode_manifest_v3(&manifest, Default::default()).unwrap();
-    request.publication.manifest = c::ManifestId::of(&request.publication.manifest_bytes);
-    let publication = store
-        .publish_captured_cloud_version("demo", owner, &request, 1, &Default::default())
+    for (stale_before_acceptance, required_format) in [
+        (false, b"tinytree-store-9".as_slice()),
+        (true, b"tinytree-store-10".as_slice()),
+    ] {
+        let (directory, store) = open();
+        let owner = CloudOwner {
+            principal: [95; 32],
+        };
+        let (_, tree, head) = fixture(&store, "portable landing source");
+        let (history, leases, artifacts) = cloud_v2_capture(
+            &store,
+            owner,
+            head,
+            tree,
+            c::PortableIndexSnapshot {
+                roots: vec![CommitId(head.key.id.0)],
+                drafts: vec![],
+            },
+        );
+        let mut request = captured_cloud_request(
+            &store,
+            owner,
+            history,
+            leases,
+            &artifacts,
+            0,
+            "landing-capture",
+        );
+        let mut data = c::decode_data(
+            &request.capture_data,
+            c::data_digest(&request.capture_data),
+            &Default::default(),
+        )
         .unwrap();
-    assert_eq!(publication.workspace.generation, 1);
-    assert_eq!(
-        store
-            .inner
-            .db
-            .read_tx()
-            .get(&store.inner.spaces.meta, b"format")
+        data.version = 2;
+        data.remote = Some(c::PortableRemoteState {
+            observations: vec![],
+            archived_pushes: vec![],
+            landing: Some(c::PortableLanding {
+                request_id: "12".repeat(16),
+                source_base: "00".repeat(32),
+                source_head: hex(&head.key.id.0),
+                reference: "main".into(),
+                bookmark: "main".into(),
+                generation: 1,
+                expected_head: hex(&head.key.id.0),
+                profile_name: "checks".into(),
+                profile_version: "v1".into(),
+                source_operation: data.working_copy.wc_operation.clone(),
+                source_stack: vec![hex(&head.key.id.0)],
+                fork_operation: None,
+                fork_acknowledged: false,
+                job_id: None,
+                result_roots: vec![],
+                candidate_head: None,
+                apply_operation: None,
+                operation_writing: None,
+                acknowledged: false,
+                terminal: None,
+                observed: None,
+                restored_lookup_only: false,
+            }),
+        });
+        request.capture_data = c::encode_capture_data(&data, Default::default()).unwrap();
+        let mut manifest = c::decode_manifest_v3(
+            &request.publication.manifest_bytes,
+            request.publication.manifest,
+            Default::default(),
+        )
+        .unwrap();
+        manifest.capture = c::CaptureDescriptor::of(&request.capture_data);
+        manifest.history.recovery.intent_roots =
+            c::capture_recovery_intents(&data, manifest.capture.id, Default::default()).unwrap();
+        request.publication.manifest_bytes =
+            c::encode_manifest_v3(&manifest, Default::default()).unwrap();
+        request.publication.manifest = c::ManifestId::of(&request.publication.manifest_bytes);
+        if stale_before_acceptance {
+            let landing = data.remote.as_mut().unwrap().landing.as_mut().unwrap();
+            landing.fork_operation = Some(landing.source_operation.clone());
+            landing.fork_acknowledged = true;
+            landing.job_id = Some("17".repeat(32));
+            landing.terminal = Some("stale_target".into());
+            landing.observed = Some(c::HistoricalLandingJob {
+                job_id: [23; 32],
+                phase: c::HistoricalLandingPhase::StaleTarget,
+                preparation: c::HistoricalLandingPreparation::ProfileConfigured,
+                roots_retained: false,
+                expires_at_seconds: 12345,
+                profile_name: "checks".into(),
+                profile_version: "v1".into(),
+                candidate: None,
+                receipt: None,
+                conflict_path: None,
+            });
+            request.capture_data = c::encode_capture_data(&data, Default::default()).unwrap();
+            manifest.capture = c::CaptureDescriptor::of(&request.capture_data);
+            manifest.history.recovery.intent_roots =
+                c::capture_recovery_intents(&data, manifest.capture.id, Default::default())
+                    .unwrap();
+            request.publication.manifest_bytes =
+                c::encode_manifest_v3(&manifest, Default::default()).unwrap();
+            request.publication.manifest = c::ManifestId::of(&request.publication.manifest_bytes);
+        }
+        let mut failed = request.publication.clone();
+        failed.expected_generation = 1;
+        assert!(
+            store
+                .publish_captured_cloud_version(
+                    "demo",
+                    owner,
+                    &PublishCapturedCloudRequest {
+                        publication: failed,
+                        capture_data: request.capture_data.clone()
+                    },
+                    1,
+                    &Default::default()
+                )
+                .is_err()
+        );
+        assert!(
+            store_feature(
+                store
+                    .inner
+                    .db
+                    .read_tx()
+                    .get(&store.inner.spaces.meta, b"format")
+                    .unwrap()
+                    .as_deref()
+            )
             .unwrap()
+                < 9
+        );
+        assert!(
+            store
+                .inner
+                .db
+                .read_tx()
+                .iter(&store.inner.spaces.landing)
+                .next()
+                .is_none()
+        );
+        let mut quota = CloudPublicationLimits::default();
+        quota.retention.max_unique_bytes_per_principal = 1;
+        assert!(matches!(
+            store.publish_captured_cloud_version("demo", owner, &request, 1, &quota),
+            Err(Error::Limit("principal promised closure byte quota"))
+        ));
+        assert!(
+            store_feature(
+                store
+                    .inner
+                    .db
+                    .read_tx()
+                    .get(&store.inner.spaces.meta, b"format")
+                    .unwrap()
+                    .as_deref()
+            )
             .unwrap()
-            .as_ref(),
-        b"tinytree-store-9"
-    );
-    assert!(
-        store.external_checks_directory().unwrap().is_some(),
-        "higher feature preserves prior durable layout fence without dispatching checks"
-    );
-    drop(store);
-    drop(Store::open_existing(directory.path(), config()).unwrap());
-    let set_format = |value: &[u8]| {
-        let db = SingleWriterTxDatabase::builder(directory.path().join("metadata"))
-            .open()
+                < 9,
+            "failed quota after layout setup cannot advance the capsule feature"
+        );
+        assert!(
+            store
+                .cloud_publication("demo", owner, "landing-capture")
+                .unwrap()
+                .is_none()
+        );
+        let publication = store
+            .publish_captured_cloud_version("demo", owner, &request, 1, &Default::default())
             .unwrap();
-        let meta = db.keyspace("meta", KeyspaceCreateOptions::default).unwrap();
-        let mut tx = db.write_tx().durability(Some(PersistMode::SyncAll));
-        tx.insert(&meta, b"format", value);
-        tx.commit().unwrap();
-    };
-    set_format(b"tinytree-store-8");
-    assert!(matches!(
-        Store::open_existing(directory.path(), config()),
-        Err(Error::Corrupt("landing capture without store feature"))
-    ));
-    set_format(b"tinytree-store-9");
-    let reopened = Store::open_existing(directory.path(), config()).unwrap();
-    assert_eq!(
-        reopened
-            .cloud_publication("demo", owner, "landing-capture")
-            .unwrap()
-            .unwrap(),
-        publication
-    );
+        assert_eq!(publication.workspace.generation, 1);
+        assert!(
+            store
+                .inner
+                .db
+                .read_tx()
+                .iter(&store.inner.spaces.landing)
+                .next()
+                .is_none(),
+            "historical capsule observations never create local landing jobs"
+        );
+        assert_eq!(
+            store.references("demo", &["main".into()]).unwrap()[0].generation,
+            0
+        );
+        assert_eq!(
+            store
+                .inner
+                .db
+                .read_tx()
+                .get(&store.inner.spaces.meta, b"format")
+                .unwrap()
+                .unwrap()
+                .as_ref(),
+            required_format
+        );
+        assert!(
+            store.external_checks_directory().unwrap().is_some(),
+            "higher feature preserves prior durable layout fence without dispatching checks"
+        );
+        drop(store);
+        drop(Store::open_existing(directory.path(), config()).unwrap());
+        let set_format = |value: &[u8]| {
+            let db = SingleWriterTxDatabase::builder(directory.path().join("metadata"))
+                .open()
+                .unwrap();
+            let meta = db.keyspace("meta", KeyspaceCreateOptions::default).unwrap();
+            let mut tx = db.write_tx().durability(Some(PersistMode::SyncAll));
+            tx.insert(&meta, b"format", value);
+            tx.commit().unwrap();
+        };
+        set_format(if stale_before_acceptance {
+            b"tinytree-store-9"
+        } else {
+            b"tinytree-store-8"
+        });
+        assert!(matches!(
+            Store::open_existing(directory.path(), config()),
+            Err(Error::Corrupt("landing capture without store feature"))
+        ));
+        set_format(required_format);
+        let reopened = Store::open_existing(directory.path(), config()).unwrap();
+        assert_eq!(
+            reopened
+                .cloud_publication("demo", owner, "landing-capture")
+                .unwrap()
+                .unwrap(),
+            publication
+        );
+    }
 }
 
 #[test]
@@ -6809,6 +6923,126 @@ fn landing_checks_bind_candidate_root_profile_and_cannot_turn_failure_into_publi
 }
 
 #[test]
+fn landing_target_moved_before_acceptance_is_durable_without_candidate_or_roots() {
+    let (directory, store) = open();
+    let owner = LandingOwner([31; 32]);
+    let (base, source, dest) = landing_fixture(&store, "demo");
+    let input = landing_request(base, source, dest, "stale-before-acceptance");
+    let next = landing_commit(
+        &store,
+        "demo",
+        CommitId(dest.key.id.0),
+        TreeId(tinytree_model::empty_tree().descriptor.key.id.0),
+        32,
+        "another writer",
+    );
+    store
+        .publish("demo", &request("other-writer", 1, Some(next)), 1)
+        .unwrap();
+    let before = store
+        .references("demo", std::slice::from_ref(&input.reference_name))
+        .unwrap();
+    let stale = store.begin_landing("demo", owner, &input, 2).unwrap();
+    assert_eq!(stale.state, LandingState::StaleTarget);
+    assert!(!stale.roots_retained);
+    assert!(stale.candidate.is_none() && stale.receipt.is_none() && stale.conflict_path.is_none());
+    assert_eq!(stale.expires_at, input.expires_at);
+    assert_eq!(
+        store
+            .prepare_landing("demo", owner, &input.idempotency_key, 3)
+            .unwrap(),
+        stale
+    );
+    assert_eq!(
+        store
+            .finalize_landing("demo", owner, &input.idempotency_key, 3)
+            .unwrap(),
+        stale
+    );
+    assert!(
+        store
+            .scan_pending_landings("demo", None, Default::default())
+            .unwrap()
+            .jobs
+            .is_empty()
+    );
+    assert!(store.external_checks_directory().unwrap().is_some());
+    let mut replay = input.clone();
+    replay.committer.timestamp.millis_since_epoch += 1;
+    replay.expires_at += 1;
+    assert_eq!(
+        store.begin_landing("demo", owner, &replay, 3).unwrap(),
+        stale
+    );
+    let mut changed = input.clone();
+    changed.expected_generation = 2;
+    changed.expected_head = CommitId(next.key.id.0);
+    assert!(matches!(
+        store.begin_landing("demo", owner, &changed, 3),
+        Err(Error::IdempotencyConflict)
+    ));
+    changed.idempotency_key = "fresh-after-stale".into();
+    let fresh = store.begin_landing("demo", owner, &changed, 3).unwrap();
+    assert_eq!(fresh.state, LandingState::Intent);
+    store
+        .expire_landing("demo", owner, &changed.idempotency_key, changed.expires_at)
+        .unwrap();
+    assert_eq!(
+        store
+            .references("demo", std::slice::from_ref(&input.reference_name))
+            .unwrap(),
+        before
+    );
+    store.gc("demo", 1000).unwrap();
+    assert!(
+        store.descriptor("demo", source.key).unwrap().is_none(),
+        "terminal rejection makes no source residency promise"
+    );
+    assert_eq!(
+        store.begin_landing("demo", owner, &input, 1001).unwrap(),
+        stale
+    );
+    drop(store);
+    let store = Store::open_existing(directory.path(), config()).unwrap();
+    assert_eq!(
+        store
+            .landing_job("demo", owner, &input.idempotency_key)
+            .unwrap(),
+        Some(stale.clone())
+    );
+    assert_eq!(
+        store
+            .inner
+            .db
+            .read_tx()
+            .get(&store.inner.spaces.meta, b"format")
+            .unwrap()
+            .unwrap()
+            .as_ref(),
+        b"tinytree-store-10"
+    );
+    drop(store);
+    let set_format = |format: &[u8]| {
+        let db = SingleWriterTxDatabase::builder(directory.path().join("metadata"))
+            .open()
+            .unwrap();
+        let meta = db.keyspace("meta", KeyspaceCreateOptions::default).unwrap();
+        let mut tx = db.write_tx().durability(Some(PersistMode::SyncAll));
+        tx.insert(&meta, b"format", format);
+        tx.commit().unwrap();
+    };
+    set_format(b"tinytree-store-9");
+    assert!(matches!(
+        Store::open_existing(directory.path(), config()),
+        Err(Error::Corrupt(
+            "preparation-stale landing without store feature"
+        ))
+    ));
+    set_format(b"tinytree-store-10");
+    drop(Store::open_existing(directory.path(), config()).unwrap());
+}
+
+#[test]
 fn landing_competing_jobs_have_one_atomic_winner_and_a_durable_stale_result() {
     let (directory, store) = open();
     let owner = LandingOwner([3; 32]);
@@ -6991,6 +7225,34 @@ fn landing_scoped_replay_and_quota_fail_closed_without_forgetting_accepted_resul
         store.begin_landing("demo", owner, &different, 100),
         Err(Error::Limit("landing accepted job quota"))
     ));
+    store
+        .publish("demo", &request("quota-other-writer", 1, Some(source)), 100)
+        .unwrap();
+    different.idempotency_key = "stale-at-quota".into();
+    assert!(matches!(
+        store.begin_landing("demo", owner, &different, 100),
+        Err(Error::Limit("landing accepted job quota"))
+    ));
+    assert!(
+        store
+            .landing_job("demo", owner, &different.idempotency_key)
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        store_feature(
+            store
+                .inner
+                .db
+                .read_tx()
+                .get(&store.inner.spaces.meta, b"format")
+                .unwrap()
+                .as_deref()
+        )
+        .unwrap()
+            < 10,
+        "failed rejection admission cannot advance its atomic feature"
+    );
     assert_eq!(
         store.landing_job("demo", owner, "same").unwrap().unwrap(),
         expired

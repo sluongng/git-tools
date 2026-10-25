@@ -376,6 +376,7 @@ fn store_feature(value: Option<&[u8]>) -> Result<u8> {
         Some(b"tinytree-store-7") => Ok(7),
         Some(b"tinytree-store-8") => Ok(8),
         Some(b"tinytree-store-9") => Ok(9),
+        Some(b"tinytree-store-10") => Ok(10),
         _ => Err(Error::Corrupt("store format")),
     }
 }
@@ -395,6 +396,7 @@ fn advance_feature(
             7 => b"tinytree-store-7".as_slice(),
             8 => b"tinytree-store-8".as_slice(),
             9 => b"tinytree-store-9".as_slice(),
+            10 => b"tinytree-store-10".as_slice(),
             _ => return Err(Error::Invalid("store feature")),
         };
         tx.insert(meta, b"format", value);

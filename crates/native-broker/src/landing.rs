@@ -165,7 +165,6 @@ fn checked(job: &l::LandingJob, intent: &LandingIntent) -> Result<(), Status> {
                 | P::Committed
                 | P::CheckFailed
                 | P::CheckUnavailable
-                | P::StaleTarget
         ) && job.candidate.is_none()
         || matches!(phase, P::Intent | P::Conflict | P::Unsupported) && job.candidate.is_some()
     {
@@ -179,9 +178,8 @@ fn checked(job: &l::LandingJob, intent: &LandingIntent) -> Result<(), Status> {
         P::Committed => has && !conflict,
         P::Conflict => !has && conflict && !job.roots_retained,
         P::Unsupported => !has && !conflict && !job.roots_retained,
-        P::CheckFailed | P::CheckUnavailable | P::StaleTarget => {
-            has && !conflict && !job.roots_retained
-        }
+        P::CheckFailed | P::CheckUnavailable => has && !conflict && !job.roots_retained,
+        P::StaleTarget => !conflict && !job.roots_retained,
         P::Expired => !job.roots_retained && !(has && conflict),
         P::Unspecified => false,
     };

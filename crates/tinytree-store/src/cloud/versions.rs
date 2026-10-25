@@ -160,7 +160,7 @@ fn snapshot_memory(value: &tinytree_cloud::PortableIndexSnapshot) -> Result<usiz
 }
 #[derive(Clone)]
 struct VersionRoots {
-    landing_recovery: bool,
+    capture_feature: u8,
     native: Vec<ObjectKey>,
     artifacts: Vec<IndexArtifactDescriptor>,
     extra: ExtraWork,
@@ -485,7 +485,7 @@ fn decode_version_roots(
 ) -> Result<VersionRoots> {
     if format == 1 {
         return Ok(VersionRoots {
-            landing_recovery: false,
+            capture_feature: 0,
             native: decode_roots(bytes, id, native_max)?,
             artifacts: Vec::new(),
             extra: ExtraWork::default(),
@@ -543,7 +543,7 @@ fn decode_version_roots(
         });
     }
     Ok(VersionRoots {
-        landing_recovery: false,
+        capture_feature: 0,
         native,
         artifacts,
         extra,
@@ -871,7 +871,7 @@ impl Inner {
             _ => return Err(Error::Invalid("cloud capture attachment selection")),
         }
         self.check_version_work(manifest)?;
-        let mut landing_recovery = false;
+        let mut capture_feature = 0;
         let mut objects = Vec::with_capacity(manifest.members.len());
         let mut retained = objects
             .capacity()
@@ -1128,7 +1128,8 @@ impl Inner {
                         binding_limits,
                     )
                     .map_err(|error| v2_error(error, "cloud capture export binding"))?;
-                    landing_recovery = verified.capture_data_version() == 2;
+                    capture_feature =
+                        super::captures::minimum_store_feature(verified.capture_data());
                     drop(verified);
                 }
                 artifacts = loaded
@@ -1214,7 +1215,7 @@ impl Inner {
             self.closure(repo, manifest.native_roots.iter().copied(), true, files)?;
         }
         Ok(VersionRoots {
-            landing_recovery,
+            capture_feature,
             native: manifest.native_roots.clone(),
             artifacts,
             extra,
@@ -2077,7 +2078,7 @@ impl Store {
             Some(true),
             capture_data,
         )?;
-        if roots.landing_recovery {
+        if roots.capture_feature >= 9 {
             // Feature nine includes the earlier Store-owned layout fence. This
             // establishes only the empty durable namespace, never a runner or
             // permission to dispatch checks.
@@ -2283,8 +2284,7 @@ impl Store {
             &mut tx,
             &self.inner.spaces.meta,
             match manifest.format() {
-                3 if roots.landing_recovery => 9,
-                3 => 5,
+                3 => roots.capture_feature.max(5),
                 2 => 4,
                 _ => 3,
             },
@@ -2895,9 +2895,8 @@ impl Inner {
                             &limits,
                         )
                         .map_err(|_| Error::Corrupt("cloud capture data schema"))?;
-                        if data.version == 2
-                            && store_feature(view.get(&self.spaces.meta, b"format")?.as_deref())?
-                                < 9
+                        if store_feature(view.get(&self.spaces.meta, b"format")?.as_deref())?
+                            < super::captures::minimum_store_feature(&data)
                         {
                             return Err(Error::Corrupt("landing capture without store feature"));
                         }

@@ -4498,6 +4498,14 @@ fn landing_reports_are_bound_to_original_intent_and_check_state() {
     unavailable.phase = l::Phase::CheckUnavailable as i32;
     unavailable.roots_retained = false;
     LandingReport::checked(unavailable.clone(), &intent, Arc::new(())).unwrap();
+    let mut preparation_stale = job.clone();
+    preparation_stale.phase = l::Phase::StaleTarget as i32;
+    preparation_stale.roots_retained = false;
+    LandingReport::checked(preparation_stale.clone(), &intent, Arc::new(())).unwrap();
+    let mut retained_stale = preparation_stale.clone();
+    retained_stale.roots_retained = true;
+    let mut conflicting_stale = preparation_stale;
+    conflicting_stale.conflict_path = Some("file.rs".into());
     let mut retained_unavailable = unavailable.clone();
     retained_unavailable.roots_retained = true;
     let mut unavailable_without_candidate = unavailable;
@@ -4515,6 +4523,8 @@ fn landing_reports_are_bound_to_original_intent_and_check_state() {
     conflict_with_candidate.roots_retained = false;
     conflict_with_candidate.conflict_path = Some("file.rs".into());
     for (name, invalid) in [
+        ("preparation_stale_with_retained_roots", retained_stale),
+        ("preparation_stale_with_conflict", conflicting_stale),
         ("unretained_intent", no_hold),
         ("changed_profile", wrong_profile),
         ("candidate_before_preparation", premature_candidate),
