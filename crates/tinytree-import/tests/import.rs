@@ -221,16 +221,36 @@ async fn committed_snapshot_ignores_dirty_and_untracked_files_and_publishes_larg
     let running = Running::new().await;
     let config_file = running._temporary.path().join("client.toml");
     std::fs::write(&config_file, toml::to_string(&running.config).unwrap()).unwrap();
-    let output = tokio::process::Command::new(env!("CARGO_BIN_EXE_tinytree-import"))
-        .args(["--source-git"])
-        .arg(&input.work)
-        .args(["--revision", &input.revision, "--config"])
-        .arg(&config_file)
-        .args(["--reference", "snapshots/example", "--git"])
-        .arg(git_path())
+    let snapshot_command = || {
+        let mut command = tokio::process::Command::new(env!("CARGO_BIN_EXE_tinytree-import"));
+        command
+            .args(["--source-git"])
+            .arg(&input.work)
+            .args(["--revision", &input.revision, "--config"])
+            .arg(&config_file)
+            .args(["--reference", "snapshots/example", "--git"])
+            .arg(git_path());
+        command
+    };
+    let rejected = snapshot_command()
+        .args(["--max-commits", "1"])
         .output()
         .await
         .unwrap();
+    assert_eq!(rejected.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&rejected.stderr).contains("--history"));
+    assert!(
+        running
+            .client()
+            .await
+            .open(vec!["snapshots/example".into()])
+            .await
+            .unwrap()
+            .references[0]
+            .commit
+            .is_none()
+    );
+    let output = snapshot_command().output().await.unwrap();
     assert!(
         output.status.success(),
         "{}",
@@ -564,18 +584,46 @@ async fn history_cli_roundtrip_preserves_all_original_git_ids_and_recovers_prove
     );
     let config_file = input._temporary.path().join("history-client.toml");
     std::fs::write(&config_file, toml::to_string(&running.config).unwrap()).unwrap();
-    let result = tokio::process::Command::new(env!("CARGO_BIN_EXE_tinytree-import"))
-        .arg("--history")
-        .arg("--state")
-        .arg(&options.state_dir)
-        .arg("--source-git")
-        .arg(&input.work)
-        .arg("--revision")
-        .arg(&head)
-        .arg("--config")
-        .arg(&config_file)
-        .args(["--reference", "history/main", "--git"])
-        .arg(git_path())
+    let history_command = || {
+        let mut command = tokio::process::Command::new(env!("CARGO_BIN_EXE_tinytree-import"));
+        command
+            .arg("--history")
+            .arg("--state")
+            .arg(&options.state_dir)
+            .arg("--source-git")
+            .arg(&input.work)
+            .arg("--revision")
+            .arg(&head)
+            .arg("--config")
+            .arg(&config_file)
+            .args(["--reference", "history/main", "--git"])
+            .arg(git_path());
+        command
+    };
+    let rejected = history_command()
+        .args(["--max-commits", "4"])
+        .output()
+        .await
+        .unwrap();
+    assert!(!rejected.status.success());
+    assert!(
+        String::from_utf8_lossy(&rejected.stderr).contains("history commit limit exceeded"),
+        "{}",
+        String::from_utf8_lossy(&rejected.stderr)
+    );
+    assert!(
+        running
+            .client()
+            .await
+            .open(vec!["history/main".into()])
+            .await
+            .unwrap()
+            .references[0]
+            .commit
+            .is_none()
+    );
+    let result = history_command()
+        .args(["--max-commits", "5"])
         .output()
         .await
         .unwrap();

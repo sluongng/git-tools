@@ -9,6 +9,9 @@ struct Args {
     source_git: PathBuf,
     #[arg(long, requires = "state")]
     history: bool,
+    /// Maximum commits to migrate in history mode.
+    #[arg(long, requires = "history")]
+    max_commits: Option<usize>,
     #[arg(long, requires = "history")]
     state: Option<PathBuf>,
     #[arg(long)]
@@ -37,6 +40,9 @@ async fn main() -> anyhow::Result<()> {
     if args.history {
         use tinytree_import::history::{HistoryLimits, HistoryOptions, import_history};
         let limits = HistoryLimits {
+            max_commits: args
+                .max_commits
+                .unwrap_or_else(|| HistoryLimits::default().max_commits),
             max_entries: args.max_entries,
             max_file_bytes: args.max_file_bytes,
             max_total_bytes: args.max_total_bytes,
