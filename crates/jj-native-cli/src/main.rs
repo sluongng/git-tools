@@ -1,5 +1,6 @@
 //! Native jj entry point. User workspaces require daemon-owned lazy jj-vfs.
 mod broker;
+mod cloud;
 mod commands;
 mod history;
 mod landing;
@@ -28,6 +29,8 @@ enum NativeCommand {
 
 #[derive(clap::Subcommand, Clone, Debug)]
 enum TinytreeCommand {
+    /// Discover retained cloud workspaces and restore a selected version.
+    Cloud(cloud::CloudArgs),
     /// Submit a frozen native stack to server-owned checks, or reconcile its result.
     Land(landing::LandArgs),
     /// Search an immutable revision, including local draft and dirty-file overlays.
@@ -132,6 +135,9 @@ async fn run_native_command(
     args: NativeCommand,
 ) -> Result<(), CommandError> {
     match args {
+        NativeCommand::Tinytree {
+            command: TinytreeCommand::Cloud(args),
+        } => cloud::run(ui, command, args),
         NativeCommand::Tinytree {
             command: TinytreeCommand::Land(args),
         } => landing::run(ui, command, args).await,
@@ -425,6 +431,48 @@ fn main() -> std::process::ExitCode {
 mod restore_arguments_tests {
     use super::*;
     use clap::Parser as _;
+    #[test]
+    fn cloud_recovery_requires_configuration_and_bounds_paging_without_manual_manifest_flags() {
+        let base = [
+            "fixture",
+            "tinytree",
+            "cloud",
+            "--daemon-config",
+            "daemon.toml",
+            "--store",
+            "example",
+        ];
+        for suffix in [
+            vec!["workspaces", "--limit", "2", "--json"],
+            vec!["versions", "workspace", "--cursor", "cursor", "--json"],
+            vec!["restore", "workspace", "destination"],
+            vec!["restore", "workspace", "destination", "--generation", "2"],
+        ] {
+            assert!(matches!(
+                NativeCommand::try_parse_from(base.into_iter().chain(suffix)),
+                Ok(NativeCommand::Tinytree {
+                    command: TinytreeCommand::Cloud(_)
+                })
+            ));
+        }
+        for suffix in [
+            vec!["workspaces", "--limit", "0"],
+            vec!["workspaces", "--limit", "129"],
+            vec!["restore", "workspace", "destination", "--generation", "0"],
+            vec![
+                "restore",
+                "workspace",
+                "destination",
+                "--endpoint",
+                "http://example.invalid",
+            ],
+        ] {
+            assert!(NativeCommand::try_parse_from(base.into_iter().chain(suffix)).is_err());
+        }
+        assert!(
+            NativeCommand::try_parse_from(["fixture", "tinytree", "cloud", "workspaces"]).is_err()
+        );
+    }
     #[test]
     fn retained_restore_requires_exact_source_and_configuration_without_clone_fallback() {
         let args = vec![

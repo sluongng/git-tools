@@ -17,6 +17,43 @@ pub struct NativeRestoreSelection {
     pub manifest_blake3: [u8; 32],
     pub manifest_size_bytes: u64,
 }
+/// Discovery rows are immutable selectors, not retention leases or restore proof.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NativeCloudWorkspace {
+    pub workspace_id: String,
+    pub generation: u64,
+    pub manifest_id: Option<String>,
+    pub local_destination: Option<PathBuf>,
+}
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NativeCloudWorkspaces {
+    pub workspaces: Vec<NativeCloudWorkspace>,
+    pub continuation: String,
+}
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NativeCloudVersion {
+    pub generation: u64,
+    pub manifest_id: String,
+    pub previous_manifest_id: Option<String>,
+}
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NativeCloudVersions {
+    pub workspace: NativeCloudWorkspace,
+    pub versions: Vec<NativeCloudVersion>,
+    pub through_generation: u64,
+    pub continuation: String,
+}
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NativeCloudRestored {
+    pub mounted: crate::native_workspaces::Mounted,
+    pub source: NativeRestoreSelection,
+    pub reused_destination: bool,
+}
 #[derive(Serialize, Deserialize)]
 #[serde(tag = "operation", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Request {
@@ -63,6 +100,24 @@ pub enum Request {
         store: String,
         workspace_id: String,
         source: NativeRestoreSelection,
+    },
+    NativeCloudWorkspaces {
+        store: String,
+        page_size: u16,
+        continuation: String,
+    },
+    NativeCloudVersions {
+        store: String,
+        workspace_id: String,
+        page_size: u16,
+        continuation: String,
+    },
+    /// Resolve a version once, then retain its exact pin in the restore journal.
+    NativeCloudRestore {
+        root: PathBuf,
+        store: String,
+        source_workspace: String,
+        generation: Option<u64>,
     },
     NativeResume {
         root: PathBuf,
@@ -266,5 +321,33 @@ mod tests {
             .unwrap(),
             serde_json::to_value(resume).unwrap()
         );
+        for request in [
+            Request::NativeCloudWorkspaces {
+                store: "example".into(),
+                page_size: 2,
+                continuation: String::new(),
+            },
+            Request::NativeCloudVersions {
+                store: "example".into(),
+                workspace_id: "02".repeat(32),
+                page_size: 2,
+                continuation: String::new(),
+            },
+            Request::NativeCloudRestore {
+                root: PathBuf::from("/workspace"),
+                store: "example".into(),
+                source_workspace: "02".repeat(32),
+                generation: None,
+            },
+        ] {
+            let value = serde_json::to_value(request).unwrap();
+            let decoded: Request = serde_json::from_value(value.clone()).unwrap();
+            assert_eq!(serde_json::to_value(decoded).unwrap(), value);
+            for key in ["endpoint", "token"] {
+                let mut altered = value.clone();
+                altered[key] = "not-a-supported-connection-override".into();
+                assert!(serde_json::from_value::<Request>(altered).is_err());
+            }
+        }
     }
 }

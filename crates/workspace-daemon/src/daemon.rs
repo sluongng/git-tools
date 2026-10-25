@@ -1170,6 +1170,18 @@ pub async fn serve(mut config: Config) -> Result<()> {
                     if !configuration_scoped {Err(anyhow::anyhow!("native restore requires matching scoped daemon configuration"))}
                     else {match state_slot.as_mut().unwrap().native_workspaces.as_mut(){Some(manager)=>manager.restore(root,store,workspace_id,source).await.and_then(|value|serde_json::to_value(value).map_err(Into::into)),None=>Err(anyhow::anyhow!("native repositories are not configured"))}}
                 }
+                Ok(Request::NativeCloudWorkspaces {store,page_size,continuation}) => {
+                    if !configuration_scoped {Err(anyhow::anyhow!("cloud discovery requires matching scoped daemon configuration"))}
+                    else {match state_slot.as_ref().unwrap().native_workspaces.as_ref(){Some(manager)=>manager.cloud_workspaces(&store,page_size,&continuation).await.and_then(|value|serde_json::to_value(value).map_err(Into::into)),None=>Err(anyhow::anyhow!("native repositories are not configured"))}}
+                }
+                Ok(Request::NativeCloudVersions {store,workspace_id,page_size,continuation}) => {
+                    if !configuration_scoped {Err(anyhow::anyhow!("cloud discovery requires matching scoped daemon configuration"))}
+                    else {match state_slot.as_ref().unwrap().native_workspaces.as_ref(){Some(manager)=>manager.cloud_versions(&store,&workspace_id,page_size,&continuation).await.and_then(|value|serde_json::to_value(value).map_err(Into::into)),None=>Err(anyhow::anyhow!("native repositories are not configured"))}}
+                }
+                Ok(Request::NativeCloudRestore {root,store,source_workspace,generation}) => {
+                    if !configuration_scoped {Err(anyhow::anyhow!("cloud restore requires matching scoped daemon configuration"))}
+                    else {match state_slot.as_mut().unwrap().native_workspaces.as_mut(){Some(manager)=>manager.restore_cloud_version(root,store,source_workspace,generation).await.and_then(|value|serde_json::to_value(value).map_err(Into::into)),None=>Err(anyhow::anyhow!("native repositories are not configured"))}}
+                }
                 Ok(Request::NativeResume {root}) => {
                     if !configuration_scoped {Err(anyhow::anyhow!("native resume requires matching scoped daemon configuration"))}
                     else {match state_slot.as_mut().unwrap().native_workspaces.as_mut(){Some(manager)=>manager.resume_root(root).await.and_then(|value|serde_json::to_value(value).map_err(Into::into)),None=>Err(anyhow::anyhow!("native repositories are not configured"))}}

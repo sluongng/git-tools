@@ -123,6 +123,18 @@ fn read_record(bytes: &[u8]) -> Result<Record> {
         _ => anyhow::bail!("unsupported native workspace record version"),
     }
 }
+/// Immutable identity reservation for an automatically named cloud restore.
+/// It precedes every per-workspace or destination write and is never repinned.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CloudRestoreIntent {
+    version: u32,
+    root: PathBuf,
+    store: String,
+    workspace_id: [u8; 32],
+    source: crate::control::NativeRestoreSelection,
+    provider_identity: [u8; 32],
+}
 struct Entry {
     record: Record,
     directory: PrivateDir,
@@ -149,6 +161,8 @@ pub(crate) struct Manager {
     directory: PrivateDir,
     retirements_directory: PrivateDir,
     retirements: BTreeMap<String, CandidateRetirement>,
+    cloud_intents_directory: PrivateDir,
+    cloud_intents: BTreeMap<String, CloudRestoreIntent>,
     registry: Option<Arc<Registry>>,
     cache: Arc<LocalCas>,
     repositories: BTreeMap<String, Repository>,
@@ -157,6 +171,8 @@ pub(crate) struct Manager {
     commands: Option<Arc<crate::native_commands::NativeCommandHost>>,
     #[cfg(test)]
     after_retirement_publication: Option<Box<dyn FnOnce() -> Result<()> + Send + Sync>>,
+    #[cfg(test)]
+    after_cloud_intent_publication: Option<Box<dyn FnOnce() -> Result<()> + Send + Sync>>,
     #[cfg(test)]
     before_provider_start: Option<Box<dyn FnOnce(&Path) -> Result<()> + Send + Sync>>,
 }
@@ -220,10 +236,22 @@ impl Manager {
             );
             retirements.insert(id.to_owned(), receipt);
         }
-        let mut entries = BTreeMap::new();
-        for item in fs::read_dir(directory.path())? {
+        let cloud_intents_directory =
+            PrivateDir::create(config.state_dir.join("native-cloud-restores"))?;
+        let cloud_intents = load_cloud_intents(
+            &cloud_intents_directory,
+            config.native.workspaces.max_workspaces,
+        )?;
+        ensure!(
+            !cloud_intents.values().any(|intent| retirements
+                .contains_key(&hex(&intent.workspace_id))
+                || overlaps(&intent.root, &config.state_dir)),
+            "cloud restore intent conflicts with daemon/retired state"
+        );
+        let mut entries: BTreeMap<String, Entry> = BTreeMap::new();
+        for (count, item) in fs::read_dir(directory.path())?.enumerate() {
             ensure!(
-                entries.len() < config.native.workspaces.max_workspaces,
+                count < config.native.workspaces.max_workspaces,
                 "native workspace registry limit exceeded"
             );
             let item = item?;
@@ -237,12 +265,33 @@ impl Manager {
                 .map_err(|_| anyhow::anyhow!("invalid native workspace registry name"))?;
             let id = unhex(&name)?;
             let child = PrivateDir::open_existing(item.path())?;
+            if !child.path().join("workspace.json").try_exists()? {
+                ensure!(
+                    cloud_intents
+                        .values()
+                        .any(|intent| intent.workspace_id == id),
+                    "unknown native workspace state; preserve it"
+                );
+                reconcile_cloud_temporary_files(&child)?;
+                continue;
+            }
             let record = read_record(&child.read("workspace.json", MAX_RECORD)?)?;
             validate_record(&record)?;
             ensure!(
                 record.workspace_id == id,
                 "native workspace registry identity mismatch"
             );
+            ensure!(
+                !entries
+                    .values()
+                    .any(|entry| overlaps(&entry.record.root, &record.root)),
+                "native workspace registry roots overlap"
+            );
+            for intent in cloud_intents.values() {
+                if intent.workspace_id == id || overlaps(&intent.root, &record.root) {
+                    validate_cloud_record(intent, &record)?;
+                }
+            }
             ensure!(
                 entries
                     .insert(
@@ -264,11 +313,22 @@ impl Manager {
                 "duplicate native workspace registry identity"
             );
         }
+        ensure!(
+            entries.len()
+                + cloud_intents
+                    .values()
+                    .filter(|intent| !entries.contains_key(&hex(&intent.workspace_id)))
+                    .count()
+                <= config.native.workspaces.max_workspaces,
+            "native workspace reservations exceed limit"
+        );
         Ok(Self {
             config,
             directory,
             retirements_directory,
             retirements,
+            cloud_intents_directory,
+            cloud_intents,
             registry: None,
             cache,
             repositories,
@@ -277,6 +337,8 @@ impl Manager {
             commands: None,
             #[cfg(test)]
             after_retirement_publication: None,
+            #[cfg(test)]
+            after_cloud_intent_publication: None,
             #[cfg(test)]
             before_provider_start: None,
         })
@@ -304,6 +366,201 @@ impl Manager {
             .as_ref()
             .map(|commands| commands.status())
             .unwrap_or(serde_json::Value::Null)
+    }
+    fn cloud_source(&self, store: &str) -> Result<Arc<crate::native_capture_upload::Source>> {
+        self.repositories
+            .get(store)
+            .context("native repository alias is not configured")?
+            .upload
+            .clone()
+            .context("cloud recovery requires a configured remote provider")
+    }
+    fn cloud_deadline(&self) -> tokio::time::Instant {
+        tokio::time::Instant::now()
+            + self
+                .config
+                .reapi
+                .operation_timeout()
+                .min(std::time::Duration::from_secs(30))
+    }
+    fn cloud_local_destination(&self, store: &str, id: &str) -> Option<PathBuf> {
+        self.entries
+            .values()
+            .find(|entry| entry.record.store == store && hex(&entry.record.workspace_id) == id)
+            .map(|entry| entry.record.root.clone())
+    }
+    pub async fn cloud_workspaces(
+        &self,
+        store: &str,
+        page_size: u16,
+        continuation: &str,
+    ) -> Result<crate::control::NativeCloudWorkspaces> {
+        let mut page = crate::native_cloud::workspaces(
+            self.cloud_source(store)?,
+            page_size,
+            continuation,
+            self.cloud_deadline(),
+        )
+        .await?;
+        for row in &mut page.workspaces {
+            row.local_destination = self.cloud_local_destination(store, &row.workspace_id);
+        }
+        Ok(page)
+    }
+    pub async fn cloud_versions(
+        &self,
+        store: &str,
+        workspace_id: &str,
+        page_size: u16,
+        continuation: &str,
+    ) -> Result<crate::control::NativeCloudVersions> {
+        let mut page = crate::native_cloud::versions(
+            self.cloud_source(store)?,
+            workspace_id,
+            page_size,
+            continuation,
+            self.cloud_deadline(),
+        )
+        .await?;
+        page.workspace.local_destination = self.cloud_local_destination(store, workspace_id);
+        Ok(page)
+    }
+    pub async fn restore_cloud_version(
+        &mut self,
+        root: PathBuf,
+        store: String,
+        source_workspace: String,
+        generation: Option<u64>,
+    ) -> Result<crate::control::NativeCloudRestored> {
+        let deadline = self.host_admission_deadline();
+        let source_id = crate::native_cloud::workspace(&source_workspace)?;
+        ensure!(generation != Some(0), "cloud generation must be positive");
+        let root = canonical_candidate(&root)?;
+        ensure!(
+            !overlaps(&root, &self.config.state_dir),
+            "cloud restore root overlaps daemon state"
+        );
+        let prior = self
+            .entries
+            .iter()
+            .find(|(_, entry)| entry.record.root == root)
+            .map(|(id, entry)| (id.clone(), entry.record.clone()));
+        let key = cloud_intent_key(&root)?;
+        let provider_identity = self
+            .repositories
+            .get(&store)
+            .context("native repository alias is not configured")?
+            .identity;
+        let saved_intent = self.cloud_intents.get(&key).cloned();
+        let (id, source, reused_destination) = if let Some((id, record)) = prior {
+            ensure!(
+                record.store == store,
+                "cloud restore destination belongs to another repository"
+            );
+            let Origin::Restore { source, .. } = record.origin else {
+                anyhow::bail!("cloud restore destination belongs to a clone origin");
+            };
+            ensure!(
+                source.workspace_id() == source_id
+                    && generation.is_none_or(|value| value == source.generation()),
+                "cloud restore selection differs from the saved destination intent"
+            );
+            // A retry of latest reuses the original pin, not a newly moved head.
+            ensure!(
+                source.provider_identity() == provider_identity,
+                "cloud restore provider differs from the saved destination intent"
+            );
+            (id, selection_from_identity(&source), true)
+        } else if let Some(intent) = &saved_intent {
+            ensure!(
+                intent.store == store
+                    && intent.provider_identity == provider_identity
+                    && intent.source.workspace_id == source_id
+                    && generation.is_none_or(|value| value == intent.source.generation),
+                "cloud restore selection/provider differs from the saved destination intent"
+            );
+            (hex(&intent.workspace_id), intent.source.clone(), true)
+        } else {
+            ensure!(
+                self.reserved_workspaces() < self.config.native.workspaces.max_workspaces,
+                "native workspace reservation limit reached"
+            );
+            ensure!(
+                !self
+                    .entries
+                    .values()
+                    .any(|entry| overlaps(&entry.record.root, &root))
+                    && !self
+                        .cloud_intents
+                        .values()
+                        .any(|intent| overlaps(&intent.root, &root)),
+                "native workspace roots overlap"
+            );
+            let source = crate::native_cloud::select(
+                self.cloud_source(&store)?,
+                &source_workspace,
+                generation,
+                deadline.min(self.cloud_deadline()),
+            )
+            .await?;
+            let id = format!(
+                "{}{}",
+                uuid::Uuid::new_v4().simple(),
+                uuid::Uuid::new_v4().simple()
+            );
+            let intent = CloudRestoreIntent {
+                version: 1,
+                root: root.clone(),
+                store: store.clone(),
+                workspace_id: unhex(&id)?,
+                source: source.clone(),
+                provider_identity,
+            };
+            ensure!(
+                !self.entries.contains_key(&id)
+                    && !self.retirements.contains_key(&id)
+                    && !self
+                        .cloud_intents
+                        .values()
+                        .any(|old| old.workspace_id == intent.workspace_id)
+                    && !self.directory.path().join(&id).try_exists()?,
+                "generated cloud restore identity is already reserved"
+            );
+            // Memory owns the exact pin before any possibly ambiguous durable
+            // publication. No per-ID state or destination has been touched.
+            self.cloud_intents.insert(key.clone(), intent);
+            (id, source, false)
+        };
+        if let Some(intent) = self.cloud_intents.get(&key) {
+            ensure!(
+                intent.workspace_id == unhex(&id)?
+                    && intent.source == source
+                    && intent.store == store
+                    && intent.provider_identity == provider_identity,
+                "cloud restore record differs from saved intent"
+            );
+            persist_cloud_intent(&self.cloud_intents_directory, intent)?;
+            #[cfg(test)]
+            if let Some(hook) = self.after_cloud_intent_publication.take() {
+                hook()?;
+            }
+        }
+        let mounted = self
+            .restore_until(root, store, id, source.clone(), deadline)
+            .await?;
+        Ok(crate::control::NativeCloudRestored {
+            mounted,
+            source,
+            reused_destination,
+        })
+    }
+    fn reserved_workspaces(&self) -> usize {
+        self.entries.len()
+            + self
+                .cloud_intents
+                .values()
+                .filter(|intent| !self.entries.contains_key(&hex(&intent.workspace_id)))
+                .count()
     }
     fn host_admission_deadline(&self) -> tokio::time::Instant {
         // Control has no caller-supplied whole-operation deadline. Bound this
@@ -441,6 +698,13 @@ impl Manager {
             .get(&store)
             .context("native repository alias is not configured")?
             .clone();
+        ensure!(
+            !self
+                .cloud_intents
+                .values()
+                .any(|intent| intent.workspace_id == id || overlaps(&intent.root, &root)),
+            "native destination is reserved by a cloud restore intent"
+        );
         let registry = self.open_registry()?;
         let record = Record {
             version: if immutable { 3 } else { 2 },
@@ -483,7 +747,7 @@ impl Manager {
             }
         } else {
             ensure!(
-                self.entries.len() < self.config.native.workspaces.max_workspaces,
+                self.reserved_workspaces() < self.config.native.workspaces.max_workspaces,
                 "native workspace limit reached"
             );
             ensure!(
@@ -892,6 +1156,18 @@ impl Manager {
             .get(&store)
             .context("native repository alias is not configured")?
             .clone();
+        for intent in self.cloud_intents.values() {
+            if intent.workspace_id == id || overlaps(&intent.root, &root) {
+                ensure!(
+                    intent.workspace_id == id
+                        && intent.root == root
+                        && intent.store == store
+                        && intent.source == selection
+                        && intent.provider_identity == repository.identity,
+                    "native restore differs from reserved cloud intent"
+                );
+            }
+        }
         let source = repository
             .upload
             .clone()
@@ -942,7 +1218,12 @@ impl Manager {
             }
         } else {
             ensure!(
-                self.entries.len() < settings.max_workspaces,
+                self.entries.len() < settings.max_workspaces
+                    && (self
+                        .cloud_intents
+                        .values()
+                        .any(|intent| intent.workspace_id == id)
+                        || self.reserved_workspaces() < settings.max_workspaces),
                 "native workspace limit reached"
             );
             ensure!(
@@ -1065,10 +1346,18 @@ impl Manager {
         *started = true;
         if existing.is_none() {
             let child = PrivateDir::create(self.directory.path().join(workspace_id))?;
-            ensure!(
-                fs::read_dir(child.path())?.next().is_none(),
-                "unknown native restore state; preserve it"
-            );
+            if self
+                .cloud_intents
+                .values()
+                .any(|intent| intent.workspace_id == id)
+            {
+                reconcile_cloud_temporary_files(&child)?;
+            } else {
+                ensure!(
+                    fs::read_dir(child.path())?.next().is_none(),
+                    "unknown native restore state; preserve it"
+                );
+            }
             let entry = Entry {
                 record: record.clone(),
                 directory: child,
@@ -1081,8 +1370,10 @@ impl Manager {
                 restore_receipt: None,
                 provider_failure: None,
             };
-            persist(&entry)?;
+            // Keep identity/source ownership even when publication is visible
+            // but the directory sync reports an error.
             self.entries.insert(workspace_id.into(), entry);
+            persist(self.entries.get(workspace_id).unwrap())?;
         } else {
             record.state = Lifecycle::Pending;
             let entry = self.entries.get_mut(workspace_id).unwrap();
@@ -1755,6 +2046,176 @@ impl Manager {
             .map_err(|_| anyhow::anyhow!("native projection RPCs did not drain"))
     }
 }
+fn cloud_intent_key(root: &Path) -> Result<String> {
+    let mut digest = blake3::Hasher::new();
+    digest.update(b"native-cloud-restore-root-v1\0");
+    digest.update(&serde_json::to_vec(root)?);
+    Ok(hex(digest.finalize().as_bytes()))
+}
+fn validate_cloud_intent(intent: &CloudRestoreIntent) -> Result<()> {
+    normalized(&intent.root)?;
+    validate_selection(&intent.source)?;
+    ensure!(
+        intent.version == 1
+            && intent.workspace_id != [0; 32]
+            && intent.provider_identity != [0; 32]
+            && !intent.store.is_empty()
+            && intent.store.len() <= 64,
+        "invalid cloud restore intent"
+    );
+    Ok(())
+}
+fn validate_cloud_record(intent: &CloudRestoreIntent, record: &Record) -> Result<()> {
+    let Origin::Restore { source, .. } = &record.origin else {
+        anyhow::bail!("cloud restore reservation conflicts with workspace origin");
+    };
+    ensure!(
+        intent.workspace_id == record.workspace_id
+            && intent.root == record.root
+            && intent.store == record.store
+            && intent.provider_identity == source.provider_identity()
+            && intent.source == selection_from_identity(source),
+        "cloud restore reservation conflicts with workspace record"
+    );
+    Ok(())
+}
+fn persist_cloud_intent(directory: &PrivateDir, intent: &CloudRestoreIntent) -> Result<()> {
+    validate_cloud_intent(intent)?;
+    let name = format!("{}.json", cloud_intent_key(&intent.root)?);
+    let encoded = serde_json::to_vec(intent)?;
+    ensure!(
+        encoded.len() <= MAX_RECORD,
+        "cloud restore intent exceeds limit"
+    );
+    match fs::symlink_metadata(directory.path().join(&name)) {
+        Ok(_) => ensure!(
+            directory.read(&name, MAX_RECORD)? == encoded,
+            "immutable cloud restore intent differs"
+        ),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
+    // Persist directory creation as well as the atomic row publication. A
+    // failure leaves the same in-memory reservation for an exact retry.
+    fs::File::open(
+        directory
+            .path()
+            .parent()
+            .context("cloud intent parent missing")?,
+    )?
+    .sync_all()?;
+    directory.replace(name, &encoded)?;
+    Ok(())
+}
+fn load_cloud_intents(
+    directory: &PrivateDir,
+    max: usize,
+) -> Result<BTreeMap<String, CloudRestoreIntent>> {
+    check_cloud_directory(directory, max.saturating_add(128))?;
+    let mut intents: BTreeMap<String, CloudRestoreIntent> = BTreeMap::new();
+    let mut temporary = Vec::new();
+    for (count, item) in fs::read_dir(directory.path())?.enumerate() {
+        ensure!(
+            count < max.saturating_add(128),
+            "cloud restore intent directory limit exceeded"
+        );
+        let item = item?;
+        let name = item
+            .file_name()
+            .into_string()
+            .map_err(|_| anyhow::anyhow!("invalid cloud intent name"))?;
+        if is_retirement_temporary(&name) {
+            validate_cloud_temporary(directory, &name)?;
+            temporary.push(name);
+            ensure!(
+                temporary.len() <= 128,
+                "cloud intent temporary limit exceeded"
+            );
+            continue;
+        }
+        ensure!(intents.len() < max, "cloud restore intent limit exceeded");
+        let key = name
+            .strip_suffix(".json")
+            .context("unknown cloud restore intent entry")?;
+        unhex(key)?;
+        let intent: CloudRestoreIntent =
+            serde_json::from_slice(&directory.read(&name, MAX_RECORD)?)?;
+        validate_cloud_intent(&intent)?;
+        ensure!(
+            cloud_intent_key(&intent.root)? == key,
+            "cloud restore intent filename differs"
+        );
+        ensure!(
+            !intents
+                .values()
+                .any(|old| old.workspace_id == intent.workspace_id
+                    || overlaps(&old.root, &intent.root)),
+            "cloud restore intent identities/roots overlap"
+        );
+        intents.insert(key.to_owned(), intent);
+    }
+    remove_cloud_temporaries(directory, temporary)?;
+    Ok(intents)
+}
+fn validate_cloud_temporary(directory: &PrivateDir, name: &str) -> Result<()> {
+    ensure!(
+        is_retirement_temporary(name),
+        "unknown cloud restore state; preserve it"
+    );
+    directory.read(name, MAX_RECORD)?; // bounded, regular and no-follow
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let metadata = fs::symlink_metadata(directory.path().join(name))?;
+        ensure!(
+            metadata.uid() == unsafe { libc::geteuid() } && metadata.nlink() == 1,
+            "cloud restore temporary ownership/link count differs"
+        );
+    }
+    Ok(())
+}
+fn remove_cloud_temporaries(directory: &PrivateDir, temporary: Vec<String>) -> Result<()> {
+    if !temporary.is_empty() {
+        for name in temporary {
+            fs::remove_file(directory.path().join(name))?;
+        }
+        fs::File::open(directory.path())?.sync_all()?;
+    }
+    Ok(())
+}
+fn check_cloud_directory(directory: &PrivateDir, max: usize) -> Result<()> {
+    let parent = PrivateDir::open_existing(
+        directory
+            .path()
+            .parent()
+            .context("cloud directory parent missing")?,
+    )?;
+    parent.check_child_tree(
+        directory
+            .path()
+            .file_name()
+            .context("cloud directory name missing")?,
+        max,
+        1,
+    )?;
+    Ok(())
+}
+fn reconcile_cloud_temporary_files(directory: &PrivateDir) -> Result<()> {
+    // Only an exact durable auto-ID intent authorizes this pre-record case.
+    // Validate the entire namespace before removing any recognized partial write.
+    check_cloud_directory(directory, 128)?;
+    let mut temporary = Vec::new();
+    for (count, item) in fs::read_dir(directory.path())?.enumerate() {
+        ensure!(count < 128, "cloud restore temporary limit exceeded");
+        let name = item?
+            .file_name()
+            .into_string()
+            .map_err(|_| anyhow::anyhow!("invalid cloud temporary name"))?;
+        validate_cloud_temporary(directory, &name)?;
+        temporary.push(name);
+    }
+    remove_cloud_temporaries(directory, temporary)
+}
 fn is_retirement_temporary(name: &str) -> bool {
     let Some(body) = name
         .strip_prefix(".private-")
@@ -2347,6 +2808,304 @@ mod tests {
         async fn missing(&self, _: &[local_cas::Artifact]) -> Result<Vec<local_cas::Artifact>> {
             anyhow::bail!("provider failure fixture must not query remote content")
         }
+    }
+    #[tokio::test]
+    async fn cloud_restore_intent_survives_ambiguous_publication_and_partial_workspace_restart()
+    -> Result<()> {
+        let temporary = tempfile::tempdir()?;
+        let state = PrivateDir::create(temporary.path().join("state"))?;
+        let objects = PrivateDir::create(temporary.path().join("objects"))?;
+        let io = Arc::new(jj_native_backend::DirectObjectIo::init(
+            objects.path(),
+            Default::default(),
+        )?);
+        let cache = LocalCas::open(
+            temporary.path().join("cas"),
+            Arc::new(NoRemoteContent),
+            Default::default(),
+        )?;
+        let mut config = Config::default();
+        config.state_dir = state.path().to_owned();
+        config.native.workspaces.max_workspaces = 2;
+        let repositories = BTreeMap::from([(
+            "example".into(),
+            Repository {
+                local_objects: io.clone(),
+                upload: None,
+                query: None,
+                io,
+                scope: Scope::from_configured_identity("example", &[8; 32])?,
+                remote: true,
+                identity: [8; 32],
+            },
+        )]);
+        let mut manager = Manager::open(config.clone(), cache.clone(), repositories.clone())?;
+        let root = temporary.path().join("restored");
+        let id = [9; 32];
+        let source = crate::control::NativeRestoreSelection {
+            workspace_id: [1; 32],
+            generation: 7,
+            manifest_id: [2; 32],
+            manifest_blake3: [3; 32],
+            manifest_size_bytes: 256,
+        };
+        let intent = CloudRestoreIntent {
+            version: 1,
+            root: root.clone(),
+            store: "example".into(),
+            workspace_id: id,
+            source: source.clone(),
+            provider_identity: [8; 32],
+        };
+        let key = cloud_intent_key(&root)?;
+        // Model the exact post-selection/pre-publication boundary. No remote
+        // provider is configured: a retry that reselects latest cannot succeed.
+        manager.cloud_intents.insert(key.clone(), intent.clone());
+        manager.after_cloud_intent_publication = Some(Box::new(|| {
+            anyhow::bail!("intent sync acknowledgement lost")
+        }));
+        let error = manager
+            .restore_cloud_version(
+                root.clone(),
+                "example".into(),
+                hex(&source.workspace_id),
+                None,
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("intent sync acknowledgement lost")
+        );
+        let intent_path = state
+            .path()
+            .join("native-cloud-restores")
+            .join(format!("{key}.json"));
+        let saved = fs::read(&intent_path)?;
+        assert_eq!(
+            serde_json::from_slice::<CloudRestoreIntent>(&saved)?,
+            intent
+        );
+        assert!(!root.exists());
+        assert!(
+            !state
+                .path()
+                .join("native-workspaces")
+                .join(hex(&id))
+                .exists()
+        );
+        for _ in 0..2 {
+            let error = manager
+                .restore_cloud_version(
+                    root.clone(),
+                    "example".into(),
+                    hex(&source.workspace_id),
+                    None,
+                )
+                .await
+                .unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("requires managed command admission"),
+                "{error:#}"
+            );
+            assert_eq!(manager.cloud_intents[&key], intent);
+            assert_eq!(fs::read(&intent_path)?, saved);
+        }
+        for (store, workspace, generation) in [
+            ("example", hex(&[4; 32]), None),
+            ("example", hex(&source.workspace_id), Some(8)),
+            ("other", hex(&source.workspace_id), None),
+        ] {
+            assert!(
+                manager
+                    .restore_cloud_version(root.clone(), store.into(), workspace, generation)
+                    .await
+                    .is_err()
+            );
+            assert_eq!(fs::read(&intent_path)?, saved);
+        }
+        manager.repositories.get_mut("example").unwrap().identity = [4; 32];
+        assert!(
+            manager
+                .restore_cloud_version(
+                    root.clone(),
+                    "example".into(),
+                    hex(&source.workspace_id),
+                    None
+                )
+                .await
+                .is_err()
+        );
+        manager.repositories.get_mut("example").unwrap().identity = [8; 32];
+        assert!(
+            manager
+                .create(
+                    root.clone(),
+                    "example".into(),
+                    hex(&[0; 32]),
+                    hex(&[11; 32])
+                )
+                .await
+                .is_err()
+        );
+        assert!(!root.exists());
+        drop(manager);
+
+        // A crash before workspace.json publication can leave an empty ID
+        // directory or an incomplete recognized atomic write. Unknown files
+        // prohibit ALL cleanup, even if a recognized temporary is also present.
+        let child = PrivateDir::create(state.path().join("native-workspaces").join(hex(&id)))?;
+        fs::write(child.path().join(".private-123-0.tmp"), b"{partial")?;
+        fs::write(child.path().join("foreign"), b"preserve")?;
+        assert!(Manager::open(config.clone(), cache.clone(), repositories.clone()).is_err());
+        assert_eq!(fs::read(child.path().join("foreign"))?, b"preserve");
+        assert_eq!(
+            fs::read(child.path().join(".private-123-0.tmp"))?,
+            b"{partial"
+        );
+        fs::remove_file(child.path().join("foreign"))?;
+        let foreign = temporary.path().join("foreign-target");
+        fs::write(&foreign, b"foreign target must survive")?;
+        let linked_temporary = child.path().join(".private-123-1.tmp");
+        std::os::unix::fs::symlink(&foreign, &linked_temporary)?;
+        assert!(Manager::open(config.clone(), cache.clone(), repositories.clone()).is_err());
+        assert!(
+            fs::symlink_metadata(&linked_temporary)?
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(fs::read(&foreign)?, b"foreign target must survive");
+        assert!(child.path().join(".private-123-0.tmp").exists());
+        fs::remove_file(&linked_temporary)?;
+        fs::hard_link(&foreign, &linked_temporary)?;
+        assert!(Manager::open(config.clone(), cache.clone(), repositories.clone()).is_err());
+        assert_eq!(fs::read(&linked_temporary)?, b"foreign target must survive");
+        assert_eq!(fs::read(&foreign)?, b"foreign target must survive");
+        assert!(child.path().join(".private-123-0.tmp").exists());
+        fs::remove_file(&linked_temporary)?;
+        let mut reopened = Manager::open(config.clone(), cache.clone(), repositories.clone())?;
+        assert!(fs::read_dir(child.path())?.next().is_none());
+        assert_eq!(reopened.cloud_intents[&key], intent);
+        let error = reopened
+            .restore_cloud_version(
+                root.clone(),
+                "example".into(),
+                hex(&source.workspace_id),
+                None,
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("requires managed command admission")
+        );
+        assert_eq!(fs::read(&intent_path)?, saved);
+        drop(reopened);
+        // A pin without a workspace row still consumes its configured slot.
+        let mut at_capacity = config.clone();
+        at_capacity.native.workspaces.max_workspaces = 1;
+        let mut reserved = Manager::open(at_capacity, cache.clone(), repositories.clone())?;
+        let other_root = temporary.path().join("other-restored");
+        let error = reserved
+            .restore_cloud_version(
+                other_root.clone(),
+                "example".into(),
+                hex(&source.workspace_id),
+                None,
+            )
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("reservation limit reached"));
+        assert!(!other_root.exists());
+        assert_eq!(reserved.cloud_intents.len(), 1);
+        assert_eq!(fs::read(&intent_path)?, saved);
+        drop(reserved);
+        // Reopening the now-empty known ID directory is idempotent.
+        drop(Manager::open(
+            config.clone(),
+            cache.clone(),
+            repositories.clone(),
+        )?);
+        assert!(!root.exists());
+
+        // A visible initial workspace record is authoritative after restart,
+        // including installations without an auto-ID outbox (compatibility).
+        // Synthetic source DATA tests journal recovery, not authenticated restore.
+        let identity = serde_json::from_value(serde_json::json!({
+            "workspace":source.workspace_id,"generation":source.generation,
+            "manifest":source.manifest_id,"manifest_blake3":source.manifest_blake3,
+            "manifest_bytes":source.manifest_size_bytes,"capture":vec![5;32],
+            "capture_blake3":vec![6;32],"capture_bytes":512,"provider":vec![8;32]
+        }))?;
+        let record = Record {
+            version: 2,
+            workspace_id: id,
+            root: root.clone(),
+            store: "example".into(),
+            scope: repositories["example"].scope.backend().into(),
+            state: Lifecycle::Pending,
+            native_mount: None,
+            origin: Origin::Restore {
+                source: identity,
+                seed: tinytree_cloud::PortableWorkingCopy {
+                    workspace: "default".into(),
+                    wc_operation: "00".repeat(64),
+                    snapshot_operation: "00".repeat(64),
+                    snapshot_commit: [5; 32],
+                    tree: tinytree_cloud::CaptureTree {
+                        terms: vec![[6; 32]],
+                        labels: vec![],
+                    },
+                },
+                committed: false,
+            },
+        };
+        child.replace("workspace.json", &serde_json::to_vec(&record)?)?;
+        for outbox in [true, false] {
+            if !outbox {
+                fs::remove_file(&intent_path)?;
+            }
+            let mut reopened = Manager::open(config.clone(), cache.clone(), repositories.clone())?;
+            assert_eq!(reopened.entries[&hex(&id)].record, record);
+            let error = reopened
+                .restore_cloud_version(
+                    root.clone(),
+                    "example".into(),
+                    hex(&source.workspace_id),
+                    None,
+                )
+                .await
+                .unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("requires managed command admission")
+            );
+            assert_eq!(reopened.entries.len(), 1);
+            assert_eq!(
+                fs::read_dir(state.path().join("native-workspaces"))?.count(),
+                1
+            );
+        }
+        // Duplicate or nested recorded roots must not be selected by map order.
+        let other =
+            PrivateDir::create(state.path().join("native-workspaces").join(hex(&[10; 32])))?;
+        for other_root in [root.clone(), root.join("nested")] {
+            let mut duplicate = record.clone();
+            duplicate.workspace_id = [10; 32];
+            duplicate.root = other_root;
+            other.replace("workspace.json", &serde_json::to_vec(&duplicate)?)?;
+            assert!(Manager::open(config.clone(), cache.clone(), repositories.clone()).is_err());
+            assert_eq!(
+                read_record(&child.read("workspace.json", MAX_RECORD)?)?,
+                record
+            );
+        }
+        Ok(())
     }
     #[tokio::test]
     async fn ambiguous_retirement_publication_keeps_identity_closed_without_cleanup() -> Result<()>

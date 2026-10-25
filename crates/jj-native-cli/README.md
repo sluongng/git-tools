@@ -91,25 +91,37 @@ ID as proof.
 ## Restore a retained capture
 
 To create backups, enable capture and asynchronous upload in the
-[daemon configuration](../workspace-daemon); both are opt-in. To restore, obtain
-the exact source workspace, generation, manifest ID, raw BLAKE3 digest and byte
-length from the authenticated retained-version API.
-Choose a new 64-hex destination workspace ID and retain it for retries.
+[daemon configuration](../workspace-daemon); both are opt-in. Use the matching
+daemon and configured alias to discover backups without supplying server URLs,
+credentials or raw manifest digests:
 
 ```sh
-"$JJ" tinytree restore restored --daemon-config CONFIG --store example \
-  --workspace-id NEW_DESTINATION_ID --source-workspace SOURCE_WORKSPACE_ID \
-  --generation GENERATION --manifest MANIFEST_ID \
-  --manifest-blake3 RAW_BLAKE3 --manifest-bytes BYTE_LENGTH
+"$JJ" tinytree cloud --daemon-config CONFIG --store example workspaces
+"$JJ" tinytree cloud --daemon-config CONFIG --store example versions WORKSPACE_ID
+"$JJ" tinytree cloud --daemon-config CONFIG --store example \
+  restore WORKSPACE_ID restored --generation GENERATION
 "$JJ" tinytree unmount restored
 "$JJ" tinytree resume restored --daemon-config CONFIG
 ```
 
-Replace the uppercase placeholders with the selected values. Restore preserves
-operation history and working-copy state in a fresh lazy mount. Later resumes
-preserve its current edits rather than replaying the original capture. Historical
-publication is not proof of current remote availability; local backup data is not
-automatically evicted.
+Select `WORKSPACE_ID` from the first command and a generation from the second.
+Omit `--generation` to select the latest published version once. Before creating
+the destination, the daemon saves its new identity and exact source selection.
+Retry the same destination to resume that selection, even if the source head has
+moved; retries and later resumes preserve current edits. A changed alias, source
+or explicit generation is rejected instead of replacing that intent.
+
+`workspaces` and `versions` return bounded pages; use the printed `--cursor`
+with the same command and alias for the next page. `versions` keeps the first
+page's generation upper bound, while the workspace catalog can move. All three
+commands accept `--json`. Catalog rows and historical publication are selectors,
+not retention leases or proof of current availability. Restore verifies the
+selected retained capture before materializing its fresh lazy mount, preserving
+operation history and working-copy state. Local backup data is not automatically
+evicted.
+
+The lower-level `tinytree restore` command remains available for an exact
+manifest selection and explicitly chosen destination identity.
 
 After a Linux daemon crash, select the workspace ID from `workspace status`, run
 `workspace recover --native-workspace ID`, then resume with the matching daemon

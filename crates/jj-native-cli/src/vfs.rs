@@ -359,7 +359,7 @@ async fn load_ready(
     Ok((workspace, repo))
 }
 
-fn restore_identity(text: &str) -> Result<[u8; 32], CommandError> {
+pub(crate) fn restore_identity(text: &str) -> Result<[u8; 32], CommandError> {
     if text.len() != 64
         || !text
             .bytes()
@@ -371,7 +371,7 @@ fn restore_identity(text: &str) -> Result<[u8; 32], CommandError> {
     }
     Ok(*blake3::Hash::from_hex(text).map_err(failure)?.as_bytes())
 }
-fn restore_control(
+pub(crate) fn restore_control(
     config_path: &Path,
 ) -> Result<workspace_daemon::control::ScopedClient, CommandError> {
     let config = workspace_daemon::config::Config::load(config_path).map_err(failure)?;
@@ -391,7 +391,7 @@ fn restore_control(
     client.validate_identity().map_err(failure)?;
     Ok(client)
 }
-fn restored_response(
+pub(crate) fn restored_response(
     value: serde_json::Value,
     destination: &Path,
     store: Option<&str>,
@@ -674,7 +674,7 @@ pub(crate) fn unmount(command: &CommandHelper, destination: &Path) -> Result<(),
     }
 }
 
-fn reject_recovery_overrides(command: &CommandHelper) -> Result<(), CommandError> {
+pub(crate) fn reject_recovery_overrides(command: &CommandHelper) -> Result<(), CommandError> {
     let args = command.global_args();
     if args.at_operation.is_some() || args.ignore_working_copy || args.no_integrate_operation {
         return Err(failure(

@@ -953,8 +953,38 @@ impl NativeClient {
         id: [u8; 32],
         generation: u64,
     ) -> Result<CloudVersion, Status> {
-        self.cloud_version_bounded(id, generation, self.inner.config.cloud.max_manifest_bytes)
-            .await
+        // Unknown-size discovery uses a static effective cap within the existing
+        // physical and retained pools. Available permits must not change which
+        // version sizes a configured client accepts.
+        let limits = &self.inner.config.limits;
+        let state = limits
+            .max_buffered_bytes
+            .saturating_sub(query_headroom(limits));
+        let fits = |size: usize| {
+            size.checked_add(4096)
+                .and_then(|cap| self.cloud_memory(cap).ok())
+                .is_some_and(|physical| {
+                    self.cloud_payload_fits(size, physical).is_ok()
+                        && size
+                            .checked_mul(2)
+                            .and_then(|n| n.checked_add(4096))
+                            .is_some_and(|n| n <= state)
+                })
+        };
+        let mut low = 0;
+        let mut high = self.inner.config.cloud.max_manifest_bytes;
+        while low < high {
+            let middle = low + (high - low).div_ceil(2);
+            if fits(middle) {
+                low = middle;
+            } else {
+                high = middle - 1;
+            }
+        }
+        if low == 0 {
+            return Err(limit());
+        }
+        self.cloud_version_bounded(id, generation, low).await
     }
     async fn cloud_version_bounded(
         &self,

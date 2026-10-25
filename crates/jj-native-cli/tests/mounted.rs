@@ -466,6 +466,20 @@ impl Fixture {
         assert_fuse_mounted(root);
     }
 
+    fn cloud(&mut self, cwd: &Path, args: &[&str]) -> String {
+        let configuration = self.daemon_config.to_str().unwrap().to_owned();
+        let mut command = vec![
+            "tinytree",
+            "cloud",
+            "--daemon-config",
+            &configuration,
+            "--store",
+            "example",
+        ];
+        command.extend_from_slice(args);
+        self.success(cwd, &command)
+    }
+
     fn clone_remote(&mut self, root: &Path) {
         let base = self.base().to_owned();
         let broker = self.broker.clone();
@@ -3043,6 +3057,59 @@ fn parallel_native_workspaces_keep_backing_up_beyond_capture_capacity() {
     }
     let initial = local_capture_status(&fixture)["queued"].as_u64().unwrap();
     wait_latest(&fixture, initial);
+    let first: workspace_daemon::control::NativeCloudWorkspaces =
+        serde_json::from_str(&fixture.cloud(&base, &["workspaces", "--limit", "1", "--json"]))
+            .unwrap();
+    assert_eq!(first.workspaces.len(), 1);
+    assert!(!first.continuation.is_empty());
+    let second: workspace_daemon::control::NativeCloudWorkspaces =
+        serde_json::from_str(&fixture.cloud(
+            &base,
+            &[
+                "workspaces",
+                "--limit",
+                "1",
+                "--cursor",
+                &first.continuation,
+                "--json",
+            ],
+        ))
+        .unwrap();
+    assert_eq!(second.workspaces.len(), 1);
+    assert!(second.continuation.is_empty());
+    let listed: std::collections::BTreeSet<_> = first
+        .workspaces
+        .into_iter()
+        .chain(second.workspaces)
+        .map(|row| {
+            let expected = bindings
+                .iter()
+                .find(|binding| capture_identity(&binding.workspace_id) == row.workspace_id)
+                .unwrap();
+            assert_eq!(
+                row.local_destination.as_deref(),
+                Some(expected.root.as_path())
+            );
+            row.workspace_id
+        })
+        .collect();
+    assert_eq!(listed.len(), 2);
+    assert_eq!(
+        local_capture_status(&fixture)["queued"],
+        initial,
+        "cloud discovery must not snapshot a source workspace"
+    );
+    assert!(
+        fixture
+            .control(Request::NativeCloudWorkspaces {
+                store: "example".into(),
+                page_size: 1,
+                continuation: String::new(),
+            })
+            .unwrap_err()
+            .to_string()
+            .contains("scoped")
+    );
     let mut expected = initial;
     // 70 distinct edits across TWO independent agents exceed both the tiny
     // four-ticket fixture limit and the ordinary 64-ticket default.
@@ -3275,7 +3342,10 @@ fn published_capture_retirement_continues_distinct_edits_and_restores_old_versio
 
     // Read only the actual remote retained versions. Old private packs have
     // already gone; neither restore may depend on a saved local capsule.
-    for selected in [captures.first().unwrap(), captures.last().unwrap()] {
+    for (selected, use_latest) in [
+        (captures.first().unwrap(), false),
+        (captures.last().unwrap(), true),
+    ] {
         let (generation, manifest_id, raw, _manifest, capsule) = versions
             .iter()
             .find(|(_, _, _, manifest, _)| {
@@ -3295,7 +3365,7 @@ fn published_capture_retirement_continues_distinct_edits_and_restores_old_versio
             manifest_blake3: raw.blake3,
             manifest_size_bytes: raw.size_bytes,
         };
-        restore_retired_capture(&upstream, &selection, &data, &selected.1);
+        restore_retired_capture(&upstream, &selection, &data, &selected.1, use_latest);
     }
 }
 
@@ -3345,37 +3415,52 @@ fn restore_retired_capture(
     selection: &workspace_daemon::control::NativeRestoreSelection,
     data: &tinytree_cloud::CaptureData,
     expected_bytes: &[u8],
+    use_latest: bool,
 ) {
     let mut fixture = Fixture::new();
     fixture.configure_remote(&upstream.endpoint);
     fixture.start();
     let base = fixture.base().to_owned();
     let root = base.join("retired-restore");
-    let configuration = fixture.daemon_config.to_str().unwrap().to_owned();
-    fixture.success(
-        &base,
-        &[
-            "tinytree",
-            "restore",
-            root.to_str().unwrap(),
-            "--daemon-config",
-            &configuration,
-            "--store",
-            "example",
-            "--workspace-id",
-            &capture_identity(&[0x6d; 32]),
-            "--source-workspace",
-            &capture_identity(&selection.workspace_id),
-            "--generation",
-            &selection.generation.to_string(),
-            "--manifest",
-            &capture_identity(&selection.manifest_id),
-            "--manifest-blake3",
-            &capture_identity(&selection.manifest_blake3),
-            "--manifest-bytes",
-            &selection.manifest_size_bytes.to_string(),
-        ],
+    let workspace = capture_identity(&selection.workspace_id);
+    let file_reads = upstream.file_reads();
+    let mut cursor = String::new();
+    let mut generations = Vec::new();
+    loop {
+        let page: workspace_daemon::control::NativeCloudVersions =
+            serde_json::from_str(&fixture.cloud(
+                &base,
+                &[
+                    "versions", &workspace, "--limit", "2", "--cursor", &cursor, "--json",
+                ],
+            ))
+            .unwrap();
+        assert_eq!(page.workspace.workspace_id, workspace);
+        assert!(page.through_generation >= selection.generation);
+        generations.extend(page.versions.into_iter().map(|version| version.generation));
+        cursor = page.continuation;
+        if cursor.is_empty() {
+            break;
+        }
+    }
+    assert_eq!(
+        generations,
+        (1..=cloud_generation(upstream, selection.workspace_id)).collect::<Vec<_>>()
     );
+    assert_eq!(
+        upstream.file_reads(),
+        file_reads,
+        "discovery reads no native FILE bodies"
+    );
+    let generation = selection.generation.to_string();
+    let mut restore = vec!["restore", &workspace, root.to_str().unwrap(), "--json"];
+    if !use_latest {
+        restore.extend(["--generation", &generation]);
+    }
+    let report: workspace_daemon::control::NativeCloudRestored =
+        serde_json::from_str(&fixture.cloud(&base, &restore)).unwrap();
+    assert_eq!(report.source, *selection);
+    assert!(!report.reused_destination);
     let binding = fixture.binding(&root);
     assert_eq!(native_operation_heads(&binding), data.operation_heads);
     let (wc, _) =
@@ -3387,6 +3472,54 @@ fn restore_retired_capture(
         fs::read(root.join("capture-only.txt")).unwrap(),
         expected_bytes
     );
+    let restored_identity = binding.workspace_id;
+    let later = b"later local edit must survive restore retry\n";
+    fs::write(root.join("capture-only.txt"), later).unwrap();
+    let retry: workspace_daemon::control::NativeCloudRestored =
+        serde_json::from_str(&fixture.cloud(
+            &base,
+            &["restore", &workspace, root.to_str().unwrap(), "--json"],
+        ))
+        .unwrap();
+    assert!(retry.reused_destination);
+    assert_eq!(
+        retry.source, *selection,
+        "latest retry must reuse the old exact pin even when newer cloud versions exist"
+    );
+    assert_eq!(retry.mounted.binding.workspace_id, restored_identity);
+    assert_eq!(fs::read(root.join("capture-only.txt")).unwrap(), later);
+    let configuration = fixture.daemon_config.to_str().unwrap().to_owned();
+    let rejected = fixture.run(
+        &base,
+        &[
+            "tinytree",
+            "cloud",
+            "--daemon-config",
+            &configuration,
+            "--store",
+            "example",
+            "restore",
+            &workspace,
+            root.to_str().unwrap(),
+            "--generation",
+            &(selection.generation + 1).to_string(),
+        ],
+    );
+    assert!(!rejected.status.success());
+    assert_eq!(fs::read(root.join("capture-only.txt")).unwrap(), later);
+    fixture.success(&base, &["tinytree", "unmount", root.to_str().unwrap()]);
+    fixture.stop_daemon();
+    fixture.start();
+    let resumed: workspace_daemon::control::NativeCloudRestored =
+        serde_json::from_str(&fixture.cloud(
+            &base,
+            &["restore", &workspace, root.to_str().unwrap(), "--json"],
+        ))
+        .unwrap();
+    assert!(resumed.reused_destination);
+    assert_eq!(resumed.source, *selection);
+    assert_eq!(resumed.mounted.binding.workspace_id, restored_identity);
+    assert_eq!(fs::read(root.join("capture-only.txt")).unwrap(), later);
     fixture.success(&base, &["tinytree", "unmount", root.to_str().unwrap()]);
     fixture.stop_daemon();
 }

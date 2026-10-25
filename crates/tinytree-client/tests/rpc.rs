@@ -5756,7 +5756,9 @@ impl tinytree_client::cloud_protocol::workspace_cloud_server::WorkspaceCloud for
     ) -> Result<Response<tinytree_client::cloud_protocol::Version>, Status> {
         self.calls.fetch_add(1, Ordering::SeqCst);
         let request = request.into_inner();
-        let manifest = if self.mode.load(Ordering::SeqCst) >= 40 {
+        let manifest = if self.mode.load(Ordering::SeqCst) == 100 {
+            vec![0; 4 * 1024 * 1024]
+        } else if self.mode.load(Ordering::SeqCst) >= 40 {
             capture_transport_fixture(self.mode.load(Ordering::SeqCst)).1
         } else {
             b"raw manifest transport fixture".to_vec()
@@ -6196,6 +6198,28 @@ async fn workspace_cloud_checks_stream_selection_reconciles_intent_and_releases_
     assert_eq!(publication.idempotency_key, intent.idempotency_key);
     let version = client.cloud_version([4; 32], 8).await.unwrap();
     assert_eq!(version.manifest(), intent.manifest);
+    // The ordinary remote-adapter profile keeps its existing 32 MiB pool.
+    // Discovery must accept a small version without reserving the configured
+    // 8 MiB maximum, while a larger response still fails within that pool.
+    let mut remote = config.clone();
+    remote.limits.max_metadata_bytes = 4 * 1024 * 1024;
+    remote.limits.max_batch_bytes = 4 * 1024 * 1024;
+    remote.limits.max_graph_bytes = 8 * 1024 * 1024;
+    remote.limits.max_graph_objects = 65_536;
+    remote.limits.max_buffered_bytes = 32 * 1024 * 1024;
+    let remote = NativeClient::connect(remote).await.unwrap();
+    assert_eq!(
+        remote.cloud_version([4; 32], 8).await.unwrap().manifest(),
+        intent.manifest
+    );
+    faults.mode.store(100, Ordering::SeqCst);
+    assert!(remote.cloud_version([4; 32], 8).await.is_err());
+    faults.mode.store(5, Ordering::SeqCst);
+    assert_eq!(
+        remote.cloud_version([4; 32], 8).await.unwrap().manifest(),
+        intent.manifest,
+        "an oversized reply must release its physical and retained owners"
+    );
     let before = faults.calls.load(Ordering::SeqCst);
     assert_eq!(
         client
