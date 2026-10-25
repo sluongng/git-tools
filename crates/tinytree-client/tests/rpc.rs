@@ -5129,6 +5129,13 @@ fn capture_transport_fixture(mode: usize) -> (Vec<u8>, Vec<u8>) {
     manifest.extend_from_slice(&(data.len() as u64).to_le_bytes());
     (data, manifest)
 }
+fn discovery_fixture_cursor(domain: u8, after: [u8; 32], ceiling: u64) -> Vec<u8> {
+    let mut token = vec![1, domain];
+    token.extend_from_slice(&[7; 32]);
+    token.extend_from_slice(&after);
+    token.extend_from_slice(&ceiling.to_be_bytes());
+    token
+}
 #[derive(Clone, Default)]
 struct CloudFaults {
     mode: Arc<AtomicUsize>,
@@ -5140,6 +5147,116 @@ struct CloudFaults {
 }
 #[tonic::async_trait]
 impl tinytree_client::cloud_protocol::workspace_cloud_server::WorkspaceCloud for CloudFaults {
+    async fn list_workspaces(
+        &self,
+        request: Request<tinytree_client::cloud_protocol::ListWorkspacesRequest>,
+    ) -> Result<Response<tinytree_client::cloud_protocol::ListWorkspacesResponse>, Status> {
+        use tinytree_client::cloud_protocol as c;
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        let input = request.into_inner();
+        let mode = self.mode.load(Ordering::SeqCst);
+        let mut rows = vec![
+            c::Workspace {
+                workspace_id: vec![2; 32],
+                generation: 2,
+                manifest_id: Some(vec![4; 32]),
+            },
+            c::Workspace {
+                workspace_id: vec![4; 32],
+                generation: 1,
+                manifest_id: Some(vec![5; 32]),
+            },
+        ];
+        if !input.continuation.is_empty() {
+            rows.remove(0);
+        }
+        let mut continuation = vec![];
+        if rows.len() > input.page_size as usize {
+            rows.truncate(input.page_size as usize);
+            continuation = discovery_fixture_cursor(1, [2; 32], 0);
+        }
+        match mode {
+            80 => rows.push(rows[0].clone()),
+            81 => rows[0].generation = 0,
+            82 => rows[0].workspace_id.pop().map(|_| ()).unwrap(),
+            83 => continuation = vec![0; 74],
+            84 => {
+                rows[0].manifest_id = None;
+            }
+            _ => (),
+        }
+        Ok(Response::new(c::ListWorkspacesResponse {
+            workspaces: rows,
+            continuation,
+        }))
+    }
+    async fn list_versions(
+        &self,
+        request: Request<tinytree_client::cloud_protocol::ListVersionsRequest>,
+    ) -> Result<Response<tinytree_client::cloud_protocol::ListVersionsResponse>, Status> {
+        use tinytree_client::cloud_protocol as c;
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        let input = request.into_inner();
+        let mode = self.mode.load(Ordering::SeqCst);
+        let mut rows = vec![
+            c::VersionSummary {
+                workspace_id: input.workspace_id.clone(),
+                generation: 1,
+                manifest_id: vec![3; 32],
+                previous_manifest_id: None,
+            },
+            c::VersionSummary {
+                workspace_id: input.workspace_id.clone(),
+                generation: 2,
+                manifest_id: vec![4; 32],
+                previous_manifest_id: Some(vec![3; 32]),
+            },
+        ];
+        if !input.continuation.is_empty() {
+            rows.remove(0);
+        }
+        let mut continuation = vec![];
+        if rows.len() > input.page_size as usize {
+            rows.truncate(input.page_size as usize);
+            let mut position = [0; 32];
+            position[..8].copy_from_slice(&1u64.to_be_bytes());
+            continuation = discovery_fixture_cursor(2, position, 2);
+        }
+        let mut current = c::Workspace {
+            workspace_id: input.workspace_id,
+            generation: 2,
+            manifest_id: Some(vec![4; 32]),
+        };
+        let mut ceiling = 2;
+        match mode {
+            90 => rows[0].workspace_id = vec![9; 32],
+            91 => rows[0].generation = 2,
+            92 => rows[1].previous_manifest_id = Some(vec![9; 32]),
+            93 => {
+                rows[0].manifest_id.pop();
+            }
+            94 => rows.clear(),
+            95 => ceiling = 1,
+            96 => continuation = vec![0; 74],
+            97 => current.manifest_id = Some(vec![9; 32]),
+            98 => {
+                current.generation = u64::MAX;
+                ceiling = u64::MAX;
+                let mut row = rows[0].clone();
+                row.generation = u64::MAX;
+                row.previous_manifest_id = Some(vec![3; 32]);
+                rows = vec![row.clone(), row];
+            }
+            _ => (),
+        }
+        Ok(Response::new(c::ListVersionsResponse {
+            workspace: Some(current),
+            versions: rows,
+            continuation,
+            through_generation: ceiling,
+        }))
+    }
+
     async fn put_object(
         &self,
         request: Request<tinytree_client::cloud_protocol::PutObjectRequest>,
@@ -5622,6 +5739,117 @@ impl tinytree_client::cloud_protocol::workspace_cloud_server::WorkspaceCloud for
             },
         ))
     }
+}
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cloud_discovery_checks_pages_scopes_chains_and_malformed_replies() {
+    use tinytree_client::cloud_protocol::workspace_cloud_server::WorkspaceCloudServer;
+    let faults = CloudFaults::default();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let incoming = async_stream::stream! {loop{match listener.accept().await{Ok((stream,_))=>yield Ok::<_,std::io::Error>(stream),Err(error)=>{yield Err(error);break}}}};
+    let service = WorkspaceCloudServer::new(faults.clone())
+        .accept_compressed(tonic::codec::CompressionEncoding::Zstd)
+        .send_compressed(tonic::codec::CompressionEncoding::Zstd);
+    let server = tokio::spawn(async move {
+        tonic::transport::Server::builder()
+            .add_service(service)
+            .serve_with_incoming(incoming)
+            .await
+            .unwrap()
+    });
+    let mut config = Config::default();
+    config.endpoint = format!("http://{address}");
+    config.rpc.retry.max_attempts = 1;
+    let client = NativeClient::connect(config).await.unwrap();
+    let first = client.cloud_workspaces(1, &[]).await.unwrap();
+    assert_eq!(first.workspaces[0].workspace_id, [2; 32]);
+    let last = client
+        .cloud_workspaces(1, &first.continuation)
+        .await
+        .unwrap();
+    assert_eq!(last.workspaces[0].workspace_id, [4; 32]);
+    assert!(last.continuation.is_empty());
+    let first = client.cloud_versions([2; 32], 1, &[]).await.unwrap();
+    assert_eq!(first.versions[0].generation, 1);
+    assert_eq!(first.through_generation, 2);
+    let last = client
+        .cloud_versions([2; 32], 1, &first.continuation)
+        .await
+        .unwrap();
+    assert_eq!(last.versions[0].generation, 2);
+    assert!(last.continuation.is_empty());
+    for (name, mode) in [
+        ("duplicate workspace", 80),
+        ("unpublished workspace", 81),
+        ("malformed workspace ID", 82),
+        ("malformed catalog cursor", 83),
+        ("missing workspace manifest", 84),
+    ] {
+        faults.mode.store(mode, Ordering::SeqCst);
+        assert_eq!(
+            client.cloud_workspaces(2, &[]).await.unwrap_err().code(),
+            Code::DataLoss,
+            "{name}"
+        );
+    }
+    for (name, mode) in [
+        ("wrong workspace", 90),
+        ("generation gap", 91),
+        ("wrong previous manifest", 92),
+        ("malformed manifest ID", 93),
+        ("missing versions", 94),
+        ("ceiling mismatch", 95),
+        ("malformed version cursor", 96),
+        ("current pointer mismatch", 97),
+    ] {
+        faults.mode.store(mode, Ordering::SeqCst);
+        assert_eq!(
+            client
+                .cloud_versions([2; 32], 2, &[])
+                .await
+                .unwrap_err()
+                .code(),
+            Code::DataLoss,
+            "{name}"
+        );
+    }
+    faults.mode.store(98, Ordering::SeqCst);
+    let mut position = [0; 32];
+    position[..8].copy_from_slice(&(u64::MAX - 1).to_be_bytes());
+    let boundary = discovery_fixture_cursor(2, position, u64::MAX);
+    assert_eq!(
+        client
+            .cloud_versions([2; 32], 2, &boundary)
+            .await
+            .unwrap_err()
+            .code(),
+        Code::DataLoss,
+        "generation overflow is a corrupt page, not a panic"
+    );
+    let before = faults.calls.load(Ordering::SeqCst);
+    assert_eq!(
+        client.cloud_workspaces(0, &[]).await.unwrap_err().code(),
+        Code::InvalidArgument
+    );
+    assert_eq!(
+        client
+            .cloud_versions([2; 32], 129, &[])
+            .await
+            .unwrap_err()
+            .code(),
+        Code::InvalidArgument
+    );
+    assert_eq!(
+        client
+            .cloud_workspaces(1, &[0; 74])
+            .await
+            .unwrap_err()
+            .code(),
+        Code::InvalidArgument
+    );
+    assert_eq!(faults.calls.load(Ordering::SeqCst), before);
+    server.abort();
+    let _ = server.await;
 }
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn workspace_cloud_checks_stream_selection_reconciles_intent_and_releases_call_owners() {

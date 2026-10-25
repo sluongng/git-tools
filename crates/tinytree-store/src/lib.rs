@@ -28,9 +28,9 @@ pub use cloud::{
     CloudCaptureReadLease, CloudConfig, CloudIndexReadLease, CloudIndexWriteReceipt,
     CloudNativeReadLease, CloudNativeReadLimits, CloudObjectDescriptor, CloudOwner,
     CloudPublication, CloudPublicationLimits, CloudReadLease, CloudResourceProfile,
-    CloudSnapshotCommit, CloudSnapshotReadGuard, CloudVersion, CloudVersionReadGuard,
-    CloudVersionSelector, CloudWorkspace, CloudWriteReceipt, PublishCapturedCloudRequest,
-    PublishCloudRequest,
+    CloudSnapshotCommit, CloudSnapshotReadGuard, CloudVersion, CloudVersionPage,
+    CloudVersionReadGuard, CloudVersionSelector, CloudWorkspace, CloudWorkspacePage,
+    CloudWriteReceipt, PublishCapturedCloudRequest, PublishCloudRequest,
 };
 mod external_checks;
 mod landing;

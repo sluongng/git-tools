@@ -222,6 +222,81 @@ pub struct CloudVersion {
     pub manifest: ManifestId,
     pub previous: Option<ManifestId>,
 }
+/// Bounded moving catalog page. Inserts before the cursor require a fresh scan.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CloudWorkspacePage {
+    pub workspaces: Vec<CloudWorkspace>,
+    pub continuation: Vec<u8>,
+}
+/// Append-only retained history through the initial page's current generation.
+/// Summaries are selectors, not read guards or verified manifest payloads.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CloudVersionPage {
+    pub workspace: CloudWorkspace,
+    pub versions: Vec<CloudVersion>,
+    pub through_generation: u64,
+    pub continuation: Vec<u8>,
+}
+const DISCOVERY_CURSOR_BYTES: usize = 74;
+const DISCOVERY_MAX_PAGE: usize = 128;
+fn discovery_binding(
+    repo: &str,
+    owner: CloudOwner,
+    workspace: Option<[u8; 32]>,
+    size: usize,
+) -> [u8; 32] {
+    let mut h = blake3::Hasher::new();
+    h.update(b"tinytree-cloud-discovery-v1\0");
+    h.update(&scope(repo, owner));
+    h.update(&(size as u64).to_be_bytes());
+    if let Some(id) = workspace {
+        h.update(&id);
+    }
+    *h.finalize().as_bytes()
+}
+fn discovery_cursor(domain: u8, binding: [u8; 32], after: [u8; 32], ceiling: u64) -> Vec<u8> {
+    let mut out = vec![1, domain];
+    out.extend_from_slice(&binding);
+    out.extend_from_slice(&after);
+    out.extend_from_slice(&ceiling.to_be_bytes());
+    out
+}
+fn discovery_after(
+    cursor: &[u8],
+    domain: u8,
+    binding: [u8; 32],
+) -> Result<Option<([u8; 32], u64)>> {
+    if cursor.is_empty() {
+        return Ok(None);
+    }
+    if cursor.len() != DISCOVERY_CURSOR_BYTES
+        || cursor[..2] != [1, domain]
+        || cursor[2..34] != binding
+    {
+        return Err(Error::Invalid("cloud discovery continuation scope"));
+    }
+    let after: [u8; 32] = cursor[34..66].try_into().unwrap();
+    let ceiling = u64::from_be_bytes(cursor[66..74].try_into().unwrap());
+    if (domain == 1 && ceiling != 0)
+        || (domain == 2
+            && (after[8..] != [0; 24]
+                || ceiling == 0
+                || u64::from_be_bytes(after[..8].try_into().unwrap()) == 0
+                || u64::from_be_bytes(after[..8].try_into().unwrap()) >= ceiling))
+    {
+        return Err(Error::Invalid("cloud discovery continuation encoding"));
+    }
+    Ok(Some((after, ceiling)))
+}
+fn discovery_upper(mut prefix: Vec<u8>) -> Vec<u8> {
+    while let Some(last) = prefix.pop() {
+        if last != u8::MAX {
+            prefix.push(last + 1);
+            return prefix;
+        }
+    }
+    unreachable!("repository scope has a non-FF delimiter")
+}
 #[derive(Clone)]
 pub struct PublishCloudRequest {
     pub workspace: [u8; 32],
@@ -1612,6 +1687,132 @@ impl Store {
         let _gate = self.inner.lock()?;
         self.inner.repository(repo)?;
         self.inner.cloud_workspace(repo, owner, workspace)
+    }
+    /// Enumerates only this authenticated owner's published workspace catalog.
+    /// Each call reads at most page_size + 1 fixed-size metadata rows.
+    pub fn list_cloud_workspaces(
+        &self,
+        repo: &str,
+        owner: CloudOwner,
+        page_size: usize,
+        continuation: &[u8],
+    ) -> Result<CloudWorkspacePage> {
+        use std::ops::Bound;
+        if !(1..=DISCOVERY_MAX_PAGE).contains(&page_size) {
+            return Err(Error::Invalid("cloud discovery page size"));
+        }
+        let binding = discovery_binding(repo, owner, None, page_size);
+        let after = discovery_after(continuation, 1, binding)?;
+        let _gate = self.inner.lock()?;
+        self.inner.repository(repo)?;
+        let prefix = scope(repo, owner);
+        let lower = after
+            .map(|(id, _)| Bound::Excluded(workspace_key(repo, owner, id)))
+            .unwrap_or_else(|| Bound::Included(prefix.clone()));
+        let view = self.inner.db.read_tx();
+        let mut rows = view.range(
+            &self.inner.spaces.cloud.workspaces,
+            (lower, Bound::Excluded(discovery_upper(prefix.clone()))),
+        );
+        let mut workspaces = Vec::new();
+        for _ in 0..page_size {
+            let Some(item) = rows.next() else { break };
+            let (key, bytes) = item.into_inner()?;
+            if key.len() != prefix.len() + 32 || bytes.len() > 512 {
+                return Err(Error::Corrupt("cloud workspace discovery row"));
+            }
+            let id: [u8; 32] = key[prefix.len()..].try_into().unwrap();
+            let record: WorkspaceRecord = decode(&bytes)?;
+            if record.generation == 0 {
+                return Err(Error::Corrupt("cloud workspace generation"));
+            }
+            workspaces.push(CloudWorkspace {
+                workspace: id,
+                generation: record.generation,
+                manifest: Some(ManifestId(record.manifest)),
+            });
+        }
+        let continuation = if let Some(item) = rows.next() {
+            let (key, bytes) = item.into_inner()?;
+            if key.len() != prefix.len() + 32 || bytes.len() > 512 {
+                return Err(Error::Corrupt("cloud workspace discovery row"));
+            }
+            discovery_cursor(1, binding, workspaces.last().unwrap().workspace, 0)
+        } else {
+            Vec::new()
+        };
+        Ok(CloudWorkspacePage {
+            workspaces,
+            continuation,
+        })
+    }
+    /// Lists immutable selectors without reading manifest payloads. New versions
+    /// after the first page are excluded; GetVersion still verifies selection.
+    pub fn list_cloud_versions(
+        &self,
+        repo: &str,
+        owner: CloudOwner,
+        workspace: [u8; 32],
+        page_size: usize,
+        continuation: &[u8],
+    ) -> Result<CloudVersionPage> {
+        use std::ops::Bound;
+        if !(1..=DISCOVERY_MAX_PAGE).contains(&page_size) {
+            return Err(Error::Invalid("cloud discovery page size"));
+        }
+        let binding = discovery_binding(repo, owner, Some(workspace), page_size);
+        let after = discovery_after(continuation, 2, binding)?;
+        let _gate = self.inner.lock()?;
+        self.inner.repository(repo)?;
+        let current = self.inner.cloud_workspace(repo, owner, workspace)?;
+        let (after_generation, ceiling) = after
+            .map(|(id, ceiling)| (u64::from_be_bytes(id[..8].try_into().unwrap()), ceiling))
+            .unwrap_or((0, current.generation));
+        if ceiling > current.generation {
+            return Err(Error::Invalid("cloud discovery continuation generation"));
+        }
+        let view = self.inner.db.read_tx();
+        let lower = Bound::Excluded(version_key(repo, owner, workspace, after_generation));
+        let upper = Bound::Included(version_key(repo, owner, workspace, ceiling));
+        let mut rows = view.range(&self.inner.spaces.cloud.versions, (lower, upper));
+        let mut versions = Vec::new();
+        for _ in 0..page_size {
+            let Some(item) = rows.next() else { break };
+            let (key, bytes) = item.into_inner()?;
+            if bytes.len() > 1024 {
+                return Err(Error::Corrupt("cloud version discovery row"));
+            }
+            let record: VersionRecord = decode(&bytes)?;
+            if ![1, 2, 3].contains(&record.format)
+                || record.workspace != workspace
+                || record.generation != after_generation + versions.len() as u64 + 1
+                || key.as_ref() != version_key(repo, owner, workspace, record.generation).as_slice()
+                || (record.generation == 1) != record.previous.is_none()
+            {
+                return Err(Error::Corrupt("cloud version discovery identity"));
+            }
+            versions.push(version(&record));
+        }
+        let last = versions
+            .last()
+            .map(|v| v.generation)
+            .unwrap_or(after_generation);
+        if last < ceiling && versions.len() != page_size {
+            return Err(Error::Corrupt("cloud version discovery gap"));
+        }
+        let continuation = if last < ceiling {
+            let mut id = [0; 32];
+            id[..8].copy_from_slice(&last.to_be_bytes());
+            discovery_cursor(2, binding, id, ceiling)
+        } else {
+            Vec::new()
+        };
+        Ok(CloudVersionPage {
+            workspace: current,
+            versions,
+            through_generation: ceiling,
+            continuation,
+        })
     }
     pub fn cloud_publication(
         &self,

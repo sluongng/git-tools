@@ -5338,6 +5338,113 @@ async fn cloud_rpc_private_compressed_history_replay_gc_and_restart() {
         .publish_version(request(second.clone(), ALPHA))
         .await
         .unwrap();
+    let catalog_request = c::ListWorkspacesRequest {
+        repository_id: "alpha".into(),
+        page_size: 1,
+        continuation: vec![],
+    };
+    assert_eq!(
+        client
+            .list_workspaces(catalog_request.clone())
+            .await
+            .unwrap_err()
+            .code(),
+        Code::Unauthenticated
+    );
+    let catalog = client
+        .list_workspaces(request(catalog_request.clone(), ALPHA))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(catalog.workspaces.len(), 1);
+    assert_eq!(catalog.workspaces[0].workspace_id, manifest.workspace);
+    assert_eq!(catalog.workspaces[0].generation, 2);
+    assert!(catalog.continuation.is_empty());
+    assert!(
+        client
+            .list_workspaces(request(catalog_request.clone(), PEER))
+            .await
+            .unwrap()
+            .into_inner()
+            .workspaces
+            .is_empty()
+    );
+    assert_eq!(
+        client
+            .list_workspaces(request(catalog_request.clone(), BETA))
+            .await
+            .unwrap_err()
+            .code(),
+        Code::PermissionDenied
+    );
+    let versions_request = c::ListVersionsRequest {
+        repository_id: "alpha".into(),
+        workspace_id: manifest.workspace.to_vec(),
+        page_size: 1,
+        continuation: vec![],
+    };
+    let versions = client
+        .list_versions(request(versions_request.clone(), ALPHA))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(versions.through_generation, 2);
+    assert_eq!(versions.versions[0].manifest_id, first.manifest_id);
+    assert!(!versions.continuation.is_empty());
+    let next_request = c::ListVersionsRequest {
+        continuation: versions.continuation.clone(),
+        ..versions_request.clone()
+    };
+    assert_eq!(
+        client
+            .list_versions(request(next_request.clone(), PEER))
+            .await
+            .unwrap_err()
+            .code(),
+        Code::InvalidArgument
+    );
+    assert_eq!(
+        client
+            .list_versions(request(
+                c::ListVersionsRequest {
+                    page_size: 2,
+                    ..next_request.clone()
+                },
+                ALPHA
+            ))
+            .await
+            .unwrap_err()
+            .code(),
+        Code::InvalidArgument
+    );
+    let mut corrupt_cursor = next_request.clone();
+    corrupt_cursor.continuation.push(0);
+    assert_eq!(
+        client
+            .list_versions(request(corrupt_cursor, ALPHA))
+            .await
+            .unwrap_err()
+            .code(),
+        Code::InvalidArgument
+    );
+    let last = client
+        .list_versions(request(next_request, ALPHA))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(last.versions[0].manifest_id, second.manifest_id);
+    assert_eq!(
+        last.versions[0].previous_manifest_id,
+        Some(first.manifest_id.clone())
+    );
+    assert!(last.continuation.is_empty());
+    let peer = client
+        .list_versions(request(versions_request, PEER))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(peer.workspace.unwrap().generation, 0);
+    assert!(peer.versions.is_empty());
     let mut stale = second.clone();
     stale.idempotency_key = "stale-cloud-capture".into();
     assert_eq!(

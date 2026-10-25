@@ -1083,6 +1083,75 @@ impl p::workspace_cloud_server::WorkspaceCloud for CloudService {
         .await?;
         Ok(response(workspace(value), work, ()))
     }
+    async fn list_workspaces(
+        &self,
+        request: Request<p::ListWorkspacesRequest>,
+    ) -> Result<Response<p::ListWorkspacesResponse>, Status> {
+        let (host, work, owner) =
+            self.context(&request, &request.get_ref().repository_id, false)?;
+        let input = request.into_inner();
+        let store = host.store.clone();
+        let page = execute(work.clone(), move || {
+            store
+                .list_cloud_workspaces(
+                    &input.repository_id,
+                    owner,
+                    input.page_size as usize,
+                    &input.continuation,
+                )
+                .map_err(status)
+        })
+        .await?;
+        Ok(response(
+            p::ListWorkspacesResponse {
+                workspaces: page.workspaces.into_iter().map(workspace).collect(),
+                continuation: page.continuation,
+            },
+            work,
+            (),
+        ))
+    }
+    async fn list_versions(
+        &self,
+        request: Request<p::ListVersionsRequest>,
+    ) -> Result<Response<p::ListVersionsResponse>, Status> {
+        let (host, work, owner) =
+            self.context(&request, &request.get_ref().repository_id, false)?;
+        let input = request.into_inner();
+        let id = array(&input.workspace_id)?;
+        let store = host.store.clone();
+        let page = execute(work.clone(), move || {
+            store
+                .list_cloud_versions(
+                    &input.repository_id,
+                    owner,
+                    id,
+                    input.page_size as usize,
+                    &input.continuation,
+                )
+                .map_err(status)
+        })
+        .await?;
+        Ok(response(
+            p::ListVersionsResponse {
+                workspace: Some(workspace(page.workspace)),
+                versions: page
+                    .versions
+                    .into_iter()
+                    .map(|v| p::VersionSummary {
+                        workspace_id: v.workspace.to_vec(),
+                        generation: v.generation,
+                        manifest_id: v.manifest.0.to_vec(),
+                        previous_manifest_id: v.previous.map(|id| id.0.to_vec()),
+                    })
+                    .collect(),
+                continuation: page.continuation,
+                through_generation: page.through_generation,
+            },
+            work,
+            (),
+        ))
+    }
     async fn get_version(
         &self,
         request: Request<p::GetVersionRequest>,

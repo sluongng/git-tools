@@ -591,6 +591,9 @@ pub(crate) enum Shape {
     CloudSelection,
     CloudChunk,
     CloudWorkspace,
+    CloudWorkspacePage,
+    CloudVersionPage,
+    CloudVersionSummary,
     CloudPublication,
     CloudPublicationResult,
     CloudVersion,
@@ -916,7 +919,8 @@ fn scan(
         | Shape::CloudIndexReceipt
         | Shape::CloudCaptureDescriptor => (1 << 1) | (1 << 2),
         Shape::CloudChunk | Shape::CloudWorkspace | Shape::CloudIndexChunk => 1 << 1,
-        Shape::CloudVersion => (1 << 1) | (1 << 3),
+        Shape::CloudVersion | Shape::CloudVersionSummary => (1 << 1) | (1 << 3),
+        Shape::CloudVersionPage => 1 << 1,
         Shape::CloudNativeAuthority => (1 << 2) | (1 << 3) | (1 << 4),
         Shape::CloudNativeChunk | Shape::CloudCaptureChunk => (1 << 1) | (1 << 5),
         Shape::IdsPage | Shape::GraphPage | Shape::CanonicalPage => (1 << 1) | (1 << 2) | (1 << 6),
@@ -1053,6 +1057,20 @@ fn rule(shape: Shape, n: u32, l: &Limits) -> Option<(u8, Option<Shape>, usize, u
             4 * std::mem::size_of::<tinytree_proto::cloud_v1::IndexArtifactSelection>(),
         ),
         (Shape::CloudIndexChunk, 3) => text(l.max_frame_bytes),
+        (Shape::CloudWorkspacePage, 1) => repeated(
+            Shape::CloudWorkspace,
+            128,
+            4 * std::mem::size_of::<tinytree_proto::cloud_v1::Workspace>(),
+        ),
+        (Shape::CloudWorkspacePage, 2) | (Shape::CloudVersionPage, 3) => text(74),
+        (Shape::CloudVersionPage, 1) => nested(Shape::CloudWorkspace),
+        (Shape::CloudVersionPage, 2) => repeated(
+            Shape::CloudVersionSummary,
+            128,
+            4 * std::mem::size_of::<tinytree_proto::cloud_v1::VersionSummary>(),
+        ),
+        (Shape::CloudVersionPage, 4) | (Shape::CloudVersionSummary, 2) => scalar(),
+        (Shape::CloudVersionSummary, 1 | 3 | 4) => text(32),
         (Shape::CloudId, 1)
         | (Shape::CloudDigest, 2)
         | (Shape::CloudReceipt, 3)

@@ -14,6 +14,8 @@ service WorkspaceCloud {
   rpc ReadObject(ReadObjectRequest) returns (stream ObjectChunk);
   rpc PublishVersion(PublishVersionRequest) returns (Publication);
   rpc GetWorkspace(GetWorkspaceRequest) returns (Workspace);
+  rpc ListWorkspaces(ListWorkspacesRequest) returns (ListWorkspacesResponse);
+  rpc ListVersions(ListVersionsRequest) returns (ListVersionsResponse);
   rpc GetVersion(GetVersionRequest) returns (Version);
   rpc ReadCapture(ReadCaptureRequest) returns (stream CaptureChunk);
   rpc ReadNativeClosure(ReadNativeClosureRequest) returns (stream NativeClosureChunk);
@@ -206,4 +208,34 @@ message CaptureChunk {
   bytes data = 3;
   bool eof = 4;
   bytes manifest_id = 5; // Mandatory echo of the exact retained selector.
+}
+
+// Discovery summaries are not retention leases. Select exact GetVersion before
+// restore to obtain and verify the complete manifest and its selected digest.
+message ListWorkspacesRequest {
+  string repository_id = 1;
+  uint32 page_size = 2; // Required, 1..128; fixed across continuation.
+  bytes continuation = 3;
+}
+message ListWorkspacesResponse {
+  repeated Workspace workspaces = 1; // Ordered by unsigned workspace ID bytes.
+  bytes continuation = 2; // Empty iff this owner-scoped scan is exhausted.
+}
+message ListVersionsRequest {
+  string repository_id = 1;
+  bytes workspace_id = 2;
+  uint32 page_size = 3; // Required, 1..128; fixed across continuation.
+  bytes continuation = 4;
+}
+message VersionSummary {
+  bytes workspace_id = 1;
+  uint64 generation = 2;
+  bytes manifest_id = 3;
+  optional bytes previous_manifest_id = 4;
+}
+message ListVersionsResponse {
+  Workspace workspace = 1; // Current pointer observed for this page.
+  repeated VersionSummary versions = 2; // Ascending generation.
+  bytes continuation = 3;
+  uint64 through_generation = 4; // Frozen initial current generation ceiling.
 }

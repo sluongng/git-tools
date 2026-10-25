@@ -3036,6 +3036,155 @@ fn cloud_publication_is_atomic_replayable_retains_history_and_survives_gc_and_re
 }
 
 #[test]
+fn cloud_discovery_is_owner_scoped_bounded_and_versions_pin_the_initial_ceiling() {
+    let (directory, store) = open();
+    let owner = CloudOwner {
+        principal: [40; 32],
+    };
+    let peer = CloudOwner {
+        principal: [41; 32],
+    };
+    let (_, root, head) = fixture(&store, "discover cloud history");
+    let (mut manifest, leases) = cloud_capture(&store, owner, head, root);
+    let limits = CloudPublicationLimits::default();
+    assert!(store.list_cloud_workspaces("demo", owner, 0, &[]).is_err());
+    assert!(
+        store
+            .list_cloud_workspaces("demo", owner, 129, &[])
+            .is_err()
+    );
+    assert!(
+        store
+            .list_cloud_workspaces("demo", owner, 2, &[])
+            .unwrap()
+            .workspaces
+            .is_empty()
+    );
+    let absent = store
+        .list_cloud_versions("demo", owner, [9; 32], 2, &[])
+        .unwrap();
+    assert_eq!(absent.workspace.generation, 0);
+    assert_eq!(absent.through_generation, 0);
+    assert!(absent.versions.is_empty() && absent.continuation.is_empty());
+    manifest.workspace = [2; 32];
+    let first = cloud_request(&manifest, 0, "discovery-first", &leases);
+    store
+        .publish_cloud_version("demo", owner, &first, 1, &limits)
+        .unwrap();
+    manifest.sequence = 2;
+    manifest.parents = vec![first.manifest];
+    let second = cloud_request(&manifest, 1, "discovery-second", &[]);
+    store
+        .publish_cloud_version("demo", owner, &second, 2, &limits)
+        .unwrap();
+    let versions = store
+        .list_cloud_versions("demo", owner, [2; 32], 1, &[])
+        .unwrap();
+    assert_eq!(versions.versions[0].manifest, first.manifest);
+    assert_eq!(versions.through_generation, 2);
+    assert!(!versions.continuation.is_empty());
+    for (who, id, size) in [(peer, [2; 32], 1), (owner, [3; 32], 1), (owner, [2; 32], 2)] {
+        assert!(
+            store
+                .list_cloud_versions("demo", who, id, size, &versions.continuation)
+                .is_err()
+        );
+    }
+    manifest.sequence = 3;
+    manifest.parents = vec![second.manifest];
+    let third = cloud_request(&manifest, 2, "discovery-third", &[]);
+    store
+        .publish_cloud_version("demo", owner, &third, 3, &limits)
+        .unwrap();
+    let page = store
+        .list_cloud_versions("demo", owner, [2; 32], 1, &versions.continuation)
+        .unwrap();
+    assert_eq!(page.workspace.generation, 3);
+    assert_eq!(page.through_generation, 2);
+    assert_eq!(page.versions.len(), 1);
+    assert_eq!(page.versions[0].manifest, second.manifest);
+    assert!(page.continuation.is_empty());
+    // Other workspace insertion precedes a moving catalog cursor: fresh scan
+    // finds it; continuation does not pretend to be a catalog snapshot.
+    manifest.workspace = [4; 32];
+    manifest.sequence = 1;
+    manifest.parents.clear();
+    let other = cloud_request(&manifest, 0, "discovery-other", &[]);
+    store
+        .publish_cloud_version("demo", owner, &other, 4, &limits)
+        .unwrap();
+    let catalog = store.list_cloud_workspaces("demo", owner, 1, &[]).unwrap();
+    assert_eq!(catalog.workspaces[0].workspace, [2; 32]);
+    assert!(!catalog.continuation.is_empty());
+    assert!(
+        store
+            .list_cloud_workspaces("demo", peer, 1, &catalog.continuation)
+            .is_err()
+    );
+    assert!(
+        store
+            .list_cloud_workspaces("demo", owner, 2, &catalog.continuation)
+            .is_err()
+    );
+    assert!(
+        store
+            .list_cloud_versions("demo", owner, [2; 32], 1, &catalog.continuation)
+            .is_err()
+    );
+    assert!(
+        store
+            .list_cloud_workspaces("demo", peer, 1, &[])
+            .unwrap()
+            .workspaces
+            .is_empty()
+    );
+    assert!(
+        store
+            .list_cloud_workspaces("other", owner, 1, &catalog.continuation)
+            .is_err()
+    );
+    manifest.workspace = [1; 32];
+    let inserted = cloud_request(&manifest, 0, "discovery-before-cursor", &[]);
+    store
+        .publish_cloud_version("demo", owner, &inserted, 5, &limits)
+        .unwrap();
+    let mut malformed = catalog.continuation.clone();
+    malformed.push(0);
+    assert!(
+        store
+            .list_cloud_workspaces("demo", owner, 1, &malformed)
+            .is_err()
+    );
+    store.gc("demo", 100).unwrap();
+    drop(store);
+    let store = Store::open_existing(directory.path(), config()).unwrap();
+    let tail = store
+        .list_cloud_workspaces("demo", owner, 1, &catalog.continuation)
+        .unwrap();
+    assert_eq!(tail.workspaces[0].workspace, [4; 32]);
+    assert!(tail.continuation.is_empty());
+    assert_eq!(
+        store
+            .list_cloud_workspaces("demo", owner, 128, &[])
+            .unwrap()
+            .workspaces
+            .iter()
+            .map(|w| w.workspace)
+            .collect::<Vec<_>>(),
+        vec![[1; 32], [2; 32], [4; 32]]
+    );
+
+    assert_eq!(
+        store
+            .list_cloud_versions("demo", owner, [2; 32], 128, &[])
+            .unwrap()
+            .versions
+            .len(),
+        3
+    );
+}
+
+#[test]
 fn invalid_cloud_checkpoint_and_incomplete_coverage_leave_no_publication() {
     let (directory, store) = open();
     let owner = CloudOwner {

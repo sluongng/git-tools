@@ -103,7 +103,8 @@ pub use captures::{CloudCaptureReadLease, PublishCapturedCloudRequest};
 mod versions;
 pub use versions::{
     CloudPublication, CloudPublicationLimits, CloudSnapshotCommit, CloudSnapshotReadGuard,
-    CloudVersion, CloudVersionReadGuard, CloudWorkspace, PublishCloudRequest,
+    CloudVersion, CloudVersionPage, CloudVersionReadGuard, CloudWorkspace, CloudWorkspacePage,
+    PublishCloudRequest,
 };
 fn decode<T: serde::de::DeserializeOwned>(bytes: &[u8]) -> Result<T> {
     if bytes.len() > CLOUD_JSON_ROW_BYTES {

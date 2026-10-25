@@ -236,6 +236,77 @@ fn descriptor(value: c::ObjectDescriptor, max: usize) -> Result<CloudDescriptor,
         },
     })
 }
+/// A selector summary; it does not carry verified manifest bytes or authority.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CloudVersionSummary {
+    pub workspace_id: [u8; 32],
+    pub generation: u64,
+    pub manifest_id: CloudManifestId,
+    pub previous_manifest_id: Option<CloudManifestId>,
+}
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CloudWorkspacePage {
+    pub workspaces: Vec<CloudWorkspace>,
+    pub continuation: Vec<u8>,
+}
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CloudVersionPage {
+    pub workspace: CloudWorkspace,
+    pub versions: Vec<CloudVersionSummary>,
+    pub through_generation: u64,
+    pub continuation: Vec<u8>,
+}
+fn discovery_cursor(
+    cursor: &[u8],
+    domain: u8,
+    size: usize,
+) -> Result<Option<([u8; 32], u64)>, Status> {
+    if !(1..=128).contains(&size) {
+        return Err(Status::invalid_argument("cloud discovery page size"));
+    }
+    if cursor.is_empty() {
+        return Ok(None);
+    }
+    if cursor.len() != 74 || cursor[..2] != [1, domain] {
+        return Err(Status::invalid_argument("cloud discovery continuation"));
+    }
+    let id: [u8; 32] = cursor[34..66].try_into().unwrap();
+    let ceiling = u64::from_be_bytes(cursor[66..].try_into().unwrap());
+    if (domain == 1 && ceiling != 0)
+        || (domain == 2
+            && (id[8..] != [0; 24]
+                || ceiling == 0
+                || u64::from_be_bytes(id[..8].try_into().unwrap()) == 0
+                || u64::from_be_bytes(id[..8].try_into().unwrap()) >= ceiling))
+    {
+        return Err(Status::invalid_argument("cloud discovery continuation"));
+    }
+    Ok(Some((id, ceiling)))
+}
+fn check_discovery_next(
+    next: &[u8],
+    before: &[u8],
+    domain: u8,
+    size: usize,
+    last: Option<[u8; 32]>,
+    ceiling: u64,
+    rows: usize,
+) -> Result<(), Status> {
+    if next.is_empty() {
+        return Ok(());
+    }
+    let (position, c) = discovery_cursor(next, domain, size)
+        .map_err(|_| corrupt())?
+        .ok_or_else(corrupt)?;
+    if rows != size
+        || Some(position) != last
+        || c != ceiling
+        || (!before.is_empty() && next[2..34] != before[2..34])
+    {
+        return Err(corrupt());
+    }
+    Ok(())
+}
 fn workspace(value: c::Workspace, expected: [u8; 32]) -> Result<CloudWorkspace, Status> {
     if array::<32>(&value.workspace_id)? != expected
         || (value.generation == 0) != value.manifest_id.is_none()
@@ -581,6 +652,149 @@ impl NativeClient {
             )
             .await?;
         workspace(value, id)
+    }
+    /// A moving owner-scoped catalog page; inserts before a continuation require
+    /// a fresh scan. Entries are selectors, not verified retained-version leases.
+    pub async fn cloud_workspaces(
+        &self,
+        page_size: usize,
+        continuation: &[u8],
+    ) -> Result<CloudWorkspacePage, Status> {
+        let after = discovery_cursor(continuation, 1, page_size)?;
+        let (value, _budget): (c::ListWorkspacesResponse, _) = self
+            .cloud_call(
+                self.deadline(),
+                "/tinytree.cloud.v1.WorkspaceCloud/ListWorkspaces",
+                Shape::CloudWorkspacePage,
+                65536,
+                1024,
+                || c::ListWorkspacesRequest {
+                    repository_id: self.inner.config.repository_id.clone(),
+                    page_size: page_size as u32,
+                    continuation: continuation.to_vec(),
+                },
+            )
+            .await?;
+        if value.workspaces.len() > page_size {
+            return Err(corrupt());
+        }
+        let mut rows = Vec::new();
+        let mut last = after.map(|(id, _)| id);
+        for row in value.workspaces {
+            let id = array(&row.workspace_id)?;
+            if last.is_some_and(|old| id <= old) || row.generation == 0 {
+                return Err(corrupt());
+            }
+            rows.push(workspace(row, id)?);
+            last = Some(id);
+        }
+        check_discovery_next(
+            &value.continuation,
+            continuation,
+            1,
+            page_size,
+            last,
+            0,
+            rows.len(),
+        )?;
+        Ok(CloudWorkspacePage {
+            workspaces: rows,
+            continuation: value.continuation,
+        })
+    }
+    /// Immutable generation selectors through the first page's ceiling. Fetch
+    /// cloud_version for the selected manifest payload/digest before restoring.
+    pub async fn cloud_versions(
+        &self,
+        id: [u8; 32],
+        page_size: usize,
+        continuation: &[u8],
+    ) -> Result<CloudVersionPage, Status> {
+        let after = discovery_cursor(continuation, 2, page_size)?;
+        let (value, _budget): (c::ListVersionsResponse, _) = self
+            .cloud_call(
+                self.deadline(),
+                "/tinytree.cloud.v1.WorkspaceCloud/ListVersions",
+                Shape::CloudVersionPage,
+                65536,
+                1024,
+                || c::ListVersionsRequest {
+                    repository_id: self.inner.config.repository_id.clone(),
+                    workspace_id: id.to_vec(),
+                    page_size: page_size as u32,
+                    continuation: continuation.to_vec(),
+                },
+            )
+            .await?;
+        let current = workspace(value.workspace.ok_or_else(corrupt)?, id)?;
+        let (old, ceiling) = after
+            .map(|(id, c)| (u64::from_be_bytes(id[..8].try_into().unwrap()), c))
+            .unwrap_or((0, current.generation));
+        if value.through_generation != ceiling
+            || ceiling > current.generation
+            || value.versions.len() > page_size
+        {
+            return Err(corrupt());
+        }
+        let mut versions = Vec::new();
+        for row in value.versions {
+            if array::<32>(&row.workspace_id)? != id
+                || Some(row.generation)
+                    != old
+                        .checked_add(versions.len() as u64)
+                        .and_then(|n| n.checked_add(1))
+                || row.generation > ceiling
+            {
+                return Err(corrupt());
+            }
+            let previous = row
+                .previous_manifest_id
+                .map(|v| array(&v).map(CloudManifestId))
+                .transpose()?;
+            if (row.generation == 1) != previous.is_none()
+                || versions
+                    .last()
+                    .is_some_and(|v: &CloudVersionSummary| Some(v.manifest_id) != previous)
+            {
+                return Err(corrupt());
+            }
+            versions.push(CloudVersionSummary {
+                workspace_id: id,
+                generation: row.generation,
+                manifest_id: CloudManifestId(array(&row.manifest_id)?),
+                previous_manifest_id: previous,
+            });
+        }
+        let last = versions.last().map(|v| v.generation).unwrap_or(old);
+        if (last < ceiling && versions.len() != page_size)
+            || (last == ceiling) != value.continuation.is_empty()
+        {
+            return Err(corrupt());
+        }
+        if last == current.generation
+            && versions
+                .last()
+                .is_some_and(|v| Some(v.manifest_id) != current.manifest_id)
+        {
+            return Err(corrupt());
+        }
+        let mut position = [0; 32];
+        position[..8].copy_from_slice(&last.to_be_bytes());
+        check_discovery_next(
+            &value.continuation,
+            continuation,
+            2,
+            page_size,
+            Some(position),
+            ceiling,
+            versions.len(),
+        )?;
+        Ok(CloudVersionPage {
+            workspace: current,
+            versions,
+            through_generation: ceiling,
+            continuation: value.continuation,
+        })
     }
     async fn cloud_publication_at(
         &self,

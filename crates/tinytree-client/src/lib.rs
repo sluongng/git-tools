@@ -9,8 +9,9 @@ pub use client::cloud::{
     CloudCapture, CloudCaptureDescriptor, CloudCaptureId, CloudCapturedPublishIntent,
     CloudDescriptor, CloudIndexArtifact, CloudIndexArtifactDescriptor, CloudIndexArtifactId,
     CloudIndexWriteReceipt, CloudLimits, CloudManifestId, CloudObject, CloudObjectId,
-    CloudPublication, CloudPublishIntent, CloudRawDigest, CloudVersion, CloudWorkspace,
-    CloudWriteReceipt, RetainedVersionSelector, VerifiedCapturedVersion, VerifiedRetainedVersion,
+    CloudPublication, CloudPublishIntent, CloudRawDigest, CloudVersion, CloudVersionPage,
+    CloudVersionSummary, CloudWorkspace, CloudWorkspacePage, CloudWriteReceipt,
+    RetainedVersionSelector, VerifiedCapturedVersion, VerifiedRetainedVersion,
 };
 pub use client::history::{CheckedBlame, CheckedPathHistory};
 pub use client::query::{

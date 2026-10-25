@@ -64,6 +64,8 @@ impl Service<http::Request<Body>> for CloudGrpcService {
                         | "ReadObject"
                         | "PublishVersion"
                         | "GetWorkspace"
+                        | "ListWorkspaces"
+                        | "ListVersions"
                         | "GetVersion"
                         | "GetPublication"
                 ) {
