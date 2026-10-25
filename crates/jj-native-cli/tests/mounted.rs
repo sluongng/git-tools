@@ -1012,6 +1012,13 @@ struct CountMetadata {
 
 #[tonic::async_trait]
 impl Repository for CountMetadata {
+    async fn get_capabilities(
+        &self,
+        request: RpcRequest<p::GetCapabilitiesRequest>,
+    ) -> Result<RpcResponse<p::Capabilities>, Status> {
+        self.inner.get_capabilities(request).await
+    }
+
     async fn open_repository(
         &self,
         request: RpcRequest<p::OpenRepositoryRequest>,

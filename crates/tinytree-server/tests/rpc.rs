@@ -697,6 +697,218 @@ async fn compressed_native_upload_publication_fetch_and_restart() {
 }
 
 #[tokio::test]
+async fn capabilities_separate_configured_support_from_authenticated_grants_without_root_work() {
+    struct Case {
+        name: &'static str,
+        cloud: bool,
+        indexed: bool,
+        captured: bool,
+        query: bool,
+    }
+    for Case {
+        name,
+        cloud,
+        indexed,
+        captured,
+        query,
+    } in [
+        Case {
+            name: "disabled services",
+            cloud: false,
+            indexed: false,
+            captured: false,
+            query: false,
+        },
+        Case {
+            name: "query and legacy cloud",
+            cloud: true,
+            indexed: false,
+            captured: false,
+            query: true,
+        },
+        Case {
+            name: "indexed cloud without captured restore",
+            cloud: true,
+            indexed: true,
+            captured: false,
+            query: true,
+        },
+        Case {
+            name: "captured indexed cloud",
+            cloud: true,
+            indexed: true,
+            captured: true,
+            query: true,
+        },
+    ] {
+        let directory = tempfile::tempdir().unwrap();
+        let mut profile: tinytree_server::Config =
+            toml::from_str(include_str!("../examples/cloud.toml")).unwrap();
+        profile.service.cloud.enabled = cloud;
+        profile.service.cloud.indexed_versions = indexed;
+        profile.service.cloud.captured_versions = captured;
+        profile.service.cloud.max_capture_bytes = 128 * 1024;
+        let store = Store::open(
+            directory.path().join("store"),
+            profile
+                .store
+                .materialize(profile.service.max_metadata_bytes),
+        )
+        .unwrap();
+        store.create_repository("alpha").unwrap();
+        store.create_repository("beta").unwrap();
+        let index =
+            tinytree_index::Index::open(directory.path().join("index"), &Default::default())
+                .unwrap();
+        let index_before = index.stats().unwrap();
+        let refs_before = store.references("alpha", &["main".into()]).unwrap();
+        let server = if query {
+            Running::start_query(store.clone(), profile.service, index.clone()).await
+        } else {
+            Running::start(store.clone(), profile.service).await
+        };
+        let mut client = server.client().await;
+        let input = p::GetCapabilitiesRequest {
+            repository_id: "alpha".into(),
+            features: vec![1, 2, 3, 4, 5],
+        };
+        assert_eq!(
+            client
+                .get_capabilities(input.clone())
+                .await
+                .unwrap_err()
+                .code(),
+            Code::Unauthenticated
+        );
+        for repo in ["beta", "does-not-exist"] {
+            assert_eq!(
+                client
+                    .get_capabilities(request(
+                        p::GetCapabilitiesRequest {
+                            repository_id: repo.into(),
+                            ..input.clone()
+                        },
+                        ALPHA
+                    ))
+                    .await
+                    .unwrap_err()
+                    .code(),
+                Code::PermissionDenied
+            );
+        }
+        for (token, repo, cloud_read, cloud_write) in [
+            (ALPHA, "alpha", cloud, cloud),
+            (READER, "alpha", cloud, false),
+            (BETA, "beta", false, false),
+        ] {
+            for _ in 0..3 {
+                let result = client
+                    .get_capabilities(request(
+                        p::GetCapabilitiesRequest {
+                            repository_id: repo.into(),
+                            ..input.clone()
+                        },
+                        token,
+                    ))
+                    .await
+                    .unwrap()
+                    .into_inner();
+                assert_eq!(result.schema_version, 1, "{name}");
+                assert_eq!(result.root_readiness, p::RootReadiness::NotChecked as i32);
+                assert_eq!(
+                    result
+                        .features
+                        .iter()
+                        .map(|f| f.feature)
+                        .collect::<Vec<_>>(),
+                    vec![1, 2, 3, 4, 5]
+                );
+                for feature in &result.features {
+                    assert_eq!(
+                        feature.supported,
+                        if feature.feature <= 3 {
+                            query
+                        } else {
+                            cloud && indexed && captured
+                        }
+                    );
+                    assert_eq!(
+                        feature.authorized,
+                        match feature.feature {
+                            1..=3 => true,
+                            4 => cloud_read,
+                            5 => cloud_write,
+                            _ => unreachable!(),
+                        }
+                    );
+                }
+            }
+        }
+        for features in [
+            vec![],
+            vec![0],
+            vec![99],
+            vec![1, 1],
+            vec![2, 1],
+            vec![1, 2, 3, 4, 5, 5],
+        ] {
+            assert_eq!(
+                client
+                    .get_capabilities(request(
+                        p::GetCapabilitiesRequest {
+                            features,
+                            ..input.clone()
+                        },
+                        ALPHA
+                    ))
+                    .await
+                    .unwrap_err()
+                    .code(),
+                Code::InvalidArgument
+            );
+        }
+        assert_eq!(
+            index.stats().unwrap(),
+            index_before,
+            "{name}: configuration discovery must not ingest or warm roots"
+        );
+        assert_eq!(
+            store.references("alpha", &["main".into()]).unwrap(),
+            refs_before
+        );
+        if cloud {
+            let channel = Endpoint::from_shared(format!("http://{}", server.address))
+                .unwrap()
+                .connect()
+                .await
+                .unwrap();
+            let mut private =
+                tinytree_proto::cloud_v1::workspace_cloud_client::WorkspaceCloudClient::new(
+                    channel,
+                );
+            assert!(
+                private
+                    .list_workspaces(request(
+                        tinytree_proto::cloud_v1::ListWorkspacesRequest {
+                            repository_id: "alpha".into(),
+                            page_size: 1,
+                            continuation: vec![]
+                        },
+                        ALPHA
+                    ))
+                    .await
+                    .unwrap()
+                    .into_inner()
+                    .workspaces
+                    .is_empty()
+            );
+        }
+        drop(client);
+        server.stop().await;
+    }
+}
+
+#[tokio::test]
 async fn authorization_precedes_scope_existence_and_isolates_native_objects() {
     let (_temporary, store) = setup();
     let server = Running::start(store, ServiceConfig::default()).await;

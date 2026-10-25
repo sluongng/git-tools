@@ -1,3 +1,5 @@
+#[path = "capabilities.rs"]
+pub(crate) mod capabilities;
 #[path = "cloud.rs"]
 pub(crate) mod cloud;
 #[path = "history.rs"]

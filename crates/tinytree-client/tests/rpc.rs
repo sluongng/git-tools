@@ -158,6 +158,14 @@ fn setup() -> (tempfile::TempDir, Store, RepositoryService) {
 }
 #[derive(Clone, Copy, PartialEq)]
 enum Mode {
+    CapabilitiesMissing,
+    CapabilitiesDuplicate,
+    CapabilitiesOrder,
+    CapabilitiesUnknown,
+    CapabilitiesSchema,
+    CapabilitiesRepository,
+    CapabilitiesReadiness,
+    CapabilitiesAbsent,
     Normal,
     RetryFile,
     CorruptFile,
@@ -180,6 +188,62 @@ enum Mode {
     EmptyGraphEntries,
     EmptyMissingKeys,
 }
+#[tokio::test]
+async fn capabilities_are_exact_checked_configuration_not_implicit_root_readiness_or_fallback() {
+    use tinytree_client::{CapabilityFeature as F, RootReadiness};
+    for (mode, expected) in [
+        (Mode::Normal, None),
+        (Mode::CapabilitiesMissing, Some(Code::DataLoss)),
+        (Mode::CapabilitiesDuplicate, Some(Code::DataLoss)),
+        (Mode::CapabilitiesOrder, Some(Code::DataLoss)),
+        (Mode::CapabilitiesUnknown, Some(Code::DataLoss)),
+        (Mode::CapabilitiesSchema, Some(Code::DataLoss)),
+        (Mode::CapabilitiesRepository, Some(Code::DataLoss)),
+        (Mode::CapabilitiesReadiness, Some(Code::DataLoss)),
+        (Mode::CapabilitiesAbsent, Some(Code::Unimplemented)),
+    ] {
+        let (_directory, _store, service) = setup();
+        let running = Running::start(service, mode).await;
+        let client = running.client().await;
+        let result = client.capabilities(&F::ALL).await;
+        if let Some(code) = expected {
+            assert_eq!(result.unwrap_err().code(), code);
+        } else {
+            let configured = result.unwrap();
+            assert_eq!(configured.root_readiness, RootReadiness::NotChecked);
+            assert_eq!(configured.features.len(), 5);
+            assert!(configured.features.iter().all(|state| !state.supported));
+            assert!(
+                configured.features[..3]
+                    .iter()
+                    .all(|state| state.authorized)
+            );
+            assert!(
+                configured.features[3..]
+                    .iter()
+                    .all(|state| !state.authorized)
+            );
+            for requested in [
+                vec![],
+                vec![F::Blame, F::PathHistory],
+                vec![F::Blame, F::Blame],
+            ] {
+                assert_eq!(
+                    client.capabilities(&requested).await.unwrap_err().code(),
+                    Code::InvalidArgument
+                );
+            }
+            assert_eq!(
+                client.capabilities(&[F::Blame]).await.unwrap().features[0].feature,
+                F::Blame
+            );
+        }
+        assert_eq!(running.metadata.load(Ordering::SeqCst), 0);
+        assert_eq!(running.graph.load(Ordering::SeqCst), 0);
+        assert_eq!(running.files.load(Ordering::SeqCst), 0);
+        running.stop().await;
+    }
+}
 #[derive(Clone)]
 struct Faults {
     service: RepositoryService,
@@ -194,6 +258,44 @@ struct Faults {
 type Stream<T> = std::pin::Pin<Box<dyn futures_util::Stream<Item = Result<T, Status>> + Send>>;
 #[tonic::async_trait]
 impl Repository for Faults {
+    async fn get_capabilities(
+        &self,
+        request: Request<p::GetCapabilitiesRequest>,
+    ) -> Result<Response<p::Capabilities>, Status> {
+        if self.mode == Mode::CapabilitiesAbsent {
+            return Err(Status::unimplemented(
+                "capability negotiation is not installed",
+            ));
+        }
+        let mut response = self.service.get_capabilities(request).await?;
+        let value = response.get_mut();
+        match self.mode {
+            Mode::CapabilitiesMissing => {
+                value.features.pop();
+            }
+            Mode::CapabilitiesDuplicate => {
+                value.features[1] = value.features[0].clone();
+            }
+            Mode::CapabilitiesOrder => {
+                value.features.swap(0, 1);
+            }
+            Mode::CapabilitiesUnknown => {
+                value.features[0].feature = 99;
+            }
+            Mode::CapabilitiesSchema => {
+                value.schema_version = 2;
+            }
+            Mode::CapabilitiesRepository => {
+                value.repository_id = "other".into();
+            }
+            Mode::CapabilitiesReadiness => {
+                value.root_readiness = 0;
+            }
+            _ => (),
+        }
+        Ok(response)
+    }
+
     async fn open_repository(
         &self,
         r: Request<p::OpenRepositoryRequest>,

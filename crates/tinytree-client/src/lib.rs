@@ -5,6 +5,7 @@ mod config;
 mod transport;
 mod verified;
 pub use client::NativeClient;
+pub use client::capabilities::{Capabilities, CapabilityFeature, FeatureCapability, RootReadiness};
 pub use client::cloud::{
     CloudCapture, CloudCaptureDescriptor, CloudCaptureId, CloudCapturedPublishIntent,
     CloudDescriptor, CloudIndexArtifact, CloudIndexArtifactDescriptor, CloudIndexArtifactId,

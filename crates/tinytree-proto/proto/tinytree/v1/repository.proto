@@ -9,6 +9,7 @@ package tinytree.v1;
 // Authentication is transport metadata. Every method authorizes repository_id
 // before inspecting object existence. IDs never grant access by themselves.
 service Repository {
+  rpc GetCapabilities(GetCapabilitiesRequest) returns (Capabilities);
   rpc OpenRepository(OpenRepositoryRequest) returns (RepositoryView);
   rpc GetCommitGraph(GetCommitGraphRequest) returns (CommitGraphPage);
   rpc BatchReadObjects(BatchReadObjectsRequest) returns (stream ObjectResult);
@@ -232,4 +233,34 @@ message Publication {
   // An immutable replay receipt. Reusing a key with different request fields is
   // an error. A deadline after publish is resolved by GetPublication/replay.
   // This is historical evidence; check the exact current hold before offloading.
+}
+
+// Configured support and authenticated grants, not selected-root readiness or
+// retention. Query callers must separately OpenScope on their immutable roots.
+enum CapabilityFeature {
+  CAPABILITY_FEATURE_UNSPECIFIED = 0;
+  FEDERATED_SCOPE_LOG = 1;
+  PATH_HISTORY = 2;
+  BLAME = 3;
+  CAPTURED_INDEXED_CLOUD_READ = 4;
+  CAPTURED_INDEXED_CLOUD_WRITE = 5;
+}
+message GetCapabilitiesRequest {
+  string repository_id = 1;
+  repeated CapabilityFeature features = 2; // Required, 1..5, unique ascending IDs.
+}
+message FeatureCapability {
+  CapabilityFeature feature = 1;
+  bool supported = 2; // Effective configuration/installed adapters, not roots.
+  bool authorized = 3; // Caller grant, independent of configured support.
+}
+enum RootReadiness {
+  ROOT_READINESS_UNSPECIFIED = 0;
+  NOT_CHECKED = 1; // No root was supplied or queried by this side-effect-free RPC.
+}
+message Capabilities {
+  uint32 schema_version = 1; // Exactly 1.
+  string repository_id = 2;
+  repeated FeatureCapability features = 3; // Exact requested set and order.
+  RootReadiness root_readiness = 4;
 }

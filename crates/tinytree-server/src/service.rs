@@ -431,6 +431,71 @@ struct Cursor {
 
 #[tonic::async_trait]
 impl Repository for RepositoryService {
+    async fn get_capabilities(
+        &self,
+        request: Request<p::GetCapabilitiesRequest>,
+    ) -> Result<Response<p::Capabilities>, Status> {
+        let identity = self.inner.auth.identify(request.metadata())?;
+        let deadline = self.deadline(request.metadata(), false)?;
+        self.bounded(request.get_ref())?;
+        let input = request.into_inner();
+        let admission = self
+            .admit(&identity, &input.repository_id, false, deadline)
+            .await?;
+        if input.features.is_empty()
+            || input.features.len() > 5
+            || input.features.iter().any(|id| !(1..=5).contains(id))
+            || input.features.windows(2).any(|pair| pair[0] >= pair[1])
+        {
+            return Err(Status::invalid_argument(
+                "invalid requested capability features",
+            ));
+        }
+        let admission = self
+            .validate_repository(input.repository_id.clone(), admission, deadline)
+            .await?;
+        let query = self.query.is_some();
+        let captured = self.cloud.is_some()
+            && self.inner.config.cloud.indexed_versions
+            && self.inner.config.cloud.captured_versions;
+        let features = input
+            .features
+            .into_iter()
+            .map(|feature| {
+                let (supported, authorized) = match feature {
+                    1..=3 => (query, true),
+                    4 => (
+                        captured,
+                        identity
+                            .authorize_cloud(&input.repository_id, false)
+                            .is_ok(),
+                    ),
+                    5 => (
+                        captured,
+                        identity.authorize_cloud(&input.repository_id, true).is_ok(),
+                    ),
+                    _ => unreachable!("validated feature"),
+                };
+                p::FeatureCapability {
+                    feature,
+                    supported,
+                    authorized,
+                }
+            })
+            .collect();
+        self.response(
+            p::Capabilities {
+                schema_version: 1,
+                repository_id: input.repository_id,
+                features,
+                root_readiness: p::RootReadiness::NotChecked as i32,
+            },
+            admission,
+            None,
+            deadline,
+        )
+        .await
+    }
     async fn open_repository(
         &self,
         request: Request<p::OpenRepositoryRequest>,

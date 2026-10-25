@@ -99,6 +99,13 @@ struct Counting {
 }
 #[tonic::async_trait]
 impl Repository for Counting {
+    async fn get_capabilities(
+        &self,
+        request: Request<p::GetCapabilitiesRequest>,
+    ) -> Result<Response<p::Capabilities>, Status> {
+        self.service.get_capabilities(request).await
+    }
+
     async fn open_repository(
         &self,
         r: Request<p::OpenRepositoryRequest>,

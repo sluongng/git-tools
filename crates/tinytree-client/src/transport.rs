@@ -443,6 +443,17 @@ impl Client {
             )
             .await
     }
+    pub async fn get_capabilities(
+        &mut self,
+        r: Request<p::GetCapabilitiesRequest>,
+    ) -> Result<Response<p::Capabilities>, Status> {
+        self.unary(
+            r,
+            "/tinytree.v1.Repository/GetCapabilities",
+            Shape::Capabilities,
+        )
+        .await
+    }
     pub async fn open_repository(
         &mut self,
         r: Request<p::OpenRepositoryRequest>,
@@ -556,6 +567,8 @@ impl Client {
 }
 #[derive(Clone, Copy)]
 pub(crate) enum Shape {
+    Capabilities,
+    FeatureCapability,
     LandingResponse,
     LandingJob,
     LandingCandidate,
@@ -813,6 +826,23 @@ fn scan(
                 return Err(exhausted());
             }
         }
+        if wire == 0
+            && matches!(
+                (shape, number),
+                (Shape::Capabilities, 1 | 4) | (Shape::FeatureCapability, 1)
+            )
+        {
+            let mut offset = 0;
+            let value = varint(data, &mut offset)?;
+            let valid = match shape {
+                Shape::Capabilities => value == 1,
+                Shape::FeatureCapability => (1..=5).contains(&value),
+                _ => false,
+            };
+            if !valid {
+                return Err(invalid());
+            }
+        }
         let rule = rule(shape, number, limits);
         if let Some((expected, child, maximum, allocation)) = rule {
             if wire != expected {
@@ -830,7 +860,8 @@ fn scan(
             if wire == 0
                 && matches!(
                     (shape, number),
-                    (Shape::LandingJob, 3)
+                    (Shape::FeatureCapability, 2 | 3)
+                        | (Shape::LandingJob, 3)
                         | (Shape::FactAnswer, 1 | 2 | 5)
                         | (Shape::ChangeTarget, 2)
                         | (Shape::IdsPage | Shape::GraphPage | Shape::CanonicalPage, 6)
@@ -895,6 +926,8 @@ fn scan(
         }
     }
     let required = match shape {
+        Shape::Capabilities => (1 << 1) | (1 << 2) | (1 << 4),
+        Shape::FeatureCapability => 1 << 1,
         Shape::LandingResponse => (1 << 1) | (1 << 2) | (1 << 3),
         Shape::LandingJob => (1 << 1) | (1 << 2) | (1 << 4) | (1 << 5) | (1 << 6) | (1 << 10),
         Shape::LandingCandidate => (1 << 1) | (1 << 2),
@@ -1057,6 +1090,13 @@ fn rule(shape: Shape, n: u32, l: &Limits) -> Option<(u8, Option<Shape>, usize, u
             4 * std::mem::size_of::<tinytree_proto::cloud_v1::IndexArtifactSelection>(),
         ),
         (Shape::CloudIndexChunk, 3) => text(l.max_frame_bytes),
+        (Shape::Capabilities, 1 | 4) | (Shape::FeatureCapability, 1 | 2 | 3) => scalar(),
+        (Shape::Capabilities, 2) => text(128),
+        (Shape::Capabilities, 3) => repeated(
+            Shape::FeatureCapability,
+            5,
+            4 * std::mem::size_of::<p::FeatureCapability>(),
+        ),
         (Shape::CloudWorkspacePage, 1) => repeated(
             Shape::CloudWorkspace,
             128,
@@ -1254,6 +1294,61 @@ mod tests {
         }
     }
 
+    #[test]
+    fn capability_wire_rejects_invalid_scalars_and_feature_counts_before_prost() {
+        let valid = p::Capabilities {
+            schema_version: 1,
+            repository_id: "example".into(),
+            features: vec![p::FeatureCapability {
+                feature: 1,
+                supported: true,
+                authorized: true,
+            }],
+            root_readiness: 1,
+        }
+        .encode_to_vec();
+        let check = |bytes: &[u8]| {
+            scan(
+                bytes,
+                Shape::Capabilities,
+                &Limits::default(),
+                &mut 65536,
+                &mut 0,
+                0,
+            )
+        };
+        check(&valid).unwrap();
+        // Raw nested fields exercise values generated bool/enum setters cannot
+        // produce, including a u32-truncating scalar before Prost decoding.
+        for (name, nested) in [
+            ("nonboolean support", vec![8, 1, 16, 2]),
+            ("unknown feature", vec![8, 99]),
+            (
+                "u32 truncating feature",
+                vec![8, 0x81, 0x80, 0x80, 0x80, 0x10],
+            ),
+        ] {
+            let mut bytes = vec![8, 1, 18, 1, b'r', 26, nested.len() as u8];
+            bytes.extend(nested);
+            bytes.extend([32, 1]);
+            assert!(check(&bytes).is_err(), "{name}");
+        }
+        let too_many = p::Capabilities {
+            schema_version: 1,
+            repository_id: "example".into(),
+            features: vec![
+                p::FeatureCapability {
+                    feature: 1,
+                    supported: false,
+                    authorized: false
+                };
+                6
+            ],
+            root_readiness: 1,
+        }
+        .encode_to_vec();
+        assert!(check(&too_many).is_err());
+    }
     #[tokio::test]
     async fn physical_encoded_body_owns_admission_after_fused_source_eof() {
         let drops = Arc::new(AtomicUsize::new(0));

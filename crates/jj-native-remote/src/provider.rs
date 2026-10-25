@@ -692,6 +692,13 @@ mod tests {
     }
     #[tonic::async_trait]
     impl Repository for DelayedFile {
+        async fn get_capabilities(
+            &self,
+            request: Request<p::GetCapabilitiesRequest>,
+        ) -> Result<Response<p::Capabilities>, Status> {
+            self.inner.get_capabilities(request).await
+        }
+
         async fn open_repository(
             &self,
             r: Request<p::OpenRepositoryRequest>,
