@@ -567,6 +567,36 @@ struct Record {
     nonce: [u8; 32],
     stage: SavedStage,
 }
+/// Fixed-size selector for an exact local Prepared record, not mutation or
+/// remote admission authority. Fresh canonical classification and Base proof
+/// remain mandatory before explicit replacement.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PreparedNonce([u8; 32]);
+impl PreparedNonce {
+    pub fn nonce(&self) -> [u8; 32] {
+        self.0
+    }
+}
+/// Fixed-size exact host Freeze lineage, not recovery or remote authority.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FreezeSelection {
+    stage: Stage,
+    observed_job: Option<[u8; 32]>,
+}
+impl FreezeSelection {
+    pub fn stage(&self) -> Stage {
+        self.stage
+    }
+    pub fn observed_job(&self) -> Option<[u8; 32]> {
+        self.observed_job
+    }
+}
+/// Host provenance retirement only; neither result grants OP authority.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PreparedRetirement {
+    Retired,
+    AlreadyRetired,
+}
 /// Small value-only selectors for canonical metadata reads. These IDs are not
 /// proofs, admission, retention roots or permission to publish/acknowledge.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -786,14 +816,7 @@ impl Registry {
                 Err(e) => return Err(e.into()),
             };
             let record: Record = serde_json::from_slice(&bytes)?;
-            let expected = context
-                .with_purpose(record.context.purpose.clone())
-                .saved()?;
-            ensure!(
-                record.context.purpose.name() == name,
-                "resolution purpose file differs"
-            );
-            validate_record(binding, &expected, &record)?;
+            validate_common_record(binding, context, &record, name)?;
             *slot = Some(match record.stage {
                 SavedStage::Prepared => Stage::Prepared,
                 SavedStage::Written { .. } => Stage::Written,
@@ -802,6 +825,54 @@ impl Registry {
             // No decoded record or wire buffer survives the next purpose read.
         }
         Ok(result)
+    }
+    /// Select only exact host Freeze lineage, retaining a legitimate pre-Start
+    /// None rather than inferring it from moving job status or captured hints.
+    /// A selected job must match the caller's fresh canonical job. Full exact-
+    /// Context/proof loading is still required for any reconciliation.
+    pub async fn freeze_landing_resolution_selection(
+        &self,
+        binding: &Binding,
+        context: &CommonContext,
+        admission: &Arc<ReadAdmission>,
+    ) -> Result<Option<FreezeSelection>> {
+        let _work = admission.enter(&[])?;
+        let common = context
+            .with_purpose(Purpose::Freeze { observed_job: None })
+            .saved()?;
+        let _lock = self.resolution_lock().await?;
+        self.resolution_binding(binding)?;
+        let Some(directory) = self.resolution_directory(binding, false)? else {
+            return Ok(None);
+        };
+        let bytes = match directory.read(journal_name(&common), admission.limits.max_record_bytes) {
+            Ok(bytes) => bytes,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(e.into()),
+        };
+        let record: Record = serde_json::from_slice(&bytes)?;
+        validate_common_record(binding, context, &record, "freeze")?;
+        let Purpose::Freeze { observed_job } = &record.context.purpose else {
+            unreachable!()
+        };
+        let observed_job = observed_job
+            .as_deref()
+            .map(|value| -> Result<[u8; 32]> {
+                let mut id = [0; 32];
+                for (slot, pair) in id.iter_mut().zip(value.as_bytes().chunks_exact(2)) {
+                    *slot = u8::from_str_radix(std::str::from_utf8(pair)?, 16)?;
+                }
+                Ok(id)
+            })
+            .transpose()?;
+        Ok(Some(FreezeSelection {
+            stage: match record.stage {
+                SavedStage::Prepared => Stage::Prepared,
+                SavedStage::Written { .. } => Stage::Written,
+                SavedStage::Completed { .. } => Stage::Completed,
+            },
+            observed_job,
+        }))
     }
     /// Caller must hold its native command/frontend mutation fence across the
     /// transaction. Registry locking serializes journals, not editor writes.
@@ -887,6 +958,151 @@ impl Registry {
             }),
             position: Position::AtBase,
         })
+    }
+    /// Select an exact Prepared nonce even if CURRENT has advanced normally.
+    /// This reads no OP/view/provider data and does not classify the stale base.
+    /// Missing, corrupt, mismatched, or non-Prepared records fail closed.
+    pub async fn prepared_landing_resolution_nonce(
+        &self,
+        binding: &Binding,
+        context: &Context,
+        admission: &Arc<ReadAdmission>,
+    ) -> Result<PreparedNonce> {
+        let _work = admission.enter(&[])?;
+        let context = context.saved()?;
+        let _lock = self.resolution_lock().await?;
+        self.resolution_binding(binding)?;
+        let (_, record) = self
+            .resolution_record(binding, &context, admission)?
+            .context("landing resolution journal missing")?;
+        ensure!(
+            matches!(record.stage, SavedStage::Prepared),
+            "resolution attempt is not prepared"
+        );
+        Ok(PreparedNonce(record.nonce))
+    }
+    /// Explicitly abandon an exact Prepared attempt after a fresh admitted
+    /// snapshot. The caller must reclassify canonical source/destination guards
+    /// against that fresh state and retain its command fence. No operation from
+    /// the superseded nonce is adopted; Written/Completed attempts never replace.
+    /// Archive-only crashes leave the old active attempt intact. After a swap,
+    /// callers must reload: replaying the superseded nonce fails closed.
+    pub async fn replace_prepared_landing_resolution(
+        &self,
+        binding: &Binding,
+        context: &Context,
+        prior_nonce: [u8; 32],
+        base: &Base,
+        proofs: &[CommitProof],
+        admission: &Arc<ReadAdmission>,
+    ) -> Result<Journal> {
+        let _work = admission.enter(proofs)?;
+        let context = context.saved()?;
+        let base = base.data();
+        base.validate()?;
+        let _lock = self.resolution_lock().await?;
+        self.resolution_binding(binding)?;
+        let (directory, mut record) = self
+            .resolution_record(binding, &context, admission)?
+            .context("landing resolution journal missing")?;
+        ensure!(
+            record.nonce == prior_nonce && matches!(record.stage, SavedStage::Prepared),
+            "only the exact prepared resolution attempt may be replaced"
+        );
+        let snapshot = read_snapshot(binding, proofs, admission).await?;
+        ensure!(
+            !snapshot.pending
+                && snapshot.base == *base
+                && snapshot.heads == [base.operation.clone()],
+            "replacement resolution baseline changed"
+        );
+        drop(snapshot);
+        let original = directory.read(journal_name(&context), admission.limits.max_record_bytes)?;
+        let archive = format!(
+            "{}-{}-{}-superseded.json",
+            context.request_id,
+            context.purpose.name(),
+            hex(&prior_nonce)
+        );
+        archive_record(
+            &directory,
+            &archive,
+            &original,
+            admission.limits.max_record_bytes,
+        )?;
+        drop(original);
+        let mut nonce = [0; 32];
+        getrandom::fill(&mut nonce)
+            .map_err(|_| anyhow::anyhow!("landing resolution nonce unavailable"))?;
+        ensure!(
+            nonce != [0; 32] && nonce != prior_nonce,
+            "landing resolution nonce unavailable"
+        );
+        record.base = base.clone();
+        record.nonce = nonce;
+        save(&directory, &record, admission)?;
+        let owner = Arc::new(admission.retain(retained_model_bytes(&record)?, None)?);
+        Ok(Journal {
+            inner: Arc::new(OwnedJournal {
+                record,
+                _owner: owner,
+            }),
+            position: Position::AtBase,
+        })
+    }
+    /// Retire only exact Prepared freeze provenance when the caller freshly
+    /// proves no freeze is needed. Keep the frontend fence through this call;
+    /// this performs no canonical source classification or operation recovery.
+    /// An absent active record is already retired only with its exact validated
+    /// retirement archive. Archives are never deleted or used as OP authority.
+    pub async fn retire_prepared_freeze_resolution(
+        &self,
+        binding: &Binding,
+        context: &Context,
+        nonce: [u8; 32],
+        admission: &Arc<ReadAdmission>,
+    ) -> Result<PreparedRetirement> {
+        let _work = admission.enter(&[])?;
+        let context = context.saved()?;
+        ensure!(
+            matches!(context.purpose, Purpose::Freeze { .. }),
+            "only prepared freeze provenance may retire"
+        );
+        let _lock = self.resolution_lock().await?;
+        self.resolution_binding(binding)?;
+        let directory = self
+            .resolution_directory(binding, false)?
+            .context("landing resolution journal missing")?;
+        let active = journal_name(&context);
+        let archive = format!("{}-freeze-{}-retired.json", context.request_id, hex(&nonce));
+        let (bytes, result) = match directory.read(&active, admission.limits.max_record_bytes) {
+            Ok(bytes) => (bytes, PreparedRetirement::Retired),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => (
+                directory.read(&archive, admission.limits.max_record_bytes)?,
+                PreparedRetirement::AlreadyRetired,
+            ),
+            Err(e) => return Err(e.into()),
+        };
+        let record: Record = serde_json::from_slice(&bytes)?;
+        validate_record(binding, &context, &record)?;
+        ensure!(
+            record.nonce == nonce && matches!(record.stage, SavedStage::Prepared),
+            "only the exact prepared freeze attempt may retire"
+        );
+        drop(record);
+        archive_record(
+            &directory,
+            &archive,
+            &bytes,
+            admission.limits.max_record_bytes,
+        )?;
+        if result == PreparedRetirement::Retired {
+            fs::remove_file(directory.path().join(active))?;
+        }
+        // This barrier is also required after a previous remove succeeded but
+        // its parent sync failed; absence alone never acknowledges retirement.
+        File::open(directory.path())?.sync_all()?;
+        Ok(result)
     }
     /// Select only the actual WC operation's commit and an exact locally owned
     /// result. This breaks the metadata bootstrap cycle after record-before-
@@ -1105,6 +1321,49 @@ impl Registry {
         save(&directory, &record, admission)?;
         classify(binding, record, proofs, admission).await
     }
+}
+fn archive_record(
+    directory: &PrivateDir,
+    archive: &str,
+    bytes: &[u8],
+    max_bytes: usize,
+) -> Result<()> {
+    match directory.read(archive, max_bytes) {
+        Ok(existing) => ensure!(
+            existing == bytes,
+            "superseded resolution record differs; preserve it"
+        ),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            ensure!(
+                fs::read_dir(directory.path())?
+                    .take(MAX_JOURNALS + 1)
+                    .collect::<std::io::Result<Vec<_>>>()?
+                    .len()
+                    < MAX_JOURNALS,
+                "landing resolution journal limit reached"
+            );
+        }
+        Err(e) => return Err(e.into()),
+    }
+    // Atomic, durable archival precedes replacement. An identical retry
+    // reestablishes the archive barrier without adopting any other record.
+    directory.replace(archive, bytes)?;
+    Ok(())
+}
+fn validate_common_record(
+    binding: &Binding,
+    context: &CommonContext,
+    record: &Record,
+    purpose: &str,
+) -> Result<()> {
+    let expected = context
+        .with_purpose(record.context.purpose.clone())
+        .saved()?;
+    ensure!(
+        record.context.purpose.name() == purpose,
+        "resolution purpose file differs"
+    );
+    validate_record(binding, &expected, record)
 }
 fn validate_record(binding: &Binding, context: &SavedContext, record: &Record) -> Result<()> {
     ensure!(

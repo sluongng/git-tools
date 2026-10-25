@@ -3597,6 +3597,15 @@ async fn host_freeze_resolution_does_not_fabricate_or_adopt_an_apply_candidate()
             observed_job: observed_job.clone(),
         };
         let common = resolution_common(&freeze);
+        assert_eq!(
+            fixture
+                .registry
+                .freeze_landing_resolution_selection(&fixture.binding, &common, &admission)
+                .await
+                .unwrap(),
+            None
+        );
+        assert!(!fixture.registry.path().join("landing-resolutions").exists());
         let base = fixture
             .registry
             .landing_resolution_base(&fixture.binding, &proofs, &admission)
@@ -3620,6 +3629,26 @@ async fn host_freeze_resolution_does_not_fabricate_or_adopt_an_apply_candidate()
             .unwrap();
         assert_eq!(presence.freeze(), Some(landing_resolution::Stage::Prepared));
         assert_eq!(presence.apply(), Some(landing_resolution::Stage::Prepared));
+        let selection = fixture
+            .registry
+            .freeze_landing_resolution_selection(&fixture.binding, &common, &admission)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(selection.stage(), landing_resolution::Stage::Prepared);
+        assert_eq!(
+            selection.observed_job(),
+            observed_job.as_ref().map(|_| [3; 32])
+        );
+        let mut changed = common.clone();
+        changed.request_digest[0] ^= 1;
+        assert!(
+            fixture
+                .registry
+                .freeze_landing_resolution_selection(&fixture.binding, &changed, &admission)
+                .await
+                .is_err()
+        );
         let attributes = journal.operation_attributes();
         assert_eq!(
             attributes.get("tinytree.landing.job"),
@@ -3663,6 +3692,18 @@ async fn host_freeze_resolution_does_not_fabricate_or_adopt_an_apply_candidate()
                 .freeze(),
             Some(landing_resolution::Stage::Written)
         );
+        assert!(
+            fixture
+                .registry
+                .retire_prepared_freeze_resolution(
+                    &fixture.binding,
+                    &freeze,
+                    journal.nonce(),
+                    &admission
+                )
+                .await
+                .is_err()
+        );
         workspace
             .start_working_copy_mutation()
             .await
@@ -3701,6 +3742,29 @@ async fn host_freeze_resolution_does_not_fabricate_or_adopt_an_apply_candidate()
             Some(landing_resolution::Stage::Completed)
         );
         assert_eq!(completed.purpose(), &freeze.purpose);
+        let selection = fixture
+            .registry
+            .freeze_landing_resolution_selection(&fixture.binding, &common, &admission)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(selection.stage(), landing_resolution::Stage::Completed);
+        assert_eq!(
+            selection.observed_job(),
+            observed_job.as_ref().map(|_| [3; 32])
+        );
+        assert!(
+            fixture
+                .registry
+                .retire_prepared_freeze_resolution(
+                    &fixture.binding,
+                    &freeze,
+                    journal.nonce(),
+                    &admission
+                )
+                .await
+                .is_err()
+        );
         assert!(
             fixture
                 .registry
@@ -3953,4 +4017,489 @@ async fn host_resolution_selects_exact_proofs_after_owned_op_before_sidecar_cras
             .is_err()
     );
     assert_eq!(fs::read(&path).unwrap(), malformed);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn prepared_replacement_preserves_prior_attempt_and_never_adopts_its_orphan() {
+    use jj_lib::op_heads_store::OpHeadsStore as _;
+    use landing_resolution::{Position, Stage};
+    let fixture = Fixture::new();
+    let (mut workspace, _, objects) = resolution_initialize(&fixture).await;
+    let admission = resolution_admission();
+    let proofs = resolution_proofs(&fixture.binding, &objects, &admission).await;
+    let context = resolution_context(&fixture);
+    let base = fixture
+        .registry
+        .landing_resolution_base(&fixture.binding, &proofs, &admission)
+        .await
+        .unwrap();
+    let prior = fixture
+        .registry
+        .begin_landing_resolution(&fixture.binding, &context, &base, &proofs, &admission)
+        .await
+        .unwrap();
+    let orphan = resolution_operation(&fixture, &prior, true).await;
+    let ordinary = resolution_operation(&fixture, &prior, false).await;
+    let directory = PrivateDir::open_existing(
+        fixture
+            .registry
+            .path()
+            .join("landing-resolutions")
+            .join(fixture.binding.id()),
+    )
+    .unwrap();
+    let active = format!("{}-apply.json", context.request_id);
+    let archive = format!(
+        "{}-apply-{}-superseded.json",
+        context.request_id,
+        hex(&prior.nonce())
+    );
+    let original = directory.read(&active, 65536).unwrap();
+    // An ordinary acknowledged operation changes the trusted actual baseline,
+    // not the provenance or ownership of the interrupted landing attempt.
+    workspace
+        .start_working_copy_mutation()
+        .await
+        .unwrap()
+        .finish(ordinary.clone())
+        .await
+        .unwrap();
+    let heads = jj_lib::simple_op_heads_store::SimpleOpHeadsStore::load(
+        &fixture.binding.repo.join("op_heads"),
+    );
+    heads
+        .update_op_heads(
+            &[OperationId::try_from_hex(base.operation()).unwrap()],
+            &ordinary,
+        )
+        .await
+        .unwrap();
+    assert!(
+        fixture
+            .registry
+            .replace_prepared_landing_resolution(
+                &fixture.binding,
+                &context,
+                prior.nonce(),
+                &base,
+                &proofs,
+                &admission
+            )
+            .await
+            .is_err()
+    );
+    assert!(
+        fixture
+            .registry
+            .load_landing_resolution(&fixture.binding, &context, &proofs, &admission)
+            .await
+            .is_err()
+    );
+    let selected = fixture
+        .registry
+        .prepared_landing_resolution_nonce(&fixture.binding, &context, &admission)
+        .await
+        .unwrap();
+    assert_eq!(selected.nonce(), prior.nonce());
+    let fresh = fixture
+        .registry
+        .landing_resolution_base(&fixture.binding, &proofs, &admission)
+        .await
+        .unwrap();
+    assert_ne!(fresh.operation(), base.operation());
+    assert!(
+        fixture
+            .registry
+            .begin_landing_resolution(&fixture.binding, &context, &fresh, &proofs, &admission)
+            .await
+            .is_err()
+    );
+    let mut changed = context.clone();
+    changed.request_digest[0] ^= 1;
+    assert!(
+        fixture
+            .registry
+            .prepared_landing_resolution_nonce(&fixture.binding, &changed, &admission)
+            .await
+            .is_err()
+    );
+    assert!(
+        fixture
+            .registry
+            .replace_prepared_landing_resolution(
+                &fixture.binding,
+                &changed,
+                prior.nonce(),
+                &fresh,
+                &proofs,
+                &admission
+            )
+            .await
+            .is_err()
+    );
+    assert!(
+        fixture
+            .registry
+            .replace_prepared_landing_resolution(
+                &fixture.binding,
+                &context,
+                [8; 32],
+                &fresh,
+                &proofs,
+                &admission
+            )
+            .await
+            .is_err()
+    );
+    assert_eq!(directory.read(&active, 65536).unwrap(), original);
+    assert!(!directory.path().join(&archive).exists());
+    directory
+        .replace(&archive, b"unrecognized archive")
+        .unwrap();
+    assert!(
+        fixture
+            .registry
+            .replace_prepared_landing_resolution(
+                &fixture.binding,
+                &context,
+                prior.nonce(),
+                &fresh,
+                &proofs,
+                &admission
+            )
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        directory.read(&archive, 65536).unwrap(),
+        b"unrecognized archive"
+    );
+    assert_eq!(directory.read(&active, 65536).unwrap(), original);
+    // Exact archive-only crash prefix is retryable; the active old record is
+    // still authoritative until the new nonce/base swap is durably complete.
+    directory.replace(&archive, &original).unwrap();
+    let replacement = fixture
+        .registry
+        .replace_prepared_landing_resolution(
+            &fixture.binding,
+            &context,
+            selected.nonce(),
+            &fresh,
+            &proofs,
+            &admission,
+        )
+        .await
+        .unwrap();
+    assert_ne!(replacement.nonce(), prior.nonce());
+    assert_eq!(replacement.base(), fresh);
+    assert_eq!(replacement.position(), Position::AtBase);
+    assert_eq!(directory.read(&archive, 65536).unwrap(), original);
+    let replaced = directory.read(&active, 65536).unwrap();
+    assert!(
+        fixture
+            .registry
+            .replace_prepared_landing_resolution(
+                &fixture.binding,
+                &context,
+                prior.nonce(),
+                &fresh,
+                &proofs,
+                &admission
+            )
+            .await
+            .is_err()
+    );
+    assert!(
+        fixture
+            .registry
+            .record_landing_resolution_operation(
+                &fixture.binding,
+                &context,
+                replacement.nonce(),
+                &orphan.hex(),
+                &proofs,
+                &admission
+            )
+            .await
+            .is_err()
+    );
+    assert_eq!(directory.read(&active, 65536).unwrap(), replaced);
+    let operation = resolution_operation(&fixture, &replacement, true).await;
+    fixture
+        .registry
+        .record_landing_resolution_operation(
+            &fixture.binding,
+            &context,
+            replacement.nonce(),
+            &operation.hex(),
+            &proofs,
+            &admission,
+        )
+        .await
+        .unwrap();
+    let written = directory.read(&active, 65536).unwrap();
+    assert!(
+        fixture
+            .registry
+            .prepared_landing_resolution_nonce(&fixture.binding, &context, &admission)
+            .await
+            .is_err()
+    );
+    assert!(
+        fixture
+            .registry
+            .replace_prepared_landing_resolution(
+                &fixture.binding,
+                &context,
+                replacement.nonce(),
+                &fresh,
+                &proofs,
+                &admission
+            )
+            .await
+            .is_err()
+    );
+    assert_eq!(directory.read(&active, 65536).unwrap(), written);
+    workspace
+        .start_working_copy_mutation()
+        .await
+        .unwrap()
+        .finish(operation.clone())
+        .await
+        .unwrap();
+    heads
+        .update_op_heads(&[ordinary], &operation)
+        .await
+        .unwrap();
+    let completed = fixture
+        .registry
+        .complete_landing_resolution(
+            &fixture.binding,
+            &context,
+            replacement.nonce(),
+            &proofs,
+            &admission,
+        )
+        .await
+        .unwrap();
+    assert_eq!(completed.stage(), Stage::Completed);
+    let finished = directory.read(&active, 65536).unwrap();
+    assert!(
+        fixture
+            .registry
+            .prepared_landing_resolution_nonce(&fixture.binding, &context, &admission)
+            .await
+            .is_err()
+    );
+    assert!(
+        fixture
+            .registry
+            .replace_prepared_landing_resolution(
+                &fixture.binding,
+                &context,
+                replacement.nonce(),
+                &completed.base(),
+                &proofs,
+                &admission
+            )
+            .await
+            .is_err()
+    );
+    assert_eq!(directory.read(&active, 65536).unwrap(), finished);
+    assert_eq!(directory.read(&archive, 65536).unwrap(), original);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn prepared_freeze_retirement_requires_exact_archive_and_preserves_other_records() {
+    use landing_resolution::{PreparedRetirement, Purpose};
+    for archive_only_crash in [false, true] {
+        let fixture = Fixture::new();
+        let (_workspace, _, objects) = resolution_initialize(&fixture).await;
+        let admission = resolution_admission();
+        let proofs = resolution_proofs(&fixture.binding, &objects, &admission).await;
+        let mut freeze = resolution_context(&fixture);
+        freeze.purpose = Purpose::Freeze { observed_job: None };
+        assert!(
+            fixture
+                .registry
+                .retire_prepared_freeze_resolution(&fixture.binding, &freeze, [8; 32], &admission)
+                .await
+                .is_err()
+        );
+        assert!(!fixture.registry.path().join("landing-resolutions").exists());
+        let base = fixture
+            .registry
+            .landing_resolution_base(&fixture.binding, &proofs, &admission)
+            .await
+            .unwrap();
+        let journal = fixture
+            .registry
+            .begin_landing_resolution(&fixture.binding, &freeze, &base, &proofs, &admission)
+            .await
+            .unwrap();
+        let apply = resolution_context(&fixture);
+        fixture
+            .registry
+            .begin_landing_resolution(&fixture.binding, &apply, &base, &proofs, &admission)
+            .await
+            .unwrap();
+        let directory = PrivateDir::open_existing(
+            fixture
+                .registry
+                .path()
+                .join("landing-resolutions")
+                .join(fixture.binding.id()),
+        )
+        .unwrap();
+        let active = format!("{}-freeze.json", freeze.request_id);
+        let archive = format!(
+            "{}-freeze-{}-retired.json",
+            freeze.request_id,
+            hex(&journal.nonce())
+        );
+        let original = directory.read(&active, 65536).unwrap();
+        directory.replace(&active, b"{").unwrap();
+        assert!(
+            fixture
+                .registry
+                .freeze_landing_resolution_selection(
+                    &fixture.binding,
+                    &resolution_common(&freeze),
+                    &admission
+                )
+                .await
+                .is_err()
+        );
+        assert_eq!(directory.read(&active, 65536).unwrap(), b"{");
+        directory.replace(&active, &original).unwrap();
+        let apply_name = format!("{}-apply.json", freeze.request_id);
+        let apply_bytes = directory.read(&apply_name, 65536).unwrap();
+        let mut changed = freeze.clone();
+        changed.request_digest[0] ^= 1;
+        assert!(
+            fixture
+                .registry
+                .retire_prepared_freeze_resolution(
+                    &fixture.binding,
+                    &changed,
+                    journal.nonce(),
+                    &admission
+                )
+                .await
+                .is_err()
+        );
+        assert!(
+            fixture
+                .registry
+                .retire_prepared_freeze_resolution(&fixture.binding, &freeze, [8; 32], &admission)
+                .await
+                .is_err()
+        );
+        assert!(
+            fixture
+                .registry
+                .retire_prepared_freeze_resolution(
+                    &fixture.binding,
+                    &apply,
+                    journal.nonce(),
+                    &admission
+                )
+                .await
+                .is_err()
+        );
+        assert_eq!(directory.read(&active, 65536).unwrap(), original);
+        assert!(!directory.path().join(&archive).exists());
+        directory.replace(&archive, b"unknown archive").unwrap();
+        assert!(
+            fixture
+                .registry
+                .retire_prepared_freeze_resolution(
+                    &fixture.binding,
+                    &freeze,
+                    journal.nonce(),
+                    &admission
+                )
+                .await
+                .is_err()
+        );
+        assert_eq!(directory.read(&active, 65536).unwrap(), original);
+        assert_eq!(directory.read(&archive, 65536).unwrap(), b"unknown archive");
+        if archive_only_crash {
+            directory.replace(&archive, &original).unwrap();
+        } else {
+            fs::remove_file(directory.path().join(&archive)).unwrap();
+        }
+        assert_eq!(
+            fixture
+                .registry
+                .retire_prepared_freeze_resolution(
+                    &fixture.binding,
+                    &freeze,
+                    journal.nonce(),
+                    &admission
+                )
+                .await
+                .unwrap(),
+            PreparedRetirement::Retired
+        );
+        assert!(!directory.path().join(&active).exists());
+        assert_eq!(directory.read(&archive, 65536).unwrap(), original);
+        assert_eq!(directory.read(&apply_name, 65536).unwrap(), apply_bytes);
+        // Active absence alone is not success; exact archive is revalidated and
+        // its durability barrier is repeated on every already-retired retry.
+        assert_eq!(
+            fixture
+                .registry
+                .retire_prepared_freeze_resolution(
+                    &fixture.binding,
+                    &freeze,
+                    journal.nonce(),
+                    &admission
+                )
+                .await
+                .unwrap(),
+            PreparedRetirement::AlreadyRetired
+        );
+        directory.replace(&archive, b"{").unwrap();
+        assert!(
+            fixture
+                .registry
+                .retire_prepared_freeze_resolution(
+                    &fixture.binding,
+                    &freeze,
+                    journal.nonce(),
+                    &admission
+                )
+                .await
+                .is_err()
+        );
+        assert_eq!(directory.read(&archive, 65536).unwrap(), b"{");
+        directory.replace(&archive, &original).unwrap();
+        assert!(
+            fixture
+                .registry
+                .retire_prepared_freeze_resolution(
+                    &fixture.binding,
+                    &changed,
+                    journal.nonce(),
+                    &admission
+                )
+                .await
+                .is_err()
+        );
+        assert_eq!(directory.read(&archive, 65536).unwrap(), original);
+        fs::remove_file(directory.path().join(&archive)).unwrap();
+        assert!(
+            fixture
+                .registry
+                .retire_prepared_freeze_resolution(
+                    &fixture.binding,
+                    &freeze,
+                    journal.nonce(),
+                    &admission
+                )
+                .await
+                .is_err()
+        );
+    }
 }
