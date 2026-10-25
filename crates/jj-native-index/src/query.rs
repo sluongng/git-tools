@@ -290,6 +290,88 @@ impl NativeReadonlyIndex {
         .map_err(err)
     }
 
+    /// Explicitly retain one freshly admitted canonical COMMIT as local index
+    /// metadata. Unlike logical `has_id`, this does not treat an implicit
+    /// ancestor as an existing local retention record. The caller still owns
+    /// fresh admission and canonical landing-result verification.
+    ///
+    /// Existing explicit roots/drafts are verified and left unchanged. New
+    /// records require parents already known in this exact checkpoint, including
+    /// its bounded query scope. Scope refresh may revalidate existing COMMIT
+    /// overlays; it does not admit additional canonical history. No live
+    /// root, FILE authority, history walk or operation association is added.
+    pub async fn with_admitted_commit_witness(&self, commit: &Commit) -> IndexResult<Self> {
+        persistence::require_durable_writer().map_err(err)?;
+        let id = model_id(commit.id()).map_err(err)?;
+        if id == m::CommitId::ROOT || commit.parent_ids().is_empty() {
+            return Err(err(Error::Invalid));
+        }
+        if commit.parent_ids().len() > self.core.limits.max_parents {
+            return Err(err(Error::Limit));
+        }
+        let prior = self.checkpoint.drafts.iter().find(|draft| draft.id() == id);
+        let explicit = prior.is_some() || self.checkpoint.roots.binary_search(&id).is_ok();
+        if !explicit {
+            if self.checkpoint.drafts.len() >= self.core.limits.max_drafts {
+                return Err(err(Error::Limit));
+            }
+            for parent in commit.parent_ids() {
+                let parent = model_id(parent).map_err(err)?;
+                if parent == id || !self.has_id(&jj_id(parent)).await? {
+                    return Err(err(Error::Canonical));
+                }
+            }
+        }
+        let metadata = self
+            .core
+            .objects
+            .read_metadata_with_owner(
+                m::ObjectKey {
+                    kind: m::Kind::Commit,
+                    id: m::ObjectId(id.0),
+                },
+                self.core.owner(),
+            )
+            .await
+            .map_err(|_| err(Error::Canonical))?;
+        let mut draft = self
+            .verify_draft(metadata.descriptor(), metadata.bytes(), id)
+            .map_err(err)?;
+        if draft.change.0.as_slice() != commit.change_id().as_bytes()
+            || draft
+                .parents
+                .iter()
+                .map(|id| id.0.as_slice())
+                .ne(commit.parent_ids().iter().map(|id| id.as_bytes()))
+            || prior.is_some_and(|prior| !prior.canonical_eq(&draft))
+        {
+            return Err(err(Error::Canonical));
+        }
+        if explicit {
+            return Ok(self.clone());
+        }
+        draft.order = self
+            .checkpoint
+            .drafts
+            .iter()
+            .map(|d| d.order)
+            .max()
+            .unwrap_or(0)
+            .checked_add(1)
+            .ok_or_else(|| err(Error::Limit))?;
+        let draft = Arc::new(draft);
+        NativeIndexStore {
+            core: self.core.clone(),
+        }
+        .persist_index(Box::new(NativeMutableIndex {
+            inner: self.clone(),
+            rebase_frozen_source: false,
+            parents: self.checkpoint.tips.clone(),
+            pending: vec![draft],
+        }))
+        .map_err(err)
+    }
+
     pub(super) async fn scope(&self) -> Result<Arc<CachedScope>, Error> {
         let mut state = self.checkpoint.scope.lock().await;
         let threshold = now()?.checked_add(1).ok_or(Error::Invalid)?;

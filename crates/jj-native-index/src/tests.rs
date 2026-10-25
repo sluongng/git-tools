@@ -1726,7 +1726,18 @@ fn fresh_initializer_seeds_actual_root_operation_without_repairing_foreign_direc
         &[81; 64],
     )
     .unwrap();
-    assert!(initialized.index_at_operation(&[81; 64]).is_ok());
+    let empty = initialized.index_at_operation(&[81; 64]).unwrap();
+    assert_eq!(empty.checkpoint.roots, vec![m::CommitId::ROOT]);
+    assert!(empty.checkpoint.drafts.is_empty());
+    let limits = Limits::default();
+    let read_bytes = LocalIndexExportReader::required_read_bytes(&limits).unwrap();
+    let reader = LocalIndexExportReader::open_existing(&path, &config, limits, read_bytes).unwrap();
+    assert!(
+        !reader
+            .operation_explicitly_retains(&[81; 64], m::CommitId::ROOT, 0, 0)
+            .unwrap(),
+        "an empty snapshot's normalized ROOT sentinel is not a landing witness"
+    );
     assert!(matches!(
         initialized.index_at_operation(&[0; 64]),
         Err(Error::MissingOperation)
@@ -3061,6 +3072,22 @@ fn portable_import_preserves_exact_cloud_baselines_without_canonical_hydration_o
         let root = jj_store.root_commit();
         let mut value = root.store_commit().as_ref().clone();
         value.parents = vec![root.id().clone()];
+        value.description = "implicit public ancestor".into();
+        let ancestor = jj_store.write_commit(value, None).await.unwrap();
+        let ancestor_id = model_id(ancestor.id()).unwrap();
+        let m::Object::Commit(ancestor_value) = objects
+            .read_metadata(m::ObjectKey {
+                kind: m::Kind::Commit,
+                id: m::ObjectId(ancestor_id.0),
+            })
+            .await
+            .unwrap()
+            .into_object()
+        else {
+            panic!()
+        };
+        let mut value = ancestor.store_commit().as_ref().clone();
+        value.parents = vec![ancestor.id().clone()];
         value.description = "public baseline".into();
         let public = jj_store.write_commit(value, None).await.unwrap();
         let public_id = model_id(public.id()).unwrap();
@@ -3076,7 +3103,10 @@ fn portable_import_preserves_exact_cloud_baselines_without_canonical_hydration_o
         else {
             panic!()
         };
-        io.remote.lock().unwrap().push(public_value.clone());
+        io.remote
+            .lock()
+            .unwrap()
+            .extend([ancestor_value.clone(), public_value.clone()]);
         io.admitted.lock().unwrap().insert(public_id);
         // A genuine supported initializer can seed operation0 at a NONROOT
         // anchor. Import must not add intrinsic ROOT to its stored anchor set.
@@ -3093,7 +3123,7 @@ fn portable_import_preserves_exact_cloud_baselines_without_canonical_hydration_o
         original.associate_operation(&[0; 64], &seed).unwrap();
         let mut branches = Vec::new();
         let mut commits = Vec::new();
-        let mut models = vec![public_value];
+        let mut models = vec![ancestor_value, public_value];
         for description in ["visible working draft", "hidden divergent draft"] {
             let mut value = public.store_commit().as_ref().clone();
             value.parents = vec![public.id().clone()];
@@ -3215,7 +3245,9 @@ fn portable_import_preserves_exact_cloud_baselines_without_canonical_hydration_o
                 .collect();
             let nodes = models
                 .iter()
-                .filter(|node| wanted.contains(&model_commit_id(node)))
+                .filter(|node| {
+                    wanted.contains(&model_commit_id(node)) || model_commit_id(node) == ancestor_id
+                })
                 .cloned()
                 .collect();
             io.cloud_snapshots.lock().unwrap().insert(
@@ -3604,6 +3636,193 @@ fn portable_import_preserves_exact_cloud_baselines_without_canonical_hydration_o
                     || key.id.0 == model_id(second.id()).unwrap().0),
             "reopening the frozen query may read supplied overlays, never their history"
         );
+        // A logical ancestor is not an explicit local retention witness. Keep
+        // the existing descendant ordinal when materializing that ancestor.
+        assert!(historical.has_id(ancestor.id()).await.unwrap());
+        let mut value = ancestor.store_commit().as_ref().clone();
+        value.parents = vec![ancestor.id().clone()];
+        value.change_id = ChangeId::from_bytes(&[31; 16]);
+        value.description = "local child of implicit ancestor".into();
+        let child = jj_store.write_commit(value, None).await.unwrap();
+        let child_only = historical
+            .with_admitted_commit_stack(std::slice::from_ref(&child))
+            .await
+            .unwrap();
+        restored
+            .associate_operation(&[14; 64], &child_only)
+            .unwrap();
+        let read_bytes = LocalIndexExportReader::required_read_bytes(&Limits::default()).unwrap();
+        let reader =
+            LocalIndexExportReader::open_existing(&path, &config, Limits::default(), read_bytes)
+                .unwrap();
+        let source_limits = PortableExportLimits::default();
+        let explicit = |op, commit| {
+            reader.operation_explicitly_retains(
+                op,
+                commit,
+                source_limits.max_source_reads,
+                source_limits.max_source_bytes,
+            )
+        };
+        let queries_before = io.opens.load(Ordering::SeqCst);
+        let reads_before = observed.reads.lock().unwrap().len();
+        assert!(explicit(&[14; 64], public_id).unwrap());
+        assert!(explicit(&[14; 64], model_id(child.id()).unwrap()).unwrap());
+        assert!(!explicit(&[14; 64], ancestor_id).unwrap());
+        assert!(!explicit(&[14; 64], m::CommitId::ROOT).unwrap());
+        assert!(matches!(
+            explicit(&[99; 64], ancestor_id),
+            Err(Error::MissingOperation)
+        ));
+        assert!(matches!(
+            reader.operation_explicitly_retains(&[99; 64], ancestor_id, 0, 1),
+            Err(Error::Limit)
+        ));
+        assert!(matches!(
+            reader.operation_explicitly_retains(&[99; 64], ancestor_id, 1, 0),
+            Err(Error::Limit)
+        ));
+        assert_eq!(io.opens.load(Ordering::SeqCst), queries_before);
+        assert_eq!(observed.reads.lock().unwrap().len(), reads_before);
+        // Its parent is also an implicit ancestor: preserve normal known-parent
+        // semantics, without turning that parent into a new local record.
+        let mut value = child.store_commit().as_ref().clone();
+        value.description = "witness with an implicit known parent".into();
+        let implicit_parent = jj_store.write_commit(value, None).await.unwrap();
+        let with_child = child_only
+            .with_admitted_commit_witness(&implicit_parent)
+            .await
+            .unwrap();
+        assert!(
+            !with_child
+                .checkpoint
+                .drafts
+                .iter()
+                .any(|draft| draft.id() == ancestor_id)
+        );
+        let child_order = with_child
+            .checkpoint
+            .drafts
+            .iter()
+            .find(|draft| draft.id() == model_id(child.id()).unwrap())
+            .unwrap()
+            .order;
+        let maximum_order = with_child
+            .checkpoint
+            .drafts
+            .iter()
+            .map(|draft| draft.order)
+            .max()
+            .unwrap();
+        let source = with_child.cloud_query_source();
+        let live_before = io.live_opens.load(Ordering::SeqCst);
+        let before_witness_reads = observed.reads.lock().unwrap().len();
+        let witness = with_child
+            .with_admitted_commit_witness(&ancestor)
+            .await
+            .unwrap();
+        assert_eq!(witness.cloud_query_source(), source);
+        assert_eq!(witness.checkpoint.baseline, with_child.checkpoint.baseline);
+        assert_eq!(witness.checkpoint.roots, with_child.checkpoint.roots);
+        let ancestor_position = witness
+            .checkpoint
+            .drafts
+            .iter()
+            .position(|draft| draft.id() == ancestor_id)
+            .unwrap();
+        let child_position = witness
+            .checkpoint
+            .drafts
+            .iter()
+            .position(|draft| draft.id() == model_id(child.id()).unwrap())
+            .unwrap();
+        assert!(ancestor_position < child_position);
+        assert_eq!(
+            witness.checkpoint.drafts[ancestor_position].order,
+            maximum_order + 1
+        );
+        assert_eq!(witness.checkpoint.drafts[child_position].order, child_order);
+        assert_eq!(
+            observed.reads.lock().unwrap()[before_witness_reads..],
+            [m::ObjectKey {
+                kind: m::Kind::Commit,
+                id: m::ObjectId(ancestor_id.0)
+            }]
+        );
+        restored.associate_operation(&[15; 64], &witness).unwrap();
+        assert!(explicit(&[15; 64], ancestor_id).unwrap());
+        assert!(!explicit(&[14; 64], ancestor_id).unwrap());
+        let mut merge = child_only.start_modification();
+        merge.merge_in(&witness).unwrap();
+        let merge = restored.persist_index(merge).unwrap();
+        restored.associate_operation(&[16; 64], &merge).unwrap();
+        let reopened = NativeIndexStore::open(
+            &path,
+            &config,
+            Limits::default(),
+            io.clone(),
+            observed.clone(),
+        )
+        .unwrap();
+        let reopened = reopened.index_at_operation(&[16; 64]).unwrap();
+        assert_eq!(reopened.checkpoint.drafts, witness.checkpoint.drafts);
+        assert_eq!(reopened.cloud_query_source(), source);
+        assert_eq!(io.live_opens.load(Ordering::SeqCst), live_before);
+        let mut exact = Limits::default();
+        exact.max_drafts = witness.checkpoint.drafts.len();
+        let at_capacity =
+            NativeIndexStore::open(&path, &config, exact, io.clone(), observed.clone())
+                .unwrap()
+                .index_at_operation(&[15; 64])
+                .unwrap();
+        for commit in [&ancestor, &public] {
+            let same = at_capacity
+                .with_admitted_commit_witness(commit)
+                .await
+                .unwrap();
+            assert_eq!(same.checkpoint.tips, at_capacity.checkpoint.tips);
+            assert_eq!(same.checkpoint.drafts, at_capacity.checkpoint.drafts);
+        }
+        let before_reject = observed.reads.lock().unwrap().len();
+        assert!(
+            at_capacity
+                .with_admitted_commit_witness(&outside)
+                .await
+                .is_err()
+        );
+        assert_eq!(observed.reads.lock().unwrap().len(), before_reject);
+        let mut value = child.store_commit().as_ref().clone();
+        value.parents = vec![outside.id().clone()];
+        value.description = "witness with an unknown parent".into();
+        let unknown_parent = jj_store.write_commit(value, None).await.unwrap();
+        assert!(
+            historical
+                .with_admitted_commit_witness(&unknown_parent)
+                .await
+                .is_err()
+        );
+        // Corrupt explicit local metadata must not bypass canonical verification
+        // merely because this ID already has a local draft record.
+        let mut corrupt = witness.clone();
+        let mut drafts = corrupt.checkpoint.drafts.clone();
+        let mut bad = drafts[ancestor_position].as_ref().clone();
+        bad.change.0[0] ^= 1;
+        drafts[ancestor_position] = Arc::new(bad);
+        corrupt.checkpoint = Arc::new(Checkpoint::new(
+            corrupt.checkpoint.tips.clone(),
+            corrupt.checkpoint.roots.clone(),
+            drafts,
+            corrupt.checkpoint.source.clone(),
+            corrupt.checkpoint.baseline.clone(),
+        ));
+        assert!(
+            corrupt
+                .with_admitted_commit_witness(&ancestor)
+                .await
+                .is_err()
+        );
+        assert_eq!(observed.files.load(Ordering::SeqCst), 0);
+        assert_eq!(observed.file_writes.load(Ordering::SeqCst), 0);
         // Corrupted/local-foreign checkpoint security cases use the real public
         // merge operation: no changed immutable selector or live mode is adopted.
         #[derive(Debug)]

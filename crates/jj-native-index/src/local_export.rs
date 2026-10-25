@@ -63,6 +63,36 @@ impl LocalIndexExportReader {
         }
         Ok(*hash.finalize().as_bytes())
     }
+    /// Check the exact saved operation's explicit retention records, not graph
+    /// ancestry or implicit membership. The caller must retain its independent
+    /// `required_read_bytes` reservation until this synchronous load completes.
+    /// Source reads obey the supplied aggregate bounds; no provider, canonical
+    /// object read, index rebuilding or remote scope is involved.
+    ///
+    /// This is a local retention witness, not replay or remote-read authority.
+    /// The intrinsic ROOT sentinel is outside this witness domain: return false
+    /// without reading storage, including for a normalized empty snapshot.
+    pub fn operation_explicitly_retains(
+        &self,
+        operation: &[u8; 64],
+        commit: m::CommitId,
+        max_reads: usize,
+        max_bytes: usize,
+    ) -> Result<bool, Error> {
+        if commit == m::CommitId::ROOT {
+            return Ok(false);
+        }
+        let mut reads = persistence::ExportReadBudget {
+            reads: 0,
+            bytes: 0,
+            max_reads,
+            max_bytes,
+        };
+        let (roots, drafts) = self
+            .storage
+            .export_operation(operation, &self.limits, &mut reads)?;
+        Ok(roots.binary_search(&commit).is_ok() || drafts.iter().any(|draft| draft.id() == commit))
+    }
     pub async fn export_operation_indexes(
         &self,
         operation_ids: &[[u8; 64]],
