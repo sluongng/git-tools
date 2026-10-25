@@ -11,6 +11,8 @@ mod git;
 mod state;
 #[cfg(unix)]
 pub mod watch;
+#[cfg(target_os = "linux")]
+pub mod push;
 #[cfg(unix)]
 mod worker;
 

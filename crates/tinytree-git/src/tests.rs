@@ -1968,3 +1968,503 @@ async fn watcher_preserves_git_on_source_deletion_or_same_head_regression_and_pa
     restarted.shutdown().await.unwrap();
     running.stop().await;
 }
+
+#[cfg(target_os = "linux")]
+fn push_options(r: &Running) -> push::PushOptions {
+    let mut o = push::PushOptions::new(
+        r.options(),
+        r.temp.path().join("push-state"),
+        r.temp.path().join("remote.git").to_str().unwrap().into(),
+    );
+    o.poll_interval = std::time::Duration::from_millis(100);
+    o.operation_timeout = std::time::Duration::from_secs(3);
+    o.max_backoff = std::time::Duration::from_millis(200);
+    o
+}
+#[cfg(target_os = "linux")]
+async fn wait_push(
+    path: &Path,
+    mut predicate: impl FnMut(&push::PushStatus) -> bool,
+) -> push::PushStatus {
+    tokio::time::timeout(std::time::Duration::from_secs(15), async {
+        loop {
+            if let Ok(s) = push::push_status(path) {
+                if predicate(&s) {
+                    break s;
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("push did not converge: {:?}", push::push_status(path)))
+}
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn push_outbox_replays_exact_pending_before_latest_delivery_and_only_publishes_one_public_branch()
+ {
+    use std::os::unix::fs::PermissionsExt;
+    let r = Running::new().await;
+    let tree = r.tree(b"one-way public backup\n");
+    let a = r.commit(tree, vec![m::CommitId::ROOT], vec![], "first backup\n");
+    r.publish(a, 0);
+    let o = push_options(&r);
+    let first = export(r.config.clone(), o.export.clone()).await.unwrap();
+    // No remote yet: select and pin A before the outage, independently of export.
+    let mut h = push::start_push_watch(r.config.clone(), o.clone()).unwrap();
+    let pending = wait_push(&o.push_dir, |s| {
+        s.pending.is_some() && s.last_error == Some(push::PushError::RemoteUnavailable)
+    })
+    .await;
+    assert_eq!(pending.pending.unwrap().position.git_head, first.git_head);
+    let b = r.commit(tree, vec![a], vec![], "second backup\n");
+    r.publish(b, 1);
+    let second = export(r.config.clone(), o.export.clone()).await.unwrap();
+    let coalesced = wait_push(&o.push_dir, |s| {
+        s.desired
+            .as_ref()
+            .is_some_and(|p| p.git_head == second.git_head)
+    })
+    .await;
+    assert_eq!(coalesced.pending.unwrap().position.git_head, first.git_head);
+    assert_ne!(coalesced.lag_at_last_observation, Some(0));
+    h.shutdown().await.unwrap();
+    let remote = r.temp.path().join("remote.git");
+    std::fs::create_dir(&remote).unwrap();
+    git(&remote, &["init", "--bare", "--template="]);
+    git(
+        &o.export.destination_git,
+        &[
+            "push",
+            remote.to_str().unwrap(),
+            &format!("{}:refs/heads/unrelated", first.git_head),
+        ],
+    );
+    let receipts = r.temp.path().join("received");
+    let hook = remote.join("hooks/post-receive");
+    std::fs::create_dir_all(hook.parent().unwrap()).unwrap();
+    std::fs::write(&hook,format!("#!/bin/sh\nwhile read old new reference; do printf '%s %s\\n' \"$new\" \"$reference\" >> {}; done\n",shell_quote(receipts.to_str().unwrap()))).unwrap();
+    std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let mut h = push::start_push_watch(r.config.clone(), o.clone()).unwrap();
+    let delivered = wait_push(&o.push_dir, |s| {
+        s.delivered
+            .as_ref()
+            .is_some_and(|p| p.git_head == second.git_head)
+            && s.pending.is_none()
+    })
+    .await;
+    assert_eq!(delivered.lag_at_last_observation, Some(0));
+    assert_eq!(
+        std::fs::read_to_string(&receipts).unwrap(),
+        format!(
+            "{} refs/heads/main\n{} refs/heads/main\n",
+            first.git_head, second.git_head
+        )
+    );
+    assert_eq!(
+        text(&remote, &["for-each-ref", "--format=%(refname)"]),
+        "refs/heads/main\nrefs/heads/unrelated"
+    );
+    assert_eq!(
+        text(&remote, &["rev-parse", "refs/heads/unrelated"]),
+        first.git_head
+    );
+    assert_eq!(
+        text(&remote, &["rev-parse", "refs/heads/main"]),
+        second.git_head
+    );
+    git(&remote, &["fsck", "--strict"]);
+    let clone = r.temp.path().join("fresh-clone");
+    git(
+        r.temp.path(),
+        &[
+            "clone",
+            "--bare",
+            remote.to_str().unwrap(),
+            clone.to_str().unwrap(),
+        ],
+    );
+    git(&clone, &["fsck", "--strict"]);
+    // A divergent/deleted receiver is observable and never repaired by force.
+    git(&remote, &["update-ref", "-d", "refs/heads/main"]);
+    let divergence = wait_push(&o.push_dir, |s| {
+        s.last_error == Some(push::PushError::RemoteDiverged)
+    })
+    .await;
+    assert_eq!(divergence.delivered.unwrap().git_head, second.git_head);
+    assert_eq!(
+        text(&remote, &["for-each-ref", "--format=%(refname)"]),
+        "refs/heads/unrelated"
+    );
+    h.shutdown().await.unwrap();
+    r.stop().await;
+}
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn push_reconciles_ambiguous_remote_success_without_reselection_and_rejects_changed_binding()
+{
+    let r = Running::new().await;
+    let tree = r.tree(b"ambiguous push\n");
+    let a = r.commit(tree, vec![m::CommitId::ROOT], vec![], "ambiguous\n");
+    r.publish(a, 0);
+    let mut o = push_options(&r);
+    let report = export(r.config.clone(), o.export.clone()).await.unwrap();
+    let remote = r.temp.path().join("remote.git");
+    std::fs::create_dir(&remote).unwrap();
+    git(&remote, &["init", "--bare", "--template="]);
+    o.after_push = true;
+    let mut h = push::start_push_watch(r.config.clone(), o.clone()).unwrap();
+    let unknown = wait_push(&o.push_dir, |s| {
+        s.last_error == Some(push::PushError::PushUnconfirmed)
+    })
+    .await;
+    assert!(unknown.delivered.is_none());
+    assert!(unknown.pending.is_some());
+    assert_eq!(
+        text(&remote, &["rev-parse", "refs/heads/main"]),
+        report.git_head
+    );
+    h.shutdown().await.unwrap();
+    o.after_push = false;
+    let mut h = push::start_push_watch(r.config.clone(), o.clone()).unwrap();
+    let ack = wait_push(&o.push_dir, |s| {
+        s.delivered.is_some() && s.pending.is_none()
+    })
+    .await;
+    assert_eq!(ack.attempts, 1);
+    assert_eq!(ack.delivered.unwrap().git_head, report.git_head);
+    h.shutdown().await.unwrap();
+    // Crash-equivalent durable ACK: receiver deletion must retain the pin on restart.
+    let b = r.commit(tree, vec![a], vec![], "ack cleanup\n");
+    r.publish(b, 1);
+    let second = export(r.config.clone(), o.export.clone()).await.unwrap();
+    o.after_ack = true;
+    let mut h = push::start_push_watch(r.config.clone(), o.clone()).unwrap();
+    wait_push(&o.push_dir, |s| {
+        s.pending.as_ref().is_some_and(|p| p.acknowledged)
+    })
+    .await;
+    h.shutdown().await.unwrap();
+    let pin = text(
+        &o.export.destination_git,
+        &[
+            "for-each-ref",
+            "--format=%(refname)",
+            "refs/tinytree-backup/",
+        ],
+    );
+    assert!(!pin.is_empty());
+    assert_eq!(
+        text(&o.export.destination_git, &["rev-parse", &pin]),
+        second.git_head
+    );
+    git(&remote, &["update-ref", "-d", "refs/heads/main"]);
+    o.after_ack = false;
+    let mut h = push::start_push_watch(r.config.clone(), o.clone()).unwrap();
+    wait_push(&o.push_dir, |s| {
+        s.last_error == Some(push::PushError::RemoteDiverged)
+    })
+    .await;
+    h.shutdown().await.unwrap();
+    assert_eq!(
+        text(&o.export.destination_git, &["rev-parse", &pin]),
+        second.git_head
+    );
+    git(
+        &remote,
+        &["update-ref", "refs/heads/main", &second.git_head],
+    );
+    // A symbolic alias to the advancing public branch is never accepted as a pin.
+    git(
+        &o.export.destination_git,
+        &["symbolic-ref", &pin, "refs/heads/main"],
+    );
+    let mut h = push::start_push_watch(r.config.clone(), o.clone()).unwrap();
+    wait_push(&o.push_dir, |s| {
+        s.last_error == Some(push::PushError::PushUnconfirmed)
+    })
+    .await;
+    h.shutdown().await.unwrap();
+    assert_eq!(
+        text(&o.export.destination_git, &["symbolic-ref", &pin]),
+        "refs/heads/main"
+    );
+    git(
+        &o.export.destination_git,
+        &["symbolic-ref", "--delete", &pin],
+    );
+    git(
+        &o.export.destination_git,
+        &["update-ref", &pin, &second.git_head],
+    );
+    let mut h = push::start_push_watch(r.config.clone(), o.clone()).unwrap();
+    wait_push(&o.push_dir, |s| {
+        s.delivered
+            .as_ref()
+            .is_some_and(|p| p.git_head == second.git_head)
+            && s.pending.is_none()
+    })
+    .await;
+    h.shutdown().await.unwrap();
+    // A valid journal losing DELIVERED is not a fresh successful observation.
+    let export_path = o.export.state_dir.join("state.json");
+    let exported = std::fs::read(&export_path).unwrap();
+    let mut e: serde_json::Value = serde_json::from_slice(&exported).unwrap();
+    e["state"]["delivered"] = serde_json::Value::Null;
+    // Re-serialize the typed state in canonical field order for its checksum.
+    let state: crate::state::State = serde_json::from_value(e["state"].clone()).unwrap();
+    e["digest"] =
+        serde_json::to_value(*blake3::hash(&serde_json::to_vec(&state).unwrap()).as_bytes())
+            .unwrap();
+    std::fs::write(&export_path, serde_json::to_vec(&e).unwrap()).unwrap();
+    let mut h = push::start_push_watch(r.config.clone(), o.clone()).unwrap();
+    let absent = wait_push(&o.push_dir, |s| {
+        s.last_error == Some(push::PushError::CheckpointUnavailable)
+    })
+    .await;
+    assert!(absent.lag_at_last_observation.is_none());
+    h.shutdown().await.unwrap();
+    std::fs::write(export_path, exported).unwrap();
+    let saved = std::fs::read(o.push_dir.join("push.json")).unwrap();
+    o.remote_reference = "refs/heads/other".into();
+    let mut h = push::start_push_watch(r.config.clone(), o.clone()).unwrap();
+    assert!(h.wait().await.is_err());
+    assert_eq!(std::fs::read(o.push_dir.join("push.json")).unwrap(), saved);
+    o.remote_reference = "refs/heads/main".into();
+    #[derive(serde::Serialize)]
+    struct SavedPushRecord {
+        identity: [u8; 32],
+        status: push::PushStatus,
+    }
+    let mut envelope: serde_json::Value = serde_json::from_slice(&saved).unwrap();
+    let mut status: push::PushStatus =
+        serde_json::from_value(envelope["record"]["status"].clone()).unwrap();
+    status.updated_at_unix_ms = u64::MAX;
+    status.lag_at_last_observation = Some(0);
+    let record = SavedPushRecord {
+        identity: serde_json::from_value(envelope["record"]["identity"].clone()).unwrap(),
+        status,
+    };
+    envelope["digest"] =
+        serde_json::to_value(*blake3::hash(&serde_json::to_vec(&record).unwrap()).as_bytes())
+            .unwrap();
+    envelope["record"] = serde_json::to_value(record).unwrap();
+    std::fs::write(
+        o.push_dir.join("push.json"),
+        serde_json::to_vec(&envelope).unwrap(),
+    )
+    .unwrap();
+    let future = push::push_status(&o.push_dir).unwrap();
+    assert!(future.clock_skewed);
+    assert!(future.lag_at_last_observation.is_none());
+    // Corruption and oversized or linked journals are preserved, never repaired.
+    for bytes in [b"invalid checkpoint".to_vec(), vec![b'x'; 65537]] {
+        std::fs::write(o.push_dir.join("push.json"), &bytes).unwrap();
+        let mut h = push::start_push_watch(r.config.clone(), o.clone()).unwrap();
+        assert!(h.wait().await.is_err());
+        assert_eq!(std::fs::read(o.push_dir.join("push.json")).unwrap(), bytes);
+    }
+    std::fs::write(o.push_dir.join("push.json"), &saved).unwrap();
+    let alias = o.push_dir.join("preserved.json");
+    std::fs::rename(o.push_dir.join("push.json"), &alias).unwrap();
+    std::os::unix::fs::symlink(&alias, o.push_dir.join("push.json")).unwrap();
+    let mut h = push::start_push_watch(r.config.clone(), o.clone()).unwrap();
+    assert!(h.wait().await.is_err());
+    assert_eq!(std::fs::read(&alias).unwrap(), saved);
+    assert!(
+        std::fs::symlink_metadata(o.push_dir.join("push.json"))
+            .unwrap()
+            .file_type()
+            .is_symlink()
+    );
+    std::fs::remove_file(&alias).unwrap(); // Deliberately broken committed-state link.
+    let next = o.push_dir.join("push.next");
+    std::fs::write(&next, b"interrupted candidate").unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&next, std::fs::Permissions::from_mode(0o600)).unwrap();
+    let mut h = push::start_push_watch(r.config.clone(), o.clone()).unwrap();
+    assert!(h.wait().await.is_err());
+    assert_eq!(std::fs::read(next).unwrap(), b"interrupted candidate");
+    r.stop().await;
+}
+
+#[cfg(target_os = "linux")]
+async fn https_helper(remote: &str) -> i32 {
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            for entry in std::fs::read_dir("/proc").unwrap().flatten() {
+                let Some(pid) = entry
+                    .file_name()
+                    .to_str()
+                    .and_then(|s| s.parse::<i32>().ok())
+                else {
+                    continue;
+                };
+                if let Ok(cmd) = std::fs::read(entry.path().join("cmdline")) {
+                    let args = String::from_utf8_lossy(&cmd);
+                    if args.contains("remote-https") && args.contains(remote) {
+                        return pid;
+                    }
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("actual declared HTTPS helper did not launch")
+}
+#[cfg(target_os = "linux")]
+fn process_live(pid: i32) -> bool {
+    std::fs::read_to_string(format!("/proc/{pid}/stat"))
+        .ok()
+        .is_some_and(|s| {
+            s.rsplit_once(')')
+                .is_some_and(|(_, r)| !matches!(r.split_whitespace().next(), Some("Z" | "X")))
+        })
+}
+#[cfg(target_os = "linux")]
+fn verify_helper_ownership(pid: i32, lock: &Path) {
+    use std::os::unix::fs::MetadataExt;
+    let lock_inode = std::fs::metadata(lock).unwrap().ino();
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).unwrap();
+    let session = stat
+        .rsplit_once(')')
+        .unwrap()
+        .1
+        .split_whitespace()
+        .nth(3)
+        .unwrap();
+    let links = |pid: &str| {
+        std::fs::read_dir(format!("/proc/{pid}/fd"))
+            .unwrap()
+            .flatten()
+            .filter_map(|f| std::fs::read_link(f.path()).ok())
+            .collect::<Vec<_>>()
+    };
+    let helper = links(&pid.to_string());
+    let leader = links(session);
+    assert!(
+        std::fs::read_dir(format!("/proc/{pid}/fd"))
+            .unwrap()
+            .flatten()
+            .any(|f| std::fs::metadata(f.path()).is_ok_and(|m| m.ino() == lock_inode)),
+        "actual HTTPS helper dropped inherited fence"
+    );
+    assert!(
+        helper.iter().any(
+            |link| link.to_str().is_some_and(|s| s.starts_with("socket:["))
+                && leader.contains(link)
+        ),
+        "actual HTTPS helper dropped inherited ownership endpoint"
+    );
+}
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn push_actual_https_helper_keeps_fence_and_endpoint_through_cancellation_and_actor_death_at_high_fds()
+ {
+    let r = Running::new().await;
+    let t = r.tree(b"helper ownership\n");
+    let a = r.commit(t, vec![m::CommitId::ROOT], vec![], "ownership\n");
+    r.publish(a, 0);
+    let mut o = push_options(&r);
+    export(r.config.clone(), o.export.clone()).await.unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    o.remote = format!("https://{}/backup.git", listener.local_addr().unwrap());
+    o.operation_timeout = std::time::Duration::from_secs(10);
+    let mut h = push::start_push_watch(r.config.clone(), o.clone()).unwrap();
+    // TCP is accepted but the loopback fixture deliberately never finishes TLS.
+    let (connection, _) =
+        tokio::time::timeout(std::time::Duration::from_secs(5), listener.accept())
+            .await
+            .unwrap()
+            .unwrap();
+    let helper = https_helper(&o.remote).await;
+    verify_helper_ownership(helper, &o.push_dir.join("push.lock"));
+    let mut competing = push::start_push_watch(r.config.clone(), o.clone()).unwrap();
+    assert!(competing.wait().await.is_err());
+    let stopped = tokio::time::timeout(std::time::Duration::from_secs(5), h.shutdown())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(stopped.phase, push::PushPhase::Stopped);
+    assert!(!process_live(helper));
+    assert_eq!(
+        push::push_status(&o.push_dir).unwrap().writer_fence_held,
+        Some(false)
+    );
+    drop(connection);
+    // Restart the real CLI through the existing declared high-descriptor launcher.
+    let config = r.temp.path().join("push-client.toml");
+    std::fs::write(&config,format!("endpoint = {:?}\nrepository_id = \"example\"\ntoken_env = \"TINYTREE_GIT_TEST_TOKEN\"\n",r.config.endpoint)).unwrap();
+    let mut child = tokio::process::Command::new(env!("TINYTREE_WATCH_FD_FIXTURE"))
+        .arg(env!("CARGO_BIN_EXE_tinytree-git"))
+        .args(["push-watch", "--config"])
+        .arg(&config)
+        .arg("--state")
+        .arg(&o.export.state_dir)
+        .arg("--push-state")
+        .arg(&o.push_dir)
+        .arg("--destination-git")
+        .arg(&o.export.destination_git)
+        .arg("--remote")
+        .arg(&o.remote)
+        .arg("--git")
+        .arg(git_program())
+        .args([
+            "--poll-interval-ms",
+            "100",
+            "--operation-timeout-ms",
+            "10000",
+            "--max-backoff-ms",
+            "200",
+        ])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let (connection, _) =
+        tokio::time::timeout(std::time::Duration::from_secs(5), listener.accept())
+            .await
+            .unwrap()
+            .unwrap();
+    let helper = https_helper(&o.remote).await;
+    verify_helper_ownership(helper, &o.push_dir.join("push.lock"));
+    use std::os::fd::{AsRawFd, FromRawFd};
+    let descriptor = unsafe { libc::syscall(libc::SYS_pidfd_open, helper, 0) } as i32;
+    assert!(descriptor >= 0);
+    let helper_identity = unsafe { std::fs::File::from_raw_fd(descriptor) };
+    child.start_kill().unwrap();
+    child.wait().await.unwrap();
+    assert!(process_live(helper));
+    assert_eq!(
+        push::push_status(&o.push_dir).unwrap().writer_fence_held,
+        Some(true)
+    );
+    let mut competing = push::start_push_watch(r.config.clone(), o.clone()).unwrap();
+    assert!(competing.wait().await.is_err());
+    // Explicit fixture cleanup targets the exact verified helper, never a guessed group.
+    assert_eq!(
+        unsafe {
+            libc::syscall(
+                libc::SYS_pidfd_send_signal,
+                helper_identity.as_raw_fd(),
+                libc::SIGKILL,
+                std::ptr::null::<libc::siginfo_t>(),
+                0,
+            )
+        },
+        0
+    );
+    drop(connection);
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            if push::push_status(&o.push_dir).unwrap().writer_fence_held == Some(false) {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    r.stop().await;
+}

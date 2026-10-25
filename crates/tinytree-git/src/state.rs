@@ -323,3 +323,46 @@ pub(crate) fn usage(path: &Path, max_entries: usize, max_depth: usize) -> Result
     let mut entries = max_entries;
     walk(path, &mut entries, max_depth)
 }
+
+/// Atomic delivered checkpoint reader; never acquires the exporter writer fence.
+pub(crate) fn delivered_checkpoint(
+    path: &Path,
+    scope: [u8; 32],
+    limits: &crate::Limits,
+) -> Result<Option<(Position, Mapping)>> {
+    let directory = PrivateDir::open_existing(path)?;
+    let state = decode(&directory, limits.max_state_bytes)?;
+    validate(&state, limits.max_commits)?;
+    ensure!(state.scope == scope, "export checkpoint identity differs");
+    state
+        .delivered
+        .map(|position| {
+            let mapping = state
+                .mappings
+                .get(&position.native)
+                .context("delivered mapping absent")?
+                .clone();
+            ensure!(mapping.git == position.git, "delivered mapping differs");
+            Ok((position, mapping))
+        })
+        .transpose()
+}
+/// Verify a frozen pending position against the authenticated export mapping.
+pub(crate) fn mapped_checkpoint(
+    path: &Path,
+    scope: [u8; 32],
+    limits: &crate::Limits,
+    native: &str,
+    git: &str,
+) -> Result<Mapping> {
+    let directory = PrivateDir::open_existing(path)?;
+    let state = decode(&directory, limits.max_state_bytes)?;
+    validate(&state, limits.max_commits)?;
+    ensure!(state.scope == scope, "export checkpoint identity differs");
+    let mapping = state
+        .mappings
+        .get(native)
+        .context("selected delivered mapping absent")?;
+    ensure!(mapping.git == git, "selected delivered mapping differs");
+    Ok(mapping.clone())
+}

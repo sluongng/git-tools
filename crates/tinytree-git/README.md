@@ -2,8 +2,9 @@
 
 `tinytree-git export` mirrors one exact native public reference into one branch of
 an initially empty, private local bare Git repository. Native storage remains the
-source of truth. The adapter does not contact GitHub, push, watch in the background,
-import original Git history, or switch an existing repository to native hosting.
+source of truth. Export is local-only; optional foreground watcher commands
+provide local replication and a separate opt-in remote backup. These commands do
+not import original Git history or switch repository authority.
 
 ```sh
 tinytree-git export --config client.toml --state /private/adapter \
@@ -151,3 +152,76 @@ replication can resume. Similarly, bounded interrupted native spool residues are
 preserved for explicit reconciliation. The tests cover cancellation and process
 death around accepted children, but not a power-loss or kill at every internal
 Git ref-lock instruction.
+
+
+## Optional one-way remote backup
+
+On Linux, `push-watch` independently backs up **delivered exporter checkpoints**
+to one public branch. It is disabled unless explicitly started. Run local
+`watch` or `export` separately; native publication and local export do not wait
+for remote pushes. No fetch, mirror, tag replication, force push, or source-side
+reference update is performed.
+
+```sh
+tinytree-git push-watch --config client.toml --state /private/export-state \
+  --push-state /private/push-state --destination-git /private/receiver.git \
+  --remote https://example.invalid/owner/backup.git \
+  --remote-reference refs/heads/main --git /path/to/git
+tinytree-git push-status --push-state /private/push-state
+```
+
+The existing source/destination reference options must match the exporter.
+`--remote-reference` selects the only remote branch. All local directories must
+be absolute, private, normalized, and pairwise independent. A changed source,
+credential identity, remote, branch, directory, Git executable path, or transport
+policy requires explicit migration, not silently reusing the old outbox.
+
+Only HTTPS and absolute local paths (including `file:///...`) are accepted.
+URLs must not contain user information, query strings, fragments, or control
+characters. SSH, custom protocol helpers and option-like destinations are not
+supported. TLS verification is enabled and redirects are disabled. Ambient Git
+configuration, credential helpers, prompts, and native source credentials are
+not forwarded. The built-in command does **not** provision authenticated hosting
+access. An explicitly selected `--git` executable is trusted code and may be a
+narrow operator-managed authentication wrapper outside this repository. Such a
+wrapper must preserve the configured arguments, owned process session, inherited
+ownership descriptors, and environment isolation; it must not daemonize or close
+those descriptors before its descendants exit. Credentials must not be embedded
+in the remote URL. Status and errors omit the URL and raw transport diagnostics.
+
+The fixed-size, checksummed, fsynced outbox holds at most a latest desired
+position, one immutable pending position, and the last verified delivery.
+New local deliveries coalesce without changing the pending Git OID. A private
+local retention ref protects that exact pending commit and its verified complete
+closure. This ref is never pushed. After a remote attempt, an independent exact
+branch readback must match the selected OID before delivery is acknowledged;
+ambiguous success is reconciled after restart. The acknowledgement is persisted
+before compare-and-swap removal of the private pin. Missing, divergent, or
+unavailable remote state preserves pending evidence. A previously acknowledged
+but unfinished cleanup is also read back before pin removal.
+
+The remote must initially have no selected branch, or already match the selected
+pending OID. Later pushes require the last acknowledged OID observed at that
+branch. The actual push is an ordinary non-force update: the receiver enforces
+fast-forward ancestry, not a lease spanning the preceding observation. Concurrent
+foreign updates that are ancestors of the selected commit are not fenced by an
+atomic expected-old lease. Unrelated branches are never selected.
+
+`desired`, `pending`, and `delivered` are separate facts. Lag is timestamped against
+the last delivered exporter checkpoint, not a fresh native-server query; it is
+unknown when observation fails, the actor stops, its fence is not held, or the
+clock moves backwards. Status records bounded error categories, attempt counts,
+retry deadlines, last remote-check time and physical writer-fence ownership.
+Defaults are a five-second poll, sixty-second operation budget and capped
+exponential retry up to five minutes. The corresponding millisecond options are
+`--poll-interval-ms`, `--operation-timeout-ms`, and `--max-backoff-ms`.
+
+Transport work owns an independent fence, never the exporter writer fence.
+Supported Git processes and transport descendants inherit that fence and an
+ownership endpoint. Logical expiry or cancellation initiates targeted session
+cleanup, but only endpoint EOF permits physical ownership release. Linux pidfds
+avoid signaling a reused numeric process identity; zombies are not treated as
+live work. Uncertain cleanup retains the fence instead of admitting replacement
+work. This contract covers the configured trusted executable and supported Git
+helpers, not hostile same-user programs escaping the session or closing the
+ownership descriptors. No service or credentials are installed by these commands.

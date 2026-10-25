@@ -264,6 +264,14 @@ pub(crate) fn scope(
     owner: &Resources,
     trust: Option<&TrustSnapshot>,
 ) -> Result<([u8; 32], Option<Arc<[u8]>>)> {
+    scope_for_destination(config, &owner.options, owner.destination.path(), trust)
+}
+pub(crate) fn scope_for_destination(
+    config: &Config,
+    options: &ExportOptions,
+    destination: &std::path::Path,
+    trust: Option<&TrustSnapshot>,
+) -> Result<([u8; 32], Option<Arc<[u8]>>)> {
     if let Some(captured) = trust {
         ensure!(
             config.tls.is_some() == captured.ca.is_some(),
@@ -275,13 +283,13 @@ pub(crate) fn scope(
     for value in [
         &config.endpoint,
         &config.repository_id,
-        &owner.options.source_reference,
-        &owner.options.destination_reference,
+        &options.source_reference,
+        &options.destination_reference,
     ] {
         hash.update(&(value.len() as u64).to_le_bytes());
         hash.update(value.as_bytes());
     }
-    let destination = serde_json::to_vec(owner.destination.path())?;
+    let destination = serde_json::to_vec(destination)?;
     hash.update(&(destination.len() as u64).to_le_bytes());
     hash.update(&destination);
     hash.update(&[u8::from(config.token_env.is_some())]);
