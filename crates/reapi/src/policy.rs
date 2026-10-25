@@ -238,6 +238,33 @@ pub fn retryable(status: &Status) -> bool {
     }
 }
 
+/// Marks a rejected, unaccepted operation as transient admission pressure.
+/// Do not use for permanent quotas, oversized requests or accepted work. The
+/// hint is bounded to 1 ms..60 s; callers still retain their original deadline.
+pub fn resource_exhausted_with_retry(message: impl Into<String>, delay: Duration) -> Status {
+    let delay = delay.clamp(Duration::from_millis(1), Duration::from_secs(60));
+    let info = RetryInfo {
+        retry_delay: Some(prost_types::Duration {
+            seconds: delay.as_secs() as i64,
+            nanos: delay.subsec_nanos() as i32,
+        }),
+    };
+    let message = message.into();
+    let rich = crate::proto::google::rpc::Status {
+        code: Code::ResourceExhausted as i32,
+        message: message.clone(),
+        details: vec![prost_types::Any {
+            type_url: "type.googleapis.com/google.rpc.RetryInfo".into(),
+            value: info.encode_to_vec(),
+        }],
+    };
+    Status::with_details(
+        Code::ResourceExhausted,
+        message,
+        rich.encode_to_vec().into(),
+    )
+}
+
 // RetryInfo is not part of the pinned generated proto set. Decode only its
 // standard wire shape instead of expanding the generated API dependencies.
 #[derive(Clone, PartialEq, Message)]
@@ -325,6 +352,16 @@ mod tests {
             Status::with_details(Code::ResourceExhausted, "busy", rich.encode_to_vec().into());
         assert!(retryable(&status));
         assert_eq!(retry_hint(&status), Some(Duration::from_millis(2)));
+        for (input, expected) in [
+            (Duration::ZERO, Duration::from_millis(1)),
+            (Duration::from_millis(25), Duration::from_millis(25)),
+            (Duration::MAX, Duration::from_secs(60)),
+        ] {
+            let status = resource_exhausted_with_retry("admission busy", input);
+            assert_eq!(status.code(), Code::ResourceExhausted);
+            assert!(retryable(&status));
+            assert_eq!(retry_hint(&status), Some(expected));
+        }
     }
     #[tokio::test]
     async fn recovery_attempt_limit_and_permanent_errors() {

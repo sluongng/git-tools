@@ -345,6 +345,9 @@ mod tests {
         let response = service.cloud_grpc_service().oneshot(request).await.unwrap();
         assert_eq!(response.headers().get("grpc-status").unwrap(), "8");
         assert_eq!(polls.load(Ordering::SeqCst), 1);
+        let shape_error = Status::from_header_map(response.headers()).unwrap();
+        assert!(shape_error.details().is_empty());
+        assert!(!reapi::policy::retryable(&shape_error));
     }
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn canceled_cloud_rpc_retains_physical_admission_and_shutdown_drain_until_job_finishes() {
@@ -364,8 +367,35 @@ mod tests {
         let (next, polls) = request("GetWorkspace", Some(WRITER), workspace_frame());
         let denied = service.cloud_grpc_service().oneshot(next).await.unwrap();
         assert_eq!(denied.headers().get("grpc-status").unwrap(), "8");
+        let pressure = Status::from_header_map(denied.headers()).unwrap();
+        assert!(reapi::policy::retryable(&pressure));
+        assert!(!pressure.details().is_empty());
+
         assert_eq!(polls.load(Ordering::SeqCst), 0);
         drop(denied);
+        let mut policy = reapi::policy::Policy::default();
+        policy.retry.max_attempts = 16;
+        policy.retry.initial_backoff_ms = 1;
+        policy.retry.max_backoff_ms = 1;
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(75);
+        let attempts = AtomicUsize::new(0);
+        let error = policy
+            .retry(deadline, Duration::from_millis(200), |_| async {
+                attempts.fetch_add(1, Ordering::SeqCst);
+                let (next, polls) = request("GetWorkspace", Some(WRITER), workspace_frame());
+                let denied = service.cloud_grpc_service().oneshot(next).await.unwrap();
+                assert_eq!(polls.load(Ordering::SeqCst), 0);
+                Err::<(), _>(Status::from_header_map(denied.headers()).unwrap())
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(error.code(), tonic::Code::DeadlineExceeded);
+        assert!((1..=16).contains(&attempts.load(Ordering::SeqCst)));
+        assert_eq!(
+            host.active_jobs(),
+            1,
+            "retry deadline does not release the accepted physical job"
+        );
         let drain_host = host.clone();
         let mut drain = tokio::spawn(async move {
             drain_host.drain().await;
@@ -381,5 +411,70 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(host.active_jobs(), 0);
+    }
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cloud_admission_retry_succeeds_only_after_the_accepted_job_releases_its_permits() {
+        let directory = tempfile::tempdir().unwrap();
+        let service = service(directory.path());
+        let host = service.cloud_host().unwrap();
+        let (entered, started) = tokio::sync::oneshot::channel();
+        let (resume, released) = std::sync::mpsc::channel();
+        host.pause_job(entered, released);
+        let (mut first_request, _) = request("GetWorkspace", Some(WRITER), workspace_frame());
+        first_request
+            .headers_mut()
+            .insert("grpc-timeout", "2S".parse().unwrap());
+        let first_service = service.clone();
+        let first = tokio::spawn(async move {
+            let response = first_service
+                .cloud_grpc_service()
+                .oneshot(first_request)
+                .await
+                .unwrap();
+            response_status(response).await
+        });
+        started.await.unwrap();
+        let seen = Arc::new(tokio::sync::Notify::new());
+        let release_seen = seen.clone();
+        let release = tokio::spawn(async move {
+            release_seen.notified().await;
+            resume.send(()).unwrap();
+        });
+        let mut policy = reapi::policy::Policy::default();
+        policy.retry.max_attempts = 8;
+        policy.retry.initial_backoff_ms = 1;
+        policy.retry.max_backoff_ms = 1;
+        let attempts = AtomicUsize::new(0);
+        policy
+            .retry(
+                tokio::time::Instant::now() + Duration::from_secs(2),
+                Duration::from_millis(200),
+                |_| async {
+                    attempts.fetch_add(1, Ordering::SeqCst);
+                    let (next, _) = request("GetWorkspace", Some(WRITER), workspace_frame());
+                    let response = service.cloud_grpc_service().oneshot(next).await.unwrap();
+                    if let Some(status) = Status::from_header_map(response.headers()) {
+                        assert_eq!(status.code(), tonic::Code::ResourceExhausted);
+                        assert!(reapi::policy::retryable(&status));
+                        seen.notify_one();
+                        return Err(status);
+                    }
+                    assert_eq!(response_status(response).await, "0");
+                    Ok(())
+                },
+            )
+            .await
+            .unwrap();
+        release.await.unwrap();
+        assert_eq!(first.await.unwrap(), "0");
+        assert!((2..=8).contains(&attempts.load(Ordering::SeqCst)));
+        assert_eq!(host.active_jobs(), 0);
+        // A subsequent ordinary call still fits: neither rejected attempt nor
+        // consumed success body leaked a call, memory or repository permit.
+        let (next, _) = request("GetWorkspace", Some(WRITER), workspace_frame());
+        assert_eq!(
+            response_status(service.cloud_grpc_service().oneshot(next).await.unwrap()).await,
+            "0"
+        );
     }
 }

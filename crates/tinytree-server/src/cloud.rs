@@ -167,6 +167,17 @@ impl CloudConfig {
         }
     }
 }
+fn admission_error(error: tokio::sync::TryAcquireError, message: &'static str) -> Status {
+    match error {
+        tokio::sync::TryAcquireError::NoPermits => reapi::policy::resource_exhausted_with_retry(
+            message,
+            std::time::Duration::from_millis(25),
+        ),
+        tokio::sync::TryAcquireError::Closed => {
+            Status::unavailable("private workspace admission is closed")
+        }
+    }
+}
 fn kib(bytes: u64) -> Result<u32, ConfigError> {
     u32::try_from(
         bytes
@@ -247,10 +258,6 @@ impl CloudHost {
         if self.closing.load(Ordering::Acquire) {
             return Err(Status::unavailable("private workspace service is draining"));
         }
-        let call =
-            self.calls.clone().try_acquire_owned().map_err(|_| {
-                Status::resource_exhausted("private workspace call budget exhausted")
-            })?;
         let wire = self.config.wire_limit(method) as u64;
         if method == "ReadCapture" && !self.config.captured_versions {
             return Err(Status::unimplemented(
@@ -289,11 +296,20 @@ impl CloudHost {
             .ok_or_else(|| Status::resource_exhausted("private workspace memory bound"))?;
         let permits =
             kib(bytes).map_err(|_| Status::resource_exhausted("private workspace memory bound"))?;
+        // A request that cannot fit even an empty pool is a permanent bound,
+        // not transient contention. Never invite retries of the same shape.
+        if permits as u64 > self.config.max_buffered_bytes / 1024 {
+            return Err(Status::resource_exhausted("private workspace memory bound"));
+        }
+        let call =
+            self.calls.clone().try_acquire_owned().map_err(|error| {
+                admission_error(error, "private workspace call budget exhausted")
+            })?;
         let memory = self
             .bytes
             .clone()
             .try_acquire_many_owned(permits)
-            .map_err(|_| Status::resource_exhausted("private workspace memory budget exhausted"))?;
+            .map_err(|error| admission_error(error, "private workspace memory budget exhausted"))?;
         self.active.fetch_add(1, Ordering::AcqRel);
         // Close/admit linearization: a call which loses the race must not
         // become accepted after drain observes the previous zero count.
@@ -321,8 +337,8 @@ impl CloudHost {
         let gate = self.repositories.get(repo).ok_or_else(|| {
             Status::permission_denied("private workspace repository access denied")
         })?;
-        let permit = gate.clone().try_acquire_owned().map_err(|_| {
-            Status::resource_exhausted("private workspace repository budget exhausted")
+        let permit = gate.clone().try_acquire_owned().map_err(|error| {
+            admission_error(error, "private workspace repository budget exhausted")
         })?;
         *work
             ._repository
@@ -1408,6 +1424,66 @@ impl p::workspace_cloud_server::WorkspaceCloud for CloudService {
 mod indexed_adapter_tests {
     use super::*;
     use p::workspace_cloud_server::WorkspaceCloud;
+    #[tokio::test]
+    async fn cloud_memory_and_repository_pressure_are_retryable_but_store_limits_are_not() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut profile: crate::Config =
+            toml::from_str(include_str!("../examples/cloud.toml")).unwrap();
+        profile.service.cloud.max_inflight = 8;
+        let store = s::Store::open(
+            directory.path(),
+            profile
+                .store
+                .materialize(profile.service.max_metadata_bytes),
+        )
+        .unwrap();
+        store.create_repository("example").unwrap();
+        let repository =
+            RepositoryService::new(store, profile.service, vec!["example".into()], Vec::new())
+                .unwrap();
+        let host = repository.cloud_host().unwrap();
+        let deadline = Instant::now() + std::time::Duration::from_secs(2);
+        let mut admitted = Vec::new();
+        loop {
+            match host.admit("GetVersion", deadline) {
+                Ok(work) => admitted.push(work),
+                Err(error) => {
+                    assert_eq!(error.message(), "private workspace memory budget exhausted");
+                    assert!(reapi::policy::retryable(&error));
+                    assert!(!error.details().is_empty());
+                    break;
+                }
+            }
+        }
+        assert!(!admitted.is_empty());
+        assert_eq!(host.active_jobs(), admitted.len());
+        drop(admitted);
+        assert_eq!(host.active_jobs(), 0);
+        let identity = repository.query_identity(&Default::default()).unwrap();
+        let first = host.admit("GetWorkspace", deadline).unwrap();
+        host.repository(&first, &identity, "example", false)
+            .unwrap();
+        let second = host.admit("GetWorkspace", deadline).unwrap();
+        let error = host
+            .repository(&second, &identity, "example", false)
+            .unwrap_err();
+        assert_eq!(
+            error.message(),
+            "private workspace repository budget exhausted"
+        );
+        assert!(reapi::policy::retryable(&error));
+        drop(second);
+        drop(first);
+        assert_eq!(host.active_jobs(), 0);
+        let next = host.admit("GetWorkspace", deadline).unwrap();
+        host.repository(&next, &identity, "example", false).unwrap();
+        drop(next);
+        assert_eq!(host.active_jobs(), 0);
+        let permanent = status(s::Error::Limit("cloud staging quota"));
+        assert_eq!(permanent.code(), tonic::Code::ResourceExhausted);
+        assert!(permanent.details().is_empty());
+        assert!(!reapi::policy::retryable(&permanent));
+    }
     #[tokio::test]
     async fn legacy_rpc_rejects_indexed_publish_and_read_before_artifact_work() {
         let directory = tempfile::tempdir().unwrap();

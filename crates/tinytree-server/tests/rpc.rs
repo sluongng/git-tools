@@ -4783,6 +4783,15 @@ async fn cloud_fixture(
     tinytree_cloud::Manifest,
     Vec<tinytree_cloud::VerifiedObject>,
 ) {
+    cloud_fixture_with_description(fixture, "snapshot task\n".repeat(6000)).await
+}
+async fn cloud_fixture_with_description(
+    fixture: &Fixture,
+    description: String,
+) -> (
+    tinytree_cloud::Manifest,
+    Vec<tinytree_cloud::VerifiedObject>,
+) {
     use jj_lib::{
         backend::{MillisSinceEpoch, Timestamp},
         object_id::ObjectId as _,
@@ -4816,7 +4825,7 @@ async fn cloud_fixture(
                 start: time.clone(),
                 end: time,
             },
-            description: "snapshot task\n".repeat(6000),
+            description,
             hostname: "agent".into(),
             username: "agent".into(),
             is_snapshot: true,
@@ -6433,13 +6442,11 @@ async fn cloud_rpc_decompressed_and_semantic_request_bounds_reject_before_store_
     profile.service.cloud.max_object_bytes = 1024;
     profile.service.cloud.max_manifest_bytes = 1024;
     profile.service.cloud.max_staging_leases = 1;
-    let store = Store::open(
-        directory.path(),
-        profile
-            .store
-            .materialize(profile.service.max_metadata_bytes),
-    )
-    .unwrap();
+    let mut store_config = profile
+        .store
+        .materialize(profile.service.max_metadata_bytes);
+    store_config.cloud.max_staging_records_per_owner = 1;
+    let store = Store::open(directory.path(), store_config).unwrap();
     store.create_repository("alpha").unwrap();
     store.create_repository("beta").unwrap();
     let server = Running::start(store, profile.service).await;
@@ -6485,6 +6492,8 @@ async fn cloud_rpc_decompressed_and_semantic_request_bounds_reject_before_store_
         .await
         .unwrap_err();
     assert_eq!(error.code(), Code::ResourceExhausted);
+    assert!(error.details().is_empty());
+    assert!(!reapi::policy::retryable(&error));
     let error = client
         .publish_version(request(
             c::PublishVersionRequest {
@@ -6502,6 +6511,8 @@ async fn cloud_rpc_decompressed_and_semantic_request_bounds_reject_before_store_
         .await
         .unwrap_err();
     assert_eq!(error.code(), Code::ResourceExhausted);
+    assert!(error.details().is_empty());
+    assert!(!reapi::policy::retryable(&error));
     assert_eq!(
         client
             .get_workspace(request(
@@ -6532,6 +6543,43 @@ async fn cloud_rpc_decompressed_and_semantic_request_bounds_reject_before_store_
             .publication
             .is_none()
     );
+    // An owner quota cannot improve by retrying the same request. It must stay
+    // distinguishable from the transient admission pressure tested separately.
+    let (_, objects) = cloud_fixture_with_description(&fixture(), "quota fixture".into()).await;
+    assert!(
+        objects
+            .iter()
+            .all(|object| object.payload().unwrap().len() <= 1024),
+        "quota fixture objects fit the independent RPC object bound"
+    );
+
+    let first = &objects[0];
+    client
+        .put_object(request(
+            c::PutObjectRequest {
+                repository_id: "alpha".into(),
+                descriptor: Some(cloud_object_descriptor(first)),
+                payload: first.payload().unwrap().to_vec(),
+            },
+            ALPHA,
+        ))
+        .await
+        .unwrap();
+    let second = &objects[1];
+    let error = client
+        .put_object(request(
+            c::PutObjectRequest {
+                repository_id: "alpha".into(),
+                descriptor: Some(cloud_object_descriptor(second)),
+                payload: second.payload().unwrap().to_vec(),
+            },
+            ALPHA,
+        ))
+        .await
+        .unwrap_err();
+    assert_eq!(error.code(), Code::ResourceExhausted);
+    assert!(error.details().is_empty());
+    assert!(!reapi::policy::retryable(&error));
     drop(client);
     server.stop().await;
 }
