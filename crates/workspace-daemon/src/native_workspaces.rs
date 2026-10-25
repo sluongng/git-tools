@@ -305,6 +305,26 @@ impl Manager {
             .map(|commands| commands.status())
             .unwrap_or(serde_json::Value::Null)
     }
+    fn host_admission_deadline(&self) -> tokio::time::Instant {
+        // Control has no caller-supplied whole-operation deadline. Bound this
+        // admission once, below the client's 180s response timeout; never renew
+        // it on a maintenance wake or cancel accepted physical lifecycle work.
+        tokio::time::Instant::now()
+            + self
+                .config
+                .reapi
+                .operation_timeout()
+                .min(std::time::Duration::from_secs(120))
+    }
+    async fn outer_host_access_until(
+        &self,
+        deadline: tokio::time::Instant,
+    ) -> Result<Option<Arc<native_retention::HostAccessGuard>>> {
+        match &self.commands {
+            Some(commands) => Ok(Some(commands.outer_host_access_until(deadline).await?)),
+            None => Ok(None),
+        }
+    }
     pub async fn collect_native(&self, alias: &str, apply: bool) -> Result<serde_json::Value> {
         ensure!(
             self.entries.values().all(|entry| {
@@ -373,7 +393,8 @@ impl Manager {
         commit: String,
         workspace_id: String,
     ) -> Result<Mounted> {
-        self.create_mode(root, store, commit, workspace_id, false)
+        let deadline = self.host_admission_deadline();
+        self.create_mode(root, store, commit, workspace_id, false, deadline)
             .await
     }
     /// Fresh immutable check source; ordinary native creation stays writable.
@@ -384,7 +405,8 @@ impl Manager {
         commit: String,
         workspace_id: String,
     ) -> Result<Mounted> {
-        self.create_mode(root, store, commit, workspace_id, true)
+        let deadline = self.host_admission_deadline();
+        self.create_mode(root, store, commit, workspace_id, true, deadline)
             .await
     }
     async fn create_mode(
@@ -394,16 +416,13 @@ impl Manager {
         commit: String,
         workspace_id: String,
         immutable: bool,
+        deadline: tokio::time::Instant,
     ) -> Result<Mounted> {
         #[cfg(not(any(target_os = "linux", target_os = "macos")))]
         if immutable {
             return Err(native_vfs::ImmutableCandidateUnsupported.into());
         }
-        let access = self
-            .commands
-            .as_ref()
-            .map(|host| host.host_access())
-            .transpose()?;
+        let access = self.outer_host_access_until(deadline).await?;
         ensure!(
             !self.retirements.contains_key(&workspace_id),
             "native workspace identity is retired"
@@ -730,6 +749,7 @@ impl Manager {
     /// Resume the exact tagged origin; a restored origin never re-enters clone
     /// admission or reconstructs its workspace from a current public reference.
     pub async fn resume_root(&mut self, root: PathBuf) -> Result<Mounted> {
+        let deadline = self.host_admission_deadline();
         let root = canonical_candidate(&root)?;
         let ids: Vec<_> = self
             .entries
@@ -741,9 +761,12 @@ impl Manager {
             ids.len() == 1,
             "native resume requires one exact saved destination root"
         );
-        self.resume(&ids[0]).await
+        self.resume_until(&ids[0], deadline).await
     }
     pub async fn resume(&mut self, id: &str) -> Result<Mounted> {
+        self.resume_until(id, self.host_admission_deadline()).await
+    }
+    async fn resume_until(&mut self, id: &str, deadline: tokio::time::Instant) -> Result<Mounted> {
         let _ = unhex(id)?;
         let record = self
             .entries
@@ -753,19 +776,34 @@ impl Manager {
             .clone();
         match &record.origin {
             Origin::Candidate { bootstrap_commit } => {
-                self.create_candidate(record.root, record.store, hex(bootstrap_commit), id.into())
-                    .await
+                self.create_mode(
+                    record.root,
+                    record.store,
+                    hex(bootstrap_commit),
+                    id.into(),
+                    true,
+                    deadline,
+                )
+                .await
             }
             Origin::Clone { bootstrap_commit } => {
-                self.create(record.root, record.store, hex(bootstrap_commit), id.into())
-                    .await
+                self.create_mode(
+                    record.root,
+                    record.store,
+                    hex(bootstrap_commit),
+                    id.into(),
+                    false,
+                    deadline,
+                )
+                .await
             }
             Origin::Restore { source, .. } => {
-                self.restore(
+                self.restore_until(
                     record.root,
                     record.store,
                     id.into(),
                     selection_from_identity(source),
+                    deadline,
                 )
                 .await
             }
@@ -778,14 +816,48 @@ impl Manager {
         workspace_id: String,
         selection: crate::control::NativeRestoreSelection,
     ) -> Result<Mounted> {
+        self.restore_until(
+            root,
+            store,
+            workspace_id,
+            selection,
+            self.host_admission_deadline(),
+        )
+        .await
+    }
+    async fn restore_until(
+        &mut self,
+        root: PathBuf,
+        store: String,
+        workspace_id: String,
+        selection: crate::control::NativeRestoreSelection,
+        deadline: tokio::time::Instant,
+    ) -> Result<Mounted> {
+        let deadline = deadline.min(
+            tokio::time::Instant::now()
+                + std::time::Duration::from_millis(
+                    crate::native_restore_source::Limits::default()
+                        .restore
+                        .timeout_ms,
+                ),
+        );
         let access = self
             .commands
             .as_ref()
             .context("native restore requires managed command admission")?
-            .host_access()?;
+            .outer_host_access_until(deadline)
+            .await?;
         let mut started = false;
         let result = self
-            .restore_inner(root, store, &workspace_id, selection, &mut started, access)
+            .restore_inner(
+                root,
+                store,
+                &workspace_id,
+                selection,
+                &mut started,
+                access,
+                deadline,
+            )
             .await;
         if result.is_err() && started && self.entries.contains_key(&workspace_id) {
             // Never let an error discard an acquired startup fence/controller.
@@ -802,6 +874,7 @@ impl Manager {
         selection: crate::control::NativeRestoreSelection,
         started: &mut bool,
         access: Arc<native_retention::HostAccessGuard>,
+        deadline: tokio::time::Instant,
     ) -> Result<Mounted> {
         #[cfg(not(target_os = "linux"))]
         anyhow::bail!("startup-gated native restore requires Linux; no checkout was created");
@@ -893,8 +966,6 @@ impl Manager {
             objects: source.io.clone(),
         };
         let limits = crate::native_restore_source::Limits::default();
-        let deadline = tokio::time::Instant::now()
-            + std::time::Duration::from_millis(limits.restore.timeout_ms);
         let mut prepared = None;
         let mut current = false;
         if let Some(record) = &existing {
@@ -1312,11 +1383,10 @@ impl Manager {
         })
     }
     pub fn recover(&mut self, id: &str) -> Result<serde_json::Value> {
-        let _access = self
-            .commands
-            .as_ref()
-            .map(|host| host.host_access())
-            .transpose()?;
+        // Recovery already runs on the control server's physical blocking
+        // worker. The registry wait uses its own runtime, not this thread's.
+        let deadline = self.host_admission_deadline();
+        let _access = futures::executor::block_on(self.outer_host_access_until(deadline))?;
         let _ = unhex(id)?;
         let entry = self
             .entries
@@ -1332,11 +1402,8 @@ impl Manager {
         recover_entry(&self.config, entry)
     }
     pub async fn stop(&mut self, id: &str) -> Result<()> {
-        let _access = self
-            .commands
-            .as_ref()
-            .map(|host| host.host_access())
-            .transpose()?;
+        let deadline = self.host_admission_deadline();
+        let _access = self.outer_host_access_until(deadline).await?;
         let _ = unhex(id)?;
         if let Some(entry) = self.entries.get_mut(id) {
             if matches!(&entry.record.origin, Origin::Restore { .. })
@@ -1368,10 +1435,8 @@ impl Manager {
             .get_mut(id)
             .context("native workspace is not registered")?;
         if matches!(&entry.record.origin, Origin::Restore { .. }) {
-            native_workspace_admin::restore::wait_for_restore_work_until(
-                std::time::Instant::now() + std::time::Duration::from_secs(120),
-            )
-            .await?;
+            native_workspace_admin::restore::wait_for_restore_work_until(deadline.into_std())
+                .await?;
             entry.restore_receipt = None;
             entry.restore_intent = None;
         }
@@ -1512,6 +1577,9 @@ impl Manager {
     ) -> Result<serde_json::Value> {
         #[cfg(not(target_os = "linux"))]
         anyhow::bail!("candidate retirement requires native Linux unmounted-state proof");
+        let access = self
+            .outer_host_access_until(self.host_admission_deadline())
+            .await?;
         let identity = unhex(id)?;
         let expected = unhex(expected_commit)?;
         ensure!(
@@ -1579,7 +1647,7 @@ impl Manager {
             .as_ref()
             .context("candidate retirement requires command admission fencing")?
             .clone();
-        let access = commands.host_access()?;
+        let access = access.context("candidate retirement requires command admission fencing")?;
         let admin_guard = registry.lock_candidate_retirement(&binding)?;
         for item in fs::read_dir(self.directory.path().join(id))? {
             let item = item?;
@@ -2414,6 +2482,7 @@ mod tests {
     #[tokio::test]
     async fn changed_mountpoint_after_preparation_retains_command_identity_and_allows_stop()
     -> Result<()> {
+        use native_vfs_rpc::CommandHost as _;
         let directory = tempfile::tempdir()?;
         let state = PrivateDir::create(directory.path().join("state"))?;
         let objects = PrivateDir::create(directory.path().join("objects"))?;
@@ -2466,13 +2535,80 @@ mod tests {
             Ok(())
         }));
         let id = hex(&[7; 32]);
+        // Hold the actual registry cleanup write owner, not a synthetic Busy
+        // status. These synced opaque bundles only arrange the admission fence;
+        // this fixture does not claim remote backup or native mount acceptance.
+        let retention = commands.capture_registry();
+        let registration = retention
+            .register(
+                native_retention::WorkspaceId([90; 16]),
+                native_retention::OpStoreId([91; 16]),
+            )
+            .await?;
+        let capsules = PrivateDir::create(state.path().join("maintenance-fixture"))?;
+        let mut tickets = Vec::new();
+        for seed in [1u8, 2] {
+            let bytes = [seed; 32];
+            capsules.replace(format!("bundle-{seed}"), &bytes)?;
+            let command = retention.begin_command(registration).await?;
+            tickets.push(
+                retention
+                    .capture_dirty(command.token(), move || async move {
+                        Ok(native_retention::CaptureBundle {
+                            checkpoint: native_retention::RootCheckpoint::default(),
+                            bundle: native_retention::BundleDescriptor {
+                                blake3: *blake3::hash(&bytes).as_bytes(),
+                                size_bytes: 32,
+                            },
+                        })
+                    })
+                    .await?,
+            );
+            drop(command);
+        }
+        retention
+            .retire_redundant_capture(
+                tickets[0].clone(),
+                tickets[1].clone(),
+                native_retention::CaptureUploadCleanup {
+                    job: None,
+                    published: native_retention::BundleDescriptor {
+                        blake3: [92; 32],
+                        size_bytes: 64,
+                    },
+                },
+            )
+            .await?;
+        let maintenance = retention.try_capture_cleanup().await?.unwrap();
         // Arrange the real filesystem race only AFTER preparation checked the
         // empty directory. Actual provider preflight must then reject it before
         // /dev/fuse; no fake provider or native kernel capability is involved.
-        let error = manager
-            .create(root, "example".into(), "0".repeat(64), id.clone())
-            .await
-            .expect_err("changed mountpoint must be rejected");
+        let error = {
+            let mut creating =
+                Box::pin(manager.create(root, "example".into(), "0".repeat(64), id.clone()));
+            assert!(
+                tokio::time::timeout(std::time::Duration::from_millis(20), &mut creating)
+                    .await
+                    .is_err()
+            );
+            assert!(
+                !state
+                    .path()
+                    .join("native-workspaces")
+                    .join(&id)
+                    .join("workspace.json")
+                    .exists(),
+                "pending create cannot publish a lifecycle record"
+            );
+            assert!(
+                !preserved.exists(),
+                "provider preparation cannot run before maintenance admission"
+            );
+            drop(maintenance);
+            creating
+                .await
+                .expect_err("changed mountpoint must be rejected")
+        };
         assert!(
             error
                 .to_string()
@@ -2489,11 +2625,79 @@ mod tests {
             !commands.active(&id),
             "idle validated command lease must not block provider recovery"
         );
-        manager.stop_all().await?;
+        {
+            let maintenance = retention.try_capture_cleanup().await?.unwrap();
+            let record_path = manager.entries[&id].directory.path().join("workspace.json");
+            let before = fs::read(&record_path)?;
+            let mut stopping = Box::pin(manager.stop(&id));
+            assert!(
+                tokio::time::timeout(std::time::Duration::from_millis(20), &mut stopping)
+                    .await
+                    .is_err()
+            );
+            assert_eq!(
+                fs::read(&record_path)?,
+                before,
+                "pending stop does not rewrite owned provider state"
+            );
+            drop(maintenance);
+            stopping.await?;
+        }
         assert!(!manager.active());
         assert_eq!(manager.status()[0]["state"], "stopped");
         assert_eq!(manager.status()[0]["provider_recovery_owned"], false);
         assert_eq!(fs::read(&preserved)?, b"preserve this file");
+        {
+            let maintenance = retention.try_capture_cleanup().await?.unwrap();
+            let path = manager.entries[&id].directory.path().join("workspace.json");
+            let before = fs::read(&path)?;
+            let recovery_id = id.clone();
+            let mut recovery = tokio::task::spawn_blocking(move || {
+                let result = manager.recover(&recovery_id);
+                (manager, result)
+            });
+            assert!(
+                tokio::time::timeout(std::time::Duration::from_millis(20), &mut recovery)
+                    .await
+                    .is_err()
+            );
+            assert_eq!(
+                fs::read(&path)?,
+                before,
+                "pending recovery cannot publish stopped state"
+            );
+            drop(maintenance);
+            let (returned, result) = recovery.await?;
+            manager = returned;
+            result?;
+        }
+        // A real same-workspace command lease remains a writer conflict, not
+        // capture maintenance to wait/retry through.
+        let binding = manager.binding(&manager.entries[&id].record)?;
+        let lease_path = native_vfs_rpc::command_lock_path(&binding.admin, &id)?;
+        let lease = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(lease_path)?;
+        let preparation = commands.prepare(&id, [93; 32]).await?;
+        lease.try_lock_exclusive()?;
+        let started = commands.begin(&id, [93; 32], preparation).await?;
+        assert!(
+            manager
+                .stop(&id)
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("active command writers")
+        );
+        drop(lease);
+        commands.finish_dirty(&id, started.token).await?;
+        retention
+            .try_capture_cleanup()
+            .await?
+            .unwrap()
+            .acknowledge_capture_cleanup()
+            .await?;
         let record_path = manager.entries[&id].directory.path().join("workspace.json");
         let before = fs::read(&record_path)?;
         let before_status = manager.status();

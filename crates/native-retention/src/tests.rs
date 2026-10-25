@@ -1623,6 +1623,18 @@ async fn cancelled_retirement_keeps_its_exclusive_fence_until_the_transaction_fi
     waiter.abort();
     assert!(waiter.await.unwrap_err().is_cancelled());
     assert!(matches!(registry.try_host_access(), Err(Error::Busy)));
+    let admission_registry = registry.clone();
+    let mut admission = tokio::spawn(async move {
+        admission_registry
+            .acquire_outer_host_access_until(tokio::time::Instant::now() + Duration::from_secs(3))
+            .await
+    });
+    assert!(
+        tokio::time::timeout(Duration::from_millis(20), &mut admission)
+            .await
+            .is_err(),
+        "cancelled maintenance waiter must not clear the physical maintenance marker"
+    );
     release.send(()).unwrap();
     mutex_owner.join().unwrap();
     assert_eq!(
@@ -1632,6 +1644,13 @@ async fn cancelled_retirement_keeps_its_exclusive_fence_until_the_transaction_fi
             .unwrap(),
         before + 1,
         "coverage payload admission survives canonical verification and actual SyncAll after cancellation"
+    );
+    drop(
+        tokio::time::timeout(Duration::from_secs(1), admission)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap(),
     );
     let cleanup = tokio::time::timeout(Duration::from_secs(3), async {
         loop {
@@ -1965,6 +1984,147 @@ fn reopen_rejects_missing_or_rebound_capture_inventory_and_old_readers_fail_clos
             );
         }
     });
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn outer_host_admission_waits_only_for_actual_capture_maintenance_with_bounded_cancellation()
+{
+    let (directory, registry) = registry().await;
+    let registration = registry
+        .register(WorkspaceId([2; 16]), OpStoreId([3; 16]))
+        .await
+        .unwrap();
+    let mut tickets = Vec::new();
+    for seed in [4, 5] {
+        let command = registry.begin_command(registration).await.unwrap();
+        let path = directory.path().to_owned();
+        tickets.push(
+            registry
+                .capture_dirty(command.token(), move || async move {
+                    let mut bundle = staged_capture(&path, seed);
+                    bundle.checkpoint.roots.push(checkpoint(4).roots[0]);
+                    Ok(bundle)
+                })
+                .await
+                .unwrap(),
+        );
+        drop(command);
+    }
+    registry
+        .retire_redundant_capture(tickets[0].clone(), tickets[1].clone(), cleanup_upload(1))
+        .await
+        .unwrap();
+    let maintenance = registry.try_capture_cleanup().await.unwrap().unwrap();
+    assert!(
+        matches!(registry.try_host_access(), Err(Error::Busy)),
+        "nested acquisition remains nonqueued"
+    );
+    // Exercise the same async API from a thread with no caller Tokio runtime.
+    let outside = registry.clone();
+    let timeout = std::thread::spawn(move || {
+        block_on(outside.acquire_outer_host_access_until(
+            tokio::time::Instant::now() + Duration::from_millis(20),
+        ))
+    });
+    assert!(matches!(
+        timeout.join().unwrap(),
+        Err(Error::DeadlineExceeded)
+    ));
+    let cancelled_registry = registry.clone();
+    let cancelled = tokio::spawn(async move {
+        cancelled_registry
+            .acquire_outer_host_access_until(tokio::time::Instant::now() + Duration::from_secs(5))
+            .await
+    });
+    tokio::task::yield_now().await;
+    cancelled.abort();
+    assert!(cancelled.await.unwrap_err().is_cancelled());
+    // Force maintenance to finish AFTER try_read fails but BEFORE admission
+    // reads its marker. A completed Notify must not turn into transient Busy.
+    let (probed, probe) = tokio::sync::oneshot::channel();
+    let (resume, resumed) = std::sync::mpsc::channel();
+    *registry.inner.after_host_busy.lock().unwrap() = Some(Box::new(move || {
+        probed.send(()).unwrap();
+        resumed.recv().unwrap();
+    }));
+    let transitioning = registry.clone();
+    let transition = tokio::spawn(async move {
+        transitioning
+            .acquire_outer_host_access_until(tokio::time::Instant::now() + Duration::from_secs(5))
+            .await
+    });
+    probe.await.unwrap();
+    drop(maintenance);
+    resume.send(()).unwrap();
+    drop(
+        tokio::time::timeout(Duration::from_secs(1), transition)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap(),
+    );
+    let maintenance = registry.try_capture_cleanup().await.unwrap().unwrap();
+    let waiting_registry = registry.clone();
+    let mut waiting = tokio::spawn(async move {
+        waiting_registry
+            .acquire_outer_host_access_until(tokio::time::Instant::now() + Duration::from_secs(5))
+            .await
+    });
+    assert!(
+        tokio::time::timeout(Duration::from_millis(20), &mut waiting)
+            .await
+            .is_err()
+    );
+    assert!(
+        matches!(registry.try_capture_cleanup().await, Err(Error::Busy)),
+        "a failed concurrent maintenance attempt does not clear the live owner"
+    );
+    assert!(
+        tokio::time::timeout(Duration::from_millis(20), &mut waiting)
+            .await
+            .is_err()
+    );
+    maintenance.acknowledge_capture_cleanup().await.unwrap();
+    let access = Arc::new(
+        tokio::time::timeout(Duration::from_secs(1), waiting)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap(),
+    );
+    assert_eq!(access.registry_id(), registry.id());
+    registry
+        .register_with_host_access(WorkspaceId([6; 16]), OpStoreId([7; 16]), access.clone())
+        .await
+        .unwrap();
+    drop(access);
+    tokio::time::timeout(Duration::from_secs(1), async {
+        loop {
+            match registry.try_capture_cleanup().await {
+                Ok(None) => break,
+                Err(Error::Busy) => tokio::task::yield_now().await,
+                other => panic!("unexpected cleanup admission: {other:?}"),
+            }
+        }
+    })
+    .await
+    .unwrap();
+    let (_other_directory, other) = self::registry().await;
+    let collector = other.try_acquire_collector().await.unwrap();
+    assert_eq!(
+        tokio::time::timeout(
+            Duration::from_millis(100),
+            other.acquire_outer_host_access_until(
+                tokio::time::Instant::now() + Duration::from_secs(5)
+            )
+        )
+        .await
+        .unwrap()
+        .unwrap_err(),
+        Error::Busy,
+        "a genuine collector is not capture maintenance and is not retried"
+    );
+    drop(collector);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

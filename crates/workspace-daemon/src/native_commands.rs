@@ -190,6 +190,7 @@ fn status(error: native_retention::Error) -> Status {
         E::Busy => Status::aborted("native command is already active"),
         E::Limit(_) => Status::resource_exhausted("native command limit exceeded"),
         E::ClosedCommand => Status::failed_precondition("native command is closed"),
+        E::DeadlineExceeded => Status::deadline_exceeded("native host admission deadline exceeded"),
         _ => Status::failed_precondition("native command retention is unavailable"),
     }
 }
@@ -345,6 +346,17 @@ impl NativeCommandHost {
         self.inner
             .registry
             .try_host_access()
+            .map(Arc::new)
+            .map_err(status)
+    }
+    pub(crate) async fn outer_host_access_until(
+        &self,
+        deadline: tokio::time::Instant,
+    ) -> std::result::Result<Arc<native_retention::HostAccessGuard>, Status> {
+        self.inner
+            .registry
+            .acquire_outer_host_access_until(deadline)
+            .await
             .map(Arc::new)
             .map_err(status)
     }

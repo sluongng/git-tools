@@ -174,6 +174,9 @@ pub(crate) struct Inner {
     pub id: RegistryId,
     pub limits: Limits,
     pub fence: Arc<RwLock<()>>,
+    pub maintenance: Arc<super::CaptureMaintenance>,
+    #[cfg(test)]
+    pub after_host_busy: Mutex<Option<Box<dyn FnOnce() + Send>>>,
     pub runtime: Mutex<super::Runtime>,
     pub data: Mutex<Data>,
     poisoned: AtomicBool,
@@ -421,6 +424,9 @@ impl Inner {
             id,
             limits,
             fence: Arc::new(RwLock::new(())),
+            maintenance: Arc::new(super::CaptureMaintenance::default()),
+            #[cfg(test)]
+            after_host_busy: Mutex::new(None),
             runtime: Mutex::new(super::Runtime::default()),
             data: Mutex::new(Data {
                 manifest,

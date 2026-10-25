@@ -8,7 +8,7 @@ use std::{
     path::Path,
     sync::{
         Arc, Mutex, Weak,
-        atomic::{AtomicBool, AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
     },
 };
 use tinytree_model::{Kind, ObjectKey};
@@ -32,6 +32,7 @@ pub enum Error {
     DirtyWorkspace,
     UntrackedAccess,
     Poisoned,
+    DeadlineExceeded,
 }
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -55,6 +56,7 @@ impl fmt::Display for Error {
                     Self::DirtyWorkspace => "dirty workspace prevents collection",
                     Self::UntrackedAccess => "untracked access prevents collection",
                     Self::Poisoned => "registry requires reopening",
+                    Self::DeadlineExceeded => "host admission deadline exceeded",
                     _ => unreachable!(),
                 }
             ),
@@ -359,8 +361,40 @@ pub struct CaptureCleanupObligation {
 /// never clears the durable obligation or changes workspace Dirty state.
 pub struct CaptureCleanupGuard {
     obligation: CaptureCleanupObligation,
-    _write: OwnedRwLockWriteGuard<()>,
+    _write: CaptureMaintenanceWrite,
     registry: Arc<storage::Inner>,
+}
+#[derive(Default)]
+pub(crate) struct CaptureMaintenance {
+    active: AtomicUsize,
+    completed: AtomicU64,
+    changed: Notify,
+}
+struct CaptureMaintenanceMarker(Arc<CaptureMaintenance>);
+impl CaptureMaintenanceMarker {
+    fn begin(state: Arc<CaptureMaintenance>) -> Self {
+        state.active.fetch_add(1, Ordering::AcqRel);
+        Self(state)
+    }
+}
+impl Drop for CaptureMaintenanceMarker {
+    fn drop(&mut self) {
+        if self.0.active.fetch_sub(1, Ordering::AcqRel) == 1 {
+            self.0.changed.notify_waiters();
+        }
+    }
+}
+struct CaptureMaintenanceWrite {
+    write: Option<OwnedRwLockWriteGuard<()>>,
+    _marker: CaptureMaintenanceMarker,
+}
+impl Drop for CaptureMaintenanceWrite {
+    fn drop(&mut self) {
+        // Wake admission only AFTER the actual write fence is released. A
+        // failed concurrent attempt must not clear another physical owner.
+        drop(self.write.take());
+        self._marker.0.completed.fetch_add(1, Ordering::AcqRel);
+    }
 }
 impl fmt::Debug for CaptureCleanupGuard {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -978,12 +1012,7 @@ impl Registry {
         coverage: OwnedCaptureCoverage,
     ) -> Result<CaptureCleanupObligation> {
         self.inner.check()?;
-        let write = self
-            .inner
-            .fence
-            .clone()
-            .try_write_owned()
-            .map_err(|_| Error::Busy)?;
+        let write = self.try_capture_maintenance()?;
         let inner = self.inner.clone();
         storage::blocking(move || {
             let _write = write;
@@ -1011,12 +1040,7 @@ impl Registry {
     }
     pub async fn try_capture_cleanup(&self) -> Result<Option<CaptureCleanupGuard>> {
         self.inner.check()?;
-        let write = self
-            .inner
-            .fence
-            .clone()
-            .try_write_owned()
-            .map_err(|_| Error::Busy)?;
+        let write = self.try_capture_maintenance()?;
         let inner = self.inner.clone();
         storage::blocking(move || {
             Ok(inner
@@ -1028,6 +1052,19 @@ impl Registry {
                 }))
         })
         .await
+    }
+    fn try_capture_maintenance(&self) -> Result<CaptureMaintenanceWrite> {
+        let marker = CaptureMaintenanceMarker::begin(self.inner.maintenance.clone());
+        let write = self
+            .inner
+            .fence
+            .clone()
+            .try_write_owned()
+            .map_err(|_| Error::Busy)?;
+        Ok(CaptureMaintenanceWrite {
+            write: Some(write),
+            _marker: marker,
+        })
     }
     /// Pin one exact pending ticket and its native roots against collection.
     /// Lookup does not require a current workspace registration or command and
@@ -1107,6 +1144,82 @@ impl Registry {
             _read: read,
             registry: self.inner.clone(),
         })
+    }
+    /// Wait only for capture maintenance at OUTER host admission. Genuine
+    /// collector contention still returns Busy; this never queues a read behind
+    /// a collector or changes nested `try_host_access` semantics. Reuse the
+    /// resulting owner throughout accepted physical work and scoped enrollment.
+    /// Cancellation aborts unaccepted waiting admission, not physical work.
+    pub async fn acquire_outer_host_access_until(
+        &self,
+        deadline: tokio::time::Instant,
+    ) -> Result<HostAccessGuard> {
+        self.inner.check()?;
+        let inner = self.inner.clone();
+        let task = storage::runtime()?.spawn(async move {
+            loop {
+                let completed = inner.maintenance.completed.load(Ordering::Acquire);
+                // Enable before probing BOTH fence and marker: notify_waiters
+                // does not retain a permit for a future waiter.
+                let changed = inner.maintenance.changed.notified();
+                tokio::pin!(changed);
+                changed.as_mut().enable();
+                if tokio::time::Instant::now() >= deadline {
+                    return Err(Error::DeadlineExceeded);
+                }
+                inner.check()?;
+                match inner.fence.clone().try_read_owned() {
+                    Ok(read) => {
+                        if tokio::time::Instant::now() >= deadline {
+                            return Err(Error::DeadlineExceeded);
+                        }
+                        inner.check()?;
+                        return Ok(HostAccessGuard {
+                            _read: read,
+                            registry: inner.clone(),
+                        });
+                    }
+                    Err(_) => {
+                        #[cfg(test)]
+                        {
+                            let hook = inner
+                                .after_host_busy
+                                .lock()
+                                .map_err(|_| Error::Poisoned)?
+                                .take();
+                            if let Some(hook) = hook {
+                                hook();
+                            }
+                        }
+                        let active = inner.maintenance.active.load(Ordering::Acquire);
+                        if inner.maintenance.completed.load(Ordering::Acquire) != completed {
+                            // Maintenance can finish between the failed fence
+                            // probe and the flag read. Re-probe that transition,
+                            // not an unrelated collector or writer conflict.
+                            continue;
+                        }
+                        if active == 0 {
+                            return Err(Error::Busy);
+                        }
+                    }
+                }
+                tokio::time::timeout_at(deadline, &mut changed)
+                    .await
+                    .map_err(|_| Error::DeadlineExceeded)?;
+            }
+        });
+        struct Waiting<T>(tokio::task::JoinHandle<T>);
+        impl<T> Drop for Waiting<T> {
+            fn drop(&mut self) {
+                self.0.abort();
+            }
+        }
+        let mut waiting = Waiting(task);
+        let guard = (&mut waiting.0).await.map_err(|_| Error::Poisoned)??;
+        if tokio::time::Instant::now() >= deadline {
+            return Err(Error::DeadlineExceeded);
+        }
+        Ok(guard)
     }
     pub async fn acquire_collector(&self) -> Result<CollectorGuard> {
         self.inner.check()?;
