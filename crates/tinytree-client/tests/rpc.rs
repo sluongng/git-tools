@@ -242,6 +242,38 @@ async fn capabilities_are_exact_checked_configuration_not_implicit_root_readines
                 client.capabilities(&[F::Blame]).await.unwrap().features[0].feature,
                 F::Blame
             );
+            // Landing recovery is requested only for those specific flows;
+            // ordinary creation must retain its original five-feature set.
+            assert_eq!(F::ALL.len(), 5);
+            let mut every_known_feature = F::ALL.to_vec();
+            every_known_feature.extend([F::LandingRecoveryCloudRead, F::LandingRecoveryCloudWrite]);
+            for requested in [
+                vec![F::LandingRecoveryCloudRead],
+                vec![F::LandingRecoveryCloudWrite],
+                every_known_feature,
+            ] {
+                let configured = client.capabilities(&requested).await.unwrap();
+                assert_eq!(configured.root_readiness, RootReadiness::NotChecked);
+                assert_eq!(
+                    configured
+                        .features
+                        .iter()
+                        .map(|v| v.feature)
+                        .collect::<Vec<_>>(),
+                    requested
+                );
+                assert!(configured.features.iter().all(|v| !v.supported));
+                assert!(
+                    configured
+                        .features
+                        .iter()
+                        .filter(|v| matches!(
+                            v.feature,
+                            F::LandingRecoveryCloudRead | F::LandingRecoveryCloudWrite
+                        ))
+                        .all(|v| !v.authorized)
+                );
+            }
         }
         assert_eq!(running.metadata.load(Ordering::SeqCst), 0);
         assert_eq!(running.graph.load(Ordering::SeqCst), 0);
@@ -286,7 +318,7 @@ impl Repository for Faults {
                 value.features.swap(0, 1);
             }
             Mode::CapabilitiesUnknown => {
-                value.features[0].feature = 99;
+                value.features[0].feature = 8;
             }
             Mode::CapabilitiesSchema => {
                 value.schema_version = 2;

@@ -845,7 +845,7 @@ fn scan(
             let value = varint(data, &mut offset)?;
             let valid = match shape {
                 Shape::Capabilities => value == 1,
-                Shape::FeatureCapability => (1..=5).contains(&value),
+                Shape::FeatureCapability => (1..=7).contains(&value),
                 _ => false,
             };
             if !valid {
@@ -1103,7 +1103,7 @@ fn rule(shape: Shape, n: u32, l: &Limits) -> Option<(u8, Option<Shape>, usize, u
         (Shape::Capabilities, 2) => text(128),
         (Shape::Capabilities, 3) => repeated(
             Shape::FeatureCapability,
-            5,
+            7,
             4 * std::mem::size_of::<p::FeatureCapability>(),
         ),
         (Shape::CloudWorkspacePage, 1) => repeated(
@@ -1331,6 +1331,7 @@ mod tests {
         // produce, including a u32-truncating scalar before Prost decoding.
         for (name, nested) in [
             ("nonboolean support", vec![8, 1, 16, 2]),
+            ("next unknown feature", vec![8, 8]),
             ("unknown feature", vec![8, 99]),
             (
                 "u32 truncating feature",
@@ -1351,7 +1352,7 @@ mod tests {
                     supported: false,
                     authorized: false
                 };
-                6
+                8
             ],
             root_readiness: 1,
         }
