@@ -21,6 +21,8 @@ tokio = { version = "1", features = ["full"] }
 uuid = { version = "1", features = ["v4"] }
 
 [dev-dependencies]
+tonic = "0.14"
+tokio-stream = { version = "0.1", features = ["net"] }
 tempfile = "3"
 tinytree-server = { path = "../tinytree-server" }
 tinytree-store = { path = "../tinytree-store" }

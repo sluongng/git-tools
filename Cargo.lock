@@ -5689,6 +5689,8 @@ dependencies = [
  "tinytree-server",
  "tinytree-store",
  "tokio",
+ "tokio-stream",
+ "tonic",
  "uuid",
 ]
 

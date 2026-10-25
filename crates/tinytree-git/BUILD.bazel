@@ -33,8 +33,11 @@ rust_test(
     crate_name = "tinytree_git",
     edition = "2024",
     aliases = aliases(),
-    data = [":tinytree-git-bin"],
-    rustc_env = {"CARGO_BIN_EXE_tinytree-git": "$(rootpath :tinytree-git-bin)"},
+    data = [":tinytree-git-bin", ":watch_fd_fixture"],
+    rustc_env = {
+        "CARGO_BIN_EXE_tinytree-git": "$(rootpath :tinytree-git-bin)",
+        "TINYTREE_WATCH_FD_FIXTURE": "$(rootpath :watch_fd_fixture)",
+    },
     deps = all_crate_deps(normal = True, normal_dev = True),
     tags = ["manual"],
 )
@@ -45,4 +48,15 @@ fixture_test(
     git = True,
     script = "tests/run.sh",
     binary_env = "TINYTREE_GIT_FIXTURE",
+)
+
+rust_binary(
+    name = "watch_fd_fixture",
+    srcs = ["tests/watch_fd.rs"],
+    crate_root = "tests/watch_fd.rs",
+    crate_name = "watch_fd_fixture",
+    edition = "2024",
+    aliases = aliases(),
+    deps = all_crate_deps(normal = True),
+    tags = ["manual"],
 )

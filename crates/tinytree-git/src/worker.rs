@@ -10,10 +10,19 @@ use tinytree_client::{Config, NativeClient, protocol as p};
 use tokio::time::Instant;
 
 pub(crate) async fn run(
-    mut config: Config,
+    config: Config,
     options: ExportOptions,
     deadline: Instant,
 ) -> Result<Report> {
+    validate_input(&config, &options)?;
+    let owner = Resources::open(options)?;
+    run_with_resources(config, owner, deadline, None).await
+}
+#[derive(Clone)]
+pub(crate) struct TrustSnapshot {
+    pub ca: Option<Arc<[u8]>>,
+}
+pub(crate) fn validate_input(config: &Config, options: &ExportOptions) -> Result<()> {
     config.validate()?;
     ensure!(
         !options.source_reference.is_empty()
@@ -27,8 +36,16 @@ pub(crate) async fn run(
             && options.destination_reference.len() <= 4096,
         "destination must be one exact branch reference"
     );
-    let owner = Resources::open(options)?;
-    let (identity, ca) = scope(&config, &owner)?;
+    Ok(())
+}
+pub(crate) async fn run_with_resources(
+    mut config: Config,
+    owner: Arc<Resources>,
+    deadline: Instant,
+    trust: Option<&TrustSnapshot>,
+) -> Result<Report> {
+    validate_input(&config, &owner.options)?;
+    let (identity, ca) = scope(&config, &owner, trust)?;
     let mut state = owner.load(identity)?;
     let git = Git::new(owner.clone(), deadline)?;
     git.initialize().await?;
@@ -70,15 +87,7 @@ pub(crate) async fn run(
         .pending
         .as_ref()
         .is_some_and(|p| p.phase == Phase::Release);
-    let reserve = (owner.options.limits.max_file_bytes as u64) * 2
-        + (owner.options.limits.max_state_bytes as u64) * 4
-        + (owner.options.limits.max_metadata_bytes as u64) * 8
-        + (owner.options.limits.max_objects as u64) * 256
-        + config.limits.max_buffered_bytes as u64;
-    ensure!(
-        reserve <= owner.options.limits.max_memory_bytes,
-        "configured SDK and adapter memory budgets do not fit"
-    );
+    admit_memory(&config, &owner.options.limits, 0)?;
     config.limits.max_file_bytes = config
         .limits
         .max_file_bytes
@@ -250,7 +259,17 @@ async fn save(owner: &Arc<Resources>, state: &State, deadline: Instant) -> Resul
     );
     owner.save(state).await
 }
-fn scope(config: &Config, owner: &Resources) -> Result<([u8; 32], Option<Arc<[u8]>>)> {
+pub(crate) fn scope(
+    config: &Config,
+    owner: &Resources,
+    trust: Option<&TrustSnapshot>,
+) -> Result<([u8; 32], Option<Arc<[u8]>>)> {
+    if let Some(captured) = trust {
+        ensure!(
+            config.tls.is_some() == captured.ca.is_some(),
+            "captured native trust configuration differs"
+        );
+    }
     let mut hash = blake3::Hasher::new();
     hash.update(b"tinytree-public-git-export-v1\0");
     for value in [
@@ -280,20 +299,30 @@ fn scope(config: &Config, owner: &Resources) -> Result<([u8; 32], Option<Arc<[u8
         let encoded = serde_json::to_vec(tls)?;
         hash.update(&(encoded.len() as u64).to_le_bytes());
         hash.update(&encoded);
-        let mut certificate = Vec::new();
-        let file = std::fs::OpenOptions::new()
-            .read(true)
-            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
-            .open(&tls.ca_certificate)?;
-        ensure!(
-            file.metadata()?.is_file(),
-            "native TLS roots must be a regular file"
-        );
-        file.take(1024 * 1024 + 1).read_to_end(&mut certificate)?;
-        ensure!(
-            certificate.len() <= 1024 * 1024,
-            "native TLS configuration exceeds identity budget"
-        );
+        let certificate = if let Some(captured) = trust {
+            captured
+                .ca
+                .as_ref()
+                .context("captured native trust is absent")?
+                .as_ref()
+                .to_vec()
+        } else {
+            let mut certificate = Vec::new();
+            let file = std::fs::OpenOptions::new()
+                .read(true)
+                .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
+                .open(&tls.ca_certificate)?;
+            ensure!(
+                file.metadata()?.is_file(),
+                "native TLS roots must be a regular file"
+            );
+            file.take(1024 * 1024 + 1).read_to_end(&mut certificate)?;
+            ensure!(
+                certificate.len() <= 1024 * 1024,
+                "native TLS configuration exceeds identity budget"
+            );
+            certificate
+        };
         hash.update(&certificate);
         ca = Some(Arc::<[u8]>::from(certificate));
     }
@@ -503,4 +532,17 @@ fn report(state: &State, commits: usize, file_bytes: u64, reused: bool) -> Resul
         delivered: true,
         hold_released: state.pending.is_none(),
     })
+}
+
+pub(crate) fn admit_memory(config: &Config, limits: &crate::Limits, extra: u64) -> Result<()> {
+    let reserve = (limits.max_file_bytes as u64) * 2
+        + (limits.max_state_bytes as u64) * 4
+        + (limits.max_metadata_bytes as u64) * 8
+        + (limits.max_objects as u64) * 256
+        + config.limits.max_buffered_bytes as u64;
+    ensure!(
+        reserve.saturating_add(extra) <= limits.max_memory_bytes,
+        "configured SDK and adapter memory budgets do not fit"
+    );
+    Ok(())
 }

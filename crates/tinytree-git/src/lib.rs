@@ -10,6 +10,8 @@ mod git;
 #[cfg(unix)]
 mod state;
 #[cfg(unix)]
+pub mod watch;
+#[cfg(unix)]
 mod worker;
 
 #[derive(Clone)]

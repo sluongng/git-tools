@@ -65,12 +65,21 @@ struct Envelope {
     digest: [u8; 32],
     state: State,
 }
+pub(crate) struct WatchLease {
+    pub fence: Arc<File>,
+    pub cancel: tokio::sync::watch::Receiver<bool>,
+    pub _owner: Arc<dyn std::any::Any + Send + Sync>,
+    #[cfg(test)]
+    pub test_pause: Option<Arc<crate::watch::TestPause>>,
+}
 pub(crate) struct Resources {
     pub state: PrivateDir,
     pub destination: PrivateDir,
     pub spool: PrivateDir,
     pub lock: File,
     pub options: ExportOptions,
+    // Last: accepted payloads and writer fences outlive their watcher owner.
+    pub watch: Option<WatchLease>,
 }
 pub(crate) fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
@@ -83,6 +92,9 @@ pub(crate) fn valid_hex(text: &str, n: usize) -> bool {
 }
 impl Resources {
     pub fn open(options: ExportOptions) -> Result<Arc<Self>> {
+        Self::open_watched(options, None)
+    }
+    pub fn open_watched(options: ExportOptions, watch: Option<WatchLease>) -> Result<Arc<Self>> {
         let state =
             PrivateDir::create(&options.state_dir).context("cannot open private adapter state")?;
         let lock = OpenOptions::new()
@@ -112,14 +124,24 @@ impl Resources {
         let next = state.path().join("state.next");
         match std::fs::symlink_metadata(&next) {
             Ok(_) => {
-                let bytes = state.read("state.next", options.limits.max_state_bytes)?;
-                let candidate: Envelope = serde_json::from_slice(&bytes)
-                    .context("interrupted adapter checkpoint is invalid; preserved")?;
+                use std::os::unix::fs::MetadataExt;
+                let candidate = state
+                    .open_existing_file("state.next", options.limits.max_state_bytes as u64)?;
                 ensure!(
-                    *blake3::hash(&serde_json::to_vec(&candidate.state)?).as_bytes()
-                        == candidate.digest,
-                    "interrupted adapter checkpoint checksum differs; preserved"
+                    candidate.metadata()?.nlink() == 1,
+                    "interrupted adapter staging hardlink preserved"
                 );
+                // Only the committed checkpoint is authority. Partial unACKed
+                // candidates can be discarded after validating that checkpoint.
+                match std::fs::symlink_metadata(state.path().join("state.json")) {
+                    Ok(_) => {
+                        let committed = decode(&state, options.limits.max_state_bytes)?;
+                        validate(&committed, options.limits.max_commits)?;
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(error) => return Err(error.into()),
+                }
+                drop(candidate);
                 std::fs::remove_file(next)?;
             }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
@@ -132,6 +154,7 @@ impl Resources {
             spool,
             lock,
             options,
+            watch,
         }))
     }
     pub fn load(&self, scope: [u8; 32]) -> Result<State> {

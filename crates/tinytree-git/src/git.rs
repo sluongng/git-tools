@@ -60,7 +60,14 @@ impl Git {
         let owner = self.owner.clone();
         let program = self.program.clone();
         let deadline = self.deadline;
+        #[cfg(test)]
+        let ref_probe = args.first().is_some_and(|a| a == "rev-parse")
+            && args.iter().any(|a| a == "--end-of-options");
         let job = tokio::spawn(async move {
+            ensure!(
+                !owner.watch.as_ref().is_some_and(|w| *w.cancel.borrow()),
+                "Git operation cancelled before admission"
+            );
             let mut command = Command::new(program);
             command.env_clear();
             // No source credentials, ambient Git configuration, replacements,
@@ -108,20 +115,27 @@ impl Git {
                 .stderr(Stdio::null())
                 .kill_on_drop(true);
             let lock = owner.lock.as_raw_fd();
-            // Inherit an independent copy of the flock's open-file description.
-            // Even abrupt adapter death cannot free the writer lock while an
-            // accepted Git writer survives. No credential/socket is inherited.
+            let watch_lock = owner.watch.as_ref().map(|w| w.fence.as_raw_fd());
+            // Clear CLOEXEC on the original already-open lock descriptors in
+            // the child only. Fixed dup2 targets can clobber another fence or
+            // std::process's exec-error pipe under descriptor pressure.
             unsafe {
                 command.pre_exec(move || {
-                    if libc::dup2(lock, 198) < 0 {
-                        return Err(std::io::Error::last_os_error());
-                    }
-                    if libc::fcntl(198, libc::F_SETFD, 0) < 0 {
-                        return Err(std::io::Error::last_os_error());
+                    for descriptor in [Some(lock), watch_lock].into_iter().flatten() {
+                        let flags = libc::fcntl(descriptor, libc::F_GETFD);
+                        if flags < 0
+                            || libc::fcntl(descriptor, libc::F_SETFD, flags & !libc::FD_CLOEXEC) < 0
+                        {
+                            return Err(std::io::Error::last_os_error());
+                        }
                     }
                     Ok(())
                 });
             }
+            ensure!(
+                !owner.watch.as_ref().is_some_and(|w| *w.cancel.borrow()),
+                "Git operation cancelled before spawn"
+            );
             let mut child = command.spawn().context("cannot start Git object worker")?;
             let mut stdin = child.stdin.take().context("missing Git input")?;
             let stdout = child.stdout.take().context("missing Git output")?;
@@ -143,20 +157,42 @@ impl Git {
                 ensure!(output.len() <= maximum, "Git output byte budget exceeded");
                 Ok::<_, anyhow::Error>(output)
             };
-            let output = match tokio::time::timeout_at(deadline, transfer).await {
-                Ok(Ok(output)) => output,
+            let mut cancellation = owner.watch.as_ref().map(|w| w.cancel.clone());
+            let output = match tokio::select! {
+                biased;
+                _=cancelled(&mut cancellation)=>None,
+                output=tokio::time::timeout_at(deadline,transfer)=>Some(output),
+            } {
+                Some(Ok(Ok(output))) => output,
                 _ => {
                     let _ = child.start_kill();
                     let _ = child.wait().await;
                     anyhow::bail!("Git object worker expired or failed; state retained");
                 }
             };
-            let status = match tokio::time::timeout_at(deadline, child.wait()).await {
-                Ok(status) => status?,
-                Err(_) => {
+            #[cfg(test)]
+            if ref_probe {
+                if let Some(pause) = owner.watch.as_ref().and_then(|w| w.test_pause.clone()) {
+                    let physical = owner.clone();
+                    tokio::task::spawn_blocking(move || {
+                        let _physical = physical;
+                        pause.block(None);
+                    })
+                    .await?;
+                }
+            }
+            let status = match tokio::select! {
+                biased;
+                _=cancelled(&mut cancellation)=>None,
+                status=tokio::time::timeout_at(deadline,child.wait())=>Some(status),
+            } {
+                Some(Ok(status)) => status?,
+                _ => {
                     let _ = child.start_kill();
                     let _ = child.wait().await;
-                    anyhow::bail!("Git object worker deadline exceeded; state retained");
+                    anyhow::bail!(
+                        "Git object worker deadline exceeded or cancelled; state retained"
+                    );
                 }
             };
             drop(owner);
@@ -377,4 +413,19 @@ fn git_hash(kind: &str, bytes: &[u8]) -> String {
     hash.update(format!("{kind} {}\0", bytes.len()).as_bytes());
     hash.update(bytes);
     hex(&hash.finalize())
+}
+
+async fn cancelled(receiver: &mut Option<tokio::sync::watch::Receiver<bool>>) {
+    let Some(receiver) = receiver else {
+        std::future::pending::<()>().await;
+        return;
+    };
+    loop {
+        if *receiver.borrow() {
+            return;
+        }
+        if receiver.changed().await.is_err() {
+            return;
+        }
+    }
 }

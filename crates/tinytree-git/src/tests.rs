@@ -43,6 +43,7 @@ struct Running {
     config: tinytree_client::Config,
     stop: tokio::sync::oneshot::Sender<()>,
     task: tokio::task::JoinHandle<()>,
+    counts: std::sync::Arc<RpcCounts>,
 }
 impl Running {
     async fn new() -> Self {
@@ -73,12 +74,10 @@ impl Running {
             ..Default::default()
         };
         let (stop, stopped) = tokio::sync::oneshot::channel();
+        let counts = std::sync::Arc::new(RpcCounts::default());
+        let observed = counts.clone();
         let task = tokio::spawn(async move {
-            tinytree_server::serve_tcp(listener, service, None, async {
-                let _ = stopped.await;
-            })
-            .await
-            .unwrap();
+            serve_counted(listener, service, observed, stopped).await;
         });
         Self {
             temp,
@@ -86,6 +85,7 @@ impl Running {
             config,
             stop,
             task,
+            counts,
         }
     }
     fn object(&self, value: m::Object) -> m::ObjectId {
@@ -885,5 +885,1086 @@ async fn abrupt_adapter_process_death_keeps_inherited_writer_fence_until_child_t
             .unwrap()
             .hold_released
     );
+    running.stop().await;
+}
+
+#[cfg(unix)]
+fn watcher_options(running: &Running) -> watch::WatchOptions {
+    let mut options =
+        watch::WatchOptions::new(running.options(), running.temp.path().join("watch-state"));
+    options.poll_interval = std::time::Duration::from_millis(100);
+    options.probe_timeout = std::time::Duration::from_millis(500);
+    options.max_backoff = std::time::Duration::from_millis(800);
+    options.export.limits.timeout = std::time::Duration::from_secs(30);
+    options
+}
+#[cfg(unix)]
+async fn wait_watch(
+    path: &Path,
+    mut predicate: impl FnMut(&watch::WatchStatus) -> bool,
+) -> watch::WatchStatus {
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        loop {
+            if let Ok(status) = watch::watch_status(path) {
+                if predicate(&status) {
+                    break status;
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| {
+        panic!(
+            "watch state did not converge: {:?}",
+            watch::watch_status(path)
+        )
+    })
+}
+#[cfg(unix)]
+fn shell_quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "'\\''"))
+}
+#[cfg(unix)]
+#[tokio::test]
+async fn watcher_cli_catches_up_without_reconverting_or_fscanning_unchanged_polls_and_stops_cleanly()
+ {
+    use std::os::unix::fs::PermissionsExt;
+    let running = Running::new().await;
+    let tree = running.tree(b"watch public bytes\n");
+    let first = running.commit(tree, vec![m::CommitId::ROOT], vec![], "watch first\n");
+    running.publish(first, 0);
+    let options = watcher_options(&running);
+    let calls = running.temp.path().join("git-write-calls");
+    let wrapper = running.temp.path().join("counting-git");
+    std::fs::write(&wrapper,format!("#!/bin/sh\n[ -z \"${{TINYTREE_GIT_TEST_TOKEN+x}}\" ] || exit 81\nfor argument do\n case \"$argument\" in fsck|hash-object) printf '%s\\n' \"$argument\" >> {} ;; esac\ndone\nexec {} \"$@\"\n",shell_quote(calls.to_str().unwrap()),shell_quote(git_program().to_str().unwrap()))).unwrap();
+    std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let config = running.temp.path().join("watch-client.toml");
+    std::fs::write(&config,format!("endpoint = {:?}\nrepository_id = \"example\"\ntoken_env = \"TINYTREE_GIT_TEST_TOKEN\"\n",running.config.endpoint)).unwrap();
+    let child = tokio::process::Command::new(env!("CARGO_BIN_EXE_tinytree-git"))
+        .arg("watch")
+        .arg("--config")
+        .arg(&config)
+        .arg("--state")
+        .arg(&options.export.state_dir)
+        .arg("--watch-state")
+        .arg(&options.watch_dir)
+        .arg("--destination-git")
+        .arg(&options.export.destination_git)
+        .arg("--git")
+        .arg(&wrapper)
+        .args([
+            "--poll-interval-ms",
+            "100",
+            "--probe-timeout-ms",
+            "500",
+            "--max-backoff-ms",
+            "800",
+            "--timeout-seconds",
+            "30",
+        ])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .unwrap();
+    let initial = wait_watch(&options.watch_dir, |s| {
+        s.delivered.as_ref().is_some_and(|p| p.generation == 1)
+            && s.lag_at_last_observation == Some(0)
+    })
+    .await;
+    assert_eq!(initial.writer_fence_held, Some(true));
+    let writes = std::fs::read(&calls).unwrap();
+    let file_reads = running
+        .counts
+        .files
+        .load(std::sync::atomic::Ordering::SeqCst);
+    let metadata_reads = running
+        .counts
+        .metadata
+        .load(std::sync::atomic::Ordering::SeqCst);
+    assert!(!writes.is_empty());
+    #[cfg(target_os = "linux")]
+    let mut mapping_opens = {
+        use std::os::fd::FromRawFd;
+        let descriptor = unsafe { libc::inotify_init1(libc::IN_NONBLOCK | libc::IN_CLOEXEC) };
+        assert!(descriptor >= 0);
+        let path = std::ffi::CString::new(
+            options
+                .export
+                .state_dir
+                .join("state.json")
+                .as_os_str()
+                .as_encoded_bytes(),
+        )
+        .unwrap();
+        assert!(unsafe { libc::inotify_add_watch(descriptor, path.as_ptr(), libc::IN_OPEN) } >= 0);
+        unsafe { std::fs::File::from_raw_fd(descriptor) }
+    };
+    let idle = wait_watch(&options.watch_dir, |s| {
+        s.probes >= initial.probes + 3 && s.lag_at_last_observation == Some(0)
+    })
+    .await;
+    assert_eq!(
+        std::fs::read(&calls).unwrap(),
+        writes,
+        "unchanged polls ran fsck or object conversion"
+    );
+    assert_eq!(idle.export_attempts, initial.export_attempts);
+    #[cfg(target_os = "linux")]
+    {
+        let mut events = [0u8; 4096];
+        let error = std::io::Read::read(&mut mapping_opens, &mut events)
+            .expect_err("unchanged polls reopened the full export mapping");
+        assert_eq!(error.kind(), std::io::ErrorKind::WouldBlock);
+    }
+
+    assert_eq!(
+        running
+            .counts
+            .files
+            .load(std::sync::atomic::Ordering::SeqCst),
+        file_reads
+    );
+    assert_eq!(
+        running
+            .counts
+            .metadata
+            .load(std::sync::atomic::Ordering::SeqCst),
+        metadata_reads
+    );
+    let second = running.commit(tree, vec![first], vec![], "watch second\n");
+    let third = running.commit(tree, vec![second], vec![], "watch third\n");
+    running.publish(second, 1);
+    running.publish(third, 2);
+    let caught = wait_watch(&options.watch_dir, |s| {
+        s.delivered.as_ref().is_some_and(|p| p.generation == 3)
+            && s.lag_at_last_observation == Some(0)
+    })
+    .await;
+    assert_eq!(
+        caught.observed_desired.as_ref().unwrap().native_head,
+        Some(state::hex(&third.0))
+    );
+    assert_eq!(
+        text(
+            &options.export.destination_git,
+            &["rev-list", "--count", "refs/heads/main"]
+        ),
+        "3"
+    );
+    git(&options.export.destination_git, &["fsck", "--strict"]);
+    let output = tokio::process::Command::new(env!("CARGO_BIN_EXE_tinytree-git"))
+        .arg("watch-status")
+        .arg("--watch-state")
+        .arg(&options.watch_dir)
+        .output()
+        .await
+        .unwrap();
+    assert!(output.status.success());
+    let cli_status: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(cli_status["delivered"]["generation"], 3);
+    assert_eq!(
+        unsafe { libc::kill(child.id().unwrap() as i32, libc::SIGINT) },
+        0
+    );
+    let output = tokio::time::timeout(std::time::Duration::from_secs(5), child.wait_with_output())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stopped = watch::watch_status(&options.watch_dir).unwrap();
+    assert_eq!(stopped.phase, watch::WatchPhase::Stopped);
+    assert_eq!(stopped.writer_fence_held, Some(false));
+    assert!(stopped.lag_at_last_observation.is_none());
+    running.stop().await;
+}
+
+#[cfg(unix)]
+async fn restart_running(
+    temp: tempfile::TempDir,
+    store: Store,
+    config: tinytree_client::Config,
+) -> Running {
+    let address = config.endpoint.strip_prefix("http://").unwrap();
+    let listener = tokio::net::TcpListener::bind(address).await.unwrap();
+    let service = RepositoryService::new(
+        store.clone(),
+        ServiceConfig::default(),
+        vec!["example".into()],
+        vec![
+            Principal::new(
+                "fixture",
+                "public-git-export-loopback-token",
+                vec!["example".into()],
+                true,
+            )
+            .unwrap()
+            .with_retention(true),
+        ],
+    )
+    .unwrap();
+    let (stop, stopped) = tokio::sync::oneshot::channel();
+    let counts = std::sync::Arc::new(RpcCounts::default());
+    let observed = counts.clone();
+    let task = tokio::spawn(async move {
+        serve_counted(listener, service, observed, stopped).await;
+    });
+    Running {
+        temp,
+        store,
+        config,
+        stop,
+        task,
+        counts,
+    }
+}
+#[cfg(unix)]
+#[tokio::test]
+async fn watcher_replays_ready_offline_then_release_after_restart_and_never_overwrites_divergent_receiver()
+ {
+    let running = Running::new().await;
+    let tree = running.tree(b"durable pending watch\n");
+    let head = running.commit(tree, vec![m::CommitId::ROOT], vec![], "pending watch\n");
+    running.publish(head, 0);
+    let mut options = watcher_options(&running);
+    options.poll_interval = std::time::Duration::from_millis(250);
+    options.max_backoff = std::time::Duration::from_secs(1);
+    options.probe_timeout = std::time::Duration::from_millis(100);
+    options.export.limits.timeout = std::time::Duration::from_secs(1);
+    options.export.fault = Some(TestFault::BeforeRef);
+    assert!(
+        export(running.config.clone(), options.export.clone())
+            .await
+            .is_err()
+    );
+    options.export.fault = None;
+    let saved: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(options.export.state_dir.join("state.json")).unwrap(),
+    )
+    .unwrap();
+    let prepared = saved["state"]["pending"]["git"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let Running {
+        temp,
+        store,
+        config,
+        stop,
+        task,
+        counts: _,
+    } = running;
+    stop.send(()).unwrap();
+    task.await.unwrap();
+    let mut handle = watch::start_watch(config.clone(), options.clone()).unwrap();
+    let outage = wait_watch(&options.watch_dir, |s| {
+        s.phase == watch::WatchPhase::Backoff
+            && s.pending_export_phase.as_deref() == Some("release")
+    })
+    .await;
+    assert!(outage.observed_desired.is_none());
+    assert!(outage.lag_at_last_observation.is_none());
+    assert_eq!(outage.delivered.as_ref().unwrap().git_head, prepared);
+    assert_eq!(
+        text(
+            &options.export.destination_git,
+            &["rev-parse", "refs/heads/main"]
+        ),
+        prepared
+    );
+    let attempt = outage.export_attempts;
+    handle.shutdown().await.unwrap();
+    let persisted = watch::watch_status(&options.watch_dir).unwrap();
+    assert!(persisted.next_retry_unix_ms.is_some());
+    let mut handle = watch::start_watch(config.clone(), options.clone()).unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+    assert_eq!(
+        watch::watch_status(&options.watch_dir)
+            .unwrap()
+            .export_attempts,
+        attempt,
+        "restart discarded durable backoff"
+    );
+    let running = restart_running(temp, store, config).await;
+    wait_watch(&options.watch_dir, |s| {
+        s.pending_export_phase.is_none() && s.lag_at_last_observation == Some(0)
+    })
+    .await;
+    assert!(
+        export(running.config.clone(), options.export.clone())
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("busy")
+    );
+    let second = running.commit(tree, vec![head], vec![], "second after outage\n");
+    let third = running.commit(tree, vec![second], vec![], "third after outage\n");
+    running.publish(second, 1);
+    running.publish(third, 2);
+    let caught = wait_watch(&options.watch_dir, |s| {
+        s.delivered.as_ref().is_some_and(|p| p.generation == 3)
+            && s.lag_at_last_observation == Some(0)
+    })
+    .await;
+    git(
+        &options.export.destination_git,
+        &["update-ref", "refs/heads/main", &prepared],
+    );
+    let conflict = wait_watch(&options.watch_dir, |s| {
+        s.last_error == Some(watch::WatchError::DestinationDiverged)
+    })
+    .await;
+    assert!(conflict.lag_at_last_observation.is_none());
+    assert_eq!(
+        text(
+            &options.export.destination_git,
+            &["rev-parse", "refs/heads/main"]
+        ),
+        prepared
+    );
+    assert_eq!(conflict.export_attempts, caught.export_attempts);
+    let permanent = wait_watch(&options.watch_dir, |s| {
+        s.consecutive_failures >= 3 && s.last_error == Some(watch::WatchError::DestinationDiverged)
+    })
+    .await;
+    assert_eq!(permanent.export_attempts, caught.export_attempts);
+    assert!(
+        permanent
+            .next_retry_unix_ms
+            .unwrap()
+            .saturating_sub(permanent.updated_at_unix_ms)
+            <= permanent.max_backoff_ms
+    );
+    handle.shutdown().await.unwrap();
+    // A clock rollback can leave future past-event and retry timestamps. The
+    // persisted retry is clamped, never treated as age zero/healthy freshness.
+    let path = options.watch_dir.join("watch.json");
+    let envelope: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    let identity: [u8; 32] =
+        serde_json::from_value(envelope["record"]["identity"].clone()).unwrap();
+    let mut snapshot: watch::WatchStatus =
+        serde_json::from_value(envelope["record"]["status"].clone()).unwrap();
+    let future = snapshot.updated_at_unix_ms + 86_400_000;
+    snapshot.next_retry_unix_ms = Some(future);
+    snapshot.last_full_verification_unix_ms = Some(future);
+    snapshot.last_receiver_ref_check_unix_ms = Some(future);
+    #[derive(serde::Serialize)]
+    struct Record {
+        identity: [u8; 32],
+        status: watch::WatchStatus,
+    }
+    let record = Record {
+        identity,
+        status: snapshot,
+    };
+    let bytes = serde_json::to_vec(&record).unwrap();
+    let rewritten = serde_json::json!({"digest":*blake3::hash(&bytes).as_bytes(),"record":record});
+    std::fs::write(&path, serde_json::to_vec(&rewritten).unwrap()).unwrap();
+    let skewed = watch::watch_status(&options.watch_dir).unwrap();
+    assert!(skewed.clock_skewed);
+    assert!(skewed.lag_at_last_observation.is_none());
+    let opens = running
+        .counts
+        .opens
+        .load(std::sync::atomic::Ordering::SeqCst);
+    let mut restarted = watch::start_watch(running.config.clone(), options.clone()).unwrap();
+    let clamped = wait_watch(&options.watch_dir, |s| {
+        s.writer_fence_held == Some(true)
+            && s.phase == watch::WatchPhase::Backoff
+            && s.next_retry_unix_ms
+                .is_some_and(|n| n.saturating_sub(s.updated_at_unix_ms) <= s.max_backoff_ms)
+    })
+    .await;
+    assert!(clamped.clock_skewed);
+    tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+    assert_eq!(
+        running
+            .counts
+            .opens
+            .load(std::sync::atomic::Ordering::SeqCst),
+        opens,
+        "future retry was reset to immediate"
+    );
+    restarted.shutdown().await.unwrap();
+    running.stop().await;
+}
+
+#[derive(Default)]
+struct RpcCounts {
+    force_generation: std::sync::atomic::AtomicU64,
+    opens: std::sync::atomic::AtomicU64,
+    files: std::sync::atomic::AtomicU64,
+    metadata: std::sync::atomic::AtomicU64,
+}
+#[derive(Clone)]
+struct CountedService {
+    inner: RepositoryService,
+    counts: std::sync::Arc<RpcCounts>,
+}
+use tinytree_client::protocol as wire;
+use wire::repository_server::Repository;
+#[tonic::async_trait]
+impl Repository for CountedService {
+    type BatchReadObjectsStream = <RepositoryService as Repository>::BatchReadObjectsStream;
+    type ReadFileStream = <RepositoryService as Repository>::ReadFileStream;
+    async fn get_capabilities(
+        &self,
+        r: tonic::Request<wire::GetCapabilitiesRequest>,
+    ) -> Result<tonic::Response<wire::Capabilities>, tonic::Status> {
+        self.inner.get_capabilities(r).await
+    }
+    async fn open_repository(
+        &self,
+        r: tonic::Request<wire::OpenRepositoryRequest>,
+    ) -> Result<tonic::Response<wire::RepositoryView>, tonic::Status> {
+        self.counts
+            .opens
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let mut response = self.inner.open_repository(r).await?;
+        let forced = self
+            .counts
+            .force_generation
+            .load(std::sync::atomic::Ordering::SeqCst);
+        if forced > 0 {
+            for reference in &mut response.get_mut().references {
+                if reference.name == "main" {
+                    reference.generation = forced;
+                }
+            }
+        }
+        Ok(response)
+    }
+    async fn get_commit_graph(
+        &self,
+        r: tonic::Request<wire::GetCommitGraphRequest>,
+    ) -> Result<tonic::Response<wire::CommitGraphPage>, tonic::Status> {
+        self.inner.get_commit_graph(r).await
+    }
+    async fn batch_read_objects(
+        &self,
+        r: tonic::Request<wire::BatchReadObjectsRequest>,
+    ) -> Result<tonic::Response<Self::BatchReadObjectsStream>, tonic::Status> {
+        self.counts
+            .metadata
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.inner.batch_read_objects(r).await
+    }
+    async fn find_missing_objects(
+        &self,
+        r: tonic::Request<wire::FindMissingObjectsRequest>,
+    ) -> Result<tonic::Response<wire::MissingObjects>, tonic::Status> {
+        self.inner.find_missing_objects(r).await
+    }
+    async fn read_file(
+        &self,
+        r: tonic::Request<wire::ReadFileRequest>,
+    ) -> Result<tonic::Response<Self::ReadFileStream>, tonic::Status> {
+        self.counts
+            .files
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.inner.read_file(r).await
+    }
+    async fn write_object(
+        &self,
+        r: tonic::Request<tonic::Streaming<wire::WriteFrame>>,
+    ) -> Result<tonic::Response<wire::WriteReceipt>, tonic::Status> {
+        self.inner.write_object(r).await
+    }
+    async fn publish_reference(
+        &self,
+        r: tonic::Request<wire::PublishReferenceRequest>,
+    ) -> Result<tonic::Response<wire::Publication>, tonic::Status> {
+        self.inner.publish_reference(r).await
+    }
+    async fn get_publication(
+        &self,
+        r: tonic::Request<wire::GetPublicationRequest>,
+    ) -> Result<tonic::Response<wire::Publication>, tonic::Status> {
+        self.inner.get_publication(r).await
+    }
+}
+async fn serve_counted(
+    listener: tokio::net::TcpListener,
+    service: RepositoryService,
+    counts: std::sync::Arc<RpcCounts>,
+    stopped: tokio::sync::oneshot::Receiver<()>,
+) {
+    use tokio_stream::StreamExt;
+    tonic::transport::Server::builder()
+        .layer(service.deadline_layer())
+        .add_service(
+            wire::repository_server::RepositoryServer::new(CountedService {
+                inner: service,
+                counts,
+            })
+            .accept_compressed(tonic::codec::CompressionEncoding::Zstd),
+        )
+        .serve_with_incoming_shutdown(
+            tokio_stream::wrappers::TcpListenerStream::new(listener).map(|s| {
+                s.map(|stream| {
+                    stream.set_nodelay(true).unwrap();
+                    stream
+                })
+            }),
+            async {
+                let _ = stopped.await;
+            },
+        )
+        .await
+        .unwrap();
+}
+
+struct Unpause(std::sync::Arc<watch::TestPause>);
+impl Drop for Unpause {
+    fn drop(&mut self) {
+        self.0.unblock();
+    }
+}
+async fn wait_pause(pause: &watch::TestPause) {
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while !pause.entered.load(std::sync::atomic::Ordering::SeqCst) {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+}
+#[tokio::test]
+async fn watcher_startup_drop_and_cancelled_wait_keep_both_fences_until_status_writer_drains() {
+    let running = Running::new().await;
+    let tree = running.tree(b"startup ownership\n");
+    let head = running.commit(tree, vec![m::CommitId::ROOT], vec![], "startup\n");
+    running.publish(head, 0);
+    let mut options = watcher_options(&running);
+    options.poll_interval = std::time::Duration::from_millis(500);
+    options.max_backoff = std::time::Duration::from_secs(1);
+    let mut too_small = options.clone();
+    too_small.export.limits.max_memory_bytes = 1024 * 1024;
+    assert!(watch::start_watch(running.config.clone(), too_small).is_err());
+    assert_eq!(
+        running
+            .counts
+            .opens
+            .load(std::sync::atomic::Ordering::SeqCst),
+        0
+    );
+    let mut overlap = options.clone();
+    overlap.watch_dir = options.export.state_dir.clone();
+    assert!(watch::start_watch(running.config.clone(), overlap).is_err());
+    assert!(!options.watch_dir.exists());
+    let pause = watch::TestPause::new(Some(watch::WatchPhase::Starting), true);
+    let release = Unpause(pause.clone());
+    options.test_pause = Some(pause.clone());
+    let mut handle = watch::start_watch(running.config.clone(), options.clone()).unwrap();
+    wait_pause(&pause).await;
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(20), handle.wait())
+            .await
+            .is_err()
+    );
+    assert!(
+        export(running.config.clone(), options.export.clone())
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("busy")
+    );
+    let mut contender = watch::start_watch(running.config.clone(), options.clone()).unwrap();
+    assert!(
+        contender
+            .wait()
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("busy")
+    );
+    drop(handle);
+    assert_eq!(
+        running
+            .counts
+            .opens
+            .load(std::sync::atomic::Ordering::SeqCst),
+        0
+    );
+    drop(release);
+    let stopped = wait_watch(&options.watch_dir, |s| {
+        s.phase == watch::WatchPhase::Stopped && s.writer_fence_held == Some(false)
+    })
+    .await;
+    assert_eq!(stopped.export_attempts, 0);
+    let before = std::fs::read(options.watch_dir.join("watch.json")).unwrap();
+    let mut wrong = running.config.clone();
+    wrong.token_env = None;
+    let mut changed = watch::start_watch(wrong, options.clone()).unwrap();
+    assert!(
+        changed
+            .wait()
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("identity changed")
+    );
+    assert_eq!(
+        std::fs::read(options.watch_dir.join("watch.json")).unwrap(),
+        before
+    );
+    options.test_pause = None;
+    let mut handle = watch::start_watch(running.config.clone(), options.clone()).unwrap();
+    wait_watch(&options.watch_dir, |s| s.lag_at_last_observation == Some(0)).await;
+    let opens = running
+        .counts
+        .opens
+        .load(std::sync::atomic::Ordering::SeqCst);
+    std::fs::create_dir(options.watch_dir.join("watch.next")).unwrap();
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_secs(2), handle.wait())
+            .await
+            .unwrap()
+            .is_err()
+    );
+    assert_eq!(
+        running
+            .counts
+            .opens
+            .load(std::sync::atomic::Ordering::SeqCst),
+        opens,
+        "status write failure did not stop scheduling"
+    );
+    assert!(
+        watch::watch_status(&options.watch_dir)
+            .unwrap()
+            .lag_at_last_observation
+            .is_none()
+    );
+    assert!(options.watch_dir.join("watch.next").is_dir());
+    running.stop().await;
+}
+
+#[tokio::test]
+async fn watcher_cheap_ref_timeout_cannot_overlap_or_ack_shutdown_before_accepted_reap_tail_drains()
+{
+    let running = Running::new().await;
+    let tree = running.tree(b"physical tail\n");
+    let head = running.commit(tree, vec![m::CommitId::ROOT], vec![], "tail\n");
+    running.publish(head, 0);
+    let mut options = watcher_options(&running);
+    options.probe_timeout = std::time::Duration::from_millis(100);
+    let pause = watch::TestPause::new(None, false);
+    let release = Unpause(pause.clone());
+    options.test_pause = Some(pause.clone());
+    let mut handle = watch::start_watch(running.config.clone(), options.clone()).unwrap();
+    wait_watch(&options.watch_dir, |s| s.lag_at_last_observation == Some(0)).await;
+    pause.arm();
+    wait_pause(&pause).await;
+    let probes = watch::watch_status(&options.watch_dir).unwrap().probes;
+    tokio::time::sleep(std::time::Duration::from_millis(350)).await;
+    assert_eq!(
+        watch::watch_status(&options.watch_dir).unwrap().probes,
+        probes,
+        "new operation overlapped accepted physical tail"
+    );
+    handle.request_shutdown();
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(20), handle.wait())
+            .await
+            .is_err()
+    );
+    assert!(
+        export(running.config.clone(), options.export.clone())
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("busy")
+    );
+    drop(release);
+    let stopped = tokio::time::timeout(std::time::Duration::from_secs(3), handle.wait())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(stopped.probes, probes);
+    assert_eq!(stopped.phase, watch::WatchPhase::Stopped);
+    running.stop().await;
+}
+
+#[tokio::test]
+async fn watcher_observation_is_not_selected_job_and_torn_checkpoints_recover_from_exporter_truth()
+{
+    use std::io::Write;
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+    let running = Running::new().await;
+    let tree = running.tree(b"latest-selection bytes\n");
+    let first = running.commit(tree, vec![m::CommitId::ROOT], vec![], "selection first\n");
+    running.publish(first, 0);
+    let mut options = watcher_options(&running);
+    options.poll_interval = std::time::Duration::from_secs(1);
+    options.max_backoff = std::time::Duration::from_secs(2);
+    let marker = running.temp.path().join("selected-version");
+    let arm = running.temp.path().join("pause-next-export");
+    let wrapper = running.temp.path().join("selection-git");
+    std::fs::write(&wrapper,format!("#!/bin/sh\nfor argument do\n if [ \"$argument\" = version ] && [ -f {} ]; then\n  printf '%s' \"$$\" > {}\n  kill -STOP \"$$\"\n fi\ndone\nexec {} \"$@\"\n",shell_quote(arm.to_str().unwrap()),shell_quote(marker.to_str().unwrap()),shell_quote(git_program().to_str().unwrap()))).unwrap();
+    std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o700)).unwrap();
+    options.export.git_program = wrapper;
+    let mut handle = watch::start_watch(running.config.clone(), options.clone()).unwrap();
+    wait_watch(&options.watch_dir, |s| s.lag_at_last_observation == Some(0)).await;
+    std::fs::write(&arm, b"pause").unwrap();
+    let second = running.commit(tree, vec![first], vec![], "observed second\n");
+    let third = running.commit(tree, vec![second], vec![], "selected third\n");
+    running.publish(second, 1);
+    tokio::time::timeout(std::time::Duration::from_secs(4), async {
+        while !marker.exists() {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let pid: i32 = std::fs::read_to_string(&marker).unwrap().parse().unwrap();
+    struct Kill(i32);
+    impl Drop for Kill {
+        fn drop(&mut self) {
+            if self.0 > 0 {
+                unsafe {
+                    libc::kill(self.0, libc::SIGKILL);
+                }
+            }
+        }
+    }
+    let mut kill = Kill(pid);
+    let inflight = watch::watch_status(&options.watch_dir).unwrap();
+    assert_eq!(inflight.phase, watch::WatchPhase::Exporting);
+    assert_eq!(inflight.observed_desired.as_ref().unwrap().generation, 2);
+    assert_eq!(inflight.lag_at_last_observation, Some(1));
+    running.publish(third, 2);
+    std::fs::remove_file(&arm).unwrap();
+    assert_eq!(unsafe { libc::kill(pid, libc::SIGCONT) }, 0);
+    let selected = wait_watch(&options.watch_dir, |s| {
+        s.delivered.as_ref().is_some_and(|d| d.generation == 3) && !s.last_probe_succeeded
+    })
+    .await;
+    kill.0 = 0;
+    assert_eq!(selected.observed_desired.as_ref().unwrap().generation, 2);
+    assert!(selected.lag_at_last_observation.is_none());
+    wait_watch(&options.watch_dir, |s| {
+        s.lag_at_last_observation == Some(0)
+            && s.observed_desired
+                .as_ref()
+                .is_some_and(|p| p.generation == 3)
+    })
+    .await;
+    handle.shutdown().await.unwrap();
+    let fourth = running.commit(tree, vec![third], vec![], "ACK before watcher save\n");
+    running.publish(fourth, 3);
+    let delivered = export(running.config.clone(), options.export.clone())
+        .await
+        .unwrap();
+    assert_eq!(delivered.source_generation, 4);
+    for path in [
+        options.watch_dir.join("watch.next"),
+        options.export.state_dir.join("state.next"),
+    ] {
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(path)
+            .unwrap();
+        f.write_all(b"{torn unACKed candidate").unwrap();
+        f.sync_all().unwrap();
+    }
+    let mut restarted = watch::start_watch(running.config.clone(), options.clone()).unwrap();
+    let recovered = wait_watch(&options.watch_dir, |s| {
+        s.delivered.as_ref().is_some_and(|d| d.generation == 4)
+            && s.lag_at_last_observation == Some(0)
+    })
+    .await;
+    assert_eq!(
+        recovered.delivered.as_ref().unwrap().git_head,
+        delivered.git_head
+    );
+    assert!(!options.watch_dir.join("watch.next").exists());
+    assert!(!options.export.state_dir.join("state.next").exists());
+    restarted.shutdown().await.unwrap();
+    running.stop().await;
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn watcher_high_descriptor_cli_death_preserves_both_original_fences_until_child_termination()
+{
+    use std::os::unix::fs::PermissionsExt;
+    let running = Running::new().await;
+    let tree = running.tree(b"high-descriptor ownership\n");
+    let head = running.commit(tree, vec![m::CommitId::ROOT], vec![], "high descriptors\n");
+    running.publish(head, 0);
+    let options = watcher_options(&running);
+    let marker = running.temp.path().join("high-fd-child");
+    let wrapper = running.temp.path().join("high-fd-git");
+    std::fs::write(&wrapper,format!("#!/bin/sh\nfor argument do\n if [ \"$argument\" = hash-object ]; then\n  printf '%s' \"$$\" > {}\n  kill -STOP \"$$\"\n fi\ndone\nexec {} \"$@\"\n",shell_quote(marker.to_str().unwrap()),shell_quote(git_program().to_str().unwrap()))).unwrap();
+    std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let config = running.temp.path().join("pressure-client.toml");
+    std::fs::write(&config,format!("endpoint = {:?}\nrepository_id = \"example\"\ntoken_env = \"TINYTREE_GIT_TEST_TOKEN\"\n",running.config.endpoint)).unwrap();
+    let mut process = tokio::process::Command::new(env!("TINYTREE_WATCH_FD_FIXTURE"))
+        .arg(env!("CARGO_BIN_EXE_tinytree-git"))
+        .arg("watch")
+        .arg("--config")
+        .arg(&config)
+        .arg("--state")
+        .arg(&options.export.state_dir)
+        .arg("--watch-state")
+        .arg(&options.watch_dir)
+        .arg("--destination-git")
+        .arg(&options.export.destination_git)
+        .arg("--git")
+        .arg(&wrapper)
+        .args([
+            "--poll-interval-ms",
+            "100",
+            "--probe-timeout-ms",
+            "500",
+            "--max-backoff-ms",
+            "800",
+            "--timeout-seconds",
+            "30",
+        ])
+        .kill_on_drop(true)
+        .spawn()
+        .unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while !marker.exists() {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let pid: i32 = std::fs::read_to_string(marker).unwrap().parse().unwrap();
+    struct Kill(i32);
+    impl Drop for Kill {
+        fn drop(&mut self) {
+            unsafe {
+                libc::kill(self.0, libc::SIGKILL);
+            }
+        }
+    }
+    let kill = Kill(pid);
+    let locks = [
+        options.watch_dir.join("watch.lock"),
+        options.export.state_dir.join("writer.lock"),
+    ];
+    let mut inherited = vec![];
+    for entry in std::fs::read_dir(format!("/proc/{pid}/fd")).unwrap() {
+        let entry = entry.unwrap();
+        if std::fs::read_link(entry.path())
+            .ok()
+            .is_some_and(|p| locks.contains(&p))
+        {
+            inherited.push(
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .parse::<usize>()
+                    .unwrap(),
+            );
+        }
+    }
+    assert_eq!(inherited.len(), 2);
+    assert!(
+        inherited.iter().all(|fd| *fd > 256),
+        "pressure did not cover original high lock descriptors"
+    );
+    process.start_kill().unwrap();
+    assert!(!process.wait().await.unwrap().success());
+    assert_eq!(
+        watch::watch_status(&options.watch_dir)
+            .unwrap()
+            .writer_fence_held,
+        Some(true)
+    );
+    let mut contender = watch::start_watch(running.config.clone(), options.clone()).unwrap();
+    assert!(
+        contender
+            .wait()
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("busy")
+    );
+    assert!(
+        export(running.config.clone(), options.export.clone())
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("busy")
+    );
+    drop(kill);
+    tokio::time::timeout(std::time::Duration::from_secs(3), async {
+        use std::os::unix::fs::OpenOptionsExt;
+        loop {
+            let lock = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+                .open(options.export.state_dir.join("writer.lock"))
+                .unwrap();
+            let free = fs2::FileExt::try_lock_exclusive(&lock).is_ok();
+            if free
+                && watch::watch_status(&options.watch_dir)
+                    .unwrap()
+                    .writer_fence_held
+                    == Some(false)
+            {
+                drop(lock);
+                break;
+            }
+            drop(lock);
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let mut recovered = watch::start_watch(running.config.clone(), options.clone()).unwrap();
+    wait_watch(&options.watch_dir, |s| s.lag_at_last_observation == Some(0)).await;
+    recovered.shutdown().await.unwrap();
+    running.stop().await;
+}
+
+#[tokio::test]
+async fn watcher_preserves_git_on_source_deletion_or_same_head_regression_and_paces_unsupported_pending_work()
+ {
+    use std::sync::atomic::Ordering;
+    let running = Running::new().await;
+    let tree = running.tree(b"deletion is not Git permission\n");
+    let head = running.commit(tree, vec![m::CommitId::ROOT], vec![], "deletion source\n");
+    running.publish(head, 0);
+    let options = watcher_options(&running);
+    let mut handle = watch::start_watch(running.config.clone(), options.clone()).unwrap();
+    let first = wait_watch(&options.watch_dir, |s| s.lag_at_last_observation == Some(0)).await;
+    let git_head = first.delivered.as_ref().unwrap().git_head.clone();
+    running
+        .store
+        .publish(
+            "example",
+            &PublishRequest {
+                idempotency_key: "delete-source-ref".into(),
+                reference_name: "main".into(),
+                expected_generation: 1,
+                new_commit: None,
+                staging_leases: vec![],
+            },
+            0,
+        )
+        .unwrap();
+    let absent = wait_watch(&options.watch_dir, |s| {
+        s.last_error == Some(watch::WatchError::SourceAbsent)
+    })
+    .await;
+    assert_eq!(absent.observed_desired.as_ref().unwrap().generation, 2);
+    assert!(
+        absent
+            .observed_desired
+            .as_ref()
+            .unwrap()
+            .native_head
+            .is_none()
+    );
+    assert!(absent.lag_at_last_observation.is_none());
+    assert_eq!(absent.export_attempts, first.export_attempts);
+    assert_eq!(
+        text(
+            &options.export.destination_git,
+            &["rev-parse", "refs/heads/main"]
+        ),
+        git_head
+    );
+    running.publish(head, 2);
+    let recreated = wait_watch(&options.watch_dir, |s| {
+        s.delivered.as_ref().is_some_and(|d| d.generation == 3)
+            && s.lag_at_last_observation == Some(0)
+    })
+    .await;
+    assert_eq!(recreated.delivered.as_ref().unwrap().git_head, git_head);
+    running.counts.force_generation.store(1, Ordering::SeqCst);
+    let regressed = wait_watch(&options.watch_dir, |s| {
+        s.last_error == Some(watch::WatchError::SourceRegressed)
+    })
+    .await;
+    assert!(regressed.lag_at_last_observation.is_none());
+    assert_eq!(regressed.delivered.as_ref().unwrap().generation, 3);
+    assert_eq!(regressed.observed_desired.as_ref().unwrap().generation, 3);
+    assert_eq!(regressed.export_attempts, recreated.export_attempts);
+    handle.shutdown().await.unwrap();
+    running.stop().await;
+
+    let running = Running::new().await;
+    let tree = running.tree(b"unsupported signature remains retained\n");
+    let unsigned = running.commit(
+        tree,
+        vec![m::CommitId::ROOT],
+        vec![],
+        "unsupported source\n",
+    );
+    let (_, raw) = running
+        .store
+        .read_metadata(
+            "example",
+            m::ObjectKey {
+                kind: m::Kind::Commit,
+                id: m::ObjectId(unsigned.0),
+            },
+        )
+        .unwrap();
+    let m::Object::Commit(mut signed) = m::decode(&raw, Default::default()).unwrap() else {
+        panic!()
+    };
+    signed.secure_signature = Some(m::SecureSignature {
+        data: m::unsigned_commit_bytes(&signed, Default::default()).unwrap(),
+        signature: b"opaque unsupported signature".to_vec(),
+    });
+    let signed = m::CommitId(running.object(m::Object::Commit(signed)).0);
+    running.publish(signed, 0);
+    let mut options = watcher_options(&running);
+    options.max_backoff = std::time::Duration::from_millis(400);
+    let mut handle = watch::start_watch(running.config.clone(), options.clone()).unwrap();
+    let failed = wait_watch(&options.watch_dir, |s| {
+        s.consecutive_failures >= 3 && s.last_error == Some(watch::WatchError::ExportFailed)
+    })
+    .await;
+    assert_eq!(failed.pending_export_phase.as_deref(), Some("held"));
+    assert!(failed.delivered.is_none());
+    assert_eq!(failed.probes, 1);
+    assert!(
+        failed
+            .next_retry_unix_ms
+            .unwrap()
+            .saturating_sub(failed.updated_at_unix_ms)
+            <= 400
+    );
+    assert_eq!(running.counts.files.load(Ordering::SeqCst), 0);
+    let envelope: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(options.export.state_dir.join("state.json")).unwrap(),
+    )
+    .unwrap();
+    let hold = envelope["state"]["pending"]["hold"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let client = tinytree_client::NativeClient::connect(running.config.clone())
+        .await
+        .unwrap();
+    assert!(
+        client.open(vec![hold]).await.unwrap().references[0]
+            .commit
+            .is_some()
+    );
+    handle.shutdown().await.unwrap();
+    let opens = running.counts.opens.load(Ordering::SeqCst);
+    let mut restarted = watch::start_watch(running.config.clone(), options.clone()).unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+    assert_eq!(running.counts.opens.load(Ordering::SeqCst), opens);
+    restarted.shutdown().await.unwrap();
     running.stop().await;
 }
