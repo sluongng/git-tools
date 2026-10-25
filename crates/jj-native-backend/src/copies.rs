@@ -109,6 +109,14 @@ impl NativeBackend {
         starts: &[m::CommitId],
         budget: &mut Budget,
     ) -> BackendResult<Vec<(m::CommitId, m::Commit)>> {
+        self.ancestors_prefetched(starts, budget, None).await
+    }
+    async fn ancestors_prefetched(
+        &self,
+        starts: &[m::CommitId],
+        budget: &mut Budget,
+        mut prefetched: Option<(m::CommitId, m::Commit)>,
+    ) -> BackendResult<Vec<(m::CommitId, m::Commit)>> {
         let mut enqueued = BTreeSet::new();
         let mut pending = Vec::new();
         let mut commits = BTreeMap::new();
@@ -121,7 +129,11 @@ impl NativeBackend {
             }
         }
         while let Some(id) = pending.pop() {
-            let commit = self.query_commit(id, budget).await?;
+            let commit = if prefetched.as_ref().is_some_and(|(known, _)| *known == id) {
+                prefetched.take().expect("matching prefetched commit").1
+            } else {
+                self.query_commit(id, budget).await?
+            };
             self.query_edges(budget, commit.parents.len())?;
             for parent in &commit.parents {
                 if enqueued.insert(*parent) {
@@ -423,13 +435,27 @@ impl NativeBackend {
         head: m::CommitId,
     ) -> BackendResult<Vec<CopyRecord>> {
         let mut budget = Budget::new();
-        let excluded = self
-            .ancestors(&[root], &mut budget)
-            .await?
-            .into_iter()
-            .map(|(id, _)| id)
-            .collect::<BTreeSet<_>>();
-        let commits = self.ancestors(&[head], &mut budget).await?;
+        let head_commit = self.query_commit(head, &mut budget).await?;
+        if root == head {
+            return Ok(Vec::new());
+        }
+        let (excluded, commits) = if head_commit.parents.as_slice() == [root] {
+            // Ordinary working-copy status asks for a direct-parent range.
+            // Its only new commit is the head, regardless of public history.
+            self.query_edges(&mut budget, head_commit.parents.len())?;
+            (BTreeSet::new(), vec![(head, head_commit)])
+        } else {
+            let excluded = self
+                .ancestors(&[root], &mut budget)
+                .await?
+                .into_iter()
+                .map(|(id, _)| id)
+                .collect::<BTreeSet<_>>();
+            let commits = self
+                .ancestors_prefetched(&[head], &mut budget, Some((head, head_commit)))
+                .await?;
+            (excluded, commits)
+        };
         let mut records = Vec::new();
         let mut emitted = BTreeSet::new();
         for (id, commit) in commits {
@@ -465,8 +491,27 @@ impl NativeBackend {
                 }
                 for source in history.parents {
                     let source_history = self.query_copy(source, &mut budget).await?;
-                    let mut found = None;
-                    for (ancestor, commit) in self.ancestors(&commit.parents, &mut budget).await? {
+                    // With one parent, its already validated files are exactly
+                    // the first candidate in the existing ancestor ordering.
+                    let mut found = if commit.parents.len() == 1 {
+                        let candidates = parent_files
+                            .iter()
+                            .filter(|candidate| {
+                                candidate.copy == Some(source)
+                                    && candidate.path == source_history.current_path
+                            })
+                            .cloned()
+                            .collect::<Vec<_>>();
+                        (!candidates.is_empty()).then(|| (commit.parents[0], candidates))
+                    } else {
+                        None
+                    };
+                    let ancestors = if found.is_none() {
+                        self.ancestors(&commit.parents, &mut budget).await?
+                    } else {
+                        Vec::new()
+                    };
+                    for (ancestor, commit) in ancestors {
                         let candidates = self
                             .files(&commit, &mut budget)
                             .await?

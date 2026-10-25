@@ -308,6 +308,224 @@ fn copy_queries_recover_descendants_and_derive_real_ancestor_file_provenance() {
     });
 }
 #[test]
+fn direct_parent_copy_queries_read_only_the_fixed_checkout_not_older_commit_history() {
+    use std::collections::HashSet;
+    use std::sync::Mutex;
+    struct CheckoutOnly {
+        inner: Arc<DirectObjectIo>,
+        allowed: HashSet<m::ObjectKey>,
+        reads: Mutex<Vec<m::ObjectKey>>,
+    }
+    impl std::fmt::Debug for CheckoutOnly {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.debug_struct("CheckoutOnly").finish_non_exhaustive()
+        }
+    }
+    #[async_trait]
+    impl NativeObjectIo for CheckoutOnly {
+        async fn descriptor(&self, key: m::ObjectKey) -> BackendResult<Option<m::Descriptor>> {
+            if key.kind == m::Kind::Commit && !self.allowed.contains(&key) {
+                return Err(invalid(
+                    "copy query requested a historical commit descriptor",
+                ));
+            }
+            self.inner.descriptor(key).await
+        }
+        async fn read_metadata(&self, key: m::ObjectKey) -> BackendResult<VerifiedMetadata> {
+            if key.kind == m::Kind::Commit {
+                self.reads.lock().unwrap().push(key);
+                if !self.allowed.contains(&key) {
+                    return Err(invalid("copy query read beyond the direct-parent checkout"));
+                }
+            }
+            self.inner.read_metadata(key).await
+        }
+        async fn write_metadata(&self, object: m::Object) -> BackendResult<m::Descriptor> {
+            self.inner.write_metadata(object).await
+        }
+        async fn read_file(&self, _: m::FileId) -> BackendResult<FileRead> {
+            Err(invalid("copy provenance must not read file payloads"))
+        }
+        async fn write_file(
+            &self,
+            input: &mut (dyn AsyncRead + Send + Unpin),
+            maximum: u64,
+        ) -> BackendResult<m::FileId> {
+            self.inner.write_file(input, maximum).await
+        }
+        async fn copy_catalog_snapshot(
+            &self,
+            limits: CopyCatalogLimits,
+        ) -> BackendResult<CopyCatalogSnapshot> {
+            self.inner.copy_catalog_snapshot(limits).await
+        }
+    }
+    struct Case {
+        name: &'static str,
+        history: usize,
+        copy_event: bool,
+    }
+    let cases = [
+        Case {
+            name: "normal_edit_after_short_history",
+            history: 8,
+            copy_event: false,
+        },
+        Case {
+            name: "normal_edit_after_long_history",
+            history: 128,
+            copy_event: false,
+        },
+        Case {
+            name: "direct_copy_after_short_history",
+            history: 8,
+            copy_event: true,
+        },
+        Case {
+            name: "direct_copy_after_long_history",
+            history: 128,
+            copy_event: true,
+        },
+    ];
+    block_on(async {
+        for case in cases {
+            let directory = tempfile::tempdir().unwrap();
+            let config = Config::default();
+            let io = Arc::new(DirectObjectIo::init(directory.path(), config.clone()).unwrap());
+            let backend = NativeBackend::from_io(io.clone(), config.clone())
+                .await
+                .unwrap();
+            let file = backend
+                .write_file(RepoPath::root(), &mut Cursor::new(b"source bytes"))
+                .await
+                .unwrap();
+            let original = if case.copy_event {
+                backend
+                    .write_copy(&CopyHistory {
+                        current_path: path("a"),
+                        parents: vec![],
+                        salt: vec![1],
+                    })
+                    .await
+                    .unwrap()
+            } else {
+                CopyId::from_bytes(&[])
+            };
+            let tree = backend
+                .write_tree(
+                    RepoPath::root(),
+                    &Tree::from_sorted_entries(vec![tree_entry(
+                        "a",
+                        TreeValue::File {
+                            id: file.clone(),
+                            executable: false,
+                            copy_id: original.clone(),
+                        },
+                    )]),
+                )
+                .await
+                .unwrap();
+            let mut base = backend.root_commit_id().clone();
+            for _ in 0..case.history {
+                base = backend
+                    .write_commit(commit(&backend, base, tree.clone()), None)
+                    .await
+                    .unwrap()
+                    .0;
+            }
+            let (target, target_file, target_copy) = if case.copy_event {
+                let copied = backend
+                    .write_copy(&CopyHistory {
+                        current_path: path("b"),
+                        parents: vec![original],
+                        salt: vec![2],
+                    })
+                    .await
+                    .unwrap();
+                ("b", file.clone(), copied)
+            } else {
+                let edited = backend
+                    .write_file(RepoPath::root(), &mut Cursor::new(b"edited bytes"))
+                    .await
+                    .unwrap();
+                ("a", edited, CopyId::from_bytes(&[]))
+            };
+            let head_tree = backend
+                .write_tree(
+                    RepoPath::root(),
+                    &Tree::from_sorted_entries(vec![tree_entry(
+                        target,
+                        TreeValue::File {
+                            id: target_file,
+                            executable: false,
+                            copy_id: target_copy,
+                        },
+                    )]),
+                )
+                .await
+                .unwrap();
+            let head = backend
+                .write_commit(commit(&backend, base.clone(), head_tree), None)
+                .await
+                .unwrap()
+                .0;
+            let key = |id: &CommitId| m::ObjectKey {
+                kind: m::Kind::Commit,
+                id: m::ObjectId(model_id(id.as_bytes()).unwrap()),
+            };
+            let guard = Arc::new(CheckoutOnly {
+                inner: io,
+                allowed: HashSet::from([key(&base), key(&head)]),
+                reads: Mutex::new(Vec::new()),
+            });
+            let observed = NativeBackend::from_io(guard.clone(), config).await.unwrap();
+            let records = observed
+                .get_copy_records(None, &base, &head)
+                .unwrap()
+                .try_collect::<Vec<_>>()
+                .await
+                .unwrap_or_else(|error| panic!("{}: {error}", case.name));
+            let expected = if case.copy_event {
+                vec![CopyRecord {
+                    target: path("b"),
+                    target_commit: head.clone(),
+                    source: path("a"),
+                    source_file: file,
+                    source_commit: base.clone(),
+                }]
+            } else {
+                vec![]
+            };
+            assert_eq!(records, expected, "{}", case.name);
+            assert_eq!(
+                *guard.reads.lock().unwrap(),
+                vec![key(&head), key(&base)],
+                "{} must use exactly the direct head and its parent, regardless of history length",
+                case.name
+            );
+            guard.reads.lock().unwrap().clear();
+            assert!(
+                observed
+                    .get_copy_records(None, &head, &head)
+                    .unwrap()
+                    .try_collect::<Vec<_>>()
+                    .await
+                    .unwrap()
+                    .is_empty(),
+                "{} same-id range must be empty",
+                case.name
+            );
+            assert_eq!(
+                *guard.reads.lock().unwrap(),
+                vec![key(&head)],
+                "{} same-id query still validates its head without walking ancestors",
+                case.name
+            );
+        }
+    });
+}
+
+#[test]
 fn intrinsic_root_invalid_ids_limits_and_submodules_are_explicit() {
     block_on(async {
         let directory = tempfile::tempdir().unwrap();
