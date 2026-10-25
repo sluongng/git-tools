@@ -19,6 +19,7 @@ struct FixtureIo {
     scope_closes: AtomicUsize,
     queries: Mutex<BTreeMap<[u8; 32], (Vec<q::GraphRow>, usize, u64)>>,
     opens: AtomicUsize,
+    live_opens: AtomicUsize,
     facts_count: AtomicUsize,
     prefix_count: AtomicUsize,
     fail_fact: AtomicBool,
@@ -327,6 +328,7 @@ impl NativeQueryIo for FixtureIo {
         i: OpenQueryScope,
         o: QueryOwner,
     ) -> Result<QueryReply<QueryScope>, tonic::Status> {
+        self.live_opens.fetch_add(1, Ordering::SeqCst);
         let remote = self.remote.lock().unwrap().clone();
         let all: BTreeMap<_, _> = remote
             .iter()
@@ -3457,6 +3459,150 @@ fn portable_import_preserves_exact_cloud_baselines_without_canonical_hydration_o
                 .iter()
                 .all(|key| key.id.0 == model_id(delta.id()).unwrap().0),
             "merging/reopening/exporting frozen baseline must not hydrate canonical history"
+        );
+        // Freshly admitted landing metadata is a bounded local overlay, not a
+        // reason to replace the exact cloud source with live roots.
+        let mut value = commits[0].store_commit().as_ref().clone();
+        value.description = "admitted first rewrite".into();
+        let first = jj_store.write_commit(value, None).await.unwrap();
+        let mut value = first.store_commit().as_ref().clone();
+        value.parents = vec![first.id().clone()];
+        value.change_id = ChangeId::from_bytes(&[30; 16]);
+        value.description = "admitted second rewrite".into();
+        let second = jj_store.write_commit(value, None).await.unwrap();
+        let mut value = first.store_commit().as_ref().clone();
+        value.description = "outside frozen selection".into();
+        let outside = jj_store.write_commit(value, None).await.unwrap();
+        let mut value = second.store_commit().as_ref().clone();
+        value.parents = vec![outside.id().clone()];
+        let missing_parent = jj_store.write_commit(value, None).await.unwrap();
+        let reads_before = observed.reads.lock().unwrap().len();
+        for (name, stack) in [
+            ("child before parent", vec![second.clone(), first.clone()]),
+            ("duplicate commit", vec![first.clone(), first.clone()]),
+            ("intrinsic root", vec![root.clone()]),
+            ("unknown first parent", vec![missing_parent]),
+            ("stack count bound", vec![first.clone(); 129]),
+        ] {
+            assert!(
+                historical.with_admitted_commit_stack(&stack).await.is_err(),
+                "must reject {name}"
+            );
+        }
+        assert_eq!(observed.reads.lock().unwrap().len(), reads_before);
+        let mut limited = Limits::default();
+        limited.max_drafts = historical.checkpoint.drafts.len() + 1;
+        let limited = NativeIndexStore::open(&path, &config, limited, io.clone(), observed.clone())
+            .unwrap()
+            .index_at_operation(&[1; 64])
+            .unwrap();
+        assert!(
+            limited
+                .with_admitted_commit_stack(&[first.clone(), second.clone()])
+                .await
+                .is_err(),
+            "new stack reserves the remaining draft capacity before canonical reads"
+        );
+        assert_eq!(observed.reads.lock().unwrap().len(), reads_before);
+        let source_before = historical.cloud_query_source().unwrap();
+        let empty = historical.with_admitted_commit_stack(&[]).await.unwrap();
+        assert_eq!(empty.checkpoint.tips, historical.checkpoint.tips);
+        assert_eq!(empty.cloud_query_source(), Some(source_before.clone()));
+        let live_before = io.live_opens.load(Ordering::SeqCst);
+        let admitted = historical
+            .with_admitted_commit_stack(&[first.clone(), second.clone()])
+            .await
+            .unwrap();
+        assert_eq!(admitted.cloud_query_source().unwrap(), source_before);
+        assert_eq!(admitted.checkpoint.baseline, historical.checkpoint.baseline);
+        assert_eq!(admitted.checkpoint.roots, historical.checkpoint.roots);
+        assert_eq!(
+            admitted
+                .evaluate_revset(
+                    &ResolvedExpression::Commits(vec![first.id().clone(), second.id().clone()]),
+                    &jj_store,
+                )
+                .unwrap()
+                .stream()
+                .try_collect::<Vec<_>>()
+                .await
+                .unwrap()
+                .into_iter()
+                .collect::<BTreeSet<_>>(),
+            BTreeSet::from([first.id().clone(), second.id().clone()])
+        );
+        assert_eq!(
+            io.fork_overlays.lock().unwrap().last().unwrap(),
+            &vec![
+                model_id(first.id()).unwrap(),
+                model_id(second.id()).unwrap()
+            ]
+        );
+        assert_eq!(io.live_opens.load(Ordering::SeqCst), live_before);
+        assert_eq!(observed.files.load(Ordering::SeqCst), 0);
+        assert_eq!(observed.file_writes.load(Ordering::SeqCst), 0);
+        assert!(
+            observed.reads.lock().unwrap()[reads_before..]
+                .iter()
+                .all(|key| key.id.0 == model_id(first.id()).unwrap().0
+                    || key.id.0 == model_id(second.id()).unwrap().0),
+            "only the exact supplied COMMITs are read, never their history"
+        );
+        let mut transaction_index = historical.start_modification();
+        transaction_index.merge_in(&admitted).unwrap();
+        let transaction_index = restored.persist_index(transaction_index).unwrap();
+        assert_eq!(
+            transaction_index.checkpoint.source,
+            admitted.checkpoint.source
+        );
+        assert_eq!(
+            transaction_index.checkpoint.drafts,
+            admitted.checkpoint.drafts
+        );
+        restored.associate_operation(&[13; 64], &admitted).unwrap();
+        let reopened = NativeIndexStore::open(
+            &path,
+            &config,
+            Default::default(),
+            io.clone(),
+            observed.clone(),
+        )
+        .unwrap();
+        assert_eq!(
+            reopened
+                .index_at_operation(&[13; 64])
+                .unwrap()
+                .cloud_query_source(),
+            Some(source_before)
+        );
+        assert_eq!(
+            reopened
+                .index_at_operation(&[1; 64])
+                .unwrap()
+                .checkpoint
+                .drafts,
+            historical.checkpoint.drafts,
+            "new admission does not overwrite the imported operation association"
+        );
+        let mut exact = Limits::default();
+        exact.max_drafts = admitted.checkpoint.drafts.len();
+        let exact = NativeIndexStore::open(&path, &config, exact, io.clone(), observed.clone())
+            .unwrap()
+            .index_at_operation(&[13; 64])
+            .unwrap();
+        let reads_before = observed.reads.lock().unwrap().len();
+        let repeated = exact
+            .with_admitted_commit_stack(&[first.clone(), second.clone()])
+            .await
+            .unwrap();
+        assert_eq!(repeated.checkpoint.drafts, admitted.checkpoint.drafts);
+        assert_eq!(repeated.checkpoint.source, admitted.checkpoint.source);
+        assert!(
+            observed.reads.lock().unwrap()[reads_before..]
+                .iter()
+                .all(|key| key.id.0 == model_id(first.id()).unwrap().0
+                    || key.id.0 == model_id(second.id()).unwrap().0),
+            "reopening the frozen query may read supplied overlays, never their history"
         );
         // Corrupted/local-foreign checkpoint security cases use the real public
         // merge operation: no changed immutable selector or live mode is adopted.

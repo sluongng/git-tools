@@ -237,6 +237,59 @@ impl NativeReadonlyIndex {
         next.checkpoint.scope.lock().await.root_only = Some(proof);
         Ok(next)
     }
+
+    /// Install a freshly admitted, canonical linear stack as local COMMIT
+    /// metadata. The caller must verify the landing result and refresh admission
+    /// before calling this method; neither a Commit nor this index is a remote
+    /// retention or FILE-read capability.
+    ///
+    /// The first parent must already belong to this exact checkpoint. In
+    /// particular, a frozen cloud source keeps its original pins and baseline:
+    /// only the supplied COMMITs become local query overlays. No live root or
+    /// moving reference is added, and prior operation associations are unchanged.
+    /// An empty stack leaves the checkpoint unchanged.
+    pub async fn with_admitted_commit_stack(&self, commits: &[Commit]) -> IndexResult<Self> {
+        persistence::require_durable_writer().map_err(err)?;
+        if commits.len() > 128 || commits.len() > self.core.limits.max_drafts {
+            return Err(err(Error::Limit));
+        }
+        if commits.is_empty() {
+            return Ok(self.clone());
+        }
+        let mut seen = BTreeSet::new();
+        for (position, commit) in commits.iter().enumerate() {
+            let id = model_id(commit.id()).map_err(err)?;
+            if id == m::CommitId::ROOT
+                || !seen.insert(id)
+                || commit.parent_ids().len() != 1
+                || (position > 0 && commit.parent_ids()[0] != *commits[position - 1].id())
+            {
+                return Err(err(Error::Invalid));
+            }
+        }
+        if !self.has_id(&commits[0].parent_ids()[0]).await? {
+            return Err(err(Error::Canonical));
+        }
+        let mut additions = 0usize;
+        for commit in commits {
+            if !self.has_id(commit.id()).await? {
+                additions += 1;
+            }
+        }
+        if self.checkpoint.drafts.len().saturating_add(additions) > self.core.limits.max_drafts {
+            return Err(err(Error::Limit));
+        }
+        let mut mutable = self.start_modification();
+        for commit in commits {
+            mutable.add_commit(commit).await?;
+        }
+        NativeIndexStore {
+            core: self.core.clone(),
+        }
+        .persist_index(mutable)
+        .map_err(err)
+    }
+
     pub(super) async fn scope(&self) -> Result<Arc<CachedScope>, Error> {
         let mut state = self.checkpoint.scope.lock().await;
         let threshold = now()?.checked_add(1).ok_or(Error::Invalid)?;
