@@ -1588,6 +1588,7 @@ fn capture_data_is_bounded_portable_data_not_frontend_authority() {
         }],
         roots: vec![],
         remote: Some(PortableRemoteState {
+            landing: None,
             observations: vec![],
             archived_pushes: vec![ArchivedIntent {
                 reference: "refs/heads/main".into(),
@@ -1633,6 +1634,173 @@ fn capture_data_is_bounded_portable_data_not_frontend_authority() {
     unknown["host_path"] = "/private/source".into();
     let unknown = serde_json::to_vec(&unknown).unwrap();
     assert!(decode_data(&unknown, data_digest(&unknown), &limits).is_err());
+    assert!(
+        !text.contains("landing"),
+        "existing v1 bytes have no new optional field"
+    );
+    let original = data.clone();
+    let mut landing = PortableLanding {
+        request_id: "12".repeat(16),
+        source_base: "00".repeat(32),
+        source_head: "13".repeat(32),
+        reference: "main".into(),
+        bookmark: "main".into(),
+        generation: 1,
+        expected_head: "14".repeat(32),
+        profile_name: "checks".into(),
+        profile_version: "v1".into(),
+        source_operation: zero.clone(),
+        source_stack: vec!["13".repeat(32)],
+        fork_operation: None,
+        fork_acknowledged: false,
+        job_id: None,
+        result_roots: vec![],
+        candidate_head: None,
+        apply_operation: None,
+        operation_writing: Some("freeze".into()),
+        acknowledged: false,
+        terminal: None,
+        observed: None,
+        restored_lookup_only: false,
+    };
+    data.version = 2;
+    data.remote.as_mut().unwrap().landing = Some(landing.clone());
+    let pending_bytes = encode_capture_data(&data, limits).unwrap();
+    assert_eq!(
+        decode_data(&pending_bytes, data_digest(&pending_bytes), &limits).unwrap(),
+        data
+    );
+    data.version = 1;
+    assert!(
+        encode_capture_data(&data, limits).is_err(),
+        "v1 cannot silently carry a landing"
+    );
+    data.version = 2;
+    data.remote.as_mut().unwrap().landing = None;
+    assert!(
+        encode_capture_data(&data, limits).is_err(),
+        "v2 requires landing"
+    );
+    landing.operation_writing = None;
+    landing.fork_operation = Some(zero.clone());
+    landing.fork_acknowledged = true;
+    landing.job_id = Some("17".repeat(32));
+    let candidate = HistoricalLandingCandidate {
+        head: [24; 32],
+        root_tree: [25; 32],
+        rewrites: vec![HistoricalLandingRewrite {
+            old_commit: [19; 32],
+            new_commit: [24; 32],
+            change_id: [26; 16],
+        }],
+    };
+    for (name, phase, retained, with_receipt, terminal) in [
+        (
+            "prepared",
+            HistoricalLandingPhase::PreparedPendingChecks,
+            true,
+            false,
+            None,
+        ),
+        (
+            "committed_not_applied",
+            HistoricalLandingPhase::Committed,
+            false,
+            true,
+            None,
+        ),
+        (
+            "acknowledged_committed",
+            HistoricalLandingPhase::Committed,
+            false,
+            true,
+            None,
+        ),
+        (
+            "terminal_unavailable",
+            HistoricalLandingPhase::CheckUnavailable,
+            false,
+            false,
+            Some("check_unavailable"),
+        ),
+    ] {
+        let mut p = landing.clone();
+        p.candidate_head = Some("18".repeat(32));
+        p.result_roots = vec!["18".repeat(32)];
+        if terminal.is_some() {
+            p.candidate_head = None;
+            p.result_roots.clear();
+        }
+        p.terminal = terminal.map(str::to_owned);
+        p.observed = Some(HistoricalLandingJob {
+            job_id: [23; 32],
+            phase,
+            preparation: HistoricalLandingPreparation::ProfileConfigured,
+            roots_retained: retained,
+            expires_at_seconds: 12345,
+            profile_name: "checks".into(),
+            profile_version: "v1".into(),
+            candidate: Some(candidate.clone()),
+            receipt: with_receipt.then(|| HistoricalLandingReceipt {
+                reference: "main".into(),
+                generation: 2,
+                commit: [24; 32],
+                commit_size_bytes: 128,
+                object_format_version: m::FORMAT_VERSION,
+                rewrites: candidate.rewrites.clone(),
+                evidence: [27; 32],
+            }),
+            conflict_path: None,
+        });
+        if name == "acknowledged_committed" {
+            p.acknowledged = true;
+            p.apply_operation = Some(zero.clone());
+            p.candidate_head = None;
+            p.result_roots.clear();
+        }
+        data.remote.as_mut().unwrap().landing = Some(p);
+        let encoded = encode_capture_data(&data, limits).unwrap_or_else(|e| panic!("{name}: {e}"));
+        assert_eq!(
+            decode_data(&encoded, data_digest(&encoded), &limits).unwrap(),
+            data,
+            "{name}"
+        );
+    }
+    let mut forged = data.clone();
+    forged
+        .remote
+        .as_mut()
+        .unwrap()
+        .landing
+        .as_mut()
+        .unwrap()
+        .source_operation = "01".repeat(64);
+    assert!(
+        encode_capture_data(&forged, limits).is_err(),
+        "landing operations belong to captured inventory"
+    );
+    let mut forged = data.clone();
+    forged
+        .remote
+        .as_mut()
+        .unwrap()
+        .landing
+        .as_mut()
+        .unwrap()
+        .observed
+        .as_mut()
+        .unwrap()
+        .expires_at_seconds = 0;
+    assert!(
+        encode_capture_data(&forged, limits).is_err(),
+        "unknown legacy expiry stays None, never fabricated zero"
+    );
+    data = original;
+    assert_eq!(
+        encode_capture_data(&data, limits).unwrap(),
+        bytes,
+        "v1 canonical bytes unchanged"
+    );
     data.remote.as_mut().unwrap().archived_pushes[0].base_operation = "01".repeat(64);
     assert!(
         encode_capture_data(&data, limits).is_err(),

@@ -6835,6 +6835,32 @@ fn native_landing_recovery_edges_preserve_divergence_and_terminal_states() {
         );
         assert_eq!(evolution.lines().filter(|id| *id == candidate).count(), 1);
         assert_eq!(evolution.lines().filter(|id| *id == source).count(), 1);
+        let (_, saved) = remote_observation(&binding);
+        assert!(saved["landing"].get("candidate_head").is_none());
+        assert!(
+            saved["landing"]["result_roots"]
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            saved["landing"]["observed"]["receipt"].is_table(),
+            "historical committed receipt survives explicit claim classification"
+        );
+        let committed = upstream
+            .store
+            .landing_job("example", RemoteServer::landing_owner(), &key)
+            .unwrap()
+            .unwrap();
+        upstream
+            .store
+            .expire_landing(
+                "example",
+                RemoteServer::landing_owner(),
+                &key,
+                committed.expires_at,
+            )
+            .unwrap();
         let replay = landing_report(fixture, &root, &["tinytree", "land", "--resume"]);
         assert_eq!(replay["applied_operation"], exact);
         fixture.success(&base, &["tinytree", "unmount", root.to_str().unwrap()]);
@@ -6952,6 +6978,324 @@ fn native_landing_recovery_edges_preserve_divergence_and_terminal_states() {
         fixture.success(&base, &["tinytree", "unmount", conflict.to_str().unwrap()]);
         fixture.stop_daemon();
     }
+    // Security boundary: an untrusted restored journal may claim a raw apply
+    // write while the authenticated original job is only prepared. Status must
+    // remain pure lookup; resume must preserve rather than reconcile raw OPs.
+    {
+        let (upstream, mut fixture, base) = new_landing_fixture();
+        let (root, _source, _key, _candidate) =
+            prepare_native_landing(&mut fixture, &upstream, "restored-apply-uncertainty");
+        let binding = fixture.binding(&root);
+        let (_, mut saved) = remote_observation(&binding);
+        let path = binding.working_copy.join("native-remote.toml");
+        saved
+            .get_mut("landing")
+            .unwrap()
+            .as_table_mut()
+            .unwrap()
+            .insert("restored_lookup_only".into(), toml::Value::Boolean(true));
+        saved
+            .get_mut("landing")
+            .unwrap()
+            .as_table_mut()
+            .unwrap()
+            .insert(
+                "operation_writing".into(),
+                toml::Value::String("apply".into()),
+            );
+        fs::write(&path, toml::to_string(&saved).unwrap()).unwrap();
+        let before = fs::read(&path).unwrap();
+        let head = fixture.revision(&root, "@");
+        let public = upstream.public();
+        let report = landing_report(&mut fixture, &root, &["tinytree", "land", "--status"]);
+        assert_eq!(report["phase"], "prepared_pending_checks");
+        assert_eq!(
+            fs::read(&path).unwrap(),
+            before,
+            "lookup must not release the restored fence or reconcile an untrusted raw operation"
+        );
+        assert_eq!(fixture.revision(&root, "@"), head);
+        let rejected = fixture.run(&root, &["tinytree", "land", "--resume"]);
+        assert!(!rejected.status.success());
+        assert!(String::from_utf8_lossy(&rejected.stderr).contains("recovery_required"));
+        assert_eq!(fs::read(&path).unwrap(), before);
+        assert_eq!(fixture.revision(&root, "@"), head);
+        assert_eq!(upstream.public(), public);
+        fixture.success(&base, &["tinytree", "unmount", root.to_str().unwrap()]);
+        fixture.stop_daemon();
+    }
+    // A fresh canonical apply may crash after its raw OP write. It must not
+    // launder any captured orphan inventory into ordinary retry authority.
+    {
+        let (upstream, mut fixture, base) = new_landing_fixture();
+        let (root, _source, key, _candidate) =
+            prepare_native_landing(&mut fixture, &upstream, "restored-mid-apply");
+        let binding = fixture.binding(&root);
+        let (_, mut saved) = remote_observation(&binding);
+        let path = binding.working_copy.join("native-remote.toml");
+        saved
+            .get_mut("landing")
+            .unwrap()
+            .as_table_mut()
+            .unwrap()
+            .insert("restored_lookup_only".into(), toml::Value::Boolean(true));
+        fs::write(&path, toml::to_string(&saved).unwrap()).unwrap();
+        upstream.finish_fixture_landing(&key, true);
+        kill_landing_at(
+            &mut fixture,
+            &root,
+            &["tinytree", "land", "--resume"],
+            "apply_written",
+        );
+        let (before, saved) = remote_observation(&binding);
+        assert_eq!(
+            saved["landing"]["restored_lookup_only"].as_bool(),
+            Some(true)
+        );
+        assert_eq!(
+            saved["landing"]["operation_writing"].as_str(),
+            Some("apply")
+        );
+        let head = fixture.revision(&root, "@");
+        let public = upstream.public();
+        let rejected = fixture.run(&root, &["tinytree", "land", "--resume"]);
+        assert!(!rejected.status.success());
+        assert!(String::from_utf8_lossy(&rejected.stderr).contains("recovery_required"));
+        assert_eq!(fs::read(&path).unwrap(), before);
+        assert_eq!(fixture.revision(&root, "@"), head);
+        assert_eq!(upstream.public(), public);
+        let report = landing_report(&mut fixture, &root, &["tinytree", "land", "--status"]);
+        assert_eq!(report["phase"], "committed");
+        assert_eq!(
+            fs::read(&path).unwrap(),
+            before,
+            "status cannot recover a captured/fresh uncertain raw operation"
+        );
+        fixture.success(&base, &["tinytree", "unmount", root.to_str().unwrap()]);
+        fixture.stop_daemon();
+    }
+    // A different agent can advance main before submission and again after
+    // this candidate commits. Applying the historical receipt must preserve the
+    // newer fetched bookmark while retaining rewritten results through the exact
+    // apply operation, not demand that its head remain a direct VIEW reference.
+    for rewritten in [false, true] {
+        let (upstream, mut fixture, base) = new_landing_fixture();
+        let root = base.join("advanced-reference-apply");
+        fixture.clone_remote(&root);
+        let source_base = fixture.revision(&root, "main");
+        fs::write(
+            root.join("advanced-source.txt"),
+            b"private source with a newer target\n",
+        )
+        .unwrap();
+        fixture.success(&root, &["describe", "-m", "advanced target source"]);
+        let source = fixture.revision(&root, "@");
+        let hex = |bytes: &[u8]| bytes.iter().map(|b| format!("{b:02x}")).collect::<String>();
+        let advance = |label: &str| {
+            let current = upstream.public();
+            let descriptor = current.commit.unwrap();
+            let (_, bytes) = upstream
+                .store
+                .read_metadata("example", descriptor.key)
+                .unwrap();
+            let m::Object::Commit(mut commit) = m::decode(&bytes, Default::default()).unwrap()
+            else {
+                unreachable!()
+            };
+            commit.parents = vec![m::CommitId(descriptor.key.id.0)];
+            commit.predecessors.clear();
+            commit.change_id = m::ChangeId([if label == "before" { 88 } else { 89 }; 16]);
+            commit.description = format!("independent public advance {label}");
+            let encoded = m::encode(&m::Object::Commit(commit), Default::default()).unwrap();
+            upstream
+                .store
+                .put("example", encoded.descriptor, &encoded.bytes, 0)
+                .unwrap();
+            upstream
+                .store
+                .publish(
+                    "example",
+                    &tinytree_store::PublishRequest {
+                        idempotency_key: format!("independent-{label}"),
+                        reference_name: "main".into(),
+                        expected_generation: current.generation,
+                        new_commit: Some(m::CommitId(encoded.descriptor.key.id.0)),
+                        staging_leases: vec![],
+                    },
+                    std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap()
+                        .as_secs() as i64,
+                )
+                .unwrap();
+            hex(&encoded.descriptor.key.id.0)
+        };
+        if rewritten {
+            advance("before");
+            fixture.success(
+                &root,
+                &[
+                    "tinytree",
+                    "fetch",
+                    "--reference",
+                    "main",
+                    "--bookmark",
+                    "main",
+                ],
+            );
+        }
+        let land_args = [
+            "tinytree",
+            "land",
+            "--base",
+            &source_base,
+            "--revision",
+            &source,
+            "--reference",
+            "main",
+            "--bookmark",
+            "main",
+            "--profile",
+            "checks",
+            "--profile-version",
+            "v1",
+        ];
+        landing_report(&mut fixture, &root, &land_args);
+        if !rewritten {
+            // Explicit historical-committer compatibility fixture. First use the
+            // normal CLI staging workflow, terminalize that attempt, then stop a
+            // NEW native intent at its real durable freeze-write boundary. The
+            // trusted embedding accepts that exact original request with the
+            // canonical source's committer, deterministically preserving its ID.
+            // This is functional fixture check evidence, not a real Bazel run.
+            let deadline = Instant::now() + Duration::from_secs(10);
+            let initial = loop {
+                let report = landing_report(&mut fixture, &root, &["tinytree", "land", "--status"]);
+                if report["phase"] == "prepared_pending_checks" {
+                    break report;
+                }
+                assert!(Instant::now() < deadline, "{report}");
+                std::thread::sleep(Duration::from_millis(10));
+            };
+            upstream.finish_fixture_landing(initial["request_id"].as_str().unwrap(), false);
+            landing_report(&mut fixture, &root, &["tinytree", "land", "--resume"]);
+            fixture.success(&root, &["edit", &source]);
+            kill_landing_at(&fixture, &root, &land_args, "freeze_written");
+            let (_, saved) = remote_observation(&fixture.binding(&root));
+            let pending = &saved["landing"];
+            let decode =
+                |text: &str| m::CommitId(*blake3::Hash::from_hex(text).unwrap().as_bytes());
+            let source_id = decode(pending["source_head"].as_str().unwrap());
+            let (_, bytes) = upstream
+                .store
+                .read_metadata(
+                    "example",
+                    m::ObjectKey {
+                        kind: m::Kind::Commit,
+                        id: m::ObjectId(source_id.0),
+                    },
+                )
+                .unwrap();
+            let m::Object::Commit(source_commit) = m::decode(&bytes, Default::default()).unwrap()
+            else {
+                unreachable!()
+            };
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs() as i64;
+            let request = tinytree_store::LandingRequest {
+                idempotency_key: pending["request_id"].as_str().unwrap().into(),
+                source_base: decode(pending["source_base"].as_str().unwrap()),
+                source_head: source_id,
+                reference_name: pending["reference"].as_str().unwrap().into(),
+                expected_generation: pending["generation"].as_integer().unwrap() as u64,
+                expected_head: decode(pending["expected_head"].as_str().unwrap()),
+                committer: source_commit.committer,
+                check_profile: tinytree_store::LandingCheckProfile {
+                    name: pending["profile_name"].as_str().unwrap().into(),
+                    version: pending["profile_version"].as_str().unwrap().into(),
+                },
+                expires_at: now + 3600,
+            };
+            upstream
+                .store
+                .begin_landing("example", RemoteServer::landing_owner(), &request, now)
+                .unwrap();
+        }
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let prepared = loop {
+            let report = landing_report(&mut fixture, &root, &["tinytree", "land", "--status"]);
+            if report["phase"] == "prepared_pending_checks" {
+                break report;
+            }
+            assert!(Instant::now() < deadline, "{report}");
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        let key = prepared["request_id"].as_str().unwrap();
+        let candidate = prepared["candidate"].as_str().unwrap().to_owned();
+        assert_eq!(candidate != source, rewritten);
+        upstream.finish_fixture_landing(key, true);
+        let newest = advance("after");
+        fixture.success(
+            &root,
+            &[
+                "tinytree",
+                "fetch",
+                "--reference",
+                "main",
+                "--bookmark",
+                "main",
+            ],
+        );
+        if rewritten {
+            // Existing canonical divergence protection treats the newly fetched
+            // tested rewrite as another visible incarnation. This fixture keeps
+            // that unsupported path explicit; retention bookkeeping must never
+            // weaken it or overwrite work to make the case succeed.
+            let status = landing_report(&mut fixture, &root, &["tinytree", "land", "--status"]);
+            assert_eq!(status["phase"], "committed");
+            let current = fixture.revision(&root, "@");
+            let binding = fixture.binding(&root);
+            let (saved_before, claims_before) = remote_observation(&binding);
+            let heads = native_operation_heads(&binding);
+            let rejected = fixture.run(&root, &["tinytree", "land", "--resume"]);
+            assert!(!rejected.status.success());
+            assert!(
+                String::from_utf8_lossy(&rejected.stderr)
+                    .contains("submitted source was amended or diverged")
+            );
+            assert_eq!(fixture.revision(&root, "@"), current);
+            assert_eq!(fixture.revision(&root, "main"), newest);
+            assert_eq!(remote_observation(&binding).0, saved_before);
+            assert_eq!(native_operation_heads(&binding), heads);
+            assert!(
+                !claims_before["landing"]["result_roots"]
+                    .as_array()
+                    .unwrap()
+                    .is_empty()
+            );
+            assert_eq!(
+                fs::read(root.join("advanced-source.txt")).unwrap(),
+                b"private source with a newer target\n"
+            );
+        } else {
+            let applied = landing_report(&mut fixture, &root, &["tinytree", "land", "--resume"]);
+            assert_eq!(applied["acknowledged"], true);
+            assert_eq!(fixture.revision(&root, "main"), newest);
+            assert_eq!(fixture.revision(&root, "@-"), candidate);
+            let (_, saved) = remote_observation(&fixture.binding(&root));
+            assert!(
+                saved["landing"]["result_roots"]
+                    .as_array()
+                    .unwrap()
+                    .is_empty()
+            );
+            assert!(saved["landing"]["observed"]["receipt"].is_table());
+        }
+        fixture.success(&base, &["tinytree", "unmount", root.to_str().unwrap()]);
+        fixture.stop_daemon();
+    }
     // Failed and stale server checks never create a local apply operation.
     for stale in [false, true] {
         let (upstream, mut owner, base) = new_landing_fixture();
@@ -7002,6 +7346,29 @@ fn native_landing_recovery_edges_preserve_divergence_and_terminal_states() {
         assert!(report["applied_operation"].is_null());
         assert_eq!(fixture.revision(&root, "@"), head);
         assert_eq!(upstream.public().commit, before.commit);
+        let (_, saved) = remote_observation(&fixture.binding(&root));
+        assert!(
+            saved["landing"].get("candidate_head").is_none(),
+            "fresh nonapplicable terminal result retires only its current candidate claim"
+        );
+        assert!(
+            saved["landing"]["result_roots"]
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            saved["landing"]["observed"]["phase"].as_str(),
+            Some(if stale {
+                "stale_target"
+            } else {
+                "check_failed"
+            })
+        );
+        assert!(
+            saved["landing"]["observed"]["candidate"].is_table(),
+            "historical candidate remains portable"
+        );
         fixture.success(&base, &["tinytree", "unmount", root.to_str().unwrap()]);
         fixture.stop_daemon();
     }

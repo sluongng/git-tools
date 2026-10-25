@@ -9,6 +9,8 @@ pub enum CapabilityFeature {
     Blame = 3,
     CapturedIndexedCloudRead = 4,
     CapturedIndexedCloudWrite = 5,
+    LandingRecoveryCloudRead = 6,
+    LandingRecoveryCloudWrite = 7,
 }
 impl CapabilityFeature {
     pub const ALL: [Self; 5] = [
@@ -45,7 +47,7 @@ impl NativeClient {
         features: &[CapabilityFeature],
     ) -> Result<Capabilities, Status> {
         if features.is_empty()
-            || features.len() > 5
+            || features.len() > 7
             || features.windows(2).any(|pair| pair[0] >= pair[1])
         {
             return Err(Status::invalid_argument(

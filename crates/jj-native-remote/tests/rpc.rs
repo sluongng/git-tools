@@ -409,6 +409,7 @@ impl Server {
                 Ok(request)
             },
         );
+        let landing = service.landing_grpc_service();
         let listener = tokio::net::TcpListener::bind(bind).await.unwrap();
         let address = listener.local_addr().unwrap();
         let (stop, stopped) = tokio::sync::oneshot::channel();
@@ -429,6 +430,7 @@ impl Server {
                 )
                 .add_service(query)
                 .add_service(cloud)
+                .add_service(landing)
                 .serve_with_incoming_shutdown(
                     tokio_stream::wrappers::TcpListenerStream::new(listener).map(|accepted| {
                         accepted.and_then(|stream| {
@@ -8961,6 +8963,206 @@ async fn capture_frontier_stays_fixed_across_public_history_and_preserves_merge_
         repo.wait_for_idle().await;
         server.stop().await;
     }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn landing_capture_reads_only_exact_candidate_commits_and_expired_cached_claims_stay_pending()
+{
+    let hex = |bytes: &[u8]| bytes.iter().map(|b| format!("{b:02x}")).collect::<String>();
+    use tinytree_store::{LandingCheckProfile, LandingOwner, LandingRequest};
+    let (_serverdir, store, fixture, base) = seed();
+    let raw = fixture
+        .objects()
+        .iter()
+        .find(|o| o.descriptor.key.id.0 == base.0)
+        .unwrap();
+    let m::Object::Commit(template) = m::decode(&raw.bytes, Default::default()).unwrap() else {
+        unreachable!()
+    };
+    let put = |object: m::Object| {
+        let value = m::encode(&object, Default::default()).unwrap();
+        store
+            .put("example", value.descriptor, &value.bytes, 0)
+            .unwrap();
+        value
+    };
+    let mut first = template.clone();
+    first.parents = vec![base];
+    first.change_id = m::ChangeId([41; 16]);
+    first.description = "first private source".into();
+    let first = put(m::Object::Commit(first));
+    let mut second = template.clone();
+    second.parents = vec![m::CommitId(first.descriptor.key.id.0)];
+    second.change_id = m::ChangeId([42; 16]);
+    second.description = "second private source".into();
+    let second = put(m::Object::Commit(second));
+    let mut target = template.clone();
+    target.parents = vec![base];
+    target.change_id = m::ChangeId([43; 16]);
+    target.description = "independent public target".into();
+    let target = put(m::Object::Commit(target));
+    store
+        .publish(
+            "example",
+            &tinytree_store::PublishRequest {
+                idempotency_key: "landing-capture-target".into(),
+                reference_name: "main".into(),
+                expected_generation: 1,
+                new_commit: Some(m::CommitId(target.descriptor.key.id.0)),
+                staging_leases: vec![],
+            },
+            1,
+        )
+        .unwrap();
+    // The production service's documented stable principal domains select the
+    // owner. No caller-supplied owner is sent on the actual lookup RPC below.
+    let mut principal = blake3::Hasher::new();
+    principal.update(b"tinytree-retention-owner-v1\0");
+    principal.update(&4u64.to_be_bytes());
+    principal.update(b"test");
+    let mut owner = blake3::Hasher::new();
+    owner.update(b"tinytree-landing-owner-v1\0");
+    owner.update(&[1]);
+    owner.update(principal.finalize().as_bytes());
+    let owner = LandingOwner(*owner.finalize().as_bytes());
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+    let request = LandingRequest {
+        idempotency_key: "12".repeat(16),
+        source_base: base,
+        source_head: m::CommitId(second.descriptor.key.id.0),
+        reference_name: "main".into(),
+        expected_generation: 2,
+        expected_head: m::CommitId(target.descriptor.key.id.0),
+        committer: template.committer.clone(),
+        check_profile: LandingCheckProfile {
+            name: "checks".into(),
+            version: "v1".into(),
+        },
+        expires_at: now + 3600,
+    };
+    store
+        .begin_landing("example", owner, &request, now)
+        .unwrap();
+    let job = store
+        .prepare_landing("example", owner, &request.idempotency_key, now)
+        .unwrap();
+    let candidate = job.candidate.unwrap();
+    assert_eq!(candidate.rewrites.len(), 2);
+    let counts = Counters::new();
+    let server = Server::start(store.clone(), counts.clone()).await;
+    let directory = private_dir();
+    let (direct, repo) = local(
+        directory.path(),
+        cache(directory.path()),
+        config(&server),
+        true,
+    );
+    let mut result_roots = std::iter::once(hex(&candidate.head.0))
+        .chain(candidate.rewrites.iter().map(|r| hex(&r.new.0)))
+        .collect::<Vec<_>>();
+    result_roots.sort();
+    result_roots.dedup();
+    let intent = tinytree_cloud::PortableLanding {
+        request_id: request.idempotency_key.clone(),
+        source_base: hex(&base.0),
+        source_head: hex(&second.descriptor.key.id.0),
+        reference: "main".into(),
+        bookmark: "main".into(),
+        generation: 2,
+        expected_head: hex(&target.descriptor.key.id.0),
+        profile_name: "checks".into(),
+        profile_version: "v1".into(),
+        source_operation: "00".repeat(64),
+        source_stack: vec![
+            hex(&first.descriptor.key.id.0),
+            hex(&second.descriptor.key.id.0),
+        ],
+        fork_operation: Some("00".repeat(64)),
+        fork_acknowledged: true,
+        job_id: Some(hex(&job.id)),
+        result_roots: result_roots.clone(),
+        candidate_head: Some(hex(&candidate.head.0)),
+        apply_operation: None,
+        operation_writing: None,
+        acknowledged: false,
+        terminal: None,
+        observed: None,
+        restored_lookup_only: false,
+    };
+    let roots = result_roots
+        .iter()
+        .map(|id| m::ObjectKey {
+            kind: m::Kind::Commit,
+            id: m::ObjectId(std::array::from_fn(|n| {
+                u8::from_str_radix(&id[n * 2..n * 2 + 2], 16).unwrap()
+            })),
+        })
+        .collect::<Vec<_>>();
+    let before = counts.metadata_keys.load(Ordering::SeqCst);
+    let holds = counts.holds.load(Ordering::SeqCst);
+    let observations = counts.reference_observations.load(Ordering::SeqCst);
+    repo.control
+        .transfer_native_capture_frontier_with_landing(
+            roots.clone(),
+            Some(intent.clone()),
+            Arc::new(()),
+            Default::default(),
+            tokio::time::Instant::now() + Duration::from_secs(10),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        counts.metadata_keys.load(Ordering::SeqCst) - before,
+        result_roots.len(),
+        "only explicit candidate/rewrite COMMIT bodies are read"
+    );
+    assert_eq!(counts.files.load(Ordering::SeqCst), 0);
+    assert_eq!(counts.holds.load(Ordering::SeqCst), holds);
+    assert_eq!(
+        counts.reference_observations.load(Ordering::SeqCst),
+        observations
+    );
+    for key in &roots {
+        assert!(
+            direct.descriptor(*key).await.unwrap().is_some(),
+            "canonical candidate metadata is cached privately"
+        );
+    }
+    store
+        .expire_landing("example", owner, &request.idempotency_key, now + 3600)
+        .unwrap();
+    let before = counts.metadata_keys.load(Ordering::SeqCst);
+    let error = repo
+        .control
+        .transfer_native_capture_frontier_with_landing(
+            roots,
+            Some(intent.clone()),
+            Arc::new(()),
+            Default::default(),
+            tokio::time::Instant::now() + Duration::from_secs(10),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(
+        error.downcast_ref::<Status>().unwrap().code(),
+        tonic::Code::FailedPrecondition
+    );
+    assert_eq!(
+        counts.metadata_keys.load(Ordering::SeqCst),
+        before,
+        "unretained cached candidate does not enter normal frontier fallback"
+    );
+    assert_eq!(counts.files.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        intent.result_roots, result_roots,
+        "backup never clears persisted claims"
+    );
+    assert_eq!(counts.holds.load(Ordering::SeqCst), holds);
+    repo.wait_for_idle().await;
+    server.stop().await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

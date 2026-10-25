@@ -252,6 +252,22 @@ fn remote_intents(
             }
         }
     }
+    if let Some(landing) = data.remote.as_ref().and_then(|r| r.landing.as_ref()) {
+        for head in landing.retained_commit_heads() {
+            budget.work(1)?;
+            let id = hex::<32>(head)?;
+            if id == [0; 32] {
+                return Err(invalid("intrinsic landing recovery root"));
+            }
+            if !roots.contains(&id) {
+                if roots.len() >= maximum {
+                    return Err(limit());
+                }
+                budget.bytes(128)?;
+                roots.insert(id);
+            }
+        }
+    }
     if roots.is_empty() {
         return Ok(Vec::new());
     }
@@ -549,6 +565,10 @@ pub struct VerifiedCaptureManifest<'a> {
     _artifacts: &'a [c::VerifiedIndexArtifact],
 }
 impl VerifiedCaptureManifest<'_> {
+    pub fn capture_data_version(&self) -> u32 {
+        self.data.version
+    }
+
     pub fn manifest(&self) -> &ManifestV3 {
         self.manifest
     }
@@ -748,6 +768,98 @@ pub fn verify_capture_export_binding<'a>(
                 .all(|(actual, text)| hex::<64>(text).is_ok_and(|id| actual.as_bytes() == id))
         {
             return Err(invalid("capture actual view or ordered parents mismatch"));
+        }
+    }
+    if let Some(landing) = data.remote.as_ref().and_then(|r| r.landing.as_ref()) {
+        // Capsule fields are historical data; these checks bind their local
+        // recovery claims to the independently decoded immutable OP inventory.
+        for (operation, phase) in [
+            (landing.fork_operation.as_deref(), "freeze"),
+            (landing.apply_operation.as_deref(), "apply"),
+        ] {
+            if let Some(id) = operation {
+                if phase == "freeze" && id == landing.source_operation {
+                    continue;
+                }
+                let op = operations
+                    .get(&hex::<64>(id)?)
+                    .ok_or_else(|| invalid("landing tagged operation absent"))?;
+                budget.work(
+                    op.metadata
+                        .attributes
+                        .len()
+                        .checked_add(4)
+                        .ok_or_else(limit)?,
+                )?;
+                let attrs = &op.metadata.attributes;
+                for (key, value) in [
+                    ("request", landing.request_id.as_str()),
+                    ("phase", phase),
+                    ("source", landing.source_head.as_str()),
+                    ("source_operation", landing.source_operation.as_str()),
+                ] {
+                    if attrs
+                        .get(&format!("tinytree.landing.{key}"))
+                        .map(String::as_str)
+                        != Some(value)
+                    {
+                        return Err(invalid("landing operation tag mismatch"));
+                    }
+                }
+                if phase == "apply" {
+                    let candidate = landing
+                        .retention_candidate_head()
+                        .ok_or_else(|| invalid("landing apply candidate binding absent"))?;
+                    if attrs.get("tinytree.landing.job") != landing.job_id.as_ref()
+                        || attrs.get("tinytree.landing.candidate") != Some(&candidate)
+                    {
+                        return Err(invalid("landing apply operation identity mismatch"));
+                    }
+                    if landing.acknowledged {
+                        let view_id: [u8; 64] = op
+                            .view_id
+                            .as_bytes()
+                            .try_into()
+                            .map_err(|_| invalid("landing apply view width"))?;
+                        budget.work(objects.len().checked_mul(2).ok_or_else(limit)?)?;
+                        let view = objects
+                            .iter()
+                            .find(|o| o.id() == c::ObjectId::View(view_id))
+                            .ok_or_else(|| invalid("acknowledged landing selected view absent"))?;
+                        budget.work(
+                            view.dependencies()
+                                .native_commits
+                                .len()
+                                .checked_add(1)
+                                .ok_or_else(limit)?,
+                        )?;
+                        let selected_op_id = hex::<64>(id)?;
+                        let selected_op = objects
+                            .iter()
+                            .find(|o| o.id() == c::ObjectId::Operation(selected_op_id))
+                            .ok_or_else(|| {
+                                invalid("acknowledged landing selected operation absent")
+                            })?;
+                        budget.work(
+                            selected_op
+                                .dependencies()
+                                .native_commits
+                                .len()
+                                .checked_add(1)
+                                .ok_or_else(limit)?,
+                        )?;
+                        let head = hex::<32>(&candidate)?;
+                        if candidate != landing.source_head
+                            && !view.dependencies().native_commits.contains(&head)
+                            && !selected_op.dependencies().native_commits.contains(&head)
+                        {
+                            return Err(invalid(
+                                "acknowledged landing operation/view does not retain candidate",
+                            ));
+                        }
+                    }
+                }
+            }
         }
     }
     if recovery.working_copy.snapshot_operation == [0; 64] {
@@ -1270,6 +1382,7 @@ mod tests {
                 })
                 .collect(),
             remote: remote.then(|| c::PortableRemoteState {
+                landing: None,
                 observations: vec![c::RemoteObservation {
                     reference: "refs/heads/main".into(),
                     bookmark: "main".into(),

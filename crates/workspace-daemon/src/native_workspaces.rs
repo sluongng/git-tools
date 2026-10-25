@@ -1662,6 +1662,10 @@ impl Manager {
                     intent,
                     restore,
                     native_workspace_admin::restore::RestoreHost {
+                        remote_scope: native_workspace_admin::remote_state::RemoteScope::new(
+                            self.config.state_dir.join("rbe.sock"),
+                            binding.repository.clone(),
+                        )?,
                         settings: restore_settings()?,
                         signer: jj_lib::signing::Signer::new(None, vec![]),
                         connector: controller.clone(),
@@ -1676,6 +1680,10 @@ impl Manager {
                     binding.clone(),
                     restore,
                     native_workspace_admin::restore::RestoreReadbackHost {
+                        remote_scope: native_workspace_admin::remote_state::RemoteScope::new(
+                            self.config.state_dir.join("rbe.sock"),
+                            binding.repository.clone(),
+                        )?,
                         settings: restore_settings()?,
                         connector: controller.clone(),
                         backend_config: Default::default(),
@@ -1695,6 +1703,10 @@ impl Manager {
             let ready = native_workspace_admin::restore::finalize_staged_restore(
                 receipt,
                 native_workspace_admin::restore::RestoreReadbackHost {
+                    remote_scope: native_workspace_admin::remote_state::RemoteScope::new(
+                        self.config.state_dir.join("rbe.sock"),
+                        binding.repository.clone(),
+                    )?,
                     settings: restore_settings()?,
                     connector: controller.clone(),
                     backend_config: Default::default(),

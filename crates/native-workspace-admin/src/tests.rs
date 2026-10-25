@@ -1996,7 +1996,16 @@ async fn fresh_restore_stages_original_plural_operations_and_wc_without_publishi
             kind: m::Kind::Tree as u8,
             id: fixture.connector.projected.tree.terms[0],
         }],
-        remote: None,
+        remote: Some(c::PortableRemoteState {
+            observations: vec![c::RemoteObservation {
+                reference: "main".into(),
+                bookmark: "main".into(),
+                generation: 0,
+                head: None,
+            }],
+            archived_pushes: vec![],
+            landing: None,
+        }),
     };
     let capsule = c::encode_capture_data(&data, Default::default()).unwrap();
     let prepared_manifest = c::prepare_capture_manifest(
@@ -2192,6 +2201,11 @@ async fn fresh_restore_stages_original_plural_operations_and_wc_without_publishi
     let (entered, waiting) = tokio::sync::oneshot::channel();
     let entered = std::sync::Mutex::new(Some(entered));
     let host = restore::RestoreHost {
+        remote_scope: remote_state::RemoteScope::new(
+            PathBuf::from("/private/broker.sock"),
+            fixture.binding.repository.clone(),
+        )
+        .unwrap(),
         settings: fixture.settings.clone(),
         signer: Signer::new(None, vec![]),
         connector: fixture.connector.clone(),
@@ -2274,6 +2288,11 @@ async fn fresh_restore_stages_original_plural_operations_and_wc_without_publishi
         fixture.binding.clone(),
         prepared,
         restore::RestoreReadbackHost {
+            remote_scope: remote_state::RemoteScope::new(
+                PathBuf::from("/private/broker.sock"),
+                fixture.binding.repository.clone(),
+            )
+            .unwrap(),
             settings: fixture.settings.clone(),
             connector: fixture.connector.clone(),
             backend_config: Default::default(),
@@ -2286,6 +2305,16 @@ async fn fresh_restore_stages_original_plural_operations_and_wc_without_publishi
         objects_io.owned_reads.load(Ordering::SeqCst) > 0,
         "actual Backend attachment must use owned physical I/O"
     );
+    let sidecar_path = fixture.binding.working_copy.join("native-remote.toml");
+    let sidecar = fs::read(&sidecar_path).unwrap();
+    let destination_scope = remote_state::RemoteScope::new(
+        PathBuf::from("/private/broker.sock"),
+        fixture.binding.repository.clone(),
+    )
+    .unwrap();
+    let recovered_remote = remote_state::decode(&sidecar, &destination_scope).unwrap();
+    assert_eq!(recovered_remote.observations.len(), 1);
+    assert_eq!(recovered_remote.observations[0].reference, "main");
     assert_eq!(receipt.wc_operation.as_slice(), wc_operation.as_bytes());
     assert_eq!(
         receipt.snapshot_operation.as_slice(),
@@ -2339,6 +2368,11 @@ async fn fresh_restore_stages_original_plural_operations_and_wc_without_publishi
     // Caller-editable diagnostic fields are never publication authority.
     receipt.wc_operation[0] ^= 1;
     let readback_host = || restore::RestoreReadbackHost {
+        remote_scope: remote_state::RemoteScope::new(
+            PathBuf::from("/private/broker.sock"),
+            fixture.binding.repository.clone(),
+        )
+        .unwrap(),
         settings: fixture.settings.clone(),
         connector: fixture.connector.clone(),
         backend_config: Default::default(),
@@ -2567,6 +2601,8 @@ fn landing_intent_fences_legacy_readers_and_retains_frozen_and_unpublished_roots
     assert!(ordinary.contains("version = 1"));
     assert!(!ordinary.contains("landing"));
     let intent = LandingPending {
+        observed: None,
+        restored_lookup_only: false,
         request_id: "12".repeat(16),
         source_base: "00".repeat(32),
         source_head: "13".repeat(32),
@@ -2590,7 +2626,14 @@ fn landing_intent_fences_legacy_readers_and_retains_frozen_and_unpublished_roots
     };
     state.begin_landing(intent.clone()).unwrap();
     let encoded = toml::to_string(&state).unwrap();
-    assert!(encoded.contains("version = 2"));
+    assert!(encoded.contains("version = 3"));
+    assert!(
+        remote_state::decode(
+            encoded.replace("version = 3", "version = 2").as_bytes(),
+            &scope
+        )
+        .is_ok()
+    );
     let decoded = remote_state::decode(encoded.as_bytes(), &scope).unwrap();
     assert_eq!(
         decoded.retained_operations().collect::<Vec<_>>(),
@@ -2613,7 +2656,7 @@ fn landing_intent_fences_legacy_readers_and_retains_frozen_and_unpublished_roots
     );
     assert!(
         remote_state::decode(
-            encoded.replace("version = 2", "version = 1").as_bytes(),
+            encoded.replace("version = 3", "version = 1").as_bytes(),
             &scope
         )
         .is_err()
@@ -2621,6 +2664,24 @@ fn landing_intent_fences_legacy_readers_and_retains_frozen_and_unpublished_roots
     assert!(
         state.begin_landing(intent.clone()).is_err(),
         "uncertain intent cannot be replaced"
+    );
+    let portable = tinytree_cloud::PortableRemoteState {
+        observations: vec![],
+        archived_pushes: vec![],
+        landing: Some(intent.clone()),
+    };
+    let destination =
+        RemoteScope::new(PathBuf::from("/another/broker.sock"), "example".into()).unwrap();
+    let restored = State::from_portable(&destination, &portable).unwrap();
+    assert!(restored.landing.as_ref().unwrap().restored_lookup_only);
+    assert_eq!(
+        restored.landing.as_ref().unwrap().request_id,
+        intent.request_id
+    );
+    assert_eq!(restored.landing.as_ref().unwrap().job_id, intent.job_id);
+    assert!(
+        remote_state::decode(toml::to_string(&restored).unwrap().as_bytes(), &scope).is_err(),
+        "restored sidecar binds current destination, not source socket"
     );
     let mut duplicate = intent.clone();
     duplicate.source_stack.push(duplicate.source_head.clone());

@@ -151,6 +151,31 @@ impl RemoteRepositoryControl {
         Ok(resources)
     }
 
+    /// Capture with a portable landing has a sequential lookup/import phase.
+    /// Its independent codec pool overlaps the ordinary exact-metadata pool and
+    /// one private encode/put, but drops before catalog/graph allocation. Charge
+    /// that phase explicitly rather than adding it to unrelated graph peaks.
+    pub fn native_landing_capture_resources(
+        &self,
+        source: &dyn NativeObjectIo,
+        limits: &NativeTransferLimits,
+    ) -> Result<ControlResources> {
+        let mut resources = self.native_transfer_resources(source, limits)?;
+        let remote = &self.inner.config.remote.limits;
+        let landing = 256u64
+            .checked_mul(1024 * 1024)
+            .and_then(|n| n.checked_add(remote.max_buffered_bytes as u64))
+            .and_then(|n| n.checked_add((remote.max_metadata_bytes as u64).checked_mul(8)?))
+            .and_then(|n| n.checked_add(tinytree_cloud::PortableLanding::MAX_WORKING_BYTES as u64))
+            .and_then(|n| n.checked_add((limits.max_roots as u64).checked_mul(256)?))
+            .ok_or_else(limit)?;
+        resources.memory_bytes = resources.memory_bytes.max(landing);
+        if resources.memory_bytes > limits.max_memory_bytes {
+            return Err(limit());
+        }
+        Ok(resources)
+    }
+
     /// Stage a bounded multi-root closure using ONLY the actual source's read
     /// authority. The transfer itself creates no target holds, references,
     /// KnownReference records or read grants. Source I/O may hydrate/cache objects
@@ -227,6 +252,30 @@ impl RemoteRepositoryControl {
         limits: NativeTransferLimits,
         originaldeadline: tokio::time::Instant,
     ) -> Result<NativeTransferReceipt> {
+        self.transfer_native_capture_frontier_with_landing(
+            roots,
+            None,
+            owner,
+            limits,
+            originaldeadline,
+        )
+        .await
+    }
+
+    /// The supplied intent is immutable capsule data, not authenticated job or
+    /// retention authority. Exact lookup and canonical reads occur only inside
+    /// the independently owned background transfer below.
+    pub async fn transfer_native_capture_frontier_with_landing(
+        &self,
+        roots: Vec<m::ObjectKey>,
+        landing: Option<tinytree_cloud::PortableLanding>,
+        owner: Owner,
+        limits: NativeTransferLimits,
+        originaldeadline: tokio::time::Instant,
+    ) -> Result<NativeTransferReceipt> {
+        if let Some(intent) = &landing {
+            intent.validate()?;
+        }
         let deadline = io::bounded_deadline(originaldeadline);
         let source: Arc<dyn NativeObjectIo> = self.inner.local.clone();
         // Exact nonresident TREE/SYMLINK reads use the provider's bounded SDK
@@ -235,7 +284,12 @@ impl RemoteRepositoryControl {
         let read_profile = crate::RemoteObjectIo {
             inner: self.inner.clone(),
         };
-        self.native_transfer_resources(&read_profile, &limits)?;
+        if landing.is_some() {
+            self.native_landing_capture_resources(&read_profile, &limits)?;
+        } else {
+            self.native_transfer_resources(&read_profile, &limits)?;
+        }
+
         if roots.is_empty() || roots.len() > limits.max_roots {
             return Err(limit());
         }
@@ -266,7 +320,13 @@ impl RemoteRepositoryControl {
                 tokio::time::timeout_at(deadline, async {
                     let physical: Owner = scope.clone();
                     let boundaries = control
-                        .capture_boundaries(&roots, physical.clone(), &limits, deadline)
+                        .capture_boundaries(
+                            &roots,
+                            landing.as_ref(),
+                            physical.clone(),
+                            &limits,
+                            deadline,
+                        )
                         .await?;
                     let closure =
                         capture_frontier::collect(&control, roots, &boundaries, &limits, physical)

@@ -58,123 +58,9 @@ pub struct Pending {
     pub base_operation: String,
     pub confirmed_generation: Option<u64>,
 }
-/// Durable original intent. This is a local recovery journal, never a client
-/// verdict or permission to finalize the server job. IDs remain protected until
-/// exact operation publication and native checkout acknowledgement are durable.
-#[derive(Clone, Serialize, Deserialize, Debug, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
-pub struct LandingPending {
-    pub request_id: String,
-    pub source_base: String,
-    pub source_head: String,
-    pub reference: String,
-    pub bookmark: String,
-    pub generation: u64,
-    pub expected_head: String,
-    pub profile_name: String,
-    pub profile_version: String,
-    pub source_operation: String,
-    /// Oldest first; source_head is last. Never reconstructed from a moving @.
-    pub source_stack: Vec<String>,
-    pub fork_operation: Option<String>,
-    pub fork_acknowledged: bool,
-    pub job_id: Option<String>,
-    /// Canonical admitted candidate/evolution roots, populated after Get.
-    #[serde(default)]
-    pub result_roots: Vec<String>,
-    pub candidate_head: Option<String>,
-    pub apply_operation: Option<String>,
-    pub operation_writing: Option<String>,
-    pub acknowledged: bool,
-    pub terminal: Option<String>,
-}
-impl LandingPending {
-    fn validate(&self) -> io::Result<()> {
-        validate_names(&self.reference, &self.bookmark)?;
-        let nonroot = |id: &str| valid_hex(id, 64) && id.bytes().any(|b| b != b'0');
-        let operation = |id: &str| valid_hex(id, 128);
-        let mut stack = std::collections::HashSet::new();
-        if !valid_hex(&self.request_id, 32)
-            || !valid_hex(&self.source_base, 64)
-            || !nonroot(&self.source_head)
-            || !nonroot(&self.expected_head)
-            || self.generation == 0
-            || self.generation == u64::MAX
-            || self.profile_name.is_empty()
-            || self.profile_name.len() > 64
-            || !self
-                .profile_name
-                .bytes()
-                .all(|b| b.is_ascii_alphanumeric() || b"-_".contains(&b))
-            || self.profile_version.is_empty()
-            || self.profile_version.len() > 128
-            || self.profile_version.contains('\0')
-            || !operation(&self.source_operation)
-            || self.source_stack.is_empty()
-            || self.source_stack.len() > 128
-            || self.source_stack.last() != Some(&self.source_head)
-            || self
-                .source_stack
-                .iter()
-                .any(|id| !nonroot(id) || !stack.insert(id))
-            || stack.contains(&self.source_base)
-            || (self.fork_acknowledged && self.fork_operation.is_none())
-            || self
-                .fork_operation
-                .as_deref()
-                .is_some_and(|id| !operation(id))
-            || self
-                .apply_operation
-                .as_deref()
-                .is_some_and(|id| !operation(id))
-            || self.job_id.as_deref().is_some_and(|id| !nonroot(id))
-            || self
-                .candidate_head
-                .as_deref()
-                .is_some_and(|id| !nonroot(id))
-            || self.result_roots.len() > 256
-            || self.result_roots.iter().any(|id| !nonroot(id))
-            || (self.job_id.is_some() && !self.fork_acknowledged)
-            || (self.candidate_head.is_some()
-                && (self.job_id.is_none()
-                    || !self
-                        .result_roots
-                        .iter()
-                        .any(|id| Some(id) == self.candidate_head.as_ref())))
-            || (!self.result_roots.is_empty() && self.candidate_head.is_none())
-            || (self.apply_operation.is_some()
-                && (self.job_id.is_none() || self.candidate_head.is_none()))
-            || (self.terminal.is_some() && (self.job_id.is_none() || self.acknowledged))
-            || self
-                .operation_writing
-                .as_deref()
-                .is_some_and(|phase| match phase {
-                    "freeze" => self.fork_operation.is_some(),
-                    "apply" => {
-                        self.apply_operation.is_some()
-                            || self.job_id.is_none()
-                            || self.candidate_head.is_none()
-                    }
-                    _ => true,
-                })
-            || (self.acknowledged && self.apply_operation.is_none())
-            || self.terminal.as_deref().is_some_and(|s| {
-                !matches!(
-                    s,
-                    "conflict"
-                        | "unsupported"
-                        | "check_failed"
-                        | "check_unavailable"
-                        | "stale_target"
-                        | "expired"
-                )
-            })
-        {
-            return Err(io::Error::other("invalid native landing recovery intent"));
-        }
-        Ok(())
-    }
-}
+pub use tinytree_cloud::{
+    HistoricalLandingJob, HistoricalLandingPhase, PortableLanding as LandingPending,
+};
 
 #[derive(Serialize, Deserialize, Debug, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
@@ -202,8 +88,13 @@ impl State {
         }
     }
     pub fn validate(&self, locator: &RemoteScope) -> io::Result<()> {
-        if !matches!(self.version, VERSION | 2)
-            || (self.landing.is_some() && self.version != 2)
+        if !matches!(self.version, VERSION | 2 | 3)
+            || (self.landing.is_some() && !matches!(self.version, 2 | 3))
+            || (self.version == 2
+                && self
+                    .landing
+                    .as_ref()
+                    .is_some_and(|p| p.observed.is_some() || p.restored_lookup_only))
             || self.socket != locator.socket
             || self.store != locator.store
             || self.observations.len() > MAX_REFERENCES
@@ -280,9 +171,59 @@ impl State {
                 "another native intent requires reconciliation",
             ));
         }
-        self.version = 2;
+        self.version = 3;
         self.landing = Some(intent);
         Ok(())
+    }
+    pub fn record_landing_observation(
+        &mut self,
+        job: &native_broker::landing_protocol::LandingJob,
+    ) -> io::Result<()> {
+        let pending = self
+            .landing
+            .as_mut()
+            .ok_or_else(|| io::Error::other("landing intent missing"))?;
+        pending.observed = Some(historical_landing_job(job)?);
+        pending.validate()?;
+        self.version = 3;
+        Ok(())
+    }
+    pub fn from_portable(
+        scope: &RemoteScope,
+        remote: &tinytree_cloud::PortableRemoteState,
+    ) -> io::Result<Self> {
+        let mut state = Self::new(scope);
+        state.observations = remote
+            .observations
+            .iter()
+            .map(|r| Observation {
+                reference: r.reference.clone(),
+                bookmark: r.bookmark.clone(),
+                generation: r.generation,
+                head: r.head.clone(),
+            })
+            .collect();
+        state.archived_pushes = remote
+            .archived_pushes
+            .iter()
+            .map(|r| Pending {
+                kind: Kind::Push,
+                reference: r.reference.clone(),
+                bookmark: r.bookmark.clone(),
+                generation: r.generation,
+                head: r.head.clone(),
+                request_id: r.request_id.clone(),
+                base_operation: r.base_operation.clone(),
+                confirmed_generation: r.confirmed_generation,
+            })
+            .collect();
+        if let Some(landing) = &remote.landing {
+            let mut landing = landing.clone();
+            landing.restored_lookup_only = true;
+            state.begin_landing(landing)?;
+        }
+        state.validate(scope)?;
+        Ok(state)
     }
     pub fn prepare(&self, reference: &str, bookmark: &str) -> io::Result<()> {
         if self.observation(reference, bookmark)?.is_none()
@@ -414,4 +355,95 @@ impl State {
                     .chain(intent.result_roots.iter().map(String::as_str))
             }))
     }
+}
+
+/// Convert checked transport fields to untrusted historical storage. This does
+/// not create a checked job or a live retention capability on later decode.
+pub fn historical_landing_job(
+    job: &native_broker::landing_protocol::LandingJob,
+) -> io::Result<HistoricalLandingJob> {
+    use native_broker::landing_protocol as l;
+    use tinytree_cloud as c;
+    let bad = || io::Error::other("invalid historical landing job");
+    fn bytes<const N: usize>(v: &[u8]) -> io::Result<[u8; N]> {
+        v.try_into()
+            .map_err(|_| io::Error::other("landing identity width"))
+    }
+    let rewrite = |r: &l::Rewrite| -> io::Result<c::HistoricalLandingRewrite> {
+        Ok(c::HistoricalLandingRewrite {
+            old_commit: bytes(&r.old_commit)?,
+            new_commit: bytes(&r.new_commit)?,
+            change_id: bytes(&r.change_id)?,
+        })
+    };
+    Ok(HistoricalLandingJob {
+        job_id: bytes(&job.id)?,
+        phase: match l::Phase::try_from(job.phase).map_err(|_| bad())? {
+            l::Phase::Intent => c::HistoricalLandingPhase::Intent,
+            l::Phase::PreparedPendingChecks => c::HistoricalLandingPhase::PreparedPendingChecks,
+            l::Phase::Checked => c::HistoricalLandingPhase::Checked,
+            l::Phase::Committed => c::HistoricalLandingPhase::Committed,
+            l::Phase::Conflict => c::HistoricalLandingPhase::Conflict,
+            l::Phase::Unsupported => c::HistoricalLandingPhase::Unsupported,
+            l::Phase::CheckFailed => c::HistoricalLandingPhase::CheckFailed,
+            l::Phase::CheckUnavailable => c::HistoricalLandingPhase::CheckUnavailable,
+            l::Phase::StaleTarget => c::HistoricalLandingPhase::StaleTarget,
+            l::Phase::Expired => c::HistoricalLandingPhase::Expired,
+            _ => return Err(bad()),
+        },
+        preparation: match l::PreparationAvailability::try_from(job.preparation)
+            .map_err(|_| bad())?
+        {
+            l::PreparationAvailability::ProfileConfigured => {
+                c::HistoricalLandingPreparation::ProfileConfigured
+            }
+            l::PreparationAvailability::ProfileUnavailable => {
+                c::HistoricalLandingPreparation::ProfileUnavailable
+            }
+            l::PreparationAvailability::PreparationDisabled => {
+                c::HistoricalLandingPreparation::PreparationDisabled
+            }
+            _ => return Err(bad()),
+        },
+        roots_retained: job.roots_retained,
+        expires_at_seconds: job.expires_at_seconds,
+        profile_name: job.profile_name.clone(),
+        profile_version: job.profile_version.clone(),
+        candidate: job
+            .candidate
+            .as_ref()
+            .map(|v| -> io::Result<_> {
+                Ok(c::HistoricalLandingCandidate {
+                    head: bytes(&v.head)?,
+                    root_tree: bytes(&v.root_tree)?,
+                    rewrites: v.rewrites.iter().map(rewrite).collect::<io::Result<_>>()?,
+                })
+            })
+            .transpose()?,
+        receipt: job
+            .receipt
+            .as_ref()
+            .map(|r| -> io::Result<_> {
+                let reference = r.reference.as_ref().ok_or_else(bad)?;
+                let descriptor = reference.commit.as_ref().ok_or_else(bad)?;
+                let key = descriptor.key.as_ref().ok_or_else(bad)?;
+                if key.kind != 3 || descriptor.content_blake3 != key.native_id {
+                    return Err(bad());
+                }
+                Ok(c::HistoricalLandingReceipt {
+                    reference: reference.name.clone(),
+                    generation: reference.generation,
+                    commit: bytes(&key.native_id)?,
+                    commit_size_bytes: descriptor.size_bytes,
+                    object_format_version: descriptor
+                        .object_format_version
+                        .try_into()
+                        .map_err(|_| bad())?,
+                    rewrites: r.rewrites.iter().map(rewrite).collect::<io::Result<_>>()?,
+                    evidence: bytes(&r.evidence)?,
+                })
+            })
+            .transpose()?,
+        conflict_path: job.conflict_path.clone(),
+    })
 }

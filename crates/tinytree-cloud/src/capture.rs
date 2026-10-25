@@ -108,6 +108,8 @@ pub struct IndexRecord {
 pub struct PortableRemoteState {
     pub observations: Vec<RemoteObservation>,
     pub archived_pushes: Vec<ArchivedIntent>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub landing: Option<crate::PortableLanding>,
 }
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
@@ -171,7 +173,9 @@ pub fn decode_data(
 }
 pub fn validate_capture_data(data: &CaptureData, limits: &CaptureDataLimits) -> Result<()> {
     ensure!(
-        data.version == 1 && data.codec == c::CODEC,
+        matches!(data.version, 1 | 2)
+            && (data.version == 2) == data.remote.as_ref().is_some_and(|r| r.landing.is_some())
+            && data.codec == c::CODEC,
         "unsupported capture data format"
     );
     ensure!(
@@ -327,6 +331,17 @@ pub fn validate_capture_data(data: &CaptureData, limits: &CaptureDataLimits) -> 
         );
     }
     if let Some(remote) = &data.remote {
+        if let Some(landing) = &remote.landing {
+            landing.validate()?;
+            for operation in landing.retained_operations() {
+                ensure!(
+                    data.operations
+                        .binary_search_by(|op| op.operation.as_str().cmp(operation))
+                        .is_ok(),
+                    "capture landing operation missing"
+                );
+            }
+        }
         ensure!(
             remote.observations.len() <= 128 && remote.archived_pushes.len() <= 128,
             "capture remote record limit"

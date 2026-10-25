@@ -170,6 +170,129 @@ impl RemoteRepositoryControl {
         );
         Ok((reference.generation, descriptor.size_bytes))
     }
+    async fn fresh_landing_capture_keys(
+        &self,
+        roots: &[m::ObjectKey],
+        landing: Option<&tinytree_cloud::PortableLanding>,
+        owner: Owner,
+        limits: &NativeTransferLimits,
+        deadline: Instant,
+    ) -> Result<HashSet<m::ObjectKey>> {
+        let mut keys = HashSet::new();
+        let Some(intent) = landing.filter(|p| !p.result_roots.is_empty()) else {
+            return Ok(keys);
+        };
+        intent.validate()?;
+        ensure!(
+            intent.result_roots.len() <= 256 && intent.result_roots.len() <= limits.max_roots,
+            "landing capture result root bound"
+        );
+        let start = tinytree_client::LandingStart {
+            idempotency_key: intent.request_id.clone(),
+            source_base: m::CommitId(crate::unhex(&intent.source_base)?),
+            source_head: m::CommitId(crate::unhex(&intent.source_head)?),
+            destination: intent.reference.clone(),
+            expected_generation: intent.generation,
+            expected_head: m::CommitId(crate::unhex(&intent.expected_head)?),
+            profile_name: intent.profile_name.clone(),
+            expected_profile_version: intent.profile_version.clone(),
+        };
+        let client = self.client_for_owned_work(owner.clone(), deadline).await?;
+        // This private clone is lookup-only, and is destroyed before ordinary
+        // catalogs/closure allocation. No persistent pool or verdict is created.
+        let landing_client = client.clone().with_landing_budget(256 * 1024 * 1024)?;
+        let observed = intent.job_id.as_deref().map(crate::unhex).transpose()?;
+        let job = io::network(landing_client.lookup_landing(&start, observed)).await?;
+        if !job.roots_retained() {
+            return Err(tonic::Status::failed_precondition("landing result roots no longer retained; capture remains pending until explicit intent reconciliation").into());
+        }
+        let candidate = job
+            .candidate()
+            .context("retained landing candidate missing")?;
+        let mut expected = std::iter::once(candidate.head.0)
+            .chain(candidate.rewrites.iter().map(|r| r.new_commit.0))
+            .collect::<Vec<_>>();
+        expected.sort();
+        expected.dedup();
+        let mut persisted = intent
+            .result_roots
+            .iter()
+            .map(|s| crate::unhex(s))
+            .collect::<Result<Vec<_>>>()?;
+        persisted.sort();
+        persisted.dedup();
+        ensure!(
+            expected == persisted
+                && intent.candidate_head.as_deref() == Some(crate::hex(&candidate.head.0).as_str()),
+            "capture landing candidate identity differs"
+        );
+        let mut total = 0usize;
+        for id in expected {
+            io::check_deadline()?;
+            let key = m::ObjectKey {
+                kind: m::Kind::Commit,
+                id: m::ObjectId(id),
+            };
+            ensure!(
+                roots.contains(&key),
+                "capture landing result is not a declared root"
+            );
+            let mut values = io::network(client.read_objects(vec![key])).await?;
+            ensure!(values.len() == 1, "landing canonical COMMIT response shape");
+            let value = match values.pop().unwrap() {
+                tinytree_client::MetadataOutcome::Object(value) => value,
+                _ => anyhow::bail!("landing canonical COMMIT unavailable"),
+            };
+            let descriptor = value.descriptor();
+            total = total
+                .checked_add(
+                    value
+                        .canonical_bytes()
+                        .len()
+                        .checked_mul(4)
+                        .context("landing capture bytes overflow")?,
+                )
+                .context("landing capture bytes overflow")?;
+            ensure!(
+                total <= limits.closure.max_metadata_bytes,
+                "landing capture metadata budget"
+            );
+            let m::Object::Commit(commit) = value.object() else {
+                anyhow::bail!("landing capture expected COMMIT");
+            };
+            if id == candidate.head.0 {
+                ensure!(
+                    commit.root_tree.terms == [candidate.root_tree]
+                        && commit.root_tree.labels.iter().all(String::is_empty),
+                    "landing head canonical tree differs"
+                );
+            }
+            if let Some(row) = candidate.rewrites.iter().find(|r| r.new_commit.0 == id) {
+                ensure!(
+                    commit.change_id == row.change_id,
+                    "landing canonical rewrite change differs"
+                );
+            }
+            // Exact objects only: no generic COMMIT admission, parent/TREE/FILE
+            // hydration, public-scope promotion or new hold is possible here.
+            let installed = self
+                .inner
+                .local
+                .write_metadata_with_owner(value.object().clone(), owner.clone())
+                .await
+                .map_err(crate::backend)?;
+            ensure!(
+                installed == descriptor,
+                "landing canonical import descriptor differs"
+            );
+            keys.insert(key);
+        }
+        ensure!(
+            Instant::now() < deadline,
+            "landing capture original deadline exceeded"
+        );
+        Ok(keys)
+    }
     /// Read-only proof refresh under the caller's independently owned background
     /// admission. No foreground lease, new hold, query grant, ledger mutation or
     /// public-history hydration is performed. The original deadline is shared
@@ -177,6 +300,7 @@ impl RemoteRepositoryControl {
     pub(crate) async fn capture_boundaries(
         &self,
         roots: &[m::ObjectKey],
+        landing: Option<&tinytree_cloud::PortableLanding>,
         owner: Owner,
         limits: &NativeTransferLimits,
         originaldeadline: Instant,
@@ -203,6 +327,14 @@ impl RemoteRepositoryControl {
             budget.used <= budget.maximum,
             "capture boundary byte budget exceeded"
         );
+        // Complete the temporary landing codec phase before retaining normal
+        // boundary catalogs. The lookup pool never overlaps catalog/graph work.
+        let mut keys = self
+            .fresh_landing_capture_keys(roots, landing, owner.clone(), limits, deadline)
+            .await?;
+        for _ in &keys {
+            budget.charge(4 * std::mem::size_of::<m::ObjectKey>() + 64)?;
+        }
         let ledger = self.inner.ledger.clone();
         let max_count = limits.closure.max_objects;
         let max_bytes = budget.remaining();
@@ -223,6 +355,7 @@ impl RemoteRepositoryControl {
             roots,
             &records,
             &authorities,
+            &keys,
             owner.clone(),
             limits,
             &mut budget,
@@ -237,7 +370,6 @@ impl RemoteRepositoryControl {
             .await?
             .with_operation_deadline(deadline)
             .with_rpc_lifetime_guard(Arc::new(owner.clone()));
-        let mut keys = HashSet::new();
         let mut holds = Vec::new();
         let mut cloud = Vec::new();
         let mut proof_edges = selection_edges;
@@ -438,6 +570,7 @@ async fn select_relevant(
     roots: &[m::ObjectKey],
     records: &[Root],
     authorities: &[crate::ledger::CloudVersionAuthority],
+    landing_keys: &HashSet<m::ObjectKey>,
     owner: Owner,
     limits: &NativeTransferLimits,
     budget: &mut Budget,
@@ -499,7 +632,7 @@ async fn select_relevant(
             done.insert(key);
             continue;
         }
-        if done.contains(&key) {
+        if done.contains(&key) || landing_keys.contains(&key) {
             continue;
         }
         let mut covered_cloud = false;

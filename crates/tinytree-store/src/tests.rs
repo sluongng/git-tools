@@ -6160,6 +6160,127 @@ fn capture_size_boundary_accepts_a_large_canonical_operation_inventory_as_a_bina
 }
 
 #[test]
+fn landing_capture_activates_its_atomic_feature_and_rejects_downgraded_reopen() {
+    use tinytree_cloud as c;
+    let (directory, store) = open();
+    let owner = CloudOwner {
+        principal: [95; 32],
+    };
+    let (_, tree, head) = fixture(&store, "portable landing source");
+    let (history, leases, artifacts) = cloud_v2_capture(
+        &store,
+        owner,
+        head,
+        tree,
+        c::PortableIndexSnapshot {
+            roots: vec![CommitId(head.key.id.0)],
+            drafts: vec![],
+        },
+    );
+    let mut request = captured_cloud_request(
+        &store,
+        owner,
+        history,
+        leases,
+        &artifacts,
+        0,
+        "landing-capture",
+    );
+    let mut data = c::decode_data(
+        &request.capture_data,
+        c::data_digest(&request.capture_data),
+        &Default::default(),
+    )
+    .unwrap();
+    data.version = 2;
+    data.remote = Some(c::PortableRemoteState {
+        observations: vec![],
+        archived_pushes: vec![],
+        landing: Some(c::PortableLanding {
+            request_id: "12".repeat(16),
+            source_base: "00".repeat(32),
+            source_head: hex(&head.key.id.0),
+            reference: "main".into(),
+            bookmark: "main".into(),
+            generation: 1,
+            expected_head: hex(&head.key.id.0),
+            profile_name: "checks".into(),
+            profile_version: "v1".into(),
+            source_operation: data.working_copy.wc_operation.clone(),
+            source_stack: vec![hex(&head.key.id.0)],
+            fork_operation: None,
+            fork_acknowledged: false,
+            job_id: None,
+            result_roots: vec![],
+            candidate_head: None,
+            apply_operation: None,
+            operation_writing: None,
+            acknowledged: false,
+            terminal: None,
+            observed: None,
+            restored_lookup_only: false,
+        }),
+    });
+    request.capture_data = c::encode_capture_data(&data, Default::default()).unwrap();
+    let mut manifest = c::decode_manifest_v3(
+        &request.publication.manifest_bytes,
+        request.publication.manifest,
+        Default::default(),
+    )
+    .unwrap();
+    manifest.capture = c::CaptureDescriptor::of(&request.capture_data);
+    manifest.history.recovery.intent_roots =
+        c::capture_recovery_intents(&data, manifest.capture.id, Default::default()).unwrap();
+    request.publication.manifest_bytes =
+        c::encode_manifest_v3(&manifest, Default::default()).unwrap();
+    request.publication.manifest = c::ManifestId::of(&request.publication.manifest_bytes);
+    let publication = store
+        .publish_captured_cloud_version("demo", owner, &request, 1, &Default::default())
+        .unwrap();
+    assert_eq!(publication.workspace.generation, 1);
+    assert_eq!(
+        store
+            .inner
+            .db
+            .read_tx()
+            .get(&store.inner.spaces.meta, b"format")
+            .unwrap()
+            .unwrap()
+            .as_ref(),
+        b"tinytree-store-9"
+    );
+    assert!(
+        store.external_checks_directory().unwrap().is_some(),
+        "higher feature preserves prior durable layout fence without dispatching checks"
+    );
+    drop(store);
+    drop(Store::open_existing(directory.path(), config()).unwrap());
+    let set_format = |value: &[u8]| {
+        let db = SingleWriterTxDatabase::builder(directory.path().join("metadata"))
+            .open()
+            .unwrap();
+        let meta = db.keyspace("meta", KeyspaceCreateOptions::default).unwrap();
+        let mut tx = db.write_tx().durability(Some(PersistMode::SyncAll));
+        tx.insert(&meta, b"format", value);
+        tx.commit().unwrap();
+    };
+    set_format(b"tinytree-store-8");
+    assert!(matches!(
+        Store::open_existing(directory.path(), config()),
+        Err(Error::Corrupt("landing capture without store feature"))
+    ));
+    set_format(b"tinytree-store-9");
+    let reopened = Store::open_existing(directory.path(), config()).unwrap();
+    assert_eq!(
+        reopened
+            .cloud_publication("demo", owner, "landing-capture")
+            .unwrap()
+            .unwrap(),
+        publication
+    );
+}
+
+#[test]
 fn capture_binding_uses_remaining_version_budget_without_changing_history_only_admission() {
     let directory = tempfile::tempdir().unwrap();
     let small = small_index_cloud_config();

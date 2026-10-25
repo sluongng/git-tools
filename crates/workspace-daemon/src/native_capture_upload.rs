@@ -1187,10 +1187,66 @@ impl Worker {
                 ..Default::default()
             };
             let roots = decoded.history.recovery.native_roots.clone();
-            let receipt = if automatic {
+            let decode_bytes = intent
+                .capture
+                .len()
+                .checked_mul(32)
+                .and_then(|n| n.checked_add(4096))
+                .context("capture DATA decode charge overflow")?;
+            ensure!(
+                retained
+                    .checked_add(decode_bytes as u64)
+                    .is_some_and(|n| n <= self.policy.max_memory_bytes),
+                "capture DATA decode memory unavailable"
+            );
+            let landing = {
+                let data = c::decode_data(
+                    &intent.capture,
+                    decoded.capture.id.0,
+                    &c::CaptureDataLimits {
+                        max_decode_bytes: decode_bytes,
+                        ..Default::default()
+                    },
+                )?;
+                // Destructuring inside this scope physically drops all OP,
+                // index/blob/root inventories before background transfer starts.
+                // Only the separately bounded landing DTO escapes.
+                let c::CaptureData { remote, .. } = data;
+                remote.and_then(|r| r.landing)
+            };
+            let transfer = jj_native_remote::NativeTransferLimits {
+                max_memory_bytes: transfer
+                    .max_memory_bytes
+                    .checked_sub(if landing.is_some() {
+                        c::PortableLanding::MAX_WORKING_BYTES as u64
+                    } else {
+                        0
+                    })
+                    .context("capture landing DTO memory unavailable")?,
+                ..transfer
+            };
+            if landing.is_some() {
+                let capabilities = client
+                    .capabilities(&[tinytree_client::CapabilityFeature::LandingRecoveryCloudWrite])
+                    .await?;
+                ensure!(
+                    capabilities.features.len() == 1
+                        && capabilities.features[0].supported
+                        && capabilities.features[0].authorized,
+                    "landing recovery publication capability unavailable"
+                );
+            }
+
+            let receipt = if automatic || landing.is_some() {
                 source
                     .control
-                    .transfer_native_capture_frontier(roots, owner.clone(), transfer, deadline)
+                    .transfer_native_capture_frontier_with_landing(
+                        roots,
+                        landing,
+                        owner.clone(),
+                        transfer,
+                        deadline,
+                    )
                     .await?
             } else {
                 source

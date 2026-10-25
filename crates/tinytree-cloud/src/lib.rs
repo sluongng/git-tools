@@ -4,6 +4,8 @@
 //! Callers own authorization, checkpoint fencing, root retention and atomic
 //! installation of the restored workspace. Importing these objects alone does
 //! not publish a workspace or authorize deleting a sole local copy.
+mod landing_recovery;
+pub use landing_recovery::*;
 mod capture;
 pub use capture::*;
 mod capture_manifest;

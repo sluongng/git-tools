@@ -12,6 +12,9 @@ pub(crate) struct LandArgs {
     /// Recover submission uncertainty and apply an exact committed result.
     #[arg(long)]
     resume: bool,
+    /// Explicitly resubmit a restored pre-Start intent after lookup reports it absent.
+    #[arg(long, requires = "resume")]
+    submit_original: bool,
     #[arg(long)]
     base: Option<RevisionArg>,
     #[arg(long)]
@@ -163,6 +166,106 @@ mod native {
                 "resolve the original pending native fetch/publication before landing; both original intents remain retained",
             ));
         }
+        if let Some(pending) = locked
+            .state
+            .landing
+            .as_ref()
+            .filter(|p| p.restored_lookup_only)
+            .cloned()
+        {
+            if !args.status && !args.resume {
+                return Err(fail(
+                    "recovery_required: restored landing must be looked up before a new intent",
+                ));
+            }
+            // Gate BEFORE orphan reconciliation, saved checkout recovery and WC
+            // freezing. Capsule receipts and operation tags are not authority.
+            let control = client(&locator, loader.repo_path()).await?;
+            match control.landing(wire(&pending)?, false).await {
+                Ok(report) => {
+                    let job = report.job();
+                    let phase = l::Phase::try_from(job.phase).map_err(fail)?;
+                    let mut display = pending.clone();
+                    display.job_id = Some(hex(&job.id));
+                    if args.status {
+                        // Lookup-only really is lookup-only: no captured raw OP
+                        // replay, snapshot, sidecar update, or fence release.
+                        return print(
+                            ui,
+                            &display,
+                            phase.as_str_name().to_ascii_lowercase().as_str(),
+                            job.candidate.as_ref().map(|c| c.head.as_slice()),
+                        );
+                    }
+                    if pending.acknowledged {
+                        classify_acknowledged_claims(command, &mut locked, job)?;
+                        return print(ui, locked.state.landing.as_ref().unwrap(), "applied", None);
+                    }
+                    if pending.apply_operation.is_some()
+                        || pending.operation_writing.is_some()
+                        || (!pending.fork_acknowledged && pending.fork_operation.is_some())
+                    {
+                        return Err(fail(
+                            "recovery_required: restored unpublished operation requires semantic reconciliation; original operation and working copy preserved",
+                        ));
+                    }
+                    if let Some(expected) = &pending.candidate_head {
+                        if job
+                            .candidate
+                            .as_ref()
+                            .is_some_and(|c| hex(&c.head) != *expected)
+                        {
+                            return Err(fail(
+                                "recovery_required: original candidate binding differs; state preserved",
+                            ));
+                        }
+                    }
+                    let phase = record_job(&mut locked, job)?;
+                    if phase == l::Phase::Committed {
+                        // This path never replays a capsule's raw operation. It
+                        // creates a fresh apply only after apply() verifies
+                        // current admission, source divergence and canonical
+                        // candidate contents against the original source stack.
+                        apply(ui, command, &mut locked, &control, &report).await?;
+                        return print(
+                            ui,
+                            locked.state.landing.as_ref().unwrap(),
+                            "applied",
+                            job.candidate.as_ref().map(|c| c.head.as_slice()),
+                        );
+                    }
+                    if locked.state.landing.as_ref().unwrap().terminal.is_some() {
+                        locked.state.landing.as_mut().unwrap().restored_lookup_only = false;
+                        locked.save().map_err(fail)?;
+                    }
+                    return print(
+                        ui,
+                        locked.state.landing.as_ref().unwrap(),
+                        phase.as_str_name().to_ascii_lowercase().as_str(),
+                        job.candidate.as_ref().map(|c| c.head.as_slice()),
+                    );
+                }
+                Err(error)
+                    if error.code() == tonic::Code::NotFound
+                        && pending.job_id.is_none()
+                        && args.submit_original
+                        && pending.apply_operation.is_none()
+                        && pending.operation_writing.is_none()
+                        && (pending.fork_operation.is_none() || pending.fork_acknowledged) =>
+                {
+                    // Only the explicit action may dispatch the exact original
+                    // pre-Start request. No request ID or expiry is invented.
+                    // Keep the restored fence through fresh freeze/Start too.
+                    // A crash must not promote another captured orphan OP into
+                    // trusted retry authority.
+                }
+                Err(error) => {
+                    return Err(fail(format!(
+                        "recovery_required: original landing lookup failed; source and intent preserved: {error}"
+                    )));
+                }
+            }
+        }
         // A saved raw operation is reconciled BEFORE ordinary helper loading can
         // snapshot a projection whose prior checkout has not yet been acknowledged.
         reconcile_orphan(command, &mut locked).await?;
@@ -247,6 +350,8 @@ mod native {
             }
             stack.reverse();
             let intent = LandingPending {
+                observed: None,
+                restored_lookup_only: false,
                 request_id: uuid::Uuid::new_v4().simple().to_string(),
                 source_base: base.id().hex(),
                 source_head: head.id().hex(),
@@ -284,7 +389,15 @@ mod native {
             .clone()
             .ok_or_else(|| fail("no landing intent exists"))?;
         if pending.acknowledged {
-            return print(ui, &pending, "applied", None);
+            if pending.candidate_head.is_some() || !pending.result_roots.is_empty() {
+                let control = client(&locator, loader.repo_path()).await?;
+                let report = control
+                    .landing(wire(&pending)?, false)
+                    .await
+                    .map_err(fail)?;
+                classify_acknowledged_claims(command, &mut locked, report.job())?;
+            }
+            return print(ui, locked.state.landing.as_ref().unwrap(), "applied", None);
         }
         if pending.fork_operation.is_none() {
             let mut helper = command.workspace_helper(ui).await?;
@@ -298,6 +411,24 @@ mod native {
             .map_err(fail)?;
         fault_point("response_received")?;
         let job = report.job();
+        let phase = record_job(&mut locked, job)?;
+        if phase == l::Phase::Committed && args.resume {
+            apply(ui, command, &mut locked, &control, &report).await?;
+            return print(
+                ui,
+                locked.state.landing.as_ref().unwrap(),
+                "applied",
+                job.candidate.as_ref().map(|c| c.head.as_slice()),
+            );
+        }
+        print(
+            ui,
+            locked.state.landing.as_ref().unwrap(),
+            phase.as_str_name().to_ascii_lowercase().as_str(),
+            job.candidate.as_ref().map(|c| c.head.as_slice()),
+        )
+    }
+    fn record_job(locked: &mut LockedState, job: &l::LandingJob) -> Result<l::Phase, CommandError> {
         let saved = locked.state.landing.as_mut().unwrap();
         saved.job_id = Some(hex(&job.id));
         if let Some(c) = &job.candidate {
@@ -319,28 +450,22 @@ mod native {
             _ => None,
         }
         .map(str::to_owned);
-        if phase == l::Phase::CheckUnavailable {
-            // This candidate can never be applied. Preserve the private source
-            // and fork, without retaining an unpromised server-only result.
+        if saved.terminal.is_some() {
+            if job.roots_retained || saved.apply_operation.is_some() {
+                return Err(fail(
+                    "reconciliation_required: terminal result contradicts a retained apply operation; state preserved",
+                ));
+            }
+            // A fresh checked nonapplicable terminal result can never be
+            // applied. Preserve historical candidate data below, all source
+            // work and operations, but explicitly retire its current root claim.
+            // Capture itself never makes this classification for old journals.
             saved.candidate_head = None;
             saved.result_roots.clear();
         }
+        locked.state.record_landing_observation(job).map_err(fail)?;
         locked.save().map_err(fail)?;
-        if phase == l::Phase::Committed && args.resume {
-            apply(ui, command, &mut locked, &control, &report).await?;
-            return print(
-                ui,
-                locked.state.landing.as_ref().unwrap(),
-                "applied",
-                job.candidate.as_ref().map(|c| c.head.as_slice()),
-            );
-        }
-        print(
-            ui,
-            locked.state.landing.as_ref().unwrap(),
-            phase.as_str_name().to_ascii_lowercase().as_str(),
-            job.candidate.as_ref().map(|c| c.head.as_slice()),
-        )
+        Ok(phase)
     }
     async fn freeze_working_copy(
         command: &CommandHelper,
@@ -587,8 +712,161 @@ mod native {
         wc.finish(op).await.map_err(fail)?;
         finish_observation(locked)?;
         locked.state.landing.as_mut().unwrap().acknowledged = true;
-        locked.save().map_err(fail)?;
+        // One durable ACK save releases the restored fence and current result
+        // claims only after exact checkout, publication and WC finish. The
+        // selected immutable apply OP/VIEW retains the historical candidate.
+        classify_acknowledged_claims(command, locked, job)?;
         Ok(())
+    }
+    fn classify_acknowledged_claims(
+        command: &CommandHelper,
+        locked: &mut LockedState,
+        job: &l::LandingJob,
+    ) -> Result<(), CommandError> {
+        let pending = locked.state.landing.as_ref().unwrap();
+        if !pending.acknowledged
+            || pending.operation_writing.is_some()
+            || job.phase != l::Phase::Committed as i32
+        {
+            return Err(fail(
+                "recovery_required: result claims require an acknowledged committed apply",
+            ));
+        }
+        let observed =
+            native_workspace_admin::remote_state::historical_landing_job(job).map_err(fail)?;
+        observed.validate(pending).map_err(fail)?;
+        if let Some(old) = &pending.observed {
+            if old.phase == native_workspace_admin::remote_state::HistoricalLandingPhase::Committed
+                && (old.candidate != observed.candidate
+                    || old.receipt != observed.receipt
+                    || old.expires_at_seconds != observed.expires_at_seconds)
+            {
+                return Err(fail(
+                    "recovery_required: committed historical receipt differs; state preserved",
+                ));
+            }
+        }
+        let candidate = observed
+            .candidate
+            .as_ref()
+            .ok_or_else(|| fail("committed candidate missing"))?;
+        let head = hex(&candidate.head);
+        let saved = pending
+            .apply_operation
+            .as_deref()
+            .ok_or_else(|| fail("acknowledged apply operation missing"))?;
+        let mut factories = jj_lib::default_backend_factories::default_backend_factories();
+        broker::register(&mut factories);
+        let loader = jj_lib::repo::RepoLoader::init_from_file_system(
+            command.settings(),
+            command.workspace_loader()?.repo_path(),
+            &factories,
+        )
+        .map_err(fail)?;
+        let op_store = loader.op_store();
+        let simple = op_store
+            .downcast_ref::<jj_lib::simple_op_store::SimpleOpStore>()
+            .ok_or_else(|| fail("unsupported landing operation store"))?;
+        // Sequential fixed payload/decode caps bound the raw records. At most
+        // two decoded 64MiB records and 16MiB raw bytes coexist; the reference
+        // proof below performs no collection/all-referenced-ID allocation.
+        let op_id =
+            OperationId::try_from_hex(saved).ok_or_else(|| fail("invalid apply operation"))?;
+        let raw = simple
+            .read_operation_bounded(&op_id, 8 * 1024 * 1024, 64 * 1024 * 1024)
+            .map_err(fail)?;
+        if jj_lib::content_hash::blake2b_hash(&raw).as_slice() != op_id.as_bytes() {
+            return Err(fail("apply operation semantic identity differs"));
+        }
+        for (key, value) in [
+            ("request", pending.request_id.as_str()),
+            ("phase", "apply"),
+            ("source", pending.source_head.as_str()),
+            ("source_operation", pending.source_operation.as_str()),
+            (
+                "job",
+                pending
+                    .job_id
+                    .as_deref()
+                    .ok_or_else(|| fail("apply job missing"))?,
+            ),
+            ("candidate", head.as_str()),
+        ] {
+            if raw
+                .metadata
+                .attributes
+                .get(&format!("tinytree.landing.{key}"))
+                .map(String::as_str)
+                != Some(value)
+            {
+                return Err(fail("acknowledged apply operation binding differs"));
+            }
+        }
+        let view = simple
+            .read_view_bounded(&raw.view_id, 8 * 1024 * 1024, 64 * 1024 * 1024)
+            .map_err(fail)?;
+        if jj_lib::content_hash::blake2b_hash(&view).as_slice() != raw.view_id.as_bytes() {
+            return Err(fail("apply view semantic identity differs"));
+        }
+        let mut work = 0usize;
+        // Self-identity results already remain explicit original-source roots.
+        // Rewritten results can also be retained by this exact immutable OP's
+        // predecessor relation when a newer fetched bookmark hides the head.
+        let mut found = head == pending.source_head;
+        let mut visit = |id: Option<&CommitId>| -> Result<(), CommandError> {
+            work = work
+                .checked_add(1)
+                .filter(|n| *n <= 100_000)
+                .ok_or_else(|| fail("acknowledged view reference work bound"))?;
+            found |= id.is_some_and(|id| id.as_bytes() == candidate.head);
+            Ok(())
+        };
+        if let Some(predecessors) = &raw.commit_predecessors {
+            for (id, parents) in predecessors {
+                visit(None)?;
+                visit(Some(id))?;
+                for parent in parents {
+                    visit(Some(parent))?;
+                }
+            }
+        }
+        for id in view.head_ids.iter().chain(view.wc_commit_ids.values()) {
+            visit(Some(id))?;
+        }
+        for target in view
+            .local_bookmarks
+            .values()
+            .chain(view.local_tags.values())
+            .chain(view.git_refs.values())
+            .chain(view.git_heads.values())
+        {
+            visit(None)?;
+            for id in target.iter().flatten() {
+                visit(Some(id))?;
+            }
+        }
+        for remote in view.remote_views.values() {
+            visit(None)?;
+            for reference in remote.bookmarks.values().chain(remote.tags.values()) {
+                visit(None)?;
+                for id in reference.target.iter().flatten() {
+                    visit(Some(id))?;
+                }
+            }
+        }
+        if !found {
+            return Err(fail(
+                "recovery_required: selected apply operation/view does not retain the candidate",
+            ));
+        }
+        // Membership proves retention only. No checkout, operation publication
+        // or raw recovery occurs in this acknowledged bookkeeping path.
+        let saved = locked.state.landing.as_mut().unwrap();
+        saved.candidate_head = None;
+        saved.result_roots.clear();
+        saved.restored_lookup_only = false;
+        locked.state.record_landing_observation(job).map_err(fail)?;
+        locked.save().map_err(fail)
     }
     fn finish_observation(locked: &mut LockedState) -> Result<(), CommandError> {
         let p = locked.state.landing.as_ref().unwrap();

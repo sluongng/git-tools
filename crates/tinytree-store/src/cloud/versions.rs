@@ -160,6 +160,7 @@ fn snapshot_memory(value: &tinytree_cloud::PortableIndexSnapshot) -> Result<usiz
 }
 #[derive(Clone)]
 struct VersionRoots {
+    landing_recovery: bool,
     native: Vec<ObjectKey>,
     artifacts: Vec<IndexArtifactDescriptor>,
     extra: ExtraWork,
@@ -484,6 +485,7 @@ fn decode_version_roots(
 ) -> Result<VersionRoots> {
     if format == 1 {
         return Ok(VersionRoots {
+            landing_recovery: false,
             native: decode_roots(bytes, id, native_max)?,
             artifacts: Vec::new(),
             extra: ExtraWork::default(),
@@ -541,6 +543,7 @@ fn decode_version_roots(
         });
     }
     Ok(VersionRoots {
+        landing_recovery: false,
         native,
         artifacts,
         extra,
@@ -868,6 +871,7 @@ impl Inner {
             _ => return Err(Error::Invalid("cloud capture attachment selection")),
         }
         self.check_version_work(manifest)?;
+        let mut landing_recovery = false;
         let mut objects = Vec::with_capacity(manifest.members.len());
         let mut retained = objects
             .capacity()
@@ -1124,6 +1128,7 @@ impl Inner {
                         binding_limits,
                     )
                     .map_err(|error| v2_error(error, "cloud capture export binding"))?;
+                    landing_recovery = verified.capture_data_version() == 2;
                     drop(verified);
                 }
                 artifacts = loaded
@@ -1209,6 +1214,7 @@ impl Inner {
             self.closure(repo, manifest.native_roots.iter().copied(), true, files)?;
         }
         Ok(VersionRoots {
+            landing_recovery,
             native: manifest.native_roots.clone(),
             artifacts,
             extra,
@@ -2071,6 +2077,12 @@ impl Store {
             Some(true),
             capture_data,
         )?;
+        if roots.landing_recovery {
+            // Feature nine includes the earlier Store-owned layout fence. This
+            // establishes only the empty durable namespace, never a runner or
+            // permission to dispatch checks.
+            self.enable_external_checks()?;
+        }
         let mut _gate = self.inner.lock()?;
         self.inner.repository(repo)?;
         if let Some(receipt) = self.inner.cloud_replay(repo, owner, request, fingerprint)? {
@@ -2271,6 +2283,7 @@ impl Store {
             &mut tx,
             &self.inner.spaces.meta,
             match manifest.format() {
+                3 if roots.landing_recovery => 9,
                 3 => 5,
                 2 => 4,
                 _ => 3,
@@ -2868,7 +2881,26 @@ impl Inner {
                                 "unreferenced cloud capture or missing feature",
                             ));
                         }
-                        super::captures::decode_record(&bytes)?;
+                        let capture = super::captures::decode_record(&bytes)?;
+                        let mut limits = tinytree_cloud::CaptureDataLimits::default();
+                        limits.max_decode_bytes = limits.max_decode_bytes.min(
+                            self.config
+                                .cloud
+                                .max_version_decode_bytes
+                                .saturating_sub(bytes.len().saturating_mul(3)),
+                        );
+                        let data = tinytree_cloud::decode_data(
+                            &capture.bytes,
+                            capture.descriptor.id.0,
+                            &limits,
+                        )
+                        .map_err(|_| Error::Corrupt("cloud capture data schema"))?;
+                        if data.version == 2
+                            && store_feature(view.get(&self.spaces.meta, b"format")?.as_deref())?
+                                < 9
+                        {
+                            return Err(Error::Corrupt("landing capture without store feature"));
+                        }
                     }
                     _ => unreachable!(),
                 }

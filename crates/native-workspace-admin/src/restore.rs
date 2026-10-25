@@ -228,6 +228,8 @@ struct Journal {
     operation_indexes: [u8; 32],
     #[serde(default)]
     index_fingerprint: Option<[u8; 32]>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    remote_state_digest: Option<[u8; 32]>,
     phase: Phase,
 }
 #[derive(Clone, Copy, Debug, Serialize, Deserialize)]
@@ -266,6 +268,7 @@ pub struct RestoreIntent {
 /// must perform synchronous bounded local publication only, not nested RPC.
 pub type BackendMetadataWriter = dyn Fn(&Path) -> Result<()> + Send + Sync;
 pub struct RestoreHost {
+    pub remote_scope: crate::remote_state::RemoteScope,
     pub settings: UserSettings,
     pub signer: Signer,
     pub connector: Arc<dyn ProjectionConnector>,
@@ -311,6 +314,7 @@ impl std::error::Error for RestoreRecoveryRequired {}
 /// Trusted current host configuration/read-only validator. Actual Linux frontend
 /// and command startup guards remain owned by the host throughout finalization.
 pub struct RestoreReadbackHost {
+    pub remote_scope: crate::remote_state::RemoteScope,
     pub settings: UserSettings,
     pub connector: Arc<dyn ProjectionConnector>,
     pub backend_config: jj_native_backend::Config,
@@ -600,6 +604,7 @@ pub async fn prepare_restore_until(
                 deadline,
                 "capture_read",
                 client
+                    .clone()
                     .with_operation_deadline(deadline.into())
                     .with_lifetime_guard(Arc::new(owner.clone()))
                     .cloud_read_capture(&inputs.version),
@@ -633,6 +638,24 @@ pub async fn prepare_restore_until(
                 .await?;
                 data
             };
+            if data.version == 2 {
+                let capabilities = call(
+                    deadline,
+                    "landing_recovery_capability",
+                    client
+                        .with_operation_deadline(deadline.into())
+                        .capabilities(&[
+                            tinytree_client::CapabilityFeature::LandingRecoveryCloudRead,
+                        ]),
+                )
+                .await?;
+                ensure!(
+                    capabilities.features.len() == 1
+                        && capabilities.features[0].supported
+                        && capabilities.features[0].authorized,
+                    "landing recovery restore capability unavailable"
+                );
+            }
             check_time(deadline)?;
             Ok(PreparedRestore {
                 source: Arc::new(Source {
@@ -855,7 +878,7 @@ impl Registry {
             index_hash.update(&entry.root.0);
         }
         let journal = Journal {
-            version: 1,
+            version: if data.remote.is_some() { 2 } else { 1 },
             binding: binding.clone(),
             source: identity(&source.source.inputs, &source.source.provider),
             operation_heads: data.operation_heads.len() as u64,
@@ -874,6 +897,7 @@ impl Registry {
             workspace: data.working_copy.workspace.clone(),
             operation_indexes: *index_hash.finalize().as_bytes(),
             index_fingerprint: None,
+            remote_state_digest: None,
             phase: Phase::Reserved,
         };
         // Reject an oversized journal before creating destination state. Full
@@ -1315,6 +1339,24 @@ async fn stage(
         &expected_tree,
     )?;
     working_copy.replace("type", wc.name().as_bytes())?;
+    if let Some(bytes) = portable_remote_bytes(&source.data, &host.remote_scope)? {
+        ensure!(
+            host.remote_scope.store == binding.repository,
+            "restore remote repository differs"
+        );
+        match working_copy.read("native-remote.toml", 1024 * 1024) {
+            Ok(existing) => ensure!(
+                existing == bytes,
+                "restore remote journal differs; preserve state"
+            ),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                working_copy.replace("native-remote.toml", &bytes)?
+            }
+            Err(error) => return Err(error.into()),
+        }
+        intent.journal.remote_state_digest = Some(*blake3::hash(&bytes).as_bytes());
+    }
+
     let workspace = Workspace::new(
         &binding.root,
         binding.repo.clone(),
@@ -1379,9 +1421,29 @@ fn restore_origin(source: &RestoreSourceIdentity) -> [u8; 32] {
 fn recovery<T>(reason: &'static str) -> Result<T> {
     Err(RestoreRecoveryRequired(reason).into())
 }
+fn portable_remote_bytes(
+    data: &c::CaptureData,
+    scope: &crate::remote_state::RemoteScope,
+) -> Result<Option<Vec<u8>>> {
+    data.remote
+        .as_ref()
+        .map(|remote| -> Result<Vec<u8>> {
+            let state = crate::remote_state::State::from_portable(scope, remote)?;
+            let bytes = toml::to_string(&state)?.into_bytes();
+            ensure!(
+                bytes.len() <= 1024 * 1024,
+                "restored remote state exceeds byte bound"
+            );
+            Ok(bytes)
+        })
+        .transpose()
+}
 fn read_journal(admin: &PrivateDir) -> Result<Journal> {
     let journal: Journal = serde_json::from_slice(&admin.read(RESTORE_JOURNAL, MAX_RECORD)?)?;
-    ensure!(journal.version == 1, "unsupported restore journal version");
+    ensure!(
+        matches!(journal.version, 1 | 2),
+        "unsupported restore journal version"
+    );
     Ok(journal)
 }
 fn check_journal_source(journal: &Journal, binding: &Binding, source: &Source) -> Result<()> {
@@ -1525,6 +1587,32 @@ async fn readback(
             return recovery("restore is ordinary-resume eligible; do not replay captured state");
         }
         _ => return recovery("restore stage is incomplete; preserve state for explicit recovery"),
+    }
+    let expected_remote = portable_remote_bytes(&source.data, &host.remote_scope)?;
+    if let Some(bytes) = &expected_remote {
+        ensure!(
+            host.remote_scope.store == binding.repository
+                && actual_journal.version == 2
+                && actual_journal.remote_state_digest == Some(*blake3::hash(bytes).as_bytes()),
+            "restore remote sidecar binding differs"
+        );
+    } else {
+        ensure!(
+            actual_journal.remote_state_digest.is_none(),
+            "unexpected restore remote sidecar binding"
+        );
+    }
+    let wc_directory = PrivateDir::open_existing(&binding.working_copy)?;
+    match (
+        expected_remote,
+        wc_directory.read("native-remote.toml", 1024 * 1024),
+    ) {
+        (Some(expected), Ok(actual)) => ensure!(
+            actual == expected,
+            "restore remote journal changed; preserve state"
+        ),
+        (None, Err(error)) if error.kind() == std::io::ErrorKind::NotFound => {}
+        _ => return recovery("restore remote journal unavailable or mismatched; preserve state"),
     }
     // Sequential peaks each include all still-live source allocations.
     let mut graph_peak = source.retained_bytes;
@@ -1893,7 +1981,8 @@ pub(super) fn ready_attachment(
         Err(error) => return Err(error.into()),
     };
     ensure!(
-        journal.version == 1
+        matches!(journal.version, 1 | 2)
+            && (journal.version != 2 || journal.remote_state_digest.is_some())
             && initialization.restore_origin == Some(restore_origin(&journal.source))
             && matches!(journal.phase, Phase::Finalized)
             && journal.binding == *binding

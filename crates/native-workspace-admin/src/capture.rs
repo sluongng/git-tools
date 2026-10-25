@@ -565,10 +565,6 @@ fn read_remote(
     match directory.read("native-remote.toml", cap.min(1024 * 1024)) {
         Ok(bytes) => {
             let state = remote_state::decode(&bytes, scope)?;
-            ensure!(
-                state.landing.as_ref().is_none_or(|p| p.acknowledged),
-                "capture of an unresolved native landing requires reconciliation first"
-            );
             Ok(Some((state, bytes)))
         }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
@@ -1226,7 +1222,11 @@ async fn read_inventory(
     }
     let exported = exported.context("portable capture requires native index export")?;
     let data = CaptureData {
-        version: 1,
+        version: if remote.as_ref().is_some_and(|(s, _)| s.landing.is_some()) {
+            2
+        } else {
+            1
+        },
         policy: if matches!(owner.permit.source, CaptureFreeze::Host(_)) {
             CapturePolicy::HostQuiescentV1
         } else {
@@ -1256,6 +1256,7 @@ async fn read_inventory(
         blobs: blobs.into_values().collect(),
         roots: roots.into_iter().collect(),
         remote: remote.as_ref().map(|(state, _)| PortableRemoteState {
+            landing: state.landing.clone(),
             observations: state
                 .observations
                 .iter()
