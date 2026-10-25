@@ -856,7 +856,9 @@ impl NativeCommandHost {
         if session.drain_started.swap(true, Ordering::AcqRel) {
             return;
         }
-        // Policy/target/admission are frozen before either sealing operation.
+        // Policy/target are frozen before either sealing operation. Staging
+        // admission waits inside the host-owned drain, bounded by the original
+        // deadline and MAX_ACTIVE sessions, never by a detached user waiter.
         // Never drain_dirty first and then try to capture its closed token.
         let target = session
             .workspace
@@ -871,11 +873,7 @@ impl NativeCommandHost {
         } else {
             None
         };
-        let plan = if clean.is_none() {
-            self.inner.capture.select(target)
-        } else {
-            crate::native_capture::Plan::DrainOnly
-        };
+        let capture_deadline = tokio::time::Instant::now() + self.inner.capture.timeout();
         let deadline = std::time::Instant::now()
             + std::time::Duration::from_millis(self.inner.gc.config.timeout_ms);
         let host = self.clone();
@@ -885,6 +883,11 @@ impl NativeCommandHost {
                 host.checkpoint_session(&session, target, permit, deadline)
                     .await
             } else {
+                let plan = host
+                    .inner
+                    .capture
+                    .select_until(target, &host.inner.registry, capture_deadline)
+                    .await;
                 match plan {
                     crate::native_capture::Plan::DrainOnly => host
                         .inner
@@ -896,7 +899,10 @@ impl NativeCommandHost {
                         target,
                         permit,
                         disk,
-                    } => host.capture_session(&session, target, permit, disk).await,
+                    } => {
+                        host.capture_session(&session, target, permit, disk, capture_deadline)
+                            .await
+                    }
                 }
             };
             match result {
@@ -1022,6 +1028,7 @@ impl NativeCommandHost {
         target: Arc<crate::native_capture::Target>,
         permit: Arc<tokio::sync::OwnedSemaphorePermit>,
         disk: Arc<crate::native_capture::DiskReservation>,
+        deadline: tokio::time::Instant,
     ) -> std::result::Result<(), Status> {
         use crate::native_capture::{Attempt, Completion};
         let command = session
@@ -1041,8 +1048,13 @@ impl NativeCommandHost {
         let callback = move || async move {
             // This is entered only after Registry has sealed and drained jobs.
             *phase.lock().unwrap_or_else(|e| e.into_inner()) = Attempt::Entered;
-            let deadline = tokio::time::Instant::now() + coordinator.timeout();
             let kernel = loop {
+                if tokio::time::Instant::now() >= deadline {
+                    *phase.lock().unwrap_or_else(|e| e.into_inner()) =
+                        Attempt::Unavailable("capture_timeout");
+                    done.complete();
+                    return Err(native_retention::Error::Storage);
+                }
                 match existing_lease(&lease, Some(identity)) {
                     Ok(file) => match file.try_lock_exclusive() {
                         Ok(()) => break file,
@@ -1063,7 +1075,10 @@ impl NativeCommandHost {
                         return Err(native_retention::Error::Storage);
                     }
                 }
-                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                tokio::time::sleep_until(
+                    deadline.min(tokio::time::Instant::now() + std::time::Duration::from_millis(5)),
+                )
+                .await;
             };
             crate::native_capture::capture(
                 coordinator,
@@ -1074,6 +1089,7 @@ impl NativeCommandHost {
                 disk,
                 done,
                 phase,
+                deadline,
             )
             .await
             .map_err(|_| native_retention::Error::Storage)
@@ -1090,7 +1106,7 @@ impl NativeCommandHost {
             Ok(_) => {
                 self.inner.capture.queued();
                 self.inner.capture.refresh(&self.inner.registry).await;
-                if !completion.wait(self.inner.capture.timeout()).await {
+                if !completion.wait_until(deadline).await {
                     self.inner.capture.disposition("indeterminate", true);
                     return Err(Status::failed_precondition(
                         "native capture physical teardown requires recovery",
@@ -1103,7 +1119,7 @@ impl NativeCommandHost {
                     || (phase == Attempt::Staged
                         && matches!(error, native_retention::Error::Limit(_))) =>
             {
-                if !completion.wait(self.inner.capture.timeout()).await {
+                if !completion.wait_until(deadline).await {
                     self.inner.capture.disposition("indeterminate", true);
                     return Err(Status::failed_precondition(
                         "native capture physical teardown requires recovery",
@@ -1366,6 +1382,144 @@ mod tests {
             nonce: [2; 32],
             expected_epoch: 0,
         }
+    }
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn capture_staging_waits_refreshes_committed_inventory_and_preserves_dirty_on_timeout()
+    -> Result<()> {
+        use crate::native_capture::{Plan, Target};
+        let directory = tempfile::tempdir()?;
+        let private = PrivateDir::create(directory.path().join("private"))?;
+        let host = NativeCommandHost::open_with_capture(
+            &private.path().join("commands"),
+            crate::config::NativeCapture {
+                policy: crate::config::NativeCapturePolicy::AfterCommandBestEffort,
+                max_pending: 4,
+                max_bundle_bytes: 4096,
+                max_pending_bytes: 32768,
+                ..Default::default()
+            },
+        )
+        .await?;
+        let binding = binding(private.path(), "queue", 1)?;
+        host.register(&binding, [8; 32]).await?;
+        let registry = host.capture_registry();
+        let registration = host.workspace("queue")?.registration;
+        let objects = PrivateDir::create(private.path().join("objects"))?;
+        let socket = private.path().join("rbe.sock");
+        let target = Arc::new(Target {
+            controller: std::sync::Weak::new(),
+            registry: native_workspace_admin::Registry::create(
+                private.path().join("admin-registry"),
+            )?,
+            binding,
+            local: Arc::new(jj_native_backend::DirectObjectIo::init(
+                objects.path(),
+                Default::default(),
+            )?),
+            index: jj_native_index::Config {
+                endpoint: jj_native_index::Endpoint::UnixSocket(socket.clone()),
+                store_alias: "example".into(),
+                provider_fingerprint: [8; 32],
+            },
+            remote_scope: native_workspace_admin::remote_state::RemoteScope::new(
+                socket,
+                "example".into(),
+            )?,
+        });
+        let pause = host.pause_capture_cleanup().await?;
+        let coordinator = host.inner.capture.clone();
+        let queued_registry = registry.clone();
+        let queued_target = target.clone();
+        let mut waiting = tokio::spawn(async move {
+            coordinator
+                .select_until(
+                    Some(queued_target),
+                    &queued_registry,
+                    tokio::time::Instant::now() + std::time::Duration::from_secs(2),
+                )
+                .await
+        });
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(20), &mut waiting)
+                .await
+                .is_err()
+        );
+        assert_eq!(host.status()["local_capture"]["skipped"], 0);
+        assert_eq!(host.status()["local_capture"]["charged_spool_bytes"], 0);
+        // Actual durable registry commit invalidates the prior cached inventory.
+        // The opaque synced bundle arranges admission only, not restore proof.
+        private.replace("bundle", &[7; 32])?;
+        let command = registry.begin_command(registration).await?;
+        registry
+            .capture_dirty(command.token(), || async {
+                Ok(native_retention::CaptureBundle {
+                    checkpoint: Default::default(),
+                    bundle: native_retention::BundleDescriptor {
+                        blake3: *blake3::hash(&[7; 32]).as_bytes(),
+                        size_bytes: 32,
+                    },
+                })
+            })
+            .await?;
+        drop(command);
+        host.inner.capture.queued();
+        assert_eq!(host.status()["local_capture"]["inventory_available"], false);
+        drop(pause);
+        let plan = tokio::time::timeout(std::time::Duration::from_secs(1), waiting).await??;
+        assert!(
+            matches!(&plan, Plan::Capture { .. }),
+            "queued staging must refresh instead of skipping stale unavailable inventory"
+        );
+        assert_eq!(host.status()["local_capture"]["inventory_available"], true);
+        assert_eq!(host.status()["local_capture"]["pending_count"], 1);
+        assert_eq!(host.status()["local_capture"]["charged_spool_bytes"], 4096);
+        let timeout = host
+            .inner
+            .capture
+            .select_until(
+                Some(target.clone()),
+                &registry,
+                tokio::time::Instant::now() + std::time::Duration::from_millis(20),
+            )
+            .await;
+        assert!(matches!(timeout, Plan::DrainOnly));
+        assert_eq!(
+            host.status()["local_capture"]["last_disposition"],
+            "admission_timeout"
+        );
+        assert_eq!(
+            host.status()["local_capture"]["queued"],
+            1,
+            "timed-out admission never claims another capture"
+        );
+        assert_eq!(
+            registry.workspace(registration).await?.state,
+            native_retention::WorkspaceState::Dirty
+        );
+        let cancelled_coordinator = host.inner.capture.clone();
+        let cancelled_registry = registry.clone();
+        let cancelled = tokio::spawn(async move {
+            cancelled_coordinator
+                .select_until(
+                    Some(target),
+                    &cancelled_registry,
+                    tokio::time::Instant::now() + std::time::Duration::from_secs(2),
+                )
+                .await
+        });
+        tokio::task::yield_now().await;
+        cancelled.abort();
+        assert!(cancelled.await.err().unwrap().is_cancelled());
+        drop(plan);
+        assert_eq!(host.status()["local_capture"]["charged_spool_bytes"], 0);
+        let cleanup = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            host.pause_capture_cleanup(),
+        )
+        .await??;
+        drop(cleanup);
+        assert_eq!(registry.pending_captures().await?.len(), 1);
+        Ok(())
     }
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn startup_registration_is_closed_until_exact_prevalidated_activation_and_drop_stays_closed()

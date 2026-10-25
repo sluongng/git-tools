@@ -164,7 +164,12 @@ impl Coordinator {
             *last = "queued";
         }
     }
-    pub(crate) fn select(&self, target: Option<Arc<Target>>) -> Plan {
+    pub(crate) async fn select_until(
+        &self,
+        target: Option<Arc<Target>>,
+        registry: &native_retention::Registry,
+        deadline: tokio::time::Instant,
+    ) -> Plan {
         if self.config.policy == NativeCapturePolicy::Disabled {
             return Plan::DrainOnly;
         }
@@ -173,10 +178,31 @@ impl Coordinator {
             self.disposition("target_unavailable", false);
             return Plan::DrainOnly;
         };
-        let Ok(permit) = self.active.clone().try_acquire_owned() else {
-            self.disposition("budget_busy", false);
+        let permit =
+            match tokio::time::timeout_at(deadline, self.active.clone().acquire_owned()).await {
+                Ok(Ok(permit)) => permit,
+                Ok(Err(_)) => {
+                    self.disposition("budget_unavailable", false);
+                    return Plan::DrainOnly;
+                }
+                Err(_) => {
+                    self.disposition("admission_timeout", false);
+                    return Plan::DrainOnly;
+                }
+            };
+        if tokio::time::Instant::now() >= deadline {
+            self.disposition("admission_timeout", false);
             return Plan::DrainOnly;
-        };
+        }
+        // A preceding capture invalidates cached inventory until its commit is
+        // observed. Refresh under the staging permit instead of skipping the
+        // next command against that deliberately unavailable cache. Accepted
+        // physical inventory work retains the permit; do not cancel it midway.
+        self.refresh(registry).await;
+        if tokio::time::Instant::now() >= deadline {
+            self.disposition("admission_timeout", false);
+            return Plan::DrainOnly;
+        }
         let available = self.inventory.lock().is_ok_and(|value| {
             value.available
                 && value.count < self.config.max_pending
@@ -274,7 +300,13 @@ impl Completion {
         self.changed.notify_waiters();
     }
     pub(crate) async fn wait(&self, timeout: Duration) -> bool {
-        tokio::time::timeout(timeout, async {
+        self.wait_until(tokio::time::Instant::now() + timeout).await
+    }
+    pub(crate) async fn wait_until(&self, deadline: tokio::time::Instant) -> bool {
+        if self.done.load(Ordering::Acquire) {
+            return true;
+        }
+        tokio::time::timeout_at(deadline, async {
             loop {
                 let changed = self.changed.notified();
                 tokio::pin!(changed);
@@ -598,6 +630,7 @@ pub(crate) async fn capture(
     disk: Arc<DiskReservation>,
     completion: Arc<Completion>,
     attempt: Arc<Mutex<Attempt>>,
+    deadline: tokio::time::Instant,
 ) -> Result<OwnedCaptureBundle> {
     *attempt.lock().unwrap_or_else(|e| e.into_inner()) = Attempt::Entered;
     let lifetime = Arc::new(Lifetime {
@@ -608,6 +641,11 @@ pub(crate) async fn capture(
         _complete: CompleteOnDrop(completion),
     });
     let result = async {
+        if tokio::time::Instant::now() >= deadline {
+            *attempt.lock().unwrap_or_else(|e| e.into_inner()) =
+                Attempt::Unavailable("capture_timeout");
+            anyhow::bail!("local capture deadline exceeded");
+        }
         // Workspace registration must not own a Host -> Controller -> Broker
         // -> Host cycle. The actual capture guard retains the upgraded instance.
         let controller = target
@@ -616,7 +654,6 @@ pub(crate) async fn capture(
             .context("native capture controller unavailable")?;
         let mut limits = capture::CaptureLimits::default();
         limits.max_working_bytes = 1024 * 1024 * 1024 - STAGER_MEMORY;
-        limits.max_elapsed_ms = coordinator.config.timeout_ms;
         let index = PrivateDir::open_existing(target.binding.repo.join("index"))?;
         if index.read("type", 128)? != jj_native_index::NAME.as_bytes() {
             *attempt.lock().unwrap_or_else(|e| e.into_inner()) =
@@ -632,7 +669,16 @@ pub(crate) async fn capture(
         )?;
         ensure!(!wc.pending, "pending native working-copy state");
         drop(wc); // Host baseline decode never overlaps core's repeated reads.
-        let controller = controller.capture_for_backup(&projection).await?;
+        let controller = controller
+            .capture_for_backup_until(&projection, deadline)
+            .await?;
+        if tokio::time::Instant::now() >= deadline {
+            // Only a successfully returned read/freeze guard exists here; its
+            // ordinary teardown precedes completion. No staged mutation exists.
+            *attempt.lock().unwrap_or_else(|e| e.into_inner()) =
+                Attempt::Unavailable("capture_timeout");
+            anyhow::bail!("local capture deadline exceeded");
+        }
         let proof = capture::TreeFreezePermit::from_controller(controller, lifetime.clone())?;
         let directory = coordinator
             .directory
@@ -681,6 +727,17 @@ pub(crate) async fn capture(
                 .build()
                 .context("capture reader runtime unavailable")?;
             runtime.block_on(async move {
+                // Queueing, kernel-lease and local preparation consume the same
+                // original command budget. Never grant a fresh full core timer.
+                let remaining = deadline
+                    .saturating_duration_since(tokio::time::Instant::now())
+                    .as_millis();
+                if remaining == 0 {
+                    *phase.lock().unwrap_or_else(|e| e.into_inner()) =
+                        Attempt::Unavailable("capture_timeout");
+                    anyhow::bail!("local capture deadline exceeded");
+                }
+                limits.max_elapsed_ms = remaining.min(u64::MAX as u128) as u64;
                 let candidate = capture::read_candidate(input, proof, limits, &mut writer).await?;
                 let result = writer.finish(candidate.seal_quiescent()?).await;
                 if result.is_err() {

@@ -45,6 +45,40 @@ struct Fixture {
     child_env: Vec<(String, String)>,
 }
 
+struct RunningNativeCommand {
+    child: Child,
+    stdout: PathBuf,
+    stderr: PathBuf,
+    deadline: Instant,
+}
+impl RunningNativeCommand {
+    fn finish(mut self) -> Output {
+        let status = loop {
+            if let Some(status) = self.child.try_wait().unwrap() {
+                break status;
+            }
+            assert!(
+                Instant::now() < self.deadline,
+                "parallel native command timed out"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        Output {
+            status,
+            stdout: fs::read(&self.stdout).unwrap(),
+            stderr: fs::read(&self.stderr).unwrap(),
+        }
+    }
+}
+impl Drop for RunningNativeCommand {
+    fn drop(&mut self) {
+        if !matches!(self.child.try_wait(), Ok(Some(_))) {
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+        }
+    }
+}
+
 impl Fixture {
     fn new() -> Self {
         // A short private scratch path is necessary for sockaddr_un. This is a
@@ -158,6 +192,15 @@ impl Fixture {
             .push(("TINYTREE_MOUNT_TEST_TOKEN".into(), REMOTE_TOKEN.into()));
     }
 
+    fn query_replay_capacity(&mut self, limit: usize) {
+        let mut config: toml::Value =
+            toml::from_str(&fs::read_to_string(&self.daemon_config).unwrap()).unwrap();
+        config["native"]["repositories"]["example"]["remote"]["query"]["max_replays"] =
+            i64::try_from(limit).unwrap().into();
+        fs::write(&self.daemon_config, toml::to_string(&config).unwrap()).unwrap();
+        workspace_daemon::config::Config::load(&self.daemon_config).unwrap();
+    }
+
     fn index_mode(&mut self, mode: &str) {
         let mut config: toml::Value =
             toml::from_str(&fs::read_to_string(&self.daemon_config).unwrap()).unwrap();
@@ -229,6 +272,10 @@ impl Fixture {
     }
 
     fn enable_capture_retirement(&mut self) {
+        self.enable_capture_retirement_with_limit(2);
+    }
+
+    fn enable_capture_retirement_with_limit(&mut self, limit: usize) {
         self.capture_policy("after_command_best_effort");
         self.enable_capture_upload();
         let mut config: toml::Value =
@@ -236,7 +283,7 @@ impl Fixture {
         config["native"]["workspaces"]["capture"]
             .as_table_mut()
             .unwrap()
-            .insert("max_pending".into(), 2.into());
+            .insert("max_pending".into(), i64::try_from(limit).unwrap().into());
         config["native"]["workspaces"]["upload"]["policy"] = "publish_retiring_redundant".into();
         fs::write(&self.daemon_config, toml::to_string(&config).unwrap()).unwrap();
         workspace_daemon::config::Config::load(&self.daemon_config).unwrap();
@@ -298,6 +345,29 @@ impl Fixture {
             .chain(args.iter().copied())
             .collect();
         self.run_binary(cwd, &binary, &args, false)
+    }
+
+    fn spawn_cli(&mut self, cwd: &Path, args: &[&str]) -> RunningNativeCommand {
+        self.command_number += 1;
+        let stdout = self.base().join(format!("{}.out", self.command_number));
+        let stderr = self.base().join(format!("{}.err", self.command_number));
+        let mut command = Command::new(&self.cli);
+        self.environment(&mut command);
+        let child = command
+            .args(["--no-pager", "--color=never"])
+            .args(args)
+            .current_dir(cwd)
+            .env("PATH", &self.empty_path)
+            .stdout(fs::File::create(&stdout).unwrap())
+            .stderr(fs::File::create(&stderr).unwrap())
+            .spawn()
+            .unwrap();
+        RunningNativeCommand {
+            child,
+            stdout,
+            stderr,
+            deadline: Instant::now() + Duration::from_secs(30),
+        }
     }
 
     fn workspace(&mut self, args: &[&str]) -> Output {
@@ -1206,6 +1276,20 @@ impl RemoteServer {
     fn start_with_cloud() -> Self {
         Self::start_with_history_and_cloud(8, true)
     }
+    fn start_with_cloud_capture_capacity() -> Self {
+        // This many-capture workload retains historical operation/index proofs
+        // for both workspaces. Give its catalog an explicit bounded profile;
+        // keep the small fixtures and production defaults unchanged. The cloud
+        // pool accounts configured worst-case work, not eager allocation/RSS.
+        Self::start_profile_configured(
+            8,
+            true,
+            None,
+            false,
+            false,
+            Some((262_144, 64 * 1024 * 1024, 12 * 1024 * 1024 * 1024)),
+        )
+    }
     fn start_with_history_and_cloud(history: usize, cloud_enabled: bool) -> Self {
         Self::start_configured(history, cloud_enabled, None)
     }
@@ -1235,6 +1319,23 @@ impl RemoteServer {
         blame_bytes: Option<usize>,
         search_seed: bool,
         landing_enabled: bool,
+    ) -> Self {
+        Self::start_profile_configured(
+            history,
+            cloud_enabled,
+            blame_bytes,
+            search_seed,
+            landing_enabled,
+            None,
+        )
+    }
+    fn start_profile_configured(
+        history: usize,
+        cloud_enabled: bool,
+        blame_bytes: Option<usize>,
+        search_seed: bool,
+        landing_enabled: bool,
+        cloud_catalog: Option<(usize, u64, u64)>,
     ) -> Self {
         assert!((1..=1024).contains(&history));
         let setup_started = Instant::now();
@@ -1277,6 +1378,18 @@ max_manifest_members=1024
                 profile.store.max_path_contexts = 4096;
                 profile.store.max_path_context_bytes = 4 * 1024 * 1024;
                 profile.store.cloud.max_version_decode_bytes = 128 * 1024 * 1024;
+            }
+            if let Some((records, bytes, admission)) = cloud_catalog {
+                profile.store.max_retention_validation_records = records;
+                profile.store.max_retention_validation_bytes = bytes;
+                profile.service.cloud.max_buffered_bytes = admission;
+                // One operator/repository drives this burst workload. Reuse the
+                // existing global replay capacity without raising active limits
+                // or shortening the closed-scope idempotency window.
+                profile.service.query.max_scope_replays_per_principal =
+                    profile.service.query.max_scope_replays;
+                profile.service.query.max_scope_replays_per_repository =
+                    profile.service.query.max_scope_replays;
             }
             profile.validate().unwrap();
             let store = profile
@@ -2870,6 +2983,114 @@ fn federated_index_production_factory_preserves_operations_and_drains_cli_querie
 
 #[test]
 #[ignore = "requires usable /dev/fuse and fusermount3; run mounted_tests locally"]
+fn parallel_native_workspaces_keep_backing_up_beyond_capture_capacity() {
+    let upstream = RemoteServer::start_with_cloud_capture_capacity();
+    let mut fixture = Fixture::new();
+    fixture.configure_remote(&upstream.endpoint);
+    // Match the upstream replay share for this rapid single-operator workload.
+    // Active scope/query limits and registry memory remain unchanged.
+    fixture.query_replay_capacity(1024);
+    fixture.index_mode("federated");
+    fixture.start();
+    let base = fixture.base().to_owned();
+    let roots = [base.join("agent-a"), base.join("agent-b")];
+    for root in &roots {
+        fixture.clone_remote(root);
+    }
+    let bindings = roots.each_ref().map(|root| fixture.binding(root));
+    assert_ne!(bindings[0].workspace_id, bindings[1].workspace_id);
+    assert_ne!(bindings[0].repo, bindings[1].repo);
+    for root in &roots {
+        fixture.success(&base, &["tinytree", "unmount", root.to_str().unwrap()]);
+    }
+    fixture.stop_daemon();
+    fixture.enable_capture_retirement_with_limit(4);
+    fixture.start();
+    for root in &roots {
+        fixture.success(&base, &["tinytree", "resume", root.to_str().unwrap()]);
+    }
+    for root in &roots {
+        fixture.success(root, &["status"]);
+    }
+    let public = upstream.public();
+    fn wait_latest(fixture: &Fixture, queued: u64) {
+        let deadline = Instant::now() + Duration::from_secs(90);
+        loop {
+            let status = fixture.control(Request::Status).unwrap();
+            let local = &status["native"]["commands"]["local_capture"];
+            let upload = &status["native"]["commands"]["capture_upload"];
+            if local["pending_count"] == 2
+                && upload["historical_published_count"] == 2
+                && upload["cleanup_pending"] == false
+                && upload["retired_local_capture_count"].as_u64().unwrap()
+                    >= queued.saturating_sub(2)
+            {
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "two-workspace backup stalled: {status}"
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+    let initial = local_capture_status(&fixture)["queued"].as_u64().unwrap();
+    wait_latest(&fixture, initial);
+    let mut expected = initial;
+    // 70 distinct edits across TWO independent agents exceed both the tiny
+    // four-ticket fixture limit and the ordinary 64-ticket default.
+    for round in 0..35 {
+        for (agent, root) in roots.iter().enumerate() {
+            fs::write(
+                root.join("agent.txt"),
+                format!("private agent {agent} iteration {round}\n"),
+            )
+            .unwrap();
+        }
+        let first = fixture.spawn_cli(&roots[0], &["status"]);
+        let second = fixture.spawn_cli(&roots[1], &["status"]);
+        for output in [first.finish(), second.finish()] {
+            assert!(
+                output.status.success(),
+                "parallel native command failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(
+                !String::from_utf8_lossy(&output.stderr)
+                    .contains("native command drain remains pending")
+            );
+        }
+        expected += 2;
+        let local = local_capture_status(&fixture);
+        assert_eq!(
+            local["queued"].as_u64().unwrap(),
+            expected,
+            "each successful independent command must retain its distinct edited snapshot: {local}"
+        );
+        assert!(local["pending_count"].as_u64().unwrap() <= 4);
+        assert_eq!(local["pending_clean"], 0);
+        wait_latest(&fixture, expected);
+        assert_eq!(local_capture_bundles(&fixture).len(), 2);
+        for (agent, root) in roots.iter().enumerate() {
+            assert_eq!(
+                fs::read_to_string(root.join("agent.txt")).unwrap(),
+                format!("private agent {agent} iteration {round}\n")
+            );
+        }
+        assert_eq!(upstream.public(), public);
+        assert_eq!(upstream.file_reads(), 0);
+    }
+    assert!(expected >= 70);
+    assert!(cloud_generation(&upstream, bindings[0].workspace_id) >= 35);
+    assert!(cloud_generation(&upstream, bindings[1].workspace_id) >= 35);
+    for root in &roots {
+        fixture.success(&base, &["tinytree", "unmount", root.to_str().unwrap()]);
+    }
+    fixture.stop_daemon();
+}
+
+#[test]
+#[ignore = "requires usable /dev/fuse and fusermount3; run mounted_tests locally"]
 fn published_capture_retirement_continues_distinct_edits_and_restores_old_versions() {
     let upstream = RemoteServer::start_with_cloud();
     let mut fixture = Fixture::new();
@@ -3074,26 +3295,41 @@ fn published_capture_retirement_continues_distinct_edits_and_restores_old_versio
 fn cloud_generation(upstream: &RemoteServer, workspace: [u8; 32]) -> u64 {
     use tinytree_client::cloud_protocol as c;
     upstream.runtime.as_ref().unwrap().block_on(async {
-        let mut client =
-            c::workspace_cloud_client::WorkspaceCloudClient::connect(upstream.endpoint.clone())
-                .await
-                .unwrap()
-                .accept_compressed(CompressionEncoding::Zstd);
-        let mut request = RpcRequest::new(c::GetWorkspaceRequest {
-            repository_id: "example".into(),
-            workspace_id: workspace.to_vec(),
-        });
-        request.metadata_mut().insert(
-            "authorization",
-            format!("Bearer {REMOTE_TOKEN}").parse().unwrap(),
-        );
-        request.set_timeout(Duration::from_secs(10));
-        client
-            .get_workspace(request)
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        let client = tokio::time::timeout_at(
+            deadline,
+            c::workspace_cloud_client::WorkspaceCloudClient::connect(upstream.endpoint.clone()),
+        )
+        .await
+        .unwrap()
+        .unwrap()
+        .accept_compressed(CompressionEncoding::Zstd);
+        // Use the shipped SDK policy: temporary admission needs a server hint;
+        // permanent resource quotas must not become an observer retry loop.
+        let policy = tinytree_client::Config::default().rpc;
+        let value = policy
+            .retry(deadline, Duration::from_secs(10), |allowance| {
+                let mut client = client.clone();
+                async move {
+                    let mut request = RpcRequest::new(c::GetWorkspaceRequest {
+                        repository_id: "example".into(),
+                        workspace_id: workspace.to_vec(),
+                    });
+                    request.metadata_mut().insert(
+                        "authorization",
+                        format!("Bearer {REMOTE_TOKEN}").parse().unwrap(),
+                    );
+                    request.set_timeout(allowance);
+                    client
+                        .get_workspace(request)
+                        .await
+                        .map(|response| response.into_inner())
+                }
+            })
             .await
-            .unwrap()
-            .into_inner()
-            .generation
+            .unwrap();
+        assert_eq!(value.workspace_id, workspace);
+        value.generation
     })
 }
 
