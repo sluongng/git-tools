@@ -21,6 +21,9 @@ enum Action {
         destination_reference: String,
         #[arg(long, default_value = "git")]
         git: PathBuf,
+        /// Maximum number of native tree levels to traverse.
+        #[arg(long, default_value_t = tinytree_git::Limits::default().max_depth)]
+        max_depth: usize,
         #[arg(long, default_value_t = 600)]
         timeout_seconds: u64,
     },
@@ -45,6 +48,9 @@ enum Action {
         probe_timeout_ms: u64,
         #[arg(long, default_value_t = 300000)]
         max_backoff_ms: u64,
+        /// Maximum number of native tree levels to traverse.
+        #[arg(long, default_value_t = tinytree_git::Limits::default().max_depth)]
+        max_depth: usize,
         #[arg(long, default_value_t = 600)]
         timeout_seconds: u64,
     },
@@ -97,11 +103,13 @@ async fn main() -> anyhow::Result<()> {
             source_reference,
             destination_reference,
             git,
+            max_depth,
             timeout_seconds,
         } => {
             let mut options = tinytree_git::ExportOptions::new(state, destination_git, git);
             options.source_reference = source_reference;
             options.destination_reference = destination_reference;
+            options.limits.max_depth = max_depth;
             options.limits.timeout = std::time::Duration::from_secs(timeout_seconds);
             let result =
                 tinytree_git::export(tinytree_client::Config::load(&config)?, options).await?;
@@ -118,6 +126,7 @@ async fn main() -> anyhow::Result<()> {
             poll_interval_ms,
             probe_timeout_ms,
             max_backoff_ms,
+            max_depth,
             timeout_seconds,
         } => {
             #[cfg(unix)]
@@ -127,6 +136,7 @@ async fn main() -> anyhow::Result<()> {
                 let mut export = tinytree_git::ExportOptions::new(state, destination_git, git);
                 export.source_reference = source_reference;
                 export.destination_reference = destination_reference;
+                export.limits.max_depth = max_depth;
                 export.limits.timeout = Duration::from_secs(timeout_seconds);
                 let mut options = WatchOptions::new(export, watch_state);
                 options.poll_interval = Duration::from_millis(poll_interval_ms);

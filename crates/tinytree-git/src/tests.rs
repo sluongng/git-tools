@@ -520,19 +520,99 @@ async fn receiver_divergence_and_resource_limits_preserve_pending_native_retenti
     );
     let deeper = running.commit(root, vec![head], vec![], "shared subtree at two depths\n");
     running.publish(deeper, 1);
-    for (name, max_depth, allowed) in [
-        ("cached subtree too deep", 3, false),
-        ("cached subtree at boundary", 4, true),
+    let config_file = running.temp.path().join("depth-client.toml");
+    std::fs::write(
+        &config_file,
+        format!(
+            "endpoint = {:?}\nrepository_id = \"example\"\ntoken_env = \"TINYTREE_GIT_TEST_TOKEN\"\n",
+            running.config.endpoint
+        ),
+    )
+    .unwrap();
+    for (name, action, max_depth, allowed) in [
+        ("export cached subtree too deep", "export", 3, false),
+        ("export cached subtree at boundary", "export", 4, true),
+        ("watch cached subtree too deep", "watch", 3, false),
+        ("watch cached subtree at boundary", "watch", 4, true),
     ] {
-        let mut depth_options = ExportOptions::new(
-            running.temp.path().join(format!("depth-{max_depth}-state")),
-            running.temp.path().join(format!("depth-{max_depth}.git")),
+        let depth_options = ExportOptions::new(
+            running
+                .temp
+                .path()
+                .join(format!("{action}-depth-{max_depth}-state")),
+            running
+                .temp
+                .path()
+                .join(format!("{action}-depth-{max_depth}.git")),
             git_program(),
         );
-        depth_options.limits.max_depth = max_depth;
-        let result = export(running.config.clone(), depth_options.clone()).await;
+        let mut command = tokio::process::Command::new(env!("CARGO_BIN_EXE_tinytree-git"));
+        command
+            .arg(action)
+            .arg("--config")
+            .arg(&config_file)
+            .arg("--state")
+            .arg(&depth_options.state_dir)
+            .arg("--destination-git")
+            .arg(&depth_options.destination_git)
+            .arg("--git")
+            .arg(git_program())
+            .arg("--max-depth")
+            .arg(max_depth.to_string())
+            .args(["--timeout-seconds", "30"]);
+        if action == "watch" {
+            let watch_dir = running.temp.path().join(format!("depth-{max_depth}-watch"));
+            let child = command
+                .arg("--watch-state")
+                .arg(&watch_dir)
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .kill_on_drop(true)
+                .spawn()
+                .unwrap();
+            let observed = wait_watch(&watch_dir, |s| {
+                if allowed {
+                    s.delivered.as_ref().is_some_and(|p| p.generation == 2)
+                } else {
+                    s.last_error == Some(watch::WatchError::ExportFailed)
+                }
+            })
+            .await;
+            if !allowed {
+                assert!(observed.delivered.is_none(), "{name}");
+            }
+            assert_eq!(
+                unsafe { libc::kill(child.id().unwrap() as i32, libc::SIGINT) },
+                0
+            );
+            let output =
+                tokio::time::timeout(std::time::Duration::from_secs(5), child.wait_with_output())
+                    .await
+                    .unwrap()
+                    .unwrap();
+            assert!(
+                output.status.success(),
+                "{name}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        } else {
+            let output = command.output().await.unwrap();
+            assert_eq!(
+                output.status.success(),
+                allowed,
+                "{name}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            if !allowed {
+                assert!(
+                    String::from_utf8_lossy(&output.stderr)
+                        .contains("native tree depth limit exceeded"),
+                    "{name}: {}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
+        }
         if allowed {
-            result.unwrap_or_else(|error| panic!("{name}: {error:#}"));
             assert_eq!(
                 git(
                     &depth_options.destination_git,
@@ -548,11 +628,6 @@ async fn receiver_divergence_and_resource_limits_preserve_pending_native_retenti
                 b"bounded\n"
             );
         } else {
-            let error = result.unwrap_err();
-            assert!(
-                format!("{error:#}").contains("native tree depth limit exceeded"),
-                "{name}: {error:#}"
-            );
             assert!(
                 status(&depth_options.state_dir)
                     .unwrap()
