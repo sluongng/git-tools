@@ -73,6 +73,11 @@ pub enum LandingState {
     Conflict,
     Unsupported,
     CheckFailed,
+    /// Checks ended without a verdict; no publication or recovery hold remains.
+    // Keep the persisted tag no longer than Expired so legacy accepted records
+    // can terminalize within their already-reserved record/catalog budgets.
+    #[serde(rename = "Unavail")]
+    CheckUnavailable,
     StaleTarget,
     Expired,
 }
@@ -549,6 +554,12 @@ impl Inner {
                     && r.reference.is_none()
                     && r.conflict.is_none()
             }
+            LandingState::CheckUnavailable => {
+                r.candidate.is_some()
+                    && r.check.is_none()
+                    && r.reference.is_none()
+                    && r.conflict.is_none()
+            }
             LandingState::Conflict => {
                 r.candidate.is_none()
                     && r.check.is_none()
@@ -677,7 +688,15 @@ impl Inner {
             create_durable_directories(&self.root.join("cloud"))?;
         }
         let mut tx = self.db.write_tx().durability(Some(PersistMode::SyncAll));
-        advance_feature(&mut tx, &self.spaces.meta, 6)?;
+        advance_feature(
+            &mut tx,
+            &self.spaces.meta,
+            if r.state == LandingState::CheckUnavailable {
+                8
+            } else {
+                6
+            },
+        )?;
         tx.insert(&self.spaces.landing, key(repo, &id), bytes);
         self.commit(tx)
     }
@@ -853,6 +872,12 @@ impl Inner {
         Ok(roots_set)
     }
     pub(super) fn validate_landing_on_reopen(&self) -> Result<()> {
+        let feature = store_feature(
+            self.db
+                .read_tx()
+                .get(&self.spaces.meta, b"format")?
+                .as_deref(),
+        )?;
         let mut repos = HashSet::new();
         let mut count = 0usize;
         let mut total = 0usize;
@@ -879,6 +904,9 @@ impl Inner {
                 .try_into()
                 .map_err(|_| Error::Corrupt("landing key"))?;
             let record = self.decode_landing(repo, id, &v)?;
+            if record.state == LandingState::CheckUnavailable && feature < 8 {
+                return Err(Error::Corrupt("unavailable landing without store feature"));
+            }
             if record.retains_roots() {
                 self.validate_landing_candidate(repo, &record, &mut canonical_bytes)?;
             }
@@ -1217,6 +1245,66 @@ impl Store {
         self.inner.landing_write(repo, id, &r)?;
         public(id, &r)
     }
+    /// Trusted embedding-only non-verdict terminalization. The embedding must
+    /// establish permanently unavailable checks and confirmed physical cleanup.
+    /// No caller verdict, check evidence, new execution or publication is implied.
+    /// Enable the Store-owned external-check layout before this transition.
+    pub fn record_landing_check_unavailable(
+        &self,
+        repo: &str,
+        owner: LandingOwner,
+        token: &str,
+        identity: &LandingCheckIdentity,
+        now: i64,
+    ) -> Result<LandingJob> {
+        request_token(token)?;
+        let id = job_id(repo, owner, token);
+        let _gate = self.inner.lock()?;
+        self.inner.repository(repo)?;
+        let mut r = self
+            .inner
+            .landing_record(repo, id)?
+            .ok_or(Error::Invalid("unknown landing job"))?;
+        let candidate = r
+            .candidate
+            .as_ref()
+            .ok_or(Error::Invalid("landing candidate not prepared"))?;
+        if identity.candidate.0 != candidate.head
+            || identity.root_tree.0 != candidate.tree
+            || identity.profile != r.intent.profile
+        {
+            return Err(Error::Invalid("landing check identity"));
+        }
+        if r.state == LandingState::CheckUnavailable {
+            return public(id, &r);
+        }
+        if r.state != LandingState::Prepared
+            || r.check.is_some()
+            || r.reference.is_some()
+            || r.conflict.is_some()
+        {
+            return Err(Error::Invalid("landing job does not accept unavailability"));
+        }
+        r.state = if r.intent.expires_at <= now {
+            LandingState::Expired
+        } else {
+            let feature = store_feature(
+                self.inner
+                    .db
+                    .read_tx()
+                    .get(&self.inner.spaces.meta, b"format")?
+                    .as_deref(),
+            )?;
+            if feature < 7 {
+                return Err(Error::Invalid("external checks are not activated"));
+            }
+            external_checks::preflight(&self.inner.root, feature)?;
+            LandingState::CheckUnavailable
+        };
+        r.roots_released = true;
+        self.inner.landing_write(repo, id, &r)?;
+        public(id, &r)
+    }
     /// Publish the exact checked candidate and receipt atomically. A stale target
     /// is terminal; its successful old check cannot authorize a rebuilt candidate.
     /// Historical committed replay returns its original result without republish.
@@ -1449,6 +1537,22 @@ impl LandingHandle {
             now,
         )
     }
+    /// Close a prepared job after trusted checks permanently stop without a verdict.
+    pub fn record_check_unavailable(
+        &self,
+        store: &Store,
+        identity: &LandingCheckIdentity,
+        now: i64,
+    ) -> Result<LandingJob> {
+        self.scope(store)?;
+        store.record_landing_check_unavailable(
+            &self.repository,
+            self.owner,
+            &self.token,
+            identity,
+            now,
+        )
+    }
     pub fn finalize(&self, store: &Store, now: i64) -> Result<LandingJob> {
         self.scope(store)?;
         store.finalize_landing(&self.repository, self.owner, &self.token, now)
@@ -1507,6 +1611,26 @@ impl LandingCandidateLease {
     }
 }
 impl Store {
+    /// Recover an exact saved embedding handle without enumerating jobs or
+    /// reattaching roots. The embedding must validate its saved request and
+    /// candidate identity before performing any authoritative transition.
+    pub fn recover_landing_handle(
+        &self,
+        repo: &str,
+        id: [u8; 32],
+    ) -> Result<Option<LandingHandle>> {
+        let _gate = self.inner.lock()?;
+        self.inner.repository(repo)?;
+        let Some(record) = self.inner.landing_record(repo, id)? else {
+            return Ok(None);
+        };
+        Ok(Some(LandingHandle {
+            repository: repo.to_owned(),
+            owner: LandingOwner(record.owner),
+            token: record.intent.token,
+            store: Arc::downgrade(&self.inner),
+        }))
+    }
     /// Trusted embedding discovery, not a user listing/authorization API. Pages
     /// advance over terminal records without cloning their candidate lists.
     /// This is not a snapshot: concurrent inserts before the cursor require a

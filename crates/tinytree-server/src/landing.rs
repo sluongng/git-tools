@@ -831,6 +831,7 @@ fn response(
         s::LandingState::CheckFailed => p::Phase::CheckFailed,
         s::LandingState::StaleTarget => p::Phase::StaleTarget,
         s::LandingState::Expired => p::Phase::Expired,
+        s::LandingState::CheckUnavailable => p::Phase::CheckUnavailable,
     };
     let candidate = job.candidate.map(|c| p::Candidate {
         head: c.head.0.to_vec(),

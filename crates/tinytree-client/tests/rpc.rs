@@ -8925,6 +8925,70 @@ async fn landing_compressed_preparation_replay_and_retained_results_are_checked(
     assert_eq!(receipt.destination, "main");
     assert_eq!(receipt.evidence, [44; 32]);
 
+    // A trusted non-verdict terminal result is distinct from failed checks and
+    // does not change the already committed reference or fabricate evidence.
+    let committed_head = tinytree_model::CommitId(receipt.commit.key.id.0);
+    let (_, committed_bytes) = store.read_metadata("example", receipt.commit.key).unwrap();
+    let tinytree_model::Object::Commit(mut followup) =
+        tinytree_model::decode(&committed_bytes, Default::default()).unwrap()
+    else {
+        unreachable!()
+    };
+    followup.parents = vec![committed_head];
+    followup.change_id = tinytree_model::ChangeId([20; 16]);
+    followup.description = "landing SDK subsequent private draft".into();
+    let followup = tinytree_model::encode(
+        &tinytree_model::Object::Commit(followup),
+        Default::default(),
+    )
+    .unwrap();
+    store
+        .put("example", followup.descriptor, &followup.bytes, 0)
+        .unwrap();
+    let mut unavailable_start = start.clone();
+    unavailable_start.idempotency_key = "unavailable-sdk".into();
+    unavailable_start.source_base = committed_head;
+    unavailable_start.source_head = tinytree_model::CommitId(followup.descriptor.key.id.0);
+    unavailable_start.expected_head = committed_head;
+    unavailable_start.expected_generation = receipt.generation;
+    let accepted = ordinary.start_landing(&unavailable_start).await.unwrap();
+    let unavailable_id = accepted.handle().id();
+    drop(accepted);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    let ready = loop {
+        let job = ordinary
+            .lookup_landing(&unavailable_start, Some(unavailable_id))
+            .await
+            .unwrap();
+        if job.phase() != LandingPhase::Intent {
+            break job;
+        }
+        drop(job);
+        assert!(tokio::time::Instant::now() < deadline);
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    };
+    assert_eq!(ready.phase(), LandingPhase::PreparedPendingChecks);
+    let saved = store
+        .recover_landing_handle("example", unavailable_id)
+        .unwrap()
+        .unwrap();
+    let pin = saved.pin_candidate(&store, now).unwrap();
+    store.enable_external_checks().unwrap();
+    saved
+        .record_check_unavailable(&store, pin.identity(), now)
+        .unwrap();
+    drop(pin);
+    let unavailable = ordinary.get_landing(&ready.handle()).await.unwrap();
+    assert_eq!(unavailable.phase(), LandingPhase::CheckUnavailable);
+    assert!(!unavailable.roots_retained());
+    assert!(unavailable.candidate().is_some());
+    assert!(unavailable.receipt().is_none());
+    let unchanged_reference = store.references("example", &["main".into()]).unwrap();
+    assert_eq!(unchanged_reference[0].generation, 2);
+    assert_eq!(unchanged_reference[0].commit, Some(receipt.commit));
+    drop(unavailable);
+    drop(ready);
+
     // Deterministic identity fast-forward: freeze the original canonical
     // committer directly through the trusted Store fixture. Server wall-clock
     // metadata is deliberately not synchronized or overridden in production.
@@ -9217,7 +9281,7 @@ async fn landing_rejects_malformed_and_overbudget_assertions_and_cancellation_re
         ..Default::default()
     };
     let client = NativeClient::connect(config).await.unwrap();
-    let cases: [(&str, Box<dyn Fn(&mut l::LandingResponse)>); 16] = [
+    let cases: [(&str, Box<dyn Fn(&mut l::LandingResponse)>); 17] = [
         (
             "unknown phase",
             Box::new(|r| r.job.as_mut().unwrap().phase = 999),
@@ -9245,6 +9309,10 @@ async fn landing_rejects_malformed_and_overbudget_assertions_and_cancellation_re
         (
             "intent with candidate",
             Box::new(|r| r.job.as_mut().unwrap().phase = l::Phase::Intent as i32),
+        ),
+        (
+            "unavailable with retained roots",
+            Box::new(|r| r.job.as_mut().unwrap().phase = l::Phase::CheckUnavailable as i32),
         ),
         (
             "prepared without retained roots",

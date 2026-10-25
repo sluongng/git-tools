@@ -4494,6 +4494,14 @@ fn landing_reports_are_bound_to_original_intent_and_check_state() {
         rewrites: vec![],
     });
     LandingReport::checked(prepared.clone(), &intent, Arc::new(())).unwrap();
+    let mut unavailable = prepared.clone();
+    unavailable.phase = l::Phase::CheckUnavailable as i32;
+    unavailable.roots_retained = false;
+    LandingReport::checked(unavailable.clone(), &intent, Arc::new(())).unwrap();
+    let mut retained_unavailable = unavailable.clone();
+    retained_unavailable.roots_retained = true;
+    let mut unavailable_without_candidate = unavailable;
+    unavailable_without_candidate.candidate = None;
     let mut no_hold = job.clone();
     no_hold.roots_retained = false;
     let mut wrong_profile = job.clone();
@@ -4511,6 +4519,11 @@ fn landing_reports_are_bound_to_original_intent_and_check_state() {
         ("changed_profile", wrong_profile),
         ("candidate_before_preparation", premature_candidate),
         ("unknown_phase", unknown_phase),
+        ("unavailable_with_retained_roots", retained_unavailable),
+        (
+            "unavailable_without_candidate",
+            unavailable_without_candidate,
+        ),
         ("conflict_with_candidate", conflict_with_candidate),
     ] {
         assert_eq!(

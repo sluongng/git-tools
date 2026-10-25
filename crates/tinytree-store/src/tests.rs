@@ -7207,6 +7207,302 @@ fn landing_roots_join_ordinary_publication_and_candidate_gc_admission_budgets() 
 }
 
 #[test]
+fn landing_unavailable_releases_roots_without_verdict_or_publication_and_replays_after_restart() {
+    let directory = external_layout_directory();
+    let store = Store::open(directory.path(), config()).unwrap();
+    store.create_repository("demo").unwrap();
+    let owner = LandingOwner([20; 32]);
+    let (base, source, dest) = landing_fixture(&store, "demo");
+    let input = landing_request(base, source, dest, "unavailable");
+    let accepted = store.begin_landing("demo", owner, &input, 0).unwrap();
+    let prepared = store
+        .prepare_landing("demo", owner, "unavailable", 1)
+        .unwrap();
+    let identity = landing_identity(&prepared);
+    let before = store
+        .references("demo", std::slice::from_ref(&input.reference_name))
+        .unwrap();
+    assert_eq!(before[0].generation, 1);
+    assert_eq!(before[0].commit, Some(dest));
+    for changed in [
+        LandingCheckIdentity {
+            candidate: CommitId([1; 32]),
+            ..identity.clone()
+        },
+        LandingCheckIdentity {
+            root_tree: TreeId([1; 32]),
+            ..identity.clone()
+        },
+        LandingCheckIdentity {
+            profile: LandingCheckProfile {
+                version: "other".into(),
+                ..identity.profile.clone()
+            },
+            ..identity.clone()
+        },
+    ] {
+        assert!(matches!(
+            store.record_landing_check_unavailable("demo", owner, "unavailable", &changed, 2),
+            Err(Error::Invalid("landing check identity"))
+        ));
+        assert_eq!(
+            store
+                .landing_job("demo", owner, "unavailable")
+                .unwrap()
+                .unwrap(),
+            prepared
+        );
+    }
+    assert!(
+        store
+            .recover_landing_handle("demo", [99; 32])
+            .unwrap()
+            .is_none()
+    );
+    store.create_repository("other").unwrap();
+    assert!(
+        store
+            .recover_landing_handle("other", accepted.id)
+            .unwrap()
+            .is_none()
+    );
+    let handle = store
+        .recover_landing_handle("demo", accepted.id)
+        .unwrap()
+        .unwrap();
+    let (other_directory, other_store) = open();
+    assert!(handle.status(&other_store).is_err());
+    drop(other_store);
+    drop(other_directory);
+    assert!(matches!(
+        handle.record_check_unavailable(&store, &identity, 2),
+        Err(Error::Invalid("external checks are not activated"))
+    ));
+    assert_eq!(handle.status(&store).unwrap(), prepared);
+    assert_eq!(store.external_checks_directory().unwrap(), None);
+    store.enable_external_checks().unwrap();
+    let unavailable = handle
+        .record_check_unavailable(&store, &identity, 2)
+        .unwrap();
+    assert_eq!(unavailable.state, LandingState::CheckUnavailable);
+    assert_eq!(unavailable.expires_at, input.expires_at);
+    assert_eq!(unavailable.candidate, prepared.candidate);
+    assert!(!unavailable.roots_retained);
+    assert!(unavailable.receipt.is_none());
+    assert!(unavailable.conflict_path.is_none());
+    assert_eq!(
+        store
+            .references("demo", std::slice::from_ref(&input.reference_name))
+            .unwrap(),
+        before
+    );
+    assert!(
+        store
+            .scan_pending_landings("demo", None, Default::default())
+            .unwrap()
+            .jobs
+            .is_empty()
+    );
+    assert_eq!(
+        handle
+            .record_check_unavailable(&store, &identity, 3)
+            .unwrap(),
+        unavailable
+    );
+    assert!(
+        handle
+            .record_check(
+                &store,
+                &identity,
+                LandingVerdict {
+                    passed: true,
+                    evidence: [1; 32]
+                },
+                3
+            )
+            .is_err()
+    );
+    assert_eq!(handle.finalize(&store, 3).unwrap(), unavailable);
+    assert_eq!(
+        store
+            .inner
+            .db
+            .read_tx()
+            .get(&store.inner.spaces.meta, b"format")
+            .unwrap()
+            .unwrap()
+            .as_ref(),
+        b"tinytree-store-8"
+    );
+    let candidate_key = ObjectKey {
+        kind: Kind::Commit,
+        id: ObjectId(identity.candidate.0),
+    };
+    store.gc("demo", 1000).unwrap();
+    assert!(store.descriptor("demo", candidate_key).unwrap().is_none());
+    drop(store);
+    let store = Store::open_existing(directory.path(), config()).unwrap();
+    assert!(
+        handle.status(&store).is_err(),
+        "a prior instance's handle is not reused after reopen"
+    );
+    let recovered = store
+        .recover_landing_handle("demo", accepted.id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(recovered.status(&store).unwrap(), unavailable);
+    assert_eq!(
+        recovered
+            .record_check_unavailable(&store, &identity, 1001)
+            .unwrap(),
+        unavailable
+    );
+    assert_eq!(
+        store
+            .references("demo", std::slice::from_ref(&input.reference_name))
+            .unwrap(),
+        before
+    );
+    drop(recovered);
+    drop(store);
+    let set_format = |format: &[u8]| {
+        let db = SingleWriterTxDatabase::builder(directory.path().join("metadata"))
+            .open()
+            .unwrap();
+        let meta = db.keyspace("meta", KeyspaceCreateOptions::default).unwrap();
+        let mut tx = db.write_tx().durability(Some(PersistMode::SyncAll));
+        tx.insert(&meta, b"format", format);
+        tx.commit().unwrap();
+    };
+    set_format(b"tinytree-store-7");
+    assert!(matches!(
+        Store::open_existing(directory.path(), config()),
+        Err(Error::Corrupt("unavailable landing without store feature"))
+    ));
+    set_format(b"tinytree-store-8");
+    drop(Store::open_existing(directory.path(), config()).unwrap());
+}
+
+#[test]
+fn landing_unavailable_cannot_replace_a_verdict_and_due_jobs_expire_normally() {
+    let directory = external_layout_directory();
+    let store = Store::open(directory.path(), config()).unwrap();
+    store.create_repository("demo").unwrap();
+    store.enable_external_checks().unwrap();
+    let owner = LandingOwner([21; 32]);
+    let (base, source, dest) = landing_fixture(&store, "demo");
+    for (token, passed) in [("passing-check", true), ("failing-check", false)] {
+        let input = landing_request(base, source, dest, token);
+        store.begin_landing("demo", owner, &input, 0).unwrap();
+        let prepared = store.prepare_landing("demo", owner, token, 1).unwrap();
+        let identity = landing_identity(&prepared);
+        let checked = store
+            .record_landing_check(
+                "demo",
+                owner,
+                token,
+                &identity,
+                LandingVerdict {
+                    passed,
+                    evidence: [2; 32],
+                },
+                2,
+            )
+            .unwrap();
+        assert!(
+            store
+                .record_landing_check_unavailable("demo", owner, token, &identity, 3)
+                .is_err()
+        );
+        assert_eq!(
+            store.landing_job("demo", owner, token).unwrap().unwrap(),
+            checked
+        );
+    }
+    let input = landing_request(base, source, dest, "due");
+    store.begin_landing("demo", owner, &input, 0).unwrap();
+    let prepared = store.prepare_landing("demo", owner, "due", 1).unwrap();
+    let expired = store
+        .record_landing_check_unavailable(
+            "demo",
+            owner,
+            "due",
+            &landing_identity(&prepared),
+            input.expires_at,
+        )
+        .unwrap();
+    assert_eq!(expired.state, LandingState::Expired);
+    assert_eq!(expired.expires_at, input.expires_at);
+    assert!(!expired.roots_retained);
+    assert!(expired.receipt.is_none());
+    assert_eq!(
+        store
+            .references("demo", std::slice::from_ref(&input.reference_name))
+            .unwrap()[0]
+            .commit,
+        Some(dest)
+    );
+}
+
+#[test]
+fn landing_unavailable_fits_legacy_prepared_record_and_exact_catalog_limits() {
+    let directory = external_layout_directory();
+    let store = Store::open(directory.path(), config()).unwrap();
+    store.create_repository("demo").unwrap();
+    store.enable_external_checks().unwrap();
+    let owner = LandingOwner([22; 32]);
+    let (base, source, dest) = landing_fixture(&store, "demo");
+    let token = "u".repeat(128);
+    let mut input = landing_request(base, source, dest, &token);
+    input.committer.name = "n".repeat(1024);
+    input.committer.email = "e".repeat(1024);
+    input.check_profile.name = "p".repeat(128);
+    input.check_profile.version = "v".repeat(128);
+    let accepted = store.begin_landing("demo", owner, &input, 0).unwrap();
+    let prepared = store.prepare_landing("demo", owner, &token, 1).unwrap();
+    let identity = landing_identity(&prepared);
+    let physical = key("demo", &accepted.id);
+    let bytes = store
+        .inner
+        .db
+        .read_tx()
+        .get(&store.inner.spaces.landing, &physical)
+        .unwrap()
+        .unwrap();
+    let record_bytes = bytes.len();
+    let catalog_bytes = physical.len() + record_bytes;
+    assert!(
+        record_bytes >= 4096,
+        "fixture reaches the supported exact record boundary"
+    );
+    drop(bytes);
+    drop(store);
+    let mut limits = config();
+    limits.landing.max_record_bytes = record_bytes;
+    limits.max_retention_validation_bytes = catalog_bytes as u64;
+    let store = Store::open_existing(directory.path(), limits.clone()).unwrap();
+    let unavailable = store
+        .record_landing_check_unavailable("demo", owner, &token, &identity, 2)
+        .unwrap();
+    assert_eq!(unavailable.state, LandingState::CheckUnavailable);
+    assert!(!unavailable.roots_retained);
+    assert!(unavailable.receipt.is_none());
+    assert!(
+        store
+            .inner
+            .db
+            .read_tx()
+            .get(&store.inner.spaces.landing, &physical)
+            .unwrap()
+            .unwrap()
+            .len()
+            <= record_bytes
+    );
+    drop(store);
+    assert!(Store::open_existing(directory.path(), limits).is_ok());
+}
+
+#[test]
 fn landing_conflicts_and_unsupported_stacks_are_durable_non_publications() {
     let (directory, store) = open();
     let owner = LandingOwner([14; 32]);

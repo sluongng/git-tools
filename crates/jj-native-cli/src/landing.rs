@@ -313,11 +313,18 @@ mod native {
             l::Phase::Conflict => Some("conflict"),
             l::Phase::Unsupported => Some("unsupported"),
             l::Phase::CheckFailed => Some("check_failed"),
+            l::Phase::CheckUnavailable => Some("check_unavailable"),
             l::Phase::StaleTarget => Some("stale_target"),
             l::Phase::Expired => Some("expired"),
             _ => None,
         }
         .map(str::to_owned);
+        if phase == l::Phase::CheckUnavailable {
+            // This candidate can never be applied. Preserve the private source
+            // and fork, without retaining an unpromised server-only result.
+            saved.candidate_head = None;
+            saved.result_roots.clear();
+        }
         locked.save().map_err(fail)?;
         if phase == l::Phase::Committed && args.resume {
             apply(ui, command, &mut locked, &control, &report).await?;

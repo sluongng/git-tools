@@ -8579,12 +8579,21 @@ async fn wait_landing_phase(
 #[tokio::test]
 async fn pinned_checker_receipts_publish_or_reject_and_recover_lost_reply() {
     use tinytree_proto::landing_v1 as l;
-    for (mode, phase, generation, expect_recovery) in [
-        ("pass", l::Phase::Committed, 2, false),
-        ("fail", l::Phase::CheckFailed, 1, false),
-        ("lost_reply", l::Phase::Committed, 2, true),
+    for (mode, phase, generation, expect_recovery, runs, attempts) in [
+        ("pass", l::Phase::Committed, 2, false, 1, 2),
+        ("fail", l::Phase::CheckFailed, 1, false, 1, 2),
+        ("lost_reply", l::Phase::Committed, 2, true, 1, 2),
+        ("unavailable", l::Phase::CheckUnavailable, 1, false, 1, 1),
+        ("unavailable_then_pass", l::Phase::Committed, 2, false, 2, 2),
     ] {
         let (_temporary, store, mut config, input, scratch) = checked_landing_setup(mode);
+        config
+            .service
+            .landing
+            .checker
+            .as_mut()
+            .unwrap()
+            .max_attempts = attempts;
         config.service.protected_references = vec![tinytree_server::ProtectedReference {
             repository: "alpha".into(),
             reference: "main".into(),
@@ -8597,9 +8606,12 @@ async fn pinned_checker_receipts_publish_or_reject_and_recover_lost_reply() {
         )
         .await;
         let mut client = running.landing_client().await;
-        client
+        let original = client
             .start_landing(request(input.clone(), ALPHA))
             .await
+            .unwrap()
+            .into_inner()
+            .job
             .unwrap();
         let job = wait_landing_phase(&mut client, &input, phase).await;
         assert_eq!(
@@ -8607,6 +8619,13 @@ async fn pinned_checker_receipts_publish_or_reject_and_recover_lost_reply() {
             generation,
             "{mode}"
         );
+        assert_eq!(job.expires_at_seconds, original.expires_at_seconds);
+        if phase == l::Phase::CheckUnavailable {
+            assert!(job.candidate.is_some());
+            assert!(!job.roots_retained);
+            assert!(job.receipt.is_none());
+            assert!(job.conflict_path.is_none());
+        }
         if phase == l::Phase::Committed {
             assert_eq!(
                 job.receipt
@@ -8635,11 +8654,151 @@ async fn pinned_checker_receipts_publish_or_reject_and_recover_lost_reply() {
         .unwrap();
         assert_eq!(replay.id, job.id);
         assert_eq!(replay.receipt, job.receipt);
+        assert_eq!(replay.phase, job.phase);
+        assert_eq!(replay.expires_at_seconds, original.expires_at_seconds);
         let executions = std::fs::read_to_string(scratch.join("executions")).unwrap();
-        assert_eq!(executions.lines().filter(|line| *line == "run").count(), 1);
+        assert_eq!(
+            executions.lines().filter(|line| *line == "run").count(),
+            runs
+        );
         if expect_recovery {
             assert!(executions.lines().any(|line| line == "recover"));
         }
+        running.stop().await;
+    }
+    for prefix in ["legacy_terminal", "ready_before_store", "ready_after_store"] {
+        let (_temporary, store, mut config, input, scratch) = checked_landing_setup("unavailable");
+        config
+            .service
+            .landing
+            .checker
+            .as_mut()
+            .unwrap()
+            .retry_delay_seconds = 5;
+        let running = Running::start_landing(
+            store.clone(),
+            config.service.clone(),
+            landing_principals(true),
+            true,
+        )
+        .await;
+        let mut client = running.landing_client().await;
+        let original = client
+            .start_landing(request(input.clone(), ALPHA))
+            .await
+            .unwrap()
+            .into_inner()
+            .job
+            .unwrap();
+        let saved = wait_checker_record(&store, &["RetryReady"]).await;
+        assert_eq!(saved["receipt"]["outcome"], "unavailable");
+        assert_eq!(saved["receipt"]["cleanup_confirmed"], true);
+        assert_eq!(saved["verdict_eligible"], true);
+        assert_eq!(saved["attempts"], 1);
+        running.stop().await;
+        drop(client);
+        let jobs = store
+            .external_checks_directory()
+            .unwrap()
+            .unwrap()
+            .join("jobs");
+        let path = std::fs::read_dir(&jobs)
+            .unwrap()
+            .map(|e| e.unwrap().path().join("state.json"))
+            .next()
+            .unwrap();
+        // Preserve all genuine receipt/request/authority bytes and ordering.
+        // Only arrange the durable coordinator crash prefix, never a verdict.
+        let mut text = std::fs::read_to_string(&path).unwrap();
+        let old: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(old["record"]["phase"], "RetryReady");
+        text = text.replacen(
+            "\"phase\":\"RetryReady\"",
+            if prefix == "legacy_terminal" {
+                "\"phase\":\"Terminal\""
+            } else {
+                "\"phase\":\"UnavailableReady\""
+            },
+            1,
+        );
+        if prefix != "legacy_terminal" {
+            text = text.replace("\"version\":1", "\"version\":2");
+            let end = text.rfind(",\"checksum\":").unwrap();
+            text.insert_str(
+                end - 1,
+                ",\"unavailable_reason\":\"permanent_unavailability\"",
+            );
+        }
+        let start = text.find("\"record\":").unwrap() + 9;
+        let end = text.rfind(",\"checksum\":").unwrap();
+        let checksum = blake3::hash(text[start..end].as_bytes())
+            .to_hex()
+            .to_string();
+        text = text.replace(old["checksum"].as_str().unwrap(), &checksum);
+        private_fs::PrivateDir::open_existing(path.parent().unwrap())
+            .unwrap()
+            .replace("state.json", text.as_bytes())
+            .unwrap();
+        if prefix == "ready_after_store" {
+            let handle = store
+                .recover_landing_handle("alpha", original.id.as_slice().try_into().unwrap())
+                .unwrap()
+                .unwrap();
+            let prepared = handle.status(&store).unwrap();
+            let candidate = prepared.candidate.as_ref().unwrap();
+            let identity = tinytree_store::LandingCheckIdentity {
+                candidate: candidate.head,
+                root_tree: candidate.root_tree,
+                profile: prepared.profile.clone(),
+            };
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs() as i64;
+            assert_eq!(
+                handle
+                    .record_check_unavailable(&store, &identity, now)
+                    .unwrap()
+                    .state,
+                tinytree_store::LandingState::CheckUnavailable
+            );
+        }
+        // Permanent withdrawal is valid unavailability; legacy v1 did not
+        // freeze an attempt limit, so never invent one or run a fresh attempt.
+        config.service.landing.checker = None;
+        config.service.landing.enabled = false;
+        let running = Running::start_landing(
+            store.clone(),
+            config.service,
+            landing_principals(true),
+            true,
+        )
+        .await;
+        let mut client = running.landing_client().await;
+        let job = wait_landing_phase(&mut client, &input, l::Phase::CheckUnavailable).await;
+        assert_eq!(job.id, original.id);
+        assert_eq!(job.expires_at_seconds, original.expires_at_seconds);
+        assert!(job.candidate.is_some());
+        assert!(!job.roots_retained);
+        assert!(job.receipt.is_none());
+        assert!(job.conflict_path.is_none());
+        let terminal = wait_checker_record(&store, &["Terminal"]).await;
+        assert_eq!(terminal["version"], 2);
+        assert_eq!(terminal["unavailable_reason"], "permanent_unavailability");
+        assert_eq!(terminal["request"], saved["request"]);
+        assert_eq!(terminal["attempts"], 1);
+        assert_eq!(
+            std::fs::read_to_string(scratch.join("executions"))
+                .unwrap()
+                .lines()
+                .filter(|line| *line == "run")
+                .count(),
+            1
+        );
+        assert_eq!(
+            store.references("alpha", &["main".into()]).unwrap()[0].generation,
+            1
+        );
         running.stop().await;
     }
 }

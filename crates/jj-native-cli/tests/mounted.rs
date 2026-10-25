@@ -7005,6 +7005,97 @@ fn native_landing_recovery_edges_preserve_divergence_and_terminal_states() {
         fixture.success(&base, &["tinytree", "unmount", root.to_str().unwrap()]);
         fixture.stop_daemon();
     }
+    {
+        let (upstream, mut fixture, base) = new_landing_fixture();
+        let (root, source, key, _) = prepare_native_landing(&mut fixture, &upstream, "unavailable");
+        let before = upstream.public();
+        let head = fixture.revision(&root, "@");
+        let owner = RemoteServer::landing_owner();
+        let prepared = upstream
+            .store
+            .landing_job("example", owner, &key)
+            .unwrap()
+            .unwrap();
+        let candidate = prepared.candidate.unwrap();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        upstream.store.enable_external_checks().unwrap();
+        let unavailable = upstream
+            .store
+            .record_landing_check_unavailable(
+                "example",
+                owner,
+                &key,
+                &tinytree_store::LandingCheckIdentity {
+                    candidate: candidate.head,
+                    root_tree: candidate.root_tree,
+                    profile: prepared.profile,
+                },
+                now,
+            )
+            .unwrap();
+        assert_eq!(
+            unavailable.state,
+            tinytree_store::LandingState::CheckUnavailable
+        );
+        let report = landing_report(&mut fixture, &root, &["tinytree", "land", "--resume"]);
+        assert_eq!(report["phase"], "check_unavailable");
+        assert!(report["applied_operation"].is_null());
+        assert_eq!(fixture.revision(&root, "@"), head);
+        assert_eq!(fixture.revision(&root, "@-"), source);
+        assert_eq!(upstream.public(), before);
+        let (_, saved) = remote_observation(&fixture.binding(&root));
+        assert_eq!(
+            saved["landing"]["terminal"].as_str(),
+            Some("check_unavailable")
+        );
+        assert!(saved["landing"].get("candidate_head").is_none());
+        assert!(
+            saved["landing"]["result_roots"]
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            saved["landing"]["source_head"].as_str(),
+            Some(source.as_str())
+        );
+        assert_eq!(
+            fs::read(root.join("unavailable.txt")).unwrap(),
+            b"source unavailable\n"
+        );
+
+        // A non-verdict terminal result permits an ordinary new intent without
+        // replacing the private working copy or claiming the checks failed.
+        let next = landing_report(
+            &mut fixture,
+            &root,
+            &[
+                "tinytree",
+                "land",
+                "--base",
+                &upstream.head,
+                "--revision",
+                &source,
+                "--reference",
+                "main",
+                "--bookmark",
+                "main",
+                "--profile",
+                "checks",
+                "--profile-version",
+                "v1",
+            ],
+        );
+        assert_ne!(next["request_id"].as_str(), Some(key.as_str()));
+        assert!(next["applied_operation"].is_null());
+        assert_eq!(fixture.revision(&root, "@"), head);
+        assert_eq!(upstream.public(), before);
+        fixture.success(&base, &["tinytree", "unmount", root.to_str().unwrap()]);
+        fixture.stop_daemon();
+    }
 }
 
 #[test]

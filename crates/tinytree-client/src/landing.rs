@@ -110,6 +110,7 @@ pub enum LandingPhase {
     Conflict,
     Unsupported,
     CheckFailed,
+    CheckUnavailable,
     StaleTarget,
     Expired,
 }
@@ -299,6 +300,7 @@ fn checked(
         l::Phase::Conflict => LandingPhase::Conflict,
         l::Phase::Unsupported => LandingPhase::Unsupported,
         l::Phase::CheckFailed => LandingPhase::CheckFailed,
+        l::Phase::CheckUnavailable => LandingPhase::CheckUnavailable,
         l::Phase::StaleTarget => LandingPhase::StaleTarget,
         l::Phase::Expired => LandingPhase::Expired,
         _ => return Err(bad()),
@@ -375,7 +377,7 @@ fn checked(
         LandingPhase::Committed => has && received && !conflict,
         LandingPhase::Conflict => !has && !received && conflict && !job.roots_retained,
         LandingPhase::Unsupported => !has && !received && !conflict && !job.roots_retained,
-        LandingPhase::CheckFailed | LandingPhase::StaleTarget => {
+        LandingPhase::CheckFailed | LandingPhase::CheckUnavailable | LandingPhase::StaleTarget => {
             has && !received && !conflict && !job.roots_retained
         }
         LandingPhase::Expired => !received && !job.roots_retained && !(has && conflict),

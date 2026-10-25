@@ -39,6 +39,8 @@ enum Phase {
   CHECK_FAILED = 7;
   STALE_TARGET = 8;
   EXPIRED = 9;
+  // Trusted checks permanently stopped without a verdict. No publication receipt.
+  CHECK_UNAVAILABLE = 10;
 }
 enum PreparationAvailability {
   PREPARATION_UNSPECIFIED = 0;

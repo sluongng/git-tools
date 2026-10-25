@@ -70,7 +70,16 @@ fn main() {
     }
     let outcome = if mode == "fail" {
         Outcome::Failed
-    } else if mode == "uncertain" {
+    } else if mode == "uncertain"
+        || mode == "unavailable"
+        || (mode == "unavailable_then_pass"
+            && std::fs::read_to_string(config.scratch.join("executions"))
+                .unwrap()
+                .lines()
+                .filter(|line| *line == "run")
+                .count()
+                == 1)
+    {
         Outcome::Unavailable
     } else {
         Outcome::Passed

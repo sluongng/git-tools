@@ -107,6 +107,7 @@ fn wire_job(job: &CheckedLandingJob) -> l::LandingJob {
             LandingPhase::Conflict => l::Phase::Conflict,
             LandingPhase::Unsupported => l::Phase::Unsupported,
             LandingPhase::CheckFailed => l::Phase::CheckFailed,
+            LandingPhase::CheckUnavailable => l::Phase::CheckUnavailable,
             LandingPhase::StaleTarget => l::Phase::StaleTarget,
             LandingPhase::Expired => l::Phase::Expired,
         } as i32,

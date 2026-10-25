@@ -161,7 +161,12 @@ impl LandingPending {
             || self.terminal.as_deref().is_some_and(|s| {
                 !matches!(
                     s,
-                    "conflict" | "unsupported" | "check_failed" | "stale_target" | "expired"
+                    "conflict"
+                        | "unsupported"
+                        | "check_failed"
+                        | "check_unavailable"
+                        | "stale_target"
+                        | "expired"
                 )
             })
         {

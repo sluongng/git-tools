@@ -129,6 +129,12 @@ enum Phase {
     Verified,
     RetryReady,
     Terminal,
+    UnavailableReady,
+}
+#[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum UnavailableReason {
+    PermanentUnavailability,
 }
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -144,6 +150,8 @@ struct Record {
     attempts: usize,
     recoveries: usize,
     retry_at: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    unavailable_reason: Option<UnavailableReason>,
 }
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -155,7 +163,8 @@ struct Envelope {
 fn decode_record(bytes: &[u8]) -> Result<Record> {
     let envelope: Envelope = serde_json::from_slice(bytes)?;
     ensure!(
-        envelope.version == 1
+        matches!(envelope.version, 1 | 2)
+            && envelope.version == envelope.record.version
             && envelope.checksum == digest(&serde_json::to_vec(&envelope.record)?),
         "checker journal checksum differs"
     );
@@ -164,12 +173,25 @@ fn decode_record(bytes: &[u8]) -> Result<Record> {
 }
 
 impl Record {
+    fn safe_unavailable(&self) -> bool {
+        self.verdict_eligible
+            && self.receipt.as_ref().is_some_and(|receipt| {
+                receipt.cleanup_confirmed && receipt.outcome == runner::Outcome::Unavailable
+            })
+    }
     fn uncertain(&self) -> bool {
         matches!(self.phase, Phase::DispatchIntent | Phase::Uncertain)
     }
     fn validate(&self) -> Result<()> {
         ensure!(
-            self.version == 1
+            ((self.version == 1
+                && self.unavailable_reason.is_none()
+                && self.phase != Phase::UnavailableReady)
+                || (self.version == 2
+                    && matches!(self.phase, Phase::UnavailableReady | Phase::Terminal)
+                    && self.unavailable_reason
+                        == Some(UnavailableReason::PermanentUnavailability)
+                    && self.safe_unavailable()))
                 && s::validate_repository_id(&self.repository).is_ok()
                 && self.request.repository_id == self.repository
                 && self.request.job_id == id(self.job),
@@ -525,7 +547,7 @@ impl CheckerHost {
     fn save(slot: &Slot) -> Result<()> {
         slot.record.validate()?;
         let bytes = serde_json::to_vec(&Envelope {
-            version: 1,
+            version: slot.record.version,
             record: slot.record.clone(),
             checksum: digest(&serde_json::to_vec(&slot.record)?),
         })?;
@@ -676,6 +698,7 @@ impl CheckerHost {
             attempts: 1,
             recoveries: 0,
             retry_at: 0,
+            unavailable_reason: None,
         };
         let staging_name = format!(
             ".pending-{}-{}",
@@ -781,7 +804,7 @@ impl CheckerHost {
             slot.handle = Some(pending.handle.clone());
         }
         if slot.active
-            || slot.record.phase == Phase::Terminal
+            || matches!(slot.record.phase, Phase::Terminal | Phase::UnavailableReady)
             || slot.record.retry_at > now().unwrap_or(i64::MAX)
         {
             return true;
@@ -830,10 +853,38 @@ impl CheckerHost {
             let mut pages = initial();
             let mut ready: VecDeque<(String, s::PendingLanding)> = VecDeque::new();
             let mut recovery_after = None;
+            let mut unavailable_after = None;
             loop {
                 let Some(host) = weak.upgrade() else { break };
                 if host.closing.load(Ordering::Acquire) {
                     break;
+                }
+                // Terminal is an absorbing dispatch decision, not a frozen
+                // attempt-limit claim. Replay only safe, durably saved cleanup
+                // receipts; this awaited worker participates in host drain.
+                let unavailable = host.state.lock().ok().and_then(|state| {
+                    state
+                        .slots
+                        .iter()
+                        .find(|(key, slot)| {
+                            !slot.active
+                                && !slot.record.uncertain()
+                                && (slot.record.phase == Phase::UnavailableReady
+                                    || (slot.record.phase == Phase::Terminal
+                                        && slot.record.version == 1
+                                        && slot.record.safe_unavailable()))
+                                && unavailable_after.as_ref().is_none_or(|after| *key > after)
+                        })
+                        .map(|(key, _)| key.clone())
+                });
+                if let Some(key) = unavailable {
+                    let selected = key.clone();
+                    let owned = host.clone();
+                    let _ = tokio::task::spawn_blocking(move || owned.apply_unavailable(&selected))
+                        .await;
+                    unavailable_after = Some(key);
+                } else {
+                    unavailable_after = None;
                 }
                 let recovery = host.state.lock().ok().and_then(|state| {
                     let select = |key: &Key, slot: &Slot| {
@@ -1062,7 +1113,7 @@ impl CheckerHost {
             self.apply_verified(key)?;
             return Ok(None);
         }
-        if slot.record.phase == Phase::Terminal {
+        if matches!(slot.record.phase, Phase::Terminal | Phase::UnavailableReady) {
             return Ok(None);
         }
         if slot.record.phase == Phase::RetryReady {
@@ -1173,6 +1224,96 @@ impl CheckerHost {
             if recovering { "recover" } else { "run" },
             candidate,
         )))
+    }
+    fn apply_unavailable(&self, key: &Key) -> Result<()> {
+        let host = self
+            .admission
+            .lock()
+            .map_err(|_| anyhow::anyhow!("checker admission poisoned"))?
+            .as_ref()
+            .and_then(std::sync::Weak::upgrade)
+            .context("landing admission unavailable")?;
+        let _work = host.admit_check_transition()?;
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| anyhow::anyhow!("checker gate poisoned"))?;
+        let slot = state
+            .slots
+            .get_mut(key)
+            .context("checker job unavailable")?;
+        if slot.active || slot.record.uncertain() || self.closing.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        // An in-memory Terminal can precede a failed save. Only this checked
+        // latest envelope proves that dispatch is durably absorbed. No current
+        // policy refresh or reconstructed legacy attempt budget is authority.
+        let saved = decode_record(&slot.directory.read("state.json", MAX_RECORD)?)?;
+        ensure!(
+            saved.repository == key.0
+                && saved.job == key.1
+                && serde_json::to_vec(&saved.request)? == serde_json::to_vec(&slot.record.request)?
+                && serde_json::to_vec(&saved.authority)?
+                    == serde_json::to_vec(&slot.record.authority)?,
+            "saved unavailable checker binding differs"
+        );
+        if !saved.safe_unavailable()
+            || !matches!(saved.phase, Phase::Terminal | Phase::UnavailableReady)
+            || (saved.phase == Phase::Terminal && saved.version == 2)
+        {
+            return Ok(());
+        }
+        let handle = self
+            .store
+            .recover_landing_handle(&key.0, key.1)?
+            .context("saved unavailable landing job disappeared")?;
+        let job = handle.status(&self.store)?;
+        let candidate = job
+            .candidate
+            .as_ref()
+            .context("unavailable candidate missing")?;
+        ensure!(
+            job.id == saved.job
+                && id(candidate.head.0) == saved.request.candidate_commit
+                && id(candidate.root_tree.0) == saved.request.root_tree
+                && job.profile.name == saved.request.profile_name
+                && job.profile.version == saved.request.profile_version,
+            "unavailable checker job binding differs"
+        );
+        if !matches!(
+            job.state,
+            s::LandingState::Prepared
+                | s::LandingState::CheckUnavailable
+                | s::LandingState::Expired
+        ) {
+            return Ok(()); // Never overwrite a different check/verdict/ref state.
+        }
+        slot.record = saved;
+        if slot.record.phase != Phase::UnavailableReady {
+            slot.record.version = 2;
+            slot.record.phase = Phase::UnavailableReady;
+            slot.record.unavailable_reason = Some(UnavailableReason::PermanentUnavailability);
+            Self::save(slot)?; // Durable finish-only intent BEFORE the Store write.
+        }
+        if job.state == s::LandingState::Prepared {
+            let identity = s::LandingCheckIdentity {
+                candidate: candidate.head,
+                root_tree: candidate.root_tree,
+                profile: job.profile.clone(),
+            };
+            let terminal = handle.record_check_unavailable(&self.store, &identity, now()?)?;
+            ensure!(
+                matches!(
+                    terminal.state,
+                    s::LandingState::CheckUnavailable | s::LandingState::Expired
+                ),
+                "unavailable transition returned nonterminal state"
+            );
+        }
+        slot.record.phase = Phase::Terminal;
+        slot.root = None;
+        Self::save(slot)?;
+        Ok(())
     }
     fn apply_verified(&self, key: &Key) -> Result<()> {
         if !self.landing_enabled {
