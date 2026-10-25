@@ -1098,7 +1098,8 @@ fn unix_seconds() -> Result<i64, Status> {
 
 /// A scoped IDS-only evaluation. The original operation deadline starts in
 /// `begin_query`, including time held by the caller between pages. No inflight
-/// permit is held between calls. Drop releases reserved cumulative-state memory.
+/// permit is held between calls. Seen-row accounting grows nonblockingly before
+/// each bounded page; Drop releases its reserved cumulative-state memory.
 pub struct CheckedIdsQuery {
     client: NativeClient,
     scope: CheckedScopeHandle,
@@ -1189,8 +1190,61 @@ impl Drop for CheckedIdsQuery {
 }
 struct QueryMemory {
     _guards: crate::verified::LifetimeGuards,
-    _bytes: OwnedSemaphorePermit,
-    _state: OwnedSemaphorePermit,
+    pools: std::sync::Mutex<QueryMemoryPools>,
+}
+struct QueryMemoryPools {
+    bytes: OwnedSemaphorePermit,
+    state: OwnedSemaphorePermit,
+    rows: usize,
+}
+impl QueryMemory {
+    fn reserve_rows(&self, client: &NativeClient, required: usize) -> Result<(), Status> {
+        let mut pools = self.pools.lock().map_err(|_| integrity())?;
+        if required <= pools.rows {
+            return Ok(());
+        }
+        let extra = required
+            .checked_sub(pools.rows)
+            .and_then(|n| n.checked_mul(128))
+            .and_then(|n| u32::try_from(n).ok())
+            .ok_or_else(|| Status::resource_exhausted("IDS query state exceeds memory budget"))?;
+        // Never await persistent capacity while a caller may hold an outer RPC
+        // reservation needed by another query's Page or Close. If either pool
+        // is full, release the other reservation and leave the cursor unchanged.
+        let state = client
+            .inner
+            .query_state
+            .clone()
+            .try_acquire_many_owned(extra)
+            .map_err(|_| Status::resource_exhausted("IDS query state capacity exhausted"))?;
+        let bytes = client
+            .inner
+            .bytes
+            .clone()
+            .try_acquire_many_owned(extra)
+            .map_err(|_| Status::resource_exhausted("IDS query memory capacity exhausted"))?;
+        pools.state.merge(state);
+        pools.bytes.merge(bytes);
+        pools.rows = required;
+        Ok(())
+    }
+}
+impl CheckedIdsQuery {
+    fn reserve_page_rows(&self) -> Result<(), Status> {
+        if Instant::now() >= self.deadline {
+            return Err(Status::deadline_exceeded("native query deadline exceeded"));
+        }
+        let required = self
+            .seen
+            .len()
+            .checked_add(self.page_size as usize)
+            .ok_or_else(|| Status::resource_exhausted("IDS query row budget exhausted"))?
+            .min(self.row_capacity);
+        self.memory
+            .as_ref()
+            .ok_or_else(integrity)?
+            .reserve_rows(&self.client, required)
+    }
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct IdRow {
@@ -1260,7 +1314,10 @@ impl NativeClient {
         // selected canonical read or template membership check coexist with its
         // still-live outer query without changing graph traversal reservations.
         let row_capacity = expression_row_capacity(expression, limits.max_graph_objects);
-        let bytes = row_capacity
+        // Reserve only the first page's possible seen IDs, not an unused full
+        // history. Further pages grow this shared physical owner nonblockingly.
+        let rows = (page_size as usize).min(row_capacity);
+        let bytes = rows
             .checked_mul(128)
             .and_then(|n| encoded.checked_mul(4).and_then(|e| n.checked_add(e)))
             .and_then(|n| nodes.checked_mul(256).and_then(|e| n.checked_add(e)))
@@ -1274,27 +1331,29 @@ impl NativeClient {
                 "IDS query state leaves no page admission budget",
             ));
         }
-        let state = reapi::policy::timeout(deadline, async {
-            self.inner
-                .query_state
-                .clone()
-                .acquire_many_owned(bytes as u32)
-                .await
-                .map_err(|_| Status::cancelled("native client closed"))
-        })
-        .await?;
-        let reservation = reapi::policy::timeout(deadline, async {
-            self.inner
-                .bytes
-                .clone()
-                .acquire_many_owned(bytes as u32)
-                .await
-                .map_err(|_| Status::cancelled("native client closed"))
-        })
-        .await?;
+        let bytes = u32::try_from(bytes)
+            .map_err(|_| Status::resource_exhausted("IDS query state exceeds memory budget"))?;
+        let state = self
+            .inner
+            .query_state
+            .clone()
+            .try_acquire_many_owned(bytes)
+            .map_err(|_| Status::resource_exhausted("IDS query state capacity exhausted"))?;
+        let reservation = self
+            .inner
+            .bytes
+            .clone()
+            .try_acquire_many_owned(bytes)
+            .map_err(|_| Status::resource_exhausted("IDS query memory capacity exhausted"))?;
+        if Instant::now() >= deadline {
+            return Err(Status::deadline_exceeded("native query deadline exceeded"));
+        }
         let memory = Arc::new(QueryMemory {
-            _state: state,
-            _bytes: reservation,
+            pools: std::sync::Mutex::new(QueryMemoryPools {
+                bytes: reservation,
+                state,
+                rows,
+            }),
             _guards: self.guards.clone(),
         });
         Ok(CheckedIdsQuery {
@@ -1347,6 +1406,7 @@ impl NativeClient {
                 "IDS query page budget exhausted",
             ));
         }
+        query.reserve_page_rows()?;
         let budget = self.admit(query.deadline, self.unary_memory()).await?;
         let request = q::EvaluateRequest {
             scope: Some(query.scope.key()),
@@ -1625,6 +1685,7 @@ impl NativeClient {
                 "graph query page budget exhausted",
             ));
         }
+        core.reserve_page_rows()?;
         let mut budget = self.admit(core.deadline, self.unary_memory()).await?;
         // Detach retained-page bytes, not its inflight slot. Physical transport
         // and canonical workers retain this reservation through Budget guards;

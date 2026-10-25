@@ -3344,34 +3344,111 @@ async fn cancelled_ids_page_releases_owned_state_and_aggregate_idle_queries_leav
     let (_store, _index, service, root, _change) = setup_query();
     let running = QueryRunning::start(service, QueryMode::Normal).await;
     let mut config = running.config.clone();
-    config.limits.max_graph_objects = 300_000;
-    config.limits.max_graph_bytes = 32 * 1024 * 1024;
-    // Valid ordinary RPC bounds leave 128 MiB page admission plus 48 MiB
-    // persistent state: one ~38.4 MB query fits, while a second must wait.
-    config.limits.max_buffered_bytes = 176 * 1024 * 1024;
+    config.limits.max_frame_bytes = 4096;
+    config.limits.max_batch_bytes = 32768;
+    config.limits.max_metadata_bytes = 16384;
+    config.limits.max_request_bytes = 1024;
+    config.limits.max_graph_bytes = 16384;
+    config.limits.max_buffered_bytes = 262144;
+    config.limits.max_batch_items = 16;
+    config.limits.max_graph_objects = 800;
     let client = NativeClient::connect(config).await.unwrap();
     let scope = client.open_query_scope(vec![root]).await.unwrap();
     let expression = ids_ancestors(root);
-    let mut first = client.begin_query(&scope, &expression, 1).await.unwrap();
-    let mut pending = Box::pin(client.begin_query(&scope, &expression, 1));
+    let mut idle = Vec::new();
+    for _ in 0..64 {
+        let result = tokio::time::timeout(
+            Duration::from_millis(100),
+            client.begin_query(&scope, &expression, 1),
+        )
+        .await
+        .expect("persistent admission must never wait on another cursor");
+        match result {
+            Ok(query) => idle.push(query),
+            Err(error) => {
+                assert_eq!(error.code(), Code::ResourceExhausted);
+                break;
+            }
+        }
+    }
     assert!(
-        tokio::time::timeout(Duration::from_millis(10), &mut pending)
-            .await
-            .is_err(),
-        "second idle query should wait on the bounded state subpool"
+        idle.len() >= 2 && idle.len() < 64,
+        "small prepared queries coexist but aggregate persistent state is bounded"
     );
     assert!(
         !client
-            .evaluate_page(&mut first)
+            .evaluate_page(&mut idle[0])
             .await
             .unwrap()
             .rows
             .is_empty(),
-        "pending state admission must leave page memory available"
+        "full persistent admission must leave page memory available"
     );
-    drop(pending);
-    drop(first);
+    drop(idle.pop());
     let _reused = client.begin_query(&scope, &expression, 1).await.unwrap();
+    drop(idle);
+    client.close_query_scope(&scope).await.unwrap();
+    running.stop().await;
+}
+
+#[tokio::test]
+async fn ids_seen_growth_retries_same_cursor_after_releasing_an_idle_owner() {
+    let (fixture, _, _, _) = linear_ids_fixture(256);
+    let running = QueryRunning::start(fixture.service.clone(), QueryMode::Normal).await;
+    let mut config = running.config.clone();
+    config.limits.max_frame_bytes = 4096;
+    config.limits.max_batch_bytes = 32768;
+    config.limits.max_metadata_bytes = 16384;
+    config.limits.max_request_bytes = 1024;
+    config.limits.max_graph_bytes = 16384;
+    config.limits.max_buffered_bytes = 262144;
+    config.limits.max_batch_items = 16;
+    config.limits.max_graph_objects = 1024;
+    let client = NativeClient::connect(config).await.unwrap();
+    let scope = client.open_query_scope(vec![fixture.root]).await.unwrap();
+    let expression = ids_ancestors(fixture.root);
+    let mut active = client.begin_query(&scope, &expression, 16).await.unwrap();
+    let mut idle = Vec::new();
+    for _ in 0..64 {
+        match client.begin_query(&scope, &expression, 16).await {
+            Ok(query) => idle.push(query),
+            Err(error) => {
+                assert_eq!(error.code(), Code::ResourceExhausted);
+                break;
+            }
+        }
+    }
+    assert!(!idle.is_empty() && idle.len() < 64);
+    let mut sequence = 0;
+    loop {
+        let calls = running.counts.evaluations.load(Ordering::SeqCst);
+        match tokio::time::timeout(Duration::from_secs(2), client.evaluate_page(&mut active))
+            .await
+            .expect("seen-row growth must fail without waiting")
+        {
+            Ok(page) => {
+                assert_eq!(page.sequence, sequence);
+                assert!(!page.exhausted, "fixture history must exceed funded state");
+                sequence += 1;
+            }
+            Err(error) => {
+                assert_eq!(error.code(), Code::ResourceExhausted);
+                assert_eq!(
+                    running.counts.evaluations.load(Ordering::SeqCst),
+                    calls,
+                    "growth fails before RPC and cannot advance its server cursor"
+                );
+                break;
+            }
+        }
+    }
+    assert!(sequence > 0);
+    drop(idle.pop());
+    let retry = client.evaluate_page(&mut active).await.unwrap();
+    assert_eq!(retry.sequence, sequence);
+    assert!(!retry.rows.is_empty());
+    client.close_ids_query(&mut active).await.unwrap();
+    drop(idle);
     client.close_query_scope(&scope).await.unwrap();
     running.stop().await;
 }
@@ -3878,44 +3955,67 @@ async fn retained_graph_pages_fail_headroom_without_waiting_or_advancing() {
     config.limits.max_metadata_bytes = 16384;
     config.limits.max_request_bytes = 1024;
     config.limits.max_graph_bytes = 16384;
-    config.limits.max_buffered_bytes = 262144;
+    config.limits.max_buffered_bytes = 160 * 1024;
     config.limits.max_batch_items = 16;
     config.limits.max_graph_objects = 800;
     let client = NativeClient::connect(config).await.unwrap();
-    // Large valid canonical descriptions make two application-held pages exceed
-    // persistent headroom while each page and wire request still fit admission.
-    let description = "x".repeat(8192);
-    let first = private_draft(fixture.root, ChangeId([87; 16]), &description);
-    let first_id = CommitId(first.descriptor.key.id.0);
-    let second = private_draft(first_id, ChangeId([88; 16]), &description);
-    let second_id = CommitId(second.descriptor.key.id.0);
-    let overlay = vec![
-        checked_draft(&client, &first).await,
-        checked_draft(&client, &second).await,
-    ];
-    let scope = client
-        .open_query_scope_with_overlay(vec![fixture.root], overlay)
-        .await
-        .unwrap();
-    // Keep this retained-page test on the general-expression state budget.
-    // Exact literal queries intentionally reserve only their literal capacity.
+    // Fill persistent headroom with actual application-held canonical pages,
+    // not an upfront reservation for hypothetical unseen history.
+    let description = "x".repeat(4000);
+    let mut parent = fixture.root;
+    let mut ids = Vec::new();
+    let mut scope = client.open_query_scope(vec![fixture.root]).await.unwrap();
+    // Install bounded overlays one at a time; scope setup must fit the same
+    // small SDK envelope used to exercise persistent page pressure below.
+    for seed in 87..95 {
+        let draft = private_draft(parent, ChangeId([seed; 16]), &description);
+        parent = CommitId(draft.descriptor.key.id.0);
+        ids.push(parent);
+        let verified = checked_draft(&client, &draft).await;
+        let next = client
+            .fork_query_scope(&scope, vec![verified])
+            .await
+            .unwrap();
+        client.close_query_scope(&scope).await.unwrap();
+        scope = next;
+    }
     let expression = q::GraphExpr {
         version: 1,
         expression: Some(q::graph_expr::Expression::Union(q::SetExpr {
-            inputs: vec![ids_commits(&[first_id, second_id])],
+            inputs: vec![ids_commits(&ids)],
         })),
     };
     let mut query = client
         .begin_graph_query(&scope, &expression, 1, true)
         .await
         .unwrap();
-    let page = client.evaluate_graph_page(&mut query).await.unwrap();
-    assert_eq!(page.rows()[0].commit, second_id);
-    let failed = client.evaluate_graph_page(&mut query).await.unwrap_err();
-    assert_eq!(failed.code(), Code::ResourceExhausted);
-    assert!(!query.is_exhausted());
-    // Retaining an extracted canonical object retains the page reservation too.
-    let mut rows = page.into_rows();
+    let mut held = Vec::new();
+    loop {
+        match tokio::time::timeout(
+            Duration::from_secs(2),
+            client.evaluate_graph_page(&mut query),
+        )
+        .await
+        .expect("retained-page exhaustion must fail without waiting")
+        {
+            Ok(page) => {
+                assert_eq!(page.sequence, held.len() as u64);
+                held.push(page);
+                assert!(
+                    !query.is_exhausted(),
+                    "fixture must fill persistent page capacity"
+                );
+            }
+            Err(error) => {
+                assert_eq!(error.code(), Code::ResourceExhausted);
+                break;
+            }
+        }
+    }
+    let next_sequence = held.len() as u64;
+    assert!(next_sequence >= 2);
+    // An extracted canonical object still owns the first page's reservation.
+    let mut rows = held.remove(0).into_rows();
     let mut row = rows.next().unwrap();
     let canonical = row.canonical.take().unwrap();
     drop(row);
@@ -3930,9 +4030,16 @@ async fn retained_graph_pages_fail_headroom_without_waiting_or_advancing() {
     );
     drop(canonical);
     let retry = client.evaluate_graph_page(&mut query).await.unwrap();
-    assert_eq!(retry.sequence, 1);
-    assert_eq!(retry.rows()[0].commit, first_id);
+    assert_eq!(
+        retry.sequence, next_sequence,
+        "failed growth/page must not advance the cursor"
+    );
+    assert_eq!(
+        retry.rows()[0].commit,
+        ids[ids.len() - 1 - next_sequence as usize]
+    );
     drop(retry);
+    drop(held);
     client.close_query_scope(&scope).await.unwrap();
     running.stop().await;
 }
@@ -4040,13 +4147,13 @@ async fn empty_graph_progress_pages_consume_retained_headroom() {
     let fixture = setup_query_configured(service_config);
     let running = QueryRunning::start(fixture.service.clone(), QueryMode::Normal).await;
     let mut config = running.config.clone();
-    config.limits.max_frame_bytes = 4096;
-    config.limits.max_batch_bytes = 32768;
+    config.limits.max_frame_bytes = 1024;
+    config.limits.max_batch_bytes = 1024;
     config.limits.max_metadata_bytes = 1024;
     config.limits.max_request_bytes = 1024;
     config.limits.max_graph_bytes = 1024;
-    config.limits.max_buffered_bytes = 262144;
-    config.limits.max_batch_items = 16;
+    config.limits.max_buffered_bytes = 16384;
+    config.limits.max_batch_items = 4;
     config.limits.max_graph_objects = 950;
     let client = NativeClient::connect(config).await.unwrap();
     let scope = client.open_query_scope(vec![fixture.root]).await.unwrap();
@@ -4054,21 +4161,35 @@ async fn empty_graph_progress_pages_consume_retained_headroom() {
         .begin_graph_query(&scope, &ids_ancestors(fixture.root), 1, false)
         .await
         .unwrap();
-    let first = client.evaluate_graph_page(&mut query).await.unwrap();
-    assert!(first.is_progress());
-    assert_eq!(
-        client
-            .evaluate_graph_page(&mut query)
-            .await
-            .unwrap_err()
-            .code(),
-        Code::ResourceExhausted
-    );
+    let mut held = Vec::new();
+    loop {
+        match tokio::time::timeout(
+            Duration::from_secs(2),
+            client.evaluate_graph_page(&mut query),
+        )
+        .await
+        .expect("held progress pages must fail without waiting")
+        {
+            Ok(page) => {
+                assert!(page.is_progress());
+                assert_eq!(page.sequence, held.len() as u64);
+                held.push(page);
+                assert!(held.len() < 16, "fixture must fill persistent headroom");
+            }
+            Err(error) => {
+                assert_eq!(error.code(), Code::ResourceExhausted);
+                break;
+            }
+        }
+    }
+    let next_sequence = held.len() as u64;
+    assert!(next_sequence > 0);
     assert!(!query.is_exhausted());
-    drop(first);
+    drop(held.pop());
     let retry = client.evaluate_graph_page(&mut query).await.unwrap();
-    assert_eq!(retry.sequence, 1);
+    assert_eq!(retry.sequence, next_sequence);
     drop(retry);
+    drop(held);
     client.close_query_scope(&scope).await.unwrap();
     running.stop().await;
 }
@@ -4633,14 +4754,14 @@ async fn drop_cleanup_cannot_steal_reserved_page_headroom_and_deadlock_sole_infl
         QueryRunning::start(fixture.service.clone(), QueryMode::CloseQueryUnavailable).await;
     let mut config = running.config.clone();
     config.limits.max_inflight = 1;
-    config.limits.max_frame_bytes = 4096;
-    config.limits.max_batch_bytes = 32768;
+    config.limits.max_frame_bytes = 1024;
+    config.limits.max_batch_bytes = 1024;
     config.limits.max_metadata_bytes = 1024;
     config.limits.max_request_bytes = 1024;
     config.limits.max_graph_bytes = 1024;
-    config.limits.max_buffered_bytes = 262144;
-    config.limits.max_batch_items = 16;
-    config.limits.max_graph_objects = 950;
+    config.limits.max_buffered_bytes = 16384;
+    config.limits.max_batch_items = 4;
+    config.limits.max_graph_objects = 4;
     config.query_cleanup_timeout_ms = 40;
     let client = NativeClient::connect(config).await.unwrap();
     let scope = client.open_query_scope(vec![fixture.root]).await.unwrap();
@@ -4650,9 +4771,10 @@ async fn drop_cleanup_cannot_steal_reserved_page_headroom_and_deadlock_sole_infl
     assert!(client.close_ids_query(&mut uncertain).await.is_err());
     assert!(uncertain.is_closed());
     // The closed handle has released its local query reservation but still owes
-    // uncertain cleanup. A new query leaves less than a queued item's 1024B in
-    // persistent headroom; Drop must use expiry, not steal the unary allowance.
-    let mut fresh = client.begin_query(&scope, &expression, 1).await.unwrap();
+    // uncertain cleanup. An explicitly wide requested first page leaves less
+    // than a queued item's 1024B in persistent headroom. This is actual page
+    // capacity, not a reservation for all hypothetical history rows.
+    let mut fresh = client.begin_query(&scope, &expression, 4).await.unwrap();
     let close_calls = running.counts.query_closes.load(Ordering::SeqCst);
     drop(uncertain);
     let page = client.evaluate_page(&mut fresh).await.unwrap();
@@ -6066,6 +6188,25 @@ async fn held_wide_graph_query_leaves_capacity_for_a_scoped_literal_without_larg
         .unwrap();
     let held = client.evaluate_graph_page(&mut wide).await.unwrap();
     assert!(!held.rows().is_empty());
+    let mut second = tokio::time::timeout(
+        Duration::from_millis(100),
+        client.begin_graph_query(&scope, &ids_ancestors(fixture.root), 1, true),
+    )
+    .await
+    .expect("another general cursor must not wait for the first")
+    .unwrap();
+    let second_page = client.evaluate_graph_page(&mut second).await.unwrap();
+    assert_eq!(second_page.sequence, 0);
+    assert_eq!(second_page.rows()[0].commit, fixture.root);
+    let next = client.evaluate_graph_page(&mut wide).await.unwrap();
+    assert_eq!(next.sequence, 1);
+    assert_eq!(next.rows()[0].commit, tinytree_model::CommitId::ROOT);
+    drop(next);
+    let second_next = client.evaluate_graph_page(&mut second).await.unwrap();
+    assert_eq!(second_next.sequence, 1);
+    drop(second_next);
+    client.close_graph_query(&mut second).await.unwrap();
+    drop(second_page);
     for (name, expression) in scoped_singleton_expressions(fixture.root) {
         let mut literal = client
             .begin_graph_query(&scope, &expression, 1, true)
