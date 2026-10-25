@@ -1129,7 +1129,14 @@ impl Inner {
                     )
                     .map_err(|error| v2_error(error, "cloud capture export binding"))?;
                     capture_feature =
-                        super::captures::minimum_store_feature(verified.capture_data());
+                        super::captures::minimum_store_feature(verified.capture_data())
+                            .max(match verified.compatibility() {
+                            tinytree_cloud::CaptureCompatibility::None => 5,
+                            tinytree_cloud::CaptureCompatibility::LegacyPortableLanding => 9,
+                            tinytree_cloud::CaptureCompatibility::SelectedIndexAcknowledgement => {
+                                10
+                            }
+                        });
                     drop(verified);
                 }
                 artifacts = loaded
@@ -2496,6 +2503,14 @@ impl Inner {
                     planned,
                     capture.as_ref().map(|capture| capture.bytes.as_slice()),
                 )?;
+                let feature = store_feature(view.get(&self.spaces.meta, b"format")?.as_deref())?;
+                if feature < verified.capture_feature {
+                    return Err(Error::Corrupt(if feature < 5 {
+                        "unreferenced cloud capture or missing feature"
+                    } else {
+                        "landing capture without store feature"
+                    }));
+                }
                 if verified.artifacts != indexed.artifacts || verified.extra != indexed.extra {
                     return Err(Error::Corrupt("cloud indexed version proof mismatch"));
                 }
@@ -2895,25 +2910,7 @@ impl Inner {
                                 "unreferenced cloud capture or missing feature",
                             ));
                         }
-                        let capture = super::captures::decode_record(&bytes)?;
-                        let mut limits = tinytree_cloud::CaptureDataLimits::default();
-                        limits.max_decode_bytes = limits.max_decode_bytes.min(
-                            self.config
-                                .cloud
-                                .max_version_decode_bytes
-                                .saturating_sub(bytes.len().saturating_mul(3)),
-                        );
-                        let data = tinytree_cloud::decode_data(
-                            &capture.bytes,
-                            capture.descriptor.id.0,
-                            &limits,
-                        )
-                        .map_err(|_| Error::Corrupt("cloud capture data schema"))?;
-                        if store_feature(view.get(&self.spaces.meta, b"format")?.as_deref())?
-                            < super::captures::minimum_store_feature(&data)
-                        {
-                            return Err(Error::Corrupt("landing capture without store feature"));
-                        }
+                        super::captures::decode_record(&bytes)?;
                     }
                     _ => unreachable!(),
                 }

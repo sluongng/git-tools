@@ -2805,6 +2805,25 @@ fn cloud_capture_with_parent_edges(
     bookmarks: usize,
     parent_edges: usize,
 ) -> (tinytree_cloud::Manifest, Vec<CloudWriteReceipt>) {
+    cloud_capture_with_attributes(
+        store,
+        owner,
+        head,
+        root,
+        bookmarks,
+        parent_edges,
+        Default::default(),
+    )
+}
+fn cloud_capture_with_attributes(
+    store: &Store,
+    owner: CloudOwner,
+    head: Descriptor,
+    root: Descriptor,
+    bookmarks: usize,
+    parent_edges: usize,
+    attributes: std::collections::BTreeMap<String, String>,
+) -> (tinytree_cloud::Manifest, Vec<CloudWriteReceipt>) {
     use jj_lib::{
         backend::{MillisSinceEpoch, Timestamp as JjTimestamp},
         object_id::ObjectId as _,
@@ -2849,7 +2868,7 @@ fn cloud_capture_with_parent_edges(
                 username: "agent".into(),
                 is_snapshot: true,
                 workspace_name: Some("task".into()),
-                attributes: Default::default(),
+                attributes,
             },
             commit_predecessors: None,
         };
@@ -6388,6 +6407,207 @@ fn capture_size_boundary_accepts_a_large_canonical_operation_inventory_as_a_bina
     bytes.clear();
     lease.read_to_end(&mut bytes).unwrap();
     assert_eq!(bytes, request.capture_data);
+}
+
+#[test]
+fn acknowledged_capture_selected_index_feature_is_atomic_and_enforced_on_reopen() {
+    use tinytree_cloud as c;
+    for (legacy_view, required_feature) in [(true, 9), (false, 10)] {
+        let (directory, store) = open();
+        let owner = CloudOwner {
+            principal: [96; 32],
+        };
+        let (_, tree, source) = fixture(&store, "landing source");
+        let mut candidate_commit = commit(TreeId(tree.key.id.0), "landed candidate");
+        candidate_commit.parents = vec![CommitId(source.key.id.0)];
+        let candidate = put_object(&store, Object::Commit(candidate_commit), 0);
+        let attributes = [
+            ("request", hex(&[12; 16])),
+            ("phase", "apply".into()),
+            ("source", hex(&source.key.id.0)),
+            ("source_operation", hex(&[0; 64])),
+            ("job", hex(&[23; 32])),
+            ("candidate", hex(&candidate.key.id.0)),
+        ]
+        .into_iter()
+        .map(|(key, value)| (format!("tinytree.landing.{key}"), value))
+        .collect();
+        let recovery = cloud_capture_with_attributes(
+            &store,
+            owner,
+            if legacy_view { candidate } else { source },
+            tree,
+            0,
+            1,
+            attributes,
+        );
+        let (mut history, leases, artifacts) = cloud_v2_capture_from_recovery(
+            &store,
+            owner,
+            c::PortableIndexSnapshot {
+                roots: vec![CommitId(candidate.key.id.0)],
+                drafts: vec![],
+            },
+            recovery,
+        );
+        history.recovery.native_roots.push(source.key);
+        history
+            .recovery
+            .native_roots
+            .sort_by_key(|key| (key.kind as u8, key.id.0));
+        history.recovery.native_roots.dedup();
+        let mut request = captured_cloud_request(
+            &store,
+            owner,
+            history,
+            leases,
+            &artifacts,
+            0,
+            "acknowledged-capture",
+        );
+        let mut data = c::decode_data(
+            &request.capture_data,
+            c::data_digest(&request.capture_data),
+            &Default::default(),
+        )
+        .unwrap();
+        let rewrites = vec![c::HistoricalLandingRewrite {
+            old_commit: source.key.id.0,
+            new_commit: candidate.key.id.0,
+            change_id: [26; 16],
+        }];
+        data.version = 2;
+        data.remote = Some(c::PortableRemoteState {
+            observations: vec![],
+            archived_pushes: vec![],
+            landing: Some(c::PortableLanding {
+                request_id: hex(&[12; 16]),
+                source_base: hex(&[0; 32]),
+                source_head: hex(&source.key.id.0),
+                reference: "main".into(),
+                bookmark: "main".into(),
+                generation: 1,
+                expected_head: hex(&source.key.id.0),
+                profile_name: "checks".into(),
+                profile_version: "v1".into(),
+                source_operation: hex(&[0; 64]),
+                source_stack: vec![hex(&source.key.id.0)],
+                fork_operation: Some(hex(&[0; 64])),
+                fork_acknowledged: true,
+                job_id: Some(hex(&[23; 32])),
+                result_roots: vec![],
+                candidate_head: None,
+                apply_operation: Some(data.operation_heads[0].clone()),
+                operation_writing: None,
+                acknowledged: true,
+                terminal: None,
+                restored_lookup_only: false,
+                observed: Some(c::HistoricalLandingJob {
+                    job_id: [23; 32],
+                    phase: c::HistoricalLandingPhase::Committed,
+                    preparation: c::HistoricalLandingPreparation::ProfileConfigured,
+                    roots_retained: false,
+                    expires_at_seconds: 12345,
+                    profile_name: "checks".into(),
+                    profile_version: "v1".into(),
+                    candidate: Some(c::HistoricalLandingCandidate {
+                        head: candidate.key.id.0,
+                        root_tree: tree.key.id.0,
+                        rewrites: rewrites.clone(),
+                    }),
+                    receipt: Some(c::HistoricalLandingReceipt {
+                        reference: "main".into(),
+                        generation: 2,
+                        commit: candidate.key.id.0,
+                        commit_size_bytes: candidate.size_bytes,
+                        object_format_version: tinytree_model::FORMAT_VERSION,
+                        rewrites,
+                        evidence: [27; 32],
+                    }),
+                    conflict_path: None,
+                }),
+            }),
+        });
+        request.capture_data = c::encode_capture_data(&data, Default::default()).unwrap();
+        let mut manifest = c::decode_manifest_v3(
+            &request.publication.manifest_bytes,
+            request.publication.manifest,
+            Default::default(),
+        )
+        .unwrap();
+        manifest.capture = c::CaptureDescriptor::of(&request.capture_data);
+        manifest.history.recovery.intent_roots =
+            c::capture_recovery_intents(&data, manifest.capture.id, Default::default()).unwrap();
+        request.publication.manifest_bytes =
+            c::encode_manifest_v3(&manifest, Default::default()).unwrap();
+        request.publication.manifest = c::ManifestId::of(&request.publication.manifest_bytes);
+        let mut quota = CloudPublicationLimits::default();
+        quota.retention.max_unique_bytes_per_principal = 1;
+        assert!(
+            store
+                .publish_captured_cloud_version("demo", owner, &request, 1, &quota)
+                .is_err()
+        );
+        assert!(
+            store_feature(
+                store
+                    .inner
+                    .db
+                    .read_tx()
+                    .get(&store.inner.spaces.meta, b"format")
+                    .unwrap()
+                    .as_deref()
+            )
+            .unwrap()
+                < 9
+        );
+        let receipt = store
+            .publish_captured_cloud_version("demo", owner, &request, 1, &Default::default())
+            .unwrap();
+        assert_eq!(
+            store_feature(
+                store
+                    .inner
+                    .db
+                    .read_tx()
+                    .get(&store.inner.spaces.meta, b"format")
+                    .unwrap()
+                    .as_deref()
+            )
+            .unwrap(),
+            required_feature
+        );
+        drop(store);
+        let reopened = Store::open_existing(directory.path(), config()).unwrap();
+        assert_eq!(
+            reopened
+                .cloud_publication("demo", owner, "acknowledged-capture")
+                .unwrap(),
+            Some(receipt)
+        );
+        drop(reopened);
+        {
+            let db = SingleWriterTxDatabase::builder(directory.path().join("metadata"))
+                .open()
+                .unwrap();
+            let meta = db.keyspace("meta", KeyspaceCreateOptions::default).unwrap();
+            let mut tx = db.write_tx().durability(Some(PersistMode::SyncAll));
+            tx.insert(
+                &meta,
+                b"format",
+                if legacy_view {
+                    b"tinytree-store-8".as_slice()
+                } else {
+                    b"tinytree-store-9".as_slice()
+                },
+            );
+            tx.commit().unwrap();
+        }
+        assert!(matches!(
+            Store::open_existing(directory.path(), config()),
+            Err(Error::Corrupt("landing capture without store feature"))
+        ));
+    }
 }
 
 #[test]

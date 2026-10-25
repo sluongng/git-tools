@@ -555,16 +555,29 @@ pub fn prepare_capture_manifest(
     })
 }
 
+/// Minimum structural compatibility used by a verified capture binding.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CaptureCompatibility {
+    None,
+    LegacyPortableLanding,
+    SelectedIndexAcknowledgement,
+}
+
 /// Structural capture/export binding only. This type cannot create the opaque
 /// host QuiescentCapture and does not prove native payload closure or retention.
 pub struct VerifiedCaptureManifest<'a> {
     manifest: &'a ManifestV3,
     data: c::CaptureData,
     work: u64,
+    compatibility: CaptureCompatibility,
     _objects: &'a [c::VerifiedObject],
     _artifacts: &'a [c::VerifiedIndexArtifact],
 }
 impl VerifiedCaptureManifest<'_> {
+    pub fn compatibility(&self) -> CaptureCompatibility {
+        self.compatibility
+    }
+
     pub fn capture_data_version(&self) -> u32 {
         self.data.version
     }
@@ -770,6 +783,12 @@ pub fn verify_capture_export_binding<'a>(
             return Err(invalid("capture actual view or ordered parents mismatch"));
         }
     }
+    let mut compatibility = if data.version == 2 {
+        CaptureCompatibility::LegacyPortableLanding
+    } else {
+        CaptureCompatibility::None
+    };
+    let mut index_acknowledgement = None;
     if let Some(landing) = data.remote.as_ref().and_then(|r| r.landing.as_ref()) {
         // Capsule fields are historical data; these checks bind their local
         // recovery claims to the independently decoded immutable OP inventory.
@@ -853,9 +872,9 @@ pub fn verify_capture_export_binding<'a>(
                             && !view.dependencies().native_commits.contains(&head)
                             && !selected_op.dependencies().native_commits.contains(&head)
                         {
-                            return Err(invalid(
-                                "acknowledged landing operation/view does not retain candidate",
-                            ));
+                            // Only an explicit witness in this exact selected OP's
+                            // associated snapshot may supplement the legacy proof.
+                            index_acknowledgement = Some((selected_op_id, head));
                         }
                     }
                 }
@@ -963,14 +982,23 @@ pub fn verify_capture_export_binding<'a>(
     // Immutable content-addressed roots bind this exact supplied closure to the
     // borrowed proof. Reapply the caller's current policy without rebuilding or
     // cloning every snapshot merely to collect its IDs.
-    validate_graph_inventory(
+    let index_retains_candidate = validate_graph_inventory(
         &manifest.history,
         artifacts,
         graph,
         &mut budget,
         &mut roots,
         limits,
+        index_acknowledgement,
     )?;
+    if index_acknowledgement.is_some() {
+        if !index_retains_candidate {
+            return Err(invalid(
+                "acknowledged landing operation/view does not retain candidate",
+            ));
+        }
+        compatibility = CaptureCompatibility::SelectedIndexAcknowledgement;
+    }
     for intent in intents {
         for root in intent.roots {
             add_root(&mut roots, root.kind, root.id.0, limits, &mut budget)?;
@@ -993,6 +1021,7 @@ pub fn verify_capture_export_binding<'a>(
         manifest,
         data,
         work: budget.work,
+        compatibility,
         _objects: objects,
         _artifacts: artifacts,
     })
@@ -1073,6 +1102,8 @@ struct GraphWalk<'a, 'b> {
     encoded: usize,
     memory: usize,
     edges: usize,
+    candidate: Option<[u8; 32]>,
+    explicitly_retained: bool,
 }
 impl GraphWalk<'_, '_> {
     fn tick(&mut self, n: usize) -> Result<()> {
@@ -1106,12 +1137,14 @@ impl GraphWalk<'_, '_> {
                 self.tick(ids.len())?;
                 self.encoded = sum(self.encoded, mul(ids.len(), 32)?)?;
                 for id in ids {
+                    self.explicitly_retained |= self.candidate == Some(id.0);
                     add_root(self.roots, m::Kind::Commit, id.0, self.limits, self.budget)?;
                 }
             }
             c::IndexNodePayload::Drafts(drafts) => {
                 self.tick(drafts.len())?;
                 for draft in drafts {
+                    self.explicitly_retained |= self.candidate == Some(draft.commit().0);
                     let s = self.limits.history.artifacts.snapshot;
                     if draft.parents.len() > s.max_parents
                         || draft.descriptor.size_bytes > s.max_metadata_bytes
@@ -1149,7 +1182,19 @@ fn validate_graph_inventory(
     budget: &mut Budget,
     roots: &mut BTreeSet<(u8, [u8; 32])>,
     limits: ManifestV3Limits,
-) -> Result<()> {
+    acknowledgement: Option<([u8; 64], [u8; 32])>,
+) -> Result<bool> {
+    let selected = if let Some((operation, candidate)) = acknowledgement {
+        budget.work(value.operation_indexes.len())?;
+        value
+            .operation_indexes
+            .iter()
+            .find(|index| index.operation == operation)
+            .map(|index| (index.root, candidate))
+    } else {
+        None
+    };
+    let mut explicitly_retained = false;
     let policy = limits.history.artifacts;
     if graph.roots() != value.index_roots {
         return Err(invalid("capture graph selected roots mismatch"));
@@ -1228,17 +1273,22 @@ fn validate_graph_inventory(
             encoded: 22,
             memory,
             edges: 0,
+            candidate: selected
+                .filter(|(id, _)| *id == descriptor.id)
+                .map(|(_, candidate)| candidate),
+            explicitly_retained: false,
         };
         walk.tick(1)?;
         walk.node(root.anchors, 0)?;
         if let Some(id) = root.drafts {
             walk.node(id, 0)?;
         }
+        explicitly_retained |= walk.explicitly_retained;
     }
     if visited.len() != table.len() {
         return Err(invalid("capture graph exact closure mismatch"));
     }
-    Ok(())
+    Ok(explicitly_retained)
 }
 
 #[cfg(test)]
@@ -1681,6 +1731,294 @@ mod tests {
                 attributes: BTreeMap::new(),
             },
             commit_predecessors: None,
+        }
+    }
+    #[tokio::test]
+    async fn acknowledged_landing_uses_only_its_selected_explicit_index_witness() {
+        let limits = ManifestV3Limits::default();
+        for (name, witness, legacy, expected) in [
+            (
+                "legacy_view",
+                "none",
+                true,
+                Some(CaptureCompatibility::LegacyPortableLanding),
+            ),
+            (
+                "selected_anchor",
+                "anchor",
+                false,
+                Some(CaptureCompatibility::SelectedIndexAcknowledgement),
+            ),
+            (
+                "selected_draft",
+                "draft",
+                false,
+                Some(CaptureCompatibility::SelectedIndexAcknowledgement),
+            ),
+            ("other_operation_only", "none", false, None),
+            ("implicit_parent_only", "parent", false, None),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let store = SimpleOpStore::init(
+                dir.path(),
+                RootOperationData {
+                    root_commit_id: jj_lib::backend::CommitId::from_bytes(&[0; 32]),
+                },
+            )
+            .unwrap();
+            let mut draft = m::synthetic_root();
+            draft.parents = vec![m::CommitId([9; 32]), m::CommitId::ROOT];
+            draft.description = "retained hidden draft".into();
+            let encoded = m::encode(&m::Object::Commit(draft.clone()), Default::default()).unwrap();
+            let row = c::IndexDraft {
+                descriptor: encoded.descriptor,
+                change: draft.change_id,
+                parents: draft.parents,
+                order: 7,
+            };
+            let candidate = if witness == "draft" {
+                row.commit().0
+            } else {
+                [9; 32]
+            };
+            let source = if legacy { candidate } else { [19; 32] };
+            let view = View::make_root(jj_lib::backend::CommitId::from_bytes(&if legacy {
+                candidate
+            } else {
+                [0; 32]
+            }));
+            let view_id = store.write_view(&view).await.unwrap();
+            let mut operation = op(
+                view_id.clone(),
+                vec![OperationId::from_bytes(&[0; 64])],
+                name,
+            );
+            for (key, value) in [
+                ("request", text(&[12; 16])),
+                ("phase", "apply".into()),
+                ("source", text(&source)),
+                ("source_operation", text(&[0; 64])),
+                ("job", text(&[23; 32])),
+                ("candidate", text(&candidate)),
+            ] {
+                operation
+                    .metadata
+                    .attributes
+                    .insert(format!("tinytree.landing.{key}"), value);
+            }
+            let operation_id = store.write_operation(&operation).await.unwrap();
+            let operation_id: [u8; 64] = operation_id.as_bytes().try_into().unwrap();
+            let objects = vec![
+                c::export_view(&store, &view_id, Default::default())
+                    .await
+                    .unwrap(),
+                c::export_operation(
+                    &store,
+                    &OperationId::from_bytes(&operation_id),
+                    Default::default(),
+                )
+                .await
+                .unwrap(),
+            ];
+            let (mut manifest, mut data, _) =
+                fixture(&objects, vec![operation_id], intrinsic(), false);
+            let selected = c::PortableIndexSnapshot {
+                roots: vec![m::CommitId(if witness == "anchor" {
+                    candidate
+                } else {
+                    [0; 32]
+                })],
+                drafts: if witness == "draft" || witness == "parent" {
+                    vec![row.clone()]
+                } else {
+                    vec![]
+                },
+            };
+            // Another OP retains the candidate in every negative case. That
+            // cannot satisfy the selected ACK OP's association.
+            let other = c::PortableIndexSnapshot {
+                roots: vec![m::CommitId(candidate)],
+                drafts: vec![],
+            };
+            let mut table = BTreeMap::new();
+            let mut descriptors = BTreeMap::new();
+            for (op_id, model) in [([0; 64], &other), (operation_id, &selected)] {
+                let built = c::build_index_artifacts(model, limits.history.artifacts).unwrap();
+                descriptors.insert(built.root.id, built.root);
+                manifest
+                    .history
+                    .operation_indexes
+                    .iter_mut()
+                    .find(|i| i.operation == op_id)
+                    .unwrap()
+                    .root = built.root.id;
+                data.indexes
+                    .iter_mut()
+                    .find(|i| i.operation == text(&op_id))
+                    .unwrap()
+                    .root = built.root.id.0;
+                for artifact in built.artifacts {
+                    table.insert(
+                        artifact.descriptor.id,
+                        c::decode_index_artifact(
+                            &artifact.bytes,
+                            artifact.descriptor,
+                            limits.history.artifacts,
+                        )
+                        .unwrap(),
+                    );
+                }
+            }
+            let artifacts: Vec<_> = table.into_values().collect();
+            manifest.history.index_roots = descriptors.into_values().collect();
+            data.blobs.retain(|b| b.kind < 3);
+            for artifact in &artifacts {
+                let d = artifact.descriptor();
+                let (kind, id) = match d.id {
+                    c::IndexArtifactId::Root(id) => (3, id.0),
+                    c::IndexArtifactId::Node(id) => (4, id.0),
+                };
+                data.blobs.push(c::BlobRecord {
+                    kind,
+                    id: text(&id),
+                    blake3: d.selected.blake3,
+                    size: d.selected.size_bytes,
+                });
+            }
+            data.blobs
+                .sort_by(|a, b| (a.kind, &a.id).cmp(&(b.kind, &b.id)));
+            let rewrites = if source == candidate {
+                vec![]
+            } else {
+                vec![c::HistoricalLandingRewrite {
+                    old_commit: source,
+                    new_commit: candidate,
+                    change_id: [26; 16],
+                }]
+            };
+            data.version = 2;
+            data.remote = Some(c::PortableRemoteState {
+                observations: vec![],
+                archived_pushes: vec![],
+                landing: Some(c::PortableLanding {
+                    request_id: text(&[12; 16]),
+                    source_base: text(&[0; 32]),
+                    source_head: text(&source),
+                    reference: "main".into(),
+                    bookmark: "main".into(),
+                    generation: 1,
+                    expected_head: text(&source),
+                    profile_name: "checks".into(),
+                    profile_version: "v1".into(),
+                    source_operation: text(&[0; 64]),
+                    source_stack: vec![text(&source)],
+                    fork_operation: Some(text(&[0; 64])),
+                    fork_acknowledged: true,
+                    job_id: Some(text(&[23; 32])),
+                    result_roots: vec![],
+                    candidate_head: None,
+                    apply_operation: Some(text(&operation_id)),
+                    operation_writing: None,
+                    acknowledged: true,
+                    terminal: None,
+                    restored_lookup_only: false,
+                    observed: Some(c::HistoricalLandingJob {
+                        job_id: [23; 32],
+                        phase: c::HistoricalLandingPhase::Committed,
+                        preparation: c::HistoricalLandingPreparation::ProfileConfigured,
+                        roots_retained: false,
+                        expires_at_seconds: 12345,
+                        profile_name: "checks".into(),
+                        profile_version: "v1".into(),
+                        candidate: Some(c::HistoricalLandingCandidate {
+                            head: candidate,
+                            root_tree: [25; 32],
+                            rewrites: rewrites.clone(),
+                        }),
+                        receipt: Some(c::HistoricalLandingReceipt {
+                            reference: "main".into(),
+                            generation: 2,
+                            commit: candidate,
+                            commit_size_bytes: 128,
+                            object_format_version: m::FORMAT_VERSION,
+                            rewrites,
+                            evidence: [27; 32],
+                        }),
+                        conflict_path: None,
+                    }),
+                }),
+            });
+            let mut roots = BTreeSet::new();
+            for model in [&other, &selected] {
+                for id in &model.roots {
+                    if *id != m::CommitId::ROOT {
+                        roots.insert((m::Kind::Commit as u8, id.0));
+                    }
+                }
+                for row in &model.drafts {
+                    roots.insert((m::Kind::Commit as u8, row.commit().0));
+                }
+            }
+            for object in &objects {
+                for id in &object.dependencies().native_commits {
+                    if *id != [0; 32] {
+                        roots.insert((m::Kind::Commit as u8, *id));
+                    }
+                }
+            }
+            for id in &manifest.history.recovery.working_copy.tree.terms {
+                if id.0 != [0; 32] {
+                    roots.insert((m::Kind::Tree as u8, id.0));
+                }
+            }
+            for intent in
+                capture_recovery_intents(&data, CaptureDataId([1; 32]), limits.binding).unwrap()
+            {
+                for root in intent.roots {
+                    if root.id.0 != [0; 32] {
+                        roots.insert((root.kind as u8, root.id.0));
+                    }
+                }
+            }
+            data.roots = roots
+                .iter()
+                .map(|(kind, id)| c::CapturedRoot {
+                    kind: *kind,
+                    id: *id,
+                })
+                .collect();
+            manifest.history.recovery.native_roots = roots
+                .into_iter()
+                .map(|(kind, id)| m::ObjectKey {
+                    kind: m::Kind::try_from(kind).unwrap(),
+                    id: m::ObjectId(id),
+                })
+                .collect();
+            let bytes = c::encode_capture_data(&data, limits.capture).unwrap();
+            manifest.capture = CaptureDescriptor::of(&bytes);
+            manifest.history.recovery.intent_roots =
+                capture_recovery_intents(&data, manifest.capture.id, limits.binding).unwrap();
+            let graph = c::verify_index_artifact_graph(
+                &manifest.history.index_roots,
+                &artifacts,
+                limits.history.artifacts,
+            )
+            .unwrap();
+            let checked = verify_capture_export_binding(
+                &manifest, &bytes, &objects, &artifacts, &graph, limits,
+            );
+            match expected {
+                Some(expected) => assert_eq!(checked.unwrap().compatibility(), expected, "{name}"),
+                None => assert!(
+                    matches!(
+                        checked,
+                        Err(Error::Invalid(
+                            "acknowledged landing operation/view does not retain candidate"
+                        ))
+                    ),
+                    "{name}"
+                ),
+            }
         }
     }
     #[tokio::test]
