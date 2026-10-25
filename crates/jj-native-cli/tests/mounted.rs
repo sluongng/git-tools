@@ -1009,6 +1009,9 @@ where
 
 #[derive(Default)]
 struct MetadataReads {
+    ordinary_scope_opens: AtomicUsize,
+    capability_requests: Mutex<Vec<Vec<i32>>>,
+    retained_scope_opens: AtomicUsize,
     creation_fault: AtomicUsize,
     unavailable_versions: AtomicBool,
     transport_calls: AtomicUsize,
@@ -1043,11 +1046,25 @@ impl Repository for CountMetadata {
         &self,
         request: RpcRequest<p::GetCapabilitiesRequest>,
     ) -> Result<RpcResponse<p::Capabilities>, Status> {
+        self.reads
+            .capability_requests
+            .lock()
+            .unwrap()
+            .push(request.get_ref().features.clone());
         match self.reads.creation_fault.load(Ordering::SeqCst) {
             1 => Err(Status::unimplemented(
                 "legacy server has no feature negotiation",
             )),
             2 => Err(Status::permission_denied("creation features denied")),
+            6 => {
+                let mut response = self.inner.get_capabilities(request).await?;
+                for feature in &mut response.get_mut().features {
+                    if feature.feature == 5 {
+                        feature.authorized = false;
+                    }
+                }
+                Ok(response)
+            }
             _ => self.inner.get_capabilities(request).await,
         }
     }
@@ -1219,6 +1236,9 @@ impl RepositoryQuery for CountQueryMetadata {
         &self,
         r: RpcRequest<Streaming<q::OpenScopeFrame>>,
     ) -> Result<RpcResponse<q::QueryScope>, Status> {
+        self.reads
+            .ordinary_scope_opens
+            .fetch_add(1, Ordering::SeqCst);
         if self.reads.creation_fault.load(Ordering::SeqCst) == 3 {
             return Err(Status::failed_precondition(
                 "selected immutable root is unavailable",
@@ -1230,6 +1250,14 @@ impl RepositoryQuery for CountQueryMetadata {
         &self,
         r: RpcRequest<Streaming<q::OpenScopeFrame>>,
     ) -> Result<RpcResponse<q::QueryScope>, Status> {
+        self.reads
+            .retained_scope_opens
+            .fetch_add(1, Ordering::SeqCst);
+        if self.reads.creation_fault.load(Ordering::SeqCst) == 4 {
+            return Err(Status::failed_precondition(
+                "selected retained source is unavailable",
+            ));
+        }
         self.inner.open_cloud_scope(r).await
     }
     async fn fork_scope(
@@ -3623,6 +3651,17 @@ fn restore_retired_capture(
 ) {
     let mut fixture = Fixture::new();
     fixture.configure_remote(&upstream.endpoint);
+    fixture.automatic_policies();
+    let mut config: toml::Value =
+        toml::from_str(&fs::read_to_string(&fixture.daemon_config).unwrap()).unwrap();
+    config["native"]["workspaces"]
+        .as_table_mut()
+        .unwrap()
+        .insert(
+            "upload".into(),
+            toml::Value::Table(toml::map::Map::from_iter([("poll_ms".into(), 250.into())])),
+        );
+    fs::write(&fixture.daemon_config, toml::to_string(&config).unwrap()).unwrap();
     fixture.start();
     let base = fixture.base().to_owned();
     let root = base.join("retired-restore");
@@ -3661,10 +3700,92 @@ fn restore_retired_capture(
     if !use_latest {
         restore.extend(["--generation", &generation]);
     }
+    let ordinary_scopes = upstream
+        .metadata
+        .ordinary_scope_opens
+        .load(Ordering::SeqCst);
+    let retained_scopes = upstream
+        .metadata
+        .retained_scope_opens
+        .load(Ordering::SeqCst);
+    let public = upstream.public();
+    // Save the host's exact request, then fail either feature admission or its
+    // private retained scope. Neither failure may allocate per-ID/destination state.
+    upstream
+        .metadata
+        .creation_fault
+        .store(if use_latest { 4 } else { 2 }, Ordering::SeqCst);
+    let configuration = fixture.daemon_config.to_str().unwrap().to_owned();
+    let mut failed_args = vec![
+        "tinytree",
+        "cloud",
+        "--daemon-config",
+        &configuration,
+        "--store",
+        "example",
+    ];
+    failed_args.extend(restore.iter().copied());
+    let failed = fixture.run(&base, &failed_args);
+    assert!(!failed.status.success());
+    assert!(!root.exists());
+    assert_eq!(upstream.file_reads(), file_reads);
+    let intents = files_in(&fixture.base().join("daemon/native-cloud-restores"));
+    assert_eq!(intents.len(), 1);
+    let (intent_name, intent_bytes) = intents.iter().next().unwrap();
+    let saved: serde_json::Value = serde_json::from_slice(intent_bytes).unwrap();
+    assert_eq!(saved["source"], serde_json::to_value(selection).unwrap());
+    assert_eq!(saved["requested_policy"]["require_lazy_queries"], true);
+    assert_eq!(saved["requested_policy"]["auto_capture"], true);
+    assert_eq!(saved["requested_policy"]["auto_upload"], true);
+    let saved_identity: [u8; 32] = serde_json::from_value(saved["workspace_id"].clone()).unwrap();
+    assert!(
+        !fixture
+            .base()
+            .join("daemon/native-workspaces")
+            .join(capture_identity(&saved_identity))
+            .exists()
+    );
+    upstream.metadata.creation_fault.store(0, Ordering::SeqCst);
+    fixture.stop_daemon();
+    // The host-owned intent already froze Auto. Changing new-workspace policy
+    // must not reselect its source or eligibility on restart.
+    fixture.index_mode("legacy");
+    fixture.start();
     let report: workspace_daemon::control::NativeCloudRestored =
         serde_json::from_str(&fixture.cloud(&base, &restore)).unwrap();
     assert_eq!(report.source, *selection);
-    assert!(!report.reused_destination);
+    assert!(report.reused_destination);
+    assert_eq!(report.mounted.binding.workspace_id, saved_identity);
+    assert_eq!(
+        fs::read(
+            fixture
+                .base()
+                .join("daemon/native-cloud-restores")
+                .join(intent_name)
+        )
+        .unwrap(),
+        *intent_bytes
+    );
+    assert_eq!(
+        upstream
+            .metadata
+            .ordinary_scope_opens
+            .load(Ordering::SeqCst),
+        ordinary_scopes,
+        "restore readiness must not reinterpret private roots as ordinary public scopes"
+    );
+    assert!(
+        upstream
+            .metadata
+            .retained_scope_opens
+            .load(Ordering::SeqCst)
+            > retained_scopes
+    );
+    assert_eq!(
+        upstream.file_reads(),
+        file_reads,
+        "restore admission is metadata-only"
+    );
     let binding = fixture.binding(&root);
     assert_eq!(native_operation_heads(&binding), data.operation_heads);
     let (wc, _) =
@@ -3675,6 +3796,33 @@ fn restore_retired_capture(
     assert_eq!(
         fs::read(root.join("capture-only.txt")).unwrap(),
         expected_bytes
+    );
+    let record: serde_json::Value = serde_json::from_slice(
+        &fs::read(
+            fixture
+                .base()
+                .join("daemon/native-workspaces")
+                .join(binding.id())
+                .join("workspace.json"),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    assert!(
+        record.get("creation_plan").is_none(),
+        "retained authority is not a public-root creation plan"
+    );
+    assert_eq!(
+        record["restore_enrollment"]["requested"]["auto_capture"],
+        true
+    );
+    assert_eq!(
+        record["restore_enrollment"]["requested"]["auto_upload"],
+        true
+    );
+    assert_eq!(
+        fs::read_to_string(binding.repo.join("index/type")).unwrap(),
+        jj_native_index::NAME
     );
     let restored_identity = binding.workspace_id;
     let later = b"later local edit must survive restore retry\n";
@@ -3711,6 +3859,12 @@ fn restore_retired_capture(
     );
     assert!(!rejected.status.success());
     assert_eq!(fs::read(root.join("capture-only.txt")).unwrap(), later);
+    fixture.success(&root, &["status"]);
+    let uploaded = wait_for_capture_publications(&fixture, 1);
+    assert!(uploaded["historical_published_count"].as_u64().unwrap() >= 1);
+    assert!(cloud_generation(upstream, restored_identity) >= 1);
+    let native_reads_after_selected_file = upstream.file_reads();
+    assert_eq!(upstream.public(), public);
     fixture.success(&base, &["tinytree", "unmount", root.to_str().unwrap()]);
     fixture.stop_daemon();
     fixture.start();
@@ -3724,8 +3878,201 @@ fn restore_retired_capture(
     assert_eq!(resumed.source, *selection);
     assert_eq!(resumed.mounted.binding.workspace_id, restored_identity);
     assert_eq!(fs::read(root.join("capture-only.txt")).unwrap(), later);
+    let after_restart = b"restored automatic backup after daemon restart\n";
+    fs::write(root.join("capture-only.txt"), after_restart).unwrap();
+    fixture.success(&root, &["status"]);
+    let deadline = Instant::now() + Duration::from_secs(90);
+    loop {
+        let generation = cloud_generation(upstream, restored_identity);
+        if generation >= 2 {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "restored workspace backup did not advance: {}",
+            fixture.control(Request::Status).unwrap()
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let retained = retained_capture_versions(
+        upstream,
+        restored_identity,
+        cloud_generation(upstream, restored_identity),
+    );
+    let latest = retained.last().unwrap();
+    let latest_data = tinytree_cloud::decode_data(
+        &latest.4,
+        tinytree_cloud::CaptureDataId::of(&latest.4).0,
+        &Default::default(),
+    )
+    .unwrap();
+    let (current_wc, _) =
+        jj_vfs::native::read_retained_state_for_capture(&binding.projection(), 1024 * 1024)
+            .unwrap();
+    assert_eq!(
+        latest_data.operation_heads,
+        native_operation_heads(&binding)
+    );
+    assert_eq!(
+        latest_data.working_copy.wc_operation,
+        current_wc.operation.hex()
+    );
+    assert_eq!(
+        latest_data.working_copy.tree.terms,
+        current_wc.trees[0].terms
+    );
+    assert_eq!(
+        upstream.file_reads(),
+        native_reads_after_selected_file,
+        "continued backup must not hydrate unrelated native FILE bodies"
+    );
+    assert_eq!(upstream.public(), public);
     fixture.success(&base, &["tinytree", "unmount", root.to_str().unwrap()]);
     fixture.stop_daemon();
+    // Explicit Legacy opts out of the new capability contract. First fail its
+    // required retained-source collector and confirm it did not negotiate CAP.
+    upstream.metadata.creation_fault.store(4, Ordering::SeqCst);
+    fixture.start();
+    let compatibility_root = base.join("explicit-legacy-restore");
+    let capability_count = upstream.metadata.capability_requests.lock().unwrap().len();
+    let configuration = fixture.daemon_config.to_str().unwrap().to_owned();
+    let failure = fixture.run(
+        &base,
+        &[
+            "tinytree",
+            "cloud",
+            "--daemon-config",
+            &configuration,
+            "--store",
+            "example",
+            "restore",
+            &workspace,
+            compatibility_root.to_str().unwrap(),
+            "--generation",
+            &generation,
+        ],
+    );
+    assert!(!failure.status.success());
+    assert!(!compatibility_root.exists());
+    assert_eq!(
+        upstream.metadata.capability_requests.lock().unwrap().len(),
+        capability_count
+    );
+    fixture.stop_daemon();
+    // Model the canonical pre-enrollment journal schema in a controlled private
+    // fixture. The next startup uses Auto, but this old intent must stay None.
+    #[derive(serde::Serialize, serde::Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct OldCloudIntent {
+        version: u32,
+        root: PathBuf,
+        store: String,
+        workspace_id: [u8; 32],
+        source: workspace_daemon::control::NativeRestoreSelection,
+        provider_identity: [u8; 32],
+    }
+    let directory =
+        private_fs::PrivateDir::open_existing(fixture.base().join("daemon/native-cloud-restores"))
+            .unwrap();
+    let intents = files_in(directory.path());
+    let (name, mut old) = intents
+        .iter()
+        .find_map(|(name, bytes)| {
+            let value: serde_json::Value = serde_json::from_slice(bytes).unwrap();
+            (value["root"] == compatibility_root.to_str().unwrap()).then_some((name, value))
+        })
+        .unwrap();
+    old.as_object_mut().unwrap().remove("requested_policy");
+    let old: OldCloudIntent = serde_json::from_value(old).unwrap();
+    directory
+        .replace(
+            Path::new(name).file_name().unwrap(),
+            &serde_json::to_vec(&old).unwrap(),
+        )
+        .unwrap();
+    fixture.automatic_policies();
+    upstream.metadata.creation_fault.store(1, Ordering::SeqCst);
+    fixture.start();
+    let compatibility: workspace_daemon::control::NativeCloudRestored =
+        serde_json::from_str(&fixture.cloud(
+            &base,
+            &[
+                "restore",
+                &workspace,
+                compatibility_root.to_str().unwrap(),
+                "--generation",
+                &generation,
+                "--json",
+            ],
+        ))
+        .unwrap();
+    assert_eq!(compatibility.source, *selection);
+    let compatibility_binding = fixture.binding(&compatibility_root);
+    assert_eq!(
+        fs::read_to_string(compatibility_binding.repo.join("index/type")).unwrap(),
+        jj_native_index::NAME
+    );
+    let old_record: serde_json::Value = serde_json::from_slice(
+        &fs::read(
+            fixture
+                .base()
+                .join("daemon/native-workspaces")
+                .join(compatibility_binding.id())
+                .join("workspace.json"),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    assert!(old_record.get("restore_enrollment").is_none());
+    let queued = local_capture_status(&fixture)["queued"].as_u64().unwrap();
+    fixture.success(&compatibility_root, &["status"]);
+    assert_eq!(local_capture_status(&fixture)["queued"], queued);
+    assert_eq!(
+        cloud_generation(upstream, compatibility_binding.workspace_id),
+        0
+    );
+    fixture.success(
+        &base,
+        &["tinytree", "unmount", compatibility_root.to_str().unwrap()],
+    );
+    fixture.stop_daemon();
+    // Explicit capture disable gates Auto upload and needs only the selected
+    // lazy-query features, even when the advertised cloud-write grant is absent.
+    fixture.capture_policy("disabled");
+    upstream.metadata.creation_fault.store(6, Ordering::SeqCst);
+    fixture.start();
+    let disabled_root = base.join("disabled-automatic-backup");
+    let capability_count = upstream.metadata.capability_requests.lock().unwrap().len();
+    let disabled: workspace_daemon::control::NativeCloudRestored =
+        serde_json::from_str(&fixture.cloud(
+            &base,
+            &[
+                "restore",
+                &workspace,
+                disabled_root.to_str().unwrap(),
+                "--generation",
+                &generation,
+                "--json",
+            ],
+        ))
+        .unwrap();
+    assert_eq!(disabled.source, *selection);
+    let requests = upstream.metadata.capability_requests.lock().unwrap();
+    assert_eq!(&requests[capability_count..], &[vec![1, 2, 3]]);
+    drop(requests);
+    let queued = local_capture_status(&fixture)["queued"].as_u64().unwrap();
+    fixture.success(&disabled_root, &["status"]);
+    assert_eq!(local_capture_status(&fixture)["queued"], queued);
+    assert_eq!(
+        cloud_generation(upstream, disabled.mounted.binding.workspace_id),
+        0
+    );
+    fixture.success(
+        &base,
+        &["tinytree", "unmount", disabled_root.to_str().unwrap()],
+    );
+    fixture.stop_daemon();
+    upstream.metadata.creation_fault.store(0, Ordering::SeqCst);
 }
 
 fn wait_for_capture_publications(fixture: &Fixture, expected: u64) -> serde_json::Value {

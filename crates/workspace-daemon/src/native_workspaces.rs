@@ -70,6 +70,8 @@ struct Record {
     native_mount: Option<crate::recovery::NativeMountProof>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     creation_plan: Option<Vec<u8>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    restore_enrollment: Option<crate::native_restore_policy::Verified>,
 }
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
@@ -110,6 +112,7 @@ fn read_record(bytes: &[u8]) -> Result<Record> {
             ensure!(old.version == 1, "invalid legacy native record");
             Ok(Record {
                 creation_plan: None,
+                restore_enrollment: None,
                 version: 2,
                 workspace_id: old.workspace_id,
                 store: old.store,
@@ -137,6 +140,8 @@ struct CloudRestoreIntent {
     workspace_id: [u8; 32],
     source: crate::control::NativeRestoreSelection,
     provider_identity: [u8; 32],
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    requested_policy: Option<crate::native_restore_policy::Requested>,
 }
 struct Entry {
     record: Record,
@@ -511,7 +516,19 @@ impl Manager {
                 uuid::Uuid::new_v4().simple(),
                 uuid::Uuid::new_v4().simple()
             );
+            let requested = crate::native_restore_policy::Requested::resolve(
+                &self.config.native.workspaces,
+                &crate::native_restore_policy::Binding {
+                    root: &root,
+                    store: &store,
+                    workspace_id: unhex(&id)?,
+                    source: &source,
+                    provider_identity,
+                },
+                self.repositories[&store].remote,
+            )?;
             let intent = CloudRestoreIntent {
+                requested_policy: Some(requested),
                 version: 1,
                 root: root.clone(),
                 store: store.clone(),
@@ -778,6 +795,7 @@ impl Manager {
         let registry = self.open_registry()?;
         let record = Record {
             creation_plan,
+            restore_enrollment: None,
             version: if immutable { 3 } else { 2 },
             workspace_id: id,
             root: root.clone(),
@@ -1361,6 +1379,38 @@ impl Manager {
                 );
             }
         }
+        let requested_policy = match &existing {
+            Some(record) => record
+                .restore_enrollment
+                .as_ref()
+                .map(|value| value.requested.clone()),
+            None => self
+                .cloud_intents
+                .values()
+                .find(|intent| intent.workspace_id == id)
+                .and_then(|intent| intent.requested_policy.clone()),
+        };
+        let policy_binding = crate::native_restore_policy::Binding {
+            root: &root,
+            store: &store,
+            workspace_id: id,
+            source: &selection,
+            provider_identity: repository.identity,
+        };
+        if existing.is_none() {
+            if let Some(requested) = &requested_policy {
+                requested.validate(&policy_binding)?;
+                if requested.needs_feature_probe(&self.config.native.workspaces) {
+                    let client = source
+                        .control
+                        .client_for_owned_work(Arc::new((source.clone(), access.clone())), deadline)
+                        .await?;
+                    requested
+                        .check_features(&client, &self.config.native.workspaces)
+                        .await?;
+                }
+            }
+        }
         let mut record = if current {
             existing.clone().unwrap()
         } else {
@@ -1379,7 +1429,7 @@ impl Manager {
                     },
                 },
                 limits,
-                Arc::new(()),
+                Arc::new(access.clone()),
                 deadline,
             )
             .await?;
@@ -1400,8 +1450,19 @@ impl Manager {
                     "native restore captured source changed"
                 );
             }
+            let restore_enrollment = requested_policy
+                .clone()
+                .map(|requested| {
+                    crate::native_restore_policy::Verified::seal(
+                        &policy_binding,
+                        requested,
+                        identity.clone(),
+                    )
+                })
+                .transpose()?;
             let record = Record {
                 creation_plan: None,
+                restore_enrollment,
                 version: 2,
                 workspace_id: id,
                 store: store.clone(),
@@ -1480,7 +1541,12 @@ impl Manager {
             .is_none()
         {
             let reservation = commands
-                .register_reserved_with_host_access(&binding, repository.identity, access.clone())
+                .register_reserved_enrolled_with_host_access(
+                    &binding,
+                    repository.identity,
+                    creation_policy(&record)?.is_some_and(|policy| policy.auto_upload),
+                    access.clone(),
+                )
                 .await?;
             self.entries.get_mut(workspace_id).unwrap().command_startup = Some(reservation);
         }
@@ -1650,7 +1716,7 @@ impl Manager {
         commands.set_capture_target(
             workspace_id,
             Some(Arc::new(crate::native_capture::Target {
-                auto_enrolled: false,
+                auto_enrolled: creation_policy(&record)?.is_some_and(|policy| policy.auto_capture),
                 controller: Arc::downgrade(&controller),
                 registry: registry.clone(),
                 binding: binding.clone(),
@@ -2148,6 +2214,15 @@ fn validate_cloud_intent(intent: &CloudRestoreIntent) -> Result<()> {
             && intent.store.len() <= 64,
         "invalid cloud restore intent"
     );
+    if let Some(requested) = &intent.requested_policy {
+        requested.validate(&crate::native_restore_policy::Binding {
+            root: &intent.root,
+            store: &intent.store,
+            workspace_id: intent.workspace_id,
+            source: &intent.source,
+            provider_identity: intent.provider_identity,
+        })?;
+    }
     Ok(())
 }
 fn validate_cloud_record(intent: &CloudRestoreIntent, record: &Record) -> Result<()> {
@@ -2161,6 +2236,14 @@ fn validate_cloud_record(intent: &CloudRestoreIntent, record: &Record) -> Result
             && intent.provider_identity == source.provider_identity()
             && intent.source == selection_from_identity(source),
         "cloud restore reservation conflicts with workspace record"
+    );
+    ensure!(
+        intent.requested_policy.as_ref()
+            == record
+                .restore_enrollment
+                .as_ref()
+                .map(|value| &value.requested),
+        "cloud restore enrollment differs from saved host request"
     );
     Ok(())
 }
@@ -2740,6 +2823,9 @@ fn persist(entry: &Entry) -> Result<()> {
     Ok(())
 }
 fn creation_policy(record: &Record) -> Result<Option<native_broker::CreationPolicy>> {
+    if let Some(verified) = &record.restore_enrollment {
+        return verified.requested.policy().map(Some);
+    }
     record
         .creation_plan
         .as_deref()
@@ -2748,6 +2834,7 @@ fn creation_policy(record: &Record) -> Result<Option<native_broker::CreationPoli
         .map(|plan| plan.map(|p| p.policy))
         .map_err(Into::into)
 }
+
 fn same_intent(a: &Record, b: &Record) -> bool {
     a.version == b.version
         && a.workspace_id == b.workspace_id
@@ -2756,6 +2843,7 @@ fn same_intent(a: &Record, b: &Record) -> bool {
         && a.origin == b.origin
         && a.scope == b.scope
         && a.creation_plan == b.creation_plan
+        && a.restore_enrollment == b.restore_enrollment
 }
 fn validate_record(record: &Record) -> Result<()> {
     ensure!(
@@ -2774,6 +2862,25 @@ fn validate_record(record: &Record) -> Result<()> {
             plan.root == bootstrap_commit,
             "saved native creation root differs"
         );
+    }
+    if let Some(verified) = &record.restore_enrollment {
+        ensure!(
+            record.creation_plan.is_none(),
+            "restore cannot carry a public-root creation plan"
+        );
+        let Origin::Restore { source, .. } = &record.origin else {
+            anyhow::bail!("automatic restore enrollment requires a restore origin");
+        };
+        verified.validate(
+            &crate::native_restore_policy::Binding {
+                root: &record.root,
+                store: &record.store,
+                workspace_id: record.workspace_id,
+                source: &selection_from_identity(source),
+                provider_identity: source.provider_identity(),
+            },
+            source,
+        )?;
     }
     normalized(&record.root)?;
     if let Origin::Restore { source, seed, .. } = &record.origin {
@@ -2917,6 +3024,17 @@ mod tests {
     #[tokio::test]
     async fn cloud_restore_intent_survives_ambiguous_publication_and_partial_workspace_restart()
     -> Result<()> {
+        for (name, automatic) in [
+            ("legacy intent without enrollment", false),
+            ("saved automatic contract", true),
+        ] {
+            exercise_cloud_restore_intent_restart(automatic)
+                .await
+                .with_context(|| name)?;
+        }
+        Ok(())
+    }
+    async fn exercise_cloud_restore_intent_restart(automatic: bool) -> Result<()> {
         let temporary = tempfile::tempdir()?;
         let state = PrivateDir::create(temporary.path().join("state"))?;
         let objects = PrivateDir::create(temporary.path().join("objects"))?;
@@ -2954,7 +3072,8 @@ mod tests {
             manifest_blake3: [3; 32],
             manifest_size_bytes: 256,
         };
-        let intent = CloudRestoreIntent {
+        let mut intent = CloudRestoreIntent {
+            requested_policy: None,
             version: 1,
             root: root.clone(),
             store: "example".into(),
@@ -2962,6 +3081,19 @@ mod tests {
             source: source.clone(),
             provider_identity: [8; 32],
         };
+        if automatic {
+            intent.requested_policy = Some(crate::native_restore_policy::Requested::resolve(
+                &config.native.workspaces,
+                &crate::native_restore_policy::Binding {
+                    root: &root,
+                    store: "example",
+                    workspace_id: id,
+                    source: &source,
+                    provider_identity: [8; 32],
+                },
+                true,
+            )?);
+        }
         let key = cloud_intent_key(&root)?;
         // Model the exact post-selection/pre-publication boundary. No remote
         // provider is configured: a retry that reselects latest cannot succeed.
@@ -2992,6 +3124,26 @@ mod tests {
             serde_json::from_slice::<CloudRestoreIntent>(&saved)?,
             intent
         );
+        if automatic {
+            let mut changed: serde_json::Value = serde_json::from_slice(&saved)?;
+            changed["requested_policy"]["require_lazy_queries"] = false.into();
+            manager.cloud_intents_directory.replace(
+                intent_path.file_name().unwrap(),
+                &serde_json::to_vec(&changed)?,
+            )?;
+            let error = Manager::open(config.clone(), cache.clone(), repositories.clone())
+                .err()
+                .context("mutated requested policy must fail startup")?;
+            assert!(
+                error
+                    .to_string()
+                    .contains("automatic restore policy binding differs")
+            );
+            assert!(!root.exists());
+            manager
+                .cloud_intents_directory
+                .replace(intent_path.file_name().unwrap(), &saved)?;
+        }
         assert!(!root.exists());
         assert!(
             !state
@@ -3140,14 +3292,33 @@ mod tests {
         // A visible initial workspace record is authoritative after restart,
         // including installations without an auto-ID outbox (compatibility).
         // Synthetic source DATA tests journal recovery, not authenticated restore.
-        let identity = serde_json::from_value(serde_json::json!({
-            "workspace":source.workspace_id,"generation":source.generation,
-            "manifest":source.manifest_id,"manifest_blake3":source.manifest_blake3,
-            "manifest_bytes":source.manifest_size_bytes,"capture":vec![5;32],
-            "capture_blake3":vec![6;32],"capture_bytes":512,"provider":vec![8;32]
-        }))?;
+        let identity: native_workspace_admin::restore::RestoreSourceIdentity =
+            serde_json::from_value(serde_json::json!({
+                "workspace":source.workspace_id,"generation":source.generation,
+                "manifest":source.manifest_id,"manifest_blake3":source.manifest_blake3,
+                "manifest_bytes":source.manifest_size_bytes,"capture":vec![5;32],
+                "capture_blake3":vec![6;32],"capture_bytes":512,"provider":vec![8;32]
+            }))?;
+        let restore_enrollment = intent
+            .requested_policy
+            .clone()
+            .map(|requested| {
+                crate::native_restore_policy::Verified::seal(
+                    &crate::native_restore_policy::Binding {
+                        root: &root,
+                        store: "example",
+                        workspace_id: id,
+                        source: &source,
+                        provider_identity: [8; 32],
+                    },
+                    requested,
+                    identity.clone(),
+                )
+            })
+            .transpose()?;
         let record = Record {
             creation_plan: None,
+            restore_enrollment,
             version: 2,
             workspace_id: id,
             root: root.clone(),
@@ -3261,6 +3432,7 @@ mod tests {
         )?;
         let record = Record {
             creation_plan: None,
+            restore_enrollment: None,
             version: 3,
             workspace_id: id,
             store: "example".into(),

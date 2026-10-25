@@ -58,13 +58,17 @@ See the [TOML example](../../examples/workspace.toml) for conservative defaults.
 
 ## Retained captures
 
-New remote native `init`/`clone` workspaces on Linux use `"auto"` capture and
-upload policies by default. Creation requires authenticated query and captured
+New remote native `init`/`clone` workspaces and convenience `cloud restore`
+destinations on Linux use `"auto"` capture and upload policies by default. Creation requires authenticated query and captured
 cloud support before it creates a destination. After each command, the daemon
 queues a durable local capture; a background worker publishes it without moving
 public references. Local aliases and workspaces created before this automatic
-enrollment remain unchanged. Restored workspaces currently require explicit
-capture/upload policies for continued backup.
+enrollment remain unchanged. Older pending restore intents and the lower-level
+exact-restore compatibility route also remain unenrolled. New cloud restores
+freeze their eligibility with the exact selected version before destination
+creation; their required query readiness uses that retained private source,
+not an ordinary public-root query. Captured index types are never converted by
+later creation-policy changes.
 
 Set capture `policy = "disabled"` to disable capture and automatic upload, or
 upload `policy = "disabled"` to retain local captures without uploading them.

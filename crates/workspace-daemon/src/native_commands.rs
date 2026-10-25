@@ -418,6 +418,21 @@ impl NativeCommandHost {
             workspace,
         })
     }
+    pub(crate) async fn register_reserved_enrolled_with_host_access(
+        &self,
+        binding: &Binding,
+        identity: [u8; 32],
+        auto_upload: bool,
+        access: Arc<native_retention::HostAccessGuard>,
+    ) -> Result<CommandStartupReservation> {
+        let workspace = self
+            .register_inner(binding, identity, true, Some(access), Some(auto_upload))
+            .await?;
+        Ok(CommandStartupReservation {
+            inner: self.inner.clone(),
+            workspace,
+        })
+    }
     /// Manager holds a stopped/gated frontend and the host fence before using
     /// this explicit invalidation. Existing roots stay pinned until recaptured.
     pub(crate) async fn invalidate_workspace_with_host_access(

@@ -30,4 +30,6 @@ mod native_capture_upload;
 #[cfg(unix)]
 mod native_cloud;
 #[cfg(unix)]
+mod native_restore_policy;
+#[cfg(unix)]
 mod native_restore_source;

@@ -81,6 +81,7 @@ buildbuddy = "https://github.com/buildbuddy-io/buildbuddy.git"
 # [native.workspaces]
 # metadata_cache_ttl_ms = 1000 # Linux default (max 5000); use 0 on other platforms.
 # index_mode = "auto" # New remote init/clone: checked lazy queries; local: legacy.
+# Cloud restore preserves its captured index; automatic eligibility is frozen at selection.
 # Existing workspaces retain their recorded index type and backup enrollment.
 # Explicit Linux-only collection; preview never deletes and no automatic GC runs.
 # "local_complete" requires a genuinely fresh native cohort under state_dir,
@@ -91,7 +92,8 @@ buildbuddy = "https://github.com/buildbuddy-io/buildbuddy.git"
 # grace_seconds = 3600
 # timeout_ms = 30000
 # [native.workspaces.capture]
-# policy = "auto" # New remote init/clone only; "disabled" or explicit "after_command_best_effort".
+# policy = "auto" # New remote init/clone and convenience cloud restore.
+# Use "disabled" or explicit "after_command_best_effort" for other workflows.
 # max_bundle_bytes = 268435456
 # max_pending_bytes = 4294967296
 # max_pending = 64

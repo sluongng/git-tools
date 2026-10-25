@@ -29,21 +29,24 @@ operation, index and working-copy state live in private external administration.
 Fetch an absent reference explicitly before its first push. Native publication
 is not Git push.
 
-For new remote `init` and `clone` workspaces on Linux, the default
+For new remote `init`, `clone` and convenience `cloud restore` destinations on
+Linux, the default
 `[native.workspaces] index_mode = "auto"` selects immutable native index checkpoints
 and lazy broker queries. Automatic capture and background cloud publication are
 also enabled for those new workspaces. Creation checks the remote server's
-features and caller access, then opens the exact selected query root before
-creating the destination. Unsupported servers or roots fail explicitly; there is
+features and caller access, then verifies the exact selected query source before
+creating the destination. Restore uses retained-cloud authority for the selected
+version, never public-root admission for private captured commits. Unsupported servers or roots fail explicitly; there is
 no eager or legacy fallback.
 
 Local aliases remain legacy and are not automatically backed up. Explicit
 `index_mode = "legacy"` also opts out of automatic portable backup; capture/upload
 `policy = "disabled"` remain available independently.
 Existing workspaces keep their recorded index type and are not enrolled merely
-by upgrading the daemon. Restored workspaces currently keep their captured index
-and require explicit capture/upload policies for continued backup. Missing native
-state always fails closed. A pending new initialization retains its selected mode
+by upgrading the daemon. Restores keep their captured index even with an explicit
+Legacy preference. Older pending restore requests and the lower-level exact
+`tinytree restore` compatibility route remain unenrolled; use explicit
+capture/upload policies to back them up. Missing native state always fails closed. A pending new initialization retains its selected mode
 and backup eligibility across retries rather than adopting later config defaults.
 
 With a federated workspace and an operator-configured landing profile:
@@ -102,8 +105,9 @@ ID as proof.
 
 ## Restore a retained capture
 
-New remote clones use automatic capture and publication. To back up an existing
-or restored workspace, select explicit capture and asynchronous upload policies
+New remote clones and convenience cloud restores use automatic capture and
+publication. To back up an existing workspace or a lower-level exact restore,
+select explicit capture and asynchronous upload policies
 in the [daemon configuration](../workspace-daemon). Use the matching daemon and
 configured alias to discover backups without supplying server URLs, credentials
 or raw manifest digests:
@@ -121,8 +125,11 @@ Select `WORKSPACE_ID` from the first command and a generation from the second.
 Omit `--generation` to select the latest published version once. Before creating
 the destination, the daemon saves its new identity and exact source selection.
 Retry the same destination to resume that selection, even if the source head has
-moved; retries and later resumes preserve current edits. A changed alias, source
-or explicit generation is rejected instead of replacing that intent.
+moved; retries and later resumes preserve current edits. Automatic backup
+eligibility is saved with that request and does not change merely because later
+new-workspace defaults change. Explicitly disabled runtime capture/upload still
+wins. A changed alias, source or explicit generation is rejected instead of
+replacing that intent.
 
 `workspaces` and `versions` return bounded pages; use the printed `--cursor`
 with the same command and alias for the next page. `versions` keeps the first
