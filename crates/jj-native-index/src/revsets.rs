@@ -96,6 +96,56 @@ pub(super) fn compile(
             P::Divergent { .. } => Err(Error::UnsupportedExpression("filter_divergent")),
         }
     }
+    // A fileset union is an existential path match, so each branch filters
+    // the same candidates. Intersections/differences cannot be lowered this way:
+    // different changed paths in one commit need not satisfy both matchers.
+    fn file(
+        fileset: &jj_lib::fileset::FilesetExpression,
+        candidates: &ResolvedExpression,
+        depth: usize,
+        left: &mut usize,
+        literals: &mut usize,
+        limits: &Limits,
+    ) -> Result<q::GraphExpr, Error> {
+        use jj_lib::fileset::{FilePattern, FilesetExpression};
+        use q::graph_expr::Expression as Q;
+        if depth > limits.max_expression_depth || *left == 0 {
+            return Err(Error::Limit);
+        }
+        *left -= 1;
+        let (path, exact_file) = match fileset {
+            FilesetExpression::UnionAll(inputs) if !inputs.is_empty() => {
+                if inputs.len() > *left {
+                    return Err(Error::Limit);
+                }
+                return Ok(expr(Q::Union(q::SetExpr {
+                    inputs: inputs
+                        .iter()
+                        .map(|input| file(input, candidates, depth + 1, left, literals, limits))
+                        .collect::<Result<_, _>>()?,
+                })));
+            }
+            FilesetExpression::Pattern(FilePattern::FilePath(path)) => (path, true),
+            FilesetExpression::Pattern(FilePattern::PrefixPath(path)) => (path, false),
+            _ => return Err(Error::UnsupportedExpression("fileset_not_exact_path")),
+        };
+        let path = path.as_internal_file_string();
+        if path.is_empty() || path.len() > 4096 || path.split('/').count() > limits.max_depth {
+            return Err(Error::UnsupportedExpression("fileset_not_exact_path"));
+        }
+        Ok(expr(Q::ChangedPath(Box::new(q::ChangedPathExpr {
+            policy_version: 1,
+            candidates: Some(Box::new(build(
+                candidates,
+                depth + 1,
+                left,
+                literals,
+                limits,
+            )?)),
+            path: path.to_owned(),
+            exact_file,
+        }))))
+    }
     fn build(
         input: &ResolvedExpression,
         depth: usize,
@@ -103,6 +153,16 @@ pub(super) fn compile(
         literals: &mut usize,
         limits: &Limits,
     ) -> Result<q::GraphExpr, Error> {
+        if let ResolvedExpression::FilterWithin {
+            candidates,
+            predicate:
+                jj_lib::revset::ResolvedPredicateExpression::Filter(
+                    jj_lib::revset::RevsetFilterPredicate::File(fileset),
+                ),
+        } = input
+        {
+            return file(fileset, candidates, depth, left, literals, limits);
+        }
         if depth > limits.max_expression_depth || *left == 0 {
             return Err(Error::Limit);
         }
@@ -178,33 +238,6 @@ pub(super) fn compile(
                 left: Some(Box::new(child(a, left, literals)?)),
                 right: Some(Box::new(child(b, left, literals)?)),
             }))),
-            R::FilterWithin {
-                candidates,
-                predicate:
-                    jj_lib::revset::ResolvedPredicateExpression::Filter(
-                        jj_lib::revset::RevsetFilterPredicate::File(fileset),
-                    ),
-            } => {
-                use jj_lib::fileset::{FilePattern, FilesetExpression};
-                let (path, exact_file) = match fileset {
-                    FilesetExpression::Pattern(FilePattern::FilePath(path)) => (path, true),
-                    FilesetExpression::Pattern(FilePattern::PrefixPath(path)) => (path, false),
-                    _ => return Err(Error::UnsupportedExpression("fileset_not_exact_path")),
-                };
-                let path = path.as_internal_file_string();
-                if path.is_empty()
-                    || path.len() > 4096
-                    || path.split('/').count() > limits.max_depth
-                {
-                    return Err(Error::UnsupportedExpression("fileset_not_exact_path"));
-                }
-                expr(Q::ChangedPath(Box::new(q::ChangedPathExpr {
-                    policy_version: 1,
-                    candidates: Some(Box::new(child(candidates, left, literals)?)),
-                    path: path.to_owned(),
-                    exact_file,
-                })))
-            }
             R::FilterWithin {
                 candidates,
                 predicate:

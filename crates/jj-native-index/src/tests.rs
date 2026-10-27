@@ -1101,6 +1101,71 @@ fn public_mutable_traits_keep_local_drafts_hidden_siblings_and_lazy_streams_acro
             panic!("wrong compiler limit category")
         };
         assert!(matches!(source.downcast_ref::<Error>(), Some(Error::Limit)));
+        use jj_lib::{
+            fileset::FilesetExpression,
+            revset::RevsetFilterPredicate as F,
+        };
+        let exact = FilesetExpression::file_path(RepoPathBuf::from_internal_string("file").unwrap());
+        let prefix =
+            FilesetExpression::prefix_path(RepoPathBuf::from_internal_string("directory").unwrap());
+        let union = FilesetExpression::UnionAll(vec![exact.clone(), prefix.clone()]);
+        let nested = FilesetExpression::UnionAll(vec![
+            exact.clone(),
+            FilesetExpression::UnionAll(vec![prefix, exact]),
+        ]);
+        for (behavior, fileset, nodes, depth, literals, accepted) in [
+            ("union at aggregate limits", union.clone(), 5, 3, 2, true),
+            (
+                "union repeated candidate literals",
+                union.clone(),
+                5,
+                3,
+                1,
+                false,
+            ),
+            ("union aggregate nodes", union.clone(), 4, 3, 2, false),
+            ("union expression depth", union, 5, 2, 2, false),
+            (
+                "nested duplicate union at limits",
+                nested.clone(),
+                8,
+                4,
+                3,
+                true,
+            ),
+            ("nested union expression depth", nested, 8, 3, 3, false),
+        ] {
+            let mut limits = Limits::default();
+            limits.max_expression_nodes = nodes;
+            limits.max_expression_depth = depth;
+            limits.max_query_rows = literals;
+            let bounded = NativeIndexStore::open(
+                &directory.path().join("index"),
+                &config,
+                limits,
+                io.clone(),
+                objects.clone(),
+            )
+            .unwrap()
+            .seed_index()
+            .unwrap();
+            let expression = ResolvedExpression::FilterWithin {
+                candidates: Box::new(ResolvedExpression::Commits(vec![root.id().clone()])),
+                predicate: P::Filter(F::File(fileset)),
+            };
+            let result = bounded.evaluate_revset(&expression, &jj_store);
+            if accepted {
+                assert!(result.is_ok(), "{behavior}: {result:?}");
+            } else {
+                let RevsetEvaluationError::Other(source) = result.unwrap_err() else {
+                    panic!("{behavior}: wrong compiler limit category")
+                };
+                assert!(
+                    matches!(source.downcast_ref::<Error>(), Some(Error::Limit)),
+                    "{behavior}"
+                );
+            }
+        }
         assert_eq!(
             io.opens.load(Ordering::SeqCst),
             before,

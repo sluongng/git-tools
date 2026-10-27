@@ -2535,6 +2535,21 @@ fn ordinary_exact_path_log_filters_graphs_over_public_private_and_dirty_entries(
     fs::write(root.join("hello.cc"), b"readded selected file\n").unwrap();
     fixture.success(&root, &["status"]);
     let readded = fixture.revision(&root, "@");
+    fixture.success(&root, &["new", "-m", "prefix-selected file"]);
+    fs::write(root.join("shape"), b"prefix-selected file\n").unwrap();
+    fixture.success(&root, &["status"]);
+    fixture.success(&root, &["new", "-m", "selected file becomes directory"]);
+    fs::remove_file(root.join("shape")).unwrap();
+    fs::create_dir(root.join("shape")).unwrap();
+    fs::write(root.join("shape/child"), b"directory child\n").unwrap();
+    fixture.success(&root, &["status"]);
+    fixture.success(&root, &["new", "-m", "selected directory child changes"]);
+    fs::write(root.join("shape/child"), b"changed directory child\n").unwrap();
+    fixture.success(&root, &["status"]);
+    fixture.success(&root, &["new", "-m", "selected directory becomes file"]);
+    fs::remove_dir_all(root.join("shape")).unwrap();
+    fs::write(root.join("shape"), b"restored file\n").unwrap();
+    fixture.success(&root, &["status"]);
     fixture.success(&root, &["new", "-m", "unrelated entry"]);
     fs::create_dir(root.join("nested")).unwrap();
     fs::write(root.join("nested/new.txt"), b"unrelated entry\n").unwrap();
@@ -2577,6 +2592,7 @@ fn ordinary_exact_path_log_filters_graphs_over_public_private_and_dirty_entries(
         ("ancestors(@)", "file:hello.cc", true),
         (disconnected.as_str(), "hello.cc", true),
         ("ancestors(@)", "nested", true),
+        ("ancestors(@)", "shape", true),
         ("ancestors(@)", "absent.txt", false),
     ] {
         let mut args = vec![
@@ -2601,6 +2617,80 @@ fn ordinary_exact_path_log_filters_graphs_over_public_private_and_dirty_entries(
             args.into_iter().map(str::to_owned).collect::<Vec<_>>(),
             output.stdout,
         ));
+    }
+    // Distinct exact/prefix selectors must share the same candidate set;
+    // nesting and duplicates must not change the existential path semantics.
+    for (selectors, graph) in [
+        (vec!["file:hello.cc", "nested"], true),
+        (vec!["file:hello.cc | (shape | file:hello.cc)"], false),
+        (
+            vec!["file:hello.cc", "file:hello.cc", "nested/new.txt"],
+            false,
+        ),
+    ] {
+        let mut args = vec![
+            "--ignore-working-copy",
+            "log",
+            "-r",
+            "ancestors(@)",
+            "-T",
+            "commit_id ++ \"\\n\"",
+        ];
+        if !graph {
+            args.push("--no-graph");
+        }
+        args.extend(selectors);
+        let output = fixture.run(&root, &args);
+        assert!(
+            output.status.success(),
+            "{args:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        observed.push((args.into_iter().map(str::to_owned).collect(), output.stdout));
+    }
+    // Exact-file history through a directory is an existing explicit boundary,
+    // including when that selector is one branch of an otherwise supported union.
+    let directory_boundary = fixture.run(
+        &root,
+        &[
+            "--ignore-working-copy",
+            "log",
+            "-r",
+            "ancestors(@)",
+            "file:hello.cc | file:shape",
+        ],
+    );
+    assert!(!directory_boundary.status.success());
+    assert!(directory_boundary.stdout.is_empty());
+    assert!(
+        String::from_utf8_lossy(&directory_boundary.stderr).contains("path_exact_file_directory")
+    );
+    let many_paths = (0..65).map(|n| format!("absent-{n}")).collect::<Vec<_>>();
+    let mut limited_args = vec!["--ignore-working-copy", "log", "-r", "ancestors(@)"];
+    limited_args.extend(many_paths.iter().map(String::as_str));
+    let limited = fixture.run(&root, &limited_args);
+    assert!(
+        !limited.status.success(),
+        "fileset union must retain AST limits"
+    );
+    assert!(limited.stdout.is_empty());
+    assert!(
+        String::from_utf8_lossy(&limited.stderr).contains("native index resource limit exceeded")
+    );
+    for unsupported_fileset in ["hello.cc & nested", "~hello.cc"] {
+        let output = fixture.run(
+            &root,
+            &[
+                "--ignore-working-copy",
+                "log",
+                "-r",
+                "ancestors(@)",
+                unsupported_fileset,
+            ],
+        );
+        assert!(!output.status.success(), "{unsupported_fileset}");
+        assert!(output.stdout.is_empty());
+        assert!(String::from_utf8_lossy(&output.stderr).contains("fileset_not_exact_path"));
     }
     let default_args = [
         "--ignore-working-copy",
