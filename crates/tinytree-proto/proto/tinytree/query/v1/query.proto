@@ -26,6 +26,8 @@ service RepositoryQuery {
   rpc Blame(BlameRequest) returns (BlameResult);
   rpc Search(SearchRequest) returns (SearchResult);
   rpc OpenAnnotationFrontier(OpenAnnotationFrontierRequest) returns (AnnotationFrontier);
+  rpc OpenAnnotationFrontierPaged(OpenAnnotationFrontierPagedRequest) returns (AnnotationFrontierPage);
+  rpc ContinueAnnotationFrontier(ContinueAnnotationFrontierRequest) returns (AnnotationFrontierPage);
   rpc ReadAnnotationInput(ReadAnnotationInputRequest) returns (AnnotationInput);
   rpc CloseAnnotationFrontier(CloseAnnotationFrontierRequest) returns (CloseAnnotationFrontierResponse);
 }
@@ -597,3 +599,44 @@ message AnnotationInput {
 }
 message CloseAnnotationFrontierRequest { ScopeKey scope = 1; bytes context = 2; }
 message CloseAnnotationFrontierResponse {}
+
+// Resumable globally filtered frontier. This is NOT blame-boundary chaining.
+// Version3 fixes one scope/path/anchor union, aggregate reservation and deadline.
+message OpenAnnotationFrontierPagedRequest {
+  OpenAnnotationFrontierRequest input = 1; // version3 and explicit limits required.
+  uint32 page_size = 2; // Zero selects128; effective cap is echoed and immutable.
+  uint32 scan_quantum = 3; // Zero selects128; node operations per advance.
+}
+message ContinueAnnotationFrontierRequest {
+  ScopeKey scope = 1;
+  bytes context = 2;
+  bytes cursor = 3; // Opaque32 issued by this exact context; no read authority.
+}
+enum AnnotationFrontierPhase {
+  ANNOTATION_FRONTIER_PHASE_UNSPECIFIED = 0;
+  ANNOTATION_FRONTIER_DISCOVERING = 1;
+  ANNOTATION_FRONTIER_SELECTING = 2;
+  ANNOTATION_FRONTIER_EMITTING = 3;
+  ANNOTATION_FRONTIER_COMPLETE = 4;
+}
+message AnnotationUsage {
+  uint64 work_nodes = 1;
+  uint64 work_edges = 2;
+  uint64 work_bytes = 3;
+  uint64 read_bytes = 4;
+}
+message AnnotationFrontierPage {
+  AnnotationFrontier frontier = 1; // version3. Nodes are this bounded page only.
+  bytes next_cursor = 2; // Opaque32 iff has_more. Last accepted advance replays exactly.
+  uint64 sequence = 3; // Open=0; each fresh advance increments exactly once.
+  bool has_more = 4;
+  uint64 operations = 5; // Cumulative retained-engine node operations.
+  AnnotationUsage usage = 6; // Cumulative, never reset on advance or retry.
+  uint32 max_commits = 7; // Effective aggregate cap, including all pages.
+  uint32 page_size = 8;
+  uint32 scan_quantum = 9;
+  AnnotationFrontierPhase phase = 10;
+  uint32 emitted_nodes = 11; // Cumulative unique parent-first nodes delivered.
+  // While has_more, inner coverage is unspecified(0), never COMPLETE/SCAN_LIMIT.
+  // Only final COMPLETE carries complete coverage. Terminal limits are errors.
+}
