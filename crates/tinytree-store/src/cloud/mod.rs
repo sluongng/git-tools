@@ -1445,6 +1445,9 @@ impl Inner {
         verify_record(record, &bytes, self.cloud_verification_limits())
     }
     pub(super) fn validate_cloud_on_reopen(&self) -> Result<()> {
+        // Store open owns the exclusive directory lock and its catalog arena.
+        // Take only the maintenance mutex, not a second full arena reservation.
+        let _gate = self.gate.lock().map_err(|_| Error::Poisoned)?;
         let feature = store_feature(
             self.db
                 .read_tx()
@@ -1565,7 +1568,9 @@ impl Inner {
             metadata_account(a, &key, &value)?;
             adjust(&mut a.stages, 1)?;
         }
-        self.validate_cloud_versions_on_reopen(&mut expected, &mut scan)?;
+        let mut rebuilt_roots = Vec::new();
+        self.validate_cloud_versions_on_reopen(&mut expected, &mut scan, &mut rebuilt_roots)?;
+        let mut rebuilt_accounts = Vec::new();
         let mut actual = HashMap::<Vec<u8>, Accounting>::new();
         let mut namespaces = Vec::new();
         for item in view.iter(&self.spaces.cloud.accounting) {
@@ -1598,9 +1603,16 @@ impl Inner {
             let key = scope(&repo, owner);
             let mut account = expected.remove(&key).unwrap_or_default();
             account.namespaces = 1;
-            if actual.remove(&key) != Some(account.clone()) {
-                return Err(Error::Corrupt("cloud owner accounting totals"));
-            }
+            let old = actual
+                .remove(&key)
+                .ok_or(Error::Corrupt("cloud owner accounting totals"))?;
+            rederive_version_work(
+                &key,
+                old,
+                &account,
+                &mut rebuilt_accounts,
+                "cloud owner accounting totals",
+            )?;
             add_account(repos.entry(repo_prefix(&repo)).or_default(), &account)?;
             add_account(&mut global, &account)?;
         }
@@ -1608,17 +1620,44 @@ impl Inner {
             return Err(Error::Corrupt("cloud owner accounting missing"));
         }
         for (key, account) in repos {
-            if actual.remove(&key) != Some(account) {
-                return Err(Error::Corrupt("cloud repository accounting totals"));
-            }
+            let old = actual
+                .remove(&key)
+                .ok_or(Error::Corrupt("cloud repository accounting totals"))?;
+            rederive_version_work(
+                &key,
+                old,
+                &account,
+                &mut rebuilt_accounts,
+                "cloud repository accounting totals",
+            )?;
         }
         let stored = actual.remove([0u8, 0u8].as_slice());
-        if stored != Some(global.clone()) && !(stored.is_none() && global == Accounting::default())
-        {
-            return Err(Error::Corrupt("cloud global accounting totals"));
+        match stored {
+            Some(old) => rederive_version_work(
+                &[0, 0],
+                old,
+                &global,
+                &mut rebuilt_accounts,
+                "cloud global accounting totals",
+            )?,
+            None if global == Accounting::default() => {}
+            None => return Err(Error::Corrupt("cloud global accounting totals")),
         }
         if !actual.is_empty() {
             return Err(Error::Corrupt("unexpected cloud accounting"));
+        }
+        // No derived write is installed until the complete canonical catalog,
+        // dependencies, version chain, receipts and all non-work totals pass.
+        // One durable transaction keeps root proofs and every aggregate coherent.
+        if !rebuilt_roots.is_empty() || !rebuilt_accounts.is_empty() {
+            let mut tx = self.db.write_tx().durability(Some(PersistMode::SyncAll));
+            for (key, value) in rebuilt_roots {
+                tx.insert(&self.spaces.cloud.roots, key, value);
+            }
+            for (key, value) in rebuilt_accounts {
+                tx.insert(&self.spaces.cloud.accounting, key, value);
+            }
+            self.commit(tx)?;
         }
         Ok(())
     }
@@ -1631,6 +1670,27 @@ impl Inner {
                 .next()
                 .is_some())
     }
+}
+// The three work totals are derived from verified retained versions. All other
+// persisted accounting remains an independent integrity check, not repair input.
+fn rederive_version_work(
+    key: &[u8],
+    mut old: Accounting,
+    expected: &Accounting,
+    updates: &mut Vec<(Vec<u8>, Vec<u8>)>,
+    invalid: &'static str,
+) -> Result<()> {
+    let changed = old != *expected;
+    old.version_records = expected.version_records;
+    old.version_metadata_bytes = expected.version_metadata_bytes;
+    old.version_payload_bytes = expected.version_payload_bytes;
+    if old != *expected {
+        return Err(Error::Corrupt(invalid));
+    }
+    if changed {
+        updates.push((key.to_vec(), encode(expected)?));
+    }
+    Ok(())
 }
 struct GcChange {
     space: usize,

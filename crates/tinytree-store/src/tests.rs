@@ -4338,13 +4338,55 @@ fn cloud_and_legacy_holds_share_one_deduplicated_principal_promise_quota() {
 #[test]
 fn prospective_cloud_validation_budget_rejects_before_ack_and_reopens_cleanly() {
     for (name, records, metadata, payload, reason) in [
-        ("records", true, false, false, "cloud validation catalog budget exceeded: records"),
-        ("metadata", false, true, false, "cloud validation catalog budget exceeded: metadata"),
-        ("records_metadata", true, true, false, "cloud validation catalog budget exceeded: records_metadata"),
-        ("payload", false, false, true, "cloud validation catalog budget exceeded: payload"),
-        ("records_payload", true, false, true, "cloud validation catalog budget exceeded: records_payload"),
-        ("metadata_payload", false, true, true, "cloud validation catalog budget exceeded: metadata_payload"),
-        ("records_metadata_payload", true, true, true, "cloud validation catalog budget exceeded: records_metadata_payload"),
+        (
+            "records",
+            true,
+            false,
+            false,
+            "cloud validation catalog budget exceeded: records",
+        ),
+        (
+            "metadata",
+            false,
+            true,
+            false,
+            "cloud validation catalog budget exceeded: metadata",
+        ),
+        (
+            "records_metadata",
+            true,
+            true,
+            false,
+            "cloud validation catalog budget exceeded: records_metadata",
+        ),
+        (
+            "payload",
+            false,
+            false,
+            true,
+            "cloud validation catalog budget exceeded: payload",
+        ),
+        (
+            "records_payload",
+            true,
+            false,
+            true,
+            "cloud validation catalog budget exceeded: records_payload",
+        ),
+        (
+            "metadata_payload",
+            false,
+            true,
+            true,
+            "cloud validation catalog budget exceeded: metadata_payload",
+        ),
+        (
+            "records_metadata_payload",
+            true,
+            true,
+            true,
+            "cloud validation catalog budget exceeded: records_metadata_payload",
+        ),
     ] {
         let (directory, store) = open();
         let owner = CloudOwner {
@@ -4361,9 +4403,15 @@ fn prospective_cloud_validation_budget_rejects_before_ack_and_reopens_cleanly() 
         let mut cfg = config();
         // Unique catalog fits, but retaining one version would require validating
         // both the catalog and its selected DAG on every fail-closed reopen.
-        if payload { cfg.cloud.max_validation_payload_bytes = raw * 2 - 1; }
-        if records { cfg.max_retention_validation_records = 15; }
-        if metadata { cfg.max_retention_validation_bytes = 8192; }
+        if payload {
+            cfg.cloud.max_validation_payload_bytes = raw * 2 - 1;
+        }
+        if records {
+            cfg.max_retention_validation_records = 15;
+        }
+        if metadata {
+            cfg.max_retention_validation_bytes = 8192;
+        }
         let store = Store::open_existing(directory.path(), cfg.clone()).unwrap();
         let request = cloud_request(&manifest, 0, "budgeted-capture", &leases);
         assert!(matches!(
@@ -4393,9 +4441,23 @@ fn prospective_cloud_validation_budget_rejects_before_ack_and_reopens_cleanly() 
         let store = Store::open_existing(directory.path(), cfg).unwrap();
         drop(store);
         let store = Store::open_existing(directory.path(), config()).unwrap();
-        let receipt = store.publish_cloud_version("demo", owner, &request, 1, &CloudPublicationLimits::default()).unwrap();
+        let receipt = store
+            .publish_cloud_version(
+                "demo",
+                owner,
+                &request,
+                1,
+                &CloudPublicationLimits::default(),
+            )
+            .unwrap();
         assert_eq!(receipt.workspace.generation, 1, "{name}");
-        assert_eq!(store.cloud_publication("demo", owner, "budgeted-capture").unwrap(), Some(receipt), "{name}");
+        assert_eq!(
+            store
+                .cloud_publication("demo", owner, "budgeted-capture")
+                .unwrap(),
+            Some(receipt),
+            "{name}"
+        );
         drop(store);
         Store::open_existing(directory.path(), config()).unwrap();
     }
@@ -6184,6 +6246,73 @@ fn cloud_v2_capture_from_recovery(
     };
     (value, leases, descriptors)
 }
+fn cloud_v2_add_snapshot(
+    store: &Store,
+    owner: CloudOwner,
+    head: Descriptor,
+    root: Descriptor,
+    value: &mut tinytree_cloud::ManifestV2,
+    leases: &mut Vec<String>,
+    logical: tinytree_cloud::PortableIndexSnapshot,
+    bookmarks: usize,
+) {
+    let (other, receipts) = cloud_capture_with_refs(store, owner, head, root, bookmarks);
+    let operation = other.operation_heads[0];
+    value.recovery.undo_operations.push(operation);
+    value.recovery.undo_operations.sort();
+    value.recovery.undo_operations.dedup();
+    value.recovery.members.extend(other.members);
+    value.recovery.members.sort_by_key(|member| member.id);
+    value.recovery.members.dedup_by_key(|member| member.id);
+    leases.extend(receipts.into_iter().map(|receipt| receipt.staging_lease));
+    value.recovery.native_roots.extend(
+        logical
+            .roots
+            .iter()
+            .filter(|id| **id != CommitId::ROOT)
+            .map(|id| ObjectKey {
+                kind: Kind::Commit,
+                id: ObjectId(id.0),
+            }),
+    );
+    value
+        .recovery
+        .native_roots
+        .extend(logical.drafts.iter().map(|draft| draft.descriptor.key));
+    value
+        .recovery
+        .native_roots
+        .sort_by_key(|key| (key.kind as u8, key.id.0));
+    value.recovery.native_roots.dedup();
+    let selected = tinytree_cloud::build_index_artifacts(&logical, Default::default()).unwrap();
+    for artifact in selected.artifacts {
+        leases.push(
+            store
+                .put_cloud_index_artifact(
+                    "demo",
+                    owner,
+                    artifact.descriptor,
+                    &artifact.bytes,
+                    0,
+                    Default::default(),
+                )
+                .unwrap()
+                .staging_lease,
+        );
+    }
+    value.index_roots.push(selected.root);
+    value.index_roots.sort_by_key(|root| root.id);
+    value.index_roots.dedup_by_key(|root| root.id);
+    value
+        .operation_indexes
+        .push(tinytree_cloud::OperationIndex {
+            operation,
+            root: selected.root.id,
+        });
+    value.operation_indexes.sort_by_key(|entry| entry.operation);
+    leases.sort();
+    leases.dedup();
+}
 fn cloud_v2_request(
     value: &tinytree_cloud::ManifestV2,
     generation: u64,
@@ -6781,12 +6910,14 @@ fn indexed_cloud_publication_rejects_canonical_draft_mismatch_and_non_anchor_par
         ParentOrder,
         UnrelatedAnchor,
         PredecessorOnly,
+        CachedCommitOutsideOtherSnapshot,
     }
     for failure in [
         Failure::Change,
         Failure::ParentOrder,
         Failure::UnrelatedAnchor,
         Failure::PredecessorOnly,
+        Failure::CachedCommitOutsideOtherSnapshot,
     ] {
         let (directory, store) = open();
         let owner = CloudOwner {
@@ -6830,7 +6961,7 @@ fn indexed_cloud_publication_rejects_canonical_draft_mismatch_and_non_anchor_par
             }
             _ => vec![CommitId(head.key.id.0)],
         };
-        let (value, leases, _) = cloud_v2_capture(
+        let (mut value, mut leases, _) = cloud_v2_capture(
             &store,
             owner,
             head,
@@ -6840,6 +6971,39 @@ fn indexed_cloud_publication_rejects_canonical_draft_mismatch_and_non_anchor_par
                 drafts: vec![record],
             },
         );
+        if matches!(failure, Failure::CachedCommitOutsideOtherSnapshot) {
+            let valid = value
+                .operation_indexes
+                .iter()
+                .find(|entry| entry.operation != [0; 64])
+                .unwrap()
+                .root;
+            // Make the valid snapshot run first, so its canonical COMMIT is
+            // cached before a different snapshot tries to borrow its authority.
+            let logical = (10..1000)
+                .map(|order| tinytree_cloud::PortableIndexSnapshot {
+                    roots: vec![CommitId::ROOT],
+                    drafts: vec![cloud_index_draft(&store, hidden, order)],
+                })
+                .find(|logical| {
+                    tinytree_cloud::build_index_artifacts(logical, Default::default())
+                        .unwrap()
+                        .root
+                        .id
+                        > valid
+                })
+                .unwrap();
+            cloud_v2_add_snapshot(
+                &store,
+                owner,
+                head,
+                root,
+                &mut value,
+                &mut leases,
+                logical,
+                1,
+            );
+        }
         let request = cloud_v2_request(&value, 0, "invalid-index-proof", leases);
         assert!(matches!(
             store.publish_cloud_version("demo", owner, &request, 1, &Default::default()),
@@ -6944,6 +7108,169 @@ fn indexed_version_read_and_gc_fail_closed_on_missing_artifact_but_v1_gate_does_
     Store::open_existing(directory.path(), config()).unwrap();
 }
 #[test]
+fn prospective_cloud_shared_index_ancestry_rebuilds_only_verified_work_across_owners() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut cfg = config();
+    cfg.max_retention_validation_records = 2048;
+    let store = Store::open(directory.path(), cfg.clone()).unwrap();
+    store.create_repository("demo").unwrap();
+    let (_, root, mut head) = fixture(&store, "shared proof base");
+    for index in 0..48 {
+        let mut node = commit(
+            TreeId(root.key.id.0),
+            &format!("shared proof ancestor {index}"),
+        );
+        node.parents = vec![CommitId(head.key.id.0)];
+        head = put_object(&store, Object::Commit(node), 0);
+    }
+    let mut draft = commit(TreeId(root.key.id.0), "shared proof draft");
+    draft.parents = vec![CommitId(head.key.id.0)];
+    let draft = put_object(&store, Object::Commit(draft), 0);
+    let mut published = Vec::new();
+    for principal in [82, 83] {
+        let owner = CloudOwner {
+            principal: [principal; 32],
+        };
+        let snapshot = |order| tinytree_cloud::PortableIndexSnapshot {
+            roots: vec![CommitId(head.key.id.0)],
+            drafts: vec![cloud_index_draft(&store, draft, order)],
+        };
+        let (mut value, mut leases, _) = cloud_v2_capture(&store, owner, head, root, snapshot(1));
+        for order in 2..=12 {
+            cloud_v2_add_snapshot(
+                &store,
+                owner,
+                head,
+                root,
+                &mut value,
+                &mut leases,
+                snapshot(order),
+                order as usize,
+            );
+        }
+        let before = store.cloud_catalog_budget_summary().unwrap();
+        let request = cloud_v2_request(&value, 0, "shared-index-proof", leases);
+        let receipt = store
+            .publish_cloud_version("demo", owner, &request, 1, &Default::default())
+            .expect("shared canonical ancestry fits the finite catalog budget for both owners");
+        let after = store.cloud_catalog_budget_summary().unwrap();
+        assert!(
+            after.retained_version_record_work - before.retained_version_record_work < 512,
+            "physical proof work must not multiply ancestry by snapshot count"
+        );
+        assert_eq!(after.versions, published.len() as u64 + 1);
+        published.push((owner, request, receipt));
+    }
+    let expected = store.cloud_catalog_budget_summary().unwrap();
+    drop(store);
+    // Boundary fixture: model prior derived overcounts, then invalidate a
+    // receipt. Failed full validation must install NONE of the recalculation.
+    let mut old_roots = Vec::new();
+    let original_receipt;
+    {
+        let db = SingleWriterTxDatabase::builder(directory.path().join("metadata"))
+            .open()
+            .unwrap();
+        let roots = db
+            .keyspace("cloud-native-roots-v1", KeyspaceCreateOptions::default)
+            .unwrap();
+        let accounting = db
+            .keyspace("cloud-accounting-v1", KeyspaceCreateOptions::default)
+            .unwrap();
+        let receipts = db
+            .keyspace("cloud-receipts-v1", KeyspaceCreateOptions::default)
+            .unwrap();
+        let view = db.read_tx();
+        let mut tx = db.write_tx().durability(Some(PersistMode::SyncAll));
+        for entry in view.iter(&roots) {
+            let (key, bytes) = entry.into_inner().unwrap();
+            let mut bytes = bytes.to_vec();
+            let count = u32::from_le_bytes(bytes[40..44].try_into().unwrap()) as usize;
+            let start = 44 + count * 33 + 2;
+            for offset in [start, start + 8, start + 16] {
+                let old = u64::from_le_bytes(bytes[offset..offset + 8].try_into().unwrap());
+                bytes[offset..offset + 8].copy_from_slice(&(old + 500).to_le_bytes());
+            }
+            tx.insert(&roots, key.clone(), bytes.clone());
+            old_roots.push((key.to_vec(), bytes));
+        }
+        for entry in view.iter(&accounting) {
+            let (key, bytes) = entry.into_inner().unwrap();
+            let mut value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            let added = if key.len() <= 6 { 1000 } else { 500 };
+            for field in [
+                "version_records",
+                "version_metadata_bytes",
+                "version_payload_bytes",
+            ] {
+                value[field] = serde_json::json!(value[field].as_u64().unwrap() + added);
+            }
+            tx.insert(&accounting, key, serde_json::to_vec(&value).unwrap());
+        }
+        let (key, bytes) = view.iter(&receipts).next().unwrap().into_inner().unwrap();
+        original_receipt = (key.to_vec(), bytes.to_vec());
+        let mut value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        value["version"]["manifest"] = serde_json::to_value([91u8; 32]).unwrap();
+        tx.insert(&receipts, key, serde_json::to_vec(&value).unwrap());
+        tx.commit().unwrap();
+    }
+    assert!(matches!(
+        Store::open_existing(directory.path(), cfg.clone()),
+        Err(Error::Corrupt("cloud receipt replay history"))
+    ));
+    {
+        let db = SingleWriterTxDatabase::builder(directory.path().join("metadata"))
+            .open()
+            .unwrap();
+        let roots = db
+            .keyspace("cloud-native-roots-v1", KeyspaceCreateOptions::default)
+            .unwrap();
+        let receipts = db
+            .keyspace("cloud-receipts-v1", KeyspaceCreateOptions::default)
+            .unwrap();
+        for (key, bytes) in &old_roots {
+            assert_eq!(
+                db.read_tx().get(&roots, key).unwrap().unwrap().as_ref(),
+                bytes
+            );
+        }
+        let mut tx = db.write_tx().durability(Some(PersistMode::SyncAll));
+        tx.insert(&receipts, original_receipt.0, original_receipt.1);
+        tx.commit().unwrap();
+    }
+    let store = Store::open_existing(directory.path(), cfg.clone()).unwrap();
+    assert_eq!(
+        store.cloud_catalog_budget_summary().unwrap(),
+        expected,
+        "verified reopen rederives root work and owner/repository/global totals together"
+    );
+    store.gc("demo", 100).unwrap();
+    let after_gc = store.cloud_catalog_budget_summary().unwrap();
+    assert_eq!(
+        after_gc.retained_version_record_work,
+        expected.retained_version_record_work
+    );
+    drop(store);
+    let store = Store::open_existing(directory.path(), cfg).unwrap();
+    assert_eq!(store.cloud_catalog_budget_summary().unwrap(), after_gc);
+    for (owner, request, receipt) in published {
+        assert_eq!(
+            store
+                .cloud_publication("demo", owner, "shared-index-proof")
+                .unwrap(),
+            Some(receipt)
+        );
+        assert_eq!(
+            store
+                .read_cloud_version("demo", owner, request.workspace, 1, Default::default())
+                .unwrap()
+                .manifest_bytes(),
+            request.manifest_bytes
+        );
+    }
+}
+
+#[test]
 fn indexed_version_prospective_payload_budget_includes_artifact_and_canonical_native_rereads() {
     let (directory, store) = open();
     let owner = CloudOwner {
@@ -6973,12 +7300,13 @@ fn indexed_version_prospective_payload_budget_includes_artifact_and_canonical_na
     let request = cloud_v2_request(&value, 0, "indexed-proof-budget", leases);
     drop(store);
     let mut cfg = config();
-    cfg.cloud.max_validation_payload_bytes =
-        2 * selected + 2 * head.size_bytes + hidden.size_bytes - 1;
+    cfg.cloud.max_validation_payload_bytes = 2 * selected + head.size_bytes + hidden.size_bytes - 1;
     let store = Store::open_existing(directory.path(), cfg.clone()).unwrap();
     assert!(matches!(
         store.publish_cloud_version("demo", owner, &request, 1, &Default::default()),
-        Err(Error::Limit("cloud validation catalog budget exceeded: payload"))
+        Err(Error::Limit(
+            "cloud validation catalog budget exceeded: payload"
+        ))
     ));
     assert_eq!(
         store
@@ -7340,8 +7668,19 @@ fn indexed_native_ancestry_proof_admits_frontier_and_decode_within_remaining_ver
         bounded.publish_cloud_version("demo", owner, &request, 1, &Default::default()),
         Err(Error::Limit("cloud index proof work exceeded: records"))
     ));
-    assert_eq!(bounded.get_cloud_workspace("demo", owner, value.recovery.workspace).unwrap().generation, 0);
-    assert_eq!(bounded.cloud_publication("demo", owner, "bounded-index-native-memory").unwrap(), None);
+    assert_eq!(
+        bounded
+            .get_cloud_workspace("demo", owner, value.recovery.workspace)
+            .unwrap()
+            .generation,
+        0
+    );
+    assert_eq!(
+        bounded
+            .cloud_publication("demo", owner, "bounded-index-native-memory")
+            .unwrap(),
+        None
+    );
     drop(bounded);
     let store = Store::open_existing(directory.path(), adequate.clone()).unwrap();
     store

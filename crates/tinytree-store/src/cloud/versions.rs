@@ -117,6 +117,22 @@ impl ExtraWork {
         Ok(())
     }
 }
+// One manifest validation owns this cache. It memoizes only verified immutable
+// COMMIT bytes, never snapshot membership or successful ancestry decisions.
+#[derive(Default)]
+struct NativeProofCache<'a> {
+    checkpoint: Option<(CommitId, &'a tinytree_model::TreeMerge)>,
+    checkpoint_matches: Option<bool>,
+    commits: HashMap<CommitId, Arc<NativeProofCommit>>,
+    retained: usize,
+}
+struct NativeProofCommit {
+    descriptor: Descriptor,
+    parents: Vec<CommitId>,
+    change: tinytree_model::ChangeId,
+    committer_millis: i64,
+    has_conflict: bool,
+}
 struct ProofMemory {
     used: usize,
     maximum: usize,
@@ -1081,6 +1097,7 @@ impl Inner {
         }
         let mut artifacts = Vec::new();
         let mut frozen_retained = 0usize;
+        let mut checkpoint_matches = None;
         match manifest.indexed() {
             None => {
                 verify_coverage(manifest, &objects, limits)
@@ -1109,6 +1126,13 @@ impl Inner {
                 verify_coverage_v2(value, &objects, &graph, policy)
                     .map_err(|error| v2_error(error, "cloud v2 manifest coverage"))?;
                 let mut steps = 0usize;
+                let mut native_proofs = NativeProofCache {
+                    checkpoint: Some((
+                        CommitId(manifest.working_copy.snapshot_commit),
+                        &manifest.working_copy.tree,
+                    )),
+                    ..Default::default()
+                };
                 for root in &value.index_roots {
                     if let Some(selected) = selection.as_ref() {
                         selected.check_deadline()?;
@@ -1122,6 +1146,7 @@ impl Inner {
                         .and_then(|n| n.checked_add(4096))
                         .and_then(|n| n.checked_add(policy.artifacts.snapshot.max_decode_bytes))
                         .and_then(|n| n.checked_add(retained))
+                        .and_then(|n| n.checked_add(native_proofs.retained))
                         .ok_or(Error::Limit("cloud frozen snapshot reconstruction memory"))?;
                     if snapshot_peak > self.config.cloud.max_version_decode_bytes {
                         return Err(Error::Limit("cloud frozen snapshot reconstruction memory"));
@@ -1174,6 +1199,7 @@ impl Inner {
                         &mut extra,
                         &mut steps,
                         available,
+                        &mut native_proofs,
                         planned,
                         proof_selection,
                         proof_deadline,
@@ -1186,6 +1212,8 @@ impl Inner {
                         .filter(|n| *n <= self.config.cloud.max_version_decode_bytes)
                         .ok_or(Error::Limit("cloud frozen index memory"))?;
                 }
+                checkpoint_matches = native_proofs.checkpoint_matches;
+                drop(native_proofs);
                 if let RecoveryManifest::V3(captured) = manifest {
                     let graph_memory = loaded
                         .len()
@@ -1229,46 +1257,55 @@ impl Inner {
         }
         let wc = &manifest.working_copy;
         if manifest.indexed().is_some() {
-            // Decoded artifact graphs and snapshot models have dropped here.
-            // OP/VIEWs and the selected closure descriptors remain live while
-            // validating the WC commit, even for ROOT-only index snapshots.
-            let descriptors = artifacts
-                .capacity()
-                .checked_mul(std::mem::size_of::<IndexArtifactDescriptor>())
-                .and_then(|n| n.checked_add(4096))
-                .ok_or(Error::Limit("cloud index native proof memory"))?;
-            let available = self
-                .config
-                .cloud
-                .max_version_decode_bytes
-                .checked_sub(op_retained)
-                .and_then(|n| n.checked_sub(frozen_retained))
-                .and_then(|n| n.checked_sub(descriptors))
-                .ok_or(Error::Limit("cloud index native proof memory"))?;
-            let mut memory = ProofMemory {
-                used: 0,
-                maximum: available,
-            };
-            let (actual, scratch) = if wc.snapshot_commit == [0; 32] {
-                memory.charge(4096)?;
-                (tinytree_model::synthetic_root(), 4096)
+            if let Some(matches) = checkpoint_matches {
+                if !matches {
+                    return Err(Error::Invalid(
+                        "cloud working-copy checkpoint tree mismatch",
+                    ));
+                }
             } else {
-                self.read_index_commit(
-                    repo,
-                    CommitId(wc.snapshot_commit),
-                    None,
-                    &mut extra,
-                    &mut memory,
-                    planned,
-                )?
-            };
-            let matches = actual.root_tree == wc.tree;
-            drop(actual);
-            memory.release(scratch);
-            if !matches {
-                return Err(Error::Invalid(
-                    "cloud working-copy checkpoint tree mismatch",
-                ));
+                // Decoded artifact graphs and snapshot models have dropped here.
+                // OP/VIEWs and the selected closure descriptors remain live while
+                // validating the WC commit, even for ROOT-only index snapshots.
+                let descriptors = artifacts
+                    .capacity()
+                    .checked_mul(std::mem::size_of::<IndexArtifactDescriptor>())
+                    .and_then(|n| n.checked_add(4096))
+                    .ok_or(Error::Limit("cloud index native proof memory"))?;
+                let available = self
+                    .config
+                    .cloud
+                    .max_version_decode_bytes
+                    .checked_sub(op_retained)
+                    .and_then(|n| n.checked_sub(frozen_retained))
+                    .and_then(|n| n.checked_sub(descriptors))
+                    .ok_or(Error::Limit("cloud index native proof memory"))?;
+                let mut memory = ProofMemory {
+                    used: 0,
+                    maximum: available,
+                };
+                let (actual, scratch) = if wc.snapshot_commit == [0; 32] {
+                    memory.charge(4096)?;
+                    (tinytree_model::synthetic_root(), 4096)
+                } else {
+                    let (_, commit, scratch) = self.read_index_commit(
+                        repo,
+                        CommitId(wc.snapshot_commit),
+                        None,
+                        &mut extra,
+                        &mut memory,
+                        planned,
+                    )?;
+                    (commit, scratch)
+                };
+                let matches = actual.root_tree == wc.tree;
+                drop(actual);
+                memory.release(scratch);
+                if !matches {
+                    return Err(Error::Invalid(
+                        "cloud working-copy checkpoint tree mismatch",
+                    ));
+                }
             }
         } else {
             let actual = if wc.snapshot_commit == [0; 32] {
@@ -1444,7 +1481,7 @@ impl Inner {
         work: &mut ExtraWork,
         memory: &mut ProofMemory,
         planned: &HashSet<ObjectKey>,
-    ) -> Result<(tinytree_model::Commit, usize)> {
+    ) -> Result<(Descriptor, tinytree_model::Commit, usize)> {
         if id == CommitId::ROOT {
             return Err(Error::Invalid("intrinsic cloud index commit payload"));
         }
@@ -1507,7 +1544,56 @@ impl Inner {
         memory.release(packed);
         // Caller retains this scratch charge until the owned Commit and its
         // parent vector have actually dropped, before admitting another node.
-        Ok((commit, scratch))
+        Ok((d, commit, scratch))
+    }
+    fn cached_index_commit(
+        &self,
+        repo: &str,
+        id: CommitId,
+        expected: Option<Descriptor>,
+        work: &mut ExtraWork,
+        memory: &mut ProofMemory,
+        planned: &HashSet<ObjectKey>,
+        cache: &mut NativeProofCache<'_>,
+    ) -> Result<Arc<NativeProofCommit>> {
+        if let Some(proof) = cache.commits.get(&id) {
+            if expected.is_some_and(|expected| expected != proof.descriptor) {
+                return Err(Error::Invalid("cloud index draft descriptor mismatch"));
+            }
+            return Ok(proof.clone());
+        }
+        let (descriptor, mut commit, scratch) =
+            self.read_index_commit(repo, id, expected, work, memory, planned)?;
+        if let Some((checkpoint, tree)) = cache.checkpoint {
+            if id == checkpoint {
+                cache.checkpoint_matches = Some(commit.root_tree == *tree);
+            }
+        }
+        // Keep only canonical proof fields, not the full decoded Commit. The
+        // temporary decoder remains charged until its strings/trees drop.
+        let retained = commit
+            .parents
+            .capacity()
+            .checked_mul(std::mem::size_of::<CommitId>())
+            .and_then(|n| n.checked_add(std::mem::size_of::<NativeProofCommit>()))
+            .and_then(|n| n.checked_add(576))
+            .ok_or(Error::Limit("cloud index native proof memory"))?;
+        memory.charge(retained)?;
+        cache.retained = cache
+            .retained
+            .checked_add(retained)
+            .ok_or(Error::Limit("cloud index native proof memory"))?;
+        let proof = Arc::new(NativeProofCommit {
+            descriptor,
+            parents: std::mem::take(&mut commit.parents),
+            change: commit.change_id,
+            committer_millis: commit.committer.timestamp.millis_since_epoch,
+            has_conflict: commit.root_tree.terms.len() > 1,
+        });
+        drop(commit);
+        memory.release(scratch);
+        cache.commits.insert(id, proof.clone());
+        Ok(proof)
     }
     fn prove_index_native(
         &self,
@@ -1516,6 +1602,7 @@ impl Inner {
         work: &mut ExtraWork,
         steps: &mut usize,
         available: usize,
+        cache: &mut NativeProofCache<'_>,
         planned: &HashSet<ObjectKey>,
         mut selection: Option<&mut SnapshotSelection<'_>>,
         deadline: Option<std::time::Instant>,
@@ -1526,6 +1613,7 @@ impl Inner {
             used: 0,
             maximum: available,
         };
+        memory.charge(cache.retained)?;
         let mut anchors = HashSet::new();
         let mut pending = Vec::new();
         // 512 bytes per unique ID covers hash-table load/capacity slack and the
@@ -1544,15 +1632,15 @@ impl Inner {
             if deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline) {
                 return Err(Error::Limit("cloud snapshot proof deadline"));
             }
-            let (mut commit, scratch) =
-                self.read_index_commit(repo, id, None, work, &mut memory, planned)?;
+            let proof =
+                self.cached_index_commit(repo, id, None, work, &mut memory, planned, cache)?;
+            let commit = &*proof;
             *steps = steps
                 .checked_add(1)
                 .and_then(|n| n.checked_add(commit.parents.len()))
                 .filter(|n| *n <= limits.max_graph_steps)
                 .ok_or(Error::Limit("cloud index native proof steps"))?;
-            let parents = std::mem::take(&mut commit.parents);
-            for parent in parents {
+            for &parent in &commit.parents {
                 if parent != CommitId::ROOT && !anchors.contains(&parent) {
                     if anchors.len() >= self.config.max_closure_objects {
                         return Err(Error::Limit("cloud index anchor proof"));
@@ -1562,8 +1650,6 @@ impl Inner {
                     pending.push(parent);
                 }
             }
-            drop(commit);
-            memory.release(scratch);
         }
         if let Some(selected) = selection.as_mut() {
             if selected.candidate.is_some_and(|id| anchors.contains(&id)) {
@@ -1589,15 +1675,17 @@ impl Inner {
             if deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline) {
                 return Err(Error::Limit("cloud snapshot proof deadline"));
             }
-            let (mut commit, scratch) = self.read_index_commit(
+            let proof = self.cached_index_commit(
                 repo,
                 draft.commit(),
                 Some(draft.descriptor),
                 work,
                 &mut memory,
                 planned,
+                cache,
             )?;
-            if commit.change_id != draft.change || commit.parents != draft.parents {
+            let commit = &*proof;
+            if commit.change != draft.change || commit.parents != draft.parents {
                 return Err(Error::Invalid(
                     "cloud index draft canonical fields mismatch",
                 ));
@@ -1627,8 +1715,8 @@ impl Inner {
                 .filter(|selected| selected.collect_frozen)
             {
                 let frozen = &mut selected.frozen;
-                let millis = commit.committer.timestamp.millis_since_epoch;
-                let has_conflict = commit.root_tree.terms.len() > 1;
+                let millis = commit.committer_millis;
+                let has_conflict = commit.has_conflict;
                 let at = frozen
                     .nodes
                     .binary_search_by_key(&draft.commit().0, |node| node.descriptor.key.id.0);
@@ -1636,7 +1724,7 @@ impl Inner {
                     Ok(at) => {
                         let previous = &mut frozen.nodes[at];
                         if previous.descriptor != draft.descriptor
-                            || previous.change != commit.change_id
+                            || previous.change != commit.change
                             || previous.parents != commit.parents
                             || previous.committer_millis != millis
                             || previous.has_conflict != has_conflict
@@ -1719,8 +1807,8 @@ impl Inner {
                             at,
                             CloudSnapshotCommit {
                                 descriptor: draft.descriptor,
-                                change: commit.change_id,
-                                parents: std::mem::take(&mut commit.parents),
+                                change: commit.change,
+                                parents: commit.parents.clone(),
                                 committer_millis: millis,
                                 has_conflict,
                                 order: draft.order,
@@ -1730,8 +1818,6 @@ impl Inner {
                     }
                 }
             }
-            drop(commit);
-            memory.release(scratch);
         }
         Ok(frozen_bytes)
     }
@@ -2477,7 +2563,7 @@ impl Inner {
         validate: bool,
         scan: &mut Scan,
     ) -> Result<RetainedPlan> {
-        self.retained_cloud_plan_packing(repo, owner, validate, scan, &HashSet::new())
+        self.retained_cloud_plan_packing(repo, owner, validate, scan, &HashSet::new(), None)
     }
     fn retained_cloud_plan_packing(
         &self,
@@ -2486,6 +2572,7 @@ impl Inner {
         validate: bool,
         scan: &mut Scan,
         planned: &HashSet<ObjectKey>,
+        mut rebuilt_roots: Option<&mut Vec<(Vec<u8>, Vec<u8>)>>,
     ) -> Result<RetainedPlan> {
         let mut plan = RetainedPlan {
             native: HashSet::new(),
@@ -2554,7 +2641,7 @@ impl Inner {
                 .get(&self.spaces.cloud.roots, &key)?
                 .ok_or(Error::Corrupt("cloud version roots missing"))?;
             scan.visit(self, &key, &root_bytes)?;
-            let indexed = decode_version_roots(
+            let mut indexed = decode_version_roots(
                 &root_bytes,
                 id,
                 limits.max_native_roots,
@@ -2657,8 +2744,22 @@ impl Inner {
                         "landing capture without store feature"
                     }));
                 }
-                if verified.artifacts != indexed.artifacts || verified.extra != indexed.extra {
+                if verified.artifacts != indexed.artifacts {
                     return Err(Error::Corrupt("cloud indexed version proof mismatch"));
+                }
+                if verified.extra != indexed.extra {
+                    let rewrites = rebuilt_roots
+                        .as_deref_mut()
+                        .ok_or(Error::Corrupt("cloud indexed version proof mismatch"))?;
+                    // Only fixed-width derived work counters change. Native
+                    // roots, artifact descriptors and every canonical proof
+                    // above remain mandatory; no version is discarded.
+                    indexed.extra = verified.extra;
+                    let rebuilt = encode_version_roots(id, &indexed, record.format)?;
+                    if rebuilt.len() != root_bytes.len() {
+                        return Err(Error::Corrupt("cloud derived root record size"));
+                    }
+                    rewrites.push((key.to_vec(), rebuilt));
                 }
             }
             for d in &indexed.artifacts {
@@ -2747,7 +2848,7 @@ impl Inner {
             bytes: 0,
             payload: 0,
         };
-        self.retained_cloud_plan_packing(Some(repo), None, true, &mut scan, planned)?;
+        self.retained_cloud_plan_packing(Some(repo), None, true, &mut scan, planned, None)?;
         Ok(())
     }
     fn legacy_principal_roots(
@@ -2978,8 +3079,16 @@ impl Inner {
         &self,
         expected: &mut HashMap<Vec<u8>, Accounting>,
         scan: &mut Scan,
+        rebuilt_roots: &mut Vec<(Vec<u8>, Vec<u8>)>,
     ) -> Result<()> {
-        let plan = self.retained_cloud_plan(None, None, true, scan)?;
+        let plan = self.retained_cloud_plan_packing(
+            None,
+            None,
+            true,
+            scan,
+            &HashSet::new(),
+            Some(rebuilt_roots),
+        )?;
         let view = self.db.read_tx();
         let mut receipts = HashSet::new();
         for (index, space) in [
