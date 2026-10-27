@@ -1832,6 +1832,7 @@ struct FakeQuery {
     page_calls: std::sync::Mutex<Vec<([u8; 32], u64)>>,
     fact_calls: std::sync::atomic::AtomicUsize,
     history_calls: std::sync::atomic::AtomicUsize,
+    blame_calls: std::sync::atomic::AtomicUsize,
     annotation_calls: std::sync::atomic::AtomicUsize,
     search_calls: std::sync::atomic::AtomicUsize,
     search_fault: std::sync::atomic::AtomicUsize,
@@ -1859,6 +1860,7 @@ impl FakeQuery {
             page_calls: Default::default(),
             fact_calls: Default::default(),
             history_calls: Default::default(),
+            blame_calls: Default::default(),
             annotation_calls: Default::default(),
             search_calls: Default::default(),
             search_fault: Default::default(),
@@ -1889,7 +1891,14 @@ impl native_broker::NativeQueryIo for FakeQuery {
     async fn annotation_capabilities(&self, _: native_broker::QueryOwner) -> Result<native_broker::QueryReply<native_broker::BlameCapabilities>, tonic::Status> {
         Ok(self.reply(native_broker::BlameCapabilities::Explicit { supported: true, authorized: true }))
     }
-    async fn open_annotation_frontier(&self, input: native_broker::OpenAnnotationFrontier, _: native_broker::QueryOwner) -> Result<native_broker::QueryReply<native_broker::query_protocol::AnnotationFrontier>, tonic::Status> {
+    async fn open_annotation_frontier(
+        &self,
+        input: native_broker::OpenAnnotationFrontier,
+        _: native_broker::QueryOwner,
+    ) -> Result<
+        native_broker::QueryReply<native_broker::query_protocol::AnnotationFrontier>,
+        tonic::Status,
+    > {
         use native_broker::query_protocol as q;
         self.annotation_calls.fetch_add(1,std::sync::atomic::Ordering::SeqCst);
         self.scope(input.scope)?;
@@ -1907,7 +1916,14 @@ impl native_broker::NativeQueryIo for FakeQuery {
                     value: Some(value), affects_path: Some(true) },
             ] }))
     }
-    async fn read_annotation_input(&self, input: native_broker::ReadAnnotationInput, _: native_broker::QueryOwner) -> Result<native_broker::QueryReply<native_broker::query_protocol::AnnotationInput>, tonic::Status> {
+    async fn read_annotation_input(
+        &self,
+        input: native_broker::ReadAnnotationInput,
+        _: native_broker::QueryOwner,
+    ) -> Result<
+        native_broker::QueryReply<native_broker::query_protocol::AnnotationInput>,
+        tonic::Status,
+    > {
         use native_broker::query_protocol as q;
         self.scope(input.scope)?;
         let mut data = vec![self.marker,b'\n']; let descriptor = tinytree_model::describe_file(&data);
@@ -2243,6 +2259,8 @@ impl native_broker::NativeQueryIo for FakeQuery {
     {
         use native_broker::query_protocol as q;
         self.scope(input.scope)?;
+        self.blame_calls
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let bytes = b"selected line\n";
         let id = blake3::hash(bytes).as_bytes().to_vec();
         let target_bytes = if self
@@ -4697,37 +4715,196 @@ async fn limited_annotation_refuses_old_broker_and_old_provider_before_frontier_
     struct OldBroker(native_broker::QueryRpcService);
     impl tonic::server::NamedService for OldBroker {const NAME:&'static str="native.broker.v1.QueryIo";}
     impl tower::Service<http::Request<tonic::body::Body>> for OldBroker {
-        type Response=http::Response<tonic::body::Body>;type Error=std::convert::Infallible;
-        type Future=std::pin::Pin<Box<dyn std::future::Future<Output=Result<Self::Response,Self::Error>>+Send>>;
-        fn poll_ready(&mut self,cx:&mut std::task::Context<'_>)->std::task::Poll<Result<(),Self::Error>>{tower::Service::poll_ready(&mut self.0,cx)}
-        fn call(&mut self,r:http::Request<tonic::body::Body>)->Self::Future {
-            if r.uri().path().ends_with("/OpenLimitedAnnotationFrontier") {
+        type Response = http::Response<tonic::body::Body>;
+        type Error = std::convert::Infallible;
+        type Future = std::pin::Pin<
+            Box<dyn std::future::Future<Output = Result<Self::Response, Self::Error>> + Send>,
+        >;
+        fn poll_ready(
+            &mut self,
+            cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Result<(), Self::Error>> {
+            tower::Service::poll_ready(&mut self.0, cx)
+        }
+        fn call(&mut self, r: http::Request<tonic::body::Body>) -> Self::Future {
+            if r.uri().path().ends_with("/OpenLimitedAnnotationFrontier")
+                || r.uri().path().ends_with("/BlameWithLimits")
+            {
                 // The previous broker vocabulary does not dispatch this method.
                 // It must not route a lowering request through old Open.
                 return Box::pin(async{Ok(http::Response::builder().status(200).header("content-type","application/grpc").header("grpc-status","12").body(tonic::body::Body::empty()).unwrap())});
             }
-            tower::Service::call(&mut self.0,r)
+            tower::Service::call(&mut self.0, r)
         }
     }
-    use native_broker::{NativeQueryIo,query_protocol as q};
-    let directory=tempfile::tempdir().unwrap();let root=directory.path().canonicalize().unwrap();private(&root);
-    let provider=Arc::new(FakeQuery::new(1,1024));
-    let service=query_service(&root,provider.clone(),Arc::new(FakeQuery::new(2,1024)),query_config());
-    let socket=root.join("old.sock");let listener=tokio::net::UnixListener::bind(&socket).unwrap();
-    {use std::os::unix::fs::PermissionsExt;std::fs::set_permissions(&socket,std::fs::Permissions::from_mode(0o600)).unwrap();}
-    let (stop,done)=oneshot::channel();
-    let old=OldBroker(service.query_rpc_service());
-    let task=tokio::spawn(async move{tonic::transport::Server::builder().add_service(old).serve_with_incoming_shutdown(tokio_stream::wrappers::UnixListenerStream::new(listener),async{let _=done.await;}).await.unwrap();});
-    let client=native_broker::BrokerQueryClient::connect(&socket,"first",query_config()).await.unwrap();
-    assert_eq!(client.annotation_capabilities(Arc::new(())).await.unwrap().value,native_broker::BlameCapabilities::Explicit{supported:true,authorized:true});
-    let input=native_broker::OpenAnnotationFrontier{scope:[1;32],anchors:vec![native_broker::CommitId([5;32])],path:"file".into(),max_commits:1,
-        limits:Some(q::AnnotationLimits{work_nodes:4096,work_edges:4096,work_bytes:4096,frontier:4096,read_bytes:4096,diff_input_bytes:4096,diff_lines:4096,diff_work:4096,diff_allocation_bytes:4096,diff_depth:64})};
-    assert_eq!(client.open_annotation_frontier(input.clone(),Arc::new(())).await.unwrap_err().code(),tonic::Code::Unimplemented);
-    assert_eq!(provider.annotation_calls.load(std::sync::atomic::Ordering::SeqCst),0,"old middle hop must not admit old larger-budget frontier work");
-    let mut legacy=input.clone();legacy.limits=None;
-    assert_eq!(client.open_annotation_frontier(legacy,Arc::new(())).await.unwrap().value.version,1,"control proves the old endpoint is functional");
-    let before=provider.annotation_calls.load(std::sync::atomic::Ordering::SeqCst);
-    assert_eq!(service.query_io("first").unwrap().open_annotation_frontier(input,Arc::new(())).await.unwrap_err().code(),tonic::Code::Unimplemented);
-    assert_eq!(provider.annotation_calls.load(std::sync::atomic::Ordering::SeqCst),before,"old provider default refuses before old Open");
-    let _=stop.send(());tokio::time::timeout(Duration::from_secs(5),task).await.unwrap().unwrap();
+    use native_broker::{NativeQueryIo, query_protocol as q};
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path().canonicalize().unwrap();
+    private(&root);
+    let provider = Arc::new(FakeQuery::new(1, 1024));
+    let service = query_service(
+        &root,
+        provider.clone(),
+        Arc::new(FakeQuery::new(2, 1024)),
+        query_config(),
+    );
+    let socket = root.join("old.sock");
+    let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o600)).unwrap();
+    }
+    let (stop, done) = oneshot::channel();
+    let old = OldBroker(service.query_rpc_service());
+    let task = tokio::spawn(async move {
+        tonic::transport::Server::builder()
+            .add_service(old)
+            .serve_with_incoming_shutdown(
+                tokio_stream::wrappers::UnixListenerStream::new(listener),
+                async {
+                    let _ = done.await;
+                },
+            )
+            .await
+            .unwrap();
+    });
+    let client = native_broker::BrokerQueryClient::connect(&socket, "first", query_config())
+        .await
+        .unwrap();
+    assert_eq!(
+        client
+            .annotation_capabilities(Arc::new(()))
+            .await
+            .unwrap()
+            .value,
+        native_broker::BlameCapabilities::Explicit {
+            supported: true,
+            authorized: true
+        }
+    );
+    let input = native_broker::OpenAnnotationFrontier {
+        scope: [1; 32],
+        anchors: vec![native_broker::CommitId([5; 32])],
+        path: "file".into(),
+        max_commits: 1,
+        limits: Some(q::AnnotationLimits {
+            work_nodes: 4096,
+            work_edges: 4096,
+            work_bytes: 4096,
+            frontier: 4096,
+            read_bytes: 4096,
+            diff_input_bytes: 4096,
+            diff_lines: 4096,
+            diff_work: 4096,
+            diff_allocation_bytes: 4096,
+            diff_depth: 64,
+        }),
+    };
+    assert_eq!(
+        client
+            .open_annotation_frontier(input.clone(), Arc::new(()))
+            .await
+            .unwrap_err()
+            .code(),
+        tonic::Code::Unimplemented
+    );
+    assert_eq!(
+        provider
+            .annotation_calls
+            .load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "old middle hop must not admit old larger-budget frontier work"
+    );
+    let mut legacy = input.clone();
+    legacy.limits = None;
+    assert_eq!(
+        client
+            .open_annotation_frontier(legacy, Arc::new(()))
+            .await
+            .unwrap()
+            .value
+            .version,
+        1,
+        "control proves the old endpoint is functional"
+    );
+    let before = provider
+        .annotation_calls
+        .load(std::sync::atomic::Ordering::SeqCst);
+    assert_eq!(
+        service
+            .query_io("first")
+            .unwrap()
+            .open_annotation_frontier(input, Arc::new(()))
+            .await
+            .unwrap_err()
+            .code(),
+        tonic::Code::Unimplemented
+    );
+    assert_eq!(
+        provider
+            .annotation_calls
+            .load(std::sync::atomic::Ordering::SeqCst),
+        before,
+        "old provider default refuses before old Open"
+    );
+    let bounded = native_broker::ScopedPathQuery {
+        scope: [1; 32],
+        revision: native_broker::CommitId([5; 32]),
+        path: "file".into(),
+        policy: q::HistoryPolicy::JjResolvedFixedPathV1,
+        max_commits: 1,
+    };
+    let limits = q::AnnotationLimits {
+        work_nodes: 4096,
+        work_edges: 4096,
+        work_bytes: 4096,
+        frontier: 4096,
+        read_bytes: 4096,
+        diff_input_bytes: 4096,
+        diff_lines: 4096,
+        diff_work: 4096,
+        diff_allocation_bytes: 4096,
+        diff_depth: 64,
+    };
+    assert_eq!(
+        client
+            .blame_with_limits(bounded.clone(), limits.clone(), Arc::new(()))
+            .await
+            .unwrap_err()
+            .code(),
+        tonic::Code::Unimplemented
+    );
+    assert_eq!(
+        provider
+            .blame_calls
+            .load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "an old peer cannot silently ignore the command reservation"
+    );
+    client.blame(bounded.clone(), Arc::new(())).await.unwrap();
+    let before = provider
+        .blame_calls
+        .load(std::sync::atomic::Ordering::SeqCst);
+    assert_eq!(
+        service
+            .query_io("first")
+            .unwrap()
+            .blame_with_limits(bounded, limits, Arc::new(()))
+            .await
+            .unwrap_err()
+            .code(),
+        tonic::Code::Unimplemented
+    );
+    assert_eq!(
+        provider
+            .blame_calls
+            .load(std::sync::atomic::Ordering::SeqCst),
+        before,
+        "a legacy provider cannot drop explicit limits either"
+    );
+    let _ = stop.send(());
+    tokio::time::timeout(Duration::from_secs(5), task)
+        .await
+        .unwrap()
+        .unwrap();
 }

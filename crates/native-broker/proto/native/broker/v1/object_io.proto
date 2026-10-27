@@ -74,6 +74,7 @@ service QueryIo {
   rpc ReadCommit(QueryReadCommitRequest) returns (Metadata);
   rpc PathHistory(QueryPathRequest) returns (tinytree.query.v1.PathHistoryResult);
   rpc Blame(QueryPathRequest) returns (tinytree.query.v1.BlameResult);
+  rpc BlameWithLimits(QueryPathRequest) returns (tinytree.query.v1.BlameResult);
   rpc Search(QuerySearchRequest) returns (tinytree.query.v1.SearchResult);
   rpc CloseQuery(QueryCloseRequest) returns (QueryCloseReply);
   rpc CloseScope(QueryCloseRequest) returns (QueryCloseReply);
@@ -156,6 +157,7 @@ message QueryPathRequest {
   string path = 4;
   tinytree.query.v1.HistoryPolicy policy = 5;
   uint32 max_commits = 6;
+  tinytree.query.v1.AnnotationLimits annotation_limits = 7; // Blame only; explicit command reservation.
 }
 // Search cursors are provider-owned local envelopes, not upstream handles.
 message QuerySearchRequest {

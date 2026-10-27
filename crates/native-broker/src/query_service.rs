@@ -62,6 +62,11 @@ fn commits(values: Vec<Vec<u8>>) -> Result<Vec<tinytree_model::CommitId>, Status
         .collect()
 }
 fn path_query(value: p::QueryPathRequest, cap: usize) -> Result<ScopedPathQuery, Status> {
+    if value.annotation_limits.is_some() {
+        return Err(Status::invalid_argument(
+            "annotation limits are only supported for blame",
+        ));
+    }
     let input = ScopedPathQuery {
         scope: handle(&value.scope)?,
         revision: tinytree_model::CommitId(handle(&value.revision)?),
@@ -926,12 +931,35 @@ impl p::query_io_server::QueryIo for BrokerService {
         &self,
         request: Request<p::QueryPathRequest>,
     ) -> Result<Response<q::BlameResult>, Status> {
-        let (input, work) = input(request, self.query_limit())?;
-        self.authorize_command(&input.store_id, &work)?;
-        let provider = self.query_provider(&input.store_id)?;
-        let input = path_query(input, self.query_limit())?;
+        let (raw, work) = input(request, self.query_limit())?;
+        self.authorize_command(&raw.store_id, &work)?;
+        let provider = self.query_provider(&raw.store_id)?;
+        let input = path_query(raw, self.query_limit())?;
         let result = provider
             .blame(input.clone(), work.clone())
+            .await
+            .map_err(crate::query::status)?;
+        input.check_blame(&result.value, self.query_config().model_limits())?;
+        reply(result, work, self.query_limit())
+    }
+    async fn blame_with_limits(
+        &self,
+        request: Request<p::QueryPathRequest>,
+    ) -> Result<Response<q::BlameResult>, Status> {
+        let (mut raw, work) = input(request, self.query_limit())?;
+        self.authorize_command(&raw.store_id, &work)?;
+        let provider = self.query_provider(&raw.store_id)?;
+        let limits = raw.annotation_limits.take().ok_or_else(|| {
+            Status::invalid_argument("bounded blame requires explicit annotation limits")
+        })?;
+        if !crate::query::annotation_limits_valid(&limits) {
+            return Err(Status::invalid_argument(
+                "positive annotation limits required",
+            ));
+        }
+        let input = path_query(raw, self.query_limit())?;
+        let result = provider
+            .blame_with_limits(input.clone(), limits, work.clone())
             .await
             .map_err(crate::query::status)?;
         input.check_blame(&result.value, self.query_config().model_limits())?;
@@ -1460,6 +1488,28 @@ impl NativeQueryIo for GuardedQuery {
         let limits = self.service.query_config().model_limits();
         self.run(owner, move |provider, owner| async move {
             let result = provider.blame(input.clone(), owner).await?;
+            input.check_blame(&result.value, limits)?;
+            Ok(result)
+        })
+        .await
+    }
+    async fn blame_with_limits(
+        &self,
+        input: ScopedPathQuery,
+        annotation_limits: q::AnnotationLimits,
+        owner: QueryOwner,
+    ) -> Result<QueryReply<q::BlameResult>, Status> {
+        input.validate(self.service.query_limit())?;
+        if !crate::query::annotation_limits_valid(&annotation_limits) {
+            return Err(Status::invalid_argument(
+                "positive annotation limits required",
+            ));
+        }
+        let limits = self.service.query_config().model_limits();
+        self.run(owner, move |provider, owner| async move {
+            let result = provider
+                .blame_with_limits(input.clone(), annotation_limits, owner)
+                .await?;
             input.check_blame(&result.value, limits)?;
             Ok(result)
         })

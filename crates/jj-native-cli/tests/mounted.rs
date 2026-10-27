@@ -16,8 +16,8 @@ use std::{
     path::{Path, PathBuf},
     process::{Child, Command, Output, Stdio},
     sync::{
-        atomic::{AtomicBool, AtomicUsize, Ordering},
         Arc, Mutex,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
     },
     task::{Context, Poll},
     time::{Duration, Instant},
@@ -25,7 +25,7 @@ use std::{
 use tinytree_client::{protocol as p, query_protocol as q};
 use tinytree_model as m;
 use tonic::{
-    codec::CompressionEncoding, Request as RpcRequest, Response as RpcResponse, Status, Streaming,
+    Request as RpcRequest, Response as RpcResponse, Status, Streaming, codec::CompressionEncoding,
 };
 use workspace_daemon::control::{Request, Response};
 
@@ -1079,6 +1079,8 @@ struct MetadataReads {
     capability_requests: Mutex<Vec<Vec<i32>>>,
     blame_policies: Mutex<Vec<i32>>,
     annotation_anchors: Mutex<Vec<Vec<Vec<u8>>>>,
+    annotation_nodes: AtomicUsize,
+    annotation_continues: AtomicUsize,
     retained_scope_opens: AtomicUsize,
     creation_fault: AtomicUsize,
     unavailable_versions: AtomicBool,
@@ -1125,14 +1127,20 @@ impl Repository for CountMetadata {
             .unwrap()
             .push(request.get_ref().features.clone());
         match self.reads.creation_fault.load(Ordering::SeqCst) {
-            8 if request.get_ref().features == [11] => Err(Status::invalid_argument("legacy feature vocabulary")),
-            9 if request.get_ref().features == [11] => {
+            8 if matches!(request.get_ref().features.as_slice(), [11] | [14]) => {
+                Err(Status::invalid_argument("legacy feature vocabulary"))
+            }
+            9 if matches!(request.get_ref().features.as_slice(), [11] | [14]) => {
                 let mut response = self.inner.get_capabilities(request).await?;
                 response.get_mut().features[0].authorized = false;
                 Ok(response)
             }
-            10 if request.get_ref().features == [11] => Err(Status::resource_exhausted("capability pressure")),
-            11 if request.get_ref().features == [11] => Err(Status::data_loss("invalid capability reply")),
+            10 if matches!(request.get_ref().features.as_slice(), [11] | [14]) => {
+                Err(Status::resource_exhausted("capability pressure"))
+            }
+            11 if matches!(request.get_ref().features.as_slice(), [11] | [14]) => {
+                Err(Status::data_loss("invalid capability reply"))
+            }
             1 => Err(Status::unimplemented(
                 "legacy server has no feature negotiation",
             )),
@@ -1315,9 +1323,56 @@ impl RepositoryQuery for CountQueryMetadata {
         self.inner.open_annotation_frontier(request).await
     }
 
-    async fn read_annotation_input(&self, request: RpcRequest<q::ReadAnnotationInputRequest>) -> Result<RpcResponse<q::AnnotationInput>, Status> { self.inner.read_annotation_input(request).await }
+    async fn open_annotation_frontier_paged(
+        &self,
+        request: RpcRequest<q::OpenAnnotationFrontierPagedRequest>,
+    ) -> Result<RpcResponse<q::AnnotationFrontierPage>, Status> {
+        self.reads.annotation_anchors.lock().unwrap().push(
+            request
+                .get_ref()
+                .input
+                .as_ref()
+                .unwrap()
+                .anchors
+                .iter()
+                .map(|id| id.value.clone())
+                .collect(),
+        );
+        let reply = self.inner.open_annotation_frontier_paged(request).await?;
+        self.reads.annotation_nodes.fetch_add(
+            reply.get_ref().frontier.as_ref().unwrap().nodes.len(),
+            Ordering::SeqCst,
+        );
+        Ok(reply)
+    }
+    async fn continue_annotation_frontier(
+        &self,
+        request: RpcRequest<q::ContinueAnnotationFrontierRequest>,
+    ) -> Result<RpcResponse<q::AnnotationFrontierPage>, Status> {
+        self.reads
+            .annotation_continues
+            .fetch_add(1, Ordering::SeqCst);
+        let reply = self.inner.continue_annotation_frontier(request).await?;
+        self.reads.annotation_nodes.fetch_add(
+            reply.get_ref().frontier.as_ref().unwrap().nodes.len(),
+            Ordering::SeqCst,
+        );
+        Ok(reply)
+    }
 
-    async fn close_annotation_frontier(&self, request: RpcRequest<q::CloseAnnotationFrontierRequest>) -> Result<RpcResponse<q::CloseAnnotationFrontierResponse>, Status> { self.inner.close_annotation_frontier(request).await }
+    async fn read_annotation_input(
+        &self,
+        request: RpcRequest<q::ReadAnnotationInputRequest>,
+    ) -> Result<RpcResponse<q::AnnotationInput>, Status> {
+        self.inner.read_annotation_input(request).await
+    }
+
+    async fn close_annotation_frontier(
+        &self,
+        request: RpcRequest<q::CloseAnnotationFrontierRequest>,
+    ) -> Result<RpcResponse<q::CloseAnnotationFrontierResponse>, Status> {
+        self.inner.close_annotation_frontier(request).await
+    }
 
     async fn search(
         &self,
@@ -1539,7 +1594,9 @@ max_manifest_members=1024
             false,
             Some((262_144, 64 * 1024 * 1024, 12 * 1024 * 1024 * 1024)),
             false,
-            None,
+            // Explicit legacy history/blame checks use a caller-supplied bound
+            // sufficient for this seeded fixture; production defaults stay fixed.
+            Some((history + 1).next_power_of_two().max(256)),
             None,
         )
     }
@@ -2815,19 +2872,35 @@ fn ordinary_annotation_unifies_private_and_canonical_merges() {
     fixture.success(&root, &["new", "-m", "annotation dirty child"]);
     fs::write(root.join("hello.cc"), b"private\nleft\nanchor\nright\ndirty\n").unwrap();
     let dirty_output = fixture.run(&root, &private_args);
-    assert!(dirty_output.status.success(), "{}", String::from_utf8_lossy(&dirty_output.stderr));
-    let policies = upstream.metadata.blame_policies.lock().unwrap().clone();
-    assert_eq!(&policies[..2], &[q::HistoryPolicy::JjResolvedFixedPathV1 as i32; 2]);
-    assert_eq!(policies.len(), 2, "mixed commands use the frontier, never forced-baseline Blame");
+    assert!(
+        dirty_output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&dirty_output.stderr)
+    );
+    assert!(
+        upstream.metadata.blame_policies.lock().unwrap().is_empty(),
+        "canonical and mixed commands share continuation, never segment Blame"
+    );
 
-    // Only explicit old-vocabulary negotiation selects legacy linear semantics.
-    // A merge stays incomplete there; no eager or first-parent fallback occurs.
+    // Ordinary annotation requires actual continuation support; unsupported
+    // vocabulary never selects a different attribution policy or graph.
     upstream.metadata.creation_fault.store(8, Ordering::SeqCst);
-    let legacy = fixture.run(&root, &["file", "annotate", "hello.cc", "-r", "annotation-base", "-T", detail]);
-    assert!(legacy.status.success(), "{}", String::from_utf8_lossy(&legacy.stderr));
+    let legacy = fixture.run(
+        &root,
+        &[
+            "file",
+            "annotate",
+            "hello.cc",
+            "-r",
+            "annotation-base",
+            "-T",
+            detail,
+        ],
+    );
+    assert!(!legacy.status.success() && legacy.stdout.is_empty());
     let legacy_merge = fixture.run(&root, &public_args);
     assert!(!legacy_merge.status.success() && legacy_merge.stdout.is_empty());
-    assert_eq!(*upstream.metadata.blame_policies.lock().unwrap().last().unwrap(), q::HistoryPolicy::LinearFixedPathV1 as i32);
+    assert!(upstream.metadata.blame_policies.lock().unwrap().is_empty());
     for fault in [9, 10, 11] {
         upstream.metadata.creation_fault.store(fault, Ordering::SeqCst);
         let calls = upstream.metadata.blame_policies.lock().unwrap().len();
@@ -2994,8 +3067,9 @@ fn ordinary_annotation_private_merge_uses_multiple_canonical_anchors() {
 #[test]
 #[ignore = "requires usable /dev/fuse and fusermount3; run mounted_tests locally"]
 fn ordinary_annotate_matches_stock_templates_private_revisions_and_dirty_bytes() {
-    // Reuse the existing public 300-line file; history depth stays unchanged.
-    let upstream = RemoteServer::start_with_search();
+    // Reuse the 300-line oracle while also crossing the former 256-commit
+    // frontier in canonical and private-tail annotation.
+    let upstream = RemoteServer::start_search_configured(300, false, None, true);
     let mut fixture = Fixture::new();
     fixture.configure_remote(&upstream.endpoint);
     fixture.index_mode("federated");
@@ -3009,12 +3083,71 @@ fn ordinary_annotate_matches_stock_templates_private_revisions_and_dirty_bytes()
     let writes = upstream.metadata.writes.load(Ordering::SeqCst);
     let detail = "commit.commit_id() ++ \":\" ++ original_line_number ++ \":\" ++ line_number ++ \":\" ++ first_line_in_hunk ++ \":\" ++ content";
     let baseline_args = ["file", "annotate", "hello.cc", "-r", "main", "-T", detail];
+    let nodes_before = upstream.metadata.annotation_nodes.load(Ordering::SeqCst);
+    let pages_before = upstream
+        .metadata
+        .annotation_continues
+        .load(Ordering::SeqCst);
     let baseline = fixture.run(&root, &baseline_args);
     assert!(
         baseline.status.success(),
         "{}",
         String::from_utf8_lossy(&baseline.stderr)
     );
+    assert_eq!(
+        upstream.metadata.annotation_nodes.load(Ordering::SeqCst),
+        nodes_before,
+        "canonical annotation keeps ancestry metadata on the server"
+    );
+    assert!(
+        upstream
+            .metadata
+            .annotation_continues
+            .load(Ordering::SeqCst)
+            > pages_before,
+        "deep canonical annotation actually continues beyond one page"
+    );
+    let limited = fixture.run(
+        &root,
+        &[
+            "--config",
+            "tinytree.annotation.max-commits=256",
+            "file",
+            "annotate",
+            "hello.cc",
+            "-r",
+            "main",
+            "-T",
+            detail,
+        ],
+    );
+    assert!(
+        !limited.status.success() && limited.stdout.is_empty(),
+        "aggregate exhaustion never emits partial stdout"
+    );
+    for setting in ["merge.hunk-level=\"word\"", "merge.same-change=\"keep\""] {
+        let legacy_calls = upstream.metadata.blame_policies.lock().unwrap().len();
+        let frontier_calls = upstream.metadata.annotation_anchors.lock().unwrap().len();
+        let rejected = fixture.run(
+            &root,
+            &[
+                "--config", setting, "file", "annotate", "hello.cc", "-r", "main",
+            ],
+        );
+        assert!(!rejected.status.success() && rejected.stdout.is_empty());
+        assert!(
+            String::from_utf8_lossy(&rejected.stderr)
+                .contains("requires line/accept merge semantics")
+        );
+        assert_eq!(
+            upstream.metadata.blame_policies.lock().unwrap().len(),
+            legacy_calls
+        );
+        assert_eq!(
+            upstream.metadata.annotation_anchors.lock().unwrap().len(),
+            frontier_calls
+        );
+    }
     let default_args = ["file", "annotate", "hello.cc", "-r", "main"];
     let baseline_default = fixture.success(&root, &default_args);
     assert!(!baseline_default.contains("<Error"));
@@ -3309,11 +3442,15 @@ fn ordinary_annotate_matches_stock_templates_private_revisions_and_dirty_bytes()
     let oversized = fixture.run(&root, &["file", "annotate", "hello.cc"]);
     assert!(!oversized.status.success());
     assert!(oversized.stdout.is_empty());
-    assert!(String::from_utf8_lossy(&oversized.stderr).contains("content limit"));
+    assert!(
+        String::from_utf8_lossy(&oversized.stderr).contains("content limit"),
+        "{}",
+        String::from_utf8_lossy(&oversized.stderr)
+    );
     fs::write(root.join("hello.cc"), &dirty).unwrap();
     fixture.success(&root, &["status"]);
-    // A resolved merge with redundant ancestry still has ordered parent edges;
-    // the linear service must not quietly simplify it to first-parent blame.
+    // A resolved merge with redundant ancestry keeps stock parent semantics;
+    // unified annotation must not simplify it to first-parent blame.
     fixture.success(
         &root,
         &[
@@ -3327,11 +3464,18 @@ fn ordinary_annotate_matches_stock_templates_private_revisions_and_dirty_bytes()
         ],
     );
     let before_merge_reads = upstream.file_reads();
-    let merge = fixture.run(&root, &["file", "annotate", "hello.cc"]);
-    assert!(!merge.status.success());
-    assert!(merge.stdout.is_empty());
-    assert!(String::from_utf8_lossy(&merge.stderr).contains("resolved linear ancestry"));
+    let merge_args = ["file", "annotate", "hello.cc"];
+    let merge = fixture.run(&root, &merge_args);
+    assert!(
+        merge.status.success(),
+        "{}",
+        String::from_utf8_lossy(&merge.stderr)
+    );
     assert_eq!(upstream.file_reads(), before_merge_reads);
+    assert_eq!(
+        merge.stdout,
+        legacy_annotation_oracle(&mut fixture, &root, &merge_args)
+    );
     fixture.success(&base, &["tinytree", "unmount", root.to_str().unwrap()]);
     fixture.stop_daemon();
 
@@ -3349,7 +3493,20 @@ fn ordinary_annotate_matches_stock_templates_private_revisions_and_dirty_bytes()
     );
     assert!(!rejected.status.success());
     assert!(rejected.stdout.is_empty());
-    assert!(String::from_utf8_lossy(&rejected.stderr).contains("baseline content unavailable"));
+    assert!(
+        String::from_utf8_lossy(&rejected.stderr).contains("limit exceeded"),
+        "{}",
+        String::from_utf8_lossy(&rejected.stderr)
+    );
+    assert!(
+        limited_upstream
+            .metadata
+            .blame_policies
+            .lock()
+            .unwrap()
+            .is_empty(),
+        "a bounded attribution failure never falls back to one-shot Blame"
+    );
     assert_eq!(limited_upstream.file_reads(), 0);
     limited.success(
         &limited_base,
@@ -5757,7 +5914,7 @@ fn pending_landing_cold_recovery(
 #[ignore = "requires usable /dev/fuse and fusermount3"]
 fn exact_nonprimary_capture_upload_and_empty_cache_restore_preserve_all_raw_encodings() {
     use jj_lib::object_id::ObjectId as _;
-    let upstream = RemoteServer::start_with_cloud();
+    let upstream = RemoteServer::start_with_cloud_capture_capacity_and_history(260);
     let mut producer = Fixture::new();
     producer.configure_remote(&upstream.endpoint);
     producer.index_mode("federated");
@@ -7157,6 +7314,24 @@ fn restore_captured_workspace_with_watchdog(
     authored_bytes: &[u8],
     restore_watchdog: Duration,
 ) {
+    // Build the eager stock oracle in a separate live view. A frozen restore
+    // deliberately cannot authorize ambient ancestry reads for a Legacy index.
+    let inherited_oracle = {
+        let mut oracle = Fixture::new();
+        oracle.configure_remote(&upstream.endpoint);
+        oracle.index_mode("legacy");
+        oracle.start();
+        let oracle_base = oracle.base().to_owned();
+        let oracle_root = oracle_base.join("retained-inherited-oracle");
+        oracle.clone_remote(&oracle_root);
+        let output = oracle.run(&oracle_root, &[
+            "file", "annotate", "hello.cc", "-r", &upstream.head,
+        ]);
+        assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+        oracle.success(&oracle_base, &["tinytree", "unmount", oracle_root.to_str().unwrap()]);
+        oracle.stop_daemon();
+        output.stdout
+    };
     let mut fixture = Fixture::new();
     fixture.configure_remote(&upstream.endpoint);
     fixture.start();
@@ -7222,6 +7397,8 @@ fn restore_captured_workspace_with_watchdog(
             "capture-only.txt",
             "-r",
             &captured_revision,
+            "--max-commits",
+            "512",
             "--json",
         ],
     ))
@@ -7241,6 +7418,8 @@ fn restore_captured_workspace_with_watchdog(
             "capture-only.txt",
             "-r",
             &captured_revision,
+            "--max-commits",
+            "512",
             "--json",
         ],
     ))
@@ -7260,6 +7439,7 @@ fn restore_captured_workspace_with_watchdog(
         .ordinary_scope_opens
         .load(Ordering::SeqCst);
     let canonical_before = upstream.metadata.query_commit_bytes.load(Ordering::SeqCst);
+    let nodes_before = upstream.metadata.annotation_nodes.load(Ordering::SeqCst);
     let annotation = fixture.success(&root, &[
         "file", "annotate", "capture-only.txt", "-r", &captured_revision,
         "-T", "commit.commit_id() ++ \":\" ++ original_line_number ++ \":\" ++ line_number ++ \":\" ++ first_line_in_hunk ++ \":\" ++ content",
@@ -7292,9 +7472,13 @@ fn restore_captured_workspace_with_watchdog(
     );
     assert!(!inherited_annotation.contains("<Error"));
     assert_eq!(
-        *upstream.metadata.blame_policies.lock().unwrap().last().unwrap(),
-        q::HistoryPolicy::JjResolvedFixedPathV1 as i32,
-        "ordinary retained annotation must select explicitly negotiated resolved blame"
+        upstream.metadata.annotation_nodes.load(Ordering::SeqCst),
+        nodes_before,
+        "retained annotation keeps canonical ancestry metadata remote"
+    );
+    assert!(
+        upstream.metadata.blame_policies.lock().unwrap().is_empty(),
+        "ordinary retained annotation uses the same checked continuation graph"
     );
     assert!(upstream.metadata.query_commit_bytes.load(Ordering::SeqCst) > canonical_before);
     assert_eq!(
@@ -7360,6 +7544,7 @@ fn restore_captured_workspace_with_watchdog(
     let mut dirty = private_bytes;
     dirty.extend_from_slice(b"unsnapshotted restored edit across restart\n");
     fs::write(root.join("capture-only.txt"), &dirty).unwrap();
+    assert_eq!(inherited_annotation.as_bytes(), inherited_oracle);
     fixture.success(&base, &["tinytree", "unmount", root.to_str().unwrap()]);
     assert!(
         !root.join("capture-only.txt").exists(),
@@ -7404,7 +7589,7 @@ fn restore_captured_workspace_with_watchdog(
         ordinary_scopes_before
     );
     let dirty_blame: serde_json::Value = serde_json::from_str(
-        &fixture.success(&root, &["tinytree", "blame", "capture-only.txt", "--json"]),
+        &fixture.success(&root, &["tinytree", "blame", "capture-only.txt", "--max-commits", "512", "--json"]),
     )
     .unwrap();
     assert_eq!(dirty_blame["coverage"], "complete");

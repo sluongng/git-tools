@@ -12,6 +12,7 @@ use jj_cli::{
 use jj_lib::{
     backend::{FileId, TreeValue},
     commit::Commit,
+    config::ConfigGetResultExt as _,
     diff::{ContentDiff, DiffHunkKind, LineDiffBudget, LineDiffLimits},
     object_id::ObjectId as _,
     repo::Repo as _,
@@ -229,30 +230,6 @@ async fn capture_path(
         state = parent_state;
     }
 }
-
-async fn annotation_policy(query: &BrokerQueryClient, store: &Store) -> Result<q::HistoryPolicy, CommandError> {
-    use native_broker::BlameCapabilities as C;
-    // Policy2 binds stock's default parent-merge settings. Other settings keep
-    // the existing linear policy and its explicit merge boundary, not guessed
-    // attribution under a different merge algorithm.
-    let options = store.merge_options();
-    if options.hunk_level != jj_lib::files::FileMergeHunkLevel::Line
-        || options.same_change != jj_lib::merge::SameChange::Accept {
-        return Ok(q::HistoryPolicy::LinearFixedPathV1);
-    }
-    match query.blame_capabilities(Arc::new(())).await {
-        Ok(reply) => match reply.value {
-            C::Explicit { authorized: false, .. } => Err(failure(tonic::Status::permission_denied("resolved blame is not authorized"))),
-            C::Explicit { supported: true, authorized: true } => Ok(q::HistoryPolicy::JjResolvedFixedPathV1),
-            C::Explicit { supported: false, authorized: true } | C::LegacyUnnegotiated => Ok(q::HistoryPolicy::LinearFixedPathV1),
-        },
-        // This is the dedicated negotiation RPC, never a failed Blame. An old
-        // broker has no such method. Other failures are not compatibility.
-        Err(error) if error.code() == tonic::Code::Unimplemented => Ok(q::HistoryPolicy::LinearFixedPathV1),
-        Err(error) => Err(failure(error)),
-    }
-}
-
 
 fn input(scope: &QueryScope, revision: CommitId, path: &str, max_commits: u32) -> ScopedPathQuery {
     ScopedPathQuery {
@@ -510,18 +487,20 @@ async fn attribution(
         // existing linear private policy and its honest merge boundary until a
         // unified private frontier is available; never retry a failed Blame.
         if captured.steps.is_empty() {
-            selected_policy = annotation_policy(query, store).await?;
+            mixed::enabled(query, store).await?;
+            selected_policy = q::HistoryPolicy::JjResolvedFixedPathV1;
         }
         let mut request = input(scope, captured.baseline, path_text, args.max_commits);
         request.policy = selected_policy;
         Some(
-            query
-                .blame(
-                    request,
-                    Arc::new(()),
-                )
-                .await
-                .map_err(failure)?,
+            if selected_policy == q::HistoryPolicy::JjResolvedFixedPathV1 {
+                query
+                    .blame_with_limits(request, mixed::remote_limits(), Arc::new(()))
+                    .await
+                    .map_err(failure)?
+            } else {
+                query.blame(request, Arc::new(())).await.map_err(failure)?
+            },
         )
     } else {
         None
@@ -717,7 +696,11 @@ pub(crate) async fn ordinary_annotate(
     let args = PathArgs {
         path: matches.get_one::<String>("path").unwrap().clone(),
         revision: matches.get_one::<RevisionArg>("revision").cloned(),
-        max_commits: 256,
+        max_commits: command
+            .settings()
+            .get::<u32>("tinytree.annotation.max-commits")
+            .optional()?
+            .unwrap_or(4096),
         json: false,
     };
     let template = matches.get_one::<String>("template").cloned();

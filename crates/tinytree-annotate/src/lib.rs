@@ -216,12 +216,28 @@ fn simplify<R: Budget, T: Clone + Eq>(
             .collect::<Vec<_>>(),
     ))
 }
+// std's B-tree nodes have up to eleven key/value slots and twelve child
+// edges. Charging a whole node per inserted entry covers even sparse initial
+// nodes, headers, alignment and unused slots for large generic Copy keys.
+fn btree_entry_bytes<K, V>() -> usize {
+    std::mem::size_of::<K>()
+        .saturating_add(std::mem::size_of::<V>())
+        .saturating_mul(11)
+        .saturating_add(std::mem::size_of::<usize>().saturating_mul(12))
+        .saturating_add(256)
+        .saturating_add(
+            std::mem::align_of::<K>()
+                .max(std::mem::align_of::<V>())
+                .saturating_mul(4),
+        )
+}
 struct Discovery<K> {
     graph: Graph<K>,
     pending: VecDeque<m::CommitId>,
     queued: BTreeSet<m::CommitId>,
     ordered: BTreeSet<(K, m::CommitId)>,
     forced: Option<m::CommitId>,
+    maximum_nodes: usize,
 }
 impl<K: Copy + Ord> Discovery<K> {
     fn new<R: Source<Key = K>>(
@@ -230,18 +246,37 @@ impl<K: Copy + Ord> Discovery<K> {
         forced: Option<m::CommitId>,
         limits: Limits,
     ) -> Step<Self, R::Error> {
-        charge(reader, heads.len(), 128)?;
+        let maximum_nodes = limits
+            .max_commits
+            .checked_add(1)
+            .ok_or(Error::Boundary(Boundary::ScanLimit))?;
+        if heads.len() > maximum_nodes {
+            return Err(Error::Boundary(Boundary::ScanLimit));
+        }
+        // Fixed queue/order capacities avoid uncharged growth during a wide
+        // single-node quantum. Two times each requested capacity also covers
+        // allocator rounding, rather than assuming every slot is occupied.
+        charge(
+            reader,
+            maximum_nodes,
+            std::mem::size_of::<m::CommitId>().saturating_mul(4),
+        )?;
+        charge(reader, heads.len(), btree_entry_bytes::<m::CommitId, ()>())?;
         reader.frontier(heads.len()).map_err(Error::Source)?;
         let queued: BTreeSet<_> = heads.iter().copied().collect();
+        let mut pending = VecDeque::with_capacity(maximum_nodes);
+        pending.extend(queued.iter().copied());
+        let order = Vec::with_capacity(maximum_nodes);
         Ok(Self {
-            pending: queued.iter().copied().collect(),
+            pending,
             queued,
             ordered: BTreeSet::new(),
             forced,
+            maximum_nodes,
             graph: Graph {
                 nodes: BTreeMap::new(),
                 limits,
-                order: Vec::new(),
+                order,
                 files: BTreeMap::new(),
                 bodies: BTreeMap::new(),
             },
@@ -258,7 +293,8 @@ impl<K: Copy + Ord> Discovery<K> {
             charge(
                 reader,
                 1,
-                640usize.saturating_add(std::mem::size_of::<K>().saturating_mul(3)),
+                btree_entry_bytes::<m::CommitId, Node<K>>()
+                    .saturating_add(btree_entry_bytes::<(K, m::CommitId), ()>()),
             )?;
             if id != m::CommitId::ROOT && *scanned as usize >= self.graph.limits.max_commits {
                 return Err(Error::Boundary(Boundary::ScanLimit));
@@ -269,14 +305,26 @@ impl<K: Copy + Ord> Discovery<K> {
                     .checked_add(1)
                     .ok_or(Error::Boundary(Boundary::ScanLimit))?;
             }
-            charge(reader, source.parents.len(), 96)?;
+            charge(
+                reader,
+                source.parents.capacity(),
+                std::mem::size_of::<m::CommitId>(),
+            )?;
             for parent in &source.parents {
-                if self.queued.insert(*parent) {
+                if !self.queued.contains(parent) {
+                    if self.queued.len() >= self.maximum_nodes {
+                        return Err(Error::Boundary(Boundary::ScanLimit));
+                    }
+                    charge(reader, 1, btree_entry_bytes::<m::CommitId, ()>())?;
+                    self.queued.insert(*parent);
                     self.pending.push_back(*parent);
                 }
             }
             if let Some(value @ m::TreeValue::File { id, .. }) = &source.value {
-                self.graph.files.insert(*id, value.clone());
+                if !self.graph.files.contains_key(id) {
+                    charge(reader, 1, btree_entry_bytes::<m::FileId, m::TreeValue>())?;
+                    self.graph.files.insert(*id, value.clone());
+                }
             }
             self.ordered.insert((source.key, id));
             self.graph.nodes.insert(
@@ -342,6 +390,18 @@ impl<K: Copy + Ord> Graph<K> {
         let bytes = reader
             .read_file(value.0.as_ref().unwrap())
             .map_err(Error::Source)?;
+        if bytes.len() > self.limits.max_file_bytes {
+            return Err(Error::Boundary(Boundary::ReadLimit));
+        }
+        charge(
+            reader,
+            1,
+            bytes
+                .capacity()
+                .saturating_add(bytes.len())
+                .saturating_add(64)
+                .saturating_add(btree_entry_bytes::<m::FileId, Arc<[u8]>>()),
+        )?;
         if count_lines(&bytes) > self.limits.max_lines {
             return Err(Error::Boundary(Boundary::DiffLimit));
         }
@@ -551,6 +611,11 @@ impl<K: Copy + Ord> Graph<K> {
         if id == m::CommitId::ROOT {
             return Ok(());
         }
+        charge(
+            reader,
+            self.nodes[&id].parents.len(),
+            std::mem::size_of::<m::CommitId>().saturating_mul(2),
+        )?;
         let parents = self.nodes[&id].parents.clone();
         let selected = if forced == Some(id) {
             true
@@ -570,7 +635,11 @@ impl<K: Copy + Ord> Graph<K> {
             } else {
                 expanded |= !self.nodes[&parent].edges.is_empty();
                 for edge in &self.nodes[&parent].edges {
-                    charge(reader, 1, 64)?;
+                    charge(
+                        reader,
+                        1,
+                        64usize.saturating_add(btree_entry_bytes::<m::CommitId, ()>()),
+                    )?;
                     if indirect_seen.insert(*edge) {
                         edges.push(*edge);
                     }
@@ -591,6 +660,7 @@ impl<K: Copy + Ord> Graph<K> {
                     }
                 }
                 if !redundant {
+                    charge(reader, 1, 64)?;
                     keep.push(*edge);
                 }
             }
@@ -665,7 +735,11 @@ fn cache_target<K: Copy + Ord, R: Budget>(
         target
             .len()
             .checked_mul(2)
-            .and_then(|bytes| bytes.checked_add(256)) // Arc/map entry, including an empty target.
+            .and_then(|bytes| {
+                bytes.checked_add(
+                    64usize.saturating_add(btree_entry_bytes::<m::FileId, Arc<[u8]>>()),
+                )
+            })
             .ok_or(Error::Boundary(Boundary::ReadLimit))?,
     )?;
     graph.bodies.insert(target_id, Arc::from(target.to_vec()));
@@ -684,6 +758,11 @@ fn annotate_graph<K: Copy + Ord, R: Source<Key = K>>(
     let lines = origins.len();
     charge(reader, lines, 32)?;
     let mut operations = 0u64;
+    charge(
+        reader,
+        1,
+        btree_entry_bytes::<m::CommitId, Vec<(usize, usize)>>(),
+    )?;
     let mut pending = BTreeMap::from([(
         revision,
         (0..lines).map(|line| (line, line)).collect::<Vec<_>>(),
@@ -703,6 +782,11 @@ fn annotate_graph<K: Copy + Ord, R: Source<Key = K>>(
             .ok_or(Error::Internal("annotation progress overflow"))?;
         let value = graph.nodes[&id].value.clone();
         let bytes = graph.body(reader, &value)?;
+        charge(
+            reader,
+            graph.nodes[&id].edges.len(),
+            std::mem::size_of::<m::CommitId>().saturating_mul(2),
+        )?;
         for parent in graph.nodes[&id].edges.clone() {
             if current.is_empty() {
                 break;
@@ -737,6 +821,13 @@ fn annotate_graph<K: Copy + Ord, R: Source<Key = K>>(
             }
             current = remaining;
             if !matched.is_empty() {
+                if !pending.contains_key(&parent) {
+                    charge(
+                        reader,
+                        1,
+                        btree_entry_bytes::<m::CommitId, Vec<(usize, usize)>>(),
+                    )?;
+                }
                 let target = pending.entry(parent).or_insert_with(Vec::new);
                 charge(reader, target.len().saturating_add(matched.len()), 64)?;
                 let previous = std::mem::take(target);
@@ -867,10 +958,7 @@ impl<R: GraphSource> GraphSource for Accounting<'_, R> {
 }
 impl<R: ContentSource> ContentSource for Accounting<'_, R> {
     fn read_file(&mut self, value: &m::TreeValue) -> Result<Vec<u8>, Self::Error> {
-        let bytes = self.source.read_file(value)?;
-        // Source return plus cached Arc conversion can coexist temporarily.
-        self.charge(0, (bytes.len() as u64).saturating_mul(2))?;
-        Ok(bytes)
+        self.source.read_file(value)
     }
 }
 impl<K: Copy + Ord> Frontier<K> {
@@ -1120,6 +1208,7 @@ mod tests {
         work: u64,
         bytes: u64,
         max_work: u64,
+        max_bytes: u64,
         active: bool,
     }
     fn id(number: u64) -> m::CommitId {
@@ -1137,6 +1226,7 @@ mod tests {
                 work: 0,
                 bytes: 0,
                 max_work: 1_000_000,
+                max_bytes: u64::MAX,
                 active: true,
             }
         }
@@ -1191,6 +1281,8 @@ mod tests {
             self.bytes += bytes;
             if self.work > self.max_work {
                 Err("work exhausted")
+            } else if self.bytes > self.max_bytes {
+                Err("bytes exhausted")
             } else {
                 Ok(())
             }
@@ -1211,9 +1303,11 @@ mod tests {
         fn node(&mut self, id: m::CommitId) -> Result<SourceNode<u64>, Self::Error> {
             *self.reads.entry(id).or_default() += 1;
             let (key, parents, value) = self.nodes.get(&id).ok_or("missing node")?;
+            let mut copied_parents = Vec::with_capacity(parents.capacity());
+            copied_parents.extend(parents.iter().copied());
             Ok(SourceNode {
                 key: *key,
-                parents: parents.clone(),
+                parents: copied_parents,
                 value: value.clone(),
             })
         }
@@ -1459,7 +1553,7 @@ mod tests {
     fn aggregate_scan_work_and_cancellation_fail_closed_without_restart() {
         for (name, scan_limit, work_limit, cancel, expected) in [
             ("aggregate scan", 16, 1_000_000, false, "scan"),
-            ("aggregate work", 300, 20, false, "work"),
+            ("aggregate work", 300, 400, false, "work"),
             ("cancellation", 300, 1_000_000, true, "cancelled"),
         ] {
             let mut source = Fixture::chain(300);
@@ -1496,6 +1590,106 @@ mod tests {
             );
         }
     }
+    #[test]
+    fn wide_discovery_and_large_keys_reserve_container_capacity_before_transfer() {
+        let mut wide = Fixture::chain(1024);
+        let mut parents = Vec::with_capacity(2048);
+        parents.extend((1..=1024).map(id));
+        wide.nodes.insert(id(1025), (1025, parents, None));
+        let mut state = Frontier::new(&mut wide, &[id(1025)], limits(1025), diff_limits()).unwrap();
+        state
+            .advance(&mut wide, NonZeroUsize::new(1).unwrap())
+            .unwrap();
+        assert_eq!(
+            wide.reads.len(),
+            1,
+            "one quantum retains the wide queue before reading parents"
+        );
+        assert!(
+            state.progress().retained_bytes_upper_bound >= (2048 * 32 + 1024 * 96) as u64,
+            "upper bound covers spare parent capacity and the queued identity copies"
+        );
+        let mut tight = Fixture::chain(1024);
+        let mut parents = Vec::with_capacity(2048);
+        parents.extend((1..=1024).map(id));
+        tight.nodes.insert(id(1025), (1025, parents, None));
+        tight.max_bytes = 200_000;
+        let mut state =
+            Frontier::new(&mut tight, &[id(1025)], limits(1025), diff_limits()).unwrap();
+        assert!(matches!(
+            state.advance(&mut tight, NonZeroUsize::new(1).unwrap()),
+            Err(Error::Source("bytes exhausted"))
+        ));
+        assert!(
+            state.next_node(&mut tight).is_err(),
+            "failed wide transfer cannot publish a frontier"
+        );
+
+        #[derive(Clone, Copy, Eq, PartialEq, Ord, PartialOrd)]
+        struct LargeKey([u8; 4096]);
+        struct LargeSource(Fixture);
+        impl Budget for LargeSource {
+            type Error = &'static str;
+            fn check(&self) -> Result<(), Self::Error> {
+                self.0.check()
+            }
+            fn charge(&mut self, work: u64, bytes: u64) -> Result<(), Self::Error> {
+                self.0.charge(work, bytes)
+            }
+            fn frontier(&mut self, n: usize) -> Result<(), Self::Error> {
+                self.0.frontier(n)
+            }
+            fn diff_active(&self) -> bool {
+                self.0.diff_active()
+            }
+        }
+        impl GraphSource for LargeSource {
+            type Key = LargeKey;
+            fn node(&mut self, id: m::CommitId) -> Result<SourceNode<LargeKey>, Self::Error> {
+                let node = self.0.node(id)?;
+                let mut key = [0; 4096];
+                key[..8].copy_from_slice(&node.key.to_be_bytes());
+                Ok(SourceNode {
+                    key: LargeKey(key),
+                    parents: node.parents,
+                    value: node.value,
+                })
+            }
+            fn common_ancestors(
+                &mut self,
+                a: &[m::CommitId],
+                b: &[m::CommitId],
+            ) -> Result<Vec<m::CommitId>, Self::Error> {
+                self.0.common_ancestors(a, b)
+            }
+            fn is_ancestor(&mut self, a: m::CommitId, b: m::CommitId) -> Result<bool, Self::Error> {
+                self.0.is_ancestor(a, b)
+            }
+        }
+        impl ContentSource for LargeSource {
+            fn read_file(&mut self, value: &m::TreeValue) -> Result<Vec<u8>, Self::Error> {
+                self.0.read_file(value)
+            }
+        }
+        let mut large = LargeSource(Fixture::chain(1));
+        let mut state = Frontier::new(&mut large, &[id(1)], limits(1), diff_limits()).unwrap();
+        state
+            .advance(&mut large, NonZeroUsize::new(1).unwrap())
+            .unwrap();
+        assert!(
+            state.progress().retained_bytes_upper_bound
+                >= (22 * std::mem::size_of::<LargeKey>()) as u64,
+            "two initially sparse B-tree nodes still allocate full key-slot arrays"
+        );
+        let mut tight = LargeSource(Fixture::chain(1));
+        tight.0.max_bytes = 40_000;
+        let mut state = Frontier::new(&mut tight, &[id(1)], limits(1), diff_limits()).unwrap();
+        assert!(matches!(
+            state.advance(&mut tight, NonZeroUsize::new(1).unwrap()),
+            Err(Error::Source("bytes exhausted"))
+        ));
+    }
+
     #[test]
     fn paged_frontier_matches_single_shot_for_merge_and_repeated_line_attribution() {
         let mut fixture = Fixture::new();

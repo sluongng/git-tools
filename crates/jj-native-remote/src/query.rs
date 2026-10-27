@@ -4,9 +4,9 @@ use anyhow::{Context, Result, ensure};
 use async_trait::async_trait;
 use jj_native_backend::NativeObjectIo;
 use native_broker::{
-    BeginQuery, ForkQueryScope, NativeQueryIo, OpenCloudQueryScope, OpenQueryScope, QueryHandle,
-    QueryOwner, QueryPage, QueryReply, QueryResources, QueryScope, ScopedPathQuery, OpenAnnotationFrontier, ReadAnnotationInput,
-    ScopedSearchQuery, query_protocol as q,
+    BeginQuery, ForkQueryScope, NativeQueryIo, OpenAnnotationFrontier, OpenCloudQueryScope,
+    OpenQueryScope, QueryHandle, QueryOwner, QueryPage, QueryReply, QueryResources, QueryScope,
+    ReadAnnotationInput, ScopedPathQuery, ScopedSearchQuery, query_protocol as q,
 };
 use prost::Message;
 use std::{
@@ -85,6 +85,9 @@ struct ScopeRecord {
 #[derive(Default)]
 struct AnnotationRecord {
     checked: Option<tinytree_client::CheckedAnnotationFrontier>,
+    blame: Option<tinytree_client::CheckedAnnotationBlame>,
+    binding: Option<[u8; 32]>,
+    deadline: Option<tokio::time::Instant>,
     closed: bool,
 }
 struct CapturedScope {
@@ -2412,7 +2415,7 @@ impl NativeQueryIo for RemoteQueryIo {
     ) -> std::result::Result<QueryReply<native_broker::BlameCapabilities>, tonic::Status> {
         self.run(owner, move |this, operation| async move {
             let client = operation.client(&this.inner.connector.get_bare().await?);
-            let capability = client.annotation_frontier_capability().await?;
+            let capability = client.annotation_frontier_paging_capability().await?;
             Ok(QueryReply {
                 value: match capability {
                     None => native_broker::BlameCapabilities::LegacyUnnegotiated,
@@ -2465,25 +2468,66 @@ impl NativeQueryIo for RemoteQueryIo {
                 !slot.closed,
                 tonic::Status::failed_precondition("native annotation context is closed")
             );
-            let checked = operation
-                .client(&scope.client)
-                .open_annotation_frontier_with_limits(
-                    &scope.checked,
-                    &input.anchors,
-                    &input.path,
-                    input.max_commits,
-                    input.limits.clone(),
+            ensure!(
+                slot.blame.is_none(),
+                tonic::Status::failed_precondition(
+                    "annotation context already selected server attribution"
                 )
-                .await?;
-            if let Some(previous) = &slot.checked {
-                ensure!(
-                    previous.result() == checked.result(),
-                    tonic::Status::data_loss("annotation replay changed captured frontier")
-                );
-            } else {
-                slot.checked = Some(checked);
+            );
+            let mut hash = blake3::Hasher::new();
+            hash.update(b"native-annotation-input-v1\0");
+            hash.update(&input.scope);
+            hash.update(&(input.path.len() as u64).to_le_bytes());
+            hash.update(input.path.as_bytes());
+            hash.update(&input.max_commits.to_le_bytes());
+            hash.update(&(input.anchors.len() as u64).to_le_bytes());
+            for anchor in &input.anchors {
+                hash.update(&anchor.0);
             }
-            let checked = slot.checked.as_ref().unwrap().clone();
+            hash.update(&[u8::from(input.limits.is_some())]);
+            if let Some(limits) = &input.limits {
+                hash.update(&limits.encode_to_vec());
+            }
+            let binding = *hash.finalize().as_bytes();
+            let checked = if let Some(checked) = &slot.checked {
+                ensure!(
+                    slot.binding == Some(binding),
+                    tonic::Status::failed_precondition("annotation context inputs changed")
+                );
+                ensure!(
+                    slot.deadline
+                        .is_some_and(|deadline| tokio::time::Instant::now() < deadline)
+                        && now()? < checked.result().expires_at_unix_seconds,
+                    tonic::Status::deadline_exceeded("annotation original deadline exceeded")
+                );
+                checked.clone()
+            } else {
+                let client = operation.client(&scope.client);
+                let checked = if let Some(limits) = input.limits.clone() {
+                    client
+                        .collect_annotation_frontier(
+                            &scope.checked,
+                            &input.anchors,
+                            &input.path,
+                            input.max_commits,
+                            limits,
+                        )
+                        .await?
+                } else {
+                    client
+                        .open_annotation_frontier(
+                            &scope.checked,
+                            &input.anchors,
+                            &input.path,
+                            input.max_commits,
+                        )
+                        .await?
+                };
+                slot.binding = Some(binding);
+                slot.deadline = Some(checked.data_deadline());
+                slot.checked = Some(checked.clone());
+                checked
+            };
             let bytes = checked
                 .result()
                 .encoded_len()
@@ -2560,16 +2604,20 @@ impl NativeQueryIo for RemoteQueryIo {
                 tonic::Status::resource_exhausted("native annotation context is busy")
             })?;
             if !slot.closed {
-                let frontier = slot
-                    .checked
-                    .as_ref()
-                    .context("native annotation context is unavailable")?;
-                operation
-                    .client(&scope.client)
-                    .close_annotation_frontier(frontier)
-                    .await?;
+                let client = operation.client(&scope.client);
+                if let Some(frontier) = &slot.checked {
+                    client.close_annotation_frontier(frontier).await?;
+                } else if let Some(blame) = &slot.blame {
+                    client.close_annotation_blame(blame).await?;
+                } else {
+                    return Err(tonic::Status::failed_precondition(
+                        "native annotation context is unavailable",
+                    )
+                    .into());
+                }
                 slot.closed = true;
                 slot.checked = None;
+                slot.blame = None;
             }
             drop(slot);
             Ok(QueryReply {
@@ -2683,6 +2731,89 @@ impl NativeQueryIo for RemoteQueryIo {
             let retained = this.charge(bytes)?;
             Ok(QueryReply {
                 value: checked.result().clone(),
+                owner: Arc::new((scope, checked, retained)),
+            })
+        })
+        .await
+    }
+    async fn blame_with_limits(
+        &self,
+        input: ScopedPathQuery,
+        limits: q::AnnotationLimits,
+        owner: QueryOwner,
+    ) -> std::result::Result<QueryReply<q::BlameResult>, tonic::Status> {
+        if input.policy != q::HistoryPolicy::JjResolvedFixedPathV1
+            || !native_broker::annotation_limits_valid(&limits)
+        {
+            return Err(tonic::Status::invalid_argument(
+                "bounded server attribution requires resolved policy and positive limits",
+            ));
+        }
+        self.run(owner, move |this, operation| async move {
+            let scope = this.captured(input.scope).await?;
+            this.online(&scope).await?;
+            ensure!(
+                !scope.overlays.contains_key(&input.revision),
+                tonic::Status::invalid_argument("server attribution target must be canonical")
+            );
+            let mut slot = scope.annotation.try_lock().map_err(|_| {
+                tonic::Status::resource_exhausted("native annotation context is busy")
+            })?;
+            ensure!(
+                !slot.closed && slot.checked.is_none(),
+                tonic::Status::failed_precondition(
+                    "annotation context is closed or selected frontier mode"
+                )
+            );
+            let mut hash = blake3::Hasher::new();
+            hash.update(b"native-annotation-blame-v1\0");
+            hash.update(&input.scope);
+            hash.update(&input.revision.0);
+            hash.update(&(input.policy as i32).to_le_bytes());
+            hash.update(&(input.path.len() as u64).to_le_bytes());
+            hash.update(input.path.as_bytes());
+            hash.update(&input.max_commits.to_le_bytes());
+            hash.update(&limits.encode_to_vec());
+            let binding = *hash.finalize().as_bytes();
+            let checked = if let Some(checked) = &slot.blame {
+                ensure!(
+                    slot.binding == Some(binding),
+                    tonic::Status::failed_precondition("annotation attribution inputs changed")
+                );
+                ensure!(
+                    slot.deadline
+                        .is_some_and(|deadline| tokio::time::Instant::now() < deadline)
+                        && now()? < checked.expires_at_unix_seconds(),
+                    tonic::Status::deadline_exceeded("annotation original deadline exceeded")
+                );
+                checked.clone()
+            } else {
+                let checked = operation
+                    .client(&scope.client)
+                    .collect_annotation_blame(
+                        &scope.checked,
+                        input.revision,
+                        &input.path,
+                        input.max_commits,
+                        limits,
+                    )
+                    .await?;
+                slot.binding = Some(binding);
+                slot.deadline = Some(checked.data_deadline());
+                slot.blame = Some(checked.clone());
+                checked
+            };
+            let bytes = checked
+                .result()
+                .encoded_len()
+                .checked_mul(128)
+                .and_then(|bytes| bytes.checked_add(4096))
+                .context("native annotation attribution allocation overflow")?;
+            let retained = this.charge(bytes)?;
+            let value = checked.result().clone();
+            drop(slot);
+            Ok(QueryReply {
+                value,
                 owner: Arc::new((scope, checked, retained)),
             })
         })

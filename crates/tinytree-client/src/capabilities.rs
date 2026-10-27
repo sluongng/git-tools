@@ -17,6 +17,7 @@ pub enum CapabilityFeature {
     JjResolvedBlameV1 = 11,
     AnnotationFrontierV1 = 12,
     DurableRetainedOffloadV1 = 13,
+    AnnotationFrontierPagingV1 = 14,
 }
 impl CapabilityFeature {
     pub const ALL: [Self; 5] = [
@@ -90,6 +91,27 @@ impl NativeClient {
         }
     }
 
+    /// Negotiate bounded frontier continuation, not legacy single-reply support.
+    pub async fn annotation_frontier_paging_capability(
+        &self,
+    ) -> Result<Option<FeatureCapability>, Status> {
+        match self
+            .capabilities(&[CapabilityFeature::AnnotationFrontierPagingV1])
+            .await
+        {
+            Ok(capabilities) => Ok(Some(capabilities.features[0])),
+            Err(error)
+                if matches!(
+                    error.code(),
+                    tonic::Code::InvalidArgument | tonic::Code::Unimplemented
+                ) =>
+            {
+                Ok(None)
+            }
+            Err(error) => Err(error),
+        }
+    }
+
     /// Negotiate the full retained backing contract, independently of exact
     /// representation reads (feature9). Legacy singleton vocabulary absence is
     /// unsupported, not a grant. Denial, corruption, quota and transport errors
@@ -121,7 +143,7 @@ impl NativeClient {
         features: &[CapabilityFeature],
     ) -> Result<Capabilities, Status> {
         if features.is_empty()
-            || features.len() > 13
+            || features.len() > 14
             || features.windows(2).any(|pair| pair[0] >= pair[1])
         {
             return Err(Status::invalid_argument(

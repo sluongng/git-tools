@@ -76,6 +76,7 @@ impl Running {
             first_page: Arc::new(std::sync::Mutex::new(None)),
             first_search: Arc::new(std::sync::Mutex::new(None)),
             first_history_entry: Arc::new(std::sync::Mutex::new(None)),
+            first_annotation: Arc::new(std::sync::Mutex::new(None)),
         })
         .accept_compressed(tonic::codec::CompressionEncoding::Zstd)
         .send_compressed(tonic::codec::CompressionEncoding::Zstd);
@@ -1683,6 +1684,22 @@ enum QueryMode {
     AnnotationMissingFlag,
     AnnotationCyclicParent,
     AnnotationInputHash,
+    AnnotationPageCursorEcho,
+    AnnotationPageSequence,
+    AnnotationPageCounters,
+    AnnotationPagePath,
+    AnnotationPageClosure,
+    AnnotationPageSlow,
+    AnnotationPagePendingNode,
+    AnnotationPageStalled,
+    AnnotationPageDuplicateNode,
+    AnnotationPageMissingParent,
+    AnnotationPageScannedCount,
+    AnnotationPageExpired,
+    AnnotationPageShortExpiry,
+    AnnotationAttributionHash,
+    AnnotationAttributionGraph,
+    AnnotationCursorFlood,
     HistoryWrongDigest,
     HistoryWrongRevision,
     HistoryWrongPath,
@@ -1798,6 +1815,9 @@ struct QueryCounts {
     closes: AtomicUsize,
     facts: AtomicUsize,
     histories: AtomicUsize,
+    annotation_pages: AtomicUsize,
+    annotation_operations: AtomicUsize,
+    annotation_nodes: AtomicUsize,
     blames: AtomicUsize,
     searches: AtomicUsize,
     search_ready: AtomicUsize,
@@ -1821,6 +1841,46 @@ struct QueryFaults {
     first_page: Arc<std::sync::Mutex<Option<q::EvaluatePage>>>,
     first_search: Arc<std::sync::Mutex<Option<q::SearchResult>>>,
     first_history_entry: Arc<std::sync::Mutex<Option<q::PathHistoryEntry>>>,
+    first_annotation: Arc<std::sync::Mutex<Option<q::AnnotationFrontierPage>>>,
+}
+impl QueryFaults {
+    fn annotation_page(&self, page: &mut q::AnnotationFrontierPage) {
+        self.counts.annotation_nodes.fetch_add(
+            page.frontier
+                .as_ref()
+                .map_or(0, |frontier| frontier.nodes.len()),
+            Ordering::SeqCst,
+        );
+        if self.mode == QueryMode::AnnotationAttributionHash {
+            if let Some(blame) = page.blame.as_mut() {
+                if let Some(byte) = blame.target_bytes.first_mut() {
+                    *byte ^= 1;
+                }
+            }
+        }
+        if self.mode == QueryMode::AnnotationAttributionGraph {
+            page.frontier
+                .as_mut()
+                .unwrap()
+                .nodes
+                .push(q::AnnotationNode {
+                    revision: Some(q::CommitId { value: vec![0; 32] }),
+                    parents: vec![],
+                    source_layer: 0,
+                    topological_key: 0,
+                    value: Some(q::AnnotationPathValue {
+                        state: Some(q::HistoryPathState {
+                            kind: 1,
+                            native_id: vec![],
+                            size_bytes: 0,
+                            executable: false,
+                        }),
+                        copy_id: vec![],
+                    }),
+                    affects_path: Some(false),
+                });
+        }
+    }
 }
 #[tonic::async_trait]
 impl RepositoryQuery for QueryFaults {
@@ -1829,14 +1889,153 @@ impl RepositoryQuery for QueryFaults {
         let result = reply.get_mut();
         match self.mode {
             QueryMode::AnnotationWrongDigest => result.scope_digest[0] ^= 1,
-            QueryMode::AnnotationMissingFlag => result.nodes.last_mut().unwrap().affects_path = None,
-            QueryMode::AnnotationCyclicParent => { let node = result.nodes.last_mut().unwrap(); node.parents = vec![node.revision.clone().unwrap()]; },
-            _ => {},
+            QueryMode::AnnotationMissingFlag => {
+                result.nodes.last_mut().unwrap().affects_path = None
+            }
+            QueryMode::AnnotationCyclicParent => {
+                let node = result.nodes.last_mut().unwrap();
+                node.parents = vec![node.revision.clone().unwrap()];
+            }
+            _ => {}
         }
         Ok(reply)
     }
 
-    async fn read_annotation_input(&self, request: Request<q::ReadAnnotationInputRequest>) -> Result<Response<q::AnnotationInput>, Status> {
+    async fn open_annotation_frontier_paged(
+        &self,
+        request: Request<q::OpenAnnotationFrontierPagedRequest>,
+    ) -> Result<Response<q::AnnotationFrontierPage>, Status> {
+        self.counts.annotation_pages.fetch_add(1, Ordering::SeqCst);
+        let mut reply = self.service.open_annotation_frontier_paged(request).await?;
+        self.annotation_page(reply.get_mut());
+        if self.mode == QueryMode::AnnotationCursorFlood {
+            let page = reply.get_mut();
+            page.blame = None;
+            page.has_more = true;
+            page.phase = 1;
+            page.sequence = 0;
+            page.operations = 1;
+            page.emitted_nodes = 0;
+            let frontier = page.frontier.as_mut().unwrap();
+            frontier.nodes.clear();
+            frontier.coverage = 0;
+            frontier.scanned_commits = 0;
+            page.next_cursor = vec![1; 32];
+            *self.first_annotation.lock().unwrap() = Some(page.clone());
+        }
+        self.counts
+            .annotation_operations
+            .store(reply.get_ref().operations as usize, Ordering::SeqCst);
+        if matches!(
+            self.mode,
+            QueryMode::AnnotationPageExpired | QueryMode::AnnotationPageShortExpiry
+        ) {
+            let seconds = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs() as i64;
+            reply
+                .get_mut()
+                .frontier
+                .as_mut()
+                .unwrap()
+                .expires_at_unix_seconds = seconds
+                + if self.mode == QueryMode::AnnotationPageExpired {
+                    -1
+                } else {
+                    2
+                };
+        }
+        if self.mode == QueryMode::AnnotationPageClosure {
+            let page = reply.get_mut();
+            page.has_more = false;
+            page.next_cursor.clear();
+            page.phase = 4;
+            page.frontier.as_mut().unwrap().coverage = q::HistoryCoverage::HistoryComplete as i32;
+        }
+        if self.mode == QueryMode::AnnotationPageSlow {
+            tokio::time::sleep(Duration::from_millis(30)).await;
+        }
+        Ok(reply)
+    }
+    async fn continue_annotation_frontier(
+        &self,
+        request: Request<q::ContinueAnnotationFrontierRequest>,
+    ) -> Result<Response<q::AnnotationFrontierPage>, Status> {
+        self.counts.annotation_pages.fetch_add(1, Ordering::SeqCst);
+        if self.mode == QueryMode::AnnotationCursorFlood {
+            let mut page = self
+                .first_annotation
+                .lock()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .clone();
+            page.sequence = (self.counts.annotation_pages.load(Ordering::SeqCst) - 1) as u64;
+            page.operations = page.sequence + 1;
+            page.next_cursor = vec![0; 32];
+            page.next_cursor[..8].copy_from_slice(&(page.sequence + 1).to_le_bytes());
+            return Ok(Response::new(page));
+        }
+        let cursor = request.get_ref().cursor.clone();
+        let mut reply = self.service.continue_annotation_frontier(request).await?;
+        self.annotation_page(reply.get_mut());
+        let page = reply.get_mut();
+        let previous_operations = self
+            .counts
+            .annotation_operations
+            .swap(page.operations as usize, Ordering::SeqCst);
+        // At a byte boundary the server may have already read/charged the last
+        // pending node. Its next page makes output progress without engine work.
+        if self.mode == QueryMode::AnnotationPagePendingNode
+            && !page.frontier.as_ref().unwrap().nodes.is_empty()
+        {
+            page.operations = previous_operations as u64;
+            self.counts
+                .annotation_operations
+                .store(previous_operations, Ordering::SeqCst);
+        }
+        if self.mode == QueryMode::AnnotationPageStalled {
+            page.operations = previous_operations as u64;
+        }
+        if let Some(node) = page
+            .frontier
+            .as_mut()
+            .unwrap()
+            .nodes
+            .iter_mut()
+            .find(|node| node.revision.as_ref().unwrap().value != [0; 32])
+        {
+            match self.mode {
+                QueryMode::AnnotationPageDuplicateNode => {
+                    node.revision.as_mut().unwrap().value = vec![0; 32]
+                }
+                QueryMode::AnnotationPageMissingParent => node.parents[0].value = vec![7; 32],
+                _ => {}
+            }
+        }
+        match self.mode {
+            QueryMode::AnnotationPageCursorEcho if page.has_more => page.next_cursor = cursor,
+            QueryMode::AnnotationPageSequence => page.sequence = 0,
+            QueryMode::AnnotationPageScannedCount if !page.has_more => {
+                page.frontier.as_mut().unwrap().scanned_commits += 1;
+            }
+            QueryMode::AnnotationPageCounters => page.usage.as_mut().unwrap().work_nodes = 0,
+            QueryMode::AnnotationPagePath => {
+                page.frontier.as_mut().unwrap().path.push_str("-changed")
+            }
+            _ => {}
+        }
+        if self.mode == QueryMode::AnnotationPageSlow {
+            tokio::time::sleep(Duration::from_millis(30)).await;
+        }
+        Ok(reply)
+    }
+
+    async fn read_annotation_input(
+        &self,
+        request: Request<q::ReadAnnotationInputRequest>,
+    ) -> Result<Response<q::AnnotationInput>, Status> {
         let mut reply = self.service.read_annotation_input(request).await?;
         if self.mode == QueryMode::AnnotationInputHash { reply.get_mut().data[0] ^= 1; }
         Ok(reply)
@@ -2508,6 +2707,7 @@ impl QueryRunning {
             first_page: Arc::new(std::sync::Mutex::new(None)),
             first_search: Arc::new(std::sync::Mutex::new(None)),
             first_history_entry: Arc::new(std::sync::Mutex::new(None)),
+            first_annotation: Arc::new(std::sync::Mutex::new(None)),
         };
         let (stop, stopped) = tokio::sync::oneshot::channel();
         let cloud = CloudFaults::default();
@@ -8649,6 +8849,559 @@ async fn captured_version_transport_checks_client_footer_stream_and_original_pub
     }
     server.abort();
     let _ = server.await;
+}
+
+fn setup_annotation_chain(length: usize) -> QueryFixture {
+    let mut fixture = setup_query_retained();
+    let (_, bytes) = fixture
+        .store
+        .read_metadata(
+            "example",
+            ObjectKey {
+                kind: Kind::Commit,
+                id: ObjectId(fixture.root.0),
+            },
+        )
+        .unwrap();
+    let tinytree_model::Object::Commit(mut model) =
+        tinytree_model::decode(&bytes, Default::default()).unwrap()
+    else {
+        unreachable!()
+    };
+    for number in 0..length {
+        model.parents = vec![fixture.root];
+        model.predecessors.clear();
+        model.description = format!("annotation continuation step {number}");
+        let object = tinytree_model::encode(
+            &tinytree_model::Object::Commit(model.clone()),
+            Default::default(),
+        )
+        .unwrap();
+        fixture
+            .store
+            .put("example", object.descriptor, &object.bytes, 0)
+            .unwrap();
+        fixture
+            .index
+            .ingest("example", object.descriptor, &object.bytes)
+            .unwrap();
+        fixture.root = tinytree_model::CommitId(object.descriptor.key.id.0);
+    }
+    fixture
+}
+fn annotation_reservation() -> q::AnnotationLimits {
+    q::AnnotationLimits {
+        work_nodes: 100_000,
+        work_edges: 1_000_000,
+        work_bytes: 32 * 1024 * 1024,
+        frontier: 8192,
+        read_bytes: 16 * 1024 * 1024,
+        diff_input_bytes: 16 * 1024 * 1024,
+        diff_lines: 1_000_000,
+        diff_work: 8_000_000,
+        diff_allocation_bytes: 16 * 1024 * 1024,
+        diff_depth: 64,
+    }
+}
+#[tokio::test]
+async fn checked_annotation_continuation_collects_deep_history_and_detaches_rpc_owners() {
+    let fixture = setup_annotation_chain(300);
+    let running = QueryRunning::start(fixture.service.clone(), QueryMode::Normal).await;
+    let mut config = running.config.clone();
+    config.limits.max_inflight = 1;
+    config.rpc.operation_timeout_ms = 30_000;
+    let client = NativeClient::connect(config).await.unwrap();
+    let scope = client.open_query_scope(vec![fixture.root]).await.unwrap();
+    let result_drops = Arc::new(AtomicUsize::new(0));
+    let rpc_drops = Arc::new(AtomicUsize::new(0));
+    let operation = client
+        .clone()
+        .with_lifetime_guard(Arc::new(LifetimeProbe(result_drops.clone())))
+        .with_rpc_lifetime_guard(Arc::new(LifetimeProbe(rpc_drops.clone())));
+    let frontier = operation
+        .collect_annotation_frontier_with_paging(
+            &scope,
+            &[fixture.root],
+            "BUILD.bazel",
+            4096,
+            annotation_reservation(),
+            7,
+            13,
+        )
+        .await
+        .unwrap();
+    assert_eq!(frontier.result().version, 3);
+    assert_eq!(
+        frontier.result().coverage,
+        q::HistoryCoverage::HistoryComplete as i32
+    );
+    assert_eq!(frontier.result().scanned_commits, 301);
+    assert_eq!(frontier.result().nodes.len(), 302);
+    assert!(running.counts.annotation_pages.load(Ordering::SeqCst) > 2);
+    let selected = frontier
+        .result()
+        .nodes
+        .last()
+        .unwrap()
+        .value
+        .as_ref()
+        .unwrap();
+    let body = operation
+        .read_annotation_input(&frontier, fixture.root, selected)
+        .await
+        .unwrap();
+    assert!(!body.result().data.is_empty());
+    client
+        .path_history(
+            &scope,
+            fixture.root,
+            "BUILD.bazel",
+            q::HistoryPolicy::LinearFixedPathV1,
+            1,
+        )
+        .await
+        .unwrap();
+    drop(operation);
+    assert_released(&rpc_drops).await;
+    assert_eq!(result_drops.load(Ordering::SeqCst), 0);
+    client.close_annotation_frontier(&frontier).await.unwrap();
+    drop(frontier);
+    drop(body);
+    assert_released(&result_drops).await;
+    client.close_query_scope(&scope).await.unwrap();
+    running.stop().await;
+}
+#[tokio::test]
+async fn checked_server_annotation_keeps_canonical_graph_remote_and_validates_final_bytes() {
+    let fixture = setup_annotation_chain(300);
+    let running = QueryRunning::start(fixture.service.clone(), QueryMode::Normal).await;
+    let mut config = running.config.clone();
+    config.limits.max_inflight = 1;
+    config.rpc.operation_timeout_ms = 30_000;
+    let client = NativeClient::connect(config).await.unwrap();
+    let scope = client.open_query_scope(vec![fixture.root]).await.unwrap();
+    let rpc_drops = Arc::new(AtomicUsize::new(0));
+    let operation = client
+        .clone()
+        .with_rpc_lifetime_guard(Arc::new(LifetimeProbe(rpc_drops.clone())));
+    let blame = operation
+        .collect_annotation_blame(
+            &scope,
+            fixture.root,
+            "BUILD.bazel",
+            4096,
+            annotation_reservation(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        blame.result().coverage,
+        q::HistoryCoverage::HistoryComplete as i32
+    );
+    assert_eq!(blame.result().scanned_commits, 301);
+    assert_eq!(
+        running.counts.annotation_nodes.load(Ordering::SeqCst),
+        0,
+        "canonical annotation returns bytes and ranges, not ancestry metadata"
+    );
+    assert_eq!(
+        running.counts.blames.load(Ordering::SeqCst),
+        0,
+        "no one-shot Blame restart"
+    );
+    drop(operation);
+    assert_released(&rpc_drops).await;
+    client
+        .path_history(
+            &scope,
+            fixture.root,
+            "BUILD.bazel",
+            q::HistoryPolicy::LinearFixedPathV1,
+            1,
+        )
+        .await
+        .unwrap();
+    client.close_annotation_blame(&blame).await.unwrap();
+    drop(blame);
+    client.close_query_scope(&scope).await.unwrap();
+    running.stop().await;
+    for mode in [
+        QueryMode::AnnotationAttributionHash,
+        QueryMode::AnnotationAttributionGraph,
+    ] {
+        let fixture = setup_query_retained();
+        let running = QueryRunning::start(fixture.service.clone(), mode).await;
+        let client = running.client().await;
+        let scope = client.open_query_scope(vec![fixture.root]).await.unwrap();
+        let error = client
+            .collect_annotation_blame(
+                &scope,
+                fixture.root,
+                "BUILD.bazel",
+                4096,
+                annotation_reservation(),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(error.code(), Code::DataLoss, "{mode:?}: {error}");
+        client.close_query_scope(&scope).await.unwrap();
+        running.stop().await;
+    }
+}
+#[tokio::test]
+async fn zero_node_annotation_progress_cannot_exceed_cursor_memory_or_page_admission() {
+    for (batch_bytes, max_pages, maximum_calls) in [(8192, 1024, 40), (32 * 1024 * 1024, 2, 3)] {
+        let fixture = setup_query_retained();
+        let running =
+            QueryRunning::start(fixture.service.clone(), QueryMode::AnnotationCursorFlood).await;
+        let mut config = running.config.clone();
+        config.limits.max_batch_bytes = batch_bytes;
+        config.limits.max_metadata_bytes = batch_bytes.min(config.limits.max_metadata_bytes);
+        config.limits.max_graph_pages = max_pages;
+        let client = NativeClient::connect(config).await.unwrap();
+        let scope = client.open_query_scope(vec![fixture.root]).await.unwrap();
+        let error = client
+            .collect_annotation_blame(
+                &scope,
+                fixture.root,
+                "BUILD.bazel",
+                4096,
+                annotation_reservation(),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(
+            error.code(),
+            Code::ResourceExhausted,
+            "{batch_bytes}/{max_pages}: {error}"
+        );
+        assert!(
+            running.counts.annotation_pages.load(Ordering::SeqCst) <= maximum_calls,
+            "refuse before an unbounded cursor allocation stream"
+        );
+        client.close_query_scope(&scope).await.unwrap();
+        running.stop().await;
+    }
+}
+
+#[tokio::test]
+async fn checked_annotation_refuses_actual_graph_capacity_before_aggregate_append() {
+    let fixture = setup_annotation_chain(12);
+    let running = QueryRunning::start(fixture.service.clone(), QueryMode::Normal).await;
+    let mut config = running.config.clone();
+    config.limits.max_batch_bytes = 8192;
+    config.limits.max_metadata_bytes = 8192;
+    let client = NativeClient::connect(config).await.unwrap();
+    let scope = client.open_query_scope(vec![fixture.root]).await.unwrap();
+    let error = client
+        .collect_annotation_frontier_with_paging(
+            &scope,
+            &[fixture.root],
+            "BUILD.bazel",
+            13,
+            annotation_reservation(),
+            4,
+            128,
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(error.code(), Code::ResourceExhausted);
+    assert_eq!(
+        error.message(),
+        "annotation aggregate allocation exceeded reservation"
+    );
+    assert!(
+        running.counts.annotation_nodes.load(Ordering::SeqCst) > 4,
+        "valid small pages fit physically before aggregate retention is refused"
+    );
+    client.close_query_scope(&scope).await.unwrap();
+    let scope = client.open_query_scope(vec![fixture.root]).await.unwrap();
+    // Untrusted opaque anchor inputs need admission even when an honest peer
+    // would reject their cardinality before emitting its copied header.
+    let anchors = (1..=64)
+        .map(|value| tinytree_model::CommitId([value; 32]))
+        .collect::<Vec<_>>();
+    let before = running.counts.annotation_pages.load(Ordering::SeqCst);
+    let error = client
+        .collect_annotation_frontier_with_paging(
+            &scope,
+            &anchors,
+            "BUILD.bazel",
+            1,
+            annotation_reservation(),
+            4,
+            128,
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(error.code(), Code::ResourceExhausted);
+    assert_eq!(
+        error.message(),
+        "annotation aggregate header exceeds reservation"
+    );
+    assert_eq!(
+        running.counts.annotation_pages.load(Ordering::SeqCst),
+        before,
+        "refuse all retained anchor-header copies before issuing frontier work"
+    );
+    client.close_query_scope(&scope).await.unwrap();
+    running.stop().await;
+}
+
+#[tokio::test]
+async fn checked_server_annotation_accepts_verified_empty_target_without_ancestry_scan() {
+    let mut fixture = setup_query_retained();
+    let (_, bytes) = fixture
+        .store
+        .read_metadata(
+            "example",
+            ObjectKey {
+                kind: Kind::Commit,
+                id: ObjectId(fixture.root.0),
+            },
+        )
+        .unwrap();
+    let tinytree_model::Object::Commit(mut commit) =
+        tinytree_model::decode(&bytes, Default::default()).unwrap()
+    else {
+        unreachable!()
+    };
+    let tree_id = commit.root_tree.terms[0];
+    let (_, bytes) = fixture
+        .store
+        .read_metadata(
+            "example",
+            ObjectKey {
+                kind: Kind::Tree,
+                id: ObjectId(tree_id.0),
+            },
+        )
+        .unwrap();
+    let tinytree_model::Object::Tree(mut tree) =
+        tinytree_model::decode(&bytes, Default::default()).unwrap()
+    else {
+        unreachable!()
+    };
+    let empty = tinytree_model::describe_file(&[]);
+    fixture.store.put("example", empty, &[], 0).unwrap();
+    tree.entries
+        .iter_mut()
+        .find(|entry| entry.name == "BUILD.bazel")
+        .unwrap()
+        .value = tinytree_model::TreeValue::File {
+        id: tinytree_model::FileId(empty.key.id.0),
+        executable: false,
+        size_bytes: 0,
+        copy_id: None,
+    };
+    let tree =
+        tinytree_model::encode(&tinytree_model::Object::Tree(tree), Default::default()).unwrap();
+    fixture
+        .store
+        .put("example", tree.descriptor, &tree.bytes, 0)
+        .unwrap();
+    commit.parents = vec![fixture.root];
+    commit.predecessors.clear();
+    commit.description = "empty annotation target".into();
+    commit.root_tree.terms = vec![tinytree_model::TreeId(tree.descriptor.key.id.0)];
+    let commit =
+        tinytree_model::encode(&tinytree_model::Object::Commit(commit), Default::default())
+            .unwrap();
+    fixture
+        .store
+        .put("example", commit.descriptor, &commit.bytes, 0)
+        .unwrap();
+    fixture
+        .index
+        .ingest("example", commit.descriptor, &commit.bytes)
+        .unwrap();
+    fixture.root = tinytree_model::CommitId(commit.descriptor.key.id.0);
+    let running = QueryRunning::start(fixture.service.clone(), QueryMode::Normal).await;
+    let client = running.client().await;
+    let scope = client.open_query_scope(vec![fixture.root]).await.unwrap();
+    let blame = client
+        .collect_annotation_blame(
+            &scope,
+            fixture.root,
+            "BUILD.bazel",
+            1,
+            annotation_reservation(),
+        )
+        .await
+        .unwrap();
+    assert!(blame.result().target_bytes.is_empty() && blame.result().ranges.is_empty());
+    assert!(blame.result().target.is_some());
+    assert_eq!(blame.result().scanned_commits, 0);
+    assert_eq!(running.counts.annotation_pages.load(Ordering::SeqCst), 1);
+    assert_eq!(running.counts.annotation_nodes.load(Ordering::SeqCst), 0);
+    client.close_annotation_blame(&blame).await.unwrap();
+    client.close_query_scope(&scope).await.unwrap();
+    running.stop().await;
+}
+
+#[tokio::test]
+async fn annotation_context_uses_command_deadline_not_first_attempt_timeout() {
+    let fixture = setup_annotation_chain(10);
+    let running = QueryRunning::start(fixture.service.clone(), QueryMode::AnnotationPageSlow).await;
+    let mut config = running.config.clone();
+    config.rpc.operation_timeout_ms = 10_000;
+    config.rpc.rpc_timeout_ms = 1000;
+    let client = NativeClient::connect(config).await.unwrap();
+    let scope = client.open_query_scope(vec![fixture.root]).await.unwrap();
+    let started = tokio::time::Instant::now();
+    let frontier = client
+        .collect_annotation_frontier_with_paging(
+            &scope,
+            &[fixture.root],
+            "BUILD.bazel",
+            4096,
+            annotation_reservation(),
+            1,
+            1,
+        )
+        .await
+        .unwrap();
+    assert!(
+        started.elapsed() > Duration::from_secs(1),
+        "multiple pages cross one attempt allowance"
+    );
+    assert_eq!(frontier.result().scanned_commits, 11);
+    client.close_annotation_frontier(&frontier).await.unwrap();
+    client.close_query_scope(&scope).await.unwrap();
+    running.stop().await;
+
+    let fixture = setup_query_retained();
+    let running = QueryRunning::start(
+        fixture.service.clone(),
+        QueryMode::AnnotationPageShortExpiry,
+    )
+    .await;
+    let client = running.client().await;
+    let scope = client.open_query_scope(vec![fixture.root]).await.unwrap();
+    let started = tokio::time::Instant::now();
+    let blame = client
+        .collect_annotation_blame(
+            &scope,
+            fixture.root,
+            "BUILD.bazel",
+            4096,
+            annotation_reservation(),
+        )
+        .await
+        .unwrap();
+    assert!(
+        blame.data_deadline() <= started + Duration::from_secs(3),
+        "a shorter returned context expiry narrows the checked data deadline"
+    );
+    client.close_annotation_blame(&blame).await.unwrap();
+    client.close_query_scope(&scope).await.unwrap();
+    running.stop().await;
+}
+
+#[tokio::test]
+async fn checked_annotation_continuation_rejects_unbound_or_nonprogressing_pages() {
+    for (mode, expected) in [
+        (QueryMode::AnnotationPageCursorEcho, Code::DataLoss),
+        (QueryMode::AnnotationPageSequence, Code::DataLoss),
+        (QueryMode::AnnotationPageCounters, Code::DataLoss),
+        (QueryMode::AnnotationPagePath, Code::DataLoss),
+        (QueryMode::AnnotationPageClosure, Code::DataLoss),
+        (QueryMode::AnnotationPageStalled, Code::DataLoss),
+        (QueryMode::AnnotationPageDuplicateNode, Code::DataLoss),
+        (QueryMode::AnnotationPageMissingParent, Code::DataLoss),
+        (QueryMode::AnnotationPageScannedCount, Code::DataLoss),
+        (QueryMode::AnnotationPageExpired, Code::DeadlineExceeded),
+    ] {
+        let fixture = setup_query_retained();
+        let running = QueryRunning::start(fixture.service.clone(), mode).await;
+        let client = running.client().await;
+        let scope = client.open_query_scope(vec![fixture.root]).await.unwrap();
+        let error = client
+            .collect_annotation_frontier_with_paging(
+                &scope,
+                &[fixture.root],
+                "BUILD.bazel",
+                4096,
+                annotation_reservation(),
+                1,
+                1,
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(error.code(), expected, "{mode:?}: {error}");
+        client.close_query_scope(&scope).await.unwrap();
+        running.stop().await;
+    }
+}
+#[tokio::test]
+async fn checked_annotation_continuation_accepts_already_charged_byte_boundary_output() {
+    let fixture = setup_query_retained();
+    let running = QueryRunning::start(
+        fixture.service.clone(),
+        QueryMode::AnnotationPagePendingNode,
+    )
+    .await;
+    let client = running.client().await;
+    let scope = client.open_query_scope(vec![fixture.root]).await.unwrap();
+    let frontier = client
+        .collect_annotation_frontier_with_paging(
+            &scope,
+            &[fixture.root],
+            "BUILD.bazel",
+            4096,
+            annotation_reservation(),
+            1,
+            1,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        frontier.result().coverage,
+        q::HistoryCoverage::HistoryComplete as i32
+    );
+    assert_eq!(frontier.result().nodes.len(), 2);
+    assert_eq!(
+        frontier
+            .result()
+            .nodes
+            .last()
+            .unwrap()
+            .revision
+            .as_ref()
+            .unwrap()
+            .value,
+        fixture.root.0
+    );
+    client.close_annotation_frontier(&frontier).await.unwrap();
+    client.close_query_scope(&scope).await.unwrap();
+    running.stop().await;
+}
+
+#[tokio::test]
+async fn checked_annotation_continuation_keeps_one_absolute_deadline() {
+    let fixture = setup_query_retained();
+    let running = QueryRunning::start(fixture.service.clone(), QueryMode::AnnotationPageSlow).await;
+    let client = running.client().await;
+    let scope = client.open_query_scope(vec![fixture.root]).await.unwrap();
+    let started = tokio::time::Instant::now();
+    let error = client
+        .clone()
+        .with_operation_deadline(started + Duration::from_millis(80))
+        .collect_annotation_frontier_with_paging(
+            &scope,
+            &[fixture.root],
+            "BUILD.bazel",
+            4096,
+            annotation_reservation(),
+            1,
+            1,
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(error.code(), Code::DeadlineExceeded);
+    assert!(started.elapsed() < Duration::from_millis(250));
+    client.close_query_scope(&scope).await.unwrap();
+    running.stop().await;
 }
 
 #[tokio::test]

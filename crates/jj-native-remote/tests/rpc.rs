@@ -5034,6 +5034,7 @@ async fn canonical_query_install_chunks_operator_limits_and_preserves_lazy_prove
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn real_broker_query_then_lazy_object_reads_share_the_captured_remote_adapter() {
+    use native_broker::query_protocol as q;
     use native_broker::{NativeQueryIo, OpenQueryScope};
     use std::collections::HashMap;
     let (_serverdir, store, fixture, head, historical) = seed_history(4);
@@ -5163,13 +5164,51 @@ async fn real_broker_query_then_lazy_object_reads_share_the_captured_remote_adap
     );
     // Annotation runs through this same real broker -> RemoteQueryIo -> checked
     // SDK -> authenticated server chain. Returned context bytes remain local.
-    let annotation = native_broker::OpenAnnotationFrontier { limits: None,
-        scope, anchors: vec![selected], path: "historical-0000.txt".into(), max_commits: 1,
+    let annotation = native_broker::OpenAnnotationFrontier {
+        limits: Some(tinytree_client::query_protocol::AnnotationLimits {
+            work_nodes: 100_000,
+            work_edges: 1_000_000,
+            work_bytes: 32 * 1024 * 1024,
+            frontier: 8192,
+            read_bytes: 16 * 1024 * 1024,
+            diff_input_bytes: 16 * 1024 * 1024,
+            diff_lines: 100_000,
+            diff_work: 8_000_000,
+            diff_allocation_bytes: 16 * 1024 * 1024,
+            diff_depth: 64,
+        }),
+        scope,
+        anchors: vec![selected],
+        path: "historical-0000.txt".into(),
+        max_commits: 1,
     };
     assert_eq!(query.annotation_capabilities(Arc::new(())).await.unwrap().value,
         native_broker::BlameCapabilities::Explicit { supported: true, authorized: true });
     let frontier = query.open_annotation_frontier(annotation.clone(), Arc::new(())).await.unwrap();
     assert_eq!(frontier.value.context, scope);
+    assert_eq!(frontier.value.version, 3);
+    let before_replay = counts.query_rpcs.load(Ordering::SeqCst);
+    let replayed = query
+        .open_annotation_frontier(annotation.clone(), Arc::new(()))
+        .await
+        .unwrap();
+    assert_eq!(replayed.value, frontier.value);
+    assert_eq!(
+        counts.query_rpcs.load(Ordering::SeqCst),
+        before_replay,
+        "completed broker replay reuses the checked aggregate, not stale server cursors"
+    );
+    drop(replayed);
+    let mut changed = annotation.clone();
+    changed.max_commits += 1;
+    assert_eq!(
+        query
+            .open_annotation_frontier(changed, Arc::new(()))
+            .await
+            .unwrap_err()
+            .code(),
+        tonic::Code::FailedPrecondition
+    );
     assert_eq!(frontier.value.scanned_commits, 1);
     assert_eq!(frontier.value.nodes.len(), 2);
     let target = frontier.value.nodes.iter().find(|node|node.revision.as_ref().unwrap().value == selected.0).unwrap();
@@ -5184,11 +5223,126 @@ async fn real_broker_query_then_lazy_object_reads_share_the_captured_remote_adap
         "frontier metadata must not become eager generic TREE hydration");
     // Retained frontier/input results cannot retain the only RPC slot, and a
     // closed annotation context does not disable other queries on the scope.
-    query.read_commit(scope, selected, Arc::new(())).await.unwrap();
-    query.close_annotation_frontier(scope, Arc::new(())).await.unwrap();
-    assert_eq!(query.open_annotation_frontier(annotation, Arc::new(())).await.unwrap_err().code(), tonic::Code::FailedPrecondition);
-    query.read_commit(scope, selected, Arc::new(())).await.unwrap();
-    drop(frontier); drop(demanded);
+    query
+        .read_commit(scope, selected, Arc::new(()))
+        .await
+        .unwrap();
+    query
+        .close_annotation_frontier(scope, Arc::new(()))
+        .await
+        .unwrap();
+    assert_eq!(
+        query
+            .open_annotation_frontier(annotation.clone(), Arc::new(()))
+            .await
+            .unwrap_err()
+            .code(),
+        tonic::Code::FailedPrecondition
+    );
+    query
+        .read_commit(scope, selected, Arc::new(()))
+        .await
+        .unwrap();
+    drop(frontier);
+    drop(demanded);
+    let attributed_scope = query
+        .fork_scope(
+            native_broker::ForkQueryScope {
+                parent: scope,
+                expected_cloud_source_digest: None,
+                overlay: vec![],
+                replay_key: [43; 32],
+            },
+            Arc::new(()),
+        )
+        .await
+        .unwrap();
+    let attributed = native_broker::ScopedPathQuery {
+        scope: attributed_scope.value.handle,
+        revision: selected,
+        path: "historical-0000.txt".into(),
+        policy: q::HistoryPolicy::JjResolvedFixedPathV1,
+        max_commits: 1,
+    };
+    let reservation = annotation.limits.clone().unwrap();
+    let blame = query
+        .blame_with_limits(attributed.clone(), reservation.clone(), Arc::new(()))
+        .await
+        .unwrap();
+    assert_eq!(
+        blame.value.coverage,
+        q::HistoryCoverage::HistoryComplete as i32
+    );
+    let before_replay = counts.query_rpcs.load(Ordering::SeqCst);
+    let replayed = query
+        .blame_with_limits(attributed.clone(), reservation.clone(), Arc::new(()))
+        .await
+        .unwrap();
+    assert_eq!(replayed.value, blame.value);
+    assert_eq!(
+        counts.query_rpcs.load(Ordering::SeqCst),
+        before_replay,
+        "completed server attribution replays without restarting pages"
+    );
+    let mut changed = reservation;
+    changed.work_nodes -= 1;
+    assert_eq!(
+        query
+            .blame_with_limits(attributed, changed, Arc::new(()))
+            .await
+            .unwrap_err()
+            .code(),
+        tonic::Code::FailedPrecondition
+    );
+    query
+        .close_annotation_frontier(attributed_scope.value.handle, Arc::new(()))
+        .await
+        .unwrap();
+    query
+        .close_scope(attributed_scope.value.handle, Arc::new(()))
+        .await
+        .unwrap();
+    drop(blame);
+    drop(replayed);
+    drop(attributed_scope);
+    let bounded_scope = query
+        .fork_scope(
+            native_broker::ForkQueryScope {
+                parent: scope,
+                expected_cloud_source_digest: None,
+                overlay: vec![],
+                replay_key: [44; 32],
+            },
+            Arc::new(()),
+        )
+        .await
+        .unwrap();
+    let mut tiny = annotation.limits.clone().unwrap();
+    tiny.work_nodes = 1;
+    assert_eq!(
+        query
+            .blame_with_limits(
+                native_broker::ScopedPathQuery {
+                    scope: bounded_scope.value.handle,
+                    revision: selected,
+                    path: "historical-0000.txt".into(),
+                    policy: q::HistoryPolicy::JjResolvedFixedPathV1,
+                    max_commits: 1
+                },
+                tiny,
+                Arc::new(())
+            )
+            .await
+            .unwrap_err()
+            .code(),
+        tonic::Code::ResourceExhausted,
+        "the broker must not drop an explicit command reservation"
+    );
+    query
+        .close_scope(bounded_scope.value.handle, Arc::new(()))
+        .await
+        .unwrap();
+    drop(bounded_scope);
 
     // A private COMMIT-only overlay is intentionally admitted for graph queries,
     // but its ID is rejected locally before a new frontier RPC can send it.

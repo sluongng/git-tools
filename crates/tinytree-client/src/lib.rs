@@ -5,7 +5,6 @@ mod config;
 mod transport;
 mod verified;
 pub use client::NativeClient;
-pub use tinytree_proto::PublicationFailureReason;
 pub use client::capabilities::{Capabilities, CapabilityFeature, FeatureCapability, RootReadiness};
 pub use client::cloud::{
     CloudCapture, CloudCaptureDescriptor, CloudCaptureId, CloudCapturedPublishIntent,
@@ -16,8 +15,8 @@ pub use client::cloud::{
     RetainedVersionSelector, VerifiedCapturedVersion, VerifiedRetainedVersion,
 };
 pub use client::history::{
-    CheckedAnnotationFrontier, CheckedAnnotationInput, CheckedBlame, CheckedPathHistory,
-    CheckedPathHistoryCollection,
+    CheckedAnnotationBlame, CheckedAnnotationFrontier, CheckedAnnotationInput, CheckedBlame,
+    CheckedPathHistory, CheckedPathHistoryCollection,
 };
 pub use client::query::{
     ChangeMatch, ChangePrefix, ChangeTarget, CheckedGraphPage, CheckedGraphQuery, CheckedGraphRows,
@@ -26,6 +25,7 @@ pub use client::query::{
 };
 pub use client::search::{CheckedSearch, CheckedSearchPage};
 pub use config::{Config, ConfigError, Limits, Tls};
+pub use tinytree_proto::PublicationFailureReason;
 pub use tinytree_proto::cloud_v1 as cloud_protocol;
 pub use tinytree_proto::query_v1 as query_protocol;
 pub use tinytree_proto::v1 as protocol;

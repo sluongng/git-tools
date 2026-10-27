@@ -1130,6 +1130,7 @@ impl NativeQueryIo for BrokerQueryClient {
                     path: input.path.clone(),
                     policy: input.policy as i32,
                     max_commits: input.max_commits,
+                    annotation_limits: None,
                 };
                 async move {
                     Ok(client
@@ -1147,29 +1148,20 @@ impl NativeQueryIo for BrokerQueryClient {
         input: ScopedPathQuery,
         owner: QueryOwner,
     ) -> Result<QueryReply<q::BlameResult>, Status> {
-        input.validate(self.inner.config.max_query_bytes)?;
-        self.preflight(input.path.len().saturating_add(128))?;
-        let expected = input.clone();
-        let result = self
-            .execute(owner, move |mut client, deadline, store_id, cap| {
-                let payload = p::QueryPathRequest {
-                    store_id,
-                    scope: input.scope.to_vec(),
-                    revision: input.revision.0.to_vec(),
-                    path: input.path.clone(),
-                    policy: input.policy as i32,
-                    max_commits: input.max_commits,
-                };
-                async move {
-                    Ok(client
-                        .blame(request(payload, deadline, cap)?)
-                        .await?
-                        .into_inner())
-                }
-            })
-            .await?;
-        expected.check_blame(&result.value, self.inner.config.model_limits())?;
-        Ok(result)
+        self.annotation_blame_call(input, None, owner).await
+    }
+    async fn blame_with_limits(
+        &self,
+        input: ScopedPathQuery,
+        limits: q::AnnotationLimits,
+        owner: QueryOwner,
+    ) -> Result<QueryReply<q::BlameResult>, Status> {
+        if !annotation_limits_valid(&limits) {
+            return Err(Status::invalid_argument(
+                "positive annotation limits required",
+            ));
+        }
+        self.annotation_blame_call(input, Some(limits), owner).await
     }
     async fn search(
         &self,
@@ -1244,7 +1236,47 @@ impl NativeQueryIo for BrokerQueryClient {
 }
 
 impl BrokerQueryClient {
-    async fn annotation_frontier_call(&self,input:OpenAnnotationFrontier,owner:QueryOwner,limited:bool)->Result<QueryReply<q::AnnotationFrontier>,Status>{
+    async fn annotation_blame_call(
+        &self,
+        input: ScopedPathQuery,
+        limits: Option<q::AnnotationLimits>,
+        owner: QueryOwner,
+    ) -> Result<QueryReply<q::BlameResult>, Status> {
+        input.validate(self.inner.config.max_query_bytes)?;
+        self.preflight(input.path.len().saturating_add(128))?;
+        let expected = input.clone();
+        let result = self
+            .execute(owner, move |mut client, deadline, store_id, cap| {
+                let payload = p::QueryPathRequest {
+                    store_id,
+                    scope: input.scope.to_vec(),
+                    revision: input.revision.0.to_vec(),
+                    path: input.path.clone(),
+                    policy: input.policy as i32,
+                    max_commits: input.max_commits,
+                    annotation_limits: limits.clone(),
+                };
+                let limited = limits.is_some();
+                async move {
+                    let request = request(payload, deadline, cap)?;
+                    Ok(if limited {
+                        client.blame_with_limits(request).await?
+                    } else {
+                        client.blame(request).await?
+                    }
+                    .into_inner())
+                }
+            })
+            .await?;
+        expected.check_blame(&result.value, self.inner.config.model_limits())?;
+        Ok(result)
+    }
+    async fn annotation_frontier_call(
+        &self,
+        input: OpenAnnotationFrontier,
+        owner: QueryOwner,
+        limited: bool,
+    ) -> Result<QueryReply<q::AnnotationFrontier>, Status> {
         input.validate(self.inner.config.max_query_bytes)?;
         let expected = input.clone();
         let result = self

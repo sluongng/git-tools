@@ -599,7 +599,10 @@ impl OpenAnnotationFrontier {
         if value.context != self.scope
             || value.scope_digest.len() != 32
             || value.index_epoch.len() != 16
-            || value.version != if self.limits.is_some() { 2 } else { 1 }
+            || !matches!(
+                (self.limits.is_some(), value.version),
+                (true, 2 | 3) | (false, 1)
+            )
             || value.path != self.path
             || value.expires_at_unix_seconds <= 0
             || value
@@ -891,8 +894,31 @@ fn search_integrity() -> Status {
 /// or ordinary-root fallback is permitted.
 #[async_trait]
 pub trait NativeQueryIo: Send + Sync + std::fmt::Debug {
-    async fn annotation_capabilities(&self, _owner: QueryOwner) -> Result<QueryReply<BlameCapabilities>, Status> { Err(Status::unimplemented("annotation frontier negotiation unavailable")) }
-    async fn open_annotation_frontier(&self, _input: OpenAnnotationFrontier, _owner: QueryOwner) -> Result<QueryReply<q::AnnotationFrontier>, Status> { Err(Status::unimplemented("annotation frontier unavailable")) }
+    async fn annotation_capabilities(
+        &self,
+        _owner: QueryOwner,
+    ) -> Result<QueryReply<BlameCapabilities>, Status> {
+        Err(Status::unimplemented(
+            "annotation frontier negotiation unavailable",
+        ))
+    }
+    async fn blame_with_limits(
+        &self,
+        _input: ScopedPathQuery,
+        _limits: q::AnnotationLimits,
+        _owner: QueryOwner,
+    ) -> Result<QueryReply<q::BlameResult>, Status> {
+        Err(Status::unimplemented(
+            "bounded annotation blame is unavailable",
+        ))
+    }
+    async fn open_annotation_frontier(
+        &self,
+        _input: OpenAnnotationFrontier,
+        _owner: QueryOwner,
+    ) -> Result<QueryReply<q::AnnotationFrontier>, Status> {
+        Err(Status::unimplemented("annotation frontier unavailable"))
+    }
     /// Explicit opt-in: old providers must refuse BEFORE admitting unbounded
     /// frontier work, rather than erase lowering fields and fail on the echo.
     async fn open_limited_annotation_frontier(&self, _input: OpenAnnotationFrontier, _owner: QueryOwner) -> Result<QueryReply<q::AnnotationFrontier>, Status> { Err(Status::unimplemented("limited annotation frontier unavailable")) }

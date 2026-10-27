@@ -421,6 +421,28 @@ impl Client {
         )
         .await
     }
+    pub async fn open_annotation_frontier_paged(
+        &mut self,
+        request: Request<q::OpenAnnotationFrontierPagedRequest>,
+    ) -> Result<Response<q::AnnotationFrontierPage>, Status> {
+        self.unary(
+            request,
+            "/tinytree.query.v1.RepositoryQuery/OpenAnnotationFrontierPaged",
+            Shape::AnnotationFrontierPage,
+        )
+        .await
+    }
+    pub async fn continue_annotation_frontier(
+        &mut self,
+        request: Request<q::ContinueAnnotationFrontierRequest>,
+    ) -> Result<Response<q::AnnotationFrontierPage>, Status> {
+        self.unary(
+            request,
+            "/tinytree.query.v1.RepositoryQuery/ContinueAnnotationFrontier",
+            Shape::AnnotationFrontierPage,
+        )
+        .await
+    }
     pub async fn read_annotation_input(
         &mut self,
         request: Request<q::ReadAnnotationInputRequest>,
@@ -651,6 +673,8 @@ pub(crate) enum Shape {
     SearchHit,
     PathHistory,
     AnnotationFrontier,
+    AnnotationFrontierPage,
+    AnnotationUsage,
     AnnotationLimits,
     AnnotationNode,
     AnnotationPathValue,
@@ -913,6 +937,7 @@ fn scan(
                     | (Shape::AnnotationFrontier, 4 | 8 | 9)
                     | (Shape::AnnotationNode, 3)
                     | (Shape::AnnotationLimits, 1..=10)
+                    | (Shape::AnnotationFrontierPage, 7..=11)
                     | (Shape::HistoryPathState, 1)
             )
         {
@@ -920,12 +945,15 @@ fn scan(
             let value = varint(data, &mut offset)?;
             let valid = match (shape, number) {
                 (Shape::Capabilities, _) => value == 1,
-                (Shape::AnnotationFrontier, 4) => matches!(value, 1 | 2),
-                (Shape::FeatureCapability, _) => (1..=13).contains(&value),
-                (Shape::AnnotationFrontier, 8) => (1..=7).contains(&value),
+                (Shape::AnnotationFrontier, 4) => matches!(value, 1 | 2 | 3),
+                (Shape::FeatureCapability, _) => (1..=14).contains(&value),
+                (Shape::AnnotationFrontier, 8) => (0..=7).contains(&value),
                 (Shape::AnnotationFrontier, 9) => value <= u32::MAX as u64,
                 (Shape::AnnotationLimits, _) => value > 0 && value <= usize::MAX as u64,
                 (Shape::AnnotationNode, 3) => value <= 1,
+                (Shape::AnnotationFrontierPage, 7..=9) => value > 0 && value <= u32::MAX as u64,
+                (Shape::AnnotationFrontierPage, 10) => (1..=4).contains(&value),
+                (Shape::AnnotationFrontierPage, 11) => value <= u32::MAX as u64,
                 (Shape::HistoryPathState, 1) => (1..=4).contains(&value),
                 _ => false,
             };
@@ -951,6 +979,7 @@ fn scan(
                 && matches!(
                     (shape, number),
                     (Shape::FeatureCapability, 2 | 3)
+                        | (Shape::AnnotationFrontierPage, 4)
                         | (Shape::LandingJob, 3)
                         | (Shape::FactAnswer, 1 | 2 | 5)
                         | (Shape::ChangeTarget, 2)
@@ -1034,7 +1063,10 @@ fn scan(
         }
         Shape::PathHistoryEntry => (1 << 1) | (1 << 2) | (1 << 3),
         Shape::AnnotationFrontier => {
-            (1 << 1) | (1 << 2) | (1 << 3) | (1 << 4) | (1 << 5) | (1 << 6) | (1 << 7) | (1 << 8)
+            (1 << 1) | (1 << 2) | (1 << 3) | (1 << 4) | (1 << 5) | (1 << 6) | (1 << 7)
+        }
+        Shape::AnnotationFrontierPage => {
+            (1 << 1) | (1 << 6) | (1 << 7) | (1 << 8) | (1 << 9) | (1 << 10)
         }
         Shape::AnnotationLimits => (1 << 11) - 2,
         Shape::AnnotationNode => (1 << 1) | (1 << 5) | (1 << 6),
@@ -1158,6 +1190,12 @@ fn rule(shape: Shape, n: u32, l: &Limits) -> Option<(u8, Option<Shape>, usize, u
             4 * std::mem::size_of::<q::AnnotationNode>(),
         ),
         (Shape::AnnotationFrontier, 11) => nested(Shape::AnnotationLimits),
+        (Shape::AnnotationFrontierPage, 1) => nested(Shape::AnnotationFrontier),
+        (Shape::AnnotationFrontierPage, 2) => text(32),
+        (Shape::AnnotationFrontierPage, 3 | 4 | 5 | 7..=11) => scalar(),
+        (Shape::AnnotationFrontierPage, 6) => nested(Shape::AnnotationUsage),
+        (Shape::AnnotationFrontierPage, 12) => nested(Shape::Blame),
+        (Shape::AnnotationUsage, 1..=4) => scalar(),
         (Shape::AnnotationLimits, 1..=10) => scalar(),
         (Shape::AnnotationNode, 1) | (Shape::AnnotationInput, 2) => nested(Shape::CommitId),
         (Shape::AnnotationNode, 2) => repeated(
@@ -1224,7 +1262,7 @@ fn rule(shape: Shape, n: u32, l: &Limits) -> Option<(u8, Option<Shape>, usize, u
         (Shape::Capabilities, 2) => text(128),
         (Shape::Capabilities, 3) => repeated(
             Shape::FeatureCapability,
-            13,
+            14,
             4 * std::mem::size_of::<p::FeatureCapability>(),
         ),
         (Shape::CloudWorkspacePage, 1) => repeated(
@@ -1452,7 +1490,7 @@ mod tests {
         // produce, including a u32-truncating scalar before Prost decoding.
         for (name, nested) in [
             ("nonboolean support", vec![8, 1, 16, 2]),
-            ("next unknown feature", vec![8, 14]),
+            ("next unknown feature", vec![8, 15]),
             ("unknown feature", vec![8, 99]),
             (
                 "u32 truncating feature",
@@ -1473,7 +1511,7 @@ mod tests {
                     supported: false,
                     authorized: false
                 };
-                14
+                15
             ],
             root_readiness: 1,
         }

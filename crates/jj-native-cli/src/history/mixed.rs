@@ -11,7 +11,7 @@ use tinytree_model as m;
 const SLICE_BYTES: usize = MAX_LOCAL_BYTES / 2;
 const SLICE_WORK: usize = MAX_DIFF_WORK / 2;
 const SLICE_FRONTIER: usize = 8192;
-fn remote_limits() -> q::AnnotationLimits {
+pub(super) fn remote_limits() -> q::AnnotationLimits {
     q::AnnotationLimits {
         work_nodes: SLICE_WORK as u64,
         work_edges: SLICE_WORK as u64,
@@ -174,7 +174,9 @@ pub(super) async fn enabled(
     if options.hunk_level != jj_lib::files::FileMergeHunkLevel::Line
         || options.same_change != jj_lib::merge::SameChange::Accept
     {
-        return Ok(false);
+        return Err(user_error(
+            "native annotation requires line/accept merge semantics",
+        ));
     }
     use native_broker::BlameCapabilities as C;
     match query.annotation_capabilities(Arc::new(())).await {
@@ -192,9 +194,13 @@ pub(super) async fn enabled(
                 supported: false,
                 authorized: true,
             }
-            | C::LegacyUnnegotiated => Ok(false),
+            | C::LegacyUnnegotiated => {
+                Err(user_error("native annotation continuation is unsupported"))
+            }
         },
-        Err(error) if error.code() == tonic::Code::Unimplemented => Ok(false),
+        Err(error) if error.code() == tonic::Code::Unimplemented => {
+            Err(user_error("native annotation continuation is unsupported"))
+        }
         Err(error) => Err(failure(error)),
     }
 }
@@ -682,10 +688,10 @@ impl engine::ContentSource for Reader {
                 .map_err(|_| user_error("mixed annotation private input deadline exceeded"))?
             })?
         };
-        if bytes.len() != size
-            || m::describe_file(&bytes).key.id.0 != id.0
-            || count_lines(&bytes) > MAX_LINES
-        {
+        if count_lines(&bytes) > MAX_LINES {
+            return Err(user_error("mixed annotation content limit exceeded"));
+        }
+        if bytes.len() != size || m::describe_file(&bytes).key.id.0 != id.0 {
             return Err(user_error(
                 "mixed annotation exact FILE verification failed",
             ));

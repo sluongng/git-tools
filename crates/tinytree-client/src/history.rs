@@ -149,6 +149,96 @@ fn footprint_header(
         + boundary.map_or(0, |v| v.value.capacity())
         + 1024
 }
+fn check_blame_result(
+    scope: &CheckedScopeHandle,
+    revision: CommitId,
+    path: &str,
+    policy: q::HistoryPolicy,
+    max_commits: u32,
+    reply: &q::BlameResult,
+    limits: &crate::Limits,
+) -> Result<usize, Status> {
+    let complete = source(
+        scope,
+        revision,
+        &path,
+        policy,
+        &reply.scope_digest,
+        &reply.index_epoch,
+        reply.revision.as_ref(),
+        &reply.path,
+        reply.policy,
+        reply.coverage,
+        reply.boundary.as_ref(),
+        reply.scanned_commits,
+        if max_commits == 0 {
+            limits.max_graph_objects as u32
+        } else {
+            max_commits
+        },
+    )?;
+    let mut retained = footprint_header(
+        &reply.scope_digest,
+        &reply.index_epoch,
+        reply.revision.as_ref(),
+        &reply.path,
+        reply.boundary.as_ref(),
+    ) + reply.target_bytes.capacity()
+        + reply.ranges.capacity() * std::mem::size_of::<q::BlameRange>();
+    let Some(target) = &reply.target else {
+        if complete || !reply.target_bytes.is_empty() || !reply.ranges.is_empty() {
+            return Err(integrity());
+        }
+        return Ok(retained);
+    };
+    let target = parse_descriptor(target)?;
+    if target.key.kind != Kind::File
+        || target.size_bytes != reply.target_bytes.len() as u64
+        || target.size_bytes > limits.max_file_bytes
+        || tinytree_model::describe_file(&reply.target_bytes) != target
+    {
+        return Err(integrity());
+    }
+    let descriptor = reply.target.as_ref().unwrap();
+    retained += descriptor.content_blake3.capacity()
+        + descriptor.key.as_ref().unwrap().native_id.capacity();
+    let lines = reply.target_bytes.split_inclusive(|b| *b == b'\n').count();
+    if reply.ranges.len() > limits.max_query_edges || lines > u32::MAX as usize {
+        return Err(integrity());
+    }
+    let mut next = 0;
+    let mut unresolved = false;
+    for range in &reply.ranges {
+        if range.start_line != next
+            || range.end_line <= range.start_line
+            || range.end_line as usize > lines
+        {
+            return Err(integrity());
+        }
+        next = range.end_line;
+        if let Some(origin) = &range.origin {
+            if id(Some(origin))? == CommitId::ROOT
+                || range
+                    .original_line
+                    .checked_add(range.end_line - range.start_line)
+                    .is_none()
+            {
+                return Err(integrity());
+            }
+            retained += origin.value.capacity();
+        } else {
+            if range.original_line != 0 {
+                return Err(integrity());
+            }
+            unresolved = true;
+        }
+    }
+    if next as usize != lines || (complete && unresolved) {
+        return Err(integrity());
+    }
+    Ok(retained)
+}
+
 impl NativeClient {
     fn history_input(
         &self,
@@ -537,87 +627,15 @@ impl NativeClient {
         let (reply, retained, _owner) = tokio::time::timeout_at(
             deadline,
             tokio::task::spawn_blocking(move || {
-                let retained = (|| {
-                    let complete = source(
-                        &captured,
-                        revision,
-                        &path,
-                        policy,
-                        &reply.scope_digest,
-                        &reply.index_epoch,
-                        reply.revision.as_ref(),
-                        &reply.path,
-                        reply.policy,
-                        reply.coverage,
-                        reply.boundary.as_ref(),
-                        reply.scanned_commits,
-                        if max_commits == 0 {
-                            limits.max_graph_objects as u32
-                        } else {
-                            max_commits
-                        },
-                    )?;
-                    let mut retained = footprint_header(
-                        &reply.scope_digest,
-                        &reply.index_epoch,
-                        reply.revision.as_ref(),
-                        &reply.path,
-                        reply.boundary.as_ref(),
-                    ) + reply.target_bytes.capacity()
-                        + reply.ranges.capacity() * std::mem::size_of::<q::BlameRange>();
-                    let Some(target) = &reply.target else {
-                        if complete || !reply.target_bytes.is_empty() || !reply.ranges.is_empty() {
-                            return Err(integrity());
-                        }
-                        return Ok(retained);
-                    };
-                    let target = parse_descriptor(target)?;
-                    if target.key.kind != Kind::File
-                        || target.size_bytes != reply.target_bytes.len() as u64
-                        || target.size_bytes > limits.max_file_bytes
-                        || tinytree_model::describe_file(&reply.target_bytes) != target
-                    {
-                        return Err(integrity());
-                    }
-                    let descriptor = reply.target.as_ref().unwrap();
-                    retained += descriptor.content_blake3.capacity()
-                        + descriptor.key.as_ref().unwrap().native_id.capacity();
-                    let lines = reply.target_bytes.split_inclusive(|b| *b == b'\n').count();
-                    if reply.ranges.len() > limits.max_query_edges || lines > u32::MAX as usize {
-                        return Err(integrity());
-                    }
-                    let mut next = 0;
-                    let mut unresolved = false;
-                    for range in &reply.ranges {
-                        if range.start_line != next
-                            || range.end_line <= range.start_line
-                            || range.end_line as usize > lines
-                        {
-                            return Err(integrity());
-                        }
-                        next = range.end_line;
-                        if let Some(origin) = &range.origin {
-                            if id(Some(origin))? == CommitId::ROOT
-                                || range
-                                    .original_line
-                                    .checked_add(range.end_line - range.start_line)
-                                    .is_none()
-                            {
-                                return Err(integrity());
-                            }
-                            retained += origin.value.capacity();
-                        } else {
-                            if range.original_line != 0 {
-                                return Err(integrity());
-                            }
-                            unresolved = true;
-                        }
-                    }
-                    if next as usize != lines || (complete && unresolved) {
-                        return Err(integrity());
-                    }
-                    Ok(retained)
-                })();
+                let retained = check_blame_result(
+                    &captured,
+                    revision,
+                    &path,
+                    policy,
+                    max_commits,
+                    &reply,
+                    &limits,
+                );
                 (reply, retained, worker_owner)
             }),
         )
@@ -632,4 +650,4 @@ impl NativeClient {
 
 #[path = "history/annotation.rs"]
 mod annotation;
-pub use annotation::{CheckedAnnotationFrontier, CheckedAnnotationInput};
+pub use annotation::{CheckedAnnotationBlame, CheckedAnnotationFrontier, CheckedAnnotationInput};
