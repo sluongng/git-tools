@@ -7450,11 +7450,20 @@ async fn annotation_frontier_pages_preserve_one_deep_source_and_budget() {
         size_bytes:selected_file.size_bytes,copy_id:None,
     };
     let mut head = None;
+    let (mut base, mut short_head) = (None, None);
     for change in 0..300usize {
         let parents = head.into_iter().collect::<Vec<_>>();
         head = Some(history_commit(&store, &index, &parents, Some(content.clone()), change as u8).descriptor.key);
+        if change == 0 { base = head; }
+        if change == 3 { short_head = head; }
     }
     let head = head.unwrap();
+    let empty = history_commit(&store, &index, &[head], Some(history_file(&store,b"",false)), 31).descriptor.key;
+    let absent = history_commit(&store, &index, &[head], None, 32).descriptor.key;
+    let empty_tree=tinytree_model::encode(&Object::Tree(tinytree_model::Tree{entries:Vec::new()}),Limits::default()).unwrap();
+    store.put("alpha",empty_tree.descriptor,&empty_tree.bytes,0).unwrap();
+    let directory=history_commit(&store,&index,&[head],Some(tinytree_model::TreeValue::Tree(TreeId(empty_tree.descriptor.key.id.0))),33).descriptor.key;
+
     // A body outside the selected path must not be needed for discovery/selection.
     let _unrelated = history_file(&store, &vec![b'z'; 64 * 1024], false);
     let mut config = ServiceConfig::default();
@@ -7469,7 +7478,7 @@ async fn annotation_frontier_pages_preserve_one_deep_source_and_budget() {
     let open = q::OpenAnnotationFrontierPagedRequest {
         input: Some(q::OpenAnnotationFrontierRequest { scope:scope.key.clone(), version:3,
             anchors:vec![query_id(head)], path:"file".into(), max_commits:300, limits:Some(limits) }),
-        page_size:7, scan_quantum:17,
+        page_size:7, scan_quantum:17, server_attribution:false,
     };
     assert_eq!(client.open_annotation_frontier_paged(request(open.clone(), BETA)).await.unwrap_err().code(), Code::PermissionDenied);
     let first = client.open_annotation_frontier_paged(request(open.clone(), ALPHA)).await.unwrap().into_inner();
@@ -7531,16 +7540,84 @@ async fn annotation_frontier_pages_preserve_one_deep_source_and_budget() {
     client.close_annotation_frontier(request(q::CloseAnnotationFrontierRequest { scope:scope.key.clone(),context:final_frontier.context.clone() },ALPHA)).await.unwrap();
     assert_eq!(client.open_annotation_frontier_paged(request(open.clone(), ALPHA)).await.unwrap_err().code(),Code::FailedPrecondition);
 
+    // Canonical-only mode returns just the final target/origins, never the
+    // canonical ancestry nodes collected by the mixed/private adapter.
+    let attributed_scope=query_ready(&mut client,&[head],184).await;
+    let mut attributed=open.clone();
+    attributed.server_attribution=true;
+    attributed.input.as_mut().unwrap().scope=attributed_scope.key.clone();
+    let mut page=client.open_annotation_frontier_paged(request(attributed.clone(),ALPHA)).await.unwrap().into_inner();
+    let mut changed_mode=attributed.clone();changed_mode.server_attribution=false;
+    assert_eq!(client.open_annotation_frontier_paged(request(changed_mode,ALPHA)).await.unwrap_err().code(),Code::FailedPrecondition);
+    let mut last_advance=None;let mut advances=0;
+    loop {
+        assert!(page.frontier.as_ref().unwrap().nodes.is_empty());
+        assert_eq!(page.emitted_nodes,0,"server mode never transfers canonical graph nodes");
+        if !page.has_more { break; }
+        assert!(page.blame.is_none());assert_eq!(page.frontier.as_ref().unwrap().coverage,0);
+        let next=q::ContinueAnnotationFrontierRequest {scope:attributed_scope.key.clone(),context:page.frontier.as_ref().unwrap().context.clone(),cursor:page.next_cursor.clone()};
+        page=client.continue_annotation_frontier(request(next.clone(),ALPHA)).await.unwrap().into_inner();
+        last_advance=Some(next);advances+=1;assert!(advances<200);
+    }
+    assert!(advances>10);
+    let blamed=page.blame.as_ref().unwrap();
+    assert_eq!(blamed.coverage,q::HistoryCoverage::HistoryComplete as i32);
+    assert_eq!(blamed.target_bytes,b"selected\n");assert_eq!(blamed.scanned_commits,300);
+    assert_eq!(expanded_origins(blamed),vec![Some((base.unwrap().id.0.to_vec(),0))]);
+    assert_eq!(client.continue_annotation_frontier(request(last_advance.unwrap(),ALPHA)).await.unwrap().into_inner(),page);
+    assert_eq!(client.read_annotation_input(request(q::ReadAnnotationInputRequest{
+        scope:attributed_scope.key.clone(),context:page.frontier.as_ref().unwrap().context.clone(),revision:Some(query_id(head)),expected:None,
+    },ALPHA)).await.unwrap_err().code(),Code::FailedPrecondition);
+    let oracle_scope=query_ready(&mut client,&[head],185).await;
+    let mut oracle_request=blame_request(&oracle_scope,short_head.unwrap(),4);
+    oracle_request.policy=q::HistoryPolicy::JjResolvedFixedPathV1 as i32;
+    let oracle=client.blame(request(oracle_request,ALPHA)).await.unwrap().into_inner();
+    let mut short=attributed.clone();
+    short.input.as_mut().unwrap().scope=oracle_scope.key.clone();
+    short.input.as_mut().unwrap().anchors=vec![query_id(short_head.unwrap())];
+    short.input.as_mut().unwrap().max_commits=4;
+    let mut page=client.open_annotation_frontier_paged(request(short,ALPHA)).await.unwrap().into_inner();
+    while page.has_more {
+        page=client.continue_annotation_frontier(request(q::ContinueAnnotationFrontierRequest{
+            scope:oracle_scope.key.clone(),context:page.frontier.as_ref().unwrap().context.clone(),cursor:page.next_cursor.clone(),
+        },ALPHA)).await.unwrap().into_inner();
+    }
+    assert_eq!(page.blame.as_ref().unwrap(),&oracle,"paged attribution shares the one-shot resolved policy");
+
+    // Target validation precedes ancestry even when its configured scan cap
+    // cannot cover this deep chain. Empty targets complete without a graph.
+    for (name,revision,expected,replay) in [
+        ("empty",empty,None,186),
+        ("missing",absent,Some(Code::NotFound),187),
+        ("directory",directory,Some(Code::FailedPrecondition),188),
+    ] {
+        let target_scope=query_ready(&mut client,&[revision],replay).await;
+        let mut input=attributed.clone();
+        input.input.as_mut().unwrap().scope=target_scope.key.clone();
+        input.input.as_mut().unwrap().anchors=vec![query_id(revision)];
+        input.input.as_mut().unwrap().max_commits=1;
+        let result=client.open_annotation_frontier_paged(request(input,ALPHA)).await;
+        if let Some(expected)=expected { assert_eq!(result.unwrap_err().code(),expected,"{name}"); }
+        else {
+            let result=result.unwrap().into_inner();assert!(!result.has_more);assert_eq!(result.operations,0);
+            assert!(result.frontier.as_ref().unwrap().nodes.is_empty());
+            let blame=result.blame.unwrap();assert_eq!(blame.scanned_commits,0);
+            assert!(blame.target_bytes.is_empty()&&blame.ranges.is_empty());assert!(blame.target.is_some());
+        }
+    }
+
     // A finite allowance is cumulative across advances, not a per-page reset.
     let limited_scope = query_ready(&mut client, &[head], 182).await;
     let mut limited = open.clone();
     limited.input.as_mut().unwrap().scope=limited_scope.key.clone();
     limited.input.as_mut().unwrap().limits.as_mut().unwrap().work_nodes=100;
     limited.scan_quantum=1;
+    limited.server_attribution=true;
     let initial = client.open_annotation_frontier_paged(request(limited.clone(),ALPHA)).await.unwrap().into_inner();
     let mut page=initial.clone(); let mut advances=0;
     let failed_request = loop {
         assert!(page.has_more);
+        assert!(page.blame.is_none()&&page.frontier.as_ref().unwrap().nodes.is_empty());
         let next=q::ContinueAnnotationFrontierRequest {scope:limited_scope.key.clone(),context:page.frontier.as_ref().unwrap().context.clone(),cursor:page.next_cursor.clone()};
         match client.continue_annotation_frontier(request(next.clone(),ALPHA)).await {
             Ok(reply)=>{page=reply.into_inner();advances+=1;assert!(advances<100);},

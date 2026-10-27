@@ -647,18 +647,60 @@ pub fn annotate<R: Source>(
 ) -> Step<(), R::Error> {
     // The adapter has already read and verified this exact target, bounded its
     // bytes/lines, and initialized one output slot per line before graph work.
-    let lines = origins.len();
     let mut graph = Graph::load(reader, &[revision], Some(revision), limits, scanned)?;
-    graph.bodies.insert(target_id, Arc::from(target.to_vec()));
+    cache_target(&mut graph, reader, target, target_id)?;
     graph.select(reader, Some(revision), diff_limits)?;
+    annotate_graph(&mut graph, reader, revision, diff_limits, origins).map(|_| ())
+}
+
+fn cache_target<K: Copy + Ord, R: Budget>(
+    graph: &mut Graph<K>,
+    reader: &mut R,
+    target: &[u8],
+    target_id: m::FileId,
+) -> Step<(), R::Error> {
+    charge(
+        reader,
+        1,
+        target
+            .len()
+            .checked_mul(2)
+            .and_then(|bytes| bytes.checked_add(256)) // Arc/map entry, including an empty target.
+            .ok_or(Error::Boundary(Boundary::ReadLimit))?,
+    )?;
+    graph.bodies.insert(target_id, Arc::from(target.to_vec()));
+    Ok(())
+}
+
+// Attribution over an already selected graph. Both one-shot and resumable
+// callers use this loop; neither segments independently attributed ancestry.
+fn annotate_graph<K: Copy + Ord, R: Source<Key = K>>(
+    graph: &mut Graph<K>,
+    reader: &mut R,
+    revision: m::CommitId,
+    diff_limits: &mut jj_lib::diff::LineDiffLimits,
+    origins: &mut [Option<Origin>],
+) -> Step<u64, R::Error> {
+    let lines = origins.len();
+    charge(reader, lines, 32)?;
+    let mut operations = 0u64;
     let mut pending = BTreeMap::from([(
         revision,
         (0..lines).map(|line| (line, line)).collect::<Vec<_>>(),
     )]);
+    charge(
+        reader,
+        graph.order.len(),
+        std::mem::size_of::<m::CommitId>(),
+    )?;
     for id in graph.order.clone().into_iter().rev() {
+        reader.check().map_err(Error::Source)?;
         let Some(mut current) = pending.remove(&id) else {
             continue;
         };
+        operations = operations
+            .checked_add(1)
+            .ok_or(Error::Internal("annotation progress overflow"))?;
         let value = graph.nodes[&id].value.clone();
         let bytes = graph.body(reader, &value)?;
         for parent in graph.nodes[&id].edges.clone() {
@@ -723,7 +765,7 @@ pub fn annotate<R: Source>(
     if !pending.is_empty() || origins.iter().any(Option::is_none) {
         return Err(Error::Internal("DAG blame left unresolved graph mappings"));
     }
-    Ok(())
+    Ok(operations)
 }
 
 /// Metadata for one node in a complete canonical ancestry union. Selection is
@@ -766,6 +808,7 @@ pub struct FrontierProgress {
 /// bounded by the original aggregate diff limits and cancellation checks.
 pub struct Frontier<K> {
     discovery: Discovery<K>,
+    heads: Vec<m::CommitId>,
     phase: FrontierPhase,
     selected: usize,
     output: usize,
@@ -849,8 +892,14 @@ impl<K: Copy + Ord> Frontier<K> {
             std::mem::size_of::<Self>().saturating_add(512),
         )?;
         let discovery = Discovery::new(&mut accounting, heads, None, limits)?;
+        charge(
+            &mut accounting,
+            heads.len(),
+            std::mem::size_of::<m::CommitId>(),
+        )?;
         Ok(Self {
             discovery,
+            heads: heads.to_vec(),
             phase: FrontierPhase::Discovering,
             selected: 0,
             output: 0,
@@ -862,6 +911,59 @@ impl<K: Copy + Ord> Frontier<K> {
             failed: false,
         })
     }
+    /// Attribute one verified target using the READY retained graph. No node may
+    /// have been emitted, and the exact original single anchor is the target.
+    /// Callers retain the same source, aggregate budget and absolute deadline.
+    pub fn annotate<R: Source<Key = K>>(
+        &mut self,
+        reader: &mut R,
+        revision: m::CommitId,
+        target: &[u8],
+        target_id: m::FileId,
+        origins: &mut [Option<Origin>],
+    ) -> Step<(), R::Error> {
+        if self.failed {
+            return Err(Error::Internal("annotation frontier is poisoned"));
+        }
+        self.failed = true;
+        if self.phase != FrontierPhase::Ready
+            || self.output != 0
+            || self.heads.as_slice() != [revision]
+        {
+            return Err(Error::InvalidGraph(
+                "server attribution requires one un-emitted ready target",
+            ));
+        }
+        let graph = &mut self.discovery.graph;
+        if target.len() > graph.limits.max_file_bytes || origins.len() > graph.limits.max_lines {
+            return Err(Error::Boundary(Boundary::ReadLimit));
+        }
+        if origins.len() != count_lines(target) || origins.iter().any(Option::is_some) || graph.nodes.get(&revision).is_none_or(|node|
+            !matches!(&node.value.0, Some(m::TreeValue::File { id,size_bytes,.. }) if *id == target_id && *size_bytes == target.len() as u64)) {
+            return Err(Error::InvalidGraph("annotation target differs from retained source"));
+        }
+        let mut reader = Accounting {
+            source: reader,
+            work: &mut self.work_items,
+            bytes: &mut self.retained,
+        };
+        cache_target(graph, &mut reader, target, target_id)?;
+        // The original frontier used intrinsic membership. Force only the real
+        // target; its ancestors' globally filtered membership remains unchanged.
+        graph.select_node(&mut reader, revision, Some(revision), &mut self.diff_limits)?;
+        let processed =
+            annotate_graph(graph, &mut reader, revision, &mut self.diff_limits, origins)?;
+        self.operations = self
+            .operations
+            .checked_add(processed)
+            .and_then(|n| n.checked_add(1))
+            .ok_or(Error::Internal("annotation progress overflow"))?;
+        self.output = graph.order.len();
+        self.phase = FrontierPhase::Done;
+        self.failed = false;
+        Ok(())
+    }
+
     pub fn progress(&self) -> FrontierProgress {
         FrontierProgress {
             phase: self.phase,
@@ -1219,6 +1321,141 @@ mod tests {
         );
     }
     #[test]
+    fn ready_frontier_attributes_deep_target_without_rediscovery_or_emission() {
+        let mut source = Fixture::chain(300);
+        let target = b"same\nsame\n";
+        let target_id = m::FileId(*blake3::hash(target).as_bytes());
+        let mut expected = vec![None; 2];
+        annotate(
+            &mut source.clone(),
+            id(300),
+            target,
+            target_id,
+            limits(300),
+            &mut diff_limits(),
+            &mut 0,
+            &mut expected,
+        )
+        .unwrap();
+        let mut state = Frontier::new(&mut source, &[id(300)], limits(300), diff_limits()).unwrap();
+        while state.progress().phase != FrontierPhase::Ready {
+            state
+                .advance(&mut source, NonZeroUsize::new(7).unwrap())
+                .unwrap();
+        }
+        let reads = source.reads.clone();
+        let mut origins = vec![None; 2];
+        state
+            .annotate(&mut source, id(300), target, target_id, &mut origins)
+            .unwrap();
+        assert_eq!(origins, expected);
+        assert_eq!(
+            source.reads, reads,
+            "attribution must not reload the discovered graph"
+        );
+        assert!(source.reads.values().all(|n| *n == 1));
+        assert_eq!(state.progress().phase, FrontierPhase::Done);
+        assert!(
+            state.next_node(&mut source).unwrap().is_none(),
+            "server attribution emits no graph nodes"
+        );
+        assert!(
+            state
+                .annotate(&mut source, id(300), target, target_id, &mut origins)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn selected_target_copy_charges_bytes_without_consuming_a_node_per_byte() {
+        let mut source = Fixture::new();
+        let target = vec![b'x'; 128 * 1024];
+        let value = source.file(&target);
+        source
+            .nodes
+            .insert(id(1), (1, vec![m::CommitId::ROOT], Some(value)));
+        source.max_work = 100_000;
+        let bounds = Limits {
+            max_commits: 1,
+            max_lines: 1,
+            max_file_bytes: 256 * 1024,
+        };
+        let mut ready = Frontier::new(&mut source, &[id(1)], bounds, diff_limits()).unwrap();
+        while ready.progress().phase != FrontierPhase::Ready {
+            ready
+                .advance(&mut source, NonZeroUsize::new(1).unwrap())
+                .unwrap();
+        }
+        let mut origins = [None];
+        ready
+            .annotate(
+                &mut source,
+                id(1),
+                &target,
+                m::FileId(*blake3::hash(&target).as_bytes()),
+                &mut origins,
+            )
+            .unwrap();
+        assert_eq!(
+            origins,
+            [Some(Origin {
+                commit: id(1),
+                line: 0
+            })]
+        );
+        assert!(
+            source.work < 1000,
+            "copy size is charged to byte allowance, not graph-node allowance"
+        );
+        assert!(source.bytes >= target.len() as u64 * 2);
+    }
+
+    #[test]
+    fn server_attribution_rejects_unready_wrong_or_emitted_targets() {
+        for (name, ready, emit, wrong_id) in [
+            ("unready", false, false, false),
+            ("emitted", true, true, false),
+            ("wrong target file", true, false, true),
+        ] {
+            let mut source = Fixture::chain(2);
+            let target = b"same\nsame\n";
+            let mut state = Frontier::new(&mut source, &[id(2)], limits(2), diff_limits()).unwrap();
+            if ready {
+                while state.progress().phase != FrontierPhase::Ready {
+                    state
+                        .advance(&mut source, NonZeroUsize::new(2).unwrap())
+                        .unwrap();
+                }
+            }
+            if emit {
+                state.next_node(&mut source).unwrap();
+            }
+            let target_id = if wrong_id {
+                m::FileId([9; 32])
+            } else {
+                m::FileId(*blake3::hash(target).as_bytes())
+            };
+            assert!(
+                state
+                    .annotate(&mut source, id(2), target, target_id, &mut [None; 2])
+                    .is_err(),
+                "{name}"
+            );
+            let before = (source.work, source.reads.clone());
+            assert!(
+                state
+                    .advance(&mut source, NonZeroUsize::new(1).unwrap())
+                    .is_err()
+            );
+            assert_eq!(
+                before,
+                (source.work, source.reads),
+                "{name} cannot reset a failed attempt"
+            );
+        }
+    }
+
+    #[test]
     fn aggregate_scan_work_and_cancellation_fail_closed_without_restart() {
         for (name, scan_limit, work_limit, cancel, expected) in [
             ("aggregate scan", 16, 1_000_000, false, "scan"),
@@ -1372,6 +1609,30 @@ mod tests {
                     line: 1
                 })
             ]
+        );
+        let mut server_source = selected.source.clone();
+        let mut ready =
+            Frontier::new(&mut server_source, &[id(4)], limits(4), diff_limits()).unwrap();
+        while ready.progress().phase != FrontierPhase::Ready {
+            ready
+                .advance(&mut server_source, NonZeroUsize::new(1).unwrap())
+                .unwrap();
+        }
+        let before = server_source.reads.clone();
+        let mut server_origins = vec![None; 2];
+        ready
+            .annotate(
+                &mut server_source,
+                id(4),
+                target,
+                target_id,
+                &mut server_origins,
+            )
+            .unwrap();
+        assert_eq!(server_origins, direct_origins);
+        assert_eq!(
+            server_source.reads, before,
+            "server merge attribution reuses retained metadata"
         );
     }
 }

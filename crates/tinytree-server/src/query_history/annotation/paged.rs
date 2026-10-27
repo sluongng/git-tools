@@ -5,6 +5,8 @@ use tinytree_annotate::{Frontier, FrontierNode, FrontierPhase};
 
 pub(super) struct State {
     engine: Option<Frontier<GraphKey>>,
+    server_attribution: bool,
+    target: Option<Target>,
     pending: Option<FrontierNode<GraphKey>>,
     grants: BTreeMap<m::CommitId, q::AnnotationPathValue>,
     maximum: u32,
@@ -21,7 +23,7 @@ pub(super) struct State {
 }
 impl State {
     pub(super) fn input_value(&self, id: m::CommitId) -> Result<&q::AnnotationPathValue, Status> {
-        if self.failed.is_some() || !self.complete {
+        if self.server_attribution || self.failed.is_some() || !self.complete {
             return Err(Status::failed_precondition(
                 "annotation frontier is incomplete",
             ));
@@ -32,6 +34,7 @@ impl State {
     }
     fn poison(&mut self, error: Status) {
         self.engine = None;
+        self.target = None;
         self.pending = None;
         self.grants.clear();
         self.complete = false;
@@ -85,6 +88,12 @@ fn retained(context: &Context, page: &q::AnnotationFrontierPage) -> usize {
         );
     usize::try_from(engine)
         .unwrap_or(usize::MAX)
+        .saturating_add(
+            state
+                .target
+                .as_ref()
+                .map_or(0, |v| v.bytes.capacity().saturating_add(256)),
+        )
         .saturating_add(state.grants.len().saturating_mul(512))
         .saturating_add(context.request.encoded_len().saturating_mul(8))
         .saturating_add(cache.saturating_add(page.encoded_len()).saturating_mul(4))
@@ -100,6 +109,7 @@ pub(crate) fn open_paged(
 ) -> Result<q::AnnotationFrontierPage, Status> {
     let page_size = parameter(outer.page_size)?;
     let quantum = parameter(outer.scan_quantum)?;
+    let server_attribution = outer.server_attribution;
     let input = outer
         .input
         .ok_or_else(|| Status::invalid_argument("annotation input required"))?;
@@ -116,6 +126,11 @@ pub(crate) fn open_paged(
         input.max_commits,
         &policy,
     )?;
+    if server_attribution && input.anchors.len() != 1 {
+        return Err(Status::invalid_argument(
+            "server attribution requires one target anchor",
+        ));
+    }
     if input.anchors.is_empty() || input.anchors.len() > host.config.max_roots {
         return Err(Status::invalid_argument(
             "annotation anchors must be bounded and nonempty",
@@ -144,10 +159,11 @@ pub(crate) fn open_paged(
             ));
         }
         if context.request != input
-            || context
-                .paged
-                .as_ref()
-                .is_none_or(|s| s.page_size != page_size || s.quantum != quantum)
+            || context.paged.as_ref().is_none_or(|s| {
+                s.page_size != page_size
+                    || s.quantum != quantum
+                    || s.server_attribution != server_attribution
+            })
         {
             return Err(Status::failed_precondition(
                 "captured scope already has another annotation context",
@@ -208,6 +224,8 @@ pub(crate) fn open_paged(
         memory: Some(memory),
         paged: Some(State {
             engine: None,
+            server_attribution,
+            target: None,
             pending: None,
             grants: BTreeMap::new(),
             maximum: maximum as u32,
@@ -314,30 +332,34 @@ fn advance(
                 .budget
                 .charge(1, 0, context.request.encoded_len() as u64)
                 .map_err(index_error)?;
-            state.engine = Some(
-                Frontier::new(
-                    &mut adapter,
-                    anchors,
-                    tinytree_annotate::Limits {
-                        max_commits: state.maximum as usize,
-                        max_lines: host.config.max_blame_lines,
-                        max_file_bytes: host.config.max_blame_file_bytes,
-                    },
-                    context.diff_limits,
-                )
-                .map_err(dag::engine_failure)?,
-            );
+            if state.server_attribution {
+                state.target = Some(load_target(&mut adapter, anchors[0])?);
+                state.complete = state.target.as_ref().unwrap().bytes.is_empty();
+            }
+            if !state.complete {
+                state.engine = Some(
+                    Frontier::new(
+                        &mut adapter,
+                        anchors,
+                        tinytree_annotate::Limits {
+                            max_commits: state.maximum as usize,
+                            max_lines: host.config.max_blame_lines,
+                            max_file_bytes: host.config.max_blame_file_bytes,
+                        },
+                        context.diff_limits,
+                    )
+                    .map_err(dag::engine_failure)?,
+                );
+            }
         }
-        let engine = state
-            .engine
-            .as_mut()
-            .ok_or_else(|| Status::failed_precondition("annotation engine unavailable"))?;
-        engine
-            .advance(
-                &mut adapter,
-                NonZeroUsize::new(state.quantum as usize).unwrap(),
-            )
-            .map_err(dag::engine_failure)?;
+        if let Some(engine) = state.engine.as_mut() {
+            engine
+                .advance(
+                    &mut adapter,
+                    NonZeroUsize::new(state.quantum as usize).unwrap(),
+                )
+                .map_err(dag::engine_failure)?;
+        }
         let mut page = q::AnnotationFrontierPage {
             frontier: Some(q::AnnotationFrontier {
                 context: context.id.to_vec(),
@@ -348,7 +370,10 @@ fn advance(
                 path: context.request.path.clone(),
                 expires_at_unix_seconds: state.expires,
                 coverage: 0,
-                scanned_commits: engine.progress().scanned_commits,
+                scanned_commits: state
+                    .engine
+                    .as_ref()
+                    .map_or(0, |engine| engine.progress().scanned_commits),
                 nodes: Vec::new(),
                 limits: Some(limits),
             }),
@@ -362,11 +387,37 @@ fn advance(
             scan_quantum: state.quantum,
             phase: 0,
             emitted_nodes: state.emitted,
+            blame: None,
         };
-        if matches!(
-            engine.progress().phase,
-            FrontierPhase::Ready | FrontierPhase::Done
-        ) {
+        if state.server_attribution
+            && (state.complete
+                || state
+                    .engine
+                    .as_ref()
+                    .is_some_and(|engine| engine.progress().phase == FrontierPhase::Ready))
+        {
+            let revision = parse_revision(context.request.anchors.first().cloned())?;
+            let target = state
+                .target
+                .take()
+                .ok_or_else(|| Status::internal("annotation target missing"))?;
+            page.blame = Some(attribute(
+                &mut adapter,
+                state.engine.as_mut(),
+                target,
+                revision,
+                &context.request.path,
+            )?);
+        }
+        if !state.server_attribution
+            && state.engine.as_ref().is_some_and(|engine| {
+                matches!(
+                    engine.progress().phase,
+                    FrontierPhase::Ready | FrontierPhase::Done
+                )
+            })
+        {
+            let engine = state.engine.as_mut().unwrap();
             while page.frontier.as_ref().unwrap().nodes.len() < state.page_size as usize {
                 let next = match state.pending.take() {
                     Some(v) => Some(v),
@@ -420,18 +471,25 @@ fn advance(
                     .ok_or_else(|| Status::resource_exhausted("annotation output overflow"))?;
             }
         }
-        let progress = engine.progress();
-        state.complete = progress.phase == FrontierPhase::Done && state.pending.is_none();
+        let progress = state.engine.as_ref().map(|engine| engine.progress());
+        state.complete = if state.server_attribution {
+            page.blame.is_some()
+        } else {
+            progress.is_some_and(|p| p.phase == FrontierPhase::Done) && state.pending.is_none()
+        };
         page.has_more = !state.complete;
-        page.phase = match progress.phase {
-            FrontierPhase::Discovering => q::AnnotationFrontierPhase::AnnotationFrontierDiscovering,
-            FrontierPhase::Selecting => q::AnnotationFrontierPhase::AnnotationFrontierSelecting,
-            FrontierPhase::Ready | FrontierPhase::Done if !state.complete => {
-                q::AnnotationFrontierPhase::AnnotationFrontierEmitting
+        page.phase = if state.complete {
+            q::AnnotationFrontierPhase::AnnotationFrontierComplete
+        } else {
+            match progress.unwrap().phase {
+                FrontierPhase::Discovering => {
+                    q::AnnotationFrontierPhase::AnnotationFrontierDiscovering
+                }
+                FrontierPhase::Selecting => q::AnnotationFrontierPhase::AnnotationFrontierSelecting,
+                _ => q::AnnotationFrontierPhase::AnnotationFrontierEmitting,
             }
-            _ => q::AnnotationFrontierPhase::AnnotationFrontierComplete,
         } as i32;
-        page.operations = progress.operations;
+        page.operations = progress.map_or(0, |p| p.operations);
         page.emitted_nodes = state.emitted;
         page.usage = Some(q::AnnotationUsage {
             work_nodes: adapter.reader.budget.nodes_read(),
@@ -445,6 +503,10 @@ fn advance(
             page.next_cursor = cursor();
         }
         state.next = page.next_cursor.clone();
+        if state.server_attribution && state.complete {
+            // The final result, not the canonical graph, survives physical work.
+            state.engine = None;
+        }
         Ok(page)
     })();
     context.read_bytes = reader.read_bytes;
@@ -463,4 +525,127 @@ fn advance(
         context.paged.as_mut().unwrap().poison(error.clone());
     }
     result
+}
+
+struct Target {
+    descriptor: m::Descriptor,
+    bytes: Vec<u8>,
+}
+
+// Only the selected path is validated/read before graph discovery.
+fn load_target(
+    adapter: &mut dag::CanonicalDagReader<'_, '_>,
+    revision: m::CommitId,
+) -> Step<Target> {
+    if revision == m::CommitId::ROOT {
+        adapter.reader.canonical_source(revision)?;
+        return Err(Status::not_found("blame path is absent at intrinsic root").into());
+    }
+    let commit = adapter.reader.commit(revision)?;
+    let selected = adapter.reader.path_entry(&commit, adapter.path)?;
+    let state = value(selected.as_ref()).state.unwrap();
+    if state.kind == PathKind::HistoryPathAbsent as i32 {
+        return Err(Status::not_found("blame path is absent at selected revision").into());
+    }
+    if state.kind != PathKind::HistoryPathFile as i32 {
+        return Err(Status::failed_precondition(
+            "blame requires a regular FILE at selected revision",
+        )
+        .into());
+    }
+    let (descriptor, target) = adapter.reader.file(&state)?;
+    let lines = count_lines(&target);
+    if lines > adapter.reader.host.config.max_blame_lines {
+        return Err(Failure::Boundary(Coverage::HistoryDiffLimit));
+    }
+    Ok(Target {
+        descriptor,
+        bytes: target,
+    })
+}
+
+// Reuse the retained graph, target and cumulative budget. Empty targets need no
+// graph at all, as in ordinary one-shot annotation.
+fn attribute(
+    adapter: &mut dag::CanonicalDagReader<'_, '_>,
+    engine: Option<&mut Frontier<GraphKey>>,
+    selected: Target,
+    revision: m::CommitId,
+    path: &str,
+) -> Step<q::BlameResult> {
+    let Target {
+        descriptor,
+        bytes: target,
+    } = selected;
+    let lines = count_lines(&target);
+    let scanned = engine.as_ref().map_or(0, |v| v.progress().scanned_commits);
+    adapter
+        .reader
+        .budget
+        .charge(
+            lines as u64,
+            0,
+            lines
+                .saturating_mul(std::mem::size_of::<Option<tinytree_annotate::Origin>>())
+                .saturating_add(target.len()) as u64,
+        )
+        .map_err(index_error)?;
+    let mut origins = vec![None; lines];
+    if let Some(engine) = engine {
+        engine
+            .annotate(
+                adapter,
+                revision,
+                &target,
+                m::FileId(descriptor.key.id.0),
+                &mut origins,
+            )
+            .map_err(dag::engine_failure)?;
+    }
+    let mut result = q::BlameResult {
+        scope_digest: adapter.reader.scope.wire.content_digest.clone(),
+        index_epoch: adapter.reader.scope.wire.index_epoch.clone(),
+        revision: Some(super::wire(revision)),
+        path: path.to_owned(),
+        policy: q::HistoryPolicy::JjResolvedFixedPathV1 as i32,
+        coverage: Coverage::HistoryComplete as i32,
+        scanned_commits: scanned,
+        boundary: None,
+        target: Some(wire_descriptor(descriptor)),
+        target_bytes: target,
+        ranges: Vec::new(),
+    };
+    adapter
+        .reader
+        .budget
+        .charge(
+            lines as u64,
+            0,
+            lines.saturating_mul(std::mem::size_of::<q::BlameRange>().saturating_add(64)) as u64,
+        )
+        .map_err(index_error)?;
+    for (line, origin) in origins.into_iter().enumerate() {
+        adapter.reader.check()?;
+        let origin = origin
+            .ok_or_else(|| Status::internal("complete annotation has an unresolved origin"))?;
+        if let Some(last) = result.ranges.last_mut() {
+            if last
+                .origin
+                .as_ref()
+                .is_some_and(|id| id.value == origin.commit.0)
+                && last.original_line as usize + (last.end_line - last.start_line) as usize
+                    == origin.line
+            {
+                last.end_line += 1;
+                continue;
+            }
+        }
+        result.ranges.push(q::BlameRange {
+            start_line: line as u32,
+            end_line: line as u32 + 1,
+            origin: Some(super::wire(origin.commit)),
+            original_line: origin.line as u32,
+        });
+    }
+    Ok(result)
 }

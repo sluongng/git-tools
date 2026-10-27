@@ -606,6 +606,7 @@ message OpenAnnotationFrontierPagedRequest {
   OpenAnnotationFrontierRequest input = 1; // version3 and explicit limits required.
   uint32 page_size = 2; // Zero selects128; effective cap is echoed and immutable.
   uint32 scan_quantum = 3; // Zero selects128; node operations per advance.
+  bool server_attribution = 4; // Exactly one anchor(target); final blame, never graph nodes.
 }
 message ContinueAnnotationFrontierRequest {
   ScopeKey scope = 1;
@@ -636,7 +637,8 @@ message AnnotationFrontierPage {
   uint32 page_size = 8;
   uint32 scan_quantum = 9;
   AnnotationFrontierPhase phase = 10;
-  uint32 emitted_nodes = 11; // Cumulative unique parent-first nodes delivered.
+  uint32 emitted_nodes = 11; // Cumulative unique parent-first nodes delivered; zero in server attribution.
+  BlameResult blame = 12; // Server-attribution mode only; COMPLETE final page only.
   // While has_more, inner coverage is unspecified(0), never COMPLETE/SCAN_LIMIT.
   // Only final COMPLETE carries complete coverage. Terminal limits are errors.
 }
