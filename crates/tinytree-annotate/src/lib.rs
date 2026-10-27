@@ -33,7 +33,9 @@ pub trait GraphSource: Budget {
     /// A parentless non-root commit must include the intrinsic root as parent.
     /// An authenticated canonical frontier can supply intrinsic NONFORCED path
     /// membership. Local/private nodes return None and are computed globally.
-    fn affects_path(&mut self, _id: m::CommitId) -> Result<Option<bool>, Self::Error> { Ok(None) }
+    fn affects_path(&mut self, _id: m::CommitId) -> Result<Option<bool>, Self::Error> {
+        Ok(None)
+    }
     fn node(&mut self, id: m::CommitId) -> Result<SourceNode<Self::Key>, Self::Error>;
     fn common_ancestors(
         &mut self,
@@ -214,6 +216,105 @@ fn simplify<R: Budget, T: Clone + Eq>(
             .collect::<Vec<_>>(),
     ))
 }
+struct Discovery<K> {
+    graph: Graph<K>,
+    pending: VecDeque<m::CommitId>,
+    queued: BTreeSet<m::CommitId>,
+    ordered: BTreeSet<(K, m::CommitId)>,
+    forced: Option<m::CommitId>,
+}
+impl<K: Copy + Ord> Discovery<K> {
+    fn new<R: Source<Key = K>>(
+        reader: &mut R,
+        heads: &[m::CommitId],
+        forced: Option<m::CommitId>,
+        limits: Limits,
+    ) -> Step<Self, R::Error> {
+        charge(reader, heads.len(), 128)?;
+        reader.frontier(heads.len()).map_err(Error::Source)?;
+        let queued: BTreeSet<_> = heads.iter().copied().collect();
+        Ok(Self {
+            pending: queued.iter().copied().collect(),
+            queued,
+            ordered: BTreeSet::new(),
+            forced,
+            graph: Graph {
+                nodes: BTreeMap::new(),
+                limits,
+                order: Vec::new(),
+                files: BTreeMap::new(),
+                bodies: BTreeMap::new(),
+            },
+        })
+    }
+    // One discovery or topological validation operation. Queues and ordering
+    // survive page boundaries; no previously examined node is read again.
+    fn step<R: Source<Key = K>>(
+        &mut self,
+        reader: &mut R,
+        scanned: &mut u32,
+    ) -> Step<bool, R::Error> {
+        if let Some(id) = self.pending.pop_front() {
+            charge(
+                reader,
+                1,
+                640usize.saturating_add(std::mem::size_of::<K>().saturating_mul(3)),
+            )?;
+            if id != m::CommitId::ROOT && *scanned as usize >= self.graph.limits.max_commits {
+                return Err(Error::Boundary(Boundary::ScanLimit));
+            }
+            let source = reader.node(id).map_err(Error::Source)?;
+            if id != m::CommitId::ROOT {
+                *scanned = scanned
+                    .checked_add(1)
+                    .ok_or(Error::Boundary(Boundary::ScanLimit))?;
+            }
+            charge(reader, source.parents.len(), 96)?;
+            for parent in &source.parents {
+                if self.queued.insert(*parent) {
+                    self.pending.push_back(*parent);
+                }
+            }
+            if let Some(value @ m::TreeValue::File { id, .. }) = &source.value {
+                self.graph.files.insert(*id, value.clone());
+            }
+            self.ordered.insert((source.key, id));
+            self.graph.nodes.insert(
+                id,
+                Node {
+                    key: source.key,
+                    parents: source.parents,
+                    value: Value(source.value),
+                    selected: self.forced == Some(id),
+                    edges: Vec::new(),
+                },
+            );
+            reader
+                .frontier(self.queued.len().saturating_add(self.pending.len()))
+                .map_err(Error::Source)?;
+            return Ok(false);
+        }
+        if let Some((_, id)) = self.ordered.pop_first() {
+            charge(reader, 1, 64)?;
+            let node = &self.graph.nodes[&id];
+            for parent in &node.parents {
+                charge(reader, 1, 0)?;
+                let parent_node = self
+                    .graph
+                    .nodes
+                    .get(parent)
+                    .ok_or(Error::InvalidGraph("DAG parent missing"))?;
+                if parent_node.key >= node.key || parent == &id {
+                    return Err(Error::InvalidGraph("DAG history is not topological"));
+                }
+            }
+            self.graph.order.push(id);
+            return Ok(false);
+        }
+        Ok(true)
+    }
+}
+
 impl<K: Copy + Ord> Graph<K> {
     fn load<R: Source<Key = K>>(
         reader: &mut R,
@@ -222,63 +323,9 @@ impl<K: Copy + Ord> Graph<K> {
         limits: Limits,
         scanned: &mut u32,
     ) -> Step<Self, R::Error> {
-        let mut graph = Self {
-            nodes: BTreeMap::new(),
-            limits,
-            order: Vec::new(),
-            files: BTreeMap::new(),
-            bodies: BTreeMap::new(),
-        };
-        let mut queued = BTreeSet::new();
-        let mut pending = VecDeque::from(heads.to_vec());
-        queued.extend(heads.iter().copied());
-        while let Some(id) = pending.pop_front() {
-            charge(reader, 1, 512)?;
-            if id != m::CommitId::ROOT && *scanned as usize >= limits.max_commits {
-                return Err(Error::Boundary(Boundary::ScanLimit));
-            }
-            let source = reader.node(id).map_err(Error::Source)?;
-            let key = source.key;
-            let (parents, value) = (source.parents, Value(source.value));
-            if id != m::CommitId::ROOT {
-                *scanned += 1;
-            }
-            charge(reader, parents.len(), 96)?;
-            for parent in &parents {
-                if queued.insert(*parent) {
-                    pending.push_back(*parent);
-                }
-            }
-            if let Some(value @ m::TreeValue::File { id, .. }) = &value.0 {
-                graph.files.insert(*id, value.clone());
-            }
-            graph.nodes.insert(
-                id,
-                Node {
-                    key,
-                    parents,
-                    value,
-                    selected: forced == Some(id),
-                    edges: Vec::new(),
-                },
-            );
-            reader
-                .frontier(queued.len().saturating_add(pending.len()))
-                .map_err(Error::Source)?;
-        }
-        graph.order = graph.nodes.keys().copied().collect();
-        // The adapter verifies ordered parent metadata and supplies stable keys
-        // that place every parent before its child. This reproduces stable
-        // graph-walk order at convergence across all captured source layers.
-        graph.order.sort_unstable_by_key(|id| graph.nodes[id].key);
-        for (id, node) in &graph.nodes {
-            for parent in &node.parents {
-                if graph.nodes[parent].key >= node.key || parent == id {
-                    return Err(Error::InvalidGraph("DAG history is not topological"));
-                }
-            }
-        }
-        Ok(graph)
+        let mut discovery = Discovery::new(reader, heads, forced, limits)?;
+        while !discovery.step(reader, scanned)? {}
+        Ok(discovery.graph)
     }
 
     fn body<R: ContentSource>(
@@ -489,61 +536,70 @@ impl<K: Copy + Ord> Graph<K> {
         forced: Option<m::CommitId>,
         diff_limits: &mut jj_lib::diff::LineDiffLimits,
     ) -> Step<(), R::Error> {
-        for id in self.order.clone() {
-            if id == m::CommitId::ROOT {
-                continue;
-            }
-            let parents = self.nodes[&id].parents.clone();
-            let selected = if forced == Some(id) {
-                true
-            } else if let Some(selected) = reader.affects_path(id).map_err(Error::Source)? {
-                selected
-            } else {
-                let before = self.parent_value(reader, parents.clone(), diff_limits)?;
-                before.as_ref() != Some(&self.nodes[&id].value)
-            };
-            let mut edges = Vec::new();
-            let mut expanded = false;
-            let mut indirect_seen = BTreeSet::new();
-            for parent in parents {
-                charge(reader, 1, 64)?;
-                if self.nodes[&parent].selected {
-                    edges.push(parent);
-                } else {
-                    expanded |= !self.nodes[&parent].edges.is_empty();
-                    for edge in &self.nodes[&parent].edges {
-                        charge(reader, 1, 64)?;
-                        if indirect_seen.insert(*edge) {
-                            edges.push(*edge);
-                        }
-                    }
-                }
-            }
-            // Stock preserves redundant direct edges, but removes transitive
-            // targets when at least one edge bypasses a filtered-out parent.
-            if expanded {
-                let mut keep = Vec::with_capacity(edges.len());
-                for edge in &edges {
-                    let mut redundant = false;
-                    for other in &edges {
-                        reader.check().map_err(Error::Source)?;
-                        if edge != other
-                            && reader.is_ancestor(*edge, *other).map_err(Error::Source)?
-                        {
-                            redundant = true;
-                            break;
-                        }
-                    }
-                    if !redundant {
-                        keep.push(*edge);
-                    }
-                }
-                edges = keep;
-            }
-            let node = self.nodes.get_mut(&id).unwrap();
-            node.selected = selected;
-            node.edges = edges;
+        for position in 0..self.order.len() {
+            self.select_node(reader, self.order[position], forced, diff_limits)?;
         }
+        Ok(())
+    }
+    fn select_node<R: Source<Key = K>>(
+        &mut self,
+        reader: &mut R,
+        id: m::CommitId,
+        forced: Option<m::CommitId>,
+        diff_limits: &mut jj_lib::diff::LineDiffLimits,
+    ) -> Step<(), R::Error> {
+        if id == m::CommitId::ROOT {
+            return Ok(());
+        }
+        let parents = self.nodes[&id].parents.clone();
+        let selected = if forced == Some(id) {
+            true
+        } else if let Some(selected) = reader.affects_path(id).map_err(Error::Source)? {
+            selected
+        } else {
+            let before = self.parent_value(reader, parents.clone(), diff_limits)?;
+            before.as_ref() != Some(&self.nodes[&id].value)
+        };
+        let mut edges = Vec::new();
+        let mut expanded = false;
+        let mut indirect_seen = BTreeSet::new();
+        for parent in parents {
+            charge(reader, 1, 64)?;
+            if self.nodes[&parent].selected {
+                edges.push(parent);
+            } else {
+                expanded |= !self.nodes[&parent].edges.is_empty();
+                for edge in &self.nodes[&parent].edges {
+                    charge(reader, 1, 64)?;
+                    if indirect_seen.insert(*edge) {
+                        edges.push(*edge);
+                    }
+                }
+            }
+        }
+        // Stock preserves redundant direct edges, but removes transitive
+        // targets when at least one edge bypasses a filtered-out parent.
+        if expanded {
+            let mut keep = Vec::with_capacity(edges.len());
+            for edge in &edges {
+                let mut redundant = false;
+                for other in &edges {
+                    reader.check().map_err(Error::Source)?;
+                    if edge != other && reader.is_ancestor(*edge, *other).map_err(Error::Source)? {
+                        redundant = true;
+                        break;
+                    }
+                }
+                if !redundant {
+                    keep.push(*edge);
+                }
+            }
+            edges = keep;
+        }
+        let node = self.nodes.get_mut(&id).unwrap();
+        node.selected = selected;
+        node.edges = edges;
+
         Ok(())
     }
 }
@@ -672,6 +728,7 @@ pub fn annotate<R: Source>(
 
 /// Metadata for one node in a complete canonical ancestry union. Selection is
 /// intrinsic `files(path)` membership: boundary heads are never forced.
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct FrontierNode<K> {
     pub id: m::CommitId,
     pub key: K,
@@ -682,6 +739,239 @@ pub struct FrontierNode<K> {
 
 /// Compute one bounded complete union, or return a typed boundary/error. No
 /// partial vector is returned as complete and no historical body is returned.
+/// Resumable frontier phase. Ready permits output; Done means output was drained.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum FrontierPhase {
+    Discovering,
+    Selecting,
+    Ready,
+    Done,
+}
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct FrontierProgress {
+    pub phase: FrontierPhase,
+    pub scanned_commits: u32,
+    /// Cumulative bounded engine operations, including metadata-only progress.
+    pub operations: u64,
+    pub work_items: u64,
+    /// Conservative cumulative allocation charge; never refunded between pages.
+    /// Sources separately account their provider buffers and physical reads.
+    pub retained_bytes_upper_bound: u64,
+}
+/// One exact immutable ancestry union. Reuse the SAME source, cumulative budget
+/// and absolute deadline for every call. The caller owns cursor replay and source
+/// lifetime; the engine owns no task, RPC permit or external FILE capability.
+/// An error poisons the state: retrying must not repeat partially charged work.
+/// Advances checkpoint between nodes; each node's merge/diff remains separately
+/// bounded by the original aggregate diff limits and cancellation checks.
+pub struct Frontier<K> {
+    discovery: Discovery<K>,
+    phase: FrontierPhase,
+    selected: usize,
+    output: usize,
+    scanned: u32,
+    operations: u64,
+    work_items: u64,
+    retained: u64,
+    diff_limits: jj_lib::diff::LineDiffLimits,
+    failed: bool,
+}
+struct Accounting<'a, R> {
+    source: &'a mut R,
+    work: &'a mut u64,
+    bytes: &'a mut u64,
+}
+impl<R: Budget> Budget for Accounting<'_, R> {
+    type Error = R::Error;
+    fn check(&self) -> Result<(), Self::Error> {
+        self.source.check()
+    }
+    fn charge(&mut self, items: u64, bytes: u64) -> Result<(), Self::Error> {
+        self.source.charge(items, bytes)?;
+        *self.work = self.work.saturating_add(items);
+        *self.bytes = self.bytes.saturating_add(bytes);
+        Ok(())
+    }
+    fn frontier(&mut self, entries: usize) -> Result<(), Self::Error> {
+        self.source.frontier(entries)
+    }
+    fn diff_active(&self) -> bool {
+        self.source.diff_active()
+    }
+}
+impl<R: GraphSource> GraphSource for Accounting<'_, R> {
+    type Key = R::Key;
+    fn node(&mut self, id: m::CommitId) -> Result<SourceNode<Self::Key>, Self::Error> {
+        self.source.node(id)
+    }
+    fn affects_path(&mut self, id: m::CommitId) -> Result<Option<bool>, Self::Error> {
+        self.source.affects_path(id)
+    }
+    fn common_ancestors(
+        &mut self,
+        left: &[m::CommitId],
+        right: &[m::CommitId],
+    ) -> Result<Vec<m::CommitId>, Self::Error> {
+        self.source.common_ancestors(left, right)
+    }
+    fn is_ancestor(
+        &mut self,
+        ancestor: m::CommitId,
+        descendant: m::CommitId,
+    ) -> Result<bool, Self::Error> {
+        self.source.is_ancestor(ancestor, descendant)
+    }
+}
+impl<R: ContentSource> ContentSource for Accounting<'_, R> {
+    fn read_file(&mut self, value: &m::TreeValue) -> Result<Vec<u8>, Self::Error> {
+        let bytes = self.source.read_file(value)?;
+        // Source return plus cached Arc conversion can coexist temporarily.
+        self.charge(0, (bytes.len() as u64).saturating_mul(2))?;
+        Ok(bytes)
+    }
+}
+impl<K: Copy + Ord> Frontier<K> {
+    pub fn new<R: Source<Key = K>>(
+        reader: &mut R,
+        heads: &[m::CommitId],
+        limits: Limits,
+        diff_limits: jj_lib::diff::LineDiffLimits,
+    ) -> Step<Self, R::Error> {
+        let (mut work_items, mut retained) = (0, 0);
+        let mut accounting = Accounting {
+            source: reader,
+            work: &mut work_items,
+            bytes: &mut retained,
+        };
+        charge(
+            &mut accounting,
+            1,
+            std::mem::size_of::<Self>().saturating_add(512),
+        )?;
+        let discovery = Discovery::new(&mut accounting, heads, None, limits)?;
+        Ok(Self {
+            discovery,
+            phase: FrontierPhase::Discovering,
+            selected: 0,
+            output: 0,
+            scanned: 0,
+            operations: 0,
+            work_items,
+            retained,
+            diff_limits,
+            failed: false,
+        })
+    }
+    pub fn progress(&self) -> FrontierProgress {
+        FrontierProgress {
+            phase: self.phase,
+            scanned_commits: self.scanned,
+            operations: self.operations,
+            work_items: self.work_items,
+            retained_bytes_upper_bound: self.retained,
+        }
+    }
+    pub fn remaining_diff_limits(&self) -> jj_lib::diff::LineDiffLimits {
+        self.diff_limits
+    }
+    pub fn advance<R: Source<Key = K>>(
+        &mut self,
+        reader: &mut R,
+        quantum: std::num::NonZeroUsize,
+    ) -> Step<FrontierProgress, R::Error> {
+        if self.failed {
+            return Err(Error::Internal("annotation frontier is poisoned"));
+        }
+        self.failed = true;
+        let mut reader = Accounting {
+            source: reader,
+            work: &mut self.work_items,
+            bytes: &mut self.retained,
+        };
+        reader.check().map_err(Error::Source)?;
+        for _ in 0..quantum.get() {
+            match self.phase {
+                FrontierPhase::Discovering => {
+                    if self.discovery.step(&mut reader, &mut self.scanned)? {
+                        self.phase = FrontierPhase::Selecting;
+                    }
+                }
+                FrontierPhase::Selecting => {
+                    if let Some(id) = self.discovery.graph.order.get(self.selected).copied() {
+                        self.discovery.graph.select_node(
+                            &mut reader,
+                            id,
+                            None,
+                            &mut self.diff_limits,
+                        )?;
+                        self.selected += 1;
+                    } else {
+                        self.phase = FrontierPhase::Ready;
+                    }
+                }
+                FrontierPhase::Ready | FrontierPhase::Done => break,
+            }
+            self.operations = self
+                .operations
+                .checked_add(1)
+                .ok_or(Error::Internal("annotation progress overflow"))?;
+        }
+        self.failed = false;
+        Ok(self.progress())
+    }
+    /// Move one parent-first node out, without cloning a complete result vector.
+    /// Calling before Ready is an error and poisons this context.
+    pub fn next_node<R: Source<Key = K>>(
+        &mut self,
+        reader: &mut R,
+    ) -> Step<Option<FrontierNode<K>>, R::Error> {
+        if self.failed {
+            return Err(Error::Internal("annotation frontier is poisoned"));
+        }
+        self.failed = true;
+        reader.check().map_err(Error::Source)?;
+        if !matches!(self.phase, FrontierPhase::Ready | FrontierPhase::Done) {
+            return Err(Error::Internal("annotation frontier is not ready"));
+        }
+        let Some(id) = self.discovery.graph.order.get(self.output).copied() else {
+            self.phase = FrontierPhase::Done;
+            self.failed = false;
+            return Ok(None);
+        };
+        charge(
+            &mut Accounting {
+                source: reader,
+                work: &mut self.work_items,
+                bytes: &mut self.retained,
+            },
+            1,
+            std::mem::size_of::<FrontierNode<K>>(),
+        )?;
+        let node = self
+            .discovery
+            .graph
+            .nodes
+            .remove(&id)
+            .ok_or(Error::Internal("annotation output node missing"))?;
+        self.output += 1;
+        self.operations = self
+            .operations
+            .checked_add(1)
+            .ok_or(Error::Internal("annotation progress overflow"))?;
+        if self.output == self.discovery.graph.order.len() {
+            self.phase = FrontierPhase::Done;
+        }
+        self.failed = false;
+        Ok(Some(FrontierNode {
+            id,
+            key: node.key,
+            parents: node.parents,
+            value: node.value.0,
+            affects_path: node.selected,
+        }))
+    }
+}
+
 pub fn frontier<R: Source>(
     reader: &mut R,
     heads: &[m::CommitId],
@@ -689,24 +979,399 @@ pub fn frontier<R: Source>(
     diff_limits: &mut jj_lib::diff::LineDiffLimits,
     scanned: &mut u32,
 ) -> Step<Vec<FrontierNode<R::Key>>, R::Error> {
-    let mut graph = Graph::load(reader, heads, None, limits, scanned)?;
-    graph.select(reader, None, diff_limits)?;
-    charge(
-        reader,
-        graph.order.len(),
-        std::mem::size_of::<FrontierNode<R::Key>>(),
-    )?;
-    let mut result = Vec::with_capacity(graph.order.len());
-    for id in graph.order {
-        reader.check().map_err(Error::Source)?;
-        let node = graph.nodes.remove(&id).unwrap();
-        result.push(FrontierNode {
-            id,
-            key: node.key,
-            parents: node.parents,
-            value: node.value.0,
-            affects_path: node.selected,
-        });
+    let mut state = Frontier::new(reader, heads, limits, *diff_limits)?;
+    state.scanned = *scanned;
+    let result = (|| {
+        while !matches!(
+            state.progress().phase,
+            FrontierPhase::Ready | FrontierPhase::Done
+        ) {
+            state.advance(reader, std::num::NonZeroUsize::new(128).unwrap())?;
+        }
+        charge(
+            reader,
+            state.discovery.graph.order.len(),
+            std::mem::size_of::<FrontierNode<R::Key>>(),
+        )?;
+        let mut output = Vec::with_capacity(state.discovery.graph.order.len());
+        while let Some(node) = state.next_node(reader)? {
+            output.push(node);
+        }
+        Ok(output)
+    })();
+    *scanned = state.progress().scanned_commits;
+    *diff_limits = state.remaining_diff_limits();
+    result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::num::NonZeroUsize;
+
+    #[derive(Clone)]
+    struct Fixture {
+        nodes: BTreeMap<m::CommitId, (u64, Vec<m::CommitId>, Option<m::TreeValue>)>,
+        bodies: BTreeMap<m::FileId, Vec<u8>>,
+        reads: BTreeMap<m::CommitId, usize>,
+        file_reads: usize,
+        work: u64,
+        bytes: u64,
+        max_work: u64,
+        active: bool,
     }
-    Ok(result)
+    fn id(number: u64) -> m::CommitId {
+        let mut bytes = [0; 32];
+        bytes[..8].copy_from_slice(&number.to_be_bytes());
+        m::CommitId(bytes)
+    }
+    impl Fixture {
+        fn new() -> Self {
+            Self {
+                nodes: BTreeMap::from([(m::CommitId::ROOT, (0, vec![], None))]),
+                bodies: BTreeMap::new(),
+                reads: BTreeMap::new(),
+                file_reads: 0,
+                work: 0,
+                bytes: 0,
+                max_work: 1_000_000,
+                active: true,
+            }
+        }
+        fn file(&mut self, bytes: &[u8]) -> m::TreeValue {
+            let file = m::FileId(*blake3::hash(bytes).as_bytes());
+            self.bodies.insert(file, bytes.to_vec());
+            m::TreeValue::File {
+                id: file,
+                executable: false,
+                size_bytes: bytes.len() as u64,
+                copy_id: None,
+            }
+        }
+        fn chain(length: u64) -> Self {
+            let mut fixture = Self::new();
+            let value = fixture.file(b"same\nsame\n");
+            for number in 1..=length {
+                let parent = if number == 1 {
+                    m::CommitId::ROOT
+                } else {
+                    id(number - 1)
+                };
+                fixture
+                    .nodes
+                    .insert(id(number), (number, vec![parent], Some(value.clone())));
+            }
+            fixture
+        }
+        fn ancestors(&self, heads: &[m::CommitId]) -> BTreeSet<m::CommitId> {
+            let mut output = BTreeSet::new();
+            let mut pending = heads.to_vec();
+            while let Some(id) = pending.pop() {
+                if output.insert(id) {
+                    pending.extend(&self.nodes[&id].1);
+                }
+            }
+            output
+        }
+    }
+    impl Budget for Fixture {
+        type Error = &'static str;
+        fn check(&self) -> Result<(), Self::Error> {
+            if self.active {
+                Ok(())
+            } else {
+                Err("cancelled")
+            }
+        }
+        fn charge(&mut self, work: u64, bytes: u64) -> Result<(), Self::Error> {
+            self.check()?;
+            self.work += work;
+            self.bytes += bytes;
+            if self.work > self.max_work {
+                Err("work exhausted")
+            } else {
+                Ok(())
+            }
+        }
+        fn frontier(&mut self, entries: usize) -> Result<(), Self::Error> {
+            if entries <= 4096 {
+                Ok(())
+            } else {
+                Err("frontier exhausted")
+            }
+        }
+        fn diff_active(&self) -> bool {
+            self.active
+        }
+    }
+    impl GraphSource for Fixture {
+        type Key = u64;
+        fn node(&mut self, id: m::CommitId) -> Result<SourceNode<u64>, Self::Error> {
+            *self.reads.entry(id).or_default() += 1;
+            let (key, parents, value) = self.nodes.get(&id).ok_or("missing node")?;
+            Ok(SourceNode {
+                key: *key,
+                parents: parents.clone(),
+                value: value.clone(),
+            })
+        }
+        fn common_ancestors(
+            &mut self,
+            left: &[m::CommitId],
+            right: &[m::CommitId],
+        ) -> Result<Vec<m::CommitId>, Self::Error> {
+            let left = self.ancestors(left);
+            let right = self.ancestors(right);
+            let shared: Vec<_> = left.intersection(&right).copied().collect();
+            Ok(shared
+                .iter()
+                .copied()
+                .filter(|candidate| {
+                    !shared.iter().any(|other| {
+                        candidate != other && self.ancestors(&[*other]).contains(candidate)
+                    })
+                })
+                .collect())
+        }
+        fn is_ancestor(
+            &mut self,
+            ancestor: m::CommitId,
+            descendant: m::CommitId,
+        ) -> Result<bool, Self::Error> {
+            Ok(self.ancestors(&[descendant]).contains(&ancestor))
+        }
+    }
+    impl ContentSource for Fixture {
+        fn read_file(&mut self, value: &m::TreeValue) -> Result<Vec<u8>, Self::Error> {
+            self.file_reads += 1;
+            let m::TreeValue::File { id, .. } = value else {
+                return Err("not a file");
+            };
+            self.bodies.get(id).cloned().ok_or("missing file")
+        }
+    }
+    fn limits(max_commits: usize) -> Limits {
+        Limits {
+            max_commits,
+            max_lines: 1024,
+            max_file_bytes: 1024,
+        }
+    }
+    fn diff_limits() -> jj_lib::diff::LineDiffLimits {
+        jj_lib::diff::LineDiffLimits {
+            max_input_bytes: 1_000_000,
+            max_lines: 100_000,
+            max_work: 1_000_000,
+            max_allocation_bytes: 1_000_000,
+            max_recursion_depth: 64,
+        }
+    }
+    fn drain(
+        source: &mut Fixture,
+        state: &mut Frontier<u64>,
+        quantum: usize,
+    ) -> Vec<FrontierNode<u64>> {
+        while state.progress().phase != FrontierPhase::Ready {
+            let before = state.progress();
+            let after = state
+                .advance(source, NonZeroUsize::new(quantum).unwrap())
+                .unwrap();
+            assert!(after.operations > before.operations);
+            assert!(after.operations - before.operations <= quantum as u64);
+            assert!(after.retained_bytes_upper_bound >= before.retained_bytes_upper_bound);
+        }
+        let mut output = vec![];
+        while let Some(node) = state.next_node(source).unwrap() {
+            output.push(node);
+        }
+        output
+    }
+    #[test]
+    fn deep_frontier_advances_with_positive_empty_progress_without_rereading_nodes() {
+        let mut source = Fixture::chain(300);
+        let mut state = Frontier::new(&mut source, &[id(300)], limits(300), diff_limits()).unwrap();
+        let first = state
+            .advance(&mut source, NonZeroUsize::new(7).unwrap())
+            .unwrap();
+        assert_eq!(first.phase, FrontierPhase::Discovering);
+        assert_eq!(first.scanned_commits, 7);
+        assert_eq!(first.operations, 7);
+        assert_eq!(source.file_reads, 0, "discovery never hydrates FILE bodies");
+        let output = drain(&mut source, &mut state, 7);
+        assert_eq!(output.len(), 301);
+        assert_eq!(output[0].id, m::CommitId::ROOT);
+        assert_eq!(output.last().unwrap().id, id(300));
+        assert_eq!(state.progress().scanned_commits, 300);
+        assert!(source.reads.values().all(|reads| *reads == 1));
+        assert_eq!(
+            source.file_reads, 0,
+            "equal path values need no historical bodies"
+        );
+        let before = (source.work, source.bytes, state.progress());
+        state
+            .advance(&mut source, NonZeroUsize::new(7).unwrap())
+            .unwrap();
+        assert!(state.next_node(&mut source).unwrap().is_none());
+        assert_eq!(
+            before,
+            (source.work, source.bytes, state.progress()),
+            "idle completion does not recharge; page replay belongs to caller"
+        );
+    }
+    #[test]
+    fn aggregate_scan_work_and_cancellation_fail_closed_without_restart() {
+        for (name, scan_limit, work_limit, cancel, expected) in [
+            ("aggregate scan", 16, 1_000_000, false, "scan"),
+            ("aggregate work", 300, 20, false, "work"),
+            ("cancellation", 300, 1_000_000, true, "cancelled"),
+        ] {
+            let mut source = Fixture::chain(300);
+            source.max_work = work_limit;
+            let mut state =
+                Frontier::new(&mut source, &[id(300)], limits(scan_limit), diff_limits()).unwrap();
+            state
+                .advance(&mut source, NonZeroUsize::new(2).unwrap())
+                .unwrap();
+            source.active = !cancel;
+            loop {
+                if let Err(error) = state.advance(&mut source, NonZeroUsize::new(3).unwrap()) {
+                    let actual = match error {
+                        Error::Boundary(Boundary::ScanLimit) => "scan",
+                        Error::Source("work exhausted") => "work",
+                        Error::Source("cancelled") => "cancelled",
+                        other => panic!("unexpected {name} error: {other:?}"),
+                    };
+                    assert_eq!(actual, expected, "{name}");
+                    break;
+                }
+            }
+            let before = (source.work, source.reads.clone());
+            assert!(
+                state
+                    .advance(&mut source, NonZeroUsize::new(3).unwrap())
+                    .is_err()
+            );
+            assert!(state.next_node(&mut source).is_err());
+            assert_eq!(
+                before,
+                (source.work, source.reads),
+                "{name} cannot restart spent work"
+            );
+        }
+    }
+    #[test]
+    fn paged_frontier_matches_single_shot_for_merge_and_repeated_line_attribution() {
+        let mut fixture = Fixture::new();
+        for (number, parents, bytes) in [
+            (1, vec![m::CommitId::ROOT], b"same\nsame\n".as_slice()),
+            (2, vec![id(1)], b"left\nsame\n".as_slice()),
+            (3, vec![id(1)], b"same\nright\n".as_slice()),
+            (4, vec![id(2), id(3)], b"left\nright\n".as_slice()),
+        ] {
+            let value = fixture.file(bytes);
+            fixture
+                .nodes
+                .insert(id(number), (number, parents, Some(value)));
+        }
+        let mut one = fixture.clone();
+        let expected = frontier(&mut one, &[id(4)], limits(4), &mut diff_limits(), &mut 0).unwrap();
+        let mut paged = fixture.clone();
+        let mut state = Frontier::new(&mut paged, &[id(4)], limits(4), diff_limits()).unwrap();
+        let actual = drain(&mut paged, &mut state, 1);
+        assert_eq!(actual, expected);
+        assert_eq!(paged.reads, one.reads);
+        assert_eq!(paged.file_reads, one.file_reads);
+        // Reuse the published NONFORCED membership as the mixed source does;
+        // forcing only the actual target must preserve the complete DAG oracle.
+        struct Selected {
+            source: Fixture,
+            flags: BTreeMap<m::CommitId, bool>,
+        }
+        impl Budget for Selected {
+            type Error = &'static str;
+            fn check(&self) -> Result<(), Self::Error> {
+                self.source.check()
+            }
+            fn charge(&mut self, n: u64, bytes: u64) -> Result<(), Self::Error> {
+                self.source.charge(n, bytes)
+            }
+            fn frontier(&mut self, n: usize) -> Result<(), Self::Error> {
+                self.source.frontier(n)
+            }
+            fn diff_active(&self) -> bool {
+                self.source.diff_active()
+            }
+        }
+        impl GraphSource for Selected {
+            type Key = u64;
+            fn affects_path(&mut self, id: m::CommitId) -> Result<Option<bool>, Self::Error> {
+                Ok(self.flags.get(&id).copied())
+            }
+            fn node(&mut self, id: m::CommitId) -> Result<SourceNode<u64>, Self::Error> {
+                self.source.node(id)
+            }
+            fn common_ancestors(
+                &mut self,
+                a: &[m::CommitId],
+                b: &[m::CommitId],
+            ) -> Result<Vec<m::CommitId>, Self::Error> {
+                self.source.common_ancestors(a, b)
+            }
+            fn is_ancestor(&mut self, a: m::CommitId, b: m::CommitId) -> Result<bool, Self::Error> {
+                self.source.is_ancestor(a, b)
+            }
+        }
+        impl ContentSource for Selected {
+            fn read_file(&mut self, value: &m::TreeValue) -> Result<Vec<u8>, Self::Error> {
+                self.source.read_file(value)
+            }
+        }
+        let target = b"left\nright\n";
+        let target_id = m::FileId(*blake3::hash(target).as_bytes());
+        let mut direct_origins = vec![None; 2];
+        annotate(
+            &mut fixture.clone(),
+            id(4),
+            target,
+            target_id,
+            limits(4),
+            &mut diff_limits(),
+            &mut 0,
+            &mut direct_origins,
+        )
+        .unwrap();
+        let mut selected = Selected {
+            source: fixture,
+            flags: actual
+                .into_iter()
+                .map(|node| (node.id, node.affects_path))
+                .collect(),
+        };
+        let mut paged_origins = vec![None; 2];
+        annotate(
+            &mut selected,
+            id(4),
+            target,
+            target_id,
+            limits(4),
+            &mut diff_limits(),
+            &mut 0,
+            &mut paged_origins,
+        )
+        .unwrap();
+        assert_eq!(paged_origins, direct_origins);
+        assert_eq!(
+            paged_origins,
+            vec![
+                Some(Origin {
+                    commit: id(2),
+                    line: 0
+                }),
+                Some(Origin {
+                    commit: id(3),
+                    line: 1
+                })
+            ]
+        );
+    }
 }
