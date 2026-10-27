@@ -57,6 +57,64 @@ pub struct ConfirmedPublication {
     pub generation: u64,
     pub head: m::CommitId,
 }
+// Publication diagnostics contain only source-defined phases and typed categories.
+// Never format the error or any request/provider value on this path.
+fn publication_failure(phase: &'static str, error: &anyhow::Error) {
+    let category = if let Some(status) = error
+        .chain()
+        .find_map(|cause| cause.downcast_ref::<tonic::Status>())
+    {
+        match status.code() {
+            tonic::Code::Ok => "rpc_ok_error",
+            tonic::Code::Cancelled => "rpc_cancelled",
+            tonic::Code::Unknown => "rpc_unknown",
+            tonic::Code::InvalidArgument => "rpc_invalid_argument",
+            tonic::Code::DeadlineExceeded => "rpc_deadline_exceeded",
+            tonic::Code::NotFound => "rpc_not_found",
+            tonic::Code::AlreadyExists => "rpc_already_exists",
+            tonic::Code::PermissionDenied => "rpc_permission_denied",
+            tonic::Code::ResourceExhausted => "rpc_resource_exhausted",
+            tonic::Code::FailedPrecondition => "rpc_failed_precondition",
+            tonic::Code::Aborted => "rpc_aborted",
+            tonic::Code::OutOfRange => "rpc_out_of_range",
+            tonic::Code::Unimplemented => "rpc_unimplemented",
+            tonic::Code::Internal => "rpc_internal",
+            tonic::Code::Unavailable => "rpc_unavailable",
+            tonic::Code::DataLoss => "rpc_data_loss",
+            tonic::Code::Unauthenticated => "rpc_unauthenticated",
+        }
+    } else if let Some(error) = error
+        .chain()
+        .find_map(|cause| cause.downcast_ref::<std::io::Error>())
+    {
+        match error.kind() {
+            std::io::ErrorKind::NotFound => "io_not_found",
+            std::io::ErrorKind::PermissionDenied => "io_permission_denied",
+            std::io::ErrorKind::AlreadyExists => "io_already_exists",
+            std::io::ErrorKind::InvalidInput => "io_invalid_input",
+            std::io::ErrorKind::InvalidData => "io_invalid_data",
+            std::io::ErrorKind::TimedOut => "io_timed_out",
+            std::io::ErrorKind::Interrupted => "io_interrupted",
+            std::io::ErrorKind::WouldBlock => "io_would_block",
+            std::io::ErrorKind::UnexpectedEof => "io_unexpected_eof",
+            std::io::ErrorKind::WriteZero => "io_write_zero",
+            std::io::ErrorKind::BrokenPipe => "io_broken_pipe",
+            std::io::ErrorKind::NotConnected => "io_not_connected",
+            std::io::ErrorKind::ConnectionRefused => "io_connection_refused",
+            std::io::ErrorKind::ConnectionReset => "io_connection_reset",
+            std::io::ErrorKind::ConnectionAborted => "io_connection_aborted",
+            _ => "io_other",
+        }
+    } else {
+        "local_unclassified"
+    };
+    // Diagnostic I/O failure must not replace the original publication failure.
+    let _ = std::io::Write::write_fmt(
+        &mut std::io::stderr(),
+        format_args!("native_publication_failure phase={phase} category={category}\n"),
+    );
+}
+
 impl RemoteRepositoryControl {
     pub(crate) async fn physical_client(&self) -> Result<NativeClient> {
         let client = self.inner.connector.get().await?;
@@ -416,6 +474,21 @@ impl RemoteRepositoryControl {
         request: PublishRequest,
         deadline: tokio::time::Instant,
     ) -> Result<ConfirmedPublication> {
+        let mut phase = "validate";
+        let result = self
+            .publish_inner_phase(request, deadline, &mut phase)
+            .await;
+        if let Err(error) = &result {
+            publication_failure(phase, error);
+        }
+        result
+    }
+    async fn publish_inner_phase(
+        &self,
+        request: PublishRequest,
+        deadline: tokio::time::Instant,
+        phase: &mut &'static str,
+    ) -> Result<ConfirmedPublication> {
         ensure!(
             request.head != m::CommitId::ROOT
                 && request.reference_name != "_tinytree"
@@ -444,10 +517,13 @@ impl RemoteRepositoryControl {
             commit: Some(hex(&request.head.0)),
             leases: Vec::new(),
         };
+        *phase = "save_pending";
         let ledger = self.inner.ledger.clone();
         let saved = pending.clone();
         io::blocking(move || ledger.save_pending(&saved)).await?;
+        *phase = "connector";
         let client = self.physical_client().await?;
+        *phase = "hydrate_closure";
         let closure = self.hydrate_closure(request.head).await?;
         let mut descriptors = closure.descriptors();
         for (id, size, _) in &closure.files {
@@ -460,6 +536,7 @@ impl RemoteRepositoryControl {
                 format_version: m::FORMAT_VERSION,
             });
         }
+        *phase = "find_missing";
         let mut missing = std::collections::HashSet::new();
         for batch in descriptors.chunks(self.inner.config.remote.limits.max_batch_items) {
             for key in io::network(
@@ -470,6 +547,7 @@ impl RemoteRepositoryControl {
                 missing.insert(key);
             }
         }
+        *phase = "metadata_upload";
         // Upload parent-first metadata, and only verified immutable file sources.
         for key in &closure.order {
             if missing.contains(key) {
@@ -480,6 +558,7 @@ impl RemoteRepositoryControl {
                 io::network(client.upload_metadata(object)).await?;
             }
         }
+        *phase = "file_upload";
         let provider = RemoteObjectIo {
             inner: self.inner.clone(),
         };
@@ -502,14 +581,17 @@ impl RemoteRepositoryControl {
                 .await?;
             io::network(client.upload_file(source)).await?;
         }
+        *phase = "hold";
         let root = self.hold(&client, request.head).await?;
         let root = self.current_hold(&client, root).await?;
+        *phase = "ledger_completed";
         // Metadata is already durable locally; this proof also makes the remote
         // complete closure live before the public generation CAS is attempted.
         let ledger = self.inner.ledger.clone();
         let members = closure.descriptors();
         let files = closure.files;
         io::blocking(move || ledger.completed(root, &members, &files)).await?;
+        *phase = "publish_cas";
         let publication = match io::network(
             client.publish(pending.wire(&self.inner.config.remote.repository_id)?),
         )
@@ -528,6 +610,7 @@ impl RemoteRepositoryControl {
                 return Err(error.into());
             }
         };
+        *phase = "receipt_persist";
         let reference = publication
             .reference
             .context("native publication receipt omitted reference")?;
