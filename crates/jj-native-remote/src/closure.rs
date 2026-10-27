@@ -8,6 +8,138 @@ use std::{
 };
 use tinytree_client::MetadataOutcome;
 use tinytree_model as m;
+// Payload-free contexts keep publication diagnostics independent of error text.
+#[derive(Debug)]
+pub(crate) enum ClosureFailure {
+    IntrinsicRoot,
+    Cycle,
+    ObjectBudget,
+    LocalIncomplete,
+    RemoteResponseMissing,
+    ObjectIdentity,
+    FileLength,
+    SymlinkLengthConflict,
+    EdgeOverflow,
+    EdgeBudget,
+    QueueBudget,
+    SymlinkMissing,
+    SymlinkKind,
+    SymlinkLength,
+    MetadataBytesOverflow,
+    MetadataBytesBudget,
+    RemoteUnavailable,
+    CanonicalMetadata,
+    DuplicateResponse,
+    TreeContextMissing,
+    TreeContextKind,
+    PathEdgeOverflow,
+    PathEdgeBudget,
+    PathLengthOverflow,
+    PathLengthBudget,
+    CopyContextMissing,
+    CopyContextKind,
+    CopyContextPath,
+    PathContextsBudget,
+    PathContextBytesOverflow,
+    PathContextBytesBudget,
+    LocalDescriptor,
+    LocalMetadataRead,
+    RemoteConnect,
+    RemoteRead,
+    InstallDescriptor,
+    InstallWrite,
+    InstallIdentity,
+}
+impl ClosureFailure {
+    pub(crate) fn category(&self) -> &'static str {
+        match self {
+            Self::IntrinsicRoot => "closure_intrinsic_root",
+            Self::Cycle => "closure_cycle",
+            Self::ObjectBudget => "closure_object_budget",
+            Self::LocalIncomplete => "closure_local_incomplete",
+            Self::RemoteResponseMissing => "closure_remote_response_missing",
+            Self::ObjectIdentity => "closure_object_identity",
+            Self::FileLength => "closure_file_length",
+            Self::SymlinkLengthConflict => "closure_symlink_length_conflict",
+            Self::EdgeOverflow => "closure_edge_overflow",
+            Self::EdgeBudget => "closure_edge_budget",
+            Self::QueueBudget => "closure_queue_budget",
+            Self::SymlinkMissing => "closure_symlink_missing",
+            Self::SymlinkKind => "closure_symlink_kind",
+            Self::SymlinkLength => "closure_symlink_length",
+            Self::MetadataBytesOverflow => "closure_metadata_bytes_overflow",
+            Self::MetadataBytesBudget => "closure_metadata_bytes_budget",
+            Self::RemoteUnavailable => "closure_remote_unavailable",
+            Self::CanonicalMetadata => "closure_canonical_metadata",
+            Self::DuplicateResponse => "closure_duplicate_response",
+            Self::TreeContextMissing => "closure_tree_context_missing",
+            Self::TreeContextKind => "closure_tree_context_kind",
+            Self::PathEdgeOverflow => "closure_path_edge_overflow",
+            Self::PathEdgeBudget => "closure_path_edge_budget",
+            Self::PathLengthOverflow => "closure_path_length_overflow",
+            Self::PathLengthBudget => "closure_path_length_budget",
+            Self::CopyContextMissing => "closure_copy_context_missing",
+            Self::CopyContextKind => "closure_copy_context_kind",
+            Self::CopyContextPath => "closure_copy_context_path",
+            Self::PathContextsBudget => "closure_path_contexts_budget",
+            Self::PathContextBytesOverflow => "closure_path_context_bytes_overflow",
+            Self::PathContextBytesBudget => "closure_path_context_bytes_budget",
+            Self::LocalDescriptor => "closure_local_descriptor",
+            Self::LocalMetadataRead => "closure_local_metadata_read",
+            Self::RemoteConnect => "closure_remote_connect",
+            Self::RemoteRead => "closure_remote_read",
+            Self::InstallDescriptor => "closure_install_descriptor",
+            Self::InstallWrite => "closure_install_write",
+            Self::InstallIdentity => "closure_install_identity",
+        }
+    }
+}
+impl std::fmt::Display for ClosureFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::IntrinsicRoot => "intrinsic root requires no remote admission",
+            Self::Cycle => "native metadata closure contains a cycle",
+            Self::ObjectBudget => "native metadata closure object budget exceeded",
+            Self::LocalIncomplete => "native local metadata closure is incomplete",
+            Self::RemoteResponseMissing => "native metadata response omitted key",
+            Self::ObjectIdentity => "native closure returned another object",
+            Self::FileLength => "conflicting native tree file lengths",
+            Self::SymlinkLengthConflict => "conflicting native symlink lengths",
+            Self::EdgeOverflow => "native closure edge overflow",
+            Self::EdgeBudget => "native metadata closure edge budget exceeded",
+            Self::QueueBudget => "native metadata traversal queue exceeded budget",
+            Self::SymlinkMissing => "native symlink closure is incomplete",
+            Self::SymlinkKind => "native symlink closure type mismatch",
+            Self::SymlinkLength => "native symlink target length mismatch",
+            Self::MetadataBytesOverflow => "native closure byte overflow",
+            Self::MetadataBytesBudget => "native closure metadata byte budget exceeded",
+            Self::RemoteUnavailable => "native metadata closure is unavailable",
+            Self::CanonicalMetadata => "invalid native canonical metadata",
+            Self::DuplicateResponse => "native metadata frontier contains a duplicate",
+            Self::TreeContextMissing => "native tree context closure is incomplete",
+            Self::TreeContextKind => "native tree context kind mismatch",
+            Self::PathEdgeOverflow => "native path edge overflow",
+            Self::PathEdgeBudget => "native path edge budget exceeded",
+            Self::PathLengthOverflow => "native path length overflow",
+            Self::PathLengthBudget => "native path length budget exceeded",
+            Self::CopyContextMissing => "native copy context closure is incomplete",
+            Self::CopyContextKind => "native copy context kind mismatch",
+            Self::CopyContextPath => "native copy history current path mismatch",
+            Self::PathContextsBudget => "native tree path context budget exceeded",
+            Self::PathContextBytesOverflow => "native path context bytes overflow",
+            Self::PathContextBytesBudget => "native path context byte budget exceeded",
+            Self::LocalDescriptor => "native local metadata descriptor failed",
+            Self::LocalMetadataRead => "native local metadata read failed",
+            Self::RemoteConnect => "native metadata remote connection failed",
+            Self::RemoteRead => "native metadata remote read failed",
+            Self::InstallDescriptor => "native metadata installation descriptor failed",
+            Self::InstallWrite => "native metadata installation write failed",
+            Self::InstallIdentity => "native metadata installation changed identity",
+        })
+    }
+}
+impl std::error::Error for ClosureFailure {}
+
 pub(crate) struct Node {
     pub descriptor: m::Descriptor,
     pub bytes: Vec<u8>,
@@ -24,10 +156,7 @@ impl Closure {
             kind: m::Kind::Commit,
             id: m::ObjectId(head.0),
         };
-        ensure!(
-            head != m::CommitId::ROOT,
-            "intrinsic root requires no remote admission"
-        );
+        ensure!(head != m::CommitId::ROOT, ClosureFailure::IntrinsicRoot);
         let mut nodes = HashMap::new();
         let mut prefetched = HashMap::new();
         let mut pending = vec![(root, false)];
@@ -56,14 +185,11 @@ impl Closure {
             if done.contains(&key) {
                 continue;
             }
-            ensure!(
-                !visiting.contains(&key),
-                "native metadata closure contains a cycle"
-            );
+            ensure!(!visiting.contains(&key), ClosureFailure::Cycle);
             ensure!(
                 nodes.len().saturating_add(prefetched.len()) < inner.config.closure.max_objects
                     || prefetched.contains_key(&key),
-                "native metadata closure object budget exceeded"
+                ClosureFailure::ObjectBudget
             );
             let node =
                 if let Some(node) = prefetched.remove(&key) {
@@ -72,14 +198,16 @@ impl Closure {
                     .local
                     .descriptor(key)
                     .await
-                    .map_err(crate::backend)?
+                    .map_err(crate::backend)
+                    .context(ClosureFailure::LocalDescriptor)?
                     .is_some()
                 {
                     let object = inner
                         .local
                         .read_metadata(key)
                         .await
-                        .map_err(crate::backend)?;
+                        .map_err(crate::backend)
+                        .context(ClosureFailure::LocalMetadataRead)?;
                     crate::io::check_deadline()?;
                     let descriptor = object.descriptor();
                     let contents = object.bytes().to_vec();
@@ -90,7 +218,7 @@ impl Closure {
                         object: object.into_object(),
                     }
                 } else {
-                    ensure!(remote, "native local metadata closure is incomplete");
+                    ensure!(remote, ClosureFailure::LocalIncomplete);
                     // The DFS stack already contains a frontier of known children.
                     // Fetch missing siblings together, but leave DFS visitation and
                     // parent-first validation unchanged. Prefetch never follows new
@@ -100,7 +228,7 @@ impl Closure {
                         .closure
                         .max_objects
                         .checked_sub(nodes.len().saturating_add(prefetched.len()))
-                        .context("native metadata closure object budget exceeded")?;
+                        .context(ClosureFailure::ObjectBudget)?;
                     // A typed 32-byte key uses at most 40 encoded bytes including
                     // its outer field. Reserve repository string framing as well.
                     let request_limit =
@@ -114,10 +242,7 @@ impl Closure {
                         .max_batch_items
                         .min(room)
                         .min(request_limit);
-                    ensure!(
-                        batch_limit != 0,
-                        "native metadata closure object budget exceeded"
-                    );
+                    ensure!(batch_limit != 0, ClosureFailure::ObjectBudget);
                     let mut keys = vec![key];
                     let mut selected = HashSet::from([key]);
                     for &(candidate, exiting) in pending.iter().rev() {
@@ -139,7 +264,8 @@ impl Closure {
                             .local
                             .descriptor(candidate)
                             .await
-                            .map_err(crate::backend)?
+                            .map_err(crate::backend)
+                            .context(ClosureFailure::LocalDescriptor)?
                             .is_none()
                         {
                             keys.push(candidate);
@@ -148,12 +274,9 @@ impl Closure {
                     prefetch(inner, keys, &mut prefetched, &mut bytes).await?;
                     prefetched
                         .remove(&key)
-                        .context("native metadata response omitted key")?
+                        .context(ClosureFailure::RemoteResponseMissing)?
                 };
-            ensure!(
-                node.descriptor.key == key,
-                "native closure returned another object"
-            );
+            ensure!(node.descriptor.key == key, ClosureFailure::ObjectIdentity);
             if let m::Object::Commit(commit) = &node.object {
                 for tree in &commit.root_tree.terms {
                     tree_roots.insert(*tree);
@@ -165,10 +288,7 @@ impl Closure {
                         m::TreeValue::File { id, size_bytes, .. } => {
                             let id = m::ObjectId(id.0);
                             if let Some((size, _)) = files.get(&id) {
-                                ensure!(
-                                    *size == size_bytes,
-                                    "conflicting native tree file lengths"
-                                );
+                                ensure!(*size == size_bytes, ClosureFailure::FileLength);
                             } else {
                                 files.insert(id, (size_bytes, key.id));
                             }
@@ -181,7 +301,7 @@ impl Closure {
                             if let Some(expected) = expectations.insert(child, target_bytes) {
                                 ensure!(
                                     expected == target_bytes,
-                                    "conflicting native symlink lengths"
+                                    ClosureFailure::SymlinkLengthConflict
                                 );
                             }
                         }
@@ -194,10 +314,10 @@ impl Closure {
             let refs = node.object.references();
             edges = edges
                 .checked_add(refs.len())
-                .context("native closure edge overflow")?;
+                .context(ClosureFailure::EdgeOverflow)?;
             ensure!(
                 edges <= inner.config.closure.max_edges,
-                "native metadata closure edge budget exceeded"
+                ClosureFailure::EdgeBudget
             );
             for child in refs.into_iter().rev() {
                 if child.kind != m::Kind::File
@@ -209,20 +329,18 @@ impl Closure {
             }
             ensure!(
                 pending.len() <= inner.config.closure.max_edges,
-                "native metadata traversal queue exceeded budget"
+                ClosureFailure::QueueBudget
             );
             nodes.insert(key, node);
         }
         for (key, expected) in expectations {
-            let node = nodes
-                .get(&key)
-                .context("native symlink closure is incomplete")?;
+            let node = nodes.get(&key).context(ClosureFailure::SymlinkMissing)?;
             let m::Object::Symlink(target) = &node.object else {
-                bail!("native symlink closure type mismatch")
+                bail!(ClosureFailure::SymlinkKind)
             };
             ensure!(
                 target.len() as u64 == expected,
-                "native symlink target length mismatch"
+                ClosureFailure::SymlinkLength
             );
         }
         validate_contexts(&nodes, tree_roots, &inner.config, &mut edges)?;
@@ -246,10 +364,10 @@ impl Closure {
 fn account_bytes(inner: &Inner, bytes: &mut usize, additional: usize) -> Result<()> {
     *bytes = bytes
         .checked_add(additional)
-        .context("native closure byte overflow")?;
+        .context(ClosureFailure::MetadataBytesOverflow)?;
     ensure!(
         *bytes <= inner.config.closure.max_metadata_bytes,
-        "native closure metadata byte budget exceeded"
+        ClosureFailure::MetadataBytesBudget
     );
     Ok(())
 }
@@ -260,7 +378,11 @@ async fn prefetch(
     prefetched: &mut HashMap<m::ObjectKey, Node>,
     bytes: &mut usize,
 ) -> Result<()> {
-    let client = inner.connector.get().await?;
+    let client = inner
+        .connector
+        .get()
+        .await
+        .context(ClosureFailure::RemoteConnect)?;
     let mut batches = vec![keys];
     while let Some(mut keys) = batches.pop() {
         crate::io::check_deadline()?;
@@ -276,25 +398,22 @@ async fn prefetch(
                 batches.push(keys);
                 continue;
             }
-            Err(error) => return Err(error.into()),
+            Err(error) => return Err(anyhow::Error::new(error).context(ClosureFailure::RemoteRead)),
         };
         ensure!(
             outcomes.len() == keys.len(),
-            "native metadata response omitted key"
+            ClosureFailure::RemoteResponseMissing
         );
         for (key, outcome) in keys.into_iter().zip(outcomes) {
             let MetadataOutcome::Object(object) = outcome else {
-                bail!("native metadata closure is unavailable")
+                bail!(ClosureFailure::RemoteUnavailable)
             };
             let descriptor = object.descriptor();
-            ensure!(
-                descriptor.key == key,
-                "native closure returned another object"
-            );
+            ensure!(descriptor.key == key, ClosureFailure::ObjectIdentity);
             let contents = object.canonical_bytes().to_vec();
             account_bytes(inner, bytes, contents.len())?;
             let decoded = m::decode(&contents, inner.model_limits())
-                .context("invalid native canonical metadata")?;
+                .context(ClosureFailure::CanonicalMetadata)?;
             ensure!(
                 prefetched
                     .insert(
@@ -306,7 +425,7 @@ async fn prefetch(
                         }
                     )
                     .is_none(),
-                "native metadata frontier contains a duplicate"
+                ClosureFailure::DuplicateResponse
             );
         }
     }
@@ -340,25 +459,27 @@ pub(crate) fn validate_contexts(
         };
         let node = nodes
             .get(&key)
-            .context("native tree context closure is incomplete")?;
+            .context(ClosureFailure::TreeContextMissing)?;
         let m::Object::Tree(tree) = &node.object else {
-            bail!("native tree context kind mismatch")
+            bail!(ClosureFailure::TreeContextKind)
         };
         for entry in &tree.entries {
             crate::io::check_deadline()?;
-            *edges = edges.checked_add(1).context("native path edge overflow")?;
+            *edges = edges
+                .checked_add(1)
+                .context(ClosureFailure::PathEdgeOverflow)?;
             ensure!(
                 *edges <= config.closure.max_edges,
-                "native path edge budget exceeded"
+                ClosureFailure::PathEdgeBudget
             );
             let length = prefix
                 .len()
                 .checked_add(usize::from(!prefix.is_empty()))
                 .and_then(|n| n.checked_add(entry.name.len()))
-                .context("native path length overflow")?;
+                .context(ClosureFailure::PathLengthOverflow)?;
             ensure!(
                 length <= config.closure.max_path_bytes,
-                "native path length budget exceeded"
+                ClosureFailure::PathLengthBudget
             );
             match entry.value {
                 m::TreeValue::Tree(child) => {
@@ -380,10 +501,12 @@ pub(crate) fn validate_contexts(
                     copy_id: Some(copy),
                     ..
                 } => {
-                    *edges = edges.checked_add(1).context("native path edge overflow")?;
+                    *edges = edges
+                        .checked_add(1)
+                        .context(ClosureFailure::PathEdgeOverflow)?;
                     ensure!(
                         *edges <= config.closure.max_edges,
-                        "native path edge budget exceeded"
+                        ClosureFailure::PathEdgeBudget
                     );
                     let path = if prefix.is_empty() {
                         entry.name.clone()
@@ -395,13 +518,13 @@ pub(crate) fn validate_contexts(
                             kind: m::Kind::CopyHistory,
                             id: m::ObjectId(copy.0),
                         })
-                        .context("native copy context closure is incomplete")?;
+                        .context(ClosureFailure::CopyContextMissing)?;
                     let m::Object::CopyHistory(history) = &node.object else {
-                        bail!("native copy context kind mismatch")
+                        bail!(ClosureFailure::CopyContextKind)
                     };
                     ensure!(
                         history.current_path == path,
-                        "native copy history current path mismatch"
+                        ClosureFailure::CopyContextPath
                     );
                 }
                 _ => {}
@@ -423,14 +546,14 @@ fn enqueue(
     }
     ensure!(
         seen.len() < config.closure.max_path_contexts,
-        "native tree path context budget exceeded"
+        ClosureFailure::PathContextsBudget
     );
     *bytes = bytes
         .checked_add(path.len())
-        .context("native path context bytes overflow")?;
+        .context(ClosureFailure::PathContextBytesOverflow)?;
     ensure!(
         *bytes <= config.closure.max_path_context_bytes,
-        "native path context byte budget exceeded"
+        ClosureFailure::PathContextBytesBudget
     );
     seen.insert((tree, path.clone()));
     pending.push((tree, path));

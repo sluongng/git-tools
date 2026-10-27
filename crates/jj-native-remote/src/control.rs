@@ -1,7 +1,7 @@
 //! Durable remote operations, deliberately separate from local object I/O.
 use crate::{
     Inner, backend,
-    closure::Closure,
+    closure::{Closure, ClosureFailure},
     hex, io,
     ledger::{Request, Root},
     provider::RemoteObjectIo,
@@ -60,7 +60,9 @@ pub struct ConfirmedPublication {
 // Publication diagnostics contain only source-defined phases and typed categories.
 // Never format the error or any request/provider value on this path.
 fn publication_failure(phase: &'static str, error: &anyhow::Error) {
-    let category = if let Some(status) = error
+    let category = if let Some(failure) = error.downcast_ref::<ClosureFailure>() {
+        failure.category()
+    } else if let Some(status) = error
         .chain()
         .find_map(|cause| cause.downcast_ref::<tonic::Status>())
     {
@@ -830,7 +832,8 @@ impl RemoteRepositoryControl {
                 .local
                 .descriptor(*key)
                 .await
-                .map_err(backend)?
+                .map_err(backend)
+                .context(ClosureFailure::InstallDescriptor)?
                 .is_none()
             {
                 let descriptor = self
@@ -843,10 +846,11 @@ impl RemoteRepositoryControl {
                             .unwrap_or_else(|| Arc::new(())),
                     )
                     .await
-                    .map_err(backend)?;
+                    .map_err(backend)
+                    .context(ClosureFailure::InstallWrite)?;
                 ensure!(
                     descriptor == node.descriptor,
-                    "native metadata installation changed identity"
+                    ClosureFailure::InstallIdentity
                 );
             }
         }
