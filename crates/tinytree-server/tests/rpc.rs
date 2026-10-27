@@ -786,7 +786,7 @@ async fn capabilities_separate_configured_support_from_authenticated_grants_with
         let mut client = server.client().await;
         let input = p::GetCapabilitiesRequest {
             repository_id: "alpha".into(),
-            features: vec![1, 2, 3, 4, 5, 8, 9, 10, 11, 13],
+            features: vec![1, 2, 3, 4, 5, 8, 9, 10, 11, 13, 14],
         };
         assert_eq!(
             client
@@ -837,12 +837,12 @@ async fn capabilities_separate_configured_support_from_authenticated_grants_with
                         .iter()
                         .map(|f| f.feature)
                         .collect::<Vec<_>>(),
-                    vec![1, 2, 3, 4, 5, 8, 9, 10, 11, 13]
+                    vec![1, 2, 3, 4, 5, 8, 9, 10, 11, 13, 14]
                 );
                 for feature in &result.features {
                     assert_eq!(
                         feature.supported,
-                        if feature.feature <= 3 || matches!(feature.feature, 8 | 11) {
+                        if feature.feature <= 3 || matches!(feature.feature, 8 | 11 | 14) {
                             query
                         } else if feature.feature == 13 {
                             cloud && indexed && captured && offload
@@ -855,7 +855,7 @@ async fn capabilities_separate_configured_support_from_authenticated_grants_with
                     assert_eq!(
                         feature.authorized,
                         match feature.feature {
-                            1..=3 | 8 | 11 => true,
+                            1..=3 | 8 | 11 | 14 => true,
                             4 | 9 | 13 => cloud_read,
                             5 | 10 => cloud_write,
                             _ => unreachable!(),
@@ -7436,6 +7436,130 @@ async fn annotation_frontier_is_nonforced_exact_and_cumulatively_bounded() {
     );
     drop(client);
     server.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn annotation_frontier_pages_preserve_one_deep_source_and_budget() {
+    let (temporary, store) = setup();
+    let index = tinytree_index::Index::open(temporary.path().join("derived"), &Default::default()).unwrap();
+    // Keep the selected FILE absent until frontier completion. Metadata-only
+    // traversal must not need it, even though all path values refer to it.
+    let selected_file = tinytree_model::describe_file(b"selected\n");
+    let content = tinytree_model::TreeValue::File {
+        id:tinytree_model::FileId(selected_file.key.id.0), executable:false,
+        size_bytes:selected_file.size_bytes,copy_id:None,
+    };
+    let mut head = None;
+    for change in 0..300usize {
+        let parents = head.into_iter().collect::<Vec<_>>();
+        head = Some(history_commit(&store, &index, &parents, Some(content.clone()), change as u8).descriptor.key);
+    }
+    let head = head.unwrap();
+    // A body outside the selected path must not be needed for discovery/selection.
+    let _unrelated = history_file(&store, &vec![b'z'; 64 * 1024], false);
+    let mut config = ServiceConfig::default();
+    config.query.max_annotation_commits = 400;
+    let server = Running::start_query(store.clone(), config, index).await;
+    let mut client = server.query_client().await;
+    let scope = query_ready(&mut client, &[head], 181).await;
+    let limits = q::AnnotationLimits { work_nodes:100_000, work_edges:1_000_000,
+        work_bytes:32*1024*1024, frontier:100_000, read_bytes:4*1024*1024,
+        diff_input_bytes:4096, diff_lines:1_000_000, diff_work:4_000_000,
+        diff_allocation_bytes:8*1024*1024, diff_depth:64 };
+    let open = q::OpenAnnotationFrontierPagedRequest {
+        input: Some(q::OpenAnnotationFrontierRequest { scope:scope.key.clone(), version:3,
+            anchors:vec![query_id(head)], path:"file".into(), max_commits:300, limits:Some(limits) }),
+        page_size:7, scan_quantum:17,
+    };
+    assert_eq!(client.open_annotation_frontier_paged(request(open.clone(), BETA)).await.unwrap_err().code(), Code::PermissionDenied);
+    let first = client.open_annotation_frontier_paged(request(open.clone(), ALPHA)).await.unwrap().into_inner();
+    assert!(first.has_more);
+    assert_eq!(first.sequence,0);
+    assert_eq!(first.frontier.as_ref().unwrap().coverage,0);
+    assert_eq!(client.open_annotation_frontier_paged(request(open.clone(), ALPHA)).await.unwrap().into_inner(),first);
+    let mut changed = open.clone(); changed.page_size += 1;
+    assert_eq!(client.open_annotation_frontier_paged(request(changed, ALPHA)).await.unwrap_err().code(),Code::FailedPrecondition);
+    let first_request = q::ContinueAnnotationFrontierRequest { scope:scope.key.clone(),
+        context:first.frontier.as_ref().unwrap().context.clone(), cursor:first.next_cursor.clone() };
+    let mut wrong = first_request.clone(); wrong.context[0] ^= 1;
+    assert_eq!(client.continue_annotation_frontier(request(wrong, ALPHA)).await.unwrap_err().code(),Code::InvalidArgument);
+    let mut wrong = first_request.clone(); wrong.cursor[0] ^= 1;
+    assert_eq!(client.continue_annotation_frontier(request(wrong, ALPHA)).await.unwrap_err().code(),Code::InvalidArgument);
+    assert_eq!(client.read_annotation_input(request(q::ReadAnnotationInputRequest {
+        scope:scope.key.clone(),context:first_request.context.clone(),revision:Some(query_id(head)),expected:None,
+    }, ALPHA)).await.unwrap_err().code(),Code::FailedPrecondition);
+    let mut page = first.clone();
+    let mut nodes = Vec::new();
+    let mut previous_usage = q::AnnotationUsage::default();
+    let mut previous_ops = 0;
+    let mut rounds = 0;
+    while page.has_more {
+        assert!(page.frontier.as_ref().unwrap().nodes.len() <= 7);
+        assert_eq!(page.frontier.as_ref().unwrap().coverage,0);
+        let usage = page.usage.as_ref().unwrap();
+        assert!(usage.work_nodes >= previous_usage.work_nodes && usage.work_edges >= previous_usage.work_edges && usage.work_bytes >= previous_usage.work_bytes);
+        assert!(usage.read_bytes >= previous_usage.read_bytes && usage.read_bytes <= 4*1024*1024);
+        assert!(page.operations >= previous_ops);
+        previous_usage = usage.clone(); previous_ops = page.operations;
+        nodes.extend(page.frontier.as_ref().unwrap().nodes.clone());
+        let advance = q::ContinueAnnotationFrontierRequest { scope:scope.key.clone(),
+            context:page.frontier.as_ref().unwrap().context.clone(),cursor:page.next_cursor.clone() };
+        let next = client.continue_annotation_frontier(request(advance.clone(), ALPHA)).await.unwrap().into_inner();
+        assert_eq!(next.sequence,page.sequence+1);
+        assert_eq!(client.continue_annotation_frontier(request(advance, ALPHA)).await.unwrap().into_inner(),next,"last accepted page is replayed without recharge");
+        page = next; rounds += 1; assert!(rounds < 200);
+    }
+    assert!(rounds > 40);
+    assert!(page.next_cursor.is_empty());
+    let final_frontier = page.frontier.as_ref().unwrap();
+    assert_eq!(final_frontier.coverage,q::HistoryCoverage::HistoryComplete as i32);
+    assert_eq!(final_frontier.scanned_commits,300);
+    assert_eq!(page.emitted_nodes,301);
+    nodes.extend(final_frontier.nodes.clone());
+    assert_eq!(nodes.len(),301);
+    let mut seen = std::collections::BTreeSet::new();
+    for node in &nodes {
+        assert!(node.parents.iter().all(|p|seen.contains(&p.value)));
+        assert!(seen.insert(node.revision.as_ref().unwrap().value.clone()));
+    }
+    assert_eq!(client.continue_annotation_frontier(request(first_request, ALPHA)).await.unwrap_err().code(),Code::InvalidArgument,"old cursor cannot restart traversal");
+    store.put("alpha", selected_file, b"selected\n", 0).unwrap();
+    let selected = nodes.iter().find(|node|node.revision.as_ref().unwrap().value==head.id.0).unwrap();
+    assert_eq!(client.read_annotation_input(request(q::ReadAnnotationInputRequest {
+        scope:scope.key.clone(),context:final_frontier.context.clone(),revision:selected.revision.clone(),expected:selected.value.clone(),
+    }, ALPHA)).await.unwrap().into_inner().data,b"selected\n");
+    client.close_annotation_frontier(request(q::CloseAnnotationFrontierRequest { scope:scope.key.clone(),context:final_frontier.context.clone() },ALPHA)).await.unwrap();
+    assert_eq!(client.open_annotation_frontier_paged(request(open.clone(), ALPHA)).await.unwrap_err().code(),Code::FailedPrecondition);
+
+    // A finite allowance is cumulative across advances, not a per-page reset.
+    let limited_scope = query_ready(&mut client, &[head], 182).await;
+    let mut limited = open.clone();
+    limited.input.as_mut().unwrap().scope=limited_scope.key.clone();
+    limited.input.as_mut().unwrap().limits.as_mut().unwrap().work_nodes=100;
+    limited.scan_quantum=1;
+    let initial = client.open_annotation_frontier_paged(request(limited.clone(),ALPHA)).await.unwrap().into_inner();
+    let mut page=initial.clone(); let mut advances=0;
+    let failed_request = loop {
+        assert!(page.has_more);
+        let next=q::ContinueAnnotationFrontierRequest {scope:limited_scope.key.clone(),context:page.frontier.as_ref().unwrap().context.clone(),cursor:page.next_cursor.clone()};
+        match client.continue_annotation_frontier(request(next.clone(),ALPHA)).await {
+            Ok(reply)=>{page=reply.into_inner();advances+=1;assert!(advances<100);},
+            Err(error)=>{assert_eq!(error.code(),Code::ResourceExhausted);break next;},
+        }
+    };
+    assert!(advances>1);
+    assert_eq!(client.continue_annotation_frontier(request(failed_request,ALPHA)).await.unwrap_err().code(),Code::ResourceExhausted);
+    assert_eq!(client.open_annotation_frontier_paged(request(limited,ALPHA)).await.unwrap().into_inner(),initial,"reopening replays first result, never grants new work");
+
+    let expiring_scope=query_ready(&mut client,&[head],183).await;
+    let mut expiring=open;expiring.input.as_mut().unwrap().scope=expiring_scope.key.clone();
+    let mut short=request(expiring,ALPHA);short.set_timeout(Duration::from_secs(1));
+    let opened=client.open_annotation_frontier_paged(short).await.unwrap().into_inner();
+    tokio::time::sleep(Duration::from_millis(1100)).await;
+    assert_eq!(client.continue_annotation_frontier(request(q::ContinueAnnotationFrontierRequest {
+        scope:expiring_scope.key,context:opened.frontier.unwrap().context,cursor:opened.next_cursor,
+    },ALPHA)).await.unwrap_err().code(),Code::DeadlineExceeded);
+    drop(client);server.stop().await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

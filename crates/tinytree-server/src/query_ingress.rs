@@ -101,6 +101,8 @@ where
         let history = request.uri().path().ends_with("/PathHistory")
             || request.uri().path().ends_with("/Blame")
             || request.uri().path().ends_with("/OpenAnnotationFrontier")
+            || request.uri().path().ends_with("/OpenAnnotationFrontierPaged")
+            || request.uri().path().ends_with("/ContinueAnnotationFrontier")
             || request.uri().path().ends_with("/ReadAnnotationInput");
         let cloud_open = request.uri().path().ends_with("/OpenCloudScope");
         let streaming = cloud_open

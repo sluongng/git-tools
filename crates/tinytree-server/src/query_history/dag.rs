@@ -3,9 +3,9 @@ use super::*;
 use crate::query_overlay::GraphKey;
 use tinytree_annotate as engine;
 
-struct CanonicalDagReader<'a, 'b> {
-    reader: &'a mut Reader<'b>,
-    path: &'a [&'a str],
+pub(super) struct CanonicalDagReader<'a, 'b> {
+    pub(super) reader: &'a mut Reader<'b>,
+    pub(super) path: &'a [&'a str],
 }
 impl engine::Budget for CanonicalDagReader<'_, '_> {
     type Error = Failure;
@@ -87,7 +87,7 @@ impl engine::ContentSource for CanonicalDagReader<'_, '_> {
         self.reader.file(&state(value)).map(|(_, bytes)| bytes)
     }
 }
-fn engine_failure(error: engine::Error<Failure>) -> Failure {
+pub(super) fn engine_failure(error: engine::Error<Failure>) -> Failure {
     match error {
         engine::Error::Source(error) => error,
         engine::Error::Boundary(boundary) => Failure::Boundary(match boundary {

@@ -1084,6 +1084,70 @@ impl RepositoryQuery for QueryService {
             self.repository.service_config().query.max_response_bytes,
         )
     }
+    async fn open_annotation_frontier_paged(
+        &self,
+        request: Request<q::OpenAnnotationFrontierPagedRequest>,
+    ) -> Result<Response<q::AnnotationFrontierPage>, Status> {
+        let (identity, deadline, host) = self.context(&request, false)?;
+        let admission = request.extensions().get::<Arc<Work>>().cloned();
+        self.bounded(request.get_ref())?;
+        let input = request.into_inner();
+        let key = scope_key(input.input.as_ref().and_then(|v| v.scope.clone()))?;
+        identity.authorize(&key.repository_id, false)?;
+        let work = admitted_history(&host, deadline, admission).await?;
+        let (value, work) = execute(host, work, deadline, move |host, work| {
+            let scope = host.lookup(&identity.id, &key.repository_id, &key.handle)?;
+            if scope.is_cloud() {
+                identity.cloud_capability()?;
+            }
+            work.scopes.lock().unwrap().push(scope.clone());
+            crate::query_history::annotation::open_paged(
+                host,
+                &scope,
+                &key.repository_id,
+                input,
+                deadline,
+            )
+        })
+        .await?;
+        response(
+            value,
+            work,
+            self.repository.service_config().query.max_response_bytes,
+        )
+    }
+    async fn continue_annotation_frontier(
+        &self,
+        request: Request<q::ContinueAnnotationFrontierRequest>,
+    ) -> Result<Response<q::AnnotationFrontierPage>, Status> {
+        let (identity, deadline, host) = self.context(&request, false)?;
+        let admission = request.extensions().get::<Arc<Work>>().cloned();
+        self.bounded(request.get_ref())?;
+        let input = request.into_inner();
+        let key = scope_key(input.scope.clone())?;
+        identity.authorize(&key.repository_id, false)?;
+        let work = admitted_history(&host, deadline, admission).await?;
+        let (value, work) = execute(host, work, deadline, move |host, work| {
+            let scope = host.lookup(&identity.id, &key.repository_id, &key.handle)?;
+            if scope.is_cloud() {
+                identity.cloud_capability()?;
+            }
+            work.scopes.lock().unwrap().push(scope.clone());
+            crate::query_history::annotation::continue_frontier(
+                host,
+                &scope,
+                &key.repository_id,
+                input,
+                deadline,
+            )
+        })
+        .await?;
+        response(
+            value,
+            work,
+            self.repository.service_config().query.max_response_bytes,
+        )
+    }
     async fn read_annotation_input(
         &self,
         request: Request<q::ReadAnnotationInputRequest>,

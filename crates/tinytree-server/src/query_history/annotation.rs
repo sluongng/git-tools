@@ -4,6 +4,9 @@ use crate::query_overlay::GraphKey;
 use prost::Message;
 use tokio::sync::OwnedSemaphorePermit;
 
+mod paged;
+pub(crate) use paged::{continue_frontier, open_paged};
+
 pub(crate) struct Context {
     request: q::OpenAnnotationFrontierRequest,
     id: [u8; 32],
@@ -13,6 +16,7 @@ pub(crate) struct Context {
     read_limit: usize,
     diff_limits: jj_lib::diff::LineDiffLimits,
     result: Option<Result<q::AnnotationFrontier, Status>>,
+    paged: Option<paged::State>,
     closed: bool,
     // Payload and cumulative state drop before the independent idle reservation.
     memory: Option<OwnedSemaphorePermit>,
@@ -210,6 +214,7 @@ pub(crate) fn open(
             max_recursion_depth: limits.as_ref().map_or(host.config.max_blame_diff_depth, |v| v.diff_depth as usize),
         },
         result: None,
+        paged: None,
         closed: false,
         memory: Some(memory),
     });
@@ -308,27 +313,19 @@ pub(crate) fn read(
         .try_lock()
         .map_err(|_| Status::resource_exhausted("annotation context is busy"))?;
     let context = context(&mut slot, &input.context, true)?;
-    let snapshot = context
-        .result
-        .as_ref()
-        .and_then(|r| r.as_ref().ok())
-        .filter(|r| r.coverage == Coverage::HistoryComplete as i32)
-        .ok_or_else(|| Status::failed_precondition("annotation frontier is incomplete"))?;
     let revision = parse_revision(input.revision.clone())?;
-    context
-        .budget
-        .charge(1, 0, input.encoded_len() as u64)
-        .map_err(index_error)?;
-    let node = snapshot
-        .nodes
-        .iter()
-        .find(|node| {
-            node.revision
-                .as_ref()
-                .is_some_and(|id| id.value == revision.0)
-        })
-        .ok_or_else(|| Status::invalid_argument("annotation input is outside frontier"))?;
-    if input.expected.is_none() || input.expected != node.value {
+    context.budget.charge(1, 0, input.encoded_len() as u64).map_err(index_error)?;
+    let selected = if let Some(paged) = &context.paged {
+        paged.input_value(revision)?
+    } else {
+        let snapshot = context.result.as_ref().and_then(|r| r.as_ref().ok())
+            .filter(|r| r.coverage == Coverage::HistoryComplete as i32)
+            .ok_or_else(|| Status::failed_precondition("annotation frontier is incomplete"))?;
+        snapshot.nodes.iter().find(|node| node.revision.as_ref().is_some_and(|id| id.value == revision.0))
+            .and_then(|node| node.value.as_ref())
+            .ok_or_else(|| Status::invalid_argument("annotation input is outside frontier"))?
+    };
+    if input.expected.is_none() || input.expected.as_ref() != Some(selected) {
         return Err(Status::invalid_argument(
             "annotation input expected state mismatch",
         ));
@@ -394,6 +391,7 @@ pub(crate) fn close(
     if !context.closed {
         context.closed = true;
         context.result = None;
+        context.paged = None;
         context.request = Default::default();
         // Retain a charged tombstone, not the released snapshot's whole arena.
         if let Some(mut memory) = context.memory.take() {

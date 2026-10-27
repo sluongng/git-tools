@@ -88,6 +88,8 @@ pub struct QueryConfig {
     pub max_scope_overlay_nodes: usize,
     pub max_overlay_layers: usize,
     pub max_history_commits: usize,
+    /// Aggregate retained annotation frontier bound, independent of page quantum.
+    pub max_annotation_commits: usize,
     pub max_history_object_bytes: usize,
     pub max_history_read_bytes: usize,
     pub max_history_path_depth: usize,
@@ -187,6 +189,7 @@ impl Default for QueryConfig {
             max_scope_overlay_nodes: 4096,
             max_overlay_layers: 32,
             max_history_commits: 256,
+            max_annotation_commits: 4096,
             max_history_object_bytes: 1024 * 1024,
             max_history_read_bytes: 16 * 1024 * 1024,
             max_history_path_depth: 128,
@@ -345,6 +348,7 @@ impl QueryConfig {
             || !(1..=65_536).contains(&self.max_scope_overlay_nodes)
             || !(1..=128).contains(&self.max_overlay_layers)
             || !(1..=4096).contains(&self.max_history_commits)
+            || !(1..=65_536).contains(&self.max_annotation_commits)
             || !(1024..=4 * 1024 * 1024).contains(&self.max_history_object_bytes)
             || !(1024..=256 * 1024 * 1024).contains(&self.max_history_read_bytes)
             || !(1..=1024).contains(&self.max_history_path_depth)
