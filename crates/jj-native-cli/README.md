@@ -28,7 +28,9 @@ User workspaces always use a daemon-owned lazy jj-vfs mount. Both `init` and
 debug fallback. The mount contains an opaque `.jj/native-workspace` marker;
 operation, index and working-copy state live in private external administration.
 Ordinary `log`, exact-path `log` and `file annotate` use lazy native queries by
-default. Fetch an absent reference explicitly before its first push. Native
+default. Multiple exact-file or prefix selectors in ordinary log form a bounded
+union. Glob patterns, intersections/negation, selected path-merge boundaries and
+exact-file histories crossing a directory remain explicit unsupported cases. Fetch an absent reference explicitly before its first push. Native
 publication is not Git push. Use the [checked landing workflow](#checked-landing)
 below for protected main.
 
@@ -72,18 +74,25 @@ reconciliation; it never overwrites newer work. Interrupted operations retain
 recovery roots. First submission upgrades local state; use a matching
 landing-aware CLI afterward. There is no Git publication or materialized fallback.
 
-`history` and `blame` pin the selected revision (`-r REV`, default `@`) and
-compose local drafts and dirty edits over this workspace's immutable remote
-baseline, without uploading them. They use fixed-path, linear-history semantics;
-merges, conflicts and exhausted limits are explicit, not complete results.
-Queries use an observed clone/fetch baseline or the exact retained version of a
-restored cloud workspace; later private edits stay local. With the Federated
-index, ordinary `jj file annotate` uses the same bounded linear attribution,
-including dirty edits and `-r` selection, and renders jj's configured annotation
-template or `-T` override. It requires complete attribution before output;
-merges, conflicts and exhausted limits are unsupported, without an eager history
-fallback. This does not yet provide jj's full multi-parent annotation semantics.
-Explicit Legacy indexes retain jj's ordinary annotation implementation.
+`history` and `blame` pin the selected revision (`-r REV`, default `@`) against
+an observed clone/fetch baseline or the exact retained version of a restored
+cloud workspace. Later private edits stay local. History discovery keeps its
+explicit fixed-path merge and conflict boundaries.
+
+With the Federated index, ordinary `jj file annotate` supports resolved merge
+attribution with jj's default line-level, accept-same-change merge options,
+including private drafts, dirty edits and `-r` selection. Canonical and retained
+attribution stays on the server; mixed private attribution uses a checked,
+bounded canonical frontier without uploading private bodies. Continuations keep
+one captured source, aggregate reservation and original deadline. They do not
+chain partial blame boundaries or silently retry with an eager history fallback.
+
+`tinytree.annotation.max-commits` bounds the complete ordinary annotation command
+(default 4096), including every continuation page. Server limits may lower this
+allowance. Conflicted paths, unsupported merge options and exhausted limits fail
+explicitly. Complete attribution and bounded template recording precede output;
+jj's configured annotation template and `-T` override remain supported. Explicit
+Legacy indexes retain jj's ordinary annotation implementation.
 
 `search` interprets its pattern as a case-sensitive regular expression in regular
 files at the selected revision, merging remote results with local additions,

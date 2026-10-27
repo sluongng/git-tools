@@ -34,6 +34,15 @@ completed-query replay state. `query_cleanup_timeout_ms` defaults to 5000 and
 network failures fall back to server expiry. Closing a scope is not query cancellation.
 
 `path_history`, `blame` and `search` pin immutable revisions within checked scopes.
+`collect_annotation_frontier` retains one captured source and cumulative
+reservation while collecting checked parent-first frontier pages for mixed
+private attribution. `collect_annotation_blame` keeps canonical or retained
+attribution server-side and receives only the selected target and complete
+origin ranges, not ancestry nodes. Both keep the original deadline across page
+attempts and retain aggregate memory independently of inflight RPC admission.
+Use `close_annotation_frontier` or `close_annotation_blame` when finished.
+Incomplete progress is not complete attribution; a blame boundary is not a
+resumable annotation cursor. Limits and source identity cannot reset on replay.
 `begin_search` / `search_page` preserve source, cursor and ordering checks across
 literal-search pages. Snippets and completeness trust the authenticated server;
 they are not canonical whole-file verification or retention proofs.

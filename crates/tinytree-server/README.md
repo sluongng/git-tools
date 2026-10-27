@@ -100,6 +100,17 @@ a fresh epoch. Older generations and legacy `derived-index` data remain untouche
 remove them only through explicit offline maintenance. There is no automatic eviction
 or in-place format conversion. An unavailable index does not disable object serving.
 
+## Annotation budgets
+
+Paged annotation holds one immutable path/anchor context across bounded advances.
+`service.query.max_annotation_commits` bounds its aggregate traversal (default
+4096), separately from the legacy per-request `max_history_commits` setting.
+Page size does not renew work, read, diff, allocation or deadline allowances.
+Canonical and retained-only attribution returns the verified target and origin
+ranges without transferring the ancestry graph. Mixed private queries can request
+a bounded frontier, while private bodies remain local. Closing leaves a replay
+binding until expiry rather than allowing a fresh budget on the same scope.
+
 ## Browser UI
 
 Open `/ui/` on the server's TCP address for the embedded WebAssembly browser.
